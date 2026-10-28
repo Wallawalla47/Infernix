@@ -1,8 +1,9 @@
 // The wide route of offloaded_sparse_moe: work planning, A4 quantization of x for the wide
-// entries, TMA descriptors and the per-pass GEMM launches (wide_expert.h, wide_expert.cuh), and the
-// W4A16 route's limb encodings and exact integer GEMMs (wide_expert_a16.cuh).
+// entries, TMA descriptors and the per-pass GEMM launches (wide_expert.h, wide_expert.cuh), the
+// W4A16 route's limb encodings and exact integer GEMMs (wide_expert_a16.cuh), and its 8-bit activation
+// GEMMs with the h encoding between them (WideA16::kA8, wide_expert_a8.cuh).
 
-#include "ops/offloaded_sparse_moe/cuda/wide_expert_a16.cuh"
+#include "ops/offloaded_sparse_moe/cuda/wide_expert_a8.cuh"
 
 #include "core/device.h"
 #include "core/temporary_switches.h"
@@ -296,6 +297,66 @@ __global__ void __launch_bounds__(kEncodeWarps * 32)
     }
 }
 
+// The pass's wide entries' BF16 h rows rewritten in place as their 8-bit codes (WideA16::kA8): ggml_a8.h's codec,
+// the narrow 8-bit down kernels' codes of the same h. One warp per entry; lane l < I / 32 holds slice l (64 bytes)
+// in registers before any lane writes: its codes at byte 32 l, its scale at byte I + 4 l.
+template <class G>
+__global__ void __launch_bounds__(kEncodeWarps * 32)
+    encode_h_a8_kernel(MoeDispatch dispatch, const std::int32_t* __restrict__ tiles, const std::int32_t* __restrict__ pass_tiles,
+                       int pass, std::uint8_t* __restrict__ h_rows) {
+    namespace a8          = ::infernix::ggml::a8;
+    constexpr int kSlices = G::kIntermediate / 32; // 20 or 32
+    static_assert(kSlices <= 32 && G::kIntermediate + 4 * kSlices <= A16Planes<G>::kHRowBytes);
+    const int lane  = static_cast<int>(threadIdx.x) % 32;
+    const int warp  = static_cast<int>(blockIdx.x) * kEncodeWarps + static_cast<int>(threadIdx.x) / 32;
+    const int warps = static_cast<int>(gridDim.x) * kEncodeWarps;
+    const int first_tile = pass_tiles[pass], tile_count = pass_tiles[pass + 1] - first_tile;
+    const bool mine = lane < kSlices;
+    for (int task = warp; task < tile_count * kTileColumns; task += warps) {
+        const int tile = first_tile + task / kTileColumns, c = task % kTileColumns;
+        const int job = tiles[2 * tile], column = tiles[2 * tile + 1];
+        const int expert = dispatch.jobs[job];
+        const int entry  = dispatch.offsets[expert] + column + c;
+        if (entry >= dispatch.offsets[expert + 1]) { continue; } // warp-uniform
+        std::uint8_t* row = h_rows + static_cast<std::size_t>(entry) * A16Planes<G>::kHRowBytes;
+        std::uint16_t v[32] = {};
+        if (mine) {
+            const auto* source = reinterpret_cast<const uint4*>(row + 64 * lane);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint4 u       = source[i];
+                const unsigned w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    v[8 * i + 2 * k]     = static_cast<std::uint16_t>(w[k] & 0xFFFFU);
+                    v[8 * i + 2 * k + 1] = static_cast<std::uint16_t>(w[k] >> 16);
+                }
+            }
+        }
+        __syncwarp(); // every lane has read its slice before any lane writes the row
+        if (mine) {
+            unsigned key = 0;
+#pragma unroll
+            for (int e = 0; e < 32; ++e) { key = max(key, static_cast<unsigned>(v[e] & 0x7FFFU)); }
+            const a8::SliceScale sc = a8::slice_scale(key);
+            int words[8];
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                const unsigned b0 = static_cast<unsigned>(a8::code(v[4 * q], sc.inv)) & 0xFFU;
+                const unsigned b1 = static_cast<unsigned>(a8::code(v[4 * q + 1], sc.inv)) & 0xFFU;
+                const unsigned b2 = static_cast<unsigned>(a8::code(v[4 * q + 2], sc.inv)) & 0xFFU;
+                const unsigned b3 = static_cast<unsigned>(a8::code(v[4 * q + 3], sc.inv)) & 0xFFU;
+                words[q]          = static_cast<int>(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            }
+            auto* codes = reinterpret_cast<int4*>(row + 32 * lane);
+            codes[0]    = make_int4(words[0], words[1], words[2], words[3]);
+            codes[1]    = make_int4(words[4], words[5], words[6], words[7]);
+            reinterpret_cast<float*>(row + G::kIntermediate)[lane] = sc.d;
+        }
+        __syncwarp(); // the row is written before the warp's next task
+    }
+}
+
 // ---------------------------------------------------------- W4A16 two-term A4 (design §19.3.23)
 
 // A row scale: amax / (6 * 448), so every block's first-term E4M3 scale stays finite. An all-zero row
@@ -578,6 +639,15 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source.scales, max_jobs, pass_jobs, call.passes,
                                                 workspace.tiles, workspace.pass_tiles);
     check_launch("plan");
+    if (source.activation == ExpertActivation::kA16 && source.wide_a16 == WideA16::kA8) {
+        // W4A16 on 8-bit activations: every token's codes are already in the x region (moe_experts encodes them
+        // once per call for the narrow kernels too, a8_x_rows); h is encoded per pass.
+        call.a8      = true;
+        call.x_limbs = a8_x_rows(workspace);
+        call.h_rows  = workspace.h_rows;
+        call.top_k   = top_k;
+        return call;
+    }
     const ResidualTerms terms =
         source.activation == ExpertActivation::kA16 ? residual_terms(source.wide_a16) : ResidualTerms{};
     if (terms.x != 0) {
@@ -653,6 +723,23 @@ bool wide_t64(const Call& call) {
 
 void run_pass(const Call& call, std::int32_t pass, cudaStream_t stream) {
     if (pass < 0 || pass >= call.passes) { throw std::out_of_range("offloaded_sparse_moe wide: pass out of range"); }
+    if (call.a8) {
+        with_expert_geometry(call.shape, [&]<class G>() {
+            // A call with shared-expert jobs maps entries through entry_column; a routed-only call keeps the token row.
+            const GateUpEpilogueA8<G> gate_up{call.scales, call.h_rows};
+            if (call.dispatch.shared_first != 0x7FFFFFFF) {
+                launch_a8<A8Matrix<G, Matrix::GateUp, true>>(call, pass, gate_up, stream);
+            } else {
+                launch_a8<A8Matrix<G, Matrix::GateUp>>(call, pass, gate_up, stream);
+            }
+            encode_h_a8_kernel<G><<<persistent_ctas(), kEncodeWarps * 32, 0, stream>>>(call.dispatch, call.tiles,
+                                                                                       call.pass_tiles, pass, call.h_rows);
+            check_launch("encode h a8");
+            launch_a8<A8Matrix<G, Matrix::Down>>(call, pass, DownEpilogueA8<G>{call.scales, call.dispatch.entries, call.outputs},
+                                                 stream);
+        });
+        return;
+    }
     if (call.a4_residual) {
         with_expert_geometry(call.shape, [&]<class G>() {
             const auto gate_up = [&]<int Terms>() {

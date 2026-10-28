@@ -184,6 +184,14 @@ struct RestoredBlock {
     std::uint32_t slab = kNoId;
 };
 
+// What a failed sequence published that PrefixCacheIndex::withdraw still has to remove (§7.8).
+struct Withdrawal {
+    std::vector<NodeRef> nodes;         // blocks whose Device copy was the sequence's page
+    std::vector<SnapshotRef> snapshots; // snapshots the sequence created
+
+    [[nodiscard]] bool empty() const noexcept { return nodes.empty() && snapshots.empty(); }
+};
+
 struct PrefixIndexStats {
     std::uint32_t nodes                   = 0;
     std::uint32_t snapshots               = 0;
@@ -368,6 +376,16 @@ public:
                                                       std::optional<std::uint32_t> tail_device_id,
                                                       HostImageReservation&& image,
                                                       SnapshotKind kind);
+
+    // ---- withdrawal (§7.8) ---------------------------------------------------------------------
+    // Removes what a sequence published from state that may be wrong (its logits went non-finite):
+    // every snapshot of `withdrawal.snapshots`, and every node of `withdrawal.nodes` with its whole
+    // subtree and each snapshot anchored there (later sequences that extended the path computed
+    // over its pages). Call once the sequence has released its pins and its transfers have landed.
+    // An entry another sequence or a transfer still pins stays in `withdrawal` for a later call;
+    // below a pinned node the unpinned snapshots go now, so no admission resumes from them. Stale
+    // references (entries evicted meanwhile) are dropped. Returns the entries removed.
+    std::uint32_t withdraw(Withdrawal& withdrawal);
 
     // ---- persistence ---------------------------------------------------------------------------
     // What a saved Host tier keeps: every Host-resident snapshot whose anchor path is Host-resident

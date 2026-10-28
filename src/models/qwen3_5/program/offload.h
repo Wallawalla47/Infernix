@@ -11,13 +11,16 @@
 #include "models/qwen3_5/execution/offloaded_moe.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/execution/vision_overlay.h"
+#include "runtime/expert_offload/drafter_pool.h"
 #include "runtime/expert_offload/expert_offload.h"
 
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -44,6 +47,9 @@ struct OffloadGeometry {
     // The experts' wide route (ExecutionSchedule::expert_wide; OffloadedExperts::wide_a16), which the
     // workspace plan sized.
     ops::offloaded_moe::WideA16 expert_wide = ops::offloaded_moe::WideA16::kExact;
+    // The experts' narrow route (--a8-activations: NarrowA16::kA8; OffloadedExperts::narrow_a16), which the
+    // CPU service's options carry too.
+    ops::offloaded_moe::NarrowA16 expert_narrow = ops::offloaded_moe::NarrowA16::kExact;
     // router-mma (ExecutionSchedule::router_mma; OffloadedExperts::router_mma).
     bool router_mma = false;
     int device = 0;
@@ -159,6 +165,10 @@ private:
     };
 
     void build_experts();
+    // The drafter pool (candidates §22 VM-01): the MTP drafter's pooled experts (Config::
+    // mtp_expert_slots), allocated before the engine sizes its frames from the free memory, and its periodic report.
+    void create_drafter_pool(cudaStream_t compute);
+    void report_drafter_pool();
     // The workspace a pass of `columns` borrows (0 at or below the static width).
     [[nodiscard]] std::uint64_t wide_bytes(std::int32_t columns) const;
     [[nodiscard]] DeviceSpan wide_workspace(std::uint64_t bytes, cudaStream_t compute);
@@ -167,10 +177,16 @@ private:
     std::uint64_t wide_pass_bytes_ = 0; // OffloadGeometry::wide_pass_bytes
     std::vector<std::pair<std::int32_t, std::size_t>> wide_ladder_; // with INFERNIX_TMP_PROMPT_SIZED_LOAN: OffloadGeometry::wide_pass_ladder
     ops::offloaded_moe::WideA16 expert_wide_ = ops::offloaded_moe::WideA16::kExact; // OffloadGeometry::expert_wide
+    ops::offloaded_moe::NarrowA16 expert_narrow_ = ops::offloaded_moe::NarrowA16::kExact; // OffloadGeometry::expert_narrow
     bool router_mma_                         = false;                                // OffloadGeometry::router_mma
     std::vector<std::uint8_t> silent_columns_; // a continuing prompt pass's not-live column flags (end_pass)
+    Diagnostic diagnostic_; // the engine's (a copy, for the drafter pool's lines)
     runtime::expert_offload::ExpertOffload engine_;
     execution::OffloadedExperts experts_;
+    // The drafter pool's memory first, so the pool (whose copies write it) goes first.
+    DeviceBuffer drafter_pool_memory_;
+    std::unique_ptr<runtime::expert_offload::DrafterExpertPool> drafter_pool_;
+    std::chrono::steady_clock::time_point drafter_reported_{};
     VisionFrames vision_window_{*this};
     // A wide pass's buffers outside the stream's lease: a frame lease, or the allocation used when the
     // cache could not lend them.

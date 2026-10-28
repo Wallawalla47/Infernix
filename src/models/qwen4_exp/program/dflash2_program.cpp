@@ -40,11 +40,28 @@ void ProgramImpl::create_dflash2_drafter() {
                                                     *work_, std::move(ring), options_.max_context);
 }
 
+execution::DFlash2ProposalCall ProgramImpl::dflash2_proposal_call(std::int32_t batch) {
+    const std::int32_t K = dflash_k_, W = K + 1;
+    constexpr std::int32_t C = ops::kSparseSpeculativeCandidates;
+    return {.anchors       = Tensor(dflash_device(dflash_io_.anchors), DType::I32, {batch}),
+            .frontiers     = Tensor(dflash_device(dflash_io_.frontiers), DType::I32, {batch}),
+            .valid_columns = Tensor(dflash_device(dflash_io_.valid), DType::I32, {batch}),
+            .slots         = Tensor(dflash_device(dflash_io_.slots), DType::I32, {batch}),
+            .configs       = static_cast<const ops::SamplingConfig*>(configs_.p),
+            .batch         = batch,
+            .width         = W,
+            .ids           = Tensor(dflash_device(dflash_io_.ids), DType::I32, {W, batch}),
+            .positions     = Tensor(dflash_device(dflash_io_.positions), DType::I32, {W, batch}),
+            .drafts        = Tensor(dflash_device(dflash_io_.drafts), DType::I32, {K, batch}),
+            .candidates    = Tensor(dflash_device(dflash_io_.candidates), DType::I32, {C, K, batch}),
+            .proposal_q    = Tensor(dflash_device(dflash_io_.q), DType::FP32, {C, K, batch}),
+            .confidence    = Tensor(dflash_device(dflash_io_.confidence), DType::FP32, {K, batch})};
+}
+
 void ProgramImpl::dflash2_propose(std::span<const std::uint32_t> lanes, const std::function<void()>& while_drafting) {
     const cudaStream_t s = device_.stream;
     const auto batch     = static_cast<std::int32_t>(lanes.size());
     const std::int32_t K = dflash_k_, W = K + 1;
-    constexpr std::int32_t C = ops::kSparseSpeculativeCandidates;
     // Each row's block starts at its unprocessed anchor; the ring holds every earlier position. The
     // selector draws a sampled row's drafts with its seed (verify uploads the configs again, with
     // grammar masks, after this round's synchronize).
@@ -61,20 +78,7 @@ void ProgramImpl::dflash2_propose(std::span<const std::uint32_t> lanes, const st
     }
     upload_pinned(dflash_device_.p, dflash_host_.data(), 4ULL * dflash_io_.ids, s);
     upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
-    const execution::DFlash2ProposalCall call{
-        .anchors       = Tensor(dflash_device(dflash_io_.anchors), DType::I32, {batch}),
-        .frontiers     = Tensor(dflash_device(dflash_io_.frontiers), DType::I32, {batch}),
-        .valid_columns = Tensor(dflash_device(dflash_io_.valid), DType::I32, {batch}),
-        .slots         = Tensor(dflash_device(dflash_io_.slots), DType::I32, {batch}),
-        .configs       = static_cast<const ops::SamplingConfig*>(configs_.p),
-        .batch         = batch,
-        .width         = W,
-        .ids           = Tensor(dflash_device(dflash_io_.ids), DType::I32, {W, batch}),
-        .positions     = Tensor(dflash_device(dflash_io_.positions), DType::I32, {W, batch}),
-        .drafts        = Tensor(dflash_device(dflash_io_.drafts), DType::I32, {K, batch}),
-        .candidates    = Tensor(dflash_device(dflash_io_.candidates), DType::I32, {C, K, batch}),
-        .proposal_q    = Tensor(dflash_device(dflash_io_.q), DType::FP32, {C, K, batch}),
-        .confidence    = Tensor(dflash_device(dflash_io_.confidence), DType::FP32, {K, batch})};
+    const execution::DFlash2ProposalCall call = dflash2_proposal_call(batch);
     replay(dflash_propose_graphs_[static_cast<std::size_t>(batch - 1)], [&] { drafter_->propose(call); });
     // The drafts and their probabilities (adjacent regions) in one copy.
     CUDA_CHECK(cudaMemcpyAsync(dflash_host(dflash_io_.drafts), dflash_device(dflash_io_.drafts),
@@ -147,24 +151,31 @@ std::pair<std::size_t, std::size_t> ProgramImpl::dflash2_verify_planes(std::int3
     return {dflash_io_.verify_candidates, dflash_io_.verify_q};
 }
 
-void ProgramImpl::dflash2_catch_up(std::span<const SequenceHandle> rows, std::int32_t W, const std::int32_t* commit) {
-    const auto batch = static_cast<std::int32_t>(rows.size());
-    auto* io         = static_cast<std::byte*>(io_device_.p);
+execution::DFlash2ContextCall ProgramImpl::dflash2_context_call(std::int32_t batch, std::int32_t W) {
+    auto* io = static_cast<std::byte*>(io_device_.p);
     // The round's features [F, W, batch] (column b * W + j), its positions [W, batch] and lanes, and
     // each row's committed column count; the launch covers every count 0..W.
-    const execution::DFlash2ContextCall call{
-        .features  = dflash_feature_columns(0, W * batch).view({dflash_feature_rows(), W, batch}),
-        .positions = Tensor(io + io_layout_.positions, DType::I32, {W, batch}),
-        .counts    = Tensor(spec_device(spec_layout_.commit), DType::I32, {batch}),
-        .slots     = Tensor(io + io_layout_.slots, DType::I32, {batch}),
-        .min_count = 0,
-        .max_count = static_cast<std::uint32_t>(W)};
-    replay(dflash_context_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)],
-           [&] { drafter_->materialize(call); });
-    for (std::int32_t b = 0; b < batch; ++b) {
-        Lane& lane = lanes_[ContractAccess::lane(rows[static_cast<std::size_t>(b)])];
+    return {.features  = dflash_feature_columns(0, W * batch).view({dflash_feature_rows(), W, batch}),
+            .positions = Tensor(io + io_layout_.positions, DType::I32, {W, batch}),
+            .counts    = Tensor(spec_device(spec_layout_.commit), DType::I32, {batch}),
+            .slots     = Tensor(io + io_layout_.slots, DType::I32, {batch}),
+            .min_count = 0,
+            .max_count = static_cast<std::uint32_t>(W)};
+}
+
+void ProgramImpl::dflash2_settle_frontiers(std::span<const SequenceHandle> rows, const std::int32_t* commit) {
+    for (std::size_t b = 0; b < rows.size(); ++b) {
+        Lane& lane = lanes_[ContractAccess::lane(rows[b])];
         if (commit[b] > 0) { lane.dflash_frontier = lane.state_tokens; }
     }
+}
+
+void ProgramImpl::dflash2_catch_up(std::span<const SequenceHandle> rows, std::int32_t W, const std::int32_t* commit) {
+    const auto batch                          = static_cast<std::int32_t>(rows.size());
+    const execution::DFlash2ContextCall call = dflash2_context_call(batch, W);
+    replay(dflash_context_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)],
+           [&] { drafter_->materialize(call); });
+    dflash2_settle_frontiers(rows, commit);
 }
 
 void ProgramImpl::dflash2_wait_copies(const Lane& lane) {

@@ -207,6 +207,22 @@ int test_cli_contract() {
     failures += expect_throws<std::invalid_argument>(
         [] { (void)parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--ngram-residency", "disk"}); },
         "--ngram-residency rejects other values");
+    // --expert-state: absent seeds from the calibrated order (no file), off starts empty, a path warm-starts.
+    {
+        const auto absent = parse_for_test({"infernix_bench", "--weights", "model.ninfer"});
+        const auto off    = parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--expert-state", "off"});
+        const auto file   = parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--expert-state", "s.expert-state"});
+        failures += expect(absent.expert_state_path.empty() && !absent.expert_state_off, "--expert-state absent: the calibrated seed");
+        failures += expect(off.expert_state_path.empty() && off.expert_state_off, "--expert-state off: an empty cache");
+        failures += expect(file.expert_state_path == "s.expert-state" && !file.expert_state_off, "--expert-state FILE");
+    }
+    // --ram-free-mib: 8 GiB by default.
+    failures += expect(parse_for_test({"infernix_bench", "--weights", "model.ninfer"}).ram_free_bytes == (8192ULL << 20),
+                       "--ram-free-mib defaults to 8 GiB");
+    // --a8-activations: off by default, a flag without a value.
+    failures += expect(!parse_for_test({"infernix_bench", "--weights", "model.ninfer"}).a8_activations &&
+                           parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--a8-activations"}).a8_activations,
+                       "--a8-activations is an opt-in flag");
     for (const std::string backend : {"mtp", "dflash", "dflash2"}) {
         for (unsigned width = 0; width <= 63; ++width) {
             for (const unsigned minimum : {4U, 12U, 64U}) {
@@ -526,7 +542,10 @@ int test_report_contract() {
 
     failures += expect(report.at("config").at("rope_yarn_factor") == 2.5,
                        "report preserves runtime YaRN factor");
-    failures += expect(report.at("schema_version") == 25, "report schema v25");
+    failures += expect(report.at("schema_version") == 26, "report schema v26");
+    failures += expect(report.at("config").at("expert_state") == "calibrated" &&
+                           report.at("config").at("ram_free_mib") == 8192,
+                       "report records the expert seed and the RAM kept free");
     failures += expect(report.at("machine").at("pcie_generation").is_null() &&
                            report.at("machine").at("h2d_gbps").is_null() &&
                            report.at("machine").at("ram_read_gbps").is_null(),
@@ -736,12 +755,43 @@ int test_constrained_batch_metrics() {
     return failures;
 }
 
+// --rows (TensorFold review TF-01): concurrent rows take distinct shares of the corpus by default, so a MoE
+// model's rows route as separate requests do; `same` repeats the first row's prompt; --prompt-ids is `same`.
+int test_row_prompts() {
+    int failures = 0;
+    failures += expect(parse_for_test({"bench", "--weights", "model.ninfer", "--concurrency", "4"}).distinct_rows,
+                       "rows are distinct by default");
+    failures += expect(!parse_for_test({"bench", "--weights", "model.ninfer", "--concurrency", "4", "--rows", "same"})
+                            .distinct_rows,
+                       "--rows same repeats the prompt");
+    failures += expect_throws<std::invalid_argument>(
+        [] { (void)parse_for_test({"bench", "--weights", "model.ninfer", "--rows", "shared"}); }, "--rows takes two values");
+    failures += expect(!parse_for_test({"bench", "--weights", "model.ninfer", "--prompt-ids", "p.ids", "-n", "8",
+                                        "--concurrency", "2"})
+                            .distinct_rows,
+                       "--prompt-ids gives every row its prompt");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test({"bench", "--weights", "model.ninfer", "--prompt-ids", "p.ids", "-n", "8", "--concurrency",
+                                  "2", "--rows", "distinct"});
+        },
+        "--prompt-ids refuses distinct rows");
+    const std::vector<infernix::TokenId> corpus{10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
+    failures += expect(qb::row_prompt_start(corpus.size(), 0, 4, true) == 0 && qb::row_prompt_start(corpus.size(), 3, 4, true) == 6 &&
+                           qb::row_prompt_start(corpus.size(), 3, 4, false) == 0 && qb::row_prompt_start(corpus.size(), 0, 1, true) == 0,
+                       "each distinct row starts its own share of the corpus");
+    failures += expect(qb::prompt_slice(corpus, 4, 8) == std::vector<infernix::TokenId>{18, 19, 10, 11},
+                       "a row's prompt wraps round the corpus's end");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
     failures += test_constrained_batch_metrics();
     failures += test_cli_contract();
+    failures += test_row_prompts();
     failures += test_measurement_contract();
     failures += test_report_contract();
     failures += test_human_and_csv_reports();

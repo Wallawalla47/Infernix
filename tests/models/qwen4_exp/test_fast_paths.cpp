@@ -1,6 +1,6 @@
 // Qwen3.8-Flash-Next fast-path selection (models/qwen4_exp/program/fast_paths.h): where each fast
-// path's kernels run, which configurations the registry qualifies it for, and how a configuration is
-// described. The selection itself (select_fast_paths) needs loaded parameters; the startup log and
+// path's kernels run, which configurations the registry qualifies it for, how a configuration is
+// described, and the routes --a8-activations gives it. The selection itself (select_fast_paths) needs loaded parameters; the startup log and
 // the quality gate's runs cover it.
 
 #include "models/qwen4_exp/program/fast_paths.h"
@@ -283,11 +283,12 @@ int main() {
         failures += check(!q::fast_path_applies(FastPath::GgmlBf16Prefill, {dense, false, KvCacheStorage::Int8Group64}, options),
                           "ggml-bf16-prefill has no route for non-GGUF dense weights");
     }
-    failures += check(!infernix::ops::has_route(exact.dense_routes, infernix::ops::LinearRoutes::GgmlBf16Wide),
+    failures += check(!infernix::ops::has_route(exact.prefill_routes, infernix::ops::LinearRoutes::GgmlBf16Wide),
                       "the exact route keeps GGUF projections exact");
     selection.paths = {FastPath::GgmlBf16Prefill};
-    failures += check(infernix::ops::has_route(selection.forward().dense_routes, infernix::ops::LinearRoutes::GgmlBf16Wide),
-                      "ggml-bf16-prefill sets its route flag");
+    failures += check(selection.forward().prefill_routes == infernix::ops::LinearRoutes::GgmlBf16Wide &&
+                          selection.forward().dense_routes == infernix::ops::LinearRoutes::Exact,
+                      "ggml-bf16-prefill sets its route flag for prefill calls only");
     failures += check(!selection.request_invariant(), "ggml-bf16-prefill couples a prompt to its call boundaries");
     for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
                           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
@@ -339,11 +340,12 @@ int main() {
                                                 options),
                           "f16-accumulate-prefill has no route for 16-bit or GGUF dense weights");
     }
-    failures += check(!infernix::ops::has_route(exact.dense_routes, infernix::ops::LinearRoutes::F16Accumulate),
+    failures += check(!infernix::ops::has_route(exact.prefill_routes, infernix::ops::LinearRoutes::F16Accumulate),
                       "the exact route keeps FP8 and MXFP8 projections exact");
     selection.paths = {FastPath::F16AccumulatePrefill};
-    failures += check(infernix::ops::has_route(selection.forward().dense_routes, infernix::ops::LinearRoutes::F16Accumulate),
-                      "f16-accumulate-prefill sets its route flag");
+    failures += check(selection.forward().prefill_routes == infernix::ops::LinearRoutes::F16Accumulate &&
+                          selection.forward().dense_routes == infernix::ops::LinearRoutes::Exact,
+                      "f16-accumulate-prefill sets its route flag for prefill calls only");
     failures += check(!selection.request_invariant(), "f16-accumulate-prefill couples a prompt to its call boundaries");
     for (const DenseKernels dense : {DenseKernels::Fp8Row, DenseKernels::Mxfp8}) {
         for (const bool a4 : {false, true}) {
@@ -422,6 +424,71 @@ int main() {
                           "block-verification is an unqualified candidate on drafted chains");
         selection.paths = {FastPath::BlockVerification};
         failures += check(selection.request_invariant(), "block-verification coupled requests");
+    }
+
+    // --a8-activations' routes (A8Routes): decode routes on a GGUF import's dense projections and on GGUF and
+    // NVFP4 W4A16 experts (not W4A4 or block-FP8 ones, nor beside expert-a4-residual-decode's two A4 terms),
+    // prefill routes on GGUF and MXFP8 dense projections and on the same experts (whose wide route needs the
+    // narrow one); an artifact with none of them refuses the flag.
+    {
+        using infernix::ops::LinearRoutes;
+        const auto routes = [](DenseKernels dense, bool a4, QType experts, std::size_t ggml_projections,
+                               bool a4_narrow = false) {
+            return q::a8_activation_routes({dense, a4, KvCacheStorage::Int8Group64}, experts, ggml_projections,
+                                           a4_narrow);
+        };
+        const q::A8Routes iq3s = routes(kGgml, false, QType::GGML_IQ3_S, 120);
+        failures += check(iq3s.ggml_projections == 120 && iq3s.ggml_dense && iq3s.ggml_experts &&
+                              iq3s.ggml_dense_prefill && iq3s.experts_prefill && !iq3s.nvfp4_experts &&
+                              !iq3s.mxfp8_dense,
+                          "a GGUF import takes its dense projections' and experts' decode and prefill routes");
+        const q::A8Routes fp4_local = routes(DenseKernels::Mxfp8, false, QType::NVFP4_MUL, 0);
+        failures += check(fp4_local.nvfp4_experts && fp4_local.experts_prefill && fp4_local.mxfp8_dense &&
+                              !fp4_local.ggml_experts && !fp4_local.ggml_dense && !fp4_local.ggml_dense_prefill,
+                          "FP4-Local takes its W4A16 experts' decode and prefill routes and its MXFP8 dense prefill route");
+        const q::A8Routes fp4_local_a4 = routes(DenseKernels::Mxfp8, true, QType::NVFP4_MUL, 0);
+        failures += check(fp4_local_a4.any() && !fp4_local_a4.nvfp4_experts && !fp4_local_a4.experts_prefill &&
+                              fp4_local_a4.mxfp8_dense,
+                          "FP4-Local with 4-bit expert activations takes the MXFP8 prefill route only");
+        const q::A8Routes recipe_c_a8 = routes(DenseKernels::Fp8Row, false, QType::NVFP4_MUL, 0);
+        failures += check(recipe_c_a8.nvfp4_experts && recipe_c_a8.experts_prefill && !recipe_c_a8.mxfp8_dense,
+                          "recipe C takes its W4A16 experts' routes (its FP8 dense prefill is fp8-a8-pair's)");
+        failures += check(!routes(DenseKernels::Fp8Row, false, QType::NVFP4_MUL, 0, true).any(),
+                          "expert-a4-residual-decode's two A4 terms keep the W4A16 experts' narrow calls, and so "
+                          "their wide calls off the 8-bit route");
+        struct Refused {
+            DenseKernels dense;
+            bool a4;
+            QType experts;
+        };
+        for (const Refused& refused : {Refused{DenseKernels::Q8, true, QType::NVFP4_MUL},
+                                       Refused{kBf16, false, QType::FP8_E4M3FN_B128},
+                                       Refused{kBf16, true, QType::NVFP4_MUL}}) {
+            failures += check(!routes(refused.dense, refused.a4, refused.experts, 0).any(),
+                              "Dense8, the official FP8 import and recipe A have no 8-bit activation route");
+        }
+        // The decode flags; the MXFP8 pair replaces f16-accumulate-prefill, in prefill calls only.
+        auto fp4_local_fast =
+            q::FastPathSelection{.configuration = {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64},
+                                 .paths         = {FastPath::F16AccumulatePrefill}}
+                .forward();
+        fp4_local.apply(fp4_local_fast);
+        failures += check(fp4_local_fast.prefill_routes == LinearRoutes::Fp8A8PairBlock32 &&
+                              fp4_local_fast.dense_routes == LinearRoutes::Exact && fp4_local_fast.a8_experts &&
+                              fp4_local_fast.a8_experts_wide,
+                          "--a8-activations on FP4-Local: the block32 pair in place of the FP16 prefill route");
+        auto iq3s_fast = q::FastPathSelection{.configuration = {kGgml, false, KvCacheStorage::Int8Group64},
+                                              .paths         = {FastPath::GgmlBf16Prefill}}
+                             .forward();
+        iq3s.apply(iq3s_fast);
+        failures += check(iq3s_fast.dense_routes == LinearRoutes::GgmlA8 &&
+                              iq3s_fast.prefill_routes == (LinearRoutes::GgmlBf16Wide | LinearRoutes::GgmlA8Wide) &&
+                              iq3s_fast.a8_experts && iq3s_fast.a8_experts_wide,
+                          "--a8-activations on a GGUF import: GgmlA8 on every call, GgmlA8Wide (ahead of the BF16 "
+                          "tiles) on prefill calls, the experts' 8-bit routes");
+        failures += check(fp4_local_a4.describe().find("decode and verification: none") != std::string::npos &&
+                              recipe_c_a8.describe().find("prefill: the routed experts") != std::string::npos,
+                          "the startup line names what takes 8-bit activations in decode and in prefill");
     }
 
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " Qwen3.8-Flash-Next fast-path selection\n";

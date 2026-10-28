@@ -494,6 +494,91 @@ void test_resident_duplicate_replacement() {
     index.check_invariants();
 }
 
+// A sequence whose logits went non-finite withdraws what it published (§7.8): the blocks whose
+// Device copy is its page, with their subtrees, and its snapshots, so a resend resumes from what
+// was cached before it. Below a block another sequence still maps, the unpinned snapshots go at
+// once and the blocks with a later call; stale references are dropped.
+void test_withdrawal() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 6), backend);
+    const auto tokens = make_tokens(64 * 6 + 10, 70);
+    const auto n      = static_cast<std::uint32_t>(tokens.size());
+    const auto hashes = block_lookup_hashes(tokens, {});
+    // An earlier request cached blocks 0-1 and a tap at 128.
+    const std::vector<TokenId> prompt(tokens.begin(), tokens.begin() + 64 * 2);
+    const auto cached       = insert_sequence(index, backend, prompt);
+    const SnapshotRef clean = publish_tap(index, cached[1]);
+    index.release_path(cached);
+
+    // The failing request resumes at 128 (it maps blocks 0-1), inserts blocks 2-5 and taps at 256
+    // and 384.
+    const auto run = [&](std::vector<NodeRef>& path, std::vector<NodeRef>& owned) {
+        path = cached;
+        owned.clear();
+        index.acquire_path(cached);
+        for (std::size_t b = 2; b < 6; ++b) {
+            const std::span<const TokenId> block(tokens.data() + b * kBlockTokens, kBlockTokens);
+            const InsertResult result =
+                index.insert_block(path.back(), hashes[b], block, 0, backend.allocate(), true);
+            require(result.inserted && result.device_attached, "the request's blocks are new");
+            path.push_back(result.node);
+            owned.push_back(result.node);
+        }
+        index.check_invariants();
+    };
+    const auto only_clean = [&] {
+        const MatchResult match = index.match(tokens, hashes, {}, n);
+        return match.candidates.size() == 1 && match.candidates[0].snapshot == clean;
+    };
+    std::vector<NodeRef> path, owned;
+    run(path, owned);
+    const SnapshotRef tap4 = publish_tap(index, path[3]);
+    const SnapshotRef tap6 = publish_tap(index, path[5]);
+    index.release_path(path);
+    const std::size_t live = backend.live.size();
+    Withdrawal withdrawal{owned, {tap4, tap6}};
+    require(index.withdraw(withdrawal) == 6, "four blocks and two snapshots are withdrawn");
+    require(withdrawal.empty(), "nothing pinned stays to withdraw");
+    for (const NodeRef node : owned) { require(!index.valid(node), "a withdrawn block is gone"); }
+    require(!index.valid(tap4) && !index.valid(tap6), "the request's snapshots are gone");
+    require(index.valid(clean) && index.valid(cached[0]) && index.valid(cached[1]),
+            "what was cached before the request stays");
+    require(backend.live.size() == live - 4, "the withdrawn blocks' pages are released");
+    require(index.match(tokens, hashes, {}, n).path.size() == 2 && only_clean(),
+            "a resend resumes from the snapshot cached before the request");
+    index.check_invariants();
+
+    // Again, while a sibling that resumed from the request's tap at 256 maps blocks 0-4 and has
+    // published its own tap at 320.
+    const std::vector<NodeRef> stale = owned;
+    run(path, owned);
+    const SnapshotRef tap_a = publish_tap(index, path[3]);
+    const SnapshotRef tap_b = publish_tap(index, path[5]);
+    const std::vector<NodeRef> sibling(path.begin(), path.begin() + 5);
+    index.acquire_path(sibling);
+    const SnapshotRef tap_s = publish_tap(index, path[4]);
+    index.release_path(path);
+    withdrawal = Withdrawal{owned, {tap_a, tap_b}};
+    withdrawal.nodes.push_back(stale.front());
+    require(index.withdraw(withdrawal) == 4, "the unpinned snapshots and block 5 go at once");
+    require(!index.valid(tap_a) && !index.valid(tap_b) && !index.valid(tap_s),
+            "no snapshot over the withdrawn blocks stays resumable");
+    require(!index.valid(path[5]), "a block nothing maps goes at once");
+    require(withdrawal.snapshots.empty() && withdrawal.nodes.size() == 3 &&
+                withdrawal.nodes[0] == path[2] && withdrawal.nodes[1] == path[3] &&
+                withdrawal.nodes[2] == path[4],
+            "the blocks the sibling maps stay to withdraw, and the stale reference is dropped");
+    require(index.valid(path[2]) && index.node(path[4]).pins == 1, "the sibling's mapping is intact");
+    require(only_clean(), "a resend resumes from the snapshot cached before the request");
+    index.check_invariants();
+    index.release_path(sibling);
+    require(index.withdraw(withdrawal) == 3 && withdrawal.empty(),
+            "the blocks go once the sibling releases them");
+    require(index.valid(clean) && only_clean(), "the earlier snapshot still serves");
+    require(backend.live.size() == live - 4, "every withdrawn page returns");
+    index.check_invariants();
+}
+
 // A saved Host tier keeps exactly the Host-backed snapshots whose paths are Host-resident, and a
 // fresh index rebuilt from it matches the same prompts through host-only blocks.
 void test_persistence_roundtrip() {
@@ -1654,6 +1739,7 @@ int main() {
         test_passed_endpoints();
         test_host_only_reattach();
         test_resident_duplicate_replacement();
+        test_withdrawal();
         test_tail_device_fill();
         test_persistence_roundtrip();
         test_restore_plan();

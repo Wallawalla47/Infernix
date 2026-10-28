@@ -78,7 +78,8 @@ HostMemorySnapshot host_memory_snapshot() {
     counters.cb = sizeof(counters);
     if (::GetProcessMemoryInfo(::GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
                                sizeof(counters))) {
-        out.process_private = counters.PrivateUsage;
+        out.process_private  = counters.PrivateUsage;
+        out.process_resident = counters.WorkingSetSize;
     }
 #else
     out.total_physical     = proc_kib_field("/proc/meminfo", "MemTotal:").value_or(0);
@@ -89,6 +90,7 @@ HostMemorySnapshot host_memory_snapshot() {
     }
     out.available_commit = out.available_physical + proc_kib_field("/proc/meminfo", "SwapFree:").value_or(0);
     out.process_private  = proc_kib_field("/proc/self/status", "VmRSS:").value_or(0);
+    out.process_resident = out.process_private;
 #endif
     return out;
 }

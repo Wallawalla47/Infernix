@@ -5,7 +5,8 @@
 // else the Engine's); with `mtp`, Qwen3.8-Flash-Next's: its MTP
 // drafter with 4 drafts and the optimized proposal head; with `plain`, no speculation (one token per
 // round, the single-column decode kernels). Fast paths run as in infernix-serve; `reproducible`
-// runs the reproducible route (EngineOptions::fast_paths off) and `path=NAME` also runs that fast
+// runs the reproducible route (EngineOptions::fast_paths off), `a8` the 8-bit activation route
+// (--a8-activations), and `path=NAME` also runs that fast
 // path whether or not it is qualified (qualification). Qwen3.8-Flash-Next's DFlash2 drafter is a companion artifact:
 // `draft-model=FILE` selects it (`drafts=N`, 1-7, its draft count, also MTP's; `auto` its per-round length;
 // `full-head` drafts with the text head instead of the proposal head). `concurrency=N` (1-8) keeps N
@@ -27,7 +28,7 @@
 // Usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> <prompt_tokens>
 //                                  <new_tokens> [ngram | ngram=N] [min-match=M] [tree=auto|N] [prompts]
 //                                  [concurrency=N] [mtp [auto] [min-p=P]] [dflash [auto]] [plain] [reproducible]
-//                                  [path=NAME]...
+//                                  [a8] [path=NAME]...
 //                                  [draft-model=FILE [drafts=N] [auto] [full-head]] (Qwen3.8-Flash-Next DFlash2)
 //                                  [temperature=T] [logits=fp32|bf16] (the head's logits; bf16 for comparisons)
 //                                  [ngram-volume=FILE] (Qwen3.8-Flash-Next; default <artifact>.ngram)
@@ -55,7 +56,7 @@
 int main(int argc, char** argv) {
     if (argc < 7) {
         std::cerr << "usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> "
-                     "<prompt_tokens> <new_tokens> [ngram] [mtp [auto] [min-p=P]] [plain] [reproducible] [path=NAME]... "
+                     "<prompt_tokens> <new_tokens> [ngram] [mtp [auto] [min-p=P]] [plain] [reproducible] [a8] [path=NAME]... "
                      "[kv=bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [logits=fp32|bf16]\n";
         return 2;
     }
@@ -64,7 +65,7 @@ int main(int argc, char** argv) {
         const auto prompt_tokens = static_cast<std::uint32_t>(std::stoul(argv[5]));
         const auto new_tokens    = static_cast<std::uint32_t>(std::stoul(argv[6]));
         bool ngram = false, mtp = false, dflash = false, plain = false, reproducible = false, draft_auto = false,
-             full_head = false, tree_auto = false, prompt_records = false, ngram_auto = false;
+             full_head = false, tree_auto = false, prompt_records = false, ngram_auto = false, a8 = false;
         std::uint32_t ngram_drafts = 15, ngram_min_match = 12, tree_nodes = 0;
         std::vector<std::string> paths;
         std::string ngram_volume, route_trace, draft_model;
@@ -105,6 +106,8 @@ int main(int argc, char** argv) {
                 plain = true;
             } else if (flag == "reproducible") {
                 reproducible = true;
+            } else if (flag == "a8") {
+                a8 = true;
             } else if (flag.starts_with("ngram-volume=")) {
                 ngram_volume = flag.substr(13);
             } else if (flag.starts_with("route-trace=")) {
@@ -151,7 +154,7 @@ int main(int argc, char** argv) {
             } else {
                 std::cerr << "unknown option " << flag
                           << " (ngram, ngram=N, min-match=M, tree=auto|N, prompts, mtp, dflash, auto, min-p=P, "
-                             "plain, reproducible, path=NAME, draft-model=FILE, drafts=N, full-head, temperature=T, "
+                             "plain, reproducible, a8, path=NAME, draft-model=FILE, drafts=N, full-head, temperature=T, "
                              "ngram-volume=FILE, route-trace=FILE, kv=NAME, logits=fp32|bf16)\n";
                 return 2;
             }
@@ -166,6 +169,10 @@ int main(int argc, char** argv) {
         }
         if (mtp && dflash) {
             std::cerr << "mtp and dflash are two drafters: choose one\n";
+            return 2;
+        }
+        if (a8 && reproducible) {
+            std::cerr << "a8 (--a8-activations) is approximate: the reproducible route refuses it\n";
             return 2;
         }
 
@@ -239,7 +246,7 @@ int main(int argc, char** argv) {
         }
         if (plain) { options.speculative = {}; }
 #if defined(INFERNIX_DECODE_QUALITY_NINFER)
-        if (reproducible || !paths.empty() || !route_trace.empty()) {
+        if (reproducible || a8 || !paths.empty() || !route_trace.empty()) {
             std::cerr << "fast-path and route-trace options are not available in NInfer\n";
             return 2;
         }
@@ -248,6 +255,7 @@ int main(int argc, char** argv) {
         // tools/expert_cache_replay (host_tier.py, replay.py).
         options.route_trace_path = route_trace;
         options.fast_paths = !reproducible;
+        options.a8_activations = a8;
         for (const std::string& name : paths) {
             const std::optional<infernix::FastPath> path = infernix::parse_fast_path(name);
             if (!path) {

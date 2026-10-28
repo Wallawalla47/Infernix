@@ -65,6 +65,14 @@ public:
                                  std::span<std::uint8_t> cpu) const = 0;
 };
 
+// The widest prefill call the CPU split (the gated stream) takes: `configured` columns on the reference link
+// (`reference_bytes_per_second`), inversely to the measured one, at most the CPU channel's call width. Probes of one
+// link differ by a few percent (27.4-27.7 GB/s on the reference box), so a link within 5 % of the reference counts as
+// it: otherwise a call exactly at the width (4,096 columns) takes the gated stream in one process and the blind one in
+// the next (candidates BX-09's first A/B mixed both).
+[[nodiscard]] std::int32_t split_width(double configured, double reference_bytes_per_second,
+                                       double link_bytes_per_second) noexcept;
+
 // The model-independent subset of a Program's options the engine follows (the Program's own
 // ProgramOptions carry them from the EngineOptions).
 struct OffloadOptions {
@@ -84,10 +92,11 @@ struct OffloadOptions {
     bool plain_divisor_by_context    = false;
     double link_bytes_per_second     = 0.0; // > 0 fixes the link rate (else measured)
     // The CPU team's reference rates (i9-13900K, 6 workers, NVFP4 records) until measured, and the
-    // widest call the prefill split takes on the reference link.
+    // widest call the prefill split takes on the reference link (split_width): 4,096 with the copy-ahead
+    // (ExpertStream::plan_ahead; without it the gated stream lost from 2,048 columns).
     double cpu_split_expert_rate = 21000.0;
     double cpu_split_column_rate = 66000.0;
-    double cpu_split_columns     = 1536.0;
+    double cpu_split_columns     = 4096.0;
     // The SSD tier's RAM (the RAM ledger's Tier placement): pinned and unpinned record bytes, and
     // the pinned bytes Infernix's later allocations need.
     std::uint64_t expert_ram_bytes      = 0;
@@ -95,9 +104,15 @@ struct OffloadOptions {
     std::uint64_t later_pinned_bytes    = 0;
     std::filesystem::path expert_state; // the saved expert state (warm start); empty: none
     std::string expert_state_identity;
+    // Without a usable saved state the warm start seeds from the model's calibrated order
+    // (OffloadSetup::calibrated_state); false (--expert-state off): the cache starts empty.
+    bool expert_seed = true;
     std::filesystem::path expert_stripe; // an expert stripe on a second drive (SSD tier)
     std::filesystem::path route_trace;   // the internal route trace; empty: none
     std::uint32_t expert_tail_skip = 0;  // approximate tail skip rank (0: off)
+    // The CPU service's arithmetic for narrow W4A16 jobs: the calls' MoeExpertSource::narrow_a16
+    // (--a8-activations: NarrowA16::kA8).
+    ops::offloaded_moe::NarrowA16 narrow_a16 = ops::offloaded_moe::NarrowA16::kExact;
 };
 
 // What the engine serves: the offloaded layers' routed banks and the Program's round geometry.
@@ -123,12 +138,10 @@ struct OffloadSetup {
     // The route trace's header: the most drafts an MTP or n-gram round verifies.
     std::uint32_t mtp_draft_tokens   = 0;
     std::uint32_t ngram_draft_tokens = 0;
-    // Graph executables the VRAM sizing reserves room for (memory_plan graph_bound), and whether the
-    // Program captures them all right after the frames are sized (VramDemand::eager_graphs).
+    // Graph executables the VRAM sizing reserves room for when the pool is fixed (memory_plan graph_bound).
     std::uint32_t graph_bound = 0;
-    bool eager_graphs         = false;
-    // A model's calibrated expert order (Qwen3.8-Flash-Next's): the warm start's seed when the saved
-    // state cannot be used; null: none.
+    // A model's calibrated expert order (the Qwen3.5-122B-A10B's, models/qwen3_5/program/calibrated_order.h):
+    // the warm start's seed when no saved state can be used; null: none. It outlives the engine.
     const expert_cache::SavedState* calibrated_state = nullptr;
     int device = 0;
 };
@@ -415,6 +428,8 @@ private:
     std::vector<PromptUses> prompt_;
 
     StreamLeases leases_;
+    // The stream's counters when the ring was lent (the copy-ahead's report at its return).
+    ExpertStream::Stats stream_at_lease_;
 
     // VRAM monitor (design §19.3.7).
     using Clock = std::chrono::steady_clock;

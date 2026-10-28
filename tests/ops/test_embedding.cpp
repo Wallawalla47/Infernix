@@ -335,9 +335,11 @@ struct Q8Row {
 
 class Q8Table {
 public:
-    explicit Q8Table(std::int32_t d)
-        : d_(d), groups_(d / kQ8Group), code_plane_bytes_(static_cast<std::size_t>(kVocab) * d),
-          scale_offset_(align_up(code_plane_bytes_, 256)),
+    // `code_offset`: the code plane starts that many bytes into the payload (a byte-addressed view).
+    explicit Q8Table(std::int32_t d, std::size_t code_offset = 0)
+        : d_(d), groups_(d / kQ8Group), code_offset_(code_offset),
+          code_plane_bytes_(static_cast<std::size_t>(kVocab) * d),
+          scale_offset_(align_up(code_offset + code_plane_bytes_, 256)),
           payload_(scale_offset_ + static_cast<std::size_t>(kVocab) * groups_ * 2) {
         for (const std::int32_t row : d == 5120 ? dflash2_fixture_ids() : repeated_ids(8)) {
             if (find(row) == nullptr) add_row(row);
@@ -352,7 +354,7 @@ public:
         result.scale_dtype      = DType::FP16;
         result.payload          = base;
         result.payload_bytes    = payload_.bytes();
-        result.qdata            = base;
+        result.qdata            = base + code_offset_;
         result.qhigh            = nullptr;
         result.scales           = base + scale_offset_;
         result.high_plane_bytes = 0;
@@ -388,7 +390,8 @@ public:
         int failures = payload_.verify_guards(label);
         for (const Q8Row& row : rows_) {
             std::vector<std::uint8_t> got(row.codes.size());
-            payload_.copy_to_host(got.data(), got.size(), static_cast<std::size_t>(row.id) * d_);
+            payload_.copy_to_host(got.data(), got.size(),
+                                  code_offset_ + static_cast<std::size_t>(row.id) * d_);
             failures += verify_exact(label, got, row.codes);
             got.resize(row.scales.size());
             payload_.copy_to_host(got.data(), got.size(),
@@ -427,7 +430,7 @@ private:
             }
         }
         payload_.copy_from_host(row.codes.data(), row.codes.size(),
-                                static_cast<std::size_t>(id) * d_);
+                                code_offset_ + static_cast<std::size_t>(id) * d_);
         payload_.copy_from_host(row.scales.data(), row.scales.size(),
                                 scale_offset_ + static_cast<std::size_t>(id) * groups_ * 2);
         rows_.push_back(std::move(row));
@@ -435,6 +438,7 @@ private:
 
     std::int32_t d_;
     std::int32_t groups_;
+    std::size_t code_offset_;
     std::size_t code_plane_bytes_;
     std::size_t scale_offset_;
     GuardedDeviceBuffer payload_;
@@ -555,9 +559,11 @@ private:
     std::vector<Fp8Row> rows_;
 };
 
+// `output_bits`: receives the first (unreplayed) call's output bits.
 template <typename Table>
 int run_quantized_case(const char* label, Table& table, const std::vector<std::int32_t>& ids,
-                       std::int32_t d, bool replay = false, std::size_t output_offset = 0) {
+                       std::int32_t d, bool replay = false, std::size_t output_offset = 0,
+                       std::vector<std::uint16_t>* output_bits = nullptr) {
     GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer output(static_cast<std::size_t>(d) * ids.size() * 2 + output_offset);
     Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
@@ -583,6 +589,10 @@ int run_quantized_case(const char* label, Table& table, const std::vector<std::i
         else
             launch();
         cuda_synchronize(device.stream);
+        if (output_bits != nullptr && phase == 0) {
+            output_bits->resize(static_cast<std::size_t>(d) * ids.size());
+            output.copy_to_host(output_bits->data(), output_bits->size() * 2, output_offset);
+        }
         failures += verify_quantized(label, output, table.oracle(selected), output_offset);
         failures += output.verify_guards(label) + verify_input(label, device_ids, selected);
         failures += table.verify_unchanged(label);
@@ -636,6 +646,45 @@ int test_q8() {
             const std::string label = "embedding Q8 [248320," + std::to_string(d) +
                                       "] T=" + std::to_string(static_cast<unsigned long long>(t));
             failures += run_quantized_case(label.c_str(), table, repeated_ids(t), d);
+        }
+    }
+    return failures;
+}
+
+// The D=2048 row kernel (T > 6) loads eight codes as one 8-byte word and stores BF16 pairs. A code
+// plane 4 bytes off an 8-byte boundary, an output 2 bytes off a 4-byte one, and both, at a row-route
+// extent (T=7) and an interior one (T=64): each matches the oracle and the aligned call's bits.
+int test_q8_2048_alignment() {
+    constexpr std::int32_t kExtents[] = {7, 64};
+    constexpr std::size_t kCodeOffset = 4, kOutputOffset = 2;
+    const auto label = [](const char* view, std::int32_t t) {
+        return std::string("embedding Q8 [248320,2048] ") + view + " T=" + std::to_string(t);
+    };
+    int failures = 0;
+    std::vector<std::vector<std::uint16_t>> aligned(std::size(kExtents));
+    {
+        Q8Table table(kQ8VisionD);
+        for (std::size_t i = 0; i < std::size(kExtents); ++i) {
+            const auto ids = repeated_ids(static_cast<std::size_t>(kExtents[i]));
+            failures += run_quantized_case(label("aligned", kExtents[i]).c_str(), table, ids,
+                                           kQ8VisionD, false, 0, &aligned[i]);
+            std::vector<std::uint16_t> bits;
+            const std::string name = label("output+2", kExtents[i]);
+            failures += run_quantized_case(name.c_str(), table, ids, kQ8VisionD, false,
+                                           kOutputOffset, &bits);
+            failures += verify_exact((name + " bits").c_str(), bits, aligned[i]);
+        }
+    }
+    Q8Table shifted(kQ8VisionD, kCodeOffset);
+    for (std::size_t i = 0; i < std::size(kExtents); ++i) {
+        const auto ids = repeated_ids(static_cast<std::size_t>(kExtents[i]));
+        for (const std::size_t output_offset : {std::size_t{0}, kOutputOffset}) {
+            std::vector<std::uint16_t> bits;
+            const std::string name =
+                label(output_offset == 0 ? "codes+4" : "codes+4 output+2", kExtents[i]);
+            failures += run_quantized_case(name.c_str(), shifted, ids, kQ8VisionD, false,
+                                           output_offset, &bits);
+            failures += verify_exact((name + " bits").c_str(), bits, aligned[i]);
         }
     }
     return failures;
@@ -726,6 +775,7 @@ INFERNIX_OP_TEST(embedding) {
         failures += test_dense();
         failures += test_q6();
         failures += test_q8();
+        failures += test_q8_2048_alignment();
         failures += test_fp8();
     } catch (const std::exception& error) {
         std::cerr << "embedding test exception: " << error.what() << '\n';

@@ -619,7 +619,7 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
 
 bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
 
-void HttpServer::attach(GenerationService& service) {
+void HttpServer::attach(GenerationBackend& service) {
     if (service_ != nullptr) {
         throw std::logic_error("HTTP generation service is already attached");
     }

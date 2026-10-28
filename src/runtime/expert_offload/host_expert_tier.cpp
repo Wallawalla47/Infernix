@@ -1,5 +1,7 @@
 #include "runtime/expert_offload/host_expert_tier.h"
 
+#include "core/cpu_topology.h"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -62,6 +64,29 @@ void* pinned_allocate(std::size_t bytes) {
 }
 
 void pinned_release(void* p) { (void)cudaFreeHost(p); }
+
+// The tier's agent (it spins while a round is open) and copier threads run on the CPU's slowest cores (a hybrid CPU's
+// E-cores), leaving the fast cores to the CPU expert team (i9-13900K: 8 P-cores for 6 workers, the service, the engine
+// thread and the agent). Dense8's exclusive layout 0.986x against 0.980x with them unpinned, the tier holding every
+// expert 0.977x against 0.973x; IQ3_S unchanged (x_ab13, 2026-10-27). No change on a CPU of one class.
+void place_on_slow_cores() noexcept {
+    static const std::uint64_t slow = [] {
+        const std::vector<PhysicalCore> cores = physical_cores();
+        if (cores.empty()) { return std::uint64_t{0}; }
+        std::uint8_t lowest = 255, highest = 0;
+        for (const PhysicalCore& core : cores) {
+            lowest  = std::min(lowest, core.efficiency);
+            highest = std::max(highest, core.efficiency);
+        }
+        std::uint64_t mask = 0;
+        if (lowest != highest) {
+            for (const PhysicalCore& core : cores) { mask |= core.efficiency == lowest ? core.cpus : 0; }
+        }
+        return mask;
+    }();
+    if (slow != 0) { (void)set_current_thread_cpus(slow); }
+}
+
 
 } // namespace
 
@@ -169,6 +194,8 @@ HostExpertTier::HostExpertTier(const ExpertStore& store, Options options)
     ticket_capacity_ = (options_.layer_calls > 0 ? options_.layer_calls * store_.experts() : keys()) + calls * options_.ahead;
     tickets_         = std::make_unique<Ticket[]>(ticket_capacity_);
     stream_state_    = std::make_unique<std::atomic<std::uint32_t>[]>(std::max<std::uint32_t>(options_.stream, 1));
+    refill_state_    = std::make_unique<std::atomic<std::uint32_t>[]>(kRefills);
+    for (std::uint32_t id = kRefills; id > 0; --id) { refill_free_.push_back(id - 1); }
     {
         std::lock_guard<std::mutex> lock(mutex_);
         tier_.begin_round(0);
@@ -213,13 +240,13 @@ const std::uint8_t* HostExpertTier::record(std::uint32_t key) const noexcept {
     return slot >= 0 ? slot_bytes(static_cast<std::uint32_t>(slot)) : nullptr;
 }
 
-void HostExpertTier::submit(std::uint32_t key, std::uint8_t* destination, std::uint64_t tag_base) {
+void HostExpertTier::submit(std::uint32_t key, std::uint8_t* destination, std::uint64_t tag_base,
+                            DirectReadQueue::Priority priority) {
     const std::uint32_t layer = key / store_.experts(), expert = key % store_.experts();
     const auto segments = store_.segments(layer, expert);
     for (std::size_t i = 0; i < segments.size(); ++i) {
         const auto& s = segments[i];
-        queue_->submit({files_[s.file], s.offset, s.bytes, destination + s.at, DirectReadQueue::Priority::Demand,
-                        tag_base | i});
+        queue_->submit({files_[s.file], s.offset, s.bytes, destination + s.at, priority, tag_base | i});
     }
 }
 
@@ -271,6 +298,19 @@ std::uint32_t HostExpertTier::prefill(std::span<const std::uint32_t> ranked) {
         if (!tier_.has_free_resident()) { break; }
         std::int32_t slot = -1;
         if (!tier_.prefill(key, slot)) { continue; } // already has a host copy
+        jobs.emplace_back(key, const_cast<std::uint8_t*>(slot_bytes(static_cast<std::uint32_t>(slot))));
+    }
+    if (jobs.empty()) { return 0; }
+    read_at_startup(jobs);
+    return static_cast<std::uint32_t>(jobs.size());
+}
+
+std::uint32_t HostExpertTier::prefill_shadows(std::span<const std::uint32_t> ranked) {
+    std::vector<std::pair<std::uint32_t, std::uint8_t*>> jobs;
+    for (const std::uint32_t key : ranked) {
+        if (!tier_.has_free_resident()) { break; }
+        std::int32_t slot = -1;
+        if (!tier_.prefill_shadow(key, slot)) { continue; } // already has a host copy
         jobs.emplace_back(key, const_cast<std::uint8_t*>(slot_bytes(static_cast<std::uint32_t>(slot))));
     }
     if (jobs.empty()) { return 0; }
@@ -431,6 +471,20 @@ const std::uint8_t* HostExpertTier::stream_wait(std::int32_t slot) noexcept {
     }
 }
 
+std::uint32_t HostExpertTier::refill(std::uint32_t key, std::uint32_t slot) {
+    if (refill_free_.empty()) { return kNoRefill; }
+    const std::uint32_t id = refill_free_.back();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!agent_failure_.empty()) { return kNoRefill; } // nothing would read it: the caller copies the frame
+        refill_free_.pop_back();
+        refill_state_[id].store(0, std::memory_order_relaxed);
+        refill_jobs_.push_back({key, slot, id});
+    }
+    wake_.notify_all();
+    return id;
+}
+
 void HostExpertTier::stream_release(std::int32_t slot) {
     std::lock_guard<std::mutex> lock(mutex_);
     stream_free_.push_back(static_cast<std::uint32_t>(slot));
@@ -478,6 +532,7 @@ void HostExpertTier::finish_copy(const Copy& copy) {
 }
 
 void HostExpertTier::copier_main() noexcept {
+    place_on_slow_cores();
     for (;;) {
         Copy copy;
         {
@@ -516,6 +571,7 @@ void HostExpertTier::copy_records(std::span<const std::pair<std::uint8_t*, const
 }
 
 void HostExpertTier::agent_main() noexcept {
+    place_on_slow_cores();
     try {
         agent_loop();
     } catch (const std::exception& error) {
@@ -535,6 +591,8 @@ void HostExpertTier::agent_failed(std::string what) noexcept {
         new_demands_.clear();
         prefill_jobs_.clear();
         stream_jobs_.clear();
+        for (const RefillJob& job : refill_jobs_) { refill_state_[job.id].store(2, std::memory_order_release); }
+        refill_jobs_.clear();
         for (std::uint32_t s = 0; s < options_.stream; ++s) { // pending stream reads fail
             std::uint32_t pending = 0;
             stream_state_[s].compare_exchange_strong(pending, 2, std::memory_order_acq_rel);
@@ -622,6 +680,15 @@ void HostExpertTier::agent_loop() {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> streams;
     std::vector<StreamEntry> stream_entries;
     std::uint32_t stream_left = 0;
+    // Refill reads in flight, by refill id (segments left, failed), tagged as prefill reads whose index carries
+    // kRefillEntry.
+    struct RefillEntry {
+        std::uint32_t remaining = 0;
+        bool failed             = false;
+    };
+    constexpr std::uint32_t kRefillEntry = 0x40000000U;
+    std::vector<RefillJob> refills;
+    std::vector<RefillEntry> refill_entries(kRefills);
     // The members of each scatter read in flight (tickets or prefill entries), by tag index.
     std::vector<std::vector<std::uint32_t>> runs;
     std::vector<DirectReadQueue::Completion> done;
@@ -692,7 +759,8 @@ void HostExpertTier::agent_loop() {
             std::unique_lock<std::mutex> lock(mutex_);
             if (outstanding == 0 && waiting.empty() && !open_) {
                 wake_.wait(lock, [&] {
-                    return stop_ || open_ || !new_demands_.empty() || !prefill_jobs_.empty() || !stream_jobs_.empty();
+                    return stop_ || open_ || !new_demands_.empty() || !prefill_jobs_.empty() || !stream_jobs_.empty() ||
+                           !refill_jobs_.empty();
                 });
                 last_work = Clock::now();
             }
@@ -701,6 +769,7 @@ void HostExpertTier::agent_loop() {
             demands.swap(new_demands_);
             prefills.swap(prefill_jobs_);
             streams.swap(stream_jobs_);
+            refills.swap(refill_jobs_);
             open = open_;
             if (round_ != round) { // a boundary reset the tickets: the last request is over
                 round = round_;
@@ -927,6 +996,16 @@ void HostExpertTier::agent_loop() {
             i = end;
         }
         streams.clear();
+        // Refills: one read each, into the demotion slot the boundary chose (behind the demands submitted above).
+        for (const RefillJob& job : refills) {
+            const auto n = static_cast<std::uint32_t>(store_.segments(job.key / store_.experts(), job.key % store_.experts()).size());
+            refill_entries[job.id] = {n, false};
+            submit(job.key, const_cast<std::uint8_t*>(slot_bytes(job.slot)), tag_of(kPrefillTag, job.id | kRefillEntry, 0),
+                   DirectReadQueue::Priority::Restore);
+            outstanding += n;
+        }
+        if (!refills.empty()) { last_work = Clock::now(); }
+        refills.clear();
         done.clear();
         // While a round is open the agent spins (a fetch request must not wait for a timer).
         queue_->poll(done, outstanding != 0 && !open ? std::chrono::microseconds(200) : std::chrono::microseconds(0));
@@ -967,10 +1046,18 @@ void HostExpertTier::agent_loop() {
                 if (--stream_left == 0) { stream_entries.clear(); }
             }
         };
-        // A prefill-kind index or run member is a stream read's when it carries kStreamEntry.
+        const auto refill_done = [&](std::uint32_t id, bool ok) {
+            RefillEntry& entry = refill_entries[id];
+            entry.failed       = entry.failed || !ok;
+            if (--entry.remaining == 0) { refill_state_[id].store(entry.failed ? 2 : 1, std::memory_order_release); }
+        };
+        // A prefill-kind index or run member is a stream read's when it carries kStreamEntry, a refill's when it
+        // carries kRefillEntry.
         const auto fill_read = [&](std::uint32_t index, bool ok) {
             if ((index & kStreamEntry) != 0) {
                 stream_done(index & ~kStreamEntry, ok);
+            } else if ((index & kRefillEntry) != 0) {
+                refill_done(index & ~kRefillEntry, ok);
             } else {
                 prefill_read(index, ok);
             }
@@ -1003,6 +1090,8 @@ void HostExpertTier::agent_loop() {
         if (outstanding == 0) { runs.clear(); } // no run is in flight: their indices start over
         if (!done.empty() || !copied.empty()) { last_work = Clock::now(); }
         if (open && done.empty() && copied.empty()) {
+            // Spinning through an open round costs nothing measurable: sleeping 200 us when idle instead left the SSD
+            // tier's Dense8 decode where it was (0.968x against 0.966x of the full layout, 2026-10-27 x_ab7).
             if (Clock::now() - last_work > kIdleSpin) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             } else {

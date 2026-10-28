@@ -52,6 +52,7 @@ other value is derived from the rest of the configuration (§14.2).
 | §7.4 tap publication | implemented: deferred until the anchoring blocks commit (a frontier inside a block, or an MTP backend one token behind); exact-frontier tails are copied into cache-owned pages |
 | §7.6 block publication, write-through | implemented: blocks join the tree at every commit; a lane's blocks are written to Host in one batch when it releases them |
 | §7.7 endpoint snapshots at finish and consistent abort | implemented |
+| §7.9 next-turn prefill | implemented 2026-10-27 (`--cache-next-turn-ms`; default on for Qwen3.5, off for Qwen3.8-Flash-Next and refused on its reproducible route): host tests pass; real scenarios `next-turn` / `next-turn-reproducible` (27B) pass; Flash-Next's reproducible resume from the pass was not exact, and its reproducible route keeps no tap where a lane ends (§7.9); the agentic replay A/B is outstanding |
 | §6.2 cost model | implemented: the Engine's context-cost coefficients (prefill and Host-to-Device transfer) rank sources and value snapshots |
 | §5.5 persistence across restarts | implemented (opt-in `--prefix-cache-file`) |
 | §12.2 in-flight prefix coalescing | implemented: requests sharing a new prefix with a lane still prefilling wait for its snapshot at the divergence instead of prefilling the prefix again |
@@ -841,6 +842,99 @@ At terminal settlement (Finish, or Cancel after at least one committed unit):
 `Disabled` requests (Serve warmup, `--no-prefix-reuse`) never insert nodes or snapshots.
 Their pages are freed at terminal.
 
+### 7.8 Withdrawal after non-finite logits
+
+A row whose sampler found no finite logit (`PendingRowFailure::NonFiniteLogits`) fails its request
+alone. The state that produced it may be non-finite as well, and the request has already published
+blocks and taps as it went (§7.4, §7.6): a resend, or any request sharing the prefix, would resume
+from them and fail again, and `--prefix-cache-file` would carry them across restarts. So the commit
+that releases the row marks its lane, and the release withdraws what the request published past its
+resume point (both families; Qwen3.5 `hybrid_withdraw`, Qwen4Exp `prefix_withdraw`):
+
+1. The lane keeps, while it runs, the nodes whose Device copy is its page (`InsertResult::
+   device_attached`: inserted, or an existing node that adopted its page) and the snapshots it
+   created (Qwen4Exp: its capture ids, resolved once they land). A marked lane writes no blocks
+   through to the Host tier and publishes no endpoint.
+2. After the lane releases its pins, the cache's transfers land (a capture or Host write pins what
+   it reads), then `PrefixCacheIndex::withdraw` removes each snapshot and each node with its whole
+   subtree and every snapshot anchored there: a later request that extended the path computed over
+   those pages. What the request merely matched (the reused prefix, a duplicate block left private)
+   stays, so a resend resumes from what was cached before it; the snapshots the request's captures
+   superseded (its resume source and earlier taps) are unsuperseded, since superseded snapshots are
+   evicted first and give up their Device slots first.
+3. An entry another sequence or a transfer still pins stays in the Program's pending withdrawal; the
+   unpinned snapshots below a pinned node go at once, so no admission resumes from them. Every later
+   lane release, and every save of the cache file, retries the rest (stale references are dropped).
+   The pending list is discarded whenever the cache is emptied, since a rebuilt index reuses its
+   references.
+4. With a cache file attached, the next save (periodic or at shutdown) rewrites it, and a file saved
+   since the request's admission, which may hold its entries, is deleted at once: a restart before
+   the next save starts cold rather than from them.
+
+Qwen4Exp's release swallows exceptions; if a withdrawal throws, the whole cache is emptied once no
+lane maps it (the step a recoverable failure already uses). Qwen3.5's release terminates on an
+exception, as every release path there does.
+
+### 7.9 Next-turn prefill
+
+The endpoint (§7.7) serves a next turn only when that turn renders the reply as the tokens the model
+generated. It does not when the template re-renders the reply (Qwen3.5's and Qwen3.6's templates drop
+earlier reasoning once a new user turn follows, as does `preserve_thinking: false`: the turn resumes
+at the TurnClosure tap of the first assistant message after the previous user turn and re-prefills
+that whole tail), and it never does without `free-cache-resume` (the reproducible route, and
+configurations not qualified for it: no endpoint and no decode-computed block is published, so every
+next turn recomputes the previous reply from the opener's grid tap). The next-turn prefill moves that
+work into idle time (candidates §24 TF-02; TensorFold's `warm_quiet`). Measured need (2026-10-27,
+`.local/review-2026-10-27/reports/tf02-count.md`): on the default route with Qwen3.8's template and an
+echoing agent client 94 % of continuing turns resumed from the endpoint and none diverged inside a
+reply, so the pass is a no-op there; for a stripping template the same traces estimate 37.5 % of
+continuing turns re-prefilling a mean 3,000 tokens; on the reproducible route every continuing turn
+re-prefills the reply (Flash-Next estimate: 0.21 s per turn). Not yet measured with the pass.
+
+Qwen3.8-Flash-Next: off by default and refused on its reproducible route. In
+`infernix_qwen4_exp_prefix_cache_real_test --next-turn` (2026-10-27, fast paths off, 512-token calls) turn 2 resumed
+at the pass's grid tap 2192, inside the cold run's call [2048, 2215), and differed from an uncached run at its 16th
+token (the default route passed its checks). Its reproducible route then resumed on a 16-token grid, assuming every
+prefill route width-invariant, and several are not (model-quality.md §6.7: the 23 tokens after 2192 ran in a narrower
+call than the cold prefill's). It also left a tap where a lane ends (the pass's end, a cancelled prompt):
+`infernix_qwen4_exp_resume_cold_real_test` failed with such taps (mean |dlogprob| 0.0011 over its teacher-forced
+readouts, both drafters; 0 without them), each readout resuming at the previous one's end and prefilling one token. Both
+are fixed: no tap where a lane ends, and since 2026-10-27 Flash-Next's reproducible route taps and resumes only on the
+prefill-chunk grid, as Qwen3.5's does (`infernix_qwen4_exp_resume_width_real_test` resumes from taps placed off it).
+
+- **Input.** After a reply that ended on its own, `infernix-serve` appends it to the request's lowered
+  conversation as the client receives it (content, reasoning, tool calls) and calls
+  `Engine::prefill_next_turn`. Only the latest reply is kept: a newer one replaces it.
+- **Render.** A preparation thread renders it with `PromptContinuationMode::NextTurnHistory`: the
+  template renders the messages followed by the next request's first message (a tool result when the
+  reply calls tools, else an empty user turn), and the prompt is cut after that message's
+  `<|im_start|>`, a control token every next turn shares. The reply's block must end exactly where the
+  next one begins. The history end (one token before the prompt's end) carries an exact opener hint
+  (§7.1). So the history is reasoning-stripped exactly where the next request strips it. Text only.
+- **Start.** The worker starts it once the Engine has had nothing pending, resident, paused or binding
+  for `next_turn_prefill_quiet` (default 150 ms) after the later of the reply and its last unit: an
+  internal request (no consumer, no outstanding capacity, one output token that is discarded) pushed
+  to the empty queue. A submitted request drops a turn not yet started.
+- **Skip.** At admission, when the best source already holds all but one block of the history's
+  deepest reusable frontier (the history end; without `free-cache-resume` its grid position, the
+  Program's `hybrid_resume_grid()`), the request ends before binding: the echoing agent loop's
+  endpoint already covers it.
+- **Run.** It is an ordinary request: the same binding, prefill path, taps, block commits and finish,
+  so it publishes what any request with that prompt publishes; on the reproducible route its calls,
+  taps and published state are on the grid, and the next turn's output equals an uncached run's.
+- **Yield.** At every worker boundary, before the queue is read, a waiting, paused, binding or
+  resident request cancels a running pass, which ends at its next unit boundary as a cancellation
+  does: a request waits at most one prefill unit. A consistent abort leaves the state reached: the
+  endpoint at its frontier, or, without `free-cache-resume`, a tap there when the frontier is
+  prefill-computed state on the grid (Qwen3.5 `hybrid_publish_endpoint`, Qwen4Exp `prefix_finish`; the
+  same holds for a client's cancellation). Qwen4Exp abandons a layer-walk span it stops inside
+  (§19.3.8), keeping only what was published before the span. Its expert-frame loans (stream lease,
+  wide work) return with the lane as for any cancelled prompt.
+- **Cost.** GPU work when no next turn comes, Host slabs for its snapshot (ordinary eviction
+  applies), and on offloaded-expert models the expert traffic of its prefill.
+- **Observation.** `RuntimeStats::next_turn_prefills_{started,completed,yielded,skipped,dropped}` and
+  `next_turn_prefill_tokens`; the serve `throughput` record's `context_cache.hybrid.next_turn_prefill`.
+
 ---
 
 ## 8. Engine and API
@@ -895,6 +989,8 @@ policy lives:
   (`BindingReservation::source_valid` false), so the Engine moves to its next candidate; a shortage
   the pools could hold at all lets the request wait for resident progress.
 - `HybridPrefixCacheStats` feed the `throughput` record's `context_cache.hybrid` object.
+- When idle, the Engine runs the next-turn prefill of the latest finished reply as an internal
+  request and cancels it for any real request (§7.9).
 
 ### 8.3 Frontend and protocol mapping
 
@@ -1249,7 +1345,10 @@ The test design follows. §13.1 and §13.3 are implemented (`infernix_prefix_cac
   - duplicate snapshot publication is a no-op.
 - **Liveness**
   - `live_snapshots_below` stays correct under interleaved publish, evict and subtree deletion;
-  - losing the last copy deletes exactly the subtree's snapshots.
+  - losing the last copy deletes exactly the subtree's snapshots;
+  - a withdrawal (§7.8) removes the failed sequence's nodes with their subtrees and its snapshots,
+    keeps the reused prefix, removes the unpinned snapshots below a node another sequence maps at
+    once and that node on a later call, and drops stale references.
 - **Device LRU**
   - tail-first order after release;
   - hits move the whole path to MRU;
@@ -1366,6 +1465,7 @@ struct HybridPrefixCacheOptions {
     PrefixCacheSaveControl persistent_save;                 // abandons the save (§5.5)
     bool queue_holds = true;                                // --no-queue-holds turns off (§9.6)
     std::optional<std::chrono::milliseconds> tool_call_hold; // --cache-tool-hold-secs (§9.7)
+    std::optional<std::chrono::milliseconds> next_turn_prefill_quiet; // --cache-next-turn-ms (§7.9)
     HybridHostStatePrecision host_state_precision = Fp32;   // --cache-host-state (§5.6)
 };
 
@@ -1387,10 +1487,11 @@ prefill_chunk` and a Host tier present when the budget is nonzero:
 | `max_new_taps` | 8 with a Host tier, 2 without | without Host, taps would evict other conversations' snapshots |
 | `tap_ladder_tokens` | `max(4096, 2·chunk)` | ladder taps land on chunk boundaries; a finer ladder only duplicates them |
 | `tap_min_gap_tokens` | `max(1024, chunk)` | the same |
+| `next_turn_prefill_quiet` | 150 ms (`kDefaultNextTurnPrefillQuiet`), `0..3600000` ms | TensorFold's measured quiet period (§7.9) |
 | KV capacity (`infernix-serve`) | `--kv-capacity auto` unless given | free VRAM becomes Device block cache |
 
-With the cache disabled, `host_capacity_bytes` and `device_snapshot_slots` resolve to 0 and a
-nonzero value is rejected.
+With the cache disabled, `host_capacity_bytes`, `device_snapshot_slots` and
+`next_turn_prefill_quiet` resolve to 0 and a nonzero value is rejected.
 
 ---
 
@@ -1831,9 +1932,10 @@ rules, measurements and the build record are in the
 | Admission | Two sources per request: the affordable snapshot chosen without a lane, then the root. `start_binding` re-selects for the actual lane (crediting a lane-resident snapshot) and returns no reservation when the choice changed, so the Engine falls back to the root; otherwise it reserves the prompt's pages plus one round, and later rounds grow the lane (design §19.3.13). A prefetch landing over the prompt's path is waited for before matching, and pending Host writes are drained before a cached source is given up (as §6.6). A blocked FIFO head's Host-only blocks are prefetched into free and Host-backed Device pages, never growing the pool into the expert frames (`RuntimeStats::hybrid_prefetched_blocks`). A fresh request whose prompt shares a prefix (media agreeing, as §12.2) with a lane still prefilling waits for that lane's snapshot at the divergence when the predicted wait is within half the queue timeout: an exact tap is planned there (splitting the lane's pending call) and published as a Boundary. Shortages are reclaimed by evicting unpinned cached Device blocks |
 | Taps | `plan_taps` with Vision exclusions, then the call planner (`prefix/call_plan.h`): boundary exact taps (Explicit, Structural) always split; the generation opener and Automatic taps split only when the split adds at most 0.1 s of call cost (a CPU-served opener tail costs ~35 ms), else become flexible. Taps planned as boundaries (Explicit, Structural, coalescing, branch) are published as `SnapshotKind::Boundary`. A branch tap is an exact boundary tap where the prompt leaves its cached path (the end of its matched blocks), planned when that point is at least 1,024 tokens past the resume frontier (`kBranchTapMinTokens`): a client re-sending a long transcript with new content inserted before its end then resumes at the branch instead of the last chunk boundary (measured 2026-10-17, Dense8, 40K-token transcript, chunk 16,384: re-sent queries reuse 40,128 against 32,768 tokens, time to first token 0.6-1.1 s against 2.1-2.2 s, the first diverging query +0.6 s for the split; the agentic replay, seeds 42/43 at scale 0.5, keeps its cache hits: 84.6 against 84.5 % and 84.9 against 85.2 %). Unlike Qwen3.5's removed branch-point taps (§16.8), a Flash-Next prefill call has a large fixed cost (the expert stream), so re-prefilling the shared tokens after a chunk boundary costs nearly a full call. The opener is kept after endpoint resumes; a resume from an opener snapshot whose capturing request had resumed from an endpoint counts `endpoint_mismatch_fallbacks` |
 | Supersession | Unlike §9.3, a request's captures never supersede its own earlier ones: its first capture (tap or endpoint) supersedes the snapshot it resumed from and the endpoints it went past; its ladder taps, system-block boundary and the prompt's last tap stay retained and GDSF values them. In agentic replays the edits and loop-detection side calls diverge at exactly those taps: superseded first, a full Host tier evicted them before they were reused |
-| Prefill calls | The plan's calls from the resume frontier: without exact taps `F, F + chunk, ...` (for F = 0 the cold grid). Calls of at most 8 columns are CPU-served and promote experts at the decode rate |
+| Prefill calls | The plan's calls from the resume frontier: without exact taps `F, F + chunk, ...` (for F = 0 the cold grid). Calls of at most 8 columns are CPU-served and promote experts at the decode rate. Without `free-cache-resume` (the reproducible route) every tap, coalescing point and resume frontier lies on the prefill-chunk grid (`ProgramImpl::resume_grid`), so a resumed prefill's calls are the cold prefill's: several prefill routes change their arithmetic with the call's width (model-quality.md §6.7) |
 | Vision | A resume frontier strictly inside an item is never chosen; items ending at or before the frontier are not encoded again (the encode window is planned from the frontier); suffix M-RoPE positions come from the prompt |
 | Statistics | `RuntimeStats::hybrid_*` and the request log's `cached_prefix_tokens` / `restored_host_bytes` as in Qwen3.5 |
 | Persistence | As §5.5, own format (`prefix/persist.cpp`, `NINFQ4PC` version 1): the block table also stores each block's `mtp_next`; snapshot meta travels inside each image's header slab and is validated by the state-image layout fingerprint, which the file's geometry also records. Saved at the Engine's stop after every lane is released; loaded into the empty cache at startup |
 | Preemption | A pause publishes the lane's blocks and its state at the frontier to the cache, as a consistent abort does, and releases the lane (design §19.3.13); the resume binds from the deepest snapshot, without replay when it sits at the paused frontier |
+| Failure | A row with non-finite logits withdraws the request's entries (§7.8): its captures are Host-born, so the release first drains the transfer stream and reads each capture's publication (the lane keeps its capture ids until its release). A `RecoverableExecutionError` (an expert record that could not be read) still empties the whole cache, since the failed round's state is unknown for every lane |
 | Not built | Device snapshot slots, prefill CPU assist and C > 1 extras (design P7, P8) |

@@ -75,6 +75,12 @@ void embed_gather_q8_2048_launch(const Tensor& ids, const Weight& table, Tensor&
     const auto* codes    = static_cast<const std::uint8_t*>(table.qdata);
     const auto* scales   = static_cast<const std::uint8_t*>(table.scales);
     if (route == Q8EmbedRoute::Auto) { route = T <= 6 ? Q8EmbedRoute::Grouped : Q8EmbedRoute::Row; }
+    // The row kernel loads eight codes as one uint2 and stores BF16 pairs; every row and column
+    // offset it adds is a multiple of 16 bytes, so the base pointers decide. A code plane off an
+    // 8-byte boundary or an output off a 4-byte one takes the grouped kernel: same bits.
+    const bool row_aligned = reinterpret_cast<std::uintptr_t>(codes) % alignof(uint2) == 0 &&
+                             reinterpret_cast<std::uintptr_t>(out.data) % alignof(__nv_bfloat162) == 0;
+    if (route == Q8EmbedRoute::Row && !row_aligned) { route = Q8EmbedRoute::Grouped; }
     if (route == Q8EmbedRoute::Grouped) {
         const int grid = T * kEmbedGatherQ8Groups;
         embed_gather_q8_grouped_2048_kernel<<<grid, kQ8GroupedBlock, 0, stream>>>(

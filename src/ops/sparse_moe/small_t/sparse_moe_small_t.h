@@ -35,8 +35,9 @@ struct SparseMoeSmallTPlan {
     SparseMoeSmallTD4Schedule d4_schedule = SparseMoeSmallTD4Schedule::Rows1;
     // The router reduces each token as the decode router does (request-invariant exact route).
     bool column_invariant = false;
-    // L2 hints (INFERNIX_TMP_SMALL_T_L2_HINTS, candidates §10.3 KW-06): the decode route's next
-    // consumer warm from SparseMoeHints for D4's tail, as T = 1 takes it. No numeric effect.
+    // L2 hints (candidates §10.3 KW-06): the decode route's next consumer warm from SparseMoeHints for
+    // D4's tail, as T = 1 takes it. No numeric effect; 35B decode at four requests +2.6 % with S1's
+    // shared-expert warm (2026-10-26, 4 of 4 ABBA pairs).
     const void* next_weight_prefetch       = nullptr;
     std::size_t next_weight_prefetch_bytes = 0;
 };

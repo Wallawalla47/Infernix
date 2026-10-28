@@ -48,7 +48,7 @@ enum class LinearPolicy : std::uint8_t {
  * a Model sets a flag only where its fast path is qualified (docs/maintainer/model-quality.md
  * section 6.7). A problem with no route for a set flag runs its exact route.
  */
-enum class LinearRoutes : std::uint8_t {
+enum class LinearRoutes : std::uint16_t {
     Exact     = 0,
     Q8SlicedK = 1, ///< q8-sliced-k: NInfer's Q8 GEMV/sliced-K routes (Flash-Next [16384,2560], [2560,6144]).
     Fp8A8Pair = 2, ///< fp8-a8-pair: FP8 weights with the activation as two E4M3 terms.
@@ -72,18 +72,33 @@ enum class LinearRoutes : std::uint8_t {
     /// reduction (NInfer's K-split residual kernel) at 2-16 columns, and at every width of the
     /// column-invariant policy; the exact route keeps four K warps (a different summation order).
     Q5KSplit = 128,
+    /// a8-activations: GGUF projections (ops::ggml_linear) of 1-31 columns take 8-bit activations, each
+    /// column quantized per 32 values of K to int8 codes with an FP32 scale (ops/ggml/ggml_a8.h: llama.cpp's
+    /// Q8_1 idea), exact int32 slice dots with the weight codes and FP32 sums of the slices' terms, instead
+    /// of the exact A16 integer routes. LOSSY and opt-in (`--a8-activations`), never on the reproducible
+    /// route; wider calls keep their routes (GgmlBf16Wide or exact). The only dense 8-bit activation
+    /// route of decode widths: the other formats' measured slower than their 16-bit decode routes and
+    /// were removed (docs/maintainer/qwen3_8-flash-next-design.md §19.3.31).
+    GgmlA8 = 256,
+    /// a8-activations at prefill widths: GGUF projections (ops::ggml_linear) of 32 or more columns take the
+    /// same 8-bit activations (the GgmlA8 codec's codes and slice scales) on int8 tensor cores over decoded
+    /// weight planes: exact int32 slice dots, fl32(dot * d * sub) and an FP32 sum in K order per output, so a
+    /// column's bits do not depend on the call's width or other columns. LOSSY and opt-in, never on the
+    /// reproducible route; it takes precedence over GgmlBf16Wide where both are set, and is independent of
+    /// GgmlA8 (which decides the calls of 1-31 columns).
+    GgmlA8Wide = 512,
 };
 
 [[nodiscard]] constexpr LinearRoutes operator|(LinearRoutes a, LinearRoutes b) noexcept {
-    return static_cast<LinearRoutes>(static_cast<std::uint8_t>(a) | static_cast<std::uint8_t>(b));
+    return static_cast<LinearRoutes>(static_cast<std::uint16_t>(static_cast<std::uint16_t>(a) | static_cast<std::uint16_t>(b)));
 }
 
 [[nodiscard]] constexpr bool has_route(LinearRoutes routes, LinearRoutes flag) noexcept {
-    return (static_cast<std::uint8_t>(routes) & static_cast<std::uint8_t>(flag)) != 0;
+    return (static_cast<std::uint16_t>(routes) & static_cast<std::uint16_t>(flag)) != 0;
 }
 
 [[nodiscard]] constexpr bool valid_linear_routes(LinearRoutes routes) noexcept {
-    return (static_cast<std::uint8_t>(routes) & ~std::uint8_t{255}) == 0;
+    return (static_cast<std::uint16_t>(routes) & ~std::uint16_t{1023}) == 0;
 }
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
@@ -149,6 +164,14 @@ enum class LinearRoutes : std::uint8_t {
  */
 [[nodiscard]] std::size_t linear_f16_accumulate_workspace_bytes(std::int32_t input_rows,
                                                                 std::int32_t tokens);
+
+/**
+ * The transient bytes LinearRoutes::Fp8A8PairBlock32 needs for a call of `tokens` columns of K =
+ * `input_rows`, a multiple of 128 (the activation's two E4M3 planes and their per-32-value scales), as
+ * linear_f16_accumulate_workspace_bytes() is for its route.
+ */
+[[nodiscard]] std::size_t linear_fp8_a8_pair_block32_workspace_bytes(std::int32_t input_rows,
+                                                                     std::int32_t tokens);
 
 /**
  * @brief Applies a bias-free matrix projection independently to every input column.

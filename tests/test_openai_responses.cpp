@@ -1811,6 +1811,48 @@ int test_sse_sequence_and_failures() {
     return failures;
 }
 
+// A streamed Response refused before its generation (a prompt over the context limit) is a whole
+// event stream: created, in_progress, then failed with the error's code and message, numbered from
+// zero, every event the same Response. Codex compacts its conversation on exactly this failure.
+int test_failed_before_generation_stream() {
+    const OpenAIResponsesCreateRequest request = parse_openai_responses_create_request(
+        Json{{"model", "m"}, {"input", "hello"}, {"stream", true}, {"temperature", 0.5}}, limits());
+    const ApiError overflow = request_error_to_api_error(infernix::RequestError(
+        infernix::ContextLengthDetails{.prompt_tokens = 9000, .max_context = 8192}));
+    const std::string wire =
+        make_openai_failed_response_stream("resp_overflow", 123, request, {.temperature = 0.5F}, overflow);
+
+    std::vector<Json> events;
+    for (std::size_t begin = 0; begin < wire.size();) {
+        const std::size_t end = wire.find("\n\n", begin);
+        if (end == std::string::npos) { break; }
+        events.push_back(parse_event(wire.substr(begin, end + 2 - begin)));
+        begin = end + 2;
+    }
+    int failures = 0;
+    failures += check(events.size() == 3 && wire.ends_with("\n\n"),
+                      "a refused streamed Response is not three framed events");
+    if (events.size() != 3) { return failures; }
+    const std::vector<std::string> types = {"response.created", "response.in_progress",
+                                            "response.failed"};
+    for (std::size_t index = 0; index < events.size(); ++index) {
+        failures += check(events[index].at("type") == types[index] &&
+                              events[index].at("sequence_number") == index &&
+                              events[index].at("response").at("id") == "resp_overflow" &&
+                              events[index].at("response").at("output").empty(),
+                          "a refused streamed Response's events are out of order or misnumbered");
+    }
+    const Json& failed = events[2].at("response");
+    failures += check(events[0].at("response").at("status") == "in_progress" &&
+                          failed.at("status") == "failed" && failed.at("completed_at").is_null() &&
+                          failed.at("usage").is_null() && failed.at("temperature") == 0.5 &&
+                          failed.at("error").at("code") == "context_length_exceeded" &&
+                          failed.at("error").at("message") == overflow.message &&
+                          overflow.message.starts_with("This model's maximum context length is 8192"),
+                      "a refused streamed Response lost the context error Codex compacts on");
+    return failures;
+}
+
 int test_input_tokens_uses_shared_state_path() {
     OpenAIResponsesStore store(8, 1ULL << 20);
     store.put(stored_parent(
@@ -1931,6 +1973,7 @@ int main() try {
     failures += test_previous_response_call_graph();
     failures += test_response_object();
     failures += test_sse_sequence_and_failures();
+    failures += test_failed_before_generation_stream();
     failures += test_streamed_function_calls();
     failures += test_input_tokens_uses_shared_state_path();
     if (failures == 0) { std::cout << "ok\n"; }

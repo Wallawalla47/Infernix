@@ -202,7 +202,7 @@ void lossless_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExp
         const int jobs = std::min(pass_jobs, job_count - base);
         CUDA_CHECK(pdl::launch_consumer({dim3(source.staging_slots > 0 ? kStageCtas : 1), dim3(kThreads), 0, stream},
                                         stage_kernel, dispatch, source, base, jobs, static_cast<const std::int32_t*>(nullptr),
-                                        layout.job_records, fetch));
+                                        layout.job_records, fetch, StageBytes{}));
         plan.clear();
         for (int j = base; j < base + jobs; ++j) {
             const int n = counts[static_cast<std::size_t>(j)];

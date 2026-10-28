@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // Speculation invariance of the reproducible route on a real Qwen3.5 artifact (owner's decision of
@@ -21,11 +22,17 @@
 // with --spec-min-p 0.5, mtp-sampled: MTP with the sampled-mtp-drafts candidate, dflash, dflash2 or
 // dflash2-ngram: DFlash2 with n-gram copy proposals); the artifact must hold them. One Engine
 // decodes plainly, then one per drafter decodes the same requests (one plain run serves every drafter).
-// The requests end with a raw one-token prompt, which must also verify drafts.
+// The requests include a raw one-token prompt, which must also verify drafts. The mtp, dflash2 and
+// dflash2-ngram drafters also decode every prompt with presence penalty 1.5 (the non-thinking default
+// of every Qwen3.5-family model) and frequency penalty 0.3, greedy and sampled: a verified draft
+// changes the next position's penalties, which speculation must apply as plain decoding does (SGLang
+// #46752 shipped DFlash outputs that ignored the penalty).
 namespace {
 
 constexpr std::uint32_t kOutputTokens = 200;
 constexpr std::uint32_t kContext      = 4096;
+constexpr float kPresencePenalty      = 1.5F;
+constexpr float kFrequencyPenalty     = 0.3F;
 
 void require(bool condition, const std::string& message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -42,16 +49,24 @@ infernix::PromptInput prompt(const std::string& text) {
     return input;
 }
 
-infernix::RequestOptions request(float temperature, std::uint64_t seed) {
+infernix::RequestOptions request(float temperature, std::uint64_t seed, bool penalised = false) {
     infernix::RequestOptions options;
     options.execution.requested_output_tokens = kOutputTokens;
     options.execution.sampling.temperature    = temperature;
     options.execution.sampling.top_k          = 20;
     options.execution.sampling.top_p          = 0.95F;
     options.execution.sampling.seed           = seed;
-    options.stop.include_model_defaults       = false;
-    options.output.raw                        = true;
+    if (penalised) {
+        options.execution.sampling.presence_penalty  = kPresencePenalty;
+        options.execution.sampling.frequency_penalty = kFrequencyPenalty;
+    }
+    options.stop.include_model_defaults = false;
+    options.output.raw                  = true;
     return options;
+}
+
+bool penalised_drafter(std::string_view drafter) {
+    return drafter == "mtp" || drafter == "dflash2" || drafter == "dflash2-ngram";
 }
 
 infernix::EngineOptions reproducible_options(const std::filesystem::path& artifact, std::string_view drafter) {
@@ -94,19 +109,29 @@ std::vector<std::string> prompts() {
     };
 }
 
+// Each request's label and tokens: per prompt greedy and two sampled seeds, then the one-token
+// prompt's, then (penalised runs only) per prompt penalised greedy and sampled. A run without the
+// penalised requests is a prefix of one with them.
 struct Decoded {
-    std::vector<std::vector<infernix::TokenId>> tokens; // three per prompt, then the one-token prompt's
-    std::uint64_t one_token_drafts = 0;                 // drafts verified for the one-token prompt
+    std::vector<std::string> labels;
+    std::vector<std::vector<infernix::TokenId>> tokens;
+    std::uint64_t one_token_drafts = 0; // drafts verified for the one-token prompt
 };
 
-Decoded decode(const std::filesystem::path& artifact, std::string_view drafter) {
+Decoded decode(const std::filesystem::path& artifact, std::string_view drafter, bool penalised) {
     infernix::Engine engine(reproducible_options(artifact, drafter));
     Decoded out;
-    for (const auto& text : prompts()) {
-        out.tokens.push_back(engine.generate(engine.prepare(prompt(text)), request(0.0F, 0)).generated_token_ids);
+    const auto add = [&out](std::string label, std::vector<infernix::TokenId> tokens) {
+        out.labels.push_back(std::move(label));
+        out.tokens.push_back(std::move(tokens));
+    };
+    const std::vector<std::string> texts = prompts();
+    for (std::size_t p = 0; p < texts.size(); ++p) {
+        const std::string name = "prompt " + std::to_string(p);
+        add(name + " greedy", engine.generate(engine.prepare(prompt(texts[p])), request(0.0F, 0)).generated_token_ids);
         for (std::uint64_t seed : {11ULL, 12ULL}) {
-            out.tokens.push_back(
-                engine.generate(engine.prepare(prompt(text)), request(1.0F, seed)).generated_token_ids);
+            add(name + " sampled seed " + std::to_string(seed),
+                engine.generate(engine.prepare(prompt(texts[p])), request(1.0F, seed)).generated_token_ids);
         }
     }
     // A one-token prompt speculates like any other (Strata aece46db: there, position 0 meant "no
@@ -114,8 +139,17 @@ Decoded decode(const std::filesystem::path& artifact, std::string_view drafter) 
     const std::vector<infernix::TokenId> first = engine.tokenize_text("Once");
     require(!first.empty(), "the tokenizer encoded no token");
     const infernix::GenerationResult one = engine.generate(engine.prepare_tokens({first.front()}), request(0.0F, 0));
-    out.tokens.push_back(one.generated_token_ids);
+    add("one-token greedy", one.generated_token_ids);
     out.one_token_drafts = one.speculative.drafted_tokens + one.speculative.ngram_drafted_tokens;
+    if (penalised) {
+        for (std::size_t p = 0; p < texts.size(); ++p) {
+            const std::string name = "prompt " + std::to_string(p);
+            add(name + " penalised greedy",
+                engine.generate(engine.prepare(prompt(texts[p])), request(0.0F, 0, true)).generated_token_ids);
+            add(name + " penalised sampled",
+                engine.generate(engine.prepare(prompt(texts[p])), request(1.0F, 11, true)).generated_token_ids);
+        }
+    }
     return out;
 }
 
@@ -131,25 +165,27 @@ int main(int argc, char** argv) {
         require(argc >= 2,
                 "usage: infernix_qwen3_5_speculation_invariance_real_test "
                 "mtp|mtp-cut|mtp-sampled|dflash|dflash2|dflash2-ngram...");
-        // Plain decoding once, then each drafter against it.
-        const auto plain_run = decode(artifact, "none");
+        // Plain decoding once (with the penalised requests when a drafter needs them), then each
+        // drafter against it.
+        bool any_penalised = false;
+        for (int a = 1; a < argc; ++a) { any_penalised = any_penalised || penalised_drafter(argv[a]); }
+        const auto plain_run = decode(artifact, "none", any_penalised);
         const auto& plain    = plain_run.tokens;
         int failed_drafters  = 0;
         for (int a = 1; a < argc; ++a) {
             const std::string_view drafter = argv[a];
-            const auto speculative_run     = decode(artifact, drafter);
+            const auto speculative_run     = decode(artifact, drafter, penalised_drafter(drafter));
             const auto& speculative        = speculative_run.tokens;
-            require(plain.size() == speculative.size(), "result counts differ");
+            require(speculative.size() <= plain.size(), "result counts differ");
             int failures = 0;
-            for (std::size_t i = 0; i < plain.size(); ++i) {
-                const bool one_token = i + 1 == plain.size();
-                const char* kind     = one_token ? "one-token greedy" : i % 3 == 0 ? "greedy" : "sampled";
-                std::size_t same     = 0;
+            for (std::size_t i = 0; i < speculative.size(); ++i) {
+                require(plain_run.labels[i] == speculative_run.labels[i], "request orders differ");
+                std::size_t same = 0;
                 while (same < plain[i].size() && same < speculative[i].size() && plain[i][same] == speculative[i][same]) {
                     ++same;
                 }
                 const bool ok = !plain[i].empty() && plain[i] == speculative[i];
-                std::cout << drafter << " prompt " << i / 3 << " " << kind << ": " << (ok ? "identical" : "DIFFERS")
+                std::cout << drafter << " " << speculative_run.labels[i] << ": " << (ok ? "identical" : "DIFFERS")
                           << " (" << same << " of " << plain[i].size() << "/" << speculative[i].size()
                           << " tokens agree)\n";
                 failures += ok ? 0 : 1;

@@ -27,7 +27,11 @@
 //   burst        (MTP mode, own Engines, default route, INT8 and FP8 KV) Four rounds of four identical chat
 //                prompts at C = 4: every request reaches its limit and the Engine keeps serving.
 //
-//   infernix_qwen4_exp_prefix_cache_real_test [--mtp] [--plain]   (default: both modes)
+//   next turn    (own Engines, default and reproducible routes) Engine::prefill_next_turn prefills a reply's
+//                history while idle: turn 2 resumes at its end (reproducible: equals an uncached run), and a
+//                request arriving during a long pass makes it yield within about one call.
+//
+//   infernix_qwen4_exp_prefix_cache_real_test [--mtp] [--plain] [--next-turn]   (default: all)
 
 #include "test_temp_path.h"
 #include "kv_cache_storage.h"
@@ -432,6 +436,146 @@ int run_identical_burst(const char* artifact, const char* ngram) {
     return failures;
 }
 
+// Next-turn prefill (hybrid-prefix-cache-spec §7.9), plain decode, one Engine per route. With
+// preserve_thinking false a reply renders without its thinking block once a user turn follows, so the
+// next request diverges at the reply's opener. Engine::prefill_next_turn prefills the history while
+// the Engine is idle:
+// - turn 2 resumes at the history's end (the reproducible route: the 16-token grid position at or
+//   before it) and, on the reproducible route, generates what an uncached run generates; the default
+//   route's qualified paths make bits depend on call boundaries, so there the comparison is reported,
+//   not required;
+// - a request arriving while a long pass runs is admitted within about one call: the pass yields at
+//   its next unit boundary. Its layer walk keeps nothing past the span it abandons (design §19.3.8), so
+//   the reuse the request finds is reported, not required.
+int run_next_turn(const char* artifact, const char* ngram, bool reproducible) {
+    std::printf("== next-turn prefill (%s route)\n", reproducible ? "reproducible" : "default");
+    if (reproducible) {
+        // The reproducible route refuses the pass: a turn resumed from its grid snapshot inside a cold run's call
+        // differed from an uncached run (2026-10-27: first difference at token 16).
+        infernix::EngineOptions refused = base_options(artifact, ngram);
+        refused.fast_path_candidates.clear();
+        refused.context_cache.hybrid.next_turn_prefill_quiet = std::chrono::milliseconds{20};
+        std::string what;
+        try {
+            infernix::Engine engine(std::move(refused));
+        } catch (const std::exception& error) { what = error.what(); }
+        return check(what.find("next-turn prefill") != std::string::npos,
+                     "the reproducible route refuses the next-turn prefill (" + what + ")");
+    }
+    infernix::EngineOptions options = base_options(artifact, ngram);
+    options.max_context              = 16384;
+    options.kv_capacity              = infernix::KvCapacityPolicy::explicit_capacity(16384 + 4096);
+    options.fast_paths               = !reproducible;
+    options.fast_path_candidates.clear();
+    options.context_cache.hybrid.next_turn_prefill_quiet = std::chrono::milliseconds{20};
+    const std::uint32_t grid = reproducible ? 16U : 1U;
+    infernix::Engine engine(std::move(options));
+    int failures = 0;
+    const auto chat = [&](std::vector<infernix::ChatMessage> messages, std::uint32_t outputs, bool reuse) {
+        infernix::PromptInput input;
+        input.messages                  = std::move(messages);
+        input.options.enable_thinking   = false;
+        input.options.preserve_thinking = false;
+        infernix::RequestOptions request    = greedy(outputs, reuse);
+        request.stop.include_model_defaults = true;
+        return engine.generate(engine.prepare(std::move(input)), request);
+    };
+    const auto conversation = [](std::vector<infernix::ChatMessage> messages) {
+        infernix::PromptInput input;
+        input.messages                  = std::move(messages);
+        input.options.enable_thinking   = false;
+        input.options.preserve_thinking = false;
+        return input;
+    };
+    const auto ended = [&](const infernix::RuntimeStats& before) {
+        for (int i = 0; i < 12000; ++i) {
+            const infernix::RuntimeStats now = engine.runtime_stats();
+            if (now.next_turn_prefills_completed + now.next_turn_prefills_yielded + now.next_turn_prefills_skipped +
+                    now.next_turn_prefills_dropped >
+                before.next_turn_prefills_completed + before.next_turn_prefills_yielded +
+                    before.next_turn_prefills_skipped + before.next_turn_prefills_dropped) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    };
+
+    const std::vector<infernix::ChatMessage> turn1{
+        message(infernix::ChatRole::System, rules_text()),
+        message(infernix::ChatRole::User, user_context() + "Explain in detail, in at least 150 words, how to "
+                                                           "plan the shelves for colours 1 to 4.")};
+    const infernix::GenerationResult first = chat(turn1, 160, true);
+    std::vector<infernix::ChatMessage> history = turn1;
+    history.push_back(message(infernix::ChatRole::Assistant, first.content));
+    std::vector<infernix::ChatMessage> turn2 = history;
+    turn2.push_back(message(infernix::ChatRole::User, "Now say it in one sentence."));
+    infernix::PromptInput rendered  = conversation(history);
+    rendered.options.continuation   = infernix::PromptContinuationMode::NextTurnHistory;
+    const std::uint32_t pass_tokens = engine.prepare(std::move(rendered)).summary().prompt_tokens;
+    const std::uint32_t expected    = (pass_tokens - 1U) / grid * grid;
+    const infernix::RuntimeStats idle = engine.runtime_stats();
+    engine.prefill_next_turn(conversation(history));
+    if (!ended(idle)) { return check(false, "the next-turn pass ended within two minutes"); }
+    const infernix::RuntimeStats passed = engine.runtime_stats();
+    const infernix::GenerationResult second = chat(turn2, 24, true);
+    std::printf("        reply %zu tokens, history %u tokens; turn 2 reused %u of %u; the pass computed %llu tokens\n",
+                first.generated_token_ids.size(), pass_tokens, second.reused_prompt_tokens, second.prompt.prompt_tokens,
+                static_cast<unsigned long long>(passed.next_turn_prefill_tokens - idle.next_turn_prefill_tokens));
+    failures += check(passed.next_turn_prefills_completed == idle.next_turn_prefills_completed + 1,
+                      "the next-turn pass ran to its end");
+    failures += check(second.reused_prompt_tokens >= expected && second.reused_prompt_tokens < second.prompt.prompt_tokens,
+                      "turn 2 resumes at the pass's history end (expected at least " + std::to_string(expected) + ")");
+    const infernix::GenerationResult uncached = chat(turn2, 24, false);
+    if (reproducible) {
+        failures += check(second.generated_token_ids == uncached.generated_token_ids,
+                          "turn 2 after the pass equals an uncached run (" +
+                              first_difference(second.generated_token_ids, uncached.generated_token_ids) + ")");
+    } else {
+        std::printf("        default route: turn 2 against an uncached run: %s\n",
+                    first_difference(second.generated_token_ids, uncached.generated_token_ids).c_str());
+    }
+
+    // Yield: a long new conversation's pass, interrupted once it has computed something.
+    std::string document;
+    for (int paragraph = 0; paragraph < 400; ++paragraph) {
+        document += "Section " + std::to_string(paragraph) + " records that the warehouse moved " +
+                    std::to_string(paragraph * 37 % 101) + " crates of part " + std::to_string(paragraph % 17) +
+                    " to bay " + std::to_string(paragraph % 9) + " during the night shift. ";
+    }
+    const std::vector<infernix::ChatMessage> long_history{
+        message(infernix::ChatRole::System, "You summarise warehouse logs."),
+        message(infernix::ChatRole::User, document + "Summarise the log."),
+        message(infernix::ChatRole::Assistant, "Crates moved between bays every night.")};
+    std::vector<infernix::ChatMessage> long_turn = long_history;
+    long_turn.push_back(message(infernix::ChatRole::User, "Which bay received the most?"));
+    const infernix::RuntimeStats before_long = engine.runtime_stats();
+    engine.prefill_next_turn(conversation(long_history));
+    bool started = false;
+    for (int i = 0; i < 60000 && !started; ++i) {
+        const infernix::RuntimeStats now = engine.runtime_stats();
+        started = now.next_turn_prefills_started > before_long.next_turn_prefills_started && now.prefilling_requests != 0;
+        if (!started) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    }
+    const infernix::GenerationResult interrupted = chat(long_turn, 8, true);
+    const infernix::RuntimeStats after_long      = engine.runtime_stats();
+    std::printf("        the long pass computed %llu tokens before yielding; the request waited %.3f s and reused %u of %u\n",
+                static_cast<unsigned long long>(after_long.next_turn_prefill_tokens - before_long.next_turn_prefill_tokens),
+                interrupted.engine_timing.queue_wait_seconds, interrupted.reused_prompt_tokens,
+                interrupted.prompt.prompt_tokens);
+    failures += check(started && after_long.next_turn_prefills_yielded == before_long.next_turn_prefills_yielded + 1,
+                      "the long pass yields to the request");
+    failures += check(interrupted.engine_timing.queue_wait_seconds < 3.0,
+                      "the request is admitted within about one call of the pass");
+    if (reproducible) {
+        const infernix::GenerationResult cold = chat(long_turn, 8, false);
+        failures += check(interrupted.generated_token_ids == cold.generated_token_ids,
+                          "the request after the yield equals an uncached run (" +
+                              first_difference(interrupted.generated_token_ids, cold.generated_token_ids) + ")");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -442,11 +586,12 @@ int main(int argc, char** argv) {
         return 77;
     }
     const char* ngram = std::getenv("INFERNIX_QWEN4_NGRAM");
-    bool plain = true, mtp = true;
+    bool plain = true, mtp = true, next_turn = true;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--mtp") { plain = false; }
-        if (arg == "--plain") { mtp = false; }
+        if (arg == "--mtp") { plain = false; next_turn = false; }
+        if (arg == "--plain") { mtp = false; next_turn = false; }
+        if (arg == "--next-turn") { plain = false; mtp = false; }
     }
     try {
         int failures = 0;
@@ -455,6 +600,10 @@ int main(int argc, char** argv) {
         if (mtp) { failures += run_one_context(artifact, ngram); }
         if (mtp) { failures += run_identical_burst(artifact, ngram); }
         if (plain) { failures += run_persistence(artifact, ngram); }
+        if (next_turn) {
+            failures += run_next_turn(artifact, ngram, false);
+            failures += run_next_turn(artifact, ngram, true);
+        }
         std::printf(failures == 0 ? "qwen4_exp prefix cache checks passed\n" : "FAIL: %d checks failed\n", failures);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

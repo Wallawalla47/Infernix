@@ -222,6 +222,11 @@ struct Config {
     bool mtp = false;                // the MTP drafter is bound (--spec mtp)
     std::optional<DFlash2Config> dflash2; // the DFlash2 drafter is bound (--spec dflash2 --draft-model)
     std::uint32_t proposal_rows = 0; // rows of the bound proposal head (--lm-head-draft), else 0
+    // LoadOptions::mtp_expert_pool: the MTP drafter's routed experts are pinned in host memory and its draft steps
+    // route among those held by this many device slots (runtime/expert_offload/drafter_pool.h);
+    // mtp_expert_bytes is one expert's gate/up and down rows (set by plan_load). 0: the bank is device-resident.
+    std::uint32_t mtp_expert_slots = 0;
+    std::uint64_t mtp_expert_bytes = 0;
     // The Vision tower (--vision): Qwen3.5's tower except its output width, which the merger's
     // bound fc2 gives (design §19.3.2).
     std::optional<qwen3_5::VisionConfig> vision;

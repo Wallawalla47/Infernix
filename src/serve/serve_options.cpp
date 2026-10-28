@@ -54,6 +54,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--lossless", false},
     ServeOptionArity{"--fast-path", true, true},
     ServeOptionArity{"--expert-a4-activations", false},
+    ServeOptionArity{"--a8-activations", false},
     ServeOptionArity{"--embedding-host", false},
     ServeOptionArity{"--context-cost-presets"},
     ServeOptionArity{"--log-stats-interval-ms"},
@@ -70,6 +71,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--prefix-cache-save-mins"},
     ServeOptionArity{"--no-queue-holds", false},
     ServeOptionArity{"--cache-tool-hold-secs"},
+    ServeOptionArity{"--cache-next-turn-ms"},
     ServeOptionArity{"--cache-host-state"},
     ServeOptionArity{"--cache-tap-min-gap"},
     ServeOptionArity{"--host-context-mib"},
@@ -80,8 +82,9 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--response-store-max-records"},
     ServeOptionArity{"--response-store-max-mib"},
     ServeOptionArity{"--device"},
-    ServeOptionArity{"--ram-headroom-mib"},
+    ServeOptionArity{"--ram-free-mib"},
     ServeOptionArity{"--expert-ram-mib"},
+    ServeOptionArity{"--expert-ram-layout"},
     ServeOptionArity{"--expert-pin-mib"},
     ServeOptionArity{"--kv-dtype"},
     ServeOptionArity{"--logits-dtype"},
@@ -307,6 +310,17 @@ std::string serve_usage_text(const char* argv0) {
            "                             the activation scales NVIDIA calibrated for them.\n"
            "                             Changes the output. No other artifact supports it\n"
            "                             (default: 16-bit activations, as NVIDIA serves it)\n"
+           "  --a8-activations           8-bit activations where they measured faster: decode\n"
+           "                             and verification calls of GGUF dense projections and\n"
+           "                             routed experts (GGUF and NVFP4 W4A16 banks, CPU-served\n"
+           "                             misses included; int8 with one scale per 32 values, as\n"
+           "                             llama.cpp's Q8_1), and prefill calls of GGUF dense\n"
+           "                             projections and those experts (the same codec), a\n"
+           "                             groupwise Q4 MLP gate/up (int8 per token) and MXFP8\n"
+           "                             dense projections (two E4M3 terms per 32 values).\n"
+           "                             Other calls keep their routes. Approximate: changes the\n"
+           "                             output; --reproducible and artifacts without such a\n"
+           "                             route refuse it (default: off)\n"
            "  --embedding-host           Qwen3.5-family artifacts: keep the token embedding in\n"
            "                             pinned host memory, read zero-copy, so its VRAM\n"
            "                             (1.18 GiB on the 27B) goes to the KV and prefix caches.\n"
@@ -352,7 +366,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             (default: the artifact path + .ngram)\n"
            "  --ngram-residency auto|ram|volume\n"
            "                             where the n-gram table lives: ram reads it all into\n"
-           "                             pinned RAM at startup, volume reads rows on demand;\n"
+           "                             RAM (locked for the CPU) at startup, volume reads rows\n"
+           "                             on demand;\n"
            "                             auto (default) takes RAM while every expert still\n"
            "                             fits in RAM beside it\n"
            "  --expert-state FILE|off    Qwen3.8-Flash-Next expert-cache state: read at\n"
@@ -368,14 +383,20 @@ std::string serve_usage_text(const char* argv0) {
            "                             (default 1); startup-fixed, extends the allowed\n"
            "                             ceiling only, not --max-context\n"
            "  --device N                 CUDA device ordinal (default 0)\n"
-           "  --ram-headroom-mib N       physical Host RAM in MiB that pinned weights and\n"
-           "                             caches leave free for the system (default " +
-           std::to_string(kDefaultRamHeadroomBytes >> 20) +
+           "  --ram-free-mib N           physical Host RAM in MiB that Infernix's weights,\n"
+           "                             experts, n-gram table and caches leave free for\n"
+           "                             other programs (default " +
+           std::to_string(kDefaultRamFreeBytes >> 20) +
            ")\n"
            "  --expert-ram-mib N|auto    Offloaded experts: Host RAM in MiB for the routed\n"
-           "                             experts (auto: what --ram-headroom-mib and the other\n"
+           "                             experts (auto: what --ram-free-mib and the other\n"
            "                             pins leave); less than all of them need reads the\n"
            "                             rest from the artifact (the SSD tier)\n"
+           "  --expert-ram-layout exclusive|full\n"
+           "                             Qwen3.8-Flash-Next experts VRAM cannot hold: exclusive\n"
+           "                             keeps in RAM only the experts VRAM does not hold;\n"
+           "                             full keeps a RAM copy of every expert (more RAM)\n"
+           "                             (default " + std::string(expert_ram_layout_name(EngineOptions{}.expert_ram_layout)) + ")\n"
            "  --expert-pin-mib N|auto    Offloaded experts: at most this much of the experts'\n"
            "                             RAM page-locked for the GPU; the rest stays in RAM\n"
            "                             and the CPU serves it (auto: what Windows allows,\n"
@@ -420,9 +441,11 @@ std::string serve_usage_text(const char* argv0) {
            "  Content-addressed 64-token KV blocks shared across requests plus sparse model\n"
            "  state snapshots. It configures itself: free VRAM becomes Device block cache\n"
            "  (--kv-capacity defaults to auto) and every option below is optional.\n"
-           "  --host-context-mib N       pinned Host pool in decimal MiB (whole bytes) that\n"
+           "  --host-context-mib N|auto  pinned Host pool in decimal MiB (whole bytes) that\n"
            "                             KV blocks and state snapshots share (default 8192;\n"
-           "                             0 = GPU only; Qwen3.8-Flash-Next: must be positive)\n"
+           "                             0 = GPU only; Qwen3.8-Flash-Next: must be positive;\n"
+           "                             auto: Qwen3.8-Flash-Next sizes it from the RAM its\n"
+           "                             experts and n-gram table leave, up to 8192)\n"
            "  --prefix-cache-file PATH   restore the host tier from PATH at startup when\n"
            "                             present (written by this binary for the same\n"
            "                             artifact and KV format) and save it there on clean\n"
@@ -455,6 +478,12 @@ std::string serve_usage_text(const char* argv0) {
            "                             conversation's cached prefix ahead of other cache\n"
            "                             entries for N seconds (default 30, 0 turns it off;\n"
            "                             Qwen3.8-Flash-Next has none)\n"
+           "  --cache-next-turn-ms N     once the server has been idle for N ms after a\n"
+           "                             reply, prefill that conversation's history as its\n"
+           "                             next request will render it (yields to any request\n"
+           "                             at its next unit; never changes output). Default\n"
+           "                             150, 0 turns it off; Qwen3.8-Flash-Next: default 0,\n"
+           "                             refused with --reproducible and --lossless\n"
            "  --cache-host-state fp32|fp24|bf16\n"
            "                             host tier form of snapshot recurrent state: fp24\n"
            "                             and bf16 shrink each 27B snapshot by 36 and 72 MiB\n"
@@ -732,6 +761,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.fast_path_candidates.push_back(*path);
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
+        } else if (arg == "--a8-activations") {
+            options.a8_activations = true;
         } else if (arg == "--embedding-host") {
             options.embedding_host = true;
         } else if (arg == "--context-cost-presets") {
@@ -824,6 +855,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.context_cache.hybrid.tool_call_hold = std::chrono::seconds(seconds);
             cache_option_flag                           = "--cache-tool-hold-secs";
+        } else if (arg == "--cache-next-turn-ms") {
+            const int milliseconds = parse_nonnegative_int(require_value("--cache-next-turn-ms"),
+                                                           "cache-next-turn-ms");
+            if (milliseconds > 3'600'000) {
+                throw std::invalid_argument("--cache-next-turn-ms must be in [0,3600000]");
+            }
+            options.context_cache.hybrid.next_turn_prefill_quiet = std::chrono::milliseconds(milliseconds);
+            cache_option_flag                               = "--cache-next-turn-ms";
         } else if (arg == "--cache-host-state") {
             const std::string value = require_value("--cache-host-state");
             if (value == "fp32") {
@@ -841,8 +880,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--cache-tap-min-gap"), "cache-tap-min-gap"));
             cache_option_flag = "--cache-tap-min-gap";
         } else if (arg == "--host-context-mib") {
-            options.context_cache.host_capacity_bytes =
-                parse_host_context_mib(require_value("--host-context-mib"));
+            const char* text = require_value("--host-context-mib");
+            if (std::string_view(text) == "auto") {
+                options.context_cache.host_capacity_bytes.reset();
+                options.context_cache.host_capacity_auto = true;
+            } else {
+                options.context_cache.host_capacity_bytes = parse_host_context_mib(text);
+                options.context_cache.host_capacity_auto  = false;
+            }
             host_context_explicit = true;
             cache_option_flag     = "--host-context-mib";
         } else if (arg == "--request-log-jsonl") {
@@ -886,12 +931,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
-        } else if (arg == "--ram-headroom-mib") {
-            const std::uint64_t mib = parse_u64(require_value("--ram-headroom-mib"), "ram-headroom-mib");
+        } else if (arg == "--ram-free-mib") {
+            const std::uint64_t mib = parse_u64(require_value("--ram-free-mib"), "ram-free-mib");
             if (mib > (std::numeric_limits<std::uint64_t>::max() >> 20)) {
-                throw std::invalid_argument("--ram-headroom-mib is out of range");
+                throw std::invalid_argument("--ram-free-mib is out of range");
             }
-            options.ram_headroom_bytes = mib << 20;
+            options.ram_free_bytes = mib << 20;
         } else if (arg == "--expert-ram-mib") {
             const std::string text = require_value("--expert-ram-mib");
             if (text == "auto") {
@@ -903,6 +948,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 }
                 options.expert_ram_bytes = mib << 20;
             }
+        } else if (arg == "--expert-ram-layout") {
+            options.expert_ram_layout = parse_expert_ram_layout(require_value("--expert-ram-layout"));
         } else if (arg == "--expert-pin-mib") {
             const std::string text = require_value("--expert-pin-mib");
             if (text == "auto") {

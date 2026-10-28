@@ -50,7 +50,16 @@ struct RingArgs {
     std::uint32_t* job_ready;   // [max_jobs]: 1 once the job's h is encoded
     std::uint32_t* counter;     // [2]: the pass's next task, CTAs finished
     std::uint16_t* outputs;     // BF16 [H, entries]
+    PassPart part;              // a split call's launches: the gate/up tasks, then the down tasks
 };
+
+// The launch's tasks of `jobs` live jobs: [first, end) of the gate/up tasks then the down tasks.
+template <class G>
+__device__ __forceinline__ void ring_task_range(const RingArgs& a, int jobs, std::uint32_t& first, std::uint32_t& end) {
+    const auto gate_up = static_cast<std::uint32_t>(jobs * G::kGateUpRowGroups);
+    first = a.part == PassPart::Down ? gate_up : 0U;
+    end   = a.part == PassPart::GateUp ? gate_up : gate_up + static_cast<std::uint32_t>(jobs * G::kDownRowGroups);
+}
 
 // A task: one row group of one job's gate/up or down matrix.
 struct RingTask {
@@ -150,11 +159,14 @@ __global__ void __launch_bounds__(kRingThreads, kRingMinBlocksPerSm) narrow_ring
         // A queue slot is reused kRingQueue allocations later. The ring holds at most kRingChunks chunks
         // and a task has at least four (a down row group), so the tasks with chunks in it, and the one
         // the consumers may still be finishing, are at most four.
+        // The counter counts from 0 over the launch's tasks [first, first + total).
         int jobs = 0;
-        std::uint32_t total = 0, next = 0;
+        std::uint32_t total = 0, next = 0, first = 0;
         if (lane == 0) {
-            jobs  = max(0, min(a.jobs, *a.dispatch.job_count - a.base));
-            total = static_cast<std::uint32_t>(jobs * (G::kGateUpRowGroups + G::kDownRowGroups));
+            jobs = max(0, min(a.jobs, *a.dispatch.job_count - a.base));
+            std::uint32_t end = 0;
+            ring_task_range<G>(a, jobs, first, end);
+            total = end - first;
             next  = atomicAdd(&a.counter[0], 1U);
         }
         int task = -1, chunk = 0, chunks = 0, alloc = 0;
@@ -170,7 +182,7 @@ __global__ void __launch_bounds__(kRingThreads, kRingMinBlocksPerSm) narrow_ring
                     task = -1;
                     while (next < total) {
                         RingTask& t = sm.queue[alloc % kRingQueue];
-                        const std::uint32_t i = next;
+                        const std::uint32_t i = first + next;
                         if (resolve_ring_task<G>(a, i, jobs, t)) {
                             task   = alloc++ % kRingQueue;
                             chunk  = 0;
@@ -178,7 +190,7 @@ __global__ void __launch_bounds__(kRingThreads, kRingMinBlocksPerSm) narrow_ring
                             next   = atomicAdd(&a.counter[0], 1U); // used at the next allocation
                             break;
                         }
-                        atomicMax(&a.counter[0], ring_job_end<G>(a, i, jobs));
+                        atomicMax(&a.counter[0], ring_job_end<G>(a, i, jobs) - first);
                         next = atomicAdd(&a.counter[0], 1U);
                     }
                     slot = task;
@@ -377,16 +389,19 @@ void launch_ring_pass_a16(const RingArgs& args, cudaStream_t stream) {
                                                                  kRingThreads, kBytes));
         return std::max(1, per_sm) * sms;
     }();
-    const int tasks = args.jobs * (G::kGateUpRowGroups + G::kDownRowGroups);
+    const int tasks = args.jobs * ((args.part == PassPart::Down ? 0 : G::kGateUpRowGroups) +
+                                   (args.part == PassPart::GateUp ? 0 : G::kDownRowGroups));
     narrow_ring_kernel_a16<G, Columns><<<std::min(ctas, tasks), kRingThreads, kBytes, stream>>>(args);
     check_launch("A16 ring");
 }
 
 // The narrow experts of jobs [base, base + jobs) of a ring call (moe::wide::ring_call) with `columns`
-// columns: one persistent launch on the phase's counter.
+// columns: one persistent launch on the phase's counter (a split call's two launches use it in turn: the
+// last CTA of each resets it, and the down launch's tasks find every job's h ready).
 void launch_ring_pass(int columns, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                       const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
-                      const moe::wide::ExpertsWorkspace& layout, bf16* outputs, cudaStream_t stream, PassPhase phase) {
+                      const moe::wide::ExpertsWorkspace& layout, bf16* outputs, cudaStream_t stream, PassPhase phase,
+                      PassPart part) {
     using G = moe::Qwen3_5_122BExperts;
     RingArgs args{};
     args.dispatch    = dispatch;
@@ -406,6 +421,7 @@ void launch_ring_pass(int columns, const MoeDispatch& dispatch, const MoeExpertS
     args.job_ready   = layout.ring_ready;
     args.counter     = layout.ring_counters + 2 * static_cast<int>(phase);
     args.outputs     = reinterpret_cast<std::uint16_t*>(outputs);
+    args.part        = part;
     // An expert has at most min(columns, kMaxColumns) entries.
     const int most = std::min(columns, moe::kMaxColumns);
     if (most <= 1) {

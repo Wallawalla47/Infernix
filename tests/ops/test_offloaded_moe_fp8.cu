@@ -279,10 +279,12 @@ void run(int columns, std::mt19937& rng) {
     auto* d_scales = device_copy(scales);
     std::uint16_t* d_out = nullptr;
     cuda_check(cudaMalloc(&d_out, expected.size() * sizeof(std::uint16_t)), "cudaMalloc");
-    cudaStream_t fork_stream = nullptr;
-    cudaEvent_t fork_events[2]{};
+    cudaStream_t fork_stream = nullptr, split_stream = nullptr;
+    cudaEvent_t fork_events[2]{}, split_events[2]{};
     cuda_check(cudaStreamCreateWithFlags(&fork_stream, cudaStreamNonBlocking), "stream");
+    cuda_check(cudaStreamCreateWithFlags(&split_stream, cudaStreamNonBlocking), "stream");
     for (auto& e : fork_events) { cuda_check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event"); }
+    for (auto& e : split_events) { cuda_check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event"); }
 
     // The CPU route (ops/offloaded_sparse_moe/cpu/fp8_expert.h through the ggml team) serving misses.
     std::vector<moe::ExpertScales> no_scales(experts);
@@ -298,10 +300,15 @@ void run(int columns, std::mt19937& rng) {
         bool fork;
         bool cpu;
         const char* name;
+        // A forked call's misses staged in two launches (MoeExpertSource::split_stream): the first copies
+        // the gate/up codes and the tile scales after the down rows, the second the down rows.
+        bool split = false;
     };
     const Config configs[] = {{0, false, false, "zero-copy"},        {3, false, false, "3 staging slots"},
                               {64, false, false, "64 staging slots"}, {64, true, false, "forked"},
-                              {64, false, true, "CPU-served misses"}, {64, true, true, "forked, CPU-served misses"}};
+                              {64, true, false, "forked, split staging", true},
+                              {64, false, true, "CPU-served misses"}, {64, true, true, "forked, CPU-served misses"},
+                              {64, true, true, "forked, split staging, CPU-served misses", true}};
     for (const auto& config : configs) {
         if (config.fork && columns > moe::kMaxColumns) { continue; }
         if (config.cpu && columns > 64) { continue; }
@@ -325,6 +332,11 @@ void run(int columns, std::mt19937& rng) {
             source.fork_stream    = fork_stream;
             source.fork_events[0] = fork_events[0];
             source.fork_events[1] = fork_events[1];
+        }
+        if (config.split) {
+            source.split_stream    = split_stream;
+            source.split_events[0] = split_events[0];
+            source.split_events[1] = split_events[1];
         }
         if (config.cpu) {
             service.wake();
@@ -363,7 +375,9 @@ void run(int columns, std::mt19937& rng) {
     cudaFree(d_frames_base);
     cudaFreeHost(host);
     cudaStreamDestroy(fork_stream);
+    cudaStreamDestroy(split_stream);
     for (auto e : fork_events) { cudaEventDestroy(e); }
+    for (auto e : split_events) { cudaEventDestroy(e); }
 }
 
 // --bench: one prefill chunk of the real geometry (512 experts, top-10, 4,096 tokens: about 80

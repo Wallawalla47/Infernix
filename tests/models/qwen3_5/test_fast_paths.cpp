@@ -1,5 +1,6 @@
 // Fast-path selection (models/qwen3_5/program/planning/fast_paths.h): where each fast path's kernels
-// run, which configurations the registry qualifies it for, and how a configuration is described.
+// run, which configurations the registry qualifies it for, how a configuration is described, and the
+// routes --a8-activations gives it.
 // The selection itself (select_fast_paths) needs a loaded model; the engine real tests and startup
 // logs cover it.
 
@@ -361,6 +362,26 @@ int main() {
                       "q4-w4a8 failed its gate");
     failures += check(q::describe(groupwise) == "24 heads, 16-bit activations, int8 KV, Q4 gate/up",
                       "groupwise configuration description changed");
+
+    // --a8-activations' routes (A8Routes): the groupwise Q4 MLP gate/up's prefill calls take q4-w4a8's int8
+    // route, offloaded experts their 8-bit decode and prefill routes; the NVFP4 27B (its FP8 and NVFP4 sites
+    // already take the activations the artifact permits) and the 35B-A3B have none, so they refuse the flag.
+    {
+        const q::A8Routes groupwise_a8 = q::a8_activation_routes(groupwise);
+        failures += check(groupwise_a8.q4_gate_up && !groupwise_a8.experts && !groupwise_a8.experts_prefill &&
+                              groupwise_a8.describe().find("decode and verification: none") != std::string::npos,
+                          "the groupwise Q4 gate/up takes the 8-bit prefill route only");
+        FastPathConfiguration offloaded_a8 = int8_24;
+        offloaded_a8.offloaded_experts     = true;
+        const q::A8Routes experts_a8       = q::a8_activation_routes(offloaded_a8);
+        failures += check(experts_a8.experts && experts_a8.experts_prefill && !experts_a8.q4_gate_up &&
+                              experts_a8.describe().find("prefill: the routed experts") != std::string::npos,
+                          "offloaded experts take the 8-bit decode and prefill routes");
+        failures += check(!q::a8_activation_routes(int8_24).any() &&
+                              !q::a8_activation_routes({16, ActivationClass::A16, KvCacheStorage::Int8Group64}).any() &&
+                              !q::a8_activation_routes({24, ActivationClass::A16, KvCacheStorage::Int8Group64}).any(),
+                          "the NVFP4 27B, the 35B-A3B and a groupwise 27B without Q4 gate/up have no 8-bit route");
+    }
 
     // sampled-mtp-drafts: MTP rounds of resident experts without n-gram copies; not yet qualified on
     // any Qwen3.5 configuration (a candidate only).

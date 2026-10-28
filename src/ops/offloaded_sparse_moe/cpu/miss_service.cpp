@@ -83,6 +83,9 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
          std::any_of(layers_.begin(), layers_.end(), [](const Layer& l) { return l.ggml.valid(); }))) {
         throw std::invalid_argument("CPU miss service: two-term A4 jobs need NVFP4 W4A16 banks of Flash-Next's geometry");
     }
+    if (options_.nvfp4_a8 && options_.activation != ExpertActivation::kA16) {
+        throw std::invalid_argument("CPU miss service: 8-bit NVFP4 jobs need banks without activation scales (kA16)");
+    }
     for (const auto& layer : layers_) {
         // Without a bank (the SSD tier) every request is tiered: it carries its records' addresses.
         // A GGUF bank's records are its own size (ggml_expert.h) and carry no per-expert scalars.
@@ -180,6 +183,7 @@ MoeCpuChannel CpuMissService::channel(int layer) const {
     out.wide_from       = options_.wide_from;
     out.wide_jobs       = options_.wide_jobs;
     out.narrow_a16      = options_.narrow_a16;
+    out.ggml_a8         = options_.ggml_a8 ? 1 : 0;
     return out;
 }
 
@@ -210,6 +214,8 @@ void CpuMissService::serve() {
                             .activation = options_.activation,
                             .narrow_a16 = options_.narrow_a16,
                             .ggml       = ggml,
+                            .ggml_a8    = ggml && options_.ggml_a8,
+                            .nvfp4_a8   = options_.nvfp4_a8,
                             .shape      = options_.shape,
                             .cpus       = options_.cpus,
                             .shared_x   = temporary_switches::flag("INFERNIX_TMP_CPU_SHARED_X")});
@@ -266,11 +272,15 @@ void CpuMissService::serve() {
                 job.record        = r.tiered != 0 ? reinterpret_cast<const std::uint8_t*>(r.record[j])
                                                       : layer.records + expert * layer.record_stride;
                 job.ggml          = layer.ggml;
+                // The 8-bit activation route: a GGUF bank's jobs take ggml_expert.h's a8 functions (a block-FP8
+                // bank keeps its exact route), an NVFP4 bank's w4a8_expert.h's.
+                job.a8            = r.a8 != 0 && (!layer.ggml.valid() || layer.ggml.gate_up != QType::FP8_E4M3FN_B128);
                 job.scales        = layer.ggml.valid() ? ExpertScales{} : layer.scales[expert];
                 job.ncols         = r.ncols[j];
                 // The device publishes 1..kMaxCpuColumns columns (cpu_plan_body); any other count
-                // would index past the job's x/y and the kernels' accumulators.
-                if (job.ncols < 1 || job.ncols > kMaxCpuColumns) {
+                // would index past the job's x/y and the kernels' accumulators. An 8-bit request for an
+                // NVFP4 bank this service was not set up for (Options::nvfp4_a8) has no route here.
+                if (job.ncols < 1 || job.ncols > kMaxCpuColumns || (job.a8 && !layer.ggml.valid() && !options_.nvfp4_a8)) {
                     job.ncols = 0;
                     status    = EINVAL;
                     continue;

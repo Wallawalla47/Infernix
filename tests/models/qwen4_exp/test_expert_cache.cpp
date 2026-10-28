@@ -514,6 +514,59 @@ void test_lending() {
     check(threw, "a frame is given back only while lent");
 }
 
+// The SSD tier's lends and shrinks (design §19.3.7): with first_victims, the experts it accepts (those
+// with a RAM copy) leave first, lowest score first, then the others; without, the lowest scores leave.
+void test_lending_prefers_host_copies() {
+    constexpr std::uint32_t kKeys = 32, kFrames = 8;
+    // The policy alone: keys 0..7 resident, key k routed k + 1 times.
+    LfruPolicy policy(kKeys, kFrames);
+    LfruPolicy::Step step;
+    for (std::uint32_t k = 0; k < kFrames; ++k) {
+        for (std::uint32_t use = 0; use <= k; ++use) {
+            const std::uint32_t group[] = {k};
+            policy.step(group, step);
+        }
+    }
+    const LfruPolicy::Admissible copies = [](std::uint32_t k) { return k == 2 || k == 5 || k == 7; };
+    std::vector<std::uint32_t> victims;
+    policy.set_capacity(5, victims, &copies);
+    check(victims == std::vector<std::uint32_t>({2, 5, 7}), "the experts with a copy leave first, lowest score first");
+    const LfruPolicy::Admissible one = [](std::uint32_t k) { return k == 6; };
+    victims.clear();
+    policy.set_capacity(3, victims, &one);
+    check(victims == std::vector<std::uint32_t>({6, 0}), "then the lowest-score others");
+    victims.clear();
+    policy.set_capacity(2, victims);
+    check(victims == std::vector<std::uint32_t>({1}) && policy.resident_count() == 2, "without a preference, the lowest score");
+
+    // The controller's lend: the loan of three frames evicts the two keys with a copy (4 and 6) and
+    // the lowest-score other (0); the run's experts move out of it.
+    CacheController cache(kKeys, kFrames, 0, 1);
+    std::vector<CacheController::Command> cmds;
+    std::uint64_t round = 0;
+    for (std::uint32_t k = 0; k < kFrames; ++k) {
+        for (std::uint32_t use = 0; use <= k; ++use) {
+            const std::uint32_t group[] = {k};
+            cache.on_route(group, ++round, cmds);
+            cache.on_quiescent(cmds);
+        }
+    }
+    for (const auto& c : cmds) {
+        if (c.kind == CacheController::Command::Kind::kCopy) { check(cache.complete_load(c.key, c.frame, c.serial), "a load publishes"); }
+    }
+    cmds.clear();
+    const LfruPolicy::Admissible host = [](std::uint32_t k) { return k == 4 || k == 6; };
+    const auto run = cache.choose_run(3, std::vector<std::uint8_t>(kFrames, 0));
+    check(run.has_value(), "a run to lend");
+    check(cache.lend(*run, 3, cmds, &host) == 3, "the loan evicts three experts");
+    bool expected = true;
+    for (std::uint32_t k = 0; k < kFrames; ++k) {
+        const bool absent = cache.entry(k).state == ResidencyState::kAbsent;
+        expected &= absent == (k == 0 || k == 4 || k == 6);
+    }
+    check(expected, "the loan's victims: the keys with a copy, then the lowest-score other");
+}
+
 // Warm start (design §19.3.5 S4b): seed sets the counts, then loads the ranked keys best first into
 // free frames while the policy has capacity (frames - slack), skipping keys already resident or out
 // of range; each loaded key issues one copy into a distinct frame and publishes when that copy lands.
@@ -771,6 +824,33 @@ void test_tier_gates() {
     }
 }
 
+// The adaptive tier (candidates §7.6 D12): Basalt's swaps through CacheController::exchange. A swap
+// retires the victim's frame (ABSENT write) and loads the newcomer once a frame is free; with no victim the newcomer
+// takes the policy's room, and nothing happens without room or for a resident newcomer or a non-resident victim.
+void test_exchange() {
+    CacheController cache(8, 2, 0, 1);
+    std::vector<CacheController::Command> cmds;
+    const std::uint32_t a[] = {1, 2};
+    cache.on_route(a, 1, cmds);
+    cache.on_quiescent(cmds);
+    const std::uint32_t frame_of_1 = cache.entry(1).frame;
+    cmds.clear();
+    check(!cache.exchange(3, std::nullopt, 2, cmds) && cmds.empty(), "no room: a swap without a victim is refused");
+    check(!cache.exchange(2, 1, 2, cmds) && !cache.exchange(3, 5, 2, cmds) && cmds.empty(),
+          "a resident newcomer or a non-resident victim is refused");
+    check(cache.exchange(3, 1, 2, cmds), "the swap is made");
+    check(cache.policy().resident(3) && !cache.policy().resident(1) && cache.entry(1).state == ResidencyState::kAbsent,
+          "the newcomer replaces the victim in the policy and the table");
+    const bool absent_written = std::any_of(cmds.begin(), cmds.end(), [](const CacheController::Command& c) {
+        return c.kind == CacheController::Command::Kind::kWriteEntry && c.key == 1;
+    });
+    check(absent_written && cache.entry(3).state == ResidencyState::kAbsent, "the victim's frame retires first");
+    cmds.clear();
+    cache.on_quiescent(cmds);
+    check(cache.entry(3).state != ResidencyState::kAbsent && cache.entry(3).frame == frame_of_1,
+          "the newcomer loads into the victim's frame once it is free");
+}
+
 // INFERNIX_TMP_ROUTE_PROTECT (candidates §13 PUB-22): guarded residents are evicted last, as
 // tools/expert_cache_replay's TierSim.guard (test_guarded_residents_are_evicted_last) decides.
 void test_route_guard() {
@@ -834,6 +914,8 @@ void test_route_predictor() {
 
 int main() {
     test_route_guard();
+    test_exchange();
+
     test_route_predictor();
     test_residency_entries();
     test_tier_gates();
@@ -845,6 +927,7 @@ int main() {
     test_controller_resize();
     test_load_serials();
     test_lending();
+    test_lending_prefers_host_copies();
     test_seed();
     test_prompt_credit();
     test_prompt_promotions();

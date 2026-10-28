@@ -35,6 +35,12 @@ set_tests_properties(infernix_device_sync_invalid_test PROPERTIES
 set_tests_properties(infernix_device_sync_empty_test PROPERTIES
   ENVIRONMENT "INFERNIX_CUDA_SYNC=")
 
+# The prefill expert stream's gated plans with copy-ahead (candidates BX-09): slots, tables and record bytes.
+infernix_add_test(infernix_expert_stream_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_stream.cpp"
+  "${PROJECT_SOURCE_DIR}/src/runtime/expert_offload/expert_stream.cpp"
+  LIBRARIES infernix_core)
+set_tests_properties(infernix_expert_stream_test PROPERTIES SKIP_RETURN_CODE 77)
+
 infernix_add_test(infernix_decode_graph_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decode_graph.cpp"
   LIBRARIES infernix_core)
 

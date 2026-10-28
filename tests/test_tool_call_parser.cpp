@@ -304,6 +304,37 @@ int test_parameter_delimiters_in_values() {
                               quoted_args.at("command") == "echo '" + close + "' more",
                           "a tolerant cut call ended its value at the wrong closer");
     }
+
+    // Tolerant: a whole call whose value quotes an unmatched opener is not a cut call. The value
+    // keeps the opener and the call keeps its sibling, with no recovery flag; a call cut inside
+    // such a value still keeps the value to the cut.
+    for (const std::string command : {std::string("echo '<parameter=x>'"),
+                                      std::string("use <parameter=NAME> to name the argument")}) {
+        for (const bool sibling : {false, true}) {
+            const std::string text =
+                sibling ? tool_call("bash", {{"command", command}, {"timeout", "30"}})
+                        : tool_call("bash", {{"command", command}});
+            const auto parsed = parse(text, 64, contract, true);
+            failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                                  parsed.diagnostics.fallback_reason == Reason::None,
+                              "a tolerant whole call quoting an unmatched opener read as cut");
+            if (parsed.tool_calls.size() != 1) { continue; }
+            const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+            failures += check(args.at("command") == command,
+                              "a tolerant value quoting an unmatched opener was not kept exactly");
+            failures += check(!sibling || args.at("timeout") == 30,
+                              "the parameter after a quoted unmatched opener was not parsed");
+        }
+    }
+    const auto quoted_open_cut = parse(head + "echo '<parameter=x>' more", 64, contract, true);
+    failures += check(quoted_open_cut.is_tool_call_response && quoted_open_cut.tool_calls.size() == 1 &&
+                          quoted_open_cut.diagnostics.fallback_reason == Reason::TruncatedTail,
+                      "a tolerant cut call quoting an unmatched opener was not kept as a truncated tail");
+    if (quoted_open_cut.tool_calls.size() == 1) {
+        const Json args = Json::parse(quoted_open_cut.tool_calls.front().arguments_json);
+        failures += check(args.at("command") == "echo '<parameter=x>' more",
+                          "a tolerant cut value quoting an unmatched opener lost its tail");
+    }
     return failures;
 }
 
@@ -592,35 +623,38 @@ int test_schema_mismatches_remain_structured() {
     return failures;
 }
 
-int test_unsupported_schema_uses_legacy_policy() {
+int test_unknown_schema_types_keep_inference() {
     const auto contract = contract_for(
         "configure",
         Json{{"missing_type", Json::object()},
              {"alias", Json{{"type", "int"}}},
              {"invalid_type_array", Json{{"type", Json::array({"integer", "int"})}}},
-             {"partial_anyof", Json{{"anyOf", Json::array({Json{{"type", "integer"}},
-                                                           Json{{"enum", Json::array({1, 2})}}})}}},
-             {"mixed_composition", Json{{"anyOf", Json::array({Json{{"type", "boolean"}}})},
-                                        {"oneOf", Json::array({Json{{"type", "null"}}})}}}});
+             {"enum_anyof", Json{{"anyOf", Json::array({Json{{"type", "integer"}},
+                                                        Json{{"enum", Json::array({1, 2})}}})}}},
+             {"empty_intersection", Json{{"anyOf", Json::array({Json{{"type", "boolean"}}})},
+                                         {"oneOf", Json::array({Json{{"type", "null"}}})}}}});
     const std::string text = tool_call("configure", {{"missing_type", "7"},
                                                      {"alias", "8"},
                                                      {"invalid_type_array", "9"},
-                                                     {"partial_anyof", "7.5"},
-                                                     {"mixed_composition", "True"},
+                                                     {"enum_anyof", "7.5"},
+                                                     {"empty_intersection", "True"},
                                                      {"undeclared", "{\"x\":1}"}});
     const auto parsed      = parse(text, 64, contract);
 
+    // A schema naming no type it can read keeps the value text's own type; a union whose branches
+    // are all typed (an enum's values type it) and a contradictory intersection are type hints, so
+    // their values are mismatches, kept for the client to judge.
     int failures = 0;
     failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
-                          parsed.diagnostics.schema_mismatch_arguments == 1,
-                      "unsupported schema did not retain legacy policy");
+                          parsed.diagnostics.schema_mismatch_arguments == 3,
+                      "unknown schema types did not keep inference or typed hints lost a mismatch");
     if (parsed.tool_calls.size() != 1) { return failures; }
     const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
     failures += check(args.at("missing_type") == 7 && args.at("alias") == 8 &&
                           args.at("invalid_type_array") == 9,
                       "legacy numeric inference changed");
-    failures += check(args.at("partial_anyof") == 7.5 && args.at("mixed_composition") == "True",
-                      "unsupported composition was partially inferred");
+    failures += check(args.at("enum_anyof") == 7.5 && args.at("empty_intersection") == "True",
+                      "a mismatched typed value was not kept as written");
     failures +=
         check(args.at("undeclared").at("x") == 1, "undeclared parameter legacy inference changed");
     return failures;
@@ -1927,6 +1961,76 @@ int test_constrained_call_streaming() {
     return failures;
 }
 
+// A non-strict parameter's type hint follows a local `$ref`, the values of an `enum` or `const`,
+// and a one-branch `allOf` (as Pydantic writes a described enum field): a string-valued one keeps
+// every value as text. A reference that resolves to nothing, or only to itself, gives no hint, so
+// the value text decides its type. The region parser (free output) and the constrained stream
+// agree byte for byte.
+int test_reference_and_value_type_hints() {
+    const Json parameters = {
+        {"type", "object"},
+        {"$defs",
+         {{"Status", {{"type", "string"}, {"enum", Json::array({"1", "2"})}}},
+          {"Loop", {{"$ref", "#/$defs/Loop"}}}}},
+        {"properties",
+         {{"by_ref", {{"$ref", "#/$defs/Status"}}},
+          {"enum_text", {{"enum", Json::array({"1", "2"})}}},
+          {"constant", {{"const", "x"}}},
+          {"wrapped",
+           {{"allOf", Json::array({Json{{"$ref", "#/$defs/Status"}}})}, {"description", "state"}}},
+          {"unresolved", {{"$ref", "#/$defs/Missing"}}},
+          {"cyclic", {{"$ref", "#/$defs/Loop"}}}}}};
+    const auto declarations = contract_from_definitions(
+        {Json{{"type", "function"},
+              {"function", {{"name", "configure"}, {"parameters", parameters}}}}
+             .dump()});
+    const auto constrained = fi::select_tool_call_contract(declarations, infernix::ToolChoice{});
+
+    int failures = 0;
+    failures += check(constrained && constrained->constrained,
+                      "default tool choice did not constrain the calls");
+    if (!constrained) { return failures; }
+    const std::vector<std::string_view> hinted   = {"by_ref", "enum_text", "constant", "wrapped"};
+    const std::vector<std::string_view> unhinted = {"unresolved", "cyclic"};
+    // Each value, and its JSON as the unhinted parameters infer it from the text.
+    const std::vector<std::pair<std::string_view, std::string_view>> values = {
+        {"123", "123"}, {"true", "true"}, {"null", "null"}, {"007", "\"007\""}, {"abc", "\"abc\""}};
+    for (const auto& [value, inferred] : values) {
+        std::string text     = "<tool_call>\n<function=configure>\n";
+        std::string expected = "{";
+        for (const bool typed : {true, false}) {
+            for (const std::string_view name : typed ? hinted : unhinted) {
+                text += "<parameter=" + std::string(name) + ">\n" + std::string(value) +
+                        "\n</parameter>\n";
+                if (expected.size() > 1) { expected += ','; }
+                expected += "\"" + std::string(name) + "\":" +
+                            (typed ? Json(std::string(value)).dump() : std::string(inferred));
+            }
+        }
+        text += "</function>\n</tool_call>";
+        expected += '}';
+
+        const auto parsed = parse(text, 64, *declarations);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls.front().arguments_json == expected,
+                          "a referenced or enum-typed value was retyped: " + std::string(value));
+
+        fi::ToolCallOutputDecoder decoder(constrained, 64);
+        StreamedCalls streamed;
+        for (std::size_t at = 0; at < text.size(); ++at) {
+            (void)feed(decoder, text, at, 1);
+            streamed.take(decoder);
+        }
+        const auto terminal = decoder.finish(infernix::FinishReason::StopToken);
+        streamed.take(decoder);
+        failures += check(terminal.tool_calls.size() == 1 && streamed.calls.size() == 1 &&
+                              terminal.tool_calls.front().arguments_json == expected &&
+                              streamed.calls.front().arguments_json == expected,
+                          "streamed arguments differ from the parsed ones: " + std::string(value));
+    }
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_constrained_call_streaming();
@@ -1945,7 +2049,8 @@ int main() {
     failures += test_composed_schema_types();
     failures += test_empty_declared_non_string_is_omitted();
     failures += test_schema_mismatches_remain_structured();
-    failures += test_unsupported_schema_uses_legacy_policy();
+    failures += test_unknown_schema_types_keep_inference();
+    failures += test_reference_and_value_type_hints();
     failures += test_strict_structure_and_active_tool_set();
     failures += test_name_limits_and_non_strict_omissions();
     failures += test_duplicate_tool_contracts_rejected();

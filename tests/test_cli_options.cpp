@@ -375,6 +375,10 @@ int run_tests() {
                       "--expert-ram-mib must parse a MiB count and auto");
     failures += check(rejects([] { (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-ram-mib", "0"}); }),
                       "--expert-ram-mib must reject zero");
+    failures += check(help.find("--expert-ram-layout") != std::string::npos, "CLI help omits the expert RAM layout control");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-ram-layout", "full"}).expert_ram_layout ==
+                          infernix::ExpertRamLayout::Full,
+                      "--expert-ram-layout must parse full");
     failures += check(help.find("--expert-pin-mib") != std::string::npos, "CLI help omits the expert pin control");
     failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-pin-mib", "24576"}).expert_pin_bytes ==
                               (24576ULL << 20) &&

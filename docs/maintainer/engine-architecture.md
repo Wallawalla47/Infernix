@@ -273,6 +273,14 @@ Program freezes dependencies on the same sequence, source/destination lease, blo
 buffer. Only one context resource transaction exists at any time, and the mappings accessed by any GPU
 unit stay stable until it completes.
 
+With nothing to run, the worker also runs the next-turn prefill ([hybrid prefix cache](hybrid-prefix-cache-spec.md)
+§7.9): once it has been idle for the quiet period, it prefills the latest finished reply's history,
+rendered as the conversation's next request will render it, as an internal request with no consumer
+and no outstanding capacity. A request submitted before it starts drops it; a waiting, paused,
+binding or resident request cancels it, so it ends at its next unit boundary and delays a request by
+at most one prefill unit. Its rendering, tokenization and output session are prepared on a thread of
+their own, never on the worker. It is idle-only internal work, not a priority class.
+
 Admission checks start a bounded scan on events such as the wait queue, capacity release and resource
 transaction completion. Ordinary decode progress by itself does not restart a failed admission scan. A
 failed resume does not close fresh admission; while older resident requests remain, a paused request
@@ -360,7 +368,20 @@ unit is stable; a paused request releases its ResumeState. Cancellation does
 not rewrite in-flight mappings, and committed output is not rolled back.
 
 Queue timeout, overload, input over limit and an unrepresentable request are request-level
-rejections. Handle generation/owner errors, PendingBatch membership errors, a physical mutation that
+rejections. So is a binding the Program refuses with its own error (`BindingReservation::refusal`,
+`capacity_possible` false): the Engine fails that request alone at admission and keeps serving.
+Qwen3.8-Flash-Next lends a media prompt's Vision window from its expert frames as part of the
+binding's reservation, after the KV: a window other lanes' leases or KV leave no room for defers the
+request (no pages short, the next release re-runs admission); one that does not fit with every other
+lane idle is refused as `MediaBudgetExceeded`. A Program step that fails inside a binding would fail
+the Engine (below), so no binding resource is taken there.
+
+A row whose logits went non-finite (`PendingRowFailure::NonFiniteLogits`) fails its request alone;
+since its state may be non-finite too, the Program's release of that lane withdraws the prefix-cache
+blocks and snapshots the request published past its resume point, with anything later requests
+built on them ([hybrid prefix cache](hybrid-prefix-cache-spec.md) §7.8), in both model families.
+
+Handle generation/owner errors, PendingBatch membership errors, a physical mutation that
 cannot stably commit/abort, and broken integrity or adoption invariants fail the Engine. Cleanup first
 ends pending context and model transactions, then releases resident/paused resources and the cache,
 and finally completes every response. Internal state corruption must not be interpreted as a cache

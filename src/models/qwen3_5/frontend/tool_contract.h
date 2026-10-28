@@ -48,7 +48,8 @@ struct ToolCallOutputContract {
         std::vector<Parameter> parameters;
         std::string schema_json;
         // A strict tool's grammar schema when it differs from schema_json: each nullable string parameter
-        // as its string branches (its value is raw text; `null` reads back as JSON null). Empty otherwise.
+        // as its string branches and members with the text `null` (its value is raw text; `null` reads
+        // back as JSON null). Empty otherwise.
         std::string grammar_schema_json;
         std::size_t declaration_index = 0;
         bool strict                   = false;

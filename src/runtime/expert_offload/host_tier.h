@@ -109,6 +109,13 @@ public:
     [[nodiscard]] std::size_t resident_count() const { return resident_count_; }
     [[nodiscard]] std::size_t shadow_count() const { return shadow_count_; }
     [[nodiscard]] std::uint32_t demotion_allowance() const { return allowance_; }
+    // Keys that left both tiers (SSD-only afterwards), by cause, since start: VRAM victims dropped (T5) because
+    // their frame was not published (a loan's or a shrink's, or one evicted while loading), no demotion slot was
+    // left, or they were not worth one; and RAM residents (their only host copy) evicted for another key.
+    struct Losses {
+        std::uint64_t unpublished = 0, no_slot = 0, unworthy = 0, residents_evicted = 0;
+    };
+    [[nodiscard]] const Losses& losses() const { return losses_; }
 
     // Keys whose host slot changed since the last call (the device pointer table's dirty set).
     void take_dirty(std::vector<std::uint32_t>& keys);
@@ -117,6 +124,9 @@ public:
     // Places `key`'s record into a free resident slot (the warm pre-fill); false when none is left
     // or the key already has a host copy. The caller writes the bytes before the first round.
     bool prefill(std::uint32_t key, std::int32_t& slot);
+    // The same for a key VRAM holds (the warm start's spare slots): the slot is its shadow, so its
+    // eviction from VRAM (a lend's or a decode victim's) needs no copy back (T3).
+    bool prefill_shadow(std::uint32_t key, std::int32_t& slot);
     [[nodiscard]] bool has_free_resident() const { return !free_resident_.empty(); }
     // Marks `key` held outside the slots (see held); false when it has a slot copy or is held.
     bool hold(std::uint32_t key);
@@ -190,6 +200,8 @@ public:
     // T7: the demotion copy into `slot` completed; `in_vram` tells whether key was re-admitted
     // into VRAM meanwhile (then the slot is its shadow).
     void demotion_completed(std::uint32_t key, std::uint32_t slot, bool in_vram);
+    // A demotion's read failed: its slot is free again and the key keeps no host copy.
+    void demotion_failed(std::uint32_t key, std::uint32_t slot);
 
     // Audit: recomputes every invariant (states, pins, lists, counts, maps); throws logic_error.
     void check() const;
@@ -239,6 +251,7 @@ private:
     std::uint64_t next_serial_ = 1;
     std::uint32_t allowance_   = 0;
     std::size_t resident_count_ = 0, shadow_count_ = 0;
+    Losses losses_;
 };
 
 } // namespace infernix::runtime::expert_offload::expert_cache

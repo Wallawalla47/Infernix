@@ -5,10 +5,17 @@ infernix_add_test(infernix_ngram_archive_test SOURCES
   "${CMAKE_CURRENT_LIST_DIR}/test_ngram_archive.cpp"
   "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/ngram.cpp")
 
-# Fast-path selection rules: where each path applies and which configurations qualify it.
+# Fast-path selection rules: where each path applies and which configurations qualify it, and the routes
+# --a8-activations gives each configuration.
 infernix_add_test(infernix_qwen3_5_fast_paths_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fast_paths.cpp"
   LIBRARIES infernix_engine infernix_model_runtime infernix::json)
+
+# The Qwen3.5-122B-A10B's calibrated expert order (offload design §9.2.1): its shape guard and conversion, the
+# built-in table, and a saved state's precedence over it at the warm start (host only).
+infernix_add_test(infernix_qwen3_5_calibrated_order_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_calibrated_order.cpp"
+  LIBRARIES infernix_qwen3_5_calibrated_order)
 
 # idle-wide-prefill planning rules: the idle width ladder and the flexible-tap step limit.
 infernix_add_test(infernix_qwen3_5_idle_prefill_test
@@ -105,7 +112,7 @@ infernix_add_test(infernix_qwen3_5_tools_real_test
 
 infernix_add_test(infernix_qwen3_5_hybrid_prefix_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_hybrid_prefix_real.cpp"
-  LIBRARIES infernix_engine)
+  LIBRARIES infernix_engine infernix_model_runtime)
 
 infernix_add_test(infernix_qwen3_5_invariance_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_invariance_real.cpp"
@@ -235,6 +242,14 @@ infernix_add_test(infernix_qwen3_5_moe_real_test
 infernix_add_test(infernix_qwen3_5_dflash_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash_real.cpp"
   LIBRARIES infernix_engine)
+
+# The tokenizer against Hugging Face `tokenizers` ids on a real tokenizer.json: skips without
+# INFERNIX_TEST_TOKENIZER_DIR (generate_tokenizer_golden.py writes the directory from an artifact).
+infernix_add_test(infernix_qwen3_5_tokenizer_golden_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tokenizer_golden_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime infernix::json
+  NEEDS_SOURCE_DIR)
+set_tests_properties(infernix_qwen3_5_tokenizer_golden_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
 infernix_add_test(infernix_tool_call_parser_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../test_tool_call_parser.cpp"

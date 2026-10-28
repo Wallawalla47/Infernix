@@ -1,7 +1,9 @@
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
+#include "runtime/engine/expert_memory.h"
 #include "runtime/engine/model_instance.h"
 
 #include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <stdexcept>
 
@@ -136,6 +138,40 @@ int main() {
         failures += check(qwen35.host_capacity_bytes == infernix::kDefaultHybridHostCacheBytes &&
                               qwen35.hybrid.device_snapshot_slots == 3U,
                           "Qwen3.5 prefix cache defaults changed");
+        // A Qwen3.5 artifact with offloaded experts keeps one Device slot beside its Host tier (the frames
+        // the others would take; candidates §22 VM-03), and the per-lane rule without a Host tier.
+        const infernix::ContextCacheOptions offloaded =
+            normalize_engine_options(options, infernix::models::Architecture::Qwen3_5, true).context_cache;
+        failures += check(offloaded.hybrid.device_snapshot_slots == 1U,
+                          "offloaded Qwen3.5 with a Host tier: one Device snapshot slot");
+        EngineOptions no_tier                          = options;
+        no_tier.context_cache.host_capacity_bytes      = 0;
+        const infernix::ContextCacheOptions device_only =
+            normalize_engine_options(no_tier, infernix::models::Architecture::Qwen3_5, true).context_cache;
+        failures += check(device_only.hybrid.device_snapshot_slots == 4U,
+                          "offloaded Qwen3.5 without a Host tier: C + 2 Device snapshot slots");
+        // --host-context-mib auto: Qwen3.8-Flash-Next keeps the size unset for its RAM plan (and still has a Host
+        // tier, so its other defaults are the tier's); Qwen3.5 takes the common default.
+        EngineOptions automatic = options;
+        automatic.context_cache.host_capacity_auto = true;
+        const infernix::ContextCacheOptions qwen4_auto =
+            normalize_engine_options(automatic, infernix::models::Architecture::Qwen4Exp).context_cache;
+        failures += check(!qwen4_auto.host_capacity_bytes && qwen4_auto.host_capacity_auto &&
+                              qwen4_auto.hybrid.max_new_taps == 8U,
+                          "Qwen3.8-Flash-Next must keep an automatic Host tier unsized for its RAM plan");
+        const infernix::ContextCacheOptions qwen35_auto = normalize_engine_options(automatic).context_cache;
+        failures += check(qwen35_auto.host_capacity_bytes == infernix::kDefaultHybridHostCacheBytes &&
+                              !qwen35_auto.host_capacity_auto,
+                          "Qwen3.5 must take the default Host tier for --host-context-mib auto");
+        // The automatic size: 0.4 of what the plan leaves beyond --ram-free-mib, in 256 MiB steps, between 1 and 8 GiB.
+        constexpr std::uint64_t kMiB = 1ULL << 20;
+        failures += check(infernix::runtime::auto_host_context_bytes(0) == 1024 * kMiB, "an automatic Host tier has a 1 GiB floor");
+        failures += check(infernix::runtime::auto_host_context_bytes(10240 * kMiB) == 4096 * kMiB,
+                          "an automatic Host tier takes 0.4 of 10 GiB left");
+        failures += check(infernix::runtime::auto_host_context_bytes(15155 * kMiB) == 5888 * kMiB,
+                          "an automatic Host tier rounds 0.4 of the RAM left down to 256 MiB");
+        failures += check(infernix::runtime::auto_host_context_bytes(40960 * kMiB) == 8192 * kMiB,
+                          "an automatic Host tier stops at 8 GiB");
         // The prefill chunk defaults per model: 16,384 for Qwen3.8-Flash-Next, whose ladder keeps
         // the 4,096-token chunk's spacing (max(4096, 2 * 4096) and max(1024, 4096)), and 1,024
         // for Qwen3.5 (ladder max(4096, 2 * 1024), gap max(1024, 1024)).
@@ -163,6 +199,48 @@ int main() {
         failures += check(normalize_engine_options(disabled).context_cache.hybrid.tool_call_hold ==
                               std::chrono::milliseconds{0},
                           "a disabled prefix cache kept a tool-call hold");
+        // Next-turn prefill (hybrid-prefix-cache-spec §7.9): on by default for Qwen3.5, off for Qwen3.8-Flash-Next
+        // (and refused on its reproducible route), an explicit zero kept, none without a cache, and a value
+        // outside [0, 1 h] refused.
+        failures += check(qwen35.hybrid.next_turn_prefill_quiet == infernix::kDefaultNextTurnPrefillQuiet &&
+                              qwen4.hybrid.next_turn_prefill_quiet == std::chrono::milliseconds{0},
+                          "next-turn prefill defaults are wrong");
+        {
+            EngineOptions flash_next                                = options;
+            flash_next.context_cache.hybrid.next_turn_prefill_quiet = std::chrono::milliseconds{150};
+            failures += check(normalize_engine_options(flash_next, infernix::models::Architecture::Qwen4Exp)
+                                      .context_cache.hybrid.next_turn_prefill_quiet == std::chrono::milliseconds{150},
+                              "Qwen3.8-Flash-Next's explicit next-turn quiet period was not kept");
+            flash_next.fast_paths = false;
+            bool refused          = false;
+            try {
+                (void)normalize_engine_options(flash_next, infernix::models::Architecture::Qwen4Exp);
+            } catch (const std::invalid_argument&) { refused = true; }
+            failures += check(refused, "Qwen3.8-Flash-Next's reproducible route accepted the next-turn prefill");
+        }
+        EngineOptions quiet_off                              = options;
+        quiet_off.context_cache.hybrid.next_turn_prefill_quiet = std::chrono::milliseconds{0};
+        failures += check(normalize_engine_options(quiet_off).context_cache.hybrid.next_turn_prefill_quiet ==
+                              std::chrono::milliseconds{0},
+                          "an explicit zero next-turn quiet period was not kept");
+        failures += check(normalize_engine_options(disabled).context_cache.hybrid.next_turn_prefill_quiet ==
+                              std::chrono::milliseconds{0},
+                          "a disabled prefix cache kept the next-turn prefill");
+        for (int variant = 0; variant < 3; ++variant) {
+            EngineOptions bad = options;
+            bad.context_cache.hybrid.next_turn_prefill_quiet =
+                std::chrono::milliseconds(variant == 0 ? -1 : variant == 1 ? 3'600'001 : 150);
+            if (variant == 2) {
+                bad                       = EngineOptions{};
+                bad.context_cache.enabled = false;
+                bad.context_cache.hybrid.next_turn_prefill_quiet = std::chrono::milliseconds{150};
+            }
+            bool rejected = false;
+            try {
+                (void)normalize_engine_options(bad);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "an unservable next-turn quiet period was accepted");
+        }
     }
     // --draft-tokens auto takes the model's most MTP drafts unless given a ceiling (Qwen3.8-Flash-Next 7,
     // Qwen3.5 5); the block drafters take it too (Qwen3.8-Flash-Next's DFlash2 7, the Qwen3.5 planner

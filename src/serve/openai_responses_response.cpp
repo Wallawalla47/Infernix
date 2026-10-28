@@ -954,4 +954,15 @@ std::string OpenAIResponsesEventStream::failed(const ApiError& error) {
     return sse(impl_->event("response.failed", Json{{"response", response}}));
 }
 
+std::string make_openai_failed_response_stream(const std::string& id, std::int64_t created_at,
+                                               OpenAIResponsesCreateRequest request,
+                                               const OpenAIResponsesRuntimeValues& runtime,
+                                               const ApiError& error) {
+    OpenAIResponsesEventStream stream(id, created_at, std::move(request), runtime);
+    std::string wire;
+    for (const std::string& event : stream.start()) { wire += event; }
+    wire += stream.failed(error);
+    return wire;
+}
+
 } // namespace infernix::serve

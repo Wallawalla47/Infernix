@@ -9,6 +9,7 @@ target_sources(infernix_model_loading PRIVATE
 )
 
 target_sources(infernix_model_runtime PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/drafter_pool.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_offload.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_residency.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_stream.cpp"

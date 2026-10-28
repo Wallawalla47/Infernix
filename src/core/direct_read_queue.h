@@ -14,9 +14,11 @@ namespace infernix {
 // from an artifact in place (design §19.3.7, the SSD expert tier). Files are opened unbuffered and
 // without write sharing, so an in-place rewrite fails for the writer while a reader holds them.
 //
-// Reads are of two classes: demand reads are issued before prefetch reads, and each class has its
-// own cap of reads in flight under a common cap. A prefetch read is issued as sub-reads of at most
-// `prefetch_split` bytes, so a demand read never queues behind a whole prefetched record.
+// Reads are of three classes, issued in this order: demand reads, restore reads (records the SSD tier
+// puts back into RAM in place of a copy over the GPU's link; they hold a VRAM frame until they land),
+// then prefetch reads; each class has its own cap of reads in flight under a common cap. Restore and
+// prefetch reads are issued as sub-reads of at most `restore_split` and `prefetch_split` bytes, so a
+// demand read never queues behind a whole record of theirs.
 //
 // Failures: a transient error (out of system resources or quota) is retried with backoff (1, 2, 4,
 // ... ms) while the read's first error is younger than `transient_bound`; any other error, and a
@@ -30,13 +32,15 @@ class DirectReadQueue {
 public:
     static constexpr std::size_t kAlignment = 4096; // offsets, sizes and destinations
 
-    enum class Priority : std::uint8_t { Demand = 0, Prefetch = 1 };
+    enum class Priority : std::uint8_t { Demand = 0, Restore = 1, Prefetch = 2 };
     enum class Status : std::uint8_t { Ok, Failed, TimedOut, Cancelled };
 
     struct Options {
         std::uint32_t demand_depth   = 8;
+        std::uint32_t restore_depth  = 4;
         std::uint32_t prefetch_depth = 1;
-        std::uint32_t total_depth    = 9;
+        std::uint32_t total_depth    = 13;
+        std::size_t restore_split    = 1024 * 1024;
         std::size_t prefetch_split   = 256 * 1024;
         std::chrono::milliseconds timeout{1500};
         std::chrono::milliseconds transient_bound{1500};

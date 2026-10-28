@@ -495,11 +495,30 @@ void test_held() {
     tier.check();
 }
 
+// A demotion whose read failed (the SSD tier's refill, HostExpertTier::refill): its slot is free again and the key
+// keeps no host copy.
+void test_demotion_failed() {
+    HostTier tier(small_config());
+    for (std::uint32_t k = 0; k < 8; ++k) {
+        std::int32_t slot = -1;
+        check(tier.prefill(k, slot), "prefill");
+    }
+    const std::size_t lists = tier.demotion_slots();
+    std::uint32_t target = 0;
+    check(tier.vram_evicted(52, true, target) == VramEviction::kDemote && tier.demotion_slots() == lists - 1,
+          "a published VRAM victim takes a demotion slot");
+    tier.check();
+    tier.demotion_failed(52, target);
+    check(!tier.host_copy(52) && tier.state(target) == SlotState::kFree, "a failed read frees the slot");
+    tier.check();
+}
+
 } // namespace
 
 int main() {
     try {
         test_lfu();
+        test_demotion_failed();
         test_transitions();
         test_warm_fill();
         test_held();

@@ -247,12 +247,14 @@ void run(int columns, std::mt19937& rng) {
                "cudaMalloc");
     std::uint16_t* d_out = nullptr;
     cuda_check(cudaMalloc(&d_out, expected.size() * sizeof(std::uint16_t)), "cudaMalloc");
-    cudaStream_t fork_stream = nullptr, overlap_stream = nullptr;
-    cudaEvent_t fork_events[2]{}, overlap_events[5]{};
+    cudaStream_t fork_stream = nullptr, overlap_stream = nullptr, split_stream = nullptr;
+    cudaEvent_t fork_events[2]{}, overlap_events[5]{}, split_events[2]{};
     cuda_check(cudaStreamCreateWithFlags(&fork_stream, cudaStreamNonBlocking), "stream");
     cuda_check(cudaStreamCreateWithFlags(&overlap_stream, cudaStreamNonBlocking), "stream");
+    cuda_check(cudaStreamCreateWithFlags(&split_stream, cudaStreamNonBlocking), "stream");
     for (auto& e : fork_events) { cuda_check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event"); }
     for (auto& e : overlap_events) { cuda_check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event"); }
+    for (auto& e : split_events) { cuda_check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event"); }
     const std::vector<moe::CpuMissService::Layer> layers{{.records = host, .record_stride = stride, .scales = scales.data()}};
     moe::CpuMissService service(layers, {.workers = 6, .max_jobs = 8, .max_columns = 64, .pcie_divisor = 2, .cpus = {},
                                          .activation = moe::ExpertActivation::kA16, .shape = kShape});
@@ -263,14 +265,17 @@ void run(int columns, std::mt19937& rng) {
         bool cpu;
         const char* name;
         bool overlap = false;
+        bool split   = false; // a forked call's misses staged in two launches (MoeExpertSource::split_stream)
     };
     const Config configs[] = {{0, false, false, "zero-copy"},
                               {3, false, false, "3 staging slots"},
                               {64, false, false, "64 staging slots"},
                               {16, false, false, "16 staging slots, double-buffered", true},
                               {64, true, false, "forked"},
+                              {64, true, false, "forked, split staging", false, true},
                               {64, false, true, "CPU-served misses"},
-                              {64, true, true, "forked, CPU-served misses"}};
+                              {64, true, true, "forked, CPU-served misses"},
+                              {64, true, true, "forked, split staging, CPU-served misses", false, true}};
     for (const auto& config : configs) {
         if (config.fork && columns > moe::kMaxColumns) { continue; }
         if (config.cpu && columns > 64) { continue; }
@@ -292,6 +297,11 @@ void run(int columns, std::mt19937& rng) {
             source.fork_stream    = fork_stream;
             source.fork_events[0] = fork_events[0];
             source.fork_events[1] = fork_events[1];
+        }
+        if (config.split) {
+            source.split_stream    = split_stream;
+            source.split_events[0] = split_events[0];
+            source.split_events[1] = split_events[1];
         }
         if (config.overlap) {
             source.overlap_stream = overlap_stream;
@@ -489,8 +499,10 @@ void run(int columns, std::mt19937& rng) {
     cudaFreeHost(host);
     cudaStreamDestroy(fork_stream);
     cudaStreamDestroy(overlap_stream);
+    cudaStreamDestroy(split_stream);
     for (auto e : fork_events) { cudaEventDestroy(e); }
     for (auto e : overlap_events) { cudaEventDestroy(e); }
+    for (auto e : split_events) { cudaEventDestroy(e); }
 }
 
 } // namespace

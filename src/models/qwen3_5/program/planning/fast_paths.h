@@ -152,4 +152,30 @@ struct FastPathSelection {
 // options.fast_path_candidates entry (qualification runs), which must apply.
 [[nodiscard]] FastPathSelection select_fast_paths(const Model& model, const EngineOptions& options);
 
+// --a8-activations (EngineOptions::a8_activations; LOSSY, opt-in, never a fast path;
+// docs/maintainer/qwen3_8-flash-next-design.md §19.3.31): the 8-bit activation routes a configuration takes,
+// by call width. A route stays only where it measured faster than the route it replaces; a8_activation_routes
+// sets each on one line, which withdraws it. The other projections have none faster than their own (the dense
+// 8-bit decode routes measured slower and were removed), or take 8- and 4-bit activations by the artifact's
+// own permissions already (the NVFP4 27B's FP8 and NVFP4 sites).
+struct A8Routes {
+    // Decode and verification calls: the offloaded experts' calls of at most 128 columns and their CPU-served
+    // misses (NVFP4 W4A16 banks, ops::offloaded_moe::NarrowA16::kA8; design §16.2.3).
+    bool experts = false;
+    // Prefill calls: the offloaded experts' calls of more than 128 columns on the same codec
+    // (ops::offloaded_moe::WideA16::kA8, which needs their 8-bit narrow route), in place of the exact route or a
+    // forced expert-a4-residual's A4 terms; and the groupwise Q4 MLP gate/up's calls of 256 or more columns on
+    // q4-w4a8's route, int8 activations with a scale per token (ops::LinearRoutes::Q4W4A8; model-quality.md 6.7).
+    bool experts_prefill = false;
+    bool q4_gate_up      = false;
+
+    [[nodiscard]] bool any() const noexcept { return experts || experts_prefill || q4_gate_up; }
+    // What takes 8-bit activations in decode and in prefill (the startup line).
+    [[nodiscard]] std::string describe() const;
+};
+
+// The routes of the configuration; the Engine applies them only with options.a8_activations on the fast route
+// (the reproducible and lossless routes refuse the flag).
+[[nodiscard]] A8Routes a8_activation_routes(const FastPathConfiguration& configuration) noexcept;
+
 } // namespace infernix::models::qwen3_5

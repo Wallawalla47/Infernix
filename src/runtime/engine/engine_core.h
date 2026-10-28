@@ -103,7 +103,11 @@ public:
           tool_call_hold_(options.context_cache.enabled
                               ? options.context_cache.hybrid.tool_call_hold.value_or(
                                     std::chrono::milliseconds{0})
-                              : std::chrono::milliseconds{0}) {
+                              : std::chrono::milliseconds{0}),
+          next_turn_quiet_(options.context_cache.enabled
+                                  ? options.context_cache.hybrid.next_turn_prefill_quiet.value_or(
+                                        std::chrono::milliseconds{0})
+                                  : std::chrono::milliseconds{0}) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
@@ -144,6 +148,30 @@ public:
         if constexpr (kProgramMaintains) {
             instance_.program->set_maintenance_waker([this] { request_maintenance(); });
         }
+        // Finished turns are rendered and tokenized off the worker (hybrid-prefix-cache-spec §7.9).
+        // Without the thread the Engine simply never prefills them.
+        if (next_turn_quiet_.count() > 0) {
+            try {
+                next_turn_thread_ = std::thread([this] { next_turn_prepare_loop(); });
+            } catch (...) {
+                next_turn_disabled_.store(true, std::memory_order_release);
+            }
+        }
+        // The first constrained request would build the constraint compiler's vocabulary index
+        // before its prefill starts (measured 0.85 s of `prepare` with a 337-token prefill), so
+        // it is built beside startup instead. Last, so nothing after it can throw past the thread.
+        constraint_warm_ = std::thread([this, frontend = instance_.frontend] {
+            const auto started = Clock::now();
+            try {
+                frontend.warm_constraints();
+                publish_diagnostic(diagnostics_, DiagnosticLevel::Info,
+                                   "constraint vocabulary index built in %.3f s",
+                                   std::chrono::duration<double>(Clock::now() - started).count());
+            } catch (const std::exception& error) {
+                publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
+                                   "constraint vocabulary index not built ahead: %s", error.what());
+            } catch (...) {}
+        });
     }
 
     ~EngineCore() noexcept {
@@ -152,7 +180,14 @@ public:
             try { instance_.program->set_maintenance_waker({}); } catch (...) {}
         }
         stop();
+        {
+            std::lock_guard lock(next_turn_mutex_);
+            next_turn_stop_ = true;
+        }
+        next_turn_cv_.notify_all();
+        if (next_turn_thread_.joinable()) { next_turn_thread_.join(); }
         if (worker_.joinable()) { worker_.join(); }
+        if (constraint_warm_.joinable()) { constraint_warm_.join(); }
     }
 
     // A Program that resizes resources outside rounds (Qwen4Exp's expert cache, design §19.3.7)
@@ -182,6 +217,38 @@ public:
 
     EngineCore(const EngineCore&)            = delete;
     EngineCore& operator=(const EngineCore&) = delete;
+
+    // Engine::prefill_next_turn (hybrid-prefix-cache-spec §7.9). `conversation` ends with a finished
+    // reply as its client will send it back. The preparation thread renders it as the next request
+    // will (PromptContinuationMode::NextTurnHistory); once the Engine has had nothing to run for the
+    // quiet period, the worker prefills it as an internal request. A newer conversation replaces it,
+    // a request submitted first drops it, and a request arriving during the pass makes it yield at
+    // its next unit boundary.
+    void prefill_next_turn(PromptInput conversation) noexcept {
+        if (next_turn_quiet_.count() == 0 || next_turn_disabled_.load(std::memory_order_acquire)) {
+            return;
+        }
+        try {
+            conversation.options.continuation = PromptContinuationMode::NextTurnHistory;
+            const Clock::time_point registered = Clock::now();
+            std::uint64_t epoch                = 0;
+            {
+                std::lock_guard lock(queue_mutex_);
+                if (stopping_ || failed_) { return; }
+                epoch = submission_epoch_;
+            }
+            bool replaced = false;
+            {
+                std::lock_guard lock(next_turn_mutex_);
+                if (next_turn_stop_) { return; }
+                replaced = next_turn_input_.has_value();
+                next_turn_input_.emplace(
+                    NextTurnInput{.input = std::move(conversation), .epoch = epoch, .registered = registered});
+            }
+            if (replaced) { next_turn_dropped_.fetch_add(1, std::memory_order_relaxed); }
+            next_turn_cv_.notify_one();
+        } catch (...) {}
+    }
 
     class Submission {
     public:
@@ -275,6 +342,13 @@ public:
             ++outstanding_;
             request_id        = next_request_id_++;
             publication_order = next_publication_order_++;
+            // A request came first: a finished turn not yet being prefilled is dropped (the request
+            // is often that conversation's next turn), and a running pass yields to it.
+            ++submission_epoch_;
+            if (next_turn_candidate_) {
+                next_turn_candidate_.reset();
+                next_turn_dropped_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
 
         std::shared_ptr<Request> request;
@@ -1052,10 +1126,13 @@ private:
                 request->cache_created_prompt_tokens = finished.cache_created_prompt_tokens;
             }
             request->terminal_reason.reset();
+            if (request->background && reason != FinishReason::Cancelled) {
+                ++next_turn_counters_.completed;
+            }
             // A reply that hands the client a tool call is followed by the conversation's next
             // turn once the tool has run: what that turn resumes from is held meanwhile.
             if (tool_call_hold_.count() > 0 && reason != FinishReason::Cancelled &&
-                request->output.has_tool_calls()) {
+                !request->background && request->output.has_tool_calls()) {
                 // Applied by the next admission pass's queue holds.
                 resources_.hold_continuation(*instance_.program, Clock::now() + tool_call_hold_);
             }
@@ -1406,6 +1483,7 @@ private:
         ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
+        if (request->background) { next_turn_counters_.tokens += progress.processed_prompt_tokens; }
         if (!request->admitted_begin) {
             throw std::logic_error("prefill progress has no committed admission summary");
         }
@@ -1718,6 +1796,21 @@ private:
         resources_.hold_queue(*instance_.program, ids, bases);
     }
 
+    // Fails a waiting (fresh or paused) request that admission can never serve, alone: as a worker
+    // error it would fail the whole Engine.
+    void fail_unadmittable(const std::shared_ptr<Request>& request, bool restoring,
+                           std::exception_ptr error) {
+        if (restoring) {
+            std::erase(paused_, request);
+        } else {
+            std::lock_guard lock(queue_mutex_);
+            std::erase(pending_, request);
+        }
+        complete_error(request, std::move(error));
+        request_admission_check();
+        publish_runtime_stats();
+    }
+
     bool try_admit_one(bool restoring) {
         if (instance_.program->has_context_transaction()) { return false; }
         const auto lane = free_lane();
@@ -1756,6 +1849,19 @@ private:
                 std::vector<SourceCandidate> sources = resources_.candidates(
                     *instance_.program, *request->base_plan,
                     restoring ? request->suspended->frontier() : UINT32_MAX);
+                // An idle-time pass whose history the cache already holds ends before any binding
+                // (an agent turn that echoed the reply resumes from its endpoint anyway, §7.9).
+                if (request->background && !restoring && next_turn_covered(*request, sources)) {
+                    {
+                        std::lock_guard lock(queue_mutex_);
+                        std::erase(pending_, request);
+                    }
+                    ++next_turn_counters_.skipped;
+                    complete_detached_cancelled(request);
+                    request_admission_check();
+                    publish_runtime_stats();
+                    return true;
+                }
                 if (!restoring && !sources.empty() && !request->admission_observed) {
                     request->admission.preferred_reused_tokens = sources.front().reused_tokens;
                     request->admission_observed                = true;
@@ -1794,6 +1900,14 @@ private:
                     continue;
                 }
                 if (!reservation) {
+                    // A request no state of the Engine admits, with the Program's own error (Qwen4Exp:
+                    // a Vision window its expert cache cannot lend): it fails alone, now.
+                    if constexpr (requires { reservation.refusal; }) {
+                        if (reservation.refusal) {
+                            fail_unadmittable(request, restoring, reservation.refusal);
+                            return true;
+                        }
+                    }
                     shortage = reservation.shortage;
                     note_source_wait(request, source, restoring);
                     if (reclaim(shortage, restoring && !has_older_resident(request->id),
@@ -1854,17 +1968,10 @@ private:
             if (admission_check_pending_.load(std::memory_order_acquire)) { return true; }
             if (resident_empty()) {
                 // Nothing running can free resources for this request, so it would wait forever.
-                // Fail it alone: as a worker error it would fail the whole Engine. It is a
-                // capacity condition, so the client sees it as unavailable, not as an internal
-                // server error.
-                if (restoring) {
-                    std::erase(paused_, request);
-                } else {
-                    std::lock_guard lock(queue_mutex_);
-                    std::erase(pending_, request);
-                }
-                complete_error(
-                    request,
+                // It is a capacity condition, so the client sees it as unavailable, not as an
+                // internal server error.
+                fail_unadmittable(
+                    request, restoring,
                     std::make_exception_ptr(RequestError(
                         RequestErrorKind::Unavailable,
                         "the Engine cannot admit this request: its first unit needs state=" +
@@ -1872,8 +1979,6 @@ private:
                             ", main_kv=" + std::to_string(shortage.main_kv_pages) +
                             ", backend_kv=" + std::to_string(shortage.backend_kv_pages) +
                             " more than an idle Engine has")));
-                request_admission_check();
-                publish_runtime_stats();
                 return true;
             }
             if (restoring) {
@@ -2214,12 +2319,18 @@ private:
     // Program introspection can observe a partially cleared physical state.
     void fail_all_locked(std::exception_ptr error, bool shutdown = false) noexcept {
         std::deque<std::shared_ptr<Request>> pending;
+        std::optional<NextTurnCandidate> next_turn_candidate;
         {
             std::lock_guard lock(queue_mutex_);
             failed_ = true;
             execution_failed_ |= !shutdown;
             pending.swap(pending_);
+            if (next_turn_candidate_) {
+                next_turn_candidate.emplace(std::move(*next_turn_candidate_));
+                next_turn_candidate_.reset();
+            }
         }
+        next_turn_request_.reset();
         scheduler_ = Scheduling{};
         const std::shared_ptr<Request> materializing_request =
             materializing_ ? materializing_->request : nullptr;
@@ -2288,16 +2399,194 @@ private:
         }
     }
 
+    // ---- idle-time prefill of finished turns (hybrid-prefix-cache-spec §7.9) ----------------------
+
+    // A pass that would leave its deepest snapshot within one block of what the cache already
+    // holds adds nothing the next request would not compute in a few tokens: it is skipped.
+    static constexpr std::uint32_t kNextTurnMinimumTokens = 64;
+
+    // The pass's request: its prompt ends one token past the history it caches (its <|im_start|>),
+    // so one output token, sampled at the prompt's end and discarded, ends it there. No constraint,
+    // no tool grammar unless a declared tool is strict, nothing published to a consumer.
+    [[nodiscard]] static ResolvedRequestOptions next_turn_options() {
+        ResolvedRequestOptions options;
+        options.execution.requested_output_tokens = 1;
+        options.execution.allow_prefix_reuse      = true;
+        options.tool_choice.constraints           = ToolConstraintMode::Automatic;
+        return options;
+    }
+
+    // Renders and tokenizes the latest finished turn off the worker, with its output session, and
+    // hands it to the worker unless a request came first.
+    void next_turn_prepare_loop() noexcept {
+        for (;;) {
+            std::optional<NextTurnInput> turn;
+            {
+                std::unique_lock lock(next_turn_mutex_);
+                next_turn_cv_.wait(lock, [&] { return next_turn_stop_ || next_turn_input_.has_value(); });
+                if (next_turn_stop_) { return; }
+                turn.swap(next_turn_input_);
+            }
+            const std::uint64_t epoch = turn->epoch;
+            const auto current        = [this, epoch] {
+                std::lock_guard lock(queue_mutex_);
+                return !stopping_ && !failed_ && submission_epoch_ == epoch;
+            };
+            bool accepted = false;
+            try {
+                if (current()) {
+                    const PreparationControl control{
+                        .deadline     = {},
+                        .cancellation = CancellationView([this, &current] {
+                            {
+                                std::lock_guard lock(next_turn_mutex_);
+                                if (next_turn_stop_ || next_turn_input_.has_value()) { return true; }
+                            }
+                            return !current();
+                        })};
+                    const Clock::time_point started = Clock::now();
+                    PreparedPrompt prompt = instance_.frontend.prepare(std::move(turn->input), control);
+                    const ResolvedRequestOptions options = next_turn_options();
+                    auto output = instance_.frontend.make_output_session(
+                        prompt, options.stop, options.output, options.execution.thinking,
+                        options.constraint, options.tool_choice);
+                    const PromptSummary summary = prompt.summary();
+                    const double seconds =
+                        std::chrono::duration<double>(Clock::now() - started).count();
+                    bool replaced = false;
+                    {
+                        std::lock_guard lock(queue_mutex_);
+                        if (!stopping_ && !failed_ && submission_epoch_ == epoch &&
+                            summary.prompt_tokens <= max_context_) {
+                            replaced = next_turn_candidate_.has_value();
+                            next_turn_candidate_.emplace(NextTurnCandidate{.prompt          = std::move(prompt),
+                                                                  .output          = std::move(output),
+                                                                  .summary         = summary,
+                                                                  .prepare_seconds = seconds,
+                                                                  .registered      = turn->registered});
+                            ++next_turn_serial_;
+                            accepted = true;
+                        }
+                    }
+                    if (replaced) { next_turn_dropped_.fetch_add(1, std::memory_order_relaxed); }
+                }
+            } catch (...) {
+                // A history the template or the context cannot take is simply not prefilled.
+            }
+            if (accepted) {
+                queue_cv_.notify_all();
+            } else {
+                next_turn_dropped_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    // When the prepared turn's pass may start: the quiet period after the later of its turn's end
+    // and the worker's last work. queue_mutex_ held.
+    [[nodiscard]] std::optional<Clock::time_point> next_turn_due() const {
+        if (!next_turn_candidate_) { return std::nullopt; }
+        return std::max(next_turn_candidate_->registered, worker_busy_at_) + next_turn_quiet_;
+    }
+
+    // Starts the prepared turn's pass once due, as an internal request at the queue's head (the
+    // queue is empty: the Engine is idle). queue_mutex_ held. Returns whether it started.
+    bool start_next_turn_locked() {
+        const auto due = next_turn_due();
+        if (!due || Clock::now() < *due) { return false; }
+        NextTurnCandidate candidate = std::move(*next_turn_candidate_);
+        next_turn_candidate_.reset();
+        if (next_request_id_ == 0 || next_publication_order_ == 0) { return false; }
+        auto request = std::make_shared<Request>(
+            next_request_id_++, next_publication_order_++, std::move(candidate.prompt),
+            std::move(candidate.output), candidate.summary, candidate.prepare_seconds,
+            next_turn_options(), OutputConsumerMode::Aggregate, GenerationObservationOptions{},
+            Clock::time_point::max(), Clock::now());
+        request->background        = true;
+        request->consumer_released = true;
+        request->capacity_released = true;
+        pending_.push_back(request);
+        next_turn_request_ = request;
+        ++next_turn_counters_.started;
+        request_admission_check();
+        return true;
+    }
+
+    // At each worker boundary: a pass that has ended is forgotten, and a running one yields to any
+    // real request (waiting, paused, binding or resident). It is cancelled, so it ends at the next
+    // unit boundary as a client's cancellation would, keeping the blocks and snapshots it published
+    // (the endpoint at its frontier, or a tap there on the reproducible route's grid).
+    void yield_next_turn() {
+        if (!next_turn_request_) { return; }
+        {
+            std::lock_guard lock(next_turn_request_->mutex);
+            if (next_turn_request_->response_done) {
+                next_turn_request_.reset();
+                return;
+            }
+        }
+        // A pass that has already reached its end settles at this boundary anyway.
+        if (next_turn_request_->cancelled.load(std::memory_order_acquire) ||
+            next_turn_request_->is_model_finished()) {
+            return;
+        }
+        bool real = !paused_.empty() || (materializing_ && materializing_->request != next_turn_request_);
+        for (std::uint32_t lane = 0; lane < max_concurrency_ && !real; ++lane) {
+            real = slots_[lane] != nullptr && slots_[lane] != next_turn_request_;
+        }
+        if (!real) {
+            std::lock_guard lock(queue_mutex_);
+            real = stopping_ || std::any_of(pending_.begin(), pending_.end(),
+                                            [&](const auto& request) { return request != next_turn_request_; });
+        }
+        if (!real) { return; }
+        next_turn_request_->cancelled.store(true, std::memory_order_release);
+        if (next_turn_request_->admitted_at) {
+            ++next_turn_counters_.yielded;
+        } else {
+            next_turn_dropped_.fetch_add(1, std::memory_order_relaxed);
+        }
+        request_admission_check();
+    }
+
+    // Whether the cache already holds the pass's history: its deepest snapshot could not land a
+    // block past the best source (the reproducible route resumes only on its grid).
+    [[nodiscard]] bool next_turn_covered(const Request& request,
+                                            std::span<const SourceCandidate> sources) const {
+        const std::uint32_t prompt = request.base_plan->summary().prompt_tokens;
+        std::uint32_t best         = 0;
+        for (const SourceCandidate& source : sources) { best = std::max(best, source.reused_tokens); }
+        std::uint32_t grid = 1;
+        if constexpr (requires { instance_.program->hybrid_resume_grid(); }) {
+            grid = std::max<std::uint32_t>(instance_.program->hybrid_resume_grid(), 1U);
+        }
+        // The pass's last snapshot sits at its history's end (one token before its prompt's end), on
+        // the grid at or before it.
+        const std::uint32_t deepest = prompt == 0 ? 0U : (prompt - 1U) / grid * grid;
+        return deepest < best + kNextTurnMinimumTokens;
+    }
+
     void worker_loop() noexcept {
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
                 if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
                     !instance_.program->has_context_transaction()) {
-                    const auto woken = [&] { return stopping_ || !pending_.empty() || maintenance_requested_; };
-                    if (prefix_save_interval_.count() == 0) {
+                    // The idle-time pass of a finished turn starts once its quiet period has passed.
+                    if (start_next_turn_locked()) { continue; }
+                    const std::uint64_t seen = next_turn_serial_;
+                    const auto woken         = [&] {
+                        return stopping_ || !pending_.empty() || maintenance_requested_ ||
+                               next_turn_serial_ != seen;
+                    };
+                    std::optional<Clock::time_point> wake;
+                    if (prefix_save_interval_.count() != 0) { wake = next_prefix_save_; }
+                    if (const auto due = next_turn_due()) { wake = wake ? std::min(*wake, *due) : *due; }
+                    if (!wake) {
                         queue_cv_.wait(lock, woken);
-                    } else if (!queue_cv_.wait_until(lock, next_prefix_save_, woken)) {
+                    } else if (!queue_cv_.wait_until(lock, *wake, woken)) {
+                        if (prefix_save_interval_.count() == 0 || Clock::now() < next_prefix_save_) {
+                            continue; // the idle-time pass is due
+                        }
                         // The periodic save falls due while the Engine is idle.
                         lock.unlock();
                         std::scoped_lock execution_lock(execution_mutex_);
@@ -2308,6 +2597,9 @@ private:
                             return;
                         }
                         continue;
+                    }
+                    if (!stopping_ && pending_.empty() && !maintenance_requested_) {
+                        continue; // a finished turn was prepared: wait for its quiet period
                     }
                     if (!stopping_ && pending_.empty() && maintenance_requested_) {
                         maintenance_requested_ = false;
@@ -2345,11 +2637,14 @@ private:
                 }
             }
             std::unique_lock execution_lock(execution_mutex_);
-            bool executed = false;
+            bool executed   = false;
+            worker_busy_at_ = Clock::now();
             try {
                 save_prefix_cache_if_due();
                 set_host_work_class(HostWorkClass::Control);
                 auto boundary = begin_host_phase();
+                // Before the queue is read: a real request makes the idle-time pass yield (§7.9).
+                yield_next_turn();
                 (void)expire_pending_requests();
                 executed = progress_context_transaction(boundary);
                 (void)settle_terminal_requests(boundary);
@@ -2558,6 +2853,8 @@ private:
     const bool queue_holds_;
     // How long a tool-call hold lasts (zero: none).
     const std::chrono::milliseconds tool_call_hold_;
+    // The idle-time prefill's quiet period (zero: off; hybrid-prefix-cache-spec §7.9).
+    const std::chrono::milliseconds next_turn_quiet_;
     std::chrono::seconds prefix_save_interval_{0}; // zero: the Host tier is saved only at shutdown
     Clock::time_point next_prefix_save_{};
     ResourceManagement resources_;
@@ -2591,7 +2888,44 @@ private:
     bool maintenance_requested_ = false; // guarded by queue_mutex_
     bool failed_   = false;
     bool execution_failed_ = false; // guarded by queue_mutex_
+
+    // Next-turn prefill: the idle-time pass over a finished turn's history (hybrid-prefix-cache-spec
+    // §7.9). Unrelated to the idle-wide-prefill fast path.
+    struct NextTurnInput {
+        PromptInput input;
+        std::uint64_t epoch = 0;
+        Clock::time_point registered;
+    };
+    struct NextTurnCandidate {
+        PreparedPrompt prompt;
+        typename Request::OutputSession output;
+        PromptSummary summary;
+        double prepare_seconds = 0.0;
+        Clock::time_point registered;
+    };
+    struct NextTurnCounters {
+        std::uint64_t started   = 0;
+        std::uint64_t completed = 0;
+        std::uint64_t yielded   = 0;
+        std::uint64_t skipped   = 0;
+        std::uint64_t tokens    = 0;
+    };
+    std::uint64_t submission_epoch_ = 0;                   // queue_mutex_: requests submitted
+    std::optional<NextTurnCandidate> next_turn_candidate_; // queue_mutex_: prepared, not started
+    std::uint64_t next_turn_serial_ = 0;                   // queue_mutex_: wakes the idle worker
+    Clock::time_point worker_busy_at_{};                   // worker: the last cycle that had work
+    std::shared_ptr<Request> next_turn_request_;           // worker: the pass queued, binding or resident
+    NextTurnCounters next_turn_counters_;                  // worker
+    std::atomic<std::uint64_t> next_turn_dropped_{0};
+    std::atomic<bool> next_turn_disabled_{false};          // its preparation thread did not start
+    std::mutex next_turn_mutex_;
+    std::condition_variable next_turn_cv_;
+    std::optional<NextTurnInput> next_turn_input_;         // next_turn_mutex_: awaiting preparation
+    bool next_turn_stop_ = false;                          // next_turn_mutex_
+    std::thread next_turn_thread_;
+
     std::thread worker_;
+    std::thread constraint_warm_;
 };
 
 } // namespace infernix::runtime

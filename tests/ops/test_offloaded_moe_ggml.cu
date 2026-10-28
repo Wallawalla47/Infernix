@@ -226,10 +226,12 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
     auto* d_scales = device_copy(scales);
     std::uint16_t* d_out = nullptr;
     cuda_check(cudaMalloc(&d_out, expected.size() * sizeof(std::uint16_t)), "cudaMalloc");
-    cudaStream_t fork_stream = nullptr;
-    cudaEvent_t fork_events[2]{};
+    cudaStream_t fork_stream = nullptr, split_stream = nullptr;
+    cudaEvent_t fork_events[2]{}, split_events[2]{};
     cuda_check(cudaStreamCreateWithFlags(&fork_stream, cudaStreamNonBlocking), "stream");
+    cuda_check(cudaStreamCreateWithFlags(&split_stream, cudaStreamNonBlocking), "stream");
     for (auto& e : fork_events) { cuda_check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event"); }
+    for (auto& e : split_events) { cuda_check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event"); }
 
     // The CPU route (ops/offloaded_sparse_moe/cpu/ggml_expert.h) serving misses through the mapped
     // channel, as the Program's service does for decode and short calls.
@@ -246,13 +248,16 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
         bool cpu;
         bool tables; // the wide tiles' codebooks in shared memory (MoeGgmlTiles::shared_codebooks)
         const char* name;
+        bool split = false; // a forked call's misses staged in two launches (MoeExpertSource::split_stream)
     };
     const Config configs[] = {{0, false, false, false, "zero-copy"},
                               {3, false, false, false, "3 staging slots"},
                               {64, false, false, false, "64 staging slots"},
                               {64, true, false, false, "forked"},
+                              {64, true, false, false, "forked, split staging", true},
                               {64, false, true, false, "CPU-served misses"},
                               {64, true, true, false, "forked, CPU-served misses"},
+                              {64, true, true, false, "forked, split staging, CPU-served misses", true},
                               {3, false, false, true, "3 staging slots, shared codebooks"}};
     for (const auto& config : configs) {
         if (config.fork && columns > moe::kMaxColumns) { continue; }
@@ -279,6 +284,11 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
             source.fork_stream    = fork_stream;
             source.fork_events[0] = fork_events[0];
             source.fork_events[1] = fork_events[1];
+        }
+        if (config.split) {
+            source.split_stream    = split_stream;
+            source.split_events[0] = split_events[0];
+            source.split_events[1] = split_events[1];
         }
         if (config.cpu) {
             service.wake();
@@ -323,7 +333,9 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
     cudaFree(d_frames_base);
     cudaFreeHost(host);
     cudaStreamDestroy(fork_stream);
+    cudaStreamDestroy(split_stream);
     for (auto e : fork_events) { cudaEventDestroy(e); }
+    for (auto e : split_events) { cudaEventDestroy(e); }
 }
 
 // One block's exact values in binary64 (llama.cpp's dequantize_row_* through ggml_exact.h's chunks):

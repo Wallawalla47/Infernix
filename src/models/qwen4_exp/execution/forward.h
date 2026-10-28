@@ -89,6 +89,10 @@ struct ForwardExperts {
     // input, joined before the combine) while the routed experts compute. Null: in order.
     cudaStream_t shared_stream = nullptr;
     std::array<cudaEvent_t, 2> shared_events{};
+    // Decode and verification calls compute their staged misses on this stream while the overlap stream
+    // stages their down rows (ops::MoeExpertSource::split_stream). Null: not split.
+    cudaStream_t split_stream = nullptr;
+    std::array<cudaEvent_t, 2> split_events{};
     // Landing frames of decode and verification calls (design §19.3.5 S4; see
     // ops::MoeExpertSource::landing): layer l uses landing + l * landing_slots and landed + l *
     // landing_slots. Null disables.
@@ -103,6 +107,14 @@ struct ForwardExperts {
     // --expert-tail-skip (approximate, 0: off): the generation rounds' ops::MoeExpertSource::
     // tail_skip_rank.
     std::int32_t tail_skip_rank = 0;
+    // The drafter pool (candidates §22 VM-01): the MTP drafter's routed experts in a pool of
+    // drafter_slots device slots (runtime/expert_offload/drafter_pool.h): its banks ([slots * 2I, H], [slots * H, I]), its slot table
+    // (device I32 [E]: slot or -1) and its demand counts (device I32 [E + 1]); the draft steps route among the pooled
+    // experts (ops::moe_route_pooled). drafter_slots = 0: the bank is device-resident (MtpParameters).
+    std::int32_t drafter_slots = 0;
+    Weight drafter_gate_up, drafter_down;
+    Tensor drafter_slot_of;
+    std::int32_t* drafter_demand = nullptr;
 };
 
 // A speculative verification call (design §11): `batch` sequences of `width` >= 2 positions. It
@@ -401,9 +413,10 @@ private:
                Tensor* residual = nullptr);
     void wait_layer(const ForwardBatch& batch, std::size_t entry);
     void mtp_block(const MtpCall& call, Tensor& residual);
-    // The dense projections' route flags for the current call: ggml-bf16-prefill's and
-    // f16-accumulate-prefill's only in eager calls (prefill chunks, forced tokens), so decode and
-    // verification rounds keep the exact GGUF, FP8 and MXFP8 routes whatever their column count.
+    // The dense projections' route flags for the current call: ForwardFastPaths::prefill_routes
+    // (ggml-bf16-prefill, f16-accumulate-prefill, --a8-activations' prefill routes) only in eager calls
+    // (prefill chunks, forced tokens), so decode and verification rounds keep their routes whatever their
+    // column count.
     [[nodiscard]] ops::LinearRoutes dense_routes() const noexcept;
 
     const Parameters& parameters_;
@@ -422,12 +435,16 @@ private:
     std::unique_ptr<ActivationScan> scan_;
     std::uint32_t scan_layer_ = 0;
     bool eager_chunk_ = false;
-    // A gated call's layer routing on the host: the dispatch offsets (pinned I32 [E + 1]), the
-    // event that lands them, and the per-expert columns and CPU marks derived from them.
+    // A gated call's layer routing on the host: the dispatch offsets (pinned I32 [2 (E + 1)]: the
+    // layer's, then the copy-ahead's guess of the next layer's), the event that lands them, the
+    // per-expert columns and CPU marks derived from them, the columns the CPU split prices (those
+    // copied ahead masked) and the guessed columns.
     PinnedHostBuffer split_offsets_{1};
     cudaEvent_t split_ready_ = nullptr;
     std::vector<std::int32_t> split_columns_;
     std::vector<std::uint8_t> split_cpu_;
+    std::vector<std::int32_t> split_priced_;
+    std::vector<std::int32_t> guess_columns_;
     // The CPU-served and streamed experts of gated calls (diagnostics).
     std::uint64_t split_cpu_experts_ = 0, split_streamed_experts_ = 0;
 

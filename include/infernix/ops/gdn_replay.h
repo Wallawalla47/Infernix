@@ -2,6 +2,7 @@
 
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
+#include "core/tensor.h"
 
 #include <cuda_runtime.h>
 
@@ -52,6 +53,16 @@ public:
     GdnReplayFoldPlan(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states);
 
     void execute(std::span<const GdnReplayFoldRow> rows, cudaStream_t stream) const;
+
+    /**
+     * The same fold with in-place rows read from the device when the kernel runs, so one captured graph serves
+     * every commit: row b (of `rows` active rows, record row b) folds commit_columns[b] columns into state slot
+     * slots[b] (source and destination). `slots` and `commit_columns` are contiguous I32 [>= rows] device tensors;
+     * the caller keeps the slots distinct. A row whose count is outside [0, T] or whose slot is outside the state's
+     * slots folds nothing (no state is read or written). Same bits as execute() with {slots[b], slots[b],
+     * commit_columns[b]}.
+     */
+    void execute_device(const Tensor& slots, const Tensor& commit_columns, std::int32_t rows, cudaStream_t stream) const;
 
 private:
     GdnReplayRecords records_;

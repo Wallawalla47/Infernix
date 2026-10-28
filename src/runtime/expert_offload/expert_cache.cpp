@@ -265,10 +265,27 @@ void LfruPolicy::evict(std::uint32_t key) {
     if (resident(key)) { erase(key); }
 }
 
-void LfruPolicy::set_capacity(std::uint32_t capacity, std::vector<std::uint32_t>& victims) {
+void LfruPolicy::set_capacity(std::uint32_t capacity, std::vector<std::uint32_t>& victims, const Admissible* first_choice) {
     if (residents_.size() > capacity) {
         const std::size_t first = victims.size();
-        select_victims(residents_.size() - capacity, {}, victims);
+        const std::size_t need  = residents_.size() - capacity;
+        if (first_choice == nullptr) {
+            select_victims(need, {}, victims);
+        } else {
+            // The residents first_choice accepts, (score, key) ascending, then the others.
+            scratch_.clear();
+            guarded_scratch_.clear();
+            for (const std::uint32_t k : residents_) {
+                ((*first_choice)(k) ? scratch_ : guarded_scratch_).emplace_back(score(k), k);
+            }
+            const std::size_t chosen = std::min(need, scratch_.size());
+            std::partial_sort(scratch_.begin(), scratch_.begin() + static_cast<std::ptrdiff_t>(chosen), scratch_.end());
+            for (std::size_t i = 0; i < chosen; ++i) { victims.push_back(scratch_[i].second); }
+            const std::size_t rest = need - chosen;
+            std::partial_sort(guarded_scratch_.begin(), guarded_scratch_.begin() + static_cast<std::ptrdiff_t>(rest),
+                              guarded_scratch_.end());
+            for (std::size_t i = 0; i < rest; ++i) { victims.push_back(guarded_scratch_[i].second); }
+        }
         for (std::size_t i = first; i < victims.size(); ++i) { erase(victims[i]); }
     }
     capacity_ = capacity;
@@ -469,6 +486,25 @@ bool CacheController::adopt(std::uint32_t key, std::uint32_t frame, std::span<co
 
 void CacheController::release(std::uint32_t frame) { frames_.release_now(frame); }
 
+bool CacheController::exchange(std::uint32_t in, std::optional<std::uint32_t> victim, std::uint64_t round_started,
+                               std::vector<Command>& out) {
+    if (in >= table_.size() || policy_.resident(in)) { return false; }
+    if (victim) {
+        if (*victim >= table_.size() || !policy_.resident(*victim)) { return false; }
+        policy_.exchange(in, *victim);
+        // A victim still queued has no frame: drain_queue drops it.
+        if (table_[*victim].state != ResidencyState::kAbsent) { frames_.retire(make_absent(*victim, out), round_started); }
+    } else if (!policy_.admit_free(in)) {
+        return false;
+    }
+    if (!is_queued_[in]) {
+        queued_.push_back(in);
+        is_queued_[in] = 1;
+    }
+    drain_queue(out);
+    return true;
+}
+
 bool CacheController::complete_load(std::uint32_t key, std::uint32_t frame, std::uint64_t serial) const {
     return table_[key].state == ResidencyState::kReady && table_[key].frame == frame && load_serial_[key] == serial;
 }
@@ -542,7 +578,7 @@ void CacheController::on_quiescent(std::vector<Command>& out) {
     drain_queue(out);
 }
 
-void CacheController::resize(std::uint32_t frames, std::vector<Command>& out) {
+void CacheController::resize(std::uint32_t frames, std::vector<Command>& out, const LfruPolicy::Admissible* first_victims) {
     if (frames_.loaned_count() != 0) { throw std::logic_error("expert cache resized while frames are lent"); }
     frames_.on_quiescent();
     const std::uint32_t capacity = frames > slack_ ? frames - slack_ : 0;
@@ -554,7 +590,7 @@ void CacheController::resize(std::uint32_t frames, std::vector<Command>& out) {
         return;
     }
     std::vector<std::uint32_t> victims;
-    policy_.set_capacity(capacity, victims);
+    policy_.set_capacity(capacity, victims, first_victims);
     for (std::uint32_t v : victims) {
         if (table_[v].state == ResidencyState::kAbsent) { continue; } // still queued: drain drops it
         frames_.release_now(make_absent(v, out));
@@ -631,13 +667,14 @@ std::optional<std::uint32_t> CacheController::choose_run(std::uint32_t count, st
     return std::nullopt;
 }
 
-std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out) {
+std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out,
+                                    const LfruPolicy::Admissible* first_victims) {
     if (frames_.pending_count() != 0) { throw std::logic_error("frames lent while some still retire"); }
     // The policy keeps no more residents than the frames it may still use: its lowest-score
-    // residents leave, wherever their frames are.
+    // residents leave, wherever their frames are (those first_victims accepts first).
     const std::uint32_t capacity = policy_.capacity() > count ? policy_.capacity() - count : 0;
     std::vector<std::uint32_t> victims;
-    policy_.set_capacity(capacity, victims);
+    policy_.set_capacity(capacity, victims, first_victims);
     std::uint32_t evicted = 0;
     for (std::uint32_t v : victims) {
         if (table_[v].state == ResidencyState::kAbsent) { continue; } // still queued: drain drops it

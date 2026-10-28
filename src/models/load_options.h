@@ -44,6 +44,11 @@ struct LoadOptions {
     // Qwen3.5 (EngineOptions::embedding_host): the token embedding stays in pinned host memory, gathered
     // zero-copy, as an artifact with offloaded experts already keeps it.
     bool embedding_host = false;
+    // --spec mtp generation off the lossless route (candidates §22 VM-01 variant B): the MTP drafter's routed experts
+    // stay in pinned host memory and its draft steps route among the experts a pool of device slots holds
+    // (runtime/expert_offload/drafter_pool.h), where the model can pool them: Qwen4Exp, and Qwen3.5 with offloaded
+    // experts, each with its measured slot count (Config::mtp_expert_slots). False: the bank is device-resident.
+    bool mtp_expert_pool = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -118,7 +123,12 @@ struct LoadOptions {
                                     !options.lossless,
             .screened_lm_head         = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
                                                   FastPath::ScreenedLmHead) != options.fast_path_candidates.end(),
-            .embedding_host           = options.embedding_host};
+            .embedding_host           = options.embedding_host,
+            // The pool follows every request's drafts, so drafts depend on the other requests; outputs do not where
+            // verification decides alone (the fast route, and the reproducible route, whose verification is
+            // width-invariant and sampling Gumbel-max). No speculation is lossless.
+            .mtp_expert_pool = !options.lossless && options.purpose == EnginePurpose::Generation &&
+                               options.speculative.backend == SpeculativeBackend::Mtp};
 }
 
 } // namespace infernix::models

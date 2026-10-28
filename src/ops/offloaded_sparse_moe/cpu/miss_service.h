@@ -5,7 +5,9 @@
 // the requested experts with the worker team (the service thread is worker 0) from the pinned
 // expert banks, writes the BF16 outputs to mapped memory and answers with the request's sequence.
 // The arithmetic is expert_forward's (A16: expert_forward_a16's, or expert_forward_a4r's under
-// NarrowA16::kA4Residual), so a CPU-served output equals the GPU's bit for bit.
+// NarrowA16::kA4Residual; a request on the 8-bit activation route, MissRequest::a8: a GGUF bank's
+// ggml_a8_expert_forward's, an NVFP4 W4A16 bank's expert_forward_a8's), so a CPU-served output equals
+// the GPU's bit for bit.
 //
 // The service owns the mapped channel buffers and the device sequence counter. It must outlive
 // every call that uses its channels, and its destructor must run only when no call is pending.
@@ -51,6 +53,13 @@ public:
         // The arithmetic of A16 jobs (exact, or expert-a4-residual-decode's two terms); it must equal
         // the calls' MoeExpertSource::narrow_a16, which moe_experts checks through the channel.
         NarrowA16 narrow_a16 = NarrowA16::kExact;
+        // --a8-activations: GGUF banks' calls may publish 8-bit activation requests (MissRequest::a8); it must
+        // equal the calls' MoeGgmlBank::a8, which moe_experts checks through the channel (MoeCpuChannel::a8).
+        bool ggml_a8 = false;
+        // --a8-activations: NVFP4 W4A16 banks' calls (activation kA16) may publish 8-bit activation requests
+        // (MissRequest::a8), whose jobs take w4a8_expert.h's route; it must equal those calls' choice. Without it
+        // such a request is answered with EINVAL in the status word.
+        bool nvfp4_a8 = false;
         // Every layer's expert geometry; it must equal the calls' MoeExpertSource::shape (another
         // registered one than Flash-Next's for NVFP4 A16 banks only).
         ExpertShape shape = kFlashNextShape;

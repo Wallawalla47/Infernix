@@ -21,8 +21,8 @@ namespace infernix::runtime::expert_offload {
 inline constexpr std::uint64_t kLedgerGiB = 1ULL << 30;
 
 struct HostMemoryDemand {
-    // Physical memory left free for the OS and other programs (--ram-headroom-mib).
-    std::uint64_t reserve = kDefaultRamHeadroomBytes;
+    // Physical memory left free for the OS and other programs (--ram-free-mib).
+    std::uint64_t reserve = kDefaultRamFreeBytes;
     // Pinned expert banks (all layers).
     std::uint64_t expert_banks = 0;
     // The model's other pinned weights (the token embedding).
@@ -116,13 +116,10 @@ struct VramDemand {
     // The frame pool shrinks at runtime when the display or another program needs memory. Without
     // that nothing absorbs their growth, so the automatic headroom and the graph reserve are larger.
     bool elastic = false;
-    // CUDA graph executables the Program may instantiate after sizing, and what each may take. An
-    // elastic pool reserves for at most 32 (a lazily capturing Program instantiates a few at a time,
-    // and the pool shrinks for more) unless the Program captures every executable right after the
-    // sizing (eager_graphs: Qwen3.5's Programs).
+    // CUDA graph executables the Program may instantiate after sizing, and what each may take: a fixed
+    // pool reserves for all of them (internal_reserve); an elastic one shrinks for them instead.
     std::uint32_t graphs      = 0;
     std::uint64_t graph_bytes = kGraphExecutableBytes;
-    bool eager_graphs         = false;
     // Device allocations still to be made besides the frames (taken from free memory and budget).
     std::uint64_t fixed = 0;
     // One expert frame, and the most frames the residency uses.
@@ -154,8 +151,9 @@ struct VramSizing {
 // The headroom left for the display and other programs: the requested one, else 256 MiB without a
 // display and, with one (or when unknown), 512 MiB for an elastic pool or 1 GiB for a fixed one.
 [[nodiscard]] std::uint64_t display_headroom(DisplayState display, bool elastic, std::optional<std::uint64_t> requested);
-// The reserve for graph executables instantiated after sizing: max(256 MiB, 128 MiB + one
-// allowance per graph), the graph count capped at 32 for an elastic pool, which absorbs the rest.
+// The reserve for Infernix's own allocations after sizing (graph executables, the driver's): 128 MiB
+// for an elastic pool, whose shrinks absorb the rest; max(256 MiB, 128 MiB + one allowance per graph)
+// for a fixed one.
 [[nodiscard]] std::uint64_t internal_reserve(std::uint32_t graphs, std::uint64_t graph_bytes, bool elastic);
 // frame_bytes = min(F - fixed - headroom, B - fixed - 64 MiB) - reserve, with F the device free
 // memory and B the OS budget less this process's usage (no budget: F's bound alone); frames =

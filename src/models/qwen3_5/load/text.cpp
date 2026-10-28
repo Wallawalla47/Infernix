@@ -54,7 +54,9 @@ GdnWeights bind_gdn(Bindings& b, const TextConfig& text, const std::string& p) {
     return out;
 }
 
-MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& prefix) {
+// `experts`: the routed experts' residency (Device, or HostPinned for the MTP drafter behind the drafter pool).
+MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& prefix,
+                    artifact::Residency experts = artifact::Residency::Device) {
     const auto& moe   = std::get<MoeConfig>(config.ffn);
     const auto p      = prefix + "moe/";
     const auto input  = prefix + "ffn_input";
@@ -67,9 +69,9 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
     out.experts.reserve(moe.num_experts);
     for (std::uint32_t e = 0; e < moe.num_experts; ++e) {
         const auto ep = p + "experts/" + std::to_string(e) + "/";
-        out.experts.push_back({b.parameter(ep + "gate", {ir, h}, {input}),
-                               b.parameter(ep + "up", {ir, h}, {input}),
-                               b.parameter(ep + "down", {h, ir}, {ep + "product"})});
+        out.experts.push_back({b.parameter(ep + "gate", {ir, h}, {input}, std::nullopt, experts),
+                               b.parameter(ep + "up", {ir, h}, {input}, std::nullopt, experts),
+                               b.parameter(ep + "down", {h, ir}, {ep + "product"}, std::nullopt, experts)});
     }
     out.shared = {b.parameter(p + "shared/gate", {shared, h}, {input}),
                   b.parameter(p + "shared/up", {shared, h}, {input}),
@@ -110,7 +112,7 @@ bool offloaded_expert_bank(const Bindings& b, const std::string& prefix) {
 }
 
 BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string& p,
-                        MixerKind mixer, bool stream_experts) {
+                        MixerKind mixer, bool stream_experts, artifact::Residency resident_experts) {
     BlockWeights out;
     out.input_norm          = b.direct(p + "input_norm", {config.hidden_size});
     out.post_attention_norm = b.direct(p + "post_attention_norm", {config.hidden_size});
@@ -124,7 +126,7 @@ BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string
     } else if (offloaded_expert_bank(b, p)) {
         out.ffn = bind_offloaded_moe(b, config, p, stream_experts);
     } else {
-        out.ffn = bind_moe(b, config, p);
+        out.ffn = bind_moe(b, config, p, resident_experts);
     }
     return out;
 }

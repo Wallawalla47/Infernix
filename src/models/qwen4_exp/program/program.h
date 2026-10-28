@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <stdexcept>
 #include <functional>
@@ -127,12 +128,18 @@ struct SourceCandidate {
 };
 
 // A binding's outcome for the Engine's admission (the shape Qwen3.5's binding returns). The prefix
-// cache quotes from its own tree, so the source is always valid and a shortage is capacity alone.
+// cache quotes from its own tree, so the source is always valid. A shortage is KV pages, or (no
+// pages short) a Vision window the expert cache cannot lend while other lanes hold its frames
+// (design §19.3.2): the Engine waits for them.
 struct BindingReservation {
     bool reserved          = false;
     bool source_valid      = true;
     bool capacity_possible = true;
     runtime::ContextResourceUsage shortage;
+    // With capacity_possible false: why no state of the Engine admits the request, a RequestError
+    // the Engine fails it with at once (a Vision window the expert cache cannot lend with every
+    // other lane idle and this request's context reserved).
+    std::exception_ptr refusal;
 
     explicit operator bool() const noexcept { return reserved; }
 };
@@ -307,6 +314,7 @@ struct ProgramDevicePlan {
     std::uint64_t io        = 0; // per-call inputs, logits, sampling and round arrays
     std::uint64_t residency = 0; // the expert frame tables and route log
     std::uint64_t expert_record_stride = 0; // the largest expert record (staging and stream-ring slots)
+    std::uint32_t expert_tier_list_slots = 0; // the SSD tier's slots that hold no expert (ring, prefetch, demotion)
     std::uint64_t expert_frame_bytes   = 0; // one average expert frame (the cache's sizing unit)
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
     std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate
@@ -346,14 +354,17 @@ struct ProgramOptions {
     // The table that volume holds (resolve_ngram_volume): another volume, in any format, replaces the
     // artifact's table. Empty: the artifact's table.
     std::optional<NgramTableConfig> ngram_table;
-    // The whole n-gram table read into pinned RAM at startup (EngineOptions::ngram_residency,
+    // The whole n-gram table read into RAM locked for the CPU at startup (EngineOptions::ngram_residency,
     // resolved by the RAM ledger); rows are then never read from the volume.
     bool ngram_in_ram = false;
     // The expert cache's saved state (design §19.3.5 S4b): read at startup to fill the frames, written
-    // at stop and every 10 minutes between requests. Empty: no warm start. The identity names the
-    // artifact the state belongs to.
+    // at stop and every 10 minutes between requests. Empty: no file. The identity names the artifact the
+    // state belongs to.
     std::filesystem::path expert_state;
     std::string expert_state_identity;
+    // Without a usable saved state, seed the frames from the calibrated expert order (false: --expert-state
+    // off, an empty cache).
+    bool expert_seed = true;
     // The SSD tier reads each record's tail from this expert stripe (EngineOptions::expert_stripe_path).
     std::filesystem::path expert_stripe;
     // Device memory left free for the display and other programs once the fixed allocations and
@@ -369,6 +380,13 @@ struct ProgramOptions {
     // pageable share). Ignored in full mode.
     std::uint64_t expert_ram_bytes      = 0;
     std::uint64_t expert_unpinned_bytes = 0;
+    // The share of the frames a warm start fills with the best-ranked experts (the rest stay free for the
+    // fill phase's landings). The exclusive RAM layout (RAM holds the experts VRAM does not, plus the
+    // shadows a prefill's loan needs) seeds more, so fewer experts need RAM at startup.
+    double expert_seed_share = 0.5;
+    // The exclusive RAM layout's tier (EngineOptions::expert_ram_layout, when the plan chose it): a loan's returned
+    // frames stay free for decode's landings (ExpertResidency::give_back).
+    bool expert_ram_exclusive = false;
     // Pinned allocations the Program makes after the tier (the prefix cache's Host tier and an
     // allowance): when the OS refuses a slot chunk, the tier leaves this much below the limit.
     std::uint64_t later_pinned_bytes = 0;
@@ -459,14 +477,18 @@ struct ProgramOptions {
     // per second on 8-column jobs, planned at a share of them (ProgramImpl::kSplitRateShare, design
     // §19.3.12). cpu_split_*_rate are the reference rates used only when the team
     // cannot be timed (the SSD tier: no records in host memory; i9-13900K, 6 workers, from
-    // host_probe with the link idle). Gating waits for each layer's
-    // routing, an idle link the blind stream does not have: it pays up to cpu_split_columns columns
-    // on the reference link (PCIe 5.0 x8, 27.5 GB/s), a limit that scales inversely with the
-    // measured link (the bytes it saves cost less on a faster one).
+    // host_probe with the link idle). Gating would leave the link idle between a layer's routing and
+    // its copies; each layer's routing guess fills the next layer's ring half meanwhile (copy-ahead,
+    // ExpertStream::plan_ahead), so the gated stream pays up to cpu_split_columns columns on the
+    // reference link (PCIe 5.0 x8, 27.5 GB/s), a limit that scales inversely with the measured link
+    // (runtime::expert_offload::split_width). Dense8 prefill against the earlier route (2026-10-26, ABBA:
+    // pp1024 gated without the copy-ahead, pp2048 and pp4096 blind; the row threshold the copy-ahead uses,
+    // ExpertStream::ahead_rows): +10.2 %, +14.4 %, +8.9 %; without
+    // the copy-ahead the gated stream lost from 2,048 columns (-2.3 % / -9.6 %).
     bool prefill_cpu_split           = true;
     double cpu_split_expert_rate     = 21000.0;
     double cpu_split_column_rate     = 66000.0;
-    std::uint32_t cpu_split_columns  = 1536;
+    std::uint32_t cpu_split_columns  = 4096;
     // Prefill expert streaming (design §19.3.8 F2, F3): chunks of at least 256 columns copy each
     // layer's non-resident experts ahead by DMA into frames lent for the prompt.
     bool prefill_stream              = true;
@@ -524,16 +546,17 @@ public:
     Program& operator=(const Program&) = delete;
 
     [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options);
-    [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 
     // ---- admission: hybrid_sources quotes, start_binding stages, poll_context activates ----
     // The prefix cache's quotes in preference order: its chosen path and snapshot, then a root start
     // (a root start only, without a prefix cache).
     [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base,
                                                               std::uint32_t maximum_frontier);
-    // Reserves the KV pages of the request's prompt plus one round on `lane` and stages its prefix
-    // restore; a shortage reports the pages missing. With `resume`, binds the paused request's
-    // ledger instead: the deepest cached state up to its paused frontier, then replay to it.
+    // Reserves the KV pages of the request's prompt plus one round on `lane`, and the frames of its
+    // Vision window, and stages its prefix restore; a shortage reports the pages missing (none for
+    // a window that waits for frames), a window that cannot fit even so a refusal. With `resume`,
+    // binds the paused request's ledger instead: the deepest cached state up to its paused frontier,
+    // then replay to it.
     [[nodiscard]] BindingReservation start_binding(const RequestBasePlan& base, runtime::LaneId lane,
                                                    const SourceCandidate& source,
                                                    ResumeState* resume           = nullptr,
@@ -561,6 +584,9 @@ public:
     [[nodiscard]] bool hybrid_holds_stale() const noexcept { return false; }
     // Changes when a queued request's choice of snapshot may have changed.
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
+    // The positions a request can resume from: every position with free-cache-resume, else the
+    // 16-token grid (the reproducible route).
+    [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
 
     // ---- execution units (design §19.3.13): a binding reserves the KV pages of its prompt (or

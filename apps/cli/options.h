@@ -22,8 +22,9 @@ struct Options {
     std::optional<std::filesystem::path> expert_state;
     // --expert-stripe FILE: the experts' record tails on a second drive (EngineOptions::expert_stripe_path).
     std::filesystem::path expert_stripe_path;
-    std::uint64_t ram_headroom_bytes = kDefaultRamHeadroomBytes;
+    std::uint64_t ram_free_bytes = kDefaultRamFreeBytes;
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
+    ExpertRamLayout expert_ram_layout = EngineOptions{}.expert_ram_layout; // --expert-ram-layout
     std::optional<std::uint64_t> expert_pin_bytes; // --expert-pin-mib; empty: what the OS lets it pin
     std::filesystem::path grammar_path;
     std::filesystem::path json_schema_path;
@@ -41,6 +42,7 @@ struct Options {
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
+    bool a8_activations            = false; // EngineOptions::a8_activations
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t prefill_chunk  = 0; // 0: the model's default (EngineOptions)
     int device                   = 0;

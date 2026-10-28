@@ -67,4 +67,13 @@ void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAll
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream);
 
+// The fold with in-place rows read from the device when the kernel runs (GdnReplayFoldPlan::execute_device).
+struct GdnReplayFoldDeviceRows {
+    const std::int32_t* slots         = nullptr; // [active_rows]
+    const std::int32_t* commit_columns = nullptr; // [active_rows]
+};
+
+void launch_replay_fold_device(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
+                               const GdnReplayFoldDeviceRows& rows, std::int32_t active_rows, cudaStream_t stream);
+
 } // namespace infernix::ops::detail::gated_delta_net

@@ -108,7 +108,10 @@ How failures end:
 - Logits with no finite value to sample from (NaN or infinity, a numerical failure of the model's
   execution) fail only the request whose row produced them, with an HTTP 500 `internal_error`
   (an error event once its stream has started), and log `the model produced non-finite logits:
-  failed 1 request; the Engine keeps serving`; the other requests of the round continue. A grammar
+  failed 1 request; the Engine keeps serving`; the other requests of the round continue. The
+  prefix-cache entries that request published are withdrawn, so a retry of the same prompt starts
+  from what was cached before it; a `--prefix-cache-file` saved while the request ran is deleted
+  and written again at the next save. A grammar
   that refuses a committed token, or reaches a position with no legal token, likewise fails only
   its own request.
 - A failure after eight such recoveries in a row, with no successful unit between them, fails every
@@ -337,16 +340,19 @@ the request log report the public model ID, as OpenAI reports the snapshot an al
 `/v1/models` and `/v1/models/{id}` still list and retrieve only the public model ID.
 Reasoning is returned separately as `reasoning_content`; answer text remains in `content`.
 
-For non-strict tools, a direct top-level tool-parameter
-`type`, or an `anyOf`/`oneOf` composed entirely of explicit primitive types, guides conversion of
-Qwen's untyped parameter text. It does not decide whether structurally complete markup is a tool
+For non-strict tools, the JSON types a top-level tool-parameter schema admits guide conversion of
+Qwen's untyped parameter text. They are read from its `type`, the values of its `enum` or `const`, a
+local `$ref` (such as Pydantic's `{"$ref": "#/$defs/Status"}`), `allOf` (each branch narrows them), and
+`anyOf`/`oneOf` (the union of their branches, when every branch names types), so a string enum's value
+`"1"` stays the string `"1"`. They do not decide whether structurally complete markup is a tool
 call. String-admitting values remain strings, including the empty string, except that the text `null`
-is the null value where `null` is a declared type too. An empty block for a
+is the null value where `null` is admitted too. An empty block for a
 declared non-string parameter is omitted. Admitted JSON values retain their JSON type;
 case-insensitive boolean text is normalized to `true` or `false`. A nonempty schema mismatch remains
 a structured call: valid JSON retains its represented type and other text becomes a JSON string so
-the tool consumer can report the validation error and continue the agent loop. Schemas without a
-supported explicit type retain untyped inference. Infernix does not apply defaults, enforce required
+the tool consumer can report the validation error and continue the agent loop. Schemas that name no
+type this way (no type keyword, an invalid type name, a remote, missing or circular reference)
+retain untyped inference. Infernix does not apply defaults, enforce required
 properties, or perform recursive JSON Schema validation on this route.
 
 On the unconstrained route, string parameters preserve function/tool-call markers and balanced nested
@@ -444,10 +450,14 @@ root must reduce to a `type:"object"` schema with `additionalProperties:false`, 
 Properties are emitted in declaration order; optional properties may be omitted. Root
 const/enum/unions are not supported. Values use the supported JSON Schema subset described above.
 Top-level pure string parameters use raw text and preserve whitespace. A nullable string (a type list
-of `string` and `null`, or an `anyOf`/`oneOf` of plain strings and null: OpenAI strict mode's form of an
-optional field) is raw text too, and the text `null` is the null value. Other values use JSON; any other
-top-level string/non-string union (such as string/integer) is rejected because the Qwen parameter format
-cannot distinguish those branches. Such unions inside JSON objects or arrays are supported.
+of `string` and `null`, an `enum` or `const` of strings and `null`, or an `anyOf`/`oneOf` of such
+strings and null: OpenAI strict mode's form of an optional field) is raw text too, and the text `null`
+is the null value: the grammar admits the string's own values (its enum members, or text within its
+bounds and pattern) and `null`, even where those bounds or that pattern refuse it. An enum or const
+that lists the string `"null"` beside null is rejected, since its raw text is the null value's. Other
+values use JSON; any other top-level string/non-string union (such as string/integer) is rejected
+because the Qwen parameter format cannot distinguish those branches. Such unions inside JSON objects
+or arrays are supported.
 Raw values cannot contain the delimiter `\n</parameter>`; unsatisfiable required values are rejected.
 Integer arguments use signed 64-bit values; number arguments use finite binary64-compatible
 representations. Unsupported schemas fail with HTTP 400 before generation.
@@ -718,7 +728,11 @@ An expanded prompt beyond `--max-context` returns HTTP 400 `context_length_excee
 wording, which agent clients match to compact the conversation and retry: "This model's maximum
 context length is N tokens. However, your messages resulted in M tokens. Please reduce the length
 of the messages." The Anthropic route returns `invalid_request_error` with the Anthropic API's
-"prompt is too long: M tokens > N maximum", which Claude Code matches the same way. M is exact up
+"prompt is too long: M tokens > N maximum", which Claude Code matches the same way. A streamed
+Responses request (`stream:true` on `/v1/responses`) answers inside its event stream instead:
+HTTP 200 with `response.created`, `response.in_progress`, then `response.failed` whose `error`
+carries the code `context_length_exceeded` and the same message, the only form in which Codex
+starts compacting; non-streamed Responses and the other routes keep the HTTP 400. M is exact up
 to four times the limit; a longer prompt is not tokenized further and reads "more than M tokens".
 The prompt's images and videos together beyond the 32,768-token Vision envelope (every turn of an
 agent session resends its screenshots, so a long session reaches it) answer in the same
@@ -727,7 +741,11 @@ the envelope, M the vision tokens counted up to the item that crossed it ("more 
 message ends with a parenthesized note that the counts are image and video tokens against the
 per-prompt vision budget. A single image or video beyond the Vision execution capacity, and the
 other media preprocessing resource rejections (source bytes, decoded pixels, live memory), return
-HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserved for a raw request
+HTTP 400 `media_budget_exceeded`. Qwen3.8-Flash-Next encodes media in memory lent from its expert
+cache: a request whose encode window the cache cannot lend while other requests run waits in the
+queue (subject to the queue timeout), and one it cannot lend with the request's own context
+reserved and nothing else running also returns HTTP 400 `media_budget_exceeded` (fewer or smaller
+images, or a shorter conversation, fit); the server keeps serving either way. HTTP 413 `request_too_large` is reserved for a raw request
 body that exceeds `--max-request-mib` before JSON parsing; it is not used for model-context or media
 resource errors.
 
@@ -953,7 +971,9 @@ carries en `encrypted_content` equal to its raw `reasoning_text`. This field is 
 Ordinary model/string stops produce `completed`. Output-token or context-capacity exhaustion
 produces `incomplete` with `incomplete_details.reason: "max_output_tokens"`. Errors accepted after
 an SSE response has started produce `response.failed`; validation and preparation errors remain
-normal HTTP error responses. `completed_at` is populated only for completed Responses. A
+normal HTTP error responses, except a streamed request's prompt over the context limit, which
+fails inside its stream after `response.created` and `response.in_progress`, as described with
+the context limit above. `completed_at` is populated only for completed Responses. A
 reasoning-only incomplete result contains no invented empty assistant message.
 
 Usage reports the Engine's exact counts:
@@ -1511,7 +1531,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vram-headroom-mib N\|auto` | VRAM in MiB that startup sizing leaves free. Qwen3.5: after `--kv-capacity auto` sizes the KV pool (requires `auto`; `auto` = 1024). Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): after the expert cache takes the rest, for the display and other programs (`auto` = 1024 with a display on the GPU, 256 without; [details](qwen3_8-flash-next.md#vram)) | `auto` |
 | `--vram-past-budget` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) on Windows: also size the expert cache into the VRAM the Windows per-process budget withholds (~0.6 GiB, ~240 more expert frames on an RTX 5090), measured at startup; that memory may be moved to system memory if another program needs VRAM ([details](qwen3_8-flash-next.md#vram)) | off |
 | `--expert-tail-skip R` | Artifacts with offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B), approximate: trades quality for decode speed. In decode and verification rounds, a routed expert missing from VRAM that every token of the round routes at top-k rank `R` or lower (`1..k-1`, 0-based, with k = 10 on Flash-Next and 8 on the 122B; k-1 skips least) is neither copied nor computed: it adds zero and the other experts keep their router weights. The output changes, is slightly worse, and depends on which experts the cache holds; prefill is unchanged; the reproducible route (`--reproducible`) refuses it. Strata does the same by default at rank 7 (`STRATA_ROUTE_TAIL_SKIP=7`) ([details](qwen3_8-flash-next.md#expert-tail-skip)) | off |
-| `--expert-state FILE\|off` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): the expert cache's saved state. At startup the engine fills the VRAM expert cache with the experts the file ranks highest (about 1 s for a full cache) and starts their use counts from it; it writes the file when it stops and every 10 minutes between requests (through `FILE.tmp` and a rename). A file from another artifact or of another size is ignored and replaced. Without a usable file Qwen3.8-Flash-Next seeds the cache from a built-in calibrated expert order instead; the 122B, which has no calibrated order, starts with an empty cache that each prompt's routes seed. `off` starts with an empty cache, no seed, and saves nothing; cold benchmarks need it | `<artifact>.expert-state` |
+| `--expert-state FILE\|off` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): the expert cache's saved state. At startup the engine fills the VRAM expert cache with the experts the file ranks highest (about 1 s for a full cache) and starts their use counts from it; it writes the file when it stops and every 10 minutes between requests (through `FILE.tmp` and a rename). A file from another artifact or of another size is ignored and replaced. Without a usable file Qwen3.8-Flash-Next seeds the cache from a built-in calibrated expert order instead, and with one the SSD tier's RAM takes the experts the file never ranked in that order; the 122B seeds it the same way from its own calibrated order once one is generated into the build (none is yet, so today it starts with an empty cache that each prompt's routes seed). `off` starts with an empty cache, no seed, and saves nothing; cold benchmarks need it | `<artifact>.expert-state` |
 | `--expert-stripe FILE` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) with the SSD expert tier: an expert stripe (`tools/flash_next/expert_stripe.py`) holding the tail of every expert record on a second drive; each record not in RAM is then read in two parts, its head from the artifact and its tail from the stripe, at the same time. The stripe must belong to the artifact. Unused when every expert fits in RAM ([guide](qwen3_8-flash-next.md#ssd-expert-tier)) | none |
 | `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
@@ -1524,15 +1544,17 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--lossless` | run the lossless route: every operation of the model's Hugging Face forward pass computed exactly and rounded once to the dtype it has there (weights decoded exactly, sums exact, logits correctly rounded to `--logits-dtype`, FP32 by default), so a request's output depends on the request and the artifact alone: not on the build, the prefill chunk, prefill or decode, other requests, the prefix cache or preemption. Text requests with `--kv-dtype bf16` (whose pages then hold V as BF16) and no speculation; no fast path runs, so it is slower than the reproducible route. Sampled tokens are drawn by Gumbel-max keyed by the seed, position and token ([definition](maintainer/lossless-route.md)) | off |
 | `--fast-path NAME` | also run this fast path (a name from the [registry](maintainer/model-quality.md#67-fast-path-registry)), qualified for the configuration or not; repeatable. For qualification and timing runs (with `--reproducible`, it times one path against the reproducible route): a path that cannot apply to the loaded model fails startup | none |
 | `--expert-a4-activations` | [nvidia/Qwen3.8-Flash-Next-FP4-Local](qwen3_8-flash-next.md#nvidia-fp4-local-checkpoint) only: run the routed experts with 4-bit NVFP4 activations (W4A4) at the activation scales NVIDIA calibrated for this checkpoint, instead of the 16-bit activations NVIDIA serves it with. Changes the output (a saved prefix-cache file from the other setting is not loaded). Every other artifact refuses it: their experts' arithmetic is fixed by the conversion | off: 16-bit expert activations |
+| `--a8-activations` | Approximate: 8-bit activations instead of a projection's own arithmetic where that measured faster (a route stays only where it does). Decode and verification calls: int8 codes with an FP32 scale per 32 values (as llama.cpp's Q8_1) in a GGUF import's dense projections (calls of up to 31 columns) and in routed experts (GGUF blocks, NVFP4 W4A16 banks; calls of up to 128 columns) with their CPU-served misses. Prefill calls: on the same codec, a GGUF import's dense projections (32 or more columns) and those routed experts (more than 128 columns, in place of `expert-a4-residual`'s A4 terms where that runs); a groupwise Q4 MLP gate/up with int8 activations per token (the groupwise 27B artifacts with Q4 gate/up; 256 or more columns); MXFP8 dense projections with two E4M3 terms per 32 values (NVIDIA FP4-Local). Every other call keeps its route: the Q8, FP8, NVFP4 and BF16 dense projections (the NVFP4 27B's FP8 and NVFP4 sites already take the 8- and 4-bit activations their artifact permits), resident experts, and W4A4 and block-FP8 experts ([guide](qwen3_8-flash-next.md#a8-activations)). Changes the output (a saved prefix-cache file from the other setting is not loaded); `--reproducible`, `--lossless` and artifacts with none of these routes refuse it (the NVFP4 Qwen3.8-27B, the Qwen3.6-35B-A3B, Flash-Next Dense8 and the official FP8 import among them) | off |
 | `--embedding-host` | Qwen3.5-family artifacts: keep the token embedding in pinned host memory and read its rows zero-copy, as artifacts with offloaded experts always do, so its VRAM (1.18 GiB on the 27B) goes to the KV and prefix caches. Same output; a prompt chunk reads its rows over PCIe | off: in VRAM |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | `on` |
 | `--log-colours on\|off` | colour the console statistics lines; never applies to file logs | `off` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
-| `--ram-headroom-mib N` | physical Host RAM in MiB that pinned weights and caches leave free for the system; startup refuses a lock that would take it (Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger) | `2048` |
+| `--ram-free-mib N` | physical Host RAM in MiB that everything Infernix keeps in RAM (weights, offloaded experts, the n-gram table, the prefix cache's Host tier) leaves free for other programs; startup refuses a lock that would take it, and Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger | `8192` |
 | `--expert-ram-mib N\|auto` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB on Flash-Next, 60.75 GiB on the 122B) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |
-| `--ngram-residency auto\|ram\|volume` | Qwen3.8-Flash-Next: where the PLE n-gram table lives. `ram` reads the whole table into pinned Host RAM at startup (27.1 GiB for a GGUF import's IQ4_NL table, 48.8 GiB for the FP8 table) and never reads the volume again; `volume` reads rows on demand through a 2^20-row cache; `auto` takes RAM only when the RAM ledger still keeps every expert in RAM beside it ([details](qwen3_8-flash-next.md#n-gram-table-in-ram)) | `auto` |
+| `--expert-ram-layout exclusive\|full` | Qwen3.8-Flash-Next, when VRAM cannot hold every routed expert: `exclusive` keeps in RAM only the experts VRAM does not hold (plus copies of the ones a prefill borrows), `full` keeps a RAM copy of every expert whenever RAM allows (about 15 GiB more on the NVFP4 artifacts). Same output bits either way. Ignored with `--expert-ram-mib N` | `full` |
+| `--ngram-residency auto\|ram\|volume` | Qwen3.8-Flash-Next: where the PLE n-gram table lives. `ram` reads the whole table into Host RAM at startup, locked for the CPU but not page-locked for the GPU (27.1 GiB for a GGUF import's IQ4_NL table, 48.8 GiB for the FP8 table) and never reads the volume again; `volume` reads rows on demand through a 2^20-row cache; `auto` takes RAM only when the RAM ledger still keeps every expert in RAM beside it ([details](qwen3_8-flash-next.md#n-gram-table-in-ram)) | `auto` |
 | `--expert-pin-mib N\|auto` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): at most N MiB of the experts' RAM page-locked for the GPU; the rest stays in RAM unpinned and the CPU serves it ([Page-locking limit](qwen3_8-flash-next.md#page-locking-limit)) | `auto` (what Windows lets the GPU page-lock) |
 | `--context-cost-presets FILE` | optional runtime context-cost preset registry | generic + compiled defaults |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
@@ -1569,13 +1591,14 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vision-max-merged N` | merged vision tokens per image or video, `64..32768` | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable the prefix cache: every request prefills from the root, and a paused request recovers by replay; rejected with `--host-context-mib` and the cache options below | prefix reuse on |
-| `--host-context-mib N` | pinned Host budget in decimal MiB that resolve to whole bytes: the slab pool the prefix cache's KV blocks and state snapshots share ([spec](maintainer/hybrid-prefix-cache-spec.md)), split at run time by eviction value. `0` keeps the cache on the Device only, and a nonzero budget below one snapshot is rejected. Qwen3.8-Flash-Next: must be positive (its state snapshots live in this pool). | `8192 MiB` |
-| `--device-snapshot-slots N` | Device state snapshot slots (`1..64`); not available for Qwen3.8-Flash-Next, whose snapshots live in the Host tier | `max-concurrency + 1`; `+ 2` without a Host tier |
+| `--host-context-mib N\|auto` | pinned Host budget in decimal MiB that resolve to whole bytes: the slab pool the prefix cache's KV blocks and state snapshots share ([spec](maintainer/hybrid-prefix-cache-spec.md)), split at run time by eviction value. `0` keeps the cache on the Device only, and a nonzero budget below one snapshot is rejected. Qwen3.8-Flash-Next: must be positive (its state snapshots live in this pool); `auto` sizes it after the experts and the n-gram table, 0.4 of the RAM they leave beyond `--ram-free-mib`, between 1 and 8 GiB, and the startup line `RAM plan:` shows the result (other models take 8192). | `8192 MiB` |
+| `--device-snapshot-slots N` | Device state snapshot slots (`1..64`); not available for Qwen3.8-Flash-Next, whose snapshots live in the Host tier | `max-concurrency + 1`; `+ 2` without a Host tier; `1` for an artifact with offloaded experts (Qwen3.5-122B-A10B) with a Host tier, whose further slots would take expert frames |
 | `--cache-taps-per-request N` | new prefill state snapshots per request (`0..64`) | `8`; `2` without a Host tier |
 | `--cache-tap-ladder N` | history-snapshot ladder base G; flexible taps at `prompt − G·2^k` | `max(4096, 2 * prefill-chunk)`; Qwen3.8-Flash-Next counts the chunk as at most `4096` |
 | `--cache-tap-min-gap N` | minimum tokens between ladder snapshots | `max(1024, prefill-chunk)`; Qwen3.8-Flash-Next counts the chunk as at most `4096` |
 | `--no-queue-holds` | turn off queue holds. With them, the snapshot each waiting request would resume from and its blocks are evicted after every other cache entry, the request furthest back in the queue first, and new snapshots or Host block writes that would need a held snapshot's slabs are skipped instead; without them eviction is plain LRU (Device) and GDSF (Host), so under a working set larger than the cache a queued request can lose its prefix while it waits ([spec §9.6](maintainer/hybrid-prefix-cache-spec.md#96-queue-holds)) | holds on |
 | `--cache-tool-hold-secs N` | Qwen3.5: after a reply that ends in a tool call, hold the snapshots its next turn resumes from (and their blocks) like a queued request's, after every queued one, for `N` seconds (`0..3600`), since an agent client usually sends the next turn once its tool has run; `0` turns the holds off. Qwen3.8-Flash-Next has none and refuses a nonzero value ([spec §9.7](maintainer/hybrid-prefix-cache-spec.md#97-tool-call-holds)) | `30` (Qwen3.5) |
+| `--cache-next-turn-ms N` | after a reply that ended on its own, once the server has had nothing to run for `N` ms (`0..3600000`), prefill the conversation's history as its next request will render it ([next-turn prefill](#next-turn-prefill), [spec §7.9](maintainer/hybrid-prefix-cache-spec.md#79-next-turn-prefill)); it yields to any request at its next unit and never changes output; `0` turns it off. Qwen3.8-Flash-Next: off by default, refused with `--reproducible` and `--lossless` | `150` (Flash-Next `0`) |
 | `--cache-host-state fp32\|fp24\|bf16` | Qwen3.5: Host-tier form of snapshot recurrent (Gated DeltaNet) state; the attention KV cache keeps `--kv-dtype` and the Device copies stay exact. `fp24` and `bf16` round it to 15 or 7 mantissa bits, shrinking each 27B snapshot by 36 or 72 MiB (about 19 % and 39 % of a DFlash2 image), so the same Host tier keeps more snapshots and restores move fewer bytes; a snapshot restored from the Host then resumes from the rounded state, so output is no longer bit-identical to `fp32`. A cache file written with another form is not loaded; `fp24` and `bf16` are refused with `--reproducible` (whether a turn resumes from the Host depends on eviction) and for Qwen3.8-Flash-Next ([spec §5.6](maintainer/hybrid-prefix-cache-spec.md#56-host-state-precision)). Under the `fp16-gdn-state` fast-path candidate the pool itself stores the state as FP16, and the Host keeps those bytes exactly whatever this option says | `fp32`: exact |
 | `--prefix-cache-file PATH` | at startup, restore the Host tier from `PATH` if the file exists; when the server stops ([Stop the server](#stop-the-server)), save it there once running and queued requests are cancelled (every Host-backed snapshot and the block path it resumes through). A save cut short is abandoned and the previous file kept: one more Ctrl+C during the stop also deletes the unfinished `PATH.tmp`, while Windows ending a closed console's process about 5 s after the close leaves it until the next save, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, and the flag needs a Host tier (not `--host-context-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling or `infernix-serve` binary is ignored and replaced at shutdown. The startup log shows the read's progress and reports what was restored; with a `--host-context-mib` smaller than the file needs, the most valuable snapshots and only the blocks they resume through are restored, and the log warns with the size the file needs; when no snapshot fits, it warns that nothing was restored and that the save at shutdown replaces the file. Saving writes up to `--host-context-mib` of data. | off: nothing is saved or restored |
 | `--prefix-cache-save-mins N` | with `--prefix-cache-file`: also save the Host tier there every `N` minutes while serving, counted from the end of the previous save, and only when it changed since the last save or load. The save runs at the first point between execution units once due, also while requests run: they wait while it is written (the log reports the size, the save time and how long requests waited). It writes `PATH.tmp` and replaces `PATH` only once complete, so a crash or power loss leaves the previous file; stopping the server during a periodic save abandons it before the shutdown save. Each save rewrites the whole file (up to `--host-context-mib`, several GB), so a short interval writes a lot to the drive and wears an SSD faster: at 7.5 GB every 5 minutes that is up to ~2 TB a day, every 30 minutes ~360 GB. | off: saved only when the server stops |
@@ -2046,7 +2069,12 @@ snapshots held for waiting requests, `held_device_evictions` counts Device copie
 evicted anyway (Host-backed ones first), `held_snapshot_losses` held snapshots that were lost, and
 `held_host_refusals` Host snapshot or block writes skipped because only held snapshots were left to
 evict. `tool_call_holds` counts holds placed after a reply ending in a tool call
-(`--cache-tool-hold-secs`).
+(`--cache-tool-hold-secs`). `next_turn_prefill` counts the [next-turn prefill](#next-turn-prefill)'s
+passes over the interval: `started`, `completed` (run to the history's end), `yielded` (stopped at a
+unit boundary because a request arrived), `skipped` (the cache already held the history),
+`dropped` (a request or a newer reply came before the pass started, or the history could not be
+rendered), and `computed_tokens`, the prompt tokens the passes computed (also counted in the
+interval's prefill tokens).
 
 The JSONL `throughput.host_work` object is the aggregation authority: the Engine worker counts each
 wall-time segment once, independent of batch size. `elapsed_seconds` contains the same five
@@ -2149,6 +2177,38 @@ Changing `preserve_thinking` or reasoning effort changes the rendered prompt whe
 already cached exact prefixes remain usable. An appended mid-conversation system message is an
 ordinary suffix. Modifying, removing or moving a historical message changes the prefix and may
 require an earlier snapshot or a root prefill.
+
+### Next-turn prefill
+
+A conversation's next request does not always render the previous reply as the tokens the model
+generated, so the endpoint above cannot serve it: a template that drops earlier reasoning once a new
+user turn arrives (Qwen3.5's and Qwen3.6's by default, any request with `preserve_thinking: false`)
+re-renders the whole tail since the previous user turn without it, and on `--reproducible` (and any
+configuration without the `free-cache-resume` fast path) no decode-computed state is reused at all,
+so every next turn recomputes the previous reply. After each reply that ended on its own (a stop
+token or stop string; not one cut by its limit or cancelled), the server renders the conversation
+with that reply appended as its next request will (the request's template options; a tool result
+follows a reply that calls tools, a user turn any other), and once the server has had nothing to run
+for `--cache-next-turn-ms` (default 150 ms), prefills that history into the prefix cache as an
+internal request. The next request then resumes at the history's end (on `--reproducible`, at the
+grid position at or before it, so its output still equals an uncached run's).
+
+- It never delays a request by more than one unit: a request that arrives before the pass starts
+  drops it, and one that arrives while it runs makes it stop at its next prefill unit, keeping the
+  blocks and snapshots it had published and the state it reached (Qwen3.8-Flash-Next: except inside
+  a layer-walk span, which a stopped pass abandons).
+- It never changes output: the next request reuses it only where its tokens are identical. A client
+  that sends the reply back differently (reordered tool arguments, dropped reasoning in a template
+  that keeps it) simply misses it.
+- A history the cache already holds (the usual agent loop with a template that keeps reasoning: the
+  endpoint already covers the reply) is skipped without running. Only the latest finished reply is
+  prefilled; text conversations only (a request with media is not followed).
+- It costs GPU time when no next request comes. `--cache-next-turn-ms 0` turns it off. The
+  `throughput` record's `context_cache.hybrid.next_turn_prefill` object counts the passes.
+- Qwen3.8-Flash-Next: off by default. Its default route already resumes nearly every agentic turn at
+  the reply's end (94 % of continuing turns in a Dense8 replay), and on `--reproducible` a turn resumed
+  from the pass's grid snapshot did not equal an uncached run, so `--reproducible` and `--lossless`
+  refuse a non-zero `--cache-next-turn-ms` there.
 
 Speculative backends preserve protocol output shapes, stop behavior, and usage accounting. If a stop
 truncates a multi-token MTP, DFlash or DFlash2 round, the Engine commits the exact accepted target prefix so

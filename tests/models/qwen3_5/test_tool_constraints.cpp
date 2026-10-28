@@ -7,6 +7,8 @@
 #include <iostream>
 #include <span>
 #include <stdexcept>
+#include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -380,6 +382,54 @@ void run() {
         (void)feed(null_decoder, call("null"));
         require(Json::parse(null_decoder.finish().tool_calls.at(0).arguments_json)["x"].is_null(),
                 ("a nullable string's null was not null: " + nullable.dump()).c_str());
+    }
+    // A nullable string's enum or const keeps its members (NInfer #425's status filter, its anyOf
+    // form, Pydantic's Optional[Status] through a reference): the grammar takes the members and the
+    // text `null`, which reads as JSON null, and refuses other text. Bounds or a pattern that refuse
+    // the four characters still leave `null` to the grammar.
+    const auto decodes = [](const auto& bound, std::string_view text) {
+        frontend::ToolCallOutputDecoder decoder(bound, 64);
+        (void)feed(decoder, call(text));
+        return Json::parse(decoder.finish().tool_calls.at(0).arguments_json)["x"];
+    };
+    const Json statuses = Json::array({"pending", "completed"});
+    Json referenced = schema({{"anyOf", {{{"$ref", "#/$defs/Status"}}, {{"type", "null"}}}}});
+    referenced["$defs"] = {{"Status", {{"type", "string"}, {"enum", statuses}}}};
+    for (const Json& parameters :
+         {schema({{"type", {"string", "null"}}, {"enum", {"pending", "completed", nullptr}}}),
+          schema({{"anyOf", {{{"type", "string"}, {"enum", statuses}}, {{"type", "null"}}}}}),
+          referenced}) {
+        const auto bound = contract(parameters, true, required);
+        require(accepts(compiled, *bound, call("pending")) &&
+                    accepts(compiled, *bound, call("completed")) &&
+                    accepts(compiled, *bound, call("null")) &&
+                    !accepts(compiled, *bound, call("other")) &&
+                    !accepts(compiled, *bound, call("Pending")),
+                ("a nullable enum refused a member or null, or admitted other text: " +
+                 parameters.dump())
+                    .c_str());
+        require(decodes(bound, "pending") == "pending" && decodes(bound, "null").is_null(),
+                ("a nullable enum's member or null decoded wrongly: " + parameters.dump()).c_str());
+    }
+    for (const auto& [parameters, text, refused] :
+         {std::tuple{schema({{"type", {"string", "null"}}, {"maxLength", 2}}), "ab", "abc"},
+          std::tuple{schema({{"type", {"string", "null"}}, {"pattern", "^[0-9]+$"}}), "12", "ab"}}) {
+        const auto bound = contract(parameters, true, required);
+        require(accepts(compiled, *bound, call(text)) && accepts(compiled, *bound, call("null")) &&
+                    !accepts(compiled, *bound, call(refused)),
+                ("a bounded nullable string refused null: " + parameters.dump()).c_str());
+        require(decodes(bound, "null").is_null() && decodes(bound, text) == text,
+                ("a bounded nullable string decoded wrongly: " + parameters.dump()).c_str());
+    }
+    // The string "null" beside null has no raw text of its own.
+    for (const Json& ambiguous :
+         {schema({{"type", {"string", "null"}}, {"enum", {"null", "a", nullptr}}}),
+          schema({{"anyOf", {{{"const", "null"}}, {{"type", "null"}}}}})}) {
+        bool refused = false;
+        try {
+            (void)contract(ambiguous, true, required);
+        } catch (const infernix::RequestError&) { refused = true; }
+        require(refused, ("the string \"null\" beside null was accepted: " + ambiguous.dump()).c_str());
     }
     // A string mixed with another JSON value type stays ambiguous.
     bool rejected = false;

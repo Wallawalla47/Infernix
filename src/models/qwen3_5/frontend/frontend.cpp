@@ -1222,6 +1222,8 @@ ChatTokens Frontend::tokenize_chat(PromptInput input) const {
     return out;
 }
 
+void Frontend::warm_constraints() const { (void)impl_->grammars(); }
+
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,

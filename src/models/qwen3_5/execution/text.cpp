@@ -392,6 +392,16 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
     ops::rmsnorm(x, mtp_->input_norm, config_.rms_norm_eps, true, ah, s);
 }
 
+const OffloadedMoeContext* TextContext::drafter_pool(OffloadedMoeContext& storage) const {
+    if (parameters_.model.config().mtp_expert_slots == 0) { return nullptr; }
+    // The pooled drafter's bank is pinned in RAM: a call without the Program's pool would read host memory.
+    if (io_.offloaded_experts == nullptr || io_.offloaded_experts->drafter_slots == 0) {
+        throw std::logic_error("Qwen3.5: the MTP drafter's experts are pooled, but the Program's pool is not set");
+    }
+    storage.experts = io_.offloaded_experts;
+    return &storage;
+}
+
 void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
                                    const Tensor& rope_positions,
                                    ops::CausalAttentionExecutionEnvelope envelope,
@@ -486,8 +496,9 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
             active_sequence_width_ > 1) {
             padding = {static_cast<const std::int32_t*>(active_valid_columns_->data), active_sequence_width_};
         }
+        OffloadedMoeContext drafter;
         ffn(mh, mtp_->ffn, x, {}, work_, ctx_.execution_view(), true, false, ops::LinearRoutes::Exact,
-            ops::LinearRoutes::Exact, nullptr, padding);
+            ops::LinearRoutes::Exact, drafter_pool(drafter), padding);
     }
 
     Tensor flat_mtp_hidden = mtp_hidden.view({dimension(config_.hidden_size), T});
@@ -637,7 +648,9 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rmsnorm(x_last, mtp_->post_attention_norm, config_.rms_norm_eps, true, mh, s);
         {
             auto post_mixer_scope = work_.scope();
-            ffn(mh, mtp_->ffn, x_last, {}, work_, ctx_.execution_view(), true);
+            OffloadedMoeContext drafter;
+            ffn(mh, mtp_->ffn, x_last, {}, work_, ctx_.execution_view(), true, false, ops::LinearRoutes::Exact,
+                ops::LinearRoutes::Exact, drafter_pool(drafter));
         }
         ops::rmsnorm(x_last, mtp_->final_norm, config_.rms_norm_eps, true, *final_hidden, s);
         proposal_argmax(*final_hidden, *logits, *draft_token);

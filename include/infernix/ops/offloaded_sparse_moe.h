@@ -35,9 +35,14 @@ namespace infernix::ops {
  * tensor cores (qualified against FP64; design §8.5, §13). Both routes depend only on the column
  * count and the stored scales, never on placement. W4A16 experts (§16.2.1) are exact on every
  * route, the wide one included (integer tensor cores), so their bits depend on neither placement
- * nor column count. The route reads each router logit as its model's forward does
- * (RouterLogits): FP32 for Qwen3.8-Flash-Next, or rounded once to BF16 for Qwen3.5-122B-A10B,
- * whose router projection writes BF16 (Transformers' Qwen3_5MoeSparseMoeBlock; ties at that
+ * nor column count. The opt-in 8-bit activation route (`--a8-activations`: MoeGgmlBank::a8,
+ * NarrowA16::kA8; LOSSY) keeps both invariances in the calls of at most 128 columns it takes (every
+ * job on its kernels, CPU-served misses in the same order); with WideA16::kA8 a wider call stays on the
+ * same 8-bit activations, its experts of at most eight columns on those kernels and its wider ones on
+ * int8 tensor-core tiles whose FP32 sums take a fixed order per output (placement- and column-count-
+ * invariant among them, but not the narrow kernels' bits). The route reads each router logit as its
+ * model's forward does (RouterLogits): FP32 for Qwen3.8-Flash-Next, or rounded once to BF16 for
+ * Qwen3.5-122B-A10B, whose router projection writes BF16 (Transformers' Qwen3_5MoeSparseMoeBlock; ties at that
  * precision go to the lower id, as in the resident Qwen3.5 sparse MoE). Each logit is one FP32 dot
  * product whose order depends only on H, so a column's routing is identical in every batch shape.
  * Routing weights, the shared gate and the combine are FP32 evaluations rounded once; their oracle
@@ -70,6 +75,30 @@ enum class RouterLogits : std::uint8_t { kFp32, kBf16 };
 /// logits: FP32 [E + 1, T], the router rows followed by the shared-expert gate row.
 void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cudaStream_t stream,
                RouterLogits precision = RouterLogits::kFp32);
+
+/// The drafter pool (candidates §22 VM-01 variant B): moe_route over a pool of device
+/// slots. `slot_of` (device I32 [E]) maps each expert to its slot, or -1 when it has none; each column's
+/// top-k is taken among the experts with a slot, by moe_route's selection and weights arithmetic, and
+/// routing.ids receive their slots (the shared gate is moe_route's). `demand` (device I32 [E + 1]): word e
+/// gains 1 for each column whose unrestricted top-k holds expert e, slot or not, and word E for each such
+/// expert without a slot. When every expert has a slot and slot_of is the identity, the outputs are
+/// moe_route's bit for bit (with the same `precision`). At least top_k experts must have a slot.
+void moe_route_pooled(const Tensor& logits, std::int32_t top_k, const Tensor& slot_of, std::int32_t* demand,
+                      MoeRouting& routing, cudaStream_t stream, RouterLogits precision = RouterLogits::kFp32);
+
+/// The drafter pool: the pool's slot-table writes in stream order, by the SMs (no copy
+/// engine, so they never queue behind other streams' bulk copies): slot_of[expert[i]] = value[i], i < count.
+inline constexpr std::int32_t kMoePoolWrites = 8;
+struct MoePoolWrites {
+    std::int32_t count = 0;
+    std::int32_t expert[kMoePoolWrites]{};
+    std::int32_t value[kMoePoolWrites]{};
+};
+void moe_pool_write(std::int32_t* slot_of, const MoePoolWrites& writes, cudaStream_t stream);
+
+/// The drafter pool: moves n demand counts (device I32) into `host` (pinned, written by
+/// the SMs through its device mapping) and zeroes them, in stream order.
+void moe_pool_drain(std::int32_t* demand, std::int32_t* host, std::int32_t n, cudaStream_t stream);
 
 /// Device-side dispatch of the routed (column, slot) entries by expert. Every array is
 /// caller-owned device memory sized for `max_entries = k * T` entries and E experts.
@@ -159,6 +188,9 @@ struct MoeCpuChannel {
     // The arithmetic the service computes W4A16 jobs with (CpuMissService::Options::narrow_a16);
     // moe_experts requires it to equal the source's narrow_a16, so a CPU-served miss keeps the GPU's bits.
     offloaded_moe::NarrowA16 narrow_a16 = offloaded_moe::NarrowA16::kExact;
+    // Whether the service computes 8-bit activation requests (CpuMissService::Options::ggml_a8); moe_experts
+    // requires it to equal the source's MoeGgmlBank::a8 for a GGUF bank.
+    std::int32_t ggml_a8 = 0;
 };
 
 /// Device memory a call warms into L2 while it waits for its CPU-served misses (design §19.3.3
@@ -225,6 +257,11 @@ struct MoeGgmlBank {
     std::uint32_t down_row_bytes = 0;
     std::uint64_t record_bytes = 0; // bytes a stage copies: the record rounded up to 16 (within its stride)
     MoeGgmlTiles tiles;             // the prefill tiles' TEMPORARY switches (default: the measured routing)
+    // --a8-activations (LOSSY, opt-in; ops/ggml/ggml_a8.h): a call of at most 128 columns runs every job on the
+    // 8-bit activation kernels, and its CPU-served misses take the CPU route's 8-bit functions (the same bits);
+    // wider calls keep the exact and BF16 routes, or with MoeExpertSource::wide_a16 = WideA16::kA8 stay on 8-bit
+    // activations (their wide experts on int8 tiles, ops/ggml/ggml_a8_tile.cuh). A GGUF bank only (not block-FP8).
+    bool a8 = false;
 };
 
 struct MoeExpertSource {
@@ -257,12 +294,22 @@ struct MoeExpertSource {
     // CPU channel's service must compute with the same arithmetic.
     offloaded_moe::ExpertActivation activation = offloaded_moe::ExpertActivation::kA4;
     // W4A16 experts' wide route: exact (default) or the two-term A4 fast path (design §19.3.23); the
-    // workspace must be sized for the same choice. Narrow routes and W4A4 experts ignore it.
+    // workspace must be sized for the same choice. Narrow routes and W4A4 experts ignore it. kA8
+    // (`--a8-activations` at prefill widths, LOSSY, opt-in; needs MoeGgmlBank::a8 for a GGUF bank or
+    // NarrowA16::kA8 for an NVFP4 W4A16 bank): a call of more than 128 columns stays on the 8-bit activations,
+    // its experts of at most kMaxColumns columns on the 8-bit narrow kernels (CPU-served misses on the CPU
+    // route's 8-bit functions) and its wider experts on int8 tensor-core tiles (offloaded_moe::WideA16).
     offloaded_moe::WideA16 wide_a16 = offloaded_moe::WideA16::kExact;
     // W4A16 experts' narrow route (experts of at most kMaxColumns columns in the call): exact (default)
     // or expert-a4-residual-decode's two-term A4 with exact sums (offloaded_moe::NarrowA16; NVFP4 banks
-    // at Flash-Next's geometry, any wide route but kLossless). The workspace is the one wide_a16 sizes;
-    // a CPU channel must carry the same choice. W4A4 experts ignore it.
+    // at Flash-Next's geometry, any wide route but kLossless). kA8 is `--a8-activations` (LOSSY, opt-in;
+    // NVFP4 banks at either registered geometry, any wide route but kLossless): x and h as ggml_a8.h's
+    // 8-bit slices, ops/offloaded_sparse_moe/nvfp4_a8.h's arithmetic; a call of at most
+    // nvfp4_a8::kMaxCallColumns (128) columns then runs every job on the 8-bit kernels, whatever its
+    // column count (no wide route, no narrow ring, the shared job included), so an expert's output depends
+    // on neither its placement nor its column count; wider calls keep wide_a16's routes (WideA16::kA8: the 8-bit
+    // wide route). The workspace is
+    // the one wide_a16 sizes; a CPU channel must carry the same choice. W4A4 experts ignore it.
     offloaded_moe::NarrowA16 narrow_a16 = offloaded_moe::NarrowA16::kExact;
     // With kLossless: the design reference's expert activations (offloaded_moe::LosslessExpertDesign).
     offloaded_moe::LosslessExpertDesign lossless_design = offloaded_moe::LosslessExpertDesign::kNone;
@@ -283,6 +330,14 @@ struct MoeExpertSource {
     // (fork, join) are caller-owned; the stream is otherwise idle.
     cudaStream_t fork_stream = nullptr;
     cudaEvent_t fork_events[2] = {};
+    // Optional with the fork: a forked call without a fetch channel stages its misses in two launches on
+    // `fork_stream`, every miss's gate/up bytes and then its down bytes, and computes them on
+    // `split_stream`: the gate/up pass once the first launch is done (beside the second), the down pass
+    // once the second is (the events: gate/up staged, down staged); the join (fork_events[1]) is then
+    // recorded on `split_stream`. The same bytes and kernels, so the same outputs. Caller-owned; the
+    // stream is otherwise idle.
+    cudaStream_t split_stream = nullptr;
+    cudaEvent_t split_events[2] = {};
     // Optional landing for forked calls (design §19.3.5 S4; ignored by every other route): the n-th
     // staged miss in job order (CPU-served misses excluded) is copied into frame landing[n]
     // (frame_base + landing[n] * record_stride) instead of a staging slot when n < landing_slots
@@ -346,8 +401,9 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                  cudaStream_t stream, bool wait_for_cpu = true, bool cpu_planned = false);
 
 /// moe_route_dispatch and, for a CPU-served call of decode or verification width, the CPU plan of
-/// the moe_experts call with these x, source, max_jobs, workspace and outputs, in one kernel.
-/// Returns true when it planned; that moe_experts call then passes cpu_planned = true.
+/// the moe_experts call with these x, source, max_jobs, workspace and outputs (and, with a fetch
+/// channel, its fetch plan), in one kernel. Returns true when it planned; that moe_experts call then
+/// passes cpu_planned = true.
 [[nodiscard]] bool moe_route_dispatch_plan(const Tensor& logits, std::int32_t top_k, MoeRouting& routing,
                                            MoeDispatch& dispatch, std::int32_t* route_log, const Tensor& x,
                                            const MoeExpertSource& source, std::int32_t max_jobs, void* workspace,

@@ -4,6 +4,7 @@
 #include "models/qwen3_5/vision_config.h"
 #include "models/registry.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -321,6 +322,14 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
                 throw ArtifactError("the artifact has no MTP component");
             }
             out.mtp = options.mtp();
+            // The drafter pool's slots (LoadOptions::mtp_expert_pool), measured best per bank kind (2026-10-27, MTP
+            // decode with three drafts, ABBA): GGUF imports 128 (IQ3_S +4.0 %; 256 +1.1 %), NVFP4 banks 256 (Dense8
+            // +1.9 %; 128 -0.5 %). At least top_k + 2 (a swap holds a slot out of the route, two at a time at most).
+            const std::uint32_t experts = out.text.moe.experts;
+            const std::uint32_t slots   = out.text.ggml_weights ? 128U : 256U;
+            if (out.mtp && options.mtp_expert_pool && slots < experts) {
+                out.mtp_expert_slots = std::min(experts - 1, std::max(slots, out.text.moe.top_k + 2U));
+            }
             if (options.proposal_head == ProposalHead::Optimized) {
                 const auto& proposal = directory.component("text").proposal;
                 if (!proposal || !proposal->indexed || proposal->rows == 0 ||

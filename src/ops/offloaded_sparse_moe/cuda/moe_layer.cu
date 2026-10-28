@@ -18,12 +18,15 @@
 #include "ops/common/canonical_math.h"
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/ggml/ggml_a8.h"
+#include "ops/ggml/ggml_a8_tile.cuh"
 #include "ops/ggml/ggml_dp4a.cuh"
 #include "ops/ggml/ggml_exact.h"
 #include "ops/ggml/ggml_bf16_tile.cuh"
 #include "ops/ggml/ggml_tile.cuh"
 #include "ops/fp8_block/fp8_exact.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
+#include "ops/offloaded_sparse_moe/nvfp4_a8.h"
 #include "infernix/ops/lossless_linear.h"
 #include "infernix/ops/lossless_quantize.h"
 #include "ops/lossless/cr_math.cuh"
@@ -108,6 +111,54 @@ __device__ __forceinline__ int record_copy_bytes(const MoeExpertSource& source) 
 __host__ __device__ __forceinline__ bool ggml_bank(const MoeExpertSource& source) {
     return source.ggml.gate_up_format != QType::NVFP4_MUL;
 }
+
+// The record bytes one stage launch copies of every miss: [begin, end), then [begin2, end2) (end < 0:
+// the record's end). A split forked call (MoeExpertSource::split_stream) stages every miss's down rows
+// in a second launch and the rest of its record in the first; only the first writes the call's job
+// records and landing log, and only the second reports the call's fetched records consumed (the host
+// may rewrite a consumed record's slot, and the second launch still reads it).
+struct StageBytes {
+    int begin = 0, end = -1, begin2 = 0, end2 = 0;
+    bool log = true, consume = true;
+};
+
+// A record's down rows, the bytes a split call stages second: an NVFP4 record's down matrix (after its
+// gate/up units), a GGUF record's down rows (after its gate and up rows, to the record's end) and a
+// block-FP8 record's down rows (before the tile scales, which its gate/up pass reads too), and the bytes a
+// stage copies of the whole record (record_copy_bytes). Nullopt when they are not on 16-byte boundaries
+// (no split).
+struct DownBytes {
+    int begin, end, record;
+};
+
+std::optional<DownBytes> record_down_bytes(const MoeExpertSource& source) {
+    const auto hidden = static_cast<std::int64_t>(source.shape.hidden);
+    const auto inter  = static_cast<std::int64_t>(source.shape.intermediate);
+    std::int64_t begin = 0, end = 0, record = 0;
+    if (source.ggml.gate_up_format == QType::FP8_E4M3FN_B128) {
+        begin  = 2 * inter * hidden;
+        end    = 3 * inter * hidden;
+        record = static_cast<std::int64_t>(source.ggml.record_bytes);
+    } else if (ggml_bank(source)) {
+        begin  = 2 * inter * source.ggml.gate_row_bytes;
+        record = static_cast<std::int64_t>(source.ggml.record_bytes);
+        end    = record;
+    } else {
+        begin  = static_cast<std::int64_t>(source.shape.gate_up_row_groups()) * (hidden / 16) *
+                static_cast<std::int64_t>(moe::kUnitBytes);
+        record = static_cast<std::int64_t>(moe::wide::nvfp4_record_bytes(source.shape));
+        end    = record;
+    }
+    if (begin <= 0 || begin >= end || end > record || begin % 16 != 0 || end % 16 != 0 || record % 16 != 0 ||
+        record > std::numeric_limits<int>::max()) {
+        return std::nullopt;
+    }
+    return DownBytes{static_cast<int>(begin), static_cast<int>(end), static_cast<int>(record)};
+}
+
+// Which matrices a pass launch computes: both, or (a split forked call's two launches) the gate/up
+// matrix or the down matrix. A Down launch is an ordinary launch: an event wait precedes it.
+enum class PassPart : int { Both = 0, GateUp = 1, Down = 2 };
 
 // A non-resident expert's host record (MoeExpertSource::host_table, else the pinned bank).
 __device__ __forceinline__ const std::uint8_t* host_record(const MoeExpertSource& source, int expert) {
@@ -236,91 +287,6 @@ __device__ const std::uint8_t* fetch_wait(const MoeExpertSource& source, FetchCa
     return reinterpret_cast<const std::uint8_t*>(*record);
 }
 
-// One CTA, after the CPU plan: the call's fetch-served jobs (non-resident, no host record, not a
-// CPU job, not streamed) move to the end of dispatch.jobs in a stable partition (cpu_flags and the
-// CPU call's job indices move with them), and their experts are published as one request in job
-// order: the payload, a system-scope fence, then the sequence (never 0).
-__global__ void __launch_bounds__(kThreads)
-    fetch_plan_kernel(MoeDispatch dispatch, MoeExpertSource source, int max_jobs, std::int32_t* __restrict__ cpu_flags,
-                      CpuCall* __restrict__ cpu_call, FetchCall* __restrict__ call) {
-    __shared__ int expert_of[offloaded_moe::kMaxFetch];
-    __shared__ int flag_of[offloaded_moe::kMaxFetch];
-    __shared__ short rank_of[offloaded_moe::kMaxFetch]; // fetch jobs before this one
-    __shared__ unsigned char fetch_of[offloaded_moe::kMaxFetch];
-    __shared__ int warp_fetch[kWarps];
-    __shared__ int carry;
-    const int jobs = min(*dispatch.job_count, max_jobs);
-    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    if (threadIdx.x == 0) {
-        call->pending = 0;
-        call->count   = 0;
-        carry         = 0;
-    }
-    __syncthreads();
-    for (int base = 0; base < jobs; base += blockDim.x) {
-        const int j = base + threadIdx.x;
-        bool fetch  = false;
-        if (j < jobs) {
-            const int expert = dispatch.jobs[j];
-            const int flag   = cpu_flags != nullptr ? cpu_flags[j] : 0;
-            expert_of[j]     = expert;
-            flag_of[j]       = flag;
-            fetch = resident_record(source, expert) == nullptr && source.host_table[expert] == nullptr && flag == 0 &&
-                    (source.prefetched == nullptr || source.prefetched[expert] < 0);
-            fetch_of[j] = fetch ? 1 : 0;
-        }
-        const unsigned ballot = __ballot_sync(0xFFFFFFFFU, fetch);
-        if (lane == 0) { warp_fetch[warp] = __popc(ballot); }
-        __syncthreads();
-        if (j < jobs) {
-            int rank = carry + __popc(ballot & ((1U << lane) - 1U));
-            for (int w = 0; w < warp; ++w) { rank += warp_fetch[w]; }
-            rank_of[j] = static_cast<short>(rank);
-        }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            for (int w = 0; w < kWarps; ++w) { carry += warp_fetch[w]; }
-        }
-        __syncthreads();
-    }
-    const int count = carry;
-    if (count == 0) { return; }
-    const int first = jobs - count;
-    // New index: fetch jobs after every other job, each group in its old order.
-    for (int j = threadIdx.x; j < jobs; j += blockDim.x) {
-        const int to = fetch_of[j] != 0 ? first + rank_of[j] : j - rank_of[j];
-        dispatch.jobs[to] = expert_of[j];
-        if (cpu_flags != nullptr) { cpu_flags[to] = flag_of[j]; }
-        if (fetch_of[j] != 0) { source.fetch.request->expert[rank_of[j]] = expert_of[j]; }
-    }
-    if (cpu_call != nullptr) {
-        for (int s = threadIdx.x; s < cpu_call->jobs; s += blockDim.x) {
-            const int j     = cpu_call->job[s]; // never a fetch job: it moves down by the fetch jobs before it
-            cpu_call->job[s] = j - rank_of[j];
-        }
-    }
-    __threadfence_system();
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        source.fetch.request->layer = source.fetch.layer;
-        source.fetch.request->count = count;
-        __threadfence_system();
-        std::uint32_t sequence = atomicAdd(source.fetch.sequence, 1U) + 1U;
-        if (sequence == 0) { sequence = atomicAdd(source.fetch.sequence, 1U) + 1U; }
-        *reinterpret_cast<volatile std::uint32_t*>(&source.fetch.request->sequence) = sequence;
-        __threadfence_system();
-        call->first   = first;
-        call->count   = count;
-        call->landed  = 0;
-        call->failed  = 0;
-        call->poller  = 0;
-        call->ctas    = 0;
-        call->beat    = *reinterpret_cast<const volatile std::uint32_t*>(source.fetch.heartbeat);
-        call->beat_ns = global_ns();
-        call->pending = sequence;
-    }
-}
-
 // ------------------------------------------------------------------------------------- staging
 
 constexpr int kStageCtas  = 16;    // with 16 KiB chunks, a 256 KiB window of host reads in flight
@@ -331,14 +297,15 @@ constexpr int kMaxPassJobs = 512;
 // non-resident records that are not CPU-served (its misses) to their destinations: the n-th miss in
 // job order lands in frame landing[n] when n < landing_slots and landing[n] >= 0 (block 0 logs
 // landed[n] = its expert), else it takes the next staging slot (pass_jobs <= slots, so all fit).
-// Every CTA ranks the misses with warp ballots; chunk c of the concatenated miss records is copied
-// by CTA c % gridDim.x, keeping the CTAs' reads adjacent. A fetch-served miss (`fetch`, the call's
-// request) is copied from the host's answer once its record has landed; after the pass's copies the
-// last CTA to finish stores `consumed` for the request's records up to the pass's last one.
+// Every CTA ranks the misses with warp ballots; chunk c of the concatenated miss records (each miss's
+// `bytes`) is copied by CTA c % gridDim.x, keeping the CTAs' reads adjacent. A fetch-served miss
+// (`fetch`, the call's request) is copied from the host's answer once its record has landed; after the
+// pass's copies the last CTA to finish stores `consumed` for the request's records up to the pass's
+// last one (when bytes.consume).
 __global__ void __launch_bounds__(kThreads)
     stage_kernel(MoeDispatch dispatch, MoeExpertSource source, int job_base, int pass_jobs,
                  const std::int32_t* __restrict__ cpu_flags, const std::uint8_t** __restrict__ job_records,
-                 FetchCall* __restrict__ fetch) {
+                 FetchCall* __restrict__ fetch, StageBytes bytes) {
     __shared__ int miss_jobs[kMaxPassJobs];
     __shared__ std::uint8_t* miss_dst[kMaxPassJobs];
     __shared__ int warp_misses[kWarps];
@@ -389,7 +356,7 @@ __global__ void __launch_bounds__(kThreads)
                 // The frames are the caller's writable pool; frame_base is const for the read routes.
                 destination = const_cast<std::uint8_t*>(source.frame_base) +
                               static_cast<std::uint64_t>(source.landing[n]) * frame_pitch(source);
-                if (blockIdx.x == 0) { source.landed[n] = expert; }
+                if (bytes.log && blockIdx.x == 0) { source.landed[n] = expert; }
             } else {
                 const int slot = n - landed_before[min(n, landing_slots)];
                 destination    = source.staging_base + static_cast<std::uint64_t>(slot) * frame_pitch(source);
@@ -398,15 +365,16 @@ __global__ void __launch_bounds__(kThreads)
             miss_dst[n]  = destination;
             record       = destination;
         }
-        if (resolved && blockIdx.x == 0) { job_records[job_base + j] = record; }
+        if (resolved && bytes.log && blockIdx.x == 0) { job_records[job_base + j] = record; }
         __syncthreads();
         if (threadIdx.x == 0) {
             for (int v = 0; v < kWarps; ++v) { misses += warp_misses[v]; }
         }
         __syncthreads();
     }
-    const int record_bytes = record_copy_bytes(source);
-    const int kChunks      = (record_bytes + kStageChunk - 1) / kStageChunk;
+    const int end          = bytes.end < 0 ? record_copy_bytes(source) : bytes.end;
+    const int first_chunks = (end - bytes.begin + kStageChunk - 1) / kStageChunk;
+    const int kChunks      = first_chunks + (bytes.end2 - bytes.begin2 + kStageChunk - 1) / kStageChunk;
     constexpr int kVec    = kStageChunk / 16;
     const int total       = misses * kChunks;
     // Tier records live in host slots the host rewrites (RAM slots, the fetch ring): .cv loads
@@ -414,8 +382,9 @@ __global__ void __launch_bounds__(kThreads)
     const bool mutable_host = source.host_table != nullptr;
     __shared__ const std::uint8_t* fetched;
     for (int c = blockIdx.x; c < total; c += gridDim.x) {
-        const int m = c / kChunks, offset = (c % kChunks) * kStageChunk;
-        const int bytes = min(kStageChunk, record_bytes - offset);
+        const int m = c / kChunks, k = c % kChunks;
+        const int offset = k < first_chunks ? bytes.begin + k * kStageChunk : bytes.begin2 + (k - first_chunks) * kStageChunk;
+        const int copied = min(kStageChunk, (k < first_chunks ? end : bytes.end2) - offset);
         const int expert = dispatch.jobs[miss_jobs[m]];
         const int f      = fetch_index(fetch, miss_jobs[m]);
         const std::uint8_t* record;
@@ -431,7 +400,7 @@ __global__ void __launch_bounds__(kThreads)
         if (record == nullptr) { continue; } // the round fails (error word); the passes compute garbage
         const auto* src = reinterpret_cast<const uint4*>(record + offset);
         auto* dst = reinterpret_cast<uint4*>(miss_dst[m] + offset);
-        const int vectors = bytes / 16;
+        const int vectors = copied / 16;
         uint4 v[kVec / kThreads];
 #pragma unroll
         for (int u = 0; u < kVec / kThreads; ++u) {
@@ -445,7 +414,9 @@ __global__ void __launch_bounds__(kThreads)
         }
     }
     // The pass's fetch-served records [0, b) of the request are copied once every CTA is here.
-    const int b = fetch != nullptr && fetch->pending != 0 ? min(job_base + jobs, fetch->first + fetch->count) - fetch->first : 0;
+    const int b = bytes.consume && fetch != nullptr && fetch->pending != 0
+                      ? min(job_base + jobs, fetch->first + fetch->count) - fetch->first
+                      : 0;
     if (b > 0) {
         __syncthreads();
         if (threadIdx.x == 0) {
@@ -466,9 +437,25 @@ __device__ __forceinline__ float router_logit(float value, bool bf16_logits) {
     return bf16_logits ? __bfloat162float(__float2bfloat16_rn(value)) : value;
 }
 
+// The order-preserving key of a non-NaN binary32 for the warp's integer max reduction: a > b exactly when
+// key(a) > key(b), and -0 and +0 (equal as floats) take one key, so equal values tie on the key too.
+__device__ __forceinline__ unsigned route_key(float v) {
+    unsigned u = __float_as_uint(v);
+    if (u == 0x80000000U) { u = 0U; }
+    return (u & 0x80000000U) != 0U ? ~u : (u | 0x80000000U);
+}
+
+__device__ __forceinline__ float route_value(unsigned key) {
+    return __uint_as_float((key & 0x80000000U) != 0U ? (key & 0x7FFFFFFFU) : ~key);
+}
+
 // One warp routes column t: exact top-k by repeated arg-max with lower-id ties, then the weights.
 // Every array index is a compile-time constant (unrolled loops), so the values stay in registers;
-// the selection and softmax order are fixed. Lane k < top_k returns the k-th selected id.
+// the selection and softmax order are fixed. Lane k < top_k returns the k-th selected id. Each
+// selection's warp step is two hardware reductions (redux.sync) instead of a five-step shuffle tree:
+// the largest key, then the lowest id among the lanes holding it, which is the tree's winner (a lane's
+// candidate is never NaN: NaN logits are never selected, as before). A selected -0 is returned as +0,
+// which changes no weight.
 __device__ __forceinline__ int route_column(const float* __restrict__ logits, int experts, int top_k, int t,
                                             bool bf16_logits, std::int32_t* __restrict__ ids,
                                             float* __restrict__ weights, float* __restrict__ shared_gate) {
@@ -497,14 +484,10 @@ __device__ __forceinline__ int route_column(const float* __restrict__ logits, in
                 best_id = e;
             }
         }
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            const float other    = __shfl_xor_sync(0xFFFFFFFFU, best, offset);
-            const int other_id   = __shfl_xor_sync(0xFFFFFFFFU, best_id, offset);
-            if (other > best || (other == best && other_id < best_id)) {
-                best    = other;
-                best_id = other_id;
-            }
-        }
+        const unsigned top_key = __reduce_max_sync(0xFFFFFFFFU, route_key(best));
+        best_id = static_cast<int>(__reduce_min_sync(
+            0xFFFFFFFFU, route_key(best) == top_key ? static_cast<unsigned>(best_id) : 0x7FFFFFFFU));
+        best    = route_value(top_key);
         if (lane == k) {
             selected = best;
             chosen   = best_id;
@@ -533,6 +516,103 @@ __global__ void route_kernel(const float* __restrict__ logits, int experts, int 
     pdl::enter(); // launched as a programmatic dependent of the router projection
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     if (warp < columns) { route_column(logits, experts, top_k, warp, bf16_logits, ids, weights, shared_gate); }
+}
+
+// The drafter pool (candidates §22 VM-01): one warp routes column t over the experts with a
+// slot (moe_route_pooled). It walks route_column's arg-max order (same reductions, ties and clearing); a pick
+// without a slot is cleared and skipped, so the restricted selection is the top_k experts with a slot in that
+// order, and its weights are route_column's arithmetic over them. Whether a pick has a slot comes from its
+// owner lane's bit mask (one shuffle; the table is read once, coalesced), and the selected experts' slots are
+// read after the walk. The first top_k picks, slot or not, are the column's demand.
+__device__ __forceinline__ void route_pooled_column(const float* __restrict__ logits, int experts, int top_k, int t,
+                                                    bool bf16_logits, const std::int32_t* __restrict__ slot_of,
+                                                    std::int32_t* __restrict__ demand, std::int32_t* __restrict__ ids,
+                                                    float* __restrict__ weights, float* __restrict__ shared_gate) {
+    const int lane      = threadIdx.x % 32;
+    const float* column = logits + static_cast<std::size_t>(t) * (experts + 1);
+    constexpr int kPerLane = 16;
+    float values[kPerLane];
+    unsigned pooled = 0U; // bit i: expert lane + 32 i has a slot
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+        const int e = lane + 32 * i;
+        values[i]   = e < experts ? router_logit(column[e], bf16_logits) : -INFINITY;
+        if (e < experts && __ldg(slot_of + e) >= 0) { pooled |= 1U << i; }
+    }
+    const float score = lane == 0 ? router_logit(column[experts], bf16_logits) : 0.0F;
+    float selected = -INFINITY;
+    int chosen     = -1; // lane k: the k-th selected expert
+    int wish       = -1; // lane k: the k-th unrestricted pick
+    int taken      = 0;
+    for (int pick = 0; taken < top_k && pick < experts; ++pick) {
+        float best  = -INFINITY;
+        int best_id = 0x7FFFFFFF;
+#pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+            const int e = lane + 32 * i;
+            if (e < experts && (values[i] > best || (values[i] == best && e < best_id))) {
+                best    = values[i];
+                best_id = e;
+            }
+        }
+        const unsigned top_key = __reduce_max_sync(0xFFFFFFFFU, route_key(best));
+        best_id = static_cast<int>(__reduce_min_sync(
+            0xFFFFFFFFU, route_key(best) == top_key ? static_cast<unsigned>(best_id) : 0x7FFFFFFFU));
+        best    = route_value(top_key);
+        if (lane == pick) { wish = best_id; }
+        const unsigned owner = __shfl_sync(0xFFFFFFFFU, pooled, best_id % 32);
+        if ((owner >> (best_id / 32)) & 1U) {
+            if (lane == taken) {
+                selected = best;
+                chosen   = best_id;
+            }
+            ++taken;
+        }
+#pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+            if (lane + 32 * i == best_id) { values[i] = -INFINITY; }
+        }
+    }
+    const float top = __shfl_sync(0xFFFFFFFFU, selected, 0);
+    float sum       = 0.0F;
+    for (int k = 0; k < top_k; ++k) { sum += expf(__shfl_sync(0xFFFFFFFFU, selected, k) - top); }
+    if (lane < top_k) {
+        // A selection the walk could not fill (fewer than top_k experts with a slot: a caller error) takes
+        // slot 0 at weight 0.
+        ids[static_cast<std::size_t>(t) * top_k + lane]     = chosen >= 0 ? __ldg(slot_of + chosen) : 0;
+        weights[static_cast<std::size_t>(t) * top_k + lane] = chosen >= 0 ? expf(selected - top) / sum : 0.0F;
+    }
+    // Each lane's pick has its slot bit in its owner lane's mask (shuffled from that lane).
+    const unsigned owner = __shfl_sync(0xFFFFFFFFU, pooled, wish >= 0 ? wish % 32 : 0);
+    if (lane < top_k && wish >= 0) {
+        atomicAdd(demand + wish, 1);
+        if (((owner >> (wish / 32)) & 1U) == 0U) { atomicAdd(demand + experts, 1); }
+    }
+    if (lane == 0) { shared_gate[t] = 1.0F / (1.0F + expf(-score)); }
+}
+
+// The drafter pool: the pool's slot-table writes and demand drain (moe_pool_write, moe_pool_drain).
+__global__ void pool_write_kernel(std::int32_t* __restrict__ slot_of, MoePoolWrites writes) {
+    const int i = static_cast<int>(threadIdx.x);
+    if (i < writes.count) { slot_of[writes.expert[i]] = writes.value[i]; }
+}
+
+__global__ void pool_drain_kernel(std::int32_t* __restrict__ demand, std::int32_t* __restrict__ host, int n) {
+    for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
+        host[i]   = demand[i];
+        demand[i] = 0;
+    }
+}
+
+__global__ void route_pooled_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
+                                    bool bf16_logits, const std::int32_t* __restrict__ slot_of,
+                                    std::int32_t* __restrict__ demand, std::int32_t* __restrict__ ids,
+                                    float* __restrict__ weights, float* __restrict__ shared_gate) {
+    pdl::enter(); // launched as a programmatic dependent of the router projection
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    if (warp < columns) {
+        route_pooled_column(logits, experts, top_k, warp, bf16_logits, slot_of, demand, ids, weights, shared_gate);
+    }
 }
 
 // ------------------------------------------------------------------------------------- dispatch
@@ -1263,7 +1343,7 @@ template <bool Pairs>
 void launch_expert_pass_as(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                            const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                            canon::A4Block* h_blocks, int columns_out, bf16* outputs, cudaStream_t stream,
-                           PassPhase phase) {
+                           PassPhase phase, PassPart part) {
     static const bool configured = [] {
         cudaFuncSetAttribute(gate_up_kernel<Pairs>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(sizeof(GateUpShared)));
@@ -1276,26 +1356,30 @@ void launch_expert_pass_as(const bf16* x, const MoeDispatch& dispatch, const Moe
         return true;
     }();
     (void)configured;
-    gate_up_kernel<Pairs><<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared), stream>>>(
-        x, moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_blocks, phase);
-    check_launch("gate/up");
+    if (part != PassPart::Down) {
+        gate_up_kernel<Pairs><<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared), stream>>>(
+            x, moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_blocks, phase);
+        check_launch("gate/up");
+    }
+    if (part == PassPart::GateUp) { return; }
     // A programmatic dependent of the gate/up pass in captured graphs (down_kernel's PDL contract).
-    CUDA_CHECK(pdl::launch_consumer({dim3(kDownCtas, jobs), dim3(kThreads), sizeof(DownShared), stream},
-                                    down_kernel<Pairs>, dispatch, source, static_cast<int>(moe::kHidden), job_records,
-                                    flags, base, static_cast<const canon::A4Block*>(h_blocks), columns_out, outputs,
-                                    phase));
+    CUDA_CHECK(pdl::launch_with(part == PassPart::Down ? pdl::Dependency::Serialized : pdl::Dependency::Programmatic,
+                                {dim3(kDownCtas, jobs), dim3(kThreads), sizeof(DownShared), stream},
+                                down_kernel<Pairs>, dispatch, source, static_cast<int>(moe::kHidden), job_records,
+                                flags, base, static_cast<const canon::A4Block*>(h_blocks), columns_out, outputs,
+                                phase));
 }
 
 void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                         const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                         canon::A4Block* h_blocks, int columns_out, bf16* outputs, cudaStream_t stream,
-                        PassPhase phase = PassPhase::All) {
+                        PassPhase phase = PassPhase::All, PassPart part = PassPart::Both) {
     if (narrow_pairs()) {
         launch_expert_pass_as<true>(x, dispatch, source, top_k, job_records, flags, base, jobs, h_blocks, columns_out,
-                                    outputs, stream, phase);
+                                    outputs, stream, phase, part);
     } else {
         launch_expert_pass_as<false>(x, dispatch, source, top_k, job_records, flags, base, jobs, h_blocks, columns_out,
-                                     outputs, stream, phase);
+                                     outputs, stream, phase, part);
     }
 }
 
@@ -1459,11 +1543,11 @@ struct GateUpShared16 {
 };
 
 template <class G, int Columns>
-__global__ void __launch_bounds__(kThreads)
-    gate_up_kernel_a16(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch, MoeExpertSource source,
-                       int top_k, const std::uint8_t* const* __restrict__ job_records,
-                       const std::int32_t* __restrict__ cpu_flags, int job_base, std::uint16_t* __restrict__ h_plane,
-                       PassPhase phase) {
+__device__ __forceinline__ void gate_up_a16_body(const bf16* __restrict__ x, int hidden, const MoeDispatch& dispatch,
+                                                 const MoeExpertSource& source, int top_k,
+                                                 const std::uint8_t* const* __restrict__ job_records,
+                                                 const std::int32_t* __restrict__ cpu_flags, int job_base,
+                                                 std::uint16_t* __restrict__ h_plane, PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm      = *reinterpret_cast<GateUpShared16<G, Columns>*>(smem_raw);
     const int job = job_base + static_cast<int>(blockIdx.y);
@@ -1518,6 +1602,15 @@ __global__ void __launch_bounds__(kThreads)
                 canon::swiglu_bf16(sm.y[c][2 * k], sm.y[c][2 * k + 1]);
         }
     }
+}
+
+template <class G, int Columns>
+__global__ void __launch_bounds__(kThreads)
+    gate_up_kernel_a16(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch, MoeExpertSource source,
+                       int top_k, const std::uint8_t* const* __restrict__ job_records,
+                       const std::int32_t* __restrict__ cpu_flags, int job_base, std::uint16_t* __restrict__ h_plane,
+                       PassPhase phase) {
+    gate_up_a16_body<G, Columns>(x, hidden, dispatch, source, top_k, job_records, cpu_flags, job_base, h_plane, phase);
 }
 
 template <class G, int Columns>
@@ -1600,7 +1693,7 @@ template <class G, int Columns>
 void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                             const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                             std::uint16_t* h_plane, bf16* outputs, cudaStream_t stream,
-                            PassPhase phase = PassPhase::All) {
+                            PassPhase phase = PassPhase::All, PassPart part = PassPart::Both) {
     constexpr int kGateUpBytes = static_cast<int>(sizeof(GateUpShared16<G, Columns>));
     constexpr int kDownBytes   = static_cast<int>(sizeof(DownShared16<G, Columns>));
     static_assert(kGateUpBytes <= 99 * 1024 && kDownBytes <= 99 * 1024, "an A16 CTA must fit an SM");
@@ -1616,12 +1709,19 @@ void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const Mo
         return true;
     }();
     (void)configured;
-    gate_up_kernel_a16<G, Columns>
-        <<<dim3(G::kGateUpRowGroups / kGateUpGroups, jobs), kThreads, kGateUpBytes, stream>>>(
-            x, G::kHidden, dispatch, source, top_k, job_records, flags, base, h_plane, phase);
-    check_launch("A16 gate/up");
+    if (part != PassPart::Down) {
+        CUDA_CHECK(pdl::launch_with(
+            pdl::Dependency::Serialized,
+            {dim3(G::kGateUpRowGroups / kGateUpGroups, jobs), dim3(kThreads), static_cast<std::size_t>(kGateUpBytes),
+             stream},
+            gate_up_kernel_a16<G, Columns>, x, static_cast<int>(G::kHidden), dispatch, source, top_k, job_records, flags,
+            base, h_plane, phase));
+        check_launch("A16 gate/up");
+    }
+    if (part == PassPart::GateUp) { return; }
     // A programmatic dependent of the gate/up pass in captured graphs (down_kernel's PDL contract).
-    CUDA_CHECK(pdl::launch_consumer(
+    CUDA_CHECK(pdl::launch_with(
+        part == PassPart::Down ? pdl::Dependency::Serialized : pdl::Dependency::Programmatic,
         {dim3(G::kDownRowGroups / kDownGroups, jobs), dim3(kThreads), static_cast<std::size_t>(kDownBytes), stream},
         down_kernel_a16<G, Columns>, dispatch, source, static_cast<int>(G::kHidden), job_records, flags, base,
         static_cast<const std::uint16_t*>(h_plane), outputs, phase));
@@ -2089,7 +2189,8 @@ __global__ void __launch_bounds__(kThreads)
 template <bool Pairs>
 void launch_expert_pass_a4r_as(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                                const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
-                               std::uint16_t* h_plane, bf16* outputs, cudaStream_t stream, PassPhase phase) {
+                               std::uint16_t* h_plane, bf16* outputs, cudaStream_t stream, PassPhase phase,
+                               PassPart part) {
     static const bool configured = [] {
         cudaFuncSetAttribute(gate_up_kernel_a4r<Pairs>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(sizeof(GateUpSharedA4r)));
@@ -2102,30 +2203,37 @@ void launch_expert_pass_a4r_as(const bf16* x, const MoeDispatch& dispatch, const
         return true;
     }();
     (void)configured;
-    gate_up_kernel_a4r<Pairs><<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpSharedA4r), stream>>>(
-        x, dispatch, source, top_k, job_records, flags, base, h_plane, phase);
-    check_launch("A4 residual gate/up");
+    if (part != PassPart::Down) {
+        gate_up_kernel_a4r<Pairs><<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpSharedA4r), stream>>>(
+            x, dispatch, source, top_k, job_records, flags, base, h_plane, phase);
+        check_launch("A4 residual gate/up");
+    }
+    if (part == PassPart::GateUp) { return; }
     // A programmatic dependent of the gate/up pass in captured graphs (down_kernel's PDL contract).
-    CUDA_CHECK(pdl::launch_consumer({dim3(kDownCtas, jobs), dim3(kThreads), sizeof(DownSharedA4r), stream},
-                                    down_kernel_a4r<Pairs>, dispatch, source, job_records, flags, base,
-                                    static_cast<const std::uint16_t*>(h_plane), outputs, phase));
+    CUDA_CHECK(pdl::launch_with(part == PassPart::Down ? pdl::Dependency::Serialized : pdl::Dependency::Programmatic,
+                                {dim3(kDownCtas, jobs), dim3(kThreads), sizeof(DownSharedA4r), stream},
+                                down_kernel_a4r<Pairs>, dispatch, source, job_records, flags, base,
+                                static_cast<const std::uint16_t*>(h_plane), outputs, phase));
 }
 
 // One pass of the two-term narrow kernels: a gate/up CTA per 16 intermediates and a down CTA per 64
 // output rows of each job; h_plane is the workspace's h rows (BF16, wide::kA16HRowElements apart).
 void launch_expert_pass_a4r(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                             const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
-                            std::uint16_t* h_plane, bf16* outputs, cudaStream_t stream, PassPhase phase) {
+                            std::uint16_t* h_plane, bf16* outputs, cudaStream_t stream, PassPhase phase,
+                            PassPart part) {
     if (narrow_pairs()) {
         launch_expert_pass_a4r_as<true>(x, dispatch, source, top_k, job_records, flags, base, jobs, h_plane, outputs,
-                                        stream, phase);
+                                        stream, phase, part);
     } else {
         launch_expert_pass_a4r_as<false>(x, dispatch, source, top_k, job_records, flags, base, jobs, h_plane, outputs,
-                                         stream, phase);
+                                         stream, phase, part);
     }
 }
 
 #include "ops/offloaded_sparse_moe/cuda/ggml_expert.cuh"
+#include "ops/offloaded_sparse_moe/cuda/ggml_expert_a8.cuh"
+#include "ops/offloaded_sparse_moe/cuda/nvfp4_expert_a8.cuh"
 #include "ops/offloaded_sparse_moe/cuda/fp8_expert.cuh"
 #include "ops/offloaded_sparse_moe/cuda/lossless_expert.cuh"
 #include "ops/offloaded_sparse_moe/cuda/narrow_ring_a16.cuh"
@@ -2135,49 +2243,68 @@ void launch_expert_pass_a4r(const bf16* x, const MoeDispatch& dispatch, const Mo
 // column pair under INFERNIX_TMP_NARROW_PAIRS); W4A16 jobs under NarrowA16::kA4Residual the two-term
 // one-column kernels (likewise); other W4A16
 // jobs take them in calls of at most kA16OneColumnCalls columns, else the multi-column kernels, and
-// ring calls (moe::wide::ring_call: the workspace has their x_acts) the narrow ring. A GGUF import's
-// or block-FP8 bank runs its own exact kernels.
+// ring calls (moe::wide::ring_call: the workspace has their x_acts) the narrow ring. Under NarrowA16::kA8
+// a call of at most kA8MaxCallColumns columns runs every W4A16 job on the 8-bit kernels
+// (nvfp4_expert_a8.cuh), whatever its column count, the ring's calls included; with WideA16::kA8 a wider call
+// runs its jobs of at most kMaxColumns columns there (the wide route takes the others). A GGUF import's or
+// block-FP8 bank runs its own kernels (a GGUF bank's 8-bit route likewise, its wide jobs on its own 8-bit
+// tiles). `part` launches only the gate/up or the down matrix (a split forked call; both by default).
 void launch_pass(int columns, const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                  const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                  const moe::wide::ExpertsWorkspace& layout, int columns_out, bf16* outputs, cudaStream_t stream,
-                 PassPhase phase = PassPhase::All) {
+                 PassPhase phase = PassPhase::All, PassPart part = PassPart::Both) {
     // Wide calls (more than kMaxColumns columns) were planned by moe_experts.
     const bool wide = columns > moe::kMaxColumns;
     if (source.ggml.gate_up_format == QType::FP8_E4M3FN_B128) {
         launch_expert_pass_fp8(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase,
-                               wide ? columns_out : 0);
+                               wide ? columns_out : 0, part);
         return;
     }
     if (ggml_bank(source)) {
+        if (a8_call(source, columns)) { // every job of the call (a wide call's wide jobs on the 8-bit tiles)
+            launch_pass_ggml_a8(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase,
+                                part, a8_wide_call(source, columns));
+            return;
+        }
         launch_pass_ggml(x, dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase,
-                         wide ? columns_out : 0, columns);
+                         wide ? columns_out : 0, columns, part);
+        return;
+    }
+    if (nvfp4_a8_call(source, columns)) { // every job of the call, whatever its column count; no ring
+        launch_pass_nvfp4_a8(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase,
+                             part);
+        return;
+    }
+    if (nvfp4_a8_wide_call(source, columns)) { // the narrow jobs; moe::wide::run_pass the others
+        launch_pass_nvfp4_a8(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase,
+                             part, true);
         return;
     }
     if (layout.x_acts != nullptr) {
         launch_ring_pass(columns, dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream,
-                         phase);
+                         phase, part);
         return;
     }
     if (source.activation == moe::ExpertActivation::kA16) {
         auto* h_plane = reinterpret_cast<std::uint16_t*>(layout.h_rows);
         if (source.narrow_a16 == moe::NarrowA16::kA4Residual) { // Flash-Next's geometry (moe_experts checks)
             launch_expert_pass_a4r(x, dispatch, source, top_k, job_records, flags, base, jobs, h_plane, outputs, stream,
-                                   phase);
+                                   phase, part);
             return;
         }
         moe::with_expert_geometry(source.shape, [&]<class G>() {
             if (columns <= kA16OneColumnCalls) {
                 launch_expert_pass_a16<G, 1>(x, dispatch, source, top_k, job_records, flags, base, jobs, h_plane,
-                                             outputs, stream, phase);
+                                             outputs, stream, phase, part);
             } else {
                 launch_expert_pass_a16<G, kA16PassColumns>(x, dispatch, source, top_k, job_records, flags, base, jobs,
-                                                           h_plane, outputs, stream, phase);
+                                                           h_plane, outputs, stream, phase, part);
             }
         });
         return;
     }
     launch_expert_pass(x, dispatch, source, top_k, job_records, flags, base, jobs, layout.h_blocks, columns_out, outputs,
-                       stream, phase);
+                       stream, phase, part);
 }
 
 // ------------------------------------------------------------------------------ CPU-served misses
@@ -2399,6 +2526,7 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
         channel.request->layer  = channel.layer;
         channel.request->jobs   = chosen;
         channel.request->tiered = source.host_table != nullptr ? 1 : 0;
+        channel.request->a8     = a8_route_call(source, columns) ? 1 : 0;
     }
     const int kVectors = source.shape.hidden * 2 / 16;
     const auto* src    = reinterpret_cast<const int4*>(x);
@@ -2498,10 +2626,111 @@ __global__ void __launch_bounds__(kThreads)
     cpu_plan<false>(dispatch, source, x, columns, top_k, max_jobs, cpu_flags, call);
 }
 
+// The fetch plan of one call by the threads [0, kThreads) of a CTA, after its CPU plan: the call's
+// fetch-served jobs (non-resident, no host record, not a CPU job, not streamed) move to the end of
+// dispatch.jobs in a stable partition (cpu_flags and the CPU call's job indices move with them), and
+// their experts are published as one request in job order: the payload, a system-scope fence, then the
+// sequence (never 0). The plan kernel's whole CTA (fetch_plan_kernel: a call whose CPU plan, if any,
+// ran in its own kernel), or (Named) the fused route kernel's planning threads after the CPU plan, so a
+// decode call's fetch plan costs no kernel of its own (Dense8 decode on the SSD tier: 3 us a call).
+struct FetchPlanShared {
+    int expert_of[offloaded_moe::kMaxFetch];
+    int flag_of[offloaded_moe::kMaxFetch];
+    short rank_of[offloaded_moe::kMaxFetch]; // fetch jobs before this one
+    unsigned char fetch_of[offloaded_moe::kMaxFetch];
+    int warp_fetch[kWarps];
+    int carry;
+};
+
+template <bool Named>
+__device__ __forceinline__ void fetch_plan_body(const MoeDispatch& dispatch, const MoeExpertSource& source,
+                                                int max_jobs, std::int32_t* __restrict__ cpu_flags,
+                                                CpuCall* __restrict__ cpu_call, FetchCall* __restrict__ call,
+                                                FetchPlanShared& sm) {
+    const int jobs = min(*dispatch.job_count, max_jobs);
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    if (threadIdx.x == 0) {
+        call->pending = 0;
+        call->count   = 0;
+        sm.carry      = 0;
+    }
+    plan_barrier<Named>();
+    for (int base = 0; base < jobs; base += kThreads) {
+        const int j = base + static_cast<int>(threadIdx.x);
+        bool fetch  = false;
+        if (j < jobs) {
+            const int expert = dispatch.jobs[j];
+            const int flag   = cpu_flags != nullptr ? cpu_flags[j] : 0;
+            sm.expert_of[j]  = expert;
+            sm.flag_of[j]    = flag;
+            fetch = resident_record(source, expert) == nullptr && source.host_table[expert] == nullptr && flag == 0 &&
+                    (source.prefetched == nullptr || source.prefetched[expert] < 0);
+            sm.fetch_of[j] = fetch ? 1 : 0;
+        }
+        const unsigned ballot = __ballot_sync(0xFFFFFFFFU, fetch);
+        if (lane == 0) { sm.warp_fetch[warp] = __popc(ballot); }
+        plan_barrier<Named>();
+        if (j < jobs) {
+            int rank = sm.carry + __popc(ballot & ((1U << lane) - 1U));
+            for (int w = 0; w < warp; ++w) { rank += sm.warp_fetch[w]; }
+            sm.rank_of[j] = static_cast<short>(rank);
+        }
+        plan_barrier<Named>();
+        if (threadIdx.x == 0) {
+            for (int w = 0; w < kWarps; ++w) { sm.carry += sm.warp_fetch[w]; }
+        }
+        plan_barrier<Named>();
+    }
+    const int count = sm.carry;
+    if (count == 0) { return; }
+    const int first = jobs - count;
+    // New index: fetch jobs after every other job, each group in its old order.
+    for (int j = threadIdx.x; j < jobs; j += kThreads) {
+        const int to = sm.fetch_of[j] != 0 ? first + sm.rank_of[j] : j - sm.rank_of[j];
+        dispatch.jobs[to] = sm.expert_of[j];
+        if (cpu_flags != nullptr) { cpu_flags[to] = sm.flag_of[j]; }
+        if (sm.fetch_of[j] != 0) { source.fetch.request->expert[sm.rank_of[j]] = sm.expert_of[j]; }
+    }
+    if (cpu_call != nullptr) {
+        for (int s = threadIdx.x; s < cpu_call->jobs; s += kThreads) {
+            const int j     = cpu_call->job[s]; // never a fetch job: it moves down by the fetch jobs before it
+            cpu_call->job[s] = j - sm.rank_of[j];
+        }
+    }
+    __threadfence_system();
+    plan_barrier<Named>();
+    if (threadIdx.x == 0) {
+        source.fetch.request->layer = source.fetch.layer;
+        source.fetch.request->count = count;
+        __threadfence_system();
+        std::uint32_t sequence = atomicAdd(source.fetch.sequence, 1U) + 1U;
+        if (sequence == 0) { sequence = atomicAdd(source.fetch.sequence, 1U) + 1U; }
+        *reinterpret_cast<volatile std::uint32_t*>(&source.fetch.request->sequence) = sequence;
+        __threadfence_system();
+        call->first   = first;
+        call->count   = count;
+        call->landed  = 0;
+        call->failed  = 0;
+        call->poller  = 0;
+        call->ctas    = 0;
+        call->beat    = *reinterpret_cast<const volatile std::uint32_t*>(source.fetch.heartbeat);
+        call->beat_ns = global_ns();
+        call->pending = sequence;
+    }
+}
+
+__global__ void __launch_bounds__(kThreads)
+    fetch_plan_kernel(MoeDispatch dispatch, MoeExpertSource source, int max_jobs, std::int32_t* __restrict__ cpu_flags,
+                      CpuCall* __restrict__ cpu_call, FetchCall* __restrict__ call) {
+    __shared__ FetchPlanShared sm;
+    fetch_plan_body<false>(dispatch, source, max_jobs, cpu_flags, cpu_call, call, sm);
+}
+
 // route_dispatch_kernel followed by the CPU plan in the same CTA: after a barrier of the whole CTA
 // makes the dispatch visible, its first kThreads threads plan as cpu_plan_kernel does (the same
 // results) and the rest exit, so the plan, and the host's start, follow the dispatch with no kernel
-// boundary.
+// boundary. With `fetch` (a call with a fetch channel), the same threads then make the fetch plan as
+// fetch_plan_kernel does.
 template <bool kMasked>
 __global__ void __launch_bounds__(kDispatchThreads)
     route_dispatch_plan_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
@@ -2510,7 +2739,7 @@ __global__ void __launch_bounds__(kDispatchThreads)
                                float* __restrict__ shared_gate, MoeDispatch dispatch,
                                std::int32_t* __restrict__ route_log, MoeExpertSource source,
                                const bf16* __restrict__ x, int max_jobs, std::int32_t* __restrict__ cpu_flags,
-                               CpuCall* __restrict__ call, MoeColumnMask mask) {
+                               CpuCall* __restrict__ call, FetchCall* __restrict__ fetch, MoeColumnMask mask) {
     __shared__ std::int32_t count[kDispatchThreads];
     __shared__ std::int32_t cursor[kDispatchThreads];
     __shared__ std::int32_t routed[kDispatchThreads];
@@ -2530,6 +2759,11 @@ __global__ void __launch_bounds__(kDispatchThreads)
     __syncthreads();
     if (i >= kThreads) { return; }
     cpu_plan<true>(dispatch, source, x, columns, top_k, max_jobs, cpu_flags, call);
+    if (fetch != nullptr) {
+        __shared__ FetchPlanShared fetch_sm;
+        plan_barrier<true>(); // the CPU plan's flags and job indices, which the fetch plan moves
+        fetch_plan_body<true>(dispatch, source, max_jobs, cpu_flags, call, fetch, fetch_sm);
+    }
 }
 
 // CTAs that warm the source's L2 spans after the waiting CTAs (design §19.3.3 Phase 2).
@@ -2750,6 +2984,41 @@ void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cu
                                     static_cast<float*>(routing.shared_gate.data)));
 }
 
+void moe_route_pooled(const Tensor& logits, std::int32_t top_k, const Tensor& slot_of, std::int32_t* demand,
+                      MoeRouting& routing, cudaStream_t stream, RouterLogits precision) {
+    require(contiguous(logits, DType::FP32) && contiguous(slot_of, DType::I32) && contiguous(routing.ids, DType::I32) &&
+                contiguous(routing.weights, DType::FP32) && contiguous(routing.shared_gate, DType::FP32),
+            "pooled route requires contiguous FP32 logits, an I32 slot table and I32/FP32 outputs");
+    const int experts = logits.ne[0] - 1, columns = logits.ne[1];
+    require(experts > 0 && experts <= 512 && top_k > 0 && top_k <= 16 && top_k <= experts && columns > 0,
+            "pooled route supports up to 512 experts and top-16");
+    require(slot_of.numel() == experts && demand != nullptr, "pooled route needs a slot per expert and demand counts");
+    require(routing.ids.ne[0] == top_k && routing.ids.ne[1] == columns && routing.weights.ne[0] == top_k &&
+                routing.weights.ne[1] == columns && routing.shared_gate.numel() == columns,
+            "pooled route output shapes disagree");
+    const int warps_per_block = kThreads / 32;
+    CUDA_CHECK(pdl::launch_consumer({dim3((columns + warps_per_block - 1) / warps_per_block), dim3(kThreads), 0, stream},
+                                    route_pooled_kernel, static_cast<const float*>(logits.data), experts, columns,
+                                    static_cast<int>(top_k), precision == RouterLogits::kBf16,
+                                    static_cast<const std::int32_t*>(slot_of.data), demand,
+                                    static_cast<std::int32_t*>(routing.ids.data),
+                                    static_cast<float*>(routing.weights.data),
+                                    static_cast<float*>(routing.shared_gate.data)));
+}
+
+void moe_pool_write(std::int32_t* slot_of, const MoePoolWrites& writes, cudaStream_t stream) {
+    require(slot_of != nullptr && writes.count >= 0 && writes.count <= kMoePoolWrites, "pool writes out of range");
+    if (writes.count == 0) { return; }
+    pool_write_kernel<<<1, 32, 0, stream>>>(slot_of, writes);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void moe_pool_drain(std::int32_t* demand, std::int32_t* host, std::int32_t n, cudaStream_t stream) {
+    require(demand != nullptr && host != nullptr && n > 0, "pool drain needs demand counts and a pinned destination");
+    pool_drain_kernel<<<1, 512, 0, stream>>>(demand, host, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 std::size_t moe_dispatch_bytes(std::int32_t experts, std::int32_t entries) {
     const std::size_t words = static_cast<std::size_t>(experts) * 4 + 1 + 1 + static_cast<std::size_t>(entries);
     return (words * sizeof(std::int32_t) + 255) / 256 * 256;
@@ -2901,9 +3170,18 @@ void require_cpu_channel(const Tensor& x, const MoeExpertSource& source) {
     // on placement.
     require(source.activation != offloaded_moe::ExpertActivation::kA16 || source.cpu.narrow_a16 == source.narrow_a16,
             "CPU channel computes another W4A16 narrow arithmetic than the call");
+    require(!ggml_bank(source) || (source.cpu.ggml_a8 != 0) == source.ggml.a8,
+            "CPU channel computes another GGUF activation route than the call (--a8-activations)");
 }
 
 bool fetch_served(const MoeExpertSource& source) { return source.fetch.request != nullptr; }
+
+void require_fetch_channel(const MoeExpertSource& source, std::int32_t max_jobs) {
+    require(source.host_table != nullptr && source.fetch.response != nullptr && source.fetch.consumed != nullptr &&
+                source.fetch.sequence != nullptr && source.fetch.heartbeat != nullptr && source.staging_slots > 0 &&
+                max_jobs <= offloaded_moe::kMaxFetch,
+            "experts fetch channel is incomplete (it needs a host table, staging and at most kMaxFetch jobs)");
+}
 
 } // namespace
 
@@ -2933,6 +3211,11 @@ bool moe_route_dispatch_plan(const Tensor& logits, std::int32_t top_k, MoeRoutin
     const bool masked       = masked_call(routing.mask, columns, shared_job);
     std::int32_t* cpu_flags = nullptr;
     CpuCall* cpu_call       = cpu_call_of(workspace, x, source, max_jobs, outputs.ne[1], &cpu_flags);
+    FetchCall* fetch        = nullptr;
+    if (fetch_served(source)) {
+        require_fetch_channel(source, max_jobs);
+        fetch = fetch_call_of(workspace, x, source, max_jobs, outputs.ne[1]);
+    }
     CUDA_CHECK(pdl::launch_consumer({dim3(1), dim3(kDispatchThreads), 0, stream},
                                     masked ? route_dispatch_plan_kernel<true> : route_dispatch_plan_kernel<false>,
                                     static_cast<const float*>(logits.data), experts, columns, static_cast<int>(top_k),
@@ -2941,7 +3224,7 @@ bool moe_route_dispatch_plan(const Tensor& logits, std::int32_t top_k, MoeRoutin
                                     static_cast<float*>(routing.weights.data),
                                     static_cast<float*>(routing.shared_gate.data), dispatch, route_log,
                                     source, static_cast<const bf16*>(x.data),
-                                    static_cast<int>(max_jobs), cpu_flags, cpu_call, routing.mask));
+                                    static_cast<int>(max_jobs), cpu_flags, cpu_call, fetch, routing.mask));
     return true;
 }
 
@@ -2995,13 +3278,26 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                 source.record_stride % 16 == 0 && frame_pitch(source) % 16 == 0 && source.staging_slots >= 0 &&
                 (source.staging_slots == 0 || source.staging_base != nullptr),
             "experts source is incomplete");
-    require(source.narrow_a16 == moe::NarrowA16::kExact ||
+    require(source.narrow_a16 != moe::NarrowA16::kA4Residual ||
                 (source.activation == moe::ExpertActivation::kA16 && !ggml && source.shape == moe::kFlashNextShape &&
                  source.wide_a16 != moe::WideA16::kLossless),
             "experts: the two-term A4 narrow route needs an NVFP4 W4A16 bank of Flash-Next's geometry");
+    require(source.narrow_a16 != moe::NarrowA16::kA8 ||
+                (source.activation == moe::ExpertActivation::kA16 && !ggml && source.wide_a16 != moe::WideA16::kLossless),
+            "experts: the 8-bit activation route (--a8-activations) takes NVFP4 W4A16 banks off the lossless route");
     require(!ggml || (source.activation == moe::ExpertActivation::kA16 && source.ggml.record_bytes % 16 == 0 &&
                       source.ggml.gate_row_bytes > 0 && source.ggml.down_row_bytes > 0),
             "a ggml bank takes the A16 workspace");
+    require(!source.ggml.a8 || (ggml && source.ggml.gate_up_format != QType::FP8_E4M3FN_B128 &&
+                                source.wide_a16 != moe::WideA16::kLossless),
+            "the 8-bit activation route (--a8-activations) takes GGUF banks off the lossless route");
+    // The 8-bit wide route (WideA16::kA8) keeps a wide call on 8-bit activations: its narrow jobs take the bank's
+    // 8-bit narrow kernels (and its CPU-served misses the CPU route's 8-bit functions), so it needs them.
+    require(source.wide_a16 != moe::WideA16::kA8 ||
+                (source.activation == moe::ExpertActivation::kA16 &&
+                 (ggml ? source.ggml.a8 : source.narrow_a16 == moe::NarrowA16::kA8)),
+            "experts: the 8-bit wide route (WideA16::kA8) needs the bank's 8-bit narrow route (MoeGgmlBank::a8 or "
+            "NarrowA16::kA8)");
     require(source.landing_slots >= 0 && source.landing_slots <= offloaded_moe::kMaxLandingSlots &&
                 (source.landing_slots == 0 || (source.landing != nullptr && source.landed != nullptr)),
             "experts landing is incomplete");
@@ -3023,14 +3319,13 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     }
     FetchCall* fetch = nullptr;
     if (fetch_served(source)) {
-        require(source.host_table != nullptr && source.fetch.response != nullptr && source.fetch.consumed != nullptr &&
-                    source.fetch.sequence != nullptr && source.fetch.heartbeat != nullptr &&
-                    source.staging_slots > 0 && max_jobs <= offloaded_moe::kMaxFetch,
-                "experts fetch channel is incomplete (it needs a host table, staging and at most kMaxFetch jobs)");
+        require_fetch_channel(source, max_jobs);
         fetch = fetch_call_of(workspace, x, source, max_jobs, outputs.ne[1]);
-        fetch_plan_kernel<<<1, kThreads, 0, stream>>>(dispatch, source, max_jobs, cpu ? cpu_flags : nullptr,
-                                                      cpu ? cpu_call : nullptr, fetch);
-        check_launch("fetch plan");
+        if (!cpu_planned) { // else moe_route_dispatch_plan's kernel made the fetch plan after the CPU plan
+            fetch_plan_kernel<<<1, kThreads, 0, stream>>>(dispatch, source, max_jobs, cpu ? cpu_flags : nullptr,
+                                                          cpu ? cpu_call : nullptr, fetch);
+            check_launch("fetch plan");
+        }
     }
     const std::int32_t* flags = cpu ? cpu_flags : nullptr;
     if (source.wide_a16 == moe::WideA16::kLossless) {
@@ -3038,19 +3333,29 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         lossless_experts(x, dispatch, source, top_k, max_jobs, layout, fetch, outputs, stream);
         return;
     }
+    // An NVFP4 W4A16 bank's call on the 8-bit route (NarrowA16::kA8): every job on the 8-bit kernels, so neither
+    // the narrow ring nor the wide route takes part. A wider call with WideA16::kA8 keeps the wide route (its
+    // 8-bit grouped GEMM) for its wide jobs and the 8-bit kernels for the others.
+    const bool nvfp4_a8      = nvfp4_a8_call(source, static_cast<int>(x.ne[1]));
+    const bool nvfp4_a8_wide = nvfp4_a8_wide_call(source, static_cast<int>(x.ne[1]));
     // The narrow ring's x, encoded once here, before any fork (its job words and counters cleared).
-    if (layout.x_acts != nullptr) { launch_ring_prepare(x, layout, static_cast<int>(max_jobs), stream); }
-    // A ggml bank's gate/up kernels read every token's x limbs, encoded once here, before any fork.
-    if (ggml) {
+    if (layout.x_acts != nullptr && !nvfp4_a8) { launch_ring_prepare(x, layout, static_cast<int>(max_jobs), stream); }
+    // A ggml bank's gate/up kernels read every token's x limbs (on the 8-bit route its codes), encoded once
+    // here, before any fork.
+    if (ggml && a8_call(source, static_cast<int>(x.ne[1]))) {
+        launch_encode_x_ggml_a8(x, layout, stream);
+    } else if (ggml) {
         launch_encode_x_ggml(x, layout, stream);
         if (x.ne[1] > moe::kMaxColumns) { launch_plan_ggml(dispatch, max_jobs, layout, stream); }
+    } else if (nvfp4_a8 || nvfp4_a8_wide) {
+        launch_encode_x_nvfp4_a8(x, source, layout, stream); // likewise, every token's codes once per call
     }
     // Passes of at most staging_slots jobs (one pass covering every job without staging).
     const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;
     const int half      = source.staging_slots / 2;
     // In a call of more than eight columns, experts with more than eight take the wide route, pass
     // by pass once each pass's records are resolved; it is planned and x quantized before the passes.
-    const bool use_wide = !ggml && x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
+    const bool use_wide = !ggml && !nvfp4_a8 && x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
     // The staging overlap is not combined with the wide route: in the Program, overlapped calls with
     // wide experts gave run-to-run differences (prefix-cache exactness failures, varying greedy ids;
     // design §19.3.8, "F1 nondeterminism") that serial passes do not; the cause is not identified.
@@ -3074,7 +3379,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
             buffer.landing_slots   = 0;
             if (pass >= 2) { CUDA_CHECK(cudaStreamWaitEvent(source.overlap_stream, events[3 + b], 0)); }
             stage_kernel<<<kStageCtas, kThreads, 0, source.overlap_stream>>>(dispatch, buffer, base, jobs, flags,
-                                                                            job_records, fetch);
+                                                                            job_records, fetch, StageBytes{});
             check_launch("stage");
             CUDA_CHECK(cudaEventRecord(events[1 + b], source.overlap_stream));
             CUDA_CHECK(cudaStreamWaitEvent(stream, events[1 + b], 0));
@@ -3092,11 +3397,42 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         // expert's arithmetic is the same as in a serial pass.
         CUDA_CHECK(cudaEventRecord(source.fork_events[0], stream));
         CUDA_CHECK(cudaStreamWaitEvent(source.fork_stream, source.fork_events[0], 0));
-        stage_kernel<<<kStageCtas, kThreads, 0, source.fork_stream>>>(dispatch, source, 0, max_jobs, flags,
-                                                                      job_records, fetch);
-        check_launch("stage");
         const auto* xs = static_cast<const bf16*>(x.data);
         auto* out      = static_cast<bf16*>(outputs.data);
+        const std::optional<DownBytes> down =
+            source.split_stream != nullptr ? record_down_bytes(source) : std::nullopt;
+        if (down.has_value()) {
+            // Split: every miss's gate/up bytes (the rest of its record but the down rows), then its
+            // down rows; the misses' gate/up pass computes on the split stream beside the second copy,
+            // their down pass once it is done. The join follows the down pass. Fetched records are
+            // reported consumed by the second copy, their last reader. (Until 2026-10-27 a fetch-served
+            // call staged unsplit; the SSD tier always has a fetch channel, so its decode lost the split:
+            // Dense8 with the tier holding every expert, gate/up and down kernels +113 ms over 98 rounds.)
+            stage_kernel<<<kStageCtas, kThreads, 0, source.fork_stream>>>(
+                dispatch, source, 0, max_jobs, flags, job_records, fetch,
+                StageBytes{0, down->begin, down->end, down->record, true, false});
+            check_launch("stage gate/up");
+            CUDA_CHECK(cudaEventRecord(source.split_events[0], source.fork_stream));
+            stage_kernel<<<kStageCtas, kThreads, 0, source.fork_stream>>>(
+                dispatch, source, 0, max_jobs, flags, job_records, fetch,
+                StageBytes{down->begin, down->end, 0, 0, false, true});
+            check_launch("stage down");
+            CUDA_CHECK(cudaEventRecord(source.split_events[1], source.fork_stream));
+            CUDA_CHECK(cudaStreamWaitEvent(source.split_stream, source.split_events[0], 0));
+            launch_pass(x.ne[1], xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, layout, outputs.ne[1],
+                        out, source.split_stream, PassPhase::Staged, PassPart::GateUp);
+            CUDA_CHECK(cudaStreamWaitEvent(source.split_stream, source.split_events[1], 0));
+            launch_pass(x.ne[1], xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, layout, outputs.ne[1],
+                        out, source.split_stream, PassPhase::Staged, PassPart::Down);
+            launch_pass(x.ne[1], xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, layout, outputs.ne[1],
+                        out, stream, PassPhase::Resident);
+            CUDA_CHECK(cudaEventRecord(source.fork_events[1], source.split_stream));
+            if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
+            return;
+        }
+        stage_kernel<<<kStageCtas, kThreads, 0, source.fork_stream>>>(dispatch, source, 0, max_jobs, flags,
+                                                                      job_records, fetch, StageBytes{});
+        check_launch("stage");
         launch_pass(x.ne[1], xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, layout, outputs.ne[1], out,
                     source.fork_stream, PassPhase::Staged);
         launch_pass(x.ne[1], xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, layout, outputs.ne[1], out,
@@ -3114,7 +3450,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     for (int base = 0; base < max_jobs; base += pass_jobs) {
         const int jobs = std::min(pass_jobs, max_jobs - base);
         CUDA_CHECK(pdl::launch_consumer({dim3(source.staging_slots > 0 ? kStageCtas : 1), dim3(kThreads), 0, stream},
-                                        stage_kernel, dispatch, unlanded, base, jobs, flags, job_records, fetch));
+                                        stage_kernel, dispatch, unlanded, base, jobs, flags, job_records, fetch,
+                                        StageBytes{}));
         launch_pass(x.ne[1], static_cast<const bf16*>(x.data), dispatch, source, top_k, job_records, flags, base, jobs,
                     layout, outputs.ne[1], static_cast<bf16*>(outputs.data), stream);
         if (wide) { moe::wide::run_pass(*wide, base / pass_jobs, stream); }

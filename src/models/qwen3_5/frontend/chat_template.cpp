@@ -285,6 +285,15 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     check_preparation_control(control, "chat template");
     const bool continuation =
         options.continuation == PromptContinuationMode::ContinueFinalAssistant;
+    // The next-turn prefill's prompt (hybrid-prefix-cache-spec §7.9): the finished reply rendered
+    // as history before the next turn. Text only: media would take the Vision path.
+    const bool history_only = options.continuation == PromptContinuationMode::NextTurnHistory;
+    if (history_only && (messages.back().role != ChatRole::Assistant ||
+                         std::any_of(messages.begin(), messages.end(),
+                                     [](const ChatMessage& message) { return message.has_media(); }))) {
+        throw std::invalid_argument(
+            "next-turn history requires text messages ending with an assistant reply");
+    }
     Json context = template_parameters(options, special_tokens_, accepted_efforts_);
     if (continuation) {
         const auto& final = messages.back();
@@ -300,7 +309,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     }
     context["continue_final_message"] = continuation;
     context["messages"]               = Json::array();
-    context["add_generation_prompt"]  = !continuation && options.add_generation_prompt;
+    context["add_generation_prompt"]  = !continuation && !history_only && options.add_generation_prompt;
     std::vector<text::TemplateInputRegion> regions;
     std::uint32_t next_tag = 1;
     const auto tag         = [&](std::string pointer) {
@@ -366,6 +375,16 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         if (!message.tool_call_id.empty()) value["tool_call_id"] = message.tool_call_id;
         context["messages"].push_back(std::move(value));
     }
+    if (history_only) {
+        // The next request's first message, rendered only to place the reply in history as that
+        // request will: a tool result when the reply calls tools (the reply stays after the last
+        // user turn), else a user turn (a template that keeps reasoning only after the last user
+        // turn drops the tail's reasoning, as that request will). Cut at its opener below.
+        const ChatMessage& reply = messages.back();
+        Json probe{{"role", reply.tool_calls.empty() ? "user" : "tool"}, {"content", ""}};
+        if (!reply.tool_calls.empty()) probe["tool_call_id"] = reply.tool_calls.front().id;
+        context["messages"].push_back(std::move(probe));
+    }
     std::vector<std::uint32_t> tool_tags;
     if (!options.tool_jsons.empty()) {
         context["tools"] = Json::array();
@@ -382,6 +401,18 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         .control_variables = control_variables};
     auto output = compiled_.render(context, execution);
     auto layout = inspect_prompt_layout(output, media);
+    const auto truncate = [&](std::size_t size) {
+        output.text.resize(size);
+        std::erase_if(output.regions,
+                      [&](const auto& region) { return region.begin > output.text.size(); });
+        for (auto& region : output.regions) region.end = std::min(region.end, output.text.size());
+        std::erase_if(output.literal_spans,
+                      [&](auto span) { return span.begin >= output.text.size(); });
+        if (!output.literal_spans.empty())
+            output.literal_spans.back().end =
+                std::min(output.literal_spans.back().end, output.text.size());
+        layout = inspect_prompt_layout(output, media);
+    };
     std::string continuation_content;
     if (continuation) {
         const auto content = unique_output_region(output, sources.back().tag);
@@ -395,16 +426,27 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                 "chat template cannot continue the final assistant content unambiguously");
         }
         continuation_content = output.text.substr(content->begin, content->end - content->begin);
-        output.text.resize(content->end);
-        std::erase_if(output.regions,
-                      [&](const auto& region) { return region.begin > output.text.size(); });
-        for (auto& region : output.regions) region.end = std::min(region.end, output.text.size());
-        std::erase_if(output.literal_spans,
-                      [&](auto span) { return span.begin >= output.text.size(); });
-        if (!output.literal_spans.empty())
-            output.literal_spans.back().end =
-                std::min(output.literal_spans.back().end, output.text.size());
-        layout = inspect_prompt_layout(output, media);
+        truncate(content->end);
+    }
+    // Next-turn history: the reply's block must end exactly where the next turn's begins. The prompt
+    // keeps that block's <|im_start|>, a control token whatever role the next request opens with, so
+    // the pass's last state (one token before its end, where the opener tap lands) is a frontier the
+    // next request can resume from.
+    std::optional<std::size_t> history_end;
+    if (history_only) {
+        constexpr std::string_view open = "<|im_start|>";
+        if (layout.messages.size() < 2) {
+            throw std::invalid_argument("chat template does not render a turn after the reply");
+        }
+        const auto& next  = layout.messages.back();
+        const auto& reply = layout.messages[layout.messages.size() - 2];
+        if (reply.role != ChatRole::Assistant || !reply.closed || reply.end != next.begin ||
+            output.text.compare(next.begin, open.size(), open) != 0) {
+            throw std::invalid_argument(
+                "chat template does not close the reply where the next turn begins");
+        }
+        history_end = next.begin;
+        truncate(next.begin + open.size());
     }
     RenderedChat result;
     result.continuation_content         = std::move(continuation_content);
@@ -488,12 +530,14 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
 
     const auto generation_begin = continuation
                                       ? std::optional<std::size_t>(layout.messages.back().begin)
-                                  : options.add_generation_prompt ? prefix(messages.size())
-                                                                  : std::nullopt;
-    if (!options.add_generation_prompt && !continuation)
+                                  : options.add_generation_prompt && !history_only ? prefix(messages.size())
+                                                                                : std::nullopt;
+    if (history_only)
+        result.message_boundaries.back() = *history_end;
+    else if (!options.add_generation_prompt && !continuation)
         result.message_boundaries.back() = output.text.size();
     std::optional<std::size_t> first_tail_assistant;
-    if (!continuation) {
+    if (!continuation && !history_only) {
         std::optional<std::size_t> query_message;
         for (std::size_t i = messages.size(); i > 0; --i) {
             if (real_user(messages[i - 1])) {
@@ -547,6 +591,11 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                                           .offset          = begin,
                                           .recovery_offset = begin};
     }
+    // The history's end is where the next request departs from this prompt: its exact opener tap.
+    if (history_only)
+        result.rewrite_checkpoint = RewriteCheckpointByteSpec{.kind = RewriteCheckpointKind::TurnClosure,
+                                                              .offset          = *history_end,
+                                                              .recovery_offset = *history_end};
     const auto part_boundary = [&](std::size_t message,
                                    std::size_t part) -> std::optional<std::size_t> {
         const auto& origin = sources[message];

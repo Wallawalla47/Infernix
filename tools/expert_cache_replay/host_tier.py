@@ -19,8 +19,10 @@ Model of one round (one trace record), following the plan's boundary protocol:
    weight 1 per use, prefill min(T, 16) / T). Reserve landings become residents; of the other
    landings only the last 128 (the ring) are still there, and each is admitted if a slot is free, a
    shadow can go, or it outranks the lowest resident. Then the VRAM policy runs per layer: the
-   engine's LFRU (f / (age + 1) per layer call), budgeted admission (16 per layer per prefill chunk;
-   decode one per layer per token while frames are free, then one every fourth token), admitting
+   engine's LFRU (f / (age + 1) per layer call), budgeted admission (16 per layer per prefill chunk
+   wider than 8 columns by default, although both engines now record 0; narrower calls and decode
+   one per layer per token while frames are free, in full mode until the session's promotions and
+   landings reach the frames, then one every fourth token), admitting
    only experts with a host copy, and the eviction gate: a victim with a host copy is dropped from
    VRAM, one that is not demotion-worthy is dropped to SSD, a demotion-worthy one is demoted (D2H;
    its frame is held, so the newcomer is visible one round later) while the boundary's allowance
@@ -35,11 +37,26 @@ comparisons use recency). Victims are shadows first, then residents; pinned slot
 the boundary, promotion copies in flight, demotions) are never victims. Modes: exclusive (shadows),
 strict (no shadows: a promoted expert's RAM slot is freed), inclusive (independent RAM tier, no
 demotions). Full mode (--ram-slots all) holds every expert in RAM: the VRAM part is then the
-engine's current policy, and --validate replays it with the trace's recorded budgets to compare
-the VRAM hit rate with the engine's own report.
+engine's current policy, and --validate replays it with the trace's recorded budgets and frame
+counts to compare the VRAM hit rate with the engine's own report (replay.py --validate also applies
+a warm start, pools and the engine log's CPU split, and compares with the log's lines).
+
+The VRAM LFRU follows ExpertResidency in both modes: one pool per record stride (one by default;
+`pools` gives a GGUF import's), each with its own clock (one tick per call of its layers), its share
+of the frames (split_frames) and its count halving (every 8,192 ticks scaled by its share of the
+layers; halved counts below 2^-10 become 0). In full mode also: the fill-phase landing (S4: while
+frames are free, a decode or verification round reserves min(16, free / layers) frames per layer,
+the call's first staged misses in job order land there, the CPU taking its share of the misses
+first, and each layer adopts them before its promotions, which they use up); the warm start
+(`warm_start`: counts capped at 16, at most half the frames, each pool its share, best first);
+`follow_frames` (each round's recorded frame count: a shrink evicts the lowest scores); and the
+budget-matched Belady policy ('belady', with a NextUse oracle and another run's budgets).
 
 Approximations: a promotion is visible from the next round (two with a held frame); copy, read
 and prefetch timing are not modelled; landings are read in layer order, ascending expert ids.
+Frame landing assumes job order is ascending expert ids and the CPU split of a call's misses by the
+whole divisor or share (not a GGUF import's one-column divisor by context); the SSD tier's landing
+and warm start, and frame lending, are not modelled.
 
 Usage (from the repository root):
 
@@ -79,6 +96,13 @@ PREFETCH_MAX = 512
 PROMPT_SEED_CREDIT = 256.0  # ExpertOffload's kPromptSeedCredit: the engine's prompt seeding is (256, 0, 0)
 EARLY_TOKENS = 256  # design §17 H8: the hit rate of the first decode tokens after a prompt
 UNKNOWN_POSITION = 0xFFFFFFFF
+LFRU_HALVING_PERIOD = 8192  # ExpertResidency::kLfruHalvingPeriod: a pool's period is its share of the layers
+COUNT_FLOOR = 1.0 / 1024.0  # LfruPolicy::kCountFloor: halved counts below it become 0
+LANDING_SLOTS = 16          # ExpertResidency::kLandingSlots: fill-phase landing frames per layer and round
+SERVED_CALL_COLUMNS = 8     # the Program's kServedCallColumns: a prefill call this narrow promotes at the decode rate
+CPU_JOBS = 16               # ProgramOptions::cpu_expert_jobs: CPU-served misses per decode or verification call
+SEED_COUNT_CAP = 16         # the warm start caps every saved count (kSeedCountCap)
+SEED_SHARE = 0.5            # and loads at most this share of the frames (kSeedShare)
 
 PREFILL, FORCED, DECODE, VERIFY, GRAPH = 0, 1, 2, 3, 4
 KIND_NAMES = {PREFILL: 'prefill', FORCED: 'forced', DECODE: 'decode', VERIFY: 'verify'}
@@ -239,7 +263,7 @@ class Metrics:
                                      'ram_evictions',
                                      'reserve_slots', 'reserve_landings', 'prefetch_reads',
                                      'prompt_seeds', 'prompt_seed_promotions', 'adaptive_admissions',
-                                     'adaptive_swaps'), 0)
+                                     'adaptive_swaps', 'frame_landings', 'warm_start_seeds', 'resizes'), 0)
 
     def summary(self):
         k = self.by_kind
@@ -295,6 +319,30 @@ def link_charged_speed(s, *, t0_ms, cost_ms, miss_ms, link_gbs, record_bytes=Non
     return 1000.0 / ms
 
 
+class NextUse:
+    """Belady's oracle over one round sequence (TierSim's 'belady' VRAM policy): for each key, the next
+    decode or verification round that computes it (any column, as the round reads it); NEVER when none
+    does. keys[i] and after[i]: the keys round i computes and their next use after it (None for other
+    rounds); first: every key's first use."""
+    NEVER = np.iinfo(np.int32).max
+
+    def __init__(self, rounds, layers, experts):
+        base = (np.arange(layers) * experts)[:, None]
+        upcoming = np.full(layers * experts, self.NEVER, np.int32)
+        self.keys = [None] * len(rounds)
+        self.after = [None] * len(rounds)
+        for i in range(len(rounds) - 1, -1, -1):
+            r = rounds[i]
+            if r.kind not in (DECODE, VERIFY):
+                continue
+            ids = r.routes.reshape(layers, -1)
+            keys = np.unique((ids + base)[(ids >= 0) & (ids < experts)])
+            self.keys[i] = keys
+            self.after[i] = upcoming[keys]
+            upcoming[keys] = i
+        self.first = upcoming
+
+
 class TierSim:
     """One configuration of the VRAM / RAM / SSD hierarchy over a key space of layers x experts."""
 
@@ -302,11 +350,32 @@ class TierSim:
                  prior_counts=None, demotion_allowance=DECODE_DEMOTION_ALLOWANCE, reserve=True,
                  prefetch_after_prefill=False, vram_budget='rule', prompt_seed=None, seed=1,
                  prefill_promotions=PREFILL_PROMOTIONS, promotion_interval=PROMOTION_INTERVAL,
-                 vram_policy='lfru'):
+                 vram_policy='lfru', halving=LFRU_HALVING_PERIOD, pools=None, landing=True, link_divisor=1,
+                 link_share=0, cpu_jobs=CPU_JOBS, warm_start=None, follow_frames=False, budgets=None,
+                 next_use=None):
         self.L, self.E, self.K = header['layers'], header['experts'], header['top_k']
         self.N = self.L * self.E
-        self.V = max(0, min(int(vram), self.N - 1))
         self.full = ram_slots is None
+        # Pools (ExpertResidency, one per record stride): each holds its layers' experts in its own frames
+        # with its own LFRU, whose clock ticks once per call of its layers and whose counts halve every
+        # `halving` x its share of the layers ticks (0: never).
+        layer_lists = [list(range(self.L))] if pools is None else [sorted(int(x) for x in p) for p in pools]
+        if any(not p for p in layer_lists) or sorted(x for p in layer_lists for x in p) != list(range(self.L)):
+            raise ValueError('the pools must hold each layer exactly once')
+        self.P = len(layer_lists)
+        self.pool_layers = layer_lists
+        self.pool_of_layer = np.zeros(self.L, np.int64)
+        for p, layers in enumerate(layer_lists):
+            self.pool_of_layer[layers] = p
+        self.pool_of_key = np.repeat(self.pool_of_layer, self.E)
+        self.pool_keys = [np.concatenate([np.arange(x * self.E, (x + 1) * self.E) for x in layers])
+                          for layers in layer_lists]
+        self.pool_period = [max(1, int(halving) * len(layers) // self.L) if halving else 0 for layers in layer_lists]
+        self.pool_now = [0] * self.P
+        self.pool_n = [0] * self.P
+        self.requested = max(0, min(int(vram), self.N - 1))
+        self.pool_V = self._split(self.requested)
+        self.V = sum(self.pool_V)
         self.H = 0 if self.full else int(ram_slots)
         self.H_res = 0 if self.full else max(0, self.H - RAM_EXTRA_SLOTS)
         if mode not in ('exclusive', 'strict', 'inclusive'):
@@ -321,18 +390,44 @@ class TierSim:
         if vram_budget not in ('rule', 'recorded'):
             raise ValueError(f'unknown VRAM budget {vram_budget}')
         self.vram_budget = vram_budget
-        # The VRAM policy: the engine's LFRU with its budgets ('lfru'), or Basalt's adaptive tier
-        # ('adaptive[:DECAY,FLOOR,MARGIN,SWAPS]', candidates §7.6 D12): per-key counts decayed by DECAY
-        # each round, a non-resident key a candidate at FLOOR or more, swapped for its layer's least-
-        # counted resident when it leads by MARGIN, at most SWAPS a round by gain (4 x SWAPS after a
-        # round that ranked 2 x SWAPS candidates, back to SWAPS at every request's start).
-        self.adaptive = parse_vram_policy(vram_policy)
+        # `budgets`: one promotion budget per round, applied as given (another run's applied_budgets,
+        # so a Belady arm admits under the engine arm's budgets); else the rule or the recorded ones.
+        self.budgets = None if budgets is None else list(budgets)
+        self.applied_budgets = []  # the budget each round's boundary applied (LFRU and Belady)
+        # The VRAM policy: the engine's LFRU with its budgets ('lfru'); Belady MIN with bypass under the
+        # same budgets ('belady', with a NextUse oracle: victim choice with perfect knowledge, the
+        # admission throttle unchanged); or Basalt's adaptive tier ('adaptive[:DECAY,FLOOR,MARGIN,SWAPS]',
+        # candidates §7.6 D12): per-key counts decayed by DECAY each round, a non-resident key a candidate
+        # at FLOOR or more, swapped for its layer's least-counted resident when it leads by MARGIN, at most
+        # SWAPS a round by gain (4 x SWAPS after a round that ranked 2 x SWAPS candidates, back to SWAPS at
+        # every request's start).
+        self.belady = vram_policy == 'belady'
+        self.adaptive = None if self.belady else parse_vram_policy(vram_policy)
+        if self.belady and (next_use is None or not self.full):
+            raise ValueError('the Belady VRAM policy needs full mode and a NextUse oracle')
+        if self.adaptive and self.P > 1:
+            raise ValueError("Basalt's adaptive tier has a single pool")
+        self.next_use = next_use
+        self.nu = next_use.first.copy() if self.belady else None  # every key's next use after this round
         self.a_count = np.zeros(self.L * self.E, np.float64)
         self.adaptive_cap = self.adaptive[3] if self.adaptive else 0
-        # The 'rule' budgets: promotions per layer of a prefill chunk (Flash-Next 16, the 122B 0) and
-        # decode tokens per promotion once the frames are full (ExpertOffload::promotion_interval).
+        # The 'rule' budgets: promotions per layer of a prefill chunk wider than SERVED_CALL_COLUMNS (both
+        # models' engines now record 0; narrower calls take the decode rule) and decode tokens per
+        # promotion once the frames are full (ExpertOffload::promotion_interval).
         self.prefill_promotions = int(prefill_promotions)
         self.promotion_interval = max(1, int(promotion_interval))
+        # Fill-phase landing (full mode, the LFRU and Belady policies): a call's misses the CPU does not
+        # serve are staged, the CPU taking min(cpu_jobs, M - kept) of a call's M misses, kept M / d
+        # (link_divisor d) or (M x link_share) >> 8; the first staged ones land in the round's reserved
+        # frames.
+        self.landing = landing and self.full and not self.adaptive
+        self.link_divisor, self.link_share, self.cpu_jobs = int(link_divisor), int(link_share), int(cpu_jobs)
+        self.landed = 0  # adopted landings (ExpertResidency::Stats::landed)
+        # The frame count each round ran with (follow_frames): this replay's frames move by the trace's
+        # change from its startup count (the header's, else the first recorded one).
+        self.follow_frames = follow_frames
+        self.base_frames = int(header.get('frames', 0))
+        self.target = self.requested
         self.allowance_per_decode = demotion_allowance
         self.reserve_on = reserve and not self.full
         self.prefetch_on = prefetch_after_prefill and not self.full
@@ -344,23 +439,32 @@ class TierSim:
         self.rng = np.random.default_rng(seed)
 
         n = self.N
-        # VRAM: the engine's LfruPolicy, a dense resident list and a per-key position. Counts are
-        # binary64 as in the engine (prompt credits are fractions).
+        # VRAM: the engine's LfruPolicy per pool, one dense resident list over the pools and a per-key
+        # position. Counts are binary64 as in the engine (prompt credits and halvings are fractions);
+        # v_last is in the key's pool's ticks.
         self.v_count = np.zeros(n, np.float64)
         self.v_last = np.zeros(n, np.int64)
-        self.v_now = 0
         self.v_pos = np.full(n, -1, np.int64)
-        self.v_keys = np.zeros(max(self.V, 1), np.int64)
+        self.v_keys = np.zeros(n, np.int64)
         self.v_n = 0
         self.visible = np.zeros(n, np.int64)  # first round a resident key is read from its frame
         self.mark = np.zeros(n, bool)
         # Eviction protection (candidates §13 PUB-22, replay only): `guard(round index, round)`, when set,
-        # returns the keys a predictor expects the next rounds to compute; at that round's boundary they
-        # are evicted only when no unprotected resident is left.
+        # names the keys a predictor expects next, evicted at that round's boundary only when no
+        # unprotected resident is left. It returns None; keys (protected at every layer's step: the
+        # oracle's round-wide guard); or a function of the layer giving that layer's keys, evaluated when
+        # the layer's step first needs a victim and protecting them in that step only (LfruPolicy::step's
+        # guard, RoutePredictor::predict(layer): the engine's).
         self.guard = None
         self.guard_mask = np.zeros(n, bool)
+        self.layer_guard = None  # the current step's layer guard, its layer and its keys once evaluated
+        self.guard_layer = 0
+        self.guard_keys = None
         self.promotions = 0
         self.budget_tokens = 0
+        self.seeded_keys = []      # the warm start's experts, in load order
+        self.round_log = None      # a list: per round (kind, lane of row 0, live keys, live hits, promotions, landed)
+        self.admission_log = None  # a list: per round and layer (round, layer, admitted, adopted landings, budget)
         # RAM: state, ranking key, lazy heaps per class (or CLOCK queues), pins.
         self.r_state = np.zeros(n, np.int8)
         self.rank = np.full(n, -np.inf)
@@ -387,6 +491,10 @@ class TierSim:
         if self.full:
             self.r_state[:] = RESIDENT
         self._apply_prior(prior, prior_counts)
+        if warm_start is not None:
+            if not self.full or prior != 'none':
+                raise ValueError('the warm start applies in full mode with no prior')
+            self._warm_start(*warm_start)
 
     # ------------------------------------------------------------------ priors
     def _apply_prior(self, prior, counts):
@@ -403,11 +511,18 @@ class TierSim:
         else:
             raise ValueError(f'unknown prior {prior}')
         order = [int(k) for k in order]
-        for k in order[:self.V]:
-            self._v_insert(k)
+        # The best keys while their pools have frames (one pool: the first V).
+        in_vram = set()
+        for k in order:
+            if self.v_n >= self.V:
+                break
+            p = self.pool_of_key[k]
+            if self.pool_n[p] < self.pool_V[p]:
+                self._v_insert(k)
+                in_vram.add(k)
         if self.full:
             return
-        ram = order[:self.H_res] if self.mode == 'inclusive' else order[self.V:self.V + self.H_res]
+        ram = order[:self.H_res] if self.mode == 'inclusive' else [k for k in order if k not in in_vram][:self.H_res]
         # Prior ranks sit far below any real use, best first: LFU -100 - i * 1e-6 (a use is >= -6 at
         # t = 0), recency -1 - i * 1e-6.
         base = -100.0 if self.policy == 'lfu' else -1.0
@@ -416,10 +531,18 @@ class TierSim:
             self._ram_add(k, RESIDENT)
 
     # ------------------------------------------------------------------ VRAM (engine LFRU)
+    def _split(self, frames):
+        """ExpertResidency::split_frames: one pool takes every frame; several take frames / layers per layer."""
+        if self.P == 1:
+            return [min(frames, self.N - 1)]
+        per_layer = frames // self.L
+        return [min(per_layer * len(layers), len(layers) * self.E - 1) for layers in self.pool_layers]
+
     def _v_insert(self, k):
         self.v_pos[k] = self.v_n
         self.v_keys[self.v_n] = k
         self.v_n += 1
+        self.pool_n[self.pool_of_key[k]] += 1
 
     def _v_erase(self, k):
         at = self.v_pos[k]
@@ -428,35 +551,53 @@ class TierSim:
         self.v_pos[tail] = at
         self.v_n -= 1
         self.v_pos[k] = -1
+        self.pool_n[self.pool_of_key[k]] -= 1
 
     def vram_visible(self, keys):
         """Which keys this round reads from a published VRAM frame (resident, copy landed)."""
         return (self.v_pos[keys] >= 0) & (self.visible[keys] <= self.round)
 
     def _vscore(self, k):
-        return self.v_count[k] / (self.v_now - self.v_last[k] + 1)
+        return self.v_count[k] / (self.pool_now[self.pool_of_key[k]] - self.v_last[k] + 1)
 
-    def _vram_victims(self, need):
+    def _vram_victims(self, need, p):
+        """Pool p's next `need` victims outside the current group (mark): the lowest (score, key), guarded
+        keys last (LfruPolicy::select_victims); the Belady policy's farthest next use, then the lower key."""
         keys = self.v_keys[:self.v_n]
+        if self.P > 1:
+            keys = keys[self.pool_of_key[keys] == p]
         cand = keys[~self.mark[keys]]
         if cand.size == 0:
             return []
-        score = self.v_count[cand] / (self.v_now - self.v_last[cand] + 1)
+        if self.belady:
+            far = self.nu[cand].astype(np.int64)
+            if need == 1:
+                return [int(cand[far == far.max()].min())]
+            return [int(x) for x in cand[np.lexsort((cand, -far))[:need]]]
+        if self.layer_guard is not None and self.guard_keys is None:
+            self.guard_keys = np.asarray(self.layer_guard(self.guard_layer), np.int64)
+            self.guard_mask[self.guard_keys] = True
+        score = self.v_count[cand] / (self.pool_now[p] - self.v_last[cand] + 1)
         guarded = self.guard_mask[cand]
         if need == 1:
-            pool = ~guarded if not guarded.all() else np.ones_like(guarded)
-            low = score[pool].min()
-            return [int(cand[pool & (score == low)].min())]
+            eligible = ~guarded if not guarded.all() else np.ones_like(guarded)
+            low = score[eligible].min()
+            return [int(cand[eligible & (score == low)].min())]
         return [int(x) for x in cand[np.lexsort((cand, score, guarded))[:need]]]
 
     def _budget(self, r):
+        if self.budgets is not None:
+            return int(self.budgets[self.round])
         if self.vram_budget == 'recorded':
             return r.budget
-        if r.kind == PREFILL:
-            return self.prefill_promotions
         if r.kind == FORCED:
             return DECODE_PROMOTIONS
-        filling = self.promotions < self.V if self.full else self.v_n < self.V
+        if r.kind == PREFILL and r.rows * r.width > SERVED_CALL_COLUMNS:
+            return self.prefill_promotions
+        # Decode, verification and CPU-served prefill calls (the Program's decode_budget): one per layer
+        # and token while this session's promotions and landings are fewer than the frames (warm-start
+        # seeds do not count), then one every promotion_interval tokens.
+        filling = self.promotions + self.landed < self.V if self.full else self.v_n < self.V
         if filling:
             return DECODE_PROMOTIONS * r.tokens
         self.budget_tokens += r.tokens
@@ -464,39 +605,59 @@ class TierSim:
         self.budget_tokens %= self.promotion_interval
         return due * DECODE_PROMOTIONS
 
-    def _vram_step(self, group, budget):
-        self.v_now += 1
+    def _tick(self, p):
+        """One call of pool p's layers (LfruPolicy::step): the clock advances, and every count of the pool
+        halves on its period's ticks."""
+        now = self.pool_now[p] + 1
+        self.pool_now[p] = now
+        period = self.pool_period[p]
+        if period and now % period == 0:
+            keys = self.pool_keys[p]
+            half = self.v_count[keys] * 0.5
+            half[half < COUNT_FLOOR] = 0.0
+            self.v_count[keys] = half
+        return now
+
+    def _vram_step(self, group, budget, layer):
+        """One layer's routed group at the boundary (CacheController::on_route); returns the admissions."""
+        p = self.pool_of_layer[layer]
+        now = self._tick(p)
         if group.size == 0:
-            return
+            return 0
         self.v_count[group] += 1
-        self.v_last[group] = self.v_now
+        self.v_last[group] = now
+        capacity = self.pool_V[p]
         misses = group[self.v_pos[group] < 0]
-        if misses.size == 0 or self.V == 0:
-            return
+        if misses.size == 0 or capacity == 0:
+            return 0
         self.mark[group] = True
         try:
+            if self.belady:
+                return self._belady_admit(misses, budget, p)
             if self.full and budget >= misses.size:
                 # The engine's unbudgeted path: every miss is admitted.
-                total = self.v_n + misses.size
-                for v in (self._vram_victims(total - self.V) if total > self.V else []):
+                total = self.pool_n[p] + misses.size
+                for v in (self._vram_victims(total - capacity, p) if total > capacity else []):
                     self._vram_evict(v)
+                admitted = 0
                 for k in misses:
-                    if self.v_n < self.V:
+                    if self.pool_n[p] < capacity:
                         self._vram_admit(int(k), held=False)
-                return
+                        admitted += 1
+                return admitted
             if not self.full:
                 misses = misses[self.r_state[misses] != 0]  # only experts with a host copy
             if misses.size == 0 or budget == 0:
-                return
-            score = self.v_count[misses] / (self.v_now - self.v_last[misses] + 1)
+                return 0
+            score = self.v_count[misses] / (now - self.v_last[misses] + 1)
             admitted = 0
             for i in np.lexsort((misses, -score)):
                 if admitted >= budget:
                     break
                 k = int(misses[i])
                 held = False
-                if self.v_n >= self.V:
-                    victims = self._vram_victims(1)
+                if self.pool_n[p] >= capacity:
+                    victims = self._vram_victims(1, p)
                     if not victims or not score[i] > self._vscore(victims[0]):
                         break
                     v = victims[0]
@@ -512,8 +673,137 @@ class TierSim:
                         self._m().events['vram_drops'] += 1
                 self._vram_admit(k, held)
                 admitted += 1
+            return admitted
         finally:
             self.mark[group] = False
+
+    def _belady_admit(self, misses, budget, p):
+        """Belady MIN with bypass within the step's budget: the misses with the nearest next use first, each
+        into a free frame, or over the resident whose next use is the farthest while its own is nearer; a
+        miss never used again is served without admission."""
+        nu = self.nu[misses].astype(np.int64)
+        admitted = 0
+        for i in np.lexsort((misses, nu)):
+            if admitted >= budget or nu[i] >= NextUse.NEVER:
+                break
+            if self.pool_n[p] >= self.pool_V[p]:
+                victims = self._vram_victims(1, p)
+                if not victims or not nu[i] < self.nu[victims[0]]:
+                    break
+                self._vram_evict(victims[0])
+            self._vram_admit(int(misses[i]), held=False)
+            admitted += 1
+        return admitted
+
+    def _landing_slots(self, r):
+        """ExpertResidency::before_round(landing): a decode or verification round reserves, for every layer,
+        min(LANDING_SLOTS, free frames / layers) frames of its pool (the scarcest pool's count for all)."""
+        if not self.landing or r.kind not in (DECODE, VERIFY) or self.V == 0:
+            return 0
+        slots = LANDING_SLOTS
+        for p in range(self.P):
+            slots = min(slots, (self.pool_V[p] - self.pool_n[p]) // len(self.pool_layers[p]))
+        return max(0, slots)
+
+    def _staged(self, missed, columns):
+        """The misses of one call the GPU stages, in job order (ascending experts): the CPU's plan takes
+        min(cpu_jobs, M - kept) of the M misses, the fewest-column ones first and in job order within a
+        width, and keeps the rest on the link (cpu_plan_body)."""
+        m = missed.size
+        if self.link_share > 0:
+            kept = (m * self.link_share) >> 8
+        else:
+            kept = m // self.link_divisor if self.link_divisor > 0 else 0
+        cpu = min(self.cpu_jobs, m - kept)
+        if cpu <= 0:
+            return missed
+        staged = np.ones(m, bool)
+        staged[np.lexsort((missed, columns))[:cpu]] = False
+        return missed[staged]
+
+    def _adopt(self, layer, landed, group):
+        """ExpertResidency::after_round's landing: each expert that landed in one of the layer's reserved
+        frames becomes resident there (CacheController::adopt: published next round; a full pool first
+        evicts its lowest-score resident outside the layer's group), unless it is already resident or
+        loading. Returns how many were adopted; they use up the layer's promotion budget."""
+        if landed is None or landed.size == 0:
+            return 0
+        p = self.pool_of_layer[layer]
+        adopted = 0
+        self.mark[group] = True
+        try:
+            for k in (int(x) for x in landed):
+                if self.v_pos[k] >= 0:
+                    continue
+                if self.pool_n[p] >= self.pool_V[p]:
+                    victims = self._vram_victims(1, p)
+                    if not victims:
+                        continue
+                    self._vram_evict(victims[0])
+                self._v_insert(k)
+                self.visible[k] = self.round + 1
+                adopted += 1
+        finally:
+            self.mark[group] = False
+        self.landed += adopted
+        self._m().events['frame_landings'] += adopted
+        return adopted
+
+    def _belady_advance(self):
+        """After a round's reads: the next use of each key it computed moves past it."""
+        keys = self.next_use.keys[self.round]
+        if keys is not None:
+            self.nu[keys] = self.next_use.after[self.round]
+
+    def _warm_start(self, counts, ranked):
+        """ExpertResidency::warm_start as the Program calls it: every key's count from the state, capped at
+        SEED_COUNT_CAP (last use 0, every clock 0), then at most SEED_SHARE of the frames loaded, each pool
+        its share of them, its keys in the state's ranking (CacheController::seed). Published before the
+        first round, counted as neither promotions nor landings."""
+        counts = np.asarray(counts, np.int64)
+        if counts.size != self.N:
+            raise ValueError(f'the warm start has {counts.size} counts for {self.N} experts')
+        self.v_count[:] = np.minimum(counts, SEED_COUNT_CAP)
+        if self.V == 0:
+            return
+        max_keys = int(SEED_SHARE * self.V)
+        ranked = np.asarray(ranked, np.int64)
+        ranked = ranked[(ranked >= 0) & (ranked < self.N)]
+        for p in range(self.P):
+            share = max_keys * self.pool_V[p] // self.V
+            for k in (int(x) for x in ranked[self.pool_of_key[ranked] == p][:share]):
+                if self.v_pos[k] >= 0 or self.pool_n[p] >= self.pool_V[p]:
+                    continue
+                self._v_insert(k)
+                self.seeded_keys.append(k)
+        self._m().events['warm_start_seeds'] += len(self.seeded_keys)
+
+    def _follow(self, r):
+        """The frame count the round ran with: the pool resized between rounds (apply_vram_target)."""
+        if not r.frames:
+            return
+        if not self.base_frames:
+            self.base_frames = r.frames
+        target = max(0, min(self.requested + r.frames - self.base_frames, self.N - 1))
+        if target != self.target:
+            self.target = target
+            self._resize(target)
+
+    def _resize(self, frames):
+        """ExpertResidency::resize: each pool takes its split of `frames`; a shrink evicts the pool's
+        lowest-score residents wherever their frames are (LfruPolicy::set_capacity: no group or guard is
+        spared; Belady: the farthest next uses), and a grow only adds room."""
+        targets = self._split(frames)
+        for p, target in enumerate(targets):
+            excess = self.pool_n[p] - target
+            if excess > 0:
+                for v in self._vram_victims(excess, p):
+                    if not self.full and self.r_state[v] == 0:
+                        self._m().events['vram_drops'] += 1  # resizing drops, never demotes
+                    self._vram_evict(v)
+            self.pool_V[p] = target
+        self.V = sum(targets)
+        self._m().events['resizes'] += 1
 
     def _adaptive_step(self, live_counts, r):
         """Basalt's adaptive tier at a round boundary (generate.cpp rank_swaps / xq_round, b80e026,
@@ -607,24 +897,26 @@ class TierSim:
         events = self._m().events
         events['prompt_seeds'] += 1
         credited = np.nonzero(uses)[0]
-        self.v_count[credited] += credit * uses[credited] / counted
-        self.v_last[credited] = self.v_now
+        scale = credit / counted  # the engine's per-token credit, then scale x uses (the same roundings)
+        self.v_count[credited] += scale * uses[credited]
+        self.v_last[credited] = np.asarray(self.pool_now, np.int64)[self.pool_of_key[credited]]
         if not self.full or budget == 0 or self.V == 0:
             return
         for layer in range(self.L):
+            p = self.pool_of_layer[layer]
             group = credited[(credited >= layer * self.E) & (credited < (layer + 1) * self.E)]
             misses = group[self.v_pos[group] < 0]
             if misses.size == 0:
                 continue
             self.mark[group] = True
             try:
-                score = self.v_count[misses] / (self.v_now - self.v_last[misses] + 1)
+                score = self.v_count[misses] / (self.pool_now[p] - self.v_last[misses] + 1)
                 admitted = 0
                 for i in np.lexsort((misses, -score)):
                     if admitted >= budget:
                         break
-                    if self.v_n >= self.V:
-                        victims = self._vram_victims(1)
+                    if self.pool_n[p] >= self.pool_V[p]:
+                        victims = self._vram_victims(1, p)
                         if not victims or not score[i] > self._vscore(victims[0]):
                             break
                         self._vram_evict(victims[0])
@@ -875,10 +1167,12 @@ class TierSim:
             self.requests += 1
         self.current_half = self.half_of_request(self.lane_request.get(int(r.lanes[0]), 0))
         m = self._m().by_kind[r.kind]
+        promotions_before, landed_before = self.promotions, self.landed
         self.allowance = 1 << 60 if r.kind == PREFILL else self.allowance_per_decode
         self._publish()
         # A lane's prefill rounds form its prompt until its first decode or verification round, before
-        # which the prompt seeds (the engine seeds right after the prompt's last chunk).
+        # which the prompt seeds (the engine seeds right after the prompt's last chunk, before that
+        # boundary's resize).
         if r.kind == PREFILL:
             self.prompt_rounds.setdefault(int(r.lanes[0]), []).append(r)
         elif r.kind in (DECODE, VERIFY):
@@ -888,6 +1182,8 @@ class TierSim:
                     self.since_prompt[lane] = 0
                     if self.prompt_seed is not None:
                         self._seed_prompt(rounds)
+        if self.follow_frames:
+            self._follow(r)
         early = (r.kind in (DECODE, VERIFY) and r.rows == 1
                  and self.since_prompt.get(int(r.lanes[0]), EARLY_TOKENS) < EARLY_TOKENS)
         if self.prefetch_on and r.kind in (DECODE, VERIFY):
@@ -897,6 +1193,9 @@ class TierSim:
                     self._prefetch()
         if self.reserve_on and r.kind == PREFILL:
             self._take_reserve(r)
+        # Fill-phase landing frames per layer (full mode): each layer's call lands its first staged misses.
+        slots = self._landing_slots(r)
+        frame_landed = [None] * self.L
 
         # Reads: every expert the round computes, live or not.
         layer_base = (np.arange(self.L) * self.E)[:, None]
@@ -905,8 +1204,13 @@ class TierSim:
         reads = 0
         layers_with_reads = 0
         for layer in range(self.L):
-            keys = np.unique(computed[layer])
+            if slots:
+                keys, widths = np.unique(computed[layer], return_counts=True)  # widths: the columns per expert
+            else:
+                keys = np.unique(computed[layer])
             in_vram = self.vram_visible(keys)
+            if slots:
+                frame_landed[layer] = self._staged(keys[~in_vram], widths[~in_vram])[:slots]
             m['computed'] += keys.size
             m['vram_hits'] += int(np.count_nonzero(in_vram))
             if self.full:
@@ -942,11 +1246,14 @@ class TierSim:
             m['tokens'] += int(np.count_nonzero(r.live))
         groups = []
         live_counts = []
+        round_keys = round_hits = 0
         for layer in range(self.L):
             keys, counts = np.unique(live_routes[layer], return_counts=True)
             groups.append(keys)
             live_counts.append((keys, counts * weight))
             hits = int(np.count_nonzero(self.vram_visible(keys)))
+            round_keys += keys.size
+            round_hits += hits
             m['live_keys'] += keys.size
             m['live_vram_hits'] += hits
             if early:
@@ -981,18 +1288,38 @@ class TierSim:
             self._adaptive_step(live_counts, r)
         else:
             budget = self._budget(r)
+            self.applied_budgets.append(budget)
+            if self.belady:
+                self._belady_advance()
             guarded = self.guard(self.round, r) if self.guard is not None else None
-            if guarded is not None:
-                self.guard_mask[guarded] = True
-            for layer in range(self.L):
-                self._vram_step(groups[layer], budget)
-            if guarded is not None:
-                self.guard_mask[guarded] = False
+            layer_guard = guarded if callable(guarded) else None
+            round_guard = None if guarded is None or layer_guard is not None else np.asarray(guarded, np.int64)
+            if round_guard is not None:
+                self.guard_mask[round_guard] = True
+            try:
+                for layer in range(self.L):
+                    # The layer's landed experts first: they use up its promotion budget
+                    # (ExpertResidency::after_round).
+                    adopted = self._adopt(layer, frame_landed[layer], groups[layer])
+                    self.layer_guard, self.guard_layer = layer_guard, layer
+                    admitted = self._vram_step(groups[layer], max(0, budget - adopted), layer)
+                    if self.guard_keys is not None:
+                        self.guard_mask[self.guard_keys] = False
+                        self.guard_keys = None
+                    self.layer_guard = None
+                    if self.admission_log is not None:
+                        self.admission_log.append((self.round, layer, admitted, adopted, budget))
+            finally:
+                if round_guard is not None:
+                    self.guard_mask[round_guard] = False
         self.protect.clear()
         if r.kind in (DECODE, VERIFY):
             for lane in (int(x) for x in r.lanes):
                 if lane in self.since_prompt:
                     self.since_prompt[lane] += r.tokens
+        if self.round_log is not None:
+            self.round_log.append((r.kind, int(r.lanes[0]), round_keys, round_hits,
+                                   self.promotions - promotions_before, self.landed - landed_before))
         self.round += 1
 
     def summary(self):
@@ -1144,7 +1471,7 @@ def main(argv=None):
     if args.validate:
         for seed in seeds:
             result = run_config(paths, {'vram': header['frames'], 'ram_slots': None, 'vram_budget': 'recorded',
-                                        'prior': 'none', 'prompt_seed': seed})
+                                        'prior': 'none', 'prompt_seed': seed, 'follow_frames': True})
             s = result['total']
             print(f'full mode, {header["frames"]} frames, recorded budgets, prompt seed {format_prompt_seed(seed)}: '
                   f'VRAM hits {100 * s["vram_hit_live"]:.2f} % of live routed experts (engine report: "since start" '

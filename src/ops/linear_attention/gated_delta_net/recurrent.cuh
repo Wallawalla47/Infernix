@@ -522,6 +522,20 @@ struct FoldAccess {
     std::int32_t record_capacity;
     std::int32_t width;
     GdnReplayFoldKernelRows rows;
+    // Device rows (GdnReplayFoldPlan::execute_device): row b folds in place at state slot device_slots[b] for
+    // device_commit[b] columns, read when the kernel runs, so a captured graph serves every commit; null: `rows`
+    // (by value). A row whose slot or count is out of range folds nothing.
+    const std::int32_t* device_slots  = nullptr;
+    const std::int32_t* device_commit = nullptr;
+    std::int32_t slot_count           = 0;
+
+    __device__ __forceinline__ GdnReplayFoldKernelRow row_of(std::int32_t batch) const {
+        if (device_commit == nullptr) { return rows.row[batch]; }
+        const std::int32_t slot = __ldg(device_slots + batch);
+        std::int32_t commit     = __ldg(device_commit + batch);
+        if (commit < 0 || commit > width || slot < 0 || slot >= slot_count) { commit = 0; }
+        return {slot, slot, commit, 0};
+    }
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         const std::int32_t batch       = static_cast<std::int32_t>(blockIdx.y);
@@ -547,7 +561,7 @@ struct FoldAccess {
 
     __device__ __forceinline__ std::int32_t
     active_columns(const RecurrentCoordinates& coord) const {
-        return rows.row[coord.batch].commit_columns;
+        return row_of(coord.batch).commit_columns;
     }
 
     __device__ __forceinline__ std::int64_t record_outer(const RecurrentCoordinates& coord) const {
@@ -559,7 +573,7 @@ struct FoldAccess {
         const std::int64_t slot_stride =
             static_cast<std::int64_t>(Geometry::kValueHeads) * kStateDim * kStateDim;
         return recurrent_layer0 + static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
-               static_cast<std::int64_t>(rows.row[coord.batch].source_state_slot) * slot_stride +
+               static_cast<std::int64_t>(row_of(coord.batch).source_state_slot) * slot_stride +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
@@ -567,7 +581,7 @@ struct FoldAccess {
         const std::int64_t slot_stride =
             static_cast<std::int64_t>(Geometry::kValueHeads) * kStateDim * kStateDim;
         return recurrent_layer0 + static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
-               static_cast<std::int64_t>(rows.row[coord.batch].destination_state_slot) *
+               static_cast<std::int64_t>(row_of(coord.batch).destination_state_slot) *
                    slot_stride +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
@@ -610,16 +624,13 @@ struct FoldAccess {
 
         const std::int32_t tid     = coord.warp * kWarpSize + coord.lane;
         const std::int32_t channel = tile_block * 128 + tid;
+        const GdnReplayFoldKernelRow row = row_of(coord.batch);
         const __nv_bfloat16* source_history =
             conv_layer0 + static_cast<std::int64_t>(coord.layer) * conv_layer_stride +
-            static_cast<std::int64_t>(rows.row[coord.batch].source_state_slot) *
-                (3LL * Geometry::kConvChannels) +
-            channel;
+            static_cast<std::int64_t>(row.source_state_slot) * (3LL * Geometry::kConvChannels) + channel;
         __nv_bfloat16* destination_history =
             conv_layer0 + static_cast<std::int64_t>(coord.layer) * conv_layer_stride +
-            static_cast<std::int64_t>(rows.row[coord.batch].destination_state_slot) *
-                (3LL * Geometry::kConvChannels) +
-            channel;
+            static_cast<std::int64_t>(row.destination_state_slot) * (3LL * Geometry::kConvChannels) + channel;
         const __nv_bfloat16* record =
             conv_record + record_outer(coord) * width * Geometry::kConvChannels + channel;
 

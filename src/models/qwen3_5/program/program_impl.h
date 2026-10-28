@@ -369,6 +369,16 @@ struct HybridLaneState {
     // position prefill reached (state computed on the grid equals any other request's cold
     // computation of the same prefix). Unbounded otherwise.
     std::uint32_t publish_frontier = std::numeric_limits<std::uint32_t>::max();
+    // What this sequence published that a non-finite failure withdraws (spec §7.8): the blocks
+    // whose Device copy is its page and the snapshots it created. `withdraw` marks that failure
+    // (set by the commit that discards its row); `saves` counts the cache file's saves at admission.
+    std::vector<runtime::prefix_cache::NodeRef> owned;
+    std::vector<runtime::prefix_cache::SnapshotRef> created;
+    // The snapshots its captures superseded: the withdrawal restores those still cached, so a resend resumes
+    // from what was cached before it (superseded snapshots are evicted first).
+    std::vector<HybridSuperseded> superseded;
+    bool withdraw      = false;
+    std::uint64_t saves = 0;
 };
 
 class ProgramImpl {
@@ -853,6 +863,10 @@ public:
     std::string hybrid_fingerprint_;
     std::optional<HybridCachePersistence> hybrid_shutdown_save_;
     std::uint64_t hybrid_saved_writes_ = 0; // host_write_bytes at the last save or load
+    std::uint64_t hybrid_saves_        = 0; // periodic saves of the attached file that succeeded
+    // Entries withdrawn after a non-finite failure that another sequence or a transfer still pinned
+    // (spec §7.8): every later lane release retries them.
+    runtime::prefix_cache::Withdrawal hybrid_withdrawal_;
     // What the last finished lane's next turn resumes from, for a tool-call hold: its endpoint
     // (an echoing client) and its prompt's last tap (a client re-rendering the reply). Invalid
     // where none was published.
@@ -927,8 +941,13 @@ public:
     // published, for a tool-call hold.
     [[nodiscard]] runtime::prefix_cache::SnapshotRef
     hybrid_publish_endpoint(SequenceState& sequence, bool endpoint) noexcept;
-    // Drops the lane's index pins and pending taps. Safe on any lane state.
+    // Drops the lane's index pins and pending taps. Safe on any lane state. A lane marked
+    // `withdraw` writes nothing through and withdraws what it published (hybrid_withdraw).
     void hybrid_release_lane(std::uint32_t lane) noexcept;
+    // After a non-finite failure, once the lane's pins are released: its snapshots' Host writes land,
+    // then its blocks and snapshots leave the cache, and the attached cache file is rewritten at its
+    // next save (deleted now when a save since the lane's admission may hold them).
+    void hybrid_withdraw(HybridLaneState& lane);
     // Supersedes the snapshot the sequence resumed from once it snapshots past it at
     // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3). Each returns
     // what it superseded, for hybrid_undo_supersession.

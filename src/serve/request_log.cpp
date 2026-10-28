@@ -895,7 +895,14 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"held_device_evictions", delta(&RuntimeStats::hybrid_held_device_evictions)},
                  {"held_snapshot_losses", delta(&RuntimeStats::hybrid_held_snapshot_losses)},
                  {"held_host_refusals", delta(&RuntimeStats::hybrid_held_host_refusals)},
-                 {"tool_call_holds", delta(&RuntimeStats::hybrid_tool_call_holds)}};
+                 {"tool_call_holds", delta(&RuntimeStats::hybrid_tool_call_holds)},
+                 {"next_turn_prefill",
+                  Json{{"started", delta(&RuntimeStats::next_turn_prefills_started)},
+                       {"completed", delta(&RuntimeStats::next_turn_prefills_completed)},
+                       {"yielded", delta(&RuntimeStats::next_turn_prefills_yielded)},
+                       {"skipped", delta(&RuntimeStats::next_turn_prefills_skipped)},
+                       {"dropped", delta(&RuntimeStats::next_turn_prefills_dropped)},
+                       {"computed_tokens", delta(&RuntimeStats::next_turn_prefill_tokens)}}}};
     }
     // The device (NVML): readings at the interval's end, energy and policy-limited time over it;
     // null without NVML, and each figure null where the driver does not report it.

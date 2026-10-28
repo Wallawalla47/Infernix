@@ -254,7 +254,13 @@ INFERNIX_QWEN4_NGRAM=G:/out/qwen3_8_flash_next.ninfer.ngram \
 ```
 
 They cover the forward pass against the FP64 reference, the SSD tier's records, the route trace, VRAM
-pressure, the prefix cache, preemption, `/v1/decide` and recovery from a failed expert read.
+pressure, the prefix cache, preemption, `/v1/decide` and recovery from a failed expert read. Two use
+test hooks: `infernix_qwen4_exp_nonfinite_withdraw_real_test` reports a row's logits as non-finite
+after the request published prefix-cache entries (the entries are withdrawn, also from a saved cache
+file), and `infernix_qwen4_exp_vision_lend_real_test` (an artifact with the vision tower) limits the
+expert frames a Vision window may be lent (the image request waits or is refused alone with
+`media_budget_exceeded`). The hybrid prefix test's `nonfinite-withdraw` scenario
+(`INFERNIX_HYBRID_REAL_SCENARIO`) checks the withdrawal on Qwen3.5.
 
 Without their artifact variable, CTest marks these real Engine tests as skipped. Real-artifact targets
 carry the `real` label and `RUN_SERIAL` so CTest runs them alone. Run directly invoked GPU
@@ -311,6 +317,27 @@ reproducible route the tokens and the teacher-forced log-probabilities of the 16
 decoded text are bit-identical; on the default route, which resumes from the decode-computed
 endpoint, the mean log-probability difference stays within max(0.1, 4 x) that of a resume from a
 prefill-made state. The Qwen4Exp entry runs DFlash2 only with `INFERNIX_QWEN4_DFLASH2`.
+
+`infernix_qwen4_exp_startup_capture_real_test` (arguments `plain mtp dflash2`; TEMPORARY with
+`INFERNIX_TMP_STARTUP_CAPTURE`, Flash-Next design §19.3.37) runs two prompts, alone and then together, through an
+Engine that captures each CUDA graph at its first use and one that captures the graph set at startup: on the
+reproducible route the ids must be equal; on both routes no graph may be captured after the startup capture. It
+prints each Engine's construction time and free VRAM. It reads `INFERNIX_QWEN4_ARTIFACT`, `INFERNIX_QWEN4_NGRAM`,
+`INFERNIX_QWEN4_DFLASH2` (dflash2 skips without it) and `INFERNIX_QWEN4_KV`.
+
+`infernix_qwen3_5_calibrated_order_test` (host only) checks the Qwen3.5-122B-A10B's calibrated expert order: the
+shape guard (a table serves only its exact geometry), the conversion to the warm start's state, the built-in table
+(empty until generated, else 48 x 256 permutations), and that a usable saved state wins over the order while a
+missing, foreign or damaged file falls back to it and `--expert-state off` starts empty.
+`tests/test_expert_cache_calibrated_order.py` covers its generator (`tools/expert_cache_replay/calibrated_order.py`).
+
+`infernix_qwen3_5_tokenizer_golden_real_test` compares the tokenizer's ids with Hugging Face
+`tokenizers` on about 2,600 adversarial strings (whitespace families, combining marks, ZWJ emoji,
+numbers, paths, code, special-token spellings; `tests/fixtures/qwen3_5/tokenizer_golden.json`). It needs
+the tokenizer files the golden was made from, not an artifact: `py -3.11 -I
+tests/models/qwen3_5/generate_tokenizer_golden.py <artifact> <golden.json> <dir>` writes them from any
+Qwen3.5-family artifact (and regenerates the golden), and `INFERNIX_TEST_TOKENIZER_DIR=<dir>` runs the
+test (skipped without it, and for a tokenizer.json of another size).
 
 The agent entry checks multi-turn continuation and branching. The preemption entry exercises
 Replay recovery and cancellation while paused or replaying; `INFERNIX_PREEMPTION_REAL_SCENARIO`

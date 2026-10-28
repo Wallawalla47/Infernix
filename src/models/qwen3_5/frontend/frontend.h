@@ -100,6 +100,10 @@ public:
                         const ThinkingControlOptions& thinking            = {},
                         const std::optional<OutputConstraint>& constraint = {},
                         const ToolChoice& tool_choice                     = {}) const;
+    // Builds the constraint compiler's vocabulary index now instead of at the first constrained
+    // request, which otherwise pays it before its prefill starts. Callable from any thread and
+    // more than once; a constrained request that arrives while it runs waits for it.
+    void warm_constraints() const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
     [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
     // Which instruction positions the active chat template renders. prepare() and count_tokens()

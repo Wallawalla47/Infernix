@@ -30,6 +30,7 @@
 #include "models/qwen4_exp/expert_offload.h"
 #include "runtime/expert_offload/placement.h"
 #include "models/qwen4_exp/program/calibrated_order.h"
+#include "runtime/expert_offload/drafter_pool.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/prefix/call_plan.h"
 #include "models/qwen4_exp/program/prefix/prefix_cache.h"
@@ -68,6 +69,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 namespace infernix::models::qwen4_exp {
@@ -147,6 +149,17 @@ struct LanePrefix {
     // restore copied back from the Host tier.
     std::uint32_t cached_tokens  = 0;
     std::uint64_t restored_bytes = 0;
+    // What the current request published that a non-finite failure withdraws (prefix_withdraw;
+    // hybrid-prefix-cache-spec §7.8): the blocks whose Device copy is its page, and its captures
+    // before the latest (`capture`). `withdraw` marks that failure (set by the commit that releases
+    // its row); `saves` counts the cache file's saves at admission.
+    std::vector<runtime::prefix_cache::NodeRef> owned;
+    std::vector<std::uint64_t> captures;
+    // The resume snapshot its first capture superseded: the withdrawal restores it (superseded snapshots are
+    // evicted first), so a resend resumes from it.
+    std::optional<runtime::prefix_cache::SnapshotRef> superseded;
+    bool withdraw       = false;
+    std::uint64_t saves = 0;
 };
 
 struct QuoteImpl {
@@ -320,6 +333,8 @@ struct DeviceLayout {
     bool kv_elastic             = false;
     std::uint32_t kv_base_pages = 0;
     std::size_t mtp_column_bytes = 0, mtp_ones = 0;
+    // The drafter pool: the drafter pool's device bytes (runtime::expert_offload::DrafterExpertPool::device_bytes; 0: none).
+    std::size_t drafter_pool = 0;
     // DFlash2 (docs/maintainer/dflash.md): drafts per proposal; the feature columns, a round region
     // (every column of a decode or verification round) then a call region (a prefill call's or layer
     // walk's last window), and their bytes; the context ring of every lane, the drafter's io and its
@@ -473,6 +488,7 @@ public:
         ExpertResidency::Stats cache_at_admission;
         std::uint64_t cpu_served_at_admission = 0;
         HostExpertTier::Stats tier_at_admission{}; // SSD tier mode
+        expert_cache::HostTier::Losses losses_at_admission{};
         NgramVolume::Counters ngram; // this request's n-gram row traffic
         GateTraffic gate;            // its verification rounds' rows read behind the n-gram gate
         std::unique_ptr<qwen3_5::detail::NgramProposer> proposer; // copy proposals over history
@@ -544,7 +560,7 @@ public:
         d.chunk         = static_cast<std::int32_t>(std::min(o.prefill_chunk, o.max_context));
         // Without free cache resume every prefill call starts on the GDN prefill's 16-token grid.
         if (!o.free_cache_resume) {
-            constexpr auto grid = static_cast<std::int32_t>(kResumeGrid);
+            constexpr auto grid = static_cast<std::int32_t>(kGdnGrid);
             d.chunk             = std::max(grid, d.chunk / grid * grid);
         }
         d.mtp_k         = d.mtp ? static_cast<std::int32_t>(o.mtp_draft_tokens) : 0;
@@ -705,6 +721,12 @@ public:
             d.mtp_io.configs   = (d.mtp_io.verify_q + candidates * verified + 1) / 2 * 2;
             d.mtp_io.runner_up = d.mtp_io.configs + sizeof(ops::SamplingConfig) / 4 * lanes;
             d.mtp_io.words     = d.mtp_io.runner_up + lanes * k;
+            // The drafter pool: the drafter's pooled experts (their banks are pinned, not in the
+            // model's device bytes).
+            if (config.mtp_expert_slots > 0) {
+                d.drafter_pool = runtime::expert_offload::DrafterExpertPool::device_bytes(config.mtp_expert_bytes, dim(config.mtp_expert_slots),
+                                                                 dim(c.moe.experts));
+            }
         }
 
         // The DFlash2 drafter: the target features of every verification column or a call's last
@@ -773,7 +795,7 @@ public:
         b.staging   = d.staging;
         b.state     = d.gdn_bytes + d.ple + d.tails + d.window + d.records_bytes + d.ple_records + d.qsa_records +
                   (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0) + d.dflash_features +
-                  d.dflash_ring;
+                  d.dflash_ring + d.drafter_pool;
         b.io = d.io.bytes + d.logits32 + d.logits16 + 4ULL * lanes + 4ULL * lanes +
                sizeof(ops::SamplingConfig) * lanes + d.token_counts + 4ULL * d.spec.words + d.mtp_ones +
                4ULL * d.mtp_io.words + 4ULL * d.dflash_io.words + kGateStatsBytes * lanes +
@@ -783,6 +805,8 @@ public:
                d.score_io;
         b.residency            = ExpertResidency::table_bytes(expert_layout(c), d.columns);
         b.expert_record_stride = d.record_stride;
+        b.expert_tier_list_slots =
+            tier_ring_slots(o, d.staging_slots) + HostExpertTier::Options{}.prefetch + HostExpertTier::Options{}.demotion;
         b.expert_frame_bytes   = d.frame_bytes;
         b.max_frames           = ExpertResidency::max_frames(expert_layout(c));
         b.graph_bound          = graph_bound(o.max_concurrency, static_cast<std::uint32_t>(W),
@@ -790,7 +814,20 @@ public:
                                              static_cast<std::uint32_t>(d.dflash_k));
         // screened-lm-head's rounds keep their own decode and verification graphs.
         if (o.screened_lm_head) { b.graph_bound += o.max_concurrency * static_cast<std::uint32_t>(W + 1); }
+        // A commit graph per batch size and width of the speculative rounds (commit_verified).
+        if (W > 1) { b.graph_bound += o.max_concurrency * static_cast<std::uint32_t>(W); }
         return d;
+    }
+
+    // The SSD tier's ring: a call's CPU jobs hold their ring slots until the call's answer, and a pass's
+    // fetched records until the pass has copied them, so it holds both with a pass to spare.
+    static std::uint32_t tier_ring_slots(const ProgramOptions& o, std::int32_t staging_slots) {
+        const std::uint32_t cpu_cap =
+            o.cpu_expert_workers > 0 && o.cpu_expert_jobs > 0
+                ? std::min<std::uint32_t>(std::max(o.cpu_expert_jobs, o.cpu_assist_jobs),
+                                          static_cast<std::uint32_t>(ops::offloaded_moe::kMaxCpuJobs))
+                : 0U;
+        return std::max<std::uint32_t>(128, cpu_cap + 2U * static_cast<std::uint32_t>(staging_slots));
     }
 
     // The chunks of the KV backing that pages [0, pages) of every plane and the block tables need.
@@ -812,24 +849,36 @@ public:
         return static_cast<std::size_t>(std::count(need.begin(), need.end(), std::uint8_t{1})) * kKvChunkBytes;
     }
 
-    // 16-bit-activation experts' wide route under these options, which sizes the workspace: the
-    // expert-a4-residual fast paths' (NVFP4 W4A16 banks, two or three terms) or ggml-bf16-prefill's (GGUF
-    // banks' BF16 planes, a superset of the exact layout).
+    // 16-bit-activation experts' wide route under these options, which sizes the workspace: --a8-activations'
+    // (GGUF and NVFP4 W4A16 banks; the exact layout), the expert-a4-residual fast paths' (NVFP4 W4A16 banks, two
+    // or three terms) or ggml-bf16-prefill's (GGUF banks' BF16 planes, a superset of the exact layout), in the
+    // Forward's order.
     static ops::offloaded_moe::WideA16 wide_a16(const ProgramOptions& o) noexcept {
+        if (o.fast_paths.a8_experts_wide) { return ops::offloaded_moe::WideA16::kA8; }
         if (o.fast_paths.expert_a4_terms == 3) { return ops::offloaded_moe::WideA16::kA4Residual3; }
         if (o.fast_paths.expert_a4_terms == 2) { return ops::offloaded_moe::WideA16::kA4Residual; }
-        return ops::has_route(o.fast_paths.dense_routes, ops::LinearRoutes::GgmlBf16Wide) ? ops::offloaded_moe::WideA16::kGgmlBf16
-                                                                                          : ops::offloaded_moe::WideA16::kExact;
+        return ops::has_route(o.fast_paths.prefill_routes, ops::LinearRoutes::GgmlBf16Wide) ? ops::offloaded_moe::WideA16::kGgmlBf16
+                                                                                            : ops::offloaded_moe::WideA16::kExact;
     }
 
     // The CPU expert engine's W4A16 arithmetic: expert-a4-residual-decode's two terms on NVFP4 W4A16
-    // banks when it is selected (the Forward gives those banks' GPU narrow calls the same), else exact.
+    // banks when it is selected, else --a8-activations' 8-bit route (the Forward gives those banks' GPU narrow
+    // calls the same), else exact.
     ops::offloaded_moe::NarrowA16 cpu_narrow_a16() const noexcept {
+        const auto& bank     = *parameters_.layers.front().moe.bank;
+        const bool nvfp4_a16 = bank.activation == ops::offloaded_moe::ExpertActivation::kA16 &&
+                               bank.planes.gate_up_format == QType::NVFP4_MUL;
+        return nvfp4_a16 && options_.fast_paths.expert_a4_narrow ? ops::offloaded_moe::NarrowA16::kA4Residual
+               : nvfp4_a16 && options_.fast_paths.a8_experts ? ops::offloaded_moe::NarrowA16::kA8
+                                                             : ops::offloaded_moe::NarrowA16::kExact;
+    }
+
+    // --a8-activations on a GGUF import: the CPU expert engine computes the 8-bit route's requests (the Forward
+    // gives the banks' calls MoeGgmlBank::a8 with the same choice).
+    bool cpu_ggml_a8() const noexcept {
         const auto& bank = *parameters_.layers.front().moe.bank;
-        return options_.fast_paths.expert_a4_narrow && bank.activation == ops::offloaded_moe::ExpertActivation::kA16 &&
-                       bank.planes.gate_up_format == QType::NVFP4_MUL
-                   ? ops::offloaded_moe::NarrowA16::kA4Residual
-                   : ops::offloaded_moe::NarrowA16::kExact;
+        return options_.fast_paths.a8_experts && bank.planes.gate_up_format != QType::NVFP4_MUL &&
+               bank.planes.gate_up_format != QType::FP8_E4M3FN_B128;
     }
 
     // The workspace arena of a Program with `lanes` lanes and the plan's widths: the forward at its
@@ -843,12 +892,18 @@ public:
             execution::Forward::workspace_bytes(c, std::max(columns, lanes * W), dim(o.max_context), o.kv_cache,
                                                 wide_a16(o)) +
             ops::sampling_workspace_capacity_bytes(d.token_domain, 1, lanes);
-        // f16-accumulate-prefill: a prefill projection's input encoded as FP16 columns, K up to the
-        // GDN/QSA value width (the output projections' input).
-        if (ops::has_route(o.fast_paths.dense_routes, ops::LinearRoutes::F16Accumulate)) {
+        // A prefill projection's input encoded for its prefill route, K up to the GDN/QSA value width (the output
+        // projections' input): f16-accumulate-prefill's FP16 columns, or the two E4M3 planes of --a8-activations'
+        // block-scaled pair (MXFP8 dense, in place of f16-accumulate-prefill).
+        {
             const std::size_t k = std::max<std::size_t>({std::size_t(c.hidden_size), std::size_t(c.gdn.value_width()),
                                                          std::size_t(c.attention.query_width())});
-            bytes += ops::linear_f16_accumulate_workspace_bytes(dim(k), std::max(columns, lanes * W));
+            if (ops::has_route(o.fast_paths.prefill_routes, ops::LinearRoutes::F16Accumulate)) {
+                bytes += ops::linear_f16_accumulate_workspace_bytes(dim(k), std::max(columns, lanes * W));
+            }
+            if (ops::has_route(o.fast_paths.prefill_routes, ops::LinearRoutes::Fp8A8PairBlock32)) {
+                bytes += ops::linear_fp8_a8_pair_block32_workspace_bytes(dim(k), std::max(columns, lanes * W));
+            }
         }
         if (W > 1) {
             std::size_t accept =
@@ -923,7 +978,6 @@ public:
         dflash_k_      = plan_.dflash_k;
         max_width_     = plan_.max_width;
         columns_       = plan_.columns;
-        pages_per_row_ = plan_.pages_per_row;
         kv_pages_      = plan_.kv_pages;
         width_         = dim(c_.residual_width());
         span_          = dim(c_.ple.conv_span());
@@ -953,6 +1007,7 @@ public:
         if (screened_head_ && !parameters_.output_head_screen) {
             throw std::logic_error("Qwen4Exp: screened-lm-head needs the LM head's bound screen");
         }
+        probe_ngram_volume();
 
         // Every fixed allocation below is checked against the plan and against device free memory
         // (an allocation the driver placed in system memory fails startup, design §19.3.7).
@@ -1072,6 +1127,7 @@ public:
         experts.frames.assign(c_.num_hidden_layers, nullptr);
         if (max_width_ > 1) { allocate_verification(lanes, allocated); }
         if (plan_.dflash2) { allocate_dflash2(lanes, allocated); }
+        if (plan_.drafter_pool > 0) { create_drafter_pool(experts, allocated); }
         work_capacity_ = plan_.work;
         wide_work_     = plan_.wide_work;
         work_          = std::make_unique<WorkspaceArena>(work_capacity_);
@@ -1098,9 +1154,15 @@ public:
         experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
         experts.staging_slots = plan_.staging_slots;
         // The expert cache's tables and route log; its frames come last (below).
+        // A GGUF import's experts take Basalt's adaptive tier (IQ3_S decode 1.070-1.076x the LFRU in four A/Bs,
+        // 2026-10-27/28, hit rate 84.6 against 85.1 % with half the promotions); NVFP4 and block-FP8 banks keep the LFRU
+        // (Dense8 0.971x adaptive).
+        const QType experts_format = parameters_.layers.front().moe.bank->planes.gate_up_format;
+        const auto policy = experts_format != QType::NVFP4_MUL && experts_format != QType::FP8_E4M3FN_B128
+                                ? ExpertResidency::VramPolicy::Adaptive
+                                : ExpertResidency::VramPolicy::Lfru;
         residency_ = std::make_unique<ExpertResidency>(expert_layout(c_), std::move(banks), record_stride, columns_,
-                                                       device_.device,
-                                                       host_strides);
+                                                       device_.device, host_strides, policy);
         allocated += plan_.bytes.residency;
         if (allocated != plan_.bytes.fixed_bytes()) {
             throw std::logic_error("Qwen4Exp: the Program's device allocations differ from its device plan");
@@ -1121,6 +1183,16 @@ public:
         for (auto& event : overlap_.shared_events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
         experts.shared_stream = overlap_.shared_stream;
         experts.shared_events = overlap_.shared_events;
+        // The stream on which a forked call's staged misses compute (their down rows stage beside the gate/up pass;
+        // Dense8 MTP decode +6.7 / +1.3 / +10.3 %, Ornith +1.6 / +8.0 / +4.6 %, IQ3_S within spread, 2026-10-27).
+        {
+            CUDA_CHECK(cudaStreamCreateWithPriority(&overlap_.split_stream, cudaStreamNonBlocking, side_priority));
+            for (auto& event : overlap_.split_events) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+            }
+            experts.split_stream = overlap_.split_stream;
+            experts.split_events = overlap_.split_events;
+        }
         // The prefill chunk the expert cache can lend a wide workspace for, from the frames the
         // cache will start with (sized below with the same demand); before the SSD tier, whose
         // tickets are sized by the chunk. A cache of several frame pools lends from one, which the
@@ -1139,15 +1211,8 @@ public:
             }
             // Slots of the largest record (a GGUF import's layers differ); a VRAM victim's demotion
             // copies a whole frame (that pitch) into one.
-            // A call's CPU jobs hold their ring slots until the call's answer, and a pass's fetched
-            // records until the pass has copied them: the ring holds both with a pass to spare.
-            const std::uint32_t cpu_cap =
-                options_.cpu_expert_workers > 0 && options_.cpu_expert_jobs > 0
-                    ? std::min<std::uint32_t>(std::max(options_.cpu_expert_jobs, options_.cpu_assist_jobs),
-                                              static_cast<std::uint32_t>(ops::offloaded_moe::kMaxCpuJobs))
-                    : 0U;
             HostExpertTier::Options tier;
-            tier.ring = std::max<std::uint32_t>(128, cpu_cap + 2U * static_cast<std::uint32_t>(plan_.staging_slots));
+            tier.ring = tier_ring_slots(options_, plan_.staging_slots);
             const std::uint32_t lists = tier.ring + tier.prefetch + tier.demotion;
             const std::uint64_t keys  = static_cast<std::uint64_t>(store->layers()) * store->experts();
             // Pinned slots up to every key besides the lists; unpinned records for the keys they leave.
@@ -1193,12 +1258,12 @@ public:
                                                    parameters_.model.info().artifact_id));
                 records = &*striped_store_;
                 tier.io.demand_depth *= 2;
-                tier.io.total_depth = tier.io.demand_depth + tier.io.prefetch_depth;
+                tier.io.total_depth = tier.io.demand_depth + tier.io.restore_depth + tier.io.prefetch_depth;
                 diagnostic("SSD tier: expert record tails from " + options_.expert_stripe.string(),
                            DiagnosticLevel::Info);
             }
             tier_ = std::make_unique<HostExpertTier>(*records, std::move(tier));
-            residency_->attach_tier(tier_.get());
+            residency_->attach_tier(tier_.get(), options_.expert_ram_exclusive);
             if (tier_->refused_slots() > 0) {
                 diagnostic("SSD expert tier: Windows refused to page-lock " + std::to_string(tier_->refused_slots()) +
                                " of the planned expert slots (its limit is the GPU's shared memory); they are kept as "
@@ -1331,6 +1396,8 @@ public:
                     .cpus        = placement_.cpus,
                     .activation  = parameters_.layers.front().moe.bank->activation,
                     .narrow_a16  = cpu_narrow_a16(),
+                    .ggml_a8     = cpu_ggml_a8(),
+                    .nvfp4_a8    = cpu_narrow_a16() == ops::offloaded_moe::NarrowA16::kA8,
                     .records     = tier_.get(), // tier mode: SSD-only jobs read through the tier
                     // Reported when it happens; check_expert_error then stops the Engine with it.
                     .on_failure  = [this](const std::string& why) {
@@ -1402,7 +1469,16 @@ public:
         // The SSD tier has no records in RAM before its fill: the CPU team's rates are measured on its
         // RAM copies now, so the decode miss divisor follows this record size and CPU, not the reference.
         if (tier_ && cpu_service_) {
+            // Right after the tier's fill (tens of GiB of direct reads) the machine's memory is slow for a few seconds:
+            // Dense8's probe read 9,377 experts/s there and 18,942 5 s later in the same process, on the same records
+            // (2026-10-27), and the low reading kept half the decode misses on the link instead of a third for the
+            // whole session (decode -26 %). The rates are measured again after a pause; the better reading stands.
             measure_cpu_rate(record_stride);
+            const double first_experts = cpu_expert_rate_, first_columns = cpu_column_rate_;
+            std::this_thread::sleep_for(kTierRateSettle);
+            measure_cpu_rate(record_stride);
+            cpu_expert_rate_ = std::max(cpu_expert_rate_, first_experts);
+            cpu_column_rate_ = std::max(cpu_column_rate_, first_columns);
             for (auto& channel : experts.cpu) {
                 channel.pcie_divisor = pcie_divisor();
                 channel.pcie_share   = pcie_share();
@@ -1425,6 +1501,7 @@ public:
         forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
                                                         std::move(experts), dim(options_.max_context), options_.fast_paths);
         if (dflash2_) { create_dflash2_drafter(); }
+        capture_graph_set();
         device_.synchronize();
         report_lane_cost(lanes, residency_->frame_bytes());
     }
@@ -1478,15 +1555,6 @@ public:
         base->pages     = (positions + kPagedKVPageSize - 1) / kPagedKVPageSize;
         base->prompt = std::make_shared<const PreparedPrompt>(std::move(prompt));
         return RequestBasePlan(std::move(base));
-    }
-
-    bool feasible(const RequestBasePlan& base) const noexcept {
-        // A window lends at most what serving never gives up (a quarter of the frames stays).
-        const bool frames = !base.impl_ || !base.impl_->vision ||
-                            base.impl_->vision->window.lease_bytes <=
-                                residency_->lend_capacity_bytes();
-        return base.impl_ != nullptr && frames && base.impl_->pages <= pool_->capacity_pages() &&
-               base.impl_->pages <= static_cast<std::uint32_t>(pages_per_row_);
     }
 
     // The positions one round may write past the lane's frontier: a verification's columns and the
@@ -1557,11 +1625,11 @@ public:
     }
 
     // Stages the binding of `source` on `lane`: re-selects against the cache as it is now (crediting
-    // a lane-resident snapshot), reserves the prompt plus one round and maps the cached blocks. The Begin
-    // the Engine published names the source's frontier, so a changed choice is refused and the Engine
-    // falls back to the next source (the root).
-    runtime::ResourceReservation start_binding(const RequestBasePlan& base, runtime::LaneId destination,
-                                               const SourceCandidate& source, ResumeState* resume) {
+    // a lane-resident snapshot), reserves the prompt plus one round, lends the Vision window
+    // (vision_lend) and maps the cached blocks. The Begin the Engine published names the source's
+    // frontier, so a changed choice is refused and the Engine falls back to the next source (the root).
+    BindingReservation start_binding(const RequestBasePlan& base, runtime::LaneId destination,
+                                     const SourceCandidate& source, ResumeState* resume) {
         if (source.hybrid == nullptr) { throw std::logic_error("Qwen4Exp: a binding source carries no quote"); }
         if (resume != nullptr && resume->impl_ == nullptr) { throw std::logic_error("Qwen4Exp: a resume carries no state"); }
         const QuoteImpl& q = *source.hybrid;
@@ -1609,10 +1677,11 @@ public:
         lane.dflash_frontier = 0;
         lane.row = tables_->acquire(static_cast<std::int32_t>(index));
         const auto shortage_of = [&](std::uint32_t need) {
-            runtime::ResourceReservation out;
+            BindingReservation out;
             out.shortage.main_kv_pages = need > pool_->available_pages() ? need - pool_->available_pages() : 0;
             return out;
         };
+        vision_make_room(q.vision.get());
         if (selection) {
             lane.prefix.reuse  = q.summary.publish_continuation;
             lane.prefix.hashes = data.block_hashes;
@@ -1631,7 +1700,15 @@ public:
                 lane.row = KVExecutionRowLease{};
                 return out;
             }
-            if (q.vision) { vision_reserve(lane, q.vision, data); }
+            if (q.vision) {
+                vision_reserve(lane, q.vision, data);
+                if (auto refused = vision_lend(lane, index)) {
+                    lane.vision.reset(); // nothing was lent
+                    prefix_unpin(*selection);
+                    lane.row = KVExecutionRowLease{};
+                    return std::move(*refused);
+                }
+            }
             const std::uint64_t restored = prefix_->counters().host_restore_bytes;
             prefix_activate(lane, index, *selection, *reservation, q.pages);
             lane.prefix.cached_tokens  = selection->cached_tokens;
@@ -1647,7 +1724,14 @@ public:
                 lane.row = KVExecutionRowLease{};
                 return out;
             }
-            if (q.vision) { vision_reserve(lane, q.vision, data); }
+            if (q.vision) {
+                vision_reserve(lane, q.vision, data);
+                if (auto refused = vision_lend(lane, index)) {
+                    lane.vision.reset(); // nothing was lent
+                    lane.row = KVExecutionRowLease{};
+                    return std::move(*refused);
+                }
+            }
             lane.pages.clear();
             lane.pages.reserve(q.pages);
             pool_->materialize(*reservation, q.pages, lane.pages);
@@ -1697,7 +1781,10 @@ public:
         lane.decode_share_ns = 0;
         lane.cache_at_admission = residency_->stats();
         lane.cpu_served_at_admission = cpu_service_ ? cpu_service_->served_experts() : 0;
-        if (tier_) { lane.tier_at_admission = tier_->stats(); }
+        if (tier_) {
+            lane.tier_at_admission   = tier_->stats();
+            lane.losses_at_admission = tier_->controller().losses();
+        }
         lane.ngram                   = {};
         lane.gate                    = {};
         lane.begin = runtime::BeginSummary{.prompt_tokens        = lane.prompt_tokens,
@@ -1714,7 +1801,7 @@ public:
         transaction_lane_ = index;
         replaying_        = false;
         ++revision_;
-        runtime::ResourceReservation out;
+        BindingReservation out;
         out.reserved = true;
         return out;
     }
@@ -1769,7 +1856,7 @@ public:
     // Binds a request paused after its first token: the deepest cached state of its ledger up to
     // the paused frontier (the pause's own capture when it is still cached), then a replay of the
     // ledger to that frontier, without sampling. The pages cover the replay and one round.
-    runtime::ResourceReservation bind_replay(const BasePlanImpl& b, std::uint32_t index, ResumeStateImpl& r) {
+    BindingReservation bind_replay(const BasePlanImpl& b, std::uint32_t index, ResumeStateImpl& r) {
         Lane& lane = lanes_[index];
         kv_busy();
         const auto& prompt = qwen3_5::PreparedPromptAccess::view(*b.prompt);
@@ -1781,7 +1868,7 @@ public:
             prefix_->drain();
             selection = b.reuse ? prefix_select(ledger, b, index) : prefix_root(ledger, b);
             if (!selection) {
-                runtime::ResourceReservation out;
+                BindingReservation out;
                 out.shortage.main_kv_pages = pages > pool_->available_pages() ? pages - pool_->available_pages() : 1U;
                 return out;
             }
@@ -1809,6 +1896,10 @@ public:
         lane.mtp_live       = mtp_;
         lane.dflash_frontier = 0;
         lane.row            = tables_->acquire(static_cast<std::int32_t>(index));
+        // The items past the resume frontier are encoded again.
+        std::shared_ptr<const VisionAdmission> vision;
+        if (b.vision) { vision = plan_vision(ledger, selection ? selection->frontier : 0U); }
+        vision_make_room(vision.get());
         if (selection) {
             lane.prefix.reuse          = b.reuse;
             lane.prefix.hashes         = ledger.block_hashes;
@@ -1820,13 +1911,21 @@ public:
             if (pool_->available_pages() < selection->need) { (void)grow_kv(selection->need); }
             auto reservation = pool_->reserve(selection->need);
             if (!reservation) {
-                runtime::ResourceReservation out;
+                BindingReservation out;
                 out.shortage.main_kv_pages = selection->need - std::min(selection->need, pool_->available_pages());
                 prefix_unpin(*selection);
                 lane.row = KVExecutionRowLease{};
                 return out;
             }
-            if (b.vision) { vision_reserve(lane, plan_vision(ledger, selection->frontier), ledger); }
+            if (vision) {
+                vision_reserve(lane, vision, ledger);
+                if (auto refused = vision_lend(lane, index)) {
+                    lane.vision.reset(); // nothing was lent
+                    prefix_unpin(*selection);
+                    lane.row = KVExecutionRowLease{};
+                    return std::move(*refused);
+                }
+            }
             const std::uint64_t restored = prefix_->counters().host_restore_bytes;
             prefix_activate(lane, index, *selection, *reservation, pages);
             lane.prefix.cached_tokens  = selection->cached_tokens;
@@ -1839,12 +1938,19 @@ public:
             if (pool_->available_pages() < pages) { (void)grow_kv(pages); }
             auto reservation = pool_->reserve(pages);
             if (!reservation) {
-                runtime::ResourceReservation out;
+                BindingReservation out;
                 out.shortage.main_kv_pages = pages - std::min(pages, pool_->available_pages());
                 lane.row = KVExecutionRowLease{};
                 return out;
             }
-            if (b.vision) { vision_reserve(lane, plan_vision(ledger, 0), ledger); }
+            if (vision) {
+                vision_reserve(lane, vision, ledger);
+                if (auto refused = vision_lend(lane, index)) {
+                    lane.vision.reset(); // nothing was lent
+                    lane.row = KVExecutionRowLease{};
+                    return std::move(*refused);
+                }
+            }
             lane.pages.clear();
             lane.pages.reserve(pages);
             pool_->materialize(*reservation, pages, lane.pages);
@@ -1882,7 +1988,7 @@ public:
         transaction_lane_ = index;
         replaying_        = lane.replay;
         ++revision_;
-        runtime::ResourceReservation out;
+        BindingReservation out;
         out.reserved = true;
         return out;
     }
@@ -2523,7 +2629,7 @@ public:
         // warms or captures its graph reads them first.
         // A round whose rows are all in the host cache reads nothing, so it stages them first.
         const bool screened = screened_round(round_lanes, batch);
-        DecodeGraph& graph  = (screened ? screened_graphs_ : graphs_)[static_cast<std::size_t>(batch - 1)];
+        DecodeGraph& graph  = decode_graph(batch, screened);
         const bool gated    = graph.executable.ready() && !decode_rows_cached(round_lanes, round_positions);
         stage_decode(round_lanes, round_positions);
         const std::uint32_t word = next_gate_word();
@@ -2643,6 +2749,10 @@ public:
                                                2ULL * width_, cudaMemcpyDeviceToDevice, device_.stream));
                     lane.mtp_cells = lane.state_tokens - 1;
                 }
+                // Non-finite logits: what the request published may hold that state, so its release
+                // withdraws it (prefix_withdraw).
+                lane.prefix.withdraw =
+                    pending.row_failure(row) == runtime::PendingRowFailure::NonFiniteLogits;
                 lane.constraint_round.clear();
                 out.rows[row].timings     = timings(lane);
                 out.rows[row].speculative = lane.speculative;
@@ -2784,7 +2894,10 @@ public:
             device_.synchronize();
             if (prefix_) {
                 prefix_->drain();
-                if (clear_prefix_on_release_) { prefix_->clear(); }
+                if (clear_prefix_on_release_) {
+                    prefix_->clear();
+                    prefix_withdrawal_ = {}; // its references would name the rebuilt index's entries
+                }
             }
             clear_prefix_on_release_ = false;
             return true;
@@ -2802,6 +2915,7 @@ public:
         try { device_.synchronize(); } catch (...) {}
         if (clear_prefix_on_release_) { // a failed round may have published state it never computed
             if (prefix_) { prefix_->clear(); }
+            prefix_withdrawal_       = {};
             clear_prefix_on_release_ = false;
         }
     }
@@ -2914,6 +3028,10 @@ private:
                                                                                static_cast<std::size_t>(deferred_.columns))
                                                : std::span<const std::uint8_t>{},
                                 std::span<const std::int32_t>(host_lanes_.data(), static_cast<std::size_t>(rows)));
+        if (drafter_pool_) { // the drafter pool: before the next round's drafts
+            drafter_pool_->step(device_.stream);
+            report_drafter_pool();
+        }
         apply_vram_target(false);
     }
 
@@ -2968,28 +3086,41 @@ public:
     }
 
     // ---- warm start (design §19.3.5 S4b) ----
-    // Fills the frames from the saved state, before the first request; without one (a first start,
-    // or a state of another artifact), from the calibrated expert order when the model has its shape.
-    // With the SSD tier, RAM is filled first (the frames load from it), then the seeds' RAM copies
-    // are released and their slots refilled with the next keys of the fill order, so the two levels
-    // hold different experts.
+    // Fills the frames from the saved state, before the first request; without one (a first start, a
+    // state of another artifact, or no file given: the bench and the tools), from the calibrated expert
+    // order when the model has its shape, unless --expert-state off asked for an empty cache. With the
+    // SSD tier, RAM is filled first (the frames load from it), then the seeds' RAM copies are released
+    // and their slots refilled with the next keys of the fill order, so the two levels hold different
+    // experts. Only a given file is read or saved.
     void warm_start_experts() {
         const auto keys = c_.num_hidden_layers * c_.moe.experts;
         expert_cache::ExpertStateLoad load;
         SeedSource source = SeedSource::None;
-        if (!options_.expert_state.empty() && options_.expert_cache) {
-            load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, keys);
+        if (options_.expert_cache) {
+            if (!options_.expert_state.empty()) {
+                load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, keys);
+            }
             if (load.state) {
                 source = SeedSource::Saved;
-            } else if (has_calibrated_order()) {
-                diagnostic("expert cache: no saved state used: " + load.message, DiagnosticLevel::Debug);
+            } else if (options_.expert_seed && has_calibrated_order()) {
+                if (!options_.expert_state.empty()) {
+                    diagnostic("expert cache: no saved state used: " + load.message, DiagnosticLevel::Debug);
+                }
                 load.state = calibrated_expert_order();
                 source     = SeedSource::Calibrated;
             }
         }
         const expert_cache::SavedState* state = load.state ? &*load.state : nullptr;
         TierFill fill;
-        if (tier_) { fill = prefill_tier(state, source); }
+        if (tier_) {
+            fill = prefill_tier(state, source);
+            // The frames seed along the whole fill order, which starts with the saved ranking: when that ranking
+            // holds fewer experts than the frames' share (a session of the full layout, whose warm start seeds half
+            // the frames), the next keys of the order take the rest, so the frames and RAM together hold every expert
+            // as the exclusive layout sizes RAM for (2026-10-27: Dense8 seeded 5,188 of its 6,306 and left 796 experts
+            // on the SSD).
+            if (load.state && load.state->ranked.size() < fill.order.size()) { load.state->ranked = fill.order; }
+        }
         const std::uint32_t seeded = warm_start_frames(load, source);
         if (tier_) { finish_tier_fill(fill, seeded); }
     }
@@ -3016,8 +3147,9 @@ private:
 
     // The SSD tier's RAM fill order (design §19.3.7 §4.9): the saved state's ranking (the last
     // session's VRAM residents, best first), then every other key that session used, most used
-    // first, then the keys it never used one expert of every layer in turn, so that no layer is left
-    // wholly on the SSD (file order filled the first layers and left the last ones on disk).
+    // first, then the calibrated order's ranking of the rest (unless --expert-state off), then the keys
+    // left one expert of every layer in turn, so that no layer is left wholly on the SSD (file order
+    // filled the first layers and left the last ones on disk).
     [[nodiscard]] std::vector<std::uint32_t> tier_fill_order(const expert_cache::SavedState* state) const {
         const std::uint32_t layers = c_.num_hidden_layers, experts = c_.moe.experts, keys = layers * experts;
         if (tier_->keys() != keys) { throw std::logic_error("Qwen3.8-Flash-Next: the SSD tier has another key count"); }
@@ -3048,6 +3180,16 @@ private:
                 }
             }
         }
+        // Then the calibrated order (unless --expert-state off): it ranks every key, so the keys a saved session
+        // never used follow its ranking rather than the file's.
+        if (options_.expert_seed && has_calibrated_order()) {
+            for (const std::uint32_t key : calibrated_expert_order().ranked) {
+                if (key < keys && listed[key] == 0) {
+                    order.push_back(key);
+                    listed[key] = 1;
+                }
+            }
+        }
         for (std::uint32_t i = 0; i < keys; ++i) {
             const std::uint32_t key = (i % layers) * experts + i / layers; // spread(key) == i
             if (listed[key] == 0) { order.push_back(key); }
@@ -3072,6 +3214,9 @@ private:
     // After the frames' warm start: the seeds are in VRAM, so their RAM copies (shadows) are
     // released and their slots take the next keys of the fill order. A seed VRAM later evicts is
     // demoted into RAM when it outranks the coldest resident (T4), as any key without a host copy.
+    // Slots still free once every other key has a host copy (the exclusive layout's reserve) hold
+    // shadows of the least-used seeds, the first a prefill's loan or decode evicts, so those
+    // evictions keep a RAM copy instead of leaving the expert to the SSD.
     void finish_tier_fill(const TierFill& fill, std::uint32_t seeded) {
         const auto start        = std::chrono::steady_clock::now();
         std::uint32_t released  = 0, refilled = 0;
@@ -3086,6 +3231,14 @@ private:
         const std::int32_t* in_vram = residency_->host_table();
         const std::uint32_t unpinned =
             tier_->fill_unpinned(fill.order, [in_vram](std::uint32_t key) { return in_vram != nullptr && in_vram[key] >= 0; });
+        std::uint32_t shadows = 0;
+        if (seeded > 0 && in_vram != nullptr) {
+            std::vector<std::uint32_t> least_used_seeds;
+            for (auto it = fill.order.rbegin(); it != fill.order.rend(); ++it) {
+                if (in_vram[*it] >= 0) { least_used_seeds.push_back(*it); }
+            }
+            shadows = tier_->prefill_shadows(least_used_seeds);
+        }
         const double seconds =
             fill.seconds + std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         const std::uint32_t keys = tier_->keys(), in_ram = fill.filled - released + refilled;
@@ -3096,31 +3249,36 @@ private:
             std::snprintf(split, sizeof(split), " and %u unpinned records (%.1f GiB, served by the CPU) hold %u more",
                           tier_->unpinned_records(), gib * tier_->unpinned_records(), unpinned);
         }
-        char line[560];
+        char shadow_text[96] = "";
+        if (shadows > 0) {
+            std::snprintf(shadow_text, sizeof(shadow_text), " and copies of the %u least-used in VRAM", shadows);
+        }
+        char line[640];
         std::snprintf(line, sizeof(line),
-                      "SSD expert tier: %u RAM slots (%.1f GiB) hold %u experts (%s)%s%s, read in %.1f s; %u of %u "
+                      "SSD expert tier: %u RAM slots (%.1f GiB) hold %u experts (%s)%s%s%s, read in %.1f s; %u of %u "
                       "experts are read from the artifact when used",
                       slots, gib * slots, in_ram,
                       fill.source == SeedSource::Saved        ? "the saved ranking, then the last session's use counts"
                       : fill.source == SeedSource::Calibrated ? "the calibrated expert order"
                                                               : "spread across the layers",
                       released > 0 ? (", none of them among the " + std::to_string(released) + " in VRAM").c_str() : "",
-                      split, seconds, keys - in_ram - released - unpinned, keys);
+                      shadow_text, split, seconds, keys - in_ram - released - unpinned, keys);
         diagnostic(line);
     }
 
     // The frames' warm start from the saved state or the calibrated order; returns how many experts
     // it loaded.
     std::uint32_t warm_start_frames(const expert_cache::ExpertStateLoad& load, SeedSource source) {
-        if (options_.expert_state.empty() || !options_.expert_cache) { return 0; }
+        if (!options_.expert_cache) { return 0; }
         if (source == SeedSource::None) {
-            diagnostic("expert cache: no saved state yet, so it starts empty and fills as requests arrive");
-            diagnostic("expert cache starts empty: " + load.message, DiagnosticLevel::Debug);
+            diagnostic(!options_.expert_seed ? "expert cache: --expert-state off, so it starts empty and fills as requests arrive"
+                                             : "expert cache: no saved state yet, so it starts empty and fills as requests arrive");
+            if (!load.message.empty()) { diagnostic("expert cache starts empty: " + load.message, DiagnosticLevel::Debug); }
             expert_state_saved_ = std::chrono::steady_clock::now();
             return 0;
         }
         const auto start           = std::chrono::steady_clock::now();
-        const auto max_keys = static_cast<std::uint32_t>(kSeedShare * residency_->frames());
+        const auto max_keys = static_cast<std::uint32_t>(options_.expert_seed_share * residency_->frames());
         const std::uint32_t loaded = residency_->warm_start(*load.state, kSeedCountCap, max_keys, device_.stream);
         device_.synchronize();
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -3230,10 +3388,12 @@ public:
 private:
     // A seeded count is capped, so an expert used heavily in an old session yields to new uses.
     static constexpr std::uint32_t kSeedCountCap = 16;
-    // The share of the frames a warm start fills (the best-ranked experts); the rest stay free for
-    // the fill phase's landing (S4), so a workload unlike the saved state still fills quickly.
-    static constexpr double kSeedShare = 0.5;
+    // ProgramOptions::expert_seed_share: the share of the frames a warm start fills (the best-ranked
+    // experts); the rest stay free for the fill phase's landing (S4), so a workload unlike the saved state
+    // still fills quickly.
     static constexpr std::chrono::minutes kExpertStateInterval{10};
+    // The pause before the SSD tier's second CPU rate reading (the first follows the tier's fill).
+    static constexpr std::chrono::seconds kTierRateSettle{4};
     std::chrono::steady_clock::time_point expert_state_saved_{};
     std::uint64_t expert_state_routed_ = 0;
 
@@ -3317,16 +3477,22 @@ private:
             const auto cpu      = cpu_service_ ? cpu_service_->served_experts() - lane.cpu_served_at_admission : 0;
             std::size_t free_vram = 0, total_vram = 0;
             if (cudaMemGetInfo(&free_vram, &total_vram) != cudaSuccess) { free_vram = 0; }
-            char text[512];
+            // The process's RAM beside the plan (candidates §22 RAM comparison: the engines' totals were only derived).
+            const HostMemorySnapshot ram = host_memory_snapshot();
+            constexpr double kGiB        = 1024.0 * 1024.0 * 1024.0;
+            char text[640];
             std::snprintf(text, sizeof(text),
                           "expert cache: %u frames; request %.1f%% of %llu routed experts hit, %llu promotions, "
-                          "%llu landed, %llu misses CPU-served; since start %.1f%%; VRAM free %zu MiB",
+                          "%llu landed, %llu misses CPU-served; since start %.1f%%; VRAM free %zu MiB; RAM: process "
+                          "%.1f GiB private, %.1f GiB resident, %.1f of %.1f GiB free",
                           residency_->frames(), routed ? 100.0 * static_cast<double>(hits) / static_cast<double>(routed) : 0.0,
                           static_cast<unsigned long long>(routed), static_cast<unsigned long long>(promoted),
                           static_cast<unsigned long long>(landed),
                           static_cast<unsigned long long>(cpu),
                           s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0,
-                          free_vram >> 20);
+                          free_vram >> 20, static_cast<double>(ram.process_private) / kGiB,
+                          static_cast<double>(ram.process_resident) / kGiB, static_cast<double>(ram.available_physical) / kGiB,
+                          static_cast<double>(ram.total_physical) / kGiB);
             diagnostic(text, DiagnosticLevel::Debug);
             if (tier_) {
                 // The tier's counters as of the last round boundary.
@@ -3352,6 +3518,31 @@ private:
                               static_cast<unsigned long long>(t.admitted - a.admitted),
                               static_cast<unsigned long long>(s.demotions - at_admission.demotions),
                               static_cast<unsigned long long>(s.unpinned_promotions - at_admission.unpinned_promotions));
+                diagnostic(text, DiagnosticLevel::Debug);
+                // Where the reads came from: the keys that left both tiers this request, by cause.
+                const auto& l  = tier_->controller().losses();
+                const auto& la = lane.losses_at_admission;
+                std::snprintf(text, sizeof(text),
+                              "SSD expert tier: request lost %llu experts to the SSD: %llu VRAM victims unpublished "
+                              "(loans, shrinks, evicted loading), %llu without a demotion slot, %llu not worth one; %llu "
+                              "RAM-only experts evicted",
+                              static_cast<unsigned long long>((l.unpublished - la.unpublished) + (l.no_slot - la.no_slot) +
+                                                              (l.unworthy - la.unworthy) +
+                                                              (l.residents_evicted - la.residents_evicted)),
+                              static_cast<unsigned long long>(l.unpublished - la.unpublished),
+                              static_cast<unsigned long long>(l.no_slot - la.no_slot),
+                              static_cast<unsigned long long>(l.unworthy - la.unworthy),
+                              static_cast<unsigned long long>(l.residents_evicted - la.residents_evicted));
+                diagnostic(text, DiagnosticLevel::Debug);
+                std::snprintf(text, sizeof(text),
+                              "SSD expert tier: request's loans and shrinks evicted %llu experts with a RAM copy and %llu "
+                              "without; %llu shadows before the last loan, %zu now, %zu RAM-only; %llu refill reads failed "
+                              "(copied over the link)",
+                              static_cast<unsigned long long>(s.loan_victims_kept - at_admission.loan_victims_kept),
+                              static_cast<unsigned long long>(s.loan_victims_lost - at_admission.loan_victims_lost),
+                              static_cast<unsigned long long>(s.shadows_at_loan), tier_->controller().shadow_count(),
+                              tier_->controller().resident_count() - tier_->controller().shadow_count(),
+                              static_cast<unsigned long long>(s.refill_fallbacks));
                 diagnostic(text, DiagnosticLevel::Debug);
             }
         } catch (...) {}
@@ -3479,6 +3670,42 @@ private:
         } catch (...) {}
     }
 
+    // Times a few hundred random 4 KiB reads of a volume that is read on use and says so: a drive
+    // that serves them slowly (a DRAM-less SSD at 5,000 reads/s against 17,000-80,000 on the owner's
+    // drives and 230,000 on a Samsung 9100 PRO) makes a long prompt spend minutes reading n-gram rows.
+    // It never changes placement; the table stays where the ledger put it.
+    void probe_ngram_volume() const noexcept {
+        constexpr double kSlowReadsPerSecond = 15000.0;
+        if (options_.ngram_in_ram) {
+            try {
+                if (const std::string why = volume_.resident_lock_failure(); !why.empty()) {
+                    diagnostic("the n-gram table is in RAM but Windows would not lock it there (" + why +
+                                   "); it still serves rows, but under memory pressure Windows may page part of it out "
+                                   "and long prompts slow down",
+                               DiagnosticLevel::Warning);
+                }
+            } catch (...) {}
+            return;
+        }
+        try {
+            const NgramVolume::ReadProbe probe = volume_.probe_reads();
+            if (probe.reads == 0) { return; }
+            const double rate = probe.reads_per_second();
+            char text[320];
+            if (rate >= kSlowReadsPerSecond) {
+                std::snprintf(text, sizeof text, "n-gram volume read probe: %.0f reads/s (%.0f us per 4 KiB read, %zu reads)",
+                              rate, 1e6 / rate, probe.reads);
+                diagnostic(text);
+            } else {
+                std::snprintf(text, sizeof text,
+                              "n-gram volume reads are slow: %.0f reads/s (%zu reads; 17,000 and more is healthy), so a long "
+                              "prompt can spend minutes reading n-gram rows; keep the table in RAM with --ngram-residency ram "
+                              "if the experts fit beside it, or move the volume to a faster drive",
+                              rate, probe.reads);
+                diagnostic(text, DiagnosticLevel::Warning);
+            }
+        } catch (...) {}
+    }
 
     // The io bytes a decode or verification round of `columns` columns reads: everything before
     // the n-gram rows (ids, positions, slots, table rows, logit columns) and its columns' rows.
@@ -3607,6 +3834,16 @@ private:
         ++revision_;
         kv_busy();
         try { shrink_kv(); } catch (...) {}
+        // A cache a failure may have left wrong state in (prefix_withdraw could not tell its entries
+        // apart) is emptied once no lane maps it.
+        if (clear_prefix_on_release_ && prefix_ && !in_transaction() &&
+            std::all_of(lanes_.begin(), lanes_.begin() + static_cast<std::ptrdiff_t>(options_.max_concurrency),
+                        [](const Lane& other) { return other.phase == Phase::Free; })) {
+            try { device_.synchronize(); } catch (...) {}
+            prefix_->clear();
+            prefix_withdrawal_       = {};
+            clear_prefix_on_release_ = false;
+        }
     }
 
     // Whether the elastic pool could grow to make `need` pages available (the quote's check).
@@ -4109,6 +4346,22 @@ private:
                       static_cast<unsigned long long>(split.streamed_experts - split_at_lease_.streamed_experts),
                       static_cast<unsigned long long>(walk_prefetched_chunks_ - prefetched_at_lease_));
         diagnostic(line, DiagnosticLevel::Debug);
+        // The copy-ahead (ExpertStream::plan_ahead): how well the guess served the gated layers.
+        if (const auto ahead = now.ahead - stream_at_lease_.ahead; ahead > 0) {
+            const auto heavy = now.heavy - stream_at_lease_.heavy;
+            const auto used  = now.ahead_used - stream_at_lease_.ahead_used;
+            const auto late  = now.late - stream_at_lease_.late;
+            std::snprintf(line, sizeof(line),
+                          "prefill copy-ahead: %llu experts ahead, %llu of them routed (precision %.3f); %llu of %llu heavy "
+                          "experts ahead (recall %.3f); %llu copied after their layer's routing",
+                          static_cast<unsigned long long>(ahead), static_cast<unsigned long long>(used),
+                          static_cast<double>(used) / static_cast<double>(ahead),
+                          static_cast<unsigned long long>(now.heavy_ahead - stream_at_lease_.heavy_ahead),
+                          static_cast<unsigned long long>(heavy),
+                          heavy > 0 ? static_cast<double>(now.heavy_ahead - stream_at_lease_.heavy_ahead) / static_cast<double>(heavy) : 0.0,
+                          static_cast<unsigned long long>(late));
+            diagnostic(line, DiagnosticLevel::Debug);
+        }
     }
 
     // Whether a lane other than `index` is prefilling.
@@ -4121,8 +4374,8 @@ private:
 
     // One decode round of `batch` sequences: its inputs are staged at fixed device addresses and
     // every row is chosen on the device, so one CUDA graph per batch size serves every round. The
-    // first round of a size runs eagerly (it also performs the Ops' one-time setup); the next is
-    // captured and later rounds replay it.
+    // first round of a size captures it (replay; startup normally did, capture_graph_set) and
+    // later rounds replay it.
     // `position`: the first sequence's (a one-column round's context, for the plain divisor). `graph`: the
     // round kind's graph for this batch (graphs_, or screened_graphs_ for a screened round).
     struct DecodeGraph; // below, with the graphs
@@ -4132,15 +4385,11 @@ private:
         upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
         residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
-        const execution::NgramRowGate gate = row_gate();
-        const auto body = [&] {
-            forward_call(batch, 1, batch, nullptr, nullptr, nullptr, &gate, false, /*decode_round=*/true, screened);
-        };
         // The lossless route runs eagerly (its experts' pass reads job counts on the host).
         if (c_.lossless) {
-            body();
+            decode_graph_body(batch, screened);
         } else {
-            replay(graph, body);
+            replay(graph, [&] { decode_graph_body(batch, screened); });
         }
         residency_->enqueue_route_download(s, batch);
     }
@@ -4165,56 +4414,141 @@ private:
     struct DecodeGraph {
         DecodeGraphDefinition definition;
         DecodeGraphExecutable executable;
-        bool warmed = false;
     };
 
-    // Runs a fixed-address round: the first time eagerly (the Ops' one-time setup), the second
-    // captured, then by replay.
-    // `launch_on`: the stream a ready executable launches on (the device stream by default); the eager
-    // first run and the capture always run on the device stream.
+    // ---- the graphed rounds by shape: each round and the startup capture (capture_graph_set) take a
+    // shape's graph slot and record its body through these, so both capture the same kernels ----
+    DecodeGraph& decode_graph(std::int32_t batch, bool screened) {
+        return (screened ? screened_graphs_ : graphs_)[static_cast<std::size_t>(batch - 1)];
+    }
+    // A decode round of `batch` rows (also the lossless route's eager round).
+    void decode_graph_body(std::int32_t batch, bool screened) {
+        const execution::NgramRowGate gate = row_gate();
+        forward_call(batch, 1, batch, nullptr, nullptr, nullptr, &gate, false, /*decode_round=*/true, screened);
+    }
+    DecodeGraph& verify_graph(std::int32_t batch, std::int32_t W, bool screened) {
+        return (screened ? screened_verify_graphs_ : verify_graphs_)[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
+    }
+    // A verification round's forward over batch x W columns.
+    void verify_graph_body(std::int32_t batch, std::int32_t W, bool screened) {
+        const execution::NgramRowGate gate  = row_gate();
+        const execution::ForwardVerify view = verify_view(batch, W);
+        forward_call(batch, W, batch * W, &view, nullptr, nullptr, &gate, false, /*decode_round=*/true, screened);
+    }
+    DecodeGraph& commit_graph(std::int32_t batch, std::int32_t W) {
+        return commit_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
+    }
+    // A verification round's commit (commit_verified): the GDN fold, the QSA tails and the PLE convolution
+    // commit of each row's committed columns (and on DFlash2 without MTP the drafter's context), every row's
+    // count and slot read on the device; `rows` (an eager commit) gives the fold its rows on the host instead.
+    void commit_body(std::int32_t batch, std::int32_t W, std::span<const ops::GdnReplayFoldRow> rows = {}) {
+        const cudaStream_t s = device_.stream;
+        auto* io             = static_cast<std::byte*>(io_device_.p);
+        const Tensor commit_columns(spec_device(spec_layout_.commit), DType::I32, {batch});
+        const Tensor slots(io + io_layout_.slots, DType::I32, {batch});
+        const Tensor positions(io + io_layout_.positions, DType::I32, {W, batch});
+        const auto layers = dim(c_.attention_layers);
+        Tensor tails(tails_backing_.p, DType::BF16, {di_, r_ - 1, dim(options_.max_concurrency), layers});
+        Tensor ple_states(ple_backing_.p, DType::BF16, {width_, span_, dim(options_.max_concurrency)});
+        if (rows.empty()) {
+            fold(W).execute_device(slots, commit_columns, batch, s);
+        } else {
+            fold(W).execute(rows, s);
+        }
+        ops::qsa_commit_tails(Tensor(qsa_records_.p, DType::BF16, {di_, W, batch, layers}), positions, commit_columns,
+                              tails, slots, execution::qsa_geometry(c_), s);
+        ops::ple_conv_commit(Tensor(ple_records_.p, DType::BF16, {width_, W, batch}), commit_columns, ple_states, slots, s);
+        if (rows.empty() && dflash2_ && !mtp_) { drafter_->materialize(dflash2_context_call(batch, W)); }
+    }
+    DecodeGraph& mtp_catch_graph(std::int32_t batch, std::int32_t W) {
+        return mtp_catch_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
+    }
+    // The MTP drafter's catch-up over a round of batch x W columns (mtp_catch_up_launch): its cells from the
+    // round's residuals and the staged ids, and its index-key tails by each row's committed count.
+    void mtp_catch_body(std::int32_t batch, std::int32_t W) {
+        const cudaStream_t s = device_.stream;
+        auto* io             = static_cast<std::byte*>(io_device_.p);
+        const Tensor positions(io + io_layout_.positions, DType::I32, {W * batch});
+        const Tensor slots(io + io_layout_.slots, DType::I32, {batch});
+        forward_->run_mtp({.residuals        = Tensor(mtp_residuals_.p, DType::BF16, {width_, W * batch}),
+                           .ids              = Tensor(mtp_device(mtp_io_.up_ids), DType::I32, {W * batch}),
+                           .positions        = positions,
+                           .rope_positions   = Tensor(io + io_layout_.rope, DType::I32, {W * batch, 3}),
+                           .block_start_rope = Tensor(io + io_layout_.block_rope, DType::I32, {batch, 3}),
+                           .slots            = slots,
+                           .table_rows       = Tensor(io + io_layout_.rows, DType::I32, {batch}),
+                           .batch            = batch,
+                           .width            = W,
+                           .kv_only          = true,
+                           .key_records      = Tensor(mtp_records_.p, DType::BF16, {di_, W, batch})});
+        Tensor tails(static_cast<std::byte*>(tails_backing_.p) +
+                         static_cast<std::size_t>(c_.attention_layers) * di_ * (r_ - 1) * options_.max_concurrency * 2,
+                     DType::BF16, {di_, r_ - 1, dim(options_.max_concurrency), 1});
+        ops::qsa_commit_tails(Tensor(mtp_records_.p, DType::BF16, {di_, W, batch, 1}), positions.view({W, batch}),
+                              Tensor(spec_device(spec_layout_.commit), DType::I32, {batch}), tails, slots,
+                              execution::qsa_geometry(c_), s);
+    }
+
+    // Runs a fixed-address round: captured on its first use (the Ops' first-use setup is capture-safe:
+    // function attributes, the TMA descriptors' relaxed-mode staging; design §19.3.34), then by replay.
+    // `launch_on`: the stream a ready executable launches on (the device stream by default); the capture
+    // always runs on the device stream.
     void replay(DecodeGraph& graph, const std::function<void()>& body, cudaStream_t launch_on = nullptr) {
         const cudaStream_t s = device_.stream;
         if (graph.executable.ready()) {
-            graph.executable.launch(launch_on != nullptr ? launch_on : s);
-        } else if (!graph.warmed) {
-            body();
-            graph.warmed = true;
-        } else {
-            // A captured body bakes in whatever it reads by address: the arena *work_ points at and
-            // the per-layer waits forward_call consumes. Neither may be a call's temporary.
-            if (wide_active_ || !next_waits_[0].empty() || !next_waits_[1].empty()) {
-                throw std::logic_error("Qwen4Exp: a graph capture inside a wide call or with pending layer waits");
-            }
-            const std::size_t free_before = trace_ ? trace_free() : 0;
-            graph.definition.capture(s, body);
-            graph.executable.instantiate(graph.definition);
-            graph.executable.launch(s);
-            if (trace_) { trace_graph(graph, free_before); }
+            if (!graph_set_.capturing) { graph.executable.launch(launch_on != nullptr ? launch_on : s); }
+            return;
         }
+        prepare_graph(graph, [&] { graph.definition.capture(s, body); });
     }
 
     // replay for a chain of `steps` bodies whose body j > 0 runs only while the gate after body
-    // j - 1 passes (DecodeGraphDefinition::capture_gated_chain). The eager first run runs every body.
+    // j - 1 passes (DecodeGraphDefinition::capture_gated_chain).
     void replay_gated(DecodeGraph& graph, std::int32_t steps, const std::function<void(std::int32_t)>& body,
                       const std::function<void(std::int32_t, cudaGraphConditionalHandle)>& gate,
                       cudaStream_t launch_on = nullptr) {
         const cudaStream_t s = device_.stream;
         if (graph.executable.ready()) {
-            graph.executable.launch(launch_on != nullptr ? launch_on : s);
-        } else if (!graph.warmed) {
-            for (std::int32_t j = 0; j < steps; ++j) { body(j); }
-            graph.warmed = true;
-        } else {
-            if (wide_active_ || !next_waits_[0].empty() || !next_waits_[1].empty()) {
-                throw std::logic_error("Qwen4Exp: a graph capture inside a wide call or with pending layer waits");
-            }
-            const std::size_t free_before = trace_ ? trace_free() : 0;
-            graph.definition.capture_gated_chain(s, steps, body, gate);
-            graph.executable.instantiate(graph.definition);
-            graph.executable.launch(s);
-            if (trace_) { trace_graph(graph, free_before); }
+            if (!graph_set_.capturing) { graph.executable.launch(launch_on != nullptr ? launch_on : s); }
+            return;
         }
+        prepare_graph(graph, [&] { graph.definition.capture_gated_chain(s, steps, body, gate); });
     }
+
+    // A graph's capture (`capture` records its body on the device stream) and instantiation, then its first
+    // launch; while capture_graph_set captures the startup set, its upload instead (nothing runs: a graph
+    // reads its inputs by address when it is launched).
+    void prepare_graph(DecodeGraph& graph, const std::function<void()>& capture) {
+        const cudaStream_t s = device_.stream;
+        // A captured body bakes in whatever it reads by address: the arena *work_ points at and
+        // the per-layer waits forward_call consumes. Neither may be a call's temporary.
+        if (wide_active_ || !next_waits_[0].empty() || !next_waits_[1].empty()) {
+            throw std::logic_error("Qwen4Exp: a graph capture inside a wide call or with pending layer waits");
+        }
+        const std::size_t free_before = trace_ ? trace_free() : 0;
+        capture();
+        graph.executable.instantiate(graph.definition);
+        if (graph_set_.capturing) {
+            graph.executable.upload(s);
+            ++graph_set_.captured;
+        } else {
+            graph.executable.launch(s);
+            if (graph_set_.at_startup) {
+                diagnostic("CUDA graph " + graph_label(graph) +
+                               " captured at its first use: the startup capture did not "
+                               "include its shape",
+                           DiagnosticLevel::Warning);
+            }
+        }
+        if (trace_) { trace_graph(graph, free_before); }
+    }
+
+    // Candidates §23 NU-04 (program/graph_set.cpp): at the end of startup, every graph a round may replay (the
+    // shapes decode() and commit() can reach) is captured, instantiated and uploaded without running, so no
+    // request pays a capture. Same kernels as a first-use capture. The lossless route and scoring skip it.
+    void capture_graph_set();
+    // A graph slot's family and shape ("verify 1x5"), for the startup capture's lines.
+    [[nodiscard]] std::string graph_label(const DecodeGraph& graph) const;
 
     // Device free bytes, and the route trace's record of a graph executable just instantiated
     // (its family and shape follow from the slot it occupies).
@@ -4260,9 +4594,9 @@ private:
 
     // A call whose MoE layers may publish fetch requests runs inside an open tier round: the read
     // agent answers them only then, and a closed round would read as a silent host after a second
-    // per layer.
+    // per layer. The startup capture (capture_graph_set) enqueues nothing, so it needs no round.
     void require_tier_round() const {
-        if (fetch_channel_ && !tier_->round_open()) {
+        if (fetch_channel_ && !graph_set_.capturing && !tier_->round_open()) {
             throw std::logic_error("Qwen4Exp: a call reading SSD-only experts was enqueued outside the tier's round");
         }
     }
@@ -4358,6 +4692,7 @@ private:
         allocate(qsa_records_, plan_.qsa_records, allocated);
         folds_.resize(static_cast<std::size_t>(max_width_) + 1);
         verify_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
+        commit_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
         if (screened_head_) { screened_verify_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_); }
         const std::size_t cells = static_cast<std::size_t>(lanes) * max_width_;
         spec_layout_ = plan_.spec;
@@ -4431,8 +4766,7 @@ private:
         };
         const std::uint32_t word = next_gate_word();
         const bool screened = screened_round(lanes, batch * W);
-        DecodeGraph& graph  = (screened ? screened_verify_graphs_ : verify_graphs_)[static_cast<std::size_t>(batch - 1) * max_width_ +
-                                                                                 (W - 1)];
+        DecodeGraph& graph  = verify_graph(batch, W, screened);
         const bool gated    = graph.executable.ready();
         if (!gated) {
             read_rows();
@@ -4442,11 +4776,7 @@ private:
         upload_pinned(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed, s);
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
         residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
-        const execution::NgramRowGate gate = row_gate();
-        replay(graph, [&] {
-            const execution::ForwardVerify view = verify_view(batch, W);
-            forward_call(batch, W, batch * W, &view, nullptr, nullptr, &gate, false, /*decode_round=*/true, screened);
-        });
+        replay(graph, [&] { verify_graph_body(batch, W, screened); });
         // From here an enqueued gate waits for `word`: an error before it is published still
         // publishes it (over zeroed rows), so the stream drains and the error keeps its class.
         GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch * W) - io_layout_.ngram};
@@ -4725,6 +5055,8 @@ private:
             commit[row]      = 0;
             out.rows[row].speculative_counters = speculative_counters(lane.speculative);
             if (d.cancelled || d.failed) {
+                lane.prefix.withdraw = pending.row_failure(static_cast<std::size_t>(row)) ==
+                                       runtime::PendingRowFailure::NonFiniteLogits;
                 lane.constraint_round.clear();
                 out.rows[row].timings     = timings(lane);
                 out.rows[row].speculative = lane.speculative;
@@ -4756,18 +5088,16 @@ private:
         // (which touch none of what it reads or writes); joined before anything reads its cache.
         const bool drafter_beside = mtp_ && overlap_.drafter_stream != nullptr;
         const bool caught_beside  = drafter_beside && mtp_catch_up_launch(rows, W, commit, overlap_.drafter_stream);
-        fold(W).execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), static_cast<std::size_t>(batch)), s);
-        auto* io = static_cast<std::byte*>(io_device_.p);
-        const Tensor commit_columns(spec_device(spec_layout_.commit), DType::I32, {batch});
-        const Tensor slots(io + io_layout_.slots, DType::I32, {batch});
-        const Tensor positions(io + io_layout_.positions, DType::I32, {W, batch});
-        const auto layers = dim(c_.attention_layers);
-        Tensor tails(tails_backing_.p, DType::BF16, {di_, r_ - 1, dim(options_.max_concurrency), layers});
-        ops::qsa_commit_tails(Tensor(qsa_records_.p, DType::BF16, {di_, W, batch, layers}), positions, commit_columns,
-                              tails, slots, execution::qsa_geometry(c_), s);
-        Tensor ple_states(ple_backing_.p, DType::BF16, {width_, span_, dim(options_.max_concurrency)});
-        ops::ple_conv_commit(Tensor(ple_records_.p, DType::BF16, {width_, W, batch}), commit_columns, ple_states,
-                             slots, s);
+        // The fold, QSA tails and PLE commit (and on DFlash2 without MTP the drafter's context too) as one graph per
+        // batch size and width, which reads every row's count and slot from the device, instead of three launches
+        // (four with the context's graph) on the host's turnaround each round (design §19.3.34). Same bits.
+        const bool graphed          = !c_.lossless;
+        const bool context_in_graph = graphed && dflash2_ && !mtp_;
+        if (graphed) {
+            replay(commit_graph(batch, W), [&] { commit_body(batch, W); });
+        } else {
+            commit_body(batch, W, std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), static_cast<std::size_t>(batch)));
+        }
         if (caught_beside) { mtp_pre_draft(rows, W, commit, decisions); }
         if (drafter_beside) {
             CUDA_CHECK(cudaStreamWaitEvent(s, overlap_.drafter_events[1], 0));
@@ -4775,7 +5105,11 @@ private:
         } else if (mtp_) {
             mtp_catch_up(rows, W, commit);
         }
-        if (dflash2_) { dflash2_catch_up(rows, W, commit); }
+        if (context_in_graph) {
+            dflash2_settle_frontiers(rows, commit);
+        } else if (dflash2_) {
+            dflash2_catch_up(rows, W, commit);
+        }
         for (const auto& row : rows) { require_mtp_settled(lanes_[ContractAccess::lane(row)]); }
         // Everything after (the prefix publication, the residency's round end, the next calls) is
         // ordered after the pre-draft, as when it ran in the next round's mtp_draft.
@@ -4845,6 +5179,45 @@ private:
                 CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
             }
         }
+    }
+
+    // The drafter pool (candidates §22 VM-01 variant B): the drafter's routed experts behind a
+    // pool of device slots (their banks were bound pinned, Config::mtp_expert_slots); the draft steps route among
+    // the pooled experts and settle_round moves the pool to their demand.
+    void create_drafter_pool(execution::ForwardExperts& experts, std::uint64_t& allocated) {
+        const auto& m        = *parameters_.mtp;
+        const Config& config = parameters_.model.config();
+        const std::int32_t E = dim(c_.moe.experts), I = dim(c_.moe.intermediate), H = dim(c_.hidden_size);
+        const auto slots     = dim(config.mtp_expert_slots);
+        if (runtime::expert_offload::DrafterExpertPool::expert_bytes(m.experts_gate_up, m.experts_down, I, H) != config.mtp_expert_bytes) {
+            throw std::logic_error("Qwen4Exp: the drafter's bound experts differ from the drafter pool's plan");
+        }
+        allocate(drafter_pool_memory_, plan_.drafter_pool, allocated);
+        drafter_pool_ = std::make_unique<runtime::expert_offload::DrafterExpertPool>(m.experts_gate_up, m.experts_down, E, I, H, slots,
+                                                            drafter_pool_memory_.p, plan_.drafter_pool, device_.stream);
+        experts.drafter_slots   = slots;
+        experts.drafter_gate_up = drafter_pool_->gate_up();
+        experts.drafter_down    = drafter_pool_->down();
+        experts.drafter_slot_of = drafter_pool_->slot_of();
+        experts.drafter_demand  = drafter_pool_->demand();
+        drafter_reported_       = Clock::now();
+        diagnostic("MTP drafter pool: " + std::to_string(slots) + " of its " + std::to_string(E) +
+                       " routed experts in a VRAM pool (" + std::to_string(plan_.drafter_pool >> 20) +
+                       " MiB), the rest pinned in RAM; draft steps route among the pooled experts",
+                   DiagnosticLevel::Info);
+    }
+    // The pool's share of draft picks it held and its swaps since startup, at most every 10 seconds.
+    void report_drafter_pool() {
+        const auto now = Clock::now();
+        if (now - drafter_reported_ < std::chrono::seconds(10)) { return; }
+        drafter_reported_                    = now;
+        const runtime::expert_offload::DrafterExpertPool::Stats& s = drafter_pool_->stats();
+        if (s.picks == 0) { return; }
+        char line[192];
+        std::snprintf(line, sizeof(line), "MTP drafter pool: %.1f %% of %llu draft picks pooled, %llu swaps",
+                      100.0 * static_cast<double>(s.picks - s.misses) / static_cast<double>(s.picks),
+                      static_cast<unsigned long long>(s.picks), static_cast<unsigned long long>(s.swaps));
+        diagnostic(line, DiagnosticLevel::Info);
     }
 
     std::int32_t* mtp_host(std::size_t offset) const { return static_cast<std::int32_t*>(mtp_host_.data()) + offset; }
@@ -5469,7 +5842,6 @@ private:
                              cudaStream_t drafter) {
         const cudaStream_t s = device_.stream;
         const auto batch     = static_cast<std::int32_t>(rows.size());
-        auto* io = static_cast<std::byte*>(io_device_.p);
         for (std::int32_t b = 0; b < batch; ++b) {
             const std::int32_t k = commit[b];
             for (std::int32_t j = 0; j < W; ++j) {
@@ -5478,35 +5850,13 @@ private:
             }
         }
         upload_pinned(mtp_device(mtp_io_.up_ids), mtp_host(mtp_io_.up_ids), 4ULL * batch * W, s);
-        const Tensor positions(io + io_layout_.positions, DType::I32, {W * batch});
-        const Tensor rope(io + io_layout_.rope, DType::I32, {W * batch, 3});
-        const Tensor block_rope(io + io_layout_.block_rope, DType::I32, {batch, 3});
-        const Tensor slots(io + io_layout_.slots, DType::I32, {batch});
-        DecodeGraph& graph = mtp_catch_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
+        DecodeGraph& graph = mtp_catch_graph(batch, W);
         const bool beside  = drafter != nullptr && graph.executable.ready();
         if (beside) {
             CUDA_CHECK(cudaEventRecord(overlap_.drafter_events[0], s));
             CUDA_CHECK(cudaStreamWaitEvent(drafter, overlap_.drafter_events[0], 0));
         }
-        replay(graph, [&] {
-        forward_->run_mtp({.residuals   = Tensor(mtp_residuals_.p, DType::BF16, {width_, W * batch}),
-                           .ids         = Tensor(mtp_device(mtp_io_.up_ids), DType::I32, {W * batch}),
-                           .positions   = positions,
-                           .rope_positions   = rope,
-                           .block_start_rope = block_rope,
-                           .slots       = slots,
-                           .table_rows  = Tensor(io + io_layout_.rows, DType::I32, {batch}),
-                           .batch       = batch,
-                           .width       = W,
-                           .kv_only     = true,
-                           .key_records = Tensor(mtp_records_.p, DType::BF16, {di_, W, batch})});
-        Tensor tails(static_cast<std::byte*>(tails_backing_.p) +
-                         static_cast<std::size_t>(c_.attention_layers) * di_ * (r_ - 1) * options_.max_concurrency * 2,
-                     DType::BF16, {di_, r_ - 1, dim(options_.max_concurrency), 1});
-        ops::qsa_commit_tails(Tensor(mtp_records_.p, DType::BF16, {di_, W, batch, 1}), positions.view({W, batch}),
-                              Tensor(spec_device(spec_layout_.commit), DType::I32, {batch}), tails, slots,
-                              execution::qsa_geometry(c_), s);
-        }, beside ? drafter : nullptr);
+        replay(graph, [&] { mtp_catch_body(batch, W); }, beside ? drafter : nullptr);
         if (drafter != nullptr) { CUDA_CHECK(cudaEventRecord(overlap_.drafter_events[1], beside ? drafter : s)); }
         return beside;
     }
@@ -5587,7 +5937,7 @@ private:
     bool pressure_warned_     = false;
     Clock::time_point vram_epoch_{};
 
-    std::int32_t vocab_ = 0, token_domain_ = 0, chunk_ = 0, columns_ = 0, pages_per_row_ = 0;
+    std::int32_t vocab_ = 0, token_domain_ = 0, chunk_ = 0, columns_ = 0;
     std::int32_t width_ = 0, span_ = 0, di_ = 0, r_ = 0;
     std::uint32_t kv_pages_ = 0;
 
@@ -5619,6 +5969,8 @@ public:
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
+    // Without free cache resume a request resumes only from prefill state on the prefill-chunk grid.
+    [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept { return resume_grid(); }
 
 private:
     void prefix_pin(const PrefixSelection& selection);
@@ -5640,7 +5992,12 @@ private:
     bool prefix_take_taps(Lane& lane, std::uint32_t B, std::size_t next_call, bool& boundary);
     void prefix_after_prefill_call(Lane& lane, std::uint32_t index, bool last);
     void prefix_finish(Lane& lane, std::uint32_t index);
+    // Releases the lane's pins; a lane marked `withdraw` withdraws what it published (prefix_withdraw).
     void prefix_release(Lane& lane) noexcept;
+    void prefix_withdraw(Lane& lane) noexcept;
+    // Entries withdrawn after a non-finite failure that another lane or a transfer still pinned
+    // (hybrid-prefix-cache-spec §7.8): every later lane release retries them.
+    runtime::prefix_cache::Withdrawal prefix_withdrawal_;
     // The cumulative Vision key of every item of the prompt: the key of each block after it.
     [[nodiscard]] static std::uint64_t prefix_trailing_extra(const qwen3_5::PreparedPromptData& prompt);
     // Every Vision item's token span: no tap and no resume lies strictly inside one.
@@ -5663,6 +6020,7 @@ private:
     std::string prefix_fingerprint_;
     std::optional<PrefixCachePersistence> prefix_shutdown_save_;
     std::uint64_t prefix_saved_writes_ = 0; // host_write_bytes at the last save or load
+    std::uint64_t prefix_saves_        = 0; // periodic saves of the attached file that succeeded
 
 public:
     [[nodiscard]] HybridPrefixCacheStats prefix_stats() const noexcept;
@@ -5801,10 +6159,10 @@ private:
     }
 
     // The widest call the prefill CPU split takes (ProgramOptions::cpu_split_columns on the reference
-    // link, inversely to the measured one; at most the CPU channel's call width).
+    // link, inversely to the measured one; at most the CPU channel's call width): runtime::expert_offload::split_width.
     [[nodiscard]] std::int32_t split_columns() const noexcept {
-        const double scaled = options_.cpu_split_columns * kReferenceLinkBytesPerSecond / link_bytes_per_second_;
-        return static_cast<std::int32_t>(std::min<double>(scaled, ops::offloaded_moe::kMaxCpuCallColumns));
+        return runtime::expert_offload::split_width(options_.cpu_split_columns, kReferenceLinkBytesPerSecond,
+                                                    link_bytes_per_second_);
     }
 
 public:
@@ -5813,7 +6171,10 @@ public:
 private:
     // ---- elastic KV (design §19.3.11) ----
     static constexpr std::size_t kKvChunkBytes   = 2ULL << 20;
-    static constexpr std::uint32_t kKvBaseTokens = 32768; // backed at startup
+    // Backed at startup: 4,096 tokens (one growth unit; candidates §22 VM-08, 2026-10-27), not 32,768. The 28K
+    // tokens less backed are ~400 MiB of frames on Dense8 while contexts stay short (the VRAM defaults measured
+    // Dense8 MTP decode +8.0 / +3.4 / +2.4 % together); longer prompts grow the pool by kKvGrowPages at a time.
+    static constexpr std::uint32_t kKvBaseTokens = 4096;
     static constexpr std::uint32_t kKvGrowPages  = 64;    // growth unit (4,096 tokens)
     static constexpr std::chrono::seconds kKvIdleShrink{60};
     // The last admission, release or idle shrink (steady-clock ticks), and whether the pool backs more
@@ -5870,8 +6231,17 @@ private:
             const auto resized = residency_->resize(frames - give, device_.stream, *vram_);
             if (resized.frames > frames - give) { return false; } // a lease holds the frames
         }
+        const std::size_t mapped_before = kv_vmm_->mapped_bytes();
         if (!map_kv(target)) {
-            if (give != 0) { (void)residency_->resize(frames, device_.stream, *vram_); }
+            // The chunks mapped before the failure stay with the region (the next growth uses them) and count as
+            // fixed bytes; the frames get back only what was not mapped (as Qwen3.5's elastic_kv.cpp), so frames and
+            // KV never claim the same memory.
+            const std::size_t kept = kv_vmm_->mapped_bytes() - mapped_before;
+            if (control_ && kept != 0) { control_->account_fixed(static_cast<std::int64_t>(kept)); }
+            const auto held = static_cast<std::uint32_t>(std::min<std::uint64_t>(give, (kept + stride - 1) / stride));
+            if (give > held) { (void)residency_->resize(frames - held, device_.stream, *vram_); }
+            frames_now_ = residency_->frames();
+            pool_now_   = residency_->pool_bytes();
             return false;
         }
         pool_->set_backed_pages(target);
@@ -5898,11 +6268,15 @@ private:
             for (std::uint32_t budget = pool_->backed_pages() - plan_.kv_base_pages;
                  budget != 0 && !pool_->can_back(plan_.kv_base_pages) && index.evict_backed_device_blocks(1) != 0; --budget) {}
         }
+        // Down in growth steps, the last one to the base (Qwen3.5's elastic_kv.cpp: a pool grown to a capacity
+        // off the step grid stopped above the base when a page below the base was in use, and then woke the
+        // engine every kKvIdleShrink for a shrink that did nothing).
         std::uint32_t target = pool_->backed_pages();
-        while (target > plan_.kv_base_pages && pool_->can_back(target - std::min(target, kKvGrowPages))) {
-            target -= std::min(target, kKvGrowPages);
+        while (target > plan_.kv_base_pages) {
+            const std::uint32_t next = std::max(plan_.kv_base_pages, target - std::min(target, kKvGrowPages));
+            if (!pool_->can_back(next)) { break; }
+            target = next;
         }
-        target = std::max(target, plan_.kv_base_pages);
         if (target == pool_->backed_pages()) { return; }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         device_.synchronize();
@@ -6010,8 +6384,10 @@ private:
             const auto count = counts.empty() ? 1 : counts[row];
             const std::uint64_t reached = count >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << count) - 1U;
             std::int32_t* const nonfinite = nonfinite_flag(ContractAccess::lane(rows[row]));
+            const bool nonfinite_row      = std::exchange(*nonfinite, 0) != 0;
             ContractAccess::set_row_failure(pending, row,
-                                            std::exchange(*nonfinite, 0) != 0 ? runtime::PendingRowFailure::NonFiniteLogits
+                                            nonfinite_row || runtime::testing::take_nonfinite_fault()
+                                                ? runtime::PendingRowFailure::NonFiniteLogits
                                             : (grammar_dead_[row] & reached) != 0
                                                 ? runtime::PendingRowFailure::ConstraintDeadEnd
                                                 : runtime::PendingRowFailure::None);
@@ -6064,6 +6440,11 @@ private:
     bool clear_prefix_on_release_ = false;
     std::unique_ptr<ExpertResidency> residency_;
     std::unique_ptr<ExpertStream> expert_stream_;
+    // The drafter pool (candidates §22 VM-01): the MTP drafter's pooled experts (their memory is
+    // declared first, so the pool, whose copies write it, goes first) and when it last reported.
+    DeviceBuffer drafter_pool_memory_;
+    std::unique_ptr<runtime::expert_offload::DrafterExpertPool> drafter_pool_;
+    Clock::time_point drafter_reported_{};
     // The stream's leases: the ring, the wide arena and a walk's area (each a run of one pool).
     ExpertResidency::FrameLease stream_lease_, stream_wide_lease_, stream_walk_lease_;
     std::size_t stream_ring_bytes_ = 0, stream_wide_bytes_ = 0, stream_walk_bytes_ = 0;
@@ -6235,14 +6616,20 @@ private:
             for (auto event : drafter_events) {
                 if (event != nullptr) { cudaEventDestroy(event); }
             }
+            for (auto event : split_events) {
+                if (event != nullptr) { cudaEventDestroy(event); }
+            }
             if (stream != nullptr) { cudaStreamDestroy(stream); }
             if (shared_stream != nullptr) { cudaStreamDestroy(shared_stream); }
             if (drafter_stream != nullptr) { cudaStreamDestroy(drafter_stream); }
+            if (split_stream != nullptr) { cudaStreamDestroy(split_stream); }
         }
         cudaStream_t stream = nullptr;
         std::array<cudaEvent_t, 5> events{};
         cudaStream_t shared_stream = nullptr;
         std::array<cudaEvent_t, 2> shared_events{};
+        cudaStream_t split_stream = nullptr;         // forked calls' staged misses
+        std::array<cudaEvent_t, 2> split_events{};
         cudaStream_t drafter_stream = nullptr;       // INFERNIX_TMP_DRAFTER_STREAM only
         // The catch-up's inputs staged; the catch-up done; the pre-draft done (mtp_pre_draft).
         std::array<cudaEvent_t, 3> drafter_events{};
@@ -6258,11 +6645,23 @@ private:
     bool mtp_sampled_round_ = false;
     std::vector<DecodeGraph> mtp_catch_graphs_; // (batch - 1) * max_width_ + width - 1
     std::vector<DecodeGraph> verify_graphs_; // (batch - 1) * max_width_ + width - 1
+    // A verification round's commit (commit_verified), indexed as verify_graphs_.
+    std::vector<DecodeGraph> commit_graphs_;
     // screened-lm-head (screened_round): the screened rounds' decode and verification graphs, indexed as
     // graphs_ and verify_graphs_.
     bool screened_head_ = false;
     std::array<DecodeGraph, kMaximumConcurrency> screened_graphs_;
     std::vector<DecodeGraph> screened_verify_graphs_;
+    // The startup capture (capture_graph_set, candidates §23 NU-04):
+    // whether it is capturing now (graphs upload instead of launching), whether it ran (a later capture is
+    // reported), how many graphs it captured and the device memory they took.
+    struct GraphSet {
+        bool capturing         = false;
+        bool at_startup        = false;
+        std::uint32_t captured = 0;
+        std::int64_t bytes     = 0;
+    };
+    GraphSet graph_set_;
 
     std::array<Lane, kMaximumConcurrency> lanes_{};
     std::array<std::int32_t, kMaximumConcurrency> host_lanes_{};
@@ -6331,10 +6730,20 @@ private:
     // (C = 2 decode on the 5090, AIME prompts sampled: K = 1 and 2 rounds took 1.44 and 1.95 plain
     // two-row rounds; K = 3, 8 columns, took 3.1 and lost to plain decode; design 19.3.5).
     static constexpr std::int32_t kPairMaxDrafts = 2;
-    // The GDN prefill's sub-chunk: prefill calls starting on multiples of it give every position the
-    // same bits whatever the call boundaries (request invariance's resume grid).
-    static constexpr std::uint32_t kResumeGrid = 16;
     static constexpr double kPairWidthCost       = 0.47;
+    // The GDN prefill's sub-chunk: every prefill call starts on a multiple of it.
+    static constexpr std::uint32_t kGdnGrid = 16;
+    // Without free cache resume (the reproducible route) taps, coalescing and resumes sit on the prefill-chunk
+    // grid, as Qwen3.5's do: a resumed prefill then runs the cold prefill's calls. Several prefill routes change
+    // their arithmetic with the call's width (GDN: decode update at 1 column, recurrent kernel to 15, chunked from
+    // 16; Q8 dense SIMT to 8 columns, MMA tiles beyond; BF16 dense by width; QSA attention split or unsplit; the
+    // hyper-connection mix fused at decode widths), so a resume on the 16-token grid gave a position other bits
+    // than the cold prefill: on Dense8 every resume of 1-17 tokens at 1040 against the cold [1024, L) call differed
+    // (|dlogprob| up to 0.078; infernix_qwen4_exp_resume_width_real_test, 2026-10-27).
+    [[nodiscard]] std::uint32_t resume_grid() const noexcept {
+        if (options_.free_cache_resume) { return 1U; }
+        return static_cast<std::uint32_t>(std::max(chunk_, static_cast<std::int32_t>(kGdnGrid)));
+    }
     // dflash2-pairs' width with --draft-tokens auto (dflash2_pair_width): a draft per row and the
     // two-row proposal in plain two-row rounds, fixed priors as for one row (an online fit chose
     // shorter lengths there and was slower). A pair round verifies MTP pair rounds' widths with the
@@ -6405,9 +6814,16 @@ private:
     // dflash_drafts_, their candidates and laws in the io); `while_drafting` runs on the host after
     // it is submitted, before its wait.
     void dflash2_propose(std::span<const std::uint32_t> lanes, const std::function<void()>& while_drafting);
+    // dflash2_propose's call over `batch` rows of the staged io (the proposal graph's body and the startup capture's).
+    [[nodiscard]] execution::DFlash2ProposalCall dflash2_proposal_call(std::int32_t batch);
     // After a round's commit: each row's committed columns' features into its ring (`commit`: the
     // committed columns per row, already on the device at spec_layout_.commit).
     void dflash2_catch_up(std::span<const SequenceHandle> rows, std::int32_t W, const std::int32_t* commit);
+    // dflash2_catch_up's two halves, for a commit graph that holds the materialization (commit_verified): the call
+    // over a round of `batch` rows of width W, whose counts the device reads
+    // at spec_layout_.commit, and each committing row's new frontier.
+    [[nodiscard]] execution::DFlash2ContextCall dflash2_context_call(std::int32_t batch, std::int32_t W);
+    void dflash2_settle_frontiers(std::span<const SequenceHandle> rows, const std::int32_t* commit);
     // After a prefill call or forced tokens (one row): its last window's features into the ring.
     void dflash2_call_context(std::int32_t batch, std::int32_t width);
     // A layer walk: a tapped layer's completed residual for the span's last window, and after the
@@ -6539,6 +6955,18 @@ private:
                                                                      std::uint32_t reused = 0) const;
     void vision_reserve(Lane& lane, std::shared_ptr<const VisionAdmission> admission,
                         const qwen3_5::PreparedPromptData& prompt);
+    // The window's frames are part of its binding's reservation: vision_lend lends them right after
+    // the binding reserved its KV (the KV may grow into the frames first, never after a lease), or
+    // returns the unreserved outcome when it cannot. Another lane holding the frames defers the
+    // admission (no pages short); with every other lane idle the request is refused
+    // (media_budget_exceeded). Failing a binding step instead would fail the Engine.
+    [[nodiscard]] std::optional<BindingReservation> vision_lend(Lane& lane, std::uint32_t index);
+    // Before such a binding reserves its KV, on an otherwise idle Program whose frames cannot hold
+    // the window: the elastic KV pool's idle top (Host-backed cached blocks first) returns to them.
+    void vision_make_room(const VisionAdmission* vision);
+    // What the window may take now, and with no lease out (testing::vision_lend_limit caps both).
+    [[nodiscard]] std::uint64_t vision_lendable() const noexcept;
+    [[nodiscard]] std::uint64_t vision_lend_capacity() const noexcept;
     [[nodiscard]] static bool vision_encoded(const Lane& lane) noexcept { return !lane.vision || lane.vision->encoded; }
     void vision_step(Lane& lane);
     void vision_release(Lane& lane) noexcept;

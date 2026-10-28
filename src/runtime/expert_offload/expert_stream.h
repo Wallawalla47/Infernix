@@ -23,7 +23,12 @@
 //
 // Gated chunks (design §19.3.12, a short prompt's CPU share) copy nothing ahead: once a layer's
 // routing is known, plan_layer copies only the experts the call routes that are neither resident
-// nor left to the CPU, and uploads the layer's slot table with them.
+// nor left to the CPU, and uploads the layer's slot table with them. The copy-ahead (candidates BX-09, as
+// Basalt 31aacda): plan_ahead fills the start of the next layer's half from a guess of its routing (this
+// layer's MoE input through the next layer's router) while this layer ends, so the link does not idle
+// between a layer's routing and its copies; plan_layer keeps those slots and copies the rest. The guess
+// was right for 99 % of the experts it copied and caught 79-89 % of the heavy ones (Dense8, 1,024-4,096
+// columns, 2026-10-26).
 //
 // Staging (set_staging; the SSD tier's unpinned records, which the copy engine cannot read without
 // the driver holding the host thread): up to per_part of a layer's streamed records may be unpinned.
@@ -103,6 +108,22 @@ public:
     // release of layer - 2's half. Returns how many it copies.
     std::uint32_t plan_layer(std::uint32_t layer, std::span<const std::int32_t> columns,
                              std::span<const std::uint8_t> cpu);
+    // A gated chunk's layer `layer`, before its routing is known (BX-09): copies the non-resident experts
+    // with a pinned record that `guess` (columns per expert: the previous layer's MoE input through this
+    // layer's router) gives more than `rows` columns, heaviest first and at most `most` (0: the half),
+    // into the start of the layer's half, behind the release of layer - 2's half. plan_layer then keeps
+    // their slots and copies only the rest. Returns how many it copies.
+    std::uint32_t plan_ahead(std::uint32_t layer, std::span<const std::int32_t> guess, std::int32_t rows,
+                             std::uint32_t most);
+    // Zeroes the columns of the experts copied ahead for `layer`: they are on their way to the device, so
+    // the CPU split neither takes nor prices them.
+    void mask_ahead(std::uint32_t layer, std::span<std::int32_t> columns) const;
+    // plan_ahead's row threshold for a call of `columns` columns: columns / 128, at least 8. Dense8 prefill
+    // gains (2026-10-26): 2,048 columns 4 / 8 / 16 / 32 / 64 rows +10.5 / +12.7 / +14.4 / +15.0 / +14.4 %;
+    // 4,096 columns 8 / 16 / 32 rows +7.7 / +8.8 / +8.9 %; 1,024 columns 8 rows +10.2 % (the only one run).
+    [[nodiscard]] static constexpr std::int32_t ahead_rows(std::int32_t columns) noexcept {
+        return columns / 128 > 8 ? columns / 128 : 8;
+    }
     [[nodiscard]] bool gated() const noexcept { return gated_; }
     // Whether the active (ungated) chunk copies every expert of `layer` that was not resident when it
     // began: its MoE then has nothing to stage.
@@ -130,11 +151,19 @@ public:
         std::uint64_t copies   = 0; // DMA calls (runs of consecutive experts)
         std::uint64_t ssd      = 0; // of the records, those read into stream slots
         std::uint64_t staged   = 0; // of the streamed records, unpinned ones bounced
+        // Copy-ahead (plan_ahead), judged once each guessed layer's routing is known (plan_layer); the
+        // streamed counts above include these records.
+        std::uint64_t ahead       = 0; // records copied ahead
+        std::uint64_t ahead_used  = 0; // of them, routed by their layer
+        std::uint64_t heavy       = 0; // non-resident experts a guessed layer routes more than `rows` columns
+        std::uint64_t heavy_ahead = 0; // of them, copied ahead
+        std::uint64_t late        = 0; // records a guessed layer copied once its routing was known
     };
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
 private:
-    void enqueue(std::uint32_t layer);
+    // Copies the layer's planned records whose slot lies at or past `first` in its half.
+    void enqueue(std::uint32_t layer, std::uint32_t first = 0);
     // Requests the stream reads of `layer` (once per chunk).
     void request_reads(std::uint32_t layer);
     // Gives back the stream slots of layers whose copies have landed (all of the oldest such layer
@@ -160,6 +189,12 @@ private:
     std::uint32_t half_       = 0;       // slots per half
     std::vector<std::uint8_t> streams_;  // per layer: whether it has copies
     std::vector<std::uint8_t> complete_; // per layer: every non-resident expert copied (complete())
+    // Copy-ahead: per layer whether plan_ahead ran this chunk and how many slots it filled; the chunk's
+    // row threshold; the candidates' scratch (guessed columns, expert).
+    std::vector<std::uint8_t> guessed_;
+    std::vector<std::uint32_t> ahead_;
+    std::int32_t ahead_rows_ = 0;
+    std::vector<std::pair<std::int32_t, std::uint32_t>> pick_;
     bool active_    = false;
     bool uploading_ = false;
     bool gated_     = false;

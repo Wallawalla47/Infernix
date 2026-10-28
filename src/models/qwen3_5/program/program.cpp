@@ -226,6 +226,10 @@ bool Program::hybrid_holds_stale() const noexcept { return impl_->hybrid_holds_s
 
 std::uint64_t Program::hybrid_cache_epoch() const noexcept { return impl_->hybrid_cache_epoch(); }
 
+std::uint32_t Program::hybrid_resume_grid() const noexcept {
+    return impl_->execution_schedule.grid_cache ? impl_->prefill_chunk : 1U;
+}
+
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->hybrid_stats(); }
 
 void Program::set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost) {

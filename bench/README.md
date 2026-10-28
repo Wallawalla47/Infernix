@@ -82,7 +82,7 @@ infernix_bench --weights <artifact.ninfer>
           [-n, --n-gen <list>]
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
-          [--concurrency <1..8>]
+          [--concurrency <1..8>] [--rows distinct|same]
           [--grammar-file <path> | --json-schema-file <path> | --json-object | --regex <pattern> | --choice <text> ...]
           [--mixed-constraints]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
@@ -134,7 +134,11 @@ For a DFlash2 companion artifact:
   --max-ctx 4096 --kv-dtype bf16 --warmup 1 -r 3
 ```
 
-`--concurrency` submits that many prepared requests per repetition. `--grammar-file`,
+`--concurrency` submits that many prepared requests per repetition. Each row's prompt starts its own share of
+the corpus (`--rows distinct`, the default), so a MoE model's rows route to different experts as separate requests
+do; `--rows same` repeats the first row's prompt, which routes every row to the same experts and understates the
+expert work of real concurrency (rows before 2026-10-27 ran that way). `--prompt-ids` gives every row its one
+prompt. `--grammar-file`,
 `--json-schema-file`, `--json-object`, `--regex` and repeated `--choice` select mutually exclusive output constraints and enable
 normal text output and default EOS; a constrained request may finish before the output limit.
 `--mixed-constraints` applies the selected constraint to alternate requests and requires concurrency
@@ -160,7 +164,13 @@ hardware thread reading its share of 512 MiB before the model loads). `null` is 
 prints the same as one `machine:` line. Each test also carries `execution`: the measured repetitions'
 Engine execution units by kind (`prefill`, `replay`, `control`, `decode`: count, `mean_ms`, and
 `max_ms`, the maxima restarted after the warm-ups) and `decode_by_batch`, the decode rounds of each
-batch size that ran.
+batch size that ran. Schema v26 adds `expert_state` to `config` (`calibrated`: no `--expert-state`, so
+an offloaded model's expert cache starts from its built-in calibrated order, where it has one (Qwen3.8-Flash-Next;
+the Qwen3.5-122B-A10B's is not generated yet, so it starts empty), and no file is read or
+written; `off`: `--expert-state off`, an empty cache, as cold measurements need; otherwise the state
+file read at startup and written at exit), `ram_free_mib` (`--ram-free-mib`, the RAM the offloaded
+models' RAM plan leaves free) and `a8_activations` (`--a8-activations`, the approximate 8-bit
+activation route; its speeds are not the engine's quoted ones).
 
 `--ngram-draft-tokens 1..63 --ngram-min-match 4..64` enables the single-request
 [ngram copy proposer](../docs/ngram.md) alongside the selected neural backend.
@@ -440,6 +450,36 @@ activation policy alone does not identify that profile. MXFP8 with FP32 accumula
 bytes with the measured `1674.5 GB/s` pure-read ceiling from `tools/hbm_bandwidth_probe.cu`; it is
 the practical utilization measure for read-dominated points. Physical traffic and instruction
 utilization still require NCU.
+
+## GGUF projection and expert 8-bit wide routes
+
+`infernix_ggml_linear_bench` times one public `ops::ggml_linear` call per point (all of a shape's segments, BF16
+outputs, a workspace of exactly `ggml_linear_workspace_bytes`; the plane decode and column encoding are inside the
+timed call) on each selected route: `exact` (`LinearRoutes::Exact`), `bf16` (`GgmlBf16Wide`, ggml-bf16-prefill) and
+`a8` (`GgmlA8 | GgmlA8Wide`, `--a8-activations`; LOSSY). The built-in shapes are the Qwen3.8-Flash-Next IQ3_S
+import's dense projections (`gdn_qkvz`, `attn_qgkv`, `shexp_gate_up`, `ssm_out`, `attn_output`, `attn_qkv_q5k`,
+`attn_gate_q4k`, `iq3s_6144`); `--shape NAME=FORMAT:ROWS:K[:tiled][:permN]` adds others. It prints the median, min and
+p95 time, `2*N*K*T` TOPS, the time relative to the first route and an output hash.
+
+```bash
+cmake --build build -j --target infernix_ggml_linear_bench infernix_offloaded_moe_wide_bench
+./build/bench/infernix_ggml_linear_bench --tokens 512,2048,4096 --routes exact,bf16,a8
+./build/bench/infernix_ggml_linear_bench --tokens 4096 --shapes gdn_qkvz,ssm_out --routes bf16,a8 --cold
+```
+
+`infernix_offloaded_moe_wide_bench` covers the routed experts' 8-bit wide route (`WideA16::kA8`) on both bank
+kinds: `--activation a8` gives NVFP4 W4A16 banks `NarrowA16::kA8` with `WideA16::kA8` (against `--activation a16`,
+the exact W4A16 wide route, or `a16x2`, expert-a4-residual), and `--bank ggml --formats GU,DOWN --ggml-wide
+exact|bf16|a8` GGUF records at Flash-Next's geometry (`bf16` takes the BF16 planes only from `MoeGgmlTiles`'
+14,336-column threshold, the exact tiles below it).
+
+```bash
+./build/bench/infernix_offloaded_moe_wide_bench --activation a16 --tokens 512,2048,4096 --placement frames
+./build/bench/infernix_offloaded_moe_wide_bench --activation a8 --tokens 512,2048,4096 --placement frames
+./build/bench/infernix_offloaded_moe_wide_bench --activation a8 --geometry 122b --tokens 512,2048,4096 --placement frames
+./build/bench/infernix_offloaded_moe_wide_bench --bank ggml --formats iq3_s,iq4_nl --ggml-wide exact --tokens 512,2048,4096 --placement frames
+./build/bench/infernix_offloaded_moe_wide_bench --bank ggml --formats iq3_s,iq4_nl --ggml-wide a8 --tokens 512,2048,4096 --placement frames
+```
 
 ## LinearTopK Op benchmark
 

@@ -107,7 +107,7 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
     // The lossless route is what the fast paths are measured against; the design reference is the lossless
     // route with the configuration's declared steps (FP4-Local's optional W4A4 experts among them).
     if (options.lossless && (options.fast_paths || !options.fast_path_candidates.empty() ||
-                             (options.expert_a4_activations && !options.reference))) {
+                             (options.expert_a4_activations && !options.reference) || options.a8_activations)) {
         throw std::invalid_argument("the lossless route runs no fast path: disable fast paths");
     }
     if (options.reference && (!options.lossless || options.purpose != EnginePurpose::CausalScoring)) {
@@ -177,6 +177,8 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     // BF16, its state layout).
     out += ";fast=" + std::to_string(options.fast_paths ? 1 : 0);
     out += ";lossless=" + std::to_string(options.lossless ? 1 : 0);
+    // The 8-bit activation routes change the KV and state their calls write (decode, short and prefill calls).
+    if (options.a8_activations) { out += ";a8"; }
     for (const FastPath path : options.fast_path_candidates) { out += std::string(",") + fast_path_name(path); }
     out += ";build=" + options.context_cache.hybrid.persistent_identity;
     return out;
@@ -287,6 +289,11 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     if (options.expert_tail_skip != 0 && !options.fast_paths) {
         throw std::invalid_argument("--expert-tail-skip is approximate; the reproducible route (--reproducible) refuses it");
     }
+    // 8-bit activations change the arithmetic of the decode, verification and prefill calls they cover (each
+    // family's A8Routes); the engine refuses an artifact without such a route.
+    if (options.a8_activations && !options.fast_paths) {
+        throw std::invalid_argument("--a8-activations is approximate; the reproducible route (--reproducible) refuses it");
+    }
     // An automatic draft length chooses up to the model's most drafts unless given a ceiling: MTP on
     // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5. The
     // block drafters propose their whole block: Qwen3.8-Flash-Next's DFlash2 7; the Qwen3.5 planner
@@ -324,8 +331,13 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     if (cache.enabled) {
         // One pinned Host slab pool serves blocks and snapshots alike; its size is the only
         // capacity a deployment has to choose (docs/maintainer/hybrid-prefix-cache-spec.md §5.4).
-        cache.host_capacity_bytes = cache.host_capacity_bytes.value_or(kDefaultHybridHostCacheBytes);
-        const bool host_tier             = *cache.host_capacity_bytes != 0;
+        // --host-context-mib auto: Qwen3.8-Flash-Next sizes it after its experts and n-gram table
+        // (construct_qwen4_exp). Other models take the default.
+        if (!(qwen4_exp && cache.host_capacity_auto)) {
+            cache.host_capacity_bytes = cache.host_capacity_bytes.value_or(kDefaultHybridHostCacheBytes);
+            cache.host_capacity_auto  = false;
+        }
+        const bool host_tier = cache.host_capacity_auto || *cache.host_capacity_bytes != 0;
         HybridPrefixCacheOptions& hybrid = cache.hybrid;
         // Whether a turn resumes from lossy Host state depends on what eviction left, so the exact
         // route's output would depend on load (model-quality 6.1).
@@ -359,13 +371,31 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         }
         hybrid.tool_call_hold =
             hybrid.tool_call_hold.value_or(qwen4_exp ? std::chrono::milliseconds{0} : kDefaultToolCallHold);
+        // Idle-time prefill of finished turns (hybrid-prefix-cache-spec §7.9). Qwen3.8-Flash-Next: off by default
+        // (its default route already resumes 94 % of agentic turns at the reply's end), and refused on the
+        // reproducible route, where a turn resumed from the pass's grid snapshot inside a cold run's call differed
+        // from an uncached run (2026-10-27, infernix_qwen4_exp_prefix_cache_real_test --next-turn).
+        if (qwen4_exp && !options.fast_paths && hybrid.next_turn_prefill_quiet.value_or(std::chrono::milliseconds{0}).count() != 0) {
+            throw std::invalid_argument(
+                "Qwen3.8-Flash-Next's idle next-turn prefill is not exact: --reproducible and --lossless refuse it");
+        }
+        hybrid.next_turn_prefill_quiet = hybrid.next_turn_prefill_quiet.value_or(
+            qwen4_exp ? std::chrono::milliseconds{0} : kDefaultNextTurnPrefillQuiet);
+        if (hybrid.next_turn_prefill_quiet->count() < 0 ||
+            *hybrid.next_turn_prefill_quiet > std::chrono::milliseconds{3'600'000}) {
+            throw std::invalid_argument("idle prefill quiet period must be in [0,3600000] ms");
+        }
         // One resident snapshot per request lane keeps every live conversation's latest
         // endpoint restorable without PCIe traffic; one more slot stages taps and endpoints while
         // their Host copies are written. Without a Host tier these slots are the only snapshot
         // storage, so one more is kept for shared prefixes.
         if (!qwen4_exp) {
-            hybrid.device_snapshot_slots =
-                hybrid.device_snapshot_slots.value_or(concurrency + (host_tier ? 1U : 2U));
+            // With offloaded experts and a Host tier one slot (candidates §22 VM-03, 2026-10-27): each further slot
+            // is 146.5 MiB of the 122B's frames, and the VRAM defaults measured its one-request decode +1.0-1.7 %
+            // with one; its conversations' endpoints restore from the Host tier instead. Resident artifacts keep a
+            // slot per lane (their freed VRAM would be context, not speed, and restores were not measured there).
+            hybrid.device_snapshot_slots = hybrid.device_snapshot_slots.value_or(
+                offloaded_experts && host_tier ? 1U : concurrency + (host_tier ? 1U : 2U));
         }
         // Taps without a Host tier would evict other conversations' resident snapshots.
         hybrid.max_new_taps = hybrid.max_new_taps.value_or(host_tier ? 8U : 2U);
@@ -402,12 +432,15 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
                 "prefix cache capacities require the context cache to be enabled");
         }
         if (cache.hybrid.tool_call_hold.value_or(std::chrono::milliseconds{0}).count() != 0 ||
+            cache.hybrid.next_turn_prefill_quiet.value_or(std::chrono::milliseconds{0}).count() != 0 ||
             cache.hybrid.host_state_precision != HybridHostStatePrecision::Fp32) {
             throw std::invalid_argument("prefix cache policies require the context cache to be enabled");
         }
         cache.host_capacity_bytes          = 0U;
+        cache.host_capacity_auto           = false;
         cache.hybrid.device_snapshot_slots = 0U;
         cache.hybrid.tool_call_hold        = std::chrono::milliseconds{0};
+        cache.hybrid.next_turn_prefill_quiet    = std::chrono::milliseconds{0};
     }
     return options;
 }
@@ -477,9 +510,9 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
             streamed.stream_experts = true;
             plan                    = models::qwen3_5::plan_load(reader, streamed);
         }
-        plan.set_host_reserve(options.ram_headroom_bytes, expert_ram->demand.later_pinned);
+        plan.set_host_reserve(options.ram_free_bytes, expert_ram->demand.later_pinned);
     } else {
-        plan.set_host_reserve(options.ram_headroom_bytes);
+        plan.set_host_reserve(options.ram_free_bytes);
     }
     // The Program's offloaded experts: the engine's options from these options and the ledger's tier.
     std::optional<models::qwen3_5::detail::ProgramOffloadOptions> offload_options;
@@ -497,6 +530,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         // The lossless route computes every expert on the GPU: no CPU split. Its wide passes read the
         // prefill stream's ring (each missing expert copied once per pass, under the earlier layers).
         if (options.lossless) { o.prefill_cpu_split = false; }
+        // --expert-state off: no file and no calibrated seed (the cache starts empty).
+        o.expert_seed = !options.expert_state_off;
         if (!options.expert_state_path.empty()) {
             // The state belongs to the artifact: its experts and their records, not the build or KV format.
             std::error_code error;
@@ -580,6 +615,23 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     }
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
     frontend.complete();
+    // --a8-activations (LOSSY, opt-in; design §19.3.31): the 8-bit activation routes of this artifact
+    // (models::qwen3_5::A8Routes, which the Program's ExecutionSchedule takes too), in decode and verification calls
+    // and in prefill calls, or a refusal where it has none. Every other call keeps its route.
+    if (options.a8_activations) {
+        const models::qwen3_5::A8Routes a8 =
+            models::qwen3_5::a8_activation_routes(models::qwen3_5::fast_path_configuration(*instance->model, options));
+        if (!a8.any()) {
+            throw std::invalid_argument(
+                "--a8-activations: no 8-bit activation route applies to this artifact (it covers offloaded experts in "
+                "decode and prefill and a groupwise Q4 MLP gate/up in prefill; the NVFP4 27B's FP8 and NVFP4 "
+                "projections already take the 8- and 4-bit activations their artifact permits)");
+        }
+        // The CPU-served misses compute the GPU's 8-bit route (offloaded experts: the offload options exist).
+        if (a8.experts) { offload_options.value().engine.narrow_a16 = ops::offloaded_moe::NarrowA16::kA8; }
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "--a8-activations (approximate): %s; every other call keeps its route", a8.describe().c_str());
+    }
     std::optional<StartupPhaseScope> planning;
     planning.emplace(options.startup_observer, StartupPhase::TargetFinalize);
     // --draft-tokens auto where its policy does not run: the configuration's fastest fixed length.
@@ -729,8 +781,9 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         summary.fast_path_configuration = models::qwen3_5::describe(fast.configuration);
         for (const FastPath path : fast.paths) { summary.fast_paths.emplace_back(fast_path_name(path)); }
         summary.fast_paths_disabled = !options.fast_paths;
-        // A tail skip depends on what the expert cache holds.
-        summary.request_invariant = fast.request_invariant() && options.expert_tail_skip == 0;
+        // A tail skip depends on what the expert cache holds; the 8-bit routes' arithmetic on the call's width.
+        summary.request_invariant =
+            fast.request_invariant() && options.expert_tail_skip == 0 && !options.a8_activations;
         // Decode and verification run the column-invariant parameters unless batched-decode runs.
         if (fast.invariant(FastPath::BatchedDecode)) {
             for (const auto& entry : instance->parameters.column_by_column) {

@@ -165,6 +165,12 @@ void EngineCore<Instance>::publish_runtime_stats() {
     std::optional<nvtx::ScopedRange> detail_range;
     detail_range.emplace(nvtx::Name::StatsPublication, nvtx::Category::Control);
     RuntimeStats snapshot                     = cumulative_stats_;
+    snapshot.next_turn_prefills_started            = next_turn_counters_.started;
+    snapshot.next_turn_prefills_completed          = next_turn_counters_.completed;
+    snapshot.next_turn_prefills_yielded            = next_turn_counters_.yielded;
+    snapshot.next_turn_prefills_skipped            = next_turn_counters_.skipped;
+    snapshot.next_turn_prefills_dropped            = next_turn_dropped_.load(std::memory_order_relaxed);
+    snapshot.next_turn_prefill_tokens              = next_turn_counters_.tokens;
     const auto physical                       = instance_.program->physical_usage();
     snapshot.device_state_occupied_slots      = physical.occupied.state_slots;
     snapshot.device_main_kv_occupied_pages    = physical.occupied.main_kv_pages;

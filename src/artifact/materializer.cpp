@@ -388,7 +388,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             char message[320];
             std::snprintf(message, sizeof(message),
                           "pinned weights need %.2f GiB, later pins %.2f GiB and a %.2f GiB reserve "
-                          "(--ram-headroom-mib), but only %.2f GiB of physical Host memory is available",
+                          "(--ram-free-mib), but only %.2f GiB of physical Host memory is available",
                           static_cast<double>(plan.pinned_capacity_bytes) / gib,
                           static_cast<double>(plan.later_pinned_bytes) / gib,
                           static_cast<double>(plan.host_reserve_bytes) / gib, static_cast<double>(available) / gib);

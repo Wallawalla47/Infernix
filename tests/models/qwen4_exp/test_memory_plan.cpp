@@ -254,11 +254,12 @@ void test_display_headroom() {
 }
 
 void test_internal_reserve() {
-    require(internal_reserve(1, kGraphExecutableBytes, false) == 256 * kMiB, "few graphs: the 256 MiB floor");
+    require(internal_reserve(1, kGraphExecutableBytes, false) == 256 * kMiB, "a fixed pool, few graphs: the 256 MiB floor");
     require(internal_reserve(40, kGraphExecutableBytes, false) == 128 * kMiB + 160 * kMiB,
             "a fixed pool reserves for every graph");
-    require(internal_reserve(320, kGraphExecutableBytes, true) == 256 * kMiB,
-            "an elastic pool counts at most 32 graphs");
+    require(internal_reserve(1, kGraphExecutableBytes, true) == 128 * kMiB &&
+                internal_reserve(320, kGraphExecutableBytes, true) == 128 * kMiB,
+            "an elastic pool reserves 128 MiB at any graph count (its shrinks absorb the executables)");
 }
 
 void test_sizing() {
@@ -273,16 +274,15 @@ void test_sizing() {
     const VramSizing attached = size_expert_frames(card(free, DisplayState::Attached), demand(fixed, 20));
     require(attached.frame_bytes == expect - static_cast<std::int64_t>(768 * kMiB),
             "a display takes 768 MiB more with a fixed pool");
-    // A Program that captures every executable right after the sizing (Qwen3.5's) reserves for all of
-    // them, elastic or not.
-    VramDemand eager = demand(fixed, 320);
-    eager.elastic      = true;
-    eager.eager_graphs = true;
-    require(size_expert_frames(card(free, DisplayState::Headless), eager).reserve == 128 * kMiB + 320 * 4 * kMiB,
-            "eager graphs: the reserve covers every executable");
-    eager.eager_graphs = false;
-    require(size_expert_frames(card(free, DisplayState::Headless), eager).reserve == 256 * kMiB,
-            "lazy graphs on an elastic pool: at most 32 counted");
+    // An elastic pool reserves 128 MiB however many executables the Program may instantiate; a fixed
+    // pool reserves for every one.
+    VramDemand many = demand(fixed, 320);
+    many.elastic    = true;
+    require(size_expert_frames(card(free, DisplayState::Headless), many).reserve == 128 * kMiB,
+            "an elastic pool: 128 MiB");
+    many.elastic = false;
+    require(size_expert_frames(card(free, DisplayState::Headless), many).reserve == 128 * kMiB + 320 * 4 * kMiB,
+            "a fixed pool: the reserve covers every executable");
 
     // An OS budget below free memory bounds the frames with its 64 MiB margin only: the display
     // headroom is not stacked on top of it.
@@ -387,8 +387,8 @@ void test_control_law() {
     d.frame_bytes = kRecord;
     d.max_frames  = 48 * 512 - 1;
     const std::uint64_t other = 6 * kGiB; // dense weights, KV, workspace, staging, context
-    // Sizing left headroom (256) + reserve (256) free, on the chunk grid.
-    const std::uint64_t pool = (31'419 * kMiB - other - 512 * kMiB) / kChunk * kChunk;
+    // Sizing left headroom (256) + reserve (128, an elastic pool's) free, on the chunk grid.
+    const std::uint64_t pool = (31'419 * kMiB - other - 384 * kMiB) / kChunk * kChunk;
     VramControl control(d, kChunk, pool + other, pool);
     const std::uint32_t frames = frames_in(pool);
     double t = 0.0;
@@ -440,7 +440,7 @@ void test_control_law() {
     // the target falls by what remains of the reserve's use, and growth never eats into it.
     VramControl reserve(d, kChunk, pool + other, pool);
     const VramSnapshot graphs = wddm(pool, other + 64 * kMiB);
-    require(reserve.reserve_left(graphs, pool) == 256 * kMiB - 64 * kMiB, "graph memory spends the reserve");
+    require(reserve.reserve_left(graphs, pool) == 128 * kMiB - 64 * kMiB, "graph memory spends the reserve");
     require(reserve.target(graphs, pool) <= frames, "an idle start never grows into the internal reserve");
     require(!reserve.decide(graphs, pool, frames, 100.0, true).shrink, "spending the reserve is not pressure");
 

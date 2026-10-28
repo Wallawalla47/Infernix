@@ -139,7 +139,7 @@ struct Q4Quad {
 };
 
 // Depth: Q4 quads whose loads are issued before the first of them is accumulated (1, or 2 for the
-// T >= 2 path-tiled D3 under INFERNIX_TMP_D3_TWO_QUADS; candidates §10 GX-02, NInfer PR #199). The
+// T >= 2 path-tiled D3: launch_d3_small_t_paths; candidates §10 GX-02, NInfer PR #199). The
 // accumulation order is the same at either depth, so are the bits.
 template <class Codec, int K, int Depth = 1>
 __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const std::uint8_t* high,
@@ -320,10 +320,6 @@ __global__ void sparse_moe_d3_path_tiled_kernel(
         }
         if constexpr (Adaptive) { __syncthreads(); }
     }
-    // A dependent D4 (INFERNIX_TMP_SMALL_T_D4_PDL) may start its blocks now; it waits for this grid.
-    if constexpr (!Adaptive) {
-        if (tid == 0) { pdl::trigger_dependents(); }
-    }
 }
 
 template <class Codec, int Rows>
@@ -446,9 +442,6 @@ __global__ void sparse_moe_d4_token_kernel(
     const int lane = static_cast<int>(threadIdx.x) & 31;
     if constexpr (Adaptive) {
         if (*adaptive_route_jobs >= 0) { return; }
-    } else {
-        // Launched as D3's programmatic dependent (or plainly: then this returns at once).
-        pdl::wait_for_dependencies();
     }
     constexpr int kRowBlocks = kHidden / Rows;
     const int total_work     = tokens * kRowBlocks;
@@ -629,23 +622,18 @@ void launch_d3_small_t_paths_at(const Tensor& x, const SparseMoeWeights& weights
     }
 }
 
-// TEMPORARY (INFERNIX_TMP_D3_TWO_QUADS, candidates §10 GX-02): Q4 routed experts at T >= 2 keep two
-// quads' loads in flight (NInfer PR #199 measured 35B MTP3 +0.57 %; at T = 1, 6-11 % slower, so the
-// nine-warp D3 keeps one). Same bits.
+// Q4 routed experts at T >= 2 keep two quads' loads in flight (candidates §10 GX-02; NInfer PR #199 measured
+// 35B MTP3 +0.57 %; here 2026-10-27, ABBA 4 pairs: four requests +0.38 % median, worst +0.22 %, MTP3 +0.12 %,
+// worst +0.08 %, every pair better). Those four requests decoded copies of one prompt; with distinct prompts
+// (TensorFold review TF-01, ABBA 4 pairs) one quad measured 0.9976x median, worst 0.9971x, 3 of 4 pairs slower.
+// At T = 1 it was 6-11 % slower, so the nine-warp D3 keeps one. Same bits.
 template <class Codec, int PathsPerBlock, bool Adaptive>
 void launch_d3_small_t_paths(const Tensor& x, const SparseMoeWeights& weights, const int* token_ids,
                              float* token_activations, std::int32_t tokens, cudaStream_t stream,
                              const int* adaptive_route_jobs) {
-    if constexpr (Codec::kD3PackedWord8) {
-        static const bool two_quads = temporary_switches::flag("INFERNIX_TMP_D3_TWO_QUADS");
-        if (two_quads) {
-            launch_d3_small_t_paths_at<Codec, PathsPerBlock, Adaptive, 2>(x, weights, token_ids, token_activations,
-                                                                          tokens, stream, adaptive_route_jobs);
-            return;
-        }
-    }
-    launch_d3_small_t_paths_at<Codec, PathsPerBlock, Adaptive, 1>(x, weights, token_ids, token_activations, tokens,
-                                                                  stream, adaptive_route_jobs);
+    constexpr int kDepth = Codec::kD3PackedWord8 ? 2 : 1;
+    launch_d3_small_t_paths_at<Codec, PathsPerBlock, Adaptive, kDepth>(x, weights, token_ids, token_activations, tokens,
+                                                                       stream, adaptive_route_jobs);
 }
 
 template <class Codec, bool Adaptive>
@@ -670,8 +658,8 @@ void launch_d3_small_t_codec(const Tensor& x, const SparseMoeWeights& weights, c
     throw std::logic_error("sparse_moe: unknown small-T D3 schedule");
 }
 
-// INFERNIX_TMP_SMALL_T_D4_PDL (candidates §10.3 KW-06): the non-adaptive small-T D4 starts as D3's
-// programmatic dependent, as T = 1's D4 does. Same bits.
+// The small-T D4 is a plain launch: as D3's programmatic dependent (T = 1's form) it measured 0.27 %
+// slower on 35B decode at four requests (candidates §10.3 KW-06, 2026-10-26, 4 of 4 ABBA pairs).
 template <class Codec, int Rows, bool Adaptive>
 void launch_d4_small_t_rows(const SparseMoeWeights& weights, Tensor& destination,
                             const int* token_ids, const float* token_alpha,
@@ -688,14 +676,6 @@ void launch_d4_small_t_rows(const SparseMoeWeights& weights, Tensor& destination
     auto* output              = static_cast<__nv_bfloat16*>(destination.data);
     const auto* prefetch      = Adaptive ? nullptr : static_cast<const char*>(prefetch_data);
     const auto bytes          = static_cast<unsigned long long>(prefetch_bytes);
-    if (!Adaptive && temporary_switches::flag("INFERNIX_TMP_SMALL_T_D4_PDL")) {
-        CUDA_CHECK(pdl::launch_dependent({grid, dim3(9 * 32), 0, stream},
-                                         sparse_moe_d4_token_kernel<Codec, Rows, Adaptive>, token_ids,
-                                         token_alpha, shared_scale, token_activations, routed_codes,
-                                         routed_high, routed_scales, shared_codes, shared_scales, output,
-                                         static_cast<int>(tokens), adaptive_route_jobs, prefetch, bytes));
-        return;
-    }
     sparse_moe_d4_token_kernel<Codec, Rows, Adaptive><<<grid, 9 * 32, 0, stream>>>(
         token_ids, token_alpha, shared_scale, token_activations, routed_codes, routed_high,
         routed_scales, shared_codes, shared_scales, output, tokens, adaptive_route_jobs, prefetch,

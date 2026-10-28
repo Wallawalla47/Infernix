@@ -51,6 +51,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -77,9 +78,14 @@ public:
         std::uint64_t lent_frames    = 0; // frames lent now (in their pools' frames)
         std::uint64_t lend_evictions   = 0; // lowest-score experts evicted to lend frames, since start
         std::uint64_t lend_relocations = 0; // experts moved out of lent runs by device copies, since start
+        // SSD tier: the victims of loans and shrinks that kept a RAM copy, and those that became SSD-only.
+        std::uint64_t loan_victims_kept = 0, loan_victims_lost = 0;
+        // SSD tier: the tier's shadows (RAM copies of VRAM experts) just before the last loan.
+        std::uint64_t shadows_at_loan = 0;
         std::uint64_t seeded         = 0; // experts loaded by the warm start
         std::uint64_t landed         = 0; // staged misses landed in reserved frames and adopted (S4)
         std::uint64_t demotions      = 0; // SSD tier: VRAM victims copied to RAM (T4)
+        std::uint64_t refill_fallbacks = 0; // SSD tier: demotions whose refill read failed, copied over the link
         std::uint64_t unpinned_promotions = 0; // SSD tier: promotions of unpinned records (bounced)
     };
     // Landing frames per layer and round (design §19.3.5 S4): free frames are reserved before a
@@ -103,8 +109,12 @@ public:
     // record stride, each at most record_stride (empty: every layer's is record_stride). The layers
     // of one stride share a pool of frames of that pitch. max_columns: the most columns one round
     // routes. The cache starts with no frames: resize() backs them.
+    // The VRAM cache's promotion policy: the LFRU's budgeted admission, or Basalt's adaptive tier (decayed live route
+    // counts, swaps that lead by a margin; adaptive_round).
+    enum class VramPolicy : std::uint8_t { Lfru, Adaptive };
     ExpertResidency(const ExpertLayout& layout, std::vector<const std::uint8_t*> banks, std::uint64_t record_stride,
-                    std::int32_t max_columns, int device, std::vector<std::uint64_t> host_strides = {});
+                    std::int32_t max_columns, int device, std::vector<std::uint64_t> host_strides = {},
+                    VramPolicy policy = VramPolicy::Lfru);
     ~ExpertResidency();
     ExpertResidency(const ExpertResidency&)            = delete;
     ExpertResidency& operator=(const ExpertResidency&) = delete;
@@ -166,8 +176,9 @@ public:
     void give_back(FrameLease& lease, cudaStream_t compute);
 
     // SSD tier mode: records come from `tier` (owned by the caller, outliving this), not the banks.
-    // Before the first round and before warm_start.
-    void attach_tier(HostExpertTier* tier);
+    // Before the first round and before warm_start. `exclusive`: the exclusive RAM layout's tier (RAM holds what
+    // VRAM does not), whose loans keep their returned frames free for landings.
+    void attach_tier(HostExpertTier* tier, bool exclusive = false);
     [[nodiscard]] bool tiered() const noexcept { return tier_ != nullptr; }
     // Layer l's host record pointers (device [E]; null entries: SSD-only), or null without a tier.
     [[nodiscard]] const std::uint8_t* const* record_table(std::uint32_t layer) const noexcept;
@@ -295,6 +306,11 @@ private:
     // Tier mode: completes the demotions whose copies finished (all of them, waiting, with `wait`):
     // publishes their slots (T7), frees their frames and loads queued experts into them.
     void finish_demotions(cudaStream_t compute, bool wait);
+    // VramPolicy::Adaptive: one round of Basalt's adaptive tier over the round's live
+    // routes, each weighing `weight` (after the layers' landings; the LFRU then admits nothing).
+    // It runs inline at the boundary: Basalt's planning thread (the plan applied a round later) was no faster (IQ3_S
+    // 0.998x full layout, 1.004x exclusive; 2026-10-28, x_ab17).
+    void adaptive_round(const std::int32_t* routes, std::size_t used, std::span<const std::uint8_t> live, float weight);
 
     ExpertLayout layout_;
     std::vector<const std::uint8_t*> banks_;
@@ -345,6 +361,7 @@ private:
     std::vector<std::uint64_t> routed_by_layer_, hits_by_layer_; // per layer, indexed by layer
 
     HostExpertTier* tier_ = nullptr;
+    bool exclusive_       = false; // attach_tier's exclusive
     // TEMPORARY (INFERNIX_TMP_ROUTE_PROTECT=<experts per layer and lane>, candidates §13 PUB-22): the
     // route predictor whose next keys each layer's evictions spare; null without the switch.
     std::unique_ptr<expert_cache::RoutePredictor> predictor_;
@@ -353,6 +370,25 @@ private:
     // request see the same hits and misses.
     std::int64_t freeze_after_ = -1;
     bool frozen_               = false;
+    // VramPolicy::Adaptive (candidates §7.6 D12, the replay's TierSim._adaptive_step; the GGUF imports' default):
+    // Basalt's adaptive tier decides the promotions. Every key's live route count
+    // decays by DECAY each round; a non-resident key counted FLOOR or more is a candidate; the pool's free room
+    // goes to the best candidates of any layer, then each layer's candidates replace its least-counted residents
+    // while they lead by MARGIN, best gain first, at most SWAPS a round (4 x SWAPS after a round that ranked
+    // 2 x SWAPS candidates). Landings, loans, resizes and the SSD tier's gates are unchanged.
+    struct Adaptive {
+        float decay = 0.85F, floor = 2.0F, margin = 1.5F;
+        std::uint32_t swaps = 96, cap = 96;
+        std::vector<float> count;     // per key
+        std::vector<std::uint8_t> done; // per key: swapped in this round
+        std::vector<std::uint32_t> candidates, residents, ranked, touched;
+        struct Pair {
+            float gain;
+            std::uint32_t in, out;
+        };
+        std::vector<Pair> pairs;
+    };
+    std::optional<Adaptive> adaptive_;
     expert_cache::LfruPolicy::Admissible admissible_;
     DeviceBuffer records_device_;       // tier: const uint8_t* [layers][experts]
     PinnedHostBuffer records_host_{1};
@@ -364,9 +400,14 @@ private:
     std::vector<std::uint16_t> copies_in_flight_; // per key: promotion copies holding its H2D pin
     expert_cache::LfruPolicy::Admissible evictable_; // the tier's eviction gate
     cudaStream_t d2h_stream_ = nullptr;
+    // A demotion: the tier's read of the record from the artifact (`refill`) or, with no refill id free, the frame's
+    // copy into the slot (`done` recorded after it); either way the frame is held, and still read from, until the slot
+    // holds the record. A lent frame's victim has no frame (frame = kNoFrame): its refill alone keeps it in RAM.
+    static constexpr std::uint32_t kNoFrame = 0xFFFFFFFFU;
     struct Demotion {
         std::uint32_t key, frame, slot;
         cudaEvent_t done;
+        std::uint32_t refill = 0xFFFFFFFFU;
     };
     std::vector<Demotion> demotions_;
     std::vector<std::uint8_t> demoting_; // per key

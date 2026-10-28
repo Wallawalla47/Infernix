@@ -51,7 +51,7 @@ struct MaterializationPlan {
     std::vector<ObjectHandle> streamed_objects;
     // Physical Host memory the pinned block must leave free, after the caller's later pins
     // (`later_pinned_bytes`, allocated once the model is loaded) are counted against it too.
-    std::uint64_t host_reserve_bytes = kDefaultRamHeadroomBytes;
+    std::uint64_t host_reserve_bytes = kDefaultRamFreeBytes;
     std::uint64_t later_pinned_bytes = 0;
     // Arena suffix holding the ranked (low-traffic) device weights that an
     // EvictableWeightPool may temporarily evict; chunk-aligned by finish().

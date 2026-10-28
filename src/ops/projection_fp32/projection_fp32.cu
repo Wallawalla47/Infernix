@@ -378,11 +378,27 @@ constexpr int kTallMinColumnsBf16 = 8;
 constexpr int kTallMinColumnsQ8   = 9;
 constexpr std::size_t kTallMaxSharedBytes = static_cast<std::size_t>(kTallMaxColumns) * kMaxK * sizeof(bf16);
 
+// ld_nc_na_evict_first (ops/common/memory.cuh) for 16 bytes: a BF16 head's chunks.
+__device__ __forceinline__ uint4 ld_nc_na_evict_first_v4(const void* ptr) {
+    std::uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+    uint4 value;
+    asm("ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0, %1, %2, %3}, [%4], %5;"
+        : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+        : "l"(ptr), "l"(policy));
+    return value;
+}
+
+// The tall codecs' weights are a vocabulary head's, read once per call: their loads leave L2 first (the
+// narrow q8 kernel's evict-first, design §19.3.20d), so the head does not push out the next round's L2 data
+// (against plain loads: Dense8 DFlash2 decode, which verifies 8 columns through the q8 head, 1.000x, 2026-10-27).
 struct TallBf16 {
     Segments segments;
     int k;
     using Chunk = uint4;
-    __device__ Chunk load(int row, int chunk) const { return *row_chunk(segments, row, k, chunk); }
+    __device__ Chunk load(int row, int chunk) const {
+        return ld_nc_na_evict_first_v4(row_chunk(segments, row, k, chunk));
+    }
     __device__ static void decode(const Chunk& c, float (&w)[8]) { widen8(c, w); }
 };
 
@@ -395,8 +411,8 @@ struct TallQ8 {
         float scale;
     };
     __device__ Chunk load(int row, int chunk) const {
-        return {reinterpret_cast<const uint2*>(codes + static_cast<std::size_t>(row) * padded_k)[chunk],
-                __half2float(scales[static_cast<std::size_t>(row) * (padded_k / 32) + chunk / 4])};
+        const auto* p = reinterpret_cast<const uint2*>(codes + static_cast<std::size_t>(row) * padded_k) + chunk;
+        return {ld_nc_na_evict_first(p), __half2float(scales[static_cast<std::size_t>(row) * (padded_k / 32) + chunk / 4])};
     }
     __device__ static void decode(const Chunk& c, float (&w)[8]) {
         const auto* v = reinterpret_cast<const std::int8_t*>(&c.code);

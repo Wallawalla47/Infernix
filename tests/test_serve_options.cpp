@@ -158,6 +158,9 @@ int main() {
     failures += check(parse({"infernix-serve", "model.ninfer", "--expert-a4-activations"}).expert_a4_activations &&
                           !parse({"infernix-serve", "model.ninfer"}).expert_a4_activations,
                       "--expert-a4-activations did not parse (default off)");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--a8-activations"}).a8_activations &&
+                          !parse({"infernix-serve", "model.ninfer"}).a8_activations,
+                      "--a8-activations did not parse (default off)");
     failures += check(parse({"infernix-serve", "model.ninfer", "--embedding-host"}).embedding_host &&
                           !parse({"infernix-serve", "model.ninfer"}).embedding_host,
                       "--embedding-host did not parse (default off)");
@@ -538,6 +541,21 @@ int main() {
     failures += check(zero_host_context.context_cache.enabled &&
                           zero_host_context.context_cache.host_capacity_bytes == 0,
                       "zero Host context capacity was not retained as an explicit budget");
+    // --host-context-mib auto: no size, the automatic flag; a later number replaces it.
+    const ServeOptions auto_host_context = parse({"infernix-serve", "model.ninfer", "--host-context-mib", "auto"});
+    failures += check(auto_host_context.context_cache.host_capacity_auto &&
+                          !auto_host_context.context_cache.host_capacity_bytes,
+                      "--host-context-mib auto must leave the size to the RAM plan");
+    const ServeOptions auto_then_number =
+        parse({"infernix-serve", "model.ninfer", "--host-context-mib", "auto", "--host-context-mib", "2048"});
+    failures += check(!auto_then_number.context_cache.host_capacity_auto &&
+                          auto_then_number.context_cache.host_capacity_bytes == (2048ULL << 20),
+                      "a later --host-context-mib N must replace auto");
+    // --ram-free-mib: the RAM everything Infernix plans leaves free (8 GiB by default).
+    failures += check(parse({"infernix-serve", "model.ninfer"}).ram_free_bytes == (8192ULL << 20),
+                      "--ram-free-mib must default to 8 GiB");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--ram-free-mib", "4096"}).ram_free_bytes == (4096ULL << 20),
+                      "--ram-free-mib must set the RAM left free");
 
     for (const auto& [mib, bytes] : std::vector<std::pair<std::string, std::size_t>>{
              {"146.822265625", 153954304},
@@ -653,10 +671,23 @@ int main() {
                                   .context_cache.hybrid.host_state_precision ==
                               infernix::HybridHostStatePrecision::Bf16,
                           "--cache-host-state bf16 was not parsed");
+        // Next-turn prefill (hybrid-prefix-cache-spec §7.9): the Engine's default unless given, 0 off.
+        failures += check(!hybrid_minimal.context_cache.hybrid.next_turn_prefill_quiet.has_value(),
+                          "serving must leave the next-turn prefill's quiet period to the Engine");
+        failures += check(parse({"infernix-serve", "model.ninfer", "--cache-next-turn-ms", "400"})
+                                      .context_cache.hybrid.next_turn_prefill_quiet ==
+                                  std::chrono::milliseconds{400} &&
+                              parse({"infernix-serve", "model.ninfer", "--cache-next-turn-ms", "0"})
+                                      .context_cache.hybrid.next_turn_prefill_quiet ==
+                                  std::chrono::milliseconds{0},
+                          "--cache-next-turn-ms did not reach serving options");
         for (const std::vector<std::string>& bad :
              std::vector<std::vector<std::string>>{{"--cache-host-state", "fp16"},
                                                    {"--cache-tool-hold-secs", "3601"},
-                                                   {"--cache-tool-hold-secs", "-1"}}) {
+                                                   {"--cache-tool-hold-secs", "-1"},
+                                                   {"--cache-next-turn-ms", "3600001"},
+                                                   {"--cache-next-turn-ms", "-1"},
+                                                   {"--no-prefix-reuse", "--cache-next-turn-ms", "150"}}) {
             std::vector<std::string> arguments{"infernix-serve", "model.ninfer"};
             arguments.insert(arguments.end(), bad.begin(), bad.end());
             bool rejected = false;
@@ -693,6 +724,20 @@ int main() {
             (void)parse({"infernix-serve", "model.ninfer", "--expert-ram-mib", bad});
         } catch (const std::exception&) { rejected = true; }
         failures += check(rejected, "--expert-ram-mib must reject a zero or malformed size");
+    }
+    failures += check(parse({"infernix-serve", "model.ninfer", "--expert-ram-layout", "full"}).expert_ram_layout ==
+                              infernix::ExpertRamLayout::Full &&
+                          parse({"infernix-serve", "model.ninfer", "--expert-ram-layout", "exclusive"}).expert_ram_layout ==
+                              infernix::ExpertRamLayout::Exclusive &&
+                          parse({"infernix-serve", "model.ninfer"}).expert_ram_layout ==
+                              infernix::EngineOptions{}.expert_ram_layout,
+                      "--expert-ram-layout must parse exclusive and full, defaulting to the Engine's");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"infernix-serve", "model.ninfer", "--expert-ram-layout", "all"});
+        } catch (const std::exception&) { rejected = true; }
+        failures += check(rejected, "--expert-ram-layout must reject another value");
     }
     failures += check(parse({"infernix-serve", "model.ninfer", "--expert-pin-mib", "24576"}).expert_pin_bytes == (24576ULL << 20) &&
                           !parse({"infernix-serve", "model.ninfer", "--expert-pin-mib", "24576", "--expert-pin-mib", "auto"})

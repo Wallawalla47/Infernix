@@ -66,4 +66,41 @@ void ggml_down(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat& f
 void ggml_expert_forward(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat& format, int ncols,
                          const std::uint16_t* const* x, std::uint16_t* const* y);
 
+// ------------------------------------------------------------------- the 8-bit activation route
+//
+// `--a8-activations` (LOSSY, opt-in; design §19.3.31; ops/ggml/ggml_a8.h): x and h quantized per 32-element
+// slice to codes in [-127, 127] with a binary32 scale, each slice's dot with the weight codes an exact int32
+// isum, and each row's slice terms a8::add_term(acc, isum, d_x, d_w) added in the GPU expert kernels' order
+// (cuda/ggml_expert_a8.cuh): slice s to partial s % P from 0.0f in ascending s, then the butterfly
+// p_i = p_i + p_(i + o), o = P / 2 .. 1, with P = a8::kGateUpPartials (gate/up rows) or a8::kDownPartials
+// (down rows). Every ISA forms the same IEEE binary32 operations in that order (the vector routes keep one
+// partial per lane), so a CPU-served miss returns the GPU's bits. The x86 routes need the default MXCSR
+// (no flush-to-zero or denormals-are-zero), as the scalar canonical arithmetic does. GGUF pairs only (not
+// block-FP8 banks).
+
+// One quantized 32-element slice: its codes (int16, which the 16-bit multiply-adds read directly), scale
+// (0 for a slice whose largest magnitude is below 2^-120, NaN for one holding Inf or NaN) and code sum.
+struct CpuA8Slice {
+    alignas(32) std::int16_t q[32];
+    float d;
+    std::int32_t sum;
+};
+
+// Quantizes BF16 v[0..n) (n a multiple of 32) slice by slice (the GPU's a8_quantize_slice).
+void ggml_a8_encode_column(const std::uint16_t* v, int n, CpuA8Slice* out);
+
+// Phase A for intermediates [i_begin, i_end): gate and up rows, SwiGLU; writes h[col][i] in BF16.
+void ggml_a8_gate_up(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat& format, const CpuA8Slice* const* x,
+                     int ncols, int i_begin, int i_end, std::uint16_t* const* h);
+
+// Phase B for down rows [row_begin, row_end) against h quantized by ggml_a8_encode_column: writes
+// y[col][row] in BF16.
+void ggml_a8_down(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat& format, const CpuA8Slice* const* h,
+                  int ncols, int row_begin, int row_end, std::uint16_t* const* y);
+
+// Whole expert on one thread on the 8-bit route: y[col][0..kHidden) from BF16 x[col][0..kHidden),
+// ncols <= kMaxColumns.
+void ggml_a8_expert_forward(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat& format, int ncols,
+                            const std::uint16_t* const* x, std::uint16_t* const* y);
+
 } // namespace infernix::ops::offloaded_moe

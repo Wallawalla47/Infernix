@@ -123,6 +123,18 @@ public:
                               OutputSink* sink                     = nullptr,
                               const CancellationView& cancellation = {});
 
+    // Idle-time prefill of a finished turn (docs/maintainer/hybrid-prefix-cache-spec.md §7.9).
+    // `conversation` is a request's text messages followed by its finished assistant reply as the
+    // client will send it back (content, reasoning, tool calls), with that request's prompt options.
+    // Off the caller's thread, the Engine renders it as the conversation's next request will
+    // (PromptContinuationMode::NextTurnHistory) and, once it has had nothing to run for
+    // HybridPrefixCacheOptions::next_turn_prefill_quiet, prefills that history into the prefix cache as an
+    // internal request. A newer conversation replaces one not yet started, a submitted request drops
+    // it, and a request arriving while it runs makes it stop at its next unit boundary. Outputs never
+    // change: the next request reuses it only where its tokens match. No effect when the option is
+    // zero, the prefix cache is off, or the Engine scores; never throws.
+    void prefill_next_turn(PromptInput conversation) noexcept;
+
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] ModelMetadata model_metadata() const;

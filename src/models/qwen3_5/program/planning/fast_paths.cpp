@@ -615,4 +615,26 @@ FastPathSelection select_fast_paths(const Model& model, const EngineOptions& opt
     return out;
 }
 
+A8Routes a8_activation_routes(const FastPathConfiguration& configuration) noexcept {
+    // One line per route (design §19.3.31); a route measured slower than the one it replaces is withdrawn on its line.
+    A8Routes out;
+    // Decode: Ornith-1.5-122B's W4A8 expert kernels 630 against 906 ms, its CPU team 47,490 against 15,831 columns/s.
+    out.experts = configuration.offloaded_experts;
+    // Prefill: the experts' wide calls on the 8-bit tiles (beside their narrow route); not yet measured end to end.
+    out.experts_prefill = out.experts;
+    // Prefill: the groupwise Qwen3.8-27B, INT8 KV, pp4096 +11.7 %, pp16384 +11.5 % (q4-w4a8, 2026-10-15).
+    out.q4_gate_up = configuration.q4_gate_up;
+    return out;
+}
+
+std::string A8Routes::describe() const {
+    std::string prefill = experts_prefill ? "the routed experts (calls of more than 128 columns)" : "";
+    if (q4_gate_up) {
+        prefill += std::string(prefill.empty() ? "" : ", ") + "the MLP gate/up (int8 per token, calls of 256 or more columns)";
+    }
+    return std::string("decode and verification: ") +
+           (experts ? "the routed experts (calls of up to 128 columns) with their CPU-served misses" : "none") +
+           "; prefill: " + (prefill.empty() ? std::string("none") : prefill);
+}
+
 } // namespace infernix::models::qwen3_5

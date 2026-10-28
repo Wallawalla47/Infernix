@@ -1,7 +1,8 @@
 // The Program side of Qwen4Exp's Vision encode window (docs/maintainer/qwen3_8-flash-next-design.md
-// §19.3.2): admission plans the window, reserve keeps the media, progress runs the layer-major pass
-// in steps, prefill calls scatter the handoff's embeddings, and the handoff returns to the expert
-// cache once the prompt's last call is enqueued (or the lane is released).
+// §19.3.2): admission plans the window, reserve keeps the media, the binding lends the window's
+// expert frames (or defers or refuses the request), progress runs the layer-major pass in steps,
+// prefill calls scatter the handoff's embeddings, and the handoff returns to the expert cache once the
+// prompt's last call is enqueued (or the lane is released).
 
 #include "models/qwen4_exp/program/program_impl.h"
 
@@ -74,6 +75,71 @@ void ProgramImpl::vision_reserve(Lane& lane, std::shared_ptr<const VisionAdmissi
     lane.vision       = std::move(vision);
 }
 
+std::uint64_t ProgramImpl::vision_lendable() const noexcept {
+    const std::uint64_t limit = testing::vision_lend_limit();
+    const std::uint64_t bytes = residency_->frames() > 0 ? residency_->lendable_bytes() : 0U;
+    return limit != 0 ? std::min(bytes, limit) : bytes;
+}
+
+std::uint64_t ProgramImpl::vision_lend_capacity() const noexcept {
+    const std::uint64_t limit = testing::vision_lend_limit();
+    const std::uint64_t bytes = residency_->frames() > 0 ? residency_->lend_capacity_bytes() : 0U;
+    return limit != 0 ? std::min(bytes, limit) : bytes;
+}
+
+void ProgramImpl::vision_make_room(const VisionAdmission* vision) {
+    if (vision == nullptr || vision->window.items.empty() || !kv_vmm_ ||
+        vision->window.lease_bytes <= vision_lend_capacity()) {
+        return;
+    }
+    if (std::any_of(lanes_.begin(), lanes_.end(), [](const Lane& lane) { return lane.phase != Phase::Free; })) {
+        return;
+    }
+    // Nothing is lent with every lane idle, so the frames grow by what the pool gives back. The
+    // blocks evicted keep their Host copies (a later match restores them).
+    shrink_kv(true);
+}
+
+std::optional<BindingReservation> ProgramImpl::vision_lend(Lane& lane, std::uint32_t index) {
+    LaneVision& v                  = *lane.vision;
+    const VisionWindowPlan& window = v.admission->window;
+    if (window.items.empty()) { return std::nullopt; } // every item lies in the reused prefix
+    const std::uint64_t need = window.lease_bytes;
+    // Another prompt's stream ring, wide arena and walk area, and the wide workspace, go back between
+    // its calls (its next streamed call lends again, design §19.3.8 F3), but not inside a layer walk's
+    // span or a wide call. For a window that does not fit they go back only when they hold every lent
+    // frame, so the window then fits: a window that waits leaves them alone.
+    if (need > vision_lendable() && !walk_.active && !wide_active_ && need <= vision_lend_capacity()) {
+        const std::uint64_t returnable = static_cast<std::uint64_t>(stream_lease_.count) + stream_wide_lease_.count +
+                                         stream_walk_lease_.count + work_lease_.count;
+        if (residency_->stats().lent_frames == returnable) {
+            return_stream_lease();
+            return_wide_work();
+        }
+    }
+    if (need <= vision_lendable()) {
+        return_stream_lease(); // a prefill ring is lent again by the next streamed chunk
+        // Promotions still landing in the run are waited for by compute and the weight stream's
+        // transfer stream.
+        const cudaStream_t writers[] = {device_.transfer_stream};
+        v.lease = residency_->lend(need, device_.stream, writers);
+        return std::nullopt;
+    }
+    BindingReservation out; // no pages short: the Engine waits while other lanes run
+    for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
+        if (i != index && lanes_[i].phase != Phase::Free) { return out; }
+    }
+    out.capacity_possible = false;
+    out.refusal           = std::make_exception_ptr(RequestError(
+        RequestErrorKind::MediaBudgetExceeded,
+        "the request's images and videos need " + std::to_string((need + (1U << 20) - 1) >> 20) +
+            " MiB of expert-cache frames for their Vision encode, and the cache can lend " +
+            std::to_string(vision_lendable() >> 20) +
+            " MiB with the request's context reserved; send fewer or smaller images, or a shorter "
+            "conversation"));
+    return out;
+}
+
 void ProgramImpl::vision_step(Lane& lane) {
     LaneVision& v                        = *lane.vision;
     const VisionWindowPlan& window       = v.admission->window;
@@ -81,11 +147,8 @@ void ProgramImpl::vision_step(Lane& lane) {
     const cudaStream_t s                 = device_.stream;
     const auto out                       = parameters_.vision->merger_fc2.weight.n;
     if (!v.pass) {
-        // Lend the handoff (W) or handoff and window (L); promotions still landing in the run are
-        // waited for by compute and the weight stream's transfer stream.
-        const cudaStream_t writers[] = {device_.transfer_stream};
-        return_stream_lease(); // a prefill ring is lent again by the next streamed chunk
-        v.lease   = residency_->lend(window.lease_bytes, s, writers);
+        // The binding lent the handoff (W) or handoff and window (L) (vision_lend).
+        if (!v.lease.valid()) { throw std::logic_error("Qwen4Exp: a Vision window runs without its lease"); }
         v.handoff = Tensor(v.lease.memory.data, DType::BF16, {out, static_cast<std::int32_t>(window.encoded_tokens)});
         DeviceSpan memory;
         if (window.lease) {

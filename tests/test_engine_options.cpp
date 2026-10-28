@@ -142,6 +142,13 @@ int main() {
     failures += check(candidate_invalid && candidate_text.find("fast paths") != std::string::npos,
                       "a fast-path candidate was accepted with the lossless route");
     options.fast_path_candidates.clear();
+    // The 8-bit activation routes (--a8-activations) are approximate: the lossless route refuses them.
+    options.a8_activations = true;
+    bool a8_invalid        = false;
+    const std::string a8_text = construction_error(options, a8_invalid);
+    failures += check(a8_invalid && a8_text.find("fast paths") != std::string::npos,
+                      "--a8-activations was accepted with the lossless route");
+    options.a8_activations = false;
     bool exact_invalid     = false;
     const std::string exact_text = construction_error(options, exact_invalid);
     failures += check(exact_text.find("fast paths") == std::string::npos,

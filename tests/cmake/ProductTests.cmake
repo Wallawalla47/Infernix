@@ -97,6 +97,12 @@ infernix_add_test(infernix_http_routes_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_routes.cpp"
   LIBRARIES infernix_serve)
 
+# Streaming requests refused before their stream starts (queue answers, a context overflow), over
+# loopback HTTP against a refusing generation backend.
+infernix_add_test(infernix_http_stream_refusals_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_stream_refusals.cpp"
+  LIBRARIES infernix_serve infernix_product_logging)
+
 infernix_add_test(infernix_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"
   LIBRARIES infernix_serve)

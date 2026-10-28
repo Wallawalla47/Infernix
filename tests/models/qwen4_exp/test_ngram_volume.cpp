@@ -267,6 +267,18 @@ int main() {
         check(!volume.cached(with_new), "cached() reports a row not yet read");
         check(!volume.cached(std::vector<std::uint32_t>{static_cast<std::uint32_t>(kRows)}), "cached() rejects a row past the table");
 
+        // The startup read-rate probe times real reads and leaves the row cache and counters alone;
+        // a zero time limit stops it after its first read.
+        before                  = volume.counters();
+        const auto probe        = volume.probe_reads(64, 60.0);
+        const auto limited      = volume.probe_reads(1'000'000, 0.0);
+        check(probe.reads == 64 && probe.seconds > 0.0 && probe.reads_per_second() > 0.0,
+              "the read probe completes its reads and times them");
+        check(limited.reads == 1, "the read probe stops at its time limit");
+        check(volume.counters().rows == before.rows && volume.counters().reads == before.reads &&
+                  volume.counters().hits == before.hits && volume.cached(many) && !volume.cached(with_new),
+              "the read probe leaves the counters and the row cache unchanged");
+
         // Two rows of one cache slot (the slot is a hash of the row id; brute-force a collision).
         const auto slot_of = [](std::uint32_t row) { return (row * 2654435761U) >> 12U; };
         std::uint32_t a = 0, b = 0;
@@ -301,6 +313,27 @@ int main() {
             (void)read(volume, {static_cast<std::uint32_t>(kRows)});
         } catch (const std::out_of_range&) { threw = true; }
         check(threw, "a row past the table throws out_of_range");
+
+        // RAM residency: the whole table read at open into memory locked for the CPU (not page-locked for
+        // the device); every call is served from it with the volume's bytes and no further reads.
+        {
+            const q4::NgramVolume ram(path, table, true);
+            check(ram.resident(), "a resident table reports its residency");
+            const auto opened = ram.counters();
+            check(rows_match(rows, read(ram, rows)) && rows_match(shared, read(ram, shared)) &&
+                      rows_match(many, read(ram, many)) && rows_match(large, read(ram, large)) &&
+                      rows_match(pair, read(ram, pair)),
+                  "resident rows equal the oracle");
+            check(ram.counters().reads == opened.reads, "a resident table reads nothing after its open");
+            if (const std::string why = ram.resident_lock_failure(); !why.empty()) {
+                std::printf("note: the resident table was not locked in RAM (%s)\n", why.c_str());
+            }
+            threw = false;
+            try {
+                (void)read(ram, {static_cast<std::uint32_t>(kRows)});
+            } catch (const std::out_of_range&) { threw = true; }
+            check(threw, "a resident row past the table throws out_of_range");
+        }
 
         q4::NgramTableConfig wrong = table;
         wrong.file_bytes += 4096;

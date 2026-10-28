@@ -31,6 +31,7 @@ Python tools are independent of CMake; there is no `INFERNIX_BUILD_TOOLS` option
 | Compare the Flash-Next A4 activation quantizer with ModelOpt's (runs ModelOpt's kernel when CUDA and `nvidia-modelopt` are present) | `python -m tools.flash_next.a4_reference [--activations FILE...]`; [`flash_next/`](flash_next/a4_reference.py) |
 | Measure the Flash-Next M0 machine facts: copy engines, PCIe, PDL chains, mapped-memory mailbox, DRAM contention, CPU expert kernel rates, NVMe random reads | `tools/flash_next_probe/run_m0.sh CHECKPOINT NVME_FILE`; [`flash_next_probe/`](flash_next_probe/) (build commands in each source header) |
 | Regenerate or check the VQ2 KV-cache codebook (needs numpy) | `python -m tools.kv_codebook.make_vq2_codebook [--check]`; [`kv_codebook/`](kv_codebook/make_vq2_codebook.py) |
+| TEMPORARY (PB-01): count the BF16 KV blocks a 12-bit lossless page form would hold, from `INFERNIX_TMP_KV_DUMP` dumps (needs numpy) | `python -I tools/kv_lossless_count/count.py DUMP_DIR`; [`kv_lossless_count/`](kv_lossless_count/README.md) |
 
 ## Standalone HBM probe
 

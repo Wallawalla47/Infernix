@@ -2,6 +2,7 @@
 
 #include "core/host_memory.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -30,7 +31,7 @@ void report_engine(const EngineOptions& options, DiagnosticLevel level, const st
 expert_offload::HostMemoryDemand expert_ram_demand(const EngineOptions& options, const ExpertPinnedTerms& pinned,
                                                    std::uint64_t prefix_cache_bytes, const VramSnapshot& vram) {
     expert_offload::HostMemoryDemand demand;
-    demand.reserve      = options.ram_headroom_bytes;
+    demand.reserve      = options.ram_free_bytes;
     demand.expert_banks = pinned.expert_banks;
     demand.other_pinned = pinned.other_pinned;
     demand.later_pinned = kProgramPinnedAllowance;
@@ -43,6 +44,16 @@ expert_offload::HostMemoryDemand expert_ram_demand(const EngineOptions& options,
     demand.pin_room       = expert_offload::pin_room(vram);
     demand.expert_pin_cap = options.expert_pin_bytes;
     return demand;
+}
+
+std::uint64_t ledger_left_bytes(const expert_offload::HostMemoryLedger& ledger) noexcept {
+    const std::uint64_t used = ledger.demand.reserve + ledger.planned + ledger.expert_ram;
+    return ledger.snapshot.available_physical > used ? ledger.snapshot.available_physical - used : 0;
+}
+
+std::uint64_t auto_host_context_bytes(std::uint64_t left_bytes) noexcept {
+    constexpr std::uint64_t kCap = 8ULL << 30, kStep = 256ULL << 20;
+    return std::max(kMinAutoHostContextBytes, std::min(kCap, left_bytes / 5 * 2) / kStep * kStep);
 }
 
 ExpertRamPlan plan_expert_ram(const EngineOptions& options, const expert_offload::HostMemoryDemand& demand,

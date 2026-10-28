@@ -3,10 +3,31 @@
 // and endpoints, and release. The binding (prefix_cache.h) moves the bytes.
 
 #include "models/qwen4_exp/program/program_impl.h"
+#include "models/qwen4_exp/program/prefix/test_taps.h"
 #include "models/qwen3_5/program/prefix/block_keys.h"
 #include "runtime/prefix_cache/block_hash.h"
 
 #include <algorithm>
+#include <atomic>
+#include <filesystem>
+#include <string>
+#include <system_error>
+
+namespace infernix::models::qwen4_exp::testing {
+namespace {
+std::atomic<std::int64_t> forced_tap_position{-1}; // -1: none
+} // namespace
+
+void set_forced_tap(std::optional<std::uint32_t> position) noexcept {
+    forced_tap_position.store(position ? static_cast<std::int64_t>(*position) : -1);
+}
+
+std::optional<std::uint32_t> forced_tap() noexcept {
+    const std::int64_t value = forced_tap_position.load();
+    if (value < 0) { return std::nullopt; }
+    return static_cast<std::uint32_t>(value);
+}
+} // namespace infernix::models::qwen4_exp::testing
 
 namespace infernix::models::qwen4_exp::detail {
 
@@ -99,9 +120,14 @@ std::optional<PrefixCachePersistence> ProgramImpl::save_prefix_cache_now(const C
     // path do not matter, the save only reads).
     device_.synchronize();
     prefix_->drain();
+    // Withdrawn entries a transfer pinned until now never reach the file (hybrid-prefix-cache-spec §7.8).
+    if (!prefix_withdrawal_.empty()) { (void)prefix_->index().withdraw(prefix_withdrawal_); }
     const std::uint64_t written = prefix_->counters().host_write_bytes;
     PrefixCachePersistence saved = public_result(prefix_->save(prefix_file_, prefix_fingerprint_, abandoned));
-    if (saved.ok) { prefix_saved_writes_ = written; }
+    if (saved.ok) {
+        prefix_saved_writes_ = written;
+        ++prefix_saves_;
+    }
     return saved;
 }
 
@@ -111,6 +137,7 @@ void ProgramImpl::save_prefix_cache_for_shutdown() noexcept {
     try {
         device_.synchronize();
         prefix_->drain();
+        if (!prefix_withdrawal_.empty()) { (void)prefix_->index().withdraw(prefix_withdrawal_); }
         // The product may abandon the save (a Ctrl+C during the stop). It counts as running only
         // from here, so an exit never waits for the Device work above.
         const PrefixCacheSaveControl& control = options_.prefix_save;
@@ -230,11 +257,11 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
         // A frontier strictly inside a Vision item would resume half an image (design §19.3.1).
         const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
         // Without free cache resume a request resumes only from prefill-computed state on the
-        // 16-token grid: a tap, never an endpoint (its state is decode's).
+        // prefill-chunk grid (resume_grid): a tap, never an endpoint (its state is decode's).
         const bool grid = !options_.free_cache_resume;
         std::erase_if(match.candidates, [&](const pc::MatchCandidate& c) {
             return c.filling_blocks != 0 || prefix::inside_exclusion(c.frontier, spans) ||
-                   (grid && (c.frontier % kResumeGrid != 0 ||
+                   (grid && (c.frontier % resume_grid() != 0 ||
                              index.snapshot(c.snapshot).kind == pc::SnapshotKind::Endpoint));
         });
         // A lane-resident snapshot needs no image restore: its state is still in the lane.
@@ -392,9 +419,9 @@ std::uint64_t ProgramImpl::hybrid_cache_epoch() const noexcept {
 // or concurrent requests over one image, prefill the shared part once.
 bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt, std::uint32_t reuse) {
     // Coalescing waits on another request and inserts its tap into this one's prefill. Without free cache
-    // resume (the reproducible route) the tap is a block boundary, which lies on the 16-token resume grid
-    // and cuts the sibling's calls only on it, and the waiting request resumes from a prefill tap there:
-    // both prompts keep their cold bits (candidates §9.2 VR-01).
+    // resume (the reproducible route) the tap lies on the prefill-chunk grid (resume_grid), where the
+    // sibling's calls end already, and the waiting request resumes from a prefill tap there: both prompts
+    // keep their cold bits (candidates §9.2 VR-01).
     const bool grid = !options_.free_cache_resume;
     if (options_.prefix_coalesce_wait_seconds <= 0.0) { return false; }
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -429,7 +456,7 @@ bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt
         // On the grid only a prefilling lane's capture (a tap) can serve: an endpoint's state is decode's.
         if (lane.prefix.capture != 0 && !prefix_->capture_result(lane.prefix.capture) &&
             lane.prefix.deepest > reuse && lane.prefix.deepest <= shared &&
-            (!grid || (lane.phase == Phase::Prefill && lane.prefix.deepest % kResumeGrid == 0))) {
+            (!grid || (lane.phase == Phase::Prefill && lane.prefix.deepest % resume_grid() == 0))) {
             consider(Wait{.lane = i, .target = lane.prefix.deepest, .plan_tap = false});
         }
         if (lane.phase != Phase::Prefill) { continue; }
@@ -440,13 +467,14 @@ bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt
         const auto realizable = [&](std::uint32_t position) {
             return position > lane.state_tokens && (!walking || position >= walk_end);
         };
-        // A new tap goes on the block boundary below the divergence (its block publishes with it);
-        // inside an image both prompts carry it moves to the image's end, so the waiting request
-        // resumes past the whole image and encodes nothing for it.
-        std::uint32_t aligned = shared / kBlock * kBlock;
+        // A new tap goes on the block boundary below the divergence (its block publishes with it), on
+        // the reproducible route the chunk grid's; inside an image both prompts carry it moves to the
+        // image's end, so the waiting request resumes past the whole image and encodes nothing for it.
+        const std::uint32_t tap_grid = grid ? resume_grid() : kBlock;
+        std::uint32_t aligned        = shared / tap_grid * tap_grid;
         for (const pc::TapExclusion& span : lane.prefix.exclusions) {
             if (span.begin < aligned && aligned < span.end && span.end <= shared &&
-                (!grid || span.end % kResumeGrid == 0)) {
+                (!grid || span.end % resume_grid() == 0)) {
                 aligned = span.end;
             }
         }
@@ -601,6 +629,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
     prefix_->forget_capture(lane.prefix.resident_capture);
     lane.prefix.resident_capture = 0;
     lane.prefix.captured         = false;
+    lane.prefix.saves            = prefix_saves_;
     if (!s.snapshot) { reset_slot(index); }
     // The block table: shared cache pages, then the private leases.
     std::vector<DeviceKVPageHandle> handles;
@@ -645,20 +674,26 @@ prefix::CallPlan ProgramImpl::plan_prefill(const qwen3_5::PreparedPromptData& pr
     if (taps && prefix_) {
         const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
         planned = pc::plan_taps(n, frontier, prompt.tap_hints.hints, existing, spans, prefix_->taps());
-        if (branch > frontier && branch < n && !prefix::inside_exclusion(branch, spans)) {
-            const auto at = std::lower_bound(planned.begin(), planned.end(), branch,
+        // A branch tap, and a test's forced tap (testing::set_forced_tap), as exact boundaries.
+        const auto exact_boundary = [&](std::uint32_t position) {
+            if (position <= frontier || position >= n || prefix::inside_exclusion(position, spans)) { return; }
+            const auto at = std::lower_bound(planned.begin(), planned.end(), position,
                                              [](const pc::PlannedTap& tap, std::uint32_t p) { return tap.position < p; });
-            if (at != planned.end() && at->position == branch) {
+            if (at != planned.end() && at->position == position) {
                 at->placement = pc::TapPlacement::Exact;
                 at->boundary  = true;
             } else {
-                planned.insert(at, pc::PlannedTap{.position = branch, .placement = pc::TapPlacement::Exact,
+                planned.insert(at, pc::PlannedTap{.position = position, .placement = pc::TapPlacement::Exact,
                                                   .boundary = true});
             }
-        }
+        };
+        exact_boundary(branch);
+        if (const auto forced = testing::forced_tap()) { exact_boundary(*forced); }
         if (!options_.free_cache_resume) {
-            // Each tap moves to the grid position at or before it, so it cuts a call on the grid.
-            for (pc::PlannedTap& tap : planned) { tap.position = tap.position / kResumeGrid * kResumeGrid; }
+            // Each tap moves to the chunk-grid position at or before it (resume_grid), where the cold prefill's
+            // calls end too, so it adds no cut.
+            const std::uint32_t grid = resume_grid();
+            for (pc::PlannedTap& tap : planned) { tap.position = tap.position / grid * grid; }
             std::erase_if(planned, [&](const pc::PlannedTap& tap) {
                 return tap.position <= frontier || prefix::inside_exclusion(tap.position, spans);
             });
@@ -796,6 +831,7 @@ void ProgramImpl::prefix_publish(Lane& lane, std::uint32_t frontier) {
         const pc::InsertResult result =
             prefix_->insert_block(parent, lane.prefix.hashes[b], tokens, extra, lease, attach, next);
         lane.prefix.path.push_back(result.node);
+        if (result.device_attached) { lane.prefix.owned.push_back(result.node); }
     }
 }
 
@@ -811,7 +847,13 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
 }
 
 void ProgramImpl::prefix_captured(Lane& lane, std::uint64_t id, std::uint32_t F) {
-    prefix_->forget_capture(lane.prefix.capture);
+    // The request's earlier captures stay known until its release, where a non-finite failure
+    // withdraws their snapshots; an earlier request's capture on the slot is forgotten now.
+    if (lane.prefix.captured) {
+        lane.prefix.captures.push_back(lane.prefix.capture);
+    } else {
+        prefix_->forget_capture(lane.prefix.capture);
+    }
     lane.prefix.capture  = id;
     lane.prefix.captured = true;
     lane.prefix.deepest  = F;
@@ -847,7 +889,8 @@ prefix::PrefixCache::Capture ProgramImpl::prefix_capture_at(Lane& lane, std::uin
     // requests diverging before this one. Its own earlier captures stay retained: its ladder taps and
     // its system-block boundary are where edits and side calls over the history diverge (§19.3.1).
     if (!lane.prefix.captured && lane.prefix.resume) {
-        c.supersedes = *lane.prefix.resume;
+        c.supersedes            = *lane.prefix.resume;
+        lane.prefix.superseded  = *lane.prefix.resume;
         if (prefix_->index().valid(*lane.prefix.resume)) {
             const std::uint32_t from = prefix_->index().snapshot(*lane.prefix.resume).frontier;
             if (from < F) {
@@ -898,7 +941,11 @@ void ProgramImpl::prefix_finish(Lane& lane, std::uint32_t index) {
     prefix_publish(lane, prefix_frontier(lane, true));
     const std::uint32_t F = lane.state_tokens;
     const bool full_blocks = !lane.mtp_live || lane.mtp_cells >= F / kBlock * kBlock;
-    // An endpoint holds decode-computed state: published only with free cache resume.
+    // An endpoint holds decode-computed state: published only with free cache resume. Nor does a lane
+    // that ends between prefill calls leave a tap there (2026-10-27): the next prompt would resume at a
+    // point its cold prefill does not cut, often with fewer than 16 tokens left, whose GDN update takes
+    // the recurrent kernel instead of the chunked kernel's partial last chunk (resume-equals-cold:
+    // mean |dlogprob| 0.0011 with such taps, 0 without).
     if (!options_.free_cache_resume) {
         prefix_->write_blocks(lane.prefix.path, device_.stream);
         lane.prefix.resident_capture = lane.prefix.deepest == F ? lane.prefix.capture : 0;
@@ -945,6 +992,21 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
         if (!lane.prefix.path.empty()) { prefix_->index().release_path(lane.prefix.path); }
         prefix_->poll();
     } catch (...) {}
+    if (lane.prefix.withdraw) {
+        prefix_withdraw(lane);
+    } else {
+        for (const std::uint64_t id : lane.prefix.captures) { prefix_->forget_capture(id); }
+    }
+    // Entries an earlier withdrawal found pinned go once nothing pins them.
+    if (!prefix_withdrawal_.empty()) {
+        try {
+            (void)prefix_->index().withdraw(prefix_withdrawal_);
+        } catch (...) { clear_prefix_on_release_ = true; }
+    }
+    lane.prefix.owned.clear();
+    lane.prefix.captures.clear();
+    lane.prefix.superseded.reset();
+    lane.prefix.withdraw = false;
     lane.prefix.path.clear();
     lane.prefix.taps.clear();
     lane.prefix.exclusions.clear();
@@ -954,6 +1016,55 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
     lane.prefix.deepest   = 0;
     lane.prefix.reused    = 0;
     lane.prefix.reuse     = false;
+}
+
+// After a non-finite failure, once the lane's pins are released (hybrid-prefix-cache-spec §7.8):
+// the request's captures land, then its blocks (with what later requests built on them) and its
+// snapshots leave the cache, so a resend resumes from what was cached before it. What another lane
+// still maps waits in prefix_withdrawal_ for a later release. The attached cache file is rewritten
+// at its next save, and deleted now when a save since the request's admission may hold them.
+void ProgramImpl::prefix_withdraw(Lane& lane) noexcept {
+    try {
+        prefix_->drain(); // each capture pins its anchor until it has landed and published
+        if (lane.prefix.captured) { lane.prefix.captures.push_back(lane.prefix.capture); }
+        for (const std::uint64_t id : lane.prefix.captures) {
+            if (const auto result = prefix_->capture_result(id); result && result->created) {
+                prefix_withdrawal_.snapshots.push_back(result->snapshot);
+            }
+            prefix_->forget_capture(id);
+        }
+        const bool published = !lane.prefix.captures.empty() || !lane.prefix.owned.empty();
+        prefix_withdrawal_.nodes.insert(prefix_withdrawal_.nodes.end(), lane.prefix.owned.begin(),
+                                        lane.prefix.owned.end());
+        const std::uint32_t removed = prefix_->index().withdraw(prefix_withdrawal_);
+        // The snapshot its first capture superseded serves again.
+        if (lane.prefix.superseded && prefix_->index().valid(*lane.prefix.superseded)) {
+            prefix_->index().unsupersede(*lane.prefix.superseded);
+        }
+        lane.prefix.superseded.reset();
+        // The slot holds the failed state: nothing resumes from it in place.
+        if (lane.prefix.captured) { lane.prefix.capture = 0; }
+        lane.prefix.captured         = false;
+        lane.prefix.resident_capture = 0;
+        if (published && !prefix_file_.empty()) {
+            prefix_saved_writes_ = ~std::uint64_t{0};
+            if (prefix_saves_ != lane.prefix.saves) {
+                std::error_code ignored;
+                std::filesystem::remove(prefix_file_, ignored);
+            }
+        }
+        const std::size_t waiting = prefix_withdrawal_.nodes.size() + prefix_withdrawal_.snapshots.size();
+        if (published || waiting != 0) {
+            diagnostic("non-finite logits: withdrew " + std::to_string(removed) +
+                           " prefix-cache entries the request published" +
+                           (waiting != 0 ? "; " + std::to_string(waiting) + " go once other requests release them"
+                                         : std::string()),
+                       DiagnosticLevel::Warning);
+        }
+    } catch (...) {
+        // What the request published cannot be told apart now: the cache is emptied once no lane maps it.
+        clear_prefix_on_release_ = true;
+    }
 }
 
 std::array<std::span<const cudaEvent_t>, 2> ProgramImpl::prefix_waits(const Lane& lane) const noexcept {

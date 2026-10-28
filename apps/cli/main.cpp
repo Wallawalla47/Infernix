@@ -380,8 +380,10 @@ int main(int argc, char** argv) {
         engine_options.ngram_residency          = cli.ngram_residency;
         engine_options.expert_state_path        = cli.expert_state ? *cli.expert_state
                                                                    : std::filesystem::path(cli.artifact_path.string() + ".expert-state");
-        engine_options.ram_headroom_bytes       = cli.ram_headroom_bytes;
+        engine_options.expert_state_off         = cli.expert_state && cli.expert_state->empty(); // --expert-state off
+        engine_options.ram_free_bytes           = cli.ram_free_bytes;
         engine_options.expert_ram_bytes         = cli.expert_ram_bytes;
+        engine_options.expert_ram_layout        = cli.expert_ram_layout;
         engine_options.expert_pin_bytes         = cli.expert_pin_bytes;
         engine_options.device                   = cli.device;
         engine_options.max_context              = cli.max_context;
@@ -391,6 +393,7 @@ int main(int argc, char** argv) {
         engine_options.vram_past_budget         = cli.vram_past_budget;
         engine_options.expert_tail_skip         = cli.expert_tail_skip;
         engine_options.expert_a4_activations    = cli.expert_a4_activations;
+        engine_options.a8_activations           = cli.a8_activations;
         engine_options.embedding_host           = cli.embedding_host;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;

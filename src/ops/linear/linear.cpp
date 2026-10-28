@@ -4,6 +4,7 @@
 
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/f16acc/f16acc_plan.h"
+#include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/mxfp8/mxfp8_dispatch.h"
 #include "ops/linear/mxfp8/mxfp8_format.h"
@@ -149,6 +150,10 @@ bool linear_column_invariant_route(QType qtype, std::int32_t output_rows,
 
 std::size_t linear_f16_accumulate_workspace_bytes(std::int32_t input_rows, std::int32_t tokens) {
     return detail::f16_accumulate_workspace_capacity_bytes(tokens, input_rows);
+}
+
+std::size_t linear_fp8_a8_pair_block32_workspace_bytes(std::int32_t input_rows, std::int32_t tokens) {
+    return detail::fp8_a8_pair_block32_workspace_capacity_bytes(tokens, input_rows);
 }
 
 std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,

@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace infernix::models::qwen4_exp {
@@ -26,15 +27,20 @@ namespace infernix::models::qwen4_exp {
 class NgramVolume {
 public:
     // Validates the header against the artifact's table geometry and volume id. With `resident`,
-    // the whole table is read into pinned host memory here (large unbuffered reads, then one
-    // registration) and every read_rows call is served from RAM; the row cache is not allocated.
+    // the whole table is read into host memory kept in RAM for the CPU (ResidentHostBuffer: locked in
+    // the working set, not page-locked for the device, since only read_rows' CPU copies read it, so it
+    // stays outside Windows' limit on page-locked memory) with large unbuffered reads, and every
+    // read_rows call is served from RAM; the row cache is not allocated.
     NgramVolume(const std::filesystem::path& path, const NgramTableConfig& table, bool resident = false);
 
-    // Host bytes a resident table pins: its blocks (the 4 KiB padding included).
+    // Host bytes a resident table takes: its blocks (the 4 KiB padding included).
     [[nodiscard]] static std::uint64_t resident_bytes(const NgramTableConfig& table) noexcept {
         return table.blocks * table.block_bytes;
     }
     [[nodiscard]] bool resident() const noexcept { return resident_ != nullptr; }
+    // Empty when a resident table is locked in RAM; otherwise the OS's reason (it still serves rows, but
+    // Windows may page it out under memory pressure).
+    [[nodiscard]] std::string resident_lock_failure() const { return resident_ ? resident_->lock_failure() : std::string(); }
 
     [[nodiscard]] const NgramTableConfig& table() const noexcept { return table_; }
 
@@ -43,6 +49,17 @@ public:
 
     // Whether every row is in the host cache, so read_rows would read nothing from the volume.
     [[nodiscard]] bool cached(std::span<const std::uint32_t> rows) const noexcept;
+
+    // Times up to `reads` unbuffered reads of random blocks, one at a time (the latency a missed row
+    // costs), for a startup warning about a drive too slow to serve the table. It stops after
+    // `max_seconds`, touches neither the row cache nor the counters, and reads nothing for a
+    // resident table.
+    struct ReadProbe {
+        std::size_t reads = 0;
+        double seconds    = 0.0;
+        [[nodiscard]] double reads_per_second() const noexcept { return seconds > 0.0 ? static_cast<double>(reads) / seconds : 0.0; }
+    };
+    [[nodiscard]] ReadProbe probe_reads(std::size_t reads = 256, double max_seconds = 2.0) const;
 
     // Row traffic since the volume was opened: rows requested, rows served by the host cache, 4 KiB
     // blocks read from the volume, and the wall time of the calls' volume reads.
@@ -78,7 +95,7 @@ private:
 
     ReadOnlyFile file_;
     NgramTableConfig table_;
-    std::unique_ptr<RegisteredHostBuffer> resident_; // the whole table's blocks (RAM mode)
+    std::unique_ptr<ResidentHostBuffer> resident_; // the whole table's blocks (RAM mode)
     mutable std::vector<std::byte> ring_storage_; // kInFlight blocks, 4 KiB-aligned at ring_
     mutable std::byte* ring_ = nullptr;
     mutable std::vector<std::byte> parallel_storage_; // kReadThreads rings of kParallelInFlight blocks

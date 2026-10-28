@@ -100,8 +100,9 @@ constexpr std::array kCliOptions{
     CliOption{"--vram-headroom-mib"},
     CliOption{"--prefill-chunk"},
     CliOption{"--device"},
-    CliOption{"--ram-headroom-mib"},
+    CliOption{"--ram-free-mib"},
     CliOption{"--expert-ram-mib"},
+    CliOption{"--expert-ram-layout"},
     CliOption{"--expert-pin-mib"},
     CliOption{"--kv-dtype"},
     CliOption{"--logits-dtype"},
@@ -132,6 +133,7 @@ constexpr std::array kCliOptions{
     CliOption{"--lossless", false},
     CliOption{"--fast-path", true, true},
     CliOption{"--expert-a4-activations", false},
+    CliOption{"--a8-activations", false},
     CliOption{"--embedding-host", false},
     CliOption{"--stop-token-id", true, true},
     CliOption{"--stop", true, true},
@@ -188,8 +190,10 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--chat-template FILE] [--ngram-volume FILE] [--ngram-residency auto|ram|volume]\n"
-           "       [--expert-state FILE|off] [--expert-stripe FILE] [--expert-a4-activations] [--embedding-host]\n"
-           "       [--ram-headroom-mib N] [--expert-ram-mib N|auto] [--expert-pin-mib N|auto]\n"
+           "       [--expert-state FILE|off] [--expert-stripe FILE] [--expert-a4-activations] [--a8-activations]\n"
+           "       [--embedding-host]\n"
+           "       [--ram-free-mib N] [--expert-ram-mib N|auto] [--expert-ram-layout exclusive|full]\n"
+           "       [--expert-pin-mib N|auto]\n"
            "       [--grammar-file FILE | --json-object | --json-schema-file FILE |\n"
            "        --regex PATTERN | --choice TEXT ...]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
@@ -220,14 +224,20 @@ std::string usage_text(const char* argv0) {
            "                           (default 16384 with offloaded experts, 1024 otherwise)\n"
            "  --max-new N              cap on generated tokens\n"
            "  --device N               CUDA device ordinal (default 0)\n"
-           "  --ram-headroom-mib N     physical Host RAM in MiB that pinned weights and\n"
-           "                           caches leave free for the system (default " +
-           std::to_string(kDefaultRamHeadroomBytes >> 20) +
+           "  --ram-free-mib N         physical Host RAM in MiB that Infernix's weights,\n"
+           "                           experts, n-gram table and caches leave free for other\n"
+           "                           programs (default " +
+           std::to_string(kDefaultRamFreeBytes >> 20) +
            ")\n"
            "  --expert-ram-mib N|auto  Offloaded experts: Host RAM in MiB for the routed\n"
-           "                           experts (auto: what --ram-headroom-mib and the other\n"
+           "                           experts (auto: what --ram-free-mib and the other\n"
            "                           pins leave); less than all of them need reads the\n"
            "                           rest from the artifact (the SSD tier)\n"
+           "  --expert-ram-layout exclusive|full\n"
+           "                           Qwen3.8-Flash-Next experts VRAM cannot hold: exclusive\n"
+           "                           keeps in RAM only the experts VRAM does not hold;\n"
+           "                           full keeps a RAM copy of every expert (more RAM)\n"
+           "                           (default " + std::string(expert_ram_layout_name(EngineOptions{}.expert_ram_layout)) + ")\n"
            "  --expert-pin-mib N|auto  Offloaded experts: at most this much of the experts'\n"
            "                           RAM page-locked for the GPU; the rest stays in RAM\n"
            "                           and the CPU serves it (auto: what Windows allows,\n"
@@ -296,6 +306,17 @@ std::string usage_text(const char* argv0) {
            "                           the activation scales NVIDIA calibrated for them.\n"
            "                           Changes the output. No other artifact supports it\n"
            "                           (default: 16-bit activations, as NVIDIA serves it)\n"
+           "  --a8-activations         8-bit activations where they measured faster: decode\n"
+           "                           and verification calls of GGUF dense projections and\n"
+           "                           routed experts (GGUF and NVFP4 W4A16 banks, CPU-served\n"
+           "                           misses included; int8 with one scale per 32 values, as\n"
+           "                           llama.cpp's Q8_1), and prefill calls of GGUF dense\n"
+           "                           projections and those experts (the same codec), a\n"
+           "                           groupwise Q4 MLP gate/up (int8 per token) and MXFP8\n"
+           "                           dense projections (two E4M3 terms per 32 values).\n"
+           "                           Other calls keep their routes. Approximate: changes the\n"
+           "                           output; --reproducible and artifacts without such a\n"
+           "                           route refuse it (default: off)\n"
            "  --embedding-host         Qwen3.5-family artifacts: keep the token embedding in\n"
            "                           pinned host memory, read zero-copy, so its VRAM\n"
            "                           (1.18 GiB on the 27B) goes to the KV and prefix\n"
@@ -453,12 +474,12 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
-        } else if (arg == "--ram-headroom-mib") {
-            const std::uint64_t mib = parse_u64(value(arg), "ram-headroom-mib");
+        } else if (arg == "--ram-free-mib") {
+            const std::uint64_t mib = parse_u64(value(arg), "ram-free-mib");
             if (mib > (std::numeric_limits<std::uint64_t>::max() >> 20)) {
-                throw std::invalid_argument("--ram-headroom-mib is out of range");
+                throw std::invalid_argument("--ram-free-mib is out of range");
             }
-            options.ram_headroom_bytes = mib << 20;
+            options.ram_free_bytes = mib << 20;
         } else if (arg == "--expert-ram-mib") {
             const std::string text = value(arg);
             if (text == "auto") {
@@ -470,6 +491,8 @@ Options parse_options(int argc, char** argv) {
                 }
                 options.expert_ram_bytes = mib << 20;
             }
+        } else if (arg == "--expert-ram-layout") {
+            options.expert_ram_layout = parse_expert_ram_layout(value(arg));
         } else if (arg == "--expert-pin-mib") {
             const std::string text = value(arg);
             if (text == "auto") {
@@ -572,6 +595,8 @@ Options parse_options(int argc, char** argv) {
             options.fast_path_candidates.push_back(*path);
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
+        } else if (arg == "--a8-activations") {
+            options.a8_activations = true;
         } else if (arg == "--embedding-host") {
             options.embedding_host = true;
         } else if (arg == "--stop-token-id") {

@@ -58,9 +58,10 @@ Field make_field(std::string_view text) {
     return field;
 }
 
-// Python's str.isspace() set: Unicode Zs/Zl/Zp, the ASCII controls \t..\r, and \x1c-\x1f, \x85.
+// Python's str.isspace() set: the Unicode White_Space property (Zs/Zl/Zp, \t..\r, U+0085) and
+// \x1c-\x1f.
 bool python_space(std::int32_t value) {
-    return unicode::is_whitespace(value) || (value >= 0x1c && value <= 0x1f) || value == 0x85;
+    return unicode::is_whitespace(value) || (value >= 0x1c && value <= 0x1f);
 }
 
 bool python_word(std::int32_t value, bool ascii) {

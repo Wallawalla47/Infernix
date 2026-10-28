@@ -24,8 +24,9 @@
 //     u8 live[columns], zero-padded to a multiple of 4 bytes (1: the column's experts count as uses)
 //     i32 routes[layers][top_k * columns] (column c's top_k experts at c * top_k)
 //   Graph (kind 4): u32 kind, family (RouteTraceGraph), batch, width, then the device free bytes
-//     before the capture and after the instantiation and first launch as two u64 (low word first).
-//     No payload.
+//     before the capture and after the instantiation and first launch (a graph Flash-Next captures at
+//     startup: its upload; those records precede every round) as two u64
+//     (low word first). No payload.
 // For rounds, rows * width == columns, and row r's columns are r * width .. r * width + width - 1.
 // tokens is what the round advances: the chunk's tokens for a prefill chunk or forced tokens, 1 for
 // decode, the longest row's accepted tokens plus one for verification. position is row 0's first

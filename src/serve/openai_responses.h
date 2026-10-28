@@ -205,4 +205,12 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// The whole event stream of a streamed Response that fails before its generation starts:
+// response.created, response.in_progress, then response.failed carrying `error`. A prompt over the
+// context limit answers so, since Codex compacts its conversation on that failure only in the stream.
+std::string make_openai_failed_response_stream(const std::string& id, std::int64_t created_at,
+                                               OpenAIResponsesCreateRequest request,
+                                               const OpenAIResponsesRuntimeValues& runtime,
+                                               const ApiError& error);
+
 } // namespace infernix::serve

@@ -1,7 +1,7 @@
 // Prefill-shape benchmark of offloaded_sparse_moe's routed experts (moe_experts) for the
 // Qwen3.8-Flash-Next layer (512 experts, top-10, H = 2560, I = 640) or, with --geometry 122b, the
 // Qwen3.5-122B-A10B layer (256 experts, top-8, H = 3072, I = 1024; W4A16 only), `nvfp4_expert_rg16_v1`
-// records.
+// records, or with --bank ggml GGUF records (Flash-Next's geometry; gate/up and down formats from --formats).
 //
 // Each point routes T columns with a fixed skewed expert popularity (a Zipf-like law, so a few
 // experts are wide over several 64-column tiles and the tail stays narrow), then times one
@@ -16,15 +16,20 @@
 //            (the cold-layer case, bound by the staging copy).
 // The FLOP figure counts the wide entries' gate/up and down products only. --activation a16 gives
 // the experts W4A16 arithmetic (no input scales, design §16.2.1); a16x2 and a16x3 run their wide calls
-// on the two- and three-term A4 fast paths (design §19.3.23), at either geometry; --narrow a4r (with a
-// W4A16 activation, Flash-Next geometry only) runs the experts of at most eight columns on
-// expert-a4-residual-decode's two-term narrow kernels.
+// on the two- and three-term A4 fast paths (design §19.3.23), at either geometry; a8 runs them on
+// --a8-activations (NarrowA16::kA8 with WideA16::kA8: calls of at most 128 columns on the 8-bit narrow
+// kernels, wider calls' wide experts on the 8-bit grouped GEMM); --narrow a4r (with a W4A16 activation,
+// Flash-Next geometry only) runs the experts of at most eight columns on expert-a4-residual-decode's
+// two-term narrow kernels. A GGUF bank (--bank ggml) takes --ggml-wide exact (the exact tiles), bf16
+// (WideA16::kGgmlBf16: its BF16 planes from MoeGgmlTiles' threshold, 14,336 columns by default, the exact tiles
+// below it) or a8 (MoeGgmlBank::a8 with WideA16::kA8: the 8-bit stage-decode tiles past 128 columns).
 // Decode shapes: --tokens 1,2,4,8 --cold (one call is a layer's routed experts of one decode or MTP round).
 //
 //   infernix_offloaded_moe_wide_bench [--tokens 64,256,1024,4096] [--placement frames|staged|both]
-//                                   [--activation a4|a16|a16x2|a16x3] [--narrow exact|a4r] [--cold] [--warmup 3]
+//                                   [--activation a4|a16|a16x2|a16x3|a8] [--narrow exact|a4r] [--cold] [--warmup 3]
 //                                   [--repeat 10] [--seed N]
 //                                   [--columns-per-expert C] [--split-scales] [--geometry flash-next|122b]
+//                                   [--bank nvfp4|ggml] [--formats iq3_s,iq4_nl] [--ggml-wide exact|bf16|a8]
 //
 // --columns-per-expert C routes uniformly instead (every used expert gets exactly C columns while
 // 10 T / C <= 512); --split-scales gives every expert distinct gate and up input scales, which keeps
@@ -33,6 +38,7 @@
 #include "infernix/ops/offloaded_sparse_moe.h"
 
 #include "core/device.h"
+#include "core/ggml_format.h"
 #include "infernix_bench_common.h"
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
@@ -60,18 +66,6 @@ namespace {
 constexpr int kDistinct      = 16; // distinct random records, repeated over the experts
 constexpr int kStagingSlots  = 64;
 
-// The layer under test (--geometry).
-struct Geometry {
-    int experts = 512;
-    int top_k   = 10;
-    moe::ExpertShape shape = moe::kFlashNextShape;
-    [[nodiscard]] std::size_t record_bytes() const { return moe::wide::nvfp4_record_bytes(shape); }
-    [[nodiscard]] double expert_flops() const {
-        return 2.0 * (2.0 * shape.intermediate * shape.hidden + 1.0 * shape.hidden * shape.intermediate);
-    }
-};
-Geometry g_geometry;
-
 struct Options {
     std::vector<int> tokens{64, 256, 1024, 4096};
     std::string placement = "both";
@@ -79,13 +73,45 @@ struct Options {
     int repeat            = 10;
     std::uint32_t seed    = 20261004U;
     bool a16              = false;
-    moe::WideA16 wide_a16 = moe::WideA16::kExact; // a16x2 / a16x3: W4A16 experts on an A4 residual route
-    moe::NarrowA16 narrow_a16 = moe::NarrowA16::kExact; // --narrow a4r: W4A16 narrow jobs on two-term A4
+    moe::WideA16 wide_a16 = moe::WideA16::kExact; // a16x2 / a16x3: W4A16 experts on an A4 residual route; a8: kA8
+    moe::NarrowA16 narrow_a16 = moe::NarrowA16::kExact; // --narrow a4r: W4A16 narrow jobs on two-term A4; a8: kA8
     bool cold             = false;
     int columns_per_expert = 0;     // > 0: uniform routing, every used expert has exactly this many columns
     bool split_scales      = false; // distinct gate and up input scales: no expert takes the wide route
     bool geometry_122b     = false;
+    bool ggml              = false; // --bank ggml: GGUF records
+    QType ggml_gate_up     = QType::GGML_IQ3_S;
+    QType ggml_down        = QType::GGML_IQ4_NL;
+    bool ggml_a8           = false; // --ggml-wide a8
 };
+
+// The layer under test (--geometry, --bank).
+struct Geometry {
+    int experts = 512;
+    int top_k   = 10;
+    moe::ExpertShape shape = moe::kFlashNextShape;
+    bool ggml              = false;
+    QType gate_up = QType::NVFP4_MUL, down = QType::NVFP4_MUL;
+
+    [[nodiscard]] std::uint32_t gate_row_bytes() const {
+        return static_cast<std::uint32_t>(shape.hidden / ggml_block_elems(gate_up) * ggml_block_bytes(gate_up));
+    }
+    [[nodiscard]] std::uint32_t down_row_bytes() const {
+        return static_cast<std::uint32_t>(shape.intermediate / ggml_block_elems(down) * ggml_block_bytes(down));
+    }
+    [[nodiscard]] std::size_t record_bytes() const {
+        if (ggml) {
+            return 2ULL * shape.intermediate * gate_row_bytes() + static_cast<std::size_t>(shape.hidden) * down_row_bytes();
+        }
+        return moe::wide::nvfp4_record_bytes(shape);
+    }
+    // A record's pitch in the bank, frames and staging slots (a GGUF record rounded to 16 bytes).
+    [[nodiscard]] std::size_t record_stride() const { return (record_bytes() + 15) / 16 * 16; }
+    [[nodiscard]] double expert_flops() const {
+        return 2.0 * (2.0 * shape.intermediate * shape.hidden + 1.0 * shape.hidden * shape.intermediate);
+    }
+};
+Geometry g_geometry;
 
 std::vector<int> parse_list(const std::string& text) {
     std::vector<int> out;
@@ -99,8 +125,19 @@ std::vector<int> parse_list(const std::string& text) {
     return out;
 }
 
+QType ggml_format(const std::string& name) {
+    if (name == "iq2_s") { return QType::GGML_IQ2_S; }
+    if (name == "iq3_xxs") { return QType::GGML_IQ3_XXS; }
+    if (name == "iq3_s") { return QType::GGML_IQ3_S; }
+    if (name == "iq4_xs") { return QType::GGML_IQ4_XS; }
+    if (name == "iq4_nl") { return QType::GGML_IQ4_NL; }
+    if (name == "q2_0") { return QType::GGML_Q2_0; }
+    throw std::invalid_argument("unknown GGUF expert format " + name + " (iq2_s, iq3_xxs, iq3_s, iq4_xs; iq4_nl, q2_0)");
+}
+
 Options parse_options(int argc, char** argv) {
     Options options;
+    std::string ggml_wide = "exact";
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto value = [&]() -> std::string {
@@ -117,13 +154,15 @@ Options parse_options(int argc, char** argv) {
             options.repeat = std::stoi(value());
         } else if (arg == "--activation") {
             const std::string v = value();
-            if (v != "a4" && v != "a16" && v != "a16x2" && v != "a16x3") {
-                throw std::invalid_argument("--activation takes a4, a16, a16x2 or a16x3");
+            if (v != "a4" && v != "a16" && v != "a16x2" && v != "a16x3" && v != "a8") {
+                throw std::invalid_argument("--activation takes a4, a16, a16x2, a16x3 or a8");
             }
             options.a16      = v != "a4";
             options.wide_a16 = v == "a16x2"   ? moe::WideA16::kA4Residual
                                : v == "a16x3" ? moe::WideA16::kA4Residual3
+                               : v == "a8"    ? moe::WideA16::kA8
                                               : moe::WideA16::kExact;
+            if (v == "a8") { options.narrow_a16 = moe::NarrowA16::kA8; }
         } else if (arg == "--narrow") {
             const std::string v = value();
             if (v != "exact" && v != "a4r") { throw std::invalid_argument("--narrow takes exact or a4r"); }
@@ -141,6 +180,21 @@ Options parse_options(int argc, char** argv) {
             const std::string v = value();
             if (v != "flash-next" && v != "122b") { throw std::invalid_argument("--geometry takes flash-next or 122b"); }
             options.geometry_122b = v == "122b";
+        } else if (arg == "--bank") {
+            const std::string v = value();
+            if (v != "nvfp4" && v != "ggml") { throw std::invalid_argument("--bank takes nvfp4 or ggml"); }
+            options.ggml = v == "ggml";
+        } else if (arg == "--formats") {
+            const std::string v     = value();
+            const std::size_t comma = v.find(',');
+            if (comma == std::string::npos) { throw std::invalid_argument("--formats takes gate_up,down (iq3_s,iq4_nl)"); }
+            options.ggml_gate_up = ggml_format(v.substr(0, comma));
+            options.ggml_down    = ggml_format(v.substr(comma + 1));
+        } else if (arg == "--ggml-wide") {
+            ggml_wide = value();
+            if (ggml_wide != "exact" && ggml_wide != "bf16" && ggml_wide != "a8") {
+                throw std::invalid_argument("--ggml-wide takes exact, bf16 or a8");
+            }
         } else {
             throw std::invalid_argument("unknown option " + arg);
         }
@@ -148,8 +202,18 @@ Options parse_options(int argc, char** argv) {
     if (options.placement != "frames" && options.placement != "staged" && options.placement != "both") {
         throw std::invalid_argument("--placement takes frames, staged or both");
     }
+    if (options.ggml) {
+        if (options.geometry_122b || options.a16 || options.narrow_a16 != moe::NarrowA16::kExact) {
+            throw std::invalid_argument("--bank ggml takes Flash-Next's geometry and --ggml-wide, not --activation or --narrow");
+        }
+        options.a16      = true; // GGUF banks take the A16 workspace
+        options.ggml_a8  = ggml_wide == "a8";
+        options.wide_a16 = ggml_wide == "a8"     ? moe::WideA16::kA8
+                           : ggml_wide == "bf16" ? moe::WideA16::kGgmlBf16
+                                                 : moe::WideA16::kExact;
+    }
     if (options.geometry_122b && !options.a16) {
-        throw std::invalid_argument("--geometry 122b registers W4A16 experts only: add --activation a16, a16x2 or a16x3");
+        throw std::invalid_argument("--geometry 122b registers W4A16 experts only: add --activation a16, a16x2, a16x3 or a8");
     }
     if (options.narrow_a16 == moe::NarrowA16::kA4Residual && (!options.a16 || options.geometry_122b)) {
         throw std::invalid_argument("--narrow a4r takes Flash-Next's W4A16 experts: add --activation a16");
@@ -157,13 +221,31 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-// Random codes with scale bytes in the checkpoint's usual range (E4M3 words 40-80).
+// Random NVFP4 codes with scale bytes in the checkpoint's usual range (E4M3 words 40-80), or random GGUF blocks
+// with finite binary16 scales of the imports' range.
 std::vector<std::uint8_t> random_records(std::mt19937& rng) {
-    std::vector<std::uint8_t> records(static_cast<std::size_t>(kDistinct) * g_geometry.record_bytes());
+    const std::size_t stride = g_geometry.record_stride();
+    std::vector<std::uint8_t> records(static_cast<std::size_t>(kDistinct) * stride, 0);
     std::uniform_int_distribution<int> byte(0, 255), scale(40, 80);
     for (auto& b : records) { b = static_cast<std::uint8_t>(byte(rng)); }
     for (int r = 0; r < kDistinct; ++r) {
-        std::uint8_t* record = records.data() + static_cast<std::size_t>(r) * g_geometry.record_bytes();
+        std::uint8_t* record = records.data() + static_cast<std::size_t>(r) * stride;
+        if (g_geometry.ggml) {
+            const auto fix = [&](std::uint8_t* rows, int count, int k, QType q) {
+                const int blocks = k / static_cast<int>(ggml_block_elems(q)), size = static_cast<int>(ggml_block_bytes(q));
+                for (int i = 0; i < count * blocks; ++i) {
+                    std::uint8_t* b      = rows + static_cast<std::size_t>(i) * size;
+                    const unsigned field = 9 + rng() % 4; // binary16 scales of 2^-6 .. 2^-3
+                    const auto w         = static_cast<std::uint16_t>((rng() & 0x8000U) | (rng() & 0x3FFU) | (field << 10));
+                    b[0]                 = static_cast<std::uint8_t>(w & 0xFF);
+                    b[1]                 = static_cast<std::uint8_t>(w >> 8);
+                }
+            };
+            const int H = g_geometry.shape.hidden, I = g_geometry.shape.intermediate;
+            fix(record, 2 * I, H, g_geometry.gate_up);
+            fix(record + 2ULL * I * g_geometry.gate_row_bytes(), H, I, g_geometry.down);
+            continue;
+        }
         const std::size_t units = static_cast<std::size_t>(g_geometry.record_bytes() / moe::kUnitBytes);
         for (std::size_t u = 0; u < units; ++u) {
             for (int s = 0; s < 16; ++s) { record[u * moe::kUnitBytes + 128 + s] = static_cast<std::uint8_t>(scale(rng)); }
@@ -218,17 +300,19 @@ struct Fixture {
     cudaStream_t overlap = nullptr;
     cudaEvent_t events[5] = {};
     bool a16 = false;
+    bool ggml_a8 = false;
 
-    Fixture(std::uint32_t seed, bool a16, bool split_scales) : a16(a16) {
+    Fixture(std::uint32_t seed, bool a16, bool split_scales, bool ggml_a8) : a16(a16), ggml_a8(ggml_a8) {
         std::mt19937 rng(seed);
         const auto records = random_records(rng);
-        const std::size_t bank = static_cast<std::size_t>(g_geometry.experts) * g_geometry.record_bytes();
+        const std::size_t stride = g_geometry.record_stride();
+        const std::size_t bank   = static_cast<std::size_t>(g_geometry.experts) * stride;
         frames_memory = DeviceBuffer(bank);
         CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&host), bank, cudaHostAllocMapped));
         CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_device), host, 0));
         for (int e = 0; e < g_geometry.experts; ++e) {
-            const std::uint8_t* source = records.data() + static_cast<std::size_t>(e % kDistinct) * g_geometry.record_bytes();
-            std::memcpy(host + static_cast<std::size_t>(e) * g_geometry.record_bytes(), source, g_geometry.record_bytes());
+            const std::uint8_t* source = records.data() + static_cast<std::size_t>(e % kDistinct) * stride;
+            std::memcpy(host + static_cast<std::size_t>(e) * stride, source, stride);
         }
         CUDA_CHECK(cudaMemcpy(frames_memory.p, host, bank, cudaMemcpyHostToDevice));
         std::vector<std::int32_t> table(g_geometry.experts), none(g_geometry.experts, -1);
@@ -253,7 +337,7 @@ struct Fixture {
         }
         scales = DeviceBuffer(sizeof(moe::ExpertScales) * g_geometry.experts);
         CUDA_CHECK(cudaMemcpy(scales.p, s.data(), scales.bytes, cudaMemcpyHostToDevice));
-        staging = DeviceBuffer(static_cast<std::size_t>(kStagingSlots) * g_geometry.record_bytes());
+        staging = DeviceBuffer(static_cast<std::size_t>(kStagingSlots) * stride);
         CUDA_CHECK(cudaStreamCreateWithFlags(&overlap, cudaStreamNonBlocking));
         for (auto& event : events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
     }
@@ -271,7 +355,7 @@ struct Fixture {
         ops::MoeExpertSource s{.frame_base    = static_cast<const std::uint8_t*>(frames_memory.p),
                                .frames        = static_cast<const std::int32_t*>(staged ? resident_none.p : frames_table.p),
                                .host_records  = host_device,
-                               .record_stride = g_geometry.record_bytes(),
+                               .record_stride = g_geometry.record_stride(),
                                .scales        = static_cast<const moe::ExpertScales*>(scales.p),
                                .activation    = a16 ? moe::ExpertActivation::kA16 : moe::ExpertActivation::kA4,
                                .staging_base  = static_cast<std::uint8_t*>(staging.p),
@@ -279,6 +363,15 @@ struct Fixture {
         s.overlap_stream = overlap;
         s.shape          = g_geometry.shape;
         for (int i = 0; i < 5; ++i) { s.overlap_events[i] = events[i]; }
+        if (g_geometry.ggml) {
+            s.ggml = {.gate_up_format = g_geometry.gate_up,
+                      .down_format    = g_geometry.down,
+                      .gate_row_bytes = g_geometry.gate_row_bytes(),
+                      .down_row_bytes = g_geometry.down_row_bytes(),
+                      .record_bytes   = g_geometry.record_stride(),
+                      .tiles          = ops::MoeGgmlTiles::from_environment(),
+                      .a8             = ggml_a8};
+        }
         return s;
     }
 };
@@ -315,7 +408,7 @@ void run_point(Fixture& fixture, int tokens, const Options& options, bench::L2Fl
     const DeviceBuffer x = bench::make_bf16(static_cast<std::size_t>(g_geometry.shape.hidden) * tokens, options.seed + 7, -0.15F, 0.15F);
     DeviceBuffer outputs(sizeof(std::uint16_t) * g_geometry.shape.hidden * entries);
     const int max_jobs = std::min(g_geometry.experts, entries);
-    DeviceBuffer workspace(ops::moe_experts_workspace_bytes(g_geometry.shape, 
+    DeviceBuffer workspace(ops::moe_experts_workspace_bytes(g_geometry.shape,
         max_jobs, entries, tokens, options.a16 ? moe::ExpertActivation::kA16 : moe::ExpertActivation::kA4,
         options.wide_a16));
     for (const bool staged : {false, true}) {
@@ -345,19 +438,38 @@ void run_point(Fixture& fixture, int tokens, const Options& options, bench::L2Fl
     }
 }
 
+const char* wide_name(moe::WideA16 wide) {
+    switch (wide) {
+    case moe::WideA16::kA4Residual: return "a4x2";
+    case moe::WideA16::kA4Residual3: return "a4x3";
+    case moe::WideA16::kGgmlBf16: return "ggml-bf16";
+    case moe::WideA16::kA8: return "a8";
+    case moe::WideA16::kLossless: return "lossless";
+    default: return "exact";
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
         if (options.geometry_122b) { g_geometry = {256, 8, moe::kQwen3_5_122BShape}; }
+        if (options.ggml) {
+            g_geometry.ggml    = true;
+            g_geometry.gate_up = options.ggml_gate_up;
+            g_geometry.down    = options.ggml_down;
+        }
         DeviceContext context;
-        std::printf("# gpu=%s geometry=%s timed=moe_experts (routing and dispatch untimed%s) activation=%s narrow=%s "
-                    "staging_slots=%d\n",
-                    context.props.name, options.geometry_122b ? "122b" : "flash-next",
+        std::printf("# gpu=%s geometry=%s bank=%s timed=moe_experts (routing and dispatch untimed%s) activation=%s narrow=%s "
+                    "wide=%s staging_slots=%d\n",
+                    context.props.name, options.geometry_122b ? "122b" : "flash-next", options.ggml ? "ggml" : "nvfp4",
                     options.cold ? ", L2 flushed before each call" : "", options.a16 ? "a16" : "a4",
-                    options.narrow_a16 == moe::NarrowA16::kA4Residual ? "a4r" : "exact", kStagingSlots);
-        Fixture fixture(options.seed, options.a16, options.split_scales);
+                    options.narrow_a16 == moe::NarrowA16::kA4Residual ? "a4r"
+                    : options.narrow_a16 == moe::NarrowA16::kA8 || options.ggml_a8 ? "a8"
+                                                                                    : "exact",
+                    wide_name(options.wide_a16), kStagingSlots);
+        Fixture fixture(options.seed, options.a16, options.split_scales, options.ggml_a8);
         std::unique_ptr<bench::L2FlushBuffer> flush;
         if (options.cold) { flush = std::make_unique<bench::L2FlushBuffer>(256ULL << 20); }
         for (const int tokens : options.tokens) { run_point(fixture, tokens, options, flush.get(), context.stream); }

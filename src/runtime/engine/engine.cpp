@@ -30,9 +30,23 @@
 namespace infernix {
 namespace {
 
+// The per-thread stack an Engine reserves (design note candidates §22 VM-12). The driver keeps stack x resident
+// threads of local memory for it (1 KiB by default, ~267 MiB on an RTX 5090), taken before the Programs size their
+// frames and KV. Every kernel off the lossless route has a frame of at most 240 bytes (cuobjdump of the 2026-10-26
+// build: the GGUF dense tiles), so 256 bytes serve them; the lossless route's attention and fallback GEMMs need up to
+// 1,472 (twenty-two functions over 256), so a lossless Engine reserves 1.5 KiB up front instead of the driver growing
+// the stack outside the plan at their first launch.
+constexpr std::size_t kStackBytes         = 256;
+constexpr std::size_t kLosslessStackBytes = 1536;
+
 DeviceContext initialize_device(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
     DeviceContext device(options.device);
+    const std::size_t stack = options.lossless ? kLosslessStackBytes : kStackBytes;
+    device.bind_to_current_thread();
+    if (const cudaError_t err = cudaDeviceSetLimit(cudaLimitStackSize, stack); err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaDeviceSetLimit(cudaLimitStackSize) failed: ") + cudaGetErrorString(err));
+    }
     phase.complete();
     return device;
 }
@@ -610,6 +624,18 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                                  pending_deadline);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
+            }
+        },
+        impl_->core);
+}
+
+void Engine::prefill_next_turn(PromptInput conversation) noexcept {
+    if (impl_ == nullptr) { return; }
+    std::visit(
+        [&](auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (!std::is_same_v<CoreState, std::monostate> && !Impl::kScoring<CoreState>) {
+                if (core != nullptr) { core->prefill_next_turn(std::move(conversation)); }
             }
         },
         impl_->core);

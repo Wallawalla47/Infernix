@@ -187,6 +187,9 @@ struct RequestRecord {
     std::optional<LaneId> lane;
     std::optional<SequenceHandle> sequence;
     std::atomic<bool> cancelled{false};
+    // The Engine's own idle-time prefill of a finished turn (hybrid-prefix-cache-spec §7.9): no
+    // consumer, no outstanding capacity, and cancelled as soon as a real request needs the Engine.
+    bool background = false;
     EngineRequestState model_state = EngineRequestState::Waiting;
     std::optional<FinishReason> terminal_reason;
 

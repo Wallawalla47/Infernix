@@ -80,6 +80,8 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
                                  .activation = layers.front().moe.bank->activation,
                                  .narrow_a16 = cpu_narrow_a16(), // the service's arithmetic sets its rates
                                  .ggml       = ggml_format(*layers.front().moe.bank).valid(),
+                                 .ggml_a8    = cpu_ggml_a8(), // decode's misses take the 8-bit route
+                                 .nvfp4_a8   = cpu_narrow_a16() == moe::NarrowA16::kA8, // likewise
                                  .cpus       = placement_.cpus,
                                  .shared_x   = temporary_switches::flag("INFERNIX_TMP_CPU_SHARED_X")});
         const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
@@ -97,6 +99,7 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
                 auto& job  = jobs[static_cast<std::size_t>(k)];
                 job.record = record_of(layer, expert);
                 job.ggml   = ggml_format(bank);
+                job.a8     = cpu_ggml_a8() || cpu_narrow_a16() == moe::NarrowA16::kA8;
                 job.scales = job.ggml.valid() ? moe::ExpertScales{} : bank.scales[expert];
                 job.ncols  = columns;
                 for (int c = 0; c < columns; ++c) {
@@ -156,8 +159,9 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
         if (const auto calibration = MachineCalibration::from_switch()) {
             const std::string key = "cpu|" + std::to_string(cpu_workers()) + "|" + placement_.text + "|" +
                                     std::to_string(static_cast<int>(cpu_narrow_a16())) + "|" +
-                                    std::to_string(ggml_format(*layers.front().moe.bank).valid() ? 1 : 0) + "|" +
-                                    std::to_string(record_stride) + (tier_ ? "|tier" : "");
+                                    std::to_string(ggml_format(*layers.front().moe.bank).valid() ? 1 : 0) +
+                                    (cpu_ggml_a8() ? "|a8" : "") + "|" + std::to_string(record_stride) +
+                                    (tier_ ? "|tier" : "");
             std::string note;
             expert_rate = calibration->resolve(key + "|experts", expert_rate, [&] { return rate(1, 0); }, note);
             if (!note.empty()) { calibration_note_ = "experts/s " + note; }
@@ -195,7 +199,9 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
                   "CPU expert team: %u workers%s, %.0f experts/s and %.0f expert columns/s (%s); decode misses kept on "
                   "the link: %s",
                   cpu_workers(),
-                  cpu_narrow_a16() == moe::NarrowA16::kA4Residual ? " (two-term A4 activations)" : "",
+                  cpu_narrow_a16() == moe::NarrowA16::kA4Residual                ? " (two-term A4 activations)"
+                  : cpu_ggml_a8() || cpu_narrow_a16() == moe::NarrowA16::kA8 ? " (8-bit activations)"
+                                                                               : "",
                   cpu_expert_rate_, cpu_column_rate_, how.c_str(), kept);
     // An A/B arm of the link share shows its choice without debug logging.
     diagnostic(text, pcie_share() > 0 ? DiagnosticLevel::Info : DiagnosticLevel::Debug);

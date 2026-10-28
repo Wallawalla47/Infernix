@@ -251,6 +251,7 @@ CpuFeatures detect_features() {
     const unsigned max_leaf = static_cast<unsigned>(r[0]);
     __cpuid(r, 1);
     c = static_cast<unsigned>(r[2]);
+    const unsigned leaf1_c = c;
     const bool osxsave = (c & (1U << 27)) != 0;
     const unsigned long long xcr0 = osxsave ? _xgetbv(0) : 0;
     if (max_leaf < 7) { return f; }
@@ -262,6 +263,7 @@ CpuFeatures detect_features() {
 #    else
     if (__get_cpuid_max(0, nullptr) < 7) { return f; }
     __cpuid(1, a, b, c, d);
+    const unsigned leaf1_c = c;
     const bool osxsave = (c & (1U << 27)) != 0;
     unsigned long long xcr0 = 0;
     if (osxsave) {
@@ -277,7 +279,9 @@ CpuFeatures detect_features() {
 #    endif
     const bool ymm = (xcr0 & 0x6) == 0x6;
     const bool zmm = (xcr0 & 0xE6) == 0xE6;
-    f.avx2    = ymm && (b & (1U << 5)) != 0;
+    // AVX2 (leaf 7 EBX 5) with FMA (leaf 1 ECX 12) and F16C (ECX 29): the GGUF 8-bit route's terms and weight
+    // scales (ggml_expert.cpp); every AVX2 CPU has both, but they are separate CPUID bits.
+    f.avx2    = ymm && (b & (1U << 5)) != 0 && (leaf1_c & (1U << 12)) != 0 && (leaf1_c & (1U << 29)) != 0;
     f.avxvnni = f.avx2 && (a & (1U << 4)) != 0;
     // AVX-512 F (EBX 16), BW (EBX 30), VL (EBX 31; the GGUF and FP8 routes' 256-bit EVEX forms) and
     // VNNI (ECX 11), with the OS saving the opmask and ZMM state.

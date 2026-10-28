@@ -3,8 +3,6 @@
 
 #include "core/layout.h"
 
-#include "core/temporary_switches.h"
-
 #include <algorithm>
 #include <stdexcept>
 
@@ -40,8 +38,8 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType r
 
     SparseMoeSmallTPlan plan{tokens, sparse_moe_small_t_workspace_bytes(tokens)};
     plan.column_invariant = column_invariant;
-    // INFERNIX_TMP_SMALL_T_L2_HINTS: the next consumer's warm at T = 1's limit (8 MiB).
-    if (hints.next_weight_prefetch != nullptr && temporary_switches::flag("INFERNIX_TMP_SMALL_T_L2_HINTS")) {
+    // The next consumer's warm at T = 1's limit (8 MiB).
+    if (hints.next_weight_prefetch != nullptr) {
         constexpr std::size_t kNextWeightPrefetchLimit = std::size_t{8} << 20;
         plan.next_weight_prefetch       = hints.next_weight_prefetch;
         plan.next_weight_prefetch_bytes = std::min(hints.next_weight_prefetch_bytes, kNextWeightPrefetchLimit);

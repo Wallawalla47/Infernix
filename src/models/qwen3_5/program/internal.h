@@ -37,9 +37,9 @@ inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
 // grid_cache splits prefill, publishes and resumes only on the prefill chunk grid; held_extent
 // holds each request's whole KV extent from admission, so nothing preempts it. With all of them a
 // request's output does not depend on the other requests of the Engine. linear_routes carries
-// the LinearRoutes flags of every Text-layer MLP gate/up projection (q4-w4a8); under
-// column_invariant_decode the decode and verification projections ignore them. Workspace
-// planning and every launch use the same settings.
+// the LinearRoutes flags of every Text-layer MLP gate/up projection (q4-w4a8, or --a8-activations'
+// prefill route: A8Routes::q4_gate_up); under column_invariant_decode the decode and verification
+// projections ignore them. Workspace planning and every launch use the same settings.
 struct ExecutionSchedule {
     bool fast                         = false;
     bool pv8                          = false;
@@ -125,12 +125,17 @@ struct ExecutionSchedule {
     // round's own draft probabilities (TreeWidthController::choose's rows) and a split family verifies
     // the chain or builds and verifies the tree.
     bool tree_round_width = false;
-    // expert-a4-residual (-3): the offloaded experts' wide route (Qwen3.5-122B-A10B's W4A16 banks;
-    // ExecutionSchedule::lossless runs its own). Its workspace is planned with the same route.
+    // --a8-activations (A8Routes::experts_prefill) or expert-a4-residual (-3): the offloaded experts' wide route
+    // (Qwen3.5-122B-A10B's W4A16 banks; ExecutionSchedule::lossless runs its own). Its workspace is planned with
+    // the same route.
     ops::offloaded_moe::WideA16 expert_wide = ops::offloaded_moe::WideA16::kExact;
     // router-mma: the offloaded MoE layers' prefill calls (OffloadedExperts::router_mma) take the
     // tensor-core router (ops::projection_fp32_router_mma), as Flash-Next's do.
     bool router_mma = false;
+    // --a8-activations (LOSSY, opt-in; A8Routes::experts): the offloaded experts' decode and verification calls
+    // and their CPU-served misses take their 8-bit route (OffloadGeometry::expert_narrow). The flag's prefill
+    // routes ride expert_wide and linear_routes.
+    bool a8_experts = false;
     // The lossless route (EngineOptions::lossless, docs/maintainer/lossless-route.md): every layer
     // execution::lossless_layer, the head's exact sums correctly rounded to `logits`. A CausalScoring Program scores each window in one pass (the
     // window form, lossless_keys 0); a Generation Program runs prefill chunks and decode rounds through

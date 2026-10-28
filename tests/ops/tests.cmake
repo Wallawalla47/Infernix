@@ -74,6 +74,25 @@ endforeach()
 infernix_add_family_op_test(infernix_offloaded_moe_ggml_test FAMILY offloaded_moe
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_ggml.cu"
   LIBRARIES infernix_ops)
+# GGUF expert banks on the 8-bit activation route (--a8-activations) through the layer route, against the
+# CPU route's scalar 8-bit expert, bit for bit; calls past the route against the exact host expert.
+infernix_add_family_op_test(infernix_offloaded_moe_ggml_a8_test FAMILY offloaded_moe
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_ggml_a8.cu"
+  LIBRARIES infernix_ops)
+# NVFP4 W4A16 expert banks on the 8-bit activation route (--a8-activations, NarrowA16::kA8) at both expert
+# geometries through the layer route (frames, zero-copy, staged, copied-ahead, landed, forked and CPU-served
+# misses; eager and graph-captured) against an independent scalar oracle of nvfp4_a8.h, bit for bit, with
+# column-count invariance; a call past the route against the exact host expert.
+infernix_add_family_op_test(infernix_offloaded_moe_w4a8_test FAMILY offloaded_moe
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_w4a8.cu"
+  LIBRARIES infernix_ops)
+# The experts' 8-bit wide route (--a8-activations at prefill widths, WideA16::kA8) on GGUF banks and NVFP4 W4A16
+# banks at both geometries through the layer route: narrow experts bit for bit against the narrow 8-bit
+# arithmetic, wide experts against the FP64 chain over the codec, placement and column-count invariance.
+infernix_add_family_op_test(infernix_offloaded_moe_a8_wide_test FAMILY offloaded_moe
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_a8_wide.cu"
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_offloaded_moe_a8_wide_test PROPERTIES TIMEOUT 900)
 # Block-FP8 expert banks (Qwen's official FP8 experts) through the layer route and the CPU route
 # against the exact host expert, bit for bit; that reference against a bignum sum.
 infernix_add_family_op_test(infernix_offloaded_moe_fp8_test FAMILY offloaded_moe
@@ -109,6 +128,17 @@ infernix_add_family_op_test(infernix_rg16_linear_test FAMILY projection
 infernix_add_family_op_test(infernix_ggml_linear_test FAMILY projection
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear.cpp"
   LIBRARIES infernix_ops)
+# The 8-bit activation route of GGUF projections (--a8-activations) against a binary64 oracle of the
+# quantized activations, every narrow route and width.
+infernix_add_family_op_test(infernix_ggml_linear_a8_test FAMILY projection
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear_a8.cu"
+  LIBRARIES infernix_ops)
+# Its wide route (LinearRoutes::GgmlA8Wide) against the same binary64 oracle at the route's and the tiles' widths and
+# at prefill widths on the IQ3_S import's shapes; width, column and repeat invariance.
+infernix_add_family_op_test(infernix_ggml_linear_a8_wide_test FAMILY projection
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear_a8_wide.cu"
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_ggml_linear_a8_wide_test PROPERTIES TIMEOUT 900)
 # The --lossless route's projections: every output the correctly rounded exact sum (tensor-core route
 # and exact fallback), against a host wide-integer oracle.
 infernix_add_family_op_test(infernix_lossless_linear_test FAMILY lossless
@@ -248,11 +278,6 @@ infernix_add_family_op_test(infernix_prepare_masked_block_test FAMILY elementwis
 infernix_add_family_op_test(infernix_sparse_moe_test FAMILY projection
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sparse_moe.cpp"
   LIBRARIES infernix_ops)
-# TEMPORARY with INFERNIX_TMP_D3_TWO_QUADS: the Q4 small-T D3 with two quads in flight, against the
-# same oracle and the column-invariant route's bitwise checks against decode.
-add_test(NAME infernix_sparse_moe_two_quads_test COMMAND ${infernix_sparse_moe_test_COMMAND})
-set_tests_properties(infernix_sparse_moe_two_quads_test
-  PROPERTIES ENVIRONMENT "INFERNIX_TMP_D3_TWO_QUADS=1" SKIP_RETURN_CODE 77 TIMEOUT 600)
 
 infernix_add_family_op_test(infernix_mtp_pack_test FAMILY sampling
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_pack.cpp"
@@ -381,7 +406,9 @@ endforeach()
 set_tests_properties(infernix_speculative_wide_accept_test PROPERTIES TIMEOUT 600)
 # The acceptance suites on FP32 verification logits (every vocabulary head writes FP32).
 add_test(NAME infernix_speculative_round_fp32_test COMMAND ${infernix_speculative_round_test_COMMAND} --fp32-logits)
-set_tests_properties(infernix_speculative_round_fp32_test PROPERTIES SKIP_RETURN_CODE 77)
+# Thousands of small synchronous launches: 119 s alone, past 900 s beside the suite's GPU-heavy tests (2026-10-27,
+# -j 8), whose kernels it waits behind at every synchronization.
+set_tests_properties(infernix_speculative_round_fp32_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
 foreach(mode IN ITEMS ngram-only mtp-onehot onehot-distribution mtp-distribution)
   string(REPLACE "-" "_" test_suffix "${mode}")
   add_test(NAME infernix_speculative_${test_suffix}_fp32_test
@@ -451,6 +478,16 @@ infernix_add_family_op_test(infernix_offloaded_moe_a4r_cpu_test FAMILY offloaded
 # The CPU route of GGUF (ggml) expert banks against the exact expert, on every ISA; host-only.
 infernix_add_family_op_test(infernix_offloaded_moe_ggml_cpu_test FAMILY offloaded_moe
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_ggml_cpu.cpp"
+  LIBRARIES infernix_offloaded_moe_cpu)
+# The CPU route's 8-bit activation functions (--a8-activations): every ISA bit-equal to scalar, scalar
+# within its bound of a binary64 oracle; host-only.
+infernix_add_family_op_test(infernix_offloaded_moe_ggml_a8_cpu_test FAMILY offloaded_moe
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_ggml_a8_cpu.cpp"
+  LIBRARIES infernix_offloaded_moe_cpu)
+# The 8-bit activations of NVFP4 W4A16 experts on the CPU route (--a8-activations, nvfp4_a8.h) at both
+# registered geometries: every ISA and width, and the worker team, bit-equal to the spec's scalar oracle; host-only.
+infernix_add_family_op_test(infernix_offloaded_moe_w4a8_cpu_test FAMILY offloaded_moe
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_w4a8_cpu.cpp"
   LIBRARIES infernix_offloaded_moe_cpu)
 
 # The CPU worker team: any worker count gives expert_forward's bits.

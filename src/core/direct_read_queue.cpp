@@ -125,12 +125,13 @@ struct DirectReadQueue::Impl {
     std::vector<std::size_t> free_requests;
     std::deque<Io> ios;
     std::vector<std::size_t> free_ios;
-    std::deque<std::size_t> waiting[2];
+    static constexpr int kClasses = 3; // Priority's values, in issue order
+    std::deque<std::size_t> waiting[kClasses];
     std::vector<std::size_t> backoff;
     std::vector<std::size_t> flight;
     std::vector<Finished> held;
     std::vector<Completion> ready;
-    std::uint32_t in_class[2] = {};
+    std::uint32_t in_class[kClasses] = {};
     std::size_t live = 0;
     bool cancelling  = false;
 
@@ -154,9 +155,10 @@ struct DirectReadQueue::Impl {
 #endif
 
     explicit Impl(const Options& o) : options(o) {
-        if (options.demand_depth == 0 || options.prefetch_depth == 0 || options.total_depth == 0 ||
-            options.prefetch_split < kAlignment || options.prefetch_split % kAlignment != 0) {
-            throw std::invalid_argument("DirectReadQueue: depths must be positive and the split a positive multiple of 4 KiB");
+        if (options.demand_depth == 0 || options.restore_depth == 0 || options.prefetch_depth == 0 ||
+            options.total_depth == 0 || options.prefetch_split < kAlignment || options.prefetch_split % kAlignment != 0 ||
+            options.restore_split < kAlignment || options.restore_split % kAlignment != 0) {
+            throw std::invalid_argument("DirectReadQueue: depths must be positive and the splits positive multiples of 4 KiB");
         }
 #ifdef _WIN32
         port = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
@@ -387,8 +389,9 @@ struct DirectReadQueue::Impl {
             r = requests.size();
             requests.emplace_back();
         }
-        const std::size_t piece =
-            read.priority == Priority::Prefetch ? std::min(read.bytes, options.prefetch_split) : read.bytes;
+        const std::size_t piece = read.priority == Priority::Prefetch ? std::min(read.bytes, options.prefetch_split)
+                                  : read.priority == Priority::Restore ? std::min(read.bytes, options.restore_split)
+                                                                       : read.bytes;
         const auto pieces = static_cast<std::uint32_t>((read.bytes + piece - 1) / piece);
         requests[r]       = Request{.tag = read.tag, .remaining = pieces, .submitted = Clock::now()};
         for (std::uint32_t k = 0; k < pieces; ++k) {
@@ -427,10 +430,10 @@ struct DirectReadQueue::Impl {
                 ++k;
             }
         }
-        const std::uint32_t caps[2] = {options.demand_depth, options.prefetch_depth};
+        const std::uint32_t caps[kClasses] = {options.demand_depth, options.restore_depth, options.prefetch_depth};
         while (in_flight() < options.total_depth) {
             int c = -1;
-            for (int k = 0; k < 2 && c < 0; ++k) {
+            for (int k = 0; k < kClasses && c < 0; ++k) {
                 if (!waiting[k].empty() && in_class[k] < caps[k]) { c = k; }
             }
             if (c < 0) { break; }

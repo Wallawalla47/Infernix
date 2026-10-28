@@ -138,6 +138,11 @@ public:
     // Reads the keys of `ranked` (best first) that have no host copy and that `skip` rejects into
     // unpinned records until none is left; they keep them for good. Returns how many.
     std::uint32_t fill_unpinned(std::span<const std::uint32_t> ranked, const std::function<bool(std::uint32_t)>& skip);
+    // The warm start's spare pinned slots (every key outside VRAM already has a host copy): reads the
+    // keys of `ranked` that VRAM holds, in its order (the caller passes the least-used first: a prefill
+    // loan's and decode's next victims), as their shadows until no slot is left (HostTier::prefill_shadow).
+    // Returns how many.
+    std::uint32_t prefill_shadows(std::span<const std::uint32_t> ranked);
     // A round boundary: admits the last round's landings (T10), refills the demotion list, then hands
     // the agent a fresh ring and opens the round. `allowance` is the boundary's demotion allowance (HostTier::begin_round).
     void begin_round(std::uint32_t allowance);
@@ -205,6 +210,20 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return static_cast<std::uint32_t>(stream_slot_.size());
     }
+    // ---- refills (a demotion that reads the evicted expert's record from the artifact instead of copying its frame
+    // back over the GPU's link)
+    // The engine thread, between rounds: queues a read of `key`'s record into `slot` (the demotion slot
+    // HostTier::vram_evicted chose) and returns its id, or kNoRefill when kRefills are in flight already.
+    // refill_state(id) is 0 while the read is in flight, 1 once it landed, 2 when it failed; refill_release(id) lets
+    // the id be reused once the state has been read.
+    static constexpr std::uint32_t kRefills  = 1024;
+    static constexpr std::uint32_t kNoRefill = 0xFFFFFFFFU;
+    std::uint32_t refill(std::uint32_t key, std::uint32_t slot);
+    [[nodiscard]] std::uint32_t refill_state(std::uint32_t id) const noexcept {
+        return refill_state_[id].load(std::memory_order_acquire);
+    }
+    void refill_release(std::uint32_t id) { refill_free_.push_back(id); }
+    [[nodiscard]] bool refill_available() const noexcept { return !refill_free_.empty(); }
     [[nodiscard]] expert_cache::HostTier& controller() noexcept { return tier_; }
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
     [[nodiscard]] const std::uint8_t* slot_bytes(std::uint32_t slot) const noexcept;
@@ -279,7 +298,8 @@ private:
     // A pending ticket that will never be read (its request failed, or the agent stopped).
     void fail_ticket(std::uint32_t t) noexcept;
     // Agent: submits the reads of `key` into `destination` with tags (kind, index, segment).
-    void submit(std::uint32_t key, std::uint8_t* destination, std::uint64_t tag_base);
+    void submit(std::uint32_t key, std::uint8_t* destination, std::uint64_t tag_base,
+                DirectReadQueue::Priority priority = DirectReadQueue::Priority::Demand);
     // Whether `key`'s record starts where `before`'s ends, each in one segment of the same file.
     [[nodiscard]] bool follows(std::uint32_t before, std::uint32_t key) const;
     // Agent: one scatter read of a run of (key, destination) whose records follow each other in a file.
@@ -335,6 +355,14 @@ private:
     std::vector<std::uint32_t> stream_free_;
     std::unique_ptr<std::atomic<std::uint32_t>[]> stream_state_;
     std::atomic<std::uint64_t> agent_stream_reads_{0};
+    // Refills: queued reads (key, slot, id) (guarded by mutex_), each id's state (0 in flight, 1 landed, 2 failed),
+    // and the free ids (the engine thread's).
+    struct RefillJob {
+        std::uint32_t key, slot, id;
+    };
+    std::vector<RefillJob> refill_jobs_;
+    std::unique_ptr<std::atomic<std::uint32_t>[]> refill_state_;
+    std::vector<std::uint32_t> refill_free_;
 
     // Tickets of the current round (stable addresses; reset at each boundary).
     std::unique_ptr<Ticket[]> tickets_;

@@ -63,7 +63,7 @@ public:
     // Reserves the configured address before model loading. The service is attached only after its
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
     bool bind();
-    void attach(GenerationService& service);
+    void attach(GenerationBackend& service);
     // Returns once stop() or an Engine-wide failure (engine_failed()) ends the accept loop.
     bool listen();
     // Whether listen() returned because the Engine failed: it then answers nothing but errors
@@ -133,7 +133,7 @@ private:
     void run_engine_watch();
     void stop_engine_watch();
 
-    GenerationService* service_ = nullptr;
+    GenerationBackend* service_ = nullptr;
     ServeOptions options_;
     std::string public_model_id_;
     infernix::ModelMetadata model_metadata_;

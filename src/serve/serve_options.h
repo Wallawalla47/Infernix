@@ -56,6 +56,7 @@ struct ServeOptions {
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
+    bool a8_activations            = false; // EngineOptions::a8_activations
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
@@ -74,8 +75,9 @@ struct ServeOptions {
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
-    std::uint64_t ram_headroom_bytes       = kDefaultRamHeadroomBytes;
+    std::uint64_t ram_free_bytes           = kDefaultRamFreeBytes;
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
+    ExpertRamLayout expert_ram_layout = EngineOptions{}.expert_ram_layout; // --expert-ram-layout
     std::optional<std::uint64_t> expert_pin_bytes; // --expert-pin-mib; empty: what the OS lets it pin
     std::uint32_t media_preprocess_threads = 0;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;

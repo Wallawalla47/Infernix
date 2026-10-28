@@ -464,14 +464,22 @@ std::string usage_text(std::string_view program) {
         << "  --route-trace <path>        write the expert route trace (offloaded experts)\n"
         << "  --ngram-volume <path>       Qwen3.8-Flash-Next n-gram volume: the artifact's, or any FP8,\n"
         << "                              IQ4_NL, BF16 or NVFP4 volume of the table (default: <weights>.ngram)\n"
-        << "  --ngram-residency <mode>    Qwen3.8-Flash-Next n-gram table: auto, ram (all of it in pinned\n"
-        << "                              RAM) or volume (rows read on demand) (default: auto)\n"
+        << "  --ngram-residency <mode>    Qwen3.8-Flash-Next n-gram table: auto, ram (all of it in RAM,\n"
+        << "                              locked for the CPU) or volume (rows read on demand) (default: auto)\n"
+        << "  --expert-state <path|off>   offloaded experts' cache state: warm-start from and save to this\n"
+        << "                              file, as infernix-serve does from <weights>.expert-state; off: an empty\n"
+        << "                              cache (cold); default: seeded from the model's calibrated order, no file\n"
+        << "                              (Qwen3.8-Flash-Next; the Qwen3.5-122B-A10B's once one is generated)\n"
         << "  --expert-stripe <path>      Qwen3.8-Flash-Next expert stripe: the SSD tier reads each record's\n"
         << "                              tail from it (a second drive) beside its head in the artifact\n"
-        << "  --ram-headroom-mib <N>      physical Host RAM pinned weights and caches leave free (default "
-        << (infernix::kDefaultRamHeadroomBytes >> 20) << ")\n"
+        << "  --ram-free-mib <N>          physical Host RAM the weights, experts, n-gram table and caches\n"
+        << "                              leave free for other programs (default "
+        << (infernix::kDefaultRamFreeBytes >> 20) << ")\n"
         << "  --expert-ram-mib <N|auto>   Qwen3.8-Flash-Next: Host RAM for the routed experts (default auto);\n"
         << "                              less than all of them need reads the rest from the artifact\n"
+        << "  --expert-ram-layout <L>     Qwen3.8-Flash-Next: exclusive (RAM holds only the experts VRAM does not)\n"
+        << "                              or full (a RAM copy of every expert); default "
+        << infernix::expert_ram_layout_name(infernix::EngineOptions{}.expert_ram_layout) << "\n"
         << "  --expert-pin-mib <N|auto>   Qwen3.8-Flash-Next: at most this much of the experts' RAM page-locked;\n"
         << "                              the rest stays in RAM for the CPU (default auto: what Windows allows)\n"
         << "  --vram-headroom-mib <N|auto> Qwen3.8-Flash-Next: VRAM the expert cache leaves free for the\n"
@@ -483,9 +491,17 @@ std::string usage_text(std::string_view program) {
         << "  --expert-a4-activations     nvidia/Qwen3.8-Flash-Next-FP4-Local only: routed experts with 4-bit\n"
         << "                              (NVFP4) activations, using the activation scales NVIDIA calibrated\n"
         << "                              for them (changes the output; default: 16-bit, as NVIDIA serves it)\n"
+        << "  --a8-activations            8-bit activations in the matmuls that have the route: GGUF dense\n"
+        << "                              projections' and GGUF or NVFP4 W4A16 routed experts' decode and\n"
+        << "                              verification calls (int8, one scale per 32 values), and the prefill\n"
+        << "                              calls of those projections and experts, a groupwise Q4 MLP gate/up and\n"
+        << "                              MXFP8 dense projections (approximate; --reproducible refuses it)\n"
         << "  --embedding-host            Qwen3.5-family artifacts: the token embedding in pinned host memory,\n"
         << "                              read zero-copy (its VRAM goes to the KV cache; same output)\n"
         << "  --concurrency <1..8>     simultaneous requests per repetition (default: 1)\n"
+        << "  --rows <distinct|same>   concurrent rows' prompts: distinct shares of the corpus (default), so a MoE\n"
+        << "                           model's rows route as separate requests do, or the first row's prompt\n"
+        << "                           repeated (--prompt-ids: same)\n"
         << "  --grammar-file <path>      constrain output with GBNF\n"
         << "  --json-object              constrain output to a JSON object\n"
         << "  --json-schema-file <path>  constrain output with JSON Schema\n"
@@ -554,6 +570,7 @@ std::string usage_text(std::string_view program) {
 BenchOptions parse_args(int argc, char** argv) {
     BenchOptions options;
     bool saw_artifact = false;
+    bool rows_given   = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         auto value = [&](std::string_view flag) -> std::string {
@@ -596,8 +613,12 @@ BenchOptions parse_args(int argc, char** argv) {
             options.ngram_residency = infernix::parse_ngram_residency(value("--ngram-residency"));
         } else if (arg == "--expert-stripe") {
             options.expert_stripe_path = value("--expert-stripe");
-        } else if (arg == "--ram-headroom-mib") {
-            const std::string text = value("--ram-headroom-mib");
+        } else if (arg == "--expert-state") {
+            const std::string path   = value("--expert-state");
+            options.expert_state_off = path == "off";
+            options.expert_state_path = options.expert_state_off ? std::string() : path;
+        } else if (arg == "--ram-free-mib") {
+            const std::string text = value("--ram-free-mib");
             std::size_t used       = 0;
             unsigned long long mib = 0;
             try {
@@ -605,15 +626,17 @@ BenchOptions parse_args(int argc, char** argv) {
             } catch (const std::exception&) { used = 0; }
             if (used != text.size() || text.empty() || text.front() == '-' ||
                 mib > (std::numeric_limits<std::uint64_t>::max() >> 20)) {
-                throw std::invalid_argument("--ram-headroom-mib must be a MiB count");
+                throw std::invalid_argument("--ram-free-mib must be a MiB count");
             }
-            options.ram_headroom_bytes = static_cast<std::uint64_t>(mib) << 20;
+            options.ram_free_bytes = static_cast<std::uint64_t>(mib) << 20;
         } else if (arg == "--vram-past-budget") {
             options.vram_past_budget = true;
         } else if (arg == "--expert-tail-skip") {
             options.expert_tail_skip = parse_u32(value("--expert-tail-skip"), "expert-tail-skip");
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
+        } else if (arg == "--a8-activations") {
+            options.a8_activations = true;
         } else if (arg == "--embedding-host") {
             options.embedding_host = true;
         } else if (arg == "--expert-ram-mib") {
@@ -632,6 +655,8 @@ BenchOptions parse_args(int argc, char** argv) {
                 }
                 options.expert_ram_bytes = static_cast<std::uint64_t>(mib) << 20;
             }
+        } else if (arg == "--expert-ram-layout") {
+            options.expert_ram_layout = infernix::parse_expert_ram_layout(value("--expert-ram-layout"));
         } else if (arg == "--expert-pin-mib") {
             const std::string text = value("--expert-pin-mib");
             if (text == "auto") {
@@ -666,6 +691,11 @@ BenchOptions parse_args(int argc, char** argv) {
             }
         } else if (arg == "--concurrency") {
             options.concurrency = parse_u32(value("--concurrency"), "concurrency");
+        } else if (arg == "--rows") {
+            const std::string rows{value("--rows")};
+            if (rows != "distinct" && rows != "same") { throw std::invalid_argument("--rows must be distinct or same"); }
+            options.distinct_rows = rows == "distinct";
+            rows_given            = true;
         } else if (arg == "--grammar-file" || arg == "--json-schema-file" ||
                    arg == "--json-object" || arg == "--regex" || arg == "--choice") {
             if (options.constraint &&
@@ -784,6 +814,13 @@ BenchOptions parse_args(int argc, char** argv) {
         (!options.n_prompt.empty() || !options.prompt_gen.empty() || options.n_gen.empty() || options.corpus_offset != 0)) {
         throw std::invalid_argument("--prompt-ids takes -n N tests only, without --corpus-offset");
     }
+    // One exact prompt: every row takes it.
+    if (!options.prompt_ids_path.empty()) {
+        if (rows_given && options.distinct_rows && options.concurrency > 1) {
+            throw std::invalid_argument("--prompt-ids gives every row the same prompt: use --rows same");
+        }
+        options.distinct_rows = false;
+    }
     if (!options.temperature && (options.top_p || options.top_k || options.min_p)) {
         throw std::invalid_argument("--top-p, --top-k and --min-p need --temperature");
     }
@@ -882,11 +919,18 @@ std::vector<TokenId> load_prompt_ids(const std::string& path) {
     return ids;
 }
 
-std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt) {
+std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt, std::size_t start) {
     if (n_prompt <= 0 || static_cast<std::size_t>(n_prompt) > corpus.size()) {
         throw std::invalid_argument("invalid prompt slice length: " + std::to_string(n_prompt));
     }
-    return {corpus.begin(), corpus.begin() + n_prompt};
+    std::vector<TokenId> out;
+    out.reserve(static_cast<std::size_t>(n_prompt));
+    for (std::size_t i = 0; i < static_cast<std::size_t>(n_prompt); ++i) { out.push_back(corpus[(start + i) % corpus.size()]); }
+    return out;
+}
+
+std::size_t row_prompt_start(std::size_t corpus_tokens, std::uint32_t row, std::uint32_t rows, bool distinct) {
+    return distinct && rows > 1 ? static_cast<std::size_t>(row) * (corpus_tokens / rows) : 0;
 }
 
 std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& speculative) {
@@ -1024,7 +1068,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << format_bytes(env.memory.kv_payload_bytes) << '\n'
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
-        << " concurrency=" << env.concurrency << " constraint=" << constraint_name(env.constraint)
+        << " concurrency=" << env.concurrency << " rows=" << (env.distinct_rows ? "distinct" : "same")
+        << " constraint=" << constraint_name(env.constraint)
         << (env.mixed_constraints ? " (mixed)" : "")
         << " original_int8_prefill_kernel=" << (env.original_int8_prefill_kernel ? "on" : "off")
         << " prefill_split_workspace_mib=" << env.prefill_split_workspace_mib
@@ -1032,10 +1077,14 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " fast_paths=" << fast_path_list(env) << " temporary_switches=\""
         << env.load.temporary_switches << '"' << " expert_tail_skip=" << env.expert_tail_skip
         << " expert_a4_activations=" << (env.expert_a4_activations ? "on" : "off")
+        << " a8_activations=" << (env.a8_activations ? "on" : "off")
+        << " expert_state=" << env.expert_state
         << " ngram_volume=" << (env.ngram_volume_path.empty() ? "default" : env.ngram_volume_path)
         << " ngram_residency=" << ngram_residency_name(env.ngram_residency)
         << " expert_stripe=" << (env.expert_stripe_path.empty() ? "none" : env.expert_stripe_path)
+        << " ram_free_mib=" << (env.ram_free_bytes >> 20)
         << " expert_ram_mib=" << mib_or_auto(env.expert_ram_bytes)
+        << " expert_ram_layout=" << infernix::expert_ram_layout_name(env.expert_ram_layout)
         << " expert_pin_mib=" << mib_or_auto(env.expert_pin_bytes)
         << " rope_yarn_factor=" << env.rope_yarn_factor
         << " kv_cache=" << kv_cache_name(env.kv_cache)
@@ -1167,6 +1216,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  },\n"
         << "  \"config\": {\n"
         << "    \"concurrency\": " << env.concurrency << ",\n"
+        << "    \"rows\": \"" << (env.distinct_rows ? "distinct" : "same") << "\",\n"
         << "    \"constraint_file\": \"" << json_escape(env.constraint_file) << "\",\n"
         << "    \"constraint_type\": \"" << constraint_name(env.constraint) << "\",\n"
         << "    \"constraint_source\": \""
@@ -1185,11 +1235,15 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"temporary_switches\": \"" << json_escape(env.load.temporary_switches) << "\",\n"
         << "    \"expert_tail_skip\": " << env.expert_tail_skip << ",\n"
         << "    \"expert_a4_activations\": " << (env.expert_a4_activations ? "true" : "false") << ",\n"
+        << "    \"a8_activations\": " << (env.a8_activations ? "true" : "false") << ",\n"
+        << "    \"expert_state\": \"" << json_escape(env.expert_state) << "\",\n"
         << "    \"ngram_volume\": \"" << json_escape(env.ngram_volume_path) << "\",\n"
         << "    \"ngram_residency\": \"" << ngram_residency_name(env.ngram_residency) << "\",\n"
         << "    \"expert_stripe\": \"" << json_escape(env.expert_stripe_path) << "\",\n"
+        << "    \"ram_free_mib\": " << (env.ram_free_bytes >> 20) << ",\n"
         << "    \"expert_ram_mib\": "
         << (env.expert_ram_bytes ? std::to_string(*env.expert_ram_bytes >> 20) : "null") << ",\n"
+        << "    \"expert_ram_layout\": \"" << infernix::expert_ram_layout_name(env.expert_ram_layout) << "\",\n"
         << "    \"expert_pin_mib\": "
         << (env.expert_pin_bytes ? std::to_string(*env.expert_pin_bytes >> 20) : "null") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"

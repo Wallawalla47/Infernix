@@ -45,10 +45,6 @@ constexpr Registration kSwitches[] = {
     // softmax_attention/dense/causal_cache/causal_softmax_attention.cpp, verify_rows_attention): BF16,
     // INT8, FP8, NVFP4 and K8V4 KV. Same bits.
     {"INFERNIX_TMP_VERIFY_ROWS_ATTENTION", Scope::Qwen3_5, Kind::Flag},
-    // The 35B small-T MoE (ops/sparse_moe, candidates §10.3 KW-06): D4 as D3's programmatic dependent,
-    // and T = 1's L2 hints (S1 warms the shared down codes, D4's tail the next consumer). Same bits.
-    {"INFERNIX_TMP_SMALL_T_D4_PDL", Scope::Qwen3_5, Kind::Flag},
-    {"INFERNIX_TMP_SMALL_T_L2_HINTS", Scope::Qwen3_5, Kind::Flag},
     // The scheduler's decode share (runtime/engine/engine_core.h, decode_share_from_environment): a
     // prefill unit's share of decode batches and the remaining tokens below which it stops. Same bits.
     {"INFERNIX_TMP_DECODE_SHARE", Scope::All, Kind::Value},
@@ -65,6 +61,10 @@ constexpr Registration kSwitches[] = {
     {"INFERNIX_TMP_ENGINE_ISOLATE", Scope::All, Kind::Value},
     {"INFERNIX_TMP_PROMPT_SEED", Scope::All, Kind::Value},
     {"INFERNIX_TMP_STAGING_SLOTS", Scope::All, Kind::Value},
+
+    // The layer walk with the prompt's narrow last call joined to the span (models/qwen4_exp/program/prefill_walk.cpp):
+    // its experts come from the span's ring, and a sibling diverging inside that call cannot coalesce. Same bits.
+    {"INFERNIX_TMP_WALK_JOIN_LAST", Scope::Qwen4Exp, Kind::Flag},
     // GGUF expert tiles (ops::MoeGgmlTiles::from_environment): the stage-decode column interval, the
     // decoded planes' threshold and shared-memory codebooks. Same bits.
     {"INFERNIX_TMP_IQ_STAGE_DECODE_MIN_COLUMNS", Scope::Qwen4Exp, Kind::Value},
@@ -99,9 +99,6 @@ constexpr Registration kSwitches[] = {
     // converting each weight unit once per pair (ops/offloaded_sparse_moe/cuda/moe_layer.cu, "column
     // pairs"; candidates §0j-1). Same bits.
     {"INFERNIX_TMP_NARROW_PAIRS", Scope::All, Kind::Flag},
-    // 35B (Q4 routed experts) small-T D3: two Q4 quads' loads in flight per warp at T >= 2
-    // (ops/sparse_moe/decode/sparse_moe_decode_kernels.cu; candidates §10 GX-02). Same bits.
-    {"INFERNIX_TMP_D3_TWO_QUADS", Scope::Qwen3_5, Kind::Flag},
     // Flash-Next's staging and shared-expert streams and the 122B's fork / staging-overlap stream
     // (runtime/expert_offload) at the device's greatest priority, and every CUDA Graph instantiated with node
     // priorities (core/decode_graph.cpp; candidates §11 D5). Same bits.
@@ -222,6 +219,10 @@ constexpr Registration kSwitches[] = {
     // (ops/offloaded_sparse_moe/cuda/wide_expert.cuh WarpTile64; candidates P5, Basalt ebf6928), in calls of at
     // least <value> columns per expert on average (1: every call). Same bits.
     {"INFERNIX_TMP_WIDE_EXPERT_T64", Scope::All, Kind::Value},
+    // Diagnostic: =<dir>; after each prompt's prefill on a BF16 KV cache, its K and V pages are written
+    // there with their layout (models/qwen3_5/program/kv_dump.cpp; tools/kv_lossless_count counts the
+    // 12-bit lossless blocks of candidates §23.2 PB-01). Output-neutral.
+    {"INFERNIX_TMP_KV_DUMP", Scope::Qwen3_5, Kind::Value},
 };
 constexpr std::size_t kCount = std::size(kSwitches);
 
@@ -408,7 +409,7 @@ OffloadSwitches read_offload() {
     }
     if (const auto v = value("INFERNIX_TMP_STAGING_SLOTS")) {
         long slots = 0;
-        if (parse_long(*v, 64, 512, slots)) {
+        if (parse_long(*v, 8, 512, slots)) {
             s.staging_slots = static_cast<std::int32_t>(slots);
         } else {
             reject("INFERNIX_TMP_STAGING_SLOTS", *v);

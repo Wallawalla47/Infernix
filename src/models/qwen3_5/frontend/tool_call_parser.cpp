@@ -777,8 +777,50 @@ private:
         return true;
     }
 
+    // True when the region ends with a call's own closers: the function close, then optionally the
+    // call and wrapper closes. A cut call does not, so a value that quotes an unmatched opener is
+    // told from a truncated value by this alone.
+    bool region_ends_with_call_close() const {
+        std::string_view rest = text_;
+        const auto trim = [&] {
+            while (!rest.empty() && is_format_whitespace(rest.back())) { rest.remove_suffix(1); }
+        };
+        const auto strip = [&](std::string_view suffix) {
+            if (!rest.ends_with(suffix)) { return false; }
+            rest.remove_suffix(suffix.size());
+            return true;
+        };
+        trim();
+        for (bool stripped = true; stripped;) {
+            stripped = strip("</function_calls>") || strip("</tool_call>");
+            trim();
+        }
+        return strip("</function>") || strip("</invoke>") || (!bare_close_.empty() && strip(bare_close_));
+    }
+
     bool find_parameter_close(std::size_t value_begin, std::size_t& value_end,
                               std::size_t& close_len, std::string_view required_close) const {
+        if (find_balanced_parameter_close(value_begin, value_end, close_len, required_close)) {
+            return true;
+        }
+        // Tolerant: a value that quotes an unmatched opener leaves the depth above one at the
+        // region end, so the call would read as cut with its own closers in the value. When the
+        // region is a whole call, the parameter ends at the first closer the grammar continues
+        // from, as it does without a quoted opener. A cut call keeps its value to the cut.
+        if (!tolerant_ || !region_ends_with_call_close()) { return false; }
+        for (std::size_t scan = value_begin; scan < text_.size(); ++scan) {
+            if (starts_with_at(text_, scan, required_close) &&
+                closes_parameter(scan + required_close.size())) {
+                value_end = scan;
+                close_len = required_close.size();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool find_balanced_parameter_close(std::size_t value_begin, std::size_t& value_end,
+                                       std::size_t& close_len, std::string_view required_close) const {
         std::size_t depth = 1;
         std::size_t scan  = value_begin;
         while (scan < text_.size()) {

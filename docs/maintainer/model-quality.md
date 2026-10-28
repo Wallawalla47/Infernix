@@ -372,8 +372,9 @@ standard a path is certified against is under revision and is not published here
   there and a draft is accepted exactly when it equals it. The default route keeps speculative
   rejection sampling (same distribution, other text for a seed). The real test
   `infernix_qwen3_5_speculation_invariance_real_test` checks MTP, DFlash2 and DFlash2 with n-gram
-  proposals (or the drafters it is given) against one plain run, greedy and sampled, and that a
-  raw one-token prompt verifies drafts too.
+  proposals (or the drafters it is given) against one plain run, greedy and sampled, also with
+  presence penalty 1.5 and frequency penalty 0.3 for those three drafters, and that a raw
+  one-token prompt verifies drafts too.
   Prompt and decode need not agree with each other. An option
   whose effect depends on load (lossy Host-tier prefix state, whose use depends on eviction) is
   refused with `--reproducible` at startup, never silently overridden. A
@@ -505,9 +506,9 @@ their request-coupling paths are listed like the others (since 2026-10-22). The 
 | Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8, IQ3_S, FP8, recipe A, recipe C (since 2026-10-21) and NVIDIA FP4-Local (16- and 4-bit expert activations), every format |
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
 | `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, every KV format (INT8 fails its decode tail, below; registered by the owner's decision, 2026-10-24) |
-| `fp8-a8-pair-block32` | the same, its two terms scaled per 32-value block (it takes precedence over `fp8-a8-pair`) | wherever `fp8-a8-pair` is, by the owner's decision (2026-10-25) ahead of its gate: tied in speed (recipe C, INT8 KV, pp4096 and pp16384 within 0.03 %, 4 blocks) and never less precise (a value is exact within 2^14 of its block's maximum instead of its column's) |
+| `fp8-a8-pair-block32` | the same, its two terms scaled per 32-value block (it takes precedence over `fp8-a8-pair`) | wherever `fp8-a8-pair` is, by the owner's decision (2026-10-25) ahead of its gate: tied in speed (recipe C, INT8 KV, pp4096 and pp16384 within 0.03 %, 4 blocks) and never less precise (a value is exact within 2^14 of its block's maximum instead of its column's); its route runs on FP4-Local's MXFP8 dense prefill under the `--a8-activations` opt-in only |
 | `q5-ksplit-mma`, `fp16-gdn-state` (Qwen3.5) | the groupwise artifacts' Q5 projections; every GDN state pool | by the owner's decision (2026-10-25) ahead of their gates, where measured faster with INT8 KV (MTP 3 decode, 3 blocks): groupwise 27B `q5-ksplit-mma` +4.5 % and `fp16-gdn-state` +0.7 %, NVFP4 27B `fp16-gdn-state` +0.7 %; not the 35B-A3B (no gain beyond spread) |
-| `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
+| `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below); its route runs under the `--a8-activations` opt-in only |
 | `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | NVFP4 27B, groupwise 27B and 35B-A3B, every format |
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format |
 | `adaptive-dflash` | Qwen3.8-27B / Qwen3.6-35B-A3B with DFlash or DFlash2 and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format (2026-10-22, below); not the groupwise 27B |
@@ -652,8 +653,15 @@ Qwen3.8-Flash-Next decodes request-invariant at every batch already (its plain a
 output was identical across concurrency 1-8 and to plain decode, 2026-10-14), so only three apply
 (`ProgramOptions` holds them): `adaptive-speculation` is its two-row MTP rounds, which share one
 draft length chosen from both rows (without it two rows decode plain, as three or more do);
-`free-cache-resume` is prefill calls, taps and resumes off its 16-token GDN sub-chunk grid,
-sibling coalescing, and endpoints and blocks holding decode-computed state; `preemption` as above.
+`free-cache-resume` is prefill calls, taps and resumes off the prefill-chunk grid, sibling
+coalescing off it, and endpoints and blocks holding decode-computed state; `preemption` as above.
+Without it the exact route taps, coalesces and resumes only on the prefill-chunk grid, so a resumed
+prefill runs the cold prefill's calls. Until 2026-10-27 it used the 16-token GDN grid, assuming every
+prefill route width-invariant; several are not (GDN: the decode update at one column, the recurrent
+kernel to 15, the chunked kernel from 16; Q8 dense SIMT to 8 columns, MMA tiles beyond; BF16 dense by
+width; QSA attention split or unsplit; the hyper-connection mix fused at decode widths), and a resume
+at a prompt's end left the cold bits (`infernix_qwen4_exp_resume_cold_real_test`: mean |dlogprob|
+0.0011). Width-invariant prefill routes would restore 16-token resumes (planned).
 Its kernel path `q8-sliced-k` (below) couples requests too: its routes depend on the round's width;
 so does `ggml-bf16-prefill`, whose routes depend on a prompt's call boundaries and MoE grouping.
 
@@ -1042,7 +1050,9 @@ of the CLI and server, the default route now runs the qualified fast paths.
 resume) on both routes. Where a path is not listed, the default route runs its request-invariant
 counterpart, which costs decode throughput (27B: 10 % at one request, 6-12 % at two to eight),
 prefix-cache reuse (no endpoints, so a conversation's next turn resumes from its last grid tap
-and recomputes the previous output) or admission (whole extents held without `preemption`).
+and recomputes the previous output, unless the idle-time next-turn prefill already computed it on
+the grid, [hybrid prefix cache](hybrid-prefix-cache-spec.md) §7.9) or admission (whole extents held
+without `preemption`).
 
 **`decode-split64`: INT8 KV decode attention, 64-key splits.** Measured on 2026-10-13 on an RTX
 5090 (CUDA 13.4, Windows).
@@ -1693,7 +1703,8 @@ NVFP4, K8V4, VQ2 or K4V2 KV, qualified 2026-10-19; BF16 KV, 2026-10-20).**
   | NVFP4 | 3.5e-3 / 2.24 % | 3.7e-3 (4.0e-3) / 3.5e-4 | +1.25 (1.38) / 0.22 | 1.3e-3 (1.0013) |
 
   Every criterion fails in both formats (p99.9 KL ratio 11.9 and 2.1), so the path runs in no
-  configuration.
+  configuration. Its route runs under `--a8-activations` (2026-10-27: the lossy opt-in, never a fast path
+  or a default; [design §19.3.31](qwen3_8-flash-next-design.md)), on the groupwise 27B's prefill calls.
 
 ### 6.8 Exact-route numerics changes
 

@@ -1467,6 +1467,42 @@ void PrefixCacheIndex::remove_subtree(std::uint32_t root) {
     }
 }
 
+// ---- withdrawal --------------------------------------------------------------------------------
+
+std::uint32_t PrefixCacheIndex::withdraw(Withdrawal& withdrawal) {
+    std::uint32_t removed = 0;
+    const auto remove_unpinned = [&](std::uint32_t snapshot) {
+        if (snapshots_[snapshot].pins != 0) { return false; }
+        remove_snapshot(snapshot);
+        ++removed;
+        return true;
+    };
+    std::erase_if(withdrawal.snapshots,
+                  [&](SnapshotRef ref) { return !valid(ref) || remove_unpinned(ref.index); });
+    std::vector<std::uint32_t> order;
+    std::vector<std::uint32_t> anchored;
+    std::erase_if(withdrawal.nodes, [&](NodeRef ref) {
+        if (!valid(ref)) { return true; } // evicted, or inside a subtree removed before
+        order.assign(1, ref.index);
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            for (const std::uint32_t child : nodes_[order[i]].children) { order.push_back(child); }
+        }
+        // Pins are path-wide, so a pinned node anywhere below pins the subtree's root.
+        bool pinned = nodes_[ref.index].pins != 0;
+        for (const std::uint32_t index : order) {
+            anchored = nodes_[index].snapshots; // removal edits the node's list
+            for (const std::uint32_t snapshot : anchored) {
+                if (!remove_unpinned(snapshot)) { pinned = true; }
+            }
+        }
+        if (pinned) { return false; }
+        removed += static_cast<std::uint32_t>(order.size());
+        remove_subtree(ref.index);
+        return true;
+    });
+    return removed;
+}
+
 // ---- views -------------------------------------------------------------------------------------
 
 NodeView PrefixCacheIndex::node(NodeRef ref) const {

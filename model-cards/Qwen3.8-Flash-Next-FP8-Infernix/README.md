@@ -200,8 +200,9 @@ the 4-bit conversions are several times faster
 ([Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix):
 146 tok/s plain, 260 with MTP on the same machine).
 
-With the experts taking all the RAM they may, little stays free for other programs while this model
-runs; `--ram-headroom-mib N` (default 2048) leaves more, at some decode speed.
+With the experts taking all the RAM they may, only `--ram-free-mib` (default 8192) stays free for other
+programs while this model runs; a smaller value such as 2048 keeps more experts in RAM and decodes faster
+(43.8 against 35.6 tok/s plain on a 96 GB machine) on a machine that runs little else.
 
 ## Provenance
 

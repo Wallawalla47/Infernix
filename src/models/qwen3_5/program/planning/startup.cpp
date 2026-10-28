@@ -1445,7 +1445,7 @@ static_assert(std::size_t{kDefaultPrefillSplitWorkspaceMiB} << 20 ==
 // INT8 and NVFP4 KV prefill with their fast prompt kernels unless the original was selected.
 // Prompt P*V runs in FP16 unless the prompt-pv8 fast path is selected, and single-column decode
 // keeps 128-key splits unless decode-split64 is (fast_paths.h). The MLP gate/up takes the q4-w4a8
-// route at prefill widths when that path is selected.
+// route at prefill widths when that path is selected, or with --a8-activations (A8Routes::q4_gate_up).
 ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
                                      const EngineOptions& options) {
     // The lossless route: causal scoring takes each window in one pass (its attention reads the window's
@@ -1480,6 +1480,11 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
     const bool chain      = mtp && !sampled_mtp && adaptive_mtp && (mtp_min_p > 0.0 || calibrated);
     // The offloaded drafter's step chain reads the confidence policy's probabilities (argmax drafts).
     const bool step_chain = mtp && offloaded && !sampled_mtp && !chain && switches.step_gate;
+    // --a8-activations' routes (the Engine refuses the flag where none applies, and on the reproducible and
+    // lossless routes).
+    const A8Routes a8 = options.a8_activations && options.fast_paths && !options.lossless
+                            ? a8_activation_routes(fast_paths.configuration)
+                            : A8Routes{};
     return {.fast = uses_fast_int8_prefill(options) ||
                     (options.kv_cache == KvCacheStorage::Nvfp4Group16 &&
                      !options.original_nvfp4_prefill_kernel),
@@ -1516,8 +1521,9 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
             .mtp_step_chain          = step_chain,
             .mtp_draft_regime        = step_chain && switches.skip_rounds,
             .sampled_mtp_drafts      = sampled_mtp,
-            .linear_routes         = fast_paths.selected(FastPath::Q4W4A8) ? ops::LinearRoutes::Q4W4A8
-                                                                             : ops::LinearRoutes::Exact,
+            .linear_routes         = fast_paths.selected(FastPath::Q4W4A8) || a8.q4_gate_up
+                                         ? ops::LinearRoutes::Q4W4A8
+                                         : ops::LinearRoutes::Exact,
             .q5_ksplit               = fast_paths.selected(FastPath::Q5KSplitMma),
             .gdn_arithmetic          = fast_paths.selected(FastPath::GdnF16Accumulate)
                                            ? ops::GdnChunkArithmetic::Fp16Accumulate
@@ -1526,15 +1532,17 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
             .block_verification      = fast_paths.selected(FastPath::BlockVerification),
             .univer_trees            = fast_paths.selected(FastPath::UniverTrees),
             .gdn_tree_closed_form    = fast_paths.selected(FastPath::GdnTreeClosedForm),
-            // The three-term form takes precedence where both are selected (as on Flash-Next); the
-            // lossless route's experts are its own.
+            // --a8-activations' wide route first (as on Flash-Next), then the three-term form where both A4
+            // forms are selected; the lossless route's experts are its own.
             .expert_wide             = options.lossless ? ops::offloaded_moe::WideA16::kExact
+                                       : a8.experts_prefill && a8.experts ? ops::offloaded_moe::WideA16::kA8
                                        : fast_paths.selected(FastPath::ExpertA4Residual3)
                                            ? ops::offloaded_moe::WideA16::kA4Residual3
                                        : fast_paths.selected(FastPath::ExpertA4Residual)
                                            ? ops::offloaded_moe::WideA16::kA4Residual
                                            : ops::offloaded_moe::WideA16::kExact,
             .router_mma              = !options.lossless && fast_paths.selected(FastPath::RouterMma),
+            .a8_experts              = a8.experts,
             .lossless                = options.lossless,
             .lossless_keys           = options.lossless && options.purpose == EnginePurpose::Generation
                                            ? static_cast<std::int32_t>(options.max_context)

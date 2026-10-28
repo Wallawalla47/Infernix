@@ -45,6 +45,8 @@ ExpertStream::ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uin
     }
     streams_.assign(layers_, 0);
     complete_.assign(layers_, 0);
+    guessed_.assign(layers_, 0);
+    ahead_.assign(layers_, 0);
 }
 
 ExpertStream::~ExpertStream() {
@@ -105,6 +107,8 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
         ssd_slots_[l].clear();
         ssd_requested_[l] = 0;
     }
+    std::fill(guessed_.begin(), guessed_.end(), std::uint8_t{0});
+    std::fill(ahead_.begin(), ahead_.end(), 0U);
     if (gated) {
         uploading_ = false;
         std::fill(streams_.begin(), streams_.end(), std::uint8_t{0});
@@ -166,21 +170,82 @@ std::uint32_t ExpertStream::plan_layer(std::uint32_t layer, std::span<const std:
     }
     auto* row                  = static_cast<std::int32_t*>(tables_host_.data()) + static_cast<std::size_t>(layer) * experts_;
     const std::int32_t* frames = residency_ + static_cast<std::size_t>(layer) * experts_;
-    std::uint32_t taken        = 0, staged = 0;
+    // A guessed layer's row already holds the slots plan_ahead filled (and -1 elsewhere).
+    const bool guessed         = guessed_[layer] != 0;
+    const std::uint32_t ahead  = ahead_[layer];
+    std::uint32_t taken        = ahead, staged = 0;
     for (std::uint32_t e = 0; e < experts_; ++e) {
+        if (guessed && row[e] >= 0) { // copied ahead: the slot stays, routed or not
+            stats_.ahead_used += columns[e] > 0 ? 1U : 0U;
+            if (columns[e] > ahead_rows_) {
+                ++stats_.heavy;
+                ++stats_.heavy_ahead;
+            }
+            continue;
+        }
+        if (guessed && columns[e] > ahead_rows_ && frames[e] < 0) { ++stats_.heavy; }
         // An SSD-only expert has no host record to copy: the CPU or the fetch channel serves it.
         const bool copy = columns[e] > 0 && frames[e] < 0 && cpu[e] == 0 && takes(layer, e, taken, staged);
         row[e]          = copy ? static_cast<std::int32_t>((layer % 2) * half_ + taken++) : -1;
         if (copy && hold_) { hold_(layer, e); }
     }
+    if (guessed) { stats_.late += taken - ahead; }
     streams_[layer] = 1; // the MoE waits for the table upload even when nothing is copied
     // The half's previous readers (layer - 2's experts) release it first; the table rides ahead of
-    // the copies on the copy stream, so the layer's landed event covers both.
+    // the copies on the copy stream, so the layer's landed event covers both (and the copies ahead,
+    // enqueued earlier on the same stream).
     if (layer >= 2) { CUDA_CHECK(cudaStreamWaitEvent(stream_, consumed_[layer - 2], 0)); }
     CUDA_CHECK(cudaMemcpyAsync(tables_ + static_cast<std::size_t>(layer) * experts_, row, experts_ * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice, stream_));
-    enqueue(layer);
+    enqueue(layer, ahead);
+    return taken - ahead;
+}
+
+std::uint32_t ExpertStream::plan_ahead(std::uint32_t layer, std::span<const std::int32_t> guess, std::int32_t rows,
+                                       std::uint32_t most) {
+    if (!active_ || !gated_ || layer >= layers_ || guess.size() < experts_ || rows < 0 || guessed_[layer] != 0) {
+        throw std::logic_error("expert stream: plan_ahead outside a gated chunk");
+    }
+    auto* row                  = static_cast<std::int32_t*>(tables_host_.data()) + static_cast<std::size_t>(layer) * experts_;
+    const std::int32_t* frames = residency_ + static_cast<std::size_t>(layer) * experts_;
+    // Non-resident experts with a pinned record (an unpinned one would hold the host at the bounce);
+    // the heaviest guesses when there are more than the limit.
+    pick_.clear();
+    for (std::uint32_t e = 0; e < experts_; ++e) {
+        if (guess[e] > rows && frames[e] < 0 && record_of_(layer, e) != nullptr) { pick_.emplace_back(guess[e], e); }
+    }
+    const std::uint32_t limit = most > 0 ? std::min(most, half_) : half_;
+    if (pick_.size() > limit) {
+        std::nth_element(pick_.begin(), pick_.begin() + limit, pick_.end(),
+                         [](const auto& a, const auto& b) { return a.first > b.first; });
+        pick_.resize(limit);
+    }
+    // In ascending ids, so adjacent records of one allocation copy as one run.
+    std::sort(pick_.begin(), pick_.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+    std::fill(row, row + experts_, -1);
+    std::uint32_t taken = 0;
+    for (const auto& pick : pick_) {
+        row[pick.second] = static_cast<std::int32_t>((layer % 2) * half_ + taken++);
+        if (hold_) { hold_(layer, pick.second); }
+    }
+    guessed_[layer] = 1;
+    ahead_[layer]   = taken;
+    ahead_rows_     = rows;
+    stats_.ahead += taken;
+    if (taken > 0) {
+        streams_[layer] = 1;
+        enqueue(layer); // behind the release of layer - 2's half
+    }
     return taken;
+}
+
+void ExpertStream::mask_ahead(std::uint32_t layer, std::span<std::int32_t> columns) const {
+    if (!active_ || !gated_ || layer >= layers_ || ahead_[layer] == 0) { return; }
+    const auto* row = static_cast<const std::int32_t*>(tables_host_.data()) + static_cast<std::size_t>(layer) * experts_;
+    const std::size_t n = std::min<std::size_t>(experts_, columns.size());
+    for (std::size_t e = 0; e < n; ++e) {
+        if (row[e] >= 0) { columns[e] = 0; }
+    }
 }
 
 const std::int32_t* ExpertStream::slots(std::uint32_t layer) const noexcept {
@@ -221,12 +286,14 @@ void ExpertStream::request_reads(std::uint32_t layer) {
     }
 }
 
-void ExpertStream::enqueue(std::uint32_t layer) {
+void ExpertStream::enqueue(std::uint32_t layer, std::uint32_t first) {
     if (layer >= 2) { CUDA_CHECK(cudaStreamWaitEvent(stream_, consumed_[layer - 2], 0)); }
     // The stream reads of this layer and the next kReadAhead (the drive reads while these copy).
     (void)release_landed(false);
     for (std::uint32_t l = layer; l <= layer + kReadAhead && l < layers_; ++l) { request_reads(l); }
     const auto* row = static_cast<const std::int32_t*>(tables_host_.data()) + static_cast<std::size_t>(layer) * experts_;
+    // Slots before `first` were copied by an earlier enqueue of this layer (plan_ahead's).
+    const std::int32_t lowest = static_cast<std::int32_t>((layer % 2) * half_ + first);
     // Runs of consecutive experts in consecutive slots and adjacent records of one allocation: one
     // copy per run (a copy may not span two pinned allocations, even adjacent ones), all enqueued as
     // one batch so the host does not wait on the copy queue.
@@ -237,7 +304,7 @@ void ExpertStream::enqueue(std::uint32_t layer) {
     // record; equal strides copy runs.
     const std::uint64_t host = host_strides_.empty() ? stride_ : host_strides_[layer];
     for (std::uint32_t e = 0; e < experts_;) {
-        if (row[e] < 0) {
+        if (row[e] < lowest) {
             ++e;
             continue;
         }

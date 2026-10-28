@@ -22,6 +22,10 @@ namespace moe = ops::offloaded_moe;
 struct Buffers {
     Tensor logits, ids, weights, gate, outputs, product, shared, y;
     DeviceSpan dispatch, shared_scratch, experts;
+    // A gated call's copy-ahead guess of the next layer's routing, sized for at most the CPU channel's width
+    // (the widest gated call) so the layout grows with T; empty below a streamed call's width.
+    Tensor guess_ids, guess_weights, guess_gate;
+    DeviceSpan guess_dispatch;
 };
 
 template <class A>
@@ -53,6 +57,13 @@ Buffers allocate(A& a, const OffloadedMoeParameters& p, const moe::ExpertShape& 
     b.experts  = a.alloc_bytes(
         ops::moe_experts_workspace_bytes(shape, max_jobs, entries, T, moe::ExpertActivation::kA16, wide_a16));
     b.y        = a.alloc(DType::BF16, {shape.hidden, T});
+    if (T >= kRouterMmaMinColumns) {
+        const std::int32_t g = std::min(T, moe::kMaxCpuCallColumns);
+        b.guess_ids      = a.alloc(DType::I32, {K, g});
+        b.guess_weights  = a.alloc(DType::FP32, {K, g});
+        b.guess_gate     = a.alloc(DType::FP32, {g});
+        b.guess_dispatch = a.alloc_bytes(ops::moe_dispatch_bytes(E, K * g));
+    }
     return b;
 }
 
@@ -164,9 +175,12 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
     // Graphed rounds take the fork route with landings; eager calls overlap staging with compute.
     if (experts.side_stream != nullptr) {
         if (call.graphed) {
-            source.fork_stream    = experts.side_stream;
-            source.fork_events[0] = experts.side_events[0];
-            source.fork_events[1] = experts.side_events[1];
+            source.fork_stream     = experts.side_stream;
+            source.fork_events[0]  = experts.side_events[0];
+            source.fork_events[1]  = experts.side_events[1];
+            source.split_stream    = experts.split_stream;
+            source.split_events[0] = experts.split_events[0];
+            source.split_events[1] = experts.split_events[1];
             if (experts.landing != nullptr) {
                 source.landing       = experts.landing + static_cast<std::size_t>(p.layer) * experts.landing_slots;
                 source.landed        = experts.landed + static_cast<std::size_t>(p.layer) * experts.landing_slots;
@@ -182,24 +196,46 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
     // A streamed chunk routes and dispatches first: its host-side split reads the dispatch.
     runtime::expert_offload::ExpertStream* const streaming =
         call.streamed && experts.stream != nullptr && experts.stream->active() ? experts.stream : nullptr;
+    // The copy-ahead (ExpertStream::plan_ahead, candidates BX-09): a gated call also routes this layer's input
+    // through the next layer's router and copies the experts that guess makes heavy while this layer ends, so the
+    // link does not wait idle for the next layer's routing. Placement only: the same record bytes are read.
+    const OffloadedMoeParameters* const next =
+        context.next != nullptr ? std::get_if<OffloadedMoeParameters>(&context.next->ffn) : nullptr;
+    const bool ahead = streaming != nullptr && streaming->gated() && next != nullptr && call.release_stream &&
+                       T <= moe::kMaxCpuCallColumns && b.guess_dispatch.data != nullptr;
     if (streaming != nullptr) {
         ops::moe_route_dispatch(b.logits, K, routing, dispatch, route_log, s, ops::RouterLogits::kBf16, shared_job);
         if (streaming->gated()) {
             // The layer's routing decides which experts the link copies and which the CPU serves: every
             // narrow miss is offered, capped at the policy's count (Flash-Next §19.3.12).
-            if (experts.split_offsets.size() < (static_cast<std::size_t>(E) + 2) * sizeof(std::int32_t)) {
-                experts.split_offsets = PinnedHostBuffer((static_cast<std::size_t>(E) + 2) * sizeof(std::int32_t));
+            if (experts.split_offsets.size() < 2 * (static_cast<std::size_t>(E) + 2) * sizeof(std::int32_t)) {
+                experts.split_offsets = PinnedHostBuffer(2 * (static_cast<std::size_t>(E) + 2) * sizeof(std::int32_t));
             }
-            CUDA_CHECK(cudaMemcpyAsync(experts.split_offsets.data(), dispatch.offsets,
-                                       (static_cast<std::size_t>(E) + 1) * sizeof(std::int32_t), cudaMemcpyDeviceToHost, s));
+            auto* offsets = static_cast<std::int32_t*>(experts.split_offsets.data());
+            CUDA_CHECK(cudaMemcpyAsync(offsets, dispatch.offsets, (static_cast<std::size_t>(E) + 1) * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToHost, s));
+            if (ahead) {
+                // The route has read `logits`, so the guess reuses them. It decides placement only, so the
+                // router's tensor-core form (a gated call has at least 256 columns).
+                const Tensor* next_rows[] = {&next->router, &next->shared_score};
+                ops::projection_fp32_router_mma(hidden, next_rows, b.logits, s);
+                ops::MoeRouting guess{b.guess_ids, b.guess_weights, b.guess_gate};
+                ops::MoeDispatch guessed = ops::carve_moe_dispatch(b.guess_dispatch.data, E, K * T);
+                ops::moe_route_dispatch(b.logits, K, guess, guessed, nullptr, s, ops::RouterLogits::kBf16);
+                CUDA_CHECK(cudaMemcpyAsync(offsets + E + 2, guessed.offsets, (static_cast<std::size_t>(E) + 1) * sizeof(std::int32_t),
+                                           cudaMemcpyDeviceToHost, s));
+            }
             CUDA_CHECK(cudaEventRecord(experts.split_ready, s));
             CUDA_CHECK(cudaEventSynchronize(experts.split_ready));
-            const auto* offsets = static_cast<const std::int32_t*>(experts.split_offsets.data());
             experts.split_columns.resize(static_cast<std::size_t>(E));
+            experts.split_priced.resize(static_cast<std::size_t>(E));
             experts.split_cpu.assign(static_cast<std::size_t>(E), 0);
             for (std::int32_t e = 0; e < E; ++e) { experts.split_columns[static_cast<std::size_t>(e)] = offsets[e + 1] - offsets[e]; }
+            // Experts copied ahead for this layer are on their way: the CPU split neither takes nor prices them.
+            std::copy(experts.split_columns.begin(), experts.split_columns.end(), experts.split_priced.begin());
+            streaming->mask_ahead(p.layer, experts.split_priced);
             const std::uint32_t cpu = call.split && experts.split != nullptr && source.cpu.max_jobs > 0
-                                          ? experts.split->choose(p.layer, experts.split_columns, experts.split_cpu)
+                                          ? experts.split->choose(p.layer, experts.split_priced, experts.split_cpu)
                                           : 0U;
             experts.split_streamed_experts += streaming->plan_layer(p.layer, experts.split_columns, experts.split_cpu);
             experts.split_cpu_experts += cpu;
@@ -227,13 +263,25 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
         }
     }
 
+    // The next layer's guessed experts, behind this layer's copies on the link: enqueued once this layer's
+    // experts are (the GPU then works while the host plans), or before them when that call waits for the CPU.
+    const auto copy_ahead = [&] {
+        if (!ahead) { return; }
+        const auto* guessed = static_cast<const std::int32_t*>(experts.split_offsets.data()) + E + 2;
+        experts.guess_columns.resize(static_cast<std::size_t>(E));
+        for (std::int32_t e = 0; e < E; ++e) { experts.guess_columns[static_cast<std::size_t>(e)] = guessed[e + 1] - guessed[e]; }
+        (void)streaming->plan_ahead(next->layer, experts.guess_columns, runtime::expert_offload::ExpertStream::ahead_rows(T), 0);
+    };
     const std::int32_t max_jobs = std::min(E, K * T) + sj;
     source.wide_a16             = experts.wide_a16;
+    source.narrow_a16           = experts.narrow_a16;
     const bool planned =
         streaming == nullptr && ops::moe_route_dispatch_plan(b.logits, K, routing, dispatch, route_log, hidden, source,
                                                              max_jobs, b.experts.data, b.outputs, s,
                                                              ops::RouterLogits::kBf16, shared_job);
     if (shared_job) {
+        // This call waits for the CPU's experts before it returns: the guessed copies go first.
+        copy_ahead();
         ops::moe_experts(hidden, dispatch, source, K, max_jobs, b.experts.data, b.outputs, s, /*wait_for_cpu=*/true,
                          planned);
         if (streaming != nullptr && call.release_stream) { streaming->after_experts(p.layer, s); }
@@ -256,6 +304,7 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
     ops::moe_experts(hidden, dispatch, source, K, max_jobs, b.experts.data, b.outputs, s, /*wait_for_cpu=*/false,
                      planned);
     if (streaming != nullptr && call.release_stream) { streaming->after_experts(p.layer, s); }
+    copy_ahead();
     dense_shared_expert(hidden, *p.shared, b, shared_s);
     ops::moe_experts_cpu_wait(hidden, dispatch, source, max_jobs, b.experts.data, b.outputs, s);
     if (shared_s != s) {

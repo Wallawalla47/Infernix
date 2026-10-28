@@ -462,6 +462,9 @@ public:
     [[nodiscard]] bool hybrid_holds_stale() const noexcept;
     // Changes when a queued request's choice of snapshot may have changed.
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
+    // The positions a request can resume from: every position with free-cache-resume, else the
+    // prefill chunk grid (the reproducible route).
+    [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     // Installs the Engine's calibrated machine model for hybrid admission choice and eviction.
     void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);

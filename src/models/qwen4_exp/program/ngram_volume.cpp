@@ -93,10 +93,10 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
     }
     static_assert(kHeaderSize == 60);
     if (resident) {
-        // The whole table in RAM: 1 GiB unbuffered reads (each keeps 16 reads of 8 MiB in flight on
-        // Windows) straight into the block, which is then page-locked and mapped in one call.
+        // The whole table in RAM: a block locked in the working set (only the CPU reads it), then 1 GiB
+        // unbuffered reads (each keeps 16 reads of 8 MiB in flight on Windows) straight into it.
         const auto start = std::chrono::steady_clock::now();
-        resident_ = std::make_unique<RegisteredHostBuffer>(resident_bytes(table));
+        resident_ = std::make_unique<ResidentHostBuffer>(resident_bytes(table));
         constexpr std::size_t kPiece = std::size_t{1} << 30;
         for (std::size_t at = 0; at < resident_->size(); at += kPiece) {
             const std::size_t bytes = std::min(kPiece, resident_->size() - at);
@@ -104,7 +104,6 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
                 throw std::runtime_error(path.string() + ": short n-gram volume read");
             }
         }
-        resident_->pin();
         counters_.reads   = table.blocks;
         counters_.read_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
@@ -262,6 +261,28 @@ bool NgramVolume::cached(std::span<const std::uint32_t> rows) const noexcept {
         if (row >= table_.rows || tags_[slot_of(row)] != row) { return false; }
     }
     return true;
+}
+
+NgramVolume::ReadProbe NgramVolume::probe_reads(std::size_t reads, double max_seconds) const {
+    ReadProbe probe;
+    if (resident_ || table_.blocks == 0) { return probe; }
+    const std::span<std::byte> block(ring_, table_.block_bytes);
+    // A different set of blocks each start, so the drive's own cache cannot answer the same ones.
+    std::uint64_t state = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) | 1U;
+    const auto start    = std::chrono::steady_clock::now();
+    for (; probe.reads < reads; ++probe.reads) {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        const std::uint64_t at = table_.header_bytes + (state >> 33U) % table_.blocks * table_.block_bytes;
+        if (file_.read_direct(at, block) != block.size()) {
+            throw std::runtime_error("short n-gram volume read in the read-rate probe");
+        }
+        probe.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        if (probe.seconds >= max_seconds) {
+            ++probe.reads;
+            break;
+        }
+    }
+    return probe;
 }
 
 std::filesystem::path default_ngram_volume(const std::filesystem::path& artifact) {

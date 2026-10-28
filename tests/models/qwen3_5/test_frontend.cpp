@@ -548,6 +548,17 @@ int test_declared_frontend_semantics() {
                 !unicode::is_mark(value.value),
             "ASCII decoding or Unicode classification differs from classic character semantics");
     }
+    // Beyond ASCII, `\s` is the Unicode White_Space property (the Oniguruma class of the reference
+    // tokenizer): U+0085 and the Z categories, and none of the format characters that only look blank.
+    for (const std::int32_t space : {0x85, 0xa0, 0x1680, 0x2000, 0x2003, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f,
+                                      0x3000}) {
+        failures += check(infernix::text::unicode_internal::is_whitespace(space),
+                          "a Unicode White_Space character was not whitespace");
+    }
+    for (const std::int32_t blank : {0x1c, 0x1f, 0xad, 0x180e, 0x200b, 0x200c, 0x200d, 0x2060, 0xfeff}) {
+        failures += check(!infernix::text::unicode_internal::is_whitespace(blank),
+                          "a character outside the Unicode White_Space property was whitespace");
+    }
     for (const auto& [path, value] : std::vector<std::pair<const char*, nlohmann::json>>{
              {"/normalizer/type", "Lowercase"},
              {"/pre_tokenizer/pretokenizers/0/pattern/Regex", "\\w+"},
@@ -1699,6 +1710,47 @@ int test_image_resize_rejection_policy() {
     return failures;
 }
 
+// The Vision canvas of the transformers smart resize (factor 32, size 8,192..4,194,304 pixels): the
+// grid rounds half to even, the maximum is tested on the rounded area and then floors, the minimum
+// scales up and ceils. The expected canvases are the reference's, recomputed by hand from the
+// published formula; each token is one 32x32 block.
+int test_image_smart_resize_canvases() {
+    FrontendResources owned = resources();
+    owned.preprocessor_config_json =
+        R"({"patch_size":16,"temporal_patch_size":2,"merge_size":2,"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"size":{"shortest_edge":8192,"longest_edge":4194304}})";
+    const Frontend frontend = make_frontend(owned);
+
+    struct Case {
+        int width, height, canvas_width, canvas_height;
+        const char* why;
+    };
+    const Case cases[] = {
+        {1280, 720, 1280, 704, "720/32 = 22.5 rounds to the even 22, not 23"},
+        {1000, 10, 928, 32, "a height that rounds to 0 takes the minimum-area branch"},
+        {2721, 1595, 2656, 1536, "the rounded area is over the maximum, so both sides floor after scaling"},
+        {90, 5, 384, 32, "a tiny image scales up to the minimum area and ceils"},
+        {1024, 1024, 1024, 1024, "an in-range multiple of the factor is kept"},
+        {2049, 1023, 2048, 1024, "a size just off the grid rounds to it"},
+    };
+    int failures = 0;
+    for (const Case& c : cases) {
+        const auto prepared = frontend.prepare(
+            image_text_input(block_ppm(c.width, c.height, 127), {}, "smart-resize.ppm"));
+        const auto& data = FrontendFactory::inspect(prepared);
+        const std::uint64_t expected =
+            static_cast<std::uint64_t>(c.canvas_width / 32) * static_cast<std::uint64_t>(c.canvas_height / 32);
+        const bool matches = data.vision_items.size() == 1 && data.prepare.vision_tokens == expected &&
+                             data.prepare.raw_patches == expected * 4;
+        if (!matches) {
+            std::cerr << "smart resize canvas differs from the reference for " << c.width << "x" << c.height
+                      << " (" << c.why << "): " << data.prepare.vision_tokens << " tokens, expected " << expected
+                      << '\n';
+        }
+        failures += matches ? 0 : 1;
+    }
+    return failures;
+}
+
 int test_explicit_leading_instruction_cache_boundary() {
     const Frontend frontend           = make_frontend(resources(), false);
     constexpr std::string_view stable = "stable cache section.";
@@ -2254,6 +2306,34 @@ int test_terminal_flush(const Frontend& frontend) {
     failures += check(channel_text(flushed, infernix::OutputChannel::Content) == "ST",
                       "between-round terminal preview lost the pending stop suffix");
     return failures;
+}
+
+// The Engine builds the constraint vocabulary index on a startup thread while requests may already
+// be arriving: concurrent warm-ups and a constrained request that races them share one build and
+// all succeed.
+int test_constraint_warm_up() {
+    const Frontend frontend = make_frontend(resources());
+    infernix::PromptInput input;
+    input.options.enable_thinking = false;
+    input.messages.push_back({.role  = infernix::ChatRole::User,
+                              .parts = {{.kind = infernix::MessagePartKind::Text, .text = "x"}}});
+    const auto prompt = frontend.prepare(input);
+
+    std::atomic<int> thrown{0};
+    std::vector<std::thread> warmers;
+    for (int index = 0; index < 2; ++index) {
+        warmers.emplace_back([&] {
+            try {
+                frontend.warm_constraints();
+            } catch (...) { ++thrown; }
+        });
+    }
+    auto session = frontend.make_output_session(prompt, {}, {}, {},
+                                                infernix::OutputConstraint::choice({"yes", "no"}));
+    for (std::thread& warmer : warmers) { warmer.join(); }
+    frontend.warm_constraints();
+    return check(thrown == 0 && session.constraint_observation().has_value(),
+                 "a constrained request racing the startup vocabulary warm-up failed");
 }
 
 int test_tools_and_json_output() {
@@ -3993,6 +4073,102 @@ int test_checkpoint_lowering_precedes_leading_instruction_tap() {
     return failures;
 }
 
+// The idle-time pass's prompt (hybrid-prefix-cache-spec §7.9): a finished reply rendered as the
+// conversation's next request will render it. Whatever follows the reply (a tool result after a
+// call, a user turn after an answer) and whichever reasoning the template keeps, the pass's tokens
+// are a prefix of that next request's tokens, end with the next turn's <|im_start|>, and carry an
+// exact opener tap at the history's end, one token before the prompt's.
+int test_next_turn_history() {
+    const auto text = [](infernix::ChatRole role, std::string content) {
+        infernix::ChatMessage message;
+        message.role = role;
+        message.parts.push_back(infernix::MessagePart{
+            .kind = infernix::MessagePartKind::Text, .text = std::move(content), .media = {}});
+        return message;
+    };
+    const std::string tool =
+        R"({"type":"function","function":{"name":"lookup","description":"Look up a city.","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}})";
+    int failures = 0;
+    for (const bool keeps_reasoning : {false, true}) {
+        // qwen3_6.jinja keeps reasoning only after the last user turn; qwen3_8.jinja keeps it.
+        const Frontend frontend =
+            make_frontend(resources(keeps_reasoning ? reasoning_effort_template_source()
+                                                    : thinking_toggle_template_source()),
+                          false);
+        for (const bool calls : {false, true}) {
+            infernix::PromptInput base;
+            base.options.enable_thinking = true;
+            base.options.tool_jsons.push_back(tool);
+            base.messages.push_back(text(infernix::ChatRole::System, "You help."));
+            base.messages.push_back(text(infernix::ChatRole::User, "Weather in Paris?"));
+            infernix::ChatMessage first = text(infernix::ChatRole::Assistant, "");
+            first.reasoning_content     = "first look";
+            first.tool_calls.push_back(
+                {.id = "call_a", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
+            base.messages.push_back(std::move(first));
+            infernix::ChatMessage result = text(infernix::ChatRole::Tool, "sunny");
+            result.tool_call_id          = "call_a";
+            base.messages.push_back(std::move(result));
+            infernix::ChatMessage reply = text(infernix::ChatRole::Assistant, calls ? "" : "It is sunny.");
+            reply.reasoning_content     = "then answer";
+            if (calls) {
+                reply.tool_calls.push_back(
+                    {.id = "call_b", .name = "lookup", .arguments_json = R"({"city":"Lyon"})"});
+            }
+            base.messages.push_back(std::move(reply));
+
+            infernix::PromptInput history = base;
+            history.options.continuation  = infernix::PromptContinuationMode::NextTurnHistory;
+            infernix::PromptInput next    = base;
+            if (calls) {
+                infernix::ChatMessage lyon = text(infernix::ChatRole::Tool, "rainy");
+                lyon.tool_call_id          = "call_b";
+                next.messages.push_back(std::move(lyon));
+            } else {
+                next.messages.push_back(text(infernix::ChatRole::User, "And tomorrow?"));
+            }
+            const auto pass    = frontend.prepare(std::move(history));
+            const auto request = frontend.prepare(std::move(next));
+            const auto& ids    = FrontendFactory::inspect(pass).token_ids;
+            const auto& full   = FrontendFactory::inspect(request).token_ids;
+            const bool prefix  = !ids.empty() && ids.size() < full.size() &&
+                                std::equal(ids.begin(), ids.end(), full.begin());
+            failures += check(prefix && ids.back() == 248045,
+                              "the next-turn history is not the next request's prefix through its "
+                              "<|im_start|>");
+            const auto& hints = FrontendFactory::inspect(pass).tap_hints.hints;
+            failures += check(std::any_of(hints.begin(), hints.end(),
+                                          [&](const TapHint& hint) {
+                                              return hint.kind == TapHintKind::GenerationOpener &&
+                                                     hint.position == ids.size() - 1;
+                                          }),
+                              "the next-turn history has no opener tap at its end");
+            // A user turn after an answer drops the tail's reasoning where the template does so.
+            const std::string rendered = frontend.detokenize(ids);
+            const bool kept            = rendered.find("first look") != std::string::npos;
+            failures += check(kept == (keeps_reasoning || calls),
+                              "the next-turn history kept or dropped earlier reasoning unlike the "
+                              "next request");
+            failures += check(!FrontendFactory::inspect(pass).starts_in_reasoning,
+                              "the next-turn history opened a reasoning block");
+        }
+        // The last message must be the reply.
+        infernix::PromptInput unanswered;
+        unanswered.messages.push_back(text(infernix::ChatRole::User, "Hi"));
+        unanswered.options.continuation = infernix::PromptContinuationMode::NextTurnHistory;
+        failures += check(throws_invalid_argument([&] { (void)frontend.prepare(unanswered); }),
+                          "a next-turn history without a final reply was rendered");
+    }
+    // Text only: a media item would take the Vision path the pass does not take.
+    const Frontend vision = make_frontend(resources(), true);
+    infernix::PromptInput media = image_text_input(gradient_ppm(), "what is this?", "inline.ppm");
+    media.messages.push_back(text(infernix::ChatRole::Assistant, "A gradient."));
+    media.options.continuation = infernix::PromptContinuationMode::NextTurnHistory;
+    failures += check(throws_invalid_argument([&] { (void)vision.prepare(media); }),
+                      "a next-turn history with media was rendered");
+    return failures;
+}
+
 int main() {
     const FrontendResources owned = resources();
     const Frontend frontend       = make_frontend(owned);
@@ -4021,6 +4197,7 @@ int main() {
     failures += test_media_token_ids_come_from_tokenizer();
     failures += test_template_media_contract();
     failures += test_image_resize_rejection_policy();
+    failures += test_image_smart_resize_canvases();
     failures += test_explicit_leading_instruction_cache_boundary();
     failures += test_trimmed_source_cache_boundaries();
     failures += test_source_part_recovery_boundary();
@@ -4036,6 +4213,7 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
     failures += test_deferred_tool_declarations();
+    failures += test_constraint_warm_up();
     failures += test_tools_and_json_output();
     failures += test_tool_marker_after_quoted_marker();
     failures += test_open_reasoning_tool_recovery();
@@ -4064,5 +4242,6 @@ int main() {
     failures += test_instruction_role_lowering();
     failures += test_checkpoint_template_prepare_lowers_instruction_roles();
     failures += test_checkpoint_lowering_precedes_leading_instruction_tap();
+    failures += test_next_turn_history();
     return failures == 0 ? 0 : 1;
 }

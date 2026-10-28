@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <fstream>
 #include <stdexcept>
+#include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace infernix::runtime::expert_offload::expert_cache {
@@ -112,6 +114,45 @@ ExpertStateLoad load_expert_state(const std::filesystem::path& path, std::string
         }
     }
     out.state = std::move(state);
+    return out;
+}
+
+SavedState calibrated_order_state(std::uint32_t layers, std::uint32_t experts,
+                                  const std::function<std::uint32_t(std::uint32_t, std::uint32_t)>& expert_at) {
+    SavedState out;
+    out.counts.assign(static_cast<std::size_t>(layers) * experts, 0);
+    out.ranked.resize(out.counts.size());
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        for (std::uint32_t rank = 0; rank < experts; ++rank) {
+            const std::uint32_t expert = expert_at(layer, rank);
+            const std::size_t key      = static_cast<std::size_t>(layer) * experts + expert;
+            if (expert >= experts || out.counts[key] != 0) {
+                throw std::invalid_argument("calibrated expert order: layer " + std::to_string(layer) +
+                                            " is not a permutation of its experts");
+            }
+            out.counts[key] = experts - rank;
+            out.ranked[static_cast<std::size_t>(rank) * layers + layer] = static_cast<std::uint32_t>(key);
+        }
+    }
+    return out;
+}
+
+WarmStartSeed choose_warm_start(const std::filesystem::path& path, std::string_view identity, std::uint32_t keys,
+                                bool seed, const SavedState* calibrated) {
+    WarmStartSeed out;
+    if (!path.empty()) {
+        ExpertStateLoad load = load_expert_state(path, identity, keys);
+        if (load.state) {
+            out.source = WarmStartSource::Saved;
+            out.state  = std::move(load.state);
+            return out;
+        }
+        out.message = std::move(load.message);
+    }
+    if (seed && calibrated != nullptr && calibrated->counts.size() == keys) {
+        out.source = WarmStartSource::Calibrated;
+        out.state  = *calibrated;
+    }
     return out;
 }
 

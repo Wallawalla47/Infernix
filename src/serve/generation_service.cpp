@@ -362,6 +362,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.expert_state_path        = options_.expert_state ? *options_.expert_state
                                                                     : std::filesystem::path(options_.artifact_path +
                                                                                             ".expert-state");
+    engine_options.expert_state_off         = options_.expert_state && options_.expert_state->empty(); // --expert-state off
     engine_options.thinking_budget_message  = options_.thinking_budget_message;
     engine_options.route_trace_path        = options_.route_trace;
     engine_options.device                   = options_.device;
@@ -372,6 +373,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.vram_past_budget         = options_.vram_past_budget;
     engine_options.expert_tail_skip         = options_.expert_tail_skip;
     engine_options.expert_a4_activations    = options_.expert_a4_activations;
+    engine_options.a8_activations           = options_.a8_activations;
     engine_options.embedding_host           = options_.embedding_host;
     engine_options.max_concurrency          = options_.max_concurrency;
     engine_options.max_pending_requests     = options_.max_pending_requests;
@@ -395,8 +397,9 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.context_cost.preset_path = options_.context_cost_presets;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;
-    engine_options.ram_headroom_bytes       = options_.ram_headroom_bytes;
+    engine_options.ram_free_bytes           = options_.ram_free_bytes;
     engine_options.expert_ram_bytes         = options_.expert_ram_bytes;
+    engine_options.expert_ram_layout        = options_.expert_ram_layout;
     engine_options.expert_pin_bytes         = options_.expert_pin_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.startup_observer         = std::move(startup_observer);
@@ -502,6 +505,16 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         check_preparation_control(prepared.lifetime->deadline, is_cancelled,
                                   queue_retry_after_seconds());
+        // Idle-time prefill of the finished turn (hybrid-prefix-cache-spec §7.9): a text chat whose
+        // next request appends to it keeps its lowered conversation for run().
+        const auto& cache = engine_->options().context_cache;
+        if (cache_participation == CacheParticipation::ReadWrite && cache.enabled &&
+            cache.hybrid.next_turn_prefill_quiet.value_or(std::chrono::milliseconds{0}).count() > 0 &&
+            request.continuation == infernix::PromptContinuationMode::NewAssistantTurn &&
+            !request_has_media && request.readout_tokens.empty() &&
+            request.token_constraint.empty() && !request.ignore_eos && request.max_tokens > 0) {
+            prepared.next_turn = input;
+        }
         const PreparationControl control{
             .deadline     = prepared.lifetime->deadline,
             .cancellation = CancellationView(is_cancelled),
@@ -689,7 +702,40 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 
     outcome.tool_calls      = std::move(result.tool_calls);
     outcome.tool_call_parse = result.tool_call_parse;
+    schedule_next_turn(prepared, outcome);
     return outcome;
+}
+
+// A reply that ended on its own (a stop token or string; not cut by its limit, not cancelled) is
+// followed by the conversation's next request: the Engine prefills that request's history while it
+// is idle (hybrid-prefix-cache-spec §7.9). The reply is appended as the client receives it and
+// sends it back: content, reasoning and tool calls (the template renders no call identifier).
+void GenerationService::schedule_next_turn(PreparedRequest& prepared,
+                                           const GenerationOutcome& outcome) const {
+    if (!prepared.next_turn) { return; }
+    infernix::PromptInput conversation = std::move(*prepared.next_turn);
+    prepared.next_turn.reset();
+    if (outcome.finish_reason != infernix::FinishReason::StopToken &&
+        outcome.finish_reason != infernix::FinishReason::StopString) {
+        return;
+    }
+    try {
+        infernix::ChatMessage reply;
+        reply.role = ChatRole::Assistant;
+        if (!outcome.text.empty()) {
+            reply.parts.push_back(infernix::MessagePart{
+                .kind = infernix::MessagePartKind::Text, .text = outcome.text, .media = {}});
+        }
+        reply.reasoning_content = outcome.reasoning;
+        reply.tool_calls.reserve(outcome.tool_calls.size());
+        for (std::size_t i = 0; i < outcome.tool_calls.size(); ++i) {
+            reply.tool_calls.push_back(infernix::ToolCall{.id             = "call_" + std::to_string(i),
+                                                          .name           = outcome.tool_calls[i].name,
+                                                          .arguments_json = outcome.tool_calls[i].arguments_json});
+        }
+        conversation.messages.push_back(std::move(reply));
+    } catch (...) { return; }
+    engine_->prefill_next_turn(std::move(conversation));
 }
 
 void GenerationService::warmup() {

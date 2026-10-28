@@ -15,7 +15,7 @@
 
 namespace infernix::bench {
 
-inline constexpr int kSchemaVersion                   = 25;
+inline constexpr int kSchemaVersion                   = 26;
 inline constexpr std::string_view kArtifactType       = "infernix_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -56,13 +56,19 @@ struct BenchOptions {
     std::string ngram_volume_path;
     infernix::NgramResidency ngram_residency = infernix::NgramResidency::Auto;
     std::string expert_stripe_path;
-    std::uint64_t ram_headroom_bytes = infernix::kDefaultRamHeadroomBytes;
+    // --expert-state FILE|off: the expert cache warm-starts from (and saves to) this file, as the server does from
+    // <artifact>.expert-state; off: an empty cache (cold); absent: seeded from the built-in calibrated order, no file.
+    std::string expert_state_path;
+    bool expert_state_off = false;
+    std::uint64_t ram_free_bytes = infernix::kDefaultRamFreeBytes;
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
+    infernix::ExpertRamLayout expert_ram_layout = infernix::EngineOptions{}.expert_ram_layout; // --expert-ram-layout
     std::optional<std::uint64_t> expert_pin_bytes; // --expert-pin-mib; empty: what the OS lets it pin
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
+    bool a8_activations            = false; // EngineOptions::a8_activations
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::string corpus_path{kDefaultCorpusPath};
     // Prompts start this many tokens into the corpus (wrapping), so A/B blocks can vary them.
@@ -84,6 +90,10 @@ struct BenchOptions {
     std::string constraint_file;
     std::optional<OutputConstraint> constraint;
     std::uint32_t concurrency = 1;
+    // --rows: with --concurrency N, each row's prompt starts its own share of the corpus (distinct, the default),
+    // so a MoE model's rows route as concurrent requests do; `same` gives every row the first row's prompt
+    // (every row then routes to the same experts). --prompt-ids takes `same` only.
+    bool distinct_rows        = true;
     bool mixed_constraints    = false;
     std::vector<int> n_prompt;
     std::vector<int> n_gen;
@@ -183,11 +193,16 @@ struct BenchEnvironment {
     bool fast_paths                    = true;
     std::uint32_t expert_tail_skip     = 0; // approximate: changes the output when set
     bool expert_a4_activations         = false; // FP4-Local W4A4 experts (changes the output)
+    bool a8_activations                = false; // --a8-activations (changes the output)
     // Qwen3.8-Flash-Next placement (they move its throughput): empty paths and budgets are the defaults.
     std::string ngram_volume_path;
     NgramResidency ngram_residency = NgramResidency::Auto;
     std::string expert_stripe_path;
+    // How the expert cache started: "calibrated" (the default seed), "off" (empty) or the state file.
+    std::string expert_state = "calibrated";
+    std::uint64_t ram_free_bytes = infernix::kDefaultRamFreeBytes;
     std::optional<std::uint64_t> expert_ram_bytes;
+    ExpertRamLayout expert_ram_layout = EngineOptions{}.expert_ram_layout;
     std::optional<std::uint64_t> expert_pin_bytes;
     KvCacheStorage kv_cache           = KvCacheStorage::BFloat16;
     LogitsDtype logits_dtype          = LogitsDtype::FP32;
@@ -209,6 +224,7 @@ struct BenchEnvironment {
     bool stop_at_eos         = false;
     std::string route_trace_path;
     std::uint32_t concurrency = 1;
+    bool distinct_rows        = true; // BenchOptions::distinct_rows
     std::string constraint_file;
     std::optional<OutputConstraint> constraint;
     bool mixed_constraints = false;
@@ -226,7 +242,11 @@ void validate_prompt_lengths(const std::vector<BenchTest>& tests, std::size_t co
 std::vector<TokenId> load_corpus_ids(const std::string& path);
 // --prompt-ids: comma- or whitespace-separated ids.
 std::vector<TokenId> load_prompt_ids(const std::string& path);
-std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt);
+// The n_prompt tokens from `start` (wrapping round the corpus's end).
+std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt, std::size_t start = 0);
+// Where row `row` of `rows` concurrent requests starts in the corpus: its own equal share when distinct
+// (BenchOptions::distinct_rows), else the corpus's start.
+std::size_t row_prompt_start(std::size_t corpus_tokens, std::uint32_t row, std::uint32_t rows, bool distinct);
 std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& speculative);
 std::uint32_t decode_graph_prime_output_tokens(const SpeculativeOptions& speculative);
 std::uint32_t decode_graph_prime_required_context(const SpeculativeOptions& speculative);

@@ -222,7 +222,8 @@ TextWeights bind_text(Bindings& b, const TextConfig& c, Residency experts) {
     return out;
 }
 
-MtpWeights bind_mtp(Bindings& b, const TextConfig& c) {
+// `experts`: the routed banks' residency (Device, or HostPinned behind the drafter pool, Config::mtp_expert_slots).
+MtpWeights bind_mtp(Bindings& b, const TextConfig& c, Residency experts) {
     const std::uint64_t h = c.hidden_size, width = c.residual_width(), e = c.moe.experts,
                         ir = c.moe.intermediate, s = c.moe.shared_intermediate;
     MtpWeights out;
@@ -243,9 +244,9 @@ MtpWeights bind_mtp(Bindings& b, const TextConfig& c) {
     out.shared_down  = b.parameter(p + "shared/down", {h, s}, p + "shared/product");
     for (std::uint64_t i = 0; i < e; ++i) {
         const std::string ep = p + "experts/" + std::to_string(i) + "/";
-        out.expert_gate_up.push_back(b.parameter(ep + "gate", {ir, h}, input));
-        out.expert_gate_up.push_back(b.parameter(ep + "up", {ir, h}, input));
-        out.expert_down.push_back(b.parameter(ep + "down", {h, ir}, ep + "product"));
+        out.expert_gate_up.push_back(b.parameter(ep + "gate", {ir, h}, input, std::nullopt, experts));
+        out.expert_gate_up.push_back(b.parameter(ep + "up", {ir, h}, input, std::nullopt, experts));
+        out.expert_down.push_back(b.parameter(ep + "down", {h, ir}, ep + "product", std::nullopt, experts));
     }
     return out;
 }
@@ -413,6 +414,7 @@ struct LoadPlan::Impl {
     InstanceInfo info;
     std::optional<qwen3_5::VisionOverlayLayout> vision_overlay; // vision offload
     std::uint64_t embedding_bytes = 0; // the token embedding's stored bytes (pinned)
+    std::uint64_t mtp_expert_pinned = 0; // the drafter's routed banks' stored bytes, pinned behind the drafter pool
     // The DFlash2 companion (--draft-model): its Reader, its plan, and the first of its weights in
     // `pending` (the main artifact's come first).
     std::unique_ptr<artifact::Reader> draft_reader;
@@ -432,8 +434,9 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
 }
 
 std::uint64_t LoadPlan::pinned_other_bytes() const {
-    // Besides the expert banks: the token embedding (bind_text) and, with vision offload, the tower.
-    std::uint64_t bytes = impl_->embedding_bytes;
+    // Besides the expert banks: the token embedding (bind_text), the drafter's routed banks behind the drafter pool
+    // and, with vision offload, the tower.
+    std::uint64_t bytes = impl_->embedding_bytes + impl_->mtp_expert_pinned;
     if (impl_->vision_overlay) {
         const auto& v = *impl_->vision_overlay;
         bytes += v.prelude.bytes + v.merger.bytes;
@@ -498,7 +501,39 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         out->weights.vision = bind_vision(bindings, *out->config.vision, out->config.text,
                                           options.overlay_vision() ? Residency::HostPinned : Residency::Device);
     }
-    if (out->config.mtp) { out->weights.mtp = bind_mtp(bindings, out->config.text); }
+    if (out->config.mtp) {
+        const bool pooled = out->config.mtp_expert_slots > 0;
+        out->weights.mtp  = bind_mtp(bindings, out->config.text, pooled ? Residency::HostPinned : Residency::Device);
+        if (pooled) {
+            // The drafter pool: one expert's rows (the pool's slot) and the pinned banks' bytes.
+            const auto& m = *out->weights.mtp;
+            std::vector<artifact::ObjectHandle> objects;
+            const auto row_bytes = [&](const std::vector<WeightId>& ids) {
+                for (const WeightId id : ids) {
+                    for (const auto& part : bindings.weights.at(id.index).reference.binding.parts) {
+                        if (std::find(objects.begin(), objects.end(), part.object) == objects.end()) {
+                            objects.push_back(part.object);
+                        }
+                    }
+                }
+                const auto& tensor =
+                    reader.directory().tensor(bindings.weights.at(ids.front().index).reference.binding.parts.front().object);
+                const auto g = weight_geometry(artifact::parse_format(tensor.format), artifact::parse_layout(tensor.layout),
+                                               tensor.shape);
+                if (g.layout != QuantLayout::RowSplit || g.high_bytes_per_row != 0) {
+                    throw ArtifactError("the drafter pool needs the MTP drafter's experts as "
+                                        "row-split Q2/Q4/Q8 banks");
+                }
+                return g.code_bytes_per_row + g.scale_bytes_per_row;
+            };
+            const std::uint64_t gate = row_bytes(m.expert_gate_up), down = row_bytes(m.expert_down);
+            out->config.mtp_expert_bytes =
+                2ULL * out->config.text.moe.intermediate * gate + out->config.text.hidden_size * down;
+            for (const auto object : objects) {
+                out->mtp_expert_pinned += artifact::object_bytes(reader.directory().object(object));
+            }
+        }
+    }
     if (out->config.mtp || out->config.dflash2) {
         if (out->config.proposal_rows != 0) {
             const std::uint64_t rows = out->config.proposal_rows;

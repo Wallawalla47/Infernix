@@ -148,6 +148,7 @@ void HostTier::evict(std::uint32_t slot) {
     mark_dirty(s.key);
     --resident_count_;
     if (s.state == SlotState::kShadow) { --shadow_count_; }
+    if (s.state == SlotState::kResident) { ++losses_.residents_evicted; } // its only host copy
     s.state = SlotState::kFree;
     push_victim(slot); // invalidates its heap entries
 }
@@ -163,6 +164,15 @@ bool HostTier::prefill(std::uint32_t key, std::int32_t& slot) {
     const std::uint32_t s = free_resident_.back();
     free_resident_.pop_back();
     set_resident(s, key, SlotState::kResident);
+    slot = static_cast<std::int32_t>(s);
+    return true;
+}
+
+bool HostTier::prefill_shadow(std::uint32_t key, std::int32_t& slot) {
+    if (host_copy(key) || held(key) || free_resident_.empty()) { return false; }
+    const std::uint32_t s = free_resident_.back();
+    free_resident_.pop_back();
+    set_resident(s, key, SlotState::kShadow);
     slot = static_cast<std::int32_t>(s);
     return true;
 }
@@ -383,7 +393,18 @@ VramEviction HostTier::vram_evicted(std::uint32_t key, bool published, std::uint
         return VramEviction::kKeptInRam;
     }
     if (held(key)) { return VramEviction::kKeptInRam; } // T3
-    if (!published || demotion_.empty() || !demotion_worthy(key)) { return VramEviction::kDropped; } // T5
+    if (!published) { // T5
+        ++losses_.unpublished;
+        return VramEviction::kDropped;
+    }
+    if (demotion_.empty()) { // T5
+        ++losses_.no_slot;
+        return VramEviction::kDropped;
+    }
+    if (!demotion_worthy(key)) { // T5
+        ++losses_.unworthy;
+        return VramEviction::kDropped;
+    }
     slot = demotion_.back(); // T4
     demotion_.pop_back();
     Slot& target = slots_[slot];
@@ -408,6 +429,17 @@ void HostTier::demotion_completed(std::uint32_t key, std::uint32_t slot, bool in
         return;
     }
     set_resident(slot, key, in_vram ? SlotState::kShadow : SlotState::kResident); // T7
+}
+
+void HostTier::demotion_failed(std::uint32_t key, std::uint32_t slot) {
+    Slot& s = slots_[slot];
+    if (s.state != SlotState::kLanding || s.key != key || !(s.pins & kPinD2H)) {
+        throw std::logic_error("HostTier: a failed demotion names a slot that was not its target");
+    }
+    s.pins &= static_cast<std::uint8_t>(~kPinD2H);
+    s.state = SlotState::kFree;
+    free_resident_.push_back(slot);
+    push_victim(slot);
 }
 
 void HostTier::check() const {

@@ -24,7 +24,10 @@
 // narrow route's and the CPU engine's bits, so a W4A16 expert's output never depends on how many
 // other columns share its call. Their A4 residual fast paths (WideA16::kA4Residual, kA4Residual3)
 // run the grouped GEMM of wide_expert.cuh on two or three NVFP4 terms per x and h row instead, at
-// either registered geometry (A4Planes); their narrow experts, GPU or CPU-served, stay exact.
+// either registered geometry (A4Planes); their narrow experts, GPU or CPU-served, stay exact. Under
+// WideA16::kA8 (--a8-activations at prefill widths, with NarrowA16::kA8) they run wide_expert_a8.cuh's grouped
+// GEMM on int8 tensor cores over x and h as ggml_a8.h's 8-bit slices (calls of more than 128 columns; the
+// narrower ones run every job on the 8-bit narrow kernels).
 
 #include "infernix/ops/offloaded_sparse_moe.h"
 
@@ -124,13 +127,13 @@ inline constexpr int kRingCounterSlots = 3; // one per concurrent pass phase (Al
 }
 
 // Whether a call of this bank's arithmetic exists at `shape`: every bank at Flash-Next's geometry;
-// another registered geometry for NVFP4 W4A16 banks on the exact, A4 residual and lossless routes.
+// another registered geometry for NVFP4 W4A16 banks on the exact, A4 residual, lossless and 8-bit wide routes.
 [[nodiscard]] inline bool shape_supported(const ExpertShape& shape, ExpertActivation activation, WideA16 wide_a16,
                                           bool ggml) {
     if (shape == kFlashNextShape) { return true; }
     return registered_shape(shape) && activation == ExpertActivation::kA16 && !ggml &&
            (wide_a16 == WideA16::kExact || wide_a16 == WideA16::kA4Residual || wide_a16 == WideA16::kA4Residual3 ||
-            wide_a16 == WideA16::kLossless);
+            wide_a16 == WideA16::kLossless || wide_a16 == WideA16::kA8);
 }
 
 // The x column of a call's dispatch entry: routed entries are t * top_k + slot, a shared job's
@@ -224,12 +227,13 @@ struct ExpertsWorkspace {
     canon::A4Block* h_blocks;     // [entries][kHBlocks]; wide entries hold their A4(h) row here
     std::uint8_t* x_plane;        // [entries][kXRowBytes]
     // W4A16
-    std::uint8_t* x_limbs;        // [columns][a16_x_row_bytes(shape)]: every token's x limbs (wide calls)
+    std::uint8_t* x_limbs;        // [columns][a16_x_row_bytes(shape)]: every token's x limbs (wide calls), or its
+                                  // A8 codes on the 8-bit route (a8_x_rows)
     std::uint8_t* h_rows;         // [entries][a16_h_row_bytes(shape)]: BF16 h, rewritten as limbs for wide entries
     std::int32_t* x_emax;         // [columns]: column exponent of each token's x
     std::int32_t* h_emax;         // [entries]: column exponent of each wide entry's h
     // W4A16, A4 residual (h_rows holds the BF16 h; x_emax and h_emax serve a ring call's narrow experts)
-    std::uint8_t* x_terms_plane;  // [entries][x_terms_row_bytes(shape, x terms)]
+    std::uint8_t* x_terms_plane;  // [entries][x_terms_row_bytes(shape, x terms)]; the 8-bit route's A8 codes (a8_x_rows)
     float* x_row_scale;           // [columns]
     std::uint8_t* h_terms_plane;  // [entries][h_terms_row_bytes(shape, h terms)]
     float* h_row_scale;           // [entries]
@@ -247,6 +251,24 @@ struct ExpertsWorkspace {
     std::uint32_t* ring_ready;
     std::uint32_t* ring_counters;
 };
+
+// The 8-bit activation route of NVFP4 W4A16 banks (NarrowA16::kA8; ops/offloaded_sparse_moe/nvfp4_a8.h): its calls
+// (at most 128 columns) take neither the wide route nor the narrow ring, so its encoded x reuses their x region:
+// every token's ggml::a8 codes then slice scales (column_words(hidden, false) words), a8_x_row_bytes apart, in the
+// x limbs (the exact wide route's workspace: a16_x_row_bytes per token) or, under the A4 residual wide routes, in
+// the x term plane (two or three term rows per entry and at least one entry per token; two term rows are exactly
+// one A8 row). Its h is the BF16 h rows'. A wider call under WideA16::kA8 (whose workspace is kExact's) reads the
+// same x rows in both its narrow kernels and its 8-bit wide GEMM, and rewrites a wide entry's h row in place as
+// its A8 codes then slice scales (a8_x_row_bytes(I-wide) bytes at most).
+INFERNIX_WIDE_HD constexpr int a8_x_row_bytes(const ExpertShape& shape) { return shape.hidden / 32 * 9 * 4; }
+[[nodiscard]] inline std::uint8_t* a8_x_rows(const ExpertsWorkspace& workspace) {
+    return workspace.x_limbs != nullptr ? workspace.x_limbs : workspace.x_terms_plane;
+}
+static_assert(a8_x_row_bytes(kFlashNextShape) <= A16Planes<FlashNextExperts>::kXRowBytes &&
+                  a8_x_row_bytes(kFlashNextShape) == A4Planes<FlashNextExperts>::x_terms_row_bytes(2) &&
+                  a8_x_row_bytes(kQwen3_5_122BShape) <= A16Planes<Qwen3_5_122BExperts>::kXRowBytes &&
+                  a8_x_row_bytes(kQwen3_5_122BShape) == A4Planes<Qwen3_5_122BExperts>::x_terms_row_bytes(2),
+              "a call's A8 x rows fit the x region of either wide route's workspace");
 
 // kLossless's region: per-job counts, the tile plan, records and column maps of every tile, and one
 // column chunk's gate/up and h planes with the projections' workspace, at the bank's geometry.
@@ -286,6 +308,9 @@ struct Call {
     const std::int32_t* x_emax  = nullptr; // [T]
     std::int32_t* h_emax        = nullptr; // [entries]
     std::int32_t top_k          = 0;
+    // W4A16 on 8-bit activations (WideA16::kA8; wide_expert_a8.cuh): x_limbs then holds every token's A8 codes
+    // (a8_x_rows, encoded by moe_experts), and h_rows a wide entry's A8 h codes once encode_h_a8 has run.
+    bool a8 = false;
     // W4A16 A4 residual (descriptors then name every term's plane)
     bool a4_residual                = false;
     ResidualTerms terms;

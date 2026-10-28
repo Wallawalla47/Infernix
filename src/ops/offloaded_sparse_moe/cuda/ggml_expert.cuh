@@ -62,11 +62,12 @@ __device__ __forceinline__ void ggml_shfl_add(ggml::I128& r, int offset) {
 }
 
 template <QType GU>
-__global__ void __launch_bounds__(kGgmlThreads)
-    gate_up_kernel_ggml(const std::uint8_t* __restrict__ x_limbs, const std::int32_t* __restrict__ x_emax,
-                        MoeDispatch dispatch, MoeExpertSource source, int top_k,
-                        const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
-                        int job_base, std::uint16_t* __restrict__ h_plane, PassPhase phase, int narrow_max) {
+__device__ __forceinline__ void gate_up_ggml_body(const std::uint8_t* __restrict__ x_limbs,
+                                                  const std::int32_t* __restrict__ x_emax, const MoeDispatch& dispatch,
+                                                  const MoeExpertSource& source, int top_k,
+                                                  const std::uint8_t* const* __restrict__ job_records,
+                                                  const std::int32_t* __restrict__ cpu_flags, int job_base,
+                                                  std::uint16_t* __restrict__ h_plane, PassPhase phase, int narrow_max) {
     constexpr int C = kGgmlColumns;
     const int job   = job_base + static_cast<int>(blockIdx.y);
     if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
@@ -114,6 +115,16 @@ __global__ void __launch_bounds__(kGgmlThreads)
             }
         }
     }
+}
+
+template <QType GU>
+__global__ void __launch_bounds__(kGgmlThreads)
+    gate_up_kernel_ggml(const std::uint8_t* __restrict__ x_limbs, const std::int32_t* __restrict__ x_emax,
+                        MoeDispatch dispatch, MoeExpertSource source, int top_k,
+                        const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
+                        int job_base, std::uint16_t* __restrict__ h_plane, PassPhase phase, int narrow_max) {
+    gate_up_ggml_body<GU>(x_limbs, x_emax, dispatch, source, top_k, job_records, cpu_flags, job_base, h_plane, phase,
+                          narrow_max);
 }
 
 template <QType D>
@@ -947,15 +958,22 @@ template <QType GU, QType D>
 void launch_expert_pass_ggml(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                              const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                              const moe::wide::ExpertsWorkspace& layout, bf16* outputs, cudaStream_t stream,
-                             PassPhase phase, int entries, int columns) {
+                             PassPhase phase, int entries, int columns, PassPart part) {
     auto* h_plane        = reinterpret_cast<std::uint16_t*>(layout.h_rows);
     const int narrow_max = entries > 0 ? moe::kMaxColumns : std::numeric_limits<int>::max();
-    gate_up_kernel_ggml<GU><<<dim3(moe::kIntermediate / kGgmlGateUpUnits, jobs), kGgmlThreads, 0, stream>>>(
-        layout.x_limbs, layout.x_emax, dispatch, source, top_k, job_records, flags, base, h_plane, phase, narrow_max);
-    check_launch("ggml gate/up");
-    CUDA_CHECK(pdl::launch_consumer({dim3(moe::kHidden / kGgmlDownRows, jobs), dim3(kGgmlThreads), 0, stream},
-                                    down_kernel_ggml<D>, dispatch, source, static_cast<int>(moe::kHidden), job_records,
-                                    flags, base, static_cast<const std::uint16_t*>(h_plane), outputs, phase, narrow_max));
+    if (part != PassPart::Down) {
+        CUDA_CHECK(pdl::launch_with(pdl::Dependency::Serialized,
+                                    {dim3(moe::kIntermediate / kGgmlGateUpUnits, jobs), dim3(kGgmlThreads), 0, stream},
+                                    gate_up_kernel_ggml<GU>, static_cast<const std::uint8_t*>(layout.x_limbs),
+                                    static_cast<const std::int32_t*>(layout.x_emax), dispatch, source, top_k, job_records,
+                                    flags, base, h_plane, phase, narrow_max));
+        check_launch("ggml gate/up");
+    }
+    if (part == PassPart::GateUp) { return; }
+    CUDA_CHECK(pdl::launch_with(part == PassPart::Down ? pdl::Dependency::Serialized : pdl::Dependency::Programmatic,
+                                {dim3(moe::kHidden / kGgmlDownRows, jobs), dim3(kGgmlThreads), 0, stream},
+                                down_kernel_ggml<D>, dispatch, source, static_cast<int>(moe::kHidden), job_records,
+                                flags, base, static_cast<const std::uint16_t*>(h_plane), outputs, phase, narrow_max));
     if (entries == 0) { return; }
     if (source.wide_a16 == moe::WideA16::kGgmlBf16 && source.ggml.tiles.stage_decode(columns)) {
         launch_decode_pass_ggml<GU, D>(reinterpret_cast<const std::uint16_t*>(x), dispatch, source, top_k, job_records, flags,
@@ -1005,17 +1023,17 @@ void launch_expert_pass_ggml(const bf16* x, const MoeDispatch& dispatch, const M
 void launch_pass_ggml(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                       const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                       const moe::wide::ExpertsWorkspace& layout, bf16* outputs, cudaStream_t stream, PassPhase phase,
-                      int entries, int columns) {
-    // The wide tiles run every job of the pass: a forked call (Staged/Resident phases) must not have
-    // wide entries, which forked()'s column bound guarantees today.
-    if (entries > 0 && phase != PassPhase::All) {
+                      int entries, int columns, PassPart part) {
+    // The wide tiles run every job of the pass: a forked call (Staged/Resident phases, gate/up and down
+    // parts) must not have wide entries, which forked()'s column bound guarantees today.
+    if (entries > 0 && (phase != PassPhase::All || part != PassPart::Both)) {
         throw std::logic_error("offloaded_sparse_moe: the GGUF wide tiles do not split by pass phase");
     }
     const QType gu = source.ggml.gate_up_format, d = source.ggml.down_format;
 #define INFERNIX_GGML_PAIR(G, DD)                                                                                       \
     if (gu == G && d == DD) {                                                                                          \
         launch_expert_pass_ggml<G, DD>(x, dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs,   \
-                                       stream, phase, entries, columns);                                              \
+                                       stream, phase, entries, columns, part);                                        \
         return;                                                                                                        \
     }
     INFERNIX_GGML_PAIR(QType::GGML_IQ2_S, QType::GGML_IQ4_NL)

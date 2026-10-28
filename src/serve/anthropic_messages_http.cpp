@@ -73,7 +73,7 @@ using CallIdentifier = std::function<std::vector<ToolCall>(const GenerationOutco
 
 // Runs `prepared` and every continuation its searches lead to, leaving the final generation in
 // `state`. `prepared` ends holding the last generation's request (and its ingress reservation).
-void run_anthropic_response(GenerationService& service, AnthropicResponseState& state,
+void run_anthropic_response(GenerationBackend& service, AnthropicResponseState& state,
                             PreparedRequest& prepared, const StreamSink* sink,
                             const std::function<bool()>& is_cancelled,
                             const ContinuationPreparer& prepare_next,

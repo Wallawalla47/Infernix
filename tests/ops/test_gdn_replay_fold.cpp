@@ -87,10 +87,13 @@ std::vector<std::int32_t> selected_slots(std::int32_t rows) {
 }
 
 // storage_width > width records and folds through a narrowed view of storage planned for the
-// wider width, as a decode frame shared by two draft windows does.
+// wider width, as a decode frame shared by two draft windows does. device_rows: the in-place fold
+// with its rows on the device (execute_device), captured once and replayed with every count out of
+// range (no state may change), then with the real counts, which must equal execute()'s oracle.
 int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
              const std::vector<std::int32_t>& commits, std::uint32_t seed,
-             bool distinct_destination = false, std::int32_t storage_width = 0) {
+             bool distinct_destination = false, std::int32_t storage_width = 0, bool device_rows = false) {
+    if (device_rows && distinct_destination) { throw std::logic_error("device rows fold in place"); }
     const std::vector<std::int32_t> source_slots = selected_slots(rows);
     std::vector<std::int32_t> destination_slots  = source_slots;
     if (distinct_destination) { destination_slots[0] = rows == 1 ? 1 : 3; }
@@ -384,7 +387,35 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             return 1;
         }
     }
-    if ((width == 16 && rows == 8) || (width >= 32 && rows == 1)) {
+    if (device_rows) {
+        cuda_synchronize();
+        DeviceBuffer original(state_bytes);
+        cuda_check(cudaMemcpy(original.p, state_base, state_bytes, cudaMemcpyDeviceToDevice),
+                   "save device-row initial state");
+        cuda_synchronize();
+        DeviceBuffer slots_buffer  = to_device(source_slots);
+        DeviceBuffer counts_buffer = to_device(std::vector<std::int32_t>(static_cast<std::size_t>(rows), 0));
+        const Tensor slots_tensor(slots_buffer.p, DType::I32, {rows});
+        const Tensor counts_tensor(counts_buffer.p, DType::I32, {rows});
+        DeviceContext context;
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable graph;
+        // Captured before any count is set: the replays read them when they run.
+        definition.capture(context.stream,
+                           [&] { fold_plan.execute_device(slots_tensor, counts_tensor, rows, context.stream); });
+        graph.instantiate(definition);
+        counts_buffer.copy_from_host(std::vector<std::int32_t>(static_cast<std::size_t>(rows), width + 5).data(),
+                                     counts_buffer.bytes);
+        graph.launch(context.stream);
+        context.synchronize();
+        if (from_device<std::uint8_t>(state_base, state_bytes) != from_device<std::uint8_t>(original.p, state_bytes)) {
+            std::cerr << "device-row fold with out-of-range counts changed the state\n";
+            return 1;
+        }
+        counts_buffer.copy_from_host(commits.data(), counts_buffer.bytes);
+        graph.launch(context.stream);
+        context.synchronize();
+    } else if ((width == 16 && rows == 8) || (width >= 32 && rows == 1)) {
         cuda_synchronize();
         DeviceBuffer original(state_bytes);
         cuda_check(cudaMemcpy(original.p, state_base, state_bytes, cudaMemcpyDeviceToDevice),
@@ -1048,6 +1079,11 @@ int run_test(int argc, char** argv) {
         failures += run_case({36, 64, 12288}, 32, 1, {commit}, 2125U + commit, true);
     }
     failures += run_case({36, 64, 12288}, 8, 2, {5, 8}, 1887U, false, 16);
+    // The device-row fold (a graph captured once serves every commit): Qwen3.8-Flash-Next's 36 GDN layers of
+    // 48 heads, one and eight rows (a zero count among them), and through a narrowed view of wider storage.
+    failures += run_case({36, 48, 10240}, 8, 1, {5}, 1891U, false, 0, true);
+    failures += run_case({36, 48, 10240}, 8, 8, {0, 1, 2, 3, 4, 5, 7, 8}, 1893U, false, 0, true);
+    failures += run_case({36, 48, 10240}, 8, 2, {8, 3}, 1895U, false, 16, true);
     failures += run_record_fold_rounds<16>();
     failures += run_record_fold_rounds<32>();
     failures += run_fp16_state_record_fold();

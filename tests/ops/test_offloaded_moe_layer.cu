@@ -424,28 +424,34 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         bool fetched  = false; // the fetch channel serves SSD-only experts no CPU job takes
         bool overlap  = false; // passes staged on the overlap stream
         int idle      = 0;     // calls after the service idles 60 ms; 2: wake() before each
+        bool split    = false; // a forked call's misses staged in two launches (MoeExpertSource::split_stream)
     };
-    // Which misses the CPU takes (design §19.3.5 S3): the fewest-column ones first, in job order within a
-    // width, want = min(cap, M - M / divisor) of those with at most max_job_columns columns.
+    // Which misses the CPU takes (design §19.3.5 S3): the SSD-only ones first (`ssd`: only the CPU or a fetch can
+    // serve them), up to the cap, then want = min(cap - taken, M - M / divisor) of the M host-memory misses; each
+    // the fewest-column ones first, in job order within a width, of those with at most max_job_columns columns.
     const auto cpu_selection = [&](const moe::CpuMissService* service, const std::vector<std::int32_t>& jobs,
-                                   bool streamed) {
+                                   bool streamed, const std::vector<std::uint8_t>* ssd) {
         std::vector<std::uint8_t> chosen(experts, 0);
         if (service == nullptr || columns > service->channel(0).max_columns) { return chosen; }
-        const auto channel = service->channel(0);
-        const auto miss    = [&](std::int32_t e) { return frames[e] < 0 && !(streamed && prefetched[e] >= 0); };
+        const auto channel  = service->channel(0);
+        const auto miss     = [&](std::int32_t e) { return frames[e] < 0 && !(streamed && prefetched[e] >= 0); };
+        const auto ssd_only = [&](std::int32_t e) { return ssd != nullptr && (*ssd)[e] != 0; };
         int misses = 0;
-        for (const std::int32_t e : jobs) { misses += miss(e) ? 1 : 0; }
-        const int cap  = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
-        const int want = std::min(cap, misses - kept_of(channel, misses));
+        for (const std::int32_t e : jobs) { misses += miss(e) && !ssd_only(e) ? 1 : 0; }
+        const int cap = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
         int n = 0;
-        for (int width = 1; width <= channel.max_job_columns && n < want; ++width) {
-            for (const std::int32_t e : jobs) {
-                if (n < want && miss(e) && expert_columns[e] == width) {
-                    chosen[e] = 1;
-                    ++n;
+        const auto take = [&](bool from_ssd, int want) {
+            for (int width = 1; width <= channel.max_job_columns && n < want; ++width) {
+                for (const std::int32_t e : jobs) {
+                    if (n < want && miss(e) && ssd_only(e) == from_ssd && expert_columns[e] == width) {
+                        chosen[e] = 1;
+                        ++n;
+                    }
                 }
             }
-        }
+        };
+        take(true, cap);
+        take(false, n + std::min(cap - n, misses - kept_of(channel, misses)));
         return chosen;
     };
     // Outputs with the CPU engine's bits: every W4A16 output (its wide route is exact too), and the
@@ -457,10 +463,12 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     }
     std::vector<std::uint16_t> placed;
     // The fork stream and its events, for the one-pass decode/verification route.
-    cudaStream_t fork_stream = nullptr;
-    cudaEvent_t fork_events[2] = {};
+    cudaStream_t fork_stream = nullptr, split_stream = nullptr;
+    cudaEvent_t fork_events[2] = {}, split_events[2] = {};
     cuda_check(cudaStreamCreateWithFlags(&fork_stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    cuda_check(cudaStreamCreateWithFlags(&split_stream, cudaStreamNonBlocking), "cudaStreamCreate");
     for (auto& event : fork_events) { cuda_check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event"); }
+    for (auto& event : split_events) { cuda_check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event"); }
     double gpu_idle_extra = 0.0; // what 60 ms of idle adds to a call without the CPU service (the GPU's own wake-up)
     for (const Config config : {Config{0, nullptr}, Config{1, nullptr}, Config{3, nullptr}, Config{64, nullptr},
                                 Config{3, &service_two}, Config{64, &service_eight}, Config{0, &service_eight},
@@ -504,6 +512,20 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                        .fetch = Responder::Mode::kFail, .fetched = true},
                                 Config{.slots = 3, .service = nullptr, .table = true, .ssd = 2,
                                        .fetch = Responder::Mode::kSilent, .fetched = true},
+                                // Split staging (forked calls): alone, with CPU jobs, with landings, with
+                                // a host table, with fetched records (copied by both launches, consumed
+                                // after the second), with fetched records and CPU jobs (the fused route
+                                // kernel's fetch plan).
+                                Config{.slots = 64, .service = nullptr, .fork = true, .split = true},
+                                Config{.slots = 64, .service = &service_two, .fork = true, .split = true},
+                                Config{.slots = 64, .service = &service_narrow, .fork = true, .land = true,
+                                       .split = true},
+                                Config{.slots = 64, .service = &service_ssd8, .fork = true, .table = true, .ssd = 1,
+                                       .split = true},
+                                Config{.slots = 64, .service = nullptr, .fork = true, .table = true, .ssd = 2,
+                                       .fetched = true, .split = true},
+                                Config{.slots = 64, .service = &service_ssd8, .fork = true, .land = true, .table = true,
+                                       .ssd = 2, .fetched = true, .split = true},
                                 // An idle service answers its first request promptly (Windows: no 15.6 ms
                                 // timer-tick sleep): through its short idle wait, and at once after wake().
                                 // The first call, without the service, measures the GPU's own idle cost.
@@ -542,6 +564,11 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
             source.fork_stream    = fork_stream;
             source.fork_events[0] = fork_events[0];
             source.fork_events[1] = fork_events[1];
+        }
+        if (config.split) {
+            source.split_stream    = split_stream;
+            source.split_events[0] = split_events[0];
+            source.split_events[1] = split_events[1];
         }
         if (config.land) {
             source.landing       = d_landing;
@@ -589,8 +616,18 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
             // one. The service check passes when any of three measurements meets the bound.
             bool within = false;
             for (int attempt = 0; attempt < 3 && !within; ++attempt) {
-                (void)timed();
-                const double busy = timed();
+                // Warm until two consecutive calls agree within 10 %: a configuration's first calls may still
+                // load kernels or fill frames (a GPU-only E=96 T=10 call took 73-82 ms as its second call and
+                // 5 ms after, which made the GPU's own idle cost -71 ms). The busy time is the fastest of three.
+                double previous = timed();
+                for (int warm = 0; warm < 8; ++warm) {
+                    const double now = timed();
+                    const bool settled = std::fabs(now - previous) <= 0.1 * std::min(now, previous);
+                    previous = now;
+                    if (settled) { break; }
+                }
+                double busy = timed();
+                for (int i = 0; i < 2; ++i) { busy = std::min(busy, timed()); }
                 std::array<double, 5> extra{};
                 for (double& e : extra) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(60));
@@ -605,7 +642,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                                       : "service",
                             busy, extra[2], extra[4]);
                 if (config.service == nullptr) {
-                    gpu_idle_extra = extra[2];
+                    // Idle cannot make a call faster than the busy one: a negative median is a slow busy call.
+                    gpu_idle_extra = std::max(0.0, extra[2]);
                     within         = true;
                 } else {
                     within = extra[2] - gpu_idle_extra < 10.0 + 0.05 * busy;
@@ -703,7 +741,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
             std::vector<std::int32_t> jobs(static_cast<std::size_t>(job_count));
             cuda_check(cudaMemcpy(jobs.data(), dispatch.jobs, jobs.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost),
                        "cudaMemcpy");
-            const auto cpu = cpu_selection(config.service, jobs, config.streamed);
+            const auto cpu = cpu_selection(config.service, jobs, config.streamed,
+                                           config.ssd == 1 ? &ssd_narrow : config.ssd == 2 ? &ssd_full : nullptr);
             std::vector<std::int32_t> staged;
             for (const std::int32_t e : jobs) {
                 if (frames[e] < 0 && !(config.streamed && prefetched[e] >= 0) && cpu[e] == 0) { staged.push_back(e); }
@@ -778,7 +817,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         cudaFreeHost(request);
     }
     for (auto event : fork_events) { cudaEventDestroy(event); }
+    for (auto event : split_events) { cudaEventDestroy(event); }
     cudaStreamDestroy(fork_stream);
+    cudaStreamDestroy(split_stream);
     for (auto event : overlap_events) { cudaEventDestroy(event); }
     cudaStreamDestroy(overlap_stream);
     cudaFree(d_out);
@@ -1364,6 +1405,170 @@ void test_service_failure_reported() {
     std::printf("CPU miss service: a stopped service reports its failure\n");
 }
 
+// moe_route_pooled (the drafter pool) against its oracle: each column's selection is the
+// first top_k experts with a slot in the unrestricted order (descending logit, lower id first on ties; the logits
+// repeat values), ids their slots, weights and the shared gate the FP64 formula over the selected logits, demand
+// exactly each column's unrestricted top_k and word E the ones without a slot. With every expert pooled under the
+// identity table, every output bit equals moe_route's. Eager, then captured and replayed on new logits; then
+// moe_pool_write and moe_pool_drain.
+void test_route_pooled(int experts, int columns, int top_k, int slots, std::uint32_t seed, bool bf16 = false) {
+    const auto precision = bf16 ? infernix::ops::RouterLogits::kBf16 : infernix::ops::RouterLogits::kFp32;
+    std::mt19937 rng(seed);
+    const int entries = columns * top_k;
+    const std::size_t logit_count = static_cast<std::size_t>(experts + 1) * columns;
+    const auto random_logits = [&] {
+        std::uniform_int_distribution<int> level(-64, 64);
+        std::vector<float> logits(logit_count);
+        for (auto& v : logits) { v = static_cast<float>(level(rng)) / 16.0F; }
+        return logits;
+    };
+    // Slots for `slots` random experts (a random slot each), -1 for the rest; the identity when slots == experts.
+    std::vector<std::int32_t> table(static_cast<std::size_t>(experts), -1);
+    if (slots == experts) {
+        for (int e = 0; e < experts; ++e) { table[static_cast<std::size_t>(e)] = e; }
+    } else {
+        std::vector<int> chosen(static_cast<std::size_t>(experts)), slot_ids(static_cast<std::size_t>(slots));
+        for (int e = 0; e < experts; ++e) { chosen[static_cast<std::size_t>(e)] = e; }
+        for (int s = 0; s < slots; ++s) { slot_ids[static_cast<std::size_t>(s)] = s; }
+        std::shuffle(chosen.begin(), chosen.end(), rng);
+        std::shuffle(slot_ids.begin(), slot_ids.end(), rng);
+        for (int s = 0; s < slots; ++s) { table[static_cast<std::size_t>(chosen[static_cast<std::size_t>(s)])] = slot_ids[static_cast<std::size_t>(s)]; }
+    }
+    const auto alloc = [](std::size_t bytes) {
+        void* p = nullptr;
+        cuda_check(cudaMalloc(&p, bytes), "cudaMalloc");
+        cuda_check(cudaMemset(p, 0x5A, bytes), "cudaMemset");
+        return p;
+    };
+    auto* d_logits = static_cast<float*>(alloc(sizeof(float) * logit_count));
+    auto* d_table  = static_cast<std::int32_t*>(alloc(sizeof(std::int32_t) * experts));
+    auto* d_demand = static_cast<std::int32_t*>(alloc(sizeof(std::int32_t) * (experts + 1)));
+    cuda_check(cudaMemcpy(d_table, table.data(), sizeof(std::int32_t) * experts, cudaMemcpyHostToDevice), "copy");
+    const auto make = [&] {
+        return infernix::ops::MoeRouting{Tensor(alloc(sizeof(std::int32_t) * entries), DType::I32, {top_k, columns}),
+                                         Tensor(alloc(sizeof(float) * entries), DType::FP32, {top_k, columns}),
+                                         Tensor(alloc(sizeof(float) * columns), DType::FP32, {columns})};
+    };
+    infernix::ops::MoeRouting pooled = make(), plain = make();
+    const Tensor logits(d_logits, DType::FP32, {experts + 1, columns});
+    const Tensor slot_of(d_table, DType::I32, {experts});
+    const auto words = [](const void* p, std::size_t n) {
+        std::vector<std::int32_t> out(n);
+        cuda_check(cudaMemcpy(out.data(), p, sizeof(std::int32_t) * n, cudaMemcpyDeviceToHost), "copy");
+        return out;
+    };
+    const auto verify = [&](const std::vector<float>& values, const char* phase) {
+        cuda_check(cudaDeviceSynchronize(), "pooled route");
+        const auto ids = words(pooled.ids.data, static_cast<std::size_t>(entries));
+        const auto demand = words(d_demand, static_cast<std::size_t>(experts) + 1);
+        std::vector<float> weights(static_cast<std::size_t>(entries)), gate(static_cast<std::size_t>(columns));
+        cuda_check(cudaMemcpy(weights.data(), pooled.weights.data, sizeof(float) * entries, cudaMemcpyDeviceToHost), "copy");
+        cuda_check(cudaMemcpy(gate.data(), pooled.shared_gate.data, sizeof(float) * columns, cudaMemcpyDeviceToHost), "copy");
+        bool ids_ok = true, values_ok = true;
+        std::vector<std::int32_t> want_demand(static_cast<std::size_t>(experts) + 1, 0);
+        for (int t = 0; t < columns; ++t) {
+            const float* column = &values[static_cast<std::size_t>(t) * (experts + 1)];
+            std::vector<int> order(static_cast<std::size_t>(experts));
+            for (int e = 0; e < experts; ++e) { order[static_cast<std::size_t>(e)] = e; }
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return column[a] > column[b]; });
+            for (int k = 0; k < top_k; ++k) {
+                const int e = order[static_cast<std::size_t>(k)];
+                ++want_demand[static_cast<std::size_t>(e)];
+                if (table[static_cast<std::size_t>(e)] < 0) { ++want_demand[static_cast<std::size_t>(experts)]; }
+            }
+            std::vector<int> selected;
+            for (const int e : order) {
+                if (table[static_cast<std::size_t>(e)] >= 0) { selected.push_back(e); }
+                if (static_cast<int>(selected.size()) == top_k) { break; }
+            }
+            double sum = 0.0;
+            for (const int e : selected) { sum += std::exp(static_cast<double>(column[e]) - column[selected[0]]); }
+            for (int k = 0; k < top_k; ++k) {
+                const std::size_t i = static_cast<std::size_t>(t) * top_k + k;
+                const int e         = selected[static_cast<std::size_t>(k)];
+                ids_ok = ids_ok && ids[i] == table[static_cast<std::size_t>(e)];
+                const double want = std::exp(static_cast<double>(column[e]) - column[selected[0]]) / sum;
+                values_ok = values_ok && std::abs(weights[i] - want) <= 2e-6 * want;
+            }
+            const double want_gate = 1.0 / (1.0 + std::exp(-static_cast<double>(column[experts])));
+            values_ok = values_ok && std::abs(gate[t] - want_gate) <= 2e-6 * want_gate;
+        }
+        const bool demand_ok = demand == want_demand;
+        bool same = true;
+        if (slots == experts) {
+            infernix::ops::moe_route(logits, top_k, plain, nullptr, precision);
+            cuda_check(cudaDeviceSynchronize(), "route");
+            same = words(plain.ids.data, static_cast<std::size_t>(entries)) == ids &&
+                   words(plain.weights.data, static_cast<std::size_t>(entries)) ==
+                       words(pooled.weights.data, static_cast<std::size_t>(entries)) &&
+                   words(plain.shared_gate.data, static_cast<std::size_t>(columns)) ==
+                       words(pooled.shared_gate.data, static_cast<std::size_t>(columns));
+        }
+        std::printf("route_pooled E=%d T=%d k=%d slots=%d (%s): ids %s, weights/gate %s, demand %s%s\n", experts, columns,
+                    top_k, slots, phase, ids_ok ? "exact" : "MISMATCH", values_ok ? "ok" : "MISMATCH",
+                    demand_ok ? "exact" : "MISMATCH",
+                    slots == experts ? (same ? ", equal to moe_route" : ", DIFFERENT from moe_route") : "");
+        check(ids_ok && values_ok && demand_ok && same, "moe_route_pooled equals its oracle");
+    };
+
+    auto values = random_logits();
+    cuda_check(cudaMemcpy(d_logits, values.data(), sizeof(float) * logit_count, cudaMemcpyHostToDevice), "copy");
+    cuda_check(cudaMemset(d_demand, 0, sizeof(std::int32_t) * (experts + 1)), "memset");
+    infernix::ops::moe_route_pooled(logits, top_k, slot_of, d_demand, pooled, nullptr, precision);
+    verify(values, "eager");
+
+    cudaStream_t stream  = nullptr;
+    cudaGraph_t graph    = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+    infernix::ops::moe_route_pooled(logits, top_k, slot_of, d_demand, pooled, stream, precision);
+    cuda_check(cudaStreamEndCapture(stream, &graph), "capture");
+    cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+    values = random_logits();
+    cuda_check(cudaMemcpy(d_logits, values.data(), sizeof(float) * logit_count, cudaMemcpyHostToDevice), "copy");
+    cuda_check(cudaMemset(d_demand, 0, sizeof(std::int32_t) * (experts + 1)), "memset");
+    cuda_check(cudaGraphLaunch(exec, stream), "launch");
+    cuda_check(cudaStreamSynchronize(stream), "replay");
+    verify(values, "graph replay");
+
+    // The pool's table writes and demand drain, in stream order.
+    infernix::ops::MoePoolWrites writes;
+    writes.count     = 3;
+    writes.expert[0] = 0;
+    writes.value[0]  = -1;
+    writes.expert[1] = experts - 1;
+    writes.value[1]  = 7;
+    writes.expert[2] = experts / 2;
+    writes.value[2]  = 3;
+    infernix::ops::moe_pool_write(d_table, writes, stream);
+    std::int32_t* host = nullptr;
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&host), sizeof(std::int32_t) * (experts + 1), cudaHostAllocMapped),
+               "cudaHostAlloc");
+    const auto before = words(d_demand, static_cast<std::size_t>(experts) + 1);
+    infernix::ops::moe_pool_drain(d_demand, host, experts + 1, stream);
+    cuda_check(cudaStreamSynchronize(stream), "write and drain");
+    auto want_table = table;
+    want_table[0] = -1;
+    want_table[static_cast<std::size_t>(experts - 1)] = 7;
+    want_table[static_cast<std::size_t>(experts / 2)] = 3;
+    const auto after = words(d_demand, static_cast<std::size_t>(experts) + 1);
+    const bool pool_ok = words(d_table, static_cast<std::size_t>(experts)) == want_table &&
+                         std::equal(before.begin(), before.end(), host) &&
+                         std::all_of(after.begin(), after.end(), [](std::int32_t v) { return v == 0; });
+    std::printf("pool write/drain E=%d: %s\n", experts, pool_ok ? "exact" : "MISMATCH");
+    check(pool_ok, "moe_pool_write and moe_pool_drain");
+    cudaFreeHost(host);
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    for (void* p : {static_cast<void*>(d_logits), static_cast<void*>(d_table), static_cast<void*>(d_demand), pooled.ids.data,
+                    pooled.weights.data, pooled.shared_gate.data, plain.ids.data, plain.weights.data,
+                    plain.shared_gate.data}) {
+        cudaFree(p);
+    }
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(offloaded_moe_layer) {
@@ -1387,6 +1592,16 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
             for (const int columns : {1, 5, 32, 33}) { test_route_dispatch(512, columns, 10, 200U + columns); }
             test_route_dispatch(512, 64, 16, 233); // 1024 entries past the one-kernel column count
             test_route_dispatch(9, 3, 3, 239);     // few experts: lanes past E in every selection
+            // The drafter pool's route: every expert pooled (bit-equal to moe_route), the Flash-Next drafter's
+            // geometry at 128 and 12 (top_k + 2) slots, a verification-wide call, and few experts.
+            test_route_pooled(512, 3, 10, 512, 251);
+            test_route_pooled(512, 1, 10, 128, 253);
+            test_route_pooled(512, 8, 10, 12, 257);
+            test_route_pooled(512, 24, 10, 192, 263);
+            test_route_pooled(9, 3, 3, 5, 269);
+            // The 122B drafter: 256 experts, top-8, logits read at BF16 (the test's logits are exact in BF16).
+            test_route_pooled(256, 3, 8, 256, 271, true);
+            test_route_pooled(256, 4, 8, 64, 277, true);
             for (const int columns : {1, 5}) { test_combine_inject(columns, 10, 4, 300U + columns); }
             test_service_column_bound();
             test_service_failure_reported();

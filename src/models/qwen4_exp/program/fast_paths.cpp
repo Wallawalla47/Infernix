@@ -7,7 +7,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <variant>
 
 namespace infernix::models::qwen4_exp {
@@ -642,9 +645,12 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
     if (selected(FastPath::Fp8A8Pair)) { routes = routes | ops::LinearRoutes::Fp8A8Pair; }
     // Where several are set the FP8 dispatch takes f16-accumulate, then the block-scaled pair, then the pair.
     if (selected(FastPath::Fp8A8PairBlock32)) { routes = routes | ops::LinearRoutes::Fp8A8PairBlock32; }
-    if (selected(FastPath::GgmlBf16Prefill)) { routes = routes | ops::LinearRoutes::GgmlBf16Wide; }
-    if (selected(FastPath::F16AccumulatePrefill)) { routes = routes | ops::LinearRoutes::F16Accumulate; }
+    // The prefill paths: prefill calls only.
+    ops::LinearRoutes prefill = ops::LinearRoutes::Exact;
+    if (selected(FastPath::GgmlBf16Prefill)) { prefill = prefill | ops::LinearRoutes::GgmlBf16Wide; }
+    if (selected(FastPath::F16AccumulatePrefill)) { prefill = prefill | ops::LinearRoutes::F16Accumulate; }
     return {.dense_routes       = routes,
+            .prefill_routes     = prefill,
             .gdn_conv_fused     = selected(FastPath::GdnConvFused),
             .qsa_prepare_fused  = selected(FastPath::QsaPrepareFused),
             .expert_a4_terms    = selected(FastPath::ExpertA4Residual3) ? 3
@@ -676,6 +682,77 @@ FastPathSelection select_fast_paths(const execution::Parameters& parameters, con
         if (candidate || qualified) { out.paths.push_back(path); }
     }
     return out;
+}
+
+A8Routes a8_activation_routes(const FastPathConfiguration& configuration, QType expert_format,
+                              std::size_t ggml_projections, bool expert_a4_narrow) noexcept {
+    const bool nvfp4 = expert_format == QType::NVFP4_MUL;
+    A8Routes out{.ggml_projections = ggml_projections};
+    // One line per route (design §19.3.31); a route measured slower than the one it replaces is withdrawn on its line.
+    // Decode: IQ3_S's dense kernel sums 62 ms 8-bit against 145 ms exact (2026-10-27).
+    out.ggml_dense = ggml_projections != 0;
+    // Decode: IQ3_S's expert kernels 195 against 274 ms, its CPU team 69,454 against 30,585 columns/s.
+    out.ggml_experts = !nvfp4 && expert_format != QType::FP8_E4M3FN_B128;
+    // Decode: Ornith-122B's W4A8 expert kernels 630 against 906 ms, FP4-Local's CPU team 80,926 against 29,371
+    // columns/s (W4A4 banks keep their 4-bit route).
+    out.nvfp4_experts = nvfp4 && !configuration.a4_experts && !expert_a4_narrow;
+    // Prefill: a GGUF import's dense projections on the 8-bit tiles; not yet measured end to end.
+    out.ggml_dense_prefill = ggml_projections != 0;
+    // Prefill: FP4-Local's MXFP8 dense on the block-scaled pair; not yet measured end to end.
+    out.mxfp8_dense = configuration.dense == DenseKernels::Mxfp8;
+    // Prefill: the experts' wide calls on the 8-bit tiles (beside their narrow route); not yet measured end to end.
+    out.experts_prefill = out.ggml_experts || out.nvfp4_experts;
+    return out;
+}
+
+A8Routes a8_activation_routes(const execution::Parameters& parameters, const FastPathSelection& fast) {
+    std::size_t ggml_projections = 0;
+    for (const execution::BlockParameters& block : parameters.layers) {
+        if (const auto* gdn = std::get_if<execution::GdnParameters>(&block.mixer)) {
+            ggml_projections += std::size_t{gdn->projection.is_ggml()} + gdn->output.is_ggml();
+        } else {
+            const auto& attention = std::get<execution::AttentionParameters>(block.mixer);
+            ggml_projections += std::size_t{attention.projection.is_ggml()} + attention.output.is_ggml();
+        }
+        ggml_projections += std::size_t{block.moe.shared_gate_up.is_ggml()} + block.moe.shared_down.is_ggml();
+    }
+    return a8_activation_routes(fast.configuration, parameters.layers.front().moe.bank->planes.gate_up_format,
+                                ggml_projections, fast.selected(FastPath::ExpertA4ResidualDecode));
+}
+
+void A8Routes::apply(execution::ForwardFastPaths& fast) const noexcept {
+    if (ggml_dense) { fast.dense_routes = fast.dense_routes | ops::LinearRoutes::GgmlA8; }
+    fast.a8_experts      = ggml_experts || nvfp4_experts;
+    fast.a8_experts_wide = experts_prefill && fast.a8_experts; // the wide route needs the narrow one
+    // ggml_linear takes the 8-bit tiles ahead of ggml-bf16-prefill's, whose flag stays (the GGUF experts' wide calls
+    // take its BF16 planes without experts_prefill).
+    if (ggml_dense_prefill) { fast.prefill_routes = fast.prefill_routes | ops::LinearRoutes::GgmlA8Wide; }
+    // The 8-bit pair replaces f16-accumulate-prefill, which the dispatch would otherwise take first from 256 columns.
+    if (mxfp8_dense) {
+        constexpr auto kF16 = static_cast<std::uint16_t>(ops::LinearRoutes::F16Accumulate);
+        fast.prefill_routes = static_cast<ops::LinearRoutes>(static_cast<std::uint16_t>(fast.prefill_routes) & ~kF16) |
+                              ops::LinearRoutes::Fp8A8PairBlock32;
+    }
+}
+
+std::string A8Routes::describe() const {
+    const auto add = [](std::string& list, const std::string& item) {
+        list += (list.empty() ? "" : ", ") + item;
+    };
+    std::string decode, prefill;
+    if (ggml_dense) {
+        add(decode, std::to_string(ggml_projections) + " GGUF dense projections (calls of up to 31 columns)");
+    }
+    if (ggml_experts || nvfp4_experts) {
+        add(decode, "the routed experts (calls of up to 128 columns) with their CPU-served misses");
+    }
+    if (ggml_dense_prefill) {
+        add(prefill, std::to_string(ggml_projections) + " GGUF dense projections (calls of 32 or more columns)");
+    }
+    if (mxfp8_dense) { add(prefill, "the MXFP8 dense projections (two E4M3 terms per 32 values, fp8-a8-pair-block32)"); }
+    if (experts_prefill) { add(prefill, "the routed experts (calls of more than 128 columns)"); }
+    return "decode and verification: " + (decode.empty() ? std::string("none") : decode) +
+           "; prefill: " + (prefill.empty() ? std::string("none") : prefill);
 }
 
 } // namespace infernix::models::qwen4_exp

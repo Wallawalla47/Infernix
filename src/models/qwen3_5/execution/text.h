@@ -263,6 +263,9 @@ private:
 
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);
+    // The drafter pool: the MTP drafter's FFN context, `storage` naming the Program's pooled
+    // experts (RoundState::offloaded_experts, read at the call), or null without a pool.
+    [[nodiscard]] const OffloadedMoeContext* drafter_pool(OffloadedMoeContext& storage) const;
     void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
                           const Tensor& rope_positions,
                           ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden);

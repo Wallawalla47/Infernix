@@ -138,8 +138,8 @@ void run_repetition(infernix::Engine& engine, const infernix::bench::BenchEnviro
     handles.reserve(env.concurrency);
     generated.reserve(env.concurrency);
     for (std::uint32_t row = 0; row < env.concurrency; ++row) {
-        prompts.push_back(
-            engine.prepare_tokens(infernix::bench::prompt_slice(corpus, prompt_tokens), false));
+        const std::size_t start = infernix::bench::row_prompt_start(corpus.size(), row, env.concurrency, env.distinct_rows);
+        prompts.push_back(engine.prepare_tokens(infernix::bench::prompt_slice(corpus, prompt_tokens, start), false));
     }
     const auto started = std::chrono::steady_clock::now();
     for (std::uint32_t row = 0; row < env.concurrency; ++row) {
@@ -265,13 +265,17 @@ int main(int argc, char** argv) {
         engine_options.ngram_volume_path = options.ngram_volume_path;
         engine_options.ngram_residency   = options.ngram_residency;
         engine_options.expert_stripe_path = options.expert_stripe_path;
-        engine_options.ram_headroom_bytes = options.ram_headroom_bytes;
+        engine_options.expert_state_path  = options.expert_state_path;
+        engine_options.expert_state_off   = options.expert_state_off;
+        engine_options.ram_free_bytes = options.ram_free_bytes;
         engine_options.expert_ram_bytes   = options.expert_ram_bytes;
+        engine_options.expert_ram_layout  = options.expert_ram_layout;
         engine_options.expert_pin_bytes   = options.expert_pin_bytes;
         engine_options.vram_headroom_bytes = options.vram_headroom_bytes;
         engine_options.vram_past_budget    = options.vram_past_budget;
         engine_options.expert_tail_skip    = options.expert_tail_skip;
         engine_options.expert_a4_activations = options.expert_a4_activations;
+        engine_options.a8_activations        = options.a8_activations;
         engine_options.embedding_host        = options.embedding_host;
         engine_options.context_cache.enabled            = false;
         engine_options.context_cache.host_capacity_bytes = 0;
@@ -291,11 +295,17 @@ int main(int argc, char** argv) {
         env.fast_paths                   = options.fast_paths;
         env.expert_tail_skip             = options.expert_tail_skip;
         env.expert_a4_activations        = options.expert_a4_activations;
+        env.a8_activations               = options.a8_activations;
         env.ngram_volume_path            = options.ngram_volume_path;
         env.ngram_residency              = options.ngram_residency;
         env.expert_stripe_path           = options.expert_stripe_path;
+        env.expert_state                 = options.expert_state_off           ? std::string("off")
+                                           : options.expert_state_path.empty() ? std::string("calibrated")
+                                                                               : options.expert_state_path;
+        env.ram_free_bytes               = options.ram_free_bytes;
         env.expert_ram_bytes             = options.expert_ram_bytes;
-        env.expert_pin_bytes             = options.expert_pin_bytes;
+        env.expert_ram_layout            = options.expert_ram_layout;
+        env.expert_pin_bytes            = options.expert_pin_bytes;
         env.kv_cache                 = options.kv_cache;
         env.logits_dtype             = options.logits_dtype;
         env.speculative              = options.speculative;
@@ -314,6 +324,7 @@ int main(int argc, char** argv) {
         env.stop_at_eos              = options.stop_at_eos;
         env.route_trace_path         = options.route_trace_path;
         env.concurrency              = options.concurrency;
+        env.distinct_rows            = options.distinct_rows;
         env.constraint_file          = options.constraint_file;
         env.constraint               = options.constraint;
         env.mixed_constraints        = options.mixed_constraints;

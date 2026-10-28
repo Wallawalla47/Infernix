@@ -31,7 +31,7 @@ struct ExpertPinnedTerms {
     std::uint64_t other_pinned = 0;
 };
 
-// The RAM ledger's demand for these options: the reserve (--ram-headroom-mib), the load plan's pins,
+// The RAM ledger's demand for these options: the reserve (--ram-free-mib), the load plan's pins,
 // the Program's allowance, the prefix cache's pinned Host tier (`prefix_cache_bytes`), the load
 // staging, --expert-ram-mib, --expert-pin-mib and what Windows still lets the process page-lock for
 // the device. The caller adds its own terms (pageable caches, later pins) before planning.
@@ -51,6 +51,16 @@ struct ExpertRamPlan {
     std::uint64_t expert_unpinned_bytes = 0;
     std::uint64_t later_pinned_bytes    = 0;
 };
+
+// Physical RAM a ledger leaves beyond its reserve and everything it planned, the experts included.
+[[nodiscard]] std::uint64_t ledger_left_bytes(const expert_offload::HostMemoryLedger& ledger) noexcept;
+
+// --host-context-mib auto (after Strata v0.2.6's min(8 GiB, 0.4 x (free - 2.5 GiB))): the prefix cache's Host tier
+// from the RAM a plan leaves beyond its reserve (--ram-free-mib, which takes the place of Strata's 2.5 GiB),
+// min(8 GiB, 0.4 x left) rounded down to 256 MiB, and at least kMinAutoHostContextBytes (Qwen3.8-Flash-Next keeps
+// its snapshots there, so it always has a tier).
+inline constexpr std::uint64_t kMinAutoHostContextBytes = 1ULL << 30;
+[[nodiscard]] std::uint64_t auto_host_context_bytes(std::uint64_t left_bytes) noexcept;
 
 // Plans `demand` against `snapshot`, reports the ledger (an Info summary, Debug details), refuses an
 // --expert-ram-mib the ledger cannot give (std::runtime_error), and asks Windows to keep the

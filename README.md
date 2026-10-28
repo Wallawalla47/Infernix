@@ -314,6 +314,11 @@ measured overall, and `auto` picks the draft length):
 | Qwen3.6-27B (NVFP4, groupwise) | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length where its configuration registers `adaptive-mtp` (startup reports it), else 3 every round |
 | Ornith-1.5-122B (and its UNCENSORED conversion) | `--spec mtp --draft-tokens auto` | 2 confidence-gated drafts: 14 % faster than plain decode at one request, about 6 % slower while two decode together; DFlash2's `auto` decodes plain |
 
+Flash-Next keeps every routed expert in RAM by default (`--expert-ram-layout full`);
+`--expert-ram-layout exclusive` keeps only the experts VRAM does not hold, about 15 GiB less RAM on the
+NVFP4 conversions and 7 GiB on IQ3_S, at 1-2 % (NVFP4) and 12 % (IQ3_S) slower decode
+([guide](docs/qwen3_8-flash-next.md)).
+
 `--prefix-cache-file PATH` keeps the prefix cache across restarts (Ctrl+C twice saves it and exits).
 `infernix-serve.exe --help` lists every option; `--config FILE` reads them from a TOML file
 ([configuration file](docs/serving.md#configuration-file), example

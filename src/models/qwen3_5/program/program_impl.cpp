@@ -334,6 +334,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             .wide_pass_bytes = std::max(workspace_plan.text_prefill_wide, workspace_plan.mtp_prefill_wide),
             .wide_pass_ladder = workspace_plan.prefill_wide_ladder,
             .expert_wide     = execution_schedule.expert_wide,
+            .expert_narrow   = execution_schedule.a8_experts ? ops::offloaded_moe::NarrowA16::kA8
+                                                             : ops::offloaded_moe::NarrowA16::kExact,
             .router_mma      = execution_schedule.router_mma,
             .device      = device.device};
         offload = std::make_unique<ProgramOffload>(parameters, geometry, offload_options->engine,

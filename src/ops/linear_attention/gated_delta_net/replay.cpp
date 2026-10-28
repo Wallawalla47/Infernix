@@ -349,4 +349,21 @@ void GdnReplayFoldPlan::execute(std::span<const GdnReplayFoldRow> rows, cudaStre
                                                 static_cast<std::int32_t>(rows.size()), stream);
 }
 
+void GdnReplayFoldPlan::execute_device(const Tensor& slots, const Tensor& commit_columns, std::int32_t rows,
+                                       cudaStream_t stream) const {
+    if (rows < 1 || rows > records_.spec.record_capacity) {
+        throw std::invalid_argument("gdn_replay_fold: active row count is out of range");
+    }
+    const auto selector = [rows](const Tensor& t, const char* what) {
+        if (t.data == nullptr || t.dtype != DType::I32 || !t.is_contiguous() || t.numel() < rows) {
+            throw std::invalid_argument(std::string("gdn_replay_fold: ") + what +
+                                        " must be a contiguous I32 device tensor of at least the active rows");
+        }
+        return static_cast<const std::int32_t*>(t.data);
+    };
+    const detail::gated_delta_net::GdnReplayFoldDeviceRows device{selector(slots, "slots"),
+                                                                  selector(commit_columns, "commit_columns")};
+    detail::gated_delta_net::launch_replay_fold_device(records_, states_, device, rows, stream);
+}
+
 } // namespace infernix::ops

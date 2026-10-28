@@ -81,7 +81,7 @@ using HostedSearchId = std::function<std::string(std::size_t index)>;
 
 // Runs `prepared` and every continuation its hosted searches lead to, leaving the final generation
 // in `state`; `prepared` ends holding the last generation's request and ingress reservation.
-void run_openai_response(GenerationService& service, const OpenAIResponsesCreateRequest& request,
+void run_openai_response(GenerationBackend& service, const OpenAIResponsesCreateRequest& request,
                          ResponseRounds& state, PreparedRequest& prepared, const StreamSink* sink,
                          const std::function<bool()>& is_cancelled,
                          const ContinuationPreparer& prepare_next, const RoundWriter& on_round,
@@ -218,6 +218,21 @@ OpenAIResponsesRuntimeValues runtime_values(const PreparedRequest& prepared,
         runtime.cached_input_tokens = static_cast<int>(outcome->reused_prompt_tokens);
     }
     return runtime;
+}
+
+// A streamed Response refused before its generation, answered as one whole failed event stream.
+// It reports the sampling the request named, or the Responses default: the Engine resolves the
+// model's own defaults only for a prepared prompt.
+void write_failed_response_stream(httplib::Response& res, const std::string& id,
+                                  OpenAIResponsesCreateRequest request,
+                                  const GenerationRequest& generation, const ApiError& error) {
+    OpenAIResponsesRuntimeValues runtime;
+    if (generation.sampling.temperature) { runtime.temperature = static_cast<float>(*generation.sampling.temperature); }
+    if (generation.sampling.top_p) { runtime.top_p = static_cast<float>(*generation.sampling.top_p); }
+    prepare_sse_response(res);
+    res.set_content(make_openai_failed_response_stream(id, unix_time_now(), std::move(request),
+                                                       runtime, error),
+                    "text/event-stream");
 }
 
 [[noreturn]] void invalid_query(std::string message, std::string param,
@@ -401,6 +416,12 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         const ApiError error = responses_error(exception.error());
         record_request_rejected(make_request_rejection_log_context(
             req_id, "openai_responses", resolved.generation, metadata, error));
+        if (request.stream && error.code == "context_length_exceeded") {
+            // Codex starts compaction only on this failure inside the stream (its HTTP error path
+            // does not), so a streamed request answers with the whole failed event stream.
+            write_failed_response_stream(res, id, std::move(request), resolved.generation, error);
+            return;
+        }
         write_openai_error(res, error);
         return;
     } catch (const std::exception& exception) {

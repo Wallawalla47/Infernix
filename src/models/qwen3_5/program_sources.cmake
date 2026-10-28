@@ -12,6 +12,7 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/vision_control.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/graphs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefill.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/kv_dump.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/constraint.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/decode.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/grammar_masks.cpp"
@@ -45,3 +46,11 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix/hybrid_persist.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix/hybrid_program.cpp"
 )
+
+# The Qwen3.5-122B-A10B's calibrated expert order (the expert cache's cold-start seed, offload design §9.2.1;
+# generated data in program/calibrated_order.inc) is host-only data over the shared expert cache; its test links it.
+add_library(infernix_qwen3_5_calibrated_order STATIC
+  "${CMAKE_CURRENT_LIST_DIR}/program/calibrated_order.cpp")
+infernix_internal_includes(infernix_qwen3_5_calibrated_order)
+target_link_libraries(infernix_qwen3_5_calibrated_order PUBLIC infernix_expert_offload_cache)
+target_link_libraries(infernix_model_runtime PUBLIC infernix_qwen3_5_calibrated_order)

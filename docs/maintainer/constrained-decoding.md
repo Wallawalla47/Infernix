@@ -197,9 +197,14 @@ it does not infer semantics by treating every control token as an ordinary strin
 Each Frontend holds a compiler/cache bound to its vocabulary. A CompiledGrammar is immutable and the
 OutputSession holds a shared reference.
 
-The constraint vocabulary index and compiler initialize thread-safely on first constrained use; that
-time belongs to that prepare. The ordinary tokenizer keeps its initialization. Requests without
-constraints trigger no extra CPU indexing.
+The constraint vocabulary index and compiler initialize thread-safely, once per Frontend. The Engine
+builds them on a startup thread beside model loading's end (`Frontend::warm_constraints`, logged as
+`constraint vocabulary index built in N s`), so the first constrained request no longer pays them in
+its prepare; one that arrives while the build runs waits for it, as it would have built it itself
+(measured before the warm-up: `prepare` 0.85 s for the first constrained request against 0.00 s for
+every unconstrained one, the index and that tool set's grammar together). A tool set's grammar
+compiles at its first request, as the cache key above says. The ordinary tokenizer keeps its
+initialization.
 
 The cache key combines the constraint kind and source, the compile options and the model's output
 framing. Different starting content phases can produce different framings; a continuation's concrete
@@ -442,7 +447,12 @@ The choice between a Qwen raw string and a JSON value must be unambiguous. Pure 
 raw string; type unions without string use JSON values. A raw argument mixing string with other types
 whose branch the model format cannot determine is rejected for strict composition while preparing; the
 existing "any argument that allows string is read as string" cannot be claimed to enforce the other
-branches.
+branches. The one admitted mix is a nullable string (string and null, through a type list, an
+enum/const or anyOf/oneOf branches): it is raw text, the grammar takes its string branches and enum
+members plus the text `null`, and the decoder reads that text as null; an enum or const listing the
+string `"null"` beside null is rejected, since its raw text would be the same. The decoder reads every
+strict argument with the types the parameter's schema admits (`type`, enum/const values, local
+`$ref`, `allOf`, `anyOf`/`oneOf`), the same domain that chose its encoding.
 
 A raw string argument ends at `\n</parameter>`, which must not occur in the value. Grammar and parser
 use the same delimiter rule and strict output generates only losslessly representable values; a

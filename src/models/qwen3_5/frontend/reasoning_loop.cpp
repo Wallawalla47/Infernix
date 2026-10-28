@@ -20,11 +20,10 @@ bool word_byte(unsigned char c) {
     return c >= 0x80 || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
 }
 
-// Python's `\s`, which Strata's split drops. unicode::is_whitespace covers the Unicode space
-// categories; U+001C-U+001F and U+0085 are whitespace to Python and not to it.
+// Python's `\s`, which Strata's split drops. unicode::is_whitespace is the Unicode White_Space
+// property; U+001C-U+001F are whitespace to Python and not to it.
 bool space_codepoint(std::int32_t value) {
-    return (value >= 0x1c && value <= 0x1f) || value == 0x85 ||
-           text::unicode_internal::is_whitespace(value);
+    return (value >= 0x1c && value <= 0x1f) || text::unicode_internal::is_whitespace(value);
 }
 
 // A non-ASCII byte only shows what it is once its whole character has arrived: one token can hold one

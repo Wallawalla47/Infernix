@@ -30,10 +30,13 @@ constexpr bool kRuns = std::is_same_v<A, WorkspaceArena>;
 // shared expert, and y = bf16(sum w y_i + s y_shared) added to the residual. Every step depends
 // only on its own column, so the route is column-invariant whenever the shared expert's
 // projections run their column-invariant policy. With a mask the routed experts skip the padding
-// columns (resident_moe_experts' valid_columns); the live columns' bits are unchanged.
+// columns (resident_moe_experts' valid_columns); the live columns' bits are unchanged. With `pool` (the
+// MTP drafter's pooled experts) the route is among the pooled experts and the
+// experts read the pool's slots.
 template <class A>
 void resident_moe(A& a, const Tensor& hidden, const ops::SparseMoeWeights& p, Tensor* residual,
-                  DeviceExecutionView execution, ops::MoeColumnMask mask = {}) {
+                  DeviceExecutionView execution, ops::MoeColumnMask mask = {},
+                  const OffloadedExperts* pool = nullptr) {
     const cudaStream_t s  = execution.stream;
     const std::int32_t T  = hidden.ne[1];
     const std::int32_t H  = p.router_shared_gate.k, E = p.router_shared_gate.n - 1;
@@ -54,9 +57,16 @@ void resident_moe(A& a, const Tensor& hidden, const ops::SparseMoeWeights& p, Te
         const Tensor router(const_cast<void*>(p.router_shared_gate.qdata), DType::BF16, {H, E + 1});
         const std::array<const Tensor*, 1> rows{&router};
         ops::projection_fp32(hidden, rows, logits, s);
-        ops::moe_route(logits, kMoeTopK, routing, s, ops::RouterLogits::kBf16);
-        ops::resident_moe_experts(hidden, routing.ids, p.routed_gate_up, p.routed_down, E, I, experts.data,
-                                  expert_ws, outputs, s, mask.valid, mask.width);
+        if (pool != nullptr && pool->drafter_slots > 0) {
+            ops::moe_route_pooled(logits, kMoeTopK, pool->drafter_slot_of, pool->drafter_demand, routing, s,
+                                  ops::RouterLogits::kBf16);
+            ops::resident_moe_experts(hidden, routing.ids, pool->drafter_gate_up, pool->drafter_down, pool->drafter_slots,
+                                      I, experts.data, expert_ws, outputs, s, mask.valid, mask.width);
+        } else {
+            ops::moe_route(logits, kMoeTopK, routing, s, ops::RouterLogits::kBf16);
+            ops::resident_moe_experts(hidden, routing.ids, p.routed_gate_up, p.routed_down, E, I, experts.data,
+                                      expert_ws, outputs, s, mask.valid, mask.width);
+        }
         {
             auto call = a.scope();
             ops::linear(hidden, p.shared_gate_up, gate_up, p.policy, a, s);
@@ -156,7 +166,8 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
         if (!ops::sparse_moe_geometry(*moe)) {
-            resident_moe(workspace, hidden, *moe, &residual, execution, padding);
+            resident_moe(workspace, hidden, *moe, &residual, execution, padding,
+                         mtp && offloaded != nullptr ? offloaded->experts : nullptr);
             return;
         }
         const auto storage =

@@ -105,10 +105,25 @@ public:
     void seed(std::span<const std::uint32_t> resident_keys, std::span<const std::uint32_t> counts);
 
     // Changes the capacity (the frame pool grew or shrank). Shrinking evicts the lowest-score
-    // residents, wherever their frames are, into `victims`; uses keep their counts.
-    void set_capacity(std::uint32_t capacity, std::vector<std::uint32_t>& victims);
+    // residents, wherever their frames are, into `victims`; uses keep their counts. With
+    // `first_choice`, the residents it accepts go first (lowest score first), then the others: the
+    // SSD tier's lends and shrinks take experts that keep a RAM copy before ones that would be lost.
+    void set_capacity(std::uint32_t capacity, std::vector<std::uint32_t>& victims,
+                      const Admissible* first_choice = nullptr);
     // Makes a resident key non-resident (its frame is lent); its count is kept.
     void evict(std::uint32_t key);
+    // Basalt's adaptive tier (ExpertResidency::VramPolicy::Adaptive, candidates §7.6 D12) decides the
+    // promotions. exchange makes the non-resident `in` resident in place of the resident `out`; admit_free
+    // makes `key` resident while the capacity has room (false when full or already resident).
+    void exchange(std::uint32_t in, std::uint32_t out) {
+        erase(out);
+        insert(in);
+    }
+    bool admit_free(std::uint32_t key) {
+        if (resident(key) || residents_.size() >= capacity_) { return false; }
+        insert(key);
+        return true;
+    }
 
 private:
     static constexpr std::uint32_t kNone = 0xFFFFFFFFU;
@@ -254,8 +269,9 @@ public:
     // Resizes the pool to `frames` while no round is in flight, every issued load has landed and no
     // frame is lent. Shrinking evicts the lowest-score residents (ABSENT writes) and relocates the
     // experts still above the new top into free frames below it (relocations precede no other
-    // command); growing admits queued experts into the new frames.
-    void resize(std::uint32_t frames, std::vector<Command>& out);
+    // command); growing admits queued experts into the new frames. `first_victims` as
+    // LfruPolicy::set_capacity's first_choice.
+    void resize(std::uint32_t frames, std::vector<Command>& out, const LfruPolicy::Admissible* first_victims = nullptr);
 
     // Frame lending (design §19.3.2): a contiguous run of frames serves another use of the memory
     // (the Vision window) and comes back later. choose_run picks the run of `count` frames whose
@@ -266,8 +282,9 @@ public:
     // At a quiescent boundary (no retiring frame, every issued load landed): shrinks the policy's
     // capacity by `count`, which evicts its lowest-score residents (ABSENT writes), relocates the
     // run's remaining experts into free frames outside it, and lends the run. Returns the number
-    // of evicted experts.
-    std::uint32_t lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);
+    // of evicted experts. `first_victims` as LfruPolicy::set_capacity's first_choice.
+    std::uint32_t lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out,
+                       const LfruPolicy::Admissible* first_victims = nullptr);
     // Returns the run: capacity grows back and queued experts load into it. With `refill`, the
     // experts the loans evicted then load into it too, best first, while the policy has room (a
     // prefill's loans would otherwise leave decode a cache short of them until misses re-admit them);
@@ -290,6 +307,11 @@ public:
     bool adopt(std::uint32_t key, std::uint32_t frame, std::span<const std::uint32_t> protect,
                std::uint64_t round_started, std::vector<Command>& out);
     void release(std::uint32_t frame);
+    // The adaptive tier's swap (ExpertResidency::VramPolicy::Adaptive, candidates §7.6 D12): the non-resident `in` becomes
+    // resident in place of the resident `victim` (its frame retires; ABSENT write) or, with none, in the
+    // policy's room, and loads into a free frame (or queues). False when it cannot.
+    bool exchange(std::uint32_t in, std::optional<std::uint32_t> victim, std::uint64_t round_started,
+                  std::vector<Command>& out);
     [[nodiscard]] std::uint32_t loaned_frames() const { return frames_.loaned_count(); }
     // The longest run of backed frames none of which is lent: the most one more lease can take, since
     // a lease is one contiguous run (an earlier lease in the middle of the pool splits the rest).

@@ -64,4 +64,11 @@ struct VisualSlice {
 VisualSlice visual_slice(std::span<const std::uint32_t> visual, std::uint32_t a, std::uint32_t b,
                          std::uint32_t base, std::span<std::int32_t> columns);
 
+namespace testing {
+// Engine-level tests: a binding may lend its Vision window at most `bytes` of expert frames, now and
+// with no lease out, as if the cache were that small (0: no limit). Process-wide.
+void set_vision_lend_limit(std::uint64_t bytes) noexcept;
+[[nodiscard]] std::uint64_t vision_lend_limit() noexcept;
+} // namespace testing
+
 } // namespace infernix::models::qwen4_exp

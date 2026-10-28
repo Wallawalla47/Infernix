@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/execution_context.h"
+#include "models/qwen3_5/program/kv_dump.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/lossless.h"
 #include "models/qwen3_5/execution/vision_overlay.h"
@@ -921,6 +922,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             readout = read_prompt_frontier(sequence.tail_hidden, request.base->readout_tokens);
         }
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+        if (!kv_dump_directory().empty()) {
+            // TEMPORARY (INFERNIX_TMP_KV_DUMP): the prompt's K/V pages, after its prefill time.
+            dump_prompt_kv(decoder->text_kv, text_kv_view(sequence), staged.prompt_tokens,
+                           parameters.model.config().text, parameters.model.info().name, device.stream);
+        }
         const double vision_seconds = staged.retired_vision_seconds +
                                       (staged.vision ? staged.vision->elapsed_seconds() : 0.0);
         const std::uint32_t prompt_tokens = staged.prompt_tokens;

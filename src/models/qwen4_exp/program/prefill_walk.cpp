@@ -16,7 +16,8 @@
 // stream lease after the ring. Each advance_prefill call enqueues about one call's work (a few
 // layers of every chunk) and synchronizes, so cancellation and other lanes interleave as between
 // chunk-major calls; the walk's own state stays valid across them. A span ends before a call too
-// narrow to stream and at kWalkMaxTokens. A prefix tap due at an inner chunk end is captured in place
+// narrow to stream (with INFERNIX_TMP_WALK_JOIN_LAST, the prompt's last joins a span of two or more streamed
+// calls as an MoE group of its own) and at kWalkMaxTokens. A prefix tap due at an inner chunk end is captured in place
 // (walk_plan_taps): each layer's state is copied once the walk has enqueued that layer of the chunk,
 // before the next chunk overwrites it, and the snapshot is committed after the span. Ending the span
 // there instead would stream every non-resident expert once more per tap (a cold 128K prompt's taps
@@ -49,6 +50,13 @@ constexpr std::uint32_t kBlock   = pc::kBlockTokens;
 
 std::size_t walk_align(std::size_t bytes) { return (bytes + kWalkAlign - 1) / kWalkAlign * kWalkAlign; }
 
+// TEMPORARY (INFERNIX_TMP_WALK_JOIN_LAST, until its A/B): the prompt's narrow last call joins the span
+// (walk_span_end).
+bool join_last_call() {
+    static const bool on = temporary_switches::flag("INFERNIX_TMP_WALK_JOIN_LAST");
+    return on;
+}
+
 } // namespace
 
 std::size_t ProgramImpl::walk_bytes(std::uint32_t tokens, std::size_t chunks) const noexcept {
@@ -76,6 +84,18 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
         if (width < static_cast<std::uint32_t>(kStreamMinColumns) || total + width > kWalkMaxTokens) { break; }
         total += width;
         from = lane.calls[end];
+        ++end;
+        tokens.push_back(total);
+    }
+    // One streamed call and a narrow last call do not walk: the streamed call keeps its gated stream and
+    // copy-ahead (walking them measured no faster, 2026-10-27: pp4125 IQ3_S 0.999x, Dense8 1.000x).
+    if (end - first < 2U) { return first; }
+    // TEMPORARY (INFERNIX_TMP_WALK_JOIN_LAST, until its A/B): the prompt's last call, too narrow to stream, joins a
+    // span of streamed calls (as its own MoE group, walk_begin), so its experts are read from the span's ring
+    // instead of being staged again right after it. It also puts a divergence inside that last call (a /v1/decide
+    // fan-out's questions) inside a running span, where a sibling cannot coalesce (prefix_await_sibling).
+    if (join_last_call() && end + 1 == lane.calls.size() && total + (lane.calls[end] - from) <= kWalkMaxTokens) {
+        total += lane.calls[end] - from;
         ++end;
         tokens.push_back(total);
     }
@@ -118,13 +138,15 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
     walk_.residual_bytes = walk_align(2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(offset));
     walk_.moe_offset     = walk_.residual_bytes + n * walk_.io_stride;
     // MoE groups: consecutive chunks while their columns fit kWalkMoeColumns and the arena the calls
-    // run in (WideWork of the span's widest chunk: the wide arena when it exceeds the static one's).
+    // run in (WideWork of the span's widest chunk: the wide arena when it exceeds the static one's). A
+    // chunk too narrow to stream (the prompt's last, walk_span_end) is a group of its own, so its router
+    // takes the chunk-major call's form (router-mma acts on calls of kRouterMmaMinColumns or more).
     const std::int32_t widest = *std::max_element(walk_.widths.begin(), walk_.widths.end());
     const std::size_t arena   = widest > plan_.static_columns && wide_work_ > 0 ? wide_work_ : plan_.work;
     for (std::size_t c = 0; c < n;) {
         std::size_t e       = c + 1;
         std::int32_t columns = walk_.widths[c];
-        while (e < n && columns + walk_.widths[e] <= kWalkMoeColumns &&
+        while (e < n && walk_.widths[e] >= kStreamMinColumns && columns + walk_.widths[e] <= kWalkMoeColumns &&
                execution::Forward::moe_workspace_bytes(c_, columns + walk_.widths[e], wide_a16(options_)) <= arena) {
             columns += walk_.widths[e];
             ++e;
@@ -324,7 +346,9 @@ void ProgramImpl::walk_prefetch_rows(Lane& lane, std::uint32_t index, std::size_
         }
         const std::uint32_t from  = lane.calls[call - 1];
         const std::uint32_t width = lane.calls[call] - from;
-        if (width < static_cast<std::uint32_t>(kStreamMinColumns) || tokens + width > kWalkMaxTokens) {
+        // A narrow call joins only as the prompt's last, after two streamed calls (walk_span_end).
+        const bool narrow_last = join_last_call() && call + 1 == lane.calls.size() && k >= 2;
+        if ((width < static_cast<std::uint32_t>(kStreamMinColumns) && !narrow_last) || tokens + width > kWalkMaxTokens) {
             f.done = true;
             break;
         }

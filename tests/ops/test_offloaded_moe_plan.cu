@@ -195,6 +195,7 @@ void oracle(const Geometry& g, const Case& k, int columns, int max_jobs, const s
         request->layer  = ch.layer;
         request->jobs   = static_cast<std::int32_t>(chosen.size());
         request->tiered = k.table.empty() ? 0 : 1;
+        request->a8     = 0; // these banks have no 8-bit activation route
         std::uint32_t sequence = run.sequence_before + 1U;
         if (sequence == 0) { sequence = run.sequence_before + 2U; }
         request->sequence = sequence;

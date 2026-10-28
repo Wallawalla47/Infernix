@@ -131,8 +131,15 @@ std::uint64_t display_headroom(DisplayState display, bool elastic, std::optional
 }
 
 std::uint64_t internal_reserve(std::uint32_t graphs, std::uint64_t graph_bytes, bool elastic) {
-    const std::uint64_t counted = elastic ? std::min<std::uint32_t>(graphs, 32) : graphs;
-    return std::max(256 * kLedgerMiB, 128 * kLedgerMiB + graph_bytes * counted);
+    // An elastic pool reserves 128 MiB (candidates §22 VM-04, adopted 2026-10-27): the rule a fixed pool keeps,
+    // max(256, 128 + 4 per graph) MiB, left 210-240 MiB unspent on Dense8 and the 122B (logged), and the fixed
+    // 128 MiB measured faster: Dense8 MTP decode +8.0 / +3.4 / +2.4 % and the 122B one-request decode +1.0-1.7 %
+    // with the other VRAM defaults (2026-10-27 window, same ids). An elastic pool shrinks by chunks while free
+    // memory is under half the headroom, so executables instantiated past its reserve take frames back; a fixed
+    // pool cannot, so it keeps room for every executable it may instantiate.
+    constexpr std::uint64_t kElasticReserveMiB = 128;
+    if (elastic) { return kElasticReserveMiB * kLedgerMiB; }
+    return std::max(256 * kLedgerMiB, 128 * kLedgerMiB + graph_bytes * graphs);
 }
 
 VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& demand) {
@@ -140,7 +147,7 @@ VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& de
     out.snapshot = snapshot;
     out.demand   = demand;
     out.headroom = display_headroom(snapshot.display, demand.elastic, demand.headroom);
-    out.reserve  = internal_reserve(demand.graphs, demand.graph_bytes, demand.elastic && !demand.eager_graphs);
+    out.reserve  = internal_reserve(demand.graphs, demand.graph_bytes, demand.elastic);
     const auto signed_bytes = [](std::uint64_t v) { return static_cast<std::int64_t>(v); };
     std::int64_t room = signed_bytes(snapshot.device_free) - signed_bytes(demand.fixed) - signed_bytes(out.headroom);
     if (snapshot.has_budget) {

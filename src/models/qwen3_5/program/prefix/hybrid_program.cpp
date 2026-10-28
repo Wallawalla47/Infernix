@@ -22,6 +22,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <cstring>
 #include <limits>
@@ -29,6 +30,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -173,9 +175,14 @@ std::optional<HybridCachePersistence> ProgramImpl::save_hybrid_cache_now(const C
     device.synchronize();
     if (device.transfer_stream != nullptr) { CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream)); }
     hybrid_->drain();
+    // Withdrawn entries a transfer pinned until now never reach the file (spec §7.8).
+    if (!hybrid_withdrawal_.empty()) { (void)hybrid_->index().withdraw(hybrid_withdrawal_); }
     const std::uint64_t written = hybrid_->counters().host_write_bytes;
     HybridCachePersistence saved = public_result(hybrid_->save(hybrid_file_, hybrid_fingerprint_, abandoned));
-    if (saved.ok) { hybrid_saved_writes_ = written; }
+    if (saved.ok) {
+        hybrid_saved_writes_ = written;
+        ++hybrid_saves_;
+    }
     return saved;
 }
 
@@ -189,6 +196,7 @@ void ProgramImpl::save_hybrid_cache_for_shutdown() noexcept {
             CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
         }
         hybrid_->drain();
+        if (!hybrid_withdrawal_.empty()) { (void)hybrid_->index().withdraw(hybrid_withdrawal_); }
         // The product may abandon the save (a Ctrl+C during the stop). It counts as running only
         // from here, so an exit never waits for the Device work above.
         const PrefixCacheSaveControl& control = context_cache.hybrid.persistent_save;
@@ -1007,6 +1015,7 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     lane_state.last_capture     = reuse;
     lane_state.restore_ticket   = ticket;
     lane_state.restore_layers_pending = ticket != 0;
+    lane_state.saves            = hybrid_saves_;
     if (execution_schedule.grid_cache) { lane_state.publish_frontier = reuse; }
 
     HybridCacheCounters& counters = hybrid_->counters();
@@ -1058,6 +1067,7 @@ void ProgramImpl::hybrid_publish_blocks(SequenceState& sequence) {
         const pc::NodeRef parent      = lane.path.empty() ? pc::NodeRef{} : lane.path.back();
         const pc::InsertResult result = hybrid_->insert_block(parent, hash, tokens, extra, pages);
         lane.path.push_back(result.node);
+        if (result.device_attached) { lane.owned.push_back(result.node); }
         lane.path_hash = hash;
     }
     if (!lane.pending.empty()) { hybrid_publish_pending(sequence, false); }
@@ -1161,6 +1171,7 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
             continue;
         }
         hybrid_->attach_image(published.snapshot, tap.image);
+        lane.created.push_back(published.snapshot);
         lane.deepest_snapshot = std::max(lane.deepest_snapshot, tap.frontier);
         if (tap.frontier >= lane.latest_frontier) {
             lane.latest_snapshot = published.snapshot;
@@ -1304,6 +1315,7 @@ HybridSuperseded ProgramImpl::hybrid_supersede_resume(HybridLaneState& lane,
                                   ? ledger.subspan(lane.resume_frontier, end - lane.resume_frontier)
                                   : std::span<const TokenId>{});
     lane.resume_snapshot = {};
+    if (out.index_changed) { lane.superseded.push_back(out); }
     return out;
 }
 
@@ -1316,6 +1328,7 @@ HybridSuperseded ProgramImpl::hybrid_supersede_tap(HybridLaneState& lane, std::u
     HybridSuperseded out{.snapshot = lane.tap_snapshot, .frontier = lane.tap_frontier};
     out.index_changed = index.supersede(lane.tap_snapshot);
     lane.tap_snapshot = {};
+    if (out.index_changed) { lane.superseded.push_back(out); }
     return out;
 }
 
@@ -1365,14 +1378,46 @@ void ProgramImpl::hybrid_release_lane(std::uint32_t lane) noexcept {
         state.pending.clear();
         if (state.active) {
             // The lane's blocks become evictable once its pins go: back them on the Host tier
-            // first, in one batch, so eviction drops Device copies instead of losing nodes.
-            try {
-                hybrid_->start_block_host_writes(state.path, device.stream, device.transfer_stream);
-            } catch (...) {}
+            // first, in one batch, so eviction drops Device copies instead of losing nodes. A lane
+            // whose logits went non-finite backs nothing: its blocks are withdrawn below.
+            if (!state.withdraw) {
+                try {
+                    hybrid_->start_block_host_writes(state.path, device.stream, device.transfer_stream);
+                } catch (...) {}
+            }
             index.release_path(state.path);
         }
+        if (state.withdraw) { hybrid_withdraw(state); }
+        // Entries an earlier withdrawal found pinned go once nothing pins them.
+        if (!hybrid_withdrawal_.empty()) { (void)index.withdraw(hybrid_withdrawal_); }
     } catch (...) { std::terminate(); }
     state = HybridLaneState{};
+}
+
+void ProgramImpl::hybrid_withdraw(HybridLaneState& lane) {
+    // A snapshot's Host write (and a restore landing over the lane's blocks) pins what it reads.
+    hybrid_->drain();
+    hybrid_withdrawal_.nodes.insert(hybrid_withdrawal_.nodes.end(), lane.owned.begin(), lane.owned.end());
+    hybrid_withdrawal_.snapshots.insert(hybrid_withdrawal_.snapshots.end(), lane.created.begin(),
+                                        lane.created.end());
+    const bool published = !lane.owned.empty() || !lane.created.empty();
+    lane.owned.clear();
+    lane.created.clear();
+    pc::PrefixCacheIndex& index = hybrid_->index();
+    (void)index.withdraw(hybrid_withdrawal_);
+    // What its captures superseded serves again (unsupersede is a no-op on one already restored).
+    for (const HybridSuperseded& entry : lane.superseded) {
+        if (entry.snapshot.valid() && index.valid(entry.snapshot)) { index.unsupersede(entry.snapshot); }
+    }
+    lane.superseded.clear();
+    if (!published || hybrid_file_.empty()) { return; }
+    // The next save rewrites the file without the withdrawn entries, and a file saved since the
+    // lane's admission, which may hold them, goes now (a restart then starts cold).
+    hybrid_saved_writes_ = ~std::uint64_t{0};
+    if (hybrid_saves_ != lane.saves) {
+        std::error_code ignored;
+        std::filesystem::remove(hybrid_file_, ignored);
+    }
 }
 
 void ProgramImpl::hybrid_finish_lane(SequenceState& sequence, bool endpoint,
@@ -1407,7 +1452,16 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence,
                 (!is_masked_draft_backend(speculative_backend) ||
                  sequence.dflash_context_frontier == frontier);
             const std::uint32_t anchor_blocks = frontier / kBlock;
-            if (endpoint && !execution_schedule.grid_cache && backend_caught_up &&
+            // On the reproducible route only prefill-computed state on the chunk grid is reusable: a
+            // lane that ends there (a prompt cancelled between chunks, the idle-time pass yielding to
+            // a request, hybrid-prefix-cache-spec §7.9) leaves it as a tap; decode-computed state is
+            // never published there.
+            const bool grid_state = execution_schedule.grid_cache &&
+                                    frontier <= lane_state.prompt_tokens &&
+                                    frontier % prefill_chunk == 0;
+            const pc::SnapshotKind kind =
+                execution_schedule.grid_cache ? pc::SnapshotKind::Tap : pc::SnapshotKind::Endpoint;
+            if (endpoint && (!execution_schedule.grid_cache || grid_state) && backend_caught_up &&
                 frontier != 0 &&
                 frontier >= lane_state.deepest_snapshot + pc::kMinimumTapSeparation &&
                 frontier <= sequence.ledger.size() && lane_state.path.size() >= anchor_blocks &&
@@ -1461,8 +1515,7 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence,
                                                        ? pc::NodeRef{}
                                                        : lane_state.path[anchor_blocks - 1U];
                         const pc::PublishResult published =
-                            index.publish_snapshot(anchor, frontier, tail_tokens, tail_id, *slot,
-                                                   pc::SnapshotKind::Endpoint);
+                            index.publish_snapshot(anchor, frontier, tail_tokens, tail_id, *slot, kind);
                         if (published.snapshot.valid()) {
                             endpoint_published = true;
                             lane_state.deepest_snapshot =
@@ -1474,7 +1527,11 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence,
                         if (published.created) {
                             hybrid_->attach_image(published.snapshot, image);
                             sequence.state = {};
-                            ++hybrid_->counters().endpoints_created;
+                            if (kind == pc::SnapshotKind::Tap) {
+                                ++hybrid_->counters().taps_created;
+                            } else {
+                                ++hybrid_->counters().endpoints_created;
+                            }
                             // Superseded first, so the Host write below can take its slabs.
                             (void)hybrid_supersede_resume(lane_state, lane_state.deepest_snapshot,
                                                           sequence.ledger);

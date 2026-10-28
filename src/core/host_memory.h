@@ -22,6 +22,8 @@ struct HostMemorySnapshot {
     std::uint64_t available_commit = 0;
     // This process's private committed bytes (Windows PrivateUsage, Linux VmRSS).
     std::uint64_t process_private = 0;
+    // This process's resident bytes (Windows WorkingSetSize, Linux VmRSS).
+    std::uint64_t process_resident = 0;
 };
 
 [[nodiscard]] HostMemorySnapshot host_memory_snapshot();

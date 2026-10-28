@@ -114,7 +114,8 @@ struct A8Subset {
 //                                 which no CPU expert worker may use.
 //   INFERNIX_TMP_PROMPT_SEED      <credit>[,<budget>]   prompt seeding's credit (today 256; 0 turns
 //                                 it off) and promotions per layer at the prompt's end (today 0).
-//   INFERNIX_TMP_STAGING_SLOTS    64..512    the staging slots instead of the width rule.
+//   INFERNIX_TMP_STAGING_SLOTS    8..512     the staging slots instead of the width rule (a call whose
+//                                 jobs exceed them is not forked).
 struct OffloadSwitches {
     enum class LinkShare : std::uint8_t { kDivisor, kAuto, kFixed };
     LinkShare link_share    = LinkShare::kDivisor;

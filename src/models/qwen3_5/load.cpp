@@ -1,6 +1,8 @@
 #include "models/qwen3_5/load.h"
 
+#include "artifact/formats.h"
 #include "artifact/reader.h"
+#include "core/weight_view.h"
 #include "models/qwen3_5/load/bindings.h"
 #include "models/qwen3_5/load/vision_overlay.h"
 
@@ -42,6 +44,7 @@ struct LoadPlan::Impl {
     FrontendResources resources;
     InstanceInfo info;
     std::uint64_t embedding_bytes = 0; // offloaded experts: the token embedding's stored bytes (pinned)
+    std::uint64_t mtp_expert_pinned = 0; // the MTP drafter's routed experts' stored bytes, pinned behind the drafter pool
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -64,7 +67,7 @@ void LoadPlan::set_host_reserve(std::uint64_t reserve_bytes, std::uint64_t later
 bool LoadPlan::offloaded_experts() const { return impl_->config.text.offloaded_experts; }
 
 std::uint64_t LoadPlan::pinned_other_bytes() const {
-    std::uint64_t bytes = impl_->embedding_bytes;
+    std::uint64_t bytes = impl_->embedding_bytes + impl_->mtp_expert_pinned;
     if (impl_->vision_overlay) {
         const auto& v = *impl_->vision_overlay;
         bytes += v.prelude.bytes + v.merger.bytes;
@@ -132,7 +135,48 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         out->weights.vision = loading::bind_vision(bindings, *out->config.vision, text, options);
     }
     if (out->config.mtp) {
-        out->weights.mtp = loading::bind_mtp(bindings, text, out->weights.text);
+        // LoadOptions::mtp_expert_pool: with offloaded experts, the drafter's routed experts pinned in RAM behind a pool
+        // of device slots, 64 as measured best on the 122B (2026-10-27, MTP decode, ABBA: one request +4.6 %, 128
+        // +3.9 %), at least top_k + 2. Two requests with distinct prompts (TensorFold review TF-01, ABBA 4 pairs): the
+        // pool off measured 1.0037x median, worst 0.9971x, within the control's own spread (0.9956x).
+        constexpr std::uint32_t kPoolSlots = 64;
+        const auto* moe = std::get_if<MoeConfig>(&text.ffn);
+        if (moe != nullptr && text.offloaded_experts && options.mtp_expert_pool && kPoolSlots < moe->num_experts) {
+            out->config.mtp_expert_slots = std::min(moe->num_experts - 1,
+                                                    std::max(kPoolSlots, moe->num_experts_per_tok + 2U));
+        }
+        const bool pooled = out->config.mtp_expert_slots > 0;
+        out->weights.mtp  = loading::bind_mtp(bindings, text, out->weights.text,
+                                              pooled ? artifact::Residency::HostPinned : artifact::Residency::Device);
+        if (pooled) {
+            // One expert's rows (the pool's slot) and the pinned bytes, a term of the RAM ledger.
+            const auto& experts = std::get<MoeWeights>(out->weights.mtp->layer.ffn).experts;
+            std::vector<artifact::ObjectHandle> objects;
+            const auto row_bytes = [&](WeightId id) {
+                const auto& tensor = reader.directory().tensor(bindings.at(id).reference.binding.parts.front().object);
+                const auto g = weight_geometry(artifact::parse_format(tensor.format), artifact::parse_layout(tensor.layout),
+                                               tensor.shape);
+                if (g.layout != QuantLayout::RowSplit || g.high_bytes_per_row != 0) {
+                    throw artifact::ArtifactError("the drafter pool needs the MTP drafter's "
+                                                  "experts as row-split Q2/Q4/Q8 banks");
+                }
+                return g.code_bytes_per_row + g.scale_bytes_per_row;
+            };
+            for (const auto& expert : experts) {
+                for (const WeightId id : {expert.gate, expert.up, expert.down}) {
+                    for (const auto& part : bindings.at(id).reference.binding.parts) {
+                        if (std::find(objects.begin(), objects.end(), part.object) == objects.end()) {
+                            objects.push_back(part.object);
+                        }
+                    }
+                }
+            }
+            out->config.mtp_expert_bytes = 2ULL * moe->moe_intermediate_size * row_bytes(experts.front().gate) +
+                                           text.hidden_size * row_bytes(experts.front().down);
+            for (const auto object : objects) {
+                out->mtp_expert_pinned += artifact::object_bytes(reader.directory().object(object));
+            }
+        }
     }
     if (out->config.draft) {
         out->weights.draft =

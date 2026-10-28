@@ -182,8 +182,9 @@ struct PersistentLayout {
     std::uint32_t text_kv_base_pages = 0;
 };
 
-// The text KV pages an elastic pool backs at startup: 32,768 tokens (Qwen3.8-Flash-Next's base).
-inline constexpr std::uint32_t kElasticKvBaseTokens = 32768;
+// The text KV pages an elastic pool backs at startup: 4,096 tokens (Qwen3.8-Flash-Next's base; candidates §22
+// VM-08, 2026-10-27: ~347 MiB of frames on the 122B while contexts stay short; longer prompts grow it).
+inline constexpr std::uint32_t kElasticKvBaseTokens = 4096;
 
 struct VisionWorkspacePlan {
     std::int32_t output_hidden         = 0;

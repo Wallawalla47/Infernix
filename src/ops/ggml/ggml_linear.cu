@@ -13,7 +13,10 @@
 // cores; calls of kTileMinColumns or more (prefill) first decode each segment's weights once into
 // a plane (plane_kernel, workspace kPlaneBytes) and run the tensor-core tiles over it. Every route
 // returns the same integers. With LinearRoutes::GgmlBf16Wide (ggml-bf16-prefill) the wide calls run
-// ops/ggml/ggml_bf16_tile.cuh's BF16 tiles over the same planes instead (no column encoding).
+// ops/ggml/ggml_bf16_tile.cuh's BF16 tiles over the same planes instead (no column encoding). With
+// LinearRoutes::GgmlA8 (a8-activations, LOSSY) the narrow calls run ops/ggml/ggml_linear_a8.cu's 8-bit
+// activation route instead, and with LinearRoutes::GgmlA8Wide the wide calls ops/ggml/ggml_linear_a8_wide.cu's
+// (int8 tiles over their own planes; before GgmlBf16Wide where both are set).
 
 #include "infernix/ops/ggml_linear.h"
 
@@ -23,6 +26,7 @@
 #include "ops/ggml/ggml_bf16_tile.cuh"
 #include "ops/ggml/ggml_dp4a.cuh"
 #include "ops/ggml/ggml_exact.h"
+#include "ops/ggml/ggml_linear_a8.h"
 #include "ops/ggml/ggml_mma_rows.cuh"
 #include "ops/ggml/ggml_tile.cuh"
 
@@ -46,11 +50,14 @@ constexpr int kEncodeThreads = 256;
 constexpr int kColumns       = 4; // columns per pass of a row group (calls of 5-8 columns: one pass of 8)
 // Calls of at least this many columns run the tensor-core tiles (ops/ggml/ggml_tile.cuh).
 constexpr int kTileMinColumns = 32;
+static_assert(kA8MaxColumns + 1 == kTileMinColumns, "the 8-bit route takes every narrow call");
 // Columns encoded at once: wider calls (prefill chunks) run in batches of this many columns, which
 // bounds the workspace (K * 512 * 3.125 bytes) whatever the chunk size.
 constexpr int kEncodeColumns = 512;
 // Workspace of a wide call's decoded planes (1.5 bytes per weight: every IQ3_S dense call in one pass).
 constexpr std::size_t kPlaneBytes = 64ULL << 20;
+static_assert(kA8WideMinColumns == kTileMinColumns && kA8WidePlaneBytes == kPlaneBytes,
+              "the 8-bit wide route takes every wide call within the wide routes' planes");
 
 // Up to kMax segments of one format in one narrow launch; CTAs [first[i], first[i + 1]) take segment
 // i's rows into out[i] (n[i] rows per column). A verification launch may hold two formats
@@ -1360,11 +1367,16 @@ void linear_bf16(const Tensor& x, std::span<const GgmlSegment> segments, std::sp
 std::size_t ggml_linear_workspace_bytes(std::int32_t k, std::int32_t columns) {
     const auto align = [](std::size_t v) { return (v + 255) / 256 * 256; };
     const std::size_t t = static_cast<std::size_t>(std::min(columns, kEncodeColumns));
-    if (!wide_call(k, columns)) { return align(fast::encoded_column_words(k) * t * 4) + align(t * 4); }
-    // The exact route's encoded batch, or the BF16 route's slice sums (both with the planes).
+    if (!wide_call(k, columns)) {
+        // The exact route's encoded columns, or the GgmlA8 route's (a8_linear_workspace_bytes: always the smaller).
+        const std::size_t exact = align(fast::encoded_column_words(k) * t * 4) + align(t * 4);
+        return columns <= kA8MaxColumns ? std::max(exact, a8_linear_workspace_bytes(k, columns, true)) : exact;
+    }
+    // The exact route's encoded batch, or the BF16 route's slice sums (both with the planes), or the GgmlA8Wide
+    // route's encoded batch and planes (a8_wide_linear_workspace_bytes).
     const std::size_t exact = align(fast::encoded_column_words(k) * t * 4) + align(t * 4);
     const std::size_t bf16  = align(static_cast<std::size_t>(k / 32) * static_cast<std::size_t>(columns) * 4);
-    return std::max(exact, bf16) + kPlaneBytes;
+    return std::max(std::max(exact, bf16) + kPlaneBytes, a8_wide_linear_workspace_bytes(k, columns));
 }
 
 std::size_t ggml_row_bytes(QType format, std::int32_t k) {
@@ -1432,8 +1444,19 @@ void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, std::sp
     // Wide calls decode each segment's weights once into planes for the tiles; segments whose
     // planes exceed kPlaneBytes run in passes of row slabs, each re-encoding the columns.
     const bool wide = wide_call(k, columns);
+    // a8-activations at prefill widths: every wide call on 8-bit activations (ops/ggml/ggml_linear_a8.h), before
+    // the BF16 tiles where both flags are set.
+    if (wide && has_route(routes, LinearRoutes::GgmlA8Wide)) {
+        ggml_linear_a8_wide(x, segments, outs, input_perm, perm_block, workspace, stream);
+        return;
+    }
     if (wide && has_route(routes, LinearRoutes::GgmlBf16Wide)) {
         linear_bf16(x, segments, outs, input_perm, perm_block, workspace, stream);
+        return;
+    }
+    // a8-activations: every narrow call on 8-bit activations (ops/ggml/ggml_linear_a8.h).
+    if (columns <= kA8MaxColumns && has_route(routes, LinearRoutes::GgmlA8)) {
+        ggml_linear_a8(x, segments, outs, input_perm, perm_block, workspace, stream);
         return;
     }
     const int batch = std::min(columns, kEncodeColumns);
