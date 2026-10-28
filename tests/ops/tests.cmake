@@ -259,6 +259,9 @@ infernix_add_family_op_test(infernix_context_kv_materialize_test FAMILY attentio
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_context_kv_materialize.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/ring_footprint.cu"
   LIBRARIES infernix_ops)
+# A device read and synchronization per layer of every case: 14 s alone, past its 900 s timeout beside the suite's
+# GPU-heavy tests (2026-10-28, -j 8), whose kernels each synchronization waits behind.
+set_tests_properties(infernix_context_kv_materialize_test PROPERTIES RUN_SERIAL TRUE)
 
 add_test(NAME infernix_kv_cache_append_nvfp4_test
   COMMAND ${infernix_kv_cache_append_test_COMMAND} --nvfp4-only)
