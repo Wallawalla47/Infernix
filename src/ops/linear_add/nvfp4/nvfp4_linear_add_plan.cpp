@@ -28,9 +28,10 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
         return Nvfp4LinearAddRoute::A16;
     }
     if (allows_a4_residual(policy)) {
-        // Two-term K=17408: 37.5 us at 8-14 tokens, against A16's 37.7-38.0 at 8 and 44.4-51.8 at
-        // 9-14 (RTX 5090, cold weights): the residual's error buys time from 9.
-        return tokens >= 9 ? Nvfp4LinearAddRoute::A4Residual : Nvfp4LinearAddRoute::A16;
+        // From 5 tokens: in warm single-request DFlash2 verification rounds of 5-8 columns (RTX
+        // 5090, 2026-10-28) the two-term routes of the MLP saved 0.7-1.2 ms per round against A16,
+        // and greedy agreement with the lossless reference stayed at A16's (98.7 % against 98.4 %).
+        return tokens >= 5 ? Nvfp4LinearAddRoute::A4Residual : Nvfp4LinearAddRoute::A16;
     }
     if (!allows_a4(policy)) { throw std::invalid_argument("nvfp4 linear_add: unsupported policy"); }
     // With the three-stage A4 tile, K=6144 is ahead of A16 from 8 tokens too: 21.1 us against

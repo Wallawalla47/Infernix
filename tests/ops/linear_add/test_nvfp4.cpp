@@ -138,8 +138,10 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{1023, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
         Invocation{1025, ops::LinearPolicy::AllowA4},
-        // The A4 residual profile: A16 below 9 columns, then each residual tile and a ragged
+        // The A4 residual profile: A16 below 5 columns, then each residual tile and a ragged
         // last tile; 128 also replays under a CUDA Graph.
+        Invocation{4, ops::LinearPolicy::AllowA4Residual},
+        Invocation{5, ops::LinearPolicy::AllowA4Residual},
         Invocation{7, ops::LinearPolicy::AllowA4Residual},
         Invocation{8, ops::LinearPolicy::AllowA4Residual},
         Invocation{9, ops::LinearPolicy::AllowA4Residual},
@@ -255,7 +257,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         }
         failures += verify_reduction(label, actual, expected,
                                      a4 ? kA4Tolerance
-                                        : (a4_residual && invocation.tokens >= 9 ? kA4ResidualTolerance
+                                        : (a4_residual && invocation.tokens >= 5 ? kA4ResidualTolerance
                                                                                  : kA16Tolerance));
     }
 
