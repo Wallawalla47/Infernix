@@ -262,10 +262,12 @@ NInfer's 4.479 on the 1.04M-token corpus (16K context, INT8 KV; NInfer `81c8ce09
 
 ## Quick start (Windows)
 
-Prerequisites: Visual Studio 2026 (or 2022, MSVC 14.44), the CUDA 13 toolkit, and FFmpeg,
-libjpeg-turbo and curl from vcpkg (`x64-windows`, at `C:\vcpkg`; `vcpkg install
-libjpeg-turbo:x64-windows` adds libjpeg-turbo to an existing tree); adjust the paths at the top of
-`build_native.bat` (and its generator for VS 2022).
+Prerequisites: Visual Studio 2026 (or 2022, MSVC 14.44) with its C++ CMake tools (they bring Ninja),
+the CUDA 13 toolkit, and FFmpeg, libjpeg-turbo and curl from vcpkg (`x64-windows`, at `C:\vcpkg`;
+`vcpkg install libjpeg-turbo:x64-windows` adds libjpeg-turbo to an existing tree); adjust the paths at
+the top of `build_native.bat`. It builds with Ninja Multi-Config (about 30 % faster than the Visual
+Studio generator); a `build-windows` tree from the Visual Studio generator is configured afresh on its
+next build.
 
 ```bat
 build_native.bat configure

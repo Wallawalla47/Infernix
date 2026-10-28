@@ -13,9 +13,12 @@ set "VCPKG_TARGET_TRIPLET=x64-windows"
 set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
 set "SRC=%~dp0control\src"
 set "BLD=%~dp0control\build"
+REM Ninja Multi-Config, as build_native.bat (the same control\build\apps\Release layout); a tree configured with
+REM another generator is deleted at configure and built anew.
+if "%~1"=="configure" if exist "%BLD%\CMakeCache.txt" if not exist "%BLD%\build.ninja" rmdir /s /q "%BLD%"
 if "%~1"=="configure" (
-  cmake -S "%SRC%" -B "%BLD%" -G "Visual Studio 18 2026" -A x64 -T "cuda=%CUDA_PATH%" -DVCPKG_TARGET_TRIPLET=x64-windows -DCMAKE_PREFIX_PATH="C:\vcpkg\installed\x64-windows" -DCMAKE_CUDA_ARCHITECTURES=120a -DINFERNIX_BUILD_APPS=ON -DBUILD_TESTING=OFF -DINFERNIX_BUILD_BENCHMARKS=OFF
+  cmake -S "%SRC%" -B "%BLD%" -G "Ninja Multi-Config" -DCMAKE_CONFIGURATION_TYPES=Release -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe" -DVCPKG_TARGET_TRIPLET=x64-windows -DCMAKE_PREFIX_PATH="C:\vcpkg\installed\x64-windows" -DCMAKE_CUDA_ARCHITECTURES=120a -DINFERNIX_BUILD_APPS=ON -DBUILD_TESTING=OFF -DINFERNIX_BUILD_BENCHMARKS=OFF
 ) else (
-  cmake --build "%BLD%" --config Release --target infernix-serve --parallel
+  cmake --build "%BLD%" --config Release --target infernix-serve
 )
 exit /b %errorlevel%
