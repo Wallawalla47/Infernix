@@ -400,10 +400,18 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
     ahead of its quality gate; `--disable-fast-paths` or `--reproducible` turns it off.
 - `--spec mtp --draft-tokens auto --lm-head-draft` drafts with the model's MTP layer.
   - `auto`: each round drafts the number of tokens, 0 to 7, the request's recent acceptance makes
-    worthwhile (down to none on text it predicts poorly), and verifies them up to the first the
-    drafter gives below 0.5 probability (`--spec-min-p`).
-  - `--draft-tokens N` (1-7): every round drafts and verifies N tokens (fewer only near the output
-    limit), whatever the acceptance; `--spec-min-p` then defaults to 0.
+    worthwhile (down to none on text it predicts poorly). A one-request round of argmax drafts
+    (every greedy request; a sampled one unless `sampled-mtp-drafts` draws its drafts) verifies them
+    up to the first whose product of binned acceptance rates (the drafter's probabilities, binned)
+    falls below the request's threshold, 0.35 falling toward 0.25 as its drafts are accepted more
+    often than the table predicts: on Dense8 1.05x on conversational text and flat on structured
+    output against the earlier 0.5 probability cut. `--spec-min-p` does not apply here (startup
+    refuses it with `auto`).
+  - `--draft-tokens N` (1-7): every round drafts N tokens (fewer only near the output limit),
+    whatever the acceptance, and verifies every one unless `--spec-min-p P` cuts a one-request
+    round of argmax drafts at the first whose probability is below P. (The cumulative cut at MTP-3
+    measured 1.04x on conversational text but 0.99x on structured output, every pair worse, so a
+    fixed length keeps verifying its drafts.)
   - The drafter's 512 experts (1.34 GB), its workspace and the proposal head (178 MB) stay in
     VRAM, so the expert cache gets about 710 fewer frames.
   - Greedy output is the same as without it when one request runs at a time. For several lanes,

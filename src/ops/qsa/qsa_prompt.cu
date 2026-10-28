@@ -2,7 +2,6 @@
 
 #include "ops/qsa/qsa_prompt.h"
 
-#include "core/temporary_switches.h"
 
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
@@ -271,7 +270,7 @@ enum class Part { Both, Keys, Values };
 template <Part P>
 using PartTag = std::integral_constant<Part, P>;
 
-// `Split` (TEMPORARY, INFERNIX_TMP_QSA_PROMPT_V2; one stage, scalar storages): each warp gathers tile
+// `Split` (one stage, scalar storages; qsa_prompt_split chooses it by storage): each warp gathers tile
 // i + Warps's keys into its stage as soon as tile i's scores are taken and its values as soon as tile
 // i's P x V is done, so every gather overlaps the rest of a tile's arithmetic instead of waiting in
 // front of it; the first tile's gather is issued before the query rows. The arithmetic, the tile
@@ -1010,12 +1009,12 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
         }
         return count;
     }();
-    // TEMPORARY (INFERNIX_TMP_QSA_PROMPT_V2): the one-stage calls of the scalar storages may take the
-    // split stage, which gives the same bits.
+    // The one-stage calls of the scalar storages may take the split stage (qsa_prompt_split), which gives the
+    // same bits.
     constexpr bool two_ctas = 2 * (prompt_smem_bytes<Storage, 1>() + 1024) <= 100 * 1024;
     if (two_ctas && q.ne[2] * g.kv_heads >= sms) {
         if constexpr (two_ctas && PromptShape<Storage>::Vq == 0) {
-            if (qsa_prompt_v2()) {
+            if (qsa_prompt_split(Storage)) {
                 run.template operator()<1, true>();
             } else {
                 run.template operator()<1, false>();
@@ -1078,16 +1077,25 @@ void qsa_prompt_attention(const Tensor& q, const QsaKVLayer& layer, const QsaBat
 
 namespace {
 
-// INFERNIX_TMP_QSA_PROMPT_V2, read once: unset, empty or 0 is today's kernel, 1 the split stage.
-std::atomic<bool>& prompt_v2_state() {
-    static std::atomic<bool> state{temporary_switches::flag("INFERNIX_TMP_QSA_PROMPT_V2")};
+// qsa_prompt_force's variant: -1 by storage.
+std::atomic<int>& forced_variant() {
+    static std::atomic<int> state{-1};
     return state;
 }
 
 } // namespace
 
-bool qsa_prompt_v2() { return prompt_v2_state().load(std::memory_order_relaxed); }
+bool qsa_prompt_split(KvCacheStorage storage) {
+    const int forced = forced_variant().load(std::memory_order_relaxed);
+    if (forced >= 0) { return forced != 0; }
+    return storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Fp8E4M3Row256;
+}
 
-void qsa_prompt_set_v2(bool on) { prompt_v2_state().store(on, std::memory_order_relaxed); }
+void qsa_prompt_force(int variant) {
+    if (variant < -1 || variant > 1) { throw std::invalid_argument("qsa_prompt_force: -1, 0 or 1"); }
+    forced_variant().store(variant, std::memory_order_relaxed);
+}
+
+int qsa_prompt_forced() { return forced_variant().load(std::memory_order_relaxed); }
 
 } // namespace infernix::ops::detail

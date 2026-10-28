@@ -508,19 +508,7 @@ public:
         std::chrono::steady_clock::time_point start{};
         std::uint32_t batch   = 0; // 0: none yet
         std::uint32_t columns = 0;
-        bool drafted          = true; // a draft-free round's cycle (MtpDraftRegime) teaches no cost
     } mtp_confidence_round;
-    // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_SKIP_ROUNDS; ExecutionSchedule::mtp_draft_regime): whether
-    // each MTP round drafts, and the last round's start, batch size, regimes and committed tokens,
-    // which close its cycle for the regime's measurement.
-    std::optional<MtpDraftRegime> mtp_regime;
-    struct MtpRegimeRound {
-        std::chrono::steady_clock::time_point start{};
-        std::uint32_t batch = 0; // 0: none yet
-        bool previous       = true;
-        bool drafted        = true;
-        std::uint32_t tokens = 0;
-    } mtp_regime_round;
     // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_DRAFT_LOG): one line per MTP row that held drafts, and the
     // start-to-start cycle of the round before (0 for the first).
     std::unique_ptr<std::ofstream> mtp_draft_log;

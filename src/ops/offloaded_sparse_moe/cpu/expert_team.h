@@ -15,6 +15,14 @@
 //
 // The calling thread is worker 0 and starts computing at once. Idle workers spin for a bounded
 // time, then park on a futex (std::atomic::wait).
+//
+// GGUF rounds (both activation routes) run the same items without barriers between the phases: a
+// job's gate/up units wait for its own x encodes, the worker that completes a job's last unit encodes
+// that job's h, and its down items wait for that job alone, so a slow core's last item delays one job,
+// not the round. The items and their arithmetic are the phased round's, so the bits are too. Measured
+// 2026-10-28 (candidates §27 CX-01; RTX 5090 + i9-13900K, 16 workers): IQ3_S DFlash2 decode after 8K
+// +0.7..+0.85 %, team op 16x1 1035 -> 909 us (with the v2 rows); the NVFP4 rounds keep the phases,
+// where it measured -0.16..-0.50 % (Dense8 MTP-3 decode).
 
 #include "ops/offloaded_sparse_moe/cpu/a4r_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/ggml_expert.h"
@@ -75,9 +83,6 @@ public:
         // Optional: the logical CPUs (a mask, bit i: CPU i) worker i may run on; 0 or a missing entry
         // leaves it unpinned (worker 0 is the caller, not pinned here).
         std::vector<std::uint64_t> cpus;
-        // TEMPORARY (INFERNIX_TMP_CPU_SHARED_X, which the callers read: this archive needs no core): encode each
-        // distinct x column once per round instead of once per job (A16, two-term A4 and NVFP4 8-bit rounds).
-        bool shared_x = false;
     };
 
     explicit CpuExpertTeam(Options options);
@@ -87,7 +92,7 @@ public:
 
     // Computes every job; returns when all outputs are written. Not reentrant. The calling thread
     // advances `heartbeat` after each item it completes, so a long round stays alive to the device
-    // while a hung worker (worker 0 then waits at a barrier) still stops it.
+    // while a hung worker (worker 0 then waits at a barrier or for a job's items) still stops it.
     void run(std::span<const CpuExpertJob> jobs, CpuExpertHeartbeat heartbeat = {});
 
     [[nodiscard]] int workers() const { return workers_; }
@@ -105,6 +110,12 @@ private:
     void work_a8(int w);
     void work_ggml(int w);
     void work_ggml_a8(int w);
+    // The GGUF rounds' driver: x items (x_per_job per job), then unit items (units_per_job), each job's
+    // h once its units are done (h_job, by the worker completing its last unit), then down items
+    // (down_per_job), with per-job waits instead of barriers. Every item callable takes the item index.
+    template <class XItem, class UnitItem, class HJob, class DownItem>
+    void flow(int w, int x_per_job, int units_per_job, int down_per_job, XItem&& x_item, UnitItem&& unit_item,
+              HJob&& h_job, DownItem&& down_item);
     void barrier();
     // Worker 0's beat after an item.
     void beat(int w) const {
@@ -133,14 +144,6 @@ private:
     // quantizes it; reset by run()).
     std::vector<CpuW4A8Slice> x8_, h8_;
     std::vector<std::atomic<int>> h8_units_;
-    // TEMPORARY (INFERNIX_TMP_CPU_SHARED_X), until its A/B: A16, two-term A4 and NVFP4 8-bit rounds encode each
-    // distinct x column once; x_owner_[job * kMaxColumns + col] is the first job column with the same x pointer
-    // (in a decode round one token's column feeds every routed expert the CPU serves).
-    bool shared_x_ = false;
-    std::vector<int> x_owner_;
-    std::vector<const std::uint16_t*> owner_keys_; // the round's x pointers (power-of-two table, null: free)
-    std::vector<int> owner_vals_, owner_used_;
-    int owner_count_ = 0;
     NarrowA16 narrow_a16_ = NarrowA16::kExact;
     std::vector<CpuLimbSlice> xg_, hg_; // ggml jobs: [job][col][kGgmlXSlices], [job][col][kGgmlHSlices]
     std::vector<CpuA8Slice> xa_, ha_;   // ggml jobs on the 8-bit route: the same shapes
@@ -148,6 +151,8 @@ private:
     bool ggml_ = false;
     std::span<const CpuExpertJob> jobs_;
     CpuExpertHeartbeat heartbeat_;
+    // GGUF rounds, per job: x items not yet done, units not yet done, and whether its h is ready (reset by run()).
+    std::vector<std::atomic<int>> x_left_, units_left_, h_ready_;
 
     alignas(64) std::atomic<std::uint64_t> epoch_{0};
     alignas(64) std::atomic<int> sleepers_{0};

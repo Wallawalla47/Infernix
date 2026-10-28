@@ -208,21 +208,6 @@ void LfruPolicy::admit_ranked(std::span<const std::uint32_t> protect, std::span<
     }
 }
 
-void LfruPolicy::admit(std::span<const std::uint32_t> keys, std::size_t budget, Step& out, const Admissible* admissible,
-                       const Admissible* evictable) {
-    out.hits.clear();
-    out.misses.clear();
-    out.admitted.clear();
-    out.victims.clear();
-    if (budget == 0) { return; }
-    candidates_.clear();
-    for (std::uint32_t k : keys) {
-        if (!resident(k) && (admissible == nullptr || (*admissible)(k))) { candidates_.push_back(k); }
-    }
-    if (candidates_.empty()) { return; }
-    admit_ranked(keys, candidates_, budget, evictable, out);
-}
-
 void LfruPolicy::credit(std::span<const std::uint32_t> keys, std::span<const double> amounts) {
     if (keys.size() != amounts.size()) { throw std::invalid_argument("LFRU credit: key and amount counts differ"); }
     for (std::size_t i = 0; i < keys.size(); ++i) {
@@ -542,25 +527,6 @@ void CacheController::on_route(std::span<const std::uint32_t> group, std::uint64
         }
     }
     drain_queue(out);
-}
-
-std::size_t CacheController::admit_credited(std::span<const std::uint32_t> keys, std::size_t budget,
-                                            std::uint64_t round_started, std::vector<Command>& out,
-                                            const LfruPolicy::Admissible* admissible,
-                                            const LfruPolicy::Admissible* evictable) {
-    policy_.admit(keys, budget, step_, admissible, evictable);
-    for (std::uint32_t v : step_.victims) {
-        if (table_[v].state == ResidencyState::kAbsent) { continue; } // was still queued
-        frames_.retire(make_absent(v, out), round_started);
-    }
-    for (std::uint32_t k : step_.admitted) {
-        if (!is_queued_[k]) {
-            queued_.push_back(k);
-            is_queued_[k] = 1;
-        }
-    }
-    drain_queue(out);
-    return step_.admitted.size();
 }
 
 void CacheController::release_held(std::uint32_t frame, std::vector<Command>& out) {

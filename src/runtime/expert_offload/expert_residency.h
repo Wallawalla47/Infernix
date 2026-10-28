@@ -244,13 +244,10 @@ public:
     void after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget,
                      std::span<const std::uint8_t> live = {}, std::span<const std::int32_t> lanes = {});
     // At a prompt's end (design §19.3.27): every key with uses[key] > 0 (the prompt's tokens that
-    // routed to it, [layers][experts]) gains `scale * uses[key]` of LFRU count, used now. With no
-    // budget nothing is copied: the credit ranks the decode's admissions and evictions. A positive
-    // `per_layer_budget` (INFERNIX_TMP_PROMPT_SEED, a temporary A/B) also loads up to that many of each
-    // layer's credited misses that outrank its pool's lowest resident, as a round boundary would (call
-    // between rounds, with the compute stream quiescent).
-    void seed_prompt(std::span<const std::uint32_t> uses, double scale, std::size_t per_layer_budget = 0,
-                     cudaStream_t compute = nullptr);
+    // routed to it, [layers][experts]) gains `scale * uses[key]` of LFRU count, used now. Nothing is
+    // copied: the credit ranks the decode's admissions and evictions. Loading the best credited misses at
+    // once lost (Dense8 MTP-3 0.993x-0.942x, IQ3_S 0.985x; removed 2026-10-28).
+    void seed_prompt(std::span<const std::uint32_t> uses, double scale);
 
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
     [[nodiscard]] bool frozen() const noexcept { return frozen_; }

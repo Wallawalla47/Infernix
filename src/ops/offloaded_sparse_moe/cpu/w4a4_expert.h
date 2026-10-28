@@ -122,8 +122,9 @@ enum class ExpertActivation : std::uint8_t { kA4, kA16 };
 // row to two NVFP4 terms (the row's NVFP4 and the NVFP4 of its remainder, one FP32 row scale) and runs
 // them on the FP4 Tensor Cores, so its outputs depend on that rounding and on the tensor core's FP32
 // order, not only on the weights; kA4Residual3, the same with three terms (the third encodes what two
-// left: more precise, slower); kGgmlBf16 (GGUF banks, the ggml-bf16-prefill fast path), BF16 tiles over
-// each expert's decoded planes with x and h as stored and FP32 sums (ops/ggml/ggml_bf16_tile.cuh).
+// left: more precise, slower); kGgmlBf16 (GGUF banks, the ggml-bf16-prefill fast path), in calls of at least
+// wide::kGgmlStageDecodeMinColumns columns BF16 tiles that decode each expert's codes per K stage, with x and h
+// as stored and FP32 sums (ops/ggml/ggml_bf16_tile.cuh compute_decode); narrower calls keep the exact tiles.
 // Every other bank ignores the value it does not name. kLossless (every bank, A4 banks too, GPU only)
 // is the --lossless route (docs/maintainer/lossless-route.md): x as stored times each weight's exact
 // value (an NVFP4 bank's multipliers in ExpertScales::alpha_*), every projection's exact sum correctly

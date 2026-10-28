@@ -169,9 +169,9 @@ enum class FastPath : std::uint8_t {
     // batched-a8-decode takes precedence. Without either they stay at 16 bits.
     BatchedA8ResidualDecode,
     // With batched-decode, wide decode and verify rounds take the artifact's one-term 8-bit
-    // activations in a subset of the FP8 projections only: rounds of at least a minimum width, the
-    // chosen projection classes, the chosen layers (temporary_switches::A8Subset, default rounds of
-    // 65+ columns, the input projections and gate/up of every layer). The others keep their route
+    // activations in a subset of the FP8 projections only: rounds of 65+ columns, the attention and
+    // GDN input projections and the dense MLP gate/up of every layer (qwen3_5 kA8SubsetMinColumns,
+    // execution::precision_decode_text). The others keep their route
     // (the A8 residual profile where batched-a8-residual-decode is selected, else 16 bits).
     // batched-a8-decode takes precedence. The narrower rung of batched-a8-decode, which failed its
     // decode gate (docs/maintainer/model-quality.md, 6.7).
@@ -235,7 +235,8 @@ enum class FastPath : std::uint8_t {
     // Qwen3.8-Flash-Next GGUF imports: dense projections of prefill calls of 32 or more columns run on
     // BF16 tensor cores (each code exact in BF16, x as stored, FP32 sums of each sub-block scaled by
     // d * sub; ops::LinearRoutes::GgmlBf16Wide) instead of the exact A16 integer tiles, and the GGUF
-    // expert banks' MoE calls of 14,336 or more columns run the same tiles over decoded expert planes.
+    // expert banks' MoE calls of 4,096 or more columns the same arithmetic, each K stage of an expert's
+    // codes decoded into shared memory (offloaded_moe::wide::kGgmlStageDecodeMinColumns).
     // A prompt's arithmetic then depends on where its calls start and how the layer walk groups them
     // (a narrower tail call stays exact), which prefix-cache resumes share between requests. Without
     // it every GGUF projection and expert is exact.
@@ -432,7 +433,7 @@ struct SpeculativeOptions {
     std::uint32_t draft_tokens = 0;
     // MTP (--draft-tokens auto): each round chooses its draft length, 0..draft_tokens, from the
     // request's learned acceptance; Qwen3.8-Flash-Next's one-row rounds also verify only the drafts
-    // above draft_min_p (default 0.5). DFlash and DFlash2: each all-neural round proposes the whole
+    // before their cumulative acceptance cut. DFlash and DFlash2: each all-neural round proposes the whole
     // block of draft_tokens and verifies as many as the drafts' calibrated probabilities make
     // fastest. On Qwen3.5/3.6 these are the adaptive-mtp and adaptive-dflash fast paths; where
     // they do not run, startup makes it the configuration's fastest fixed length (Engine::options()
@@ -458,9 +459,10 @@ struct SpeculativeOptions {
     // fixed (every round would verify the n-gram window). Engine::options() then reports false and
     // the resolved values.
     bool ngram_draft_tokens_auto = false;
-    // Qwen3.8-Flash-Next MTP (--spec-min-p): a one-row round verifies its drafts up to the first
-    // whose draft-head probability is below this value; 0 verifies every draft. In [0, 1]; unset
-    // is the measured 0.5 with draft_tokens_auto and 0 with a fixed draft length. Other models
+    // --spec-min-p (MTP, Qwen3.8-Flash-Next DFlash2): a one-row round verifies its drafts up to the
+    // first whose drafter probability is below this value; 0 verifies every draft. In [0, 1]; unset
+    // is 0. Qwen3.8-Flash-Next MTP takes it with a fixed draft length only (with draft_tokens_auto its
+    // argmax chains stop at a cumulative acceptance cut, and startup refuses it); other backends
     // refuse it.
     std::optional<float> draft_min_p;
     // DFlash2, DFlash or MTP tree verification by batch size: entry c-1 is the column count (anchor
@@ -1722,8 +1724,6 @@ struct SpeculativeStats {
     std::uint64_t ngram_archive_rounds          = 0;
     std::uint64_t ngram_archive_drafted_tokens  = 0;
     std::uint64_t ngram_archive_accepted_tokens = 0;
-    // Qwen3.8-Flash-Next with INFERNIX_TMP_NGRAM_AGREE: copy proposals the agreement gate refused.
-    std::uint64_t ngram_gate_rejections = 0;
     // Tree-verified rounds, those whose accepted path left the main chain, and the drafts those
     // paths accepted after leaving it (what the main chain alone would not have accepted).
     std::uint64_t tree_rounds               = 0;

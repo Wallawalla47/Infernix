@@ -366,8 +366,8 @@ void check_isa(moe::CpuIsa isa, const moe::ExpertShape& shape, const Expert& e, 
 }
 
 // The worker team's 8-bit NVFP4 rounds (CpuExpertTeam::work_a8) against expert_forward_a8: three jobs of one, two
-// and three columns of distinct experts at 1, 3 and 16 workers, the jobs' columns shared (the same x pointers) so
-// INFERNIX_TMP_CPU_SHARED_X's owners are exercised too.
+// and three columns of distinct experts at 1, 3 and 16 workers, the jobs' columns shared (the same x pointers, as
+// in a decode round).
 void check_team(const moe::ExpertShape& shape, std::mt19937& rng) {
     const int H = shape.hidden;
     constexpr int kJobs = 3, kJobCols = 3;
@@ -400,20 +400,17 @@ void check_team(const moe::ExpertShape& shape, std::mt19937& rng) {
             job.y[c] = got.data() + y_index(j, c);
         }
     }
-    for (const bool shared_x : {false, true}) {
-        for (const int workers : {1, 3, 16}) {
-            moe::CpuExpertTeam team({.workers    = workers,
-                                     .max_jobs   = kJobs,
-                                     .activation = moe::ExpertActivation::kA16,
-                                     .nvfp4_a8   = true,
-                                     .shape      = shape,
-                                     .shared_x   = shared_x});
-            std::fill(got.begin(), got.end(), 0);
-            team.run(jobs);
-            if (got != want) {
-                fail("H " + std::to_string(H) + ": the worker team's 8-bit NVFP4 round at " + std::to_string(workers) +
-                     " workers" + (shared_x ? " (shared x)" : "") + " differs from expert_forward_a8");
-            }
+    for (const int workers : {1, 3, 16}) {
+        moe::CpuExpertTeam team({.workers    = workers,
+                                 .max_jobs   = kJobs,
+                                 .activation = moe::ExpertActivation::kA16,
+                                 .nvfp4_a8   = true,
+                                 .shape      = shape});
+        std::fill(got.begin(), got.end(), 0);
+        team.run(jobs);
+        if (got != want) {
+            fail("H " + std::to_string(H) + ": the worker team's 8-bit NVFP4 round at " + std::to_string(workers) +
+                 " workers differs from expert_forward_a8");
         }
     }
     // A team without the route has no buffers for it: such a job is refused, not computed on the A16 route.

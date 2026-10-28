@@ -198,22 +198,14 @@ struct ResidualTerms {
 };
 [[nodiscard]] ResidualTerms residual_terms(WideA16 route);
 
-// GGUF banks' kGgmlBf16 route (ggml_expert.cuh): every wide job's records decoded into planes
-// (ggml_tile.cuh CodeStage images: kGgmlCodeStageBytes per 64 rows x 64 elements), its gate and up
-// rows (2 kIntermediate x kHidden) then its down rows (kHidden x kIntermediate), kGgmlBf16Experts
-// jobs at a time. Calls of fewer than kGgmlBf16MinColumns columns carve no planes and keep the exact
-// tiles: below it the BF16 route measured no faster, its planes a per-expert cost (RTX 5090, IQ3_S banks:
-// 8,192 columns 0 to +7 %, 12,288 columns -10 to +3 %, 14,336 columns 7-9 % faster, 32,768 columns
-// 15-18 % faster; the walk's MoE groups reach it from 14,336-token prompts).
-inline constexpr int kGgmlBf16Experts         = 32;
-inline constexpr int kGgmlBf16MinColumns      = 14336;
-static_assert(MoeGgmlTiles{}.plane_min_columns == kGgmlBf16MinColumns, "MoeGgmlTiles' default is the measured threshold");
-inline constexpr std::size_t kGgmlCodeStageBytes = 6144;
-inline constexpr std::size_t kGgmlBf16GateUpImages = static_cast<std::size_t>(2 * kIntermediate / 64) * (kHidden / 64);
-inline constexpr std::size_t kGgmlBf16DownImages   = static_cast<std::size_t>(kHidden / 64) * (kIntermediate / 64);
-inline constexpr std::size_t kGgmlBf16ExpertBytes =
-    (kGgmlBf16GateUpImages + kGgmlBf16DownImages) * kGgmlCodeStageBytes;
-inline constexpr std::size_t kGgmlBf16PlaneBytes = kGgmlBf16Experts * kGgmlBf16ExpertBytes;
+// GGUF banks' kGgmlBf16 route (ggml_expert.cuh): calls of at least kGgmlStageDecodeMinColumns columns
+// run their wide jobs on the BF16 stage-decode tiles (each K stage's GGUF codes decoded into shared
+// memory; no workspace of their own), narrower calls on the exact tiles. RTX 5090, IQ3_S prefill
+// against the exact tiles below 14,336 columns and the decoded BF16 planes (removed 2026-10-28) from
+// there: pp512 +5.6 %, pp2048 +4.8 %, pp4096 1.13x, pp8192 +11.6 %, pp12288 +26.7 %, pp16384 +14.6 %,
+// pp32768 and pp65536 +9.1 % (pp1024 +1.8 %, two of three pairs; design §19.3.29). Narrower calls were
+// not timed.
+inline constexpr int kGgmlStageDecodeMinColumns = 512;
 
 // The layout of moe_experts' workspace, the single place that defines it. The bookkeeping comes
 // first, so its offsets depend only on max_jobs and entries; the activation planes follow.
@@ -237,8 +229,6 @@ struct ExpertsWorkspace {
     float* x_row_scale;           // [columns]
     std::uint8_t* h_terms_plane;  // [entries][h_terms_row_bytes(shape, h terms)]
     float* h_row_scale;           // [entries]
-    // GGUF banks, kGgmlBf16 in calls of kGgmlBf16MinColumns or more (else null): kGgmlBf16PlaneBytes
-    std::uint8_t* ggml_planes;
     // kLossless: lossless_experts_bytes(shape, max_jobs, entries) (moe_layer.cu's lossless_expert.cuh)
     std::uint8_t* lossless;
     // The narrow ring (ring_call; else null): x_acts [columns][shape.hidden / 16] and h_acts
@@ -287,6 +277,12 @@ inline constexpr std::size_t kCpuCallBytes = 2304; // 2 words + 512 indices, rou
                                                        std::int32_t entries, std::int32_t columns,
                                                        ExpertActivation activation, WideA16 wide_a16);
 
+// Calls of at least this many columns per expert on average (Call::mean_job_columns) run the W4A4 and
+// A4-residual grouped GEMMs on WarpTile64 schedules (the same bits), narrower ones on the 32-token warp
+// tiles. FP4-Local prefill with every call on WarpTile64 measured 1.0001x at pp4096, 0.9985x at pp16384
+// (~320 columns per expert) and 1.0127x at pp32768 (~640); Ornith (~256 at pp8192) flat (2026-10-28).
+inline constexpr std::int32_t kWarpTile64MinColumns = 512;
+
 // Device and host state of one moe_experts call's wide route; a plain value, valid until the call's
 // workspace is released. `descriptors` points to the call's staged TMA descriptors (W4A4 only).
 struct Call {
@@ -300,7 +296,7 @@ struct Call {
     std::uint16_t* outputs                    = nullptr; // BF16 [H, entries]
     const void* descriptors                   = nullptr;
     std::int32_t passes                       = 0;
-    std::int32_t mean_job_columns             = 0; // entries / max_jobs (INFERNIX_TMP_WIDE_EXPERT_T64's rule)
+    std::int32_t mean_job_columns             = 0; // entries / max_jobs (kWarpTile64MinColumns' rule)
     bool a16                                  = false;
     // W4A16 (wide_expert_a16.cuh)
     const std::uint8_t* x_limbs = nullptr; // [T][kA16XRowBytes]

@@ -106,7 +106,7 @@ infernix_add_family_op_test(infernix_offloaded_moe_qwen3_5_122b_test FAMILY offl
   LIBRARIES infernix_ops)
 # The expert-a4-residual fast paths (two and three NVFP4 terms) at that geometry, 24 to 16,384 columns:
 # gate/up, down and end to end against the FP64 expert oracle, narrow entries against the exact host
-# expert bit for bit, repeat and staging determinism.
+# expert bit for bit, repeat and staging determinism; 4,096 columns and more on the 64-token warp tiles.
 infernix_add_family_op_test(infernix_offloaded_moe_a4_residual_122b_test FAMILY offloaded_moe
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_a4_residual_122b.cu"
   LIBRARIES infernix_ops)
@@ -198,26 +198,6 @@ foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
   set_tests_properties(infernix_softmax_attention_${kv_dtype}_test PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
 
-# TEMPORARY with INFERNIX_TMP_VERIFY_ROWS_ATTENTION: the column-invariant rounds as rows of one launch,
-# each column checked bit for bit against its one-column call.
-# TEMPORARY with INFERNIX_TMP_INT8_PIPELINED16: INT8 attention with the 16/2 geometry's two- to
-# four-column rows on the pipelined kernel, against the same oracle. The switch reaches no other
-# call, so the entry runs only the INT8 suite's cases of that geometry and width (every other case's
-# bits are the int8 entry's).
-add_test(NAME infernix_softmax_attention_int8_pipelined16_test
-  COMMAND ${infernix_softmax_attention_test_COMMAND} --kv-dtype int8 --geometry d256-h16-kv2 --columns 2-4)
-set_tests_properties(infernix_softmax_attention_int8_pipelined16_test
-  PROPERTIES ENVIRONMENT "INFERNIX_TMP_INT8_PIPELINED16=1" SKIP_RETURN_CODE 77
-  RESOURCE_LOCK infernix_attention_oracle)
-
-foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
-  add_test(NAME infernix_softmax_attention_${kv_dtype}_verify_rows_test
-    COMMAND ${infernix_softmax_attention_test_COMMAND} --kv-dtype ${kv_dtype} --column-invariant-only)
-  set_tests_properties(infernix_softmax_attention_${kv_dtype}_verify_rows_test
-    PROPERTIES ENVIRONMENT "INFERNIX_TMP_VERIFY_ROWS_ATTENTION=1" SKIP_RETURN_CODE 77
-    RESOURCE_LOCK infernix_attention_oracle)
-endforeach()
-
 # Beyond the native 262,144 visible keys that --rope-yarn-factor opens (up to 1,048,576).
 add_test(NAME infernix_softmax_attention_extended_test
   COMMAND ${infernix_softmax_attention_test_COMMAND} --extended)
@@ -234,18 +214,6 @@ infernix_add_family_op_test(infernix_kv_cache_append_test FAMILY attention
 infernix_add_family_op_test(infernix_kv_cache_vq_test FAMILY attention
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_cache_vq.cu"
   LIBRARIES infernix_ops)
-# TEMPORARY with INFERNIX_TMP_VQ_APPEND_V2: the split encoder and the FP32-table block kernel against
-# the same exact host encoders, by rows and with every call forced to 1, 2 and 8 pattern ranges.
-foreach(variant IN ITEMS auto 1 2 8)
-  if(variant STREQUAL "auto")
-    set(vq_append_env "INFERNIX_TMP_VQ_APPEND_V2=1")
-  else()
-    set(vq_append_env "INFERNIX_TMP_VQ_APPEND_V2=1;INFERNIX_TMP_VQ_APPEND_SPLIT=${variant}")
-  endif()
-  add_test(NAME infernix_kv_cache_vq_v2_${variant}_test COMMAND ${infernix_kv_cache_vq_test_COMMAND})
-  set_tests_properties(infernix_kv_cache_vq_v2_${variant}_test
-    PROPERTIES ENVIRONMENT "${vq_append_env}" SKIP_RETURN_CODE 77)
-endforeach()
 
 infernix_add_family_op_test(infernix_vq_attention_test FAMILY attention
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vq_attention.cu"
@@ -377,27 +345,13 @@ endforeach()
 set_tests_properties(${infernix_attention_oracle_tests} PROPERTIES RESOURCE_LOCK infernix_attention_oracle)
 # Their turns are the run's critical path, so a tree without measured costs (CTestCostData.txt, which
 # replaces COST once present) starts them first, with the longest single entry.
-set(infernix_attention_first ${infernix_attention_oracle_tests} infernix_softmax_attention_int8_pipelined16_test
-  infernix_lossless_ops_test)
-foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
-  list(APPEND infernix_attention_first infernix_softmax_attention_${kv_dtype}_verify_rows_test)
-endforeach()
+set(infernix_attention_first ${infernix_attention_oracle_tests} infernix_lossless_ops_test)
 set_tests_properties(${infernix_attention_first} PROPERTIES COST 1000)
 
 add_test(NAME infernix_sparse_moe_wide_test
   COMMAND ${infernix_sparse_moe_test_COMMAND} --wide-only)
 set_tests_properties(infernix_sparse_moe_wide_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
-
-# TEMPORARY with INFERNIX_TMP_Q56_FP32_SCALE: the Q5/Q6 prefill down (qx_down) under the switch
-# against the same oracle (tests/ops/linear/tests.cmake runs the dense kernels' arms).
-add_test(NAME infernix_sparse_moe_fp32_scale_test COMMAND ${infernix_sparse_moe_test_COMMAND})
-add_test(NAME infernix_sparse_moe_wide_fp32_scale_test COMMAND ${infernix_sparse_moe_test_COMMAND} --wide-only)
-set_tests_properties(infernix_sparse_moe_fp32_scale_test infernix_sparse_moe_wide_fp32_scale_test
-  PROPERTIES ENVIRONMENT "INFERNIX_TMP_Q56_FP32_SCALE=1" SKIP_RETURN_CODE 77 TIMEOUT 600)
-# The wide sweep runs alone like infernix_sparse_moe_wide_test; the rest beside other tests like
-# infernix_sparse_moe_test.
-set_tests_properties(infernix_sparse_moe_wide_fp32_scale_test PROPERTIES RUN_SERIAL TRUE)
 
 foreach(mode IN ITEMS ngram-only onehot-distribution mtp-onehot mtp-distribution ngram-negative-penalties wide-accept wide-distribution)
   string(REPLACE "-" "_" test_suffix "${mode}")
@@ -443,12 +397,6 @@ infernix_add_family_op_test(infernix_hyper_connection_test FAMILY projection
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection.cpp"
   LIBRARIES infernix_linear_test_support)
 set_tests_properties(infernix_hyper_connection_test PROPERTIES SKIP_RETURN_CODE 77)
-# TEMPORARY with INFERNIX_TMP_HC_DOWN_COLUMNS: calls of 2-8 columns on the column grid; the column
-# invariance checks then compare it with the 16-column call's per-stream loop, bit for bit.
-add_test(NAME infernix_hyper_connection_columns_test COMMAND ${infernix_hyper_connection_test_COMMAND})
-set_tests_properties(infernix_hyper_connection_columns_test
-  PROPERTIES ENVIRONMENT "INFERNIX_TMP_HC_DOWN_COLUMNS=1" SKIP_RETURN_CODE 77)
-
 # hyper_connection_stream_mean (DFlash2's target features) against the FP64 stream mean.
 infernix_add_family_op_test(infernix_hyper_connection_stream_mean_test FAMILY elementwise
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection_stream_mean.cpp"
@@ -530,11 +478,6 @@ infernix_add_family_op_test(infernix_offloaded_moe_layer_test FAMILY offloaded_m
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
   LIBRARIES infernix_ops
   ARGS --no-idle)
-# TEMPORARY with INFERNIX_TMP_NARROW_PAIRS: the W4A4 and two-term narrow kernels' column pairs against
-# the same CPU oracle (jobs of 2-5 columns in its several-columns-per-expert layers).
-add_test(NAME infernix_offloaded_moe_layer_pairs_test COMMAND ${infernix_offloaded_moe_layer_test_COMMAND} --no-idle)
-set_tests_properties(infernix_offloaded_moe_layer_pairs_test
-  PROPERTIES ENVIRONMENT "INFERNIX_TMP_NARROW_PAIRS=1" SKIP_RETURN_CODE 77)
 
 # The fused route's CPU plan at Qwen3.5-122B-A10B's and
 # Qwen3.8-Flash-Next's routing against a host oracle of the plan, byte for byte.
@@ -547,33 +490,11 @@ infernix_add_family_op_test(infernix_offloaded_moe_wide_test FAMILY offloaded_mo
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_wide.cu"
   LIBRARIES infernix_ops)
 set_tests_properties(infernix_offloaded_moe_wide_test PROPERTIES TIMEOUT 900)
-# TEMPORARY with INFERNIX_TMP_CPU_SHARED_X: CPU-served misses whose jobs share x columns (A16 and two-term
-# A4), every output compared with the GPU route's bits as without the switch.
-add_test(NAME infernix_offloaded_moe_layer_shared_x_test COMMAND ${infernix_offloaded_moe_layer_test_COMMAND} --no-idle)
-set_tests_properties(infernix_offloaded_moe_layer_shared_x_test
-  PROPERTIES ENVIRONMENT "INFERNIX_TMP_CPU_SHARED_X=1" SKIP_RETURN_CODE 77)
 # The layer test's idle-service checks, which bound a call's latency to 10 ms beyond the GPU's own:
 # beside other GPU tests the same call's time ranged 40-75 ms and the check failed five times
-# (2026-10-22), so they run alone, without and with each switch above; the rest of the layer test runs
-# beside other tests.
+# (2026-10-22), so they run alone; the rest of the layer test runs beside other tests.
 add_test(NAME infernix_offloaded_moe_layer_idle_test COMMAND ${infernix_offloaded_moe_layer_test_COMMAND} --idle-only)
-add_test(NAME infernix_offloaded_moe_layer_idle_pairs_test
-  COMMAND ${infernix_offloaded_moe_layer_test_COMMAND} --idle-only)
-add_test(NAME infernix_offloaded_moe_layer_idle_shared_x_test
-  COMMAND ${infernix_offloaded_moe_layer_test_COMMAND} --idle-only)
-set_tests_properties(infernix_offloaded_moe_layer_idle_test infernix_offloaded_moe_layer_idle_pairs_test
-  infernix_offloaded_moe_layer_idle_shared_x_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
-set_tests_properties(infernix_offloaded_moe_layer_idle_pairs_test PROPERTIES ENVIRONMENT "INFERNIX_TMP_NARROW_PAIRS=1")
-set_tests_properties(infernix_offloaded_moe_layer_idle_shared_x_test
-  PROPERTIES ENVIRONMENT "INFERNIX_TMP_CPU_SHARED_X=1")
-# TEMPORARY with INFERNIX_TMP_WIDE_EXPERT_T64: the layer's wide route and the A4-residual one on the 64-token
-# warp tiles (the probes compare both schedules bit for bit in every run).
-add_test(NAME infernix_offloaded_moe_wide_t64_test COMMAND ${infernix_offloaded_moe_wide_test_COMMAND})
-set_tests_properties(infernix_offloaded_moe_wide_t64_test
-  PROPERTIES ENVIRONMENT "INFERNIX_TMP_WIDE_EXPERT_T64=1" TIMEOUT 900 SKIP_RETURN_CODE 77)
-add_test(NAME infernix_offloaded_moe_a4_residual_122b_t64_test COMMAND ${infernix_offloaded_moe_a4_residual_122b_test_COMMAND})
-set_tests_properties(infernix_offloaded_moe_a4_residual_122b_t64_test
-  PROPERTIES ENVIRONMENT "INFERNIX_TMP_WIDE_EXPERT_T64=1" TIMEOUT 900 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+set_tests_properties(infernix_offloaded_moe_layer_idle_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
 # The family executables of every op test above (infernix_ops_<family>_test).
 infernix_finish_op_families()

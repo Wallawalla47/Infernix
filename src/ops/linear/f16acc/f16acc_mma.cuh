@@ -1,15 +1,14 @@
 #pragma once
 
-// f16-accumulate-prefill's GEMM (f16acc_plan.h): E4M3 or int8 weights x FP16-encoded activations on FP16
-// Tensor Cores with FP16 accumulation over 32-value K chunks and an FP32 carry.
+// f16-accumulate-prefill's GEMM (f16acc_plan.h): E4M3 weights x FP16-encoded activations on FP16 Tensor
+// Cores with FP16 accumulation over 32-value K chunks and an FP32 carry.
 //
 //   out[N,T] = row_scale[N] * inverse[T] * sum_chunks( g[N,chunk] * fp16_sum_k(code[N,k] * x16[k,T]) )
 //
-// g is 1 for row-scaled FP8 (fp8_e4m3fn_row_bf16 / _f32: the row's word scales in the epilogue), the
-// chunk's UE8M0 power of two for MXFP8 (fp8_e4m3fn_g32_e8m0 in g32_scale_rows16_v1: no row word), and the
-// group's FP16 scale for Q8 (q8_g32_fp16, row-major codes and scales: no row word; F16AccScales::Fp16,
-// cp.async producers only). An int8 code is an FP16 value too, so every weight enters the MMA exactly;
-// a Q8 chunk's partial sums are bounded by 32 * 128 * 2 = 8,192.
+// g is 1 for row-scaled FP8 (fp8_e4m3fn_row_bf16 / _f32: the row's word scales in the epilogue) and the
+// chunk's UE8M0 power of two for MXFP8 (fp8_e4m3fn_g32_e8m0 in g32_scale_rows16_v1: no row word). Q8
+// (Dense8's q8_g32_fp16) has no route: on these kernels with its FP16 group scales it measured 1.6-1.9 %
+// slower than its exact routes on Dense8 pp32K/64K prefill, removed 2026-10-28.
 //
 // The pipeline is the exact A16 route's (fp8_a16_ring_mma.cuh, mxfp8_a16_tma_mma.cuh): the same
 // schedules (Fp8A16RingMmaSchedule, with Mxfp8ProducerWarps or Mxfp8TmaProducer for the producer), the
@@ -51,19 +50,18 @@
 
 namespace infernix::ops::detail {
 
-// The weight's scales: a row word (row-scaled FP8, in the epilogue), a UE8M0 byte per 32-K group (MXFP8)
-// or an FP16 word per 32-K group (Q8, whose codes are int8).
-enum class F16AccScales : std::uint8_t { Row, Ue8m0, Fp16 };
+// The weight's scales: a row word (row-scaled FP8, in the epilogue) or a UE8M0 byte per 32-K group (MXFP8).
+enum class F16AccScales : std::uint8_t { Row, Ue8m0 };
 
 // The operands of one f16-accumulate projection: row_scales of word type Scale (Row), or the group
-// scales (Ue8m0 bytes, Fp16 words).
+// scales (Ue8m0 bytes).
 template <F16AccScales Scales, class Scale = __nv_bfloat16>
 struct F16AccOperands {
     const __half* x;       // the encoded activation [K, T]
     const float* inverses; // 2^-s_t per column
     const std::uint8_t* codes;
     const Scale* row_scales;           // Row only
-    const std::uint8_t* group_scales;  // Ue8m0 / Fp16 only
+    const std::uint8_t* group_scales;  // Ue8m0 only
     int rows, k, tokens;
 };
 
@@ -74,18 +72,8 @@ __device__ __forceinline__ unsigned fp8_e4m3x2_to_f16x2_bits(unsigned packed) {
     return result;
 }
 
-// Exact int8 pair widening into an FP16 pair: each byte biased to q + 128 becomes the mantissa of the FP16
-// 1024 + (q + 128) (0x64xx), less 1152.
-__device__ __forceinline__ unsigned s8x2_to_f16x2_bits(unsigned packed) {
-    const unsigned biased = __byte_perm(packed ^ 0x8080U, 0x64646464U, 0x4140U);
-    const __half2 value   = __hsub2(half2_from_bits(biased), __floats2half2_rn(1152.0F, 1152.0F));
-    return *reinterpret_cast<const unsigned*>(&value);
-}
-
 // Shared storage: the schedule's activation and weight stages, the MXFP8 group-scale stages, the
-// epilogue's output staging over them, then the barriers. Row-scaled FP8 has no scale stage, and Q8's
-// FP16 group scales are read by the consumers from global memory (f16acc_compute_stage): staged, they
-// would put the 98,304-byte three-stage T64 ring 48 bytes past the 99 KiB a CTA may use.
+// epilogue's output staging over them, then the barriers. Row-scaled FP8 has no scale stage.
 template <class Schedule, F16AccScales Scales>
 struct F16AccLayout {
     static constexpr int kScaleStageBytes =
@@ -106,12 +94,11 @@ struct F16AccLayout {
 // end, 2026-10-25). Lane (g, t) holds codes 4t .. 4t + 3 of row g of each tile's 16-byte k slice; the encoder
 // writes each 16-value activation block permuted (f16acc_encode.cu) so that the A fragment's slots
 // (2t, 2t + 1) and (2t + 8, 2t + 9) hold those values. Each k16 step sums the same 16 products.
-// scale_stage is the stage's MXFP8 scale bytes, or for Q8 the global FP16 group scales of the CTA's first
-// row at the stage's first group (rows of scale_stride words).
+// scale_stage is the stage's MXFP8 scale bytes.
 template <class Schedule, F16AccScales Scales>
 __device__ __forceinline__ void
 f16acc_compute_stage(const unsigned char* activation_stage, const std::uint8_t* weight_stage,
-                     const std::uint8_t* scale_stage, int scale_stride,
+                     const std::uint8_t* scale_stage,
                      float (&carry)[Schedule::kMmaTokens][Schedule::kMmaRows][4], int warp, int lane) {
     constexpr bool GroupScales = Scales != F16AccScales::Row;
     constexpr int kRowBytes = Schedule::kActivationRowBytes;
@@ -127,11 +114,6 @@ f16acc_compute_stage(const unsigned char* activation_stage, const std::uint8_t* 
     const int a_byte       = (a_matrix >> 1) * 16;
     // The accumulator's weight rows (C columns 2t and 2t + 1 of each n8 tile).
     const int c_row = 2 * (lane & 3);
-    // Q8: the chunk's FP16 group scales of rows c_row and c_row + 1 of each n8 tile, read-only loads issued
-    // at the chunk's first k16 step and used after its last (one half2 register per n8 tile: the T128 ring
-    // runs at its 96-register cap).
-    __half2 q8_scales[Schedule::kMmaRows];
-    const auto* q8_words = reinterpret_cast<const __half*>(scale_stage);
     unsigned partial[Schedule::kMmaTokens][Schedule::kMmaRows][2];
 #pragma unroll
     for (int k_step = 0; k_step < Schedule::kMmaK; ++k_step) {
@@ -166,27 +148,11 @@ f16acc_compute_stage(const unsigned char* activation_stage, const std::uint8_t* 
             }
 #pragma unroll
             for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
-                if constexpr (Scales == F16AccScales::Fp16) {
-                    b[mma_row][0] = s8x2_to_f16x2_bits(codes[mma_row]);
-                    b[mma_row][1] = s8x2_to_f16x2_bits(codes[mma_row] >> 16);
-                } else {
-                    b[mma_row][0] = fp8_e4m3x2_to_f16x2_bits(codes[mma_row]);
-                    b[mma_row][1] = fp8_e4m3x2_to_f16x2_bits(codes[mma_row] >> 16);
-                }
+                b[mma_row][0] = fp8_e4m3x2_to_f16x2_bits(codes[mma_row]);
+                b[mma_row][1] = fp8_e4m3x2_to_f16x2_bits(codes[mma_row] >> 16);
             }
         }
         const bool first = k_step % kChunkSteps == 0;
-        if constexpr (Scales == F16AccScales::Fp16) {
-            if (first) {
-                const int group = k_step / kChunkSteps;
-#pragma unroll
-                for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
-                    const int row         = warp_row * Schedule::kWarpRows + mma_row * 8 + c_row;
-                    const __half* words   = q8_words + static_cast<std::size_t>(row) * scale_stride + group;
-                    q8_scales[mma_row]    = __halves2half2(__ldg(words), __ldg(words + scale_stride));
-                }
-            }
-        }
 #pragma unroll
         for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
 #pragma unroll
@@ -214,8 +180,6 @@ f16acc_compute_stage(const unsigned char* activation_stage, const std::uint8_t* 
                 const unsigned two = *reinterpret_cast<const std::uint16_t*>(
                     scale_stage + (row >> 4) * kGroupsPerStage * 16 + group * 16 + (row & 15));
                 scale = make_float2(__uint_as_float((two & 0xFFU) << 23), __uint_as_float((two >> 8) << 23));
-            } else if constexpr (Scales == F16AccScales::Fp16) {
-                scale = __half22float2(q8_scales[mma_row]);
             }
 #pragma unroll
             for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
@@ -288,7 +252,6 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     using Layout       = F16AccLayout<Schedule, Scales>;
     constexpr bool kTma = kMxfp8TmaProducer<Schedule>;
     constexpr bool GroupScales = Scales != F16AccScales::Row;
-    static_assert(!(kTma && Scales == F16AccScales::Fp16), "Q8 group scales are staged by cp.async producers");
     constexpr int BT = Schedule::kBlockTokens, BR = Schedule::kBlockRows;
     constexpr int BK = Schedule::kBlockK, S = Schedule::kStages;
     const int k       = Schedule::kStaticK ? Schedule::kStaticK : operands.k;
@@ -407,14 +370,10 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     for (int kt = 0; kt < tiles_k; ++kt) {
         const int stage = kt % S;
         cta_mbarrier_wait(full + stage, (kt / S) & 1U);
-        const std::uint8_t* stage_scales =
-            Scales == F16AccScales::Fp16
-                ? operands.group_scales + (static_cast<std::size_t>(row_begin) * (k / 32) + kt * (BK / 32)) * 2
-                : reinterpret_cast<const std::uint8_t*>(scales + stage * Layout::kScaleStageStride);
         f16acc_compute_stage<Schedule, Scales>(
             activation + stage * Schedule::kActivationStageBytes,
-            reinterpret_cast<const std::uint8_t*>(weight + stage * Schedule::kWeightStageBytes), stage_scales, k / 32,
-            carry, warp, lane);
+            reinterpret_cast<const std::uint8_t*>(weight + stage * Schedule::kWeightStageBytes),
+            reinterpret_cast<const std::uint8_t*>(scales + stage * Layout::kScaleStageStride), carry, warp, lane);
         // Release only after every lane in this consumer warp has finished its shared reads; a TMA refill
         // is an async-proxy write, so each thread first orders its generic-proxy reads before it.
         if constexpr (kTma) { fence_reads_before_async_refill(); }
@@ -441,9 +400,8 @@ inline void validate_f16acc_operands(const F16AccOperands<Scales, Scale>& p) {
     const auto aligned = [](const void* v, int alignment) {
         return v && reinterpret_cast<std::uintptr_t>(v) % alignment == 0;
     };
-    const bool scales = Scales == F16AccScales::Row     ? aligned(p.row_scales, sizeof(Scale) == 4 ? 8 : 4)
-                        : Scales == F16AccScales::Ue8m0 ? aligned(p.group_scales, 16)
-                                                        : aligned(p.group_scales, Schedule::kBlockK / 16);
+    const bool scales = Scales == F16AccScales::Row ? aligned(p.row_scales, sizeof(Scale) == 4 ? 8 : 4)
+                                                    : aligned(p.group_scales, 16);
     if (p.rows <= 0 || p.k <= 0 || p.tokens <= 0 || p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK ||
         (Scales == F16AccScales::Ue8m0 && Schedule::kBlockRows % 16) || !aligned(p.x, 16) || !aligned(p.inverses, 4) ||
         !aligned(p.codes, 16) || !scales) {
@@ -457,9 +415,8 @@ inline void validate_f16acc_operands(const F16AccOperands<Scales, Scale>& p) {
 // MXFP8 (NVIDIA FP4-Local) calls of at least kF16AccRowFastTokens tokens take their schedule with the rows of
 // one token tile walked before the next (the weights stay in L2 and each FP16 token tile is read once) instead
 // of the tokens of one row tile: at 32,768 tokens the FP16 activation (168 MB at K = 2,560) exceeds L2 and every
-// row tile streamed it again from DRAM. FP4-Local pp32768 +3.8 % end to end, pp4096 neutral (2026-10-25). Q8
-// keeps its rasters (Dense8's problems 0.79-1.14x row-fast, flat end to end, 2026-10-24), as does row FP8
-// (unmeasured). The same bits: each output's sums do not depend on the order of the tiles.
+// row tile streamed it again from DRAM. FP4-Local pp32768 +3.8 % end to end, pp4096 neutral (2026-10-25). Row
+// FP8 keeps its rasters (unmeasured). The same bits: each output's sums do not depend on the order of the tiles.
 template <class Schedule>
 struct F16AccRowFast : Schedule {
     static constexpr Fp8MmaRaster kRaster = Fp8MmaRaster::RowFast;
@@ -481,7 +438,7 @@ constexpr int f16acc_launch_registers(int threads) {
 // sub-partition, so every thread was held to 96 registers and the consumers spilled 8-72 B (cuda_stack review,
 // 2026-10-24); a warpgroup at 32 registers releases 64 per thread to its sub-partition's 4 consumer warps: 112
 // each. The producers' cp.async copies spread over 128 threads; every consumer instruction and so every bit is
-// the base schedule's. Chosen per call by f16acc_split_registers.
+// the base schedule's. Chosen by kF16AccSplitRaster.
 template <class Base>
 struct F16AccSplitRegisters : Base {
     static_assert(Base::kProducerThreads == 32 && Base::kConsumerWarps % 4 == 0 && Base::kMinBlocksPerSm == 1);
@@ -508,22 +465,11 @@ inline constexpr bool kF16AccSplitEligible = [] {
 }();
 
 // The split schedule where it measured faster than the 17-warp one (ABBA, Flash-Next's dense shapes,
-// 2026-10-24, RTX 5090; split / unsplit time). Q8 (FP16 group scales): the default raster at every width
-// (0.91-0.97x at 4,096-32,768 columns); row-fast below 2^28 rows x tokens (0.94-0.97x; 1.01-1.02x from
-// 16,384 x 16,384). Row-scaled FP8: row-fast at every width (0.96-0.99x at 16,384 and 32,768); the default
-// raster keeps the 17-warp schedule (0.97-1.04x at 4,096, 0.99-1.01x at 16,384, 0.99-1.05x at 32,768: N 13,312
-// and 16,384 lose 4-5 %).
-template <class Schedule, F16AccScales Scales>
-inline constexpr bool kF16AccSplitRaster = Schedule::kRaster == Fp8MmaRaster::RowFast || Scales == F16AccScales::Fp16;
-
-template <class Schedule, F16AccScales Scales>
-bool f16acc_split_registers(std::int64_t rows, std::int64_t tokens) {
-    if constexpr (Schedule::kRaster == Fp8MmaRaster::RowFast && Scales == F16AccScales::Fp16) {
-        return rows * tokens < (std::int64_t{1} << 28);
-    } else {
-        return true;
-    }
-}
+// 2026-10-24, RTX 5090; split / unsplit time). Row-scaled FP8: row-fast at every width (0.96-0.99x at 16,384
+// and 32,768); the default raster keeps the 17-warp schedule (0.97-1.04x at 4,096, 0.99-1.01x at 16,384,
+// 0.99-1.05x at 32,768: N 13,312 and 16,384 lose 4-5 %).
+template <class Schedule>
+inline constexpr bool kF16AccSplitRaster = Schedule::kRaster == Fp8MmaRaster::RowFast;
 
 template <class Schedule, F16AccScales Scales, class Scale, class Output, class Epilogue>
 void launch_f16acc_mma(const F16AccOperands<Scales, Scale>& p, Output output, Epilogue epilogue,
@@ -536,11 +482,9 @@ void launch_f16acc_mma(const F16AccOperands<Scales, Scale>& p, Output output, Ep
             return;
         }
     }
-    if constexpr (kF16AccSplitEligible<Schedule> && kF16AccSplitRaster<Schedule, Scales>) {
-        if (f16acc_split_registers<Schedule, Scales>(p.rows, p.tokens)) {
-            launch_f16acc_mma<F16AccSplitRegisters<Schedule>>(p, output, epilogue, stream);
-            return;
-        }
+    if constexpr (kF16AccSplitEligible<Schedule> && kF16AccSplitRaster<Schedule>) {
+        launch_f16acc_mma<F16AccSplitRegisters<Schedule>>(p, output, epilogue, stream);
+        return;
     }
     validate_f16acc_operands<Schedule>(p);
     constexpr bool kTma = kMxfp8TmaProducer<Schedule>;
@@ -614,26 +558,6 @@ void mxfp8_f16acc(const Tensor& x, const Weight& w, Output output, F16Accumulate
                                                                            stream);
 }
 
-// Q8 (q8_g32_fp16: int8 codes [N, K] and FP16 group scales [N, K / 32], row-major, K a multiple of 128):
-// the FP16 group scale folds each chunk into the carry. Its schedules stage by cp.async.
-template <class Geometry, class Schedule, class Output>
-void q8_f16acc(const Tensor& x, const Weight& w, Output output, F16AccumulateWorkspace workspace, cudaStream_t stream) {
-    if (w.padded_shape[1] != w.k) { throw std::invalid_argument("q8 f16-accumulate: K must need no padding"); }
-    launch_f16_accumulate_encode(x, workspace, stream);
-    const F16AccOperands<F16AccScales::Fp16> p{workspace.x, workspace.inverses, static_cast<const std::uint8_t*>(w.qdata),
-                                               static_cast<const __nv_bfloat16*>(nullptr),
-                                               static_cast<const std::uint8_t*>(w.scales), w.n, w.k, x.ne[1]};
-    launch_f16acc_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(p, output, LinearIdentityEpilogue{},
-                                                                           stream);
-}
-
-template <class Geometry, class Schedule>
-void q8_linear_f16acc(const Tensor& x, const Weight& w, Tensor& out, F16AccumulateWorkspace workspace,
-                      cudaStream_t stream) {
-    q8_f16acc<Geometry, Schedule>(x, w, LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n}, workspace,
-                                  stream);
-}
-
 // The plain-linear forms ([N, T] output).
 template <class Geometry, class Schedule>
 void fp8_linear_f16acc(const Tensor& x, const Weight& w, Tensor& out, F16AccumulateWorkspace workspace,
@@ -651,10 +575,9 @@ void mxfp8_linear_f16acc(const Tensor& x, const Weight& w, Tensor& out, F16Accum
 
 // Every split-register launch the routes reach, each built once in f16acc_split_registers.cu (the non-RDC
 // archive: relocatable device code drops setmaxnreg) and declared here so that no including translation unit
-// instantiates it. X(schedule, scales, output) for the Q8 problems (q8_f16acc.cu: T128 past 3,072 tokens; plain,
-// GDN and QSA-group outputs) in the token-fast and row-fast rasters, and the row-scaled FP8 shapes (fp8/shapes:
-// T128 and T64 x 256 rows) in the row-fast one (kF16AccSplitRaster). A route that reaches another fails the RDC
-// static_assert in f16acc_mma_kernel.
+// instantiates it. X(schedule, scales, output) for the row-scaled FP8 shapes (fp8/shapes: T128 and T64 x 256
+// rows) in the row-fast raster (kF16AccSplitRaster). A route that reaches another fails the RDC static_assert in
+// f16acc_mma_kernel.
 using F16AccRingT128R128 = Fp8A16RingMmaSchedule<128, 128, 4, 4, 2, 1>;
 using F16AccRingT64R256  = Fp8A16RingMmaSchedule<64, 256, 2, 8, 2, 1>;
 using F16AccT128K2560    = Fp8ScheduleInstance<F16AccRingT128R128, 2560>;
@@ -662,18 +585,8 @@ using F16AccT128K6144    = Fp8ScheduleInstance<F16AccRingT128R128, 6144>;
 using F16AccT128K640     = Fp8ScheduleInstance<F16AccRingT128R128, 640>;
 using F16AccT64R256K2560 = Fp8ScheduleInstance<F16AccRingT64R256, 2560>;
 using F16AccT64R256K640  = Fp8ScheduleInstance<F16AccRingT64R256, 640>;
-using F16AccQ8GdnOutput  = LinearBf16SegmentedOutput<10240, 6144>;
-using F16AccQ8QsaOutput  = LinearBf16SegmentedOutput<6144, 6144, 512, 512, 512, 128>;
 
-#define INFERNIX_F16ACC_SPLIT_RASTERS(X, SCHEDULE, SCALES, OUTPUT) \
-    X(SCHEDULE, SCALES, OUTPUT)                                    \
-    X(F16AccRowFast<SCHEDULE>, SCALES, OUTPUT)
 #define INFERNIX_F16ACC_SPLIT_LAUNCHES(X)                                                           \
-    INFERNIX_F16ACC_SPLIT_RASTERS(X, F16AccT128K2560, F16AccScales::Fp16, LinearBf16Output)         \
-    INFERNIX_F16ACC_SPLIT_RASTERS(X, F16AccT128K2560, F16AccScales::Fp16, F16AccQ8GdnOutput)        \
-    INFERNIX_F16ACC_SPLIT_RASTERS(X, F16AccT128K2560, F16AccScales::Fp16, F16AccQ8QsaOutput)        \
-    INFERNIX_F16ACC_SPLIT_RASTERS(X, F16AccT128K6144, F16AccScales::Fp16, LinearBf16Output)         \
-    INFERNIX_F16ACC_SPLIT_RASTERS(X, F16AccT128K640, F16AccScales::Fp16, LinearBf16Output)          \
     X(F16AccRowFast<F16AccT128K2560>, F16AccScales::Row, LinearBf16Output)                          \
     X(F16AccRowFast<F16AccT128K6144>, F16AccScales::Row, LinearBf16Output)                          \
     X(F16AccRowFast<F16AccT128K640>, F16AccScales::Row, LinearBf16Output)                           \

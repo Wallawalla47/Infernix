@@ -471,7 +471,6 @@ int main() {
     outcome.speculative.tree_side_accepted_tokens = 11;
     outcome.speculative.ngram_archive_drafted_tokens  = 441;
     outcome.speculative.ngram_archive_accepted_tokens = 400;
-    outcome.speculative.ngram_gate_rejections         = 5;
     outcome.ngram_archive                             = {.enabled       = true,
                                                          .bound         = true,
                                                          .published     = true,
@@ -567,8 +566,6 @@ int main() {
     failures += check(done.at("speculative").at("tree_side_accepted_tokens") == 11 &&
                           done.at("speculative").at("tree_rounds") == 0,
                       "speculative tree counters missing");
-    failures += check(done.at("speculative").at("ngram_gate_rejections") == 5,
-                      "n-gram agreement gate counter missing");
     failures += check(done.at("speculative").at("ngram_archive_accepted_tokens") == 400 &&
                           done.at("speculative").at("ngram_archive").at("generation") == 3 &&
                           done.at("speculative").at("ngram_archive").at("bound") == true &&

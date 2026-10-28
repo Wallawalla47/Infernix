@@ -20,7 +20,6 @@ add_library(infernix_core STATIC
   host_memory.cpp
   host_worker_pool.cpp
   link_probe.cu
-  machine_calibration.cpp
   power_throttling.cpp
   temporary_switches.cpp
   vram_budget.cpp

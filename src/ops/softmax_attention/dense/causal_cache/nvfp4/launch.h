@@ -18,7 +18,7 @@ void nvfp4_kv_cached_attention(const Tensor& q, const Tensor& positions, float s
                                Tensor& out, DeviceExecutionView execution);
 
 // Rows of one-column calls whose keys are already appended (the column-invariant verification
-// round's rows variant, INFERNIX_TMP_VERIFY_ROWS_ATTENTION): q [256, heads, 1, rows], positions,
+// round's rows variant): q [256, heads, 1, rows], positions,
 // valid and rows hold one entry per row (valid and rows may be empty). Each row's key partition is
 // the one a one-column call of `call_batch` rows plans, so every row computes what that call
 // computes for it.

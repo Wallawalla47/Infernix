@@ -307,6 +307,17 @@ constexpr std::array kQualified{
     Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::Vq2}},
     Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    // expert-a4-residual on the Qwen3.5-122B-A10B (32 heads, 8-bit FP8 activations, offloaded NVFP4 W4A16 experts)
+    // by the owner's rule of 2026-10-25 (a path measured faster goes on before its gate): Ornith-1.5-122B MTP
+    // decode +2.0 % (ABBA, RTX 5090, 2026-10-28, 4 of 4 pairs, worst +1.69 %). Only the experts' wide calls change,
+    // so every KV format.
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::BFloat16, false, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, false, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, false, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, false, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, false, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Vq2, false, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, false, true}},
 };
 
 const char* kv_name(KvCacheStorage kv) {
@@ -428,8 +439,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     // The W4A8 gate/up kernel runs only on groupwise Q4 weights (the text MLP's linear_swiglu).
     case FastPath::Q4W4A8: return configuration.q4_gate_up;
     // The offloaded experts' wide calls (Qwen3.5-122B-A10B: every offloaded bank is NVFP4 W4A16, its
-    // shared expert one more job of the call). Not qualified for any Qwen3.5 configuration: it runs
-    // only as a --fast-path candidate.
+    // shared expert one more job of the call). Two terms are registered on the 122B (kQualified); three
+    // run only as a --fast-path candidate.
     case FastPath::ExpertA4Residual:
     case FastPath::ExpertA4Residual3: return configuration.offloaded_experts;
     // The narrow form is Flash-Next's geometry only (its CPU engine and narrow A4 kernels).

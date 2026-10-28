@@ -42,7 +42,7 @@ struct OffloadGeometry {
     // A full-width prefill pass's workspace (WorkspacePlan::text_prefill_wide, mtp_prefill_wide): what
     // the cache lends a pass wider than kOffloadedMoeStaticColumns; 0 without lent passes.
     std::uint64_t wide_pass_bytes = 0;
-    // WorkspacePlan::prefill_wide_ladder: the pass workspace by width (INFERNIX_TMP_PROMPT_SIZED_LOAN).
+    // WorkspacePlan::prefill_wide_ladder: the pass workspace by width, from which a pass borrows what it needs.
     std::vector<std::pair<std::int32_t, std::size_t>> wide_pass_ladder;
     // The experts' wide route (ExecutionSchedule::expert_wide; OffloadedExperts::wide_a16), which the
     // workspace plan sized.
@@ -175,7 +175,7 @@ private:
 
     const execution::Parameters& parameters_;
     std::uint64_t wide_pass_bytes_ = 0; // OffloadGeometry::wide_pass_bytes
-    std::vector<std::pair<std::int32_t, std::size_t>> wide_ladder_; // with INFERNIX_TMP_PROMPT_SIZED_LOAN: OffloadGeometry::wide_pass_ladder
+    std::vector<std::pair<std::int32_t, std::size_t>> wide_ladder_; // OffloadGeometry::wide_pass_ladder
     ops::offloaded_moe::WideA16 expert_wide_ = ops::offloaded_moe::WideA16::kExact; // OffloadGeometry::expert_wide
     ops::offloaded_moe::NarrowA16 expert_narrow_ = ops::offloaded_moe::NarrowA16::kExact; // OffloadGeometry::expert_narrow
     bool router_mma_                         = false;                                // OffloadGeometry::router_mma

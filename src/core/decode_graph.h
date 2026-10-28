@@ -16,16 +16,10 @@ void launch_graph_gate(const float* value, double threshold, cudaGraphConditiona
 // step + 1 < *limit, so a chain gated after each step j runs steps 0..*limit-1 at most.
 void launch_graph_gate(const float* value, double threshold, const std::int32_t* limit, std::int32_t step,
                        cudaGraphConditionalHandle handle, cudaStream_t stream);
-// A gate over `rows` rows before the step that computes draft `draft`: `handle` is 1 when some row
-// has draft < limits[row] and, unless `values` is null, values[row] (its previous draft's
-// probability) widened to binary64 is not below *threshold (a device word; NaN passes).
-void launch_graph_gate_rows(const float* values, const double* threshold, const std::int32_t* limits,
-                            std::int32_t rows, std::int32_t draft, cudaGraphConditionalHandle handle,
-                            cudaStream_t stream);
 
-// A binned-product gate (TEMPORARY with INFERNIX_TMP_MTP_CUMULATIVE, candidates §7 D8): each value
-// maps to the rate of the first bin whose edge it is below (edges ascending; at or past the last edge,
-// or NaN, the last rate), and a chain's steps 0..step multiply their rates in step order.
+// A binned-product gate (Flash-Next MTP's cumulative cut, candidates §7 D8): each value maps to the
+// rate of the first bin whose edge it is below (edges ascending; at or past the last edge, or NaN,
+// the last rate), and a chain's steps 0..step multiply their rates in step order.
 // graph_gate_product is that product on host and device alike (the same comparisons and binary32
 // multiplications in the same order), so a host cut and a device gate agree on every chain.
 struct GraphGateBins {

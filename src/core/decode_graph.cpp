@@ -2,7 +2,6 @@
 
 #include "core/device.h"
 #include "core/nvtx.h"
-#include "core/temporary_switches.h"
 
 #include <cstddef>
 #include <cstdio>
@@ -191,11 +190,9 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
     reset();
 
     cudaGraphExec_t exec = nullptr;
-    // TEMPORARY (INFERNIX_TMP_STREAM_PRIORITY, candidates §11 D5): kernels captured from a stream of
-    // greater priority (Flash-Next's staging and shared-expert streams) keep it inside the graph.
-    static const bool node_priority = temporary_switches::flag("INFERNIX_TMP_STREAM_PRIORITY");
-    const cudaError_t err =
-        cudaGraphInstantiate(&exec, definition.graph_, node_priority ? cudaGraphInstantiateFlagUseNodePriority : 0);
+    // No node priorities: prioritized staging and shared-expert streams kept inside the graph (candidates
+    // §11 D5) measured 0.999x (removed 2026-10-28).
+    const cudaError_t err = cudaGraphInstantiate(&exec, definition.graph_, 0);
     if (err != cudaSuccess) {
         destroy_graph_exec(exec);
         if (err == cudaErrorMemoryAllocation) {

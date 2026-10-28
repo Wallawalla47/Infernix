@@ -13,7 +13,6 @@
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_dispatch.h"
-#include "ops/linear/q8/q8_f16acc.h"
 #include "ops/linear/qsa_group.h"
 
 #include <cstdint>
@@ -100,7 +99,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q6_dispatch(x, w, out, policy, stream);
         return;
     case QType::Q8_G32_FP16:
-        detail::q8_dispatch(x, w, out, policy, routes, workspace, stream);
+        detail::q8_dispatch(x, w, out, policy, routes, stream);
         return;
     case QType::BF16:
         detail::bf16_dispatch(x, w, out, policy, stream);
@@ -185,10 +184,7 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::Q8_G32_FP16:
         (void)detail::select_q8_launch(output_rows, input_rows, min_tokens, policy, LinearRoutes::Exact);
         (void)detail::select_q8_launch(output_rows, input_rows, max_tokens, policy, LinearRoutes::Exact);
-        // The query does not see the route flags: the f16-accumulate route's encoded activation wherever
-        // the interval reaches it.
-        return column_invariant(policy) ? 0
-                                        : detail::q8_f16acc_workspace_capacity_bytes(output_rows, input_rows, max_tokens);
+        return 0;
     case QType::BF16:
         (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_bf16_launch(output_rows, input_rows, max_tokens, policy);
@@ -259,7 +255,7 @@ void linear_qsa_group(const Tensor& x, const Weight& w, Tensor* const* parts, Li
     detail::QsaGroupParts out{};
     for (std::int32_t i = 0; i < kQsaGroupSegments; ++i) { out.data[i] = static_cast<__nv_bfloat16*>(parts[i]->data); }
     if (w.qtype == QType::Q8_G32_FP16) {
-        detail::q8_qsa_group(x, w, out, routes, &workspace, stream);
+        detail::q8_qsa_group(x, w, out, stream);
     } else {
         (void)detail::validate_mxfp8_weight(w, "linear_qsa_group");
         // MXFP8's routes give a column the same bits at every T; column invariance masks the others.

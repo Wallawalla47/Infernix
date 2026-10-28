@@ -16,8 +16,8 @@ conv, struct and prose over their summed decode time, Basalt's token-weighted fi
 Suite `chart` (BX-02, giveen's ninfer-ext chart): cold unique prompts of the same construction at 16K /
 64K / 128K / 256K, 262,144 max context, 256 output tokens, greedy and T 1.0 (top_p 0.95, top_k 20).
 
-Arms (--arms): plain; mtp (MTP auto); mtp-copies (MTP auto, n-gram copies at min match 4 with
-INFERNIX_TMP_NGRAM_AGREE=1); dflash2 (DFlash2 auto, needs --draft-model). Each sampled request runs
+Arms (--arms): plain; mtp (MTP auto); mtp-copies (MTP auto, n-gram copies at min match 4);
+dflash2 (DFlash2 auto, needs --draft-model). Each sampled request runs
 --seeds times; seed s is the same for every arm. --route-trace-arm writes one route trace per decode
 fixture (seed 0), for the D12 / PUB-22 cache-policy replays.
 
@@ -69,7 +69,7 @@ ARMS: dict[str, tuple[list[str], dict[str, str]]] = {
     "plain": ([], {}),
     "mtp": (["--spec", "mtp", "--draft-tokens", "auto"], {}),
     "mtp-copies": (["--spec", "mtp", "--draft-tokens", "auto", "--ngram-draft-tokens", "7",
-                    "--ngram-min-match", "4"], {"INFERNIX_TMP_NGRAM_AGREE": "1"}),
+                    "--ngram-min-match", "4"], {}),
     "dflash2": (["--spec", "dflash2", "--draft-tokens", "auto"], {}),
 }
 

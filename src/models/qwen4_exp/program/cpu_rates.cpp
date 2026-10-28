@@ -19,7 +19,6 @@
 
 #include "core/cpu_topology.h"
 #include "core/host_load.h"
-#include "core/temporary_switches.h"
 
 #include <algorithm>
 #include <chrono>
@@ -82,8 +81,7 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
                                  .ggml       = ggml_format(*layers.front().moe.bank).valid(),
                                  .ggml_a8    = cpu_ggml_a8(), // decode's misses take the 8-bit route
                                  .nvfp4_a8   = cpu_narrow_a16() == moe::NarrowA16::kA8, // likewise
-                                 .cpus       = placement_.cpus,
-                                 .shared_x   = temporary_switches::flag("INFERNIX_TMP_CPU_SHARED_X")});
+                                 .cpus       = placement_.cpus});
         const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
         std::vector<std::uint16_t> x(static_cast<std::size_t>(moe::kHidden) * kNarrowColumns);
         std::vector<std::uint16_t> y(static_cast<std::size_t>(moe::kHidden) * kRateJobs * kNarrowColumns);
@@ -153,24 +151,6 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
             if (quiet || std::chrono::steady_clock::now() - began >= kRetryBudget) { break; }
             std::this_thread::sleep_for(kRetryPause);
         }
-        // TEMPORARY (INFERNIX_TMP_MACHINE_CALIBRATION, candidates §7.3 D11): a rate far below this
-        // configuration's saved one is measured once more (one quiet attempt), and the saved rate kept
-        // when that is low too.
-        if (const auto calibration = MachineCalibration::from_switch()) {
-            const std::string key = "cpu|" + std::to_string(cpu_workers()) + "|" + placement_.text + "|" +
-                                    std::to_string(static_cast<int>(cpu_narrow_a16())) + "|" +
-                                    std::to_string(ggml_format(*layers.front().moe.bank).valid() ? 1 : 0) +
-                                    (cpu_ggml_a8() ? "|a8" : "") + "|" + std::to_string(record_stride) +
-                                    (tier_ ? "|tier" : "");
-            std::string note;
-            expert_rate = calibration->resolve(key + "|experts", expert_rate, [&] { return rate(1, 0); }, note);
-            if (!note.empty()) { calibration_note_ = "experts/s " + note; }
-            note.clear();
-            column_rate = calibration->resolve(key + "|columns", column_rate,
-                                               [&] { return rate(kNarrowColumns, (kRepeats + 1) * kRounds) * kNarrowColumns; },
-                                               note);
-            if (!note.empty()) { calibration_note_ += (calibration_note_.empty() ? "" : "; ") + ("columns/s " + note); }
-        }
         cpu_expert_rate_ = expert_rate;
         cpu_column_rate_ = column_rate;
         (void)set_current_thread_cpus(caller_cpus);
@@ -178,7 +158,6 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
     }
     std::string how = measured ? (tier_ ? "measured on the SSD tier's RAM copies" : "measured")
                                : "reference: no expert records in RAM yet";
-    if (!calibration_note_.empty()) { how += "; calibration: " + calibration_note_; }
     char share[160];
     if (measured && attempts > 1) {
         std::snprintf(share, sizeof(share), " after %d attempts: other processes used %.0f %% of the CPU at first, %.0f %% last",

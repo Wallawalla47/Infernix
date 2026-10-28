@@ -45,7 +45,8 @@ inline constexpr int kGgmlHSlices = kIntermediate / 32; // 20
 [[nodiscard]] bool ggml_cpu_supported(const GgmlExpertFormat& format) noexcept;
 
 // Encodes BF16 v[0..n) (n a multiple of 32) under its column exponent, which it returns
-// (canon::kA16NonFinite for a non-finite column: its X are zero and its outputs NaN).
+// (canon::kA16NonFinite for a non-finite column: its X are zero and its outputs NaN). AVX2 when the CPU
+// has it; the integers are the same on every CPU.
 int ggml_encode_column(const std::uint16_t* v, int n, CpuLimbSlice* out);
 
 // Exact R of rows [row_begin, row_end) of a matrix of `format` rows (row_bytes apart, `slices`

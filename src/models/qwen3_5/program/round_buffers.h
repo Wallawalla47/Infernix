@@ -51,10 +51,6 @@ struct RoundStateSpec {
     // Tree rounds of a DFlash drafter: its frame carries the sparse laws and tree tables that a
     // DFlash2 frame always has.
     bool tree = false;
-    // INFERNIX_TMP_TREE_ROUND_WIDTH: the DFlash2 selector rank of the block's lattice, which the
-    // proposal graph keeps for a split tree family's builder (block_scores, block_projected); 0
-    // without it.
-    std::int32_t block_lattice_rank = 0;
 };
 
 struct PrefillRoundHost {
@@ -97,9 +93,6 @@ struct MtpDecodeIngress {
     // The proposal chain (ExecutionSchedule::mtp_proposal_chain): the most drafts each row's round
     // proposes, which the chain's device gates read (row 0: chained rounds have one row).
     std::array<std::int32_t, kMaximumConcurrency> proposal_limits{};
-    // The step chain (ExecutionSchedule::mtp_step_chain): its gates' probability threshold for the
-    // round (MtpConfidencePolicy::step_threshold); a row's next drafts end at its first one below it.
-    double step_threshold = 0.0;
     // sampled-mtp-drafts only (the round copies these planes only then): each current draft's 16
     // candidates and its proposal q, row-major per row at the round's draft width k (a tree round's
     // at its chain length):
@@ -263,10 +256,6 @@ struct DFlashDecodeStateLayout {
     std::optional<TensorRegion> block_candidates;
     std::optional<TensorRegion> block_q;
     std::optional<TensorRegion> block_confidence;
-    // INFERNIX_TMP_TREE_ROUND_WIDTH (RoundStateSpec::block_lattice_rank): the block's DFlash2 lattice
-    // beside block_candidates, FP32 [16,K,B] candidate scores and BF16 [rank,K,B] selector projections.
-    std::optional<TensorRegion> block_scores;
-    std::optional<TensorRegion> block_projected;
 };
 
 // Constrained-generation controls (TokenConstraint): each lane's permitted sets, the per-column
@@ -369,7 +358,6 @@ struct MtpDecodeState {
     Tensor rope_deltas;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor proposal_limits;
-    const double* step_threshold = nullptr; // MtpDecodeIngress::step_threshold
     // sampled-mtp-drafts: I32/FP32 [16,K,C] (empty in a view wider than the MTP draft window, which
     // only n-gram copy rounds take, and those run without sampled drafts; a tree round's view is
     // at its chain length).
@@ -464,8 +452,6 @@ struct DFlashDecodeState {
     Tensor block_candidates;
     Tensor block_q;
     Tensor block_confidence;
-    Tensor block_scores;    // INFERNIX_TMP_TREE_ROUND_WIDTH; empty without it
-    Tensor block_projected; // INFERNIX_TMP_TREE_ROUND_WIDTH; empty without it
     // The columns target_logits holds (RoundStateSpec::verify_columns).
     std::int32_t verify_columns = 0;
 

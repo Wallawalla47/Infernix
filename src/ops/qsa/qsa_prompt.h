@@ -61,14 +61,15 @@ void qsa_prompt_attention(const Tensor& q, const QsaKVLayer& layer, const QsaBat
                           const std::int32_t* counts, Tensor& out, cudaStream_t stream,
                           const QsaVqWindow& vq);
 
-/// TEMPORARY A/B (INFERNIX_TMP_QSA_PROMPT_V2=1, read once from the environment; default off): the
-/// one-stage calls (two CTAs per SM, 85+ columns at 2 KV heads) of the scalar storages run the split
-/// stage, in which each warp gathers its next tile's keys right after its scores and the values right
-/// after its P x V, and its first tile before the query rows. Same tiles, arithmetic and merge, so the
-/// same bits; vq2/k4v2 keep the combined gather. qsa_prompt_set_v2 overrides the setting for the
-/// calls that follow (tests and the Op bench compare both in one process; a captured graph keeps the
-/// kernel it captured).
-[[nodiscard]] bool qsa_prompt_v2();
-void qsa_prompt_set_v2(bool on);
+/// Whether the one-stage calls (two CTAs per SM, 85+ columns at 2 KV heads) of `storage` run the split stage, in
+/// which each warp gathers its next tile's keys right after its scores and the values right after its P x V, and
+/// its first tile before the query rows, instead of the combined gather. Same tiles, arithmetic and merge, so the
+/// same bits. BF16 and FP8 KV take it (4-8 % faster at the op; adopted 2026-10-28); INT8 was mixed and NVFP4
+/// and K8V4 slower, so they keep the combined gather, as vq2/k4v2 do.
+[[nodiscard]] bool qsa_prompt_split(KvCacheStorage storage);
+/// Tests and the Op bench: -1 the choice by storage (the default), 0 the combined gather, 1 the split stage, for the
+/// calls that follow (a captured graph keeps the kernel it captured).
+void qsa_prompt_force(int variant);
+[[nodiscard]] int qsa_prompt_forced();
 
 } // namespace infernix::ops::detail

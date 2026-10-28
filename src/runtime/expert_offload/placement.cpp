@@ -43,28 +43,22 @@ std::int32_t link_share_256(const OffloadSwitches& switches, double link_bytes_p
     return static_cast<std::int32_t>(std::clamp<long>(std::lround(share * 256.0), 1, 256));
 }
 
-std::int32_t plain_divisor(const OffloadSwitches& switches, std::int32_t position) noexcept {
-    const bool long_context = position >= kPlainDivisorContext;
-    if (switches.plain_divisor_all) { return long_context ? switches.plain_long : switches.plain_short; }
-    return long_context ? 2 : 1;
-}
-
-CpuPlacement cpu_placement(const OffloadSwitches& switches, std::uint32_t configured) {
+CpuPlacement cpu_placement(const OffloadSwitches& switches, std::uint32_t configured, bool engine_isolate) {
     CpuPlacement out;
     out.workers = switches.workers > 0 ? switches.workers : configured;
-    if (switches.placement == OffloadSwitches::Placement::kDefault && !switches.engine_isolate) {
+    if (switches.placement == OffloadSwitches::Placement::kDefault && !engine_isolate) {
         if (switches.workers > 0) { out.text = "CPU expert team: " + std::to_string(out.workers) + " workers (INFERNIX_TMP_CPU_PLACEMENT), unpinned"; }
         return out;
     }
     std::vector<PhysicalCore> cores = physical_cores();
     if (cores.empty()) {
-        out.text = "CPU placement switches ignored: the CPU topology is unknown (or the machine has more than 64 logical CPUs)";
+        out.text = "CPU placement ignored: the CPU topology is unknown (or the machine has more than 64 logical CPUs)";
         return out;
     }
     // The fastest class first (hybrid CPUs: the P-cores), the OS's order within a class.
     std::stable_sort(cores.begin(), cores.end(),
                      [](const PhysicalCore& a, const PhysicalCore& b) { return a.efficiency > b.efficiency; });
-    if (switches.engine_isolate && cores.size() > 1) {
+    if (engine_isolate && cores.size() > 1) {
         // The last core of the fastest class: away from CPU 0, where Windows delivers the GPU's interrupts.
         std::size_t last = 0;
         for (std::size_t i = 0; i < cores.size(); ++i) {
@@ -98,8 +92,7 @@ CpuPlacement cpu_placement(const OffloadSwitches& switches, std::uint32_t config
         break;
     }
     }
-    out.text = "CPU expert team placement (INFERNIX_TMP_CPU_PLACEMENT / INFERNIX_TMP_ENGINE_ISOLATE): " +
-               std::to_string(out.workers) + " workers, " + mode + ";";
+    out.text = "CPU expert team placement: " + std::to_string(out.workers) + " workers, " + mode + ";";
     if (switches.placement == OffloadSwitches::Placement::kPhysical) {
         for (std::uint32_t w = 0; w < out.workers; ++w) { out.text += " w" + std::to_string(w) + ":" + cpu_list(out.cpus[w]); }
         if (out.workers > cores.size()) { out.text += " (workers past the physical cores run unpinned)"; }
@@ -110,13 +103,10 @@ CpuPlacement cpu_placement(const OffloadSwitches& switches, std::uint32_t config
     return out;
 }
 
-void place_engine_thread() noexcept {
+void place_engine_thread(std::uint64_t cpus) noexcept {
     try {
-        const OffloadSwitches& switches = temporary_switches::offload();
-        if (!switches.engine_isolate) { return; }
-        const std::uint64_t cpus = cpu_placement(switches, 0).engine;
         if (cpus != 0 && set_current_thread_cpus(cpus) == 0) {
-            std::fprintf(stderr, "[engine] INFERNIX_TMP_ENGINE_ISOLATE: the engine thread could not be pinned\n");
+            std::fprintf(stderr, "[engine] the engine thread could not be pinned to CPUs %s\n", cpu_list(cpus).c_str());
         }
     } catch (...) {}
 }

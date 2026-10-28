@@ -49,8 +49,8 @@ struct Options {
     std::vector<int> widths{1, 5};
     int warmup = 5;
     int repeat = 50;
-    // TEMPORARY (INFERNIX_TMP_QSA_PROMPT_V2): the prompt-kernel variants timed per case, in order
-    // (-1: the process's setting; e.g. 0,1,1,0 for an in-process ABBA).
+    // The prompt-kernel variants timed per case, in order (-1: the storage's default; e.g. 0,1,1,0 for an
+    // in-process ABBA).
     std::vector<int> prompt_v2{-1};
 };
 
@@ -115,8 +115,8 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--help") {
             std::printf("infernix_qsa_attention_bench [--storage bf16,int8,fp8,nvfp4,k8v4,vq2,k4v2] "
                         "[--contexts 8192,131072] [--widths 1,5] [--warmup N] [--repeat N] [--prompt-v2 0,1,1,0]\n"
-                        "  --prompt-v2: TEMPORARY, the prompt kernel's variants timed per case in this order "
-                        "(0 combined gather, 1 split K/V stage; default: INFERNIX_TMP_QSA_PROMPT_V2)\n");
+                        "  --prompt-v2: the prompt kernel's variants timed per case in this order "
+                        "(0 combined gather, 1 split K/V stage, -1 the storage's default; default -1)\n");
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown option " + std::string(arg));
@@ -260,7 +260,6 @@ int main(int argc, char** argv) {
         std::printf("%s\n", temporary_switches::describe(temporary_switches::Scope::Qwen4Exp).c_str());
         std::printf("storage context width v2   total_us  select_us  attention_us  (median of %d, cold L2, graph)\n",
                     options.repeat);
-        const bool process_v2 = ops::detail::qsa_prompt_v2();
         for (const auto storage : options.storages) {
             for (const int context : options.contexts) {
                 for (const int width : options.widths) {
@@ -269,8 +268,8 @@ int main(int argc, char** argv) {
                         const auto select = time(flush, stream, options.warmup, options.repeat,
                                                  [&](cudaStream_t s) { data.selection(s); });
                         for (const int variant : options.prompt_v2) {
-                            const bool v2 = variant < 0 ? process_v2 : variant != 0;
-                            ops::detail::qsa_prompt_set_v2(v2);
+                            ops::detail::qsa_prompt_force(variant);
+                            const bool v2 = ops::detail::qsa_prompt_split(storage);
                             const auto total = time(flush, stream, options.warmup, options.repeat,
                                                     [&](cudaStream_t s) { data.attention(s); });
                             std::printf("%-7s %7d %5d %2d %10.2f %10.2f %13.2f\n", storage_name(storage), context,
@@ -278,7 +277,7 @@ int main(int argc, char** argv) {
                                         total.median_us - select.median_us);
                             std::fflush(stdout);
                         }
-                        ops::detail::qsa_prompt_set_v2(process_v2);
+                        ops::detail::qsa_prompt_force(-1);
                     } catch (const std::invalid_argument& e) {
                         std::printf("%-7s %7d %5d unsupported: %s\n", storage_name(storage), context, width,
                                     e.what());

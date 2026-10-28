@@ -575,12 +575,11 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
                (configuration.dense == DenseKernels::Fp8Row || configuration.dense == DenseKernels::Mxfp8);
     // The GGUF imports' dense projections (ops::ggml_linear's BF16 prefill tiles).
     case FastPath::GgmlBf16Prefill: return configuration.dense == DenseKernels::Ggml;
-    // The 8-bit-code dense projections: recipe C's row FP8 and NVIDIA FP4-Local's MXFP8 (E4M3 codes), and
-    // Dense8's Q8 (int8 codes, FP16 group scales; ops/linear/q8/q8_f16acc.h), all at 16-bit activations;
-    // the official FP8 import's dense weights are BF16.
+    // The E4M3-code dense projections at 16-bit activations: recipe C's row FP8 and NVIDIA FP4-Local's MXFP8;
+    // the official FP8 import's dense weights are BF16. Dense8's Q8 has no route (1.6-1.9 % slower on its
+    // pp32K/64K prefill, removed 2026-10-28).
     case FastPath::F16AccumulatePrefill:
-        return configuration.dense == DenseKernels::Fp8Row || configuration.dense == DenseKernels::Mxfp8 ||
-               configuration.dense == DenseKernels::Q8;
+        return configuration.dense == DenseKernels::Fp8Row || configuration.dense == DenseKernels::Mxfp8;
     // Qwen3.5's dense causal attention only (Flash-Next attends through QSA).
     case FastPath::Bf16PromptSplit: return false;
     // Every Flash-Next artifact's BF16 router (512 experts plus the shared expert's score).
@@ -725,7 +724,7 @@ void A8Routes::apply(execution::ForwardFastPaths& fast) const noexcept {
     fast.a8_experts      = ggml_experts || nvfp4_experts;
     fast.a8_experts_wide = experts_prefill && fast.a8_experts; // the wide route needs the narrow one
     // ggml_linear takes the 8-bit tiles ahead of ggml-bf16-prefill's, whose flag stays (the GGUF experts' wide calls
-    // take its BF16 planes without experts_prefill).
+    // take its BF16 tiles without experts_prefill).
     if (ggml_dense_prefill) { fast.prefill_routes = fast.prefill_routes | ops::LinearRoutes::GgmlA8Wide; }
     // The 8-bit pair replaces f16-accumulate-prefill, which the dispatch would otherwise take first from 256 columns.
     if (mxfp8_dense) {

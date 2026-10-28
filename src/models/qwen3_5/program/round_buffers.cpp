@@ -295,13 +295,6 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                                                      "DFlash2 block proposal candidate ids");
                 decode.block_q = add_tensor(builder, DType::FP32, {16, block, batch},
                                             "DFlash2 block proposal q");
-                if (layout.spec.block_lattice_rank != 0) {
-                    decode.block_scores = add_tensor(builder, DType::FP32, {16, block, batch},
-                                                     "DFlash2 block lattice scores");
-                    decode.block_projected =
-                        add_tensor(builder, DType::BF16, {layout.spec.block_lattice_rank, block, batch},
-                                   "DFlash2 block lattice selector projections");
-                }
             }
         }
     }
@@ -375,8 +368,6 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     sampling    = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, sampling));
     proposal_limits = ingress_tensor(offsetof(MtpDecodeIngress, proposal_limits), DType::I32, {batch});
-    step_threshold  = reinterpret_cast<const double*>(static_cast<const unsigned char*>(ingress.data) +
-                                                     offsetof(MtpDecodeIngress, step_threshold));
     constexpr auto slots = static_cast<std::int32_t>(kMtpSparseSlots);
     current_candidates   = ingress_tensor(offsetof(MtpDecodeIngress, current_candidates), DType::I32,
                                           {slots, neural_drafts, batch});
@@ -602,8 +593,6 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     if (layout.block_candidates) { block_candidates = layout.block_candidates->bind(backing); }
     if (layout.block_q) { block_q = layout.block_q->bind(backing); }
     if (layout.block_confidence) { block_confidence = layout.block_confidence->bind(backing); }
-    if (layout.block_scores) { block_scores = layout.block_scores->bind(backing); }
-    if (layout.block_projected) { block_projected = layout.block_projected->bind(backing); }
 }
 
 void constrain_round_logits(const RoundState& io, const Tensor& logits, const Tensor* argmax,

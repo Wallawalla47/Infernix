@@ -22,13 +22,8 @@ struct QsaGroupParts {
     __nv_bfloat16* data[kQsaGroupSegments];
 };
 
-// Q8 (Dense8): the exact Q8 routes of [13952,2560], or LinearRoutes::F16Accumulate's from its admission
-// (needs `workspace`).
-void q8_qsa_group(const Tensor& x, const Weight& w, const QsaGroupParts& parts, LinearRoutes routes,
-                  WorkspaceArena* workspace, cudaStream_t stream);
-// The f16-accumulate route of q8_qsa_group (ops/linear/q8/q8_f16acc.cu).
-void q8_qsa_group_f16acc(const Tensor& x, const Weight& w, const QsaGroupParts& parts, WorkspaceArena& workspace,
-                         cudaStream_t stream);
+// Q8 (Dense8): the exact Q8 routes of [13952,2560].
+void q8_qsa_group(const Tensor& x, const Weight& w, const QsaGroupParts& parts, cudaStream_t stream);
 // MXFP8 (FP4-Local): mxfp8_dispatch's routes of [13952,2560] (A16, f16-accumulate, block32 pair).
 void mxfp8_qsa_group(const Tensor& x, const Weight& w, const QsaGroupParts& parts, LinearRoutes routes,
                      WorkspaceArena* workspace, cudaStream_t stream);

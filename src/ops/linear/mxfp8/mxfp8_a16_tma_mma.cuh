@@ -363,9 +363,8 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 // so nothing launched beside them takes their SMs. The cp.async producer reads only the weights and
 // scales before its PDL wait. The TMA producer also reads its tensor maps there, so it is
 // programmatic only where they cannot change under it: by value (Linux, or Windows parameter words read
-// in place, INFERNIX_TMP_TMA_PARAM_WORDS) or, on Windows, a captured
-// launch's own staged copy (an eager Windows launch reads the one staging buffer the staging kernel
-// has just stored into, core/tma_descriptor_staging.cuh).
+// in place) or, where Windows stages them, a captured launch's own staged copy (an eager staged launch
+// reads the one staging buffer the staging kernel has just stored into, core/tma_descriptor_staging.cuh).
 inline constexpr int kMxfp8ProgrammaticTokens = 16;
 
 template <class Schedule, class Output, class Epilogue>

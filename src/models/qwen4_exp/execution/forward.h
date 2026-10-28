@@ -251,10 +251,6 @@ struct MtpCall {
     const ops::SamplingConfig* sample_configs = nullptr;
     std::uint32_t draft_step                  = 0;
     Tensor sample_rows, sample_logprobs, draft_candidates, draft_q;
-    // TEMPORARY (INFERNIX_TMP_MTP_RUNNER_UP, candidates GX-09): an argmax draft's second-ranked head
-    // row (I32 [T]; the proposal head's row, not its token), for the runner-up rate draft trees need.
-    // Unscreened, unsampled drafts only.
-    Tensor runner_up;
     // Cells whose next token is an image token take its visual embedding (prompt cells only).
     const VisionInput* vision = nullptr;
 };
@@ -377,12 +373,6 @@ private:
     void lossless_head(const Tensor& residuals, Tensor& logits);
     // The block's mixed input (into `into` when given, else the workspace).
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into = nullptr);
-    // The attention half's inject (y with its coefficients `pending`) into the residual, then the MLP
-    // half's mix: one Op that folds the inject into the fused mixer's reads under the temporary
-    // INFERNIX_TMP_HC_INJECT_FOLD (candidates §7.3 D6), else the two Ops in turn. Same bits either way.
-    // `inject` receives the MLP half's coefficients and must not be `pending`.
-    Tensor inject_mix(const HyperConnectionParameters& p, const Tensor& y, const Tensor& pending, Tensor& residual,
-                      Tensor* inject, Tensor* into = nullptr);
     // The layer's token mixer (GDN or QSA attention) over its mixed input.
     Tensor mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa);
     Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);

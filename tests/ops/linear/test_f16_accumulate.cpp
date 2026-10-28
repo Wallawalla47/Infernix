@@ -1,9 +1,6 @@
-// f16-accumulate-prefill (LinearRoutes::F16Accumulate, ops/linear/f16acc/f16acc_plan.h): the FP8, MXFP8
-// and Q8 problems that register the route, against the FP64 oracle of the represented weights and
+// f16-accumulate-prefill (LinearRoutes::F16Accumulate, ops/linear/f16acc/f16acc_plan.h): the FP8 and
+// MXFP8 problems that register the route, against the FP64 oracle of the represented weights and
 // activations, with the exact (FP32-accumulation) route's error on the same inputs reported beside it.
-// A Q8 weight is its int8 code times its FP16 group scale; the exact Q8 route rounds that product to
-// BF16, the FP16 route folds the scale into the FP32 carry, and the same criterion holds (chunk partial
-// sums stay below 32 * 128 * 2 = 8,192).
 //
 // Named criterion: the route meets the A16 criterion (relative L2 <= 2^-8, |error| <= 2^-8 + 2^-7
 // max|reference|), and, as a guard on its own arithmetic, its relative L2 error stays within twice the
@@ -15,8 +12,8 @@
 //
 // Also: the encoder against the exact oracle; the worst case for overflow (every code 448 and every
 // activation at the top of its binade); repeat determinism; column invariance across widths and
-// schedules; the admission seam and the flags the route ignores; the workspace contract; and the MXFP8
-// GDN input projection's rows against linear's under the flag.
+// schedules; the admission seam and the flags the route ignores; the workspace contract; the MXFP8
+// GDN input projection's rows against linear's under the flag; and the QSA group projection's parts.
 
 #include "ops/op_family.h"
 #include "core/arena.h"
@@ -53,9 +50,8 @@ struct Problem {
     std::int32_t n, k;
 };
 
-// Recipe C's row-FP8 Flash-Next problems, the Qwen3.8-27B-class [5120,6144], FP4-Local's MXFP8 ones and
-// Dense8's Q8 ones (ops/linear/q8/q8_f16acc.h).
-constexpr std::array<Problem, 18> kProblems{{{QType::FP8_E4M3FN_ROW_BF16, 16384, 2560},
+// Recipe C's row-FP8 Flash-Next problems, the Qwen3.8-27B-class [5120,6144] and FP4-Local's MXFP8 ones.
+constexpr std::array<Problem, 11> kProblems{{{QType::FP8_E4M3FN_ROW_BF16, 16384, 2560},
                                              {QType::FP8_E4M3FN_ROW_BF16, 13312, 2560},
                                              {QType::FP8_E4M3FN_ROW_BF16, 2560, 6144},
                                              {QType::FP8_E4M3FN_ROW_BF16, 1280, 2560},
@@ -65,14 +61,7 @@ constexpr std::array<Problem, 18> kProblems{{{QType::FP8_E4M3FN_ROW_BF16, 16384,
                                              {QType::FP8_E4M3FN_G32_E8M0, 13952, 2560},
                                              {QType::FP8_E4M3FN_G32_E8M0, 2560, 6144},
                                              {QType::FP8_E4M3FN_G32_E8M0, 1280, 2560},
-                                             {QType::FP8_E4M3FN_G32_E8M0, 2560, 640},
-                                             {QType::Q8_G32_FP16, 16384, 2560},
-                                             {QType::Q8_G32_FP16, 13952, 2560},
-                                             {QType::Q8_G32_FP16, 12800, 2560},
-                                             {QType::Q8_G32_FP16, 2560, 2560},
-                                             {QType::Q8_G32_FP16, 1280, 2560},
-                                             {QType::Q8_G32_FP16, 2560, 6144},
-                                             {QType::Q8_G32_FP16, 2560, 640}}};
+                                             {QType::FP8_E4M3FN_G32_E8M0, 2560, 640}}};
 // ops/linear/fp8/fp8_shapes.h kFp8F16MinTokens, ops/linear/mxfp8/mxfp8_shapes.h kMxfp8F16MinTokens.
 constexpr std::int32_t kAdmission  = 256;
 constexpr ops::LinearRoutes kF16    = ops::LinearRoutes::F16Accumulate;
@@ -216,13 +205,12 @@ int run_accuracy() {
 // chunk partial reaches 32 * 448 * 1.9921875 = 28,560 before the carry.
 int run_worst_case() {
     int failures = 0;
-    for (const QType qtype : {QType::FP8_E4M3FN_ROW_BF16, QType::FP8_E4M3FN_G32_E8M0, QType::Q8_G32_FP16}) {
+    for (const QType qtype : {QType::FP8_E4M3FN_ROW_BF16, QType::FP8_E4M3FN_G32_E8M0}) {
         const Problem p{qtype, 2560, 640};
         auto packed = make_weight(p, 4301U);
-        // The largest code: E4M3 448 (0x7E), int8 127 (0x7F), in the codes plane's first 16 rows.
-        const std::uint8_t largest = qtype == QType::Q8_G32_FP16 ? std::uint8_t{0x7F} : std::uint8_t{0x7E};
+        // The largest code, E4M3 448 (0x7E), in the codes plane's first 16 rows.
         for (std::int32_t row = 0; row < 16; ++row)
-            std::fill_n(packed.payload.begin() + static_cast<std::ptrdiff_t>(row) * p.k, p.k, largest);
+            std::fill_n(packed.payload.begin() + static_cast<std::ptrdiff_t>(row) * p.k, p.k, std::uint8_t{0x7E});
         const DeviceProblem problem(std::move(packed));
         for (const std::int32_t t : {kAdmission, 513}) {
             std::vector<std::uint16_t> bits(static_cast<std::size_t>(p.k) * t);
@@ -396,18 +384,19 @@ int seams_and_workspace() {
             ++failures;
         }
     }
-    // Qwen3.8-27B's FP8 [14336,5120] registers no FP16 route.
-    const Problem dense{QType::FP8_E4M3FN_ROW_BF16, 14336, 5120};
-    const DeviceProblem problem(make_weight(dense, seed++));
-    compare(dense, problem, 300, ops::LinearPolicy::A16Only);
+    // Qwen3.8-27B's FP8 [14336,5120] registers no FP16 route, nor does any Q8 problem.
+    for (const Problem& dense :
+         {Problem{QType::FP8_E4M3FN_ROW_BF16, 14336, 5120}, Problem{QType::Q8_G32_FP16, 16384, 2560}}) {
+        const DeviceProblem problem(make_weight(dense, seed++));
+        compare(dense, problem, 300, ops::LinearPolicy::A16Only);
+    }
     return failures;
 }
 
 // FP4-Local's GDN input projection under the flag: its q/k/v and z rows hold linear's FP16-route bits.
 int gdn_input_rows() {
     int failures = 0;
-    for (const QType qtype : {QType::FP8_E4M3FN_G32_E8M0, QType::Q8_G32_FP16}) {
-    const Problem p{qtype, 16384, 2560};
+    const Problem p{QType::FP8_E4M3FN_G32_E8M0, 16384, 2560};
     const DeviceProblem problem(make_weight(p, 4801U));
     for (const std::int32_t t : {kAdmission - 1, 300, 2049}) {
         const DeviceBuffer x = upload(transformer_activations(p.k, t, 4802U));
@@ -437,13 +426,12 @@ int gdn_input_rows() {
             ++failures;
         }
     }
-    }
     return failures;
 }
 
-// The QSA group projection (ops::linear_qsa_group, the TEMPORARY INFERNIX_TMP_QSA_GROUP_DIRECT route): its
-// six parts hold linear's rows bit for bit, on the exact routes (decode and prefill widths) and the
-// f16-accumulate route, for Q8 (Dense8) and MXFP8 (FP4-Local); A16ColumnInvariant has no Q8 segmented form.
+// The QSA group projection (ops::linear_qsa_group, Flash-Next's QSA layers' route): its
+// six parts hold linear's rows bit for bit, on the exact routes (decode and prefill widths) for Q8 (Dense8)
+// and MXFP8 (FP4-Local) and on MXFP8's f16-accumulate route; A16ColumnInvariant has no Q8 segmented form.
 int qsa_group_rows() {
     int failures = 0;
     constexpr std::int32_t kRows[ops::kQsaGroupSegments] = {6144, 6144, 512, 512, 512, 128};
@@ -452,6 +440,7 @@ int qsa_group_rows() {
         const DeviceProblem problem(make_weight(p, 4901U));
         for (const std::int32_t t : {1, 4, 8, 64, 97, 300}) {
             for (const ops::LinearRoutes routes : {kExact, kF16}) {
+                if (routes == kF16 && qtype == QType::Q8_G32_FP16) { continue; }
                 const DeviceBuffer x = upload(transformer_activations(p.k, t, 4902U));
                 const auto linear    = run_linear(problem.view, x, t, ops::LinearPolicy::A16Only, routes);
                 std::vector<DeviceBuffer> buffers;

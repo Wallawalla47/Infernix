@@ -877,16 +877,11 @@ void ExpertResidency::adaptive_round(const std::int32_t* routes, std::size_t use
     for (const std::uint32_t k : a.touched) { a.done[k] = 0; }
 }
 
-void ExpertResidency::seed_prompt(std::span<const std::uint32_t> uses, double scale, std::size_t per_layer_budget,
-                                  cudaStream_t compute) {
+void ExpertResidency::seed_prompt(std::span<const std::uint32_t> uses, double scale) {
     if (uses.size() != static_cast<std::size_t>(layers_) * experts_) {
         throw std::invalid_argument("expert residency: prompt uses have another key count");
     }
     if (!(scale > 0.0) || frozen_) { return; }
-    const bool promote = per_layer_budget > 0 && frames() > 0;
-    if (promote) {
-        for (auto& pool : pools_) { pool.commands.clear(); }
-    }
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
         group_.clear();
         amounts_.clear();
@@ -897,38 +892,8 @@ void ExpertResidency::seed_prompt(std::span<const std::uint32_t> uses, double sc
             amounts_.push_back(scale * static_cast<double>(uses[key]));
         }
         if (group_.empty()) { continue; }
-        Pool& pool = pools_[pool_of_layer_[layer]];
-        pool.controller->credit(group_, amounts_);
-        // The best credited misses that outrank the layer pool's lowest resident, per_layer_budget of
-        // them, load now (INFERNIX_TMP_PROMPT_SEED's budget; the commands accumulate per pool). With the
-        // SSD tier only keys with a host copy are admitted, and only victims with one are evicted (they
-        // keep it, T3): outside a round boundary nothing is demoted.
-        if (promote) {
-            pool.controller->admit_credited(group_, per_layer_budget, round_, pool.commands,
-                                            tier_ != nullptr ? &admissible_ : nullptr,
-                                            tier_ != nullptr ? &admissible_ : nullptr);
-        }
+        pools_[pool_of_layer_[layer]].controller->credit(group_, amounts_);
     }
-    if (!promote) { return; }
-    // As after_round at a quiescent boundary (the prompt's last call has completed): victims leave the
-    // tables before the next round, the loads copy once that table is in place.
-    auto* table = static_cast<std::int32_t*>(table_host_.data());
-    load_commands_.clear();
-    for (auto& pool : pools_) {
-        if (pool.frames == 0) { continue; }
-        report_evictions(pool.commands);
-        pool.controller->on_quiescent(pool.commands);
-        for (const auto& command : pool.commands) {
-            if (absent_write(command) && table[command.key] >= 0) {
-                table[command.key] = -1;
-                table_dirty_       = true;
-            }
-        }
-        take_loads(pool.commands);
-    }
-    if (table_dirty_) { upload_table(compute); }
-    issue_loads(compute);
-    sync_queue_pins();
 }
 
 ExpertResidency::SavedState ExpertResidency::saved_state() const {

@@ -130,8 +130,11 @@ public:
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
             try {
                 device_.bind_to_current_thread();
-                // INFERNIX_TMP_ENGINE_ISOLATE: this round thread on a core no CPU expert worker uses.
-                expert_offload::place_engine_thread();
+                // A Program whose CPU expert team leaves a core to this round thread (the Qwen3.5-122B's
+                // offloaded experts) places it there.
+                if constexpr (kProgramPlacesEngine) {
+                    expert_offload::place_engine_thread(instance_.program->engine_thread_cpus());
+                }
                 startup.set_value();
             } catch (...) {
                 startup.set_exception(std::current_exception());
@@ -195,6 +198,11 @@ public:
     static constexpr bool kProgramMaintains = requires(typename Instance::ModelContract::Program& program) {
         program.maintain();
         program.set_maintenance_waker(std::function<void()>{});
+    };
+    // A Program that names the logical CPUs of the round thread (Qwen3.5's offloaded experts:
+    // runtime::expert_offload::CpuPlacement::engine, 0 for unpinned).
+    static constexpr bool kProgramPlacesEngine = requires(const typename Instance::ModelContract::Program& program) {
+        program.engine_thread_cpus();
     };
 
     void request_maintenance() noexcept {

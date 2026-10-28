@@ -192,9 +192,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                                : 0U;
     // A fixed draft length verifies every draft unless --spec-min-p asks for the cut.
     program_options.auto_draft_length = options.speculative.draft_tokens_auto;
-    // MTP's automatic length cuts at 0.5 by default; DFlash2's calibrated length needs no cut.
-    program_options.draft_min_p = options.speculative.draft_min_p.value_or(
-        options.speculative.draft_tokens_auto && options.speculative.backend == SpeculativeBackend::Mtp ? 0.5F : 0.0F);
+    // MTP's automatic length cuts by its drafts' cumulative acceptance (MtpCumulative) and DFlash2's
+    // calibrated length needs no cut.
+    program_options.draft_min_p = options.speculative.draft_min_p.value_or(0.0F);
     if (!options.expert_state_path.empty()) {
         // The state belongs to the artifact: its experts and their records, not the build or KV format.
         std::error_code error;

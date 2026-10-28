@@ -55,8 +55,7 @@ top-p 0.95, top-k 20), struct (8,192 tokens, greedy), each ending at EOS, and 16
 Basalt's filler construction. It reports per-fixture decode tok/s and tokens per round, Basalt's
 token-weighted `decode_tps`, and the prefill rates, beside Basalt's published row. `--suite chart` runs
 giveen's chart protocol (16K-256K cold prompts, 256 output tokens, greedy and T 1.0, 262,144 max
-context). The arms are plain, `mtp`, `mtp-copies` (n-gram copies at min match 4 with the agreement
-gate) and `dflash2`, each sampled request over `--seeds` seeds; the `--route-trace-arm` writes a route
+context). The arms are plain, `mtp`, `mtp-copies` (n-gram copies at min match 4) and `dflash2`, each sampled request over `--seeds` seeds; the `--route-trace-arm` writes a route
 trace per decode fixture for the cache-policy replays. The machines and quantizations differ, so the
 figures place Infernix beside Basalt rather than decide a winner.
 

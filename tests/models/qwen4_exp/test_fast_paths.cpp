@@ -330,15 +330,15 @@ int main() {
     // f16-accumulate-prefill acts on the 8-bit-code dense projections (recipe C's row FP8, FP4-Local's
     // MXFP8, Dense8's Q8) only, sets its route flag, couples a prompt to its call boundaries, and is
     // qualified only where it measured faster (FP4-Local, INT8 KV; the owner's decision, 2026-10-25).
-    for (const DenseKernels dense : {DenseKernels::Fp8Row, DenseKernels::Mxfp8, DenseKernels::Q8}) {
+    for (const DenseKernels dense : {DenseKernels::Fp8Row, DenseKernels::Mxfp8}) {
         failures += check(q::fast_path_applies(FastPath::F16AccumulatePrefill, {dense, false, KvCacheStorage::Int8Group64},
                                                options),
-                          "f16-accumulate-prefill runs on FP8, MXFP8 and Q8 dense weights");
+                          "f16-accumulate-prefill runs on FP8 and MXFP8 dense weights");
     }
-    for (const DenseKernels dense : {DenseKernels::Bf16, DenseKernels::Ggml, DenseKernels::Nvfp4}) {
+    for (const DenseKernels dense : {DenseKernels::Bf16, DenseKernels::Ggml, DenseKernels::Nvfp4, DenseKernels::Q8}) {
         failures += check(!q::fast_path_applies(FastPath::F16AccumulatePrefill, {dense, false, KvCacheStorage::Int8Group64},
                                                 options),
-                          "f16-accumulate-prefill has no route for 16-bit or GGUF dense weights");
+                          "f16-accumulate-prefill has no route for 16-bit, GGUF or Q8 dense weights");
     }
     failures += check(!infernix::ops::has_route(exact.prefill_routes, infernix::ops::LinearRoutes::F16Accumulate),
                       "the exact route keeps FP8 and MXFP8 projections exact");

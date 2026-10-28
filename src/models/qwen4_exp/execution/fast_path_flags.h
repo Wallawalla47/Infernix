@@ -39,7 +39,7 @@ struct ForwardFastPaths {
     bool a8_experts = false;
     // --a8-activations' prefill route of the same banks (with a8_experts): their calls of more than 128 columns
     // stay on 8-bit activations (ops::offloaded_moe::WideA16::kA8), in place of expert-a4-residual's A4 terms,
-    // ggml-bf16-prefill's BF16 planes or the exact route.
+    // ggml-bf16-prefill's BF16 tiles or the exact route.
     bool a8_experts_wide = false;
 };
 

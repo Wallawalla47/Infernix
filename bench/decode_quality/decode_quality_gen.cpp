@@ -213,9 +213,10 @@ int main(int argc, char** argv) {
             // `drafts=N` another count (with `auto`, its ceiling).
             options.speculative.backend      = infernix::SpeculativeBackend::Mtp;
             options.speculative.draft_tokens = drafts_set ? drafts : 4;
-            // `auto`: --draft-tokens auto, each round's own length up to 4 and the --spec-min-p 0.5 cut.
+            // `auto`: --draft-tokens auto, each round's own length up to 4 (on Qwen3.8-Flash-Next with
+            // its cumulative acceptance cut).
             options.speculative.draft_tokens_auto = draft_auto;
-            // `min-p=P`: --spec-min-p P, the draft-confidence cut (a fixed length's default is none).
+            // `min-p=P`: --spec-min-p P, the draft-confidence cut of MTP (Flash-Next: fixed lengths only).
             options.speculative.draft_min_p = min_p;
 #endif
         }

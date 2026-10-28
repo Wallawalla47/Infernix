@@ -1,11 +1,11 @@
 #pragma once
 
 #include "core/device.h"
-#include "core/temporary_switches.h"
 
 #include <cuda_runtime.h>
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -16,16 +16,21 @@
 
 namespace infernix {
 
-// Stages an over-aligned (alignas(128)) CUtensorMap descriptor struct into device global memory
-// for a kernel launch on Windows, where MSVC cannot pass the struct by value as a
-// __grid_constant__ parameter (C2719). The kernel reads the descriptors from the device pointer
-// returned by stage() and makes each tensor map visible to the TMA (tensormap) proxy with a
-// fence.proxy.tensormap acquire before its first cp.async.bulk.tensor.
+// Passes an over-aligned (alignas(128)) CUtensorMap descriptor struct to a kernel launch on Windows,
+// where MSVC cannot pass the struct by value as a __grid_constant__ parameter (C2719). MSVC does pass
+// the same bytes as an 8-byte-aligned word array by value, which the kernel reads as its tensor maps in
+// place (TmaDescriptorArgument) when the parameter space puts the words on a 64-byte boundary, as the
+// TMA requires. That alignment is not documented, so a probe launch checks it once
+// (tma_param_words_aligned), and where it fails the descriptors are staged into device global memory
+// instead: the kernel reads them from the device pointer returned by stage() and makes each tensor
+// map visible to the TMA (tensormap) proxy with a fence.proxy.tensormap acquire before its first
+// cp.async.bulk.tensor.
 //
-// An eager launch: MSVC does pass the same bytes as an 8-byte-aligned word array, so stage()
-// launches a one-block kernel that takes the words by value and stores them into one persistent
-// device buffer. Kernel parameters are copied when the launch is issued, so the launch never
-// reads host memory the host may since have rewritten, and the host never waits for the GPU. The
+// Staging (that fallback, and the only form of a caller that stages directly, such as the offloaded MoE
+// wide route). An eager launch: stage() launches a one-block kernel that takes the words by value and
+// stores them into one persistent device buffer. Kernel parameters are copied when the launch is issued,
+// so the launch never reads host memory the host may since have rewritten, and the host never waits for
+// the GPU. The
 // staging kernel and the TMA kernel that reads the buffer are ordinary stream-ordered launches,
 // so a launch's descriptors are stored only after the previous TMA kernel on the stream has
 // finished reading them.
@@ -81,12 +86,9 @@ __device__ __forceinline__ void acquire_staged_tensor_map(const void* tensor_map
     }
 }
 
-// TEMPORARY (INFERNIX_TMP_TMA_PARAM_WORDS, candidates §2.3 GX-03): the descriptor words as a Windows
-// kernel parameter. MSVC passes the descriptor bytes as an 8-byte-aligned word array by value, which the
-// kernel reads as its tensor maps in place (a __grid_constant__ parameter, as Linux passes the struct)
-// when the parameter space puts the words on a 64-byte boundary, as the TMA requires: no staging kernel
-// then runs before an eager launch. That alignment is not documented, so a probe launch checks it once
-// (tma_param_words_aligned).
+// The descriptor words as a Windows kernel parameter, read in place (a __grid_constant__ parameter, as
+// Linux passes the struct): no staging kernel runs before an eager launch (measured +0.1-0.3 % on IQ3_S
+// and FP4-Local eager prefill, 14 of 15 pairs, 2026-10-28).
 template <class Descriptor>
 struct TmaDescriptorArgument {
     tma_staging_detail::DescriptorWords<sizeof(Descriptor) / sizeof(std::uint64_t)> words{};
@@ -94,7 +96,7 @@ struct TmaDescriptorArgument {
 };
 
 // A Windows TMA kernel's descriptor parameter: the address of the device copy TmaDescriptorStaging made,
-// or (InPlace) the words read in place. A template argument rather than a runtime select, so the default
+// or (InPlace) the words read in place. A template argument rather than a runtime select, so the staged
 // instantiation compiles exactly as the plain pointer parameter did.
 template <class Descriptor, bool InPlace>
 using TmaDescriptorParameter = std::conditional_t<InPlace, TmaDescriptorArgument<Descriptor>, const Descriptor*>;
@@ -115,11 +117,10 @@ __global__ void probe_parameter_alignment(const __grid_constant__ TmaDescriptorA
 
 } // namespace tma_staging_detail
 
-// Whether descriptor words in the first kernel parameter land on a 64-byte boundary (the switch on and
-// the probe launch confirming it), once per process.
+// Whether descriptor words in the first kernel parameter land on a 64-byte boundary (the probe launch
+// confirming it), once per process.
 inline bool tma_param_words_aligned() {
     static const bool aligned = [] {
-        if (!temporary_switches::flag("INFERNIX_TMP_TMA_PARAM_WORDS")) { return false; }
         // On a stream of its own, in relaxed capture mode: the first launch may come while this thread
         // captures a decode graph on another stream.
         cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
@@ -210,13 +211,27 @@ class TmaDescriptorStaging {
     std::size_t used_ = 0;
 };
 
+namespace tma_staging_detail {
+
+inline std::atomic<bool>& staging_forced() {
+    static std::atomic<bool> forced{false};
+    return forced;
+}
+
+} // namespace tma_staging_detail
+
+// Tests: every Windows launch takes the staged copy, the route a misaligned parameter block falls back to.
+inline void tma_descriptor_force_staging(bool force) {
+    tma_staging_detail::staging_forced().store(force, std::memory_order_relaxed);
+}
+
 // Calls `launch(std::bool_constant<InPlace>{}, parameter)` once with the descriptor parameter of the
 // kernel instantiation to run: the words read in place when tma_param_words_aligned(), else the copy
 // staged for the next launch on `stream` (every launch `launch` makes reads it, in stream order).
 template <class Descriptor, class Launch>
 void with_tma_descriptor_parameter(TmaDescriptorStaging<Descriptor>& staging, const Descriptor& descriptors,
                                    cudaStream_t stream, Launch&& launch) {
-    if (tma_param_words_aligned()) {
+    if (!tma_staging_detail::staging_forced().load(std::memory_order_relaxed) && tma_param_words_aligned()) {
         TmaDescriptorArgument<Descriptor> words;
         std::memcpy(words.words.words, &descriptors, sizeof(Descriptor));
         launch(std::true_type{}, words);

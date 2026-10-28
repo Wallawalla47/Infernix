@@ -637,59 +637,6 @@ void test_prompt_credit() {
           "the controller credits without loading");
 }
 
-// Prompt seeding's promotions (INFERNIX_TMP_PROMPT_SEED's budget, design §19.3.27): admit makes the
-// best credited misses resident, each only if it outranks the lowest resident outside the credited
-// keys, up to the budget, counting no use and ticking no clock; the controller loads them.
-void test_prompt_promotions() {
-    LfruPolicy policy(64, 3);
-    LfruPolicy::Step step;
-    const std::vector<std::uint32_t> fill{0, 1, 2};
-    policy.step(fill, step); // now 1: keys 0, 1, 2 count 1, score 1
-    const std::vector<std::uint32_t> keys{10, 11, 1};
-    const std::vector<double> amounts{5.0, 0.5, 2.0};
-    policy.credit(keys, amounts); // 10 scores 5, 11 0.5, resident 1 3
-    const std::uint64_t now = policy.now();
-    policy.admit(keys, 0, step);
-    check(step.admitted.empty() && !policy.resident(10), "a zero budget admits nothing");
-    // Admission is filtered: with key 10 inadmissible, 11 (0.5) does not outrank the victim (1).
-    const LfruPolicy::Admissible not_ten = [](std::uint32_t k) { return k != 10; };
-    policy.admit(keys, 8, step, &not_ten);
-    check(step.admitted.empty() && step.victims.empty(), "an inadmissible key is passed over, and a weak one stops");
-    // Key 10 (5) replaces key 0 (the lowest-key resident of score 1 outside the credited keys); key 11
-    // (0.5) does not outrank key 2 (1), so admission stops there although the budget allows more.
-    policy.admit(keys, 8, step);
-    check(step.admitted == std::vector<std::uint32_t>{10} && step.victims == std::vector<std::uint32_t>{0},
-          "the best credited miss replaces the lowest resident outside the prompt's keys");
-    check(policy.resident(1) && policy.resident(2) && !policy.resident(11), "the credited resident is protected");
-    check(policy.now() == now && policy.count(10) == 5.0 && policy.count(11) == 0.5,
-          "promotions count no use and tick no clock");
-
-    // The controller: the victim's frame retires, so the load waits for the quiescent boundary.
-    CacheController cache(64, 4, 0, 1);
-    std::vector<CacheController::Command> cmds;
-    const std::vector<std::uint32_t> warm{0, 1, 2, 3};
-    cache.on_route(warm, 1, cmds);
-    cmds.clear();
-    const std::vector<std::uint32_t> prompt{20, 21};
-    const std::vector<double> credit{9.0, 6.0};
-    cache.credit(prompt, credit);
-    check(cache.admit_credited(prompt, 1, 1, cmds) == 1, "the budget caps the promotions");
-    check(cache.policy().resident(20) && !cache.policy().resident(21) && !cache.policy().resident(0),
-          "the best credited miss is admitted in place of the lowest resident");
-    bool copied = false;
-    for (const auto& c : cmds) { copied |= c.kind == CacheController::Command::Kind::kCopy; }
-    check(!copied && cache.queued_loads() == 1, "with every frame held the promotion queues");
-    cache.on_quiescent(cmds);
-    std::uint32_t copies = 0;
-    for (const auto& c : cmds) {
-        if (c.kind == CacheController::Command::Kind::kCopy) {
-            ++copies;
-            check(c.key == 20, "the queued promotion loads into the victim's retired frame");
-        }
-    }
-    check(copies == 1 && cache.queued_loads() == 0, "the quiescent boundary loads the promotion");
-}
-
 // The saved state file: a round trip keeps counts and ranking; another identity, key count, version
 // or a truncated file loads nothing (with a reason).
 void test_state_file() {
@@ -930,7 +877,6 @@ int main() {
     test_lending_prefers_host_copies();
     test_seed();
     test_prompt_credit();
-    test_prompt_promotions();
     test_landing();
     test_state_file();
     test_calibrated_order();

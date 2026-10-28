@@ -40,18 +40,18 @@ def test_schedule_balances_positions():
 
 
 def test_parse_switches_and_sample_checks():
-    record = "INFERNIX_TMP_NGRAM_AGREE=1 | INFERNIX_TMP_QSA_PROMPT_V2=unset"
-    assert abba.parse_switches(record) == {"INFERNIX_TMP_NGRAM_AGREE": "1",
+    record = "INFERNIX_TMP_STAGING_SLOTS=64 | INFERNIX_TMP_QSA_PROMPT_V2=unset"
+    assert abba.parse_switches(record) == {"INFERNIX_TMP_STAGING_SLOTS": "64",
                                            "INFERNIX_TMP_QSA_PROMPT_V2": "unset"}
-    arm = abba.Arm("agree", env={"INFERNIX_TMP_NGRAM_AGREE": "1"},
+    arm = abba.Arm("slots", env={"INFERNIX_TMP_STAGING_SLOTS": "64"},
                    args=["--fast-path", "dflash2-pairs"],
-                   expect_switches={"INFERNIX_TMP_NGRAM_AGREE": "1"})
-    good = abba.Sample("agree", 0, 0, {"config": {"temporary_switches": record,
+                   expect_switches={"INFERNIX_TMP_STAGING_SLOTS": "64"})
+    good = abba.Sample("slots", 0, 0, {"config": {"temporary_switches": record,
                                                        "fast_paths": "dflash2-pairs"}},
                        "PCIe link to the GPU: 27.9 GB/s\n", 0, 1.0)
     abba.check_sample(good, arm, 20.0)
     assert good.problems == []
-    bad = abba.Sample("agree", 0, 0, {"config": {"temporary_switches": "INFERNIX_TMP_NGRAM_AGREE=unset",
+    bad = abba.Sample("slots", 0, 0, {"config": {"temporary_switches": "INFERNIX_TMP_STAGING_SLOTS=unset",
                                                       "fast_paths": ""}},
                       "PCIe link to the GPU: 3.0 GB/s\n", 0, 1.0)
     abba.check_sample(bad, arm, 20.0)

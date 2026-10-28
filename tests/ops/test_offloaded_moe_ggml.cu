@@ -12,9 +12,10 @@
 // the exact arithmetic (ops/ggml/ggml_exact.h, whose decode, sums and rounding
 // infernix_ggml_linear_test qualifies against an independent bignum oracle): x and h A16-encoded,
 // gate/up rows rounded to BF16, SwiGLU, the down rows. Every output must be bit-equal to it in
-// every configuration (also with the wide tiles' codebooks in shared memory). The ggml-bf16-prefill
-// route (run_bf16) is checked against the exact route and a binary64 chain within bounds instead, and
-// its stage-decode tiles (run_stage_decode) bit for bit against its planes.
+// every configuration. The ggml-bf16-prefill route (run_bf16) keeps the exact tiles' bits below
+// kGgmlStageDecodeMinColumns columns; from there its stage-decode tiles are checked against the exact
+// route and a binary64 chain within bounds instead, and (run_stage_decode) for the same bits across
+// call widths and staged passes.
 //
 // `--bench [tokens] [bf16]` times one layer's expert call of a prefill chunk (512 experts, top-10,
 // every record resident) per format pair and route instead.
@@ -24,6 +25,7 @@
 #include "core/ggml_format.h"
 #include "ops/ggml/ggml_exact.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
+#include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -246,23 +248,20 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
         int slots;
         bool fork;
         bool cpu;
-        bool tables; // the wide tiles' codebooks in shared memory (MoeGgmlTiles::shared_codebooks)
         const char* name;
         bool split = false; // a forked call's misses staged in two launches (MoeExpertSource::split_stream)
     };
-    const Config configs[] = {{0, false, false, false, "zero-copy"},
-                              {3, false, false, false, "3 staging slots"},
-                              {64, false, false, false, "64 staging slots"},
-                              {64, true, false, false, "forked"},
-                              {64, true, false, false, "forked, split staging", true},
-                              {64, false, true, false, "CPU-served misses"},
-                              {64, true, true, false, "forked, CPU-served misses"},
-                              {64, true, true, false, "forked, split staging, CPU-served misses", true},
-                              {3, false, false, true, "3 staging slots, shared codebooks"}};
+    const Config configs[] = {{0, false, false, "zero-copy"},
+                              {3, false, false, "3 staging slots"},
+                              {64, false, false, "64 staging slots"},
+                              {64, true, false, "forked"},
+                              {64, true, false, "forked, split staging", true},
+                              {64, false, true, "CPU-served misses"},
+                              {64, true, true, "forked, CPU-served misses"},
+                              {64, true, true, "forked, split staging, CPU-served misses", true}};
     for (const auto& config : configs) {
         if (config.fork && columns > moe::kMaxColumns) { continue; }
         if (config.cpu && columns > 64) { continue; }
-        if (config.tables && columns <= moe::kMaxColumns) { continue; } // the narrow kernels read no table copy
         infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
         cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
         infernix::ops::MoeExpertSource source{.frame_base    = d_frames_base,
@@ -279,7 +278,6 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
                                .gate_row_bytes = row_bytes(gu, H),
                                .down_row_bytes = row_bytes(down, I),
                                .record_bytes   = record};
-        source.ggml.tiles.shared_codebooks = config.tables;
         if (config.fork) {
             source.fork_stream    = fork_stream;
             source.fork_events[0] = fork_events[0];
@@ -375,15 +373,16 @@ std::uint16_t bf16_round(double v) {
     return static_cast<std::uint16_t>((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
 }
 
-// The ggml-bf16-prefill route (WideA16::kGgmlBf16) of a call wide enough for its planes
-// (kGgmlBf16MinColumns): 64 experts, top-4, some resident, the rest read zero-copy in one pass or staged
-// through 24 slots (passes of 24 jobs, each one sub-batch), a few rarely routed experts left to
-// the narrow kernels. Its arithmetic is not the exact route's (x and h as stored, FP32 sums), so the
-// exact route of the same call (bit-equal to the host oracle at the other widths) is the control: per
-// output column the normwise difference must stay within 2^-6 and at least 90 % of the outputs must
-// be equal. A sample of 48 (token, slot) pairs is checked against a binary64 chain with the route's
-// semantic boundaries (gate and up rounded to BF16, swiglu_bf16, BF16 h, the down rows): within
-// 2^-7 of sum |w h| plus half a BF16 ulp per output.
+// The ggml-bf16-prefill route (WideA16::kGgmlBf16) of a call of `columns` columns: 64 experts, top-4,
+// some resident, the rest read zero-copy in one pass or staged through 24 slots (passes of 24 jobs), a
+// few rarely routed experts left to the narrow kernels and one favoured expert of many tiles. The exact
+// route of the same call (bit-equal to the host oracle at the other widths) is the control. Below
+// kGgmlStageDecodeMinColumns the route keeps the exact tiles: every output must equal the exact route's.
+// From it the stage-decode tiles' arithmetic is not the exact route's (x and h as stored, FP32 sums):
+// per output column the normwise difference must stay within 2^-6 and at least 90 % of the outputs
+// must be equal, and a sample of 48 (token, slot) pairs is checked against a binary64 chain with the
+// route's semantic boundaries (gate and up rounded to BF16, swiglu_bf16, BF16 h, the down rows):
+// within 2^-7 of sum |w h| plus half a BF16 ulp per output.
 void run_bf16(QType gu, QType down, int columns, std::mt19937& rng) {
     constexpr int experts = 64, top_k = 4;
     const int H = moe::kHidden, I = moe::kIntermediate;
@@ -470,6 +469,15 @@ void run_bf16(QType gu, QType down, int columns, std::mt19937& rng) {
     const auto exact = call(moe::WideA16::kExact, 0);
     for (const int slots : {0, 24}) {
         const auto fast = call(moe::WideA16::kGgmlBf16, slots);
+        char what[200];
+        if (columns < moe::wide::kGgmlStageDecodeMinColumns) {
+            std::size_t bad = 0;
+            for (std::size_t i = 0; i < outputs; ++i) { bad += fast[i] != exact[i]; }
+            std::snprintf(what, sizeof what, "ggml bf16 experts (%d, %d) x %d columns, %d slots (exact tiles): %zu of %zu outputs differ from the exact route",
+                          static_cast<int>(gu), static_cast<int>(down), columns, slots, bad, outputs);
+            check(bad == 0, what);
+            continue;
+        }
         std::size_t same = 0, bad_columns = 0;
         double worst = 0;
         for (int c = 0; c < top_k * columns; ++c) {
@@ -485,7 +493,6 @@ void run_bf16(QType gu, QType down, int columns, std::mt19937& rng) {
             worst = std::max(worst, std::isnan(rel) ? 1e30 : rel);
             bad_columns += !(rel <= 1.0 / 64);
         }
-        char what[200];
         std::snprintf(what, sizeof what, "ggml bf16 experts (%d, %d) x %d columns, %d slots: %zu output columns beyond 2^-6 of the exact route",
                       static_cast<int>(gu), static_cast<int>(down), columns, slots, bad_columns);
         check(bad_columns == 0, what);
@@ -545,14 +552,14 @@ void run_bf16(QType gu, QType down, int columns, std::mt19937& rng) {
     cudaFreeHost(host);
 }
 
-// The stage-decode tiles (MoeGgmlTiles::stage_decode) against the planes, bit for bit: 128 experts,
-// top-4, every third resident and the rest read zero-copy, a few rarely routed experts left to the
-// narrow kernels and one favoured expert of many tiles. The planes' call of 16,384 columns is the
-// reference (its planes also decoded with the codebooks in shared memory: the same bits); the
-// stage-decode route must give the same bits for the call itself (one pass, and passes of 24 staged
-// jobs) and for calls of its first 4,096, 8,192 and 12,288 columns (an output depends only on its
-// column, its expert and K, so a prefix call's outputs are the full call's first columns). About 128
-// entries per expert at 4,096 columns, so jobs end in tiles of 64 and of 128 columns.
+// The stage-decode tiles' call invariance, bit for bit: 128 experts, top-4, every third resident and
+// the rest read zero-copy, a few rarely routed experts left to the narrow kernels and one favoured
+// expert of many tiles. The one-pass call of 16,384 columns is the reference; the same call in passes
+// of 24 staged jobs and the calls of its first 4,096, 8,192 and 12,288 columns must give the same bits
+// (an output depends only on its column, its expert and K, so a prefix call's outputs are the full
+// call's first columns). About 128 entries per expert at 4,096 columns, so jobs end in tiles of 64 and
+// of 128 columns. run_bf16 bounds the route against the exact one.
+static_assert(moe::wide::kGgmlStageDecodeMinColumns <= 4096, "run_stage_decode's prefix calls take the stage-decode tiles");
 void run_stage_decode(QType gu, QType down, std::mt19937& rng) {
     constexpr int experts = 128, top_k = 4, columns = 16384;
     const int H = moe::kHidden, I = moe::kIntermediate;
@@ -602,7 +609,7 @@ void run_stage_decode(QType gu, QType down, std::mt19937& rng) {
     const std::size_t outputs = static_cast<std::size_t>(H) * top_k * columns;
     std::uint8_t* d_staging = nullptr;
     cuda_check(cudaMalloc(&d_staging, stride * 24), "cudaMalloc");
-    void* d_workspace = nullptr; // the widest call's (with its planes) serves every narrower one
+    void* d_workspace = nullptr; // the widest call's serves every narrower one
     cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(infernix::ops::offloaded_moe::kFlashNextShape,
                                                                                   max_jobs, top_k * columns, columns,
                                                                                   moe::ExpertActivation::kA16,
@@ -613,7 +620,7 @@ void run_stage_decode(QType gu, QType down, std::mt19937& rng) {
     std::uint16_t* d_out = nullptr;
     cuda_check(cudaMalloc(&d_out, outputs * sizeof(std::uint16_t)), "cudaMalloc");
     // The call of the first `width` columns; its outputs are the [H, top_k * width] prefix.
-    const auto call = [&](int width, const infernix::ops::MoeGgmlTiles& tiles, int slots) {
+    const auto call = [&](int width, int slots) {
         infernix::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {top_k, width}), Tensor(d_weights, DType::FP32, {top_k, width}),
                                           Tensor(d_gate, DType::FP32, {width})};
         infernix::ops::moe_route(Tensor(d_logits, DType::FP32, {experts + 1, width}), top_k, routing, nullptr);
@@ -628,7 +635,7 @@ void run_stage_decode(QType gu, QType down, std::mt19937& rng) {
         source.wide_a16     = moe::WideA16::kGgmlBf16;
         source.frame_stride = stride;
         source.ggml         = {.gate_up_format = gu, .down_format = down, .gate_row_bytes = gr, .down_row_bytes = dr,
-                               .record_bytes = record, .tiles = tiles};
+                               .record_bytes = record};
         Tensor tx(d_x, DType::BF16, {H, width});
         Tensor out(d_out, DType::BF16, {H, top_k * width});
         infernix::ops::moe_experts(tx, dispatch, source, top_k, std::min(experts, top_k * width), d_workspace, out, nullptr);
@@ -642,22 +649,15 @@ void run_stage_decode(QType gu, QType down, std::mt19937& rng) {
         std::size_t bad = 0;
         for (std::size_t i = 0; i < got.size(); ++i) { bad += got[i] != reference[i]; }
         char what[200];
-        std::snprintf(what, sizeof what, "ggml stage-decode experts (%d, %d), %s at %d columns: %zu of %zu outputs differ from the planes'",
+        std::snprintf(what, sizeof what, "ggml stage-decode experts (%d, %d), %s at %d columns: %zu of %zu outputs differ from the one-pass call's",
                       static_cast<int>(gu), static_cast<int>(down), arm, width, bad, got.size());
         check(bad == 0, what);
     };
-    const infernix::ops::MoeGgmlTiles planes{};
-    infernix::ops::MoeGgmlTiles plane_tables{};
-    plane_tables.shared_codebooks = true;
-    infernix::ops::MoeGgmlTiles decode{};
-    decode.stage_decode_min_columns = 0;
-    const auto reference = call(columns, planes, 0);
-    check(reference.size() == outputs, "the planes' call covers every output");
-    compare(call(columns, plane_tables, 0), reference, columns, "the planes with shared codebooks (not stage decode)");
-    compare(call(columns, decode, 0), reference, columns, "one pass");
-    compare(call(columns, decode, 24), reference, columns, "passes of 24 staged jobs");
-    for (const int width : {4096, 8192, 12288}) { compare(call(width, decode, 0), reference, width, "a prefix call"); }
-    std::printf("info ggml stage-decode experts (%d, %d): bit-equal to the planes at 4,096 / 8,192 / 12,288 / 16,384 columns\n",
+    const auto reference = call(columns, 0);
+    check(reference.size() == outputs, "the one-pass call covers every output");
+    compare(call(columns, 24), reference, columns, "passes of 24 staged jobs");
+    for (const int width : {4096, 8192, 12288}) { compare(call(width, 0), reference, width, "a prefix call"); }
+    std::printf("info ggml stage-decode experts (%d, %d): the same bits at 4,096 / 8,192 / 12,288 / 16,384 columns and in staged passes\n",
                 static_cast<int>(gu), static_cast<int>(down));
     cudaFree(d_out);
     cudaFree(d_scales);
@@ -677,8 +677,7 @@ void run_stage_decode(QType gu, QType down, std::mt19937& rng) {
 // --bench: one layer call of the real geometry (512 experts, top-10; 4,096 tokens, a prefill chunk of
 // about 80 columns per expert, or a decode or verification width) with every record resident and
 // the model's job bound, timed over repeated moe_experts calls.
-void bench(QType gu, QType down, int columns, std::mt19937& rng, moe::WideA16 route,
-           const infernix::ops::MoeGgmlTiles& tiles = {}) {
+void bench(QType gu, QType down, int columns, std::mt19937& rng, moe::WideA16 route) {
     constexpr int experts = 512, top_k = 10, reps = 10;
     const int H = moe::kHidden, I = moe::kIntermediate;
     const std::uint64_t record = 2ULL * I * row_bytes(gu, H) + static_cast<std::uint64_t>(H) * row_bytes(down, I);
@@ -733,7 +732,7 @@ void bench(QType gu, QType down, int columns, std::mt19937& rng, moe::WideA16 ro
     source.frame_stride = stride;
     source.wide_a16     = route;
     source.ggml         = {.gate_up_format = gu, .down_format = down, .gate_row_bytes = row_bytes(gu, H),
-                           .down_row_bytes = row_bytes(down, I), .record_bytes = record, .tiles = tiles};
+                           .down_row_bytes = row_bytes(down, I), .record_bytes = record};
     Tensor tx(d_x, DType::BF16, {H, columns});
     Tensor out(d_out, DType::BF16, {H, top_k * columns});
     cudaEvent_t start, stop;
@@ -751,13 +750,11 @@ void bench(QType gu, QType down, int columns, std::mt19937& rng, moe::WideA16 ro
     ms /= reps;
     const double macs = static_cast<double>(top_k) * columns * (2.0 * I * H + static_cast<double>(H) * I);
     // The route the call's wide jobs took (ggml_expert.cuh launch_expert_pass_ggml's order).
-    const char* arm = route != moe::WideA16::kGgmlBf16                                     ? "exact"
-                      : tiles.stage_decode(columns)                                         ? "bf16 stage decode"
-                      : columns >= infernix::ops::MoeGgmlTiles::from_environment().plane_min_columns ? "bf16 planes"
-                                                                                            : "exact (below the plane threshold)";
-    std::printf("experts (%d, %d) x %d tokens, %s%s: %8.3f ms per layer call, %6.1f effective TOPS\n", static_cast<int>(gu),
-                static_cast<int>(down), columns, arm, tiles.shared_codebooks ? ", shared codebooks" : "", ms,
-                2.0 * macs / (ms * 1e-3) / 1e12);
+    const char* arm = route != moe::WideA16::kGgmlBf16                       ? "exact"
+                      : columns >= moe::wide::kGgmlStageDecodeMinColumns ? "bf16 stage decode"
+                                                                             : "exact (below the stage-decode threshold)";
+    std::printf("experts (%d, %d) x %d tokens, %s: %8.3f ms per layer call, %6.1f effective TOPS\n", static_cast<int>(gu),
+                static_cast<int>(down), columns, arm, ms, 2.0 * macs / (ms * 1e-3) / 1e12);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     cudaFree(d_out);
@@ -778,25 +775,16 @@ void bench(QType gu, QType down, int columns, std::mt19937& rng, moe::WideA16 ro
 INFERNIX_OP_TEST(offloaded_moe_ggml) {
     std::mt19937 rng(20261010);
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
-        // --bench [tokens] [bf16]: the exact route, alone and with its codebooks in shared memory, and,
-        // with bf16, the ggml-bf16-prefill route on its planes (calls of INFERNIX_TMP_IQ_PLANE_MIN_COLUMNS
-        // or more columns, default 14,336; narrower ones print as exact) and on the stage-decode tiles.
+        // --bench [tokens] [bf16]: the exact route and, with bf16, the ggml-bf16-prefill route (the
+        // stage-decode tiles from kGgmlStageDecodeMinColumns columns; narrower calls print as exact).
         const int columns = argc > 2 ? std::atoi(argv[2]) : 4096;
         const bool bf16   = argc > 3 && std::strcmp(argv[3], "bf16") == 0;
-        infernix::ops::MoeGgmlTiles tables{}, decode{};
-        tables.shared_codebooks         = true;
-        decode.stage_decode_min_columns = 0;
         for (const auto& [gu, down] : {std::pair{QType::GGML_IQ2_S, QType::GGML_IQ4_NL}, std::pair{QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL},
                                        std::pair{QType::GGML_IQ3_S, QType::GGML_IQ4_NL}, std::pair{QType::GGML_IQ3_S, QType::GGML_Q2_0},
                                        std::pair{QType::GGML_IQ4_XS, QType::GGML_IQ4_NL}}) {
             try {
                 bench(gu, down, columns, rng, moe::WideA16::kExact);
-                bench(gu, down, columns, rng, moe::WideA16::kExact, tables);
-                if (bf16) {
-                    bench(gu, down, columns, rng, moe::WideA16::kGgmlBf16);
-                    bench(gu, down, columns, rng, moe::WideA16::kGgmlBf16, tables);
-                    bench(gu, down, columns, rng, moe::WideA16::kGgmlBf16, decode);
-                }
+                if (bf16) { bench(gu, down, columns, rng, moe::WideA16::kGgmlBf16); }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "bench: %s\n", e.what());
                 return 1;
@@ -818,9 +806,11 @@ INFERNIX_OP_TEST(offloaded_moe_ggml) {
             run(gu, down, columns, rng, Spread::kEdge);
             run(gu, down, columns, rng, Spread::kWide);
         }
-        // The ggml-bf16-prefill route at a width that carves its planes (a partial last tile).
-        run_bf16(gu, down, 14336 + 37, rng); // wide_expert.h kGgmlBf16MinColumns = 14336
-        // Its stage-decode tiles: the planes' bits at 4,096 to 16,384 columns.
+        // The ggml-bf16-prefill route on both sides of its stage-decode threshold: the exact tiles just
+        // below it, the stage-decode tiles just above it (a partial last tile).
+        run_bf16(gu, down, moe::wide::kGgmlStageDecodeMinColumns - 1, rng);
+        run_bf16(gu, down, moe::wide::kGgmlStageDecodeMinColumns + 37, rng);
+        // The stage-decode tiles' bits across call widths (4,096 to 16,384 columns) and staged passes.
         run_stage_decode(gu, down, rng);
     }
     if (g_failures != 0) {
@@ -828,7 +818,7 @@ INFERNIX_OP_TEST(offloaded_moe_ggml) {
         return 1;
     }
     std::printf("ggml experts: every format pair, width and placement bit-equal to the exact host expert; the "
-                "ggml-bf16-prefill route within its bounds of the exact route and a binary64 chain, its stage-decode "
-                "tiles bit-equal to its planes\n");
+                "ggml-bf16-prefill route bit-equal to the exact route below its stage-decode threshold, its "
+                "stage-decode tiles within their bounds of the exact route and a binary64 chain and call-invariant\n");
     return 0;
 }

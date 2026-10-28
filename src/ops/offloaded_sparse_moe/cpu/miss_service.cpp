@@ -1,7 +1,6 @@
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 
 #include "core/nvtx.h"
-#include "core/temporary_switches.h"
 
 #include <cuda_runtime.h>
 
@@ -217,8 +216,7 @@ void CpuMissService::serve() {
                             .ggml_a8    = ggml && options_.ggml_a8,
                             .nvfp4_a8   = options_.nvfp4_a8,
                             .shape      = options_.shape,
-                            .cpus       = options_.cpus,
-                            .shared_x   = temporary_switches::flag("INFERNIX_TMP_CPU_SHARED_X")});
+                            .cpus       = options_.cpus});
         const std::size_t hidden = static_cast<std::size_t>(options_.shape.hidden);
         std::vector<CpuExpertJob> jobs(static_cast<std::size_t>(jobs_));
         std::vector<CpuExpertJob> ready, read;

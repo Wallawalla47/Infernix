@@ -197,6 +197,10 @@ void Program::set_maintenance_waker(std::function<void()> waker) {
     if (impl_->offload) { impl_->offload->engine().set_maintenance_waker(std::move(waker)); }
 }
 
+std::uint64_t Program::engine_thread_cpus() const noexcept {
+    return impl_->offload ? impl_->offload->engine().engine_cpus() : 0U;
+}
+
 std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base,
                                                      std::uint32_t maximum_frontier) {
     return impl_->hybrid_sources(base, maximum_frontier);

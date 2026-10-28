@@ -121,8 +121,8 @@ struct ScheduleResidual : Schedule {
     static constexpr bool kSkipIdleColumns = !(G::kHidden == kHidden && G::kIntermediate == kIntermediate);
 };
 
-// TEMPORARY (INFERNIX_TMP_WIDE_EXPERT_T64, candidates P5; Basalt ebf6928), until its A/B: schedule Base with
-// a 64-token warp tile. Four consumer warps each take every column of the 64-column token tile against
+// Schedule Base with a 64-token warp tile (Basalt ebf6928), for calls of kWarpTile64MinColumns columns per
+// expert or more on average (wide_expert.h). Four consumer warps each take every column of the 64-column token tile against
 // their 32 rows, so each B fragment (rg16_fragments' decode of a row group's staged units) feeds four
 // 16-column MMA tiles instead of two: half the B decodes and shared loads per MMA. The stages, the K
 // order of every output's MMA chain and so every output bit are Base's; the 160-thread CTA keeps two

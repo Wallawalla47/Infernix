@@ -17,7 +17,6 @@
 #include "ops/softmax_attention/dense/causal_cache/vq2/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/column_invariant.h"
 #include "core/arena.h"
-#include "core/temporary_switches.h"
 #include "ops/kv_cache/append/launch.h"
 
 #include <algorithm>
@@ -290,14 +289,14 @@ StagedColumns stage_columns(Allocator& allocator, AttentionHeadGeometry geometry
     return out;
 }
 
-// INFERNIX_TMP_VERIFY_ROWS_ATTENTION (candidates §10.3 KW-01): a column-invariant round appends all
+// The rows variant (candidates §10.3 KW-01): a column-invariant round appends all
 // of its columns' K/V in one launch, then attends every column as a row of one-column calls over
 // the appended keys, up to kRowsPerCall rows per launch, instead of one append-and-attend call per
 // column. Each row keeps the key partition and merge order its one-column call plans (for the
 // round's batch), and a row reads only keys at or before its own position, which the append wrote
 // exactly as the fused one-column append writes them; so every column's bits are unchanged. The
 // formats whose appended rows are independent per token take it; the VQ2 and K4V2 exact window
-// keeps the column order.
+// keeps the column order. 27B NVFP4 DFlash2 7 drafts, --reproducible: +6.7 % decode (2026-10-28).
 constexpr std::int32_t kRowsPerCall = kMaximumBatchSize;
 
 bool verify_rows_attention(KvCacheStorage storage) {
@@ -306,10 +305,8 @@ bool verify_rows_attention(KvCacheStorage storage) {
     case KvCacheStorage::Int8Group64:
     case KvCacheStorage::Fp8E4M3Row256:
     case KvCacheStorage::Nvfp4Group16:
-    case KvCacheStorage::Fp8KeyNvfp4Value:
-        return temporary_switches::flag("INFERNIX_TMP_VERIFY_ROWS_ATTENTION");
-    default:
-        return false;
+    case KvCacheStorage::Fp8KeyNvfp4Value: return true;
+    default: return false;
     }
 }
 

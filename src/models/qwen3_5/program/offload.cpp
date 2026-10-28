@@ -19,6 +19,18 @@ namespace infernix::models::qwen3_5::detail {
 
 namespace expert_offload = runtime::expert_offload;
 
+namespace {
+
+// The engine's round thread alone on the last P-core, which no CPU expert worker uses (placement.h
+// cpu_placement): the 122B's CPU-bound offloaded decode +0.3 % (Ornith, 4/4 pairs, 2026-10-28;
+// Flash-Next measured flat or slower and stays unpinned).
+expert_offload::OffloadOptions with_isolated_engine(expert_offload::OffloadOptions options) {
+    options.engine_isolate = true;
+    return options;
+}
+
+} // namespace
+
 runtime::expert_offload::OffloadSetup offload_setup(const execution::Parameters& parameters,
                                                     const OffloadGeometry& geometry) {
     const Model& model = parameters.model;
@@ -70,11 +82,10 @@ std::uint64_t ProgramOffload::fixed_bytes(const execution::Parameters& parameter
 ProgramOffload::ProgramOffload(const execution::Parameters& parameters, const OffloadGeometry& geometry,
                                expert_offload::OffloadOptions options, Diagnostic diagnostic)
     : parameters_(parameters), wide_pass_bytes_(geometry.wide_pass_bytes),
-      wide_ladder_(temporary_switches::flag("INFERNIX_TMP_PROMPT_SIZED_LOAN") ? geometry.wide_pass_ladder
-                                                                             : decltype(geometry.wide_pass_ladder){}),
+      wide_ladder_(geometry.wide_pass_ladder),
       expert_wide_(geometry.expert_wide), expert_narrow_(geometry.expert_narrow), router_mma_(geometry.router_mma),
       diagnostic_(diagnostic),
-      engine_(offload_setup(parameters, geometry), std::move(options), std::move(diagnostic)) {}
+      engine_(offload_setup(parameters, geometry), with_isolated_engine(std::move(options)), std::move(diagnostic)) {}
 
 ProgramOffload::~ProgramOffload() {
     if (experts_.split_ready != nullptr) { cudaEventDestroy(experts_.split_ready); }
@@ -207,11 +218,10 @@ void ProgramOffload::build_experts() {
 }
 
 std::uint64_t ProgramOffload::wide_bytes(std::int32_t columns) const {
-    // The planner's full-width pass (0 on the lossless route, whose layers run their own path): one
-    // size for every wide pass, so a prompt's passes reuse one lease. TEMPORARY (INFERNIX_TMP_PROMPT_SIZED_LOAN,
-    // candidates BX-01, Flash-Next's default), until its A/B: the ladder's first width holding the pass, so a
-    // short prompt no longer evicts a whole chunk's workspace of experts (a wider later pass's lease
-    // replaces the held one, wide_workspace).
+    // The ladder's first width holding the pass (candidates BX-01, as on Flash-Next), so a short prompt
+    // does not evict a whole chunk's workspace of experts; a wider later pass's lease replaces the held
+    // one (wide_workspace). Ornith-122B prefill +0.2 % over one chunk-sized lease (5/6 pairs, 2026-10-28).
+    // The planner's full-width pass caps it (0 on the lossless route, whose layers run their own path).
     if (columns <= execution::kOffloadedMoeStaticColumns) { return 0; }
     for (const auto& [width, bytes] : wide_ladder_) {
         if (columns <= width) { return std::min<std::uint64_t>(bytes, wide_pass_bytes_); }
@@ -306,7 +316,7 @@ void ProgramOffload::end_pass(cudaStream_t compute, const execution::OffloadedCa
                         .position = position,
                         .lanes    = std::span<const std::int32_t>(&lane_id, 1)},
                        silent ? std::span<const std::uint8_t>(silent_columns_) : std::span<const std::uint8_t>{});
-    if (prompt && prompt_end && !silent) { engine_.seed_prompt(lane, compute); }
+    if (prompt && prompt_end && !silent) { engine_.seed_prompt(lane); }
 }
 
 bool ProgramOffload::continuing_prompt(std::uint32_t reused, std::uint32_t prompt) {

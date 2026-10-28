@@ -42,6 +42,10 @@ struct KVCacheVqStaging {
 void kv_cache_append_vq_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                PagedKVLayerView cache, cudaStream_t stream);
 
+// Tests: every following vector-quantized append takes the split encoder at `split` (1, 2, 4 or 8) pattern
+// ranges, or 0 for the route by rows (the default).
+void vq_append_force_split(int split);
+
 void kv_cache_append_vq_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                      const Tensor& valid_columns, const Tensor& table_rows,
                                      PagedKVBatchLayerView cache, const KVCacheVqStaging* staging,

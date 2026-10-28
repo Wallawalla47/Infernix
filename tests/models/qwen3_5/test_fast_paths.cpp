@@ -220,18 +220,21 @@ int main() {
     failures += check(!q::fast_path_qualified(FastPath::IdleWidePrefill,
                                               {24, ActivationClass::A16, KvCacheStorage::Int8Group64}),
                       "idle-wide-prefill is not qualified at 16-bit activations");
-    // expert-a4-residual (either term count) acts on offloaded W4A16 experts (Qwen3.5-122B-A10B) only, as a
-    // candidate: it is qualified for no Qwen3.5 configuration, and it couples a column to its call.
+    // expert-a4-residual (either term count) acts on offloaded W4A16 experts (Qwen3.5-122B-A10B: 32 heads, 8-bit
+    // FP8 activations) only, and it couples a column to its call. Two terms are registered there on every KV
+    // format (measured faster, 2026-10-28); three terms stay a candidate.
     for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
                                     KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
                                     KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                                     KvCacheStorage::Q4KeyVq2Value}) {
-        const q::FastPathConfiguration offloaded{32, ActivationClass::A16, kv, false, true};
+        const q::FastPathConfiguration offloaded{32, ActivationClass::A8, kv, false, true};
         for (const FastPath path : {FastPath::ExpertA4Residual, FastPath::ExpertA4Residual3}) {
             failures += check(q::fast_path_applies(path, offloaded, options),
                               "expert-a4-residual applies to the 122B's offloaded experts");
-            failures += check(!q::fast_path_qualified(path, offloaded), "expert-a4-residual is not qualified on the 122B");
         }
+        failures += check(q::fast_path_qualified(FastPath::ExpertA4Residual, offloaded) &&
+                              !q::fast_path_qualified(FastPath::ExpertA4Residual3, offloaded),
+                          "two-term expert-a4-residual is registered on the 122B, three terms are not");
     }
     failures += check(!q::fast_path_applies(FastPath::ExpertA4Residual, int8_24, options) &&
                           !q::fast_path_applies(FastPath::ExpertA4Residual3, int8_24, options),

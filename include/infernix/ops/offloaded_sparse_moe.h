@@ -225,38 +225,12 @@ struct MoeFetchChannel {
 /// storage layouts §9). gate_up_format == NVFP4_MUL selects the NVFP4 record and its
 /// routes. Both banks run exact A16 arithmetic on every column count, so their outputs depend on
 /// neither placement nor batch.
-// TEMPORARY (A/B of the GGUF banks' prefill expert tiles, docs/maintainer/qwen3_8-flash-next-design.md
-// §19.3.29): the defaults are the measured routing; from_environment() reads the switches once.
-// - INFERNIX_TMP_IQ_STAGE_DECODE_MIN_COLUMNS / _MAX_COLUMNS: ggml-bf16-prefill calls
-//   (WideA16::kGgmlBf16) of [min, max) columns run the BF16 stage-decode tiles (each K stage's codes
-//   decoded into shared memory, no planes: the planes' bits) instead of the exact tiles or the
-//   planes. Unset: no call (min = max = INT32_MAX).
-// - INFERNIX_TMP_IQ_PLANE_MIN_COLUMNS: ggml-bf16-prefill calls of at least this many columns carve
-//   the planes (the workspace layout reads from_environment()'s, every call the same) and, unless
-//   stage_decode takes them, run on them; below it the exact tiles. Default 14,336
-//   (offloaded_moe::wide::kGgmlBf16MinColumns); lower only to time the planes at narrower calls.
-// - INFERNIX_TMP_GGML_SHARED_CODEBOOKS=1: the exact gate/up tiles and the plane decode read the
-//   codebooks from shared memory (the same bits).
-struct MoeGgmlTiles {
-    std::int32_t stage_decode_min_columns = INT32_MAX;
-    std::int32_t stage_decode_max_columns = INT32_MAX;
-    std::int32_t plane_min_columns        = 14336;
-    bool shared_codebooks                 = false;
-
-    [[nodiscard]] bool stage_decode(std::int32_t columns) const noexcept {
-        return columns >= stage_decode_min_columns && columns < stage_decode_max_columns;
-    }
-    // Read once (core/temporary_switches.h, which the startup log lists).
-    [[nodiscard]] static const MoeGgmlTiles& from_environment();
-};
-
 struct MoeGgmlBank {
     QType gate_up_format       = QType::NVFP4_MUL;
     QType down_format          = QType::NVFP4_MUL;
     std::uint32_t gate_row_bytes = 0;
     std::uint32_t down_row_bytes = 0;
     std::uint64_t record_bytes = 0; // bytes a stage copies: the record rounded up to 16 (within its stride)
-    MoeGgmlTiles tiles;             // the prefill tiles' TEMPORARY switches (default: the measured routing)
     // --a8-activations (LOSSY, opt-in; ops/ggml/ggml_a8.h): a call of at most 128 columns runs every job on the
     // 8-bit activation kernels, and its CPU-served misses take the CPU route's 8-bit functions (the same bits);
     // wider calls keep the exact and BF16 routes, or with MoeExpertSource::wide_a16 = WideA16::kA8 stay on 8-bit

@@ -1,5 +1,4 @@
 #include "ops/linear/q8/q8_dispatch.h"
-#include "ops/linear/q8/q8_f16acc.h"
 #include "ops/linear/q8/q8_launch.h"
 #include "ops/linear/q8/q8_shapes.h"
 
@@ -115,17 +114,9 @@ Q8Launch select_q8_fp32_launch(std::int32_t n, std::int32_t k, std::int32_t t, L
 } // namespace
 
 void q8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                 LinearRoutes routes, WorkspaceArena* workspace, cudaStream_t stream) {
+                 LinearRoutes routes, cudaStream_t stream) {
     if (out.dtype == DType::FP32) {
         select_q8_fp32_launch(w.n, w.k, x.ne[1], policy)(x, w, out, stream);
-        return;
-    }
-    if (has_route(routes, LinearRoutes::F16Accumulate) && !column_invariant(policy) &&
-        q8_f16acc_admits(w.n, w.k, x.ne[1]) && w.padded_shape[1] == w.k) {
-        if (workspace == nullptr) {
-            throw std::invalid_argument("q8 linear: the f16-accumulate route requires caller workspace");
-        }
-        q8_linear_f16acc(x, w, out, *workspace, stream);
         return;
     }
     select_q8_launch(w.n, w.k, x.ne[1], policy, routes)(x, w, out, stream);

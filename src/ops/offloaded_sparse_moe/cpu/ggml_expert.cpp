@@ -8,6 +8,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include "ops/offloaded_sparse_moe/cpu/x86_mad.h"
 
@@ -102,7 +103,8 @@ inline __m256i iq4nl_codes(const std::uint8_t* qs) {
 
 // The IQ grid entries are read by scalar loads, not vpgather (microcoded and slow on hybrid CPUs'
 // efficiency cores): scalar loads measured 0.9 % faster end to end than vpgather (RTX 5090, IQ3_S
-// artifact, MTP 4 + n-gram 7 at 4K: 202.0 against 200.2 tok/s, 2026-10-16).
+// artifact, MTP 4 + n-gram 7 at 4K: 202.0 against 200.2 tok/s, 2026-10-16), and gathers on P-cores only
+// gained nothing end to end (IQ3_S DFlash2 decode after 8K, 2026-10-28, candidates §27 CX-03).
 template <QType F>
 INFERNIX_TARGET("avx2")
 inline Decoded decode(const std::uint8_t* row, int s) {
@@ -203,86 +205,6 @@ using x86::hsum8;
 template <QType F>
 inline constexpr int kUnitSlices = F == QType::GGML_IQ4_NL ? 1 : F == QType::GGML_Q2_0 ? 2 : 4;
 
-// Rows [row_begin, row_end) against NC columns. Each unit's lane vectors are kept in a batch of
-// eight, reduced together, and each block's exact P = 2048 sum(w * hi) + sum(w * lo) (int64,
-// |P| < 2^42) enters R as mant(d) * P * 2^(e(d) - 1). One copy per ISA, each for its target.
-#define INFERNIX_GGML_ROW_SUMS(Name, Target, Mad)                                                                      \
-    template <QType F, int NC>                                                                                         \
-    INFERNIX_TARGET(Target)                                                                                            \
-    void Name##_n(const std::uint8_t* matrix, int row_bytes, int slices, int row_begin, int row_end,                   \
-                  const CpuLimbSlice* const* columns, int c0, int ncols, ggml::I128* r) {                              \
-        constexpr int kUnit          = kUnitSlices<F>;                                                                 \
-        constexpr int kUnitsPerBlock = block_slices(F) / kUnit;                                                        \
-        static_assert(8 % kUnitsPerBlock == 0, "a batch holds whole blocks");                                         \
-        const int units = slices / kUnit;                                                                              \
-        for (int row = row_begin; row < row_end; ++row) {                                                              \
-            const std::uint8_t* w = matrix + static_cast<std::size_t>(row) * row_bytes;                                \
-            ggml::I128 out[NC];                                                                                        \
-            __m256i batch_lo[NC][8], batch_hi[NC][8];                                                                  \
-            std::uint16_t batch_d[8];                                                                                  \
-            int n = 0;                                                                                                 \
-            for (int u = 0; u < units; ++u) {                                                                          \
-                __m256i lo[NC], hi[NC];                                                                                \
-                for (int k = 0; k < NC; ++k) { lo[k] = hi[k] = _mm256_setzero_si256(); }                               \
-                std::uint16_t d = 0;                                                                                   \
-                for (int j = 0; j < kUnit; ++j) {                                                                      \
-                    const int s       = u * kUnit + j;                                                                 \
-                    const Decoded dw  = decode<F>(w, s);                                                               \
-                    const Weights sw  = scaled(dw);                                                                    \
-                    d                 = dw.d;                                                                          \
-                    for (int k = 0; k < NC; ++k) {                                                                     \
-                        const CpuLimbSlice& l = columns[c0 + k][s];                                                    \
-                        const auto* xl = reinterpret_cast<const __m256i*>(l.lo);                                       \
-                        const auto* xh = reinterpret_cast<const __m256i*>(l.hi);                                       \
-                        lo[k] = Mad::mad(Mad::mad(lo[k], sw.lo, _mm256_load_si256(xl)), sw.hi, _mm256_load_si256(xl + 1)); \
-                        hi[k] = Mad::mad(Mad::mad(hi[k], sw.lo, _mm256_load_si256(xh)), sw.hi, _mm256_load_si256(xh + 1)); \
-                    }                                                                                                  \
-                }                                                                                                      \
-                for (int k = 0; k < NC; ++k) {                                                                         \
-                    batch_lo[k][n] = lo[k];                                                                            \
-                    batch_hi[k][n] = hi[k];                                                                            \
-                }                                                                                                      \
-                batch_d[n++] = d;                                                                                      \
-                if (n == 8 || u + 1 == units) {                                                                        \
-                    for (int k = 0; k < NC; ++k) {                                                                     \
-                        for (int b = n; b < 8; ++b) { batch_lo[k][b] = batch_hi[k][b] = _mm256_setzero_si256(); }      \
-                        alignas(32) std::int32_t sl[8], sh[8];                                                         \
-                        _mm256_store_si256(reinterpret_cast<__m256i*>(sl), hsum8(batch_lo[k]));                       \
-                        _mm256_store_si256(reinterpret_cast<__m256i*>(sh), hsum8(batch_hi[k]));                       \
-                        for (int b = 0; b < n; b += kUnitsPerBlock) {                                                  \
-                            std::int64_t p = 0;                                                                        \
-                            for (int i = 0; i < kUnitsPerBlock; ++i) {                                                 \
-                                p += static_cast<std::int64_t>(sh[b + i]) * 2048 + sl[b + i];                          \
-                            }                                                                                          \
-                            std::int64_t mant;                                                                         \
-                            int shift;                                                                                 \
-                            bool negative;                                                                             \
-                            ggml::f16_parts(batch_d[b], mant, shift, negative);                                        \
-                            ggml::add_shifted(out[k], (negative ? -mant : mant) * p, shift);                           \
-                        }                                                                                              \
-                    }                                                                                                  \
-                    n = 0;                                                                                             \
-                }                                                                                                      \
-            }                                                                                                          \
-            for (int k = 0; k < NC; ++k) { r[static_cast<std::size_t>(row - row_begin) * ncols + c0 + k] = out[k]; }  \
-        }                                                                                                              \
-    }                                                                                                                  \
-    template <QType F>                                                                                                 \
-    void Name(const std::uint8_t* matrix, int row_bytes, int slices, int row_begin, int row_end,                       \
-              const CpuLimbSlice* const* columns, int ncols, ggml::I128* r) {                                          \
-        for (int c0 = 0; c0 < ncols; c0 += 4) {                                                                        \
-            switch (std::min(4, ncols - c0)) {                                                                         \
-            case 1: Name##_n<F, 1>(matrix, row_bytes, slices, row_begin, row_end, columns, c0, ncols, r); break;       \
-            case 2: Name##_n<F, 2>(matrix, row_bytes, slices, row_begin, row_end, columns, c0, ncols, r); break;       \
-            case 3: Name##_n<F, 3>(matrix, row_bytes, slices, row_begin, row_end, columns, c0, ncols, r); break;       \
-            default: Name##_n<F, 4>(matrix, row_bytes, slices, row_begin, row_end, columns, c0, ncols, r); break;      \
-            }                                                                                                          \
-        }                                                                                                              \
-    }
-
-INFERNIX_GGML_ROW_SUMS(row_sums_avx2, "avx2", Avx2Mad)
-INFERNIX_GGML_ROW_SUMS(row_sums_avxvnni, "avx2,avxvnni", AvxVnniMad)
-#undef INFERNIX_GGML_ROW_SUMS
 
 // ------------------------------------------------------------------- AVX-512 (512-bit vectors)
 //
@@ -380,13 +302,12 @@ void row_sums_avx512(const std::uint8_t* matrix, int row_bytes, int slices, int 
 
 #endif // INFERNIX_GGML_X86
 
+// The ISAs without the tiled rows (AVX-512, scalar); the 256-bit ISAs take ggml_rows.
 template <QType F>
 void row_sums_format(CpuIsa isa, const std::uint8_t* matrix, int row_bytes, int slices, int row_begin, int row_end,
                      const CpuLimbSlice* const* columns, int ncols, ggml::I128* r) {
     switch (isa) {
 #if defined(INFERNIX_GGML_X86)
-    case CpuIsa::kAvx2: row_sums_avx2<F>(matrix, row_bytes, slices, row_begin, row_end, columns, ncols, r); return;
-    case CpuIsa::kAvxVnni: row_sums_avxvnni<F>(matrix, row_bytes, slices, row_begin, row_end, columns, ncols, r); return;
     case CpuIsa::kAvx512Vnni:
         row_sums_avx512<F>(matrix, row_bytes, slices, row_begin, row_end, columns, ncols, r);
         return;
@@ -399,6 +320,286 @@ void row_sums_format(CpuIsa isa, const std::uint8_t* matrix, int row_bytes, int 
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("offloaded_moe ggml: ") + message); }
+}
+
+// ---------------------------------------------------------------- AVX2 and AVX-VNNI tiled rows
+//
+// The unit and batch arithmetic of the AVX-512 rows (each unit's int32 lanes, eight units' hsum8, each
+// block's exact int64 P into I128), so every output is the same integer on every ISA:
+// - a unit's kUnit slices of R matrices (R = 2: a gate row and its up row) are decoded once into a
+//   tile, then every column (1-8) runs its multiply-adds from the tile, sharing its x loads across
+//   the R rows: no second decode pass at 5-8 columns, and two independent decode chains;
+// - the block pointer and slice index come from unsigned unit arithmetic, not a signed s / 8 per slice;
+// - IQ3_XXS signs are bit arithmetic: ksigns[i] = i | parity(i) << 7 for each 7-bit field.
+// Measured 2026-10-28 (candidates §27 CX-04, CX-10; RTX 5090 + i9-13900K): IQ3_S DFlash2 decode after 8K
+// +0.38..+0.58 % against the rows that decoded each slice per four columns and per matrix.
+
+#if defined(INFERNIX_GGML_X86)
+
+// The four 7-bit sign fields of an IQ3_XXS aux word as ksigns_iq2xs bytes (field | parity << 7).
+inline std::uint32_t iq3xxs_signs(std::uint32_t aux) {
+    const std::uint32_t f = (aux & 0x7FU) | ((aux << 1) & 0x7F00U) | ((aux << 2) & 0x7F0000U) | ((aux << 3) & 0x7F000000U);
+    std::uint32_t p = f ^ ((f >> 4) & 0x0F0F0F0FU);
+    p ^= (p >> 2) & 0x03030303U;
+    p ^= (p >> 1) & 0x01010101U;
+    return f | ((p & 0x01010101U) << 7);
+}
+
+// Slice sb of the block at b (decode<F>'s values).
+template <QType F>
+INFERNIX_TARGET("avx2")
+inline Decoded decode_block(const std::uint8_t* b, unsigned sb) {
+    Decoded o;
+    if constexpr (F == QType::GGML_IQ3_XXS) {
+        o.d                     = u16(b);
+        const std::uint32_t aux = u32(b + 66 + 4 * sb);
+        o.sub0 = o.sub1        = 2 * static_cast<int>(aux >> 28) + 1;
+        const std::uint8_t* qs = b + 2 + 8 * sb;
+        const auto e           = [&](int k) { return static_cast<int>(ggml::k_iq3xxs_grid[qs[k]]); };
+        o.q = apply_signs(_mm256_setr_epi32(e(0), e(1), e(2), e(3), e(4), e(5), e(6), e(7)), iq3xxs_signs(aux));
+    } else if constexpr (F == QType::GGML_IQ3_S) {
+        o.d                    = u16(b);
+        o.sub0 = o.sub1        = 2 * ((b[106 + sb / 2] >> (4 * (sb % 2))) & 0xF) + 1;
+        const std::uint8_t* qs = b + 2 + 8 * sb;
+        const unsigned qh      = b[66 + sb];
+        const auto e = [&](int k) { return static_cast<int>(ggml::k_iq3s_grid[qs[k] | (((qh >> k) & 1U) << 8)]); };
+        o.q = apply_signs(_mm256_setr_epi32(e(0), e(1), e(2), e(3), e(4), e(5), e(6), e(7)), u32(b + 74 + 4 * sb));
+    } else if constexpr (F == QType::GGML_IQ2_S) {
+        o.d                    = u16(b);
+        const int sc           = b[74 + sb];
+        o.sub0                 = 2 * (sc & 0xF) + 1;
+        o.sub1                 = 2 * (sc >> 4) + 1;
+        const std::uint8_t* qs = b + 2 + 4 * sb;
+        const unsigned qh      = b[66 + sb];
+        const int i0 = qs[0] | ((qh << 8) & 0x300), i1 = qs[1] | ((qh << 6) & 0x300);
+        const int i2 = qs[2] | ((qh << 4) & 0x300), i3 = qs[3] | ((qh << 2) & 0x300);
+        const __m256i g =
+            _mm256_setr_epi64x(static_cast<long long>(ggml::k_iq2s_grid[i0]), static_cast<long long>(ggml::k_iq2s_grid[i1]),
+                               static_cast<long long>(ggml::k_iq2s_grid[i2]), static_cast<long long>(ggml::k_iq2s_grid[i3]));
+        o.q = apply_signs(g, u32(b + 34 + 4 * sb));
+    } else if constexpr (F == QType::GGML_IQ4_XS) {
+        o.d          = u16(b);
+        const int ls = ((b[4 + sb / 2] >> (4 * (sb % 2))) & 0xF) | (((u16(b + 2) >> (2 * sb)) & 3) << 4);
+        o.sub0 = o.sub1 = ls - 32;
+        o.q             = iq4nl_codes(b + 8 + 16 * sb);
+    } else if constexpr (F == QType::GGML_IQ4_NL) {
+        o.d    = u16(b);
+        o.sub0 = o.sub1 = 1;
+        o.q    = iq4nl_codes(b + 2);
+    } else if constexpr (F == QType::GGML_Q2_0) {
+        o = decode<F>(b, static_cast<int>(sb)); // block-relative: decode<Q2_0> indexes 18-byte blocks by s / 2
+    }
+    return o;
+}
+
+// Rows [row_begin, row_end) of R matrices (mats[r], row_bytes apart, `slices` slices) against NC columns:
+// out[r][(row - row_begin) * NC + c].
+#    define INFERNIX_GGML_TILED_ROWS(Name, Target, Mad)                                                                     \
+    template <QType F, int NC, int R>                                                                                    \
+    INFERNIX_TARGET(Target)                                                                                              \
+void Name(const std::uint8_t* const* mats, int row_bytes, int slices, int row_begin, int row_end,                        \
+               const CpuLimbSlice* const* columns, ggml::I128* const* out) {                                             \
+    constexpr unsigned kUnit         = kUnitSlices<F>;                                                                   \
+    constexpr unsigned kBlockSlices  = block_slices(F);                                                                  \
+    constexpr unsigned kBlockBytes   = static_cast<unsigned>(ggml_block_bytes(F));                                       \
+    constexpr int kUnitsPerBlock     = static_cast<int>(kBlockSlices / kUnit);                                           \
+    static_assert(8 % kUnitsPerBlock == 0, "a batch holds whole blocks");                                                \
+    const unsigned units = static_cast<unsigned>(slices) / kUnit;                                                        \
+    for (int row = row_begin; row < row_end; ++row) {                                                                    \
+        const std::uint8_t* w[R];                                                                                        \
+        for (int r = 0; r < R; ++r) { w[r] = mats[r] + static_cast<std::size_t>(row) * static_cast<std::size_t>(row_bytes); } \
+        ggml::I128 acc[R][NC];                                                                                           \
+        __m256i batch_lo[R][NC][8], batch_hi[R][NC][8];                                                                  \
+        std::uint16_t batch_d[R][8];                                                                                     \
+        int n = 0;                                                                                                       \
+        for (unsigned u = 0; u < units; ++u) {                                                                           \
+            const unsigned first = u * kUnit;                                                                            \
+            Weights tile[R][kUnit];                                                                                      \
+            for (int r = 0; r < R; ++r) {                                                                                \
+                const std::uint8_t* block = w[r] + static_cast<std::size_t>(first / kBlockSlices) * kBlockBytes;         \
+                for (unsigned j = 0; j < kUnit; ++j) {                                                                   \
+                    const Decoded dw = decode_block<F>(block, first % kBlockSlices + j);                                  \
+                    tile[r][j]       = scaled(dw);                                                                       \
+                    batch_d[r][n]    = dw.d;                                                                             \
+                }                                                                                                        \
+            }                                                                                                            \
+            for (int c = 0; c < NC; ++c) {                                                                               \
+                const CpuLimbSlice* col = columns[c] + first;                                                            \
+                __m256i lo[R], hi[R];                                                                                    \
+                for (int r = 0; r < R; ++r) { lo[r] = hi[r] = _mm256_setzero_si256(); }                                  \
+                for (unsigned j = 0; j < kUnit; ++j) {                                                                   \
+                    const auto* xl   = reinterpret_cast<const __m256i*>(col[j].lo);                                      \
+                    const auto* xh   = reinterpret_cast<const __m256i*>(col[j].hi);                                      \
+                    const __m256i l0 = _mm256_load_si256(xl), l1 = _mm256_load_si256(xl + 1);                            \
+                    const __m256i h0 = _mm256_load_si256(xh), h1 = _mm256_load_si256(xh + 1);                            \
+                    for (int r = 0; r < R; ++r) {                                                                        \
+                        lo[r] = Mad::mad(Mad::mad(lo[r], tile[r][j].lo, l0), tile[r][j].hi, l1);                         \
+                        hi[r] = Mad::mad(Mad::mad(hi[r], tile[r][j].lo, h0), tile[r][j].hi, h1);                         \
+                    }                                                                                                    \
+                }                                                                                                        \
+                for (int r = 0; r < R; ++r) {                                                                            \
+                    batch_lo[r][c][n] = lo[r];                                                                           \
+                    batch_hi[r][c][n] = hi[r];                                                                           \
+                }                                                                                                        \
+            }                                                                                                            \
+            ++n;                                                                                                         \
+            if (n == 8 || u + 1 == units) {                                                                              \
+                for (int r = 0; r < R; ++r) {                                                                            \
+                    for (int c = 0; c < NC; ++c) {                                                                       \
+                        for (int b = n; b < 8; ++b) { batch_lo[r][c][b] = batch_hi[r][c][b] = _mm256_setzero_si256(); }  \
+                        alignas(32) std::int32_t sl[8], sh[8];                                                           \
+                        _mm256_store_si256(reinterpret_cast<__m256i*>(sl), hsum8(batch_lo[r][c]));                       \
+                        _mm256_store_si256(reinterpret_cast<__m256i*>(sh), hsum8(batch_hi[r][c]));                       \
+                        for (int b = 0; b < n; b += kUnitsPerBlock) {                                                    \
+                            std::int64_t p = 0;                                                                          \
+                            for (int i = 0; i < kUnitsPerBlock; ++i) { p += static_cast<std::int64_t>(sh[b + i]) * 2048 + sl[b + i]; } \
+                            std::int64_t mant;                                                                           \
+                            int shift;                                                                                   \
+                            bool negative;                                                                               \
+                            ggml::f16_parts(batch_d[r][b], mant, shift, negative);                                       \
+                            ggml::add_shifted(acc[r][c], (negative ? -mant : mant) * p, shift);                          \
+                        }                                                                                                \
+                    }                                                                                                    \
+                }                                                                                                        \
+                n = 0;                                                                                                   \
+            }                                                                                                            \
+        }                                                                                                                \
+        for (int r = 0; r < R; ++r) {                                                                                    \
+            for (int c = 0; c < NC; ++c) { out[r][static_cast<std::size_t>(row - row_begin) * NC + c] = acc[r][c]; }     \
+        }                                                                                                                \
+    }                                                                                                                    \
+}
+INFERNIX_GGML_TILED_ROWS(rows_avx2_n, "avx2", Avx2Mad)
+INFERNIX_GGML_TILED_ROWS(rows_avxvnni_n, "avx2,avxvnni", AvxVnniMad)
+#    undef INFERNIX_GGML_TILED_ROWS
+
+template <QType F, int R, class Mad>
+void rows_mad(const std::uint8_t* const* mats, int row_bytes, int slices, int row_begin, int row_end,
+              const CpuLimbSlice* const* columns, int ncols, ggml::I128* const* out) {
+    switch (ncols) {
+#    define INFERNIX_GGML_TILED_NC(n)                                                                                    \
+    case n:                                                                                                            \
+        if constexpr (std::is_same_v<Mad, AvxVnniMad>) {                                                               \
+            rows_avxvnni_n<F, n, R>(mats, row_bytes, slices, row_begin, row_end, columns, out);                        \
+        } else {                                                                                                       \
+            rows_avx2_n<F, n, R>(mats, row_bytes, slices, row_begin, row_end, columns, out);                           \
+        }                                                                                                              \
+        return;
+        INFERNIX_GGML_TILED_NC(1)
+        INFERNIX_GGML_TILED_NC(2)
+        INFERNIX_GGML_TILED_NC(3)
+        INFERNIX_GGML_TILED_NC(4)
+        INFERNIX_GGML_TILED_NC(5)
+        INFERNIX_GGML_TILED_NC(6)
+        INFERNIX_GGML_TILED_NC(7)
+    default:
+        if constexpr (std::is_same_v<Mad, AvxVnniMad>) {
+            rows_avxvnni_n<F, 8, R>(mats, row_bytes, slices, row_begin, row_end, columns, out);
+        } else {
+            rows_avx2_n<F, 8, R>(mats, row_bytes, slices, row_begin, row_end, columns, out);
+        }
+        return;
+#    undef INFERNIX_GGML_TILED_NC
+    }
+}
+
+// The tiled rows of format F on a 256-bit ISA (false: another ISA, which takes row_sums_format).
+template <QType F, int R>
+bool rows_256(CpuIsa isa, const std::uint8_t* const* mats, int row_bytes, int slices, int row_begin, int row_end,
+              const CpuLimbSlice* const* columns, int ncols, ggml::I128* const* out) {
+    if (isa == CpuIsa::kAvxVnni) {
+        rows_mad<F, R, AvxVnniMad>(mats, row_bytes, slices, row_begin, row_end, columns, ncols, out);
+        return true;
+    }
+    if (isa == CpuIsa::kAvx2) {
+        rows_mad<F, R, Avx2Mad>(mats, row_bytes, slices, row_begin, row_end, columns, ncols, out);
+        return true;
+    }
+    return false;
+}
+
+// X of 8 elements v[0..8) of a column with exponent emax (encode_column_avx2).
+INFERNIX_TARGET("avx2")
+inline __m256i a16_values8(const std::uint16_t* p, int emax) {
+    const __m256i em    = _mm256_set1_epi32(emax);
+    const __m256i one   = _mm256_set1_epi32(1);
+    const __m256i zero  = _mm256_setzero_si256();
+    const __m256i vv    = _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+    const __m256i field = _mm256_and_si256(_mm256_srli_epi32(vv, 7), _mm256_set1_epi32(0xFF));
+    const __m256i sub   = _mm256_cmpeq_epi32(field, zero);
+    const __m256i m     = _mm256_or_si256(_mm256_and_si256(vv, _mm256_set1_epi32(0x7F)),
+                                          _mm256_andnot_si256(sub, _mm256_set1_epi32(0x80)));
+    const __m256i d     = _mm256_sub_epi32(em, _mm256_max_epi32(field, one));
+    const __m256i q     = _mm256_slli_epi32(m, 13);
+    // Round half to even at 2^d: (q + 2^(d-1) - 1 + (q >> d & 1)) >> d; counts past 31 give 0 in
+    // vpsllvd/vpsrlvd, which is the scalar d >= 22 case's 0 (q < 2^21); d = 0 keeps q.
+    const __m256i half  = _mm256_sllv_epi32(one, _mm256_sub_epi32(d, one));
+    const __m256i odd   = _mm256_and_si256(_mm256_srlv_epi32(q, d), one);
+    const __m256i r     = _mm256_srlv_epi32(_mm256_add_epi32(_mm256_sub_epi32(_mm256_add_epi32(q, half), one), odd), d);
+    const __m256i x     = _mm256_blendv_epi8(r, q, _mm256_cmpeq_epi32(d, zero));
+    return _mm256_sign_epi32(x, _mm256_or_si256(_mm256_slli_epi32(vv, 16), one));
+}
+
+// canon::a16_column_exponent and a16_value with AVX2 (8 elements per vector, 32-bit lanes), then the
+// limb planes: the same integers.
+INFERNIX_TARGET("avx2")
+int encode_column_avx2(const std::uint16_t* v, int n, CpuLimbSlice* out) {
+    __m256i key = _mm256_setzero_si256();
+    for (int j = 0; j < n; j += 16) {
+        key = _mm256_max_epu16(key, _mm256_and_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(v + j)),
+                                                     _mm256_set1_epi16(0x7FFF)));
+    }
+    alignas(32) std::uint16_t lanes[16];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), key);
+    unsigned top = 0;
+    for (const std::uint16_t k : lanes) { top = k > top ? k : top; }
+    if (top >= 0x7F80U) {
+        std::memset(out, 0, sizeof(CpuLimbSlice) * static_cast<std::size_t>(n / 32));
+        return canon::kA16NonFinite;
+    }
+    const int emax = (top >> 7) == 0 ? 1 : static_cast<int>(top >> 7);
+    for (int j = 0; j < n; j += 16) {
+        const __m256i a = a16_values8(v + j, emax), b = a16_values8(v + j + 8, emax);
+        const __m256i lo = _mm256_permute4x64_epi64(
+            _mm256_packs_epi32(_mm256_and_si256(a, _mm256_set1_epi32(2047)), _mm256_and_si256(b, _mm256_set1_epi32(2047))), 0xD8);
+        const __m256i hi =
+            _mm256_permute4x64_epi64(_mm256_packs_epi32(_mm256_srai_epi32(a, 11), _mm256_srai_epi32(b, 11)), 0xD8);
+        CpuLimbSlice& l = out[j / 32];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(l.lo + j % 32), lo);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(l.hi + j % 32), hi);
+    }
+    return emax;
+}
+
+#endif // INFERNIX_GGML_X86
+
+// The tiled rows of `format` (R = 1: one matrix; R = 2: a gate and up pair); false when the ISA has none.
+template <int R>
+bool ggml_rows(CpuIsa isa, QType format, const std::uint8_t* const* mats, int row_bytes, int slices, int row_begin,
+               int row_end, const CpuLimbSlice* const* columns, int ncols, ggml::I128* const* out) {
+#if defined(INFERNIX_GGML_X86)
+    switch (format) {
+#    define INFERNIX_GGML_TILED_FORMAT(Q)                                                                                   \
+    case Q:                                                                                                            \
+        if constexpr (R == 1 || (Q != QType::GGML_IQ4_NL && Q != QType::GGML_Q2_0)) { /* pairs: gate/up formats */     \
+            return rows_256<Q, R>(isa, mats, row_bytes, slices, row_begin, row_end, columns, ncols, out);              \
+        } else {                                                                                                       \
+            return false;                                                                                              \
+        }
+        INFERNIX_GGML_TILED_FORMAT(QType::GGML_IQ2_S)
+        INFERNIX_GGML_TILED_FORMAT(QType::GGML_IQ3_XXS)
+        INFERNIX_GGML_TILED_FORMAT(QType::GGML_IQ3_S)
+        INFERNIX_GGML_TILED_FORMAT(QType::GGML_IQ4_XS)
+        INFERNIX_GGML_TILED_FORMAT(QType::GGML_IQ4_NL)
+        INFERNIX_GGML_TILED_FORMAT(QType::GGML_Q2_0)
+#    undef INFERNIX_GGML_TILED_FORMAT
+    default: return false;
+    }
+#else
+    (void)isa, (void)format, (void)mats, (void)row_bytes, (void)slices, (void)row_begin, (void)row_end, (void)columns,
+        (void)ncols, (void)out;
+    return false;
+#endif
 }
 
 // ======================================================================= the 8-bit activation route
@@ -952,6 +1153,10 @@ bool ggml_cpu_supported(const GgmlExpertFormat& format) noexcept {
 
 int ggml_encode_column(const std::uint16_t* v, int n, CpuLimbSlice* out) {
     require(n % 32 == 0, "a column is whole 32-element slices");
+#if defined(INFERNIX_GGML_X86)
+    static const bool avx2 = cpu_isa_supported(CpuIsa::kAvx2);
+    if (avx2) { return encode_column_avx2(v, n, out); }
+#endif
     const int emax = canon::a16_column_exponent(v, n);
     for (int j = 0; j < n; ++j) {
         const std::int32_t x = emax == canon::kA16NonFinite ? 0 : canon::a16_value(v[j], emax);
@@ -965,9 +1170,15 @@ int ggml_encode_column(const std::uint16_t* v, int n, CpuLimbSlice* out) {
 void ggml_row_sums(CpuIsa isa, QType format, const std::uint8_t* matrix, int row_bytes, int slices, int row_begin,
                    int row_end, const CpuLimbSlice* const* columns, int ncols, ggml::I128* r) {
     require(cpu_isa_supported(isa), "unsupported CPU ISA");
+    require(ncols >= 1 && ncols <= kMaxColumns, "ncols must be in [1, 8]");
 #define INFERNIX_GGML_FORMAT(Q)                                                                                        \
     case Q:                                                                                                            \
         require(slices % (block_slices(Q) > 4 ? 4 : block_slices(Q)) == 0, "K is not whole units");                  \
+        {                                                                                                              \
+            const std::uint8_t* const mats[1] = {matrix};                                                              \
+            ggml::I128* const outs[1]         = {r};                                                                   \
+            if (ggml_rows<1>(isa, Q, mats, row_bytes, slices, row_begin, row_end, columns, ncols, outs)) { return; }   \
+        }                                                                                                              \
         row_sums_format<Q>(isa, matrix, row_bytes, slices, row_begin, row_end, columns, ncols, r);                     \
         return;
     switch (format) {
@@ -996,8 +1207,14 @@ void ggml_gate_up(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat
     const std::uint8_t* up = record + static_cast<std::size_t>(kIntermediate) * row_bytes;
     for (int i0 = i_begin; i0 < i_end; i0 += kUnit) {
         const int i1 = std::min(i_end, i0 + kUnit);
-        ggml_row_sums(isa, format.gate_up, record, row_bytes, kGgmlXSlices, i0, i1, x, ncols, g);
-        ggml_row_sums(isa, format.gate_up, up, row_bytes, kGgmlXSlices, i0, i1, x, ncols, u);
+        // A gate row and its up row in one pass on the 256-bit ISAs.
+        const std::uint8_t* const mats[2] = {record, up};
+        ggml::I128* const outs[2]         = {g, u};
+        if (ncols < 1 || ncols > kMaxColumns || !cpu_isa_supported(isa) ||
+            !ggml_rows<2>(isa, format.gate_up, mats, row_bytes, kGgmlXSlices, i0, i1, x, ncols, outs)) {
+            ggml_row_sums(isa, format.gate_up, record, row_bytes, kGgmlXSlices, i0, i1, x, ncols, g);
+            ggml_row_sums(isa, format.gate_up, up, row_bytes, kGgmlXSlices, i0, i1, x, ncols, u);
+        }
         for (int i = i0; i < i1; ++i) {
             for (int c = 0; c < ncols; ++c) {
                 const std::size_t at = static_cast<std::size_t>(i - i0) * ncols + c;

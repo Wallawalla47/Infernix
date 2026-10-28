@@ -16,21 +16,6 @@ infernix_add_family_op_test(infernix_linear_q6_a16_test FAMILY linear
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q6_a16.cpp"
   LIBRARIES infernix_linear_test_support)
 
-# TEMPORARY with INFERNIX_TMP_Q56_FP32_SCALE: both arms against the FP64 oracle (the switch is read
-# once per process), plus the Q5/Q6 conformance suites and the sparse-MoE prefill under the
-# switch, so the FP32-scale kernels meet the same oracles as the default ones.
-infernix_add_family_op_test(infernix_linear_q56_fp32_scale_test FAMILY linear
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q56_fp32_scale.cpp"
-  LIBRARIES infernix_linear_test_support)
-set_tests_properties(infernix_linear_q56_fp32_scale_test PROPERTIES
-  ENVIRONMENT "INFERNIX_TMP_Q56_FP32_SCALE=0" TIMEOUT 900)
-foreach(q56_test infernix_linear_q56_fp32_scale_test infernix_linear_q5_a16_test
-        infernix_linear_q6_a16_test)
-  add_test(NAME ${q56_test}_fp32_scale COMMAND ${${q56_test}_COMMAND})
-  set_tests_properties(${q56_test}_fp32_scale PROPERTIES
-    ENVIRONMENT "INFERNIX_TMP_Q56_FP32_SCALE=1" SKIP_RETURN_CODE 77 TIMEOUT 900)
-endforeach()
-
 infernix_add_family_op_test(infernix_linear_q8_a16_test FAMILY linear
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q8_a16.cpp"
   LIBRARIES infernix_linear_test_support)
@@ -110,16 +95,20 @@ infernix_add_family_op_test(infernix_linear_fp32_head_test FAMILY linear
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_fp32_head.cpp"
   LIBRARIES infernix_linear_test_support)
 
-# TEMPORARY with INFERNIX_TMP_TMA_PARAM_WORDS (GX-03): every TMA family's Windows instantiations that read
-# their descriptors in place from the kernel parameters, against the same oracles, the staging race probe
-# and the overlap probe.
-foreach(tma_test infernix_linear_fp8_a8_test infernix_linear_fp8_a16_test infernix_fp8_a8_pair_repeat_test
-        infernix_linear_mxfp8_a16_test infernix_linear_f16_accumulate_test infernix_linear_nvfp4_a4_test
-        infernix_nvfp4_tma_staging_race_test infernix_tma_moe_overlap_test infernix_linear_bf16_a16_test)
-  add_test(NAME ${tma_test}_param_words COMMAND ${${tma_test}_COMMAND})
-  set_tests_properties(${tma_test}_param_words PROPERTIES
-    ENVIRONMENT "INFERNIX_TMP_TMA_PARAM_WORDS=1" SKIP_RETURN_CODE 77)
-endforeach()
+# Windows TMA launches read their descriptors in place from the kernel parameters; these run every TMA
+# family's staged instantiations, the fallback where the parameter block is misaligned, against the same
+# oracles, the staging race probe and the overlap probe.
+infernix_add_family_op_test(infernix_tma_staging_test FAMILY linear NO_TEST
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tma_staging.cu")
+if(WIN32)
+  foreach(tma_test infernix_linear_fp8_a8_test infernix_linear_fp8_a16_test infernix_fp8_a8_pair_repeat_test
+          infernix_linear_mxfp8_a16_test infernix_linear_f16_accumulate_test infernix_linear_nvfp4_a4_test
+          infernix_nvfp4_tma_staging_race_test infernix_tma_moe_overlap_test infernix_linear_bf16_a16_test)
+    string(REGEX REPLACE "^infernix_(.*)_test$" "\\1" tma_member "${tma_test}")
+    add_test(NAME ${tma_test}_staging COMMAND ${infernix_tma_staging_test_COMMAND} ${tma_member})
+    set_tests_properties(${tma_test}_staging PROPERTIES SKIP_RETURN_CODE 77)
+  endforeach()
+endif()
 
 # FP32 projections (router and lm_head logits), BF16 and q8_g32_fp16 weights, against FP64.
 infernix_add_family_op_test(infernix_projection_fp32_test FAMILY linear

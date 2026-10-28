@@ -96,7 +96,6 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         // round); the fit replaces it.
         mtp_confidence.emplace(plan.dflash_width_costs.per_draft);
     }
-    if (execution_schedule.mtp_draft_regime) { mtp_regime.emplace(); }
     if (const std::string& path = mtp_draft_switches().draft_log;
         !path.empty() && speculative_backend == SpeculativeBackend::Mtp) {
         mtp_draft_log = std::make_unique<std::ofstream>(path, std::ios::app);
@@ -376,13 +375,6 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
 ProgramImpl::~ProgramImpl() noexcept {
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
-    // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_SKIP_ROUNDS): how often the regime chose draft-free rounds.
-    if (mtp_regime && offload) {
-        try {
-            offload->engine().report("MTP draft-free rounds: " + std::to_string(mtp_regime->draft_free_rounds()) +
-                                     " of " + std::to_string(mtp_regime->rounds()));
-        } catch (...) {}
-    }
 }
 
 ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t first_target,

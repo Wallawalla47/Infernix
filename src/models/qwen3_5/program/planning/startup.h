@@ -59,8 +59,7 @@ struct SpeculativeRoundShape {
 // Whether a round of the family with `batch_size` rows proposes through the gated proposal chain
 // (ExecutionSchedule::mtp_proposal_chain): a one-row neural round then proposes up to the
 // configured window, and the device stops it at the round's proposal limit (the draft-length
-// policy's choice) and, with mtp_gate, after the first draft below --spec-min-p, so its verify width
-// (the family) and its proposal depth are chosen apart.
+// policy's choice), so its verify width (the family) and its proposal depth are chosen apart.
 [[nodiscard]] inline bool mtp_chained_round(const SpeculativeRoundShape& shape, std::uint32_t batch_size,
                                             bool chain) noexcept {
     return chain && shape.kind == SpeculativeRoundKind::Neural && batch_size == 1U;
@@ -204,7 +203,7 @@ struct WorkspacePlan {
     std::size_t text_prefill_wide = 0;
     std::size_t mtp_prefill_wide  = 0;
     // With lent passes: the wider of the two plans at widths 512, 1,024, ... below the chunk, then the chunk
-    // (ascending), so a pass can borrow what its width needs (INFERNIX_TMP_PROMPT_SIZED_LOAN).
+    // (ascending), so a pass can borrow what its width needs (ProgramOffload::wide_bytes).
     std::vector<std::pair<std::int32_t, std::size_t>> prefill_wide_ladder;
     std::size_t ordinary_round   = 0;
     std::size_t mtp_prefill      = 0;
@@ -309,26 +308,10 @@ idle_prefill_widths_impl(const execution::Parameters& parameters, const EngineOp
 
 // TEMPORARY A/B switches of the Qwen3.5 MTP drafting package (rank 5 of the 2026-10-21 candidates),
 // read once from the environment ("1" sets a flag); each defaults to today's behaviour:
-//   INFERNIX_TMP_QWEN35_MTP_PROBS       resident targets' drafts carry their drafter probability
-//                                       (ExecutionSchedule::mtp_draft_confidence) with nothing reading it,
-//                                       which isolates its cost; the cut, gate and calibrated extents imply it
-//   INFERNIX_TMP_QWEN35_MTP_GATE        the proposal chain stops at --spec-min-p on the device (mtp_gate)
 //   INFERNIX_TMP_QWEN35_MTP_CALIBRATED  one-row rounds verify their calibrated extent (mtp_calibrated_extent)
 //   INFERNIX_TMP_QWEN35_MTP_DRAFT_LOG   a file path: one line per verified MTP row (the offline cut replay)
-// and of the offloaded-expert drafter's round cost (candidates §11 OR-09; output-neutral):
-//   INFERNIX_TMP_QWEN35_MTP_PAD_MASK    the drafter's resident MoE skips each row's padding columns
-//                                       (mtp_drafter_mask)
-//   INFERNIX_TMP_QWEN35_MTP_STEP_GATE   offloaded MTP rounds propose through the step chain, whose device gate
-//                                       stops where no later draft could be verified (mtp_step_chain)
-//   INFERNIX_TMP_QWEN35_MTP_SKIP_ROUNDS with the step chain, rounds also run without drafting (the drafter's
-//                                       KV only) while that measures faster (mtp_draft_regime)
 struct MtpDraftSwitches {
-    bool probabilities = false;
-    bool gate          = false;
-    bool calibrated    = false;
-    bool pad_mask      = false;
-    bool step_gate     = false;
-    bool skip_rounds   = false;
+    bool calibrated = false;
     std::string draft_log;
 };
 [[nodiscard]] const MtpDraftSwitches& mtp_draft_switches();

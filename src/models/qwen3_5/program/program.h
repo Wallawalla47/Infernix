@@ -433,6 +433,9 @@ public:
     // through the waker, from its own thread, and the Engine calls maintain() under its execution lock.
     void maintain();
     void set_maintenance_waker(std::function<void()> waker);
+    // Offloaded experts: the logical CPUs the Engine's round thread runs on, a core the CPU expert team
+    // leaves free (runtime::expert_offload::CpuPlacement::engine); 0 (unpinned) otherwise.
+    [[nodiscard]] std::uint64_t engine_thread_cpus() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
 
     // The prefix cache, when the context cache is enabled. Admission binds a lane through a

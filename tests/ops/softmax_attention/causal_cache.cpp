@@ -2402,8 +2402,8 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         failures += cache.verify(label, expected, after);
         failures += cache.verify_untouched(label, before, after, positions, lanes, valid, width);
         if (test_case.column_invariant && !tree && phase == 0) {
-            // The column-invariant contract, whichever variant ran (the column loop, or
-            // INFERNIX_TMP_VERIFY_ROWS_ATTENTION's rows): column j equals a one-column call made
+            // The column-invariant contract, whichever variant ran (the rows variant, or the VQ
+            // formats' column loop): column j equals a one-column call made
             // after columns 0..j-1 appended, bit for bit, and the caches end byte-identical.
             BatchDeviceCache columns(initial, test_case.mapping, envelope.max_visible_keys);
             ops::CausalAttentionExecutionEnvelope one = envelope;
@@ -2711,8 +2711,7 @@ int run_tree_mask_cases(DeviceExecutionView execution, KvCacheStorage storage) {
 // The exact route's row-invariant partition: every row splits its keys as if alone, so batched
 // Column-invariant rounds: each column equals a one-column call made in column order (run_batch_case
 // checks it bit for bit), every row full or ending early (its later columns masked), with and
-// without the row-invariant partition. CTest also runs these with INFERNIX_TMP_VERIFY_ROWS_ATTENTION=1
-// (--column-invariant-only).
+// without the row-invariant partition.
 int run_column_invariant_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     int failures       = 0;
     std::uint32_t seed = 3900u;

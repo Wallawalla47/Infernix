@@ -489,16 +489,9 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 
     {
         auto post_mixer_scope = work_.scope();
-        // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_PAD_MASK): a batched call's columns past each row's
-        // valid count (an alignment's past the licensed tokens) route no resident expert.
-        ops::MoeColumnMask padding;
-        if (execution_schedule_.mtp_drafter_mask && active_sequence_batch_ != 0 && active_valid_columns_ != nullptr &&
-            active_sequence_width_ > 1) {
-            padding = {static_cast<const std::int32_t*>(active_valid_columns_->data), active_sequence_width_};
-        }
         OffloadedMoeContext drafter;
         ffn(mh, mtp_->ffn, x, {}, work_, ctx_.execution_view(), true, false, ops::LinearRoutes::Exact,
-            ops::LinearRoutes::Exact, drafter_pool(drafter), padding);
+            ops::LinearRoutes::Exact, drafter_pool(drafter));
     }
 
     Tensor flat_mtp_hidden = mtp_hidden.view({dimension(config_.hidden_size), T});

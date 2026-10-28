@@ -80,13 +80,6 @@ public:
     // with no clock tick (the prompt's prefill calls ticked already) and no admission: the credit
     // ranks later admissions and evictions.
     void credit(std::span<const std::uint32_t> keys, std::span<const double> amounts);
-    // Prompt seeding's promotions (design §19.3.27; INFERNIX_TMP_PROMPT_SEED's budget, a temporary
-    // A/B): of `keys`, the non-resident ones (only those `admissible` accepts, when given) become
-    // resident best score first, each only if it outranks the victim it replaces (the lowest resident
-    // outside `keys`; with `evictable`, stopping at the first victim it refuses), at most `budget`.
-    // Counts and the clock are unchanged. out.admitted and out.victims list them.
-    void admit(std::span<const std::uint32_t> keys, std::size_t budget, Step& out,
-               const Admissible* admissible = nullptr, const Admissible* evictable = nullptr);
 
     // Promote a non-resident key (for example a staged prefetch whose frame changes role).
     // Returns the victim, or nothing when the pool still has room.
@@ -253,12 +246,6 @@ public:
                   const LfruPolicy::Guard* guard = nullptr);
     // A prompt's weighted routes at its end (LfruPolicy::credit); issues no command.
     void credit(std::span<const std::uint32_t> keys, std::span<const double> amounts) { policy_.credit(keys, amounts); }
-    // Promotions at a prompt's end (LfruPolicy::admit): admits up to `budget` of the credited `keys`,
-    // retires their victims' frames and loads them into free frames (the rest queue). Returns the
-    // number admitted.
-    std::size_t admit_credited(std::span<const std::uint32_t> keys, std::size_t budget, std::uint64_t round_started,
-                               std::vector<Command>& out, const LfruPolicy::Admissible* admissible = nullptr,
-                               const LfruPolicy::Admissible* evictable = nullptr);
     // The SSD tier's demotion (design §19.3.7 T4/T7): after on_route evicted an expert and before
     // on_quiescent, its retired frame is held while its record is copied to RAM; release_held frees
     // it once the copy completed and loads queued experts into free frames.

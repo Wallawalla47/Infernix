@@ -28,10 +28,6 @@ infernix_add_test(infernix_qwen4_exp_expert_activations_test
 infernix_add_test(infernix_qwen4_exp_ngram_volume_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_volume.cpp"
   LIBRARIES infernix_model_runtime)
-# TEMPORARY with INFERNIX_TMP_NGRAM_SCATTER: the large call's scattered reading order, same oracle.
-add_test(NAME infernix_qwen4_exp_ngram_volume_scatter_test COMMAND infernix_qwen4_exp_ngram_volume_test)
-set_tests_properties(infernix_qwen4_exp_ngram_volume_scatter_test
-  PROPERTIES ENVIRONMENT "INFERNIX_TMP_NGRAM_SCATTER=1")
 
 # The forward pass on the real artifact (INFERNIX_QWEN4_ARTIFACT) against the FP64 reference.
 infernix_add_test(infernix_qwen4_exp_forward_real_test

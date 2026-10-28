@@ -6,7 +6,6 @@
 #include "ops/offloaded_sparse_moe/cuda/wide_expert_a8.cuh"
 
 #include "core/device.h"
-#include "core/temporary_switches.h"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 
 #include <cuda_bf16.h>
@@ -168,9 +167,7 @@ struct Offsets {
     std::size_t h_blocks, x_plane;                      // W4A4
     std::size_t x_limbs, h_rows, x_emax, h_emax;        // W4A16
     std::size_t x_terms_plane, x_row_scale, h_terms_plane, h_row_scale; // W4A16 two-term A4
-    std::size_t ggml_planes;                            // GGUF banks' kGgmlBf16
-    bool has_ggml_planes;
-    std::size_t lossless;                               // kLossless
+    std::size_t lossless;                              // kLossless
     std::size_t x_acts, h_acts, ring_jobs, ring_counters; // the narrow ring (ring_call)
     bool has_ring;
     std::size_t end;
@@ -219,12 +216,6 @@ Offsets offsets(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t en
         o.h_rows  = take(e * h_row);
         o.x_emax  = take(t * sizeof(std::int32_t));
         o.h_emax  = take(e * sizeof(std::int32_t));
-        // TEMPORARY: the threshold from the environment (MoeGgmlTiles, default kGgmlBf16MinColumns),
-        // the same for every call of the process, so that a call's layout matches its sizing.
-        if (wide_a16 == WideA16::kGgmlBf16 && columns >= MoeGgmlTiles::from_environment().plane_min_columns) {
-            o.ggml_planes     = take(kGgmlBf16PlaneBytes);
-            o.has_ggml_planes = true;
-        }
     } else {
         o.h_blocks = take(e * kHBlocks * sizeof(canon::A4Block));
         o.x_plane  = take(e * kXRowBytes);
@@ -595,7 +586,6 @@ ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, s
         w.h_rows  = reinterpret_cast<std::uint8_t*>(p + o.h_rows);
         w.x_emax  = reinterpret_cast<std::int32_t*>(p + o.x_emax);
         w.h_emax  = reinterpret_cast<std::int32_t*>(p + o.h_emax);
-        w.ggml_planes = o.has_ggml_planes ? reinterpret_cast<std::uint8_t*>(p + o.ggml_planes) : nullptr;
     } else {
         w.h_blocks = reinterpret_cast<canon::A4Block*>(p + o.h_blocks);
         w.x_plane  = reinterpret_cast<std::uint8_t*>(p + o.x_plane);
@@ -711,15 +701,9 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     return call;
 }
 
-// TEMPORARY (INFERNIX_TMP_WIDE_EXPERT_T64=<n>, candidates P5), until its A/B: the W4A4 and A4-residual
-// grouped GEMMs on WarpTile64 schedules (the same bits) in calls of at least n columns per expert on
-// average (unset: never; 1: every call). Op bench 2026-10-24: 1.05-1.11x the time at 80 columns per
-// expert (Flash-Next 4K tokens), 0.94-0.97x from about 128 (the 122B at 4K, either model at 16K+).
-bool wide_t64(const Call& call) {
-    static const std::int64_t threshold =
-        temporary_switches::integer("INFERNIX_TMP_WIDE_EXPERT_T64", 0, 0, 1 << 30);
-    return threshold > 0 && call.mean_job_columns >= threshold;
-}
+// The W4A4 and A4-residual grouped GEMMs on WarpTile64 schedules (the same bits) from
+// kWarpTile64MinColumns columns per expert on average.
+bool wide_t64(const Call& call) { return call.mean_job_columns >= kWarpTile64MinColumns; }
 
 void run_pass(const Call& call, std::int32_t pass, cudaStream_t stream) {
     if (pass < 0 || pass >= call.passes) { throw std::out_of_range("offloaded_sparse_moe wide: pass out of range"); }

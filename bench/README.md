@@ -200,8 +200,10 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   DFlash2 with 7 drafts and the optimized proposal head, INT8 KV, CUDA Graph decode, prefix reuse
   off. `ngram` adds the production n-gram drafting (15 drafts, minimum match 12); `mtp` drafts with
   the MTP layer instead (4 drafts), Qwen3.8-Flash-Next's production path, and `auto` with it lets each
-  round choose its length with the `--spec-min-p` 0.5 cut (`--draft-tokens auto`), `min-p=P` sets that
-  cut for the fixed length; `plain` drafts nothing
+  round choose its length (`--draft-tokens auto`), whose one-row rounds of argmax drafts stop at the
+  cumulative acceptance cut; `min-p=P` (`--spec-min-p`) cuts the fixed length's (the Engine refuses it
+  with `auto`);
+  `plain` drafts nothing
   (one token per round through the single-column decode kernels). Fast paths run as in
   `infernix-serve`; `reproducible` runs the reproducible route and `path=NAME` also runs a candidate fast path.
   It writes one line per segment: the corpus token offset, the prompt length and the generated
@@ -470,8 +472,8 @@ cmake --build build -j --target infernix_ggml_linear_bench infernix_offloaded_mo
 `infernix_offloaded_moe_wide_bench` covers the routed experts' 8-bit wide route (`WideA16::kA8`) on both bank
 kinds: `--activation a8` gives NVFP4 W4A16 banks `NarrowA16::kA8` with `WideA16::kA8` (against `--activation a16`,
 the exact W4A16 wide route, or `a16x2`, expert-a4-residual), and `--bank ggml --formats GU,DOWN --ggml-wide
-exact|bf16|a8` GGUF records at Flash-Next's geometry (`bf16` takes the BF16 planes only from `MoeGgmlTiles`'
-14,336-column threshold, the exact tiles below it).
+exact|bf16|a8` GGUF records at Flash-Next's geometry (`bf16` takes the BF16 stage-decode tiles from 4,096 columns,
+`kGgmlStageDecodeMinColumns`, the exact tiles below it).
 
 ```bash
 ./build/bench/infernix_offloaded_moe_wide_bench --activation a16 --tokens 512,2048,4096 --placement frames

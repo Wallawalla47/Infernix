@@ -87,8 +87,11 @@ struct OffloadOptions {
     std::uint32_t cpu_expert_jobs    = 16;  // CPU-served misses per decode or verification call
     std::uint32_t cpu_assist_jobs    = 256; // CPU-served misses per assisted prefill call (0: none)
     int cpu_pcie_divisor             = 0;  // > 0 fixes the decode miss divisor
-    // A GGUF import's one-column calls take the context's divisor (plain_divisor) without speculation
-    // (INFERNIX_TMP_PLAIN_DIVISOR_ALL: every bank's).
+    // The engine thread alone on a core no CPU expert worker uses (placement.h cpu_placement): the
+    // Qwen3.5 offloaded Program sets it (Ornith decode +0.3 %; Flash-Next flat, 2026-10-28).
+    bool engine_isolate              = false;
+    // A GGUF import's one-column calls take the context's divisor (plain_divisor) without speculation;
+    // every bank's lost on Dense8 (plain decode 0.731x / 0.933x, removed 2026-10-28).
     bool plain_divisor_by_context    = false;
     double link_bytes_per_second     = 0.0; // > 0 fixes the link rate (else measured)
     // The CPU team's reference rates (i9-13900K, 6 workers, NVFP4 records) until measured, and the
@@ -276,10 +279,9 @@ public:
     // routes (read from the route log its after_call is about to apply; a layer walk's span counts
     // its last chunk) add to its lane's uses, and at the prompt's end, after its last after_call, an
     // expert every counted token routed to gains kPromptSeedCredit of count, the others in
-    // proportion (INFERNIX_TMP_PROMPT_SEED: another credit, and promotions on `compute`). A lane's
-    // uses clear when it binds a new request.
+    // proportion. A lane's uses clear when it binds a new request.
     void note_prompt_routes(std::uint32_t lane, std::int32_t columns);
-    void seed_prompt(std::uint32_t lane, cudaStream_t compute);
+    void seed_prompt(std::uint32_t lane);
     void clear_prompt_uses(std::uint32_t lane);
 
     // ---- frames and memory ----
@@ -342,6 +344,8 @@ public:
     void set_plain_position(std::int32_t position, cudaStream_t compute);
     // The widest call the prefill CPU split takes at the measured link.
     [[nodiscard]] std::int32_t split_columns() const noexcept;
+    // The engine thread's logical CPUs (OffloadOptions::engine_isolate; 0: unpinned).
+    [[nodiscard]] std::uint64_t engine_cpus() const noexcept { return placement_.engine; }
 
     // The route trace (optional; settle and after_call append their rounds).
     [[nodiscard]] RouteTrace* trace() noexcept { return trace_.get(); }
@@ -383,7 +387,7 @@ private:
     DeviceBuffer divisor_word_;
     PinnedHostBuffer divisor_host_{16};
     std::int32_t divisor_now_ = 0;
-    // The CPU expert team's worker count and CPUs (INFERNIX_TMP_CPU_PLACEMENT / _ENGINE_ISOLATE).
+    // The CPU expert team's worker count and CPUs (INFERNIX_TMP_CPU_PLACEMENT, OffloadOptions::engine_isolate).
     CpuPlacement placement_;
     std::unique_ptr<ExpertResidency> residency_;
     std::optional<ExpertStore> striped_store_;
@@ -395,7 +399,6 @@ private:
     std::unique_ptr<CpuSplitPolicy> split_;
     double link_bytes_per_second_ = kReferenceLinkBytesPerSecond;
     double cpu_expert_rate_ = 0.0, cpu_column_rate_ = 0.0; // 0 until measured
-    std::string calibration_note_; // INFERNIX_TMP_MACHINE_CALIBRATION's note on the CPU rates (the startup line)
     bool failed_round_ = false;
 
     // The fork / overlap stream and its events (start, staged[2], consumed[2]; the fork uses the first two).

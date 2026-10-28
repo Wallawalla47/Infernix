@@ -355,7 +355,6 @@ Json speculative_json(const GenerationOutcome& outcome) {
         {"ngram_archive_rounds", outcome.speculative.ngram_archive_rounds},
         {"ngram_archive_drafted_tokens", outcome.speculative.ngram_archive_drafted_tokens},
         {"ngram_archive_accepted_tokens", outcome.speculative.ngram_archive_accepted_tokens},
-        {"ngram_gate_rejections", outcome.speculative.ngram_gate_rejections},
         {"tree_rounds", outcome.speculative.tree_rounds},
         {"tree_side_rounds", outcome.speculative.tree_side_rounds},
         {"tree_side_accepted_tokens", outcome.speculative.tree_side_accepted_tokens},

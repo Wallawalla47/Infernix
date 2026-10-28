@@ -7,7 +7,6 @@
 #include "core/cyclic_kv_cache.h"
 #include "core/vmm_arena.h"
 #include "core/decode_graph.h"
-#include "core/machine_calibration.h"
 #include "core/round_clock.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
@@ -266,20 +265,18 @@ struct SpecLayout {
 
 // I32 MTP drafter io: chain ids [B], cells [K, B], per draft step the cells' RoPE positions and
 // pooled-block starts [K][3][B] (axis-major per step), the draft rows' state slots and table rows
-// [B] each, the one-row round's FP32 cumulative threshold [1] (INFERNIX_TMP_MTP_CUMULATIVE),
+// [B] each, the one-row round's FP32 cumulative threshold [1] (MtpCumulative),
 // drafts [K, B], catch-up ids [W, B], gather columns [B], catch-up cells [W, B], the
 // drafts' FP32 log-probabilities [K, B]. Everything before `drafts` is uploaded per draft round.
 // Sampled drafts add, per draft step, the head's top ranks and their FP32 log-probabilities
 // [kSampledDraftRanks, B] and the proposal's candidates and FP32 q [16, B] (step j at j * rows * B),
 // then the verify layout of candidates and q [16, W - 1, B], then the draft rows' samplers
-// (ops::SamplingConfig [B], 8-byte aligned), then the argmax drafts' runner-up head rows [K, B]
-// (INFERNIX_TMP_MTP_RUNNER_UP). The draft's slots, rows and samplers are its own, so a draft never
-// shares an input with the target's io.
+// (ops::SamplingConfig [B], 8-byte aligned). The draft's slots, rows and samplers are its own, so a
+// draft never shares an input with the target's io.
 struct MtpIo {
     std::size_t ids = 0, cells = 0, rope_cells = 0, block_rope_cells = 0, slots = 0, rows = 0, cumulative = 0,
                 drafts = 0, up_ids = 0, gather = 0, up_cells = 0, logprobs = 0, sample_rows = 0, sample_logprobs = 0,
-                draft_candidates = 0, draft_q = 0, verify_candidates = 0, verify_q = 0, configs = 0, runner_up = 0,
-                words = 0;
+                draft_candidates = 0, draft_q = 0, verify_candidates = 0, verify_q = 0, configs = 0, words = 0;
 };
 
 // I32 DFlash2 drafter io (FP32 words where noted): per row its anchor, frontier, live block columns
@@ -380,30 +377,29 @@ inline ops::SamplingConfig translate(const ResolvedSamplingParameters& s) {
     return out;
 }
 
-// TEMPORARY (INFERNIX_TMP_MTP_CUMULATIVE=<base threshold>, candidates §7 D8; Basalt draft_cum.hpp), until
-// its A/B: an MTP chain keeps draft j while the product over i <= j of the observed acceptance rate of
-// draft i's probability bin stays at or above the request's threshold, instead of stopping at the first
-// draft below --spec-min-p. The bins are Basalt's, as log-probability edges (the drafter's stored
-// values, compared without exp, so host and device classify alike: core/decode_graph.h). The
-// threshold starts at the base and falls toward 0.25 as the request's drafts are accepted more often
-// than the table predicts (observed / expected accepted, decayed 0.97 per round, mapped linearly over
-// 0.9..1.1). Draft-only: verification and outputs are unchanged.
+// The cumulative cut of an argmax MTP chain (candidates §7 D8; Basalt draft_cum.hpp): the chain keeps
+// draft j while the product over i <= j of the observed acceptance rate of draft i's probability bin
+// stays at or above the request's threshold. The bins are Basalt's, as log-probability edges (the
+// drafter's stored values, compared without exp, so host and device classify alike:
+// core/decode_graph.h). The threshold starts at kMtpCumulativeBase and falls toward 0.25 as the
+// request's drafts are accepted more often than the table predicts (observed / expected accepted,
+// decayed 0.97 per round, mapped linearly over 0.9..1.1). Draft-only: verification and outputs are
+// unchanged. It is the cut of `--draft-tokens auto` (Dense8 MTP auto, ABBA x5: conv 1.0529x, 5/5, worst 1.0296;
+// struct 1.0009x); a fixed draft length keeps the --spec-min-p cut (MTP-3 under this cut: conv 1.0423x, struct
+// 0.9919x, worse in every pair; 2026-10-28).
 inline constexpr GraphGateBins kMtpCumulativeBins{
     {-1.20397280F, -0.693147181F, -0.356674944F, -0.223143551F, -0.105360516F, -0.0512932944F, -0.0100503359F},
     {0.12F, 0.26F, 0.43F, 0.51F, 0.59F, 0.66F, 0.79F, 0.96F}};
+inline constexpr float kMtpCumulativeBase = 0.35F;
 
 struct MtpCumulative {
-    float base      = 0.0F; // 0: the rule is off
-    float threshold = 0.0F;
+    float threshold = kMtpCumulativeBase;
     double observed = 0.0, expected = 0.0;
 
-    void reset(float start) {
-        base = threshold = start;
-        observed = expected = 0.0;
-    }
+    void reset() { *this = MtpCumulative{}; }
     // One verified chain: `offered` drafts with these log-probabilities, `accepted` of them taken.
     void observe(const float* logprobs, std::int32_t offered, std::int32_t accepted) {
-        if (base <= 0.0F || offered <= 0) { return; }
+        if (offered <= 0) { return; }
         constexpr double kDecay = 0.97, kLowRatio = 0.9, kHighRatio = 1.1;
         constexpr float kFloor  = 0.25F;
         double chance = 1.0, sum = 0.0;
@@ -415,7 +411,7 @@ struct MtpCumulative {
         expected = expected * kDecay + sum;
         if (expected < 0.5) { return; }
         const double t = std::clamp((observed / expected - kLowRatio) / (kHighRatio - kLowRatio), 0.0, 1.0);
-        threshold      = base + static_cast<float>(t) * (std::min(kFloor, base) - base);
+        threshold      = kMtpCumulativeBase + static_cast<float>(t) * (kFloor - kMtpCumulativeBase);
     }
 };
 
@@ -505,7 +501,7 @@ public:
         // Draft-length policy (design 11.3): conditional acceptance of each draft position.
         std::array<double, 8> mtp_accept{};
         std::uint64_t mtp_policy_rounds = 0;
-        MtpCumulative mtp_cumulative; // INFERNIX_TMP_MTP_CUMULATIVE
+        MtpCumulative mtp_cumulative; // the argmax chains' cumulative cut
         // DFlash2 (--draft-tokens auto): a draft's acceptance (given the earlier ones') by its
         // selector probability's decile.
         runtime::speculative::DraftCalibration dflash_calibration;
@@ -700,7 +696,7 @@ public:
             d.mtp_io.block_rope_cells = d.mtp_io.rope_cells + 3 * lanes * k;
             d.mtp_io.slots            = d.mtp_io.block_rope_cells + 3 * lanes * k;
             d.mtp_io.rows             = d.mtp_io.slots + lanes;
-            // INFERNIX_TMP_MTP_CUMULATIVE: the one-row round's FP32 threshold (uploaded with the round).
+            // The cumulative cut: the one-row round's FP32 threshold (uploaded with the round).
             d.mtp_io.cumulative       = d.mtp_io.rows + lanes;
             d.mtp_io.drafts           = d.mtp_io.cumulative + 1;
             d.mtp_io.up_ids    = d.mtp_io.drafts + lanes * k;
@@ -718,9 +714,8 @@ public:
             d.mtp_io.verify_candidates = d.mtp_io.draft_q + candidates * lanes * k;
             d.mtp_io.verify_q          = d.mtp_io.verify_candidates + candidates * verified;
             static_assert(alignof(ops::SamplingConfig) <= 8 && sizeof(ops::SamplingConfig) % 8 == 0);
-            d.mtp_io.configs   = (d.mtp_io.verify_q + candidates * verified + 1) / 2 * 2;
-            d.mtp_io.runner_up = d.mtp_io.configs + sizeof(ops::SamplingConfig) / 4 * lanes;
-            d.mtp_io.words     = d.mtp_io.runner_up + lanes * k;
+            d.mtp_io.configs = (d.mtp_io.verify_q + candidates * verified + 1) / 2 * 2;
+            d.mtp_io.words   = d.mtp_io.configs + sizeof(ops::SamplingConfig) / 4 * lanes;
             // The drafter pool: the drafter's pooled experts (their banks are pinned, not in the
             // model's device bytes).
             if (config.mtp_expert_slots > 0) {
@@ -851,7 +846,7 @@ public:
 
     // 16-bit-activation experts' wide route under these options, which sizes the workspace: --a8-activations'
     // (GGUF and NVFP4 W4A16 banks; the exact layout), the expert-a4-residual fast paths' (NVFP4 W4A16 banks, two
-    // or three terms) or ggml-bf16-prefill's (GGUF banks' BF16 planes, a superset of the exact layout), in the
+    // or three terms) or ggml-bf16-prefill's (GGUF banks' BF16 stage-decode tiles; the exact layout), in the
     // Forward's order.
     static ops::offloaded_moe::WideA16 wide_a16(const ProgramOptions& o) noexcept {
         if (o.fast_paths.a8_experts_wide) { return ops::offloaded_moe::WideA16::kA8; }
@@ -985,10 +980,6 @@ public:
         r_             = dim(c_.qsa.compress_ratio);
         draft_min_logprob_ = options_.draft_min_p > 0.0 ? std::log(options_.draft_min_p)
                                                         : -std::numeric_limits<double>::infinity();
-        mtp_cumulative_base_ =
-            static_cast<float>(temporary_switches::number("INFERNIX_TMP_MTP_CUMULATIVE", 0.0, 0.0, 1.0));
-        ngram_chain_ = temporary_switches::flag("INFERNIX_TMP_NGRAM_CHAIN");
-        dflash2_rows_ = static_cast<std::int32_t>(temporary_switches::integer("INFERNIX_TMP_DFLASH2_ROWS", 2, 2, 8));
         sampled_drafts_ = options_.sampled_mtp_drafts && plan_.mtp && max_width_ > 1 &&
                           sparse_acceptance(plan_.token_domain, max_width_, plan_.lanes);
         if (options_.sampled_mtp_drafts && plan_.mtp && !sampled_drafts_) {
@@ -996,12 +987,6 @@ public:
                        DiagnosticLevel::Warning);
         }
         walk_step_tokens_ = walk_step_tokens_from_environment();
-        ngram_agree_         = temporary_switches::flag("INFERNIX_TMP_NGRAM_AGREE");
-        ngram_process_stats_ = temporary_switches::flag("INFERNIX_TMP_NGRAM_PROCESS_STATS");
-        ngram_first_span_async_ = temporary_switches::flag("INFERNIX_TMP_NGRAM_FIRST_SPAN_ASYNC");
-        ngram_process_accept_ = kNgramAcceptancePriors;
-        draft_process_stats_  = temporary_switches::flag("INFERNIX_TMP_DRAFT_PROCESS_STATS");
-        mtp_process_accept_.fill(kAcceptancePrior);
         dflash_process_calibration_.reset();
         screened_head_ = options_.screened_lm_head;
         if (screened_head_ && !parameters_.output_head_screen) {
@@ -1170,23 +1155,20 @@ public:
         if (const std::uint64_t spilled = guard.end(allocated); spilled != 0) {
             throw std::runtime_error(spill_message(spilled));
         }
-        // TEMPORARY (INFERNIX_TMP_STREAM_PRIORITY, candidates §11 D5): the staging and shared-expert
-        // streams at the device's greatest priority, so their short kernels are not queued behind the
-        // routed experts' (graphs then instantiate with node priorities, core/decode_graph.cpp).
-        static const bool prioritized = temporary_switches::flag("INFERNIX_TMP_STREAM_PRIORITY");
-        const int side_priority       = prioritized ? greatest_stream_priority() : 0;
-        CUDA_CHECK(cudaStreamCreateWithPriority(&overlap_.stream, cudaStreamNonBlocking, side_priority));
+        // The staging and shared-expert streams at the default priority: the greatest, with node priorities in
+        // the graphs (candidates §11 D5), measured 0.999x (removed 2026-10-28).
+        CUDA_CHECK(cudaStreamCreateWithFlags(&overlap_.stream, cudaStreamNonBlocking));
         for (auto& event : overlap_.events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
         experts.overlap_stream = overlap_.stream;
         experts.overlap_events = overlap_.events;
-        CUDA_CHECK(cudaStreamCreateWithPriority(&overlap_.shared_stream, cudaStreamNonBlocking, side_priority));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&overlap_.shared_stream, cudaStreamNonBlocking));
         for (auto& event : overlap_.shared_events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
         experts.shared_stream = overlap_.shared_stream;
         experts.shared_events = overlap_.shared_events;
         // The stream on which a forked call's staged misses compute (their down rows stage beside the gate/up pass;
         // Dense8 MTP decode +6.7 / +1.3 / +10.3 %, Ornith +1.6 / +8.0 / +4.6 %, IQ3_S within spread, 2026-10-27).
         {
-            CUDA_CHECK(cudaStreamCreateWithPriority(&overlap_.split_stream, cudaStreamNonBlocking, side_priority));
+            CUDA_CHECK(cudaStreamCreateWithFlags(&overlap_.split_stream, cudaStreamNonBlocking));
             for (auto& event : overlap_.split_events) {
                 CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
             }
@@ -1345,21 +1327,17 @@ public:
         // A GGUF import's records are computed by the ggml CPU route (ops/offloaded_sparse_moe/cpu/ggml_expert.h).
         // What the offload switches resolved to (their values are in the startup log's temporary switches line).
         {
-            const auto& switches = temporary_switches::offload();
-            std::string line     = "expert offload (temporary switches resolved): staging slots " +
+            std::string line = "expert offload (temporary switches resolved): staging slots " +
                                std::to_string(plan_.staging_slots);
             if (one_column_divisor() != 0) {
                 line += "; plain decode one-column divisor " + std::to_string(plain_divisor(0)) + " below " +
                         std::to_string(runtime::expert_offload::kPlainDivisorContext) + " context tokens, " +
                         std::to_string(plain_divisor(runtime::expert_offload::kPlainDivisorContext)) + " from there";
             }
-            if (switches.prompt_credit >= 0.0 || switches.prompt_budget > 0) {
-                line += "; prompt seed credit " + std::to_string(switches.credit_or(kPromptSeedCredit)) + ", " +
-                        std::to_string(switches.prompt_budget) + " promotions per layer";
-            }
             diagnostic(line, DiagnosticLevel::Info);
         }
-        // The team's size and CPUs (INFERNIX_TMP_CPU_PLACEMENT / _ENGINE_ISOLATE; today unpinned).
+        // The team's size and CPUs (INFERNIX_TMP_CPU_PLACEMENT; today unpinned). The engine thread is not
+        // isolated: Dense8 +0.15 %, IQ3_S -0.14 % (2026-10-28).
         placement_ = runtime::expert_offload::cpu_placement(
             temporary_switches::offload(),
             c_.exact_experts ? options_.cpu_ggml_expert_workers : options_.cpu_expert_workers);
@@ -1744,13 +1722,9 @@ public:
         clear_prompt_uses(lane);
         lane.mtp_accept.fill(kAcceptancePrior);
         lane.mtp_policy_rounds = 0;
-        lane.mtp_cumulative.reset(mtp_cumulative_base_);
-        lane.dflash_calibration.reset();
-        if (draft_process_stats_) {
-            lane.mtp_accept         = mtp_process_accept_;
-            lane.dflash_calibration = dflash_process_calibration_;
-        }
-        lane.ngram_accept      = ngram_process_stats_ ? ngram_process_accept_ : kNgramAcceptancePriors;
+        lane.mtp_cumulative.reset();
+        lane.dflash_calibration = dflash_process_calibration_;
+        lane.ngram_accept       = kNgramAcceptancePriors;
         if (max_width_ > 1) {
             if (options_.ngram_draft_tokens > 0) {
                 lane.proposer =
@@ -2334,12 +2308,9 @@ public:
 
     // At the prompt's end, after its last after_round: an expert that every counted token routed to
     // gains kPromptSeedCredit of LFRU count, the others in proportion.
-    // INFERNIX_TMP_PROMPT_SEED overrides the credit and adds promotions at the prompt's end.
     void seed_prompt_experts(Lane& lane) {
         if (lane.prompt_counted == 0) { return; }
-        const auto& switches = temporary_switches::offload();
-        residency_->seed_prompt(lane.prompt_uses, switches.credit_or(kPromptSeedCredit) / lane.prompt_counted,
-                                switches.prompt_budget, device_.stream);
+        residency_->seed_prompt(lane.prompt_uses, kPromptSeedCredit / lane.prompt_counted);
         clear_prompt_uses(lane);
     }
     static void clear_prompt_uses(Lane& lane) {
@@ -2442,8 +2413,8 @@ public:
         //   --draft-tokens auto, the round's one width is chosen after it (dflash2_pair_width);
         // - otherwise two or more rows decode plain (one draft each measured slower at four rows).
         // A plain round's W = 1 catch-up keeps each drafter current.
-        const bool pair_round = options_.pair_speculation &&
-                                (batch == 2 ? (mtp_ || dflash2_) : (dflash2_ && batch > 2 && batch <= dflash2_rows_));
+        // DFlash2 rounds of three or four rows at one shared length lost (4 rows 0.78x, removed 2026-10-28).
+        const bool pair_round = options_.pair_speculation && batch == 2 && (mtp_ || dflash2_);
         const std::int32_t pair_k = pair_round ? choose_pair_draft_length(lanes_[lanes[0]], lanes_[lanes[1]]) : 0;
         const bool speculate = batch == 1 || pair_k > 0;
         std::array<std::int32_t, kMaximumConcurrency> wanted{};
@@ -2459,12 +2430,8 @@ public:
         // Each row's draft count and source are fixed before the drafter runs (an MTP row's count
         // is its draft length; a longer n-gram copy proposal replaces its drafts), so the round's
         // width, and with it every row's n-gram landing columns, is known while it drafts.
-        std::array<std::int32_t, kMaximumConcurrency> extents{}, limits{};
+        std::array<std::int32_t, kMaximumConcurrency> extents{};
         std::int32_t width = 1;
-        // INFERNIX_TMP_NGRAM_AGREE: a one-row round's copy waits for the drafter's first draft; this
-        // is the row's neural extent meanwhile (-1: no copy waits). The drafter runs either way.
-        std::int32_t gate_extent = -1;
-        chain_tail_              = 0;
         for (std::int32_t b = 0; b < batch && max_width_ > 1; ++b) {
             Lane& lane = lanes_[lanes[b]];
             drafts_[b].clear();
@@ -2474,7 +2441,6 @@ public:
             if (remaining < 2) { continue; }
             auto limit = std::min<std::uint32_t>(static_cast<std::uint32_t>(max_width_ - 1), remaining - 1U);
             if (batch > 1) { limit = std::min<std::uint32_t>(limit, static_cast<std::uint32_t>(pair_k)); }
-            limits[b] = static_cast<std::int32_t>(limit);
             if (drafter_live(lane) && wanted[b] > 0) {
                 extents[b] = static_cast<std::int32_t>(std::min<std::uint32_t>(limit, static_cast<std::uint32_t>(wanted[b])));
             }
@@ -2502,7 +2468,6 @@ public:
                     take = copy_tokens / (1.0 + cost * static_cast<double>(match.tokens.size())) >
                            mtp_tokens / (1.0 + cost * extents[b]);
                 }
-                if (take && ngram_agree_ && batch == 1 && extents[b] > 0) { gate_extent = extents[b]; }
                 if (take) {
                     drafts_[b]       = std::move(match.tokens);
                     from_ngram_[b]   = true;
@@ -2516,22 +2481,6 @@ public:
         // Columns of each verification row whose n-gram rows are already staged: the drafter's
         // wait reads every committed-token column (the anchor's) and all of a copy row's.
         std::array<std::int32_t, kMaximumConcurrency> staged{};
-        // The agreement gate, once the drafter has drafted: a copy whose first token is not the
-        // drafter's first draft gives way to the drafter's tokens. Its staged copy columns past the
-        // anchor are restaged by the verification (staged = 1).
-        const auto settle_gate = [&](std::span<const std::int32_t> neural) {
-            if (gate_extent < 0) { return; }
-            const std::int32_t extent = std::exchange(gate_extent, -1);
-            if (neural.empty() || drafts_[0].empty() || neural.front() == drafts_[0].front()) { return; }
-            ++lanes_[lanes[0]].speculative.ngram_gate_rejections;
-            from_ngram_[0]   = false;
-            ngram_bucket_[0] = -1;
-            drafts_[0].clear();
-            extents[0] = extent;
-            staged[0]  = std::min(staged[0], 1);
-            width      = 1 + extent;
-            if (mtp_) { last_round_steps_ = steps; }
-        };
         if (mtp_) {
             mtp_draft(std::span<const std::uint32_t>(lanes.data(), batch), steps, [&] {
                 if (width == 1) { return; }
@@ -2540,26 +2489,24 @@ public:
                     stage_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], width, 0, staged[b]);
                 }
             });
-            settle_gate(mtp_drafts_[0]);
             for (std::int32_t b = 0; b < batch && max_width_ > 1; ++b) {
                 if (!from_ngram_[b] && extents[b] > 0) {
                     drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + extents[b]);
                 }
             }
-            // A one-row round verifies only its confident drafts: those before the first whose
-            // draft-head probability is below --spec-min-p (draft_min_logprob_). Its width may
+            // A one-row round verifies only its confident drafts: those its cumulative cut keeps
+            // (read_mtp_drafts; every draft of a sampled row with sampled-mtp-drafts). Its width may
             // still shrink, as the drafter staged only column 0's n-gram rows; a pair round's
             // columns are staged at their offsets, so it keeps its length.
             if (batch == 1 && !from_ngram_[0] && extents[0] > 0) {
                 extents[0] = std::min(extents[0], mtp_confident_[0]);
                 drafts_[0].resize(static_cast<std::size_t>(extents[0]));
                 width = 1 + extents[0];
-                if (ngram_chain_) { chain_copy(lanes_[lanes[0]], limits[0], extents[0], width); }
             }
         } else if (dflash2_ && width > 1) {
             // One proposal for every row that takes the drafter's tokens (none when every speculating
             // row copies an n-gram), while the host stages the verification's n-gram rows.
-            bool neural = gate_extent >= 0; // a gated copy needs the proposal's first draft
+            bool neural = false;
             for (std::int32_t b = 0; b < batch; ++b) { neural = neural || (!from_ngram_[b] && extents[b] > 0); }
             const auto stage_rows = [&] {
                 for (std::int32_t b = 0; b < batch; ++b) {
@@ -2569,11 +2516,6 @@ public:
             };
             if (neural) {
                 dflash2_propose(std::span<const std::uint32_t>(lanes.data(), batch), stage_rows);
-                if (gate_extent >= 0) {
-                    settle_gate(dflash_drafts_[0]);
-                    // A kept copy verifies one-hot drafts: the round is not a DFlash2 round.
-                    neural = !from_ngram_[0] && extents[0] > 0;
-                }
                 for (std::int32_t b = 0; b < batch; ++b) {
                     if (!from_ngram_[b] && extents[b] > 0) {
                         drafts_[b].assign(dflash_drafts_[b].begin(), dflash_drafts_[b].begin() + extents[b]);
@@ -2587,10 +2529,9 @@ public:
                     if (options_.auto_draft_length) { extents[0] = dflash2_auto_length(lanes_[lanes[0]], extents[0]); }
                     drafts_[0].resize(static_cast<std::size_t>(extents[0]));
                     width = 1 + extents[0];
-                    if (ngram_chain_) { chain_copy(lanes_[lanes[0]], limits[0], extents[0], width, true); }
-                } else if (batch >= 2 && options_.auto_draft_length) {
-                    // A pair round (dflash2-pairs; up to INFERNIX_TMP_DFLASH2_ROWS rows) verifies one width for
-                    // every row, chosen from all rows' drafts (dflash2_pair_width); its drafter rows keep that many.
+                } else if (batch == 2 && options_.auto_draft_length) {
+                    // A pair round (dflash2-pairs) verifies one width for both rows, chosen from both rows'
+                    // drafts (dflash2_pair_width); its drafter rows keep that many.
                     const auto rows = static_cast<std::size_t>(batch);
                     const std::int32_t k = dflash2_pair_width(std::span<const std::uint32_t>(lanes.data(), rows),
                                                               std::span<const std::int32_t>(extents.data(), rows));
@@ -3745,48 +3686,11 @@ private:
 
     void release(std::uint32_t index) noexcept {
         Lane& lane = lanes_[index];
-        if (pre_drafts_launched_ != 0) {
-            // TEMPORARY (INFERNIX_TMP_DRAFTER_STREAM): how often the next round took its pre-draft.
-            try {
-                diagnostic("MTP pre-drafts taken: " + std::to_string(pre_drafts_taken_) + " of " +
-                           std::to_string(pre_drafts_launched_));
-            } catch (...) {}
-        }
         if (continuing_calls_ != 0) {
             // TEMPORARY (INFERNIX_TMP_CONTINUING_PROMPT, CF-01): the positive control of the arm.
             try {
                 diagnostic("continuing prompts: " + std::to_string(continuing_calls_) +
                            " prefill calls left out of the expert cache's scores");
-            } catch (...) {}
-        }
-        if (ngram_chain_) {
-            // TEMPORARY (INFERNIX_TMP_NGRAM_CHAIN): the chained copies since startup.
-            try {
-                diagnostic("n-gram chain: " + std::to_string(chain_rounds_) + " rounds appended " +
-                           std::to_string(chain_drafted_) + " copied drafts after the drafter's, " +
-                           std::to_string(chain_accepted_) + " accepted");
-            } catch (...) {}
-        }
-        if (runner_up_) {
-            // TEMPORARY (INFERNIX_TMP_MTP_RUNNER_UP, GX-09): since startup, how often a greedy row's first
-            // rejected draft had the target's token as the draft head's second choice, overall and by
-            // the rejected draft's position (a width-2 tree pays only above about 0.20).
-            try {
-                std::uint64_t rejections = 0, hits = 0;
-                std::string by_position;
-                for (std::size_t j = 0; j < runner_up_rejections_.size(); ++j) {
-                    rejections += runner_up_rejections_[j];
-                    hits += runner_up_hits_[j];
-                    by_position += (j == 0 ? "" : ", ") + std::to_string(runner_up_hits_[j]) + "/" +
-                                   std::to_string(runner_up_rejections_[j]);
-                }
-                diagnostic("MTP runner-up: " + std::to_string(hits) + " of " + std::to_string(rejections) +
-                           " first rejections were the draft's second choice (" +
-                           std::to_string(rejections == 0 ? 0.0 : static_cast<double>(hits) / static_cast<double>(rejections)) +
-                           "); by position " + by_position +
-                           (head_covers_.empty() ? std::string()
-                                                 : "; the target's token was outside the head's rows at " +
-                                                       std::to_string(runner_up_outside_) + " of them"));
             } catch (...) {}
         }
         if (replay_clock_) {
@@ -4463,7 +4367,7 @@ private:
     DecodeGraph& mtp_catch_graph(std::int32_t batch, std::int32_t W) {
         return mtp_catch_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
     }
-    // The MTP drafter's catch-up over a round of batch x W columns (mtp_catch_up_launch): its cells from the
+    // The MTP drafter's catch-up over a round of batch x W columns (mtp_catch_up): its cells from the
     // round's residuals and the staged ids, and its index-key tails by each row's committed count.
     void mtp_catch_body(std::int32_t batch, std::int32_t W) {
         const cudaStream_t s = device_.stream;
@@ -4491,12 +4395,10 @@ private:
 
     // Runs a fixed-address round: captured on its first use (the Ops' first-use setup is capture-safe:
     // function attributes, the TMA descriptors' relaxed-mode staging; design §19.3.34), then by replay.
-    // `launch_on`: the stream a ready executable launches on (the device stream by default); the capture
-    // always runs on the device stream.
-    void replay(DecodeGraph& graph, const std::function<void()>& body, cudaStream_t launch_on = nullptr) {
+    void replay(DecodeGraph& graph, const std::function<void()>& body) {
         const cudaStream_t s = device_.stream;
         if (graph.executable.ready()) {
-            if (!graph_set_.capturing) { graph.executable.launch(launch_on != nullptr ? launch_on : s); }
+            if (!graph_set_.capturing) { graph.executable.launch(s); }
             return;
         }
         prepare_graph(graph, [&] { graph.definition.capture(s, body); });
@@ -4505,11 +4407,10 @@ private:
     // replay for a chain of `steps` bodies whose body j > 0 runs only while the gate after body
     // j - 1 passes (DecodeGraphDefinition::capture_gated_chain).
     void replay_gated(DecodeGraph& graph, std::int32_t steps, const std::function<void(std::int32_t)>& body,
-                      const std::function<void(std::int32_t, cudaGraphConditionalHandle)>& gate,
-                      cudaStream_t launch_on = nullptr) {
+                      const std::function<void(std::int32_t, cudaGraphConditionalHandle)>& gate) {
         const cudaStream_t s = device_.stream;
         if (graph.executable.ready()) {
-            if (!graph_set_.capturing) { graph.executable.launch(launch_on != nullptr ? launch_on : s); }
+            if (!graph_set_.capturing) { graph.executable.launch(s); }
             return;
         }
         prepare_graph(graph, [&] { graph.definition.capture_gated_chain(s, steps, body, gate); });
@@ -4556,13 +4457,6 @@ private:
         std::size_t free_bytes = 0, total_bytes = 0;
         CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
         return free_bytes;
-    }
-
-    // The device's greatest stream priority (numerically the lowest).
-    static int greatest_stream_priority() {
-        int least = 0, greatest = 0;
-        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
-        return greatest;
     }
     void trace_graph(const DecodeGraph& graph, std::size_t free_before) {
         RouteTraceGraph family = RouteTraceGraph::Decode;
@@ -4846,26 +4740,12 @@ private:
                     upload_pinned(mtp_device(mtp_io_.verify_q + row), host_q + row, 4ULL * C * n, s);
                     continue;
                 }
-                // Draft step j's plane of row b is at (j * batch + b) * C. A chained row (INFERNIX_TMP_NGRAM_CHAIN)
-                // verifies its copied tail one-hot after its drafter steps.
-                const std::int32_t neural = n - (b == 0 ? chain_tail_ : 0);
+                // Draft step j's plane of row b is at (j * batch + b) * C.
                 for (const auto [from, to] : {std::pair{mtp_io_.draft_candidates, mtp_io_.verify_candidates},
                                               std::pair{mtp_io_.draft_q, mtp_io_.verify_q}}) {
                     CUDA_CHECK(cudaMemcpy2DAsync(mtp_device(to + row), 4ULL * C,
                                                  mtp_device(from + static_cast<std::size_t>(C) * b), 4ULL * C * batch,
-                                                 4ULL * C, static_cast<std::size_t>(neural), cudaMemcpyDeviceToDevice, s));
-                }
-                if (neural < n) {
-                    const std::size_t tail = row + static_cast<std::size_t>(neural) * C;
-                    for (std::int32_t j = neural; j < n; ++j) {
-                        const std::int32_t token = drafts_[b][static_cast<std::size_t>(j)];
-                        for (std::int32_t c = 0; c < C; ++c) {
-                            host_candidates[row + j * C + c] = (token + c) % token_domain_;
-                            host_q[row + j * C + c]          = c == 0 ? 1.0F : 0.0F;
-                        }
-                    }
-                    upload_pinned(mtp_device(mtp_io_.verify_candidates + tail), host_candidates + tail, 4ULL * C * (n - neural), s);
-                    upload_pinned(mtp_device(mtp_io_.verify_q + tail), host_q + tail, 4ULL * C * (n - neural), s);
+                                                 4ULL * C, static_cast<std::size_t>(n), cudaMemcpyDeviceToDevice, s));
                 }
             }
             Tensor candidates(mtp_device(mtp_io_.verify_candidates), DType::I32, {C, K, batch});
@@ -4924,73 +4804,26 @@ private:
             ++stats.rounds;
             stats.drafted_tokens += n;
             stats.accepted_tokens += static_cast<std::uint64_t>(A);
-            // INFERNIX_TMP_NGRAM_CHAIN: a chained row's drafter drafts, then its copied tail.
-            const std::uint64_t tail   = b == 0 ? static_cast<std::uint64_t>(chain_tail_) : 0;
-            const std::uint64_t neural = n - tail;
             if (!from_ngram_[b]) {
                 // Positions 1..A were accepted; position A + 1 (when drafted) was the first rejected.
-                for (std::uint64_t j = 0; j < neural && j <= static_cast<std::uint64_t>(A); ++j) {
+                for (std::uint64_t j = 0; j < n && j <= static_cast<std::uint64_t>(A); ++j) {
                     const double hit = j < static_cast<std::uint64_t>(A) ? 1.0 : 0.0;
                     double& a        = lane.mtp_accept[static_cast<std::size_t>(j)];
                     a                = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * hit;
-                    if (draft_process_stats_) {
-                        double& shared = mtp_process_accept_[static_cast<std::size_t>(j)];
-                        shared         = (1.0 - kAcceptanceWeight) * shared + kAcceptanceWeight * hit;
-                    }
                 }
-                // INFERNIX_TMP_MTP_CUMULATIVE: the chain's verified drafts against the bin table (rows whose
-                // drafts read_mtp_drafts kept: argmax drafts).
-                if (mtp_cumulative_base_ > 0.0F && mtp_ && !dflash2_ && neural > 0 &&
-                    !(sparse && lane.sampling.temperature > 0.0F)) {
+                // The chain's verified drafts against the cumulative cut's bin table (rows whose drafts
+                // read_mtp_drafts kept: argmax drafts).
+                if (mtp_ && !dflash2_ && !(sparse && lane.sampling.temperature > 0.0F)) {
                     lane.mtp_cumulative.observe(mtp_draft_logprobs_[static_cast<std::size_t>(b)].data(),
-                                                static_cast<std::int32_t>(std::min<std::uint64_t>(neural, 8)),
-                                                static_cast<std::int32_t>(std::min<std::uint64_t>(A, neural)));
-                }
-                if (tail > 0) {
-                    // The tail is reached once every drafter draft is accepted; its positions train the copy's
-                    // bucket as a copy round's do.
-                    ++chain_rounds_;
-                    chain_drafted_ += tail;
-                    const std::uint64_t taken = static_cast<std::uint64_t>(A) > neural ? A - neural : 0;
-                    chain_accepted_ += taken;
-                    stats.ngram_drafted_tokens += tail;
-                    stats.ngram_accepted_tokens += taken;
-                    if (chain_bucket_ >= 0 && static_cast<std::uint64_t>(A) >= neural) {
-                        const auto bucket = static_cast<std::size_t>(chain_bucket_);
-                        double& a         = lane.ngram_accept[bucket];
-                        double& shared    = ngram_process_accept_[bucket];
-                        for (std::uint64_t j = 0; j < tail && j <= taken; ++j) {
-                            const double hit = j < taken ? 1.0 : 0.0;
-                            a = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * hit;
-                            if (ngram_process_stats_) { shared = (1.0 - kAcceptanceWeight) * shared + kAcceptanceWeight * hit; }
-                        }
-                    }
+                                                static_cast<std::int32_t>(std::min<std::uint64_t>(n, 8)),
+                                                static_cast<std::int32_t>(std::min<std::uint64_t>(A, n)));
                 }
                 if (dflash2_) {
-                    // The drafter's drafts only (a chained tail has no selector probabilities).
-                    const std::span<const float> confidences(dflash_confidence_[b].data(), neural);
-                    const auto verified = static_cast<std::uint32_t>(neural);
-                    const auto taken    = static_cast<std::uint32_t>(std::min<std::uint64_t>(A, neural));
+                    const std::span<const float> confidences(dflash_confidence_[b].data(), n);
+                    const auto verified = static_cast<std::uint32_t>(n);
+                    const auto taken    = static_cast<std::uint32_t>(std::min<std::uint64_t>(A, n));
                     lane.dflash_calibration.observe(confidences, verified, taken, kAcceptanceWeight);
-                    if (draft_process_stats_) {
-                        dflash_process_calibration_.observe(confidences, verified, taken, kAcceptanceWeight);
-                    }
-                }
-                // GX-09: a greedy MTP row's first rejected draft against the head's second choice there
-                // (the target's own token at that column is the licensed one).
-                if (runner_up_ && !dflash2_ && lane.sampling.temperature <= 0.0F && static_cast<std::uint64_t>(A) < neural) {
-                    const std::int32_t row = mtp_runner_up_[b][static_cast<std::size_t>(A)];
-                    if (row >= 0) {
-                        const std::int32_t token =
-                            runner_up_tokens_.empty() ? row : runner_up_tokens_[static_cast<std::size_t>(row)];
-                        ++runner_up_rejections_[static_cast<std::size_t>(A)];
-                        runner_up_hits_[static_cast<std::size_t>(A)] += token == licensed_host[b * W + A] ? 1U : 0U;
-                        const std::int32_t target = licensed_host[b * W + A];
-                        if (!head_covers_.empty() && target >= 0 && target < vocab_ &&
-                            !head_covers_[static_cast<std::size_t>(target)]) {
-                            ++runner_up_outside_;
-                        }
-                    }
+                    dflash_process_calibration_.observe(confidences, verified, taken, kAcceptanceWeight);
                 }
             }
             if (from_ngram_[b]) {
@@ -4999,13 +4832,10 @@ private:
                 stats.ngram_accepted_tokens += static_cast<std::uint64_t>(A);
                 // The bucket's acceptance per position.
                 if (ngram_bucket_[b] >= 0) {
-                    const auto bucket = static_cast<std::size_t>(ngram_bucket_[b]);
-                    double& a         = lane.ngram_accept[bucket];
-                    double& shared    = ngram_process_accept_[bucket];
+                    double& a = lane.ngram_accept[static_cast<std::size_t>(ngram_bucket_[b])];
                     for (std::uint64_t j = 0; j < n && j <= static_cast<std::uint64_t>(A); ++j) {
                         const double hit = j < static_cast<std::uint64_t>(A) ? 1.0 : 0.0;
                         a = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * hit;
-                        if (ngram_process_stats_) { shared = (1.0 - kAcceptanceWeight) * shared + kAcceptanceWeight * hit; }
                     }
                 }
             }
@@ -5083,11 +4913,6 @@ private:
             }
         }
         upload_pinned(spec_device(spec_layout_.commit), commit, 4ULL * batch, s);
-        // TEMPORARY (INFERNIX_TMP_DRAFTER_STREAM, candidates §13 SR-01): the drafter's catch-up on its
-        // stream of greater priority, beside the target's GDN fold, QSA tails and PLE commit below
-        // (which touch none of what it reads or writes); joined before anything reads its cache.
-        const bool drafter_beside = mtp_ && overlap_.drafter_stream != nullptr;
-        const bool caught_beside  = drafter_beside && mtp_catch_up_launch(rows, W, commit, overlap_.drafter_stream);
         // The fold, QSA tails and PLE commit (and on DFlash2 without MTP the drafter's context too) as one graph per
         // batch size and width, which reads every row's count and slot from the device, instead of three launches
         // (four with the context's graph) on the host's turnaround each round (design §19.3.34). Same bits.
@@ -5098,22 +4923,15 @@ private:
         } else {
             commit_body(batch, W, std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), static_cast<std::size_t>(batch)));
         }
-        if (caught_beside) { mtp_pre_draft(rows, W, commit, decisions); }
-        if (drafter_beside) {
-            CUDA_CHECK(cudaStreamWaitEvent(s, overlap_.drafter_events[1], 0));
-            mtp_catch_up_finish(rows, W, commit);
-        } else if (mtp_) {
-            mtp_catch_up(rows, W, commit);
-        }
+        // The drafter's catch-up on a stream of greater priority beside these commit kernels, with the next
+        // round's drafts pre-drafted there (candidates §13 SR-01), measured within chance (removed 2026-10-28).
+        if (mtp_) { mtp_catch_up(rows, W, commit); }
         if (context_in_graph) {
             dflash2_settle_frontiers(rows, commit);
         } else if (dflash2_) {
             dflash2_catch_up(rows, W, commit);
         }
         for (const auto& row : rows) { require_mtp_settled(lanes_[ContractAccess::lane(row)]); }
-        // Everything after (the prefix publication, the residency's round end, the next calls) is
-        // ordered after the pre-draft, as when it ran in the next round's mtp_draft.
-        if (pre_draft_.live) { CUDA_CHECK(cudaStreamWaitEvent(s, overlap_.drafter_events[2], 0)); }
         for (std::int32_t row = 0; row < batch; ++row) {
             const auto& d = decisions[static_cast<std::size_t>(row)];
             if (!d.cancelled && !d.failed) {
@@ -5149,36 +4967,10 @@ private:
         allocate(mtp_device_, 4ULL * mtp_io_.words, allocated);
         mtp_host_ = PinnedHostBuffer(4ULL * mtp_io_.words);
         for (auto& d : mtp_drafts_) { d.assign(static_cast<std::size_t>(mtp_k_), 0); }
-        // TEMPORARY (INFERNIX_TMP_MTP_RUNNER_UP, candidates GX-09): the argmax drafts' runner-up rows,
-        // mapped to tokens on the host through a copy of the proposal head's row map.
-        if (temporary_switches::flag("INFERNIX_TMP_MTP_RUNNER_UP")) {
-            runner_up_ = true;
-            for (auto& r : mtp_runner_up_) { r.assign(static_cast<std::size_t>(mtp_k_), -1); }
-            runner_up_rejections_.assign(static_cast<std::size_t>(mtp_k_), 0);
-            runner_up_hits_.assign(static_cast<std::size_t>(mtp_k_), 0);
-            if (const auto& head = parameters_.draft_head; head.rows) {
-                runner_up_tokens_.resize(static_cast<std::size_t>(head.rows->weight.n));
-                CUDA_CHECK(cudaMemcpy(runner_up_tokens_.data(), head.token_ids.data,
-                                      runner_up_tokens_.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
-                // The tokens the head can draft (candidates D15 / GX-10: how often a rejection's target
-                // token is one it cannot propose).
-                head_covers_.assign(static_cast<std::size_t>(vocab_), false);
-                for (const std::int32_t token : runner_up_tokens_) {
-                    if (token >= 0 && token < vocab_) { head_covers_[static_cast<std::size_t>(token)] = true; }
-                }
-            }
-        }
         mtp_catch_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
         mtp_draft_graphs_.resize(static_cast<std::size_t>(lanes) * mtp_k_);
         mtp_gated_graphs_.resize(static_cast<std::size_t>(mtp_k_));
         if (sampled_drafts_) { mtp_sampled_graphs_.resize(static_cast<std::size_t>(lanes) * mtp_k_); }
-        if (temporary_switches::flag("INFERNIX_TMP_DRAFTER_STREAM")) {
-            CUDA_CHECK(cudaStreamCreateWithPriority(&overlap_.drafter_stream, cudaStreamNonBlocking,
-                                                    greatest_stream_priority()));
-            for (auto& event : overlap_.drafter_events) {
-                CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-            }
-        }
     }
 
     // The drafter pool (candidates §22 VM-01 variant B): the drafter's routed experts behind a
@@ -5349,52 +5141,6 @@ private:
         return round_cost_fit(a, b) ? std::min(b / a, kCostMax) : kWidthCost;
     }
 
-    // TEMPORARY (INFERNIX_TMP_NGRAM_CHAIN, candidates §13 "lookup chain"; Strata --lookup-chain, HyperQwen's
-    // DFlash2 + lookup), until its A/B: a one-row MTP round whose `extent` confident drafts leave room under
-    // `limit` appends the n-gram copy that continues the history and those drafts, as long a prefix of it
-    // as maximizes the round's expected tokens per round time (the copy rule's model: the drafts' learned
-    // acceptance, then the copy bucket's per position, each column at width_cost()). Draft-only: the
-    // verification licenses the same tokens; the drafter's catch-up replays every verified column.
-    // With `dflash`, a one-row DFlash2 round: its drafts' calibrated acceptance (dflash_calibration over
-    // their selector probabilities) and DFlash2's round costs replace the MTP model.
-    void chain_copy(Lane& lane, std::int32_t limit, std::int32_t& extent, std::int32_t& width, bool dflash = false) {
-        const std::int32_t k = extent;
-        if (!lane.proposer || k <= 0 || k >= limit) { return; }
-        chain_context_.assign(lane.history.begin(), lane.history.end());
-        chain_context_.insert(chain_context_.end(), drafts_[0].begin(), drafts_[0].end());
-        auto match = lane.proposer->propose(chain_context_, static_cast<std::uint32_t>(limit - k), options_.ngram_min_match);
-        if (match.tokens.empty()) { return; }
-        const int bucket = ngram_bucket(match.matched);
-        const double p    = lane.ngram_accept[static_cast<std::size_t>(bucket)];
-        const double cost = dflash ? kDFlashDraftCost : width_cost();
-        const double base = dflash ? 1.0 + kDFlashProposalCost : 1.0;
-        double reach = 1.0, tokens = 1.0;
-        for (std::int32_t j = 0; j < k; ++j) {
-            reach *= dflash ? lane.dflash_calibration.accept[runtime::speculative::DraftCalibration::bin(
-                                  dflash_confidence_[0][static_cast<std::size_t>(j)])]
-                            : lane.mtp_accept[static_cast<std::size_t>(j)];
-            tokens += reach;
-        }
-        double best = tokens / (base + cost * k);
-        std::int32_t best_tail = 0;
-        for (std::size_t m = 1; m <= match.tokens.size(); ++m) {
-            reach *= p;
-            tokens += reach;
-            const double rate = tokens / (base + cost * static_cast<double>(k + static_cast<std::int32_t>(m)));
-            if (rate > best) {
-                best      = rate;
-                best_tail = static_cast<std::int32_t>(m);
-            }
-        }
-        if (best_tail == 0) { return; }
-        drafts_[0].insert(drafts_[0].end(), match.tokens.begin(), match.tokens.begin() + best_tail);
-        chain_tail_       = best_tail;
-        chain_bucket_     = bucket;
-        extent            = k + best_tail;
-        width             = 1 + extent;
-        last_round_steps_ = -1; // the round's width no longer follows its drafter steps
-    }
-
     // At a decode round's start: the previous round's cycle when both are one-row MTP rounds (an
     // n-gram round's width does not follow its drafter steps: not sampled).
     void observe_round(Clock::time_point start, std::int32_t batch) {
@@ -5464,20 +5210,9 @@ private:
             any |= lanes_[lanes[b]].mtp_live;
             unwritten |= lanes_[lanes[b]].mtp_live && lanes_[lanes[b]].mtp_cells < lanes_[lanes[b]].state_tokens;
         }
-        // TEMPORARY (INFERNIX_TMP_DRAFTER_STREAM, candidates §13 SR-01): this round's drafts when the
-        // last commit drafted them (mtp_pre_draft).
-        const bool drafted = take_pre_draft(lanes, steps, unwritten);
         // Without drafts (a gated or zero-length round) only unwritten pending cells need the drafter.
         if (!any || (steps == 0 && !unwritten)) { return; }
         const bool sampled = mtp_sampled(lanes);
-        if (drafted) {
-            mtp_sampled_round_ = sampled;
-            if (while_drafting) { while_drafting(); }
-            device_.synchronize();
-            read_mtp_drafts(lanes, steps, false, sampled);
-            return;
-        }
-        join_pre_draft();
         stage_mtp_draft(lanes, s);
         for (std::int32_t b = 0; b < batch; ++b) {
             CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(mtp_chain_.p) + column * b, saved_column(lanes[b]).data,
@@ -5507,15 +5242,11 @@ private:
         }
         mtp_sampled_round_ = sampled;
         if (sampled) { stage_mtp_samplers(lanes, s); }
-        run_mtp_draft_steps(batch, steps, sampled, nullptr);
+        run_mtp_draft_steps(batch, steps, sampled);
         CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.drafts), mtp_device(mtp_io_.drafts), 4ULL * steps * batch,
                                    cudaMemcpyDeviceToHost, s));
         CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.logprobs), mtp_device(mtp_io_.logprobs), 4ULL * steps * batch,
                                    cudaMemcpyDeviceToHost, s));
-        if (runner_up_) {
-            CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.runner_up), mtp_device(mtp_io_.runner_up), 4ULL * steps * batch,
-                                       cudaMemcpyDeviceToHost, s));
-        }
         if (while_drafting) {
             device_.flush();
             while_drafting();
@@ -5576,13 +5307,14 @@ private:
         upload_pinned(mtp_device(mtp_io_.configs), configs, sizeof(ops::SamplingConfig) * lanes.size(), stream);
     }
 
-    // A one-row argmax round verifies its drafts only up to the first below --spec-min-p, so a
-    // draft step runs only while every earlier draft cleared it: the device applies the host's
-    // cut (the same binary64 comparison) and skips the steps whose drafts it would discard. A
-    // skipped step leaves its draft and confidence words stale, beyond the cut that reads them.
-    // (Design §19.3.27: 34 % of the steps of mixed-topic MTP 4 rounds, decode +2.2 %.)
+    // A one-row argmax round verifies its drafts only up to its cut (with --draft-tokens auto the cumulative
+    // cut, MtpCumulative; with a fixed length the first draft below --spec-min-p), so a draft step runs only
+    // while every earlier draft cleared it: the device applies the host's cut (the same comparisons) and
+    // skips the steps whose drafts it would discard. A skipped step leaves its draft and confidence words
+    // stale, beyond the cut that reads them. (Design §19.3.27: at --spec-min-p, 34 % of the steps of
+    // mixed-topic MTP 4 rounds, decode +2.2 %.)
     [[nodiscard]] bool mtp_draft_gated(std::int32_t batch, std::int32_t steps, bool sampled) const noexcept {
-        return !sampled && batch == 1 && steps > 1 && (mtp_cumulative_base_ > 0.0F || std::isfinite(draft_min_logprob_));
+        return !sampled && batch == 1 && steps > 1 && (options_.auto_draft_length || std::isfinite(draft_min_logprob_));
     }
 
     DecodeGraph& mtp_draft_graph(std::int32_t batch, std::int32_t steps, bool sampled) {
@@ -5591,9 +5323,8 @@ private:
         return graphs[static_cast<std::size_t>(batch - 1) * mtp_k_ + (steps - 1)];
     }
 
-    // The draft round's `steps` chained steps over its staged io and chain columns; `launch_on` as
-    // for replay (only with a ready graph).
-    void run_mtp_draft_steps(std::int32_t batch, std::int32_t steps, bool sampled, cudaStream_t launch_on) {
+    // The draft round's `steps` chained steps over its staged io and chain columns.
+    void run_mtp_draft_steps(std::int32_t batch, std::int32_t steps, bool sampled) {
         const cudaStream_t s = device_.stream;
         const Tensor slot_tensor(mtp_device(mtp_io_.slots), DType::I32, {batch});
         const Tensor row_tensor(mtp_device(mtp_io_.rows), DType::I32, {batch});
@@ -5633,17 +5364,13 @@ private:
                                .sample_rows      = plane(mtp_io_.sample_rows, kSampledDraftRanks, DType::I32),
                                .sample_logprobs  = plane(mtp_io_.sample_logprobs, kSampledDraftRanks, DType::FP32),
                                .draft_candidates = plane(mtp_io_.draft_candidates, C, DType::I32),
-                               .draft_q          = plane(mtp_io_.draft_q, C, DType::FP32),
-                               .runner_up        = runner_up_ && !sampled
-                                                       ? Tensor(mtp_device(mtp_io_.runner_up + static_cast<std::size_t>(j) * batch),
-                                                                DType::I32, {batch})
-                                                       : Tensor{}});
+                               .draft_q          = plane(mtp_io_.draft_q, C, DType::FP32)});
         };
         DecodeGraph& graph = mtp_draft_graph(batch, steps, sampled);
         if (mtp_draft_gated(batch, steps, sampled)) {
             replay_gated(graph, steps, draft_step,
                          [&](std::int32_t j, cudaGraphConditionalHandle next) {
-                             if (mtp_cumulative_base_ > 0.0F) {
+                             if (options_.auto_draft_length) {
                                  // Steps 0..j's product against the round's threshold word (one row).
                                  launch_graph_gate_product(reinterpret_cast<const float*>(mtp_device(mtp_io_.logprobs)),
                                                            1, j, kMtpCumulativeBins,
@@ -5654,12 +5381,11 @@ private:
                              const auto* confidence =
                                  reinterpret_cast<const float*>(mtp_device(mtp_io_.logprobs + static_cast<std::size_t>(j)));
                              launch_graph_gate(confidence, draft_min_logprob_, next, s);
-                         },
-                         launch_on);
+                         });
         } else {
             replay(graph, [&] {
                 for (std::int32_t j = 0; j < steps; ++j) { draft_step(j); }
-            }, launch_on);
+            });
         }
     }
 
@@ -5672,33 +5398,23 @@ private:
             if (unwritten && lane.mtp_live) { lane.mtp_cells = lane.state_tokens; }
             for (std::int32_t j = 0; j < steps; ++j) {
                 mtp_drafts_[b][static_cast<std::size_t>(j)] = mtp_host(mtp_io_.drafts)[j * batch + b];
-                // A sampled round computes no runner-up (its argmax rows draw through the sampler).
-                if (runner_up_) {
-                    mtp_runner_up_[b][static_cast<std::size_t>(j)] = sampled ? -1 : mtp_host(mtp_io_.runner_up)[j * batch + b];
-                }
             }
-            // The row's confident drafts: those before the first below draft_min_logprob_ (every
-            // sampled draft with sampled-mtp-drafts: a sampled proposal's acceptance does not follow
-            // the head's top probability, and its rounds were measured faster without the cut).
+            // The row's confident drafts: those before the first chain product below the staged
+            // threshold with --draft-tokens auto, else before the first below draft_min_logprob_ (the
+            // device gate's comparison for a gated one-row round); every sampled draft
+            // with sampled-mtp-drafts (a sampled proposal's acceptance does not follow the head's top
+            // probability, and its rounds were measured faster without a cut).
             mtp_confident_[b] = steps;
             if (sampled && lane.sampling.temperature > 0.0F) { continue; }
             const auto* logprobs = reinterpret_cast<const float*>(mtp_host(mtp_io_.logprobs));
-            if (mtp_cumulative_base_ > 0.0F) {
-                // INFERNIX_TMP_MTP_CUMULATIVE: the drafts before the first chain product below the staged
-                // threshold (the device gate's comparison for a gated one-row round).
-                auto& kept = mtp_draft_logprobs_[static_cast<std::size_t>(b)];
-                for (std::int32_t j = 0; j < steps; ++j) { kept[static_cast<std::size_t>(j)] = logprobs[j * batch + b]; }
-                for (std::int32_t j = 0; j < steps; ++j) {
-                    if (graph_gate_product(logprobs + b, batch, j, kMtpCumulativeBins) <
-                        mtp_cumulative_threshold_[static_cast<std::size_t>(b)]) {
-                        mtp_confident_[b] = j;
-                        break;
-                    }
-                }
-                continue;
-            }
+            auto& kept           = mtp_draft_logprobs_[static_cast<std::size_t>(b)];
+            for (std::int32_t j = 0; j < steps; ++j) { kept[static_cast<std::size_t>(j)] = logprobs[j * batch + b]; }
             for (std::int32_t j = 0; j < steps; ++j) {
-                if (logprobs[j * batch + b] < draft_min_logprob_) {
+                const bool cut = options_.auto_draft_length
+                                     ? graph_gate_product(logprobs + b, batch, j, kMtpCumulativeBins) <
+                                           mtp_cumulative_threshold_[static_cast<std::size_t>(b)]
+                                     : logprobs[j * batch + b] < draft_min_logprob_;
+                if (cut) {
                     mtp_confident_[b] = j;
                     break;
                 }
@@ -5706,142 +5422,18 @@ private:
         }
     }
 
-    // TEMPORARY (INFERNIX_TMP_DRAFTER_STREAM, candidates §13 SR-01): the next round's MTP drafts,
-    // drafted at a verification round's commit on the drafter stream right after its catch-up
-    // (which wrote every cell they read), beside the target's commit kernels and the host's work
-    // until the next round. The next round is predicted to be these rows again, in this order, at
-    // the draft length its policy will choose (draft_length_at / pair_draft_length_at for its next
-    // policy round: nothing between the commit and that round's choice changes their inputs).
-    // mtp_draft takes the drafts when the round is that one at that length or shorter (a draft step
-    // reads only the earlier steps, and a gated step only the earlier confidences), and drafts again
-    // otherwise. The draft's inputs are its own (mtp_io_'s slots, rows and samplers, each row's
-    // committed residual column, which mtp_catch_up_finish also saves), so no commit kernel shares
-    // one; the device stream waits for it before the commit's prefix publication, so everything
-    // after is ordered after it as when it ran in mtp_draft.
-    struct PreDraft {
-        bool live           = false;
-        bool unjoined       = false; // not taken, and not yet waited for
-        std::int32_t batch  = 0;
-        std::int32_t steps  = 0;
-        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
-        std::array<std::uint64_t, kMaximumConcurrency> epochs{};
-        std::array<std::uint32_t, kMaximumConcurrency> states{};
-    };
-    PreDraft pre_draft_;
-    std::uint64_t pre_drafts_launched_ = 0, pre_drafts_taken_ = 0; // reported at each lane's release
-    // TEMPORARY (INFERNIX_TMP_MTP_RUNNER_UP, GX-09): each row's runner-up head rows of its last drafts
-    // (-1: none), the proposal head's row -> token map (empty: rows are tokens), and the first
-    // rejections and runner-up hits by the rejected draft's position.
     // TEMPORARY (INFERNIX_TMP_CONTINUING_PROMPT, CF-01): the not-live column flags of a continuing turn's
     // prefill call, and how many such calls skipped the cache's scoring (reported at each release).
     std::vector<std::uint8_t> prompt_silent_;
     std::uint64_t continuing_calls_ = 0;
-    bool runner_up_ = false;
-    std::array<std::vector<std::int32_t>, kMaximumConcurrency> mtp_runner_up_;
-    std::vector<std::int32_t> runner_up_tokens_;
-    std::vector<bool> head_covers_;      // token -> in the proposal head's rows (with a row map)
-    std::uint64_t runner_up_outside_ = 0; // first rejections whose target token the head lacks
-    std::vector<std::uint64_t> runner_up_rejections_, runner_up_hits_;
-
-    // Launches the pre-draft after the catch-up that commit_verified launched on the drafter stream,
-    // when every row continues (committed, not terminal) at a predicted length of one or more drafts
-    // whose cells are mapped and whose draft graph is captured. Records overlap_.drafter_events[2].
-    void mtp_pre_draft(std::span<const SequenceHandle> rows, std::int32_t W, const std::int32_t* commit,
-                       std::span<const runtime::CommitDecision> decisions) {
-        pre_draft_.unjoined = pre_draft_.unjoined || std::exchange(pre_draft_.live, false);
-        join_pre_draft();
-        const auto batch = static_cast<std::int32_t>(rows.size());
-        if (batch > 2 || (batch == 2 && !options_.pair_speculation)) { return; }
-        PreDraft next{.batch = batch};
-        for (std::int32_t b = 0; b < batch; ++b) {
-            const auto& d = decisions[static_cast<std::size_t>(b)];
-            next.lanes[b] = ContractAccess::lane(rows[static_cast<std::size_t>(b)]);
-            const Lane& lane = lanes_[next.lanes[b]];
-            if (d.cancelled || d.failed || d.terminal || commit[b] < 1 || !lane.mtp_live) { return; }
-            next.epochs[b] = lane.epoch;
-            next.states[b] = lane.state_tokens;
-        }
-        next.steps = batch == 1 ? draft_length_at(lanes_[next.lanes[0]], lanes_[next.lanes[0]].mtp_policy_rounds + 1)
-                                : pair_draft_length_at(lanes_[next.lanes[0]], lanes_[next.lanes[1]], pair_policy_rounds_ + 1);
-        if (next.steps < 1) { return; }
-        for (std::int32_t b = 0; b < batch; ++b) {
-            const Lane& lane = lanes_[next.lanes[b]];
-            if (static_cast<std::int32_t>(lane.state_tokens) - 1 + next.steps - 1 > mtp_last_cell(lane)) { return; }
-        }
-        const std::span<const std::uint32_t> lanes(next.lanes.data(), static_cast<std::size_t>(batch));
-        const bool sampled = mtp_sampled(lanes);
-        if (!mtp_draft_graph(batch, next.steps, sampled).executable.ready()) { return; }
-        const cudaStream_t d     = overlap_.drafter_stream;
-        const std::size_t column = 2ULL * width_;
-        stage_mtp_draft(lanes, d);
-        for (std::int32_t b = 0; b < batch; ++b) {
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(mtp_chain_.p) + column * b,
-                                       static_cast<const std::byte*>(mtp_residuals_.p) + column * (b * W + commit[b] - 1),
-                                       column, cudaMemcpyDeviceToDevice, d));
-        }
-        if (sampled) { stage_mtp_samplers(lanes, d); }
-        run_mtp_draft_steps(batch, next.steps, sampled, d);
-        CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.drafts), mtp_device(mtp_io_.drafts), 4ULL * next.steps * batch,
-                                   cudaMemcpyDeviceToHost, d));
-        CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.logprobs), mtp_device(mtp_io_.logprobs), 4ULL * next.steps * batch,
-                                   cudaMemcpyDeviceToHost, d));
-        if (runner_up_) {
-            CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.runner_up), mtp_device(mtp_io_.runner_up),
-                                       4ULL * next.steps * batch, cudaMemcpyDeviceToHost, d));
-        }
-        CUDA_CHECK(cudaEventRecord(overlap_.drafter_events[2], d));
-        // Submit it now (a batched driver model may otherwise hold it until the next blocking call).
-        if (const cudaError_t status = cudaStreamQuery(d); status == cudaErrorNotReady) {
-            (void)cudaGetLastError();
-        } else {
-            CUDA_CHECK(status);
-        }
-        next.live  = true;
-        pre_draft_ = next;
-        ++pre_drafts_launched_;
-    }
-
-    // Whether the pre-draft holds this draft round's drafts (the same rows in the same order, still
-    // at the commit's state, `steps` of at most its length, no pending cell to write). It is consumed
-    // either way.
-    [[nodiscard]] bool take_pre_draft(std::span<const std::uint32_t> lanes, std::int32_t steps, bool unwritten) {
-        if (!pre_draft_.live) { return false; }
-        pre_draft_.live = false;
-        bool same       = !unwritten && steps >= 1 && steps <= pre_draft_.steps &&
-                    static_cast<std::int32_t>(lanes.size()) == pre_draft_.batch;
-        for (std::int32_t b = 0; same && b < pre_draft_.batch; ++b) {
-            const Lane& lane = lanes_[lanes[b]];
-            same = lanes[b] == pre_draft_.lanes[b] && lane.epoch == pre_draft_.epochs[b] &&
-                   lane.state_tokens == pre_draft_.states[b];
-        }
-        pre_draft_.unjoined = !same;
-        pre_drafts_taken_ += same ? 1U : 0U;
-        return same;
-    }
-
-    // Waits for a pre-draft no round took before the io it uploads is staged again.
-    void join_pre_draft() {
-        if (std::exchange(pre_draft_.unjoined, false)) { CUDA_CHECK(cudaEventSynchronize(overlap_.drafter_events[2])); }
-    }
 
     // After a verification round's commit: the drafter's cells of the verified window from its
     // residuals and committed tokens (index-key tails advance by the committed count), and each
     // row's last committed residual becomes its pending cell, already written.
     void mtp_catch_up(std::span<const SequenceHandle> rows, std::int32_t W, const std::int32_t* commit) {
-        (void)mtp_catch_up_launch(rows, W, commit, nullptr);
-        mtp_catch_up_finish(rows, W, commit);
-    }
-
-    // mtp_catch_up's drafter work: stages the window's ids on the device stream, then runs the
-    // catch-up there, or, with `drafter` (a stream of greater priority) and a ready graph, launches
-    // it on that stream after the staging and records overlap_.drafter_events[1] when it is done (on
-    // the device stream when it ran there). It reads the round's inputs, the committed counts, the
-    // drafter's residuals and its own cache only, so the target's commit kernels may run beside it.
-    // Returns whether it ran on `drafter`.
-    bool mtp_catch_up_launch(std::span<const SequenceHandle> rows, std::int32_t W, const std::int32_t* commit,
-                             cudaStream_t drafter) {
-        const cudaStream_t s = device_.stream;
-        const auto batch     = static_cast<std::int32_t>(rows.size());
+        const cudaStream_t s     = device_.stream;
+        const auto batch         = static_cast<std::int32_t>(rows.size());
+        const std::size_t column = 2ULL * width_;
         for (std::int32_t b = 0; b < batch; ++b) {
             const std::int32_t k = commit[b];
             for (std::int32_t j = 0; j < W; ++j) {
@@ -5850,23 +5442,7 @@ private:
             }
         }
         upload_pinned(mtp_device(mtp_io_.up_ids), mtp_host(mtp_io_.up_ids), 4ULL * batch * W, s);
-        DecodeGraph& graph = mtp_catch_graph(batch, W);
-        const bool beside  = drafter != nullptr && graph.executable.ready();
-        if (beside) {
-            CUDA_CHECK(cudaEventRecord(overlap_.drafter_events[0], s));
-            CUDA_CHECK(cudaStreamWaitEvent(drafter, overlap_.drafter_events[0], 0));
-        }
-        replay(graph, [&] { mtp_catch_body(batch, W); }, beside ? drafter : nullptr);
-        if (drafter != nullptr) { CUDA_CHECK(cudaEventRecord(overlap_.drafter_events[1], beside ? drafter : s)); }
-        return beside;
-    }
-
-    // The rest of mtp_catch_up, on the device stream: each row's last committed residual becomes its
-    // pending cell.
-    void mtp_catch_up_finish(std::span<const SequenceHandle> rows, std::int32_t W, const std::int32_t* commit) {
-        const cudaStream_t s     = device_.stream;
-        const auto batch         = static_cast<std::int32_t>(rows.size());
-        const std::size_t column = 2ULL * width_;
+        replay(mtp_catch_graph(batch, W), [&] { mtp_catch_body(batch, W); });
         for (std::int32_t b = 0; b < batch; ++b) {
             const std::int32_t k = commit[b];
             const auto lane      = ContractAccess::lane(rows[static_cast<std::size_t>(b)]);
@@ -6053,21 +5629,10 @@ private:
         double rate = options_.link_bytes_per_second;
         const void* source = parameters_.layers.front().moe.bank->planes.records;
         if (source == nullptr && tier_) { source = tier_->slot_bytes(0); }
-        std::string calibrated; // INFERNIX_TMP_MACHINE_CALIBRATION's note
         if (rate <= 0.0 && source != nullptr && staging_.p != nullptr && plan_.staging > 0) {
             rate = measure_h2d_bytes_per_second(source, staging_.p, plan_.staging, 3);
-            // TEMPORARY (INFERNIX_TMP_MACHINE_CALIBRATION): a reading far below this GPU's saved rate is
-            // taken again, and the saved rate kept when that is low too.
-            if (const auto calibration = MachineCalibration::from_switch(); calibration && rate > 0.0) {
-                char bus[32] = {};
-                (void)cudaDeviceGetPCIBusId(bus, sizeof(bus), device_.device);
-                rate = calibration->resolve(
-                    std::string("link|") + bus + "|" + std::to_string(plan_.staging), rate,
-                    [&] { return measure_h2d_bytes_per_second(source, staging_.p, plan_.staging, 3); }, calibrated);
-            }
         }
         if (rate <= 0.0) { return; } // no frames to probe with: keep the reference rate
-        if (!calibrated.empty()) { diagnostic("PCIe link calibration: " + calibrated, DiagnosticLevel::Warning); }
         link_bytes_per_second_ = rate;
         options_.prefix_cost.h2d_bytes_per_second = rate;
         options_.prefix_span_seconds *= kReferenceLinkBytesPerSecond / rate;
@@ -6093,7 +5658,6 @@ private:
     // its RAM copies once filled; until then (and without any host record) the reference rates stand
     // (ProgramOptions::cpu_split_*_rate, the i9-13900K at 6 workers on NVFP4 records).
     double cpu_expert_rate_ = 0.0; // 0 until measured
-    std::string calibration_note_; // INFERNIX_TMP_MACHINE_CALIBRATION: what the CPU rates' calibration did
     double cpu_column_rate_ = 0.0;
     void measure_cpu_rate(std::uint64_t record_stride);
     [[nodiscard]] double cpu_expert_rate() const noexcept {
@@ -6113,7 +5677,7 @@ private:
     // against 107.5 tok/s). A positive cpu_pcie_divisor fixes d (one_column_divisor below
     // overrides d in a GGUF import's one-column calls).
     // The CPU expert team's workers: a GGUF import's banks take their own count (ProgramOptions), and
-    // their CPUs (both from INFERNIX_TMP_CPU_PLACEMENT / _ENGINE_ISOLATE when set).
+    // their CPUs (both from INFERNIX_TMP_CPU_PLACEMENT when set; the engine thread stays unpinned).
     runtime::expert_offload::CpuPlacement placement_;
     [[nodiscard]] std::uint32_t cpu_workers() const noexcept { return placement_.workers; }
 
@@ -6137,15 +5701,14 @@ private:
     // by context (plain_divisor; 1 until the first round sets it). 0 (pcie_divisor) for other banks,
     // with speculation and when cpu_pcie_divisor fixes d: MTP keeps d everywhere, as d = 1 in its
     // rounds' one-column calls lost 216.2 -> 212.9 tok/s (2026-10-13, IQ3_S, 16 workers, derived d = 2).
-    // INFERNIX_TMP_PLAIN_DIVISOR_ALL applies the rule to every bank (a temporary A/B).
+    // The rule on every bank lost on Dense8 (plain decode 0.731x / 0.933x, removed 2026-10-28).
     [[nodiscard]] int one_column_divisor() const noexcept {
         const bool speculative = mtp_k_ > 0 || options_.ngram_draft_tokens > 0;
-        const bool by_context  = c_.ggml_weights || temporary_switches::offload().plain_divisor_all;
-        return by_context && !speculative && options_.cpu_pcie_divisor == 0 ? plain_divisor(0) : 0;
+        return c_.ggml_weights && !speculative && options_.cpu_pcie_divisor == 0 ? plain_divisor(0) : 0;
     }
 
-    // Plain decode's one-column divisor (runtime/expert_offload/placement.h plain_divisor, which
-    // the switch's pair replaces): every host-memory miss on the link (d = 1) below
+    // Plain decode's one-column divisor (runtime/expert_offload/placement.h plain_divisor): every
+    // host-memory miss on the link (d = 1) below
     // kPlainDivisorContext context tokens, half of them on the CPU (d = 2) from there; each round
     // writes it into the device io word its graph reads. Measured 2026-10-16 (Q2 IQ3_S artifact, RTX
     // 5090 on PCIe 5.0 x8, plain decode, tok/s at d = 1 / d = 2; prompt + output tokens): 512 + 256
@@ -6155,7 +5718,7 @@ private:
     // switch). A divisor following the hit rate over eight-token windows trailed the better fixed
     // divisor at every length (its windows swing around any threshold: 47 switches in a 4K run).
     [[nodiscard]] static std::int32_t plain_divisor(std::int32_t position) noexcept {
-        return runtime::expert_offload::plain_divisor(temporary_switches::offload(), position);
+        return runtime::expert_offload::plain_divisor(position);
     }
 
     // The widest call the prefill CPU split takes (ProgramOptions::cpu_split_columns on the reference
@@ -6603,8 +6166,8 @@ private:
     };
     std::unique_ptr<SplitPolicy> split_policy_;
     bool split_call_ = false;
-    // Prefill staging overlap, the shared expert's stream (see ForwardExperts) and the drafter's
-    // catch-up and pre-draft stream (commit_verified); destroyed after every call has completed.
+    // Prefill staging overlap and the shared expert's stream (see ForwardExperts); destroyed after every
+    // call has completed.
     struct OverlapResources {
         ~OverlapResources() {
             for (auto event : events) {
@@ -6613,15 +6176,11 @@ private:
             for (auto event : shared_events) {
                 if (event != nullptr) { cudaEventDestroy(event); }
             }
-            for (auto event : drafter_events) {
-                if (event != nullptr) { cudaEventDestroy(event); }
-            }
             for (auto event : split_events) {
                 if (event != nullptr) { cudaEventDestroy(event); }
             }
             if (stream != nullptr) { cudaStreamDestroy(stream); }
             if (shared_stream != nullptr) { cudaStreamDestroy(shared_stream); }
-            if (drafter_stream != nullptr) { cudaStreamDestroy(drafter_stream); }
             if (split_stream != nullptr) { cudaStreamDestroy(split_stream); }
         }
         cudaStream_t stream = nullptr;
@@ -6630,9 +6189,6 @@ private:
         std::array<cudaEvent_t, 2> shared_events{};
         cudaStream_t split_stream = nullptr;         // forked calls' staged misses
         std::array<cudaEvent_t, 2> split_events{};
-        cudaStream_t drafter_stream = nullptr;       // INFERNIX_TMP_DRAFTER_STREAM only
-        // The catch-up's inputs staged; the catch-up done; the pre-draft done (mtp_pre_draft).
-        std::array<cudaEvent_t, 3> drafter_events{};
     };
     OverlapResources overlap_;
     std::unique_ptr<execution::Forward> forward_;
@@ -6676,7 +6232,7 @@ private:
     PinnedHostBuffer mtp_host_{1};
     MtpIo mtp_io_;
     std::array<std::vector<std::int32_t>, kMaximumConcurrency> mtp_drafts_;
-    std::array<std::int32_t, kMaximumConcurrency> mtp_confident_{}; // per row: drafts above draft_min_logprob_
+    std::array<std::int32_t, kMaximumConcurrency> mtp_confident_{}; // per row: drafts kept by the cumulative cut
     std::array<bool, kMaximumConcurrency> from_ngram_{};
     // Copy proposals are chosen against the MTP drafts by expected tokens per round time, their
     // acceptance learned per match-length bucket (4-7, 8-11, 12-15, 16+ tokens; Strata's priors).
@@ -6684,24 +6240,11 @@ private:
     static int ngram_bucket(std::uint32_t matched) { return matched < 8 ? 0 : matched < 12 ? 1 : matched < 16 ? 2 : 3; }
     static constexpr std::array<double, 4> kNgramAcceptancePriors{0.75, 0.88, 0.93, 0.96};
     std::array<int, kMaximumConcurrency> ngram_bucket_{};
-    // INFERNIX_TMP_NGRAM_AGREE: a one-row round keeps a copy proposal only when its first token is
-    // the neural drafter's first draft (Basalt's agreement gate, candidates §7.3 D1); otherwise the
-    // round verifies the drafter's tokens. INFERNIX_TMP_NGRAM_PROCESS_STATS: the copies' acceptance
-    // per bucket is learned across the process's requests, and a new request starts from it rather
-    // than from the priors (structured output repeats across requests). Both change drafts only.
-    bool ngram_agree_         = false;
-    bool ngram_process_stats_ = false;
-    // INFERNIX_TMP_NGRAM_FIRST_SPAN_ASYNC: a walk span whose rows nothing prefetched reads its later
-    // chunks' n-gram rows on a worker thread while its first chunk stages and runs (prefill_walk.cpp).
-    bool ngram_first_span_async_ = false;
-    std::array<double, 4> ngram_process_accept_{};
-    // TEMPORARY (INFERNIX_TMP_DRAFT_PROCESS_STATS, candidates VS-2 / D11's draft half), until its A/B: the MTP
-    // drafts' acceptance per position and DFlash2's acceptance per probability decile learned across the
-    // process's requests with the requests' own EWMA, and a new request starts from them rather than from
-    // the prior and the deciles' face values (a short request otherwise spends its rounds unlearning
-    // them). Draft-only.
-    bool draft_process_stats_ = false;
-    std::array<double, 8> mtp_process_accept_{};
+    // DFlash2's acceptance per probability decile learned across the process's requests with the
+    // requests' own EWMA (candidates VS-2 / D11's draft half): a new request starts from it rather than
+    // from the deciles' face values, which a short request otherwise spends its rounds unlearning.
+    // Draft-only. Dense8 DFlash2 auto, ABBA x5: struct 1.0168x (4/5), conv 1.0089x (4/5); MTP's
+    // per-position acceptance learned the same way was flat (0.9985x / 0.9961x) and starts from its prior.
     runtime::speculative::DraftCalibration dflash_process_calibration_;
     // Draft-length policy: acceptance prior and EWMA weight, and the cost of each draft column in
     // plain rounds (warm tg512 on the 5090: W = 3, 4, 5 rounds took 1.84, 2.13 and 2.54 plain
@@ -6752,28 +6295,12 @@ private:
     // the longer two-row round. Neither is measured on DFlash2 pair rounds yet.
     static constexpr double kDFlashPairDraftCost    = kPairWidthCost;
     static constexpr double kDFlashPairProposalCost = 0.1;
-    // A one-row round verifies its drafts up to the first whose draft-head probability is below
-    // ProgramOptions::draft_min_p, held as its log (-inf at 0: every draft). The 0.5 default is
-    // Strata's --spec-min-p rule (C = 1 MTP, AIME prompts sampled on the 5090: 138.8 -> 147.2 tok/s,
-    // acceptance 75.6 -> 81.8 %, repeatable to the decimal; 0.7 gave 142.6; design 19.3.5).
-    double draft_min_logprob_ = 0.0;
-    // INFERNIX_TMP_MTP_CUMULATIVE (MtpCumulative): the base threshold (0: off), each staged row's
-    // threshold (the device gate's for row 0 of a one-row round, the host cut's for every row), and
-    // each row's draft log-probabilities, kept for the verified chain's observe.
-    float mtp_cumulative_base_ = 0.0F;
-    // INFERNIX_TMP_NGRAM_CHAIN (chain_copy): on, the round's chained tail (row 0's copied drafts after its
-    // drafter drafts) and its bucket, the context buffer, and since startup the chained rounds and their
-    // tails' drafted and accepted tokens (the release line).
-    bool ngram_chain_          = false;
-    // TEMPORARY (INFERNIX_TMP_DFLASH2_ROWS=<n>, 2 by default), until its A/B: dflash2-pairs' rounds for up to n
-    // rows (DFlash2 at C = 2: +28 % decode; three or more rows decode plain today, a choice measured for MTP's
-    // one draft each, not DFlash2's one proposal for every row). Each row keeps at most kPairMaxDrafts drafts.
-    std::int32_t dflash2_rows_ = 2;
-    std::int32_t chain_tail_   = 0;
-    int chain_bucket_          = -1;
-    std::vector<std::int32_t> chain_context_;
-    std::uint64_t chain_rounds_ = 0, chain_drafted_ = 0, chain_accepted_ = 0;
+    // The cumulative cut (MtpCumulative): each staged row's threshold (the device gate's for row 0 of
+    // a one-row round, the host cut's for every row), and each row's draft log-probabilities, kept for
+    // the verified chain's observe.
     std::array<float, kMaximumConcurrency> mtp_cumulative_threshold_{};
+    // A fixed draft length's cut: log(--spec-min-p), -inf without one (every draft verified).
+    double draft_min_logprob_ = 0.0;
     std::array<std::array<float, 8>, kMaximumConcurrency> mtp_draft_logprobs_{};
     // Prompt seeding (seed_prompt_experts): the LFRU count an expert gains when every token of the
     // prompt routed to it. Mixed-topic Dense8 decode, credit only: 64 -0.9 %, 256 -1.8 % time, and
@@ -6863,13 +6390,10 @@ private:
     // from its drafts' calibrated probabilities, a copy row's from its bucket's acceptance (its whole
     // copy is verified, so it bounds the width from below). `extents`: each row's drafts so far (at
     // most kPairMaxDrafts). One draft more every kProbeInterval pair rounds, as for one row.
-    // INFERNIX_TMP_DFLASH2_ROWS rounds of n > 2 rows: the same choice over every row, a draft costing
-    // n / 2 times the two-row prior (each adds a column per row; not measured past two rows).
     std::int32_t dflash2_pair_width(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> extents) {
-        std::array<std::array<double, kPairMaxDrafts + 1>, kMaximumConcurrency> tokens{};
+        std::array<std::array<double, kPairMaxDrafts + 1>, 2> tokens{};
         std::int32_t least = 0, most = 0;
-        const std::size_t rows = lanes.size();
-        for (std::size_t b = 0; b < rows; ++b) {
+        for (std::size_t b = 0; b < 2; ++b) {
             const Lane& lane = lanes_[lanes[b]];
             const std::int32_t n = extents[b];
             most                 = std::max(most, n);
@@ -6893,26 +6417,8 @@ private:
                 }
             }
         }
-        std::int32_t best = 0;
-        if (rows == 2) {
-            best = runtime::speculative::pair_draft_width(tokens[0], tokens[1], least, most, kDFlashPairDraftCost,
-                                                          kDFlashPairProposalCost);
-        } else {
-            most = std::min(most, kPairMaxDrafts);
-            least = std::clamp(least, 0, std::max(most, 0));
-            best  = least;
-            const double per_draft = kDFlashPairDraftCost * static_cast<double>(rows) / 2.0;
-            double best_score      = -1.0;
-            for (std::int32_t k = least; k <= most; ++k) {
-                double sum = 0.0;
-                for (std::size_t b = 0; b < rows; ++b) { sum += tokens[b][static_cast<std::size_t>(k)]; }
-                const double score = sum / (1.0 + kDFlashPairProposalCost + per_draft * k);
-                if (score > best_score) {
-                    best_score = score;
-                    best       = k;
-                }
-            }
-        }
+        std::int32_t best = runtime::speculative::pair_draft_width(tokens[0], tokens[1], least, most,
+                                                                   kDFlashPairDraftCost, kDFlashPairProposalCost);
         if (++pair_policy_rounds_ % kProbeInterval == 0) { best = std::min(best + 1, most); }
         return best;
     }

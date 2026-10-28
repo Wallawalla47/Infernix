@@ -33,8 +33,8 @@ Arm file (JSON):
       "control": "base",
       "arms": [
         {"name": "base"},
-        {"name": "agree", "env": {"INFERNIX_TMP_NGRAM_AGREE": "1"},
-         "expect_switches": {"INFERNIX_TMP_NGRAM_AGREE": "1"}},
+        {"name": "slots", "env": {"INFERNIX_TMP_STAGING_SLOTS": "64"},
+         "expect_switches": {"INFERNIX_TMP_STAGING_SLOTS": "64"}},
         {"name": "f16", "args": ["--fast-path", "f16-accumulate-prefill"]}
       ]
     }

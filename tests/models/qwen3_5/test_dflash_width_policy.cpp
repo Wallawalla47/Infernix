@@ -134,12 +134,32 @@ int main() {
             for (float& v : p[r]) { v = uniform(); }
             for (double& a : states[r].calibration.accept) { a = uniform(); }
             limits[r] = static_cast<std::uint32_t>(uniform() * static_cast<float>(ceiling + 1U));
-            states[r].rounds = 1; // keep the probe period away from this choice
+            states[r].rounds = 1;    // keep the probe period away from this choice
+            states[r].pooled = true; // this calibration, not the process-wide one a new request starts from
         }
         std::vector<DFlashPolicyRow> view;
         for (std::uint32_t r = 0; r < rows; ++r) { view.push_back({p[r], &states[r], limits[r]}); }
         const std::uint32_t expected = exhaustive(policy.widths(rows), p, states, limits, c);
         check(policy.choose(view) == expected, "the choice equals the exhaustive one (trial " + std::to_string(trial) + ")");
+    }
+    // A new request's first choice starts from what earlier requests taught the policy: after one request
+    // learned rounds, a fresh state holds that request's calibration (both observed the same rounds from
+    // the prior), and a state seeded once keeps its own.
+    {
+        DFlashWidthPolicy policy(15, 2, costs);
+        DFlashLaneDraftState first;
+        const std::vector<float> p(15, 0.6F);
+        DFlashPolicyRow row{p, &first, 15};
+        (void)policy.choose(std::span<const DFlashPolicyRow>(&row, 1));
+        for (int round = 0; round < 8; ++round) { policy.learn(first, p, 15, 2); }
+        DFlashLaneDraftState fresh;
+        check(fresh.calibration != first.calibration, "learning moved the first request's calibration");
+        row.state = &fresh;
+        (void)policy.choose(std::span<const DFlashPolicyRow>(&row, 1));
+        check(fresh.pooled && fresh.calibration == first.calibration, "a new request starts from the process's calibration");
+        policy.learn(first, p, 15, 15);
+        (void)policy.choose(std::span<const DFlashPolicyRow>(&row, 1));
+        check(fresh.calibration != first.calibration, "a seeded request keeps its own calibration");
     }
     // With width 1 allowed (offloaded experts: a masked column routes no expert), doubtful drafts
     // verify nothing when a draft column costs most of a round (the 122B's 0.72), confident ones still

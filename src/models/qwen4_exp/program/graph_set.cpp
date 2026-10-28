@@ -80,19 +80,14 @@ void ProgramImpl::capture_graph_set() {
 
     const std::int32_t lanes = plan_.lanes;
     // The rounds that verify, by rows, with their widest verification (decode()): one row up to max_width_
-    // (its drafts, or a longer n-gram copy); with pair speculation and a neural drafter two rows, and with
-    // DFlash2 up to INFERNIX_TMP_DFLASH2_ROWS rows, at one shared draft length of at most kPairMaxDrafts (n-gram
-    // copies included). Every other round decodes plain.
+    // (its drafts, or a longer n-gram copy); with pair speculation and a neural drafter two rows, at one shared
+    // draft length of at most kPairMaxDrafts (n-gram copies included). Every other round decodes plain.
     std::vector<std::pair<std::int32_t, std::int32_t>> verified;
     if (max_width_ > 1) {
         verified.emplace_back(1, max_width_);
         const std::int32_t pair_width = 1 + std::min(kPairMaxDrafts, neural_k());
-        if (options_.pair_speculation && pair_width > 1) {
-            for (std::int32_t rows = 2; rows <= lanes; ++rows) {
-                if (rows == 2 ? (mtp_ || dflash2_) : (dflash2_ && rows <= dflash2_rows_)) {
-                    verified.emplace_back(rows, pair_width);
-                }
-            }
+        if (options_.pair_speculation && pair_width > 1 && lanes >= 2 && (mtp_ || dflash2_)) {
+            verified.emplace_back(2, pair_width);
         }
     }
 
@@ -144,7 +139,7 @@ void ProgramImpl::capture_graph_set() {
                     for (const bool sampled : {false, true}) {
                         if (sampled && !sampled_drafts_) { continue; }
                         current = &mtp_draft_graph(batch, steps, sampled);
-                        run_mtp_draft_steps(batch, steps, sampled, nullptr);
+                        run_mtp_draft_steps(batch, steps, sampled);
                     }
                 }
             } else if (dflash2_) {

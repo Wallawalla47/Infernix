@@ -1,6 +1,5 @@
 #include "models/qwen4_exp/execution/forward.h"
 
-#include "core/temporary_switches.h"
 #include "infernix/ops/causal_conv1d_silu.h"
 #include "infernix/ops/embedding.h"
 #include "infernix/ops/gated_delta_net.h"
@@ -41,13 +40,6 @@ namespace infernix::models::qwen4_exp::execution {
 namespace {
 
 std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
-
-// TEMPORARY (INFERNIX_TMP_QSA_GROUP_DIRECT, candidates §7 D7), until its A/B: the QSA group projection
-// writes its six parts directly (ops::linear_qsa_group) instead of a [13952,T] result split by copies.
-bool qsa_group_direct() {
-    static const bool direct = temporary_switches::flag("INFERNIX_TMP_QSA_GROUP_DIRECT");
-    return direct;
-}
 
 // The screened heads' selection: the rows within 5 logits of a column's best screen score, at most 64,
 // rescored exactly (Basalt's screened draft head: the exact head's pick in 99.93 % of 1,500 real inputs).
@@ -305,13 +297,13 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
     try {
         auto scope = work_.scope();
         if (block.ple) { ple(*block.ple, residual, batch); }
-        // The attention half's coefficients, then the MLP half's (inject_mix reads the first while
-        // the mix writes the second).
-        Tensor inject_a = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
-        Tensor inject   = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
-        Tensor xa       = mix(block.attn_hc, residual, &inject_a);
-        Tensor y        = mixer(layer, batch, xa);
-        Tensor xm       = inject_mix(block.mlp_hc, y, inject_a, residual, &inject);
+        Tensor inject = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
+        Tensor xa     = mix(block.attn_hc, residual, &inject);
+        Tensor y      = mixer(layer, batch, xa);
+        // The attention half's inject, then the MLP half's mix. One fused Op folding the inject into the
+        // mixer's reads (candidates §7.3 D6) measured flat (removed 2026-10-28).
+        ops::hyper_connection_inject(y, inject, residual, s);
+        Tensor xm = mix(block.mlp_hc, residual, &inject);
         // The combine injects its output directly unless a tap records it.
         const bool fused_inject = tap == nullptr || tap->moe_outputs == nullptr;
         Tensor ym = moe(block.moe, xm, layer,
@@ -391,10 +383,10 @@ void Forward::layer_mixer(std::uint32_t layer, const ForwardBatch& batch, Tensor
     try {
         auto scope = work_.scope();
         if (block.ple) { ple(*block.ple, residual, batch); }
-        Tensor inject_a = work_.alloc(DType::FP32, {inject.ne[0], inject.ne[1]}); // the attention half's
-        Tensor xa       = mix(block.attn_hc, residual, &inject_a);
-        Tensor y        = mixer(layer, batch, xa);
-        (void)inject_mix(block.mlp_hc, y, inject_a, residual, &inject, &xm);
+        Tensor xa = mix(block.attn_hc, residual, &inject);
+        Tensor y  = mixer(layer, batch, xa);
+        ops::hyper_connection_inject(y, inject, residual, device_.stream);
+        (void)mix(block.mlp_hc, residual, &inject, &xm);
     } catch (const std::exception& error) {
         throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
     }
@@ -526,23 +518,6 @@ Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, 
     Tensor x = into != nullptr ? *into : work_.alloc(DType::BF16, {H, T});
     ops::hyper_connection_mix(residual, p.norm, p.down.weight, p.up.weight, p.down.policy, S, rank, config_.rms_norm_eps,
                               x, p.combine ? inject : nullptr, work_, s);
-    return x;
-}
-
-Tensor Forward::inject_mix(const HyperConnectionParameters& p, const Tensor& y, const Tensor& pending, Tensor& residual,
-                           Tensor* inject, Tensor* into) {
-    // TEMPORARY (INFERNIX_TMP_HC_INJECT_FOLD) until the decode A/B.
-    static const bool fold = temporary_switches::flag("INFERNIX_TMP_HC_INJECT_FOLD");
-    const cudaStream_t s = device_.stream;
-    if (!fold) {
-        ops::hyper_connection_inject(y, pending, residual, s);
-        return mix(p, residual, inject, into);
-    }
-    const std::int32_t T = residual.ne[1], H = dim(config_.hidden_size);
-    const std::int32_t S = dim(config_.hc.streams), rank = dim(config_.hc.rank);
-    Tensor x = into != nullptr ? *into : work_.alloc(DType::BF16, {H, T});
-    ops::hyper_connection_inject_mix(y, pending, residual, p.norm, p.down.weight, p.up.weight, p.down.policy, S, rank,
-                                     config_.rms_norm_eps, x, p.combine ? inject : nullptr, work_, s);
     return x;
 }
 
@@ -774,11 +749,11 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
         Tensor* parts[] = {&qf, &gate, &kf, &vf, &iqf, &ik};
         project_ggml_split(x, segments, bounds, parts, work_, s, dense_routes());
     } else if (Tensor qf = q.view({QW, T}), kf = k.view({KW, T}), vf = v.view({KW, T}), iqf = iq.view({IH * ID, T});
-               qsa_group_direct() && !p.index_projection && !p.projection.is_ggml() &&
+               !p.index_projection && !p.projection.is_ggml() &&
                ops::linear_qsa_group_supported(p.projection.weight, std::array<const Tensor*, 6>{&qf, &gate, &kf, &vf, &iqf, &ik}.data(),
                                                p.projection.policy)) {
-        // TEMPORARY (INFERNIX_TMP_QSA_GROUP_DIRECT, candidates §7 D7): the [13952,2560] parent writes its six
-        // parts directly (linear's bits), with no [13952,T] intermediate and no split_rows copy.
+        // The [13952,2560] parent writes its six parts directly (linear's bits), with no [13952,T] intermediate
+        // and no split_rows copy (candidates §7 D7: FP4-Local pp32768 / pp65536 +0.7 / +0.6 %, Dense8 flat, 2026-10-28).
         Tensor* parts[] = {&qf, &gate, &kf, &vf, &iqf, &ik};
         ops::linear_qsa_group(x, p.projection.weight, parts, p.projection.policy, work_, s, dense_routes());
     } else {
@@ -865,14 +840,13 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
     Tensor out = work_.alloc(DType::BF16, {D, dim(a.heads), T});
     const std::size_t scratch = ops::qsa_attention_workspace_bytes(geometry, T, max_context_, layer.kv.storage);
     const DeviceSpan span     = work_.alloc_bytes(scratch);
-    // Output gate: out * sigmoid(gate), then o_proj. TEMPORARY (INFERNIX_TMP_QSA_GATE_MERGE, candidates §7.3
-    // D7): qsa_attention applies it in its split merge (same bits), so the separate launch goes.
-    static const bool gate_merge = temporary_switches::flag("INFERNIX_TMP_QSA_GATE_MERGE");
     ops::qsa_attention(qn, iq, layer, qsa_batch, geometry,
                        static_cast<float>(1.0 / std::sqrt(static_cast<double>(D))), max_context_, span.data,
-                       span.bytes, out, s, vq ? &append : nullptr, gate_merge ? &gate : nullptr);
+                       span.bytes, out, s, vq ? &append : nullptr);
+    // Output gate: out * sigmoid(gate), then o_proj. Applying the gate in qsa_attention's split merge
+    // (candidates §7.3 D7) measured flat (removed 2026-10-28).
     Tensor gated = out.view({QW, T});
-    if (!gate_merge) { ops::sigmoid_mul(gate, gated, s); }
+    ops::sigmoid_mul(gate, gated, s);
     Tensor y = work_.alloc(DType::BF16, {H, T});
     scan_input(gated, scan_layer_, ActivationScan::Site::QsaOutput);
     project(gated, p.output, y, work_, s, dense_routes());
@@ -1090,7 +1064,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     // --a8-activations' wide route (GGUF and NVFP4 W4A16 banks, beside their 8-bit narrow route) takes a call of
     // more than 128 columns first. The A4 residual routes exist for NVFP4 W4A16 banks only; their layouts carry no
     // x limbs, which the GGUF and block-FP8 wide routes read, so another bank keeps the exact layout whatever the
-    // flag. ggml-bf16-prefill takes a GGUF bank's wide jobs in prefill calls onto the BF16 planes.
+    // flag. ggml-bf16-prefill takes a GGUF bank's wide jobs in prefill calls onto the BF16 stage-decode tiles.
     const bool ggml_bank = source.ggml.gate_up_format != QType::NVFP4_MUL &&
                            source.ggml.gate_up_format != QType::FP8_E4M3FN_B128;
     const bool nvfp4_a16 = source.activation == ops::offloaded_moe::ExpertActivation::kA16 &&
@@ -1121,12 +1095,9 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     // The shared expert runs while the host computes the CPU-served misses, and in decode and
     // verification calls on its own stream while the routed experts compute too. It reads only x,
     // and its scoped workspace lies past every buffer the routed experts use; this stream allocates
-    // nothing more until the join. TEMPORARY (INFERNIX_TMP_SHARED_SIDE_PREFILL, candidates W18): eager
-    // prefill chunks take the side stream too, so a link-bound chunk's shared expert overlaps the
-    // routed experts' staging; an activation scan reads `product` on the main stream, so it keeps
-    // the serial order.
-    static const bool side_prefill = temporary_switches::flag("INFERNIX_TMP_SHARED_SIDE_PREFILL");
-    const bool side = (!eager_chunk_ || (side_prefill && scan_ == nullptr)) && experts_.shared_stream != nullptr;
+    // nothing more until the join. Eager prefill chunks keep the serial order: the side stream there
+    // (candidates W18) measured flat twice (removed 2026-10-28).
+    const bool side = !eager_chunk_ && experts_.shared_stream != nullptr;
     cudaStream_t shared_s = s;
     if (side) {
         CUDA_CHECK(cudaEventRecord(experts_.shared_events[0], s));
@@ -1190,8 +1161,7 @@ ops::MoeExpertSource Forward::expert_source(const MoeParameters& p, std::uint32_
                                        .gate_row_bytes = static_cast<std::uint32_t>(planes.gate_row_bytes),
                                        .down_row_bytes = static_cast<std::uint32_t>(planes.down_row_bytes),
                                        .record_bytes   = (planes.record_bytes + 15) / 16 * 16,
-                                       .tiles          = ops::MoeGgmlTiles::from_environment(),
-                                       .a8             = fast_.a8_experts &&
+                                       .a8            = fast_.a8_experts &&
                                                          planes.gate_up_format != QType::FP8_E4M3FN_B128};
     }
     source.frame_stride = pitch;
@@ -1261,12 +1231,10 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
                                            .width        = call.width};
         Tensor y = attention(p.attention, xa, attention_call);
         if (call.kv_only) { return; }
+        ops::hyper_connection_inject(y, inject, residual, s);
 
-        // MoE over the device-resident experts, with the shared expert; the attention half's inject
-        // goes in with the MLP half's mix (its coefficients stay in `inject_a`).
-        Tensor inject_a = inject;
-        inject          = work_.alloc(DType::FP32, {S, T});
-        Tensor xm       = inject_mix(p.mlp_hc, y, inject_a, residual, &inject);
+        // MoE over the device-resident experts, with the shared expert.
+        Tensor xm = mix(p.mlp_hc, residual, &inject);
         const auto& m        = config_.moe;
         const std::int32_t E = dim(m.experts), K = dim(m.top_k), I = dim(m.intermediate);
         Tensor logits = work_.alloc(DType::FP32, {E + 1, T});
@@ -1318,7 +1286,7 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
         }
         if (call.sample_configs != nullptr) {
             // Sampled drafts: the head's top rows, one draw each under the column's sampler; the top
-            // row's log-probability is also the --spec-min-p confidence.
+            // row's log-probability is also the cumulative cut's confidence (a greedy row's).
             Tensor sample_rows     = call.sample_rows;
             Tensor sample_logprobs = call.sample_logprobs;
             if (screened) {
@@ -1355,15 +1323,6 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
             Tensor logprob(call.draft_logprobs.data, DType::FP32, {1, T});
             ops::top_logprobs(narrow, valid, top_row, logprob, s);
         }
-        if (!screened && call.runner_up.data != nullptr && call.sample_configs == nullptr) {
-            // GX-09: the two best rows in the argmax's order; the second, strided out of [2, T].
-            Tensor top_rows = work_.alloc(DType::I32, {2, T});
-            Tensor top_lp   = work_.alloc(DType::FP32, {2, T});
-            ops::top_logprobs(narrow, valid, top_rows, top_lp, s);
-            CUDA_CHECK(cudaMemcpy2DAsync(call.runner_up.data, sizeof(std::int32_t),
-                                         static_cast<const std::int32_t*>(top_rows.data) + 1, 2 * sizeof(std::int32_t),
-                                         sizeof(std::int32_t), static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
-        }
     } catch (const std::exception& error) {
         throw std::runtime_error(std::string("qwen4_exp/mtp: ") + error.what());
     }
@@ -1377,11 +1336,10 @@ std::size_t Forward::mtp_workspace_bytes(const TextConfig& c, std::int32_t kv_co
     // One block at t columns (as the text forward sizes it), the input fusion's and the copied
     // residuals; the draft head's logits and the resident experts only at full steps, which run
     // one column per sequence.
-    // The trailing 4 KiB: the runner-up's top two rows and log-probabilities (INFERNIX_TMP_MTP_RUNNER_UP).
     return workspace_bytes(c, static_cast<std::int32_t>(t), max_context, storage) +
            std::size_t(c.residual_width()) * t * 2 * 4 + std::size_t(c.hidden_size) * t * 2 * 4 +
            std::size_t(vocabulary_rows) * d * 6 +
-           ops::resident_moe_workspace_bytes(dim(c.moe.top_k * d), dim(c.moe.intermediate)) + 4096 + 16 * d;
+           ops::resident_moe_workspace_bytes(dim(c.moe.top_k * d), dim(c.moe.intermediate));
 }
 
 } // namespace infernix::models::qwen4_exp::execution

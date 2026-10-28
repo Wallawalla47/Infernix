@@ -825,7 +825,9 @@ Flash-Next kernel integer-issue-bound at 74 TFLOP/s.
   i9-13900K, AVX-512 VNNI where present (tested under Intel SDE). Records stream once per miss;
   three byte products per weight (Flash-Next §16.2.1).
 - **Workers.** Six by default, dynamic handout, worker 0 the miss service. Flash-Next measured
-  that more workers lose.
+  that more workers lose. The Engine's round thread runs alone on the last P-core (both its logical
+  CPUs), which the workers leave free (`OffloadOptions::engine_isolate`, placement.h): Ornith's
+  CPU-bound offloaded decode +0.3 % in 4/4 pairs (2026-10-28); Flash-Next measured flat or slower and stays unpinned.
 - **Budget.** Memory-bound at ~55 GB/s: ~100 µs per 5.31 MB record at T = 1.
 - **Startup calibration.** The engine measures its rate per column count for the divisor and the
   CPU cap.
@@ -1102,27 +1104,15 @@ draft, higher for later ones), and an MTP round averaged 0.75. Two changes targe
   rounds plain at one draft -18.3 %; each row's verify columns bring their own misses, and a
   draft-free MTP round still runs the drafter. Over one and two requests MTP's 2 drafts gain about
   3.6 % and adaptive-dflash loses about 1.6 % (eight corpus pairs at one request: +13.5 %), so
-  DFlash2's `auto` decodes without its drafter. Whether MTP's draft-free rounds (below) bring two
-  requests to plain speed is the open measurement; a round kind that appends only the MTP layer's KV,
+  DFlash2's `auto` decodes without its drafter. A round kind that appends only the MTP layer's KV,
   without its MoE and head, would remove part of the alignment of one layer (estimated from its weight
-  bytes at a few hundred MB, 0.2-0.3 ms of a 12 ms round; an nsys of both regimes will measure it) and
-  is not planned until that measurement shows a residual worth the restructure.
+  bytes at a few hundred MB, 0.2-0.3 ms of a 12 ms round) and is not planned.
   DFlash2 with the forced adaptive policy and `auto`: 68.8 / 69.1 tok/s sampled, below plain.
-- **The drafter's round cost (candidates §11 OR-09, unmeasured; three output-neutral switches, read in
-  `models/qwen3_5/program/planning/startup.h`).** The drafter's MoE is resident here (`resident_moe`),
-  but each round still runs the alignment over every verify column, then each draft step's layer and
-  proposal head:
-  - `INFERNIX_TMP_QWEN35_MTP_PAD_MASK`: the alignment's padding columns (past a row's licensed tokens)
-    route no resident expert.
-  - `INFERNIX_TMP_QWEN35_MTP_STEP_GATE`: Finish is captured as a step chain (the alignment, then each draft
-    behind a device gate), whose gates stop where no later draft could be verified. The threshold
-    (`MtpConfidencePolicy::step_threshold`) is the lowest bucket edge below which every bucket's
-    acceptance times the best bucket's is at most the column cost; a row's drafts end at its first
-    one below it.
-  - `INFERNIX_TMP_QWEN35_MTP_SKIP_ROUNDS` (with the step chain): `MtpDraftRegime` runs rounds without
-    drafting (the alignment's KV only) while their measured tokens per second beat drafting rounds',
-    probing the other regime 4 rounds in 32; the release log reports "MTP draft-free rounds: X of Y".
-    The aim is greedy decode at plain speed without unloading the drafter, and the sampled gain kept.
+- **The drafter's round cost (candidates §11 OR-09; measured and removed 2026-10-28).** Three
+  output-neutral switches trimmed the drafter's round: padding columns of the alignment routing no
+  resident expert, a device step gate stopping the draft steps where no later draft could be verified,
+  and draft-free rounds while those measured faster. MTP `auto`'s confidence gate does the job better
+  (+15.5 % against +13.9 % with the switches), so all three were removed.
 - **DFlash2.** The adaptive-dflash policy already chooses each round's verify width from the
   block's per-draft probabilities after a split proposal (a host wait that costs nothing next to a
   14 ms round). It is not qualified here, so the A/B forces it (`adaptive-speculation`,

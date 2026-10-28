@@ -410,11 +410,11 @@ struct ProgramOptions {
     // one-row rounds draft mtp_draft_tokens and pair rounds min(mtp_draft_tokens, 2) (DFlash2:
     // dflash2_draft_tokens and min(dflash2_draft_tokens, 2)).
     bool auto_draft_length = false;
-    // A one-row round verifies its neural drafts up to the first whose drafter probability is below
-    // this value (design §19.3.5; --spec-min-p): MTP's draft-head probability, DFlash2's
-    // candidate-selector probability (temperature 1); 0 verifies every draft. 0.5 is the measured MTP
-    // value the Engine passes with the automatic draft length, 0 with a fixed one.
-    double draft_min_p = 0.5;
+    // A one-row DFlash2 round, or a one-row argmax MTP round of a fixed draft length, verifies its drafts
+    // up to the first whose probability (DFlash2: the candidate selector's at temperature 1) is below this
+    // value (design §19.3.5; --spec-min-p); 0 verifies every draft. MTP with auto_draft_length stops its
+    // argmax chains at the cumulative cut (MtpCumulative); sampled-draft rows verify every draft.
+    double draft_min_p = 0.0;
     // The request-coupling fast paths (FastPath; docs/maintainer/model-quality.md section 6.7). Each
     // is off unless selected, and with all three off a request's output does not depend on the other
     // requests (concurrency, cache contents, KV pressure):
@@ -434,7 +434,7 @@ struct ProgramOptions {
     bool preemption        = false;
     // sampled-mtp-drafts (FastPath::SampledMtpDrafts): a sampled row's MTP drafts are drawn from the
     // draft head's top tokens under its sampler and verified by sparse rejection sampling, and its
-    // one-row rounds verify every draft (no draft_min_p cut). Greedy rows are unchanged.
+    // one-row rounds verify every draft (no cumulative cut). Greedy rows are unchanged.
     bool sampled_mtp_drafts = false;
     // The reproducible route (EngineOptions::fast_paths off): sampled requests draw by Gumbel-max
     // (ops::SamplingConfig::gumbel_max), so speculation returns plain sampling's text.

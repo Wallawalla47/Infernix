@@ -310,7 +310,6 @@ void ProgramImpl::prepare_graphs() {
                 // The deepest proposal any round may run, and (sampled-mtp-drafts) one-hot
                 // proposals of the representative drafts.
                 mtp_host_ingress->proposal_limits[row] = static_cast<std::int32_t>(neural_draft_window);
-                mtp_host_ingress->step_threshold       = 0.0; // the step chain's every gate passes
                 if (execution_schedule.sampled_mtp_drafts && sparse <= kMtpDecodeMaximumDrafts) {
                     for (std::uint32_t step = 0; step < sparse; ++step) {
                         const auto base = (row * sparse + step) * kMtpSparseSlots;
@@ -510,11 +509,10 @@ void ProgramImpl::prepare_graphs() {
             // The DFlash drafter proposes at its own width, a neural family (the configured one or
             // adaptive-dflash's batch-only one) at the family's, and a copy family's batched rows
             // without a copy at the batch length where one is set; a split family's representative
-            // verifies its own width of the proposal graph's block (a split tree family,
-            // INFERNIX_TMP_TREE_ROUND_WIDTH, builds its tree from the block, the drafter's window).
+            // verifies its own width of the proposal graph's block.
             const bool split                    = round.shape.split;
             const std::uint32_t proposal_drafts =
-                mtp || (split && !tree) || round.shape.kind == SpeculativeRoundKind::Neural ? verify_drafts
+                mtp || split || round.shape.kind == SpeculativeRoundKind::Neural ? verify_drafts
                 : ngram && dflash_batch_drafts != 0                             ? dflash_batch_drafts
                                                                                 : neural_draft_window;
             const auto forward_phase            = split ? SpeculativePhase::Verify : SpeculativePhase::Forward;
@@ -546,7 +544,6 @@ void ProgramImpl::prepare_graphs() {
                                                  state_images->continuation_hidden_store()};
                 state.neural_proposal_drafts = mtp_proposal_drafts(round.shape, neural_draft_window, batch, chain);
                 state.proposal_chain         = mtp_chained_round(round.shape, batch, chain);
-                state.step_chain             = execution_schedule.mtp_step_chain && !tree;
                 state.tree                   = tree;
                 state.chain_drafts           = neural_draft_window;
                 state.tree_paths             = draft_tree_paths;

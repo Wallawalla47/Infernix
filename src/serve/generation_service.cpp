@@ -1,7 +1,6 @@
 #include <charconv>
 #include "serve/generation_service.h"
 
-#include "core/temporary_switches.h"
 #include "product/media_acquire/acquire.h"
 #include "serve/translate.h"
 
@@ -757,13 +756,13 @@ void GenerationService::warmup() {
         run(prepared, nullptr);
     };
     generate(4, false);
-    // TEMPORARY (INFERNIX_TMP_WARMUP_GRAPHS, candidates §7.6 D14): before READY, max-concurrency
-    // requests at the server's default sampling, of staggered lengths (32 + 16 i tokens, end of
-    // sequence ignored), so the decode rounds pass every batch size from 1 to the maximum and back,
-    // each for several rounds: a Program's decode, verification and draft graphs run eagerly once and
-    // are captured on the next round, so a fresh server's first requests replay them instead. The
-    // widths are those the default draft policy picks; requests use no prefix cache. Startup only.
-    if (!temporary_switches::flag("INFERNIX_TMP_WARMUP_GRAPHS")) { return; }
+    // Before READY, max-concurrency requests at the server's default sampling, of staggered lengths
+    // (32 + 16 i tokens, end of sequence ignored), so the decode rounds pass every batch size from 1 to
+    // the maximum and back, each for several rounds: a Program's decode, verification and draft graphs
+    // run eagerly once and are captured on the next round, so a fresh server's first requests replay
+    // them instead. The widths are those the default draft policy picks; requests use no prefix cache.
+    // Candidates §7.6 D14: Dense8, the slower of the first two concurrent requests' TTFT 0.535 -> 0.389 s
+    // (three servers each), startup about 1 s longer (2026-10-28).
     const std::uint32_t rows = std::max<std::uint32_t>(1, options_.max_concurrency);
     std::vector<std::exception_ptr> errors(rows);
     std::vector<std::thread> threads;

@@ -3,7 +3,6 @@
 #include "core/cpu_topology.h"
 #include "core/host_load.h"
 #include "core/link_probe.h"
-#include "core/machine_calibration.h"
 #include "core/temporary_switches.h"
 #include "ops/offloaded_sparse_moe/cpu/expert_team.h"
 #include "runtime/contract/execution.h"
@@ -134,11 +133,11 @@ std::uint64_t ExpertOffload::record_stride(const OffloadSetup& setup) {
     return stride;
 }
 
-// Whether plain decode's one-column calls take the divisor by context: a GGUF import's (or, with
-// INFERNIX_TMP_PLAIN_DIVISOR_ALL, every bank's) without speculation or a fixed divisor.
+// Whether plain decode's one-column calls take the divisor by context: a GGUF import's without
+// speculation or a fixed divisor.
 static bool plain_by_context(const OffloadSetup& setup, const OffloadOptions& options) noexcept {
-    return (options.plain_divisor_by_context || temporary_switches::offload().plain_divisor_all) && !setup.speculative &&
-           options.cpu_pcie_divisor == 0 && options.cpu_expert_workers > 0 && options.cpu_expert_jobs > 0;
+    return options.plain_divisor_by_context && !setup.speculative && options.cpu_pcie_divisor == 0 &&
+           options.cpu_expert_workers > 0 && options.cpu_expert_jobs > 0;
 }
 
 std::uint64_t ExpertOffload::fixed_bytes(const OffloadSetup& setup, const OffloadOptions& options) {
@@ -175,10 +174,10 @@ ExpertOffload::ExpertOffload(OffloadSetup setup, OffloadOptions options, Diagnos
     }
     staging_slots_ = staging_slots(setup_, options_);
     staging_       = DeviceBuffer(static_cast<std::size_t>(staging_slots_) * record_stride_);
-    placement_     = cpu_placement(temporary_switches::offload(), options_.cpu_expert_workers);
+    placement_     = cpu_placement(temporary_switches::offload(), options_.cpu_expert_workers, options_.engine_isolate);
     if (plain_by_context(setup_, options_)) {
         divisor_word_ = DeviceBuffer(16);
-        divisor_now_  = plain_divisor(temporary_switches::offload(), 0);
+        divisor_now_  = plain_divisor(0);
         std::memset(divisor_host_.data(), 0, 16);
         *static_cast<std::int32_t*>(divisor_host_.data()) = divisor_now_;
         divisor_word_.copy_from_host(divisor_host_.data(), 16);
@@ -186,13 +185,7 @@ ExpertOffload::ExpertOffload(OffloadSetup setup, OffloadOptions options, Diagnos
     residency_     = std::make_unique<ExpertResidency>(layout, std::move(banks), record_stride_, setup_.columns,
                                                        setup_.device, host_strides_);
     std::memset(error_.data(), 0, 64);
-    // TEMPORARY (INFERNIX_TMP_STREAM_PRIORITY, candidates §11 D5, as Flash-Next's staging and shared-expert
-    // streams): the fork and staging-overlap stream at the device's greatest priority (graphs keep it per
-    // node, core/decode_graph.cpp), so its copies and side work are scheduled ahead of the round's kernels.
-    static const bool prioritized = temporary_switches::flag("INFERNIX_TMP_STREAM_PRIORITY");
-    int least = 0, greatest = 0;
-    if (prioritized) { CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest)); }
-    CUDA_CHECK(cudaStreamCreateWithPriority(&overlap_.stream, cudaStreamNonBlocking, prioritized ? greatest : 0));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&overlap_.stream, cudaStreamNonBlocking));
     for (auto& event : overlap_.events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
 }
 
@@ -219,17 +212,12 @@ void ExpertOffload::diagnostic(const std::string& text, DiagnosticLevel level) c
 void ExpertOffload::start(cudaStream_t compute, const std::function<void(std::uint64_t, std::uint64_t)>& lendable_frames) {
     // What the offload switches resolved to (their values are in the startup log's temporary switches line).
     {
-        const OffloadSwitches& switches = temporary_switches::offload();
         std::string line =
             "expert offload (temporary switches resolved): staging slots " + std::to_string(staging_slots_);
         if (divisor_word_.p != nullptr) {
-            line += "; plain decode one-column divisor " + std::to_string(plain_divisor(switches, 0)) + " below " +
+            line += "; plain decode one-column divisor " + std::to_string(plain_divisor(0)) + " below " +
                     std::to_string(kPlainDivisorContext) + " context tokens, " +
-                    std::to_string(plain_divisor(switches, kPlainDivisorContext)) + " from there";
-        }
-        if (switches.prompt_credit >= 0.0 || switches.prompt_budget > 0) {
-            line += "; prompt seed credit " + std::to_string(switches.credit_or(kPromptSeedCredit)) + ", " +
-                    std::to_string(switches.prompt_budget) + " promotions per layer";
+                    std::to_string(plain_divisor(kPlainDivisorContext)) + " from there";
         }
         diagnostic(line);
     }
@@ -354,21 +342,10 @@ void ExpertOffload::measure_link() {
     double rate        = options_.link_bytes_per_second;
     const void* source = setup_.banks.front()->planes.records;
     if (source == nullptr && tier_) { source = tier_->slot_bytes(0); }
-    std::string calibrated; // INFERNIX_TMP_MACHINE_CALIBRATION's note
     if (rate <= 0.0 && source != nullptr && staging_.p != nullptr && staging_.bytes > 0) {
         rate = measure_h2d_bytes_per_second(source, staging_.p, staging_.bytes, 3);
-        // TEMPORARY (INFERNIX_TMP_MACHINE_CALIBRATION, candidates §7.3 D11, as Flash-Next's probe): a reading far
-        // below this GPU's saved rate is taken again, and the saved rate kept when that is low too.
-        if (const auto calibration = MachineCalibration::from_switch(); calibration && rate > 0.0) {
-            char bus[32] = {};
-            (void)cudaDeviceGetPCIBusId(bus, sizeof(bus), setup_.device);
-            rate = calibration->resolve(
-                std::string("link|") + bus + "|" + std::to_string(staging_.bytes), rate,
-                [&] { return measure_h2d_bytes_per_second(source, staging_.p, staging_.bytes, 3); }, calibrated);
-        }
     }
     if (rate <= 0.0) { return; } // nothing to probe with: keep the reference rate
-    if (!calibrated.empty()) { diagnostic("PCIe link calibration: " + calibrated, DiagnosticLevel::Warning); }
     link_bytes_per_second_ = rate;
     char text[256];
     std::snprintf(text, sizeof(text),
@@ -406,12 +383,12 @@ int ExpertOffload::pcie_share() const noexcept {
 }
 
 int ExpertOffload::one_column_divisor() const noexcept {
-    return plain_by_context(setup_, options_) ? plain_divisor(temporary_switches::offload(), 0) : 0;
+    return plain_by_context(setup_, options_) ? plain_divisor(0) : 0;
 }
 
 void ExpertOffload::set_plain_position(std::int32_t position, cudaStream_t compute) {
     if (divisor_word_.p == nullptr) { return; }
-    const std::int32_t d = plain_divisor(temporary_switches::offload(), position);
+    const std::int32_t d = plain_divisor(position);
     if (d == divisor_now_) { return; }
     // The last upload has run (rounds synchronize), so the pinned source may change.
     *static_cast<std::int32_t*>(divisor_host_.data()) = d;
@@ -463,8 +440,7 @@ void ExpertOffload::measure_cpu_rate() {
                                  .ggml       = ggml_format(front).valid(),
                                  .nvfp4_a8   = options_.narrow_a16 == moe::NarrowA16::kA8, // the misses' route sets the rates
                                  .shape      = shape,
-                                 .cpus       = placement_.cpus,
-                                 .shared_x   = temporary_switches::flag("INFERNIX_TMP_CPU_SHARED_X")});
+                                 .cpus       = placement_.cpus});
         const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
         const auto H = static_cast<std::size_t>(shape.hidden);
         std::vector<std::uint16_t> x(H * kNarrowColumns);
@@ -531,23 +507,6 @@ void ExpertOffload::measure_cpu_rate() {
             if (quiet || std::chrono::steady_clock::now() - began >= kRetryBudget) { break; }
             std::this_thread::sleep_for(kRetryPause);
         }
-        // TEMPORARY (INFERNIX_TMP_MACHINE_CALIBRATION, as Flash-Next's): a rate far below this configuration's
-        // saved one is measured once more, and the saved rate kept when that is low too.
-        if (const auto calibration = MachineCalibration::from_switch()) {
-            const std::string key = "cpu|" + std::to_string(placement_.workers) + "|" + placement_.text + "|" +
-                                    std::to_string(static_cast<int>(front.activation)) + "|" +
-                                    std::to_string(ggml_format(front).valid() ? 1 : 0) + "|" +
-                                    std::to_string(static_cast<int>(options_.narrow_a16)) + "|" +
-                                    std::to_string(front.planes.record_stride) + (tier_ ? "|tier" : "");
-            std::string note;
-            expert_rate = calibration->resolve(key + "|experts", expert_rate, [&] { return rate(1, 0); }, note);
-            if (!note.empty()) { calibration_note_ = "experts/s " + note; }
-            note.clear();
-            column_rate = calibration->resolve(
-                key + "|columns", column_rate,
-                [&] { return rate(kNarrowColumns, (kRateRepeats + 1) * kRateRounds) * kNarrowColumns; }, note);
-            if (!note.empty()) { calibration_note_ += (calibration_note_.empty() ? "" : "; ") + ("columns/s " + note); }
-        }
         cpu_expert_rate_ = expert_rate;
         cpu_column_rate_ = column_rate;
         (void)set_current_thread_cpus(caller_cpus);
@@ -555,7 +514,6 @@ void ExpertOffload::measure_cpu_rate() {
     }
     std::string how = measured ? (tier_ ? "measured on the SSD tier's RAM copies" : "measured")
                                : "reference: no expert records in RAM yet";
-    if (!calibration_note_.empty()) { how += "; calibration: " + calibration_note_; }
     char share[160];
     if (measured && attempts > 1) {
         std::snprintf(share, sizeof(share), " after %d attempts: other processes used %.0f %% of the CPU at first, %.0f %% last",
@@ -1356,12 +1314,9 @@ void ExpertOffload::note_prompt_routes(std::uint32_t lane, std::int32_t columns)
     prompt.counted += static_cast<std::uint32_t>(columns);
 }
 
-void ExpertOffload::seed_prompt(std::uint32_t lane, cudaStream_t compute) {
+void ExpertOffload::seed_prompt(std::uint32_t lane) {
     if (lane >= prompt_.size() || prompt_[lane].counted == 0) { return; }
-    // INFERNIX_TMP_PROMPT_SEED overrides the credit and adds promotions at the prompt's end.
-    const OffloadSwitches& switches = temporary_switches::offload();
-    residency_->seed_prompt(prompt_[lane].uses, switches.credit_or(kPromptSeedCredit) / prompt_[lane].counted,
-                            switches.prompt_budget, compute);
+    residency_->seed_prompt(prompt_[lane].uses, kPromptSeedCredit / prompt_[lane].counted);
     clear_prompt_uses(lane);
 }
 

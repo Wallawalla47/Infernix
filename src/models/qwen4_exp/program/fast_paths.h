@@ -84,7 +84,7 @@ struct A8Routes {
     // (ops::LinearRoutes::Fp8A8PairBlock32, from 33 to 1,025 columns by problem), in place of
     // f16-accumulate-prefill's FP16 route; and the routed experts' calls of more than 128 columns on the same
     // codec (ops::offloaded_moe::WideA16::kA8, which needs their 8-bit narrow route), in place of
-    // expert-a4-residual's A4 terms, ggml-bf16-prefill's BF16 planes or the exact route.
+    // expert-a4-residual's A4 terms, ggml-bf16-prefill's BF16 tiles or the exact route.
     bool ggml_dense_prefill = false;
     bool mxfp8_dense        = false;
     bool experts_prefill    = false;

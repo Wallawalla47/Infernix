@@ -134,12 +134,14 @@ void expect(bool ok, const std::string& what) {
     }
 }
 
-// TEMPORARY (INFERNIX_TMP_QSA_PROMPT_V2): its scope runs the prompt kernel's other variant (the split
-// K/V stage or the combined gather) than the process's setting, which it restores.
+// Its scope runs the prompt kernel's other variant (the split K/V stage or the combined gather) than the
+// storage's default, then restores the setting.
 struct OtherPromptVariant {
-    bool was = ops::detail::qsa_prompt_v2();
-    OtherPromptVariant() { ops::detail::qsa_prompt_set_v2(!was); }
-    ~OtherPromptVariant() { ops::detail::qsa_prompt_set_v2(was); }
+    int was;
+    explicit OtherPromptVariant(KvCacheStorage storage) : was(ops::detail::qsa_prompt_forced()) {
+        ops::detail::qsa_prompt_force(ops::detail::qsa_prompt_split(storage) ? 0 : 1);
+    }
+    ~OtherPromptVariant() { ops::detail::qsa_prompt_force(was); }
     OtherPromptVariant(const OtherPromptVariant&)            = delete;
     OtherPromptVariant& operator=(const OtherPromptVariant&) = delete;
 };
@@ -1207,10 +1209,10 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
     synchronize("attention");
     const auto got = t::from_device_bf16(dout, static_cast<std::size_t>(kD) * kHeads * columns);
     const std::string tag = std::string("qsa_attention ") + storage_name(storage) + " " + c.name;
-    // The prompt kernel's temporary split stage (INFERNIX_TMP_QSA_PROMPT_V2) and its combined gather
-    // give the same bits (calls off the one-stage prompt route run the same kernel either way).
+    // The prompt kernel's split stage and its combined gather give the same bits (calls off the one-stage
+    // prompt route run the same kernel either way).
     {
-        const OtherPromptVariant other;
+        const OtherPromptVariant other(storage);
         DeviceBuffer dother(static_cast<std::size_t>(kD) * kHeads * columns * 2);
         Tensor other_out(dother.p, DType::BF16, {kD, kHeads, columns});
         ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, columns}),
@@ -1352,7 +1354,7 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
         // Both prompt variants: the split stage's gathers translate the page spaces too.
         for (const bool other_variant : {false, true}) {
             std::optional<OtherPromptVariant> other;
-            if (other_variant) { other.emplace(); }
+            if (other_variant) { other.emplace(storage); }
             ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, columns}),
                                Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}), spaced, moved_batch,
                                kGeometry, 1.0F / 16.0F, max_context, workspace.p, workspace_bytes, spaced_out,
@@ -1412,7 +1414,7 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
     g_failures += t::verify_reduction(tag, got, ref, kAttentionCriterion);
 }
 
-// TEMPORARY (INFERNIX_TMP_QSA_PROMPT_V2): the prompt kernel's split stage against its combined gather,
+// The prompt kernel's split stage against its combined gather,
 // bit for bit, at the real prefill shape: one 4,096-column chunk whose first column is at `start`
 // (0: a 4K prompt, dense columns, the dense/selected boundary and lists off the tile grid; 28,672: the
 // last chunk of a 32K prompt, every column on 2,048 selected tokens plus its tail), scattered pages.
@@ -1467,15 +1469,15 @@ void test_prompt_variants(KvCacheStorage storage, int start, std::uint32_t seed)
     DeviceBuffer workspace(workspace_bytes);
     const std::size_t elements = static_cast<std::size_t>(kD) * kHeads * kWidth;
     const auto run = [&](bool split) {
-        const bool was = ops::detail::qsa_prompt_v2();
-        ops::detail::qsa_prompt_set_v2(split);
+        const int was = ops::detail::qsa_prompt_forced();
+        ops::detail::qsa_prompt_force(split ? 1 : 0);
         DeviceBuffer dout(elements * 2);
         Tensor out(dout.p, DType::BF16, {kD, kHeads, kWidth});
         ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, kWidth}),
                            Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, kWidth}), layer, batch, kGeometry,
                            1.0F / 16.0F, max_context, workspace.p, workspace_bytes, out, nullptr);
         synchronize("attention, prompt variant");
-        ops::detail::qsa_prompt_set_v2(was);
+        ops::detail::qsa_prompt_force(was);
         return download<std::uint16_t>(dout, elements);
     };
     const auto combined = run(false), split = run(true);

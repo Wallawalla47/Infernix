@@ -86,13 +86,9 @@ struct MtpBatchContext {
     Tensor& continuation_hidden_store;
     std::uint32_t neural_proposal_drafts = 0;
     // The round proposes through the gated chain (one row; detail::mtp_chained_round): Finish's
-    // proposal steps are captured as a chain whose gates read the ingress proposal limit and, with
-    // ExecutionSchedule::mtp_gate, each draft's probability. neural_proposal_drafts is then the window.
+    // proposal steps are captured as a chain whose gates read the ingress proposal limit.
+    // neural_proposal_drafts is then the window.
     bool proposal_chain = false;
-    // ExecutionSchedule::mtp_step_chain (any row count): Finish is captured as the step chain, the
-    // alignment then each draft behind launch_graph_gate_rows (the ingress proposal limits and step
-    // threshold, the previous draft's probability).
-    bool step_chain = false;
     // A tree round: each row's chain (its MTP drafts, chain_drafts long) gains side leaves on the
     // device (ops::candidate_chain_tree) and the round verifies the tree at its width, whose rows
     // hold at most tree_paths root-to-leaf paths.

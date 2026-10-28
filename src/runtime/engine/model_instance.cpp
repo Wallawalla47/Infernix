@@ -327,6 +327,11 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         if (qwen4_exp ? !mtp && options.speculative.backend != SpeculativeBackend::DFlash2 : !mtp) {
             throw std::invalid_argument("--spec-min-p applies to --spec mtp (and dflash2 on Qwen3.8-Flash-Next) only");
         }
+        // Qwen3.8-Flash-Next MTP with --draft-tokens auto cuts its drafts by their cumulative acceptance instead.
+        if (qwen4_exp && mtp && options.speculative.draft_tokens_auto) {
+            throw std::invalid_argument("--spec-min-p applies to a fixed --draft-tokens N with Qwen3.8-Flash-Next "
+                                        "MTP; --draft-tokens auto cuts by the drafts' cumulative acceptance");
+        }
     }
     if (cache.enabled) {
         // One pinned Host slab pool serves blocks and snapshots alike; its size is the only

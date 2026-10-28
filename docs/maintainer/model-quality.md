@@ -514,18 +514,19 @@ their request-coupling paths are listed like the others (since 2026-10-22). The 
 | `adaptive-dflash` | Qwen3.8-27B / Qwen3.6-35B-A3B with DFlash or DFlash2 and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format (2026-10-22, below); not the groupwise 27B |
 | `gdn-tree-closed-form` | tree rounds' GDN records of at most 16 columns (wider rows walk) | NVFP4 27B and 35B-A3B, every format, by the owner's decision (2026-10-25) ahead of its gate, where measured faster (ABBA, INT8 KV, greedy pp1280+tg256, fixed trees of 16, 6 blocks): NVFP4 27B DFlash2 decode +1.19 % (6 of 6, at least +1.01 %), 35B-A3B DFlash rounds 1.0-1.7 % shorter in 6 of 6 (decode +1.6 % where the greedy text matched); its kernel 0.65-0.93 of the walk's time at 1-4 rows (`gdn_replay_bench --component tree`) |
 | `block-verification` | sampled chain rounds (DFlash2, sampled MTP) | none: re-timed after its keys were made round-unique (2026-10-25, ABBA, sampled, 6 blocks): Dense8 MTP no resolved difference (median +1.9 %, worst -14.9 %), Dense8 DFlash2 `auto` -14.2 % (6 of 6 worse), NVFP4 27B DFlash2 7 no resolved difference (median -0.1 %, worst -4.8 %) |
+| `expert-a4-residual` (Qwen3.5) | Qwen3.5-122B-A10B's offloaded NVFP4 W4A16 experts, expert calls of more than eight columns | 32 heads, 8-bit (FP8) activations, offloaded experts (Qwen3.5-122B-A10B and Ornith-1.5-122B), every KV format, by the owner's rule (2026-10-25) ahead of its gate, where measured faster: Ornith MTP decode +2.0 % (ABBA, RTX 5090, 2026-10-28, 4 of 4 pairs, worst +1.69 %); only the experts' wide calls change, so every format |
 | Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with NVFP4 W4A16 experts (recipe C; NVIDIA FP4-Local at its default 16-bit expert activations), expert calls of more than eight columns | FP8 dense (recipe C) and MXFP8 dense (FP4-Local, by recipe C's kernel verdicts and its own timing), 16-bit expert activations, every KV format (BF16 by FP4-Local's gates against the precise reference, below) |
 | Qwen3.8-Flash-Next: `expert-a4-residual-3` | the same calls as `expert-a4-residual`, three NVFP4 terms per x and h row (its more precise form, design §19.3.23; it takes precedence where both are selected) | none: two terms pass on every configuration and format they run in (2026-10-21), so it stays an unregistered candidate (`--fast-path expert-a4-residual-3`) for a cell where two terms fail; three terms cost 7-8 points of prefill speed (below) |
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
 | Qwen3.8-Flash-Next: `dflash2-pairs` | two-row rounds with the DFlash2 drafter (`--spec dflash2 --draft-model`) | every Flash-Next configuration, every format, by the owner's decision (2026-10-24) ahead of its gate (not run); timed on Dense8, two requests, INT8 KV: decode +28 % median, 4 of 4 blocks |
-| Qwen3.8-Flash-Next: `screened-lm-head`, `f16-accumulate-prefill` | greedy decode and verification rounds of at most 16 columns through the LM head's 2-bit screen (artifacts with `--screen-heads`); FP8, MXFP8 and Q8 dense prefill calls of 256+ columns | NVIDIA FP4-Local (MXFP8 dense, 16-bit experts), INT8 KV, by the owner's decision (2026-10-25) ahead of their gates: `screened-lm-head` plain decode +7.5 %, MTP 3 +3.7 % (4 of 4 blocks); `f16-accumulate-prefill` pp32768 +5.3 % (3 of 3), pp4096 neutral; not Dense8 or recipe C (no gain beyond spread) |
-| Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S, every format (BF16 KV since 2026-10-20, against the precise reference; below) |
+| Qwen3.8-Flash-Next: `screened-lm-head`, `f16-accumulate-prefill` | greedy decode and verification rounds of at most 16 columns through the LM head's 2-bit screen (artifacts with `--screen-heads`); FP8 and MXFP8 dense prefill calls of 256+ columns | NVIDIA FP4-Local (MXFP8 dense, 16-bit experts), INT8 KV, by the owner's decision (2026-10-25) ahead of their gates: `screened-lm-head` plain decode +7.5 %, MTP 3 +3.7 % (4 of 4 blocks); `f16-accumulate-prefill` pp32768 +5.3 % (3 of 3), pp4096 neutral; not recipe C (no gain beyond spread); Dense8's Q8 route was removed (2026-10-28: pp32768 0.984x, pp65536 0.981x) |
+| Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 512+ columns (the stage-decode tiles since 2026-10-28; the planes from 14,336 columns before, which the gates measured) | IQ3_S, every format (BF16 KV since 2026-10-20, against the precise reference; below) |
 | `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B, FP8 and IQ3_S, every format (FP8 with BF16 KV by its prefill gate against the precise reference, 2026-10-21; IQ3_S with BF16 since 2026-10-20, below); not the 35B-A3B, Dense8 or FP4-Local (no gain beyond spread, below; recipe C and recipe A are timed in the 2026-10-20 queue) |
 
 **`sampled-mtp-drafts`: drafts drawn from the draft head's top four tokens (Flash-Next, qualified
 2026-10-17).** It changes no logit: a sampled request's drafts are drawn from the head's four most
 probable tokens under its sampler and verified by sparse rejection sampling against that proposal,
-and its rounds verify every draft (no `--spec-min-p` cut). The output distribution stays the
+and its rounds verify every draft (no cumulative cut). The output distribution stays the
 sampler's, but a seeded request's text changes, so it cannot be the exact route; greedy requests
 keep the argmax drafts. Its gate is therefore the distribution, not the model-level arms
 (`tests/models/qwen4_exp/test_speculative_sampling_real.cpp`, Dense8, INT8 KV, exact route otherwise):
@@ -1593,9 +1594,11 @@ NVFP4, K8V4, VQ2 or K4V2 KV, qualified 2026-10-19; BF16 KV, 2026-10-20).**
   (`ops::ggml_linear`, `LinearRoutes::GgmlBf16Wide`) as BF16 m16n8k16 MMAs with FP32 accumulation over
   the exact route's decoded planes: each code is exact in BF16, x is read as stored, each
   sub-block's FP32 sum is scaled by d · sub (exact in binary32), the K-quants subtract
-  dmin · min · Σx, and κ applies at the end. The GGUF expert banks' MoE calls of 14,336 or more
-  columns run the same tiles over expert planes decoded into the experts' workspace
-  (`WideA16::kGgmlBf16`). The exact route rounds every activation column to 21-bit integers and sums
+  dmin · min · Σx, and κ applies at the end. The GGUF expert banks' MoE calls of 512 or more
+  columns (`WideA16::kGgmlBf16`, `kGgmlStageDecodeMinColumns`) run the same arithmetic on the
+  stage-decode tiles, which decode each K stage of an expert's codes into shared memory: the bits of
+  the expert planes the gates below measured in calls of 14,336 or more columns (planes removed
+  2026-10-28, Flash-Next design §19.3.29). The exact route rounds every activation column to 21-bit integers and sums
   exactly; this one keeps x exact and rounds the sums. A prompt's bits depend on its call boundaries
   and the layer walk's MoE grouping, so it couples requests (`request_invariant` is false). Decode,
   verification and drafting keep their kernels (graph calls never take it).

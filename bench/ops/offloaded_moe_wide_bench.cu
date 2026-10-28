@@ -21,7 +21,7 @@
 // kernels, wider calls' wide experts on the 8-bit grouped GEMM); --narrow a4r (with a W4A16 activation,
 // Flash-Next geometry only) runs the experts of at most eight columns on expert-a4-residual-decode's
 // two-term narrow kernels. A GGUF bank (--bank ggml) takes --ggml-wide exact (the exact tiles), bf16
-// (WideA16::kGgmlBf16: its BF16 planes from MoeGgmlTiles' threshold, 14,336 columns by default, the exact tiles
+// (WideA16::kGgmlBf16: its BF16 stage-decode tiles from kGgmlStageDecodeMinColumns columns, the exact tiles
 // below it) or a8 (MoeGgmlBank::a8 with WideA16::kA8: the 8-bit stage-decode tiles past 128 columns).
 // Decode shapes: --tokens 1,2,4,8 --cold (one call is a layer's routed experts of one decode or MTP round).
 //
@@ -369,8 +369,7 @@ struct Fixture {
                       .gate_row_bytes = g_geometry.gate_row_bytes(),
                       .down_row_bytes = g_geometry.down_row_bytes(),
                       .record_bytes   = g_geometry.record_stride(),
-                      .tiles          = ops::MoeGgmlTiles::from_environment(),
-                      .a8             = ggml_a8};
+                      .a8            = ggml_a8};
         }
         return s;
     }

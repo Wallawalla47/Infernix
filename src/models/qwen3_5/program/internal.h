@@ -15,6 +15,9 @@ namespace infernix::models::qwen3_5 {
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
+// batched-a8-subset-decode's narrowest call: the two-term tiles step up from 64 columns, one term
+// does not.
+inline constexpr std::int64_t kA8SubsetMinColumns = 65;
 
 // Execution settings of a Program that select among equivalent arithmetic. Causal attention
 // (CausalAttentionExecutionEnvelope), for prefill chunks: fast selects the storage's fast prompt
@@ -27,7 +30,7 @@ inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
 // column_invariant_decode runs decode and verification projections under
 // LinearPolicy::A16ColumnInvariant (without it, a8_decode and a4_decode let wide rounds of FP8 and
 // NVFP4 projections take the artifact's 8- or 4-bit activations, a8_subset_decode the 8-bit ones in
-// rounds of A8Subset::min_columns or more for A8Subset's projections only, a8_residual_decode the
+// rounds of kA8SubsetMinColumns or more for the input and MLP gate/up projections only, a8_residual_decode the
 // FP8 projections the A8 residual profile and a4_residual_decode the NVFP4 MLP projections the A4
 // residual profile, else they stay at 16 bits), except calls of one column under
 // single_column_decode (batched_columns);
@@ -53,10 +56,9 @@ struct ExecutionSchedule {
     bool a4_decode                    = true;
     bool a8_residual_decode           = false;
     bool a4_residual_decode           = false;
-    // batched-a8-subset-decode: calls of a8_subset_min_columns or more columns
-    // (temporary_switches::A8Subset, which also sets its projection classes and layers).
+    // batched-a8-subset-decode: calls of kA8SubsetMinColumns or more columns, on the projections
+    // execution::precision_decode_text gives it.
     bool a8_subset_decode             = false;
-    std::int32_t a8_subset_min_columns = 0;
     bool row_invariant_partition      = false;
     bool fixed_speculation            = false;
     bool grid_cache                   = false;
@@ -68,7 +70,7 @@ struct ExecutionSchedule {
     bool adaptive_dflash              = false;
     // MTP rounds write each next draft's drafter probability (ops::argmax_with_probability):
     // MtpConfidencePolicy's input with offloaded experts, and on resident targets the input of the
-    // cut, the gate and the calibrated extents below (or alone under INFERNIX_TMP_QWEN35_MTP_PROBS).
+    // cut and the calibrated extents below.
     bool mtp_draft_confidence         = false;
     // --spec-min-p on Qwen3.5 MTP: a one-row round verifies its drafts up to the first whose drafter
     // probability is below it (0: every draft). With adaptive-mtp the round runs the family of that
@@ -79,25 +81,9 @@ struct ExecutionSchedule {
     // draft-length policy, which a device limit applies. adaptive-mtp with the cut or the
     // calibrated extents, argmax drafts.
     bool mtp_proposal_chain           = false;
-    // The chain also stops on the device after the first draft below mtp_min_p, skipping the steps
-    // whose drafts the cut discards (INFERNIX_TMP_QWEN35_MTP_GATE; B-01's draft gate).
-    bool mtp_gate                     = false;
     // A one-row chained round verifies the extent its drafts' calibrated acceptance makes fastest
     // (MtpConfidencePolicy over the cut prefix; INFERNIX_TMP_QWEN35_MTP_CALIBRATED).
     bool mtp_calibrated_extent        = false;
-    // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_PAD_MASK, candidates §11 OR-09): a batched drafter call's
-    // columns past each row's valid count route no resident expert (the 122B drafter's MoE).
-    bool mtp_drafter_mask             = false;
-    // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_STEP_GATE): offloaded MTP rounds (MtpConfidencePolicy's
-    // extents) propose through the step chain: the alignment, then each draft behind a device gate
-    // that runs it while some row's proposal limit admits it and its previous draft clears the
-    // policy's step threshold (MtpConfidencePolicy::step_threshold), past which no later draft
-    // could be verified; a row's drafts end at its first one below it.
-    bool mtp_step_chain               = false;
-    // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_SKIP_ROUNDS): with the step chain, a round may run its
-    // alignment alone (proposal limit 0: the drafter's KV, no draft) while MtpDraftRegime measures
-    // such rounds faster.
-    bool mtp_draft_regime             = false;
     // sampled-mtp-drafts: MTP drafts are drawn from the draft head's top kMtpSampledDraftRanks
     // tokens under each row's sampler and verified by sparse rejection sampling against that
     // proposal (greedy rows draw the argmax with a one-hot proposal); its rounds verify every draft.
@@ -119,12 +105,6 @@ struct ExecutionSchedule {
     bool univer_trees = false;
     // gdn-tree-closed-form: tree rounds' GDN records in closed form (ops::GdnTreeRecordRoute::ClosedForm).
     bool gdn_tree_closed_form = false;
-    // TEMPORARY (INFERNIX_TMP_TREE_ROUND_WIDTH, candidates §13 PUB-03): with DFlash2 and
-    // --draft-tree-nodes auto (not adaptive-dflash), each automatic round first proposes (the
-    // proposal graph keeps the block's lattice), then the controller chooses its width from the
-    // round's own draft probabilities (TreeWidthController::choose's rows) and a split family verifies
-    // the chain or builds and verifies the tree.
-    bool tree_round_width = false;
     // --a8-activations (A8Routes::experts_prefill) or expert-a4-residual (-3): the offloaded experts' wide route
     // (Qwen3.5-122B-A10B's W4A16 banks; ExecutionSchedule::lossless runs its own). Its workspace is planned with
     // the same route.
@@ -176,7 +156,7 @@ struct ExecutionSchedule {
                 .a4          = a4_decode,
                 .a8_residual = a8_residual_decode,
                 .a4_residual = a4_residual_decode,
-                .a8_subset   = a8_subset_decode && columns >= a8_subset_min_columns};
+                .a8_subset   = a8_subset_decode && columns >= kA8SubsetMinColumns};
     }
 
     // A prefill chunk's envelope.
