@@ -174,11 +174,14 @@ is 56.8 GB, of which the routed experts are 46.9 GiB.
 - **Expert cache.** The records come in five sizes (mean 1.95 MiB, largest 2.54 MiB). The cache
   keeps one frame pool per size, each with its own frames and LFRU counters, so it holds 13,008
   experts where frames of the largest size held about 10,200. A GGUF import's cache uses the adaptive
-  policy (Basalt's: per-window decayed route counts, decay 0.85, a candidate floor of 2 and a 1.5x
-  margin, at most 96 swaps a round, planned off the decode path) instead of LFRU: DFlash2 decode after
-  an 8K prompt 1.070-1.076x at the median in three A/Bs (2026-10-27, ABBA 3 pairs each; pooled
-  1.051-1.052x, worst pair 1.002-1.005x, the first block's cold cache). The NVFP4 conversions keep LFRU,
-  where the adaptive policy decoded 0.970x (Dense8, MTP). Same bits either way.
+  policy (Basalt's: per-window decayed route counts, decay 0.85, a 1.5x margin, at most 96 swaps a
+  round, planned off the decode path) instead of LFRU: DFlash2 decode after an 8K prompt 1.070-1.076x
+  at the median in three A/Bs (2026-10-27, ABBA 3 pairs each; pooled 1.051-1.052x, worst pair
+  1.002-1.005x, the first block's cold cache). Its candidate floor is 1 where Basalt's is 2, so any
+  expert a round routes may be promoted: decode +1.5 % after a 16K prompt, +5.4 % on the community
+  struct fixture and +2.7-4.2 % on its conv and prose fixtures (2026-10-29), for about 70 % more
+  promotions. The NVFP4 conversions keep LFRU, where the adaptive policy decoded 0.970x (Dense8, MTP).
+  Same bits either way.
 
 **Speed and quality** (RTX 5090 on PCIe 5.0 x8, i9-13900K, INT8 KV, one request, against recipe B
 in the same session on 2026-10-16; the n-gram table in RAM, `auto`; one run of `-r 3`, or `-r 1`

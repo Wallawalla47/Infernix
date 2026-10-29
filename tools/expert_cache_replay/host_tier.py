@@ -1352,9 +1352,9 @@ def format_prompt_seed(seed):
     return 'none' if seed is None else f'credit {seed[0]:g}, budget {seed[1]}, window {seed[2]}'
 
 
-# Basalt's adaptive-tier defaults (b80e026, bde2328): decay 0.85 per round, candidate floor 2.0, margin 1.5,
-# 96 swaps a round.
-ADAPTIVE_DEFAULTS = (0.85, 2.0, 1.5, 96)
+# The engine's adaptive tier (ExpertResidency::Adaptive): Basalt's rules (b80e026, bde2328) of decay 0.85 per round,
+# margin 1.5 and 96 swaps a round, with the candidate floor 1.0 where Basalt's is 2.0 (2026-10-29).
+ADAPTIVE_DEFAULTS = (0.85, 1.0, 1.5, 96)
 
 
 def parse_vram_policy(text):
@@ -1435,7 +1435,8 @@ def main(argv=None):
     ap.add_argument('--vram-budget', default='rule', choices=('rule', 'recorded'))
     ap.add_argument('--vram-policies', default='lfru',
                     help='";"-separated VRAM policies: lfru (the engine) and adaptive[:DECAY,FLOOR,MARGIN,SWAPS] '
-                         f'(Basalt\'s rules, default {",".join(f"{x:g}" for x in ADAPTIVE_DEFAULTS)}; candidates D12)')
+                         f'(the engine\'s, default {",".join(f"{x:g}" for x in ADAPTIVE_DEFAULTS)}; Basalt\'s floor is 2; '
+                         'candidates D12)')
     ap.add_argument('--t0-ms', type=float, default=11.2, help='base decode time per token (plain)')
     ap.add_argument('--cost-ms', type=float, default=0.65, help='exposed time per decode SSD read')
     ap.add_argument('--miss-ms', type=float, default=0.035,

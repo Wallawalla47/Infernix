@@ -121,7 +121,7 @@ def test_link_charged_speed_pays_for_promotions_and_misses():
 
 def test_adaptive_vram_policy_parses_basalts_rules():
     assert ht.parse_vram_policy('lfru') is None
-    assert ht.parse_vram_policy('adaptive') == (0.85, 2.0, 1.5, 96)
+    assert ht.parse_vram_policy('adaptive') == (0.85, 1.0, 1.5, 96)
     assert ht.parse_vram_policy('adaptive:0.9,3') == (0.9, 3.0, 1.5, 96)
     for bad in ('adaptive:1.5', 'adaptive:0.8,1,1,0', 'adaptive:1,2,3,4,5', 'belady'):
         with pytest.raises(ValueError):

@@ -377,8 +377,11 @@ private:
     // goes to the best candidates of any layer, then each layer's candidates replace its least-counted residents
     // while they lead by MARGIN, best gain first, at most SWAPS a round (4 x SWAPS after a round that ranked
     // 2 x SWAPS candidates). Landings, loans, resizes and the SSD tier's gates are unchanged.
+    // FLOOR is 1 (Basalt's is 2): any key routed in the round is a candidate. A replay of a 16K route trace at 12,528
+    // frames gave 96.4 % hits at floor 1 against 91.6 % at 2 (0.5 no better, 1.5 93.9 %), for 6.5 against 3.8
+    // promotions a token; IQ3_S decode 16K +1.5 %, struct +5.4 %, community conv / prose +2.7-4.2 % (2026-10-29).
     struct Adaptive {
-        float decay = 0.85F, floor = 2.0F, margin = 1.5F;
+        float decay = 0.85F, floor = 1.0F, margin = 1.5F;
         std::uint32_t swaps = 96, cap = 96;
         std::vector<float> count;     // per key
         std::vector<std::uint8_t> done; // per key: swapped in this round
