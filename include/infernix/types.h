@@ -842,8 +842,9 @@ struct EngineOptions {
     // artifact when used. Empty: what the RAM ledger leaves after the reserve and every other pin.
     std::optional<std::uint64_t> expert_ram_bytes;
     // Qwen3.8-Flash-Next (--expert-ram-layout), without expert_ram_bytes: Exclusive keeps in RAM only the experts
-    // VRAM does not hold (plus shadows for a prefill's loan and the KV growth), Full a copy of every expert.
-    ExpertRamLayout expert_ram_layout = ExpertRamLayout::Full;
+    // VRAM does not hold (plus shadows for a prefill's loan and the KV growth), Full a copy of every expert. Exclusive
+    // is the default since it decodes at Full's speed (design §19.3.7, 2026-10-29) with 4-6 GiB less RAM.
+    ExpertRamLayout expert_ram_layout = ExpertRamLayout::Exclusive;
     // Qwen3.8-Flash-Next (--expert-pin-mib): at most this much of the experts' RAM page-locked for
     // the GPU; the rest stays in RAM unpinned and the CPU serves it. Empty: what Windows lets the
     // process page-lock (the GPU's shared memory) after every other pin; no limit elsewhere.

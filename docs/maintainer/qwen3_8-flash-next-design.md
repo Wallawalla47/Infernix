@@ -7425,7 +7425,7 @@ measured results are under "Status" at the end of this section.
     borrow 2,901-3,098 of IQ3_S's 12,576 frames at 8K (a quarter), and a loan's victims, the
     lowest-score experts, were released at once with no copy back (R10.1), so the ones without a RAM copy
     left both tiers and came back by synchronous reads when next routed. The joint plan was removed.
-- **Exclusive layout (2026-10-27, `--expert-ram-layout exclusive`; the default stays `full`).** Same bits.
+- **Exclusive layout (2026-10-27, `--expert-ram-layout exclusive`; the default since 2026-10-29, below).** Same bits.
   - A loan or a shrink (`ExpertResidency::lend`, the KV pool taking frames) evicts the lowest-score
     experts that keep a RAM copy first, then the others (`LfruPolicy::set_capacity` first_choice; the old
     choice, the lowest scores whatever their copies, decoded IQ3_S 0.978x, worst pair 0.764x). This applies to

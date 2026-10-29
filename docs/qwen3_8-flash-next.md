@@ -681,17 +681,19 @@ of life, and fails only when one has been silent for 10 s ("the CPU expert servi
 answering" or "the SSD expert tier's read agent stopped answering"); until 2026-10-17 that was 1 s,
 which RAM pressure alone could exceed (FP8 runs at the default headroom failed 8 times in 34).
 
-**Expert RAM layout (`--expert-ram-layout exclusive|full`, default `full`).** When VRAM cannot hold
-every routed expert, `full` keeps a RAM copy of every expert whenever RAM allows it (the banks above),
-and `exclusive` keeps in RAM only the experts VRAM does not hold, plus copies of the ones a prefill
-borrows from VRAM and the KV cache's growth may take. The tier then serves the RAM experts. The exclusive
-layout needs about 15 GiB less RAM on the NVFP4 artifacts (49.1 against 64.4 GiB on Dense8) and 7 GiB
-less on the IQ3_S import (41.1 against 48.0 GiB); a VRAM eviction of an expert without a RAM copy
-reads its record back from the artifact into RAM (it stays readable in VRAM until the read lands).
-Outputs are the same bits in both layouts. Decode costs more in `exclusive` (2026-10-28, ABBA 3 pairs, decode
-after an 8K prompt): Dense8 MTP 0.983-0.987x of `full`, IQ3_S DFlash2 0.88x, so `full` stays the default
-and `exclusive` suits a machine whose RAM is otherwise short. `--expert-ram-mib N` overrides either with an
-explicit cap.
+**Expert RAM layout (`--expert-ram-layout exclusive|full`, default `exclusive`).** When VRAM cannot hold
+every routed expert, `exclusive` keeps in RAM only the experts VRAM does not hold, plus copies of the ones a
+prefill borrows from VRAM and the KV cache's growth may take, and the tier serves them; `full` keeps a RAM
+copy of every expert whenever RAM allows it (the banks above). On an RTX 5090 at 16K the experts' RAM plan
+is 42.4 against 48.0 GiB on the IQ3_S import and 60.3 against 64.4 GiB on Dense8 (resident 47.4 against
+51.9 and 67.2 against 70.3 GiB). A VRAM eviction of an expert without a RAM copy reads its record back
+from the artifact into RAM (it stays readable in VRAM until the read lands), or copies it over the link
+when that read would land more than 4 ms late (a slower drive); RAM drops the copies of the most-used
+VRAM experts first, so such evictions are few. Outputs are the same bits in both layouts. Speed
+(2026-10-29): decode within run-to-run spread of `full` on IQ3_S and Dense8 (16K steady state, the struct
+fixture, also with the artifact read at 800 MB/s), the community suite 0.993x; a 16K prefill 0.988x on
+IQ3_S (the first prompt reads 17 experts the warm start left on the SSD) and equal on Dense8.
+`--expert-ram-mib N` overrides either with an explicit cap.
 
 **A second drive (`--expert-stripe FILE`).** One drive bounds the tier's reads, most of all in
 prefill, which reads every expert missing from RAM (about 38 GiB for a 4K-token prompt with the FP8
