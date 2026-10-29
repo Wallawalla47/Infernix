@@ -6204,7 +6204,7 @@ private:
         cudaStream_t stream = nullptr;
         std::array<cudaEvent_t, 5> events{};
         cudaStream_t shared_stream = nullptr;
-        std::array<cudaEvent_t, 2> shared_events{};
+        std::array<cudaEvent_t, 4> shared_events{};
         cudaStream_t split_stream = nullptr;         // forked calls' staged misses
         std::array<cudaEvent_t, 2> split_events{};
     };

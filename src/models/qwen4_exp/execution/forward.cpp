@@ -859,12 +859,6 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
     Tensor logits = work_.alloc(DType::FP32, {E + 1, T});
-    const Tensor* rows[] = {&p.router, &p.shared_score};
-    if (fast_.router_mma && T >= kRouterMmaMinColumns) {
-        ops::projection_fp32_router_mma(x, rows, logits, s);
-    } else {
-        ops::projection_fp32(x, rows, logits, s);
-    }
     ops::MoeRouting routing{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
                             work_.alloc(DType::FP32, {T})};
     // The route log holds the call's last `logged` columns: all of them (written by the dispatch), or
@@ -890,12 +884,6 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const bool streamed_chunk = eager_chunk_ && batch != nullptr && batch->stream && experts_.stream != nullptr &&
                                 experts_.stream->active();
     const bool route_plans = route_tap == nullptr && !streamed_chunk;
-    if (!route_plans) { ops::moe_route_dispatch(logits, K, routing, dispatch, route_log, s); }
-    if (route_tap != nullptr &&
-        cudaMemcpyAsync(route_tap->data, routing.ids.data, routing.ids.bytes(), cudaMemcpyDeviceToDevice, s) !=
-            cudaSuccess) {
-        throw std::runtime_error("Qwen4Exp forward: route tap copy failed");
-    }
     ops::MoeExpertSource source = expert_source(p, layer);
     // --expert-tail-skip acts in generation rounds only; prefill, forced and scored tokens stay exact.
     if (batch != nullptr && batch->decode_round) { source.tail_skip_rank = experts_.tail_skip_rank; }
@@ -993,6 +981,62 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             ++i;
         }
     }
+    Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
+    const std::int32_t max_jobs = std::min(E, K * T);
+    // --a8-activations' wide route (GGUF and NVFP4 W4A16 banks, beside their 8-bit narrow route) takes a call of
+    // more than 128 columns first. The A4 residual routes exist for NVFP4 W4A16 banks only; their layouts carry no
+    // x limbs, which the GGUF and block-FP8 wide routes read, so another bank keeps the exact layout whatever the
+    // flag. ggml-bf16-prefill takes a GGUF bank's wide jobs in prefill calls onto the BF16 stage-decode tiles.
+    const bool ggml_bank = source.ggml.gate_up_format != QType::NVFP4_MUL &&
+                           source.ggml.gate_up_format != QType::FP8_E4M3FN_B128;
+    const bool nvfp4_a16 = source.activation == ops::offloaded_moe::ExpertActivation::kA16 &&
+                           source.ggml.gate_up_format == QType::NVFP4_MUL;
+    source.wide_a16 = fast_.a8_experts_wide && (ggml_bank || nvfp4_a16) ? ops::offloaded_moe::WideA16::kA8
+                      : fast_.expert_a4_terms != 0 && source.ggml.gate_up_format == QType::NVFP4_MUL
+                          ? (fast_.expert_a4_terms == 3 ? ops::offloaded_moe::WideA16::kA4Residual3
+                                                        : ops::offloaded_moe::WideA16::kA4Residual)
+                      : ggml_bank && ops::has_route(dense_routes(), ops::LinearRoutes::GgmlBf16Wide)
+                          ? ops::offloaded_moe::WideA16::kGgmlBf16
+                          : ops::offloaded_moe::WideA16::kExact;
+    // expert-a4-residual-decode, else --a8-activations' 8-bit route (calls of at most 128 columns): the same
+    // NVFP4 W4A16 banks' narrow jobs (the CPU service was created with the same choice, which moe_experts checks).
+    source.narrow_a16 = nvfp4_a16 && fast_.expert_a4_narrow ? ops::offloaded_moe::NarrowA16::kA4Residual
+                        : nvfp4_a16 && fast_.a8_experts ? ops::offloaded_moe::NarrowA16::kA8
+                                                        : ops::offloaded_moe::NarrowA16::kExact;
+    const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(source.shape, max_jobs, K * T, T, source.activation,
+                                                                                 source.wide_a16));
+    const std::int32_t I = dim(m.shared_intermediate);
+    Tensor product = work_.alloc(DType::BF16, {I, T});
+    Tensor shared  = work_.alloc(DType::BF16, {H, T});
+    // The shared expert runs while the host computes the CPU-served misses, and in decode and
+    // verification calls on its own stream while the routed experts compute too. It reads only x,
+    // and its scoped workspace lies past every buffer the routed experts use; this stream allocates
+    // nothing more until the join. Eager prefill chunks keep the serial order: the side stream there
+    // (candidates W18) measured flat twice (removed 2026-10-28).
+    const bool side = !eager_chunk_ && experts_.shared_stream != nullptr;
+    // The routed experts' activation encoding needs x alone, so it runs on the side stream beside the router and
+    // the route (it followed the route on the call's critical path, ~3 us a layer); a call without one (an NVFP4
+    // W4A16 bank) forks nothing: the empty fork and join alone cost Dense8 MTP decode 1.4 %. 16K decode, 3 runs each
+    // (2026-10-29): IQ3_S 265.5 -> 267.7 tok/s with the fork, Dense8 243.9 either way.
+    const bool early = side && ops::moe_experts_prepares(x, source, max_jobs, expert_ws.data, outputs);
+    if (early) {
+        CUDA_CHECK(cudaEventRecord(experts_.shared_events[2], s));
+        CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[2], 0));
+        ops::moe_experts_prepare(x, source, max_jobs, expert_ws.data, outputs, experts_.shared_stream);
+        CUDA_CHECK(cudaEventRecord(experts_.shared_events[3], experts_.shared_stream));
+    }
+    const Tensor* rows[] = {&p.router, &p.shared_score};
+    if (fast_.router_mma && T >= kRouterMmaMinColumns) {
+        ops::projection_fp32_router_mma(x, rows, logits, s);
+    } else {
+        ops::projection_fp32(x, rows, logits, s);
+    }
+    if (!route_plans) { ops::moe_route_dispatch(logits, K, routing, dispatch, route_log, s); }
+    if (route_tap != nullptr &&
+        cudaMemcpyAsync(route_tap->data, routing.ids.data, routing.ids.bytes(), cudaMemcpyDeviceToDevice, s) !=
+            cudaSuccess) {
+        throw std::runtime_error("Qwen4Exp forward: route tap copy failed");
+    }
     // A streamed prefill chunk: the layer's copied-ahead experts are read from the ring.
     ExpertStream* const streaming = streamed_chunk ? experts_.stream : nullptr;
     // The copy-ahead (ExpertStream::plan_ahead, candidates BX-09): a gated call also routes this layer's input
@@ -1059,52 +1103,21 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             source.overlap_stream = nullptr;
         }
     }
-    Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
-    const std::int32_t max_jobs = std::min(E, K * T);
-    // --a8-activations' wide route (GGUF and NVFP4 W4A16 banks, beside their 8-bit narrow route) takes a call of
-    // more than 128 columns first. The A4 residual routes exist for NVFP4 W4A16 banks only; their layouts carry no
-    // x limbs, which the GGUF and block-FP8 wide routes read, so another bank keeps the exact layout whatever the
-    // flag. ggml-bf16-prefill takes a GGUF bank's wide jobs in prefill calls onto the BF16 stage-decode tiles.
-    const bool ggml_bank = source.ggml.gate_up_format != QType::NVFP4_MUL &&
-                           source.ggml.gate_up_format != QType::FP8_E4M3FN_B128;
-    const bool nvfp4_a16 = source.activation == ops::offloaded_moe::ExpertActivation::kA16 &&
-                           source.ggml.gate_up_format == QType::NVFP4_MUL;
-    source.wide_a16 = fast_.a8_experts_wide && (ggml_bank || nvfp4_a16) ? ops::offloaded_moe::WideA16::kA8
-                      : fast_.expert_a4_terms != 0 && source.ggml.gate_up_format == QType::NVFP4_MUL
-                          ? (fast_.expert_a4_terms == 3 ? ops::offloaded_moe::WideA16::kA4Residual3
-                                                        : ops::offloaded_moe::WideA16::kA4Residual)
-                      : ggml_bank && ops::has_route(dense_routes(), ops::LinearRoutes::GgmlBf16Wide)
-                          ? ops::offloaded_moe::WideA16::kGgmlBf16
-                          : ops::offloaded_moe::WideA16::kExact;
-    // expert-a4-residual-decode, else --a8-activations' 8-bit route (calls of at most 128 columns): the same
-    // NVFP4 W4A16 banks' narrow jobs (the CPU service was created with the same choice, which moe_experts checks).
-    source.narrow_a16 = nvfp4_a16 && fast_.expert_a4_narrow ? ops::offloaded_moe::NarrowA16::kA4Residual
-                        : nvfp4_a16 && fast_.a8_experts ? ops::offloaded_moe::NarrowA16::kA8
-                                                        : ops::offloaded_moe::NarrowA16::kExact;
-    const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(source.shape, max_jobs, K * T, T, source.activation,
-                                                                                 source.wide_a16));
     const bool planned = route_plans && ops::moe_route_dispatch_plan(logits, K, routing, dispatch, route_log, x, source,
                                                                      max_jobs, expert_ws.data, outputs, s);
     if (log_tail != nullptr) {
         CUDA_CHECK(cudaMemcpyAsync(log_tail, static_cast<const std::int32_t*>(routing.ids.data) + static_cast<std::size_t>(K) * (T - logged),
                                    static_cast<std::size_t>(K) * logged * sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
     }
-    const std::int32_t I = dim(m.shared_intermediate);
-    Tensor product = work_.alloc(DType::BF16, {I, T});
-    Tensor shared  = work_.alloc(DType::BF16, {H, T});
-    // The shared expert runs while the host computes the CPU-served misses, and in decode and
-    // verification calls on its own stream while the routed experts compute too. It reads only x,
-    // and its scoped workspace lies past every buffer the routed experts use; this stream allocates
-    // nothing more until the join. Eager prefill chunks keep the serial order: the side stream there
-    // (candidates W18) measured flat twice (removed 2026-10-28).
-    const bool side = !eager_chunk_ && experts_.shared_stream != nullptr;
     cudaStream_t shared_s = s;
+    if (early) { CUDA_CHECK(cudaStreamWaitEvent(s, experts_.shared_events[3], 0)); }
     if (side) {
         CUDA_CHECK(cudaEventRecord(experts_.shared_events[0], s));
         CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[0], 0));
         shared_s = experts_.shared_stream;
     }
-    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, planned);
+    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, planned,
+                     /*x_prepared=*/early);
     if (streaming != nullptr && batch->release_stream) { streaming->after_experts(layer, s); }
     if (ahead) {
         // The next layer's guessed experts follow this layer's copies on the link.

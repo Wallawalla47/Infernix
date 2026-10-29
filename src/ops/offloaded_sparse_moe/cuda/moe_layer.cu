@@ -455,7 +455,11 @@ __device__ __forceinline__ float route_value(unsigned key) {
 // selection's warp step is two hardware reductions (redux.sync) instead of a five-step shuffle tree:
 // the largest key, then the lowest id among the lanes holding it, which is the tree's winner (a lane's
 // candidate is never NaN: NaN logits are never selected, as before). A selected -0 is returned as +0,
-// which changes no weight.
+// which changes no weight. A lane's own arg-max is a depth-4 tree over its 16 candidates' keys (on a tie
+// the lower index, so the lower id, wins; NaN and e >= experts take key 0, below every candidate, and a
+// lane left with none offers -inf and id 0x7FFFFFFF): the 16-step compare chain it replaced took ~7,400
+// of the fused route kernel's ~24,000 cycles at decode widths (2026-10-29). Each lane computes its own
+// softmax term once; the sum still adds the terms in selection order.
 __device__ __forceinline__ int route_column(const float* __restrict__ logits, int experts, int top_k, int t,
                                             bool bf16_logits, std::int32_t* __restrict__ ids,
                                             float* __restrict__ weights, float* __restrict__ shared_gate) {
@@ -470,41 +474,56 @@ __device__ __forceinline__ int route_column(const float* __restrict__ logits, in
         values[i]   = e < experts ? router_logit(column[e], bf16_logits) : -INFINITY;
     }
     const float score = lane == 0 ? router_logit(column[experts], bf16_logits) : 0.0F;
+    constexpr unsigned kNegInfKey = 0x007FFFFFU; // route_key(-INFINITY)
+    unsigned key[kPerLane];
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+        key[i] = lane + 32 * i < experts && !isnan(values[i]) ? route_key(values[i]) : 0U;
+    }
     // Lane k keeps the k-th selection.
     float selected = -INFINITY;
     int chosen     = 0;
     for (int k = 0; k < top_k; ++k) {
-        float best   = -INFINITY;
-        int best_id  = 0x7FFFFFFF;
+        unsigned bk[kPerLane / 2];
+        int bi[kPerLane / 2];
 #pragma unroll
-        for (int i = 0; i < kPerLane; ++i) {
-            const int e = lane + 32 * i;
-            if (e < experts && (values[i] > best || (values[i] == best && e < best_id))) {
-                best    = values[i];
-                best_id = e;
+        for (int p = 0; p < kPerLane / 2; ++p) {
+            const bool upper = key[2 * p + 1] > key[2 * p];
+            bk[p]            = upper ? key[2 * p + 1] : key[2 * p];
+            bi[p]            = upper ? 2 * p + 1 : 2 * p;
+        }
+#pragma unroll
+        for (int width = kPerLane / 4; width >= 1; width /= 2) {
+#pragma unroll
+            for (int p = 0; p < width; ++p) {
+                const bool upper = bk[2 * p + 1] > bk[2 * p];
+                bk[p]            = upper ? bk[2 * p + 1] : bk[2 * p];
+                bi[p]            = upper ? bi[2 * p + 1] : bi[2 * p];
             }
         }
-        const unsigned top_key = __reduce_max_sync(0xFFFFFFFFU, route_key(best));
-        best_id = static_cast<int>(__reduce_min_sync(
-            0xFFFFFFFFU, route_key(best) == top_key ? static_cast<unsigned>(best_id) : 0x7FFFFFFFU));
-        best    = route_value(top_key);
+        const unsigned lane_key = bk[0] != 0U ? bk[0] : kNegInfKey;
+        const int lane_id       = bk[0] != 0U ? lane + 32 * bi[0] : 0x7FFFFFFF;
+        const unsigned top_key  = __reduce_max_sync(0xFFFFFFFFU, lane_key);
+        const int best_id       = static_cast<int>(
+            __reduce_min_sync(0xFFFFFFFFU, lane_key == top_key ? static_cast<unsigned>(lane_id) : 0x7FFFFFFFU));
         if (lane == k) {
-            selected = best;
+            selected = route_value(top_key);
             chosen   = best_id;
         }
 #pragma unroll
         for (int i = 0; i < kPerLane; ++i) {
-            if (lane + 32 * i == best_id) { values[i] = -INFINITY; }
+            if (lane + 32 * i == best_id) { key[i] = kNegInfKey; }
         }
     }
     // softmax over all experts then renormalized over the selected ones equals the softmax of the
     // selected logits. Every lane sums them in selection order.
-    const float top = __shfl_sync(0xFFFFFFFFU, selected, 0);
-    float sum       = 0.0F;
-    for (int k = 0; k < top_k; ++k) { sum += expf(__shfl_sync(0xFFFFFFFFU, selected, k) - top); }
+    const float top  = __shfl_sync(0xFFFFFFFFU, selected, 0);
+    const float term = expf(selected - top);
+    float sum        = 0.0F;
+    for (int k = 0; k < top_k; ++k) { sum += __shfl_sync(0xFFFFFFFFU, term, k); }
     if (lane < top_k) {
         ids[static_cast<std::size_t>(t) * top_k + lane]     = chosen;
-        weights[static_cast<std::size_t>(t) * top_k + lane] = expf(selected - top) / sum;
+        weights[static_cast<std::size_t>(t) * top_k + lane] = term / sum;
     }
     if (lane == 0) { shared_gate[t] = 1.0F / (1.0F + expf(-score)); }
     return chosen;
@@ -1927,9 +1946,10 @@ struct CpuPlanShared {
 //   chosen job's slot is first_slot + prefix + lane rank and the chunks need no carry barriers;
 // - a chosen job's width stays in shared memory (not read back from the mapped request: a PCIe read
 //   the host answers behind the link's staging traffic);
-// - a call of at most 32 columns (every fused-route call) compacts x from the one mask word in
-//   each thread (compact index = used columns below), so no thread walks the columns; wider calls
-//   compact in one warp scan;
+// - the fused route (Named) names each column by its own index (its idle warps published every column
+//   before the routing, publish_x_columns); otherwise a call of at most 32 columns compacts x from the one
+//   mask word in each thread (compact index = used columns below), so no thread walks the columns, and
+//   wider calls compact in one warp scan;
 // - one system-scope fence, by thread 0 after the barrier that follows every thread's request and
 //   x stores, then the sequence. Fences are cumulative (PTX memory model; the cooperative-groups grid
 //   barrier relies on the same pattern): the stores thread 0 has synchronized with at that barrier
@@ -2076,7 +2096,11 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
         sm.slot_width[slot]           = static_cast<std::int8_t>(width);
         for (int c = 0; c < width; ++c) {
             const int column = moe::wide::entry_column(dispatch.entries[first + c], top_k, dispatch.shared_first);
-            atomicOr(&sm.used[column / 32], 1U << (column % 32));
+            if constexpr (Named) {
+                channel.request->column[slot][c] = column; // the fused route published every column at its index
+            } else {
+                atomicOr(&sm.used[column / 32], 1U << (column % 32));
+            }
         }
     }
     plan_barrier<Named>();
@@ -2089,7 +2113,9 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
     const int kVectors = source.shape.hidden * 2 / 16;
     const auto* src    = reinterpret_cast<const int4*>(x);
     auto* dst          = reinterpret_cast<int4*>(channel.x);
-    if (columns <= 32) {
+    if constexpr (Named) {
+        // publish_x_columns ran before the routing.
+    } else if (columns <= 32) {
         // One mask word: column t's compact index is the number of used columns below t.
         const unsigned used = sm.used[0];
         for (int i = threadIdx.x; i < chosen * offloaded_moe::kMaxCpuColumns; i += kThreads) {
@@ -2284,11 +2310,24 @@ __global__ void __launch_bounds__(kThreads)
     fetch_plan_body<false>(dispatch, source, max_jobs, cpu_flags, cpu_call, call, sm);
 }
 
+// The fused route's x for the CPU channel: every column at its own index (the request names columns
+// by their index), by threads [first, first + count) of the CTA.
+__device__ __forceinline__ void publish_x_columns(const MoeCpuChannel& channel, const bf16* __restrict__ x, int hidden,
+                                                  int columns, int first, int count) {
+    const int vectors = hidden * 2 / 16;
+    const auto* src   = reinterpret_cast<const int4*>(x);
+    auto* dst         = reinterpret_cast<int4*>(channel.x);
+    for (int i = static_cast<int>(threadIdx.x) - first; i < columns * vectors; i += count) { dst[i] = src[i]; }
+}
+
 // route_dispatch_kernel followed by the CPU plan in the same CTA: after a barrier of the whole CTA
 // makes the dispatch visible, its first kThreads threads plan as cpu_plan_kernel does (the same
 // results) and the rest exit, so the plan, and the host's start, follow the dispatch with no kernel
 // boundary. With `fetch` (a call with a fetch channel), the same threads then make the fetch plan as
-// fetch_plan_kernel does.
+// fetch_plan_kernel does. The warps that route no column publish x for the CPU while the others route (a
+// call of 32 columns: every thread, after the routing), so the copy, ~4,300 cycles after the plan's
+// decision before, overlaps the routing and the request goes out that much sooner (2026-10-29); the
+// plan's system fence orders these stores too (every thread passed the barriers before it).
 template <bool kMasked>
 __global__ void __launch_bounds__(kDispatchThreads)
     route_dispatch_plan_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
@@ -2308,8 +2347,13 @@ __global__ void __launch_bounds__(kDispatchThreads)
     if (warp < columns) {
         const int id = route_column(logits, experts, top_k, warp, bf16_logits, ids, weights, shared_gate);
         if (lane < top_k) { routed[warp * top_k + lane] = id; }
+    } else {
+        publish_x_columns(source.cpu, x, source.shape.hidden, columns, 32 * columns, kDispatchThreads - 32 * columns);
     }
     __syncthreads();
+    if (32 * columns == kDispatchThreads) {
+        publish_x_columns(source.cpu, x, source.shape.hidden, columns, 0, kDispatchThreads);
+    }
     const int routed_entries = columns * top_k, entries = routed_entries + (shared_job ? columns : 0);
     dispatch_small(i < entries ? (i < routed_entries ? routed[i] : experts) : 0,
                    !kMasked || (i < entries && entry_live<kMasked>(mask, i, routed_entries, top_k)), entries,
@@ -2741,7 +2785,49 @@ void require_fetch_channel(const MoeExpertSource& source, std::int32_t max_jobs)
             "experts fetch channel is incomplete (it needs a host table, staging and at most kMaxFetch jobs)");
 }
 
+// The call's routing-independent preparation, before any fork of its passes: the narrow ring's x (its job words
+// and counters cleared), a ggml bank's x limbs (on the 8-bit route its codes) and its jobs' gate/up CTA counts,
+// or an NVFP4 bank's 8-bit codes, each encoded once per call.
+// Whether prepare_x launches anything for the call (a ring, a ggml bank or an 8-bit NVFP4 call).
+bool prepares_x(const Tensor& x, const MoeExpertSource& source, const moe::wide::ExpertsWorkspace& layout) {
+    const int columns   = static_cast<int>(x.ne[1]);
+    const bool nvfp4_a8 = nvfp4_a8_call(source, columns);
+    return (layout.x_acts != nullptr && !nvfp4_a8) || ggml_bank(source) || nvfp4_a8 || nvfp4_a8_wide_call(source, columns);
+}
+
+void prepare_x(const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs,
+               const moe::wide::ExpertsWorkspace& layout, cudaStream_t stream) {
+    const int columns        = static_cast<int>(x.ne[1]);
+    const bool nvfp4_a8      = nvfp4_a8_call(source, columns);
+    const bool nvfp4_a8_wide = nvfp4_a8_wide_call(source, columns);
+    if (layout.x_acts != nullptr && !nvfp4_a8) { launch_ring_prepare(x, layout, static_cast<int>(max_jobs), stream); }
+    if (ggml_bank(source) && a8_call(source, columns)) {
+        launch_encode_x_ggml_a8(x, layout, stream);
+    } else if (ggml_bank(source)) {
+        launch_encode_x_ggml(x, static_cast<int>(max_jobs), layout, stream);
+    } else if (nvfp4_a8 || nvfp4_a8_wide) {
+        launch_encode_x_nvfp4_a8(x, source, layout, stream);
+    }
+}
+
 } // namespace
+
+bool moe_experts_prepares(const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs, void* workspace,
+                          const Tensor& outputs) {
+    if (source.wide_a16 == moe::WideA16::kLossless) { return false; }
+    return prepares_x(x, source, moe::wide::carve_experts_workspace(workspace, source.shape, max_jobs, outputs.ne[1], x.ne[1],
+                                                                     source.activation, source.wide_a16));
+}
+
+void moe_experts_prepare(const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs, void* workspace,
+                         const Tensor& outputs, cudaStream_t stream) {
+    require(contiguous(x, DType::BF16) && contiguous(outputs, DType::BF16) && max_jobs > 0,
+            "experts prepare needs BF16 x and outputs and jobs");
+    if (source.wide_a16 == moe::WideA16::kLossless) { return; } // the lossless route encodes inside its passes
+    const auto layout = moe::wide::carve_experts_workspace(workspace, source.shape, max_jobs, outputs.ne[1], x.ne[1],
+                                                           source.activation, source.wide_a16);
+    prepare_x(x, source, max_jobs, layout, stream);
+}
 
 bool moe_route_dispatch_plan(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, MoeDispatch& dispatch,
                              std::int32_t* route_log, const Tensor& x, const MoeExpertSource& source,
@@ -2811,7 +2897,7 @@ void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const Mo
 
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                  std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs,
-                 cudaStream_t stream, bool wait_for_cpu, bool cpu_planned) {
+                 cudaStream_t stream, bool wait_for_cpu, bool cpu_planned, bool x_prepared) {
     require(contiguous(x, DType::BF16) && contiguous(outputs, DType::BF16), "experts need BF16 x and outputs");
     const bool ggml = ggml_bank(source);
     require(moe::wide::shape_supported(source.shape, source.activation, source.wide_a16,
@@ -2894,19 +2980,11 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     // An NVFP4 W4A16 bank's call on the 8-bit route (NarrowA16::kA8): every job on the 8-bit kernels, so neither
     // the narrow ring nor the wide route takes part. A wider call with WideA16::kA8 keeps the wide route (its
     // 8-bit grouped GEMM) for its wide jobs and the 8-bit kernels for the others.
-    const bool nvfp4_a8      = nvfp4_a8_call(source, static_cast<int>(x.ne[1]));
-    const bool nvfp4_a8_wide = nvfp4_a8_wide_call(source, static_cast<int>(x.ne[1]));
-    // The narrow ring's x, encoded once here, before any fork (its job words and counters cleared).
-    if (layout.x_acts != nullptr && !nvfp4_a8) { launch_ring_prepare(x, layout, static_cast<int>(max_jobs), stream); }
-    // A ggml bank's gate/up kernels read every token's x limbs (on the 8-bit route its codes), encoded once
-    // here, before any fork.
-    if (ggml && a8_call(source, static_cast<int>(x.ne[1]))) {
-        launch_encode_x_ggml_a8(x, layout, stream);
-    } else if (ggml) {
-        launch_encode_x_ggml(x, static_cast<int>(max_jobs), layout, stream);
-        if (x.ne[1] > moe::kMaxColumns) { launch_plan_ggml(dispatch, max_jobs, layout, stream); }
-    } else if (nvfp4_a8 || nvfp4_a8_wide) {
-        launch_encode_x_nvfp4_a8(x, source, layout, stream); // likewise, every token's codes once per call
+    const bool nvfp4_a8 = nvfp4_a8_call(source, static_cast<int>(x.ne[1]));
+    // Encoded here unless the caller ran moe_experts_prepare on a stream ordered before this one.
+    if (!x_prepared) { prepare_x(x, source, max_jobs, layout, stream); }
+    if (ggml && !a8_call(source, static_cast<int>(x.ne[1])) && x.ne[1] > moe::kMaxColumns) {
+        launch_plan_ggml(dispatch, max_jobs, layout, stream);
     }
     // Passes of at most staging_slots jobs (one pass covering every job without staging).
     const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;

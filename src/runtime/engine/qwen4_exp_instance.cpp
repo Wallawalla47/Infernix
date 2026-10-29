@@ -320,10 +320,14 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
             demand.expert_cap = cap;
             exclusive         = !expert_offload::plan_host_memory(snapshot, demand).cap_too_large;
             if (exclusive) {
-                // Seeding every frame measured slower (IQ3_S 16K decode 223 against 235 tok/s, struct 349 against 361:
-                // no free frames left for the fill phase's landings), so the reserve stays unseeded.
+                // The warm start seeds the full layout's share of the frames (never the loan reserve): the free
+                // frames take the fill phase's landings. Seeding every frame measured slower (IQ3_S 16K decode 223
+                // against 235 tok/s); seeding all but the reserve (68 % of the frames) left fewer landings (2,878
+                // against 4,281 a 16K request) and more CPU-served misses: 16K decode 258.2 / 258.8 against
+                // 264.2 / 264.6 tok/s at half (full layout 266.5 / 266.4), struct 455.0 / 455.5 against 457.7 /
+                // 457.4 (full 463.1 / 462.9), the same 47.4 GiB resident (2026-10-29).
                 const double reserve_share          = static_cast<double>(reserve) / static_cast<double>(frames);
-                program_options.expert_seed_share   = 1.0 - reserve_share;
+                program_options.expert_seed_share   = std::min(program_options.expert_seed_share, 1.0 - reserve_share);
                 program_options.expert_shadow_share = reserve_share;
                 program_options.expert_ram_exclusive = true;
             } else {

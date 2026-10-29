@@ -370,9 +370,20 @@ struct MoeExpertSource {
 /// With wait_for_cpu == false the call returns before placing CPU-served outputs; the caller may
 /// enqueue unrelated work (the shared expert) and must call moe_experts_cpu_wait with the same
 /// arguments before reading `outputs`. The workspace stays reserved until then.
+/// With x_prepared the caller ran moe_experts_prepare for this call, ordered before it.
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                  std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs,
-                 cudaStream_t stream, bool wait_for_cpu = true, bool cpu_planned = false);
+                 cudaStream_t stream, bool wait_for_cpu = true, bool cpu_planned = false, bool x_prepared = false);
+
+/// The routing-independent part of the moe_experts call with these x, source, max_jobs, workspace and outputs
+/// (its activation encoding), which needs neither the dispatch nor the CPU plan: run on any stream after x's
+/// producer, so it overlaps the router and the route, and ordered before that call, which passes x_prepared.
+void moe_experts_prepare(const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs, void* workspace,
+                         const Tensor& outputs, cudaStream_t stream);
+
+/// Whether moe_experts_prepare launches anything for that call (a fork that moves no work only adds dependencies).
+[[nodiscard]] bool moe_experts_prepares(const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs,
+                                        void* workspace, const Tensor& outputs);
 
 /// moe_route_dispatch and, for a CPU-served call of decode or verification width, the CPU plan of
 /// the moe_experts call with these x, source, max_jobs, workspace and outputs (and, with a fetch

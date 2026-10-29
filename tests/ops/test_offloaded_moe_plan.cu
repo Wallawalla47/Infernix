@@ -13,8 +13,8 @@
 // of the M host-memory misses, the SSD-only misses of at most max_job_columns columns first up to the
 // cap, then want = min(cap - n, M - M / d) host-memory ones, the fewest-column ones first and in job
 // order within a width; the chosen jobs flagged 1 (tail-skipped ones 2), listed in call->job and the
-// request (expert, record, width, columns by compact index); the x columns they read published
-// compacted in column order; the request's header and sequence. Every byte of the mapped request,
+// request (expert, record, width, columns by their index); every x column published at its index
+// (whether or not the call has CPU jobs); the request's header and sequence. Every byte of the mapped request,
 // the published x columns, cpu_flags and the call's bookkeeping must equal it exactly, in both runs.
 // Where both runs produced the same dispatch (always at one column), their bytes are compared directly.
 
@@ -165,23 +165,14 @@ void oracle(const Geometry& g, const Case& k, int columns, int max_jobs, const s
         }
     }
     call.jobs = static_cast<std::int32_t>(chosen.size());
+    // The fused route publishes every x column at its own index, whether or not the call has CPU jobs.
+    const std::size_t row = static_cast<std::size_t>(g.shape.hidden) * sizeof(std::uint16_t);
+    std::memcpy(want.x.data(), x.data(), static_cast<std::size_t>(columns) * row);
     if (chosen.empty()) {
         call.pending = 0;
     } else {
         auto* request = reinterpret_cast<moe::MissRequest*>(want.request.data());
         const auto column_of = [&](int entry) { return moe::wide::entry_column(entry, K, shared_first); };
-        std::vector<int> used(static_cast<std::size_t>(columns), 0);
-        for (const int j : chosen) {
-            const int e = run.jobs[j];
-            for (int c = run.offsets[e]; c < run.offsets[e + 1]; ++c) { used[column_of(run.entries[c])] = 1; }
-        }
-        std::vector<int> compact(static_cast<std::size_t>(columns), -1), published;
-        for (int t = 0; t < columns; ++t) {
-            if (used[t] != 0) {
-                compact[t] = static_cast<int>(published.size());
-                published.push_back(t);
-            }
-        }
         for (std::size_t s = 0; s < chosen.size(); ++s) {
             const int j = chosen[s], e = run.jobs[j];
             const int first = run.offsets[e], width = run.offsets[e + 1] - first;
@@ -190,7 +181,7 @@ void oracle(const Geometry& g, const Case& k, int columns, int max_jobs, const s
             request->expert[s] = e;
             request->record[s] = k.table.empty() ? 0 : k.table[e];
             request->ncols[s]  = width;
-            for (int c = 0; c < width; ++c) { request->column[s][c] = compact[column_of(run.entries[first + c])]; }
+            for (int c = 0; c < width; ++c) { request->column[s][c] = column_of(run.entries[first + c]); }
         }
         request->layer  = ch.layer;
         request->jobs   = static_cast<std::int32_t>(chosen.size());
@@ -200,10 +191,6 @@ void oracle(const Geometry& g, const Case& k, int columns, int max_jobs, const s
         if (sequence == 0) { sequence = run.sequence_before + 2U; }
         request->sequence = sequence;
         call.pending      = static_cast<std::int32_t>(sequence);
-        const std::size_t row = static_cast<std::size_t>(g.shape.hidden) * sizeof(std::uint16_t);
-        for (std::size_t c = 0; c < published.size(); ++c) {
-            std::memcpy(want.x.data() + c * row, reinterpret_cast<const std::uint8_t*>(x.data()) + published[c] * row, row);
-        }
     }
     want.flags.resize(flags.size() * sizeof(std::int32_t));
     std::memcpy(want.flags.data(), flags.data(), want.flags.size());

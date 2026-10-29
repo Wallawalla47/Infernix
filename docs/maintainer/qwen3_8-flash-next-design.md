@@ -7431,8 +7431,8 @@ measured results are under "Status" at the end of this section.
     choice, the lowest scores whatever their copies, decoded IQ3_S 0.978x, worst pair 0.764x). This applies to
     every SSD-tier configuration.
   - RAM slots (pooled by record size, below) hold every expert VRAM does not plus 5/16 of the frames and
-    the KV growth's frames as shadows; the warm start seeds the rest of the frames
-    (`ProgramOptions::expert_seed_share`), the fill phase's landings keep their RAM copies, and the warm
+    the KV growth's frames as shadows; the warm start seeds the full layout's share of the frames, never the
+    reserve (`ProgramOptions::expert_seed_share`; 2026-10-29, below), the fill phase's landings keep their RAM copies, and the warm
     start's spare slots hold shadows of the least-used seeds. A prefill's loan then takes shadowed
     experts, and give-back leaves the returned frames free for decode's landings (the SSD tier's
     refill of the victims left Dense8 none: 0 landings a request against ~1,000 in the full layout).
@@ -7490,6 +7490,17 @@ measured results are under "Status" at the end of this section.
       of ~2 MiB holding its frame until it lands; the full layout discards its victims), and loans early in a session
       (the warm start leaves RAM full of RAM-only experts, so only ~1,100 shadows fit where a 16K prefill's loan
       evicts ~1,000 experts: 208 a request still left without a copy and were read back).
+  - 2026-10-29 (with the tensor-core expert kernels, main 0689e1bb, then): **the warm start seeds half the frames**,
+    as the full layout does, instead of all but the loan reserve (68 % on IQ3_S). The free frames take the fill
+    phase's landings: a 16K request landed 4,281 misses against 2,878 and CPU-served 12,407 against 13,990, the full
+    layout's counts (4,255 and 12,445); RAM unchanged (47.4 GiB resident against the full layout's 51.9). IQ3_S, 2
+    runs each: 16K decode 258.2 / 258.8 -> 264.2 / 264.6 tok/s (full 266.5 / 266.4), struct 455.0 / 455.5 ->
+    457.7 / 457.4 (full 463.1 / 462.9); with this session's later route changes exclusive is 0.993x of full at 16K
+    (266.2 / 266.1 against 267.7 / 268.4) and 0.987x on struct. Prefill stays 0.96x (6,521 against 6,801 at 16K).
+    Dense8 (seeds 4,554 of 9,109 frames, 6,217 before) against main 0689e1bb: struct exclusive 307.7 / 309.2 ->
+    327.0 / 326.9 (full 354.3 / 354.5: still 0.92x, ~24,000 demotions a request, each a refill read of the artifact);
+    16K MTP 3, 2 runs, 241.0 / 241.1 -> 242.7 / 242.6 (full 242.7 / 244.3). The prefill streams the same 34.2 GiB through the same lent frames in both layouts; full
+    merges 277 adjacent records into fewer copies, exclusive copies each from its slot (cause of its 4 % unconfirmed).
 - **Storage** (§4.4): `artifact::Residency::Streamed` and a long-lived `StreamSource` (per-part
   direct, deny-write handles); `ExpertStore` (Model data) holds each record's ≤ 2 aligned file
   segments (two records straddle part files: L22 E305, L45 E103). Core `DirectReadQueue` (IOCP on
@@ -11421,6 +11432,25 @@ after 16K, bits 7 0.990x, 1 1.012x (3 of 5 better, worst 0.984), 2 1.002x, 4 0.9
 run); Dense8 MTP decode, bits 7 0.997x (worse in 5 of 5). No bit is a consistent gain, so the code and the
 switch are removed. The chain's PDL boundaries were not its cost (the trivial dependents above), and the fused
 HC + router + top-k megakernel already lost on 2026-10-15 (above), so no further form is pending.
+
+**2026-10-29: inside the route kernel (built, exact).** `clock64` stamps in `route_dispatch_plan_kernel` (IQ3_S,
+DFlash2 auto, struct fixture, 40,000 calls, after the tensor-core expert kernels): of ~23,700 cycles, the routing took
+10,200 (its ten selections' 16-step compare chains 7,400), the dispatch 2,200, the CPU plan's classification,
+decision and job list 5,900, the compacted x publication 4,300 and the fence and sequence 2,300. Three changes:
+- `route_column` takes each lane's arg-max as a depth-4 tree over its 16 candidates' keys (NaN and absent experts
+  key 0; ties to the lower index, so the lower id) and each lane computes its own softmax term once, summed in
+  selection order as before: the selections 7,400 -> 3,500 cycles, the same ids and weights (the tie-heavy route
+  oracle, `offloaded_moe_layer`).
+- The warps that route no column publish every x column to the CPU channel at its own index right after the
+  programmatic wait (a 32-column call: every thread, after the routing), and the plan names columns by index: the
+  publication 4,300 -> 400 cycles, the request out ~2.5 µs sooner. Unlike step 1(b)'s helper CTAs (a cluster and
+  its barrier), the copy uses the one CTA's idle warps. Kernel total 23,700 -> 17,300 cycles.
+- `moe_experts_prepare`: a call with an activation encoding (GGUF banks, 8-bit NVFP4 calls, the 122B ring) runs it
+  on the shared-expert stream from the MoE input beside the router and the route; the passes wait on its event. A
+  call without one forks nothing: the empty fork and join alone cost Dense8 MTP decode 1.4 % (243.9 -> 240.3).
+Measured against main `0689e1bb` built the same session (3 runs each, 16K steady state): IQ3_S full layout
+264.1 -> 267.7 tok/s (+1.4 %; 265.5 without the forked encode), Dense8 MTP 3 242.9 -> 243.9 (+0.4 %); 2 runs:
+IQ3_S struct full 463.4 / 461.8 -> 468.6 / 468.1, Dense8 struct full 352.1 / 353.6 -> 354.3 / 354.5. Ids equal.
 
 **Split staging is the default** (the 2026-10-27 window's ABBA, three blocks each): a forked call stages its
 misses' gate/up bytes, then their down rows, computing the gate/up pass on the split stream beside the second

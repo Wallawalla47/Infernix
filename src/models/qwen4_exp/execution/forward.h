@@ -88,7 +88,7 @@ struct ForwardExperts {
     // Decode and verification calls run the shared expert on this stream (forked at the layer's
     // input, joined before the combine) while the routed experts compute. Null: in order.
     cudaStream_t shared_stream = nullptr;
-    std::array<cudaEvent_t, 2> shared_events{};
+    std::array<cudaEvent_t, 4> shared_events{};
     // Decode and verification calls compute their staged misses on this stream while the overlap stream
     // stages their down rows (ops::MoeExpertSource::split_stream). Null: not split.
     cudaStream_t split_stream = nullptr;
