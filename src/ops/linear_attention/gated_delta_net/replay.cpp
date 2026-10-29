@@ -301,7 +301,85 @@ validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayer
     return packed;
 }
 
+// gated_delta_net_replay_record_conv: the geometry comes from the records (Hq = 16, Hv = 48, width 2..16,
+// 1..8 rows); outputs are pairwise disjoint and disjoint from every input.
+void validate_replay_record_conv(const Tensor& qkv, const Tensor& conv_weight, const Tensor& conv_states,
+                                 const Tensor& a, const Tensor& b, const Tensor& a_log, const Tensor& dt_bias,
+                                 float scale, const Tensor& states, const Tensor& initial_slots,
+                                 const Tensor& key_record, const Tensor& value_record, const Tensor& gate_record,
+                                 const Tensor& out) {
+    constexpr const char* kOp      = "gated_delta_net_replay_record_conv";
+    const std::int32_t qk_heads    = key_record.ne[1];
+    const std::int32_t value_heads = value_record.ne[1];
+    const std::int32_t width       = key_record.ne[2];
+    const std::int32_t rows        = key_record.ne[3];
+    if (qk_heads != 16 || value_heads != 48 || width < 2 ||
+        width > detail::gated_delta_net::kRecordConvMaxWidth || rows <= 0 || rows > kMaximumRows) {
+        throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
+    }
+    const std::int32_t channels = kStateDim * (2 * qk_heads + value_heads);
+    require_tensor(qkv, DType::BF16, {channels, width, rows}, 2, kOp, "qkv");
+    require_tensor(conv_weight, DType::BF16, {channels, 4}, 2, kOp, "convolution weight");
+    if (conv_states.ne[2] <= 0) { throw std::invalid_argument(std::string(kOp) + ": empty convolution state pool"); }
+    require_tensor(conv_states, DType::BF16, {channels, 3, conv_states.ne[2]}, 2, kOp, "convolution states");
+    for (const Tensor* t : {&a, &b}) {
+        constexpr std::int64_t element = 2;
+        if (t->data == nullptr || t->dtype != DType::BF16 || t->ne[0] != value_heads || t->ne[1] != width * rows ||
+            t->ne[2] != 1 || t->ne[3] != 1 || t->nb[0] != element ||
+            (t->ne[1] > 1 && (t->nb[1] < value_heads * element || t->nb[1] % element != 0))) {
+            throw std::invalid_argument(std::string(kOp) + ": gating inputs need BF16 [Hv, T] with contiguous, "
+                                                           "non-overlapping columns");
+        }
+    }
+    require_tensor(a_log, DType::FP32, {value_heads}, 4, kOp, "A_log");
+    require_tensor(dt_bias, DType::FP32, {value_heads}, 4, kOp, "dt_bias");
+    if (states.dtype != DType::FP32 && states.dtype != DType::FP16) {
+        throw std::invalid_argument(std::string(kOp) + ": states must be FP32 or FP16");
+    }
+    if (states.ne[3] <= 0) { throw std::invalid_argument(std::string(kOp) + ": state slot count must be positive"); }
+    require_tensor(states, states.dtype, {kStateDim, kStateDim, value_heads, states.ne[3]}, 16, kOp, "states");
+    require_tensor(initial_slots, DType::I32, {rows}, 4, kOp, "initial state slots");
+    require_tensor(key_record, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp, "key record");
+    require_tensor(value_record, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "value record");
+    require_tensor(gate_record, DType::FP32, {2, value_heads, width, rows}, 8, kOp, "gate record");
+    require_tensor(out, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "out");
+    require_scale(scale, kOp);
+
+    const std::array<MemoryRange, 4> outputs{tensor_range(key_record, kOp), tensor_range(value_record, kOp),
+                                             tensor_range(gate_record, kOp), tensor_range(out, kOp)};
+    require_pairwise_disjoint(outputs, "gated_delta_net_replay_record_conv: outputs must not overlap");
+    const auto column_span = [&](const Tensor& t) {
+        return make_range(t.data, static_cast<std::size_t>(t.nb[1]) * (t.ne[1] - 1) + 2 * value_heads, kOp);
+    };
+    const std::array<MemoryRange, 9> inputs{tensor_range(qkv, kOp),     tensor_range(conv_weight, kOp),
+                                            tensor_range(conv_states, kOp), column_span(a),
+                                            column_span(b),             tensor_range(a_log, kOp),
+                                            tensor_range(dt_bias, kOp), tensor_range(states, kOp),
+                                            tensor_range(initial_slots, kOp)};
+    for (const MemoryRange output : outputs) {
+        for (const MemoryRange input : inputs) {
+            if (overlaps(output, input)) {
+                throw std::invalid_argument("gated_delta_net_replay_record_conv: outputs must not overlap inputs");
+            }
+        }
+    }
+}
+
 } // namespace
+
+void gated_delta_net_replay_record_conv(const Tensor& qkv, const Tensor& conv_weight, const Tensor& conv_states,
+                                        const Tensor& a, const Tensor& b, const Tensor& A_log, const Tensor& dt_bias,
+                                        bool a_direct, float scale, const Tensor& ssm_states,
+                                        const Tensor& initial_state_slots, Tensor& key_record, Tensor& value_record,
+                                        Tensor& gate_record, Tensor& out, cudaStream_t stream) {
+    validate_replay_record_conv(qkv, conv_weight, conv_states, a, b, A_log, dt_bias, scale, ssm_states,
+                                initial_state_slots, key_record, value_record, gate_record, out);
+    const detail::gated_delta_net::RecordConvInputs inputs{qkv, conv_weight, conv_states, a, b, A_log, dt_bias,
+                                                           a_direct};
+    detail::gated_delta_net::launch_recurrent_record_conv(inputs, key_record.ne[1], scale, ssm_states,
+                                                          initial_state_slots, key_record, value_record, gate_record,
+                                                          out, stream);
+}
 
 void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,

@@ -236,6 +236,61 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
     });
 }
 
+void launch_recurrent_record_conv(const RecordConvInputs& inputs, std::int32_t qk_heads, float scale,
+                                  const Tensor& ssm_states, const Tensor& initial_state_slots, Tensor& key_record,
+                                  Tensor& value_record, Tensor& gate_record, Tensor& out, cudaStream_t stream) {
+    const std::int32_t value_heads = out.ne[1], width = out.ne[2], rows = out.ne[3];
+    const auto heads               = head_map::of(qk_heads, value_heads);
+    const dim3 grid(static_cast<unsigned>(value_heads), static_cast<unsigned>(rows),
+                    static_cast<unsigned>(kStateDim / kBlockDv));
+    const dim3 block(kWarpSize, kNumWarps, 1);
+    const std::int64_t state_slot_stride = static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
+    // A single column has no stride of its own; its heads are contiguous either way.
+    const auto column_stride = [&](const Tensor& t) {
+        return t.ne[1] == 1 ? std::int64_t{value_heads} : t.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
+    };
+    with_state_type(ssm_states, [&]<class State>() {
+        const RecordConvAccess<State> access{
+            RecordAccess<false, State>{
+                nullptr,
+                nullptr,
+                nullptr,
+                nullptr,
+                nullptr,
+                static_cast<const State*>(ssm_states.data),
+                nullptr,
+                static_cast<const std::int32_t*>(initial_state_slots.data),
+                static_cast<__nv_bfloat16*>(key_record.data),
+                static_cast<__nv_bfloat16*>(value_record.data),
+                reinterpret_cast<uint2*>(gate_record.data),
+                static_cast<__nv_bfloat16*>(out.data),
+                heads,
+                width,
+                state_slot_stride,
+                scale,
+            },
+            static_cast<const __nv_bfloat16*>(inputs.qkv.data),
+            static_cast<const __nv_bfloat16*>(inputs.conv_weight.data),
+            static_cast<const __nv_bfloat16*>(inputs.conv_states.data),
+            static_cast<const __nv_bfloat16*>(inputs.a.data),
+            static_cast<const __nv_bfloat16*>(inputs.b.data),
+            column_stride(inputs.a),
+            column_stride(inputs.b),
+            static_cast<const float*>(inputs.a_log.data),
+            static_cast<const float*>(inputs.dt_bias.data),
+            inputs.qkv.ne[0],
+        };
+        if (inputs.a_direct) {
+            CUDA_CHECK(pdl::launch_consumer({grid, block, 0, stream}, recurrent_record_conv_kernel<true, State>,
+                                            access));
+        } else {
+            CUDA_CHECK(pdl::launch_consumer({grid, block, 0, stream}, recurrent_record_conv_kernel<false, State>,
+                                            access));
+        }
+    });
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void launch_recurrent_tree_record(const Tensor& q, const Tensor& k, const Tensor& v,
                                   const Tensor& g, const Tensor& beta, float scale,
                                   const Tensor& ssm_states, const Tensor& valid_columns,

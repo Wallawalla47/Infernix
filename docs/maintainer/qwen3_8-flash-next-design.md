@@ -11668,6 +11668,41 @@ and sampled state of lanes that never ran. This capture launches nothing, so it 
 A/B (pending): a fresh process per run, the first requests' TTFT and round times, startup time and idle VRAM, and
 reproducible ids on IQ3_S, Dense8 MTP and Dense8 DFlash2 auto.
 
+### 19.3.38 The verification GDN middle in one kernel (2026-10-29; exact, same bits; default)
+
+A verification round's GDN layer ran four kernels between its projections:
+1. `causal_conv1d_silu_from_states_split` into q, k, v;
+2. `gdn_gating(_direct)` into g, beta;
+3. `gated_delta_net_replay_record`;
+4. the gated norm.
+
+The first two were short (1.1 and 4.2 µs of a ~13 µs middle, the recurrence 10.4) and already overlapped by PDL.
+`gated_delta_net_replay_record_conv` evaluates the convolution and the gates inside the record kernel:
+- *Before the PDL wait:* each CTA loads its state tile, the convolution weights and the history of its channels.
+- *After it:* the CTA computes into shared memory its Q/K head's 256 channels, its state tile's 16 value channels and
+  its head's gates over the row's columns, with `causal_conv1d_from_states_kernel`'s and `gdn_gate_values`' arithmetic.
+- *Then* the recurrence runs from shared memory as the record kernel's does.
+- q, k, v, g and beta are never materialized.
+
+Domain: gdn_gating's 16/48 heads, 2-16 columns, 1-8 rows, dense rows. Wider verifications keep the composed
+kernels.
+
+**Test.** `infernix_gated_delta_net_replay_record_conv_test`: output and the three records bit-equal to the composed
+kernels at every width 2-16, rows 1-8, FP32 and FP16 states, both gate forms. Run eagerly and as a captured
+programmatic dependent of the kernel that writes its input, which is poisoned before the replay.
+
+**A/B** (RTX 5090, exclusive layout, `phase1b/ab2.ps1`, two interleaved runs each, one build with a temporary switch).
+
+| Workload | Session 1: fused vs composed (tok/s) | Change | Session 2: fused vs composed (tok/s) | Change |
+|---|---|---|---|---|
+| IQ3_S 16K | 269.1 / 268.7 vs 269.2 / 267.7 | +0.2 % | 268.5 / 269.3 vs 268.9 / 267.3 | +0.3 % |
+| IQ3_S struct | 491.5 / 491.3 vs 488.0 / 487.2 | +0.7 % | 487.8 / 487.3 vs 485.8 / 484.8 | +0.5 % |
+
+- Acceptance per position is identical in every pair.
+- Dense8 with automatic draft lengths is too noisy to read: 138.8-160.6 within an arm.
+- Dense8 with 3 drafts is bimodal at 16K whatever the arm (about 231 or 243 tok/s, set by the startup CPU-tier probe).
+  The pair in the same mode reads 231.5 against 230.5 (+0.4 %).
+
 ---
 
 ## 20. Documentation and authority changes

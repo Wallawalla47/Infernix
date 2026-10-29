@@ -641,11 +641,15 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         }
         project(x, p.control, ab, work_, s);
     }
+    // A verification of at most kGdnReplayConvMaxWidth columns evaluates its convolution and gates inside the
+    // recurrence (gated_delta_net_replay_record_conv, the same bits as the composed kernels below; design §19.3.38).
+    const bool replay_conv = batch.verify != nullptr && batch.width <= ops::kGdnReplayConvMaxWidth && NK == 16 &&
+                             NV == 48 && DK == 128 && DV == 128;
     // Verification and prefill chunks evaluate the gates once for their recurrence; decode evaluates
     // them inside the recurrent update, except a GGUF import's (its third input holds A itself), whose
     // decode takes them from gdn_gating_direct too.
     Tensor gate, beta;
-    if (batch.verify != nullptr || batch.width > 1 || g.a_direct) {
+    if (!replay_conv && (batch.verify != nullptr || batch.width > 1 || g.a_direct)) {
         gate = work_.alloc(DType::FP32, {NV, T});
         beta = work_.alloc(DType::FP32, {NV, T});
         if (g.a_direct) {
@@ -655,14 +659,22 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         }
     }
 
-    if (!fused_conv) {
+    if (!fused_conv && !replay_conv) {
         q = work_.alloc(DType::BF16, {KW, T});
         k = work_.alloc(DType::BF16, {KW, T});
         v = work_.alloc(DType::BF16, {VW, T});
     }
     Tensor o = work_.alloc(DType::BF16, {DV, NV, T});
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(DK)));
-    if (batch.verify != nullptr) {
+    if (replay_conv) {
+        const std::int32_t Wd = batch.width, B = batch.batch;
+        auto layer    = state_.gdn->layer_view(index);
+        Tensor o_rows = o.view({DV, NV, Wd, B});
+        ops::gated_delta_net_replay_record_conv(qkv.view({C, Wd, B}), p.convolution, layer.conv, ab.slice(0, 0, NV),
+                                                ab.slice(0, NV, NV), p.a_log, p.dt_bias, g.a_direct, scale,
+                                                layer.recurrent, batch.slots, records.key, records.value, records.gate,
+                                                o_rows, s);
+    } else if (batch.verify != nullptr) {
         // Speculative verification: the convolution and recurrence run from the live states
         // without changing them, and the recurrence's inputs are recorded for the commit fold.
         const std::int32_t Wd = batch.width, B = batch.batch;

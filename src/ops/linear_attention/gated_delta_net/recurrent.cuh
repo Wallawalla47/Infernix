@@ -492,6 +492,104 @@ struct RecordAccess {
     }
 };
 
+// gated_delta_net_replay_record_conv: the record kernel with its q, k, v and gates evaluated by each CTA into
+// shared memory from the convolution input and the control projection, with the arithmetic of
+// causal_conv1d_from_states_kernel and gdn_gate_values (the same bits as those kernels write).
+template <class State>
+struct RecordConvAccess {
+    RecordAccess<false, State> record; // states, initial slots, records, out (q, k, v, g and beta unused)
+    const __nv_bfloat16* qkv;           // [C, width, rows]: q's channels, then k's, then v's
+    const __nv_bfloat16* conv_weight;   // [C, 4]
+    const __nv_bfloat16* conv_states;   // [C, 3, slots]
+    const __nv_bfloat16* gate_a;
+    const __nv_bfloat16* gate_b;
+    std::int64_t gate_a_ld;
+    std::int64_t gate_b_ld;
+    const float* a_log;
+    const float* dt_bias;
+    std::int32_t conv_channels;
+};
+
+struct RecordConvShared {
+    __nv_bfloat16 query[kRecordConvMaxWidth][kStateDim];
+    __nv_bfloat16 key[kRecordConvMaxWidth][kStateDim];
+    // Only the CTA's state tile's rows are evaluated; the full head width keeps RecordAccess's indexing.
+    __nv_bfloat16 value[kRecordConvMaxWidth][kStateDim];
+    float g[kRecordConvMaxWidth];
+    float beta[kRecordConvMaxWidth];
+};
+
+// run_recurrent_sequence's view of the CTA's evaluated inputs; outputs and records go where RecordAccess puts them.
+template <class State>
+struct RecordConvSharedAccess {
+    const RecordAccess<false, State>& record;
+    const RecordConvShared& shared;
+    float scale;
+
+    __device__ __forceinline__ const __nv_bfloat16* key_ptr(const RecurrentCoordinates&, std::int32_t token) const {
+        return shared.key[token];
+    }
+
+    __device__ __forceinline__ const __nv_bfloat16* value_ptr(const RecurrentCoordinates&,
+                                                              std::int32_t token) const {
+        return shared.value[token];
+    }
+
+    __device__ __forceinline__ RawGatePair load_gate(const RecurrentCoordinates&, std::int32_t token) const {
+        const float g_value = shared.g[token], beta_value = shared.beta[token];
+        return {make_uint2(__float_as_uint(g_value), __float_as_uint(beta_value)), g_value, beta_value};
+    }
+
+    __device__ __forceinline__ const __nv_bfloat16* query_ptr(const RecurrentCoordinates&,
+                                                              std::int32_t token) const {
+        return shared.query[token];
+    }
+
+    __device__ __forceinline__ __nv_bfloat16* output_ptr(const RecurrentCoordinates& coord, std::int32_t token) const {
+        return record.output_ptr(coord, token);
+    }
+
+    __device__ __forceinline__ void store_key(const RecurrentCoordinates& coord, std::int32_t token,
+                                              const RawQkLane& raw) const {
+        record.store_key(coord, token, raw);
+    }
+
+    __device__ __forceinline__ void store_value(const RecurrentCoordinates& coord, std::int32_t token,
+                                                const RawValueLane& raw) const {
+        record.store_value(coord, token, raw);
+    }
+
+    __device__ __forceinline__ void store_gate(const RecurrentCoordinates& coord, std::int32_t token,
+                                               const RawGatePair& raw) const {
+        record.store_gate(coord, token, raw);
+    }
+};
+
+// One channel's taps and history: what causal_conv1d_from_states_kernel holds before its column loop.
+struct ConvChannel {
+    float w0, w1, w2, w3;
+    __nv_bfloat16 s0, s1, s2;
+};
+
+__device__ __forceinline__ ConvChannel load_conv_channel(const __nv_bfloat16* weight, const __nv_bfloat16* history,
+                                                         std::int64_t channels, std::int64_t c) {
+    return {__bfloat162float(weight[c]),           __bfloat162float(weight[channels + c]),
+            __bfloat162float(weight[2 * channels + c]), __bfloat162float(weight[3 * channels + c]),
+            history[c],                            history[channels + c],
+            history[2 * channels + c]};
+}
+
+// causal_conv1d_from_states_kernel's output for one column from its four inputs, oldest first.
+__device__ __forceinline__ __nv_bfloat16 conv_column(const ConvChannel& ch, __nv_bfloat16 s0, __nv_bfloat16 s1,
+                                                     __nv_bfloat16 s2, __nv_bfloat16 x0) {
+    float acc = 0.0f;
+    acc += ch.w0 * __bfloat162float(s0);
+    acc += ch.w1 * __bfloat162float(s1);
+    acc += ch.w2 * __bfloat162float(s2);
+    acc += ch.w3 * __bfloat162float(x0);
+    return __float2bfloat16_rn(silu(acc));
+}
+
 template <int Layers, int QkHeads, int ValueHeads, int ConvChannels>
 struct FoldGeometry {
     static constexpr int kLayers       = Layers;
@@ -757,6 +855,81 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     const std::int32_t valid = access.active_columns(coord);
     run_recurrent_sequence<true, RecordEffects>(state, access, coord, valid);
     zero_output_suffix(access, coord, valid, access.width);
+}
+
+// gated_delta_net_replay_record_conv. Thread i evaluates channel i of the CTA's q and k heads over the row's
+// columns, value channel i mod 16 of its state tile at every eighth column from i / 16, and the last warp one
+// column's gates per lane; the recurrence then runs from shared memory as recurrent_record_kernel's.
+template <bool ADirect, class State>
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+    recurrent_record_conv_kernel(const __grid_constant__ RecordConvAccess<State> access) {
+    __shared__ __align__(16) RecordConvShared shared;
+    const RecordAccess<false, State>& record = access.record;
+    const RecurrentCoordinates coord         = record.coordinates();
+    const std::int32_t width                 = record.width;
+    const int thread                         = coord.warp * kWarpSize + coord.lane;
+    const std::int64_t C                     = access.conv_channels;
+    const std::int64_t key_channels          = static_cast<std::int64_t>(record.heads.H_qk) * kStateDim;
+    const std::int64_t qc = static_cast<std::int64_t>(coord.qk_head) * kStateDim + thread;
+    const std::int64_t kc = key_channels + qc;
+    const int value_row   = coord.state_tile * kBlockDv + thread % kBlockDv;
+    const std::int64_t vc = 2 * key_channels + static_cast<std::int64_t>(coord.value_head) * kStateDim + value_row;
+    __align__(16) float state[kDvPerWarp][kQkPerLane];
+    // As in recurrent_record_kernel; the convolution history likewise was last written by the preceding fold.
+    load_state_tile(state, record.state_read_base(coord), coord);
+    const __nv_bfloat16* history =
+        access.conv_states + static_cast<std::int64_t>(record.initial_slots[coord.batch]) * 3 * C;
+    const ConvChannel qch = load_conv_channel(access.conv_weight, history, C, qc);
+    const ConvChannel kch = load_conv_channel(access.conv_weight, history, C, kc);
+    const ConvChannel vch = load_conv_channel(access.conv_weight, history, C, vc);
+    pdl::enter_streaming();
+
+    const __nv_bfloat16* x = access.qkv + static_cast<std::int64_t>(coord.batch) * width * C;
+    __nv_bfloat16 xq[kRecordConvMaxWidth], xk[kRecordConvMaxWidth];
+#pragma unroll
+    for (int t = 0; t < kRecordConvMaxWidth; ++t) {
+        if (t < width) {
+            xq[t] = x[t * C + qc];
+            xk[t] = x[t * C + kc];
+        }
+    }
+    __nv_bfloat16 q0 = qch.s0, q1 = qch.s1, q2 = qch.s2, k0 = kch.s0, k1 = kch.s1, k2 = kch.s2;
+#pragma unroll
+    for (int t = 0; t < kRecordConvMaxWidth; ++t) {
+        if (t < width) {
+            shared.query[t][thread] = conv_column(qch, q0, q1, q2, xq[t]);
+            shared.key[t][thread]   = conv_column(kch, k0, k1, k2, xk[t]);
+            q0 = q1;
+            q1 = q2;
+            q2 = xq[t];
+            k0 = k1;
+            k1 = k2;
+            k2 = xk[t];
+        }
+    }
+    for (std::int32_t column = thread / kBlockDv; column < width; column += kStateDim / kBlockDv) {
+        __nv_bfloat16 in[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const std::int32_t source = column - 3 + j;
+            in[j] = source >= 0   ? x[source * C + vc]
+                    : source == -3 ? vch.s0
+                    : source == -2 ? vch.s1
+                                   : vch.s2;
+        }
+        shared.value[column][value_row] = conv_column(vch, in[0], in[1], in[2], in[3]);
+    }
+    const int gate_column = thread - (kNumWarps - 1) * kWarpSize;
+    if (gate_column >= 0 && gate_column < width) {
+        const std::int64_t column = record.column(coord, gate_column);
+        const int h               = static_cast<int>(coord.value_head);
+        gdn_gate_values<ADirect>(access.gate_a[column * access.gate_a_ld + h],
+                                 access.gate_b[column * access.gate_b_ld + h], access.a_log[h], access.dt_bias[h],
+                                 shared.g[gate_column], shared.beta[gate_column]);
+    }
+    __syncthreads();
+    const RecordConvSharedAccess<State> inputs{record, shared, record.scale};
+    run_recurrent_sequence<true, RecordEffects>(state, inputs, coord, width);
 }
 
 // One step of a verification-tree walk: the column it computes, where its starting state comes

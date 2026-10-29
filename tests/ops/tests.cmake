@@ -317,6 +317,10 @@ infernix_add_family_op_test(infernix_gated_delta_net_replay_record_test FAMILY r
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gated_delta_net_replay_record.cpp"
   LIBRARIES infernix_ops)
 
+infernix_add_family_op_test(infernix_gated_delta_net_replay_record_conv_test FAMILY recurrent
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gated_delta_net_replay_record_conv.cpp"
+  LIBRARIES infernix_ops)
+
 infernix_add_family_op_test(infernix_gdn_replay_fold_test FAMILY recurrent
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_replay_fold.cpp"
   LIBRARIES infernix_ops)

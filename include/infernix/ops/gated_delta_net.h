@@ -132,6 +132,27 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
                                    cudaStream_t stream);
 
+// The widest call gated_delta_net_replay_record_conv takes.
+inline constexpr std::int32_t kGdnReplayConvMaxWidth = 16;
+
+/**
+ * gated_delta_net_replay_record with its inputs' causal convolution and gates evaluated inside the same kernel:
+ * bit for bit the composition causal_conv1d_silu_from_states_split (q, k and v from qkv's [q | k | v] channels and
+ * conv_states' slot initial_state_slots[b], read only), gdn_gating (gdn_gating_direct when a_direct) and
+ * gated_delta_net_replay_record over dense rows, without materializing q, k, v, g or beta.
+ *
+ * qkv is BF16 [C, T, B] with C = 2 * 128 Hq + 128 Hv (causal_conv1d's x), conv_weight BF16 [C, 4] and
+ * conv_states BF16 [C, 3, S] (causal_conv1d's), all contiguous; a and b BF16 [Hv, T B] whose columns are
+ * contiguous at any element stride of at least Hv (row slices of one control projection qualify); A_log (A itself
+ * when a_direct) and dt_bias FP32 [Hv]. The rest as gated_delta_net_replay_record with no valid_columns. Domain:
+ * gdn_gating's Hq = 16 and Hv = 48 (C = 10240), T in [2, kGdnReplayConvMaxWidth], B in [1, 8].
+ */
+void gated_delta_net_replay_record_conv(const Tensor& qkv, const Tensor& conv_weight, const Tensor& conv_states,
+                                        const Tensor& a, const Tensor& b, const Tensor& A_log, const Tensor& dt_bias,
+                                        bool a_direct, float scale, const Tensor& ssm_states,
+                                        const Tensor& initial_state_slots, Tensor& key_record, Tensor& value_record,
+                                        Tensor& gate_record, Tensor& out, cudaStream_t stream);
+
 // How the tree form of gated_delta_net_replay_record computes its outputs.
 enum class GdnTreeRecordRoute : std::uint8_t {
     // Each column's root path replayed as a chain: bit-identical to the chain Op.
