@@ -22,6 +22,7 @@
 #include "ops/ggml/ggml_dp4a.cuh"
 #include "ops/ggml/ggml_exact.h"
 #include "ops/ggml/ggml_bf16_tile.cuh"
+#include "ops/ggml/ggml_narrow_mma.cuh"
 #include "ops/ggml/ggml_tile.cuh"
 #include "ops/fp8_block/fp8_exact.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
@@ -2902,7 +2903,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     if (ggml && a8_call(source, static_cast<int>(x.ne[1]))) {
         launch_encode_x_ggml_a8(x, layout, stream);
     } else if (ggml) {
-        launch_encode_x_ggml(x, layout, stream);
+        launch_encode_x_ggml(x, static_cast<int>(max_jobs), layout, stream);
         if (x.ne[1] > moe::kMaxColumns) { launch_plan_ggml(dispatch, max_jobs, layout, stream); }
     } else if (nvfp4_a8 || nvfp4_a8_wide) {
         launch_encode_x_nvfp4_a8(x, source, layout, stream); // likewise, every token's codes once per call

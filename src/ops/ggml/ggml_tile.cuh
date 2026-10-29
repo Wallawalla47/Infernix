@@ -312,8 +312,25 @@ struct TileChunk {
     std::uint16_t dmin;
 };
 
-template <QType F, class Codebook = fast::DeviceCodebook<F>>
+// A2: the block starts at an even address (every block of the formats here is an even number of bytes, so a
+// copy that keeps the rows' alignment modulo 2 keeps every multi-byte field 2-byte aligned): 16-bit loads, not
+// bytes (the dense tiled narrow route: 100 byte loads and ~300 assembling IMADs a unit of Q6_K, 2026-10-29).
+template <QType F, class Codebook = fast::DeviceCodebook<F>, bool A2 = false>
 __device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part, const Codebook& cb = Codebook{}) {
+    const auto ld16 = [](const std::uint8_t* p) -> std::uint32_t {
+        if constexpr (A2) {
+            return *reinterpret_cast<const std::uint16_t*>(p);
+        } else {
+            return u16_at(p);
+        }
+    };
+    const auto ld32 = [&](const std::uint8_t* p) -> std::uint32_t {
+        if constexpr (A2) {
+            return ld16(p) | (ld16(p + 2) << 16);
+        } else {
+            return u32_at(p);
+        }
+    };
     TileChunk o{};
     o.sub = 1;
     if constexpr (F == QType::GGML_IQ3_S) {
@@ -325,7 +342,7 @@ __device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part,
         o.w[0] = fast::apply_signs4(cb.grid32(i1), sign & 0xFU);
         o.w[1] = fast::apply_signs4(cb.grid32(i2), sign >> 4);
         o.sub  = 2 * ((b[106 + sb / 2] >> (4 * (sb % 2))) & 0xF) + 1;
-        o.d    = u16_at(b);
+        o.d    = ld16(b);
     } else if constexpr (F == QType::GGML_IQ2_S) {
         const int ib = part / 4, l = part % 4;
         const int index = b[2 + 4 * ib + l] | ((b[66 + ib] << (8 - 2 * l)) & 0x300);
@@ -334,15 +351,15 @@ __device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part,
         o.w[0] = fast::apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
         o.w[1] = fast::apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
         o.sub  = 2 * ((b[74 + ib] >> (4 * (l / 2))) & 0xF) + 1;
-        o.d    = u16_at(b);
+        o.d    = ld16(b);
     } else if constexpr (F == QType::GGML_IQ3_XXS) {
         const int ib = part / 4, l = part % 4;
-        const std::uint32_t aux = u32_at(b + 66 + 4 * ib);
+        const std::uint32_t aux = ld32(b + 66 + 4 * ib);
         const unsigned sign = cb.sign((aux >> (7 * l)) & 127);
         o.w[0] = fast::apply_signs4(cb.grid32(b[2 + 8 * ib + 2 * l]), sign & 0xFU);
         o.w[1] = fast::apply_signs4(cb.grid32(b[3 + 8 * ib + 2 * l]), sign >> 4);
         o.sub  = 2 * static_cast<int>(aux >> 28) + 1;
-        o.d    = u16_at(b);
+        o.d    = ld16(b);
     } else if constexpr (F == QType::GGML_Q2_0) {
         // Four 2-bit codes per byte (element 4i + k at bits 2k), each minus 1.
 #pragma unroll
@@ -351,17 +368,17 @@ __device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part,
             const std::uint32_t e = (v & 3U) | (((v >> 2) & 3U) << 8) | (((v >> 4) & 3U) << 16) | (((v >> 6) & 3U) << 24);
             o.w[h] = fast::sub_bytes4(e, 0x01010101U);
         }
-        o.d = u16_at(b);
+        o.d = ld16(b);
     } else if constexpr (F == QType::GGML_IQ4_NL || F == QType::GGML_IQ4_XS) {
         // Elements 0-15 of a 32-element group are the low nibbles of its 16 bytes, 16-31 the high.
         const int group = F == QType::GGML_IQ4_NL ? 0 : part / 4, p = part % 4;
         const std::uint8_t* qs = b + (F == QType::GGML_IQ4_NL ? 2 : 8 + 16 * group) + 8 * (p & 1);
-        const int2 v0 = fast::iq4nl_values(u32_at(qs)), v1 = fast::iq4nl_values(u32_at(qs + 4));
+        const int2 v0 = fast::iq4nl_values(ld32(qs)), v1 = fast::iq4nl_values(ld32(qs + 4));
         o.w[0] = p >= 2 ? v0.y : v0.x;
         o.w[1] = p >= 2 ? v1.y : v1.x;
-        o.d    = u16_at(b);
+        o.d    = ld16(b);
         if constexpr (F == QType::GGML_IQ4_XS) {
-            o.sub = (((b[4 + group / 2] >> (4 * (group % 2))) & 0xF) | (((u16_at(b + 2) >> (2 * group)) & 3) << 4)) - 32;
+            o.sub = (((b[4 + group / 2] >> (4 * (group % 2))) & 0xF) | (((ld16(b + 2) >> (2 * group)) & 3) << 4)) - 32;
         }
     } else if constexpr (F == QType::GGML_Q4_K || F == QType::GGML_Q5_K) {
         const int e = 8 * part, ch = e / 64, l = e % 64, sb = 2 * ch + (l >= 32 ? 1 : 0), li = l % 32;
@@ -369,13 +386,13 @@ __device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part,
         const std::uint8_t* qs = b + (F == QType::GGML_Q4_K ? 16 : 48) + 32 * ch + li;
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            std::uint32_t v = (u32_at(qs + 4 * h) >> shift) & 0x0F0F0F0FU;
-            if constexpr (F == QType::GGML_Q5_K) { v |= ((u32_at(b + 16 + li + 4 * h) >> sb) & 0x01010101U) << 4; }
+            std::uint32_t v = (ld32(qs + 4 * h) >> shift) & 0x0F0F0F0FU;
+            if constexpr (F == QType::GGML_Q5_K) { v |= ((ld32(b + 16 + li + 4 * h) >> sb) & 0x01010101U) << 4; }
             o.w[h] = static_cast<int>(v);
         }
         scale_min_k4(sb, b + 4, o.sub, o.min_sub);
-        o.d    = u16_at(b);
-        o.dmin = u16_at(b + 2);
+        o.d    = ld16(b);
+        o.dmin = ld16(b + 2);
     } else if constexpr (F == QType::GGML_Q6_K) {
         const int e = 8 * part, half = e / 128, r = e % 128, quarter = r / 32, l = r % 32;
         const std::uint8_t* ql = b + 64 * half + (quarter & 1) * 32 + l;
@@ -383,12 +400,12 @@ __device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part,
         const int lshift = quarter >= 2 ? 4 : 0, hshift = 2 * quarter;
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const std::uint32_t lo = (u32_at(ql + 4 * h) >> lshift) & 0x0F0F0F0FU;
-            const std::uint32_t hi = ((u32_at(qh + 4 * h) >> hshift) & 0x03030303U) << 4;
+            const std::uint32_t lo = (ld32(ql + 4 * h) >> lshift) & 0x0F0F0F0FU;
+            const std::uint32_t hi = ((ld32(qh + 4 * h) >> hshift) & 0x03030303U) << 4;
             o.w[h] = fast::sub_bytes4(lo | hi, 0x20202020U);
         }
         o.sub = static_cast<std::int8_t>(b[192 + 8 * half + l / 16 + 2 * quarter]);
-        o.d   = u16_at(b + 208);
+        o.d   = ld16(b + 208);
     } else {
         static_assert(F == QType::GGML_IQ3_S, "tile_chunk: no decoder for this format");
     }

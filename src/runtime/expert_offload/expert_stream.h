@@ -64,7 +64,9 @@ public:
         std::function<std::int32_t(std::uint32_t layer, std::uint32_t expert)> read; // a slot, or -1: none free
         std::function<const std::uint8_t*(std::int32_t slot)> wait;                  // the landed record, or null
         std::function<void(std::int32_t slot)> release;
-        std::function<std::uint32_t()> slots; // the stream slots now (a span's begin plans with them)
+        // The reads one layer may hold now (a span's begin plans with it): the lent slots of the layer's
+        // record size shared by the kReadAhead + 2 layers that hold reads at once (HostExpertTier::stream_layer_cap).
+        std::function<std::uint32_t()> layer_cap;
     };
     // Layers between a stream read's request and its copy.
     static constexpr std::uint32_t kReadAhead = 2;

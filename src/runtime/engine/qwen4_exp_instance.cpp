@@ -299,19 +299,32 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                 ? (estimate.kv_max - estimate.kv + estimate.expert_frame_bytes - 1) / estimate.expert_frame_bytes
                 : 0;
         const std::uint64_t reserve = frames * 5 / 16 + kv_frames;
-        // RAM slots are the largest record's size (expert_record_stride): the cap counts slots, not bank bytes, and
-        // the tier's lists (ring, prefetch, demotion) hold no expert.
-        const std::uint64_t slots =
-            (keys > frames - std::min(frames, reserve) ? keys - (frames - std::min(frames, reserve)) : 0) +
-            estimate.expert_tier_list_slots;
+        // The tier pools its slots by record size, each layer the same share (HostExpertTier), so the experts' slots
+        // cost the layers' mean record (the average frame) and only the lists (ring, prefetch, demotion), which hold
+        // no expert, cost the largest record each. A layer walk's span lends the prefill stream its slots (free ones
+        // first): without room for them a span evicted that many RAM-only experts, which came back from the SSD
+        // (2026-10-28, IQ3_S at 16K: 2,563 stream reads and 833 decode reads a request; 0.89x of the full layout).
+        // The reserve is counted twice: until decode fills the frames the warm start left unseeded, their experts take
+        // RAM slots as RAM-only residents, while the shadows a prefill's loan needs take the reserve again. With it
+        // once, a cold 16K request lost ~1,000 experts to the SSD and decoded 237 tok/s; twice, 0 and 247 (0.5x: 4 and
+        // 246; the full layout 254; 2026-10-28, IQ3_S).
+        const std::uint64_t experts_slots =
+            (keys > frames - std::min(frames, reserve) ? keys - (frames - std::min(frames, reserve)) : 0) + reserve +
+            estimate.expert_tier_stream_slots;
+        const std::uint64_t bytes = experts_slots * estimate.expert_frame_bytes +
+                                    estimate.expert_tier_list_slots * estimate.expert_record_stride;
         // Plus 2 % for the lock overhead the tier takes off its pinned bytes (IQ3_S: 15,255 of 15,468 planned slots
         // pinned, leaving 217 experts SSD-only at the warm start).
-        const std::uint64_t cap = slots * estimate.expert_record_stride + slots * estimate.expert_record_stride / 50;
+        const std::uint64_t cap = bytes + bytes / 50;
         if (frames > reserve && cap + expert_offload::kLedgerGiB < demand.expert_banks) {
             demand.expert_cap = cap;
             exclusive         = !expert_offload::plan_host_memory(snapshot, demand).cap_too_large;
             if (exclusive) {
-                program_options.expert_seed_share    = 1.0 - static_cast<double>(reserve) / static_cast<double>(frames);
+                // Seeding every frame measured slower (IQ3_S 16K decode 223 against 235 tok/s, struct 349 against 361:
+                // no free frames left for the fill phase's landings), so the reserve stays unseeded.
+                const double reserve_share          = static_cast<double>(reserve) / static_cast<double>(frames);
+                program_options.expert_seed_share   = 1.0 - reserve_share;
+                program_options.expert_shadow_share = reserve_share;
                 program_options.expert_ram_exclusive = true;
             } else {
                 demand.expert_cap.reset(); // a machine too small for it: the ledger's own share (the SSD tier)

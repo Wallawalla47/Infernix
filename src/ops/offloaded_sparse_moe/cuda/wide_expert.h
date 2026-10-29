@@ -223,7 +223,10 @@ struct ExpertsWorkspace {
                                   // A8 codes on the 8-bit route (a8_x_rows)
     std::uint8_t* h_rows;         // [entries][a16_h_row_bytes(shape)]: BF16 h, rewritten as limbs for wide entries
     std::int32_t* x_emax;         // [columns]: column exponent of each token's x
-    std::int32_t* h_emax;         // [entries]: column exponent of each wide entry's h
+    std::int32_t* h_emax;         // [entries]: column exponent of each wide entry's h (and each narrow entry's on
+                                  // a GGUF bank's tensor-core route)
+    std::uint32_t* job_ctas;      // [max_jobs]: a GGUF bank's narrow gate/up CTAs finished per job (the last one
+                                  // encodes the job's h); cleared by the call's x encoder
     // W4A16, A4 residual (h_rows holds the BF16 h; x_emax and h_emax serve a ring call's narrow experts)
     std::uint8_t* x_terms_plane;  // [entries][x_terms_row_bytes(shape, x terms)]; the 8-bit route's A8 codes (a8_x_rows)
     float* x_row_scale;           // [columns]

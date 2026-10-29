@@ -22,7 +22,7 @@ ExpertStream::ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uin
     if (experts_ == 0 || layers_ == 0 || stride_ == 0 || stride_ % 16 != 0 || !record_of_) {
         throw std::invalid_argument("expert stream: empty geometry or unaligned records");
     }
-    if (ssd_.slots && (!ssd_.read || !ssd_.wait || !ssd_.release)) {
+    if (ssd_.layer_cap && (!ssd_.read || !ssd_.wait || !ssd_.release)) {
         throw std::invalid_argument("expert stream: stream slots without their reads");
     }
     ssd_planned_.resize(layers_);
@@ -120,8 +120,8 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
     }
     auto* tables = static_cast<std::int32_t*>(tables_host_.data());
     // Stream slots are held from a layer's read request to its copy's landing: about kReadAhead + 2
-    // layers' worth at once, so each layer takes at most that share.
-    const std::uint32_t ssd_cap = ssd && ssd_.slots ? ssd_.slots() / (kReadAhead + 2) : 0;
+    // layers' worth at once, so each layer takes at most that share of its record size's slots.
+    const std::uint32_t ssd_cap = ssd && ssd_.layer_cap ? ssd_.layer_cap() : 0;
     for (std::uint32_t l = 0; l < layers_; ++l) {
         std::int32_t* row = tables + static_cast<std::size_t>(l) * experts_;
         const std::int32_t* frames = residency + static_cast<std::size_t>(l) * experts_;

@@ -773,13 +773,15 @@ public:
         // to 80 experts, and 80 slots ran MTP 4 + n-gram 7 on the IQ3_S import at 204.0 tok/s
         // against 190.3 with 64 (+7.2 %, 3 runs, 2026-10-16). With the tier the larger staging and
         // its ring took RAM and frames from the cache: the FP8 import with n-gram 7 ran 48.6-49.8
-        // against 51.2 with 64 (SSD reads 59.0 against 35.2 GiB), so it keeps 64.
+        // against 51.2 with 64 (SSD reads 59.0 against 35.2 GiB), so a tier short of RAM keeps 64. The
+        // exclusive layout's tier holds every expert VRAM does not, and with 64 slots its eight-column
+        // verification calls lost the fork: IQ3_S struct decode 363.7 -> 419.4 tok/s with 80 (2026-10-28).
         // INFERNIX_TMP_STAGING_SLOTS fixes the count (a temporary A/B: n-gram 15 asks for 160 slots).
         const std::int32_t fixed_slots = temporary_switches::offload().staging_slots;
-        d.staging_slots = fixed_slots > 0             ? fixed_slots
-                          : o.expert_ram_bytes != 0 ? kStagingSlots
-                                                    : std::clamp(static_cast<std::int32_t>(c.moe.top_k) * d.max_width,
-                                                                 kStagingSlots, kMaxStagingSlots);
+        d.staging_slots = fixed_slots > 0                                     ? fixed_slots
+                          : o.expert_ram_bytes != 0 && !o.expert_ram_exclusive ? kStagingSlots
+                                                                               : std::clamp(static_cast<std::int32_t>(c.moe.top_k) * d.max_width,
+                                                                                            kStagingSlots, kMaxStagingSlots);
         d.staging       = static_cast<std::size_t>(d.staging_slots) * d.record_stride;
 
         auto& b     = d.bytes;
@@ -802,6 +804,7 @@ public:
         b.expert_record_stride = d.record_stride;
         b.expert_tier_list_slots =
             tier_ring_slots(o, d.staging_slots) + HostExpertTier::Options{}.prefetch + HostExpertTier::Options{}.demotion;
+        b.expert_tier_stream_slots = o.prefill_stream && o.expert_cache ? kStreamReadSlots : 0;
         b.expert_frame_bytes   = d.frame_bytes;
         b.max_frames           = ExpertResidency::max_frames(expert_layout(c));
         b.graph_bound          = graph_bound(o.max_concurrency, static_cast<std::uint32_t>(W),
@@ -1155,20 +1158,26 @@ public:
         if (const std::uint64_t spilled = guard.end(allocated); spilled != 0) {
             throw std::runtime_error(spill_message(spilled));
         }
-        // The staging and shared-expert streams at the default priority: the greatest, with node priorities in
-        // the graphs (candidates §11 D5), measured 0.999x (removed 2026-10-28).
-        CUDA_CHECK(cudaStreamCreateWithFlags(&overlap_.stream, cudaStreamNonBlocking));
+        // The staging, shared-expert and split streams at the device's greatest priority (the decode graphs keep
+        // it as node priorities, core/decode_graph.cpp), so their short kernels take an SM as the routed experts'
+        // CTAs retire: the tensor-core gate/up holds ~90 % of an SM's registers and shared memory, and the shared
+        // expert's SwiGLU waited ~30 us a layer for an SM. IQ3_S full layout, 2 runs each (2026-10-29): 16K
+        // 263.6 -> 265.3 tok/s, struct 456.5 -> 463.3; the shared stream alone 265.8 / 455.4. (With the dp4a
+        // kernels' smaller CTAs this measured 0.999x and was removed on 2026-10-28.)
+        int least_priority = 0, side_priority = 0;
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_priority, &side_priority));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&overlap_.stream, cudaStreamNonBlocking, side_priority));
         for (auto& event : overlap_.events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
         experts.overlap_stream = overlap_.stream;
         experts.overlap_events = overlap_.events;
-        CUDA_CHECK(cudaStreamCreateWithFlags(&overlap_.shared_stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&overlap_.shared_stream, cudaStreamNonBlocking, side_priority));
         for (auto& event : overlap_.shared_events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
         experts.shared_stream = overlap_.shared_stream;
         experts.shared_events = overlap_.shared_events;
         // The stream on which a forked call's staged misses compute (their down rows stage beside the gate/up pass;
         // Dense8 MTP decode +6.7 / +1.3 / +10.3 %, Ornith +1.6 / +8.0 / +4.6 %, IQ3_S within spread, 2026-10-27).
         {
-            CUDA_CHECK(cudaStreamCreateWithFlags(&overlap_.split_stream, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaStreamCreateWithPriority(&overlap_.split_stream, cudaStreamNonBlocking, side_priority));
             for (auto& event : overlap_.split_events) {
                 CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
             }
@@ -1191,8 +1200,8 @@ public:
                     throw std::logic_error("Qwen4Exp: the expert store's records differ from the banks' strides");
                 }
             }
-            // Slots of the largest record (a GGUF import's layers differ); a VRAM victim's demotion
-            // copies a whole frame (that pitch) into one.
+            // Slots pooled by record size (a GGUF import's layers differ; HostExpertTier): a VRAM victim's
+            // demotion copies its frame (its layer's pitch) into a slot of that size.
             HostExpertTier::Options tier;
             tier.ring = tier_ring_slots(options_, plan_.staging_slots);
             const std::uint32_t lists = tier.ring + tier.prefetch + tier.demotion;
@@ -1209,10 +1218,19 @@ public:
                     kStreamBounceMin, kStreamBounceMax);
                 tier.stream_bounce = ExpertStream::kBounceParts * per_part;
             }
-            tier.slots    = static_cast<std::uint32_t>(std::min<std::uint64_t>(options_.expert_ram_bytes / record_stride, keys + lists));
+            tier.slots    = HostExpertTier::slots_for_bytes(*store, options_.expert_ram_bytes, tier);
             // The prefill stream's reads of SSD-only experts (one per layer walk span instead of one
             // per call) borrow RAM slots for the span (the lowest-ranked residents leave RAM).
             if (options_.prefill_stream && options_.expert_cache) { tier.stream = std::min(kStreamReadSlots, tier.slots / 8); }
+            // The exclusive layout keeps RAM copies of as many VRAM experts as the RAM plan's reserve for a prefill's
+            // loan and the KV growth (a loan takes shadowed experts first): without a floor the
+            // shadows were RAM's first victims, a loan found 804 of its ~3,250 and the experts it evicted without a copy
+            // came back from the SSD (2026-10-28, IQ3_S at 16K).
+            if (options_.expert_ram_exclusive && options_.expert_cache) {
+                const std::uint64_t frames = size_expert_frames(vram_->query(), expert_frame_demand(record_stride)).frames;
+                tier.shadow_floor =
+                    static_cast<std::uint32_t>(std::llround(static_cast<double>(frames) * options_.expert_shadow_share));
+            }
             const std::uint32_t reserved =
                 options_.expert_unpinned_bytes >= record_stride ? lists + tier.bounce + tier.stream_bounce : lists;
             tier.unpinned = static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -1300,7 +1318,7 @@ public:
                 };
                 ssd.wait    = [tier = tier_.get()](std::int32_t slot) { return tier->stream_wait(slot); };
                 ssd.release = [tier = tier_.get()](std::int32_t slot) { tier->stream_release(slot); };
-                ssd.slots   = [tier = tier_.get()] { return tier->stream_slots(); };
+                ssd.layer_cap = [tier = tier_.get()] { return tier->stream_layer_cap(); };
             }
             expert_stream_ = std::make_unique<ExpertStream>(c_.num_hidden_layers, c_.moe.experts, record_stride,
                                                                        std::move(record_of), !tier_, std::move(hold),
@@ -3184,7 +3202,7 @@ private:
             fill.seconds + std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         const std::uint32_t keys = tier_->keys(), in_ram = fill.filled - released + refilled;
         const std::uint32_t slots = tier_->pinned_slots();
-        const double gib          = static_cast<double>(tier_->record_bytes()) / (1ULL << 30); // a slot: the largest record
+        const double gib          = static_cast<double>(tier_->record_bytes()) / (1ULL << 30); // an unpinned record: the largest
         char split[160] = "";
         if (tier_->unpinned_records() > 0) {
             std::snprintf(split, sizeof(split), " and %u unpinned records (%.1f GiB, served by the CPU) hold %u more",
@@ -3198,7 +3216,7 @@ private:
         std::snprintf(line, sizeof(line),
                       "SSD expert tier: %u RAM slots (%.1f GiB) hold %u experts (%s)%s%s%s, read in %.1f s; %u of %u "
                       "experts are read from the artifact when used",
-                      slots, gib * slots, in_ram,
+                      slots, static_cast<double>(tier_->pinned_bytes()) / (1ULL << 30), in_ram,
                       fill.source == SeedSource::Saved        ? "the saved ranking, then the last session's use counts"
                       : fill.source == SeedSource::Calibrated ? "the calibrated expert order"
                                                               : "spread across the layers",
@@ -6259,7 +6277,9 @@ private:
     // plain one-row rounds. Measured on the 5090 with the NVFP4 Dense8 import, greedy code, INT8 KV
     // (2026-10-20): fixed lengths 2-7 took 14.2-27.7 ms rounds against 8.4 ms plain ones, about 2.6 ms
     // a draft and 0.6-1 ms of proposal. The online fit (width_cost) chose shorter lengths and was
-    // 6 % slower, so the priors stand.
+    // 6 % slower, so the priors stand. Re-checked on the GSQ-RCO IQ3_S import with the tensor-core expert
+    // kernels (2026-10-29, full layout, 2 runs each): 16K steady state 252.3 / 260.4 / 249.5 tok/s at costs
+    // 0.15 / 0.31 / 0.5 (2.61 drafts, 2.01 accepted a round at 0.31), the struct fixture flat within its noise.
     static constexpr double kDFlashDraftCost    = 0.31;
     static constexpr double kDFlashProposalCost = 0.1;
     // The online draft cost (width_cost): sample decay (about 50 rounds), the rounds and the share of

@@ -315,6 +315,7 @@ struct ProgramDevicePlan {
     std::uint64_t residency = 0; // the expert frame tables and route log
     std::uint64_t expert_record_stride = 0; // the largest expert record (staging and stream-ring slots)
     std::uint32_t expert_tier_list_slots = 0; // the SSD tier's slots that hold no expert (ring, prefetch, demotion)
+    std::uint32_t expert_tier_stream_slots = 0; // the slots a layer walk's span lends its prefill stream
     std::uint64_t expert_frame_bytes   = 0; // one average expert frame (the cache's sizing unit)
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
     std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate
@@ -387,6 +388,9 @@ struct ProgramOptions {
     // The exclusive RAM layout's tier (EngineOptions::expert_ram_layout, when the plan chose it): a loan's returned
     // frames stay free for decode's landings (ExpertResidency::give_back).
     bool expert_ram_exclusive = false;
+    // The exclusive layout's share of the frames whose experts RAM keeps shadow copies of for a prefill's loan and the
+    // KV growth (the SSD tier's shadow floor).
+    double expert_shadow_share = 0.0;
     // Pinned allocations the Program makes after the tier (the prefix cache's Host tier and an
     // allowance): when the OS refuses a slot chunk, the tier leaves this much below the limit.
     std::uint64_t later_pinned_bytes = 0;

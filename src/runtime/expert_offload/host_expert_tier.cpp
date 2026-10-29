@@ -8,6 +8,8 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <functional>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -91,7 +93,8 @@ void place_on_slow_cores() noexcept {
 } // namespace
 
 HostExpertTier::Pinned::Pinned(Pinned&& other) noexcept
-    : chunks(std::move(other.chunks)), slots(other.slots), refused(other.refused), release(std::move(other.release)) {
+    : chunks(std::move(other.chunks)), regions(std::move(other.regions)), slots(other.slots), refused(other.refused),
+      bytes(other.bytes), release(std::move(other.release)) {
     other.chunks.clear();
 }
 
@@ -114,49 +117,177 @@ HostExpertTier::Options HostExpertTier::normalized(Options options) {
     return options;
 }
 
-HostExpertTier::Pinned HostExpertTier::pin_slots(const ExpertStore& store, const Options& options) {
+namespace {
+
+// The layers' record sizes, largest first (a class per size).
+std::vector<std::uint64_t> class_pitches(const ExpertStore& store) {
+    std::vector<std::uint64_t> pitches;
+    for (std::uint32_t l = 0; l < store.layers(); ++l) { pitches.push_back(store.record_bytes(l)); }
+    std::sort(pitches.begin(), pitches.end(), std::greater<>());
+    pitches.erase(std::unique(pitches.begin(), pitches.end()), pitches.end());
+    return pitches;
+}
+
+// A class's demotion list: its layers' share of Options::demotion, at least one slot.
+std::uint32_t class_demotion(std::uint32_t demotion, std::uint32_t class_layers, std::uint32_t layers) {
+    return std::max<std::uint32_t>(1, (demotion * class_layers + layers - 1) / layers);
+}
+
+} // namespace
+
+std::uint32_t HostExpertTier::slots_for_bytes(const ExpertStore& store, std::uint64_t bytes, const Options& raw) {
+    const Options options       = normalized(raw);
+    const std::uint64_t keys    = static_cast<std::uint64_t>(store.layers()) * store.experts();
+    const auto pitches          = class_pitches(store);
+    if (pitches.size() <= 1) {
+        const std::uint64_t lists = static_cast<std::uint64_t>(options.ring) + options.prefetch + options.demotion;
+        return static_cast<std::uint32_t>(std::min<std::uint64_t>(bytes / store.record_bytes(), keys + lists));
+    }
+    const std::uint64_t transit =
+        static_cast<std::uint64_t>(options.ring) + options.prefetch + options.bounce + options.stream_bounce;
+    const std::uint64_t transit_bytes = transit * store.record_bytes();
+    if (bytes <= transit_bytes) { return static_cast<std::uint32_t>(transit); }
+    // Each layer gets the same share of its class's slots, so the class slots cost the layers' mean record size.
+    std::uint64_t stride_sum = 0, demotions = 0;
+    for (std::uint32_t l = 0; l < store.layers(); ++l) { stride_sum += store.record_bytes(l); }
+    for (const std::uint64_t pitch : pitches) {
+        std::uint32_t layers_here = 0;
+        for (std::uint32_t l = 0; l < store.layers(); ++l) { layers_here += store.record_bytes(l) == pitch ? 1U : 0U; }
+        demotions += class_demotion(options.demotion, layers_here, store.layers());
+    }
+    const std::uint64_t class_slots = (bytes - transit_bytes) * store.layers() / stride_sum;
+    return static_cast<std::uint32_t>(transit + std::min(class_slots, keys + demotions));
+}
+
+HostExpertTier::Plan HostExpertTier::plan_slots(const ExpertStore& store, const Options& options) {
     if (store.record_bytes() % DirectReadQueue::kAlignment != 0) {
         throw std::invalid_argument("SSD tier: expert records must be a multiple of 4 KiB");
     }
+    Plan plan;
+    const std::uint32_t layers = store.layers(), experts = store.experts();
+    const auto pitches         = class_pitches(store);
+    if (pitches.size() <= 1) {
+        plan.regions = {{store.record_bytes(), options.slots}};
+        plan.layer_class.assign(layers, 0);
+        plan.class_layers = {layers};
+        return plan;
+    }
+    plan.layer_class.resize(layers);
+    plan.class_layers.assign(pitches.size(), 0);
+    for (std::uint32_t l = 0; l < layers; ++l) {
+        const auto c = static_cast<std::uint8_t>(std::find(pitches.begin(), pitches.end(), store.record_bytes(l)) - pitches.begin());
+        plan.layer_class[l] = c;
+        ++plan.class_layers[c];
+    }
+    plan.transit                = options.bounce + options.stream_bounce;
+    const std::uint64_t transit = static_cast<std::uint64_t>(options.ring) + options.prefetch + plan.transit;
+    if (options.slots <= transit) {
+        throw std::invalid_argument("SSD tier: the slots must exceed the ring, prefetch and bounce slots");
+    }
+    std::vector<std::uint32_t> demotion(pitches.size());
+    std::uint64_t demotions = 0;
+    for (std::size_t c = 0; c < pitches.size(); ++c) {
+        demotion[c] = class_demotion(options.demotion, plan.class_layers[c], layers);
+        demotions += demotion[c];
+    }
+    if (options.slots - transit <= demotions + pitches.size()) {
+        throw std::invalid_argument("SSD tier: every record size needs a resident slot beyond its demotion list");
+    }
+    // Every layer the same share of resident slots (as each layer gets the same share of the VRAM
+    // frames), then the rest one more slot per layer, class by class, while its layers have keys left.
+    std::uint64_t left            = options.slots - transit - demotions;
+    const std::uint64_t per_layer = std::min<std::uint64_t>(experts, left / layers);
+    std::vector<std::uint64_t> residents(pitches.size());
+    for (std::size_t c = 0; c < pitches.size(); ++c) {
+        residents[c] = per_layer * plan.class_layers[c];
+        left -= residents[c];
+    }
+    for (std::size_t c = 0; c < pitches.size() && left > 0 && per_layer < experts; ++c) {
+        const std::uint64_t more = std::min<std::uint64_t>(left, plan.class_layers[c]);
+        residents[c] += more;
+        left -= more;
+    }
+    plan.regions.push_back({pitches[0], static_cast<std::uint32_t>(transit)});
+    for (std::size_t c = 0; c < pitches.size(); ++c) {
+        const auto slots = static_cast<std::uint32_t>(residents[c] + demotion[c]);
+        plan.regions.push_back({pitches[c], slots});
+        plan.classes.push_back({.slots = slots, .demotion = demotion[c], .transit_pitch = pitches[c] == pitches[0]});
+    }
+    return plan;
+}
+
+HostExpertTier::Pinned HostExpertTier::pin_slots(const Plan& plan, const Options& options) {
     Pinned out;
     out.release = options.release;
-    std::vector<std::uint32_t> sizes;
-    bool refused = false;
-    for (std::uint32_t s = 0; s < options.slots; s += options.slots_per_chunk) {
-        const std::uint32_t here = std::min(options.slots_per_chunk, options.slots - s);
-        auto* p = static_cast<std::byte*>(options.allocate(static_cast<std::size_t>(here) * store.record_bytes()));
-        if (p == nullptr) {
-            refused = true;
-            break;
-        }
+    out.regions.resize(plan.regions.size());
+    struct Piece {
+        std::uint32_t region, slots;
+        std::uint64_t bytes;
+    };
+    std::vector<Piece> pieces;
+    std::vector<std::uint32_t> next(plan.regions.size(), 0);
+    // 1: a chunk of region r was pinned; 0: the region is complete; -1: the OS refused.
+    const auto pin_chunk = [&](std::uint32_t r) {
+        const Region& region = plan.regions[r];
+        if (next[r] >= region.slots) { return 0; }
+        const std::uint32_t here  = std::min(options.slots_per_chunk, region.slots - next[r]);
+        const std::uint64_t bytes = static_cast<std::uint64_t>(here) * region.pitch;
+        auto* p = static_cast<std::byte*>(options.allocate(static_cast<std::size_t>(bytes)));
+        if (p == nullptr) { return -1; }
         if (reinterpret_cast<std::uintptr_t>(p) % DirectReadQueue::kAlignment != 0) {
             options.release(p);
             throw std::runtime_error("SSD tier: expert slots must be 4 KiB-aligned");
         }
         out.chunks.push_back(p);
-        sizes.push_back(here);
+        pieces.push_back({r, here, bytes});
+        for (std::uint32_t i = 0; i < here; ++i) {
+            out.regions[r].push_back(reinterpret_cast<std::uint8_t*>(p) + static_cast<std::size_t>(i) * region.pitch);
+        }
+        next[r] += here;
         out.slots += here;
+        out.bytes += bytes;
+        return 1;
+    };
+    // Region 0 first (the transit slots, or the one region), then the classes' chunks in turn, so a
+    // refusal leaves every class a like share.
+    bool refused = false;
+    for (int got = 1; got == 1;) {
+        got     = pin_chunk(0);
+        refused = got < 0;
+    }
+    for (bool more = !refused; more && !refused;) {
+        more = false;
+        for (std::uint32_t r = 1; r < plan.regions.size() && !refused; ++r) {
+            const int got = pin_chunk(r);
+            refused       = got < 0;
+            more          = more || got == 1;
+        }
     }
     if (refused) {
+        std::uint64_t planned = 0;
+        for (const Region& region : plan.regions) { planned += region.slots; }
         // Whatever is pinned after the tier (the prefix cache's Host tier, the Program's buffers)
         // must still fit below the limit the OS just reached.
         std::uint64_t freed = 0;
         while (!out.chunks.empty() && freed < options.pin_reserve) {
             options.release(out.chunks.back());
             out.chunks.pop_back();
-            freed += static_cast<std::uint64_t>(sizes.back()) * store.record_bytes();
-            out.slots -= sizes.back();
-            sizes.pop_back();
+            const Piece piece = pieces.back();
+            pieces.pop_back();
+            out.regions[piece.region].resize(out.regions[piece.region].size() - piece.slots);
+            freed += piece.bytes;
+            out.slots -= piece.slots;
+            out.bytes -= piece.bytes;
         }
-        out.refused = options.slots - out.slots;
+        out.refused = static_cast<std::uint32_t>(planned - out.slots);
         // The refused slots become unpinned records, whose promotions need the bounce slots.
         const std::uint32_t needed = options.min_slots + options.bounce + options.stream_bounce;
-        if (out.slots < needed) {
-            throw std::runtime_error("SSD tier: the OS let Infernix page-lock only " +
-                                     std::to_string((static_cast<std::uint64_t>(out.slots) * store.record_bytes()) >> 20) +
+        const std::uint64_t largest = plan.regions[0].pitch;
+        if (out.slots < needed || (plan.regions.size() > 1 && out.regions[0].size() < plan.regions[0].slots)) {
+            throw std::runtime_error("SSD tier: the OS let Infernix page-lock only " + std::to_string(out.bytes >> 20) +
                                      " MiB of expert slots once " + std::to_string(options.pin_reserve >> 20) +
                                      " MiB are left for later pinned buffers; at least " +
-                                     std::to_string((static_cast<std::uint64_t>(needed) * store.record_bytes()) >> 20) +
+                                     std::to_string((static_cast<std::uint64_t>(needed) * largest) >> 20) +
                                      " MiB are needed (Windows limits page-locked memory to the GPU's shared memory: "
                                      "close programs that use it, or lower --host-context-mib)");
         }
@@ -164,22 +295,67 @@ HostExpertTier::Pinned HostExpertTier::pin_slots(const ExpertStore& store, const
     return out;
 }
 
+expert_cache::HostTier::Config HostExpertTier::controller_config() const {
+    expert_cache::HostTier::Config config{.num_keys  = store_.layers() * store_.experts(),
+                                          .ring      = options_.ring,
+                                          .prefetch  = options_.prefetch,
+                                          .demotion  = options_.demotion,
+                                          .half_life = options_.half_life};
+    if (plan_.classes.empty()) {
+        config.slots        = pinned_.slots - bounce_ - stream_bounce_;
+        config.shadow_floor = options_.shadow_floor;
+        return config;
+    }
+    config.key_class.resize(config.num_keys);
+    for (std::uint32_t key = 0; key < config.num_keys; ++key) {
+        config.key_class[key] = plan_.layer_class[key / store_.experts()];
+    }
+    config.slots = options_.ring + options_.prefetch;
+    for (std::size_t c = 0; c < plan_.classes.size(); ++c) {
+        auto pinned = plan_.classes[c];
+        pinned.slots = static_cast<std::uint32_t>(pinned_.regions[1 + c].size()); // less any refused chunks
+        pinned.shadow_floor = static_cast<std::uint32_t>(static_cast<std::uint64_t>(options_.shadow_floor) *
+                                                         plan_.class_layers[c] / store_.layers());
+        if (pinned.slots <= pinned.demotion) {
+            throw std::runtime_error("SSD tier: too few expert slots of one record size could be page-locked");
+        }
+        config.slots += pinned.slots;
+        config.classes.push_back(pinned);
+    }
+    return config;
+}
+
 HostExpertTier::HostExpertTier(const ExpertStore& store, Options options)
-    : store_(store), options_(normalized(std::move(options))), pinned_(pin_slots(store_, options_)),
+    : store_(store), options_(normalized(std::move(options))), plan_(plan_slots(store_, options_)),
+      pinned_(pin_slots(plan_, options_)),
       bounce_(options_.unpinned > 0 || pinned_.refused > 0 ? options_.bounce : 0),
       stream_bounce_(options_.unpinned > 0 || pinned_.refused > 0 ? options_.stream_bounce : 0),
-      tier_(expert_cache::HostTier::Config{.num_keys  = store.layers() * store.experts(),
-                                           .slots     = pinned_.slots - bounce_ - stream_bounce_,
-                                           .ring      = options_.ring,
-                                           .prefetch  = options_.prefetch,
-                                           .demotion  = options_.demotion,
-                                           .half_life = options_.half_life}),
-      per_chunk_(options_.slots_per_chunk), unpinned_of_(static_cast<std::size_t>(store.layers()) * store.experts(), -1),
+      tier_(controller_config()), unpinned_of_(static_cast<std::size_t>(store.layers()) * store.experts(), -1),
       round_ticket_of_key_(static_cast<std::size_t>(store.layers()) * store.experts(), 0) {
+    // The controller's slots in its order (the ring, the prefetch list, then each class's), and the
+    // bounce slots: the one region's last slots, or region 0's after the ring and the prefetch list.
+    std::uint32_t resident = 0;
+    if (plan_.classes.empty()) {
+        const auto& all                = pinned_.regions[0];
+        const std::uint32_t controller = pinned_.slots - bounce_ - stream_bounce_;
+        slot_address_.assign(all.begin(), all.begin() + controller);
+        bounce_address_.assign(all.begin() + controller, all.end());
+        resident = controller - (options_.ring + options_.prefetch + options_.demotion);
+    } else {
+        const auto& transit       = pinned_.regions[0];
+        const std::uint32_t lists = options_.ring + options_.prefetch;
+        slot_address_.assign(transit.begin(), transit.begin() + lists);
+        bounce_address_.assign(transit.begin() + lists, transit.end());
+        for (std::size_t c = 0; c < plan_.classes.size(); ++c) {
+            const auto& region = pinned_.regions[1 + c];
+            slot_address_.insert(slot_address_.end(), region.begin(), region.end());
+            resident += static_cast<std::uint32_t>(region.size()) - plan_.classes[c].demotion;
+        }
+    }
+    stream_free_.assign(tier_.class_count(), {});
+    stream_lent_.assign(tier_.class_count(), 0);
     // Unpinned records: those asked for and the slots the OS refused, at most the keys the
     // resident slots leave.
-    const std::uint32_t lists     = options_.ring + options_.prefetch + options_.demotion;
-    const std::uint32_t resident  = pinned_.slots - bounce_ - stream_bounce_ - lists;
     const std::uint32_t uncovered = keys() > resident ? keys() - resident : 0;
     unpinned_count_ = std::min<std::uint32_t>(options_.unpinned + pinned_.refused, uncovered);
     if (unpinned_count_ > 0) {
@@ -230,10 +406,7 @@ const std::string& HostExpertTier::unpinned_lock_failure() const noexcept {
     return unpinned_ ? unpinned_->lock_failure() : none;
 }
 
-const std::uint8_t* HostExpertTier::slot_bytes(std::uint32_t slot) const noexcept {
-    return reinterpret_cast<const std::uint8_t*>(pinned_.chunks[slot / per_chunk_]) +
-           static_cast<std::size_t>(slot % per_chunk_) * store_.record_bytes();
-}
+const std::uint8_t* HostExpertTier::slot_bytes(std::uint32_t slot) const noexcept { return slot_address_[slot]; }
 
 const std::uint8_t* HostExpertTier::record(std::uint32_t key) const noexcept {
     const std::int32_t slot = tier_.slot_of(key);
@@ -355,6 +528,19 @@ void HostExpertTier::begin_round(std::uint32_t allowance) {
     const std::size_t admitted = tier_.admit(landings, false);
     stats_.admitted += admitted;
     stats_.discarded += landings.size() - admitted;
+    // Landings admitted into a class of smaller records are copied there from their ring slots (the
+    // agent is drained, and the ring is handed out again only below).
+    if (!tier_.copies().empty()) {
+        std::vector<Copy> batch;
+        for (const expert_cache::AdmissionCopy& a : tier_.copies()) {
+            batch.push_back({.destination = slot_address_[a.to],
+                             .source      = slot_address_[a.from],
+                             .bytes       = static_cast<std::size_t>(store_.record_bytes(a.key / store_.experts()))});
+        }
+        run_copies(batch);
+        tier_.finish_copies();
+        stats_.copied_admissions += batch.size();
+    }
     // The demotion list refills at every boundary (design §19.3.7 §4.8): without it the first 32
     // demotions used it up, after which every VRAM victim without a host copy was dropped to the
     // SSD and the eviction gate refused demotion-worthy victims outright (T6).
@@ -424,12 +610,26 @@ std::uint32_t HostExpertTier::new_ticket(std::uint32_t key, std::int32_t fetch) 
 }
 
 std::uint32_t HostExpertTier::lend_stream(std::uint32_t n) {
-    const std::vector<std::uint32_t> slots = tier_.lend(std::min(n, options_.stream));
+    const std::uint32_t total = std::min(n, options_.stream);
+    // A class's share of the loan by its layers, as its RAM is (each layer the same share): the loan takes the
+    // free slots the RAM plan left for it instead of evicting RAM-only experts.
+    std::vector<std::uint32_t> per_class(tier_.class_count(), 0);
+    for (std::size_t c = 0; c < per_class.size(); ++c) {
+        per_class[c] = static_cast<std::uint32_t>(static_cast<std::uint64_t>(total) * plan_.class_layers[c] / store_.layers());
+    }
+    const std::vector<std::uint32_t> slots = tier_.lend(per_class);
     std::lock_guard<std::mutex> lock(mutex_);
     if (!stream_slot_.empty()) { throw std::logic_error("SSD tier: stream slots are lent already"); }
     stream_slot_ = slots;
-    stream_free_.clear();
-    for (std::uint32_t s = static_cast<std::uint32_t>(slots.size()); s > 0; --s) { stream_free_.push_back(s - 1); }
+    stream_class_.resize(slots.size());
+    for (auto& free : stream_free_) { free.clear(); }
+    std::fill(stream_lent_.begin(), stream_lent_.end(), 0U);
+    for (std::uint32_t s = static_cast<std::uint32_t>(slots.size()); s > 0; --s) {
+        const std::uint8_t c = tier_.slot_class(slots[s - 1]);
+        stream_class_[s - 1] = c;
+        stream_free_[c].push_back(s - 1);
+        ++stream_lent_[c];
+    }
     return static_cast<std::uint32_t>(slots.size());
 }
 
@@ -437,20 +637,33 @@ void HostExpertTier::return_stream() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stream_slot_.empty()) { return; }
-        if (stream_free_.size() != stream_slot_.size()) { throw std::logic_error("SSD tier: a stream slot is still in use"); }
+        std::size_t free = 0;
+        for (const auto& f : stream_free_) { free += f.size(); }
+        if (free != stream_slot_.size()) { throw std::logic_error("SSD tier: a stream slot is still in use"); }
         stream_slot_.clear();
-        stream_free_.clear();
+        for (auto& f : stream_free_) { f.clear(); }
+        std::fill(stream_lent_.begin(), stream_lent_.end(), 0U);
     }
     tier_.give_back();
+}
+
+std::uint32_t HostExpertTier::stream_layer_cap() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::uint32_t cap = std::numeric_limits<std::uint32_t>::max();
+    for (std::size_t c = 0; c < stream_lent_.size(); ++c) {
+        cap = std::min(cap, stream_lent_[c] / std::min(plan_.class_layers[c], kStreamWindow));
+    }
+    return stream_lent_.empty() ? 0 : cap;
 }
 
 std::int32_t HostExpertTier::stream_read(std::uint32_t key) {
     std::int32_t slot = -1;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!agent_failure_.empty() || stream_free_.empty()) { return -1; }
-        slot = static_cast<std::int32_t>(stream_free_.back());
-        stream_free_.pop_back();
+        auto& free = stream_free_[tier_.class_of(key)];
+        if (!agent_failure_.empty() || free.empty()) { return -1; }
+        slot = static_cast<std::int32_t>(free.back());
+        free.pop_back();
         stream_state_[slot].store(0, std::memory_order_relaxed);
         stream_jobs_.emplace_back(key, static_cast<std::uint32_t>(slot));
     }
@@ -487,7 +700,7 @@ std::uint32_t HostExpertTier::refill(std::uint32_t key, std::uint32_t slot) {
 
 void HostExpertTier::stream_release(std::int32_t slot) {
     std::lock_guard<std::mutex> lock(mutex_);
-    stream_free_.push_back(static_cast<std::uint32_t>(slot));
+    stream_free_[stream_class_[static_cast<std::size_t>(slot)]].push_back(static_cast<std::uint32_t>(slot));
 }
 
 std::uint32_t HostExpertTier::demand(int layer, int expert) noexcept {
@@ -522,7 +735,7 @@ std::string HostExpertTier::failure() const {
 }
 
 void HostExpertTier::finish_copy(const Copy& copy) {
-    std::memcpy(copy.destination, copy.source, store_.record_bytes());
+    std::memcpy(copy.destination, copy.source, copy.bytes != 0 ? copy.bytes : store_.record_bytes());
     std::lock_guard<std::mutex> lock(copy_mutex_);
     if (copy.left == nullptr) {
         copied_.push_back(copy.tag);
@@ -547,11 +760,21 @@ void HostExpertTier::copier_main() noexcept {
 }
 
 void HostExpertTier::copy_records(std::span<const std::pair<std::uint8_t*, const std::uint8_t*>> copies) {
-    if (copies.empty()) { return; }
-    std::uint32_t left = static_cast<std::uint32_t>(copies.size());
+    std::vector<Copy> batch;
+    batch.reserve(copies.size());
+    for (const auto& [destination, source] : copies) { batch.push_back({.destination = destination, .source = source}); }
+    run_copies(batch);
+}
+
+void HostExpertTier::run_copies(std::vector<Copy>& batch) {
+    if (batch.empty()) { return; }
+    std::uint32_t left = static_cast<std::uint32_t>(batch.size());
     {
         std::lock_guard<std::mutex> lock(copy_mutex_);
-        for (const auto& [destination, source] : copies) { copies_.push_back({destination, source, 0, &left}); }
+        for (Copy& copy : batch) {
+            copy.left = &left;
+            copies_.push_back(copy);
+        }
     }
     copy_wake_.notify_all();
     // This thread copies too, then waits for the copies the threads took.

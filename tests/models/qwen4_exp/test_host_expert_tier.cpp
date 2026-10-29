@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -383,18 +384,30 @@ void test_mixed_strides() {
     };
     const ExpertStore store({path}, {pitch[0], pitch[1]}, kExpertsHere, records, {{}, {}});
     check(store.record_bytes() == kRecord && store.record_bytes(1) == kRecord / 2 && store.multipliers(1) == nullptr,
-          "mixed strides: slots of the largest pitch, each layer its own, no scale tail");
+          "mixed strides: the largest pitch, each layer its own, no scale tail");
     HostExpertTier::Options o = options();
-    o.slots = 24; // ring 8 + prefetch 2 + demotion 4 + 10 resident slots
+    // Transit: ring 8 + prefetch 2 + bounce 32 at the largest pitch; each class (one layer each) 2 demotion + 5
+    // resident slots at its own pitch.
+    o.slots = 42 + 2 * (2 + 5);
+    check(HostExpertTier::slots_for_bytes(store, 42 * kRecord + 7 * kRecord + 7 * (kRecord / 2), o) == o.slots,
+          "mixed strides: slots_for_bytes prices class slots at the mean record");
     HostExpertTier tier(store, o);
-    // Layer 1's keys 20..29 follow each other in the file: one scatter run of half-size records.
+    check(tier.controller().class_count() == 2 && tier.pinned_slots() == o.slots &&
+              tier.pinned_bytes() == 42 * kRecord + 7 * kRecord + 7 * (kRecord / 2),
+          "mixed strides: a class per record size, each slot its record's size");
+    // Layer 1's keys 20..29 follow each other in the file: one scatter run of half-size records into its 5 slots.
     std::vector<std::uint32_t> ranked;
     for (std::uint32_t k = kExpertsHere; k < kExpertsHere + 10; ++k) { ranked.push_back(k); }
-    check(tier.prefill(ranked) == 10, "mixed strides: the pre-fill fills the resident slots");
+    check(tier.prefill(ranked) == 5, "mixed strides: the pre-fill fills layer 1's class");
     bool all = true;
-    for (const auto k : ranked) { all = all && holds(tier.record(k), k); }
-    check(all && tier.stats().run_reads == 1 && tier.stats().run_records == 10,
-          "mixed strides: a run of short records lands in full-size slots");
+    for (std::uint32_t k = kExpertsHere; k < kExpertsHere + 5; ++k) { all = all && holds(tier.record(k), k); }
+    check(all && tier.stats().run_reads == 1 && tier.stats().run_records == 5,
+          "mixed strides: a run of short records lands in its class's slots");
+    check(tier.record(kExpertsHere + 1) - tier.record(kExpertsHere) == static_cast<std::ptrdiff_t>(kRecord / 2),
+          "mixed strides: half-size records are packed at their own pitch");
+    std::vector<std::uint32_t> layer0;
+    for (std::uint32_t k = 10; k < kExpertsHere; ++k) { layer0.push_back(k); }
+    check(tier.prefill(layer0) == 5, "mixed strides: layer 0's class takes its own 5 keys");
     tier.begin_round(32);
     std::vector<const std::uint8_t*> got(3);
     std::vector<std::uint32_t> status(3);
@@ -413,6 +426,19 @@ void test_mixed_strides() {
     service.join();
     check(got[0] != nullptr && got[1] != nullptr && got[2] != nullptr,
           "mixed strides: demanded records of either pitch equal the file bytes");
+    tier.end_round();
+    tier.controller().check();
+    // Hot landings are admitted at the next boundary: layer 1's (half size) by a copy into its class's slots,
+    // layer 0's (the transit size) by swapping its ring slot into the class.
+    const std::vector<std::uint32_t> hot{3, kExpertsHere + 15};
+    tier.record_uses(1, hot, 50.0);
+    tier.begin_round(32);
+    const std::uint8_t* copied = tier.record(kExpertsHere + 15);
+    const std::ptrdiff_t from_packed = copied - tier.record(kExpertsHere + 1);
+    check(holds(copied, kExpertsHere + 15) && holds(tier.record(3), 3) && tier.stats().copied_admissions == 1,
+          "mixed strides: both landings admitted with their bytes, the short one by a copy");
+    check(from_packed % static_cast<std::ptrdiff_t>(kRecord / 2) == 0 && std::abs(from_packed) < 7 * static_cast<std::ptrdiff_t>(kRecord / 2),
+          "mixed strides: the copied record sits in its class's packed slots");
     tier.end_round();
     tier.controller().check();
     std::error_code ec;

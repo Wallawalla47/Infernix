@@ -190,9 +190,10 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
     reset();
 
     cudaGraphExec_t exec = nullptr;
-    // No node priorities: prioritized staging and shared-expert streams kept inside the graph (candidates
-    // §11 D5) measured 0.999x (removed 2026-10-28).
-    const cudaError_t err = cudaGraphInstantiate(&exec, definition.graph_, 0);
+    // Node priorities: the stream priorities captured into the graph keep their order inside it (Flash-Next's
+    // staging, shared-expert and split streams, models/qwen4_exp/program/program_impl.h).
+    const cudaError_t err =
+        cudaGraphInstantiate(&exec, definition.graph_, cudaGraphInstantiateFlagUseNodePriority);
     if (err != cudaSuccess) {
         destroy_graph_exec(exec);
         if (err == cudaErrorMemoryAllocation) {

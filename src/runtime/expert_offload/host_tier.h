@@ -3,10 +3,20 @@
 // Host side of the SSD expert tier's RAM level (docs/maintainer/qwen3_8-flash-next-design.md
 // §19.3.7, plan local/workdirs/fn/plans/memory-tiers.md §4.3, §4.7, §4.8): the decayed-LFU ranking
 // of every expert key, the pinned host slots with their states, pins and load serials, the landing
-// lists (demand ring, prefetch list, demotion list), the admission and demotion gates, and the keys
+// lists (demand ring, prefetch list, demotion lists), the admission and demotion gates, and the keys
 // held outside the slots (resident pageable records past the page-locking limit). Pure
 // host logic with no CUDA dependency, driven by the engine thread at round boundaries; the Program
 // turns its decisions into copies and host-pointer table uploads.
+//
+// Size classes. A GGUF import's layers have records of up to seven sizes (IQ3_S: 1.49-2.54 MiB), so
+// slots of one size padded every record to the largest (29 % of the tier's RAM on IQ3_S). The slots
+// are partitioned into classes, one per record size: a class's slots hold only its keys' records,
+// and each class has its own free slots, victim ranking and demotion list, so admissions, demotions
+// and loans exchange records of one size. The transit slots (the ring and the prefetch list) hold
+// any key's record: a landing there is admitted by swapping its slot into the class when the class's
+// slots have the transit size (one class of the largest record, as an NVFP4 or block-FP8 bank has),
+// and otherwise by a copy into a class slot that the caller makes at the boundary (copies(),
+// finish_copies()).
 
 #include <cstddef>
 #include <cstdint>
@@ -52,6 +62,7 @@ enum SlotPin : std::uint8_t {
     kPinUse      = 1U << 3, // a landing read by the current round
     kPinPrefetch = 1U << 4, // a prefetch read in flight
     kPinStream   = 1U << 5, // a prefill expert stream copies its record
+    kPinCopy     = 1U << 6, // an admission's copy reads (the transit slot) or writes (the class slot) it
 };
 
 // The list a non-resident slot belongs to.
@@ -65,6 +76,12 @@ struct Landing {
     std::uint32_t key    = 0;
 };
 
+// An admission by copy: the caller copies key's record from the transit slot `from` into the class
+// slot `to`, then calls finish_copies().
+struct AdmissionCopy {
+    std::uint32_t from = 0, to = 0, key = 0;
+};
+
 // What happens to a key's bytes when the VRAM policy evicts it.
 enum class VramEviction : std::uint8_t {
     kKeptInRam, // T3: it had a host copy (a shadow becomes resident)
@@ -74,16 +91,33 @@ enum class VramEviction : std::uint8_t {
 
 class HostTier {
 public:
+    // The class of the transit slots (the ring and the prefetch list).
+    static constexpr std::uint8_t kTransit = 0xFF;
+
+    struct Class {
+        std::uint32_t slots    = 0;     // its slots, its demotion list included
+        std::uint32_t demotion = 0;     // its demotion list
+        bool transit_pitch     = false; // its slots have the transit slots' size (admission swaps, no copy)
+        // Shadows kept for a prefill's loan (the exclusive layout): at or below this many, a shadow is no
+        // longer the first victim, and a loan takes free slots and shadows above it only.
+        std::uint32_t shadow_floor = 0;
+    };
+
     struct Config {
         std::uint32_t num_keys = 0;
-        std::uint32_t slots    = 0; // all pinned slots
+        std::uint32_t slots    = 0; // all slots: the ring, the prefetch list and every class's
         std::uint32_t ring     = 128;
         std::uint32_t prefetch = 16;
-        std::uint32_t demotion = 32;
+        std::uint32_t demotion = 32; // the demotion list of the one class (without `classes`)
         double half_life       = 64;
         double prefetch_margin = 1.25; // a prefetch landing must outrank the victim by this factor
         double demotion_margin = 1.25; // a VRAM victim is demotion-worthy at this factor
         std::uint32_t decode_demotions = 32; // demotion allowance per decode boundary
+        std::uint32_t shadow_floor     = 0;  // the one class's (without `classes`)
+        // Size classes: key_class[k] is key k's class, classes[c] its slots. Empty: one class of every
+        // slot past the ring and the prefetch list, `demotion` of them in its list, of the transit size.
+        std::vector<std::uint8_t> key_class;
+        std::vector<Class> classes;
     };
 
     explicit HostTier(const Config& config);
@@ -91,6 +125,11 @@ public:
     // ---- queries
     [[nodiscard]] const Config& config() const { return config_; }
     [[nodiscard]] const DecayedLfu& lfu() const { return lfu_; }
+    [[nodiscard]] std::uint32_t class_count() const { return static_cast<std::uint32_t>(classes_.size()); }
+    [[nodiscard]] std::uint8_t class_of(std::uint32_t key) const { return key_class_[key]; }
+    // A slot's class, or kTransit for the ring and prefetch slots. A swap moves a transit-size
+    // class's slot into the ring and the ring's slot into the class.
+    [[nodiscard]] std::uint8_t slot_class(std::uint32_t slot) const { return slot_class_[slot]; }
     // The slot holding key's bytes (resident or shadow), or -1.
     [[nodiscard]] std::int32_t slot_of(std::uint32_t key) const { return slot_of_[key]; }
     [[nodiscard]] bool host_copy(std::uint32_t key) const { return slot_of_[key] >= 0; }
@@ -105,7 +144,8 @@ public:
     [[nodiscard]] SlotList list(std::uint32_t slot) const { return slots_[slot].list; }
     [[nodiscard]] std::span<const std::uint32_t> ring() const { return ring_; }
     [[nodiscard]] std::span<const std::uint32_t> prefetch_list() const { return prefetch_; }
-    [[nodiscard]] std::size_t demotion_slots() const { return demotion_.size(); }
+    // Slots in every class's demotion list.
+    [[nodiscard]] std::size_t demotion_slots() const;
     [[nodiscard]] std::size_t resident_count() const { return resident_count_; }
     [[nodiscard]] std::size_t shadow_count() const { return shadow_count_; }
     [[nodiscard]] std::uint32_t demotion_allowance() const { return allowance_; }
@@ -121,13 +161,15 @@ public:
     void take_dirty(std::vector<std::uint32_t>& keys);
 
     // ---- startup
-    // Places `key`'s record into a free resident slot (the warm pre-fill); false when none is left
-    // or the key already has a host copy. The caller writes the bytes before the first round.
+    // Places `key`'s record into a free resident slot of its class (the warm pre-fill); false when
+    // its class has none left or the key already has a host copy. The caller writes the bytes
+    // before the first round.
     bool prefill(std::uint32_t key, std::int32_t& slot);
     // The same for a key VRAM holds (the warm start's spare slots): the slot is its shadow, so its
     // eviction from VRAM (a lend's or a decode victim's) needs no copy back (T3).
     bool prefill_shadow(std::uint32_t key, std::int32_t& slot);
-    [[nodiscard]] bool has_free_resident() const { return !free_resident_.empty(); }
+    // Whether any class has a free resident slot.
+    [[nodiscard]] bool has_free_resident() const;
     // Marks `key` held outside the slots (see held); false when it has a slot copy or is held.
     bool hold(std::uint32_t key);
     // Seeds the decayed LFU at the current time with a saved session's use counts, each capped at
@@ -140,9 +182,11 @@ public:
     // The warm start uses it so RAM holds the keys ranked below the VRAM seeds, not copies of them.
     std::uint32_t release_shadows();
     // ---- lending (engine thread, no round in flight)
-    // Lends up to `n` resident slots (free ones first, then the lowest-ranked unpinned residents,
-    // shadows before residents, which leave RAM): they hold no key until give_back. Returns them.
-    std::vector<std::uint32_t> lend(std::uint32_t n);
+    // Lends up to per_class[c] resident slots of each class c (free ones first, then the lowest-ranked
+    // unpinned residents, shadows before residents, which leave RAM; a class with a shadow floor lends
+    // free slots and shadows above the floor only): they hold no key until give_back. Returns them;
+    // slot_class tells which keys each can hold.
+    std::vector<std::uint32_t> lend(std::span<const std::uint32_t> per_class);
     // Every lent slot becomes a free resident slot again.
     void give_back();
     [[nodiscard]] std::size_t lent() const { return lent_.size(); }
@@ -156,12 +200,17 @@ public:
     void record_uses(double dt, std::span<const std::uint32_t> keys, double weight);
     // A landing read by the round just begun (its slot keeps Use until the next begin_round).
     void mark_used(std::uint32_t slot);
-    // Admits the round's landings (T10): a demand landing when a slot is free, a shadow can go or
-    // it outranks the lowest resident, a prefetch landing with prefetch_margin. A landing with a
-    // stale serial or of a key that already has a host copy is discarded. The victim's slot (T12)
-    // takes the landing's place in its list. Returns the number admitted.
+    // Admits the round's landings (T10): a demand landing when its class has a free slot, a shadow
+    // can go or it outranks the class's lowest resident, a prefetch landing with prefetch_margin. A
+    // landing with a stale serial or of a key that already has a host copy is discarded. In a class
+    // of the transit size the victim's slot (T12) takes the landing's place in its list; in another
+    // the landing is admitted by a copy (copies()), complete once finish_copies() is called. Returns
+    // the number admitted.
     std::size_t admit(std::span<const Landing> landings, bool prefetch);
-    // Keeps the demotion list full by evicting the lowest-ranked RAM residents (shadows first).
+    // The admissions waiting for their copies, and their completion (before the next round begins).
+    [[nodiscard]] std::span<const AdmissionCopy> copies() const { return copies_; }
+    void finish_copies();
+    // Keeps each class's demotion list full by evicting its lowest-ranked RAM residents (shadows first).
     void replenish_demotion_list();
 
     // ---- prefetch
@@ -195,7 +244,8 @@ public:
     // Whether evicting `key` (no host copy) would be worth a demotion.
     [[nodiscard]] bool demotion_worthy(std::uint32_t key);
     // T3 / T4 / T5. `published` tells whether key's frame is published (its load completed); only
-    // then can it be demoted. On kDemote, `slot` receives the D2H target (pinned D2H).
+    // then can it be demoted. On kDemote, `slot` receives the D2H target (pinned D2H), a slot of the
+    // key's class: from its demotion list, else a free one.
     VramEviction vram_evicted(std::uint32_t key, bool published, std::uint32_t& slot);
     // T7: the demotion copy into `slot` completed; `in_vram` tells whether key was re-admitted
     // into VRAM meanwhile (then the slot is its shadow).
@@ -203,7 +253,7 @@ public:
     // A demotion's read failed: its slot is free again and the key keeps no host copy.
     void demotion_failed(std::uint32_t key, std::uint32_t slot);
 
-    // Audit: recomputes every invariant (states, pins, lists, counts, maps); throws logic_error.
+    // Audit: recomputes every invariant (states, pins, lists, classes, counts, maps); throws logic_error.
     void check() const;
 
 private:
@@ -221,13 +271,31 @@ private:
         std::uint32_t stamp;
     };
     enum class Victims : std::uint8_t { kShadow, kResident };
+    // One size class's slots: its free resident slots, demotion list and victim heaps.
+    struct ClassState {
+        std::vector<std::uint32_t> free; // free slots of the resident partition
+        std::vector<std::uint32_t> demotion;
+        std::vector<HeapEntry> heap[2];
+        std::uint32_t demotion_target = 0;
+        std::uint32_t shadow_floor    = 0;
+        std::uint32_t shadows         = 0;
+        bool transit_pitch            = false;
+    };
+    // Whether class c's shadows are its first victims (more of them than its floor).
+    [[nodiscard]] bool shadows_spare(std::uint8_t c) const {
+        return classes_[c].shadows > classes_[c].shadow_floor;
+    }
+    // Shadow counts follow a slot's state changes (resident <-> shadow, eviction).
+    void count_shadow(std::uint32_t slot, int delta);
 
     [[nodiscard]] bool eligible(const Slot& s, Victims kind) const;
     void push_victim(std::uint32_t slot);
-    // The lowest-ranked eligible victim of `kind` (left in its heap), or -1.
-    std::int32_t peek_victim(Victims kind);
-    // The victim a landing would replace: a shadow, else the lowest resident; -1 when none.
-    std::int32_t victim_for_admission(double& victim_score);
+    // The lowest-ranked eligible victim of `kind` in class c (left in its heap), or -1.
+    std::int32_t peek_victim(std::uint8_t c, Victims kind);
+    // The victim a landing of class c would replace: a shadow, else the lowest resident; -1 when none.
+    std::int32_t victim_for_admission(std::uint8_t c, double& victim_score);
+    // A free slot of class c taken from its free list, else -1.
+    std::int32_t take_free(std::uint8_t c);
     void set_resident(std::uint32_t slot, std::uint32_t key, SlotState state);
     // Removes the slot's key from RAM (T12) and returns it as a free slot.
     void evict(std::uint32_t slot);
@@ -237,15 +305,18 @@ private:
     Config config_;
     DecayedLfu lfu_;
     std::vector<Slot> slots_;
+    std::vector<std::uint8_t> slot_class_;
+    std::vector<std::uint8_t> key_class_;
+    std::vector<ClassState> classes_;
     std::vector<std::int32_t> slot_of_;
     std::vector<std::uint8_t> held_;
     std::size_t held_count_ = 0;
-    std::vector<std::uint32_t> free_resident_; // free slots of the resident partition
-    std::vector<std::uint32_t> ring_, prefetch_, demotion_;
-    std::vector<std::uint32_t> lent_; // lend(): free slots out of the resident partition
+    std::vector<std::uint32_t> ring_, prefetch_;
+    std::vector<std::uint32_t> lent_; // lend(): slots out of the classes' resident partitions
     std::vector<std::uint32_t> used_; // slots holding a Use pin
     std::vector<std::uint32_t> streamed_; // slots holding a Stream pin
-    std::vector<HeapEntry> heap_[2];
+    std::vector<AdmissionCopy> copies_;  // admissions waiting for their copies
+    std::vector<std::uint8_t> copying_;  // per key: an admission copy is pending
     std::vector<std::uint8_t> dirty_mark_;
     std::vector<std::uint32_t> dirty_;
     std::uint64_t next_serial_ = 1;

@@ -7430,7 +7430,7 @@ measured results are under "Status" at the end of this section.
     experts that keep a RAM copy first, then the others (`LfruPolicy::set_capacity` first_choice; the old
     choice, the lowest scores whatever their copies, decoded IQ3_S 0.978x, worst pair 0.764x). This applies to
     every SSD-tier configuration.
-  - RAM slots (each the largest record) hold every expert VRAM does not plus 5/16 of the frames and
+  - RAM slots (pooled by record size, below) hold every expert VRAM does not plus 5/16 of the frames and
     the KV growth's frames as shadows; the warm start seeds the rest of the frames
     (`ProgramOptions::expert_seed_share`), the fill phase's landings keep their RAM copies, and the warm
     start's spare slots hold shadows of the least-used seeds. A prefill's loan then takes shadowed
@@ -7466,6 +7466,30 @@ measured results are under "Status" at the end of this section.
       `.local/slot-2026-10-27/rejected/`.
     - Remaining cost on IQ3_S: the CPU team runs 10 % slower a job in tier mode with identical record bytes
       (Dense8 4 %), unattributed; candidates §26.3 EX-01.
+  - Built 2026-10-28 (owner's goal: exclusive at no speed cost, then the default as in Basalt; plan
+    `.local/redesign-2026-10-28/REDESIGN-PROPOSAL.md` §6.4a). Measured on IQ3_S, 16,413-token prompt then 1,024 tokens
+    greedy, DFlash2 auto, 3 unprofiled runs each, against the same day's main (b36f35ae); ids equal in every run
+    (identical speculative statistics in all 18 runs):
+    - **Slots per record size** (`HostTier` classes, `HostExpertTier` regions): a GGUF import's 7 record sizes
+      (1.49-2.54 MiB, mean 1.96) each get a pool of slots of their own size, every layer the same share; the ring,
+      prefetch and bounce slots (any record) keep the largest size, and a landing admitted into a smaller class is
+      copied there at the boundary (a class of the largest size swaps as before; one-size banks are unchanged). The
+      RAM plan prices the experts' slots at the mean record and budgets the prefill stream's 1,280 lent slots, which
+      before evicted that many RAM-only experts a span (2,563 stream reads from the SSD a 16K request). Stream loans
+      are shared by class (each layer's reads fit its class's slots, `stream_layer_cap`).
+    - **A shadow floor** (the frames the warm start leaves unseeded, shared by class): shadows up to it are not RAM's
+      first victims and a stream loan takes free slots and spare shadows only; a demotion takes a free class slot when
+      its class's list (a few slots per record size) is empty.
+    - Exclusive with the n-gram table on the volume: decode 225.2-226.3 -> 231.6-234.7 tok/s, prefill 5,652-5,722 ->
+      6,354-6,406; with the table in RAM 226.7-227.7 -> 233.2-236.1 and 6,018-6,098 -> 6,398-6,432; the full layout
+      249.1-254.5 (before 252.7-254.1), 6,786. Resident RAM 46.1 -> 39.5 GiB (table on the volume), 73.2 -> 66.0 GiB
+      (table in RAM); the full layout 51.9. Exclusive is still 0.92x of full on decode and 0.94x on prefill; on
+      `basalt_parity.py --suite community` (DFlash2, one run) 302.9-306.4 against the full layout's 346.1 (struct 363
+      against 437).
+    - Remaining cost, from the counters: decode churn (struct: 9,621 promotions and 6,212 demotions, each a refill read
+      of ~2 MiB holding its frame until it lands; the full layout discards its victims), and loans early in a session
+      (the warm start leaves RAM full of RAM-only experts, so only ~1,100 shadows fit where a 16K prefill's loan
+      evicts ~1,000 experts: 208 a request still left without a copy and were read back).
 - **Storage** (§4.4): `artifact::Residency::Streamed` and a long-lived `StreamSource` (per-part
   direct, deny-write handles); `ExpertStore` (Model data) holds each record's ≤ 2 aligned file
   segments (two records straddle part files: L22 E305, L45 E103). Core `DirectReadQueue` (IOCP on
@@ -10562,14 +10586,32 @@ bytes and frame pitch, or `FP8_E4M3FN_B128`); the NVFP4 family is unchanged and 
 dispatches per format (`cuda/ggml_expert.cuh`, `cuda/fp8_expert.cuh`, `cpu/ggml_expert.cpp`,
 `cpu/fp8_expert.cpp`).
 
-- **GPU narrow (≤ 8 columns).** dp4a kernels decode each slice's codes once for every column; IQ4
-  values by two `__byte_perm` lookups; grid signs and Q2_0/Q6_K offsets in native arithmetic (IQ3_S,
-  IQ3_XXS and IQ2_S grid bytes are never zero, so m = (s4 · 0x00204081) & 0x01010101 and
-  (v ^ m · 0xFF) + m negate without borrows: five instructions where `__vcmpne4`/`__vsub4` compiled
-  to about ten per word); 2-byte-aligned GGUF words through N + 1 aligned 4-byte loads and funnel
-  shifts (`ld_words_a2`: op at one column −10 % to +5 %, tg512 ~+1 %). The FP8 kernels decode a
-  word's three base-64 digits from a 256-entry shared table and byte permutes (~11 instructions per
-  code word instead of ~60), once per slice for all of a pass's columns.
+- **GPU narrow (≤ 8 columns), int8 tensor cores since 2026-10-29** (`ops/ggml/ggml_narrow_mma.cuh`,
+  `cuda/ggml_expert.cuh`). A warp owns 8 weight rows (gate/up: 4 intermediates' gate rows then their up
+  rows; down: 8 output rows) and streams them through a private `cp.async` ring of one-block stages
+  (gate/up, 3 deep) or holds the whole 640-element down row (copied before the PDL wait). Per
+  `mma.m16n8k32.s8`, thread (g, t) decodes chunk t of its row for both slots: slot g holds slice 2p and
+  slot g + 8 slice 2p + 1 of the same row, with B columns n = 2 l + s (limb plane l of slice 2p + s), so
+  thread t < 3 receives limb plane t of both slices (IQ2_S, whose sub-scale covers 16 elements, puts the
+  two halves of one slice in the two slots); each thread sums sub · C per block and adds one int128 term
+  per block, and the three limb planes combine once per output. Down rows accumulate in int64 units of
+  the row's smallest scale shift (one IMAD.WIDE a block; int128 when a row's span exceeds 20). The x of a
+  job of ≤ 2 columns is copied to shared memory; row pieces are an odd number of 16-byte chunks (an even
+  count put the warp's 8 rows in one bank); codebooks live in shared memory. The job's last gate/up CTA
+  (a per-job count in the workspace, cleared by the x encoder) encodes its h once; the down CTAs copy
+  it to shared memory. The dp4a kernels before this issued 9.5 thread instructions per weight at one
+  column (24 dp4a of 229 a lane-slice, the rest decode and per-slice int128 terms, plus a 364-instruction
+  per-pass shuffle reduction) at 1.15 IPC with long-scoreboard stalls on their own weight loads.
+  Measured (op bench, cold L2, all 7 format pairs bit-identical; RTX 5090; bench wall per call, ~40 µs of
+  it host gaps): T = 4 −11 % to +1 % (IQ4_XS +1 %), T = 8 −13 % to −2.5 %, T = 1 +5 % to +18 % (IQ4_XS
+  37.4 → 44.1 µs; IQ3_S kernel time 33.3 against 33.0 µs); in the model (IQ3_S, full layout) struct decode
+  437.2 → 462.9 tok/s (+5.9 %), 16K steady state 252.4 → 261.1 (+3.5 %), prefill flat. Rejected:
+  x fragments a stage ahead in registers (156 registers), int64 base accumulation for gate/up (its
+  scale-word loads stalled; six K-loop copies), a persistent gate/up tile stream with bulk copies of
+  whole 4-row runs (slots held shared memory while computing: −6 %), persistent down tiles with h
+  through L1 (−20 % on the down pass), 4-warp gate/up CTAs for 1-2 column calls (no gain). The FP8
+  kernels (dp4a) decode a word's three base-64 digits from a 256-entry shared table and byte permutes
+  (~11 instructions per code word instead of ~60), once per slice for all of a pass's columns.
 - **GPU wide (prefill).** Exact int8 tensor-core tiles, 64 × 64, decode-then-MMA: sixteen warps of
   16 × 16 outputs within 128 registers (eight warps of 32 × 16 needed 253 for one CTA per SM); codes
   and sub-scales in A-fragment order; `ldmatrix.x4` limb fragments; int64 accumulators relative to a

@@ -2,20 +2,17 @@
 // by moe_layer.cu after its pass helpers. A record holds the gate rows, the up rows (one ggml
 // format) and the down rows (another), each row verbatim GGUF blocks.
 //
-// The arithmetic is ops/ggml/ggml_exact.h in the dp4a form of ops/ggml/ggml_dp4a.cuh: x and h are
-// encoded per column as A16 limbs and every output row is an exact int128 rounded once, so an
-// expert's outputs depend neither on where its record lives nor on how many columns share the
-// call; the same kernels serve every column count (there is no wide route for ggml banks).
+// The arithmetic is ops/ggml/ggml_exact.h: x and h are encoded per column as A16 limbs (ggml_dp4a.cuh's
+// layout) and every output row is an exact int128 rounded once, so an expert's outputs depend neither on
+// where its record lives nor on how many columns share the call. Jobs of at most kMaxColumns columns run the
+// narrow kernels on int8 tensor cores (ops/ggml/ggml_narrow_mma.cuh; below), wider jobs the exact tiles.
 //
 // - ggml_encode_x_kernel encodes every token's x once per call into the A16 workspace's x limb
 //   rows (kHidden / 32 slices of kSliceWords words: exactly kA16XRowBytes; the expert formats
 //   have no min term, so no slice sums) and x_emax.
-// - A gate/up CTA owns kGgmlGateUpUnits intermediates, one per warp: lanes 0-15 its gate row and
-//   lanes 16-31 its up row, five slices each; one shuffle pairs them for SwiGLU, and lane 0 writes
-//   BF16 h to the entry's h row.
-// - A down CTA owns kGgmlDownRows output rows, four lanes per row (K = 640: twenty slices); each
-//   warp encodes one column's h into shared memory per pass.
 
+// The block-FP8 bank's dp4a kernels (fp8_expert.cuh): a gate/up CTA owns kGgmlGateUpUnits intermediates, one
+// per warp; a down CTA kGgmlDownRows output rows, four lanes a row.
 constexpr int kGgmlThreads       = 128;
 constexpr int kGgmlWarps         = kGgmlThreads / 32;
 constexpr int kGgmlGateUpUnits   = kGgmlWarps;      // intermediates per gate/up CTA
@@ -28,12 +25,17 @@ static_assert(kGgmlXSlices * ggml::fast::kSliceWords * 4 == moe::wide::kA16XRowB
               "a ggml call's x limbs fill the A16 x limb row exactly");
 static_assert(kGgmlColumns == kGgmlWarps, "a down CTA encodes one column per warp");
 
-// One CTA per column.
+// One CTA per column; a last CTA clears the jobs' gate/up CTA counts (the tensor-core route's).
 __global__ void __launch_bounds__(kThreads)
-    ggml_encode_x_kernel(const bf16* __restrict__ x, std::uint8_t* __restrict__ x_limbs, std::int32_t* __restrict__ x_emax) {
+    ggml_encode_x_kernel(const bf16* __restrict__ x, int columns, std::uint8_t* __restrict__ x_limbs,
+                         std::int32_t* __restrict__ x_emax, std::uint32_t* __restrict__ job_ctas, int max_jobs) {
     __shared__ unsigned warp_key[kWarps];
     __shared__ int column_emax;
     const int t = blockIdx.x;
+    if (t == columns) {
+        for (int j = static_cast<int>(threadIdx.x); j < max_jobs; j += kThreads) { job_ctas[j] = 0U; }
+        return;
+    }
     const auto* v = reinterpret_cast<const std::uint16_t*>(x) + static_cast<std::size_t>(t) * moe::kHidden;
     unsigned key = 0;
     for (int j = threadIdx.x; j < moe::kHidden; j += blockDim.x) { key = max(key, static_cast<unsigned>(v[j] & 0x7FFFU)); }
@@ -61,84 +63,244 @@ __device__ __forceinline__ void ggml_shfl_add(ggml::I128& r, int offset) {
     ggml::add(r, ggml::I128{static_cast<std::uint64_t>(lo), static_cast<std::int64_t>(hi)});
 }
 
+// ------------------------------------------------------------------- narrow tensor-core route
+//
+// The same outputs on int8 tensor cores (ops/ggml/ggml_narrow_mma.cuh): a warp owns 8 weight rows and
+// streams them through a private cp.async ring; CTAs of kNmmaWarps warps.
+// - Gate/up: a warp's rows are 4 intermediates' gate rows then their up rows, K in ten one-block stages
+//   kNmmaDepth deep; thread (g, 0) of a gate row pairs it with its up row (lane + 16) for SwiGLU. A job of at
+//   most kNmmaSharedX columns reads x from a shared-memory copy. The job's last CTA to finish (a per-job count
+//   in the workspace) encodes every entry's h once for the down tiles: its limbs over the h row, and h_emax.
+// - Down: a warp's rows are 8 output rows, K in two resident stages of ten slices copied before the PDL wait;
+//   the job's encoded h is then copied to shared memory (its columns: the call's, at most kMaxColumns).
+//   Row sums accumulate in int64 units of the row's smallest scale shift (int128 when a row's span is wider).
+// Measured on the RTX 5090 (2026-10-29): in-model decode +5.9 % (struct), +3.5 % (16K) over the dp4a kernels.
+// Rejected: x a stage ahead in registers (156 registers), gate/up int64 base accumulation (its scale-word
+// loads stalled, six K-loop copies), a persistent gate/up tile stream (whole-tile slots held shared memory
+// while computing: -6 %), persistent down tiles with h through L1 (-20 % on the down pass), 4-warp gate/up
+// CTAs for one- and two-column calls (no gain).
+
+constexpr int kNmmaWarps      = 8;
+constexpr int kNmmaThreads    = 32 * kNmmaWarps;
+constexpr int kNmmaUnits      = 4 * kNmmaWarps; // intermediates per gate/up CTA
+constexpr int kNmmaDepth      = 3;              // gate/up stages in a warp's ring
+constexpr int kNmmaSharedX    = 2;              // columns whose x a gate/up CTA copies to shared memory
+constexpr int kNmmaDownRows   = 8 * kNmmaWarps; // output rows per down CTA
+constexpr int kNmmaDownSlices = kGgmlHSlices / 2;
+constexpr int kNmmaGateUpCtas = moe::kIntermediate / kNmmaUnits; // per job
+static_assert(moe::kIntermediate % kNmmaUnits == 0 && moe::kHidden % kNmmaDownRows == 0);
+static_assert(moe::kMaxColumns <= kNmmaWarps, "a job's last gate/up CTA encodes one entry per warp");
+
 template <QType GU>
-__device__ __forceinline__ void gate_up_ggml_body(const std::uint8_t* __restrict__ x_limbs,
-                                                  const std::int32_t* __restrict__ x_emax, const MoeDispatch& dispatch,
-                                                  const MoeExpertSource& source, int top_k,
-                                                  const std::uint8_t* const* __restrict__ job_records,
-                                                  const std::int32_t* __restrict__ cpu_flags, int job_base,
-                                                  std::uint16_t* __restrict__ h_plane, PassPhase phase, int narrow_max) {
-    constexpr int C = kGgmlColumns;
-    const int job   = job_base + static_cast<int>(blockIdx.y);
-    if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
-    const int expert = dispatch.jobs[job];
-    const std::uint8_t* record = pass_record(phase, source, expert, job_records, job);
+using NmmaGateUpRing = ggml::nmma::Ring<8, kGgmlXSlices / 8, kNmmaDepth, ggml::nmma::kBlockBytes<GU>>;
+template <QType D>
+using NmmaDownRing =
+    ggml::nmma::Ring<kNmmaDownSlices, 2, 2, kNmmaDownSlices / ggml::nmma::kBlockSlices<D> * ggml::nmma::kBlockBytes<D>>;
+
+template <QType GU>
+struct NmmaGateUpShared {
+    ggml::fast::SharedCodebook<GU> cb;
+    alignas(16) std::int32_t x[kNmmaSharedX][kGgmlXSlices * ggml::fast::kSliceWords];
+    alignas(16) std::uint8_t ring[kNmmaWarps][NmmaGateUpRing<GU>::kBytes];
+};
+
+// A down CTA's shared memory: the rows' rings, then the job's encoded h, kA16HRowBytes a column for as many
+// columns as the call has (at most kMaxColumns): sized at launch, so one- and two-column calls fit more CTAs.
+template <QType D>
+struct NmmaDownShared {
+    int emax[moe::kMaxColumns];
+    alignas(16) std::uint8_t ring[kNmmaWarps][NmmaDownRing<D>::kBytes];
+    alignas(16) std::int32_t limbs[1][kGgmlHSlices * ggml::fast::kSliceWords]; // [columns] at launch
+};
+template <QType D>
+std::size_t nmma_down_shared_bytes(int columns) {
+    return offsetof(NmmaDownShared<D>, limbs) + static_cast<std::size_t>(std::min(columns, moe::kMaxColumns)) * moe::wide::kA16HRowBytes;
+}
+
+// Entry `entry`'s h (BF16, written by the call's gate/up CTAs) rewritten in place as its limbs, and its exponent:
+// one warp, holding the whole row in registers (the wide route's encode_h_ggml layout). Reads through L2.
+__device__ __forceinline__ void nmma_encode_h(std::uint16_t* __restrict__ h_plane, std::int32_t* __restrict__ h_emax,
+                                              int entry, int lane) {
+    constexpr int kGroups = moe::kIntermediate / 4 / 32; // per lane
+    std::uint16_t* h = h_plane + static_cast<std::size_t>(entry) * moe::wide::kA16HRowElements;
+    std::uint16_t v[kGroups][4];
+    unsigned key = 0;
+#pragma unroll
+    for (int i = 0; i < kGroups; ++i) {
+        const uint2 w = __ldcg(reinterpret_cast<const uint2*>(h + 4 * (lane + 32 * i)));
+        v[i][0] = static_cast<std::uint16_t>(w.x & 0xFFFFU);
+        v[i][1] = static_cast<std::uint16_t>(w.x >> 16);
+        v[i][2] = static_cast<std::uint16_t>(w.y & 0xFFFFU);
+        v[i][3] = static_cast<std::uint16_t>(w.y >> 16);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) { key = max(key, static_cast<unsigned>(v[i][j] & 0x7FFFU)); }
+    }
+    key = __reduce_max_sync(0xFFFFFFFFU, key);
+    const int e = key >= 0x7F80U ? canon::kA16NonFinite : max(static_cast<int>(key >> 7), 1);
+    __syncwarp();
+    const auto value = [&](std::uint16_t b) { return e == canon::kA16NonFinite ? 0 : canon::a16_value(b, e); };
+    auto* column_words = reinterpret_cast<std::int32_t*>(h);
+#pragma unroll
+    for (int i = 0; i < kGroups; ++i) {
+        (void)ggml::fast::store_group(column_words, lane + 32 * i, value(v[i][0]), value(v[i][1]), value(v[i][2]),
+                                      value(v[i][3]));
+    }
+    if (lane == 0) { h_emax[entry] = e; }
+}
+
+// The arguments of a pass of the narrow tensor-core kernels.
+struct NmmaPassArgs {
+    const std::uint8_t* x_limbs;
+    const std::int32_t* x_emax;
+    MoeDispatch dispatch;
+    MoeExpertSource source;
+    int top_k;
+    const std::uint8_t* const* job_records;
+    const std::int32_t* cpu_flags;
+    int job_base, jobs;
+    std::uint16_t* h_plane;
+    std::int32_t* h_emax;
+    std::uint32_t* job_ctas; // [max_jobs]: gate/up CTAs finished per job
+    bf16* outputs;
+    int hidden;
+    PassPhase phase;
+    int narrow_max;
+};
+
+// Gate/up CTA tile `bx` (intermediates 32 bx ..) of job `job`: every thread of the CTA calls it. The codebook is
+// in sm.cb already, or (load_codebook) loaded here and published by the x barrier.
+template <QType GU>
+__device__ __forceinline__ void gate_up_nmma_task(NmmaGateUpShared<GU>& sm, const NmmaPassArgs& a, int job, int bx,
+                                                  bool load_codebook) {
+    namespace nm = ggml::nmma;
+    constexpr int W        = kNmmaWarps;
+    constexpr int kThreads = kNmmaThreads;
+    __shared__ int last_cta;
+    const auto& dispatch = a.dispatch;
+    const auto& source   = a.source;
+    const std::uint8_t* x_limbs = a.x_limbs;
+    const std::int32_t* x_emax  = a.x_emax;
+    std::uint16_t* h_plane      = a.h_plane;
+    const int top_k             = a.top_k;
+    if (job >= *dispatch.job_count || (a.cpu_flags != nullptr && a.cpu_flags[job] != 0)) { return; }
+    const int expert           = dispatch.jobs[job];
+    const std::uint8_t* record = pass_record(a.phase, source, expert, a.job_records, job);
     if (record == nullptr) { return; }
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (count > narrow_max) { return; } // a wide job: its tiles compute it
-    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    const int part = lane % 16, up = lane / 16;
-    const int i    = blockIdx.x * kGgmlGateUpUnits + warp; // intermediate
-    const int row_bytes = static_cast<int>(source.ggml.gate_row_bytes);
-    const std::uint8_t* row = record + (static_cast<std::size_t>(up) * moe::kIntermediate + i) * row_bytes;
-    pdl::trigger_dependents();
-    for (int pass = 0; pass < count; pass += C) {
-        const int n = min(C, count - pass);
-        const std::int32_t* xs[C];
-        int tokens[C];
-#pragma unroll
-        for (int c = 0; c < C; ++c) {
-            tokens[c] = c < n ? dispatch.entries[first + pass + c] / top_k : 0;
-            xs[c]     = reinterpret_cast<const std::int32_t*>(x_limbs + static_cast<std::size_t>(tokens[c]) *
-                                                                       moe::wide::kA16XRowBytes);
-        }
-        ggml::I128 acc[C];
-        for (int s = part; s < kGgmlXSlices; s += 16) {
-            const ggml::fast::Slice w      = ggml::fast::slice<GU>(row, s);
-            const ggml::fast::SliceScale sc = ggml::fast::slice_scale(w);
-#pragma unroll
-            for (int c = 0; c < C; ++c) {
-                if (c < n) { ggml::fast::add_slice(acc[c], w, sc, xs[c] + s * ggml::fast::kSliceWords, 0); }
-            }
-        }
-#pragma unroll
-        for (int c = 0; c < C; ++c) {
-            if (c < n) {
-#pragma unroll
-                for (int offset = 8; offset >= 1; offset >>= 1) { ggml_shfl_add(acc[c], offset); }
-                const std::uint16_t y     = ggml::output_bf16(acc[c], x_emax[tokens[c]], GU);
-                const std::uint16_t other = static_cast<std::uint16_t>(__shfl_xor_sync(0xFFFFFFFFU, y, 16));
-                if (lane == 0) {
-                    h_plane[static_cast<std::size_t>(first + pass + c) * moe::wide::kA16HRowElements + i] =
-                        canon::swiglu_bf16(y, other);
-                }
-            }
+    if (count > a.narrow_max) { return; } // a wide job: its tiles compute it
+    const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
+    const int i0   = bx * 4 * W + 4 * warp;
+    const std::size_t row_bytes = source.ggml.gate_row_bytes;
+    const auto row_of = [&](int r) {
+        return record + static_cast<std::size_t>(r < 4 ? i0 + r : moe::kIntermediate + i0 + r - 4) * row_bytes;
+    };
+    std::uint8_t* ring = sm.ring[warp];
+    const auto token   = [&](int c) { return dispatch.entries[first + c] / top_k; };
+    if (load_codebook) { sm.cb.template load<kThreads>(); }
+    // A job of at most kNmmaSharedX columns reads its x from shared memory (one copy per CTA, the first commit
+    // group), wider ones from L2 with the next stage's lines prefetched into L1.
+    const bool shared_x = count <= kNmmaSharedX;
+    if (shared_x) {
+        constexpr int kChunks = moe::wide::kA16XRowBytes / 16;
+        for (int i = static_cast<int>(threadIdx.x); i < count * kChunks; i += kThreads) {
+            const int c = i / kChunks, k = i % kChunks;
+            ggml::tile::cp_async16(reinterpret_cast<std::uint8_t*>(sm.x[c]) + 16 * k,
+                                   x_limbs + static_cast<std::size_t>(token(c)) * moe::wide::kA16XRowBytes + 16 * k, 16);
         }
     }
+    ggml::tile::cp_async_commit();
+    NmmaGateUpRing<GU>::prologue(ring, row_of, lane);
+    ggml::tile::cp_async_wait<kNmmaDepth - 1>(); // the x group
+    __syncthreads();                             // the codebook and x
+    // Columns [pass, pass + n) of the job (n <= C).
+    const auto run = [&](auto width, auto from_shared, int pass, int n) {
+        constexpr int C       = decltype(width)::value;
+        constexpr bool kShared = decltype(from_shared)::value;
+        const std::int32_t* xs[C];
+#pragma unroll
+        for (int c = 0; c < C; ++c) {
+            xs[c] = kShared ? sm.x[min(c, n - 1)]
+                            : reinterpret_cast<const std::int32_t*>(x_limbs + static_cast<std::size_t>(token(pass + min(c, n - 1))) *
+                                                                                  moe::wide::kA16XRowBytes);
+        }
+        const auto xpair = [&](int c, int slice, int word) {
+            const std::int32_t* p = xs[c] + slice * ggml::fast::kSliceWords + word;
+            if constexpr (kShared) {
+                if constexpr (nm::kWordStep<GU> == 1) { return *reinterpret_cast<const int2*>(p); }
+                return make_int2(p[0], p[nm::kWordStep<GU>]);
+            } else {
+                if constexpr (nm::kWordStep<GU> == 1) { return __ldg(reinterpret_cast<const int2*>(p)); }
+                return make_int2(__ldg(p), __ldg(p + nm::kWordStep<GU>));
+            }
+        };
+        const auto xprefetch = [&](int c, int slice, int word) {
+            if constexpr (!kShared) {
+                asm volatile("prefetch.global.L1 [%0];" ::"l"(xs[c] + slice * ggml::fast::kSliceWords + word));
+            }
+        };
+        nm::Rows<C> acc;
+        if (pass > 0) { NmmaGateUpRing<GU>::prologue(ring, row_of, lane); }
+        NmmaGateUpRing<GU>::template body<GU, C, false>(ring, row_of, sm.cb, xpair, xprefetch, lane, acc);
+#pragma unroll
+        for (int c = 0; c < C; ++c) {
+            const ggml::I128 r     = nm::combine_limbs(acc.r[c]);
+            const std::uint16_t y  = ggml::output_bf16(r, x_emax[token(pass + min(c, n - 1))], GU);
+            const std::uint16_t up = static_cast<std::uint16_t>(__shfl_down_sync(0xFFFFFFFFU, y, 16));
+            if (c < n && lane < 16 && lane % 4 == 0) {
+                h_plane[static_cast<std::size_t>(first + pass + c) * moe::wide::kA16HRowElements + i0 + lane / 4] =
+                    canon::swiglu_bf16(y, up);
+            }
+        }
+    };
+    if (count == 1) {
+        run(std::integral_constant<int, 1>{}, std::true_type{}, 0, 1);
+    } else if (count == 2) {
+        run(std::integral_constant<int, 2>{}, std::true_type{}, 0, 2);
+    } else {
+        for (int pass = 0; pass < count; pass += 4) { run(std::integral_constant<int, 4>{}, std::false_type{}, pass, min(4, count - pass)); }
+    }
+    // The job's last CTA encodes its h. The barrier orders every thread's h stores before thread 0's acq_rel
+    // count (a cumulative release; per-thread __threadfence before it cost every CTA a store drain at exit: T = 8
+    // op +2.7 %, struct decode -3 %), and the last CTA's acquire reaches its other threads through the barrier.
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        std::uint32_t done;
+        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(done) : "l"(a.job_ctas + job) : "memory");
+        last_cta = done == kNmmaGateUpCtas - 1 ? 1 : 0;
+    }
+    __syncthreads();
+    if (last_cta == 0) { return; } // (a job belongs to one pass; the call's x encoder clears the counts)
+    if (warp < count) { nmma_encode_h(h_plane, a.h_emax, first + warp, lane); }
 }
 
 template <QType GU>
-__global__ void __launch_bounds__(kGgmlThreads)
-    gate_up_kernel_ggml(const std::uint8_t* __restrict__ x_limbs, const std::int32_t* __restrict__ x_emax,
-                        MoeDispatch dispatch, MoeExpertSource source, int top_k,
-                        const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
-                        int job_base, std::uint16_t* __restrict__ h_plane, PassPhase phase, int narrow_max) {
-    gate_up_ggml_body<GU>(x_limbs, x_emax, dispatch, source, top_k, job_records, cpu_flags, job_base, h_plane, phase,
-                          narrow_max);
+__global__ void __launch_bounds__(kNmmaThreads) gate_up_nmma_ggml(NmmaPassArgs a) {
+    extern __shared__ __align__(16) unsigned char nmma_shared[];
+    pdl::trigger_dependents();
+    gate_up_nmma_task<GU>(*reinterpret_cast<NmmaGateUpShared<GU>*>(nmma_shared), a, a.job_base + static_cast<int>(blockIdx.y),
+                          static_cast<int>(blockIdx.x), true);
 }
 
+// Down CTA tile `bx` (output rows 64 bx ..) of job `job`: every thread of the CTA calls it, a programmatic
+// dependent of the gate/up pass (every CTA waits on PDL, after its weight copies are issued). (One persistent
+// launch of a pass's gate/up and down tiles, down tasks waiting for their job's h, measured slower: 16K 264.8 ->
+// 258.2, struct 463.1 -> 455.9, 2026-10-29: its CTAs held every SM through the pass, where the two launches'
+// retiring CTAs let the prioritized shared-expert and staged kernels in.)
 template <QType D>
-__global__ void __launch_bounds__(kGgmlThreads)
-    down_kernel_ggml(MoeDispatch dispatch, MoeExpertSource source, int hidden,
-                     const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
-                     int job_base, const std::uint16_t* __restrict__ h_plane, bf16* __restrict__ outputs, PassPhase phase,
-                     int narrow_max) {
-    constexpr int C = kGgmlColumns;
-    __shared__ __align__(16) std::int32_t limbs[C][kGgmlHSlices * ggml::fast::kSliceWords];
-    __shared__ int emax[C];
-    const int job = job_base + static_cast<int>(blockIdx.y);
-    // A programmatic dependent of the gate/up pass (down_kernel's PDL contract): only h_plane is read
-    // after the wait, and every CTA waits.
+__device__ __forceinline__ void down_nmma_task(NmmaDownShared<D>& sm, const NmmaPassArgs& a, int job, int bx) {
+    const auto& dispatch = a.dispatch;
+    const auto& source   = a.source;
+    const std::uint16_t* h_plane = a.h_plane;
+    const std::int32_t* h_emax   = a.h_emax;
+    bf16* outputs                = a.outputs;
+    const int hidden             = a.hidden;
+    const std::int32_t* cpu_flags = a.cpu_flags;
+    const auto job_records       = a.job_records;
+    const PassPhase phase        = a.phase;
+    const int narrow_max         = a.narrow_max;
+    namespace nm = ggml::nmma;
+    // Only h_plane and h_emax are read after the wait (the job's last gate/up CTA encoded its h); the weights do
+    // not depend on it, so their copies start first.
     int expert = 0, first = 0, count = 0;
     const std::uint8_t* record = nullptr;
     if (job < *dispatch.job_count && (cpu_flags == nullptr || cpu_flags[job] == 0)) {
@@ -148,55 +310,72 @@ __global__ void __launch_bounds__(kGgmlThreads)
     if (record != nullptr) {
         first = dispatch.offsets[expert];
         count = dispatch.offsets[expert + 1] - first;
+        if (count > narrow_max) { record = nullptr; }
     }
+    const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
+    const int r0   = bx * kNmmaDownRows + 8 * warp;
+    const std::uint8_t* down = record + 2 * static_cast<std::size_t>(moe::kIntermediate) * source.ggml.gate_row_bytes;
+    const auto row_of = [&](int r) { return down + static_cast<std::size_t>(r0 + r) * source.ggml.down_row_bytes; };
+    std::uint8_t* ring = sm.ring[warp];
+    if (record != nullptr) { NmmaDownRing<D>::issue_all(ring, row_of, lane); }
     pdl::wait_for_dependencies();
-    if (record == nullptr || count > narrow_max) { return; }
-    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    const int part = lane % kGgmlDownLanes;
-    const int row  = blockIdx.x * kGgmlDownRows + threadIdx.x / kGgmlDownLanes;
-    const int row_bytes = static_cast<int>(source.ggml.down_row_bytes);
-    const std::uint8_t* w = record + 2 * static_cast<std::size_t>(moe::kIntermediate) * source.ggml.gate_row_bytes +
-                            static_cast<std::size_t>(row) * row_bytes;
-    for (int pass = 0; pass < count; pass += C) {
-        const int n = min(C, count - pass);
-        // Warp c encodes column c's h: its exponent (a warp maximum), then its limbs.
-        if (warp < n) {
-            const std::uint16_t* h = h_plane + static_cast<std::size_t>(first + pass + warp) * moe::wide::kA16HRowElements;
-            unsigned key = 0;
-            for (int j = lane; j < moe::kIntermediate; j += 32) { key = max(key, static_cast<unsigned>(h[j] & 0x7FFFU)); }
-            key = __reduce_max_sync(0xFFFFFFFFU, key);
-            const int e = key >= 0x7F80U ? canon::kA16NonFinite : max(static_cast<int>(key >> 7), 1);
-            if (lane == 0) { emax[warp] = e; }
-            const auto value = [&](int j) { return e == canon::kA16NonFinite ? 0 : canon::a16_value(h[j], e); };
-            for (int g = lane; g < moe::kIntermediate / 4; g += 32) {
-                (void)ggml::fast::store_group(limbs[warp], g, value(4 * g), value(4 * g + 1), value(4 * g + 2),
-                                              value(4 * g + 3));
+    if (record == nullptr) { return; }
+    // The job's encoded h (its last gate/up CTA wrote each entry's limbs over its h row) and exponents.
+    for (int i = static_cast<int>(threadIdx.x); i < count * (moe::wide::kA16HRowBytes / 16); i += kNmmaThreads) {
+        const int c = i / (moe::wide::kA16HRowBytes / 16), k = i % (moe::wide::kA16HRowBytes / 16);
+        ggml::tile::cp_async16(reinterpret_cast<std::uint8_t*>(sm.limbs[0] + c * kGgmlHSlices * ggml::fast::kSliceWords) + 16 * k,
+                               reinterpret_cast<const std::uint8_t*>(h_plane + static_cast<std::size_t>(first + c) *
+                                                                                   moe::wide::kA16HRowElements) + 16 * k,
+                               16);
+    }
+    ggml::tile::cp_async_commit();
+    if (static_cast<int>(threadIdx.x) < count) { sm.emax[threadIdx.x] = __ldcg(h_emax + first + threadIdx.x); }
+    ggml::tile::cp_async_wait<0>();
+    __syncthreads(); // the limbs, and every lane's weight copies
+    const ggml::fast::DeviceCodebook<D> no_codebook{}; // the down formats read no table
+    int base         = 0;
+    const bool by_base = NmmaDownRing<D>::template row_base<D>(ring, row_of, lane, base);
+    for (int pass = 0; pass < count; pass += 4) {
+        const int n    = min(4, count - pass);
+        const auto run = [&](auto width) {
+            constexpr int C = decltype(width)::value;
+            const auto xpair = [&](int c, int slice, int word) {
+                const std::int32_t* p = sm.limbs[0] + (pass + min(c, n - 1)) * kGgmlHSlices * ggml::fast::kSliceWords + slice * ggml::fast::kSliceWords + word;
+                if constexpr (nm::kWordStep<D> == 1) { return *reinterpret_cast<const int2*>(p); }
+                return make_int2(p[0], p[nm::kWordStep<D>]);
+            };
+            nm::Rows<C> acc;
+            acc.base = base;
+            if (by_base) {
+                NmmaDownRing<D>::template resident<D, C, true>(ring, row_of, no_codebook, xpair, lane, acc);
+            } else {
+                NmmaDownRing<D>::template resident<D, C, false>(ring, row_of, no_codebook, xpair, lane, acc);
             }
-        }
-        __syncthreads();
-        ggml::I128 acc[C];
-        for (int s = part; s < kGgmlHSlices; s += kGgmlDownLanes) {
-            const ggml::fast::Slice ws      = ggml::fast::slice<D>(w, s);
-            const ggml::fast::SliceScale sc = ggml::fast::slice_scale(ws);
 #pragma unroll
             for (int c = 0; c < C; ++c) {
-                if (c < n) { ggml::fast::add_slice(acc[c], ws, sc, limbs[c] + s * ggml::fast::kSliceWords, 0); }
-            }
-        }
-#pragma unroll
-        for (int c = 0; c < C; ++c) {
-            if (c < n) {
-#pragma unroll
-                for (int offset = kGgmlDownLanes / 2; offset >= 1; offset >>= 1) { ggml_shfl_add(acc[c], offset); }
-                if (part == 0) {
+                const ggml::I128 r    = nm::combine_limbs(acc.r[c]);
+                const std::uint16_t y = ggml::output_bf16(r, sm.emax[pass + min(c, n - 1)], D);
+                if (c < n && lane % 4 == 0) {
                     const int column = dispatch.entries[first + pass + c];
-                    reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(column) * hidden + row] =
-                        ggml::output_bf16(acc[c], emax[c], D);
+                    reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(column) * hidden + r0 + lane / 4] = y;
                 }
             }
+        };
+        if (n == 1) {
+            run(std::integral_constant<int, 1>{});
+        } else if (n == 2) {
+            run(std::integral_constant<int, 2>{});
+        } else {
+            run(std::integral_constant<int, 4>{});
         }
-        __syncthreads(); // every warp has read the limbs before the next pass re-encodes them
     }
+}
+
+template <QType D>
+__global__ void __launch_bounds__(kNmmaThreads) down_nmma_ggml(NmmaPassArgs a) {
+    extern __shared__ __align__(16) unsigned char nmma_shared[];
+    down_nmma_task<D>(*reinterpret_cast<NmmaDownShared<D>*>(nmma_shared), a, a.job_base + static_cast<int>(blockIdx.y),
+                      static_cast<int>(blockIdx.x));
 }
 
 // ------------------------------------------------------------------------------- wide route
@@ -459,10 +638,12 @@ void launch_plan_ggml(const MoeDispatch& dispatch, int max_jobs, const moe::wide
     check_launch("ggml plan");
 }
 
-// Encodes the call's x for the gate/up kernels (once per moe_experts call, before its passes).
-void launch_encode_x_ggml(const Tensor& x, const moe::wide::ExpertsWorkspace& layout, cudaStream_t stream) {
-    ggml_encode_x_kernel<<<static_cast<unsigned>(x.ne[1]), kThreads, 0, stream>>>(static_cast<const bf16*>(x.data),
-                                                                                   layout.x_limbs, layout.x_emax);
+// Encodes the call's x for the gate/up kernels and clears its jobs' gate/up CTA counts (once per moe_experts
+// call, before its passes).
+void launch_encode_x_ggml(const Tensor& x, int max_jobs, const moe::wide::ExpertsWorkspace& layout, cudaStream_t stream) {
+    const int columns = static_cast<int>(x.ne[1]);
+    ggml_encode_x_kernel<<<static_cast<unsigned>(columns + 1), kThreads, 0, stream>>>(
+        static_cast<const bf16*>(x.data), columns, layout.x_limbs, layout.x_emax, layout.job_ctas, max_jobs);
     check_launch("ggml encode x");
 }
 
@@ -733,19 +914,48 @@ void launch_expert_pass_ggml(const bf16* x, const MoeDispatch& dispatch, const M
                              PassPhase phase, int entries, int columns, PassPart part) {
     auto* h_plane        = reinterpret_cast<std::uint16_t*>(layout.h_rows);
     const int narrow_max = entries > 0 ? moe::kMaxColumns : std::numeric_limits<int>::max();
+    static const bool configured_narrow = [] {
+        const auto shared_carveout = [](auto kernel, std::size_t bytes) {
+            return cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared) ==
+                       cudaSuccess &&
+                   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)) ==
+                       cudaSuccess;
+        };
+        return shared_carveout(gate_up_nmma_ggml<GU>, sizeof(NmmaGateUpShared<GU>)) &&
+               shared_carveout(down_nmma_ggml<D>, nmma_down_shared_bytes<D>(moe::kMaxColumns));
+    }();
+    if (!configured_narrow) {
+        throw std::runtime_error("offloaded_sparse_moe: the ggml narrow kernels' shared memory exceeds the device's");
+    }
+    NmmaPassArgs args{};
+    args.x_limbs     = layout.x_limbs;
+    args.x_emax      = layout.x_emax;
+    args.dispatch    = dispatch;
+    args.source      = source;
+    args.top_k       = top_k;
+    args.job_records = job_records;
+    args.cpu_flags   = flags;
+    args.job_base    = base;
+    args.jobs        = jobs;
+    args.h_plane     = h_plane;
+    args.h_emax      = layout.h_emax;
+    args.job_ctas    = layout.job_ctas;
+    args.outputs     = outputs;
+    args.hidden      = static_cast<int>(moe::kHidden);
+    args.phase       = phase;
+    args.narrow_max  = narrow_max;
     if (part != PassPart::Down) {
         CUDA_CHECK(pdl::launch_with(pdl::Dependency::Serialized,
-                                    {dim3(moe::kIntermediate / kGgmlGateUpUnits, jobs), dim3(kGgmlThreads), 0, stream},
-                                    gate_up_kernel_ggml<GU>, static_cast<const std::uint8_t*>(layout.x_limbs),
-                                    static_cast<const std::int32_t*>(layout.x_emax), dispatch, source, top_k, job_records,
-                                    flags, base, h_plane, phase, narrow_max));
+                                    {dim3(kNmmaGateUpCtas, jobs), dim3(kNmmaThreads), sizeof(NmmaGateUpShared<GU>), stream},
+                                    gate_up_nmma_ggml<GU>, args));
         check_launch("ggml gate/up");
     }
     if (part == PassPart::GateUp) { return; }
     CUDA_CHECK(pdl::launch_with(part == PassPart::Down ? pdl::Dependency::Serialized : pdl::Dependency::Programmatic,
-                                {dim3(moe::kHidden / kGgmlDownRows, jobs), dim3(kGgmlThreads), 0, stream},
-                                down_kernel_ggml<D>, dispatch, source, static_cast<int>(moe::kHidden), job_records,
-                                flags, base, static_cast<const std::uint16_t*>(h_plane), outputs, phase, narrow_max));
+                                {dim3(moe::kHidden / kNmmaDownRows, jobs), dim3(kNmmaThreads), nmma_down_shared_bytes<D>(columns),
+                                 stream},
+                                down_nmma_ggml<D>, args));
+    check_launch("ggml down");
     if (entries == 0) { return; }
     if (source.wide_a16 == moe::WideA16::kGgmlBf16 && columns >= moe::wide::kGgmlStageDecodeMinColumns) {
         launch_decode_pass_ggml<GU, D>(reinterpret_cast<const std::uint16_t*>(x), dispatch, source, top_k, job_records, flags,

@@ -165,7 +165,7 @@ namespace {
 struct Offsets {
     std::size_t job_records, cpu_flags, cpu_call, tiles, pass_tiles;
     std::size_t h_blocks, x_plane;                      // W4A4
-    std::size_t x_limbs, h_rows, x_emax, h_emax;        // W4A16
+    std::size_t x_limbs, h_rows, x_emax, h_emax, job_ctas; // W4A16
     std::size_t x_terms_plane, x_row_scale, h_terms_plane, h_row_scale; // W4A16 two-term A4
     std::size_t lossless;                              // kLossless
     std::size_t x_acts, h_acts, ring_jobs, ring_counters; // the narrow ring (ring_call)
@@ -216,6 +216,7 @@ Offsets offsets(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t en
         o.h_rows  = take(e * h_row);
         o.x_emax  = take(t * sizeof(std::int32_t));
         o.h_emax  = take(e * sizeof(std::int32_t));
+        o.job_ctas = take(j * sizeof(std::uint32_t));
     } else {
         o.h_blocks = take(e * kHBlocks * sizeof(canon::A4Block));
         o.x_plane  = take(e * kXRowBytes);
@@ -586,6 +587,7 @@ ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, s
         w.h_rows  = reinterpret_cast<std::uint8_t*>(p + o.h_rows);
         w.x_emax  = reinterpret_cast<std::int32_t*>(p + o.x_emax);
         w.h_emax  = reinterpret_cast<std::int32_t*>(p + o.h_emax);
+        w.job_ctas = reinterpret_cast<std::uint32_t*>(p + o.job_ctas);
     } else {
         w.h_blocks = reinterpret_cast<canon::A4Block*>(p + o.h_blocks);
         w.x_plane  = reinterpret_cast<std::uint8_t*>(p + o.x_plane);

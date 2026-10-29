@@ -22,6 +22,9 @@
 // their measured values and references.
 
 namespace infernix::runtime::expert_offload {
+
+// The tier shares its lent stream slots among the layers whose reads the stream holds at once.
+static_assert(HostExpertTier::kStreamWindow == ExpertStream::kReadAhead + 2);
 namespace {
 
 namespace moe = ops::offloaded_moe;
@@ -282,7 +285,7 @@ void ExpertOffload::create_tier() {
             kStreamBounceMax);
         tier.stream_bounce = ExpertStream::kBounceParts * per_part;
     }
-    tier.slots = static_cast<std::uint32_t>(std::min<std::uint64_t>(options_.expert_ram_bytes / record_stride_, keys + lists));
+    tier.slots = HostExpertTier::slots_for_bytes(store, options_.expert_ram_bytes, tier);
     if (options_.prefill_stream && options_.expert_cache) { tier.stream = std::min(kStreamReadSlots, tier.slots / 8); }
     const std::uint32_t reserved =
         options_.expert_unpinned_bytes >= record_stride_ ? lists + tier.bounce + tier.stream_bounce : lists;
@@ -676,7 +679,7 @@ void ExpertOffload::create_stream() {
         };
         ssd.wait    = [tier = tier_.get()](std::int32_t slot) { return tier->stream_wait(slot); };
         ssd.release = [tier = tier_.get()](std::int32_t slot) { tier->stream_release(slot); };
-        ssd.slots   = [tier = tier_.get()] { return tier->stream_slots(); };
+        ssd.layer_cap = [tier = tier_.get()] { return tier->stream_layer_cap(); };
     }
     stream_ = std::make_unique<ExpertStream>(setup_.layout.layers, setup_.layout.experts, record_stride_, std::move(record_of),
                                              !tier_, std::move(hold), host_strides_, std::move(ssd));
@@ -1106,12 +1109,11 @@ void ExpertOffload::warm_start(cudaStream_t compute) {
     }
     const double seconds     = tier_seconds + std::chrono::duration<double>(Clock::now() - began).count();
     const std::uint32_t in_ram = filled - released + refilled;
-    const double gib           = static_cast<double>(tier_->record_bytes()) / (1ULL << 30);
     char line[600];
     std::snprintf(line, sizeof(line),
                   "SSD expert tier: %u RAM slots (%.1f GiB) hold %u experts (%s) and copies of %u of the least-used in "
                   "VRAM, %u unpinned records %u more, read in %.1f s; %u of %u experts are read from the artifact when used",
-                  tier_->pinned_slots(), gib * tier_->pinned_slots(), in_ram,
+                  tier_->pinned_slots(), static_cast<double>(tier_->pinned_bytes()) / (1ULL << 30), in_ram,
                   seed == Seed::Saved        ? "the saved ranking, then the last session's use counts"
                   : seed == Seed::Calibrated ? "the calibrated expert order"
                                              : "spread across the layers",

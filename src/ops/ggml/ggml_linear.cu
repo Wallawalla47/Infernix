@@ -408,7 +408,10 @@ __global__ void __launch_bounds__(kMmaWarps * 32, 4)
 // slots (the first stages - 1 before the programmatic wait: the weights are immutable) and runs
 // mma_rows::unit_sums over each, mma_rows_kernel's arithmetic; the tile's warps add their int128
 // partials through shared memory (exact, in any order). A call's segments of two tiled formats share
-// one launch (tiled_mma_mixed_kernel). One-column Q6_K and IQ4_XS calls of one format run rows_kernel
+// one launch (tiled_mma_mixed_kernel). A run's blocks start 2-byte aligned, so their fields are read by 16-bit
+// shared loads (unit_sums<F, true>: the byte-wise reads cost a Q6_K unit 100 byte loads and ~300 assembling
+// IMADs; the IQ3_S import's tiled calls at 4 columns 1-10 % faster, decode +1.5 % at 16K, 2026-10-29).
+// One-column Q6_K and IQ4_XS calls of one format run rows_kernel
 // with tiled addressing instead (tiled_rows_route); every route returns the same integers. Against
 // the row-major routes (2026-10-16, RTX 5090, the IQ3_S import's dense calls weighted per token):
 // -12 / -23 / -26 / -27 / -32 % at 1 / 2 / 4 / 5 / 8 columns; end to end MTP 4 + n-gram 7 at 4K
@@ -455,6 +458,7 @@ __device__ __forceinline__ void tiled_mma_body(const GroupSlot& seg, int slices,
     static_assert(kTiledFormat<F>, "tiled rows: formats of 256-element blocks");
     constexpr int kBlockBytes = static_cast<int>(ggml_block_bytes(F));
     constexpr int kRun        = kTiledRun<F>;
+    static_assert(ggml_block_bytes(F) % 2 == 0, "unit_sums<F, true>: every block of a run starts 2-byte aligned");
     static_assert(kRun % 16 == 0, "a tile's block run is whole 16-byte copies");
     void* const out = seg.out;
     const int warps = static_cast<int>(blockDim.x) / 32, warp = static_cast<int>(threadIdx.x) / 32;
@@ -493,7 +497,7 @@ __device__ __forceinline__ void tiled_mma_body(const GroupSlot& seg, int slices,
         cp_async_wait_upto(stages - 1); // block i has landed
         __syncwarp();
         const unsigned char* run = ring + (i % stages) * slot_bytes;
-        ggml::mma_rows::unit_sums<F>(acc, run + g * kBlockBytes, run + (g + 8) * kBlockBytes, part + i * split, 8, bcol, xs0,
+        ggml::mma_rows::unit_sums<F, true>(acc, run + g * kBlockBytes, run + (g + 8) * kBlockBytes, part + i * split, 8, bcol, xs0,
                                      xs1, t);
     }
     ggml::tile::cp_async_wait<0>();
@@ -611,6 +615,7 @@ __device__ __forceinline__ void tiled_wide_body(const GroupSlot& seg, int group,
     static_assert(kTiledFormat<F>, "tiled rows: formats of 256-element blocks");
     constexpr int kBlockBytes = static_cast<int>(ggml_block_bytes(F));
     constexpr int kRun        = kTiledRun<F>;
+    static_assert(ggml_block_bytes(F) % 2 == 0, "unit_sums<F, true>: every block of a run starts 2-byte aligned");
     void* const out = seg.out;
     const int warps = static_cast<int>(blockDim.x) / 32, warp = static_cast<int>(threadIdx.x) / 32;
     const int lane = static_cast<int>(threadIdx.x) % 32;
@@ -655,7 +660,7 @@ __device__ __forceinline__ void tiled_wide_body(const GroupSlot& seg, int group,
         cp_async_wait_upto(stages - 1);
         __syncwarp();
         const unsigned char* run = ring + (i % stages) * slot_bytes;
-        ggml::mma_rows::unit_sums_columns<F, kWideTiles>(acc, run + g * kBlockBytes, run + (g + 8) * kBlockBytes, part + i * split,
+        ggml::mma_rows::unit_sums_columns<F, kWideTiles, true>(acc, run + g * kBlockBytes, run + (g + 8) * kBlockBytes, part + i * split,
                                                          8, bcol, xs0, xs1, t);
     }
     ggml::tile::cp_async_wait<0>();

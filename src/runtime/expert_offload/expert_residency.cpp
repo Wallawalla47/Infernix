@@ -807,6 +807,9 @@ void ExpertResidency::adaptive_round(const std::int32_t* routes, std::size_t use
     const auto by_count_desc = [&a](std::uint32_t x, std::uint32_t y) {
         return a.count[x] != a.count[y] ? a.count[x] > a.count[y] : x < y;
     };
+    // A victim's cost is its count. Adding a demotion's cost for the exclusive layout's victims without a RAM copy
+    // made the shadows (the experts just promoted) the victims: IQ3_S struct 28,470 promotions a request against
+    // 9,621, decode 270 against 361 tok/s (2026-10-28).
     const auto by_count_asc = [&a](std::uint32_t x, std::uint32_t y) {
         return a.count[x] != a.count[y] ? a.count[x] < a.count[y] : x < y;
     };
