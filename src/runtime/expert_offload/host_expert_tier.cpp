@@ -465,10 +465,12 @@ void HostExpertTier::read_at_startup(const std::vector<std::pair<std::uint32_t, 
     stats_.run_records = agent_run_records_.load(std::memory_order_relaxed);
 }
 
-std::uint32_t HostExpertTier::prefill(std::span<const std::uint32_t> ranked) {
+std::uint32_t HostExpertTier::prefill(std::span<const std::uint32_t> ranked,
+                                      const std::function<bool(std::uint32_t)>& skip) {
     std::vector<std::pair<std::uint32_t, std::uint8_t*>> jobs;
     for (const std::uint32_t key : ranked) {
         if (!tier_.has_free_resident()) { break; }
+        if (skip && skip(key)) { continue; }
         std::int32_t slot = -1;
         if (!tier_.prefill(key, slot)) { continue; } // already has a host copy
         jobs.emplace_back(key, const_cast<std::uint8_t*>(slot_bytes(static_cast<std::uint32_t>(slot))));

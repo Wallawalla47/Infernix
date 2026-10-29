@@ -691,8 +691,8 @@ from the artifact into RAM (it stays readable in VRAM until the read lands), or 
 when that read would land more than 4 ms late (a slower drive); RAM drops the copies of the most-used
 VRAM experts first, so such evictions are few. Outputs are the same bits in both layouts. Speed
 (2026-10-29): decode within run-to-run spread of `full` on IQ3_S and Dense8 (16K steady state, the struct
-fixture, also with the artifact read at 800 MB/s), the community suite 0.993x; a 16K prefill 0.988x on
-IQ3_S (the first prompt reads 17 experts the warm start left on the SSD) and equal on Dense8.
+fixture, also with the artifact read at 800 MB/s), the community suite 0.993x; a 16K prefill equal on
+IQ3_S (6,832-6,833 against 6,787-6,809 tok/s) and on Dense8.
 `--expert-ram-mib N` overrides either with an explicit cap.
 
 **A second drive (`--expert-stripe FILE`).** One drive bounds the tier's reads, most of all in

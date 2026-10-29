@@ -318,7 +318,7 @@ measured overall, and `auto` picks the draft length):
 
 Flash-Next keeps in RAM only the routed experts VRAM does not hold by default (`--expert-ram-layout
 exclusive`); `--expert-ram-layout full` keeps a copy of every expert, 4-6 GiB more RAM on Dense8 and IQ3_S at
-the same decode speed and a 16K prefill about 1 % faster on IQ3_S ([guide](docs/qwen3_8-flash-next.md)).
+the same decode and prefill speed ([guide](docs/qwen3_8-flash-next.md)).
 
 `--prefix-cache-file PATH` keeps the prefix cache across restarts (Ctrl+C twice saves it and exits).
 `infernix-serve.exe --help` lists every option; `--config FILE` reads them from a TOML file

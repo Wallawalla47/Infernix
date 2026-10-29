@@ -3179,17 +3179,19 @@ private:
     void finish_tier_fill(const TierFill& fill, std::uint32_t seeded) {
         const auto start        = std::chrono::steady_clock::now();
         std::uint32_t released  = 0, refilled = 0;
+        const std::int32_t* in_vram = residency_->host_table();
+        const auto vram_holds = [in_vram](std::uint32_t key) { return in_vram != nullptr && in_vram[key] >= 0; };
         if (seeded > 0) {
             released = tier_->controller().release_shadows();
-            if (released > 0) {
-                refilled = tier_->prefill(std::span<const std::uint32_t>(fill.order).subspan(fill.filled));
-            }
+            // The whole order again, past the keys VRAM holds: with record-size classes the first pass passed over
+            // the keys of a class it had filled, wherever they rank, so the released slots are theirs first. From
+            // the position the first pass stopped at, IQ3_S kept 17 experts on the SSD beside 2,895 shadows, and the
+            // first 16K prefill read them (6,700-6,723 against 6,836-6,845 tok/s, 2026-10-29).
+            if (released > 0) { refilled = tier_->prefill(fill.order, vram_holds); }
         }
         // The unpinned records take the next keys of the order that neither the slots nor the frames
         // hold: they keep them for good, so a copy of a VRAM seed would be wasted.
-        const std::int32_t* in_vram = residency_->host_table();
-        const std::uint32_t unpinned =
-            tier_->fill_unpinned(fill.order, [in_vram](std::uint32_t key) { return in_vram != nullptr && in_vram[key] >= 0; });
+        const std::uint32_t unpinned = tier_->fill_unpinned(fill.order, vram_holds);
         std::uint32_t shadows = 0;
         if (seeded > 0 && in_vram != nullptr) {
             std::vector<std::uint32_t> least_used_seeds;

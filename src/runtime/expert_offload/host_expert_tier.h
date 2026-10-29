@@ -158,9 +158,10 @@ public:
     [[nodiscard]] const std::string& unpinned_lock_failure() const noexcept;
 
     // ---- engine thread, no round in flight
-    // Reads the keys of `ranked` (best first) that have no host copy into free resident slots until
-    // none is left; returns how many.
-    std::uint32_t prefill(std::span<const std::uint32_t> ranked);
+    // Reads the keys of `ranked` (best first) that have no host copy and that `skip` (when given) rejects
+    // into free resident slots of their record size until none is left; returns how many. A key whose
+    // size has no free slot is passed over, so later keys can be read before it.
+    std::uint32_t prefill(std::span<const std::uint32_t> ranked, const std::function<bool(std::uint32_t)>& skip = {});
     // Reads the keys of `ranked` (best first) that have no host copy and that `skip` rejects into
     // unpinned records until none is left; they keep them for good. Returns how many.
     std::uint32_t fill_unpinned(std::span<const std::uint32_t> ranked, const std::function<bool(std::uint32_t)>& skip);

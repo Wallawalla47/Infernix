@@ -441,6 +441,30 @@ void test_mixed_strides() {
           "mixed strides: the copied record sits in its class's packed slots");
     tier.end_round();
     tier.controller().check();
+    {
+        // The warm start's refill with record-size classes: the first pass fills layer 1's class with keys 20-24 and
+        // passes over 25-29, then fills layer 0's with 0-4; the frames take 20 and 21, whose released slots go to the
+        // best-ranked keys of their class the first pass passed over (25, 26), not to keys after where it stopped.
+        HostExpertTier warm(store, o);
+        std::vector<std::uint32_t> order;
+        for (std::uint32_t k = kExpertsHere; k < kExpertsHere + 10; ++k) { order.push_back(k); }
+        for (std::uint32_t k = 0; k < 10; ++k) { order.push_back(k); }
+        check(warm.prefill(order) == 10 && warm.record(kExpertsHere + 5) == nullptr,
+              "mixed strides: the first pass passes over a full class's keys");
+        auto& host = warm.controller();
+        for (const std::uint32_t k : {kExpertsHere, kExpertsHere + 1}) {
+            host.queued(k);
+            host.promotion_issued(k);
+            host.promotion_completed(k, true);
+        }
+        check(host.release_shadows() == 2, "mixed strides: the seeds' RAM copies are released");
+        const auto in_vram = [](std::uint32_t k) { return k == kExpertsHere || k == kExpertsHere + 1; };
+        check(warm.prefill(order, in_vram) == 2 && holds(warm.record(kExpertsHere + 5), kExpertsHere + 5) &&
+                  holds(warm.record(kExpertsHere + 6), kExpertsHere + 6) && warm.record(kExpertsHere + 7) == nullptr &&
+                  warm.record(kExpertsHere) == nullptr,
+              "mixed strides: the refill takes the passed-over keys first and skips the frames' keys");
+        host.check();
+    }
     std::error_code ec;
     std::filesystem::remove(path, ec);
 }

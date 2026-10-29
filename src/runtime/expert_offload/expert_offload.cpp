@@ -1087,16 +1087,18 @@ void ExpertOffload::warm_start(cudaStream_t compute) {
     }
     if (!tier_) { return; }
     // The seeds are in VRAM: their RAM copies (shadows) are released and their slots take the next keys
-    // of the fill order; the unpinned records take the next keys neither the slots nor the frames hold.
+    // of the fill order (all of it past the keys VRAM holds: the first pass passed over the keys of a record
+    // size whose slots it had filled, wherever they rank); the unpinned records take the next keys neither the
+    // slots nor the frames hold.
     const auto began       = Clock::now();
     std::uint32_t released = 0, refilled = 0;
+    const std::int32_t* in_vram = residency_->host_table();
+    const auto vram_holds = [in_vram](std::uint32_t key) { return in_vram != nullptr && in_vram[key] >= 0; };
     if (seeded > 0) {
         released = tier_->controller().release_shadows();
-        if (released > 0) { refilled = tier_->prefill(std::span<const std::uint32_t>(order).subspan(filled)); }
+        if (released > 0) { refilled = tier_->prefill(order, vram_holds); }
     }
-    const std::int32_t* in_vram = residency_->host_table();
-    const std::uint32_t unpinned =
-        tier_->fill_unpinned(order, [in_vram](std::uint32_t key) { return in_vram != nullptr && in_vram[key] >= 0; });
+    const std::uint32_t unpinned = tier_->fill_unpinned(order, vram_holds);
     // Slots still free hold shadows of the least-used seeds (a loan's and decode's first victims), as
     // Qwen3.8-Flash-Next's Program does.
     std::uint32_t shadows = 0;
