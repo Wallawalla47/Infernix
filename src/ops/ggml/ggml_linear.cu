@@ -25,6 +25,7 @@
 #include "core/ggml_format.h"
 #include "ops/ggml/ggml_bf16_tile.cuh"
 #include "ops/ggml/ggml_dp4a.cuh"
+#include "ops/ggml/ggml_encode.cuh"
 #include "ops/ggml/ggml_exact.h"
 #include "ops/ggml/ggml_linear_a8.h"
 #include "ops/ggml/ggml_mma_rows.cuh"
@@ -111,107 +112,6 @@ void check_launch(const char* what) {
     if (error != cudaSuccess) { throw std::runtime_error(std::string("ggml_linear ") + what + ": " + cudaGetErrorString(error)); }
 }
 
-// Encodes one column with the whole CTA (Threads threads): its exponent (returned to every thread),
-// then its limbs and slice sums into `column`. `warp_key` and `broadcast` are shared scratch.
-template <int Threads>
-__device__ int encode_column(const std::uint16_t* __restrict__ v, int k, const std::int32_t* __restrict__ perm,
-                             int perm_block, std::int32_t* __restrict__ column, unsigned* warp_key, int* broadcast) {
-    constexpr int kEncodeWarps = Threads / 32;
-    const auto source = [&](int j) { return perm == nullptr ? j : perm[j / perm_block] * perm_block + j % perm_block; };
-    unsigned key = 0;
-    for (int j = threadIdx.x; j < k; j += Threads) { key = max(key, static_cast<unsigned>(v[j] & 0x7FFFU)); }
-    key = __reduce_max_sync(0xFFFFFFFFU, key);
-    if (threadIdx.x % 32 == 0) { warp_key[threadIdx.x / 32] = key; }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        unsigned m = 0;
-        for (int w = 0; w < kEncodeWarps; ++w) { m = max(m, warp_key[w]); }
-        *broadcast = m >= 0x7F80U ? canon::kA16NonFinite : max(static_cast<int>(m >> 7), 1);
-    }
-    __syncthreads();
-    const int e = *broadcast;
-    const int groups = k / 4, slices = k / 32;
-    const auto value = [&](int j) { return e == canon::kA16NonFinite ? 0 : canon::a16_value(v[source(j)], e); };
-    // Groups are visited so that the eight groups of a slice sit in eight consecutive lanes.
-    for (int base = 0; base < groups; base += Threads) {
-        const int g = base + static_cast<int>(threadIdx.x);
-        int sum     = 0;
-        if (g < groups) { sum = fast::store_group(column, g, value(4 * g), value(4 * g + 1), value(4 * g + 2), value(4 * g + 3)); }
-        sum += __shfl_xor_sync(0xFFFFFFFFU, sum, 1);
-        sum += __shfl_xor_sync(0xFFFFFFFFU, sum, 2);
-        sum += __shfl_xor_sync(0xFFFFFFFFU, sum, 4);
-        if (g < groups && g % 8 == 0) { column[slices * fast::kSliceWords + g / 8] = sum; }
-    }
-    return e;
-}
-
-// encode_column with 16-byte loads, for every column it can read (end to end 0.7 % faster, two
-// rounds, 2026-10-16). Thread i takes the column's 8-element chunks i, i + Threads, ... (chunk c holds
-// groups 2c and 2c + 1, read from the permuted source in one load: needs perm_block % 8 == 0 and a
-// 16-byte aligned column), keeps the first kKeep of them in registers from the exponent's pass to the
-// limbs' pass, and adds a slice's sum over its four chunks' lanes. Writes the same words as
-// encode_column.
-template <int Threads>
-__device__ int encode_column_vec(const std::uint16_t* __restrict__ v, int k, const std::int32_t* __restrict__ perm,
-                                 int perm_block, std::int32_t* __restrict__ column, unsigned* warp_key, int* broadcast) {
-    constexpr int kEncodeWarps = Threads / 32;
-    constexpr int kKeep        = 4;
-    const auto source = [&](int j) { return perm == nullptr ? j : perm[j / perm_block] * perm_block + j % perm_block; };
-    const int chunks  = k / 8;
-    const auto load   = [&](int c) { return *reinterpret_cast<const uint4*>(v + source(8 * c)); };
-    const auto max8   = [](const uint4& u) {
-        const unsigned m0 = max(u.x & 0x7FFFU, (u.x >> 16) & 0x7FFFU), m1 = max(u.y & 0x7FFFU, (u.y >> 16) & 0x7FFFU);
-        const unsigned m2 = max(u.z & 0x7FFFU, (u.z >> 16) & 0x7FFFU), m3 = max(u.w & 0x7FFFU, (u.w >> 16) & 0x7FFFU);
-        return max(max(m0, m1), max(m2, m3));
-    };
-    uint4 raw[kKeep];
-    unsigned key = 0;
-#pragma unroll
-    for (int m = 0; m < kKeep; ++m) {
-        const int c = m * Threads + static_cast<int>(threadIdx.x);
-        raw[m]      = c < chunks ? load(c) : make_uint4(0, 0, 0, 0);
-        key         = max(key, max8(raw[m]));
-    }
-    for (int c = kKeep * Threads + static_cast<int>(threadIdx.x); c < chunks; c += Threads) { key = max(key, max8(load(c))); }
-    key = __reduce_max_sync(0xFFFFFFFFU, key);
-    if (threadIdx.x % 32 == 0) { warp_key[threadIdx.x / 32] = key; }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        unsigned m = 0;
-        for (int w = 0; w < kEncodeWarps; ++w) { m = max(m, warp_key[w]); }
-        *broadcast = m >= 0x7F80U ? canon::kA16NonFinite : max(static_cast<int>(m >> 7), 1);
-    }
-    __syncthreads();
-    const int e = *broadcast;
-    const int slices = k / 32;
-    const auto value = [&](unsigned bits) {
-        return e == canon::kA16NonFinite ? 0 : canon::a16_value(static_cast<std::uint16_t>(bits), e);
-    };
-    const auto encode = [&](int c, const uint4& u) { // groups 2c and 2c + 1; returns their sum
-        int sum = fast::store_group(column, 2 * c, value(u.x & 0xFFFFU), value(u.x >> 16), value(u.y & 0xFFFFU),
-                                    value(u.y >> 16));
-        sum += fast::store_group(column, 2 * c + 1, value(u.z & 0xFFFFU), value(u.z >> 16), value(u.w & 0xFFFFU),
-                                 value(u.w >> 16));
-        return sum;
-    };
-    const auto finish = [&](int c, int sum) { // every lane of the warp: a slice is four chunks' lanes
-        sum += __shfl_xor_sync(0xFFFFFFFFU, sum, 1);
-        sum += __shfl_xor_sync(0xFFFFFFFFU, sum, 2);
-        if (c < chunks && c % 4 == 0) { column[slices * fast::kSliceWords + c / 4] = sum; }
-    };
-#pragma unroll
-    for (int m = 0; m < kKeep; ++m) {
-        if (m * Threads >= chunks) { break; } // uniform
-        const int c = m * Threads + static_cast<int>(threadIdx.x);
-        finish(c, c < chunks ? encode(c, raw[m]) : 0);
-    }
-    for (int base = kKeep * Threads; base < chunks; base += Threads) {
-        const int c = base + static_cast<int>(threadIdx.x);
-        finish(c, c < chunks ? encode(c, load(c)) : 0);
-    }
-    return e;
-}
-
 // One CTA per column.
 __global__ void __launch_bounds__(kEncodeThreads)
     encode_kernel(const std::uint16_t* __restrict__ x, int k, const std::int32_t* __restrict__ perm, int perm_block,
@@ -222,8 +122,9 @@ __global__ void __launch_bounds__(kEncodeThreads)
     const int t = blockIdx.x;
     const std::uint16_t* v  = x + static_cast<std::size_t>(t) * k;
     std::int32_t* column    = encoded + static_cast<std::size_t>(t) * fast::encoded_column_words(k);
-    const int e = vec != 0 ? encode_column_vec<kEncodeThreads>(v, k, perm, perm_block, column, warp_key, &broadcast)
-                           : encode_column<kEncodeThreads>(v, k, perm, perm_block, column, warp_key, &broadcast);
+    const int e = vec != 0 ? ggml_encode::encode_column_vec<kEncodeThreads>(v, k, perm, perm_block, column, warp_key,
+                                                                            &broadcast)
+                           : ggml_encode::encode_column<kEncodeThreads>(v, k, perm, perm_block, column, warp_key, &broadcast);
     if (threadIdx.x == 0) { emax[t] = e; }
 }
 
@@ -1420,14 +1321,12 @@ void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, Tensor&
     ggml_linear(x, segments, outs, input_perm, perm_block, workspace, stream, routes);
 }
 
-void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs,
-                 const std::int32_t* input_perm, std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream,
-                 LinearRoutes routes) {
-    require(valid_linear_routes(routes), "unknown linear route flags");
-    require(x.data != nullptr && x.dtype == DType::BF16 && x.is_contiguous(), "x must be contiguous BF16 [K, T]");
+namespace {
+
+// The outputs and segments of a call of `columns` columns of K = k.
+void validate_call(int k, int columns, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs) {
     require(!outs.empty() && outs.front() != nullptr, "no outputs");
     const DType dtype = outs.front()->dtype;
-    const int k = x.ne[0], columns = x.ne[1];
     for (const Tensor* o : outs) {
         require(o != nullptr && o->data != nullptr && (o->dtype == DType::FP32 || o->dtype == DType::BF16) &&
                     o->dtype == dtype && o->is_contiguous() && o->ne[1] == columns,
@@ -1443,8 +1342,115 @@ void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, std::sp
         require(s.layout == GgmlLayout::Rows || ggml_tiles16_supported(s.format),
                 "ggml_tiles16_v1 holds Q4_K, Q5_K, Q6_K and IQ4_XS matrices only");
     }
-    require(input_perm == nullptr || (perm_block > 0 && k % perm_block == 0), "input permutation needs whole blocks");
+}
+
+// A narrow call's launches for its columns [first, first + count), encoded in `in`.
+void launch_narrow_call(std::span<const GgmlSegment> segments, int k, const Columns& in, int first, int count,
+                        std::span<Tensor* const> outs, cudaStream_t stream) {
+    const DType dtype           = outs.front()->dtype;
     const std::size_t out_bytes = dtype == DType::FP32 ? 4 : 2;
+    const auto column_out = [&](const GgmlSegment& s) {
+        const Tensor& out = *outs[static_cast<std::size_t>(s.output)];
+        return static_cast<void*>(static_cast<std::byte*>(out.data) + static_cast<std::size_t>(first) * out.ne[0] * out_bytes);
+    };
+    // A call of exactly two mixed-capable formats (BF16 outputs, at most kMax segments of one
+    // layout) runs in one launch: row-major segments at verification widths, tiled ones at
+    // every narrow width (by MMA whatever tiled_rows_route says of either format alone: GDN
+    // q/k/v/z at one column 21.9 us against 26.0 in a rows launch per format; past
+    // kMmaMaxColumns on the wide kernel).
+    const GgmlLayout layout0 = segments.front().layout;
+    const bool tiled_pass    = layout0 == GgmlLayout::Tiles16;
+    const int mixed_max      = tiled_pass ? kEncodeColumns : kMmaMaxColumns;
+    if (dtype == DType::BF16 && count >= (tiled_pass ? 1 : kMmaMinColumns) && count <= mixed_max &&
+        segments.size() <= static_cast<std::size_t>(RowsGroup::kMax)) {
+        QType f0 = segments.front().format, f1 = f0;
+        bool ok = true;
+        for (const auto& s : segments) {
+            const QType f = s.format;
+            ok = ok && mixed_format(f) && s.layout == layout0;
+            if (f != f0 && f1 == f0) {
+                f1 = f;
+            } else if (f != f0 && f != f1) {
+                ok = false;
+            }
+        }
+        if (ok && f1 != f0) {
+            if (static_cast<int>(f1) < static_cast<int>(f0)) { std::swap(f0, f1); }
+            RowsGroup g;
+            for (const auto& s : segments) {
+                g.data[g.count]       = s.data;
+                g.out[g.count]        = column_out(s);
+                g.rows[g.count]       = s.rows;
+                g.n[g.count]          = outs[static_cast<std::size_t>(s.output)]->ne[0];
+                g.out_offset[g.count] = s.out_offset;
+                g.row_bytes[g.count]  = static_cast<int>(ggml_row_bytes(s.format, k));
+                g.format[g.count]     = s.format == f0 ? 0 : 1;
+                ++g.count;
+            }
+            if (tiled_pass ? launch_tiled_mixed(f0, f1, g, k, in, count, stream) : launch_mixed(f0, f1, g, k, in, count, stream)) {
+                return;
+            }
+        }
+    }
+    std::vector<bool> taken(segments.size(), false);
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+        if (taken[i]) { continue; }
+        // The segments of each format and layout, in order of first appearance, share
+        // launches of up to RowsGroup::kMax.
+        const QType format      = segments[i].format;
+        const GgmlLayout layout = segments[i].layout;
+        RowsGroup g;
+        for (std::size_t j = i; j < segments.size() && g.count < RowsGroup::kMax; ++j) {
+            const GgmlSegment& s = segments[j];
+            if (taken[j] || s.format != format || s.layout != layout) { continue; }
+            taken[j]              = true;
+            g.data[g.count]       = s.data;
+            g.out[g.count]        = column_out(s);
+            g.rows[g.count]       = s.rows;
+            g.n[g.count]          = outs[static_cast<std::size_t>(s.output)]->ne[0];
+            g.out_offset[g.count] = s.out_offset;
+            ++g.count;
+        }
+        if (dtype == DType::FP32) {
+            launch_narrow<true>(format, layout, g, k, in, count, stream);
+        } else {
+            launch_narrow<false>(format, layout, g, k, in, count, stream);
+        }
+    }
+}
+
+} // namespace
+
+std::int32_t ggml_encoded_column_words(std::int32_t k) { return static_cast<std::int32_t>(fast::encoded_column_words(k)); }
+
+bool ggml_linear_takes_encoded(std::int32_t k, std::int32_t columns, LinearRoutes routes) {
+    return columns > 0 && columns <= kEncodeColumns && k % 32 == 0 && !wide_call(k, columns) &&
+           !(columns <= kA8MaxColumns && has_route(routes, LinearRoutes::GgmlA8));
+}
+
+void ggml_linear_encoded(const GgmlEncodedColumns& x, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs,
+                         cudaStream_t stream) {
+    const int k = x.k, columns = x.emax.ne[0];
+    require(x.words.data != nullptr && x.words.dtype == DType::I32 && x.words.is_contiguous() && x.emax.data != nullptr &&
+                x.emax.dtype == DType::I32 && x.emax.is_contiguous() && x.emax.ne[1] == 1 && k > 0 && k % 32 == 0 &&
+                x.words.ne[0] == ggml_encoded_column_words(k) && x.words.ne[1] == columns && x.words.ne[2] == 1,
+            "encoded x must be I32 words [ggml_encoded_column_words(K), T] and exponents [T]");
+    validate_call(k, columns, segments, outs);
+    require(columns <= kEncodeColumns && !wide_call(k, columns), "encoded x is for the narrow route's widths");
+    const Columns in{.encoded = static_cast<const std::int32_t*>(x.words.data),
+                     .emax    = static_cast<const std::int32_t*>(x.emax.data)};
+    launch_narrow_call(segments, k, in, 0, columns, outs, stream);
+}
+
+void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs,
+                 const std::int32_t* input_perm, std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream,
+                 LinearRoutes routes) {
+    require(valid_linear_routes(routes), "unknown linear route flags");
+    require(x.data != nullptr && x.dtype == DType::BF16 && x.is_contiguous(), "x must be contiguous BF16 [K, T]");
+    const int k = x.ne[0], columns = x.ne[1];
+    validate_call(k, columns, segments, outs);
+    const DType dtype = outs.front()->dtype;
+    require(input_perm == nullptr || (perm_block > 0 && k % perm_block == 0), "input permutation needs whole blocks");
     auto scope = workspace.scope();
     // Wide calls decode each segment's weights once into planes for the tiles; segments whose
     // planes exceed kPlaneBytes run in passes of row slabs, each re-encoding the columns.
@@ -1469,106 +1475,36 @@ void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, std::sp
     Tensor emax    = workspace.alloc(DType::I32, {batch});
     const Columns in{.encoded = static_cast<const std::int32_t*>(encoded.data),
                      .emax    = static_cast<const std::int32_t*>(emax.data)};
-    std::vector<std::vector<Slab>> passes;
-    std::uint8_t* planes = nullptr;
-    if (wide) {
-        passes = plan_slabs(segments, k);
-        planes = static_cast<std::uint8_t*>(workspace.alloc(DType::U8, {static_cast<int>(kPlaneBytes)}).data);
-    } else {
-        passes.emplace_back();
-        for (const auto& s : segments) { passes.back().push_back(Slab{s, 0}); }
-    }
     // The encoder's 16-byte loads (encode_column_vec) wherever the columns allow them.
     const int vec = (input_perm == nullptr || perm_block % 8 == 0) && reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0 ? 1 : 0;
-    for (const auto& pass : passes) {
-        if (wide) {
-            for (const auto& slab : pass) { decode_plane(slab.segment, k, planes + slab.offset, stream); }
-        }
+    const auto encode = [&](int first, int count) {
+        CUDA_CHECK(pdl::launch_consumer({dim3(count), dim3(kEncodeThreads), 0, stream}, encode_kernel,
+                                        static_cast<const std::uint16_t*>(x.data) + static_cast<std::size_t>(first) * k, k,
+                                        input_perm, perm_block, static_cast<std::int32_t*>(encoded.data),
+                                        static_cast<std::int32_t*>(emax.data), vec));
+    };
+    if (!wide) {
         for (int first = 0; first < columns; first += batch) {
             const int count = std::min(batch, columns - first);
-            CUDA_CHECK(pdl::launch_consumer({dim3(count), dim3(kEncodeThreads), 0, stream}, encode_kernel,
-                                            static_cast<const std::uint16_t*>(x.data) + static_cast<std::size_t>(first) * k,
-                                            k, input_perm, perm_block, static_cast<std::int32_t*>(encoded.data),
-                                            static_cast<std::int32_t*>(emax.data), vec));
-            const auto column_out = [&](const GgmlSegment& s) {
-                const Tensor& out = *outs[static_cast<std::size_t>(s.output)];
-                return static_cast<void*>(static_cast<std::byte*>(out.data) + static_cast<std::size_t>(first) * out.ne[0] * out_bytes);
-            };
-            if (wide) {
-                for (const auto& slab : pass) {
-                    const int n = outs[static_cast<std::size_t>(slab.segment.output)]->ne[0];
-                    if (dtype == DType::FP32) {
-                        launch_tiles<true>(slab.segment, k, in, count, column_out(slab.segment), n, planes + slab.offset, stream);
-                    } else {
-                        launch_tiles<false>(slab.segment, k, in, count, column_out(slab.segment), n, planes + slab.offset, stream);
-                    }
-                }
-                continue;
-            }
-            // A call of exactly two mixed-capable formats (BF16 outputs, at most kMax segments of one
-            // layout) runs in one launch: row-major segments at verification widths, tiled ones at
-            // every narrow width (by MMA whatever tiled_rows_route says of either format alone: GDN
-            // q/k/v/z at one column 21.9 us against 26.0 in a rows launch per format; past
-            // kMmaMaxColumns on the wide kernel).
-            const GgmlLayout layout0 = pass.front().segment.layout;
-            const bool tiled_pass    = layout0 == GgmlLayout::Tiles16;
-            const int mixed_max      = tiled_pass ? kEncodeColumns : kMmaMaxColumns;
-            if (dtype == DType::BF16 && count >= (tiled_pass ? 1 : kMmaMinColumns) && count <= mixed_max &&
-                pass.size() <= static_cast<std::size_t>(RowsGroup::kMax)) {
-                QType f0 = pass.front().segment.format, f1 = f0;
-                bool ok = true;
-                for (const auto& slab : pass) {
-                    const QType f = slab.segment.format;
-                    ok = ok && mixed_format(f) && slab.segment.layout == layout0;
-                    if (f != f0 && f1 == f0) {
-                        f1 = f;
-                    } else if (f != f0 && f != f1) {
-                        ok = false;
-                    }
-                }
-                if (ok && f1 != f0) {
-                    if (static_cast<int>(f1) < static_cast<int>(f0)) { std::swap(f0, f1); }
-                    RowsGroup g;
-                    for (const auto& slab : pass) {
-                        const GgmlSegment& s  = slab.segment;
-                        g.data[g.count]       = s.data;
-                        g.out[g.count]        = column_out(s);
-                        g.rows[g.count]       = s.rows;
-                        g.n[g.count]          = outs[static_cast<std::size_t>(s.output)]->ne[0];
-                        g.out_offset[g.count] = s.out_offset;
-                        g.row_bytes[g.count]  = static_cast<int>(ggml_row_bytes(s.format, k));
-                        g.format[g.count]     = s.format == f0 ? 0 : 1;
-                        ++g.count;
-                    }
-                    if (tiled_pass ? launch_tiled_mixed(f0, f1, g, k, in, count, stream)
-                                   : launch_mixed(f0, f1, g, k, in, count, stream)) {
-                        continue;
-                    }
-                }
-            }
-            std::vector<bool> taken(pass.size(), false);
-            for (std::size_t i = 0; i < pass.size(); ++i) {
-                if (taken[i]) { continue; }
-                // The segments of each format and layout, in order of first appearance, share
-                // launches of up to RowsGroup::kMax.
-                const QType format      = pass[i].segment.format;
-                const GgmlLayout layout = pass[i].segment.layout;
-                RowsGroup g;
-                for (std::size_t j = i; j < pass.size() && g.count < RowsGroup::kMax; ++j) {
-                    const GgmlSegment& s = pass[j].segment;
-                    if (taken[j] || s.format != format || s.layout != layout) { continue; }
-                    taken[j]              = true;
-                    g.data[g.count]       = s.data;
-                    g.out[g.count]        = column_out(s);
-                    g.rows[g.count]       = s.rows;
-                    g.n[g.count]          = outs[static_cast<std::size_t>(s.output)]->ne[0];
-                    g.out_offset[g.count] = s.out_offset;
-                    ++g.count;
-                }
+            encode(first, count);
+            launch_narrow_call(segments, k, in, first, count, outs, stream);
+        }
+        return;
+    }
+    const std::size_t out_bytes = dtype == DType::FP32 ? 4 : 2;
+    std::uint8_t* planes = static_cast<std::uint8_t*>(workspace.alloc(DType::U8, {static_cast<int>(kPlaneBytes)}).data);
+    for (const auto& pass : plan_slabs(segments, k)) {
+        for (const auto& slab : pass) { decode_plane(slab.segment, k, planes + slab.offset, stream); }
+        for (int first = 0; first < columns; first += batch) {
+            const int count = std::min(batch, columns - first);
+            encode(first, count);
+            for (const auto& slab : pass) {
+                const Tensor& out = *outs[static_cast<std::size_t>(slab.segment.output)];
+                void* column_out  = static_cast<std::byte*>(out.data) + static_cast<std::size_t>(first) * out.ne[0] * out_bytes;
                 if (dtype == DType::FP32) {
-                    launch_narrow<true>(format, layout, g, k, in, count, stream);
+                    launch_tiles<true>(slab.segment, k, in, count, column_out, out.ne[0], planes + slab.offset, stream);
                 } else {
-                    launch_narrow<false>(format, layout, g, k, in, count, stream);
+                    launch_tiles<false>(slab.segment, k, in, count, column_out, out.ne[0], planes + slab.offset, stream);
                 }
             }
         }

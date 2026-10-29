@@ -5,6 +5,7 @@
 #include "infernix/ops/gated_delta_net.h"
 #include "infernix/ops/gated_rmsnorm.h"
 #include "infernix/ops/gdn_gating.h"
+#include "infernix/ops/ggml_encode.h"
 #include "infernix/ops/ggml_linear.h"
 #include "infernix/ops/ggml_rows.h"
 #include "infernix/ops/gdn_input_proj.h"
@@ -59,6 +60,19 @@ void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceA
         return;
     }
     ops::linear(x, p.weight, out, p.policy, work, s, routes);
+}
+
+// Whether a GGUF projection of `columns` columns of K = k takes its input encoded by the input's producer
+// (infernix/ops/ggml_encode.h; design §19.3.39) instead of encoding it itself: the exact narrow route, and no
+// activation scan to feed.
+bool producer_encodes(const LinearParameters& p, std::int32_t k, std::int32_t columns, ops::LinearRoutes routes,
+                      bool scanning) {
+    return !scanning && p.is_ggml() && ops::ggml_encode_length(k) && (p.input_perm == nullptr || p.perm_block % 8 == 0) &&
+           ops::ggml_linear_takes_encoded(k, columns, routes);
+}
+
+ops::GgmlEncodedColumns alloc_encoded(WorkspaceArena& work, std::int32_t k, std::int32_t columns) {
+    return {work.alloc(DType::I32, {ops::ggml_encoded_column_words(k), columns}), work.alloc(DType::I32, {columns}), k};
 }
 
 // A GGUF import's projection split among several outputs (one encoding of x).
@@ -717,13 +731,21 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
                                                      batch.slots, batch.slots, o_batch, s);
         }
     }
-    Tensor normed      = work_.alloc(DType::BF16, {DV, NV * T});
     const Tensor rows  = o.view({DV, NV * T});
     const Tensor gates = z.view({DV, NV * T});
-    ops::gated_rmsnorm(rows, p.norm, gates,
-                       g.output_gate == GateActivation::Sigmoid ? ops::RmsGate::Sigmoid : ops::RmsGate::Silu,
-                       config_.rms_norm_eps, normed, device_.execution_view().on_stream(s));
+    const ops::RmsGate gate_kind = g.output_gate == GateActivation::Sigmoid ? ops::RmsGate::Sigmoid : ops::RmsGate::Silu;
     Tensor y = work_.alloc(DType::BF16, {H, T});
+    if (producer_encodes(p.output, VW, T, dense_routes(), scan_ != nullptr && eager_chunk_)) {
+        // The gated norm writes the output projection's input encoded (no encoding launch).
+        ops::GgmlEncodedColumns encoded = alloc_encoded(work_, VW, T);
+        ops::gated_rmsnorm_ggml_encoded(rows, p.norm, gates, gate_kind, config_.rms_norm_eps, p.output.input_perm,
+                                        p.output.perm_block, encoded, s);
+        Tensor* const outs[] = {&y};
+        ops::ggml_linear_encoded(encoded, p.output.ggml, outs, s);
+        return y;
+    }
+    Tensor normed = work_.alloc(DType::BF16, {DV, NV * T});
+    ops::gated_rmsnorm(rows, p.norm, gates, gate_kind, config_.rms_norm_eps, normed, device_.execution_view().on_stream(s));
     scan_input(normed.view({VW, T}), scan_layer_, ActivationScan::Site::GdnOutput);
     project(normed.view({VW, T}), p.output, y, work_, s, dense_routes());
     return y;
@@ -858,8 +880,16 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
     // Output gate: out * sigmoid(gate), then o_proj. Applying the gate in qsa_attention's split merge
     // (candidates §7.3 D7) measured flat (removed 2026-10-28).
     Tensor gated = out.view({QW, T});
+    Tensor y     = work_.alloc(DType::BF16, {H, T});
+    if (producer_encodes(p.output, QW, T, dense_routes(), scan_ != nullptr && eager_chunk_)) {
+        // The gate writes the output projection's input encoded (no encoding launch).
+        ops::GgmlEncodedColumns encoded = alloc_encoded(work_, QW, T);
+        ops::sigmoid_mul_ggml_encoded(gate, gated, p.output.input_perm, p.output.perm_block, encoded, s);
+        Tensor* const outs[] = {&y};
+        ops::ggml_linear_encoded(encoded, p.output.ggml, outs, s);
+        return y;
+    }
     ops::sigmoid_mul(gate, gated, s);
-    Tensor y = work_.alloc(DType::BF16, {H, T});
     scan_input(gated, scan_layer_, ActivationScan::Site::QsaOutput);
     project(gated, p.output, y, work_, s, dense_routes());
     return y;

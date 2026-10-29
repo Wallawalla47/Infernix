@@ -114,6 +114,29 @@ void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, std::sp
                  const std::int32_t* input_perm, std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream,
                  LinearRoutes routes);
 
+/**
+ * x as ggml_linear's exact route encodes it, written by x's producer (infernix/ops/ggml_encode.h) instead of by
+ * ggml_linear: `words` I32 [ggml_encoded_column_words(k), T] holds each column's A16 limbs and slice sums
+ * (ops/ggml/ggml_dp4a.cuh) in input order, the projection's input permutation applied, and `emax` I32 [T] the
+ * columns' exponents.
+ */
+struct GgmlEncodedColumns {
+    Tensor words;
+    Tensor emax;
+    std::int32_t k = 0;
+};
+
+[[nodiscard]] std::int32_t ggml_encoded_column_words(std::int32_t k);
+
+/** Whether ggml_linear runs a call of `columns` columns of K = k under `routes` from one A16 encoding of x (no wide
+ * tiles, no 8-bit route, at most 512 columns): the calls ggml_linear_encoded takes. */
+[[nodiscard]] bool ggml_linear_takes_encoded(std::int32_t k, std::int32_t columns, LinearRoutes routes);
+
+/** ggml_linear from encoded columns, for a call ggml_linear_takes_encoded accepts: the same bits as ggml_linear on
+ * the x they encode (with its permutation). No workspace. */
+void ggml_linear_encoded(const GgmlEncodedColumns& x, std::span<const GgmlSegment> segments,
+                         std::span<Tensor* const> outs, cudaStream_t stream);
+
 /** The workspace of a call of `columns` columns of K = k on every route (the GgmlA8 route's encoding of a
  * narrow call, about 1.25 bytes per element, and the GgmlA8Wide route's planes and encoded batches of up to
  * 2,048 columns included). */

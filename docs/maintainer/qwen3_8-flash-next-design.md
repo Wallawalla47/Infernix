@@ -11703,6 +11703,50 @@ programmatic dependent of the kernel that writes its input, which is poisoned be
 - Dense8 with 3 drafts is bimodal at 16K whatever the arm (about 231 or 243 tok/s, set by the startup CPU-tier probe).
   The pair in the same mode reads 231.5 against 230.5 (+0.4 %).
 
+### 19.3.39 GGUF output projections take their input encoded by its producer (2026-10-29; exact, same bits; default)
+
+**What.** A GGUF projection encodes x itself (`encode_kernel`, one CTA a column, then the projection kernels): one
+launch between the producer and the projection, on the critical path of every mixer output. Now the GDN gated norm
+and QSA's output gate write the output projection's input already encoded (`include/infernix/ops/ggml_encode.h`:
+`gated_rmsnorm_ggml_encoded`, `sigmoid_mul_ggml_encoded`), and the projection runs from those words
+(`ggml_linear_encoded`, the same narrow launches). This applies to decode and verification calls on the exact narrow
+route; prefill widths, `--a8-activations` and the activation scan keep the composed kernels.
+
+**How.**
+- A cluster of K / 2,048 CTAs takes a column (three at K = 6,144). Each CTA computes 2,048 of the column's outputs into
+  shared memory with its Op's arithmetic: the gated norm's rows of 128, one per warp as `rmsnorm_warp_bf16x2_kernel`
+  has them, or `sigmoid_gate_mul_pair`'s packs.
+- The cluster takes the column exponent from every CTA's largest key through distributed shared memory.
+- Each CTA encodes a 2,048-element share of the column's chunks, reading each chunk's permuted source from the CTA that
+  holds it (the GDN output's head permutation crosses CTAs). The per-chunk encoding is `encode_kernel`'s
+  (`ops/ggml/ggml_encode.cuh`), so the words are the same.
+
+**Rejected forms** (traced: record or merge end to output projection end, IQ3_S 16K; and A/B):
+- *One CTA a column, rows in a loop:* GDN +0.45 µs, QSA +0.22 µs; A/B −0.4 % (16K) and −0.6 % (struct) in every pair.
+- *The same with every row's loads issued first:* GDN median −0.6 µs but the mean only −0.08 µs (a tail that grows with
+  the width); QSA worse; per-round wall +0.1 %.
+- Cause: a column's rows and its encode wait in one CTA, and the slowest column sets the projection's start.
+
+**Test.** `infernix_ggml_encode_test`: projection outputs bit-equal to gated_rmsnorm or sigmoid_mul followed by
+ggml_linear, covering:
+- widths 1-31;
+- two, three and four parts;
+- with and without the permutation;
+- formats with and without slice-sum terms, and a mixed two-format projection;
+- non-finite columns;
+- the producer captured as a programmatic dependent of a kernel that rewrites its input.
+
+**Measured** (cluster form):
+- Same-session 16K trace: GDN span 18.03 → 16.74 µs (mean), QSA 16.39 → 15.70; wall per round 11,098 → 10,946 µs.
+  Node tracing inflates kernel boundaries, so this overstates the untraced gain.
+- A/B (RTX 5090, exclusive layout, `phase1b/ab2.ps1`, two interleaved runs each in opposite orders, one build with a
+  temporary switch):
+  - IQ3_S struct: 492.3 / 492.5 against 490.6 / 490.5 tok/s (+0.4 %, both pairs);
+  - IQ3_S 16K: 268.2 / 271.9 against 270.2 / 267.3 (means +0.5 %; the pairs −0.7 % and +1.7 %, within this
+    workload's spread);
+  - identical acceptance per position.
+- Dense8 runs no GGUF projection and is unchanged.
+
 ---
 
 ## 20. Documentation and authority changes
