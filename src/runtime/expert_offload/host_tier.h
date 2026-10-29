@@ -27,26 +27,33 @@ namespace infernix::runtime::expert_offload::expert_cache {
 
 // ---------------------------------------------------------------------------- decayed LFU
 
-// score_k(t) = sum over uses of w * 2^-(t - t_use) / h. Each key keeps only the time-invariant
-// value v_k = log2 score_k + t_k / h, so a use is O(1) and ranking by v equals ranking by the
-// current score; v only increases (design §4.7).
+// score_k(t) = sum over uses of w * 2^-(t - t_use) / h. Each key keeps the time-invariant value
+// v_k = sum over uses of w * 2^((t_use - base) / h), so a use is one multiply-add by the clock's
+// growth 2^((t - base) / h) and ranking by v equals ranking by the current score; v only increases,
+// except that a rebase divides every v by the same power of two (exactly) once the clock is kRebase
+// half-lives past the base (design §4.7). The log2 form it replaced took two transcendentals a use,
+// ~100 us of a decode round's host time (IQ3_S struct, 2026-10-29).
 class DecayedLfu {
 public:
     DecayedLfu(std::uint32_t num_keys, double half_life);
 
-    void advance(double dt) { now_ += dt; }
-    void use(std::uint32_t key, double weight);
+    // Advances the clock. Returns the halvings a rebase applied to every value (almost always 0); a
+    // holder of copies of values divides them alike (std::ldexp(v, -halvings)).
+    int advance(double dt);
+    void use(std::uint32_t key, double weight) { value_[key] += weight * growth_; }
 
     [[nodiscard]] double now() const { return now_; }
     [[nodiscard]] double half_life() const { return half_life_; }
-    // v_k; -infinity for a key never used.
+    // v_k; 0 for a key never used.
     [[nodiscard]] double value(std::uint32_t key) const { return value_[key]; }
-    [[nodiscard]] double score(std::uint32_t key) const;
+    [[nodiscard]] double score(std::uint32_t key) const { return value_[key] / growth_; }
     [[nodiscard]] std::uint32_t num_keys() const { return static_cast<std::uint32_t>(value_.size()); }
 
 private:
+    static constexpr double kRebase = 256;
     double half_life_;
-    double now_ = 0;
+    double now_ = 0, base_ = 0;
+    double growth_ = 1; // 2^((now - base) / h)
     std::vector<double> value_;
 };
 
@@ -263,12 +270,14 @@ private:
         SlotList list     = SlotList::kNone;
         std::uint32_t key = 0;
         std::uint64_t serial = 0;
-        std::uint32_t stamp  = 0; // victim-heap generation
     };
+    // A victim heap holds each eligible slot of its class and kind once (heap_pos_), at the value it had when last
+    // placed: a shadow's is placed again at each use of its key, which raises its rank (most-used first); a
+    // resident's only falls behind its current value, which a use raises, so peek_victim re-ranks a stale top. The
+    // heaps grew by an entry a use before (re-ranks pushed copies), 2,000 a decode round.
     struct HeapEntry {
         double value;
         std::uint32_t slot;
-        std::uint32_t stamp;
     };
     enum class Victims : std::uint8_t { kShadow, kResident };
     // One size class's slots: its free resident slots, demotion list and victim heaps.
@@ -291,9 +300,14 @@ private:
     [[nodiscard]] bool eligible(const Slot& s, Victims kind) const;
     // A key's rank in its class's victim heap of `kind` (the lowest goes first).
     [[nodiscard]] double victim_value(std::uint32_t key, Victims kind) const;
-    // Replaces an eligible shadow's victim heap entry after its key's use.
+    // Re-ranks an eligible shadow's victim heap entry after its key's use.
     void rerank_shadow(std::uint32_t key);
+    // Places the slot in, re-ranks it in or removes it from its class's victim heaps after a change of its state,
+    // pins, list, class or value.
     void push_victim(std::uint32_t slot);
+    void place_victim(Victims kind, std::uint32_t slot, std::uint8_t c, bool wanted);
+    // Applies an LFU rebase (DecayedLfu::advance) to the heaps' values, and restores their order.
+    void rescale_victims(int halvings);
     // The lowest-ranked eligible victim of `kind` in class c (left in its heap), or -1.
     std::int32_t peek_victim(std::uint8_t c, Victims kind);
     // The victim a landing of class c would replace: a shadow, else the lowest resident; -1 when none.
@@ -312,6 +326,8 @@ private:
     std::vector<std::uint8_t> slot_class_;
     std::vector<std::uint8_t> key_class_;
     std::vector<ClassState> classes_;
+    std::vector<std::int32_t> heap_pos_[2];   // per kind and slot: its index in its victim heap, or -1
+    std::vector<std::uint8_t> heap_class_[2]; // per kind and slot: the class whose heap holds it
     std::vector<std::int32_t> slot_of_;
     std::vector<std::uint8_t> held_;
     std::size_t held_count_ = 0;

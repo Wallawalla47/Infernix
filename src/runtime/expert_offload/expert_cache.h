@@ -124,6 +124,22 @@ private:
     void erase(std::uint32_t key);
     void select_victims(std::size_t need, std::span<const std::uint32_t> protect,
                         std::vector<std::uint32_t>& out);
+    // The victim search's low set (select_victims without a guard): low_ holds every resident whose score can
+    // reach low_bound_ or less before tick low_until_. build_low takes the bound from the kLowSize lowest scores now
+    // and admits each resident scoring at or below it at low_until_: a resident's score only falls until its next use,
+    // so one left out stays above the bound until then. A resident whose count or last use changes, or a key that
+    // becomes resident, passes the same test (note_low). A search within low_ is the scan's answer when that answer
+    // scores at or below the bound; otherwise the set is rebuilt, and when a fresh set cannot answer either, every
+    // resident is scanned. A decode round's 48 calls scanned 9,125 residents for each of ~75 victims (Dense8
+    // struct, ~1 ms of host time per round).
+    static constexpr std::size_t kLowSize    = 256;
+    static constexpr std::uint64_t kLowTicks = 64;
+    void build_low();
+    void note_low(std::uint32_t key);
+    // The `need` lowest (score, key) residents outside the marked keys (mark_) from low_, appended to out; false when
+    // the low set cannot answer.
+    bool low_victims(std::size_t need, std::vector<std::uint32_t>& out);
+    bool try_low(std::size_t need, std::vector<std::uint32_t>& out);
     // Budgeted admission of `candidates` (non-resident keys): best score first, each only if it
     // outranks the victim (outside `protect`) it replaces; appends to out.admitted and out.victims.
     void admit_ranked(std::span<const std::uint32_t> protect, std::span<const std::uint32_t> candidates,
@@ -141,7 +157,14 @@ private:
     // every score equals score()'s.
     std::vector<double> resident_count_;
     std::vector<double> resident_last_;
-    std::vector<std::uint8_t> mark_;       // scratch: keys of the current group
+    std::vector<std::uint8_t> mark_;       // scratch: the protected residents of a victim search
+    std::vector<std::uint32_t> marked_;    // scratch: the keys mark_ flags
+    std::vector<std::uint32_t> low_;
+    std::vector<std::uint8_t> in_low_;     // per key: listed in low_ (resident or since evicted)
+    std::vector<double> low_scores_;       // scratch: build_low's selection
+    double low_bound_        = 0;
+    std::uint64_t low_until_ = 0;
+    bool low_valid_          = false;
     std::vector<std::pair<double, std::uint32_t>> scratch_;
     std::vector<double> scores_;           // scratch: residents' scores, in residents_ order
     std::vector<std::uint32_t> candidates_;

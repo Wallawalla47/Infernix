@@ -164,6 +164,57 @@ void test_budgeted_admission() {
                 us / kSteps, us_sort / kSteps);
 }
 
+// The victim search's low set (more residents than LfruPolicy::kLowSize): every step's victims are the lowest
+// (score, key) residents outside its group, as a scan of every resident orders them, across the set's rebuilds, a
+// shifting hot set, halving periods, credits, and each admission path (budgets 0 to unlimited, an eviction gate).
+void test_low_set() {
+    std::mt19937 rng(9);
+    const LfruPolicy::Admissible gate = [](std::uint32_t) { return true; };
+    for (const std::uint32_t halving : {0U, 300U}) {
+        LfruPolicy policy(24576, 3000, halving);
+        LfruPolicy::Step step;
+        std::size_t checked = 0;
+        for (int i = 0; i < 6000; ++i) {
+            std::set<std::uint32_t> g;
+            const auto hot = static_cast<std::uint32_t>(i / 1000) * 3000;
+            while (g.size() < 24) { g.insert((hot + static_cast<std::uint32_t>(rng() % 6000)) % 24576); }
+            const std::vector<std::uint32_t> group(g.begin(), g.end());
+            if (i % 97 == 0 && policy.resident_count() > 0) { // a prompt's credit of some residents
+                std::vector<std::uint32_t> keys;
+                std::vector<double> amounts;
+                for (int c = 0; c < 8; ++c) {
+                    keys.push_back(policy.residents()[rng() % policy.resident_count()]);
+                    amounts.push_back(0.25 * static_cast<double>(1 + rng() % 8));
+                }
+                policy.credit(keys, amounts);
+            }
+            const std::size_t budget = i % 4 == 3 ? static_cast<std::size_t>(-1) : static_cast<std::size_t>(i % 4);
+            policy.step(group, step, budget, nullptr, i % 8 == 7 ? &gate : nullptr);
+            if (step.victims.empty()) { continue; }
+            // Evictions leave the other scores unchanged: every resident outside the group ranks above every victim.
+            double top_score     = -1;
+            std::uint32_t top_key = 0;
+            for (const std::uint32_t v : step.victims) {
+                check(!g.count(v) && !policy.resident(v), "a victim is outside the group and evicted");
+                const double s = policy.score(v);
+                if (s > top_score || (s == top_score && v > top_key)) {
+                    top_score = s;
+                    top_key   = v;
+                }
+            }
+            for (const std::uint32_t r : policy.residents()) {
+                if (g.count(r)) { continue; }
+                const double s = policy.score(r);
+                check(s > top_score || (s == top_score && r > top_key), "victims are the lowest (score, key) residents");
+            }
+            checked += step.victims.size();
+            if (g_failures) { return; }
+        }
+        std::printf("low set (halving %u): %zu victims checked\n", halving, checked);
+        check(checked > 2000, "the low-set run evicted enough victims");
+    }
+}
+
 void test_frame_epochs() {
     FramePool pool(3, 1);
     auto a = pool.acquire(), b = pool.acquire(), c = pool.acquire();
@@ -868,6 +919,7 @@ int main() {
     test_tier_gates();
     test_lfru_conformance();
     test_budgeted_admission();
+    test_low_set();
     test_frame_epochs();
     test_agent_simulation();
     test_pool_resize();

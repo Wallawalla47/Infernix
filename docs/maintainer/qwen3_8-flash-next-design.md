@@ -7546,7 +7546,11 @@ measured results are under "Status" at the end of this section.
   2 s `cpu_wait` trap becomes the same wait, and both channel sequences become wrap-safe. Exposed
   cost per SSD read ≈ 0.6-0.7 ms (estimated).
 - **RAM policy** (§4.7): decayed LFU, score `Σ w · 2^−(t − t_use)/h`, kept as the time-invariant key
-  `v = log2 s + t/h` (O(1) per use) with lazy min-heaps for victims. Clock: +1 per decode token
+  `v = Σ w · 2^((t_use − base)/h)` (one multiply-add per use; a rebase divides every v by the same power of
+  two once t is 256 half-lives past the base) with indexed min-heaps for victims (each eligible slot once;
+  a resident's entry re-ranked lazily, a shadow's at each use; 2026-10-29: the `log2` key cost two
+  transcendentals a use, and re-ranks that pushed copies grew the heaps by ~2,000 entries a decode round).
+  Clock: +1 per decode token
   (verification: + accepted tokens, live columns only); a prefill chunk of T tokens advances
   min(T, 16) with weight Δ/T per use. Default h = 64 until RM0f; LRU or CLOCK replaces it only with
   ≥ 5 % fewer SSD reads (Q13). Demand landings are admitted if they outrank the RAM victim, prefetches

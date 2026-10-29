@@ -27,7 +27,7 @@ ResidencyEntry ResidencyEntry::next(ResidencyState new_state, std::uint32_t new_
 
 LfruPolicy::LfruPolicy(std::uint32_t num_keys, std::uint32_t capacity, std::uint32_t halving_period)
     : capacity_(capacity), halving_period_(halving_period), count_(num_keys, 0.0), last_(num_keys, 0),
-      slot_(num_keys, kNone), mark_(num_keys, 0) {
+      slot_(num_keys, kNone), mark_(num_keys, 0), in_low_(num_keys, 0) {
     residents_.reserve(capacity);
     resident_count_.reserve(capacity);
     resident_last_.reserve(capacity);
@@ -42,6 +42,85 @@ void LfruPolicy::insert(std::uint32_t key) {
     residents_.push_back(key);
     resident_count_.push_back(count_[key]);
     resident_last_.push_back(static_cast<double>(last_[key]));
+    note_low(key);
+}
+
+void LfruPolicy::build_low() {
+    for (const std::uint32_t k : low_) { in_low_[k] = 0; }
+    low_.clear();
+    low_until_ = now_ + kLowTicks;
+    low_valid_ = true;
+    const std::size_t n = residents_.size();
+    if (n <= kLowSize) {
+        low_bound_ = std::numeric_limits<double>::infinity();
+        for (const std::uint32_t k : residents_) {
+            low_.push_back(k);
+            in_low_[k] = 1;
+        }
+        return;
+    }
+    // Scores as select_victims computes them (exact integer denominators), now and at low_until_.
+    const double* counts = resident_count_.data();
+    const double* lasts  = resident_last_.data();
+    const double next    = static_cast<double>(now_) + 1.0;
+    low_scores_.resize(n);
+    for (std::size_t i = 0; i < n; ++i) { low_scores_[i] = counts[i] / (next - lasts[i]); }
+    std::nth_element(low_scores_.begin(), low_scores_.begin() + static_cast<std::ptrdiff_t>(kLowSize - 1),
+                     low_scores_.end());
+    low_bound_       = low_scores_[kLowSize - 1];
+    const double end = static_cast<double>(low_until_) + 1.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (counts[i] / (end - lasts[i]) <= low_bound_) {
+            low_.push_back(residents_[i]);
+            in_low_[residents_[i]] = 1;
+        }
+    }
+}
+
+void LfruPolicy::note_low(std::uint32_t key) {
+    if (!low_valid_ || in_low_[key] != 0) { return; }
+    if (now_ > low_until_) {
+        low_valid_ = false;
+        return;
+    }
+    if (count_[key] / (static_cast<double>(low_until_) + 1.0 - static_cast<double>(last_[key])) <= low_bound_) {
+        low_.push_back(key);
+        in_low_[key] = 1;
+    }
+}
+
+bool LfruPolicy::try_low(std::size_t need, std::vector<std::uint32_t>& out) {
+    const double next = static_cast<double>(now_) + 1.0;
+    scratch_.clear();
+    for (const std::uint32_t k : low_) {
+        if (slot_[k] != kNone && mark_[k] == 0) {
+            scratch_.emplace_back(count_[k] / (next - static_cast<double>(last_[k])), k);
+        }
+    }
+    if (scratch_.size() < need) { return false; }
+    if (need == 1) {
+        const auto best = std::min_element(scratch_.begin(), scratch_.end());
+        if (!(best->first <= low_bound_)) { return false; }
+        out.push_back(best->second);
+        return true;
+    }
+    std::partial_sort(scratch_.begin(), scratch_.begin() + static_cast<std::ptrdiff_t>(need), scratch_.end());
+    if (!(scratch_[need - 1].first <= low_bound_)) { return false; }
+    for (std::size_t i = 0; i < need; ++i) { out.push_back(scratch_[i].second); }
+    return true;
+}
+
+bool LfruPolicy::low_victims(std::size_t need, std::vector<std::uint32_t>& out) {
+    if (need == 0) { return true; }
+    bool fresh = false;
+    if (!low_valid_ || now_ > low_until_) {
+        build_low();
+        fresh = true;
+    }
+    if (try_low(need, out)) { return true; }
+    if (fresh) { return false; }
+    build_low();
+    return try_low(need, out);
 }
 
 void LfruPolicy::erase(std::uint32_t key) {
@@ -59,6 +138,18 @@ void LfruPolicy::erase(std::uint32_t key) {
 
 void LfruPolicy::select_victims(std::size_t need, std::span<const std::uint32_t> protect,
                                 std::vector<std::uint32_t>& out) {
+    if (guard_ == nullptr) {
+        marked_.clear();
+        for (const std::uint32_t k : protect) {
+            if (resident(k) && mark_[k] == 0) {
+                mark_[k] = 1;
+                marked_.push_back(k);
+            }
+        }
+        const bool found = low_victims(std::min(need, residents_.size() - marked_.size()), out);
+        for (const std::uint32_t k : marked_) { mark_[k] = 0; }
+        if (found) { return; }
+    }
     // Every resident's score, computed exactly as score() does, from the arrays parallel to
     // residents_ (contiguous loads; the loop vectorizes). Protected residents score +infinity and
     // are skipped below.
@@ -147,6 +238,7 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
     if (halving_period_ != 0 && now_ % halving_period_ == 0) {
         for (auto& c : count_) { c = c * 0.5 < kCountFloor ? 0.0 : c * 0.5; }
         for (std::size_t i = 0; i < residents_.size(); ++i) { resident_count_[i] = count_[residents_[i]]; }
+        low_valid_ = false;
     }
     for (std::uint32_t k : group) {
         count_[k] += 1.0;
@@ -155,6 +247,7 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
             resident_count_[slot_[k]] = count_[k];
             resident_last_[slot_[k]]  = static_cast<double>(now_);
             out.hits.push_back(k);
+            note_low(k);
         } else {
             out.misses.push_back(k);
         }
@@ -188,6 +281,7 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
 void LfruPolicy::admit_ranked(std::span<const std::uint32_t> protect, std::span<const std::uint32_t> candidates,
                               std::size_t budget, const Admissible* evictable, Step& out) {
     // Budgeted admission: best candidates first, each only if it outranks the victim it replaces.
+    if (budget == 0) { return; } // a step without a budget only counts
     ranked_.assign(candidates.begin(), candidates.end());
     std::sort(ranked_.begin(), ranked_.end(), [this](std::uint32_t a, std::uint32_t b) {
         const double sa = score(a), sb = score(b);
@@ -217,6 +311,7 @@ void LfruPolicy::credit(std::span<const std::uint32_t> keys, std::span<const dou
         if (resident(k)) {
             resident_count_[slot_[k]] = count_[k];
             resident_last_[slot_[k]]  = static_cast<double>(now_);
+            note_low(k);
         }
     }
 }
@@ -240,6 +335,7 @@ void LfruPolicy::seed(std::span<const std::uint32_t> resident_keys, std::span<co
         if (counts.size() != count_.size()) { throw std::invalid_argument("LFRU seed: count size mismatch"); }
         std::copy(counts.begin(), counts.end(), count_.begin());
         for (std::size_t i = 0; i < residents_.size(); ++i) { resident_count_[i] = count_[residents_[i]]; }
+        low_valid_ = false;
     }
     for (std::uint32_t k : resident_keys) {
         if (!resident(k) && residents_.size() < capacity_) { insert(k); }

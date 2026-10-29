@@ -833,13 +833,15 @@ void ExpertResidency::adaptive_round(const std::int32_t* routes, std::size_t use
         const expert_cache::LfruPolicy& policy = pools_[pool_of_layer_[layer]].controller->policy();
         const std::uint32_t first = layer * experts_;
         for (std::uint32_t k = first; k < first + experts_; ++k) {
-            if (policy.resident(k)) {
-                a.residents.push_back(k);
-            } else if (a.count[k] >= a.floor && (tier_ == nullptr || admissible_(k))) { // with the tier: a host copy
+            if (a.count[k] >= a.floor && !policy.resident(k) && (tier_ == nullptr || admissible_(k))) { // tier: a host copy
                 a.candidates.push_back(k);
             }
         }
         if (a.candidates.empty()) { continue; }
+        // The residents only of a layer with candidates (listing every layer's cost 115 us a round, IQ3_S struct).
+        for (std::uint32_t k = first; k < first + experts_; ++k) {
+            if (policy.resident(k)) { a.residents.push_back(k); }
+        }
         candidates += a.candidates.size();
         std::sort(a.candidates.begin(), a.candidates.end(), by_count_desc);
         a.ranked.insert(a.ranked.end(), a.candidates.begin(), a.candidates.end());
