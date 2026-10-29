@@ -474,8 +474,17 @@ std::uint32_t HostExpertTier::prefill(std::span<const std::uint32_t> ranked) {
         jobs.emplace_back(key, const_cast<std::uint8_t*>(slot_bytes(static_cast<std::uint32_t>(slot))));
     }
     if (jobs.empty()) { return 0; }
+    const auto start = std::chrono::steady_clock::now();
     read_at_startup(jobs);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    if (seconds > 0) { read_rate_ = static_cast<double>(jobs.size()) * static_cast<double>(store_.record_bytes()) / seconds; }
     return static_cast<std::uint32_t>(jobs.size());
+}
+
+bool HostExpertTier::refill_within(double seconds) const noexcept {
+    if (read_rate_ <= 0) { return true; }
+    const double queued = static_cast<double>(kRefills - refill_free_.size()) + 1.0;
+    return queued * static_cast<double>(store_.record_bytes()) / read_rate_ <= seconds;
 }
 
 std::uint32_t HostExpertTier::prefill_shadows(std::span<const std::uint32_t> ranked) {

@@ -86,6 +86,7 @@ public:
         std::uint64_t landed         = 0; // staged misses landed in reserved frames and adopted (S4)
         std::uint64_t demotions      = 0; // SSD tier: VRAM victims copied to RAM (T4)
         std::uint64_t refill_fallbacks = 0; // SSD tier: demotions whose refill read failed, copied over the link
+        std::uint64_t d2h_demotions    = 0; // SSD tier: demotions copied over the link (no refill id, or past the budget)
         std::uint64_t unpinned_promotions = 0; // SSD tier: promotions of unpinned records (bounced)
     };
     // Landing frames per layer and round (design §19.3.5 S4): free frames are reserved before a
@@ -96,6 +97,9 @@ public:
     // greedy decode traces of 14 mixed requests, 9-12 % fewer misses than never halving. A pool
     // ticks once per call of its layers, so its period is this share of its layers.
     static constexpr std::uint32_t kLfruHalvingPeriod = 8192;
+    // A demotion refills RAM from the artifact while that read would land within this many seconds behind the
+    // refills in flight; otherwise it copies the frame over the link (demote_or_drop).
+    static constexpr double kRefillBudget = 0.004;
 
     using SavedState = expert_cache::SavedState;
     [[nodiscard]] SavedState saved_state() const;

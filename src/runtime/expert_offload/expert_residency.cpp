@@ -348,10 +348,19 @@ void ExpertResidency::demote_or_drop(Pool& pool, const std::vector<Command>& com
         pool.controller->hold(frame); // T4: the frame stays readable in the table until the record lands
         demoting_[key] = 1;
         ++stats_.demotions;
-        if (const std::uint32_t id = tier_->refill(key, slot); id != HostExpertTier::kNoRefill) {
-            demotions_.push_back({key, frame, slot, nullptr, id});
-            continue;
+        // A refill that would land later than kRefillBudget behind those in flight (at the rate the startup fill read
+        // the artifact) copies the frame instead: a slow drive's refills held their frames and the promotions waited.
+        // With the artifact read at 800 MB/s (INFERNIX_TMP_SSD_MBPS), refills only: Dense8 16K MTP 3 236.8 tok/s, IQ3_S
+        // struct 451.3; with the budget 243.4 and 463.1, the fast drive's speed (2026-10-29, one run each). Since shadows
+        // leave RAM most-used first (HostTier::victim_value), demotions are few enough that the copies cost nothing
+        // measurable on the fast drive either (IQ3_S struct 465.8 with 996 of 2,268 copied, 462.3 with none).
+        if (tier_->refill_within(kRefillBudget)) {
+            if (const std::uint32_t id = tier_->refill(key, slot); id != HostExpertTier::kNoRefill) {
+                demotions_.push_back({key, frame, slot, nullptr, id});
+                continue;
+            }
         }
+        ++stats_.d2h_demotions;
         CUDA_CHECK(cudaMemcpyAsync(const_cast<std::uint8_t*>(tier_->slot_bytes(slot)),
                                    pool.base() + static_cast<std::size_t>(frame) * pool.pitch, pool.pitch,
                                    cudaMemcpyDeviceToHost, d2h_stream_));

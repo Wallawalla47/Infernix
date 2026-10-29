@@ -284,8 +284,10 @@ void test_random() {
                     continue;
                 }
                 if (is_shadow != shadow) { continue; }
+                // Residents go least-used first, shadows most-used first (their experts are VRAM's last victims).
                 const double best = tier.lfu().value(tier.key(static_cast<std::uint32_t>(expected)));
-                if (v < best || (v == best && s < static_cast<std::uint32_t>(expected))) { expected = static_cast<std::int32_t>(s); }
+                const bool before = shadow ? v > best : v < best;
+                if (before || (v == best && s < static_cast<std::uint32_t>(expected))) { expected = static_cast<std::int32_t>(s); }
             }
             const std::uint32_t victim_key = expected >= 0 ? tier.key(static_cast<std::uint32_t>(expected)) : 0;
             const Landing l{slot, tier.serial(slot), key};
@@ -739,7 +741,8 @@ void test_random_classes() {
                 if (is_shadow != shadow) { continue; }
                 const double v    = tier.lfu().value(tier.key(s));
                 const double best = tier.lfu().value(tier.key(static_cast<std::uint32_t>(naive)));
-                if (v < best || (v == best && s < static_cast<std::uint32_t>(naive))) { naive = static_cast<std::int32_t>(s); }
+                const bool before = shadow ? v > best : v < best; // shadows most-used first, residents least-used first
+                if (before || (v == best && s < static_cast<std::uint32_t>(naive))) { naive = static_cast<std::int32_t>(s); }
             }
             const std::uint32_t victim_key = naive >= 0 ? tier.key(static_cast<std::uint32_t>(naive)) : 0;
             const Landing l{slot, tier.serial(slot), key};

@@ -3496,12 +3496,13 @@ private:
                 std::snprintf(text, sizeof(text),
                               "SSD expert tier: request's loans and shrinks evicted %llu experts with a RAM copy and %llu "
                               "without; %llu shadows before the last loan, %zu now, %zu RAM-only; %llu refill reads failed "
-                              "(copied over the link)",
+                              "(copied over the link); %llu demotions copied over the link since start",
                               static_cast<unsigned long long>(s.loan_victims_kept - at_admission.loan_victims_kept),
                               static_cast<unsigned long long>(s.loan_victims_lost - at_admission.loan_victims_lost),
                               static_cast<unsigned long long>(s.shadows_at_loan), tier_->controller().shadow_count(),
                               tier_->controller().resident_count() - tier_->controller().shadow_count(),
-                              static_cast<unsigned long long>(s.refill_fallbacks));
+                              static_cast<unsigned long long>(s.refill_fallbacks),
+                              static_cast<unsigned long long>(s.d2h_demotions));
                 diagnostic(text, DiagnosticLevel::Debug);
             }
         } catch (...) {}

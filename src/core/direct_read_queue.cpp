@@ -1,4 +1,5 @@
 #include "core/direct_read_queue.h"
+#include "core/temporary_switches.h"
 
 #ifdef _WIN32
 #    ifndef NOMINMAX
@@ -18,12 +19,31 @@
 #include <algorithm>
 #include <deque>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 
 namespace infernix {
 namespace {
+
+// Diagnostic: INFERNIX_TMP_SSD_MBPS=<MB/s> emulates a slower drive: every finished read is held until
+// a device of that rate, shared by every queue of the process and serving reads in finishing order, would have
+// delivered its bytes (0: off).
+struct SlowDevice {
+    std::mutex lock;
+    std::chrono::steady_clock::time_point clock{};
+    double bytes_per_ns = 0.0;
+};
+SlowDevice& slow_device() {
+    static SlowDevice device;
+    static const bool configured = [] {
+        device.bytes_per_ns = static_cast<double>(temporary_switches::integer("INFERNIX_TMP_SSD_MBPS", 0, 0, 100000)) * 1e-3;
+        return true;
+    }();
+    (void)configured;
+    return device;
+}
 
 using Clock = std::chrono::steady_clock;
 
@@ -475,8 +495,16 @@ struct DirectReadQueue::Impl {
     // A device read has finished: apply the delay fault, then its outcome.
     void arrive(const Finished& f) {
         const Io& io = ios[f.io];
-        const auto release = io.issued + faults.delay;
-        if (!cancelling && faults.delay.count() > 0 && release > f.release) {
+        auto release = io.issued + faults.delay;
+        bool hold    = faults.delay.count() > 0;
+        if (SlowDevice& slow = slow_device(); slow.bytes_per_ns > 0.0 && f.bytes > 0) {
+            const std::lock_guard<std::mutex> guard(slow.lock);
+            const auto start = std::max(slow.clock, io.issued);
+            slow.clock       = start + std::chrono::nanoseconds(static_cast<std::int64_t>(static_cast<double>(f.bytes) / slow.bytes_per_ns));
+            release          = std::max(release, slow.clock);
+            hold             = true;
+        }
+        if (!cancelling && hold && release > f.release) {
             held.push_back({f.io, f.error, f.bytes, release});
         } else {
             finish(f.io, f.error, f.bytes);

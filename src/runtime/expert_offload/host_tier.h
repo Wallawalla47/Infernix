@@ -289,6 +289,10 @@ private:
     void count_shadow(std::uint32_t slot, int delta);
 
     [[nodiscard]] bool eligible(const Slot& s, Victims kind) const;
+    // A key's rank in its class's victim heap of `kind` (the lowest goes first).
+    [[nodiscard]] double victim_value(std::uint32_t key, Victims kind) const;
+    // Replaces an eligible shadow's victim heap entry after its key's use.
+    void rerank_shadow(std::uint32_t key);
     void push_victim(std::uint32_t slot);
     // The lowest-ranked eligible victim of `kind` in class c (left in its heap), or -1.
     std::int32_t peek_victim(std::uint8_t c, Victims kind);

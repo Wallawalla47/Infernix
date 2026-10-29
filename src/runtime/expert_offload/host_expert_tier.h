@@ -252,6 +252,9 @@ public:
     }
     void refill_release(std::uint32_t id) { refill_free_.push_back(id); }
     [[nodiscard]] bool refill_available() const noexcept { return !refill_free_.empty(); }
+    // Whether one more refill, behind those in flight, lands within the given seconds at the rate the startup fill read the
+    // artifact (true before the fill measured it).
+    [[nodiscard]] bool refill_within(double seconds) const noexcept;
     [[nodiscard]] expert_cache::HostTier& controller() noexcept { return tier_; }
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
     [[nodiscard]] const std::uint8_t* slot_bytes(std::uint32_t slot) const noexcept;
@@ -416,6 +419,7 @@ private:
     std::vector<RefillJob> refill_jobs_;
     std::unique_ptr<std::atomic<std::uint32_t>[]> refill_state_;
     std::vector<std::uint32_t> refill_free_;
+    double read_rate_ = 0; // bytes a second of the startup fill (prefill), 0 before it
 
     // Tickets of the current round (stable addresses; reset at each boundary).
     std::unique_ptr<Ticket[]> tickets_;

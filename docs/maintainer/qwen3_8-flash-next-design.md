@@ -7499,8 +7499,27 @@ measured results are under "Status" at the end of this section.
     (266.2 / 266.1 against 267.7 / 268.4) and 0.987x on struct. Prefill stays 0.96x (6,521 against 6,801 at 16K).
     Dense8 (seeds 4,554 of 9,109 frames, 6,217 before) against main 0689e1bb: struct exclusive 307.7 / 309.2 ->
     327.0 / 326.9 (full 354.3 / 354.5: still 0.92x, ~24,000 demotions a request, each a refill read of the artifact);
-    16K MTP 3, 2 runs, 241.0 / 241.1 -> 242.7 / 242.6 (full 242.7 / 244.3). The prefill streams the same 34.2 GiB through the same lent frames in both layouts; full
-    merges 277 adjacent records into fewer copies, exclusive copies each from its slot (cause of its 4 % unconfirmed).
+    16K MTP 3, 2 runs, 241.0 / 241.1 -> 242.7 / 242.6 (full 242.7 / 244.3). The prefill streams the same 34.2 GiB
+    through the same lent frames in both layouts; full merges 277 adjacent records into fewer copies, exclusive copies
+    each from its slot (cause of its 4 % unconfirmed).
+  - 2026-10-29: **shadows leave RAM most-used first** (`HostTier::victim_value`; a use re-ranks the shadow's heap entry,
+    since the heap's lazy re-rank only catches entries that fell). A shadow saves a demotion only when VRAM evicts its
+    expert, and VRAM evicts the least-used first, so dropping the least-used experts' shadows (the residents' order)
+    left nearly every VRAM victim without a copy. Demotions a request: Dense8 struct 24,318 -> 2,057, Dense8 16K 2,179
+    -> 903, IQ3_S struct 4,354 -> 2,268 (demand SSD reads 78 -> 20). One run each: Dense8 struct exclusive 327.2 ->
+    345.8 tok/s (full 346.0 in the same run, 355.1 in another), Dense8 16K MTP 3 243.5 (full 244.2), IQ3_S 16K 265.1
+    (full 267.5), IQ3_S struct 462.3.
+  - **A slower SSD** (`INFERNIX_TMP_SSD_MBPS`: the artifact read queue holds each read until a device of that rate
+    would have delivered it): demotions are refill reads of the artifact, so before the shadow order, at 800 MB/s,
+    exclusive fell to IQ3_S struct 409.0 (0.876x), Dense8 16K 220.3 (0.902x), Dense8 struct 318.9 (0.898x); after
+    it, 453.1, 236.8 and 346.1 (0.97x, 0.97x, 1.00x).
+  - **A demotion copies its frame over the link when its refill would land late** (`ExpertResidency::kRefillBudget`,
+    4 ms behind the refills in flight at the startup fill's measured read rate, `HostExpertTier::refill_within`), as
+    Basalt demotes every victim. The earlier D2H demotions (0.958x on Dense8, x_ab11) queued thousands of copies ahead
+    of the promotions on this GPU's one copy engine; with shadows leaving most-used first the copies are few. At 800
+    MB/s: Dense8 16K 236.8 -> 243.4 tok/s (723 of 903 demotions copied), IQ3_S struct 451.3 -> 463.1 (1,650 of
+    2,268), the fast drive's speed; on the fast drive (copies only past the budget) Dense8 16K 243.3, IQ3_S struct
+    465.8 (one run each, 2026-10-29).
 - **Storage** (§4.4): `artifact::Residency::Streamed` and a long-lived `StreamSource` (per-part
   direct, deny-write handles); `ExpertStore` (Model data) holds each record's ≤ 2 aligned file
   segments (two records straddle part files: L22 E305, L45 E103). Core `DirectReadQueue` (IOCP on
