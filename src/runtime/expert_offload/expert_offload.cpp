@@ -679,7 +679,7 @@ void ExpertOffload::create_stream() {
         };
         ssd.wait    = [tier = tier_.get()](std::int32_t slot) { return tier->stream_wait(slot); };
         ssd.release = [tier = tier_.get()](std::int32_t slot) { tier->stream_release(slot); };
-        ssd.layer_cap = [tier = tier_.get()] { return tier->stream_layer_cap(); };
+        ssd.layer_cap = [tier = tier_.get()](std::uint32_t layer) { return tier->stream_layer_cap(layer); };
     }
     stream_ = std::make_unique<ExpertStream>(setup_.layout.layers, setup_.layout.experts, record_stride_, std::move(record_of),
                                              !tier_, std::move(hold), host_strides_, std::move(ssd));

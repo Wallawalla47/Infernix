@@ -209,6 +209,9 @@ struct ForwardBatch {
     // release_stream on the span's last chunk only (every chunk reads the same layer copies).
     bool stream         = false;
     bool release_stream = true;
+    // The SSD tier lost no expert (left both tiers) since the stream's span began: a complete layer's experts are
+    // all in VRAM, the ring, a held frame or RAM, so its call runs as one pass, as without the tier.
+    bool stream_whole   = false;
     // With a gated stream (ExpertStream::gated): each layer's routing decides, through
     // ForwardExperts::split, which experts the stream copies and which the CPU serves.
     bool split          = false;

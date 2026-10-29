@@ -235,9 +235,9 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return static_cast<std::uint32_t>(stream_slot_.size());
     }
-    // The stream reads one layer may hold at once: kStreamWindow layers' reads of one class fit its
+    // The stream reads a layer may hold at once: kStreamWindow layers' reads of its class fit the class's
     // lent slots.
-    [[nodiscard]] std::uint32_t stream_layer_cap() const noexcept;
+    [[nodiscard]] std::uint32_t stream_layer_cap(std::uint32_t layer) const noexcept;
     // ---- refills (a demotion that reads the evicted expert's record from the artifact instead of copying its frame
     // back over the GPU's link)
     // The engine thread, between rounds: queues a read of `key`'s record into `slot` (the demotion slot

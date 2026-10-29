@@ -656,13 +656,13 @@ void HostExpertTier::return_stream() {
     tier_.give_back();
 }
 
-std::uint32_t HostExpertTier::stream_layer_cap() const noexcept {
+std::uint32_t HostExpertTier::stream_layer_cap(std::uint32_t layer) const noexcept {
+    // Per layer, by its class: the least over every class left every layer without a read whenever one class lent
+    // nothing.
     std::lock_guard<std::mutex> lock(mutex_);
-    std::uint32_t cap = std::numeric_limits<std::uint32_t>::max();
-    for (std::size_t c = 0; c < stream_lent_.size(); ++c) {
-        cap = std::min(cap, stream_lent_[c] / std::min(plan_.class_layers[c], kStreamWindow));
-    }
-    return stream_lent_.empty() ? 0 : cap;
+    if (stream_lent_.empty() || layer >= plan_.layer_class.size()) { return 0; }
+    const std::uint8_t c = plan_.layer_class[layer];
+    return stream_lent_[c] / std::max<std::uint32_t>(1, std::min(plan_.class_layers[c], kStreamWindow));
 }
 
 std::int32_t HostExpertTier::stream_read(std::uint32_t key) {

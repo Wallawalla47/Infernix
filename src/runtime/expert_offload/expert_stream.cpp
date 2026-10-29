@@ -121,8 +121,8 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
     auto* tables = static_cast<std::int32_t*>(tables_host_.data());
     // Stream slots are held from a layer's read request to its copy's landing: about kReadAhead + 2
     // layers' worth at once, so each layer takes at most that share of its record size's slots.
-    const std::uint32_t ssd_cap = ssd && ssd_.layer_cap ? ssd_.layer_cap() : 0;
     for (std::uint32_t l = 0; l < layers_; ++l) {
+        const std::uint32_t ssd_cap = ssd && ssd_.layer_cap ? ssd_.layer_cap(l) : 0;
         std::int32_t* row = tables + static_cast<std::size_t>(l) * experts_;
         const std::int32_t* frames = residency + static_cast<std::size_t>(l) * experts_;
         std::uint32_t taken = 0, staged = 0;

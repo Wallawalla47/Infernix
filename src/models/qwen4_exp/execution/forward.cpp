@@ -1097,10 +1097,14 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         // Every expert not resident when the chunk began has a ring slot and every record is in RAM:
         // the call stages nothing, so it runs as one pass over every job instead of staging passes of
         // half the slots (13 for a 16,384-column call of the layer walk). An expert a decode round
-        // evicted since is read in place from its host record (the same bytes, so the same bits).
-        if (streaming->complete(layer) && experts_.host_tables.empty()) {
+        // evicted since is read in place from its host record (the same bytes, so the same bits). With the
+        // SSD tier, while no expert left both tiers since the span began (stream_whole), an expert evicted
+        // since is still in its held frame or in RAM: IQ3_S's exclusive 16K prefill ran 13 passes a layer,
+        // 6,500 against the full layout's 6,794 tok/s (2026-10-29).
+        if (streaming->complete(layer) && (experts_.host_tables.empty() || batch->stream_whole)) {
             source.staging_slots  = 0;
             source.overlap_stream = nullptr;
+            source.fetch          = {}; // nothing is SSD-only: an unserved record would fail the call
         }
     }
     const bool planned = route_plans && ops::moe_route_dispatch_plan(logits, K, routing, dispatch, route_log, x, source,

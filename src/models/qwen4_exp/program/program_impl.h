@@ -1318,7 +1318,7 @@ public:
                 };
                 ssd.wait    = [tier = tier_.get()](std::int32_t slot) { return tier->stream_wait(slot); };
                 ssd.release = [tier = tier_.get()](std::int32_t slot) { tier->stream_release(slot); };
-                ssd.layer_cap = [tier = tier_.get()] { return tier->stream_layer_cap(); };
+                ssd.layer_cap = [tier = tier_.get()](std::uint32_t layer) { return tier->stream_layer_cap(layer); };
             }
             expert_stream_ = std::make_unique<ExpertStream>(c_.num_hidden_layers, c_.moe.experts, record_stride,
                                                                        std::move(record_of), !tier_, std::move(hold),
@@ -3992,7 +3992,10 @@ private:
         residency_->before_round(s);
         // A call the CPU can share (design §19.3.12) gates the stream on each layer's routing.
         split_call_ = streamed && split_policy_ && batch * width <= split_columns();
-        if (streamed) { expert_stream_->begin(ring_span(), residency_->host_table(), s, split_call_); }
+        if (streamed) {
+            expert_stream_->begin(ring_span(), residency_->host_table(), s, split_call_);
+            tier_losses_at_span_ = tier_losses();
+        }
         const WideWork wide(*this, batch * width);
         try {
             forward_call(batch, width, logit_columns, nullptr, chunk, vision, nullptr, streamed);
@@ -4529,6 +4532,7 @@ private:
         next_waits_      = {};
         fb.vision        = vision;
         fb.stream        = streamed;
+        fb.stream_whole  = streamed && tier_losses() == tier_losses_at_span_;
         fb.split         = streamed && split_call_;
         // Decode and verification rounds export their final residuals for the MTP catch-up.
         const std::int32_t cols = batch * width;
@@ -6014,6 +6018,13 @@ private:
     std::optional<ExpertStore> striped_store_;
     std::unique_ptr<ops::offloaded_moe::FetchChannel> fetch_channel_;
     std::unique_ptr<HostExpertTier> tier_;
+    // The tier's losses (keys that left both tiers) when the current stream span began (ForwardBatch::stream_whole).
+    std::uint64_t tier_losses_at_span_ = 0;
+    [[nodiscard]] std::uint64_t tier_losses() const {
+        if (!tier_) { return 0; }
+        const auto& l = tier_->controller().losses();
+        return l.unpublished + l.no_slot + l.unworthy + l.residents_evicted;
+    }
     PinnedHostBuffer expert_error_{1}; // mapped u32: ops::MoeExpertSource::error of every call
     // TEMPORARY (INFERNIX_TMP_REPLAY_BENCH, candidates §8.5 CF-03): decode rounds' device time and the
     // CPU waits' nanoseconds (ops::MoeExpertSource::wait_ns), reported at each lane's release.

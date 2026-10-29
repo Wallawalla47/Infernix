@@ -7520,6 +7520,13 @@ measured results are under "Status" at the end of this section.
     MB/s: Dense8 16K 236.8 -> 243.4 tok/s (723 of 903 demotions copied), IQ3_S struct 451.3 -> 463.1 (1,650 of
     2,268), the fast drive's speed; on the fast drive (copies only past the budget) Dense8 16K 243.3, IQ3_S struct
     465.8 (one run each, 2026-10-29).
+  - **Prefill: a complete stream layer runs one pass in tier mode** while the tier lost no expert since the span began
+    (`ForwardBatch::stream_whole`; a call then has no fetch channel). Every layer call of the exclusive layout's walk
+    ran 13 staging passes (`ggml_gate_up_decode` 624 launches against 48 in a 16K prefill); IQ3_S 16K prefill 6,500
+    -> 6,724 tok/s (full 6,805), Dense8 7,039 (full 6,993). The remaining 1.2 % on IQ3_S: the warm start leaves 17
+    experts SSD-only (a few record-size pools short while others hold shadows), and with the shadows below their floor
+    no pool lends the stream a slot, so 15 calls of the first prefill fetch them in 13 passes (~30 ms once a session).
+    The stream's SSD read cap is now per layer by its pool (`stream_layer_cap(layer)`), not the least over pools.
 - **Storage** (§4.4): `artifact::Residency::Streamed` and a long-lived `StreamSource` (per-part
   direct, deny-write handles); `ExpertStore` (Model data) holds each record's ≤ 2 aligned file
   segments (two records straddle part files: L22 E305, L45 E103). Core `DirectReadQueue` (IOCP on

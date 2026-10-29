@@ -177,6 +177,7 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
     if (cpu_service_) { cpu_service_->wake(); }
     residency_->before_round(s, /*landing=*/false, /*walking=*/false, kStreamReadSlots);
     expert_stream_->begin(ring_span(), residency_->host_table(), s, /*gated=*/false, /*ssd=*/true);
+    tier_losses_at_span_ = tier_losses();
     // The first span's later chunks read their n-gram rows here, chunk by chunk: a worker reading them
     // while chunk 0 ran (candidates §8.3 GX-08) measured flat (prefill is compute-bound; removed 2026-10-28).
     for (std::size_t c = 0; c < n; ++c) {
@@ -314,6 +315,7 @@ execution::ForwardBatch ProgramImpl::walk_batch(std::size_t c) {
     }
     fb.stream         = true;
     fb.release_stream = c + 1 == walk_.widths.size();
+    fb.stream_whole   = tier_losses() == tier_losses_at_span_;
     if (scoring_) { fb.residual_out = score_residuals(walk_.begins[c], w); } // a scored prompt's (causal_score)
     return fb;
 }
