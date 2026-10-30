@@ -177,9 +177,45 @@ inline Decoded decode(const std::uint8_t* row, int s) {
             _mm256_setr_epi64x(static_cast<long long>(ggml::k_iq2s_grid[i0]), static_cast<long long>(ggml::k_iq2s_grid[i1]),
                                static_cast<long long>(ggml::k_iq2s_grid[i2]), static_cast<long long>(ggml::k_iq2s_grid[i3]));
         o.q = apply_signs(g, u32(b + 34 + 4 * ib));
+    } else if constexpr (F == QType::GGML_IQ2_XXS) {
+        const std::uint8_t* b  = row + static_cast<std::size_t>(s / 8) * 66;
+        const std::uint8_t* qs = b + 2 + 8 * (s % 8);
+        o.d                     = u16(b);
+        const std::uint32_t aux = u32(qs + 4);
+        o.sub0 = o.sub1 = 2 * static_cast<int>(aux >> 28) + 1;
+        const __m256i g =
+            _mm256_setr_epi64x(static_cast<long long>(ggml::k_iq2xxs_grid[qs[0]]), static_cast<long long>(ggml::k_iq2xxs_grid[qs[1]]),
+                               static_cast<long long>(ggml::k_iq2xxs_grid[qs[2]]), static_cast<long long>(ggml::k_iq2xxs_grid[qs[3]]));
+        const std::uint32_t signs = static_cast<std::uint32_t>(ggml::k_ksigns_iq2xs[aux & 127]) |
+                                    static_cast<std::uint32_t>(ggml::k_ksigns_iq2xs[(aux >> 7) & 127]) << 8 |
+                                    static_cast<std::uint32_t>(ggml::k_ksigns_iq2xs[(aux >> 14) & 127]) << 16 |
+                                    static_cast<std::uint32_t>(ggml::k_ksigns_iq2xs[(aux >> 21) & 127]) << 24;
+        o.q = apply_signs(g, signs);
+    } else if constexpr (F == QType::GGML_IQ2_XS) {
+        const std::uint8_t* b  = row + static_cast<std::size_t>(s / 8) * 74;
+        const int ib           = s % 8;
+        const std::uint8_t* qs = b + 2 + 8 * ib;
+        o.d                    = u16(b);
+        const int sc           = b[66 + ib];
+        o.sub0                 = 2 * (sc & 0xF) + 1;
+        o.sub1                 = 2 * (sc >> 4) + 1;
+        // Per 8 elements one u16: a 9-bit grid index and a 7-bit sign field.
+        const unsigned q0 = u16(qs), q1 = u16(qs + 2), q2 = u16(qs + 4), q3 = u16(qs + 6);
+        const __m256i g =
+            _mm256_setr_epi64x(static_cast<long long>(ggml::k_iq2xs_grid[q0 & 511]), static_cast<long long>(ggml::k_iq2xs_grid[q1 & 511]),
+                               static_cast<long long>(ggml::k_iq2xs_grid[q2 & 511]), static_cast<long long>(ggml::k_iq2xs_grid[q3 & 511]));
+        const std::uint32_t signs = static_cast<std::uint32_t>(ggml::k_ksigns_iq2xs[q0 >> 9]) |
+                                    static_cast<std::uint32_t>(ggml::k_ksigns_iq2xs[q1 >> 9]) << 8 |
+                                    static_cast<std::uint32_t>(ggml::k_ksigns_iq2xs[q2 >> 9]) << 16 |
+                                    static_cast<std::uint32_t>(ggml::k_ksigns_iq2xs[q3 >> 9]) << 24;
+        o.q = apply_signs(g, signs);
     }
     return o;
 }
+
+// Formats whose sub-scale covers 16 elements (Decoded::sub0 for elements 0-15, sub1 for 16-31).
+template <QType F>
+inline constexpr bool kHalfSub = F == QType::GGML_IQ2_S || F == QType::GGML_IQ2_XS;
 
 // ------------------------------------------------------------------------ AVX2 dot products
 //
@@ -239,7 +275,7 @@ void row_sums_avx512_n(const std::uint8_t* matrix, int row_bytes, int slices, in
                 const int s      = u * kUnit + j;
                 const Decoded dw = decode<F>(w, s);
                 __m512i sub;
-                if constexpr (F == QType::GGML_IQ2_S) { // elements 0-15 and 16-31 have their own sub-scales
+                if constexpr (kHalfSub<F>) { // elements 0-15 and 16-31 have their own sub-scales
                     sub = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi16(static_cast<short>(dw.sub0))),
                                              _mm256_set1_epi16(static_cast<short>(dw.sub1)), 1);
                 } else {
@@ -336,13 +372,17 @@ void require(bool condition, const char* message) {
 
 #if defined(INFERNIX_GGML_X86)
 
-// The four 7-bit sign fields of an IQ3_XXS aux word as ksigns_iq2xs bytes (field | parity << 7).
-inline std::uint32_t iq3xxs_signs(std::uint32_t aux) {
-    const std::uint32_t f = (aux & 0x7FU) | ((aux << 1) & 0x7F00U) | ((aux << 2) & 0x7F0000U) | ((aux << 3) & 0x7F000000U);
+// Four 7-bit sign fields, one in each byte of f, as ksigns_iq2xs bytes (field | parity << 7).
+inline std::uint32_t ksigns_bytes(std::uint32_t f) {
     std::uint32_t p = f ^ ((f >> 4) & 0x0F0F0F0FU);
     p ^= (p >> 2) & 0x03030303U;
     p ^= (p >> 1) & 0x01010101U;
     return f | ((p & 0x01010101U) << 7);
+}
+
+// The four 7-bit sign fields of an IQ3_XXS (or IQ2_XXS) aux word as ksigns_iq2xs bytes.
+inline std::uint32_t iq3xxs_signs(std::uint32_t aux) {
+    return ksigns_bytes((aux & 0x7FU) | ((aux << 1) & 0x7F00U) | ((aux << 2) & 0x7F0000U) | ((aux << 3) & 0x7F000000U));
 }
 
 // Slice sb of the block at b (decode<F>'s values).
@@ -377,6 +417,28 @@ inline Decoded decode_block(const std::uint8_t* b, unsigned sb) {
             _mm256_setr_epi64x(static_cast<long long>(ggml::k_iq2s_grid[i0]), static_cast<long long>(ggml::k_iq2s_grid[i1]),
                                static_cast<long long>(ggml::k_iq2s_grid[i2]), static_cast<long long>(ggml::k_iq2s_grid[i3]));
         o.q = apply_signs(g, u32(b + 34 + 4 * sb));
+    } else if constexpr (F == QType::GGML_IQ2_XXS) {
+        const std::uint8_t* qs  = b + 2 + 8 * sb;
+        o.d                     = u16(b);
+        const std::uint32_t aux = u32(qs + 4);
+        o.sub0 = o.sub1 = 2 * static_cast<int>(aux >> 28) + 1;
+        const __m256i g =
+            _mm256_setr_epi64x(static_cast<long long>(ggml::k_iq2xxs_grid[qs[0]]), static_cast<long long>(ggml::k_iq2xxs_grid[qs[1]]),
+                               static_cast<long long>(ggml::k_iq2xxs_grid[qs[2]]), static_cast<long long>(ggml::k_iq2xxs_grid[qs[3]]));
+        o.q = apply_signs(g, iq3xxs_signs(aux));
+    } else if constexpr (F == QType::GGML_IQ2_XS) {
+        const std::uint8_t* qs = b + 2 + 8 * sb;
+        o.d                    = u16(b);
+        const int sc           = b[66 + sb];
+        o.sub0                 = 2 * (sc & 0xF) + 1;
+        o.sub1                 = 2 * (sc >> 4) + 1;
+        const std::uint64_t q  = u32(qs) | static_cast<std::uint64_t>(u32(qs + 4)) << 32; // four u16 words
+        const auto word        = [&](int k) { return static_cast<unsigned>(q >> (16 * k)) & 0xFFFFU; };
+        const __m256i g        = _mm256_setr_epi64x(static_cast<long long>(ggml::k_iq2xs_grid[word(0) & 511]),
+                                                    static_cast<long long>(ggml::k_iq2xs_grid[word(1) & 511]),
+                                                    static_cast<long long>(ggml::k_iq2xs_grid[word(2) & 511]),
+                                                    static_cast<long long>(ggml::k_iq2xs_grid[word(3) & 511]));
+        o.q = apply_signs(g, ksigns_bytes((word(0) >> 9) | (word(1) >> 9) << 8 | (word(2) >> 9) << 16 | (word(3) >> 9) << 24));
     } else if constexpr (F == QType::GGML_IQ4_XS) {
         o.d          = u16(b);
         const int ls = ((b[4 + sb / 2] >> (4 * (sb % 2))) & 0xF) | (((u16(b + 2) >> (2 * sb)) & 3) << 4);
@@ -586,6 +648,8 @@ bool ggml_rows(CpuIsa isa, QType format, const std::uint8_t* const* mats, int ro
         } else {                                                                                                       \
             return false;                                                                                              \
         }
+        INFERNIX_GGML_TILED_FORMAT(QType::GGML_IQ2_XXS)
+        INFERNIX_GGML_TILED_FORMAT(QType::GGML_IQ2_XS)
         INFERNIX_GGML_TILED_FORMAT(QType::GGML_IQ2_S)
         INFERNIX_GGML_TILED_FORMAT(QType::GGML_IQ3_XXS)
         INFERNIX_GGML_TILED_FORMAT(QType::GGML_IQ3_S)
@@ -962,7 +1026,7 @@ inline __m512i a8_weights512(const Decoded& d) {
     const __m512i codes = _mm512_cvtepi8_epi16(d.q);
     if constexpr (kUnitSub<F>) {
         return codes;
-    } else if constexpr (F == QType::GGML_IQ2_S) { // elements 0-15 and 16-31 have their own sub-scales
+    } else if constexpr (kHalfSub<F>) { // elements 0-15 and 16-31 have their own sub-scales
         return _mm512_mullo_epi16(codes, _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi16(static_cast<short>(d.sub0))),
                                                             _mm256_set1_epi16(static_cast<short>(d.sub1)), 1));
     } else {
@@ -1161,7 +1225,8 @@ bool ggml_cpu_supported(const GgmlExpertFormat& format) noexcept {
         return format.down == QType::FP8_E4M3FN_B128 && format.gate_row_bytes == kHidden &&
                format.down_row_bytes == kIntermediate;
     }
-    const bool gate_up = format.gate_up == QType::GGML_IQ2_S || format.gate_up == QType::GGML_IQ3_XXS ||
+    const bool gate_up = format.gate_up == QType::GGML_IQ2_XXS || format.gate_up == QType::GGML_IQ2_XS ||
+                         format.gate_up == QType::GGML_IQ2_S || format.gate_up == QType::GGML_IQ3_XXS ||
                          format.gate_up == QType::GGML_IQ3_S || format.gate_up == QType::GGML_IQ4_XS;
     const bool down    = format.down == QType::GGML_IQ4_NL || format.down == QType::GGML_Q2_0;
     return gate_up && down &&
@@ -1200,6 +1265,8 @@ void ggml_row_sums(CpuIsa isa, QType format, const std::uint8_t* matrix, int row
         row_sums_format<Q>(isa, matrix, row_bytes, slices, row_begin, row_end, columns, ncols, r);                     \
         return;
     switch (format) {
+        INFERNIX_GGML_FORMAT(QType::GGML_IQ2_XXS)
+        INFERNIX_GGML_FORMAT(QType::GGML_IQ2_XS)
         INFERNIX_GGML_FORMAT(QType::GGML_IQ2_S)
         INFERNIX_GGML_FORMAT(QType::GGML_IQ3_XXS)
         INFERNIX_GGML_FORMAT(QType::GGML_IQ3_S)
@@ -1314,6 +1381,12 @@ void ggml_a8_gate_up(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFor
             "8-bit gate/up: width or intermediates out of range");
     const int row_bytes = static_cast<int>(format.gate_row_bytes);
     switch (format.gate_up) {
+    case QType::GGML_IQ2_XXS:
+        a8_gate_up_format<QType::GGML_IQ2_XXS>(isa, record, row_bytes, x, ncols, i_begin, i_end, h);
+        return;
+    case QType::GGML_IQ2_XS:
+        a8_gate_up_format<QType::GGML_IQ2_XS>(isa, record, row_bytes, x, ncols, i_begin, i_end, h);
+        return;
     case QType::GGML_IQ2_S:
         a8_gate_up_format<QType::GGML_IQ2_S>(isa, record, row_bytes, x, ncols, i_begin, i_end, h);
         return;

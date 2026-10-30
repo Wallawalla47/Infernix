@@ -97,6 +97,8 @@ template <QType F> ggml::I128 dot(const std::uint8_t* row, const std::int32_t* x
 
 ggml::I128 row_dot(QType q, const std::uint8_t* row, const std::int32_t* x, int k) {
     switch (q) {
+    case QType::GGML_IQ2_XXS: return dot<QType::GGML_IQ2_XXS>(row, x, k);
+    case QType::GGML_IQ2_XS: return dot<QType::GGML_IQ2_XS>(row, x, k);
     case QType::GGML_IQ2_S: return dot<QType::GGML_IQ2_S>(row, x, k);
     case QType::GGML_IQ3_XXS: return dot<QType::GGML_IQ3_XXS>(row, x, k);
     case QType::GGML_IQ3_S: return dot<QType::GGML_IQ3_S>(row, x, k);
@@ -343,6 +345,8 @@ void decode_row(QType q, const std::uint8_t* row, int k, double* out) {
     for (int i = 0; i < k / 8; ++i) {
         ggml::Chunk c{};
         switch (q) {
+        case QType::GGML_IQ2_XXS: c = ggml::row_chunk<QType::GGML_IQ2_XXS>(row, i); break;
+        case QType::GGML_IQ2_XS: c = ggml::row_chunk<QType::GGML_IQ2_XS>(row, i); break;
         case QType::GGML_IQ2_S: c = ggml::row_chunk<QType::GGML_IQ2_S>(row, i); break;
         case QType::GGML_IQ3_XXS: c = ggml::row_chunk<QType::GGML_IQ3_XXS>(row, i); break;
         case QType::GGML_IQ3_S: c = ggml::row_chunk<QType::GGML_IQ3_S>(row, i); break;
@@ -866,6 +870,8 @@ INFERNIX_OP_TEST(offloaded_moe_ggml) {
         return 0;
     }
     const std::pair<QType, QType> pairs[] = {
+        {QType::GGML_IQ2_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ2_XXS, QType::GGML_Q2_0},
+        {QType::GGML_IQ2_XS, QType::GGML_IQ4_NL}, {QType::GGML_IQ2_XS, QType::GGML_Q2_0},
         {QType::GGML_IQ2_S, QType::GGML_IQ4_NL}, {QType::GGML_IQ2_S, QType::GGML_Q2_0},
         {QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ3_XXS, QType::GGML_Q2_0},
         {QType::GGML_IQ3_S, QType::GGML_IQ4_NL}, {QType::GGML_IQ3_S, QType::GGML_Q2_0},

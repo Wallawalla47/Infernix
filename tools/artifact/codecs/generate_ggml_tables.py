@@ -17,6 +17,8 @@ import re
 TABLES = (
     ("kmask_iq2xs", "uint8_t", 8),
     ("ksigns_iq2xs", "uint8_t", 128),
+    ("iq2xxs_grid", "uint64_t", 256),
+    ("iq2xs_grid", "uint64_t", 512),
     ("iq2s_grid", "uint64_t", 1024),
     ("iq3xxs_grid", "uint32_t", 256),
     ("iq3s_grid", "uint32_t", 512),

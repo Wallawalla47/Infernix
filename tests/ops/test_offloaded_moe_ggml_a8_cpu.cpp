@@ -234,8 +234,9 @@ void check_codec(std::mt19937& rng) {
 
 // --------------------------------------------- the GPU kernels' order on the independent decode
 
-double kappa(QType q) { return q == QType::GGML_IQ2_S ? 0.125 : q == QType::GGML_IQ3_XXS ? 0.25 : 1.0; }
-int kappa_log2(QType q) { return q == QType::GGML_IQ2_S ? -3 : q == QType::GGML_IQ3_XXS ? -2 : 0; }
+bool iq2(QType q) { return q == QType::GGML_IQ2_S || q == QType::GGML_IQ2_XS || q == QType::GGML_IQ2_XXS; }
+double kappa(QType q) { return iq2(q) ? 0.125 : q == QType::GGML_IQ3_XXS ? 0.25 : 1.0; }
+int kappa_log2(QType q) { return iq2(q) ? -3 : q == QType::GGML_IQ3_XXS ? -2 : 0; }
 
 struct RowResult {
     float y32    = 0.0F; // the GPU order's binary32 output (output_f32 of p_0)
@@ -644,6 +645,8 @@ INFERNIX_OP_TEST(offloaded_moe_ggml_a8_cpu) {
         std::mt19937 rng(20261027);
         check_codec(rng);
         const std::pair<QType, QType> pairs[] = {
+            {QType::GGML_IQ2_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ2_XXS, QType::GGML_Q2_0},
+            {QType::GGML_IQ2_XS, QType::GGML_IQ4_NL},  {QType::GGML_IQ2_XS, QType::GGML_Q2_0},
             {QType::GGML_IQ2_S, QType::GGML_IQ4_NL},   {QType::GGML_IQ2_S, QType::GGML_Q2_0},
             {QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ3_XXS, QType::GGML_Q2_0},
             {QType::GGML_IQ3_S, QType::GGML_IQ4_NL},   {QType::GGML_IQ3_S, QType::GGML_Q2_0},

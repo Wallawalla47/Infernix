@@ -11,7 +11,7 @@
 // times its sub-scales fit 16 bits (|code * sub| <= 4064), so 16-bit multiply-adds (vpmaddwd,
 // vpdpwssd) give the exact sums sum sub * code * X = 2^11 sum w * hi + sum w * lo.
 //
-// The expert formats are IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS (gate/up) and IQ4_NL and Q2_0 (down);
+// The expert formats are IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS (gate/up) and IQ4_NL and Q2_0 (down);
 // none has a min term.
 
 #include "core/weight.h"

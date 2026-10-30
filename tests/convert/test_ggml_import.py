@@ -125,6 +125,14 @@ def test_layout_geometry():
     assert encoded_size("ggml_expert_q2_0_v1", "ggml_iq3_s", (512, 2560, 640)) == 512 * 1_871_872
     with pytest.raises(ValueError):
         ggml_rows_geometry("ggml_q4_k", (8, 100))
+    # GSQ-RCO IQ3_XXS's 2-bit gate/up formats: expert banks only (no dense route decodes them).
+    xxs = ggml_expert_geometry("ggml_expert_iq4_nl_v1", "ggml_iq2_xxs", (512, 2560, 640))
+    assert xxs.gate_row_bytes == 10 * 66 and xxs.record_bytes == 2 * 640 * 660 + 2560 * 360
+    xs = ggml_expert_geometry("ggml_expert_q2_0_v1", "ggml_iq2_xs", (512, 2560, 640))
+    assert xs.gate_row_bytes == 10 * 74 and xs.down_row_bytes == 10 * 18 and xs.record_stride % 4096 == 0
+    for name in ("ggml_iq2_xxs", "ggml_iq2_xs"):
+        with pytest.raises(ValueError):
+            ggml_rows_geometry(name, (16, 2560))
 
 
 def test_tiles16_layout_is_a_block_permutation():

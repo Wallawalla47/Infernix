@@ -64,13 +64,15 @@ static_assert(kUnitSlices % kStageSlices == 0);
 // log2 of a bound on one block's term |mant(d) * P| (with the K-quants' min term): elements x
 // |sub| x |code| x |X| (< 2^21) x mant (< 2^11). Q6_K 2^8 2^7 2^5; Q5_K 2^8 2^6 2^5 (+ the min term
 // < 2^46); Q4_K 2^8 2^6 2^4 (+ 2^46); IQ4_XS 2^8 2^5 2^7; IQ4_NL 2^5 1 2^7; IQ3_S 2^8 2^5 2^4;
-// IQ3_XXS 2^8 2^5 2^6; IQ2_S 2^8 2^5 2^6; Q2_0 2^6 1 2^1.
+// IQ3_XXS 2^8 2^5 2^6; IQ2_S, IQ2_XS and IQ2_XXS 2^8 2^5 2^6; Q2_0 2^6 1 2^1.
+template <QType F>
+inline constexpr bool kIq2 = F == QType::GGML_IQ2_S || F == QType::GGML_IQ2_XS || F == QType::GGML_IQ2_XXS;
 template <QType F>
 inline constexpr int kTermLog2 = F == QType::GGML_Q6_K || F == QType::GGML_Q5_K || F == QType::GGML_IQ4_XS ? 52
-                                 : F == QType::GGML_Q4_K || F == QType::GGML_IQ3_XXS || F == QType::GGML_IQ2_S ? 51
-                                 : F == QType::GGML_IQ3_S                                                          ? 49
-                                 : F == QType::GGML_IQ4_NL                                                         ? 44
-                                                                                                                   : 39;
+                                 : F == QType::GGML_Q4_K || F == QType::GGML_IQ3_XXS || kIq2<F>              ? 51
+                                 : F == QType::GGML_IQ3_S                                                      ? 49
+                                 : F == QType::GGML_IQ4_NL                                                     ? 44
+                                                                                                               : 39;
 
 // Formats whose sub-scales are all 1 (the MMA sums need no scaling).
 template <QType F>
@@ -78,7 +80,7 @@ inline constexpr bool kUnitSub = F == QType::GGML_IQ4_NL || F == QType::GGML_Q2_
 
 // Formats whose sub-scale covers 16 elements: two k16 MMAs per slice, each scaled by its own.
 template <QType F>
-inline constexpr bool kHalfSub = F == QType::GGML_Q6_K || F == QType::GGML_IQ2_S;
+inline constexpr bool kHalfSub = F == QType::GGML_Q6_K || F == QType::GGML_IQ2_S || F == QType::GGML_IQ2_XS;
 
 // d = a * b over one 16x8x32 int8 tile (exact int32).
 __device__ __forceinline__ void mma_k32(int (&d)[4], int a0, int a1, int a2, int a3, int b0, int b1) {
@@ -351,6 +353,24 @@ __device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part,
         o.w[0] = fast::apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
         o.w[1] = fast::apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
         o.sub  = 2 * ((b[74 + ib] >> (4 * (l / 2))) & 0xF) + 1;
+        o.d    = ld16(b);
+    } else if constexpr (F == QType::GGML_IQ2_XXS) {
+        const int ib = part / 4, l = part % 4;
+        const std::uint32_t aux  = ld32(b + 6 + 8 * ib);
+        const std::uint64_t grid = cb.grid64(b[2 + 8 * ib + l]);
+        const unsigned sign      = cb.sign((aux >> (7 * l)) & 127);
+        o.w[0] = fast::apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
+        o.w[1] = fast::apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
+        o.sub  = 2 * static_cast<int>(aux >> 28) + 1;
+        o.d    = ld16(b);
+    } else if constexpr (F == QType::GGML_IQ2_XS) {
+        const int ib = part / 4, l = part % 4;
+        const std::uint32_t q    = ld16(b + 2 + 8 * ib + 2 * l);
+        const std::uint64_t grid = cb.grid64(static_cast<int>(q & 511));
+        const unsigned sign      = cb.sign(static_cast<int>(q >> 9));
+        o.w[0] = fast::apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
+        o.w[1] = fast::apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
+        o.sub  = 2 * ((b[66 + ib] >> (4 * (l / 2))) & 0xF) + 1;
         o.d    = ld16(b);
     } else if constexpr (F == QType::GGML_IQ3_XXS) {
         const int ib = part / 4, l = part % 4;

@@ -35,13 +35,17 @@ Q2_0 = GgmlType("ggml_q2_0", 42, 64, 18, 1.0)
 Q4_K = GgmlType("ggml_q4_k", 12, 256, 144, 1.0, has_min=True)
 Q5_K = GgmlType("ggml_q5_k", 13, 256, 176, 1.0, has_min=True)
 Q6_K = GgmlType("ggml_q6_k", 14, 256, 210, 1.0)
+IQ2_XXS = GgmlType("ggml_iq2_xxs", 16, 256, 66, 0.125)
+IQ2_XS = GgmlType("ggml_iq2_xs", 17, 256, 74, 0.125)
 IQ3_XXS = GgmlType("ggml_iq3_xxs", 18, 256, 98, 0.25)
 IQ4_NL = GgmlType("ggml_iq4_nl", 20, 32, 18, 1.0)
 IQ3_S = GgmlType("ggml_iq3_s", 21, 256, 110, 1.0)
 IQ2_S = GgmlType("ggml_iq2_s", 22, 256, 82, 0.125)
 IQ4_XS = GgmlType("ggml_iq4_xs", 23, 256, 136, 1.0)
 
-GGML_TYPES = MappingProxyType({t.name: t for t in (Q2_0, Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS)})
+GGML_TYPES = MappingProxyType(
+    {t.name: t for t in (Q2_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS)}
+)
 BY_GGML_ID = MappingProxyType({t.ggml_id: t for t in GGML_TYPES.values()})
 
 # Plain GGUF types the converter reads as values (not stored as ggml blocks).
@@ -87,6 +91,8 @@ def _u32(raw: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(raw).view("<u4")
 
 
+_GRID2XXS = np.array(tables.IQ2XXS_GRID, dtype=np.uint64).view(np.uint8).reshape(256, 8).astype(np.int32)
+_GRID2XS = np.array(tables.IQ2XS_GRID, dtype=np.uint64).view(np.uint8).reshape(512, 8).astype(np.int32)
 _GRID2S = np.array(tables.IQ2S_GRID, dtype=np.uint64).view(np.uint8).reshape(1024, 8).astype(np.int32)
 _GRID3XXS = np.array(tables.IQ3XXS_GRID, dtype=np.uint32).view(np.uint8).reshape(256, 4).astype(np.int32)
 _GRID3S = np.array(tables.IQ3S_GRID, dtype=np.uint32).view(np.uint8).reshape(512, 4).astype(np.int32)
@@ -227,6 +233,31 @@ def decode_terms(fmt: GgmlType, raw, n: int, k: int) -> Terms:
                 s = _signs(signs[:, 4 * ib + l])
                 base = 32 * ib + 8 * l
                 code[:, base : base + 8] = _GRID2S[index] * s
+                nibble = (scales[:, ib] >> (4 * (l // 2))) & 0xF
+                sub[:, base : base + 8] = (2 * nibble + 1)[:, None]
+    elif fmt is IQ2_XXS:
+        # Per 32 elements, 8 bytes of qs: four grid indices, then a word of four 7-bit sign fields and
+        # the 4-bit sub-scale (bits 28-31).
+        qs = b[:, 2:66]
+        for ib in range(8):
+            a = _u32(qs[:, 8 * ib + 4 : 8 * ib + 8])[:, 0].astype(np.int64)
+            s32 = (2 * (a >> 28) + 1).astype(np.int32)
+            for l in range(4):
+                s = _signs(_KSIGNS[((a >> (7 * l)) & 127).astype(np.int64)])
+                base = 32 * ib + 8 * l
+                code[:, base : base + 8] = _GRID2XXS[qs[:, 8 * ib + l].astype(np.int64)] * s
+                sub[:, base : base + 8] = s32[:, None]
+    elif fmt is IQ2_XS:
+        # Per 8 elements one little-endian u16: a 9-bit grid index and a 7-bit sign field; one scale byte
+        # per 32 elements, its low nibble for elements 0-15, its high nibble for 16-31.
+        q16 = np.ascontiguousarray(b[:, 2:66]).view("<u2").astype(np.int64)
+        scales = b[:, 66:74].astype(np.int32)
+        for ib in range(8):
+            for l in range(4):
+                v = q16[:, 4 * ib + l]
+                s = _signs(_KSIGNS[v >> 9])
+                base = 32 * ib + 8 * l
+                code[:, base : base + 8] = _GRID2XS[v & 511] * s
                 nibble = (scales[:, ib] >> (4 * (l // 2))) & 0xF
                 sub[:, base : base + 8] = (2 * nibble + 1)[:, None]
     elif fmt is IQ3_XXS:

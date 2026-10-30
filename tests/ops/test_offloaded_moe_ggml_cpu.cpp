@@ -17,6 +17,8 @@
 #include "ops/offloaded_sparse_moe/cpu/expert_team.h"
 #include "ops/offloaded_sparse_moe/cpu/ggml_expert.h"
 
+#include "ggml_block_oracle.h"
+
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -53,6 +55,8 @@ void random_rows(QType q, int rows, int k, std::mt19937& rng, std::uint8_t* out)
 
 ggml::I128 row_dot(QType q, const std::uint8_t* row, const std::int32_t* x, int k) {
     switch (q) {
+    case QType::GGML_IQ2_XXS: return ggml::row_dot<QType::GGML_IQ2_XXS>(row, x, k);
+    case QType::GGML_IQ2_XS: return ggml::row_dot<QType::GGML_IQ2_XS>(row, x, k);
     case QType::GGML_IQ2_S: return ggml::row_dot<QType::GGML_IQ2_S>(row, x, k);
     case QType::GGML_IQ3_XXS: return ggml::row_dot<QType::GGML_IQ3_XXS>(row, x, k);
     case QType::GGML_IQ3_S: return ggml::row_dot<QType::GGML_IQ3_S>(row, x, k);
@@ -274,6 +278,37 @@ void check_team_ggml(std::mt19937& rng) {
     }
 }
 
+// The expert-only formats' reference decode (ggml_exact.h chunk<F>, which the routes above are held to)
+// against ggml_block_oracle.h's transcription of llama.cpp's dequantize_row_*: every element's
+// kappa * d * sub * code equals the binary64 formula. infernix_ggml_linear_test qualifies the dense
+// formats; IQ2_XXS and IQ2_XS have no dense route, so they are qualified here.
+template <QType F>
+void check_reference_decode(std::mt19937& rng) {
+    constexpr int kElems = static_cast<int>(infernix::ggml_block_elems(F)), kBytes = static_cast<int>(infernix::ggml_block_bytes(F));
+    constexpr int kBlocks = 64;
+    std::vector<std::uint8_t> blocks(static_cast<std::size_t>(kBlocks) * kBytes);
+    random_rows(F, kBlocks, kElems, rng, blocks.data());
+    std::vector<double> want(kElems);
+    std::size_t bad = 0;
+    for (int b = 0; b < kBlocks; ++b) {
+        const std::uint8_t* block = blocks.data() + static_cast<std::size_t>(b) * kBytes;
+        infernix::test::ggml_oracle::decode_block(F, block, want.data());
+        for (int part = 0; part < kElems / 8; ++part) {
+            const ggml::Chunk c = ggml::chunk<F>(block, part);
+            const double d      = infernix::test::ggml_oracle::f16(c.d);
+            for (int j = 0; j < 8; ++j) {
+                const double got = std::ldexp(d * c.sub * c.code[j], ggml::kappa_log2(F));
+                bad += got != want[static_cast<std::size_t>(8 * part + j)];
+            }
+        }
+    }
+    if (bad != 0) {
+        std::fprintf(stderr, "FAIL: format %d: %zu of %d reference decodes differ from llama.cpp's formula\n",
+                     static_cast<int>(F), bad, kBlocks * kElems);
+        ++g_failures;
+    }
+}
+
 // ggml_encode_column (AVX2 on this CPU when it has it) against canon::a16_column_exponent and a16_value
 // split into limbs: the same exponent and limbs for normal, subnormal, zero, signed, wide-range and
 // non-finite columns.
@@ -429,7 +464,11 @@ INFERNIX_OP_TEST(offloaded_moe_ggml_cpu) {
     }
     try {
         std::mt19937 rng(20261011);
+        check_reference_decode<QType::GGML_IQ2_XXS>(rng);
+        check_reference_decode<QType::GGML_IQ2_XS>(rng);
         const std::pair<QType, QType> pairs[] = {
+            {QType::GGML_IQ2_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ2_XXS, QType::GGML_Q2_0},
+            {QType::GGML_IQ2_XS, QType::GGML_IQ4_NL},  {QType::GGML_IQ2_XS, QType::GGML_Q2_0},
             {QType::GGML_IQ2_S, QType::GGML_IQ4_NL},   {QType::GGML_IQ2_S, QType::GGML_Q2_0},
             {QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ3_XXS, QType::GGML_Q2_0},
             {QType::GGML_IQ3_S, QType::GGML_IQ4_NL},   {QType::GGML_IQ3_S, QType::GGML_Q2_0},

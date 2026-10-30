@@ -112,6 +112,38 @@ inline void decode_block(QType q, const std::uint8_t* b, double* y) {
         }
         break;
     }
+    case QType::GGML_IQ2_XXS: { // dequantize_row_iq2_xxs
+        const double d = f16(u16(b));
+        for (int ib = 0; ib < 8; ++ib) {
+            std::uint32_t aux32[2];
+            std::memcpy(aux32, b + 2 + 8 * ib, 8);
+            const double db = d * (0.5 + (aux32[1] >> 28)) * 0.25;
+            for (int l = 0; l < 4; ++l) {
+                const std::uint64_t g     = k_iq2xxs_grid[(aux32[0] >> 8 * l) & 0xFF];
+                const std::uint8_t signs = k_ksigns_iq2xs[(aux32[1] >> 7 * l) & 127];
+                for (int j = 0; j < 8; ++j) {
+                    y[32 * ib + 8 * l + j] = db * ((g >> 8 * j) & 0xFF) * ((signs & k_kmask_iq2xs[j]) ? -1 : 1);
+                }
+            }
+        }
+        break;
+    }
+    case QType::GGML_IQ2_XS: { // dequantize_row_iq2_xs
+        const double d = f16(u16(b));
+        const std::uint8_t* scales = b + 66;
+        for (int ib = 0; ib < 8; ++ib) {
+            const double db[2] = {d * (0.5 + (scales[ib] & 0xF)) * 0.25, d * (0.5 + (scales[ib] >> 4)) * 0.25};
+            for (int l = 0; l < 4; ++l) {
+                const std::uint16_t q     = u16(b + 2 + 2 * (4 * ib + l));
+                const std::uint64_t g     = k_iq2xs_grid[q & 511];
+                const std::uint8_t signs = k_ksigns_iq2xs[q >> 9];
+                for (int j = 0; j < 8; ++j) {
+                    y[32 * ib + 8 * l + j] = db[l / 2] * ((g >> 8 * j) & 0xFF) * ((signs & k_kmask_iq2xs[j]) ? -1 : 1);
+                }
+            }
+        }
+        break;
+    }
     case QType::GGML_IQ3_XXS: {
         const double d = f16(u16(b));
         for (int ib = 0; ib < 8; ++ib) {

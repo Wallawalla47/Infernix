@@ -236,7 +236,10 @@ NVFP4_EXPERT_RG16_V1 = Layout(
 )
 NVFP4_RG16_V1 = Layout("nvfp4_rg16_v1", 256, frozenset(("nvfp4_mul",)))
 
-GGML_ROWS_V1 = Layout("ggml_rows_v1", 256, frozenset(GGML_FORMATS))
+# Formats only the expert-bank kernels decode (ops/offloaded_sparse_moe): GSQ-RCO IQ3_XXS imports store them in
+# routed experts' gate/up matrices only, so no dense route takes them.
+GGML_EXPERT_ONLY_FORMATS = frozenset(("ggml_iq2_xxs", "ggml_iq2_xs"))
+GGML_ROWS_V1 = Layout("ggml_rows_v1", 256, frozenset(GGML_FORMATS) - GGML_EXPERT_ONLY_FORMATS)
 
 # The dense formats the tiled narrow kernels decode (ops/ggml/ggml_linear.cu, 256-element blocks).
 GGML_TILES16_FORMATS = frozenset(("ggml_q4_k", "ggml_q5_k", "ggml_q6_k", "ggml_iq4_xs"))
@@ -244,7 +247,9 @@ GGML_TILES16_V1 = Layout("ggml_tiles16_v1", 256, GGML_TILES16_FORMATS)
 
 # Expert banks of GGUF formats: the layout names the down matrices' format; the bank's own format
 # is the gate/up format.
-_GGML_EXPERT_GATE_UP = frozenset(("ggml_iq2_s", "ggml_iq3_xxs", "ggml_iq3_s", "ggml_iq4_xs"))
+_GGML_EXPERT_GATE_UP = frozenset(
+    ("ggml_iq2_xxs", "ggml_iq2_xs", "ggml_iq2_s", "ggml_iq3_xxs", "ggml_iq3_s", "ggml_iq4_xs")
+)
 GGML_EXPERT_IQ4_NL_V1 = Layout("ggml_expert_iq4_nl_v1", EXPERT_RECORD_ALIGNMENT, _GGML_EXPERT_GATE_UP)
 GGML_EXPERT_Q2_0_V1 = Layout("ggml_expert_q2_0_v1", EXPERT_RECORD_ALIGNMENT, _GGML_EXPERT_GATE_UP)
 GGML_EXPERT_DOWN_FORMATS = MappingProxyType(
@@ -514,6 +519,8 @@ def ggml_rows_geometry(format: str | GgmlFormat, shape: Sequence[int]) -> GgmlRo
     spec = _format(format)
     if not isinstance(spec, GgmlFormat):
         raise ValueError("ggml_rows_v1 requires a ggml block format")
+    if spec.name in GGML_EXPERT_ONLY_FORMATS:
+        raise ValueError(f"{spec.name} is decoded in routed-expert banks only, not as a dense matrix")
     n, k = _shape(shape, rank=2)
     if k % spec.block_elems:
         raise ValueError(f"ggml_rows_v1: K={k} is not a multiple of {spec.name}'s {spec.block_elems}")

@@ -157,8 +157,8 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         if (!is_ggml(format) || shape.size() != 3 || format == QType::GGML_IQ4_NL || format == QType::GGML_Q2_0 ||
             shape[1] % ggml_block_elems(format) || shape[2] % ggml_block_elems(down)) {
             throw std::invalid_argument(
-                "a ggml expert bank requires an IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS [experts, hidden, intermediate] with whole "
-                "blocks on both matrices");
+                "a ggml expert bank requires an IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS [experts, hidden, intermediate] "
+                "with whole blocks on both matrices");
         }
         const auto experts = shape[0], hidden = shape[1], inter = shape[2];
         const auto gate_row = mul(hidden / ggml_block_elems(format), ggml_block_bytes(format));
@@ -197,6 +197,9 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     if (layout == QuantLayout::GgmlRows || layout == QuantLayout::GgmlTiles16) {
         if (!is_ggml(format) || shape[1] % ggml_block_elems(format)) {
             throw std::invalid_argument("ggml_rows_v1 requires a ggml format and whole blocks per row");
+        }
+        if (is_ggml_expert_only(format)) {
+            throw std::invalid_argument("IQ2_XXS and IQ2_XS are decoded in routed-expert banks only, not as a dense matrix");
         }
         const bool tiles = layout == QuantLayout::GgmlTiles16;
         if (tiles && ggml_block_elems(format) != 256) {

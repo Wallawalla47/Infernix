@@ -555,6 +555,10 @@ void launch_pass_ggml_a8(const MoeDispatch& dispatch, const MoeExpertSource& sou
                                           stream, phase, part, wide);                                                 \
         return;                                                                                                        \
     }
+    INFERNIX_GGML_A8_PAIR(QType::GGML_IQ2_XXS, QType::GGML_IQ4_NL)
+    INFERNIX_GGML_A8_PAIR(QType::GGML_IQ2_XXS, QType::GGML_Q2_0)
+    INFERNIX_GGML_A8_PAIR(QType::GGML_IQ2_XS, QType::GGML_IQ4_NL)
+    INFERNIX_GGML_A8_PAIR(QType::GGML_IQ2_XS, QType::GGML_Q2_0)
     INFERNIX_GGML_A8_PAIR(QType::GGML_IQ2_S, QType::GGML_IQ4_NL)
     INFERNIX_GGML_A8_PAIR(QType::GGML_IQ2_S, QType::GGML_Q2_0)
     INFERNIX_GGML_A8_PAIR(QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL)

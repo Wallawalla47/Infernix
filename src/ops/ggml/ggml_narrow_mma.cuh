@@ -40,7 +40,7 @@ template <QType F>
 inline constexpr bool kNatural = F == QType::GGML_IQ4_NL || F == QType::GGML_IQ4_XS;
 // Formats whose sub-scale covers 16 elements.
 template <QType F>
-inline constexpr bool kHalves = F == QType::GGML_IQ2_S;
+inline constexpr bool kHalves = F == QType::GGML_IQ2_S || F == QType::GGML_IQ2_XS;
 // Slices of one MMA step.
 template <QType F>
 inline constexpr int kStepSlices = kHalves<F> ? 1 : 2;
@@ -49,8 +49,9 @@ inline constexpr int kBlockSlices = static_cast<int>(ggml_block_elems(F)) / 32;
 template <QType F>
 inline constexpr int kBlockBytes = static_cast<int>(ggml_block_bytes(F));
 template <QType F>
-inline constexpr bool kSupported = F == QType::GGML_IQ2_S || F == QType::GGML_IQ3_XXS || F == QType::GGML_IQ3_S ||
-                                   F == QType::GGML_IQ4_XS || F == QType::GGML_IQ4_NL || F == QType::GGML_Q2_0;
+inline constexpr bool kSupported = F == QType::GGML_IQ2_XXS || F == QType::GGML_IQ2_XS || F == QType::GGML_IQ2_S ||
+                                   F == QType::GGML_IQ3_XXS || F == QType::GGML_IQ3_S || F == QType::GGML_IQ4_XS ||
+                                   F == QType::GGML_IQ4_NL || F == QType::GGML_Q2_0;
 
 // A thread's A fragment of one step, with the sub-scales of its two slots.
 struct Step {
@@ -92,6 +93,21 @@ __device__ __forceinline__ void chunk_words(const std::uint8_t* b, int sb, int t
         w0  = fast::apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
         w1  = fast::apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
         sub = b[74 + sb];
+    } else if constexpr (F == QType::GGML_IQ2_XS) {
+        // sub: the slice's scale byte, as IQ2_S's.
+        const std::uint32_t q    = lds16(b + 2 + 8 * sb + 2 * t);
+        const std::uint64_t grid = cb.grid64(static_cast<int>(q & 511U));
+        const unsigned sign      = cb.sign(static_cast<int>(q >> 9));
+        w0  = fast::apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
+        w1  = fast::apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
+        sub = b[66 + sb];
+    } else if constexpr (F == QType::GGML_IQ2_XXS) {
+        const std::uint32_t aux  = lds32_a2(b + 6 + 8 * sb);
+        const std::uint64_t grid = cb.grid64(b[2 + 8 * sb + t]);
+        const unsigned sign      = cb.sign((aux >> (7 * t)) & 127);
+        w0  = fast::apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
+        w1  = fast::apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
+        sub = 2 * static_cast<int>(aux >> 28) + 1;
     } else if constexpr (F == QType::GGML_Q2_0) {
         // Element 4 i + k at bits 2 k of byte i of the slice's eight bytes, each code minus 1.
         const std::uint32_t v = lds16(b + 2 + 8 * sb + 2 * t);

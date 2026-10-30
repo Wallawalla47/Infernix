@@ -17,7 +17,13 @@
 namespace infernix {
 
 [[nodiscard]] INFERNIX_GGML_FORMAT_HD constexpr bool is_ggml(QType q) noexcept {
-    return (q >= QType::GGML_Q2_0 && q <= QType::GGML_IQ4_NL) || q == QType::GGML_Q8_0;
+    return (q >= QType::GGML_Q2_0 && q <= QType::GGML_IQ4_NL) || q == QType::GGML_Q8_0 || q == QType::GGML_IQ2_XXS ||
+           q == QType::GGML_IQ2_XS;
+}
+
+// Formats only the expert-bank kernels decode (ops/offloaded_sparse_moe): no dense route takes them.
+[[nodiscard]] INFERNIX_GGML_FORMAT_HD constexpr bool is_ggml_expert_only(QType q) noexcept {
+    return q == QType::GGML_IQ2_XXS || q == QType::GGML_IQ2_XS;
 }
 
 // Elements per block (the K-axis unit of a row).
@@ -31,6 +37,8 @@ namespace infernix {
     case QType::GGML_Q4_K:
     case QType::GGML_Q5_K:
     case QType::GGML_Q6_K:
+    case QType::GGML_IQ2_XXS:
+    case QType::GGML_IQ2_XS:
     case QType::GGML_IQ2_S:
     case QType::GGML_IQ3_XXS:
     case QType::GGML_IQ3_S:
@@ -55,6 +63,10 @@ namespace infernix {
         return 176;
     case QType::GGML_Q6_K:
         return 210;
+    case QType::GGML_IQ2_XXS:
+        return 66;
+    case QType::GGML_IQ2_XS:
+        return 74;
     case QType::GGML_IQ2_S:
         return 82;
     case QType::GGML_IQ3_XXS:
