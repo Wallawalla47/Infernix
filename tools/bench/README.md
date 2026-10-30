@@ -27,12 +27,22 @@ candidates, options or binaries, one fresh process per sample, in interleaved bl
 rotation for more arms). It discards a warm-up process, adds a noise arm (the control again), varies
 the prompt per block with `--corpus-offset` when the arm file lists offsets, and drops any sample
 whose startup evidence is wrong: an arm's switch missing from the `temporary switches` record, a
-requested fast path absent from the report, a PCIe link probe below `--min-link-gbs`, or a CPU expert
-team rate off the run's median (the probe and the rate are read from the `[engine]` lines
-`infernix_bench` writes to stderr, which include the Engine's debug diagnostics). Per metric and arm it reports pairs better than the control, the
-median and worst paired ratio, the ratio of pooled means and an exact Wilcoxon signed-rank p-value
-with Holm's correction; a resolved difference in the noise arm marks the whole run noisy. The arm
-file format is in the script's docstring.
+requested fast path absent from the report, a PCIe link probe below `--min-link-gbs`, a CPU expert
+team rate off the run's median, or a report whose PCIe link width is not the one the run is guarded
+to. (The probe and the rate are read from the `[engine]` lines `infernix_bench` writes to stderr,
+which include the Engine's debug diagnostics; the width is read from the report's own machine probe.)
+Per metric and arm it reports pairs better than the control, the median and worst paired ratio, the
+ratio of pooled means and an exact Wilcoxon signed-rank p-value with Holm's correction; a resolved
+difference in the noise arm marks the whole run noisy. The arm file format is in the script's
+docstring.
+
+`--expect-width N` (or `"expect_width": N` in the arm file) guards the PCIe link *width*, which the
+bandwidth probe cannot see: a card in an x8 slot is a different experiment from the same card in x16
+and still reads a plausible 28.9 GB/s at gen5. The discarded warm-up's report must show that width, or
+the run exits 4 before any measured block starts; every sample's own probe is then checked against it.
+Without an explicit width, a run's width is the one its reports mostly record, and a sample that
+disagrees — the card moved, or the link retrained, between blocks — is dropped instead of paired.
+`report.md` and `summary.json` name the link the run was made on and any report that carried no probe.
 
 For exact changes below about 1 %, which sit inside run-to-run drift, the TEMPORARY replay bench
 (`INFERNIX_TMP_REPLAY_BENCH=<warm rounds>` in the common `env`) replays one greedy request the same way
@@ -45,6 +55,45 @@ CPU expert leg, acceptance or the cache policy need the ordinary metrics.
 
 ```bash
 python3 tools/bench/abba.py arms.json --out profiles/bench/abba/<name> --blocks 6
+python3 tools/bench/abba.py arms.json --out profiles/bench/abba/<name> --expect-width 16
+```
+
+## Cross-run report join
+
+`join_reports.py` reads stored `infernix_bench` JSON reports from several runs and prints the same
+arm's metric beside itself in every group, so one table answers "what did the wider link buy?" or
+"what did this build change?". It reads a run script's `<run>/report/<arm>.json` layout and an
+`abba.py --out` directory (whose `b<block>-<position>-<arm>` tags fold back to the arm name, so the
+blocks of one arm pool). A positional ROOT makes its subdirectories the runs in sorted order; repeated
+`--run LABEL=DIR` is the explicit form and wins. `--group-by link` (default) places every report on the
+PCIe gen/width its own probe recorded, narrowest first, so a ratio reads as the better link over the
+worse one; `--group-by run` groups by run and lists the link without enforcing it. `--metric`
+(repeatable) selects metrics; duration metrics such as `load_seconds` are read as lower is better
+unless `--higher-is-better` says otherwise.
+
+What makes a ratio defensible, and what the output says when each applies:
+
+* a report whose probe recorded no `pcie_width` cannot be placed on the link axis: it is dropped and
+  counted;
+* a run whose reports disagree on width (the card moved, or the link retrained, mid-run) is dropped
+  whole unless `--allow-mixed-link` says the split is what you meant to measure;
+* every field that differs between the runs — GPU, driver, KV dtype, context, repetitions, fast paths,
+  temporary switches and the rest — is listed beside the tables, while fields that vary between arms
+  inside one run and the per-run paths (expert state, corpus offset) are not compared;
+* arms that are not measurements (`warmup`, `000_*`, overridable with `--exclude`) are left out;
+* `h2d_gbps` and `ram_read_gbps` print as the link's own numbers in their own section, because that is
+  what a width claim rests on (`--no-probes` omits them).
+
+Per metric, key and group it shows `n`, the mean of the joined reports and the spread across them (a
+group with one report can only offer that report's own repetition stddev). Nothing here is paired —
+separate processes share no block — so the table places runs side by side and a small difference stays
+`abba.py`'s question. `--out` writes `join.md`, `join.csv` and `join.json`.
+
+```bash
+python3 tools/bench/join_reports.py profiles/bench/<root> --out profiles/bench/<root>/join
+python3 tools/bench/join_reports.py \
+  --run x8=profiles/bench/<root>/<x8 run> --run x16=profiles/bench/<root>/<x16 run> \
+  --metric decode_output_tok_s --metric prefill_tok_s
 ```
 
 ## Basalt parity runs
