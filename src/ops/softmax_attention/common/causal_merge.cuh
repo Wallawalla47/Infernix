@@ -90,15 +90,41 @@ __launch_bounds__(256) __global__
     __shared__ float weights[256], warp_sums[8], scalars[2];
     const float head_l = causal_merge_natural_statistics<Geometry>(
         partial_m, partial_l, q_head, token, tokens, active_splits, weights, warp_sums, scalars);
+    // The splits with weight, in ascending order: their loads are issued together and summed in
+    // that order, the same additions as one pass over every split that skips the empty ones. With
+    // a branch per split each load waited for the previous one (12 us for two rows of eight
+    // columns over 42 splits, k4v2, RTX 5090).
+    __shared__ int live[256];
+    __shared__ int live_count;
+    {
+        const bool has   = tid < active_splits && weights[tid] != 0.0f;
+        const unsigned b = __ballot_sync(0xffffffffu, has);
+        if ((tid & 31) == 0) warp_sums[tid >> 5] = __int_as_float(__popc(b));
+        __syncthreads();
+        int before = 0;
+        for (int w = 0; w < (tid >> 5); ++w) before += __float_as_int(warp_sums[w]);
+        if (has) live[before + __popc(b & ((1u << (tid & 31)) - 1u))] = tid;
+        if (tid == 255) live_count = before + __popc(b);
+        __syncthreads();
+    }
     const int d = d_start + tid;
     if (tid >= DChunk || d >= 256) return;
+    const int count = live_count;
     float numerator = 0.0f;
-    for (int split = 0; split < active_splits; ++split) {
-        if (weights[split] != 0.0f)
-            numerator +=
-                partial_acc[causal_partial_index<Geometry>(q_head, d, token, split, tokens)] *
-                weights[split];
+    int i           = 0;
+    for (; i + 4 <= count; i += 4) {
+        float a[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            a[k] =
+                partial_acc[causal_partial_index<Geometry>(q_head, d, token, live[i + k], tokens)];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) numerator += a[k] * weights[live[i + k]];
     }
+    for (; i < count; ++i)
+        numerator +=
+            partial_acc[causal_partial_index<Geometry>(q_head, d, token, live[i], tokens)] *
+            weights[live[i]];
 
     const float value = head_l > 0.0F ? numerator / head_l : 0.0F;
     if constexpr (InverseRotation) {
