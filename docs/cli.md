@@ -268,7 +268,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | Option | Meaning | Default |
 |---|---|---:|
 | `--config FILE` | read options, and the model path, from a TOML file ([Configuration file](#configuration-file)); command-line options override it | unset |
-| `--rope-yarn-factor F` | startup-fixed runtime YaRN factor, finite `[1,4]`; extends allowed ceiling only | `1` |
+| `--rope-yarn-factor F` | startup-fixed runtime YaRN factor, finite `[1,4]`, for the target model (DFlash and DFlash2 drafters keep their own RoPE); extends allowed ceiling only | `1` |
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory (with offloaded experts, as on Qwen3.8-Flash-Next and Qwen3.5-122B-A10B, `auto` is `--max-context` x `--max-concurrency` and the expert cache takes the rest); omitted means `--max-context` | `2048` |
 | `--vram-headroom-mib N\|auto` | VRAM in MiB that startup sizing leaves free. Qwen3.5: after `--kv-capacity auto` sizes the KV pool (requires `auto`; `auto` = 1024). Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): after the expert cache takes the rest, for the display and other programs (`auto` = 1024 with a display on the GPU, 256 without; [details](qwen3_8-flash-next.md#vram)) | `auto` |
@@ -405,6 +405,9 @@ The artifact describes its model configuration and weight representations;
 extends the allowed context ceiling, but does not enlarge the default `--max-context` or KV pool;
 request a larger context explicitly. Memory and selected speculative-backend limits still apply.
 This is long-context extrapolation, not a guarantee of answer quality; evaluate your workload.
+YaRN applies to the target model only: a DFlash or DFlash2 drafter keeps its own unscaled RoPE, as it
+was trained (with the target's factor its draft acceptance collapsed even at 50K tokens: on the
+Qwen3.8-27B NVFP4, YaRN 4 decoded 106 against 207 tok/s with it, YaRN 2 135 against 197).
 
 `--kv-dtype` independently selects runtime KV storage. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
