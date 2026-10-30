@@ -100,6 +100,23 @@ struct HostMemoryLedger {
 
 [[nodiscard]] HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const HostMemoryDemand& demand);
 
+// The exclusive RAM layout's tier for an engine whose experts share one record size (ExpertOffload;
+// Qwen3.5-122B-A10B design §11.3; Qwen3.8-Flash-Next's Program sizes its own, with its layer walk's stream
+// slots and record-size pools): the warm start seeds `seeded` frames and RAM holds every other expert plus
+// `shadows`, RAM copies of VRAM experts for what VRAM gives back without a promotion: a prefill's loan of
+// `loan_frames`, the copies decode's swaps hold at that moment (a sixteenth of the frames, as Flash-Next
+// measured) and the elastic KV's growth of `kv_frames`. The seeds never take the frames the shadows cover, so
+// a first loan finds them free.
+struct ExclusiveTier {
+    std::uint64_t seeded  = 0; // frames the warm start fills at most
+    std::uint64_t shadows = 0; // the shadow floor (HostExpertTier::Options::shadow_floor)
+    std::uint64_t slots   = 0; // expert slots: every key but the seeds, and the shadows (0: no exclusive tier)
+};
+// `seed_share`: the share of the frames the warm start would fill without the shadows' bound. Empty when the
+// shadows take every frame (the layout would keep nothing out of RAM).
+[[nodiscard]] ExclusiveTier plan_exclusive_tier(std::uint64_t keys, std::uint64_t frames, std::uint64_t loan_frames,
+                                                std::uint64_t kv_frames, double seed_share);
+
 // ---------------------------------------------------------------- device memory
 
 inline constexpr std::uint64_t kLedgerMiB = 1ULL << 20;

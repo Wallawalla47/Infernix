@@ -729,9 +729,8 @@ int main() {
                               infernix::ExpertRamLayout::Full &&
                           parse({"infernix-serve", "model.ninfer", "--expert-ram-layout", "exclusive"}).expert_ram_layout ==
                               infernix::ExpertRamLayout::Exclusive &&
-                          parse({"infernix-serve", "model.ninfer"}).expert_ram_layout ==
-                              infernix::EngineOptions{}.expert_ram_layout,
-                      "--expert-ram-layout must parse exclusive and full, defaulting to the Engine's");
+                          !parse({"infernix-serve", "model.ninfer"}).expert_ram_layout.has_value(),
+                      "--expert-ram-layout must parse exclusive and full, unset leaving the model's default");
     {
         bool rejected = false;
         try {

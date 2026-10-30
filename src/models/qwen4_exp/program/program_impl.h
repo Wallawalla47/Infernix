@@ -1148,7 +1148,8 @@ public:
         // The expert cache's tables and route log; its frames come last (below).
         // A GGUF import's experts take Basalt's adaptive tier (IQ3_S decode 1.070-1.076x the LFRU in four A/Bs,
         // 2026-10-27/28, hit rate 84.6 against 85.1 % with half the promotions); NVFP4 and block-FP8 banks keep the LFRU
-        // (Dense8 0.971x adaptive).
+        // (Dense8 0.971x adaptive; FP4-Local with the candidate floor 1, 2026-10-30, 3 interleaved runs: 16K decode
+        // 0.979x and struct 0.993x, slower in every pair, hit rate 88.9 against 89.4 %).
         const QType experts_format = parameters_.layers.front().moe.bank->planes.gate_up_format;
         const auto policy = experts_format != QType::NVFP4_MUL && experts_format != QType::FP8_E4M3FN_B128
                                 ? ExpertResidency::VramPolicy::Adaptive

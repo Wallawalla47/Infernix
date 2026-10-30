@@ -184,7 +184,9 @@ is 56.8 GB, of which the routed experts are 46.9 GiB.
   not only within each layer, so a layer that routes more takes frames from one that routes fewer:
   struct +1.1 % (494 -> 499 tok/s, hits 96.6 -> 96.9 %, about 7 % fewer CPU-served misses), 16K
   unchanged (2026-10-30). The NVFP4 conversions keep LFRU, where the adaptive policy decoded 0.970x
-  (Dense8, MTP). Same bits either way.
+  (Dense8, MTP) and, with the floor of 1, 0.979x after a 16K prompt and 0.993x on the struct fixture
+  (NVIDIA FP4-Local, DFlash2 auto, exclusive layout, 3 interleaved runs, every pair slower, hits 88.9
+  against 89.4 %; 2026-10-30). Same bits either way.
 
 **Speed and quality** (RTX 5090 on PCIe 5.0 x8, i9-13900K, INT8 KV, one request, against recipe B
 in the same session on 2026-10-16; the n-gram table in RAM, `auto`; one run of `-r 3`, or `-r 1`

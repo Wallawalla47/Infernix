@@ -61,6 +61,18 @@ HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const Host
     return out;
 }
 
+ExclusiveTier plan_exclusive_tier(std::uint64_t keys, std::uint64_t frames, std::uint64_t loan_frames,
+                                  std::uint64_t kv_frames, double seed_share) {
+    ExclusiveTier out;
+    const std::uint64_t shadows = loan_frames + frames / 16 + kv_frames;
+    if (frames == 0 || shadows >= frames || keys == 0) { return out; }
+    const auto share = static_cast<std::uint64_t>(std::clamp(seed_share, 0.0, 1.0) * static_cast<double>(frames));
+    out.shadows      = shadows;
+    out.seeded       = std::min(frames - shadows, share);
+    out.slots        = std::min(keys, keys - std::min(keys, out.seeded) + shadows);
+    return out;
+}
+
 std::optional<std::uint64_t> pin_room(const VramSnapshot& snapshot) {
     if (snapshot.shared_system == 0) { return std::nullopt; }
     return saturating_sub(snapshot.shared_system, snapshot.nonlocal_usage + kPinRoomMarginBytes);

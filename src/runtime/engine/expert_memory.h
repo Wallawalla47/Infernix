@@ -64,9 +64,11 @@ inline constexpr std::uint64_t kMinAutoHostContextBytes = 1ULL << 30;
 
 // Plans `demand` against `snapshot`, reports the ledger (an Info summary, Debug details), refuses an
 // --expert-ram-mib the ledger cannot give (std::runtime_error), and asks Windows to keep the
-// process's pageable growth resident (a Warning when it will not).
+// process's pageable growth resident (a Warning when it will not). `always_tier`: the banks load as the
+// SSD tier's even where every expert fits in RAM, the ledger's share being the tier's budget (an engine
+// that sizes the exclusive RAM layout at start, ExpertOffload).
 [[nodiscard]] ExpertRamPlan plan_expert_ram(const EngineOptions& options, const expert_offload::HostMemoryDemand& demand,
-                                            const HostMemorySnapshot& snapshot);
+                                            const HostMemorySnapshot& snapshot, bool always_tier = false);
 
 // The VRAM check before the weights are read: `fixed` (the dense weights and the Program's fixed
 // allocations) and the graph reserve for `graphs` executables must leave the expert cache room for

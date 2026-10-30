@@ -105,6 +105,10 @@ struct OffloadOptions {
     std::uint64_t expert_ram_bytes      = 0;
     std::uint64_t expert_unpinned_bytes = 0;
     std::uint64_t later_pinned_bytes    = 0;
+    // The exclusive RAM layout (--expert-ram-layout exclusive; the SSD tier's banks): RAM holds the experts the
+    // frames do not, and shadows for what VRAM gives back without a promotion (plan_exclusive_tier, sized at
+    // start once the frames are known). A RAM budget too small for it keeps the plain SSD tier.
+    bool ram_exclusive = false;
     std::filesystem::path expert_state; // the saved expert state (warm start); empty: none
     std::string expert_state_identity;
     // Without a usable saved state the warm start seeds from the model's calibrated order
@@ -143,6 +147,10 @@ struct OffloadSetup {
     std::uint32_t ngram_draft_tokens = 0;
     // Graph executables the VRAM sizing reserves room for when the pool is fixed (memory_plan graph_bound).
     std::uint32_t graph_bound = 0;
+    // The exclusive RAM layout's shadows (plan_exclusive_tier): the largest wide workspace a prefill pass borrows
+    // beside the stream's ring, and what the elastic KV may still take from the frames.
+    std::uint64_t loan_bytes      = 0;
+    std::uint64_t kv_growth_bytes = 0;
     // A model's calibrated expert order (the Qwen3.5-122B-A10B's, models/qwen3_5/program/calibrated_order.h):
     // the warm start's seed when no saved state can be used; null: none. It outlives the engine.
     const expert_cache::SavedState* calibrated_state = nullptr;
@@ -154,8 +162,8 @@ public:
     using Diagnostic = std::function<void(const std::string&, DiagnosticLevel)>;
 
     // Misses staged per pass of a layer's experts: every decode and verification call's misses in
-    // one pass, a prefill chunk's in several; at least kStagingSlots, with the SSD tier exactly that
-    // (Flash-Next: 80 slots +7.2 % MTP on IQ3_S; with the tier the larger staging cost frames and RAM).
+    // one pass, a prefill chunk's in several; with the SSD tier short of RAM kStagingSlots (Flash-Next:
+    // 80 slots +7.2 % MTP on IQ3_S; with the tier the larger staging cost frames and RAM).
     static constexpr std::int32_t kStagingSlots = 64, kMaxStagingSlots = 512;
     // Fewer frames than this make decode slow (runtime/engine's kFewExpertFrames for Flash-Next).
     static constexpr std::uint32_t kFewFrames = 2048;
@@ -173,6 +181,13 @@ public:
     static constexpr double kReferenceLinkBytesPerSecond = 27.5e9;
     // Promotions per layer and token at the decode rate (a forced-token call takes one).
     static constexpr std::size_t kDecodePromotionsPerLayer = 1;
+
+    // The priority of the streams beside the routed experts (the staging fork's here, the Program's shared-expert
+    // and split streams): the device's greatest, which the decode graphs keep as node priorities
+    // (core/decode_graph.cpp), so their short kernels take an SM as the routed experts' CTAs retire, as
+    // Qwen3.8-Flash-Next's Program measured. Ornith, full layout, MTP auto, 2 interleaved pairs (2026-10-30):
+    // decode after a 1,280-token prompt 101.24 against 101.04 tok/s, after 32,768 101.73 against 100.72.
+    [[nodiscard]] static int side_stream_priority();
 
     // The staging slots and the device bytes the constructor allocates (staging and the residency's
     // tables), for the Program's device plan.
@@ -363,6 +378,9 @@ private:
     // in cudaHostAlloc copies, logged once at startup.
     void cpu_probe_detail();
     void create_tier();
+    // The exclusive layout's slots and shadow floor in `tier` (exclusive_), or the plain tier's when its budget
+    // or the frames are short of them.
+    void plan_exclusive(const ExpertStore& store, HostExpertTier::Options& tier);
     void create_stream();
     void create_cpu_service();
     void size_frames(cudaStream_t compute, const std::function<void(std::uint64_t, std::uint64_t)>& lendable_frames);
@@ -393,6 +411,7 @@ private:
     std::optional<ExpertStore> striped_store_;
     std::unique_ptr<ops::offloaded_moe::FetchChannel> fetch_channel_;
     std::unique_ptr<HostExpertTier> tier_;
+    ExclusiveTier exclusive_; // the exclusive layout's tier (slots 0: not exclusive)
     PinnedHostBuffer error_{64};
     std::unique_ptr<ExpertStream> stream_;
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
