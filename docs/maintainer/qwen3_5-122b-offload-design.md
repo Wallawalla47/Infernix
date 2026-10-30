@@ -1070,11 +1070,53 @@ a promotion batch in flight (one H2D copy engine, FIFO) 629-2,195 µs against 39
 (`.local/redesign-2026-10-28/phase2/ce_handoff_probe.cu`). The copy engine's higher rate does not survive the
 handoff and the promotions' queue.
 
-**Open: the decode split.** The full layout at a pinned share, A B B A: 85/256 108.82 / 100.08 tok/s (after 1,280 /
-32,768 tokens), 64/256 112.18 (+3.1 %) / 95.10 (−5.0 %). The rule's divisor 3 (M / 3, floored) decoded 101.3-101.5
-after 1,280 tokens in the same session, so the share form (M × s >> 8, floored) is the finer split and its best
-value depends on the context. Not built: a split by context needs its own A/B over real contexts (the 32K figures
-are 16 tokens after the prompt).
+**The decode split** at a pinned share first suggested a context-dependent optimum (64/256 +3.1 % after 1,280 tokens,
+−5.0 % after 32,768). Those 32K figures were 16 tokens right after the prompt, while the cache still held the
+prompt's experts; steady decode on real text has one optimum (§11.4).
+
+### 11.4 Decode split (2026-10-30)
+
+A decode or verification call's M host-memory misses split between the link (the SM stage, 230 µs a record) and
+the CPU team. The engine used Flash-Next's divisor rule, M / d with d = floor(1.65 + C t) (C the team's experts/s, t
+a record's link seconds; d = 3 here, 4 when C reads above ~12,200/s). The share form keeps (M × s) >> 8.
+
+**Grid** (`infernix_decode_quality_gen` on real code, greedy, MTP auto, INT8 KV, 384 new tokens a segment; 6 / 4 / 3
+segments at 1,536 / 8,192 / 32,768 tokens; two interleaved rounds, decode tok/s):
+
+| Split | 1,536 | 8,192 | 32,768 |
+|---|---:|---:|---:|
+| rule (1/3) | 84.53 | 83.48 | 85.10 |
+| 107/256 | 77.59 | 77.32 | 78.41 |
+| 85/256 | 91.35 | 87.90 | 90.37 |
+| 64/256 | 95.28 (+12.7 %) | 90.16 (+8.0 %) | 92.55 (+8.8 %) |
+| 43/256 | 95.50 | 89.20 | 92.55 |
+
+The optimum hardly moves with the context: from 85/256 down the CPU team, which serves a miss in ~90 µs of its 6
+workers' bandwidth, should take the misses of a narrow call, and the link only the excess of a wide one (64/256 sends
+nothing below four misses). At 32K the 43 and 64 runs decoded identically (no call held enough misses to differ).
+
+**Rule.** `placement.h` `decode_link_share_256`: s = 256 / (1 + 1.46 C t), the two legs' balance with the weight
+fitted to 64/256 at this machine's C t of 2.06 (link 27.5 GB/s, 10,650 experts/s, 5.06 MiB records), so a faster link
+or a slower CPU team moves the share the same way as the divisor rule did. It replaces the divisor rule in
+`ExpertOffload` (the 122B); `INFERNIX_TMP_LINK_SHARE` still overrides it, and Flash-Next's Program keeps its own
+rule. Same bits: placement only.
+
+**A/B** (main 3a1f6bcf's generator against the rule's build, the same workload, two rounds A B / B A; the rule's
+measured share 63-68/256; greedy outputs equal in all 10 pairs):
+
+| Workload | Divisor rule | Share rule | Change |
+|---|---:|---:|---:|
+| MTP auto, 1,536-token prompts | 87.64 | 95.86 | +9.4 % (one pair; the other below) |
+| MTP auto, 8,192 | 83.77 | 90.27 | +7.8 % (+7.3, +8.2) |
+| MTP auto, 32,768 | 85.23 | 92.37 | +8.4 % (+8.1, +8.7) |
+| plain decode, 1,536 | 70.17 | 72.37 | +3.1 % (+3.1, +3.2) |
+| MTP auto, two requests at once, 1,536 (wall clock, prefill included) | 65.99 | 73.84 | +11.9 % (+11.2, +12.6) |
+
+**A slow first reading.** The other 1,536 pair's rule run started right after another session's tens-of-GiB runs
+ended: its single reading in the full layout found 4,923 experts/s, kept half its misses on the link and decoded
+52.4 tok/s. The share rule would have taken 107/256 from that reading. The engine now measures in both layouts
+until the readings settle (§11.3's pause, again while a reading beats the best by 10 %, at most three), and the
+best stands.
 
 ---
 

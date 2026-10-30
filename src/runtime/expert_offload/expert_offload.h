@@ -348,8 +348,9 @@ public:
     // ---- CPU ----
     [[nodiscard]] double cpu_expert_rate() const noexcept;
     [[nodiscard]] double cpu_column_rate() const noexcept;
+    // A fixed decode miss divisor (OffloadOptions::cpu_pcie_divisor; 0: the share decides).
     [[nodiscard]] int pcie_divisor() const noexcept;
-    // INFERNIX_TMP_LINK_SHARE: the link's share of a call's misses in 256ths (0: pcie_divisor).
+    // The link's share of a decode call's misses in 256ths (0 with a fixed divisor).
     [[nodiscard]] int pcie_share() const noexcept;
     // Plain decode's one-column divisor by context (placement.h plain_divisor; Flash-Next: d = 1
     // below 1,536 tokens, 2 from there): its startup value, 0 when the rule does not apply.
@@ -372,7 +373,11 @@ public:
 
 private:
     void measure_link();
-    void measure_cpu_rate();
+    // One reading of the CPU team's rates (cpu_rate_note_ and cpu_rate_busy_share_ describe it); false without
+    // expert records in RAM (the reference rates stand).
+    [[nodiscard]] bool measure_cpu_rate();
+    // The rates the decode split takes: readings until they settle, the best standing, and their report.
+    void measure_cpu_rate_settled();
     // INFERNIX_TMP_CPU_PROBE_DETAIL=1 (candidates §11.2 OR-08): the team's rates on the same 32 records
     // where they live (the tier's slots or the registered banks), in registered VirtualAlloc copies and
     // in cudaHostAlloc copies, logged once at startup.
@@ -418,6 +423,8 @@ private:
     std::unique_ptr<CpuSplitPolicy> split_;
     double link_bytes_per_second_ = kReferenceLinkBytesPerSecond;
     double cpu_expert_rate_ = 0.0, cpu_column_rate_ = 0.0; // 0 until measured
+    std::string cpu_rate_note_;         // how the last reading was taken (the report's parenthesis)
+    double cpu_rate_busy_share_ = -1.0; // the last reading's other-process CPU share when busy, else < 0
     bool failed_round_ = false;
 
     // The fork / overlap stream and its events (start, staged[2], consumed[2]; the fork uses the first two).

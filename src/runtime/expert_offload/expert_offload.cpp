@@ -61,8 +61,11 @@ constexpr int kNarrowColumns = moe::kMaxCpuColumns;
 constexpr double kQuietShare = 0.25;
 constexpr auto kRetryPause   = std::chrono::milliseconds(500);
 constexpr auto kRetryBudget  = std::chrono::seconds(20);
-// The pause before the SSD tier's second rate measurement (start), as Flash-Next's Program waits.
-constexpr std::chrono::seconds kTierRateSettle{4};
+// The settled rate measurement (measure_cpu_rate_settled): the pause before each further reading (as Flash-Next's
+// Program waits for its tier), the most readings, and the gain over the best that asks for another.
+constexpr std::chrono::seconds kRateSettle{4};
+constexpr int kRateSettleReadings  = 3;
+constexpr double kRateSettleGain   = 0.10;
 
 class SplitPolicy final : public CpuSplitPolicy {
 public:
@@ -248,20 +251,8 @@ void ExpertOffload::start(cudaStream_t compute, const std::function<void(std::ui
     size_frames(compute, lendable_frames);
     warm_start(compute);
     // The SSD tier has no records in RAM before its fill: the CPU team's rates are measured on its RAM
-    // copies now, so the decode divisor follows this record size and CPU (source() reads it). Right after
-    // the fill (tens of GiB of direct reads) the machine's memory is slow for a few seconds, as Flash-Next's
-    // Program found (Dense8 9,377 experts/s there, 18,942 5 s later): the 122B's exclusive layout read
-    // 5,536-6,027 against the full layout's 9,515-10,379, kept half the decode misses on the link instead of a
-    // third and decoded 76.5 against 100.9 tok/s (2026-10-30). The rates are measured again after a pause;
-    // the better reading stands.
-    if (tier_ && cpu_service_) {
-        measure_cpu_rate();
-        const double first_experts = cpu_expert_rate_, first_columns = cpu_column_rate_;
-        std::this_thread::sleep_for(kTierRateSettle);
-        measure_cpu_rate();
-        cpu_expert_rate_ = std::max(cpu_expert_rate_, first_experts);
-        cpu_column_rate_ = std::max(cpu_column_rate_, first_columns);
-    }
+    // copies now, so the decode split follows this record size and CPU (source() reads it).
+    if (tier_ && cpu_service_) { measure_cpu_rate_settled(); }
     if (!options_.route_trace.empty()) {
         trace_ = std::make_unique<RouteTrace>(
             options_.route_trace, RouteTraceSetup{.layers             = setup_.layout.layers,
@@ -433,21 +424,20 @@ double ExpertOffload::cpu_column_rate() const noexcept {
     return cpu_column_rate_ > 0.0 ? cpu_column_rate_ : options_.cpu_split_column_rate;
 }
 
-// The share of a decode call's misses the PCIe stage keeps, misses / d, from C t (C experts per second
-// on the CPU, t seconds per record on the link): d = floor(1.65 + C t) (§19.3.12: the measured fastest
-// divisors put the switch from 2 to 3 at C t = 1.35).
-int ExpertOffload::pcie_divisor() const noexcept {
-    if (options_.cpu_pcie_divisor > 0) { return options_.cpu_pcie_divisor; }
-    const double record_seconds = static_cast<double>(setup_.banks.front()->planes.record_stride) / link_bytes_per_second_;
-    return std::max(1, static_cast<int>(std::floor(1.65 + cpu_expert_rate() * record_seconds)));
-}
+int ExpertOffload::pcie_divisor() const noexcept { return options_.cpu_pcie_divisor; }
 
-// INFERNIX_TMP_LINK_SHARE (Strata's L / (L + 1.85 R)): R from the CPU-rate probe and the first bank's
-// record, as pcie_divisor's C t.
+// The link's share of a decode call's misses in 256ths: INFERNIX_TMP_LINK_SHARE when set (Strata's
+// L / (L + 1.85 R) or a fixed fraction), else the decode split (placement.h decode_link_share_256) from the
+// measured link, the CPU team's rate and the first bank's record. It replaced the divisor rule d = floor(1.65 + C t)
+// (Flash-Next §19.3.12), whose 1/3 decoded the 122B 7-11 % slower (design §11.4).
 int ExpertOffload::pcie_share() const noexcept {
     if (options_.cpu_pcie_divisor > 0) { return 0; } // a fixed divisor wins
-    return link_share_256(temporary_switches::offload(), link_bytes_per_second_, cpu_expert_rate(),
-                          static_cast<double>(setup_.banks.front()->planes.record_stride));
+    const double record = static_cast<double>(setup_.banks.front()->planes.record_stride);
+    if (const int set = link_share_256(temporary_switches::offload(), link_bytes_per_second_, cpu_expert_rate(), record);
+        set > 0) {
+        return set;
+    }
+    return decode_link_share_256(link_bytes_per_second_, cpu_expert_rate(), record);
 }
 
 int ExpertOffload::one_column_divisor() const noexcept {
@@ -484,7 +474,7 @@ std::uint64_t ExpertOffload::promotion_interval() const noexcept {
 // DRAM reads compete with the CPU's): experts per second on one-column jobs and expert columns per
 // second on kNarrowColumns-column jobs, the best of three batches each, retried while other processes
 // load the CPU (§19.3.28).
-void ExpertOffload::measure_cpu_rate() {
+bool ExpertOffload::measure_cpu_rate() {
     const std::uint32_t L = setup_.layout.layers, E = setup_.layout.experts;
     std::vector<std::vector<std::uint32_t>> held(L); // per layer, the experts with a host copy
     bool measured = L > 0;
@@ -591,11 +581,45 @@ void ExpertOffload::measure_cpu_rate() {
         std::snprintf(share, sizeof(share), "; other processes used %.0f %% of the CPU", 100.0 * last_share);
         how += share;
     }
+    cpu_rate_note_       = how;
+    cpu_rate_busy_share_ = measured && !quiet ? last_share : -1.0;
+    return measured;
+}
+
+// The CPU team's rates, settled: right after the banks' load or the tier's fill (tens of GiB of direct reads), or
+// while the OS clears memory another process freed, memory is slow for some seconds (the 122B read 4,923-6,027
+// experts/s there against 9,515-12,805 settled, 2026-10-30, and the low reading kept half its decode misses on the
+// link for the session: decode -24 to -40 %; Flash-Next's Program measures twice for its tier). After a pause the
+// rates are measured again, and again while a reading beats the best by more than kRateSettleGain, at most
+// kRateSettleReadings readings; the best stands.
+void ExpertOffload::measure_cpu_rate_settled() {
+    int readings        = 1;
+    const bool measured = measure_cpu_rate();
+    if (measured) {
+        double best_experts = cpu_expert_rate_, best_columns = cpu_column_rate_;
+        while (readings < kRateSettleReadings) {
+            std::this_thread::sleep_for(kRateSettle);
+            (void)measure_cpu_rate();
+            ++readings;
+            const bool improved = cpu_expert_rate_ > best_experts * (1.0 + kRateSettleGain);
+            best_experts        = std::max(best_experts, cpu_expert_rate_);
+            best_columns        = std::max(best_columns, cpu_column_rate_);
+            if (!improved) { break; }
+        }
+        cpu_expert_rate_ = best_experts;
+        cpu_column_rate_ = best_columns;
+    }
+    std::string how = cpu_rate_note_;
+    if (readings > 1) { how += "; the best of " + std::to_string(readings) + " readings"; }
     char kept[160];
-    if (const int share = pcie_share(); share > 0) {
-        std::snprintf(kept, sizeof(kept), "%d/256 (INFERNIX_TMP_LINK_SHARE; the divisor rule's 1/%d)", share, pcie_divisor());
+    const double ct = cpu_expert_rate() * static_cast<double>(setup_.banks.front()->planes.record_stride) /
+                      link_bytes_per_second_;
+    if (pcie_divisor() > 0) {
+        std::snprintf(kept, sizeof(kept), "1/%d (fixed)", pcie_divisor());
+    } else if (temporary_switches::offload().link_share != OffloadSwitches::LinkShare::kDivisor) {
+        std::snprintf(kept, sizeof(kept), "%d/256 (INFERNIX_TMP_LINK_SHARE)", pcie_share());
     } else {
-        std::snprintf(kept, sizeof(kept), "1/%d", pcie_divisor());
+        std::snprintf(kept, sizeof(kept), "%d/256 (C t %.2f)", pcie_share(), ct);
     }
     char text[640];
     std::snprintf(text, sizeof(text),
@@ -610,9 +634,9 @@ void ExpertOffload::measure_cpu_rate() {
                    DiagnosticLevel::Warning);
     }
     if (measured && temporary_switches::flag("INFERNIX_TMP_CPU_PROBE_DETAIL")) { cpu_probe_detail(); }
-    if (measured && !quiet) {
+    if (measured && cpu_rate_busy_share_ >= 0.0) {
         diagnostic("the CPU expert team's rates were measured while other processes kept the CPU busy (" +
-                       std::to_string(static_cast<int>(100.0 * last_share + 0.5)) +
+                       std::to_string(static_cast<int>(100.0 * cpu_rate_busy_share_ + 0.5)) +
                        " %); the decode miss split follows them for this session and may leave decode slower; start "
                        "the engine when the machine is quieter",
                    DiagnosticLevel::Warning);
@@ -767,7 +791,7 @@ void ExpertOffload::create_cpu_service() {
     const std::uint32_t workers = placement_.workers, jobs = options_.cpu_expert_jobs;
     if (workers == 0 || jobs == 0) { return; }
     if (!placement_.text.empty()) { diagnostic(placement_.text); }
-    if (!tier_) { measure_cpu_rate(); } // the tier's rates follow its fill (start)
+    if (!tier_) { measure_cpu_rate_settled(); } // the tier's rates follow its fill (start)
     const int decode_columns = std::max(moe::kMaxCpuColumns, setup_.lanes * setup_.max_width);
     const bool assist        = options_.cpu_assist_jobs > 0 && decode_columns < kAssistMaxColumns;
     std::vector<moe::CpuMissService::Layer> layers;

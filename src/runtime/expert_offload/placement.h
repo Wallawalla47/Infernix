@@ -7,6 +7,8 @@
 
 #include "core/temporary_switches.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -19,6 +21,21 @@ using temporary_switches::OffloadSwitches;
 // the divisor rule), from the measured link (bytes/s), the CPU team's experts/s and the record bytes.
 [[nodiscard]] std::int32_t link_share_256(const OffloadSwitches& switches, double link_bytes_per_second,
                                           double cpu_expert_rate, double record_bytes) noexcept;
+
+// ExpertOffload's decode split without INFERNIX_TMP_LINK_SHARE (the Qwen3.5-122B-A10B's offloaded experts): the
+// link's share of a decode call's host-memory misses in 256ths, 256 / (1 + kDecodeLinkWeight C t), with C the CPU
+// team's experts/s and t a record's seconds on the link (the two legs' balance); the stage keeps (M share) >> 8 of
+// a call's M misses. Fitted on Ornith-1.5-122B (RTX 5090 at PCIe 5.0 x8, i9-13900K, 2026-10-30, design §11.4):
+// real code continued greedily with MTP auto decoded fastest at 64/256 (C t 2.06) after 1,536, 8,192 and 32,768
+// context tokens, 8.0-12.7 % faster than the divisor rule's 1/3 (M / 3), level with 43/256, 7-8 % slower at
+// 107/256. Flash-Next's Program keeps its own divisor rule.
+inline constexpr double kDecodeLinkWeight = 1.46;
+[[nodiscard]] inline std::int32_t decode_link_share_256(double link_bytes_per_second, double cpu_expert_rate,
+                                                        double record_bytes) noexcept {
+    if (!(link_bytes_per_second > 0.0) || !(cpu_expert_rate > 0.0) || !(record_bytes > 0.0)) { return 0; }
+    const double ct = cpu_expert_rate * record_bytes / link_bytes_per_second;
+    return static_cast<std::int32_t>(std::clamp<long>(std::lround(256.0 / (1.0 + kDecodeLinkWeight * ct)), 1, 256));
+}
 
 // Plain decode's one-column divisor at `position` context tokens: 1 below kPlainDivisorContext, 2 from
 // there (Flash-Next §19.3.12, measured on the GGUF IQ3_S import; NVFP4 banks keep their rate-based split,
