@@ -5,7 +5,6 @@
 #include <chrono>
 #include <cstring>
 #include <exception>
-#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -259,13 +258,20 @@ std::filesystem::path default_ngram_volume(const std::filesystem::path& artifact
 
 NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const PleConfig& ple) {
     const auto fail = [&](const std::string& why) { throw std::runtime_error(path.string() + ": " + why); };
+    // The header's first page, read unbuffered like every later read of the volume: once a process has
+    // read a file through the cache, Windows completes its unbuffered reads about one at a time (~12K
+    // reads/s; F9, Basalt #57).
     std::array<std::byte, kHeaderFieldsBytes> header{};
     {
-        std::ifstream file(path, std::ios::binary);
-        if (!file) { fail("cannot open the n-gram volume"); }
-        if (!file.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()))) {
-            fail("short n-gram volume header");
-        }
+        std::unique_ptr<ReadOnlyFile> file;
+        try {
+            file = std::make_unique<ReadOnlyFile>(path, FileMapping::None);
+        } catch (const std::exception&) { fail("cannot open the n-gram volume"); }
+        std::vector<std::byte> page(2 * 4096);
+        const auto base = reinterpret_cast<std::uintptr_t>(page.data());
+        const std::span<std::byte> aligned(page.data() + (4096 - base % 4096) % 4096, 4096);
+        if (file->read_direct(0, aligned) < header.size()) { fail("short n-gram volume header"); }
+        std::memcpy(header.data(), aligned.data(), header.size());
     }
     const std::byte* p = header.data();
     if (std::memcmp(p, kMagic, 8) != 0 || read_le<std::uint32_t>(p + 8) != kVersion) {

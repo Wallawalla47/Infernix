@@ -159,7 +159,14 @@ struct DecoderState {
     std::uint64_t decoded_bytes    = 0;
     std::uint32_t reasoning_tokens = 0;
     std::optional<std::uint32_t> matched_stop_order;
+    // Between the model's `<tool_call>` token in the answer and the `</tool_call>` that follows it,
+    // stop strings do not match: a call's arguments are the tool's data, not the answer (vLLM
+    // #64088). `tool_call_tail` keeps the call's last bytes, enough to see a close split by tokens.
+    bool in_tool_call = false;
+    std::string tool_call_tail;
 };
+
+inline constexpr std::string_view kToolCallClose = "</tool_call>";
 
 struct SemanticThinkingState {
     std::optional<std::uint32_t> budget;
@@ -269,8 +276,33 @@ void feed_content(DecoderState& state, std::string_view text, const StopPolicy& 
         }
         if (begin < text.size()) { state.strip_content_leading = false; }
     }
-    feed_channel(state, OutputChannel::Content, text.substr(begin), policy, emitted,
-                 committed_tokens, best_match);
+    if (!state.in_tool_call) {
+        feed_channel(state, OutputChannel::Content, text.substr(begin), policy, emitted,
+                     committed_tokens, best_match);
+        return;
+    }
+    // Inside a call nothing is held or matched; its bytes publish as they come, up to and including
+    // the close, after which matching resumes.
+    static const StopPolicy kNoStops{};
+    const std::string_view call = text.substr(begin);
+    std::string seen            = state.tool_call_tail;
+    seen.append(call);
+    const std::size_t close = seen.find(kToolCallClose);
+    std::size_t inside      = call.size();
+    if (close != std::string::npos) {
+        inside = close + kToolCallClose.size() - state.tool_call_tail.size();
+        state.in_tool_call = false;
+        state.tool_call_tail.clear();
+    } else {
+        const std::size_t keep = std::min(seen.size(), kToolCallClose.size() - 1U);
+        state.tool_call_tail   = seen.substr(seen.size() - keep);
+    }
+    feed_channel(state, OutputChannel::Content, call.substr(0, inside), kNoStops, emitted, committed_tokens,
+                 nullptr);
+    if (inside < call.size()) {
+        feed_channel(state, OutputChannel::Content, call.substr(inside), policy, emitted, committed_tokens,
+                     best_match);
+    }
 }
 
 void feed_reasoning(DecoderState& state, std::string_view text, const StopPolicy& policy,
@@ -322,12 +354,18 @@ void close_reasoning(DecoderState& state, const StopPolicy& policy, PublishedOut
     }
 }
 
-void feed_token(DecoderState& state, bool reasoning_close, std::string_view bytes,
+void feed_token(DecoderState& state, bool reasoning_close, bool tool_call_open, std::string_view bytes,
                 const StopPolicy& policy, PublishedOutput& emitted, std::uint32_t committed_tokens,
                 StopMatch* best_match) {
     if (reasoning_close && state.in_reasoning) {
         close_reasoning(state, policy, emitted, committed_tokens, best_match);
         return;
+    }
+    if (tool_call_open && !state.in_reasoning) {
+        // The opener's bytes are the call's; bytes the answer held before it (a stop string's
+        // possible start) publish with them, unmatched.
+        state.in_tool_call = true;
+        state.tool_call_tail.clear();
     }
     state.utf8_pending.append(bytes);
     const std::string text = consume_generated_utf8(state.utf8_pending);
@@ -685,7 +723,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         StopMatch match;
         const std::string_view bytes =
             !impl_->preserve_special && decoded.special ? std::string_view{} : decoded.bytes;
-        feed_token(impl_->preview_state, reasoning_close, bytes, impl_->policy,
+        feed_token(impl_->preview_state, reasoning_close, token == impl_->markers.tool_call, bytes, impl_->policy,
                    impl_->preview_output, count, &match);
 
         if (match.found) {
@@ -795,7 +833,8 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
         if (reasoning_close) { impl_->preview_semantic.in_reasoning = false; }
         const std::string_view presentation_bytes =
             !impl_->preserve_special && decoded.special ? std::string_view{} : decoded.bytes;
-        feed_token(impl_->preview_state, reasoning_close, presentation_bytes, impl_->policy,
+        feed_token(impl_->preview_state, reasoning_close, token == impl_->markers.tool_call, presentation_bytes,
+                   impl_->policy,
                    impl_->preview_output, static_cast<std::uint32_t>(index + 1), nullptr);
         impl_->record_tool_call(token, presentation_bytes);
     }

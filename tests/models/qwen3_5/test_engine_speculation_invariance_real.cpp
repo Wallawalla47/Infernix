@@ -19,8 +19,10 @@
 // returns the token plain sampling draws there.
 //
 // INFERNIX_TEST_ARTIFACT names the artifact; the arguments name one or more drafters (mtp, mtp-cut: MTP
-// with --spec-min-p 0.5, mtp-sampled: MTP with the sampled-mtp-drafts candidate, dflash, dflash2 or
-// dflash2-ngram: DFlash2 with n-gram copy proposals); the artifact must hold them. One Engine
+// with --spec-min-p 0.5, mtp-sampled: MTP with the sampled-mtp-drafts candidate, dflash, dflash2,
+// dflash2-ngram: DFlash2 with n-gram copy proposals, or dflash2-ngramN: copies of N drafts at the
+// shortest minimum match, e.g. 14, 15, 16, 62, 63 for the verify widths around the GDN record routes'
+// boundaries); the artifact must hold them. One Engine
 // decodes plainly, then one per drafter decodes the same requests (one plain run serves every drafter).
 // The requests include a raw one-token prompt, which must also verify drafts. The mtp, dflash2 and
 // dflash2-ngram drafters also decode every prompt with presence penalty 1.5 (the non-thinking default
@@ -89,12 +91,23 @@ infernix::EngineOptions reproducible_options(const std::filesystem::path& artifa
     } else if (drafter == "dflash") {
         options.speculative.backend      = infernix::SpeculativeBackend::DFlash;
         options.speculative.draft_tokens = 7;
-    } else if (drafter == "dflash2" || drafter == "dflash2-ngram") {
+    } else if (drafter == "dflash2" || drafter.starts_with("dflash2-ngram")) {
         options.speculative.backend      = infernix::SpeculativeBackend::DFlash2;
         options.speculative.draft_tokens = 7;
         if (drafter == "dflash2-ngram") { options.speculative.ngram_draft_tokens = 16; }
+        // dflash2-ngramN: copy windows of N drafts at the shortest minimum match, so copy rounds verify
+        // N + 1 columns and their last drafts are often rejected. N = 14..16 and 62..63 put the round
+        // on both sides of the GDN record routes' width boundaries (16 columns; the tree closed form's
+        // 16-column records) and at the 64-column top, where llama.cpp #31160/#31350 met a state
+        // its rollback had not written.
+        if (drafter.size() > std::string_view("dflash2-ngram").size()) {
+            options.speculative.ngram_draft_tokens =
+                static_cast<std::uint32_t>(std::stoul(std::string(drafter.substr(std::string_view("dflash2-ngram").size()))));
+            options.speculative.ngram_min_match = 4;
+        }
     } else if (drafter != "none") {
-        throw std::invalid_argument("the drafter must be mtp, mtp-cut, mtp-sampled, dflash, dflash2 or dflash2-ngram");
+        throw std::invalid_argument(
+            "the drafter must be mtp, mtp-cut, mtp-sampled, dflash, dflash2, dflash2-ngram or dflash2-ngramN");
     }
     return options;
 }

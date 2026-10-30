@@ -605,6 +605,38 @@ int test_tools() {
     failures += check(parse(history).generation.has_tool_history(),
                       "tool-call history follows wire types without inventing JSON validation");
 
+    // Results returned out of call order (as parallel runners finish) are put back in call order
+    // when their ids name exactly the turn's calls; any other run keeps the order received.
+    const auto call = [](const char* id, const char* name) {
+        return Json{{"id", id}, {"type", "function"}, {"function", Json{{"name", name}, {"arguments", "{}"}}}};
+    };
+    const auto result = [](const char* id, const char* text) {
+        return Json{{"role", "tool"}, {"tool_call_id", id}, {"content", text}};
+    };
+    const auto results_order = [&](Json results) {
+        Json body        = base_request();
+        body["messages"] = Json::array({Json{{"role", "user"}, {"content", "go"}},
+                                        Json{{"role", "assistant"},
+                                             {"content", nullptr},
+                                             {"tool_calls", Json::array({call("c1", "a"), call("c2", "b"),
+                                                                         call("c3", "c")})}}});
+        for (Json& item : results) { body["messages"].push_back(std::move(item)); }
+        std::vector<std::string> ids;
+        for (const auto& turn : parse(body).generation.messages) {
+            if (turn.role == infernix::ChatRole::Tool) { ids.push_back(turn.tool_call_id); }
+        }
+        return ids;
+    };
+    using Ids = std::vector<std::string>;
+    failures += check(results_order(Json::array({result("c3", "z"), result("c1", "x"), result("c2", "y")})) ==
+                          Ids{"c1", "c2", "c3"},
+                      "out-of-order tool results follow the call order");
+    failures += check(results_order(Json::array({result("c2", "y"), result("c1", "x")})) == Ids{"c2", "c1"},
+                      "a partial run keeps the order received");
+    failures += check(results_order(Json::array({result("c2", "y"), result("c2", "x"), result("c1", "z")})) ==
+                          Ids{"c2", "c2", "c1"},
+                      "a run with a repeated id keeps the order received");
+
     Json mixed_assistant        = base_request();
     mixed_assistant["messages"] = Json::array(
         {Json{{"role", "user"}, {"content", "inspect"}},
@@ -936,11 +968,10 @@ int test_stops_and_ranges() {
     Json body                               = base_request();
     body["stop"]                            = Json::array({"A", "B"});
     const infernix::RequestOptions translated = options(parse(body).generation);
-    failures += check(translated.stop.strings.size() == 4,
-                      "each stop string applies to Content and Reasoning");
-    failures += check(translated.stop.strings[0].channel == infernix::OutputChannel::Content &&
-                          translated.stop.strings[1].channel == infernix::OutputChannel::Reasoning,
-                      "stop channel ordering is explicit");
+    failures += check(translated.stop.strings.size() == 2 &&
+                          translated.stop.strings[0].channel == infernix::OutputChannel::Content &&
+                          translated.stop.strings[1].channel == infernix::OutputChannel::Content,
+                      "each stop string applies to the answer only");
 
     body["stop"] = Json::array({"1", "2", "3", "4", "5"});
     failures += check(api_error([&] { (void)parse(body); }).param == "stop",
@@ -989,6 +1020,7 @@ int test_aggregate_response() {
     Json response             = Json::parse(make_chat_completion_response(identity(), outcome));
     failures += check(response["choices"][0]["message"]["content"] == "answer" &&
                           response["choices"][0]["message"]["reasoning_content"] == "thought" &&
+                          response["choices"][0]["message"]["reasoning"] == "thought" &&
                           response["choices"][0]["message"]["refusal"].is_null(),
                       "aggregate response separates reasoning and content");
     failures += check(response["choices"][0]["logprobs"].is_null(),
@@ -1053,6 +1085,8 @@ int test_stream_response() {
     Json reasoning = parse_sse(stream.reasoning_delta("thought"));
     Json content   = parse_sse(stream.content_delta("ans"));
     failures += check(reasoning["choices"][0]["delta"]["reasoning_content"] == "thought" &&
+                          reasoning["choices"][0]["delta"]["reasoning"] == "thought" &&
+                          !content["choices"][0]["delta"].contains("reasoning") &&
                           content["choices"][0]["delta"]["content"] == "ans",
                       "stream separates reasoning and content deltas");
 

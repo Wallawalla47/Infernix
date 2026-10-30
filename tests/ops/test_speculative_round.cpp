@@ -1785,14 +1785,18 @@ int transforms_conformance() {
 // rule's acceptance and residual both matter. The emitted text must follow the target: the first
 // token, and the second (the round's own, or for a round that emitted one token the next round's
 // first, a fresh target draw since the columns repeat) with the first, by token and pair.
-int block_distribution_case(int k) {
+// `boundary_tie`: ids 2 and 3 tie at top_k = 3, so the target's support is {0, 1, 2} (the lower id
+// wins a tie, as in the sampler): a proposed 3 must never be accepted or emitted (FlashInfer #7921).
+int block_distribution_case(int k, bool boundary_tie = false) {
     constexpr int batch = 8, trials = 8192 / batch;
     const int width     = k + 1;
-    const std::array<float, 4> requested{0.6F, 0.25F, 0.1F, 0.05F};
+    const std::array<float, 4> requested = boundary_tie ? std::array<float, 4>{0.4F, 0.3F, 0.15F, 0.15F}
+                                                        : std::array<float, 4>{0.6F, 0.25F, 0.1F, 0.05F};
     const std::array<double, 4> proposal{0.3, 0.4, 0.2, 0.1};
+    const int support = boundary_tie ? 3 : 4;
     std::array<double, 4> probabilities{};
     double total = 0;
-    for (int id = 0; id < 4; ++id) {
+    for (int id = 0; id < support; ++id) {
         probabilities[id] = std::exp(bf16_to_f32(f32_to_bf16(std::log(requested[id]))));
         total += probabilities[id];
     }
@@ -1823,7 +1827,7 @@ int block_distribution_case(int k) {
     std::vector<ops::SamplingConfig> configs(batch);
     for (int row = 0; row < batch; ++row) {
         configs[row].temperature  = 1;
-        configs[row].top_k        = 4;
+        configs[row].top_k        = support;
         configs[row].top_p        = 1;
         configs[row].token_counts = static_cast<int*>(d_history.p) + row * kSparseTokenDomain;
     }
@@ -1909,9 +1913,14 @@ int block_distribution_case(int k) {
             failures += within(pairs[id * 4 + other], probabilities[id] * probabilities[other]) ? 0 : 1;
         }
     }
+    if (boundary_tie && (first[3] != 0 || second[3] != 0)) {
+        std::cerr << "block distribution: the token tied at the top-k boundary with a lower id was emitted\n";
+        ++failures;
+    }
     failures += scratch.verify_guards("block distribution workspace");
     failures += licensed.verify_guards("block distribution output");
-    std::cout << "block distribution K=" << k << " trials=" << n << " accepted/round="
+    std::cout << "block distribution K=" << k << (boundary_tie ? " (top-k boundary tie)" : "") << " trials=" << n
+              << " accepted/round="
               << static_cast<double>(accepted_total) / static_cast<double>(n) << " first=";
     for (const auto count : first) { std::cout << count << ','; }
     std::cout << " second=";
@@ -2758,6 +2767,7 @@ INFERNIX_OP_TEST(speculative_round) {
     // block-verification: its output distribution, then its sampled rows against the block rule's
     // host oracle, greedy rows unchanged.
     for (const int k : {1, 3, 7}) failures += block_distribution_case(k);
+    failures += block_distribution_case(3, true);
     for (const int k : {4, 7}) failures += block_chain_distribution_case(k);
     for (const int k : {1, 3, 7, 15, 31}) {
         for (const int batch : {1, 8}) {

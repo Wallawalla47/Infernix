@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -394,6 +395,56 @@ std::string encode_json_string(std::string_view value) {
     return Json(std::string(value)).dump(-1, ' ', false, Json::error_handler_t::replace);
 }
 
+// A model writing an array or object argument often puts a real line break (or tab) inside one of
+// its strings, a multi-line edit for example, which strict JSON refuses (Strata #4630). The value
+// with the control bytes inside its string literals escaped is the one the model meant; nullopt
+// when there were none.
+std::optional<std::string> escape_string_controls(std::string_view value) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(value.size() + 16);
+    bool in_string = false, escaped = false, changed = false;
+    for (const char c : value) {
+        const auto byte = static_cast<unsigned char>(c);
+        if (!in_string) {
+            in_string = c == '"';
+        } else if (escaped) {
+            escaped = false;
+        } else if (c == '\\') {
+            escaped = true;
+        } else if (c == '"') {
+            in_string = false;
+        } else if (byte < 0x20) {
+            changed = true;
+            switch (c) {
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            default:
+                out += "\\u00";
+                out.push_back(kHex[byte >> 4U]);
+                out.push_back(kHex[byte & 15U]);
+            }
+            continue;
+        }
+        out.push_back(c);
+    }
+    if (!changed) { return std::nullopt; }
+    return out;
+}
+
+// Strict JSON first; an array or object refused only for control bytes inside its strings is read
+// with them escaped.
+std::optional<std::string> parse_json_value(std::string_view value, JsonValueKind& kind) {
+    if (classify_json_value(value, kind)) { return std::string(value); }
+    if (value.empty() || (value.front() != '[' && value.front() != '{')) { return std::nullopt; }
+    auto escaped = escape_string_controls(value);
+    if (escaped && classify_json_value(*escaped, kind)) { return escaped; }
+    return std::nullopt;
+}
+
 NormalizedParameter normalize_declared_parameter(std::string_view encoded_value, TypeSet types,
                                                 bool nullable = false) {
     const std::string_view framed = remove_parameter_framing_newlines(encoded_value);
@@ -409,10 +460,10 @@ NormalizedParameter normalize_declared_parameter(std::string_view encoded_value,
     if (value.empty()) { return {.disposition = ParameterNormalization::Omitted}; }
 
     JsonValueKind kind;
-    if (classify_json_value(value, kind)) {
+    if (auto json = parse_json_value(value, kind)) {
         return {.disposition = admits_value(types, kind) ? ParameterNormalization::Emitted
                                                          : ParameterNormalization::SchemaMismatch,
-                .json_value  = std::string(value)};
+                .json_value  = std::move(*json)};
     }
 
     if (admits_type(types, SchemaType::Boolean)) {
@@ -431,6 +482,8 @@ NormalizedParameter normalize_parameter(std::string_view encoded_value,
 
     const std::string_view value = trim_format_whitespace(encoded_value);
     if (Json::accept(value.begin(), value.end())) { return {.json_value = std::string(value)}; }
+    JsonValueKind kind;
+    if (auto json = parse_json_value(value, kind)) { return {.json_value = std::move(*json)}; }
     return {.json_value = encode_json_string(value)};
 }
 

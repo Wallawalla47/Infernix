@@ -369,20 +369,15 @@ infernix::RequestOptions to_request_options(const GenerationRequest& request,
     options.output.tolerant_tool_calls  = server.tolerant_tool_calls;
     options.stop.include_model_defaults = !request.ignore_eos;
     options.stop.token_ids              = request.stop_token_ids;
-    options.stop.strings.reserve(request.stop_strings.size() *
-                                 (request.stop_strings_apply_to_reasoning ? 2U : 1U));
+    // Client stop strings end the answer only: reasoning is the model's working, and a tool call's
+    // arguments are the tool's data (the output session does not match inside a call).
+    options.stop.strings.reserve(request.stop_strings.size());
     for (const std::string& stop : request.stop_strings) {
         if (!stop.empty()) {
             options.stop.strings.push_back(
                 infernix::StopString{.text              = stop,
                                    .channel           = infernix::OutputChannel::Content,
                                    .include_in_output = false});
-            if (request.stop_strings_apply_to_reasoning) {
-                options.stop.strings.push_back(
-                    infernix::StopString{.text              = stop,
-                                       .channel           = infernix::OutputChannel::Reasoning,
-                                       .include_in_output = false});
-            }
         }
     }
     return options;

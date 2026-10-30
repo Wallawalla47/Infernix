@@ -149,7 +149,8 @@ add_executable(infernix_qwen3_5_speculation_invariance_real_test
 infernix_test_includes(infernix_qwen3_5_speculation_invariance_real_test)
 target_link_libraries(infernix_qwen3_5_speculation_invariance_real_test PRIVATE infernix_engine)
 add_test(NAME infernix_qwen3_5_speculation_invariance_real_test
-  COMMAND infernix_qwen3_5_speculation_invariance_real_test mtp mtp-cut mtp-sampled dflash2 dflash2-ngram)
+  COMMAND infernix_qwen3_5_speculation_invariance_real_test mtp mtp-cut mtp-sampled dflash2 dflash2-ngram
+  dflash2-ngram15 dflash2-ngram16 dflash2-ngram63)
 set_tests_properties(infernix_qwen3_5_speculation_invariance_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
 infernix_add_test(infernix_qwen3_5_readout_real_test

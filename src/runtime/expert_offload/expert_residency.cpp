@@ -822,26 +822,31 @@ void ExpertResidency::adaptive_round(const std::int32_t* routes, std::size_t use
     const auto by_count_asc = [&a](std::uint32_t x, std::uint32_t y) {
         return a.count[x] != a.count[y] ? a.count[x] < a.count[y] : x < y;
     };
-    // Per layer: its candidates best first, paired with its residents least counted first while they lead
-    // by the margin (the pairs stay within the layer, so within its pool).
+    // Per frame pool: its candidates of every layer best first, paired with its residents of every layer least
+    // counted first while they lead by the margin, so a layer that routes more takes frames from one that routes
+    // fewer (Basalt 557d442; the frames of one pool hold records of one stride, so the swaps stay in place).
+    // Against pairs within each layer (candidates BG-01, IQ3_S exclusive, 3 ABBA pairs, 2026-10-30): struct decode
+    // 493.9 -> 499.4 tok/s (+1.1 %, every pair; hits 96.6 -> 96.9 %, CPU-served misses 54,988 -> 50,948), 16K
+    // 273.6 -> 273.4 (flat); same ids.
     a.pairs.clear();
     a.ranked.clear();
     std::size_t candidates = 0;
-    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+    for (std::uint32_t pool_index = 0; pool_index < pools_.size(); ++pool_index) {
+        if (pools_[pool_index].frames == 0) { continue; }
         a.candidates.clear();
-        a.residents.clear();
-        const expert_cache::LfruPolicy& policy = pools_[pool_of_layer_[layer]].controller->policy();
-        const std::uint32_t first = layer * experts_;
-        for (std::uint32_t k = first; k < first + experts_; ++k) {
-            if (a.count[k] >= a.floor && !policy.resident(k) && (tier_ == nullptr || admissible_(k))) { // tier: a host copy
-                a.candidates.push_back(k);
+        const expert_cache::LfruPolicy& policy = pools_[pool_index].controller->policy();
+        for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+            if (pool_of_layer_[layer] != pool_index) { continue; }
+            const std::uint32_t first = layer * experts_;
+            for (std::uint32_t k = first; k < first + experts_; ++k) {
+                if (a.count[k] >= a.floor && !policy.resident(k) && (tier_ == nullptr || admissible_(k))) { // tier: a host copy
+                    a.candidates.push_back(k);
+                }
             }
         }
         if (a.candidates.empty()) { continue; }
-        // The residents only of a layer with candidates (listing every layer's cost 115 us a round, IQ3_S struct).
-        for (std::uint32_t k = first; k < first + experts_; ++k) {
-            if (policy.resident(k)) { a.residents.push_back(k); }
-        }
+        const std::span<const std::uint32_t> residents = policy.residents();
+        a.residents.assign(residents.begin(), residents.end());
         candidates += a.candidates.size();
         std::sort(a.candidates.begin(), a.candidates.end(), by_count_desc);
         a.ranked.insert(a.ranked.end(), a.candidates.begin(), a.candidates.end());

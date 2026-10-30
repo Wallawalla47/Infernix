@@ -7,6 +7,7 @@
 #include "ops/softmax_attention/oracle.h"
 
 #include <algorithm>
+#include <type_traits>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -174,6 +175,8 @@ struct AttentionCase {
     std::size_t split_workspace_bytes = ops::kCausalPromptSplitWorkspaceDefaultBytes;
     // The decode-split64 fast path (FastPath::DecodeSplit64).
     bool decode_split64 = false;
+    // Every cache row past the attended positions holds NaN / out-of-range bytes (poison_tail).
+    bool poison_tail = false;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -877,6 +880,46 @@ HostCache make_cache(const Geometry& geometry, KvCacheStorage storage, std::int3
         }
     });
     return cache;
+}
+
+// The bytes a released page's stale rows may hold (NVIDIA flare #116: masked positions read 0 x NaN
+// into P.V), in every row from `from` to the page-rounded capacity: NaN in each 16-bit float field
+// (0x7FFF is NaN as FP16 and as BF16), E4M3 NaN codes and scales, and INT8 / FP4 codes outside the
+// encoders' range. Attention over positions before `from` must not see them.
+void poison_tail(HostCache& cache, std::int32_t from) {
+    constexpr std::uint16_t kNan16  = 0x7FFF;
+    constexpr std::uint8_t kE4m3Nan = 0x7F;
+    const Geometry& geometry        = cache.geometry;
+    const std::int32_t capacity     = cache.logical_capacity;
+    const auto fill = [](auto& plane, std::size_t at, std::size_t count, auto value) {
+        if (plane.empty()) return;
+        using Value = typename std::remove_reference_t<decltype(plane)>::value_type;
+        std::fill_n(plane.begin() + static_cast<std::ptrdiff_t>(at), count, static_cast<Value>(value));
+    };
+    for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+        for (std::int32_t position = from; position < capacity; ++position) {
+            const std::size_t row = cache_index(geometry, capacity, head, position, 0);
+            fill(cache.k_bf16, row, kHeadDim, kNan16);
+            fill(cache.v_fp16, row, kHeadDim, kNan16);
+            fill(cache.k_i8, row, kHeadDim, -128);
+            fill(cache.v_i8, row, kHeadDim, -128);
+            fill(cache.k_fp8, row, kHeadDim, kE4m3Nan);
+            fill(cache.v_fp8, row, kHeadDim, kE4m3Nan);
+            if (cache.storage == KvCacheStorage::Int8Group64) {
+                fill(cache.k_scale, scale_index(geometry, capacity, head, position, 0), kQuantGroups, kNan16);
+                fill(cache.v_scale, scale_index(geometry, capacity, head, position, 0), kQuantGroups, kNan16);
+            } else {
+                fill(cache.k_scale, fp8_scale_index(geometry, capacity, head, position), 1, kNan16);
+                fill(cache.v_scale, fp8_scale_index(geometry, capacity, head, position), 1, kNan16);
+            }
+            const std::size_t codes  = logical_plane_index(kNvfp4CodeBytes, geometry, capacity, head, position, 0);
+            const std::size_t scales = logical_plane_index(kNvfp4QuantGroups, geometry, capacity, head, position, 0);
+            fill(cache.k_nvfp4, codes, kNvfp4CodeBytes, 0xFF);
+            fill(cache.v_nvfp4, codes, kNvfp4CodeBytes, 0xFF);
+            fill(cache.k_nvfp4_scale, scales, kNvfp4QuantGroups, kE4m3Nan);
+            fill(cache.v_nvfp4_scale, scales, kNvfp4QuantGroups, kE4m3Nan);
+        }
+    }
 }
 
 void append_cache(HostCache& cache, const std::vector<float>& k, const std::vector<float>& v,
@@ -2109,8 +2152,9 @@ int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     envelope.prompt_split_workspace_bytes = test_case.split_workspace_bytes;
     envelope.decode_split64               = test_case.decode_split64;
 
-    const HostCache cache_host = make_cache(geometry, storage, total + 3, test_case.seed + 10u,
-                                            amplitude, test_case.value_amplitude);
+    HostCache cache_host = make_cache(geometry, storage, total + 3, test_case.seed + 10u, amplitude,
+                                      test_case.value_amplitude);
+    if (test_case.poison_tail) { poison_tail(cache_host, total); }
     const std::vector<double> reference =
         ideal_attention(select_query_columns(q, kHeadDim * geometry.q_heads, oracle_queries),
                         cache_host, select_query_columns(positions, 1, oracle_queries));
@@ -2834,6 +2878,13 @@ int run_geometry(DeviceExecutionView execution, const Geometry& geometry, KvCach
     };
     for (const AttentionCase& test_case : a3_cases) {
         failures += run_a3_case(execution, geometry, storage, test_case, MappingPattern::Identity);
+    }
+    // Stale bytes past the live rows (the last page's tail, its codes and scales) never reach the
+    // output: decode at a page's first row and short prompts, through a fragmented table.
+    for (AttentionCase test_case : {AttentionCase{1, 128, 129, 311u}, AttentionCase{17, 31, 48, 312u},
+                                    AttentionCase{7, 17, 512, 313u}}) {
+        test_case.poison_tail = true;
+        failures += run_a3_case(execution, geometry, storage, test_case, MappingPattern::Fragmented);
     }
 
     if (geometry.kv_heads == 2) {

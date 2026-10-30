@@ -352,7 +352,7 @@ class TierSim:
                  prefill_promotions=PREFILL_PROMOTIONS, promotion_interval=PROMOTION_INTERVAL,
                  vram_policy='lfru', halving=LFRU_HALVING_PERIOD, pools=None, landing=True, link_divisor=1,
                  link_share=0, cpu_jobs=CPU_JOBS, warm_start=None, follow_frames=False, budgets=None,
-                 next_use=None):
+                 next_use=None, adaptive_groups=None):
         self.L, self.E, self.K = header['layers'], header['experts'], header['top_k']
         self.N = self.L * self.E
         self.full = ram_slots is None
@@ -398,7 +398,7 @@ class TierSim:
         # same budgets ('belady', with a NextUse oracle: victim choice with perfect knowledge, the
         # admission throttle unchanged); or Basalt's adaptive tier ('adaptive[:DECAY,FLOOR,MARGIN,SWAPS]',
         # candidates §7.6 D12): per-key counts decayed by DECAY each round, a non-resident key a candidate
-        # at FLOOR or more, swapped for its layer's least-counted resident when it leads by MARGIN, at most
+        # at FLOOR or more, swapped for its group's least-counted resident when it leads by MARGIN, at most
         # SWAPS a round by gain (4 x SWAPS after a round that ranked 2 x SWAPS candidates, back to SWAPS at
         # every request's start).
         self.belady = vram_policy == 'belady'
@@ -411,6 +411,9 @@ class TierSim:
         self.nu = next_use.first.copy() if self.belady else None  # every key's next use after this round
         self.a_count = np.zeros(self.L * self.E, np.float64)
         self.adaptive_cap = self.adaptive[3] if self.adaptive else 0
+        # The adaptive tier's groups of layers whose frames are interchangeable (the engine's per-stride
+        # pools); None: all layers one group.
+        self.adaptive_groups = adaptive_groups
         # The 'rule' budgets: promotions per layer of a prefill chunk wider than SERVED_CALL_COLUMNS (both
         # models' engines now record 0; narrower calls take the decode rule) and decode tokens per
         # promotion once the frames are full (ExpertOffload::promotion_interval).
@@ -820,8 +823,11 @@ class TierSim:
             return
         events = self._m().events
         candidates, pairs = [], []
-        for layer in range(self.L):
-            keys = np.arange(layer * self.E, (layer + 1) * self.E)
+        # Pairs across the layers of each group, as the engine pairs across each frame pool's layers (Basalt
+        # 557d442, candidates BG-01: a layer that routes more takes frames from one that routes fewer).
+        groups = self.adaptive_groups or [list(range(self.L))]
+        key_sets = [np.concatenate([np.arange(l * self.E, (l + 1) * self.E) for l in group]) for group in groups]
+        for keys in key_sets:
             counts = self.a_count[keys]
             resident = self.v_pos[keys] >= 0
             mask = ~resident & (counts >= floor)
@@ -1406,6 +1412,20 @@ def _load(paths):
     return _TRACES[1]
 
 
+def parse_layer_groups(text):
+    """"0-8,12;9-11,13-47" -> [[0..8, 12], [9..11, 13..47]]; "" -> None (all layers one group)."""
+    groups = []
+    for group in (g.strip() for g in text.split(';')):
+        if not group:
+            continue
+        layers = []
+        for part in (p.strip() for p in group.split(',') if p.strip()):
+            first, _, last = part.partition('-')
+            layers.extend(range(int(first), int(last or first) + 1))
+        groups.append(layers)
+    return groups or None
+
+
 def run_config(paths, config, counts=None):
     traces = _load(tuple(paths))
     header = traces[0].header
@@ -1436,7 +1456,10 @@ def main(argv=None):
     ap.add_argument('--vram-policies', default='lfru',
                     help='";"-separated VRAM policies: lfru (the engine) and adaptive[:DECAY,FLOOR,MARGIN,SWAPS] '
                          f'(the engine\'s, default {",".join(f"{x:g}" for x in ADAPTIVE_DEFAULTS)}; Basalt\'s floor is 2; '
-                         'candidates D12)')
+                         'candidates D12; swaps pair across the layers of each --adaptive-groups group, BG-01)')
+    ap.add_argument('--adaptive-groups', default='',
+                    help='adaptive: ";"-separated groups of layers sharing frames (the engine\'s per-stride '
+                         'pools), each a comma list of layers or FIRST-LAST ranges; empty: all layers one group')
     ap.add_argument('--t0-ms', type=float, default=11.2, help='base decode time per token (plain)')
     ap.add_argument('--cost-ms', type=float, default=0.65, help='exposed time per decode SSD read')
     ap.add_argument('--miss-ms', type=float, default=0.035,
@@ -1456,6 +1479,7 @@ def main(argv=None):
     vram_policies = [x.strip() for x in args.vram_policies.split(';') if x.strip()]
     for vram_policy in vram_policies:
         parse_vram_policy(vram_policy)
+    adaptive_groups = parse_layer_groups(args.adaptive_groups)
 
     paths = tuple(args.traces)
     traces = _load(paths)
@@ -1512,7 +1536,7 @@ def main(argv=None):
                                           'reserve': not args.no_reserve,
                                           'prefetch_after_prefill': args.prefetch_after_prefill,
                                           'vram_budget': args.vram_budget, 'prompt_seed': seed,
-                                          'vram_policy': vram_policy}
+                                          'vram_policy': vram_policy, 'adaptive_groups': adaptive_groups}
                                 jobs.append((paths, config, counts, mib))
     if args.jobs > 1:
         with ProcessPoolExecutor(args.jobs) as pool:

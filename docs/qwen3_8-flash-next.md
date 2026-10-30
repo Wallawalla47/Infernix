@@ -180,8 +180,11 @@ is 56.8 GB, of which the routed experts are 46.9 GiB.
   1.002-1.005x, the first block's cold cache). Its candidate floor is 1 where Basalt's is 2, so any
   expert a round routes may be promoted: decode +1.5 % after a 16K prompt, +5.4 % on the community
   struct fixture and +2.7-4.2 % on its conv and prose fixtures (2026-10-29), for about 70 % more
-  promotions. The NVFP4 conversions keep LFRU, where the adaptive policy decoded 0.970x (Dense8, MTP).
-  Same bits either way.
+  promotions. A round's swaps pair candidates with residents across all the layers of a frame pool,
+  not only within each layer, so a layer that routes more takes frames from one that routes fewer:
+  struct +1.1 % (494 -> 499 tok/s, hits 96.6 -> 96.9 %, about 7 % fewer CPU-served misses), 16K
+  unchanged (2026-10-30). The NVFP4 conversions keep LFRU, where the adaptive policy decoded 0.970x
+  (Dense8, MTP). Same bits either way.
 
 **Speed and quality** (RTX 5090 on PCIe 5.0 x8, i9-13900K, INT8 KV, one request, against recipe B
 in the same session on 2026-10-16; the n-gram table in RAM, `auto`; one run of `-r 3`, or `-r 1`

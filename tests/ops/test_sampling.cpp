@@ -534,6 +534,60 @@ int capped_distribution_contract() {
            verify_distribution("sample top-k public cap", result.tokens, oracle);
 }
 
+// A tie at the support's edge keeps the lower id, as the speculative verifier's target support does
+// (FlashInfer #7921: a verifier that accepted a token tied with the boundary token): at the
+// 20-candidate cap, and inside the top-p cut.
+int tied_boundary_distribution_contract() {
+    int failures = 0;
+    {
+        // Ids 5 and 20 tie at ranks 19 and 20; the 19 other leading ids are all larger.
+        std::vector<float> column(24, -2.0f);
+        int rank = 0;
+        for (int token = 0; token < 20; ++token) {
+            if (token != 5) { column[static_cast<std::size_t>(token)] = 2.0f - 0.1f * static_cast<float>(rank++); }
+        }
+        column[5] = column[20] = 0.0f;
+        round_to_bf16(column);
+        ops::SamplingConfig config;
+        config.temperature = 1.0f;
+        config.top_k       = 64;
+        config.top_p       = 1.0f;
+        config.seed        = 20261030;
+        const Distribution oracle = distribution_oracle(column, static_cast<int>(column.size()), config);
+        const auto has = [&](int token) {
+            return std::find(oracle.tokens.begin(), oracle.tokens.end(), token) != oracle.tokens.end();
+        };
+        if (oracle.tokens.size() != 20 || !has(5) || has(20)) {
+            std::cerr << "top-k tie fixture did not put the tie at the cap\n";
+            return 1;
+        }
+        const RunResult result = run_repeated(column, static_cast<int>(column.size()), 16384, 8, config, 910,
+                                              ops::kSamplePurposeDecode);
+        failures += result.integrity_failures + verify_distribution("sample top-k cap tie", result.tokens, oracle);
+    }
+    {
+        // Ids 1 and 3 tie after id 0; the top-p cut falls between them.
+        std::vector<float> column(8, -3.0f);
+        column[0] = 2.0f;
+        column[1] = column[3] = 1.0f;
+        round_to_bf16(column);
+        ops::SamplingConfig config;
+        config.temperature = 1.0f;
+        config.top_k       = 64;
+        config.top_p       = 0.65f;
+        config.seed        = 20261031;
+        const Distribution oracle = distribution_oracle(column, static_cast<int>(column.size()), config);
+        if (oracle.tokens != std::vector<int>{0, 1}) {
+            std::cerr << "top-p tie fixture did not cut inside the tie\n";
+            return failures + 1;
+        }
+        const RunResult result = run_repeated(column, static_cast<int>(column.size()), 16384, 8, config, 920,
+                                              ops::kSamplePurposeDecode);
+        failures += result.integrity_failures + verify_distribution("sample top-p cut tie", result.tokens, oracle);
+    }
+    return failures;
+}
+
 int real_shape_distribution_contract() {
     constexpr int physical_rows = 248320;
     constexpr int token_domain  = 248077;
@@ -901,6 +955,7 @@ INFERNIX_OP_TEST(sampling) {
     failures += heterogeneous_batch_contract();
     failures += filtered_distribution_contract();
     failures += capped_distribution_contract();
+    failures += tied_boundary_distribution_contract();
     failures += real_shape_distribution_contract();
     failures += fp32_greedy_contract();
     failures += fp32_distribution_contract();

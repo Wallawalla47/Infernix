@@ -376,6 +376,51 @@ int test_declared_json_types() {
     return failures;
 }
 
+// A multi-line edit's array argument with real line breaks, tabs and carriage returns inside its
+// strings (Strata #4630) decodes to the array the model meant, whole and at every streamed
+// chunking; a declared string keeps its raw text, and other invalid text stays a string.
+int test_control_bytes_inside_declared_json_strings() {
+    const auto contract = contract_for(
+        "edit_file", Json{{"path", Json{{"type", "string"}}},
+                          {"edits", Json{{"type", "array"}}},
+                          {"options", Json{{"type", "object"}}},
+                          {"broken", Json{{"type", "array"}}}});
+    const std::string edits = "[{\"old\":\"line one\nline two\",\"new\":\"a\tb\r\nc\"}]";
+    const std::string text  = tool_call("edit_file", {{"path", "notes\n.md"},
+                                                      {"edits", edits},
+                                                      {"options", "{\"note\":\"x\ny\",\"n\":1}"},
+                                                      {"broken", "[\"a\nb\", oops]"}});
+    int failures            = 0;
+    const auto expect       = [&](const std::string& arguments, const std::string& how) {
+        const Json args = Json::parse(arguments);
+        failures += check(args.at("edits").is_array() && args.at("edits").at(0).at("old") == "line one\nline two" &&
+                              args.at("edits").at(0).at("new") == "a\tb\r\nc",
+                          how + ": the array with raw control bytes in its strings was not decoded");
+        failures += check(args.at("options").is_object() && args.at("options").at("note") == "x\ny" &&
+                              args.at("options").at("n") == 1,
+                          how + ": the object with a raw line break in a string was not decoded");
+        failures += check(args.at("path") == "notes\n.md", how + ": a declared string lost its raw text");
+        failures += check(args.at("broken") == "[\"a\nb\", oops]", how + ": invalid JSON did not stay a string");
+    };
+    const auto whole = parse(text, 64, contract);
+    failures += check(whole.is_tool_call_response && whole.tool_calls.size() == 1, "the call was not parsed");
+    if (whole.tool_calls.size() == 1) { expect(whole.tool_calls.front().arguments_json, "whole"); }
+    for (std::size_t width = 1; width <= 7; ++width) {
+        fi::ToolCallOutputDecoder decoder(output_contract_for("edit_file", Json{{"path", Json{{"type", "string"}}},
+                                                                                {"edits", Json{{"type", "array"}}},
+                                                                                {"options", Json{{"type", "object"}}},
+                                                                                {"broken", Json{{"type", "array"}}}}),
+                                          64);
+        for (std::size_t at = 0; at < text.size(); at += width) { (void)feed(decoder, text, at, width); }
+        const auto terminal = decoder.finish();
+        failures += check(terminal.tool_calls.size() == 1, "a streamed chunking lost the call");
+        if (terminal.tool_calls.size() == 1) {
+            expect(terminal.tool_calls.front().arguments_json, "streamed at width " + std::to_string(width));
+        }
+    }
+    return failures;
+}
+
 int test_boolean_boundary() {
     const auto contract =
         contract_for("configure", Json{{"lower_true", Json{{"type", "boolean"}}},
@@ -2044,6 +2089,7 @@ int main() {
     failures += test_string_values_preserve_embedded_tool_markup();
     failures += test_parameter_delimiters_in_values();
     failures += test_declared_json_types();
+    failures += test_control_bytes_inside_declared_json_strings();
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();
     failures += test_composed_schema_types();

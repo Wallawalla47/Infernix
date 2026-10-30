@@ -9163,7 +9163,10 @@ unwritten.
 **Resume.**
 
 - A request paused inside its prompt binds its prompt again; the selection finds the state the pause
-  published (or an earlier tap) and prefill continues.
+  published (or an earlier tap) and prefill continues. When that publication was refused or evicted,
+  the state lies below the frontier the Engine has already counted as prefilled: the lane keeps that
+  counted frontier and reports only the tokens past it, so the walk below it is not counted twice
+  (before 2026-10-30 it was, and the Engine's suffix check failed every request; review TK-01).
 - A request paused after its first token binds its ledger: lookup keys are the prompt's, chained
   over the output blocks as publication chains them (`ledger_prompt`), and the index may return a
   snapshot at the paused frontier itself. The deepest affordable one restores; prefill calls
@@ -10402,11 +10405,24 @@ bit-identical greedy output, plain decode 397.4 → 398.6 tok/s (every four-bloc
   15.9 → 13.1, T 8 19.4 → 16.0; T 1 8.5 → 8.7 µs, so one column keeps K1a/K1b. Decode ABBA, pg4096:
   MTP 4 149.2 → 150.5 tok/s (+0.9 %, runs 149.1 / 149.2 against 150.3 / 150.8), plain 94.7 → 95.2.
   v4's two rows per warp in K1a spilled 120-160 bytes of stack and was slower; not adopted.
+  A wide K1b (a row per warp, 4 features x 4 streams per CTA, 640 CTAs, after Strata `d18d8ba0`; review
+  SX-01, 2026-10-30) gave v4's bits but lost at every width it serves (op bench, whole mix per call, BF16
+  T = 2 / 4 / 8: 11.62 / 14.41 / 18.10 -> 12.37 / 15.96 / 23.95 us; Q8 9.60 / 12.02 / 16.01 -> 11.35 / 14.83 /
+  20.92 us): each of its CTAs forms m from the partials again, 4x v4's reads. Not adopted; m formed once
+  (K1a's last CTA) is the untried variant.
 - A prefill chunk whose wide workspace the expert cache could never lend is halved at startup (a
   warning; exact route chunk-invariant): a 65,536-token chunk on the SSD tier had wanted 27 GiB,
   failed `cudaMalloc` after admission and took the Engine down (GitHub #5 comment); now it prefills at
   32,768 and served a 49K-token prompt. A failed fallback allocation fails the prompt's requests, not
   the Engine.
+- The cache can shrink after startup (elastic KV growth, the VRAM monitor, a vision loan) until it no
+  longer lends that chunk's workspace, which then failed every later long prompt; and the failed
+  allocation left its error as the runtime's last, which aborted the next launch check (closed PR
+  #46). Since 2026-10-30 (review TK-02) a binding made while no lane prefills re-fits the chunk to
+  what the cache can lend then, less the binding's own vision loan, up to the startup chunk (halving;
+  at nothing lendable the static arena's width), on the default route only: the reproducible route's
+  taps and resumes sit on the chunk grid, so its chunk stays fixed. `DeviceBuffer` now consumes the
+  failed allocation's error.
 - GitHub #24 through the layer walk: after each walk span the Program reports that its lent frames are
   returnable and the Engine re-runs admission, so a request waiting for KV growth is admitted after
   the span instead of after the whole prompt. Scenario (exact route, C = 2, `--max-context 190000`):

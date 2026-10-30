@@ -419,7 +419,12 @@ public:
 
 Engine::Engine(EngineOptions options) {
     // Before any host thread starts: a throttled process runs every one of them slower.
-    exempt_process_from_power_throttling();
+    if (const auto refused = exempt_process_from_power_throttling()) {
+        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                                    "Windows refused the power-throttling exemption (error %lu): run in a "
+                                    "background window, the host threads may be slowed many times over",
+                                    *refused);
+    }
     StartupObserver startup_observer = options.startup_observer;
     StartupPhaseScope startup_phase(startup_observer, StartupPhase::EngineStartup);
     impl_ = std::make_shared<Impl>(std::move(options));

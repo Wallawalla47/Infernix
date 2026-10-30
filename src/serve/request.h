@@ -201,7 +201,6 @@ struct GenerationRequest {
     std::size_t tool_name_max_length = kMaximumToolNameLength;
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;
-    bool stop_strings_apply_to_reasoning = false;
     // Benchmark/serving extension shared with vLLM, SGLang and llama.cpp: suppress the
     // checkpoint's default stop tokens so generation runs to the requested token budget.
     // Caller-supplied stop tokens and stop strings still apply.

@@ -1234,6 +1234,14 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
             search_definition = out.prompt.generation.tools.size() - 1U;
             continue;
         }
+        if (type == "web_search") {
+            // Codex declares OpenAI's hosted web search on every turn unless its configuration
+            // disables it (`web_search = "disabled"`). Infernix runs no search: the declaration is
+            // accepted and echoed, and the model is not offered the tool (a tool_choice naming it
+            // is still refused).
+            out.wire_tools.push_back(item);
+            continue;
+        }
         if (type != "namespace") {
             bad_request("tool type '" + type +
                             "' requires an executor that Infernix does not provide",

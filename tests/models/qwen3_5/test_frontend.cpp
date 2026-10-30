@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -3058,6 +3059,62 @@ int test_open_reasoning_tool_recovery() {
 // Session-level tool calls by token identity, on the free and the constrained route: the model's
 // `<tool_call>` token opens a call even mid-line, the same spelling from ordinary tokens is content,
 // and every split into decode rounds publishes the same content and calls.
+// A client stop string ends the answer, never a tool call the model opened with its token: the
+// call's arguments are the tool's data (vLLM #64088). The same text in the answer, or after the
+// call's close, still stops it, at every round width.
+int test_stop_strings_skip_tool_calls() {
+    const Frontend frontend = make_frontend(resources());
+    infernix::PromptInput input;
+    input.messages.push_back({.role  = infernix::ChatRole::User,
+                              .parts = {{.kind = infernix::MessagePartKind::Text, .text = "x"}}});
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}})");
+    const auto prompt = frontend.prepare(std::move(input));
+    const infernix::TokenId eos = frontend.default_stop_policy().token_ids.front();
+    infernix::StopPolicy stop;
+    stop.strings.push_back(infernix::StopString{.text = "STOP"});
+    // Free tool calls: a constrained tool route refuses custom stops.
+    infernix::ToolChoice choice;
+    choice.constraints      = infernix::ToolConstraintMode::Automatic;
+    const auto make_session = [&] {
+        return frontend.make_output_session(prompt, stop, infernix::OutputOptions{.tool_name_max_length = 64}, {}, {},
+                                            choice);
+    };
+    const auto call = fixture_tokenizer().encode(
+        "<tool_call>\n<function=bash>\n<parameter=command>\necho STOP\n</parameter>\n</function>\n</tool_call>");
+
+    int failures = 0;
+    std::vector<infernix::TokenId> inside = fixture_tokens("Running it.");
+    inside.insert(inside.end(), call.begin(), call.end());
+    inside.push_back(eos);
+    std::vector<infernix::TokenId> after = inside;
+    after.pop_back();
+    const auto tail = fixture_tokens(" Then STOP here.");
+    after.insert(after.end(), tail.begin(), tail.end());
+    after.push_back(eos);
+    const std::vector<infernix::TokenId> answer = fixture_tokens("Say STOP now.");
+    for (const std::size_t round : {0U, 1U, 3U}) {
+        const std::string width = " (round width " + std::to_string(round) + ")";
+        const Published whole   = publish_rounds(make_session, inside, round);
+        failures += check(whole.content == "Running it." &&
+                              whole.calls == std::vector<std::string>{R"(bash {"command":"echo STOP"})"},
+                          ("a stop string cut a tool call's arguments" + width).c_str());
+        const Published later = publish_rounds(make_session, after, round);
+        // Text after a call keeps the call as content (calls end the output); the stop inside it
+        // was skipped and the one after its close ended the answer.
+        const std::size_t close = later.content.find("</tool_call>");
+        failures += check(close != std::string::npos && later.content.find("echo STOP") < close &&
+                              later.content.substr(close) == "</tool_call> Then ",
+                          ("a stop string after the call's close did not stop the answer" + width + ": [" +
+                           later.content + "]")
+                              .c_str());
+        failures += check(publish_rounds(make_session, answer, round).content == "Say ",
+                          ("a stop string in the answer did not stop it" + width).c_str());
+    }
+    return failures;
+}
+
 int test_tool_call_marker_by_token_identity() {
     const Frontend frontend = make_frontend(resources());
     infernix::PromptInput input;
@@ -4169,7 +4226,7 @@ int test_next_turn_history() {
     return failures;
 }
 
-int main() {
+int main() try {
     const FrontendResources owned = resources();
     const Frontend frontend       = make_frontend(owned);
     int failures                  = 0;
@@ -4218,6 +4275,7 @@ int main() {
     failures += test_tool_marker_after_quoted_marker();
     failures += test_open_reasoning_tool_recovery();
     failures += test_tool_call_marker_by_token_identity();
+    failures += test_stop_strings_skip_tool_calls();
     failures += test_reasoning_split(frontend);
     failures += test_reasoning_close_by_token_identity(frontend);
     failures += test_reasoning_close_resolves_at_terminal(frontend);
@@ -4244,4 +4302,7 @@ int main() {
     failures += test_checkpoint_lowering_precedes_leading_instruction_tap();
     failures += test_next_turn_history();
     return failures == 0 ? 0 : 1;
+} catch (const std::exception& error) {
+    std::fprintf(stderr, "FAIL: uncaught exception: %s\n", error.what());
+    return 1;
 }
