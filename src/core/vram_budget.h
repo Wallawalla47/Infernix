@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 
 namespace infernix {
 
@@ -80,13 +81,18 @@ class SpillGuard {
 public:
     explicit SpillGuard(VramBudgetSource& source) : source_(source) {}
     // Records free memory before a step.
-    void begin() { before_ = source_.query().device_free; }
+    void begin() { before_ = source_.query(); }
     // After a step that allocated `bytes`: the bytes not placed in device memory (0: resident).
     [[nodiscard]] std::uint64_t end(std::uint64_t bytes);
+    // The last step's readings, for its failure: free device memory before and after a step of
+    // `bytes`, and where the source reads it (Windows, WSL2) this process's shared system memory use,
+    // which a real sysmem fallback raises and a misread free-memory figure does not.
+    [[nodiscard]] std::string readings(std::uint64_t bytes) const;
 
 private:
     VramBudgetSource& source_;
-    std::uint64_t before_ = 0;
+    VramSnapshot before_;
+    VramSnapshot after_;
 };
 
 namespace testing {

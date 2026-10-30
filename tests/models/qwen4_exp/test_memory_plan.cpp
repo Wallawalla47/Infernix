@@ -321,18 +321,27 @@ void test_sizing() {
             "the sizing line names the headroom's source and the display: " + line);
 }
 
+// Free device memory per query, and optionally this process's shared system memory use (a source
+// with an adapter: Windows, WSL2) in step with it.
 class ScriptedSource final : public VramBudgetSource {
 public:
-    explicit ScriptedSource(std::deque<std::uint64_t> readings) : readings_(std::move(readings)) {}
+    explicit ScriptedSource(std::deque<std::uint64_t> readings, std::deque<std::uint64_t> nonlocal = {})
+        : readings_(std::move(readings)), nonlocal_(std::move(nonlocal)) {}
     VramSnapshot query() override {
         VramSnapshot s;
         s.device_free = readings_.front();
         if (readings_.size() > 1) { readings_.pop_front(); }
+        if (!nonlocal_.empty()) {
+            s.shared_system  = 76 * kGiB;
+            s.nonlocal_usage = nonlocal_.front();
+            if (nonlocal_.size() > 1) { nonlocal_.pop_front(); }
+        }
         return s;
     }
 
 private:
     std::deque<std::uint64_t> readings_;
+    std::deque<std::uint64_t> nonlocal_;
 };
 
 void test_spill() {
@@ -352,6 +361,18 @@ void test_spill() {
     SpillGuard confirm(spilled);
     confirm.begin();
     require(confirm.end(n) == n - 100 * kMiB, "a confirmed shortfall is reported");
+    require(confirm.readings(n) == "free device memory 10240 MiB before and 10140 MiB after 1024 MiB of allocations",
+            "the failure names the free-memory readings it compared");
+    // Where the source reads this process's shared system memory use (Windows, WSL2), the readings
+    // carry it: a real sysmem fallback raises it, a misread free-memory figure does not.
+    ScriptedSource shared({10 * kGiB, 10 * kGiB - 100 * kMiB, 10 * kGiB - 100 * kMiB},
+                          {200 * kMiB, 1124 * kMiB, 1124 * kMiB});
+    SpillGuard fallback(shared);
+    fallback.begin();
+    require(fallback.end(n) == n - 100 * kMiB, "a shortfall with shared-memory readings is reported");
+    require(fallback.readings(n) == "free device memory 10240 MiB before and 10140 MiB after 1024 MiB of allocations; "
+                                    "this process's shared system memory use 200 MiB before and 1124 MiB after",
+            "the failure names the shared system memory readings where the source has them");
 
     // The test seam replaces the sources opened afterwards.
     infernix::testing::set_vram_budget_source([] { return card(5 * kGiB, DisplayState::Headless); });

@@ -306,8 +306,21 @@ std::uint64_t spill_shortfall(std::uint64_t free_before, std::uint64_t free_afte
 }
 
 std::uint64_t SpillGuard::end(std::uint64_t bytes) {
-    if (spill_shortfall(before_, source_.query().device_free, bytes) == 0) { return 0; }
-    return spill_shortfall(before_, source_.query().device_free, bytes);
+    after_ = source_.query();
+    if (spill_shortfall(before_.device_free, after_.device_free, bytes) == 0) { return 0; }
+    after_ = source_.query();
+    return spill_shortfall(before_.device_free, after_.device_free, bytes);
+}
+
+std::string SpillGuard::readings(std::uint64_t bytes) const {
+    const auto mib = [](std::uint64_t value) { return std::to_string(value >> 20) + " MiB"; };
+    std::string out = "free device memory " + mib(before_.device_free) + " before and " + mib(after_.device_free) +
+                      " after " + mib(bytes) + " of allocations";
+    if (before_.shared_system != 0 && after_.shared_system != 0) {
+        out += "; this process's shared system memory use " + mib(before_.nonlocal_usage) + " before and " +
+               mib(after_.nonlocal_usage) + " after";
+    }
+    return out;
 }
 
 std::unique_ptr<VramBudgetSource> open_vram_budget_source(int device, bool past_budget) {

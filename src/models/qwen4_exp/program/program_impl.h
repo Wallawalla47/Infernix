@@ -948,13 +948,14 @@ public:
         tally += bytes;
     }
 
-    // The startup failure for device allocations the driver placed in system memory.
-    static std::string spill_message(std::uint64_t bytes) {
+    // The startup failure for device allocations the driver placed in system memory, with the
+    // readings that found it (SpillGuard::readings).
+    static std::string spill_message(std::uint64_t bytes, const std::string& readings) {
         return std::to_string(bytes >> 20) +
                " MiB of Infernix's VRAM allocations were placed in shared system memory by the driver's sysmem "
                "fallback: free VRAM, or lower --max-context, --max-concurrency or --prefill-chunk. Setting the NVIDIA "
                "Control Panel 'CUDA - Sysmem Fallback Policy' to 'Prefer No Sysmem Fallback' for this program makes "
-               "this fail at allocation instead.";
+               "this fail at allocation instead. Readings: " + readings + ".";
     }
 
     ProgramImpl(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
@@ -1156,7 +1157,7 @@ public:
             throw std::logic_error("Qwen4Exp: the Program's device allocations differ from its device plan");
         }
         if (const std::uint64_t spilled = guard.end(allocated); spilled != 0) {
-            throw std::runtime_error(spill_message(spilled));
+            throw std::runtime_error(spill_message(spilled, guard.readings(allocated)));
         }
         // The staging, shared-expert and split streams at the device's greatest priority (the decode graphs keep
         // it as node priorities, core/decode_graph.cpp), so their short kernels take an SM as the routed experts'

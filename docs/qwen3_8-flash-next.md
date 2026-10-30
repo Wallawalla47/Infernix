@@ -781,7 +781,9 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
 - **No silent spill.** On Windows the driver can place an allocation that does not fit in shared
   system memory without an error, which slows everything down. The engine checks that every startup
   allocation lowered free VRAM by its size: dense weights or fixed buffers that spilled stop
-  startup; expert frames that spilled are given back once and the cache starts smaller. Setting the
+  startup; expert frames that spilled are given back once and the cache starts smaller. The error
+  prints the readings it compared: free VRAM before and after the allocations and, on Windows and
+  under WSL2, this process's shared system memory use, which a real spill raises. Setting the
   NVIDIA Control Panel's *CUDA - Sysmem Fallback Policy* to *Prefer No Sysmem Fallback* for the
   Infernix executables makes such an allocation fail instead (optional).
 - **At runtime** the cache follows free VRAM. When another program (a browser, a game, the
