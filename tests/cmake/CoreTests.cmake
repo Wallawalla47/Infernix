@@ -104,6 +104,14 @@ infernix_add_test(infernix_cpu_topology_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cpu_topology.cpp"
   LIBRARIES infernix_core)
 
+if(NOT WIN32)
+  # The WSL2 adapter facts through DXCore (skips outside WSL2 or without a CUDA device).
+  infernix_add_test(infernix_dxcore_adapter_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_dxcore_adapter.cpp"
+    LIBRARIES infernix_core)
+  set_tests_properties(infernix_dxcore_adapter_test PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 infernix_add_test(infernix_jinja_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_jinja.cpp"
   LIBRARIES infernix_jinja infernix::json)

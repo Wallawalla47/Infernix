@@ -621,7 +621,7 @@ the Engine, and each acts only where the artifact can be request-invariant
   columns, and fails. The 4-bit activations alone add two thirds of the floor at every prompt
   length. Perplexity cannot see either: the NLL excess is negative in every arm.
 - `batched-a4-residual-decode`: with `batched-decode`, wide rounds of the NVFP4 MLP projections
-  (gate/up and down from 9 columns) quantize each column's activations into NVFP4 terms that
+  (gate/up and down from 5 columns) quantize each column's activations into NVFP4 terms that
   sum to it, the first being the 4-bit encoding and each later one the NVFP4 encoding of what the
   earlier ones left (`LinearPolicy::AllowA4Residual`), and multiply every term by the same weight
   tile into one accumulator. Weight traffic is the 4-bit route's; the activation error is roughly

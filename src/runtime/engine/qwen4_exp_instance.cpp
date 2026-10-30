@@ -422,7 +422,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     if (const std::uint64_t spilled = guard.end(dense); spilled != 0) {
         throw std::runtime_error(std::to_string(mib(spilled)) +
                                  " MiB of the dense weights were placed in shared system memory by the driver's "
-                                 "sysmem fallback: free VRAM and start again");
+                                 "sysmem fallback: free VRAM and start again (" + guard.readings(dense) + ")");
     }
     const std::uint64_t after_weights = vram->query().device_free;
 

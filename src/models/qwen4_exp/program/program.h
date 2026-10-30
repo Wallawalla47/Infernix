@@ -462,6 +462,8 @@ struct ProgramOptions {
     // 0 derives it from the measured link and CPU rates, design §19.3.12).
     // Defaults measured fastest on the i9-13900K (design sections 19.2 and 19.3.16): 16 jobs pay in
     // calls with many misses (C = 4 fill +7 %, cold MTP +3 %) and are neutral elsewhere; 32 is no faster.
+    // Both worker counts are at most the process's logical CPUs less four (expert_offload/placement.h
+    // default_workers).
     std::uint32_t cpu_expert_workers = 6;
     // The workers for a GGUF import's banks (the ggml CPU route, compute-bound where the NVFP4
     // route is DRAM-bound): on the i9-13900K, tg512 decoded 100.5 tok/s without CPU service, 98.4

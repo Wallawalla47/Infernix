@@ -605,7 +605,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         if (const std::uint64_t spilled = spill->end(dense_bytes); spilled != 0) {
             throw std::runtime_error(std::to_string(spilled >> 20) +
                                      " MiB of the dense weights were placed in shared system memory by the driver's "
-                                     "sysmem fallback: free VRAM and start again");
+                                     "sysmem fallback: free VRAM and start again (" + spill->readings(dense_bytes) +
+                                     ")");
         }
     }
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);

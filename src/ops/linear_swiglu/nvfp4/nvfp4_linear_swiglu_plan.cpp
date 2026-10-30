@@ -34,10 +34,9 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
         return Nvfp4LinearSwiGluRoute::SmallTFusedA16;
     }
     if (allows_a4_residual(policy)) {
-        // Two terms take 64.1-66.1 us at 6-14 tokens; A16 takes 62.0-64.1 at 6-8, then 76.4-90.7
-        // at 9-14 (RTX 5090, cold weights): the residual's error buys time from 9.
+        // From 5 tokens, as linear_add's two-term route (nvfp4_linear_add_plan.cpp).
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
-        if (tokens <= 8) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
+        if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
         return Nvfp4LinearSwiGluRoute::FusedA4Residual;
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }

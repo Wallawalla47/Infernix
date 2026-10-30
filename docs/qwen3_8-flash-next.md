@@ -459,6 +459,10 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   workers measured slower: the CPU and the PCIe stage share the host's memory bandwidth.
   The GSQ-RCO IQ3_S artifact's CPU route decodes its GGUF blocks before multiplying, so it is
   compute-bound and starts 16 workers instead (decode 98.4 tok/s with six, 103.7 with 16).
+  Either way the team leaves four of the process's logical CPUs to the engine, the CUDA runtime
+  and the OS: a 16-vCPU host runs 12 workers. With 16 workers on 16 logical CPUs the spinning
+  threads starved each other and the IQ3_S decoded 61-87 tok/s, against 189-217 with 8 (the
+  startup log notes a reduced team).
 - On Windows the engine opts its process out of power throttling. Windows otherwise slows a
   process it considers in the background (a server whose console is not in front, a job without a
   window) and moves its threads to efficiency cores; a hidden run decoded 37.6 tok/s at 8K throttled
@@ -786,7 +790,9 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
 - **No silent spill.** On Windows the driver can place an allocation that does not fit in shared
   system memory without an error, which slows everything down. The engine checks that every startup
   allocation lowered free VRAM by its size: dense weights or fixed buffers that spilled stop
-  startup; expert frames that spilled are given back once and the cache starts smaller. Setting the
+  startup; expert frames that spilled are given back once and the cache starts smaller. The error
+  prints the readings it compared: free VRAM before and after the allocations and, on Windows and
+  under WSL2, this process's shared system memory use, which a real spill raises. Setting the
   NVIDIA Control Panel's *CUDA - Sysmem Fallback Policy* to *Prefer No Sysmem Fallback* for the
   Infernix executables makes such an allocation fail instead (optional).
 - **At runtime** the cache follows free VRAM. When another program (a browser, a game, the

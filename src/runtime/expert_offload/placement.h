@@ -28,6 +28,20 @@ inline constexpr std::int32_t kPlainDivisorContext = 1536;
     return position >= kPlainDivisorContext ? 2 : 1;
 }
 
+// The logical CPUs a default team leaves to the engine's spinning round thread, the CUDA runtime and
+// the OS. With the process held to 16 logical CPUs (one per core) of the i9-13900K, the GSQ-RCO IQ3_S
+// with DFlash2 decoded at 61-87 tok/s with 16 GGUF workers, 189-217 with 8, and 268 with 16 on all 32
+// CPUs (2026-10-30); a 16-vCPU VM decoded at 8.6-10.6 with 16 and 184-240 with 4-12 (GitHub issue #48).
+inline constexpr std::uint32_t kReservedCpus = 4;
+
+// The default team size: `configured` workers, at most `logical_cpus` - kReservedCpus and at least one
+// (`logical_cpus` 0: unknown, `configured`; `configured` 0 keeps the team off).
+[[nodiscard]] constexpr std::uint32_t default_workers(std::uint32_t configured, std::uint32_t logical_cpus) noexcept {
+    if (configured == 0 || logical_cpus == 0) { return configured; }
+    const std::uint32_t room = logical_cpus > kReservedCpus ? logical_cpus - kReservedCpus : 1U;
+    return configured < room ? configured : room;
+}
+
 // Where the CPU expert team and the engine thread run.
 struct CpuPlacement {
     std::uint32_t workers = 0;          // the team's worker count
@@ -35,7 +49,8 @@ struct CpuPlacement {
     std::uint64_t engine  = 0;          // the engine thread's logical CPUs (0: unpinned)
     std::string text;                   // the startup line ("" with the default placement)
 };
-// The placement of a team of `configured` workers under the switches (by default unpinned). With
+// The placement of a team of `configured` workers under the switches (by default unpinned; without
+// INFERNIX_TMP_CPU_PLACEMENT's count, default_workers of the process's logical CPUs). With
 // `engine_isolate` (the Qwen3.5-122B's offloaded route: OffloadOptions::engine_isolate) the engine
 // thread takes the last core of the fastest class (both its logical CPUs), which no worker may use.
 [[nodiscard]] CpuPlacement cpu_placement(const OffloadSwitches& switches, std::uint32_t configured,
