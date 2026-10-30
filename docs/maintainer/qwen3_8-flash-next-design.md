@@ -11771,8 +11771,9 @@ ggml_linear, covering:
 
 ### 19.3.40 NVFP4 W4A16 narrow experts on int8 tensor cores (2026-10-30; exact, same bits; default)
 
-**What.** The narrow jobs (at most eight columns) of decode and verification calls of NVFP4 W4A16 experts at Flash-Next's geometry
-(NVIDIA FP4-Local at its 16-bit expert activations, recipe C, the uncensored NVFP4) ran the dp4a narrow kernels: a
+**What.** The narrow jobs (at most eight columns) of decode and verification calls of NVFP4 W4A16 experts at
+Flash-Next's geometry (NVIDIA FP4-Local at its 16-bit expert activations, recipe C, the uncensored NVFP4) ran the dp4a
+narrow kernels: a
 gate/up CTA per 16 intermediates that staged its whole 46 KB slice before its first product (one CTA an SM), encoded
 the call's x itself, and made one pass over the staged weights per column (the one-column kernels up to four
 columns). A 16K trace of FP4-Local (DFlash2 auto) had those kernels at 3.48 of 11.56 ms a round, about 27 % of the
@@ -11798,7 +11799,8 @@ DRAM bandwidth their resident records need. They now run `ops/offloaded_sparse_m
 staging pass, CPU share and SSD-tier read against `expert_forward_a16`'s bits, with exact and (new) A4 residual
 workspaces. Op bench output hashes equal the dp4a kernels' at every point below.
 
-**Measured** (RTX 5090, PCIe 5.0 x8, one build with the temporary switch `INFERNIX_TMP_A16_DP4A`, 2026-10-30):
+**Measured** (RTX 5090, PCIe 5.0 x8, one build with the temporary switch `INFERNIX_TMP_A16_DP4A`, removed since,
+2026-10-30):
 - `infernix_offloaded_moe_wide_bench --cold --placement frames`, median moe_experts call, dp4a against tensor cores
   (two runs each, exact and A4 residual workspaces alike): T = 1 49.8 → 43.6 µs (0.87x), T = 3 96.9 → 74.2 (0.76x),
   T = 8 309 → 203 (0.66x); eight columns as 80 one-column experts 0.67-0.68x, as 10 of eight 0.59x.
@@ -11830,21 +11832,46 @@ that thread can publish. The helper owns the row scratch (window_, row_ids_), th
 counters until it is joined; a failed read publishes zero rows and rethrows after the join.
 
 **Measured** (FP4-Local, rows from the IQ3_S import's IQ4_NL volume on E:, three interleaved runs, every pair ahead):
-pp16413 6,829 -> 6,999 tok/s (+2.5 %), pp4096 2,727 -> 2,802 (+2.7 %). A walk's first chunk reads its rows before
-its first launch too, but the stream's `begin` has enqueued two layers' copies by then; walk_begin submits them first
-(`device_.flush()`), so the link copies during the read.
+pp16413 6,829 -> 6,999 tok/s (+2.5 %), pp4096 2,727 -> 2,802 (+2.7 %). A walk's first chunk still reads its rows
+before its first launch, but the stream's `begin` has enqueued two layers' copies by then: submitting them before
+the read (`device_.flush()`) measured pp16413 0.998x and pp65565 1.000x, so the walk is unchanged.
 
 ### 19.3.42 One streamed call and the prompt's narrow last call walk (2026-10-30; same bits; default)
 
 **What.** A prompt of one streamed call and a last call narrower than `kStreamMinColumns` (16,385-16,639 tokens at
-FP4-Local's 16,384-token chunk, the engine comparison's 16,413-token prompt among them) ran the two chunk-major: the last call staged its
-misses again right after the streamed call. FP4-Local's 16K trace: the 29-token last call took 299 ms (12 % of the
-prompt), mostly CPU-served misses at 5-7 ms a layer. `walk_span_end` now walks the two (the last call as its own MoE
-group, §19.3.8 F4), as it already did after two or more streamed calls.
+FP4-Local's 16,384-token chunk) ran the two chunk-major, and the last call staged its misses again right after the
+streamed call: FP4-Local's 16K trace had the 29-token last call at 299 ms (12 % of the prompt), mostly CPU-served
+misses at 5-7 ms a layer. `walk_span_end` now walks the two (the last call as its own MoE group), as it already did
+after two or more streamed calls.
 
-**Measured** (FP4-Local, the same runs as §19.3.41): pp16413 6,999 -> 7,684 tok/s (+9.8 %; +12.5 % against the
-rows-first order); pp4096 (one call) unchanged. 2026-10-27's "walking measured no faster" was pp4125 on IQ3_S and
-Dense8 at 4,096-token chunks (0.999x, 1.000x), where the last call's misses cost little.
+**Measured** (FP4-Local, the same runs as §19.3.41): pp16413 6,999 -> 7,684 tok/s (+9.8 %); pp4096 (one call)
+unchanged; the decode after pp16413 unchanged (249.2 -> 249.8 tok/s, three pairs within +0.3 %). 2026-10-27's
+"walking measured no faster" was pp4125 on IQ3_S and Dense8 at 4,096-token chunks (0.999x, 1.000x).
+
+**Trade-off.** As for two or more streamed calls, a /v1/decide fan-out whose questions diverge in that last call
+cannot coalesce while the span runs (a running span's inner positions are not realizable taps,
+`prefix_await_sibling`). `infernix_qwen4_exp_decide_real_test`'s coalescing case (1,064-token prompts, one call, no
+walk) fails on FP4-Local with and without this change and on main 75e25b5c alike (leader 0, follower 0 reused
+tokens; not investigated here).
+
+### 19.3.43 NVFP4 W4A16 banks split decode misses by the share form (2026-10-30; placement only; default)
+
+**What.** Flash-Next's Program kept a decode call's host-memory misses on the link by the divisor rule, M / d with
+d = floor(1.65 + C t) (§19.3.12; FP4-Local: C 19,100 experts/s, t 0.10 ms a 2.64 MiB record, d = 3). Its NVFP4 W4A16
+banks now take the share form the Qwen3.5-122B's split took (`placement.h` `decode_link_share_256`: the link keeps
+(M s) >> 8 with s = 256 / (1 + 1.46 C t), 67/256 on FP4-Local), so a call's three misses all go to the CPU where the
+rule sent one over the link. `INFERNIX_TMP_LINK_SHARE=divisor` keeps the rule; GGUF and W4A4 banks keep it (not
+measured).
+
+**Measured** (FP4-Local, DFlash2 auto, the share form against `divisor`, three interleaved runs each):
+- with the tensor-core narrow experts (§19.3.40): short context 214.9 -> 226.5 tok/s (+5.4 %), after a 16K prompt
+  249.2 -> 249.5 (+0.1 %), the struct fixture 422.9 -> 449.5 (+6.3 %); every short-context and struct pair ahead;
+- with the dp4a narrow experts (the same day, 1-2 runs a share, before §19.3.40): after a 16K prompt the rule led
+  every share below it (67/256 0.988x), short context 77/256 +1.1 % and 67/256 +0.7 %: the faster GPU legs moved the
+  balance toward the CPU.
+- Other shares on the tensor-core build: 77/256 struct +3.6 % and short context +1.3 %; 107/256 struct -4.6 %.
+- More CPU workers did not help: 8, 11 and 14 against 6 (dp4a build) 0.999, 0.994 and 0.995x after a 16K prompt,
+  8 workers 1.019x at short context and 0.982x on the struct fixture.
 
 ---
 

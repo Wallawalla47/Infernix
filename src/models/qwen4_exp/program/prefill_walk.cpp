@@ -82,9 +82,7 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
     // last call after it, the two walk: as its own call the last one stages its misses again right after the
     // streamed call (FP4-Local pp16413, a 29-token last call after 16,384 tokens: 299 ms, mostly CPU-served
     // misses; walked 6,999 -> 7,684 tok/s, 2026-10-30; pp4125 on IQ3_S and Dense8 1.000x, 2026-10-27).
-    static const bool no_join = temporary_switches::flag("INFERNIX_TMP_WALK_NO_JOIN"); // the decode A/B's old order
-    const bool one_then_last = !no_join && end - first == 1U && end + 1 == lane.calls.size() &&
-                               lane.calls[end] - from >= kWalkJoinMinTokens;
+    const bool one_then_last = end - first == 1U && end + 1 == lane.calls.size() && lane.calls[end] - from >= kWalkJoinMinTokens;
     if (end - first < 2U && !one_then_last) { return first; }
     // The prompt's last call, too narrow to stream, joins a
     // span of streamed calls (as its own MoE group, walk_begin), so its experts are read from the span's ring
