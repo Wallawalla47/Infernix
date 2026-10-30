@@ -823,14 +823,10 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
   - If Windows lowers the budget later, the cache shrinks by the same amount.
   - The cost: memory past the budget may be moved to system memory if another program needs VRAM,
     which slows decode until the cache shrinks. It is off by default.
-  - The driver loads a kernel's code at its first launch, after the cache has taken the budget, so
-    that code lands past the budget and the server could fail with `unspecified launch failure`
-    (5 of 7 starts at `--vram-headroom-mib 128`). With this flag the engine therefore loads every
-    kernel module when it creates the CUDA context (`CUDA_MODULE_LOADING=EAGER`; about 380 MiB and
-    2.7 s at startup, shown in `in use before loading`). That costs 7 % of single-lane decode and
-    2 % of two-lane decode (RTX 5090, FP4-Local, 128.2 against 137.9 tok/s), so the flag's extra
-    expert frames do not pay for it: without the flag decode is faster. A `CUDA_MODULE_LOADING` you
-    set yourself is kept.
+  - Measured on an RTX 5090 (2026-10-30, greedy 500-token decodes, three runs a side,
+    `--vram-headroom-mib 128`): FP4-Local 9,023 frames against 8,780, single-lane decode 142.7
+    against 139.4 tok/s and two-lane 204.4 against 197.4 tok/s; Ornith-1.5-122B 4,924 experts
+    against 4,797, 73.4 against 71.4 and 84.4 against 82.0 tok/s.
 - With more than one CUDA device visible (Windows), free VRAM is read as the Windows budget less this
   process's usage: there CUDA's own free figure stopped following allocations, so the cache would size
   to almost nothing. `CUDA_VISIBLE_DEVICES` naming one device restores the single-device reading.
