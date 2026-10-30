@@ -379,6 +379,8 @@ int run_tests() {
     failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-ram-layout", "full"}).expert_ram_layout ==
                           infernix::ExpertRamLayout::Full,
                       "--expert-ram-layout must parse full");
+    failures += check(!parse({"infernix-cli", "model.ninfer", "--prompt", "x"}).expert_ram_layout.has_value(),
+                      "without --expert-ram-layout the model's default must stand");
     failures += check(help.find("--expert-pin-mib") != std::string::npos, "CLI help omits the expert pin control");
     failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-pin-mib", "24576"}).expert_pin_bytes ==
                               (24576ULL << 20) &&

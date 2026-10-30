@@ -332,6 +332,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                 runtime::expert_offload::kGraphExecutableBytes),
             .wide_pass_bytes = std::max(workspace_plan.text_prefill_wide, workspace_plan.mtp_prefill_wide),
             .wide_pass_ladder = workspace_plan.prefill_wide_ladder,
+            .kv_growth_bytes = kv_vmm ? kv_vmm->reserved_bytes() - kv_vmm->mapped_bytes() : 0U,
             .expert_wide     = execution_schedule.expert_wide,
             .expert_narrow   = execution_schedule.a8_experts ? ops::offloaded_moe::NarrowA16::kA8
                                                              : ops::offloaded_moe::NarrowA16::kExact,

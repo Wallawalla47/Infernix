@@ -243,6 +243,10 @@ INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R infernix_qwen3_5_moe_real_test --output-on-failure
 ```
 
+With the 122B-A10B's artifact the same test also runs its offloaded experts: the first engine in the exclusive
+RAM layout (`--expert-ram-layout exclusive`), the 262,144-token configuration in the default full layout with
+the elastic KV grown from the expert frames.
+
 The Qwen3.8-Flash-Next (`qwen4_exp`) artifact tests read `INFERNIX_QWEN4_ARTIFACT` instead (the first
 shard of a `.infernix` artifact) and, when the n-gram volume is not beside it,
 `INFERNIX_QWEN4_NGRAM`:

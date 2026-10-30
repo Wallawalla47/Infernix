@@ -5,7 +5,10 @@
 // stacking the headroom on it, the graph reserve, fixed allocations that do not fit, the frame
 // clamp, and the spill test with noisy free-memory readings. RT9, the runtime law of the elastic
 // pool: shrink on low free memory or an exceeded budget, hysteresis, the grow delay and per-boundary
-// cap, display hot-plug, and the reserve spent by Infernix's own later allocations.
+// cap, display hot-plug, and the reserve spent by Infernix's own later allocations. The exclusive RAM
+// layout's tier for one record size (the Qwen3.5-122B-A10B's, plan_exclusive_tier): the shadows cover the
+// loan, a sixteenth of the frames and the KV growth, the seeds never take the frames they cover, and RAM holds
+// every other expert.
 
 #include "runtime/expert_offload/memory_plan.h"
 
@@ -451,6 +454,24 @@ void test_control_law() {
     require(control.decide(trimmed, pool, frames, 200.0, false).shrink, "an exceeded budget shrinks the pool");
 }
 
+void test_exclusive_tier() {
+    // The 122B: 48 x 256 experts, 4,993 frames, a ring of 2 x 256 + 1 and a 304-frame wide workspace, 57 frames of
+    // KV growth.
+    constexpr std::uint64_t keys = 48 * 256, frames = 4'993, loan = 2 * 256 + 1 + 304, kv = 57;
+    const ExclusiveTier half = plan_exclusive_tier(keys, frames, loan, kv, 0.5);
+    require(half.shadows == loan + frames / 16 + kv, "the shadows cover the loan, a sixteenth of the frames and the KV");
+    require(half.seeded == frames / 2, "half the frames seeded");
+    require(half.slots == keys - half.seeded + half.shadows, "RAM holds every key but the seeds, and the shadows");
+    const ExclusiveTier rest = plan_exclusive_tier(keys, frames, loan, kv, 1.0);
+    require(rest.seeded == frames - rest.shadows, "the seeds never take the frames the shadows cover");
+    require(rest.slots == keys - rest.seeded + rest.shadows && rest.slots < half.slots, "more seeds, fewer slots");
+    require(plan_exclusive_tier(keys, 1'000, 900, 100, 0.5).slots == 0, "shadows taking every frame: no exclusive tier");
+    require(plan_exclusive_tier(keys, 0, loan, kv, 0.5).slots == 0, "no frames: no exclusive tier");
+    // More frames than keys need: the slots never exceed the keys.
+    const ExclusiveTier ample = plan_exclusive_tier(1'000, 100'000, 10, 0, 0.0);
+    require(ample.seeded == 0 && ample.slots == 1'000, "no seeds: RAM holds every key, never more");
+}
+
 } // namespace
 
 int main() {
@@ -468,6 +489,7 @@ int main() {
         test_sizing();
         test_spill();
         test_control_law();
+        test_exclusive_tier();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

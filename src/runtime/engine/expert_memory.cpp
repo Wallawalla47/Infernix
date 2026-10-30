@@ -57,7 +57,7 @@ std::uint64_t auto_host_context_bytes(std::uint64_t left_bytes) noexcept {
 }
 
 ExpertRamPlan plan_expert_ram(const EngineOptions& options, const expert_offload::HostMemoryDemand& demand,
-                              const HostMemorySnapshot& snapshot) {
+                              const HostMemorySnapshot& snapshot, bool always_tier) {
     ExpertRamPlan out;
     out.demand = demand;
     out.ledger = expert_offload::plan_host_memory(snapshot, demand);
@@ -70,7 +70,7 @@ ExpertRamPlan plan_expert_ram(const EngineOptions& options, const expert_offload
     }
     // The SSD tier: the banks stay in the artifact; the Program pins RAM slots for the experts the
     // ledger leaves room for (less their lock overhead) and reads the rest on use.
-    out.tier = out.ledger.placement == expert_offload::ExpertPlacement::Tier;
+    out.tier = out.ledger.placement == expert_offload::ExpertPlacement::Tier || always_tier;
     if (out.tier) {
         out.expert_ram_bytes =
             static_cast<std::uint64_t>(static_cast<double>(out.ledger.expert_pinned) / (1.0 + demand.lock_overhead));

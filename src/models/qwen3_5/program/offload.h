@@ -44,6 +44,9 @@ struct OffloadGeometry {
     std::uint64_t wide_pass_bytes = 0;
     // WorkspacePlan::prefill_wide_ladder: the pass workspace by width, from which a pass borrows what it needs.
     std::vector<std::pair<std::int32_t, std::size_t>> wide_pass_ladder;
+    // What the elastic text KV may still take from the frames (its reserved range less the pages backed at
+    // startup; 0 without it): the exclusive RAM layout keeps shadows for it (OffloadSetup::kv_growth_bytes).
+    std::uint64_t kv_growth_bytes = 0;
     // The experts' wide route (ExecutionSchedule::expert_wide; OffloadedExperts::wide_a16), which the
     // workspace plan sized.
     ops::offloaded_moe::WideA16 expert_wide = ops::offloaded_moe::WideA16::kExact;

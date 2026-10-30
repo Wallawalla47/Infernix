@@ -62,6 +62,8 @@ runtime::expert_offload::OffloadSetup offload_setup(const execution::Parameters&
     setup.mtp_draft_tokens          = geometry.mtp_draft_tokens;
     setup.ngram_draft_tokens        = geometry.ngram_draft_tokens;
     setup.graph_bound               = geometry.graph_bound;
+    setup.loan_bytes                = geometry.wide_pass_bytes;
+    setup.kv_growth_bytes           = geometry.kv_growth_bytes;
     setup.device                    = geometry.device;
     // The warm start's seed without a usable saved state: the built-in calibrated order of the model's shape (the
     // 122B's), null for any other shape or while none is generated (calibrated_order.h).
@@ -167,7 +169,8 @@ void ProgramOffload::build_experts() {
         } else if (!layer.shared) {
             throw std::logic_error("Qwen3.5 offload: a layer has neither a shared expert bank nor projections");
         } else if (experts_.shared_stream == nullptr) {
-            CUDA_CHECK(cudaStreamCreateWithFlags(&experts_.shared_stream, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaStreamCreateWithPriority(&experts_.shared_stream, cudaStreamNonBlocking,
+                                                    expert_offload::ExpertOffload::side_stream_priority()));
             for (cudaEvent_t& event : experts_.shared_events) {
                 CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
             }
@@ -190,7 +193,8 @@ void ProgramOffload::build_experts() {
     // pass: Ornith two-request MTP decode +1.6 / +8.0 / +4.6 %, Dense8 MTP +6.7 / +1.3 / +10.3 %, IQ3_S within
     // spread, 2026-10-27, design §19.3.33).
     if (experts_.side_stream != nullptr && experts_.split_stream == nullptr) {
-        CUDA_CHECK(cudaStreamCreateWithFlags(&experts_.split_stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&experts_.split_stream, cudaStreamNonBlocking,
+                                                expert_offload::ExpertOffload::side_stream_priority()));
         for (cudaEvent_t& event : experts_.split_events) {
             CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
         }

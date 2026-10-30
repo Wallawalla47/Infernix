@@ -675,7 +675,8 @@ inline NgramResidency parse_ngram_residency(std::string_view value) {
     throw std::invalid_argument("--ngram-residency must be auto, ram or volume");
 }
 
-// Which routed experts of Qwen3.8-Flash-Next keep a copy in Host RAM when VRAM cannot hold them all.
+// Which offloaded routed experts (Qwen3.8-Flash-Next, the Qwen3.5-122B-A10B) keep a copy in Host RAM when VRAM
+// cannot hold them all.
 enum class ExpertRamLayout : std::uint8_t {
     Exclusive, // only the experts VRAM does not hold, plus shadows for what a prefill borrows (the SSD tier)
     Full,      // every expert, whenever the RAM ledger allows it (else the SSD tier with the ledger's share)
@@ -691,6 +692,11 @@ inline ExpertRamLayout parse_expert_ram_layout(std::string_view value) {
 inline const char* expert_ram_layout_name(ExpertRamLayout layout) {
     return layout == ExpertRamLayout::Exclusive ? "exclusive" : "full";
 }
+
+// The layout without --expert-ram-layout, by model: Qwen3.8-Flash-Next exclusive (Full's decode speed with 4-6 GiB
+// less RAM, design §19.3.7, 2026-10-29), the Qwen3.5-122B-A10B full (exclusive's 3.9 GiB less RAM cost 1.0 % of its
+// decode after a 32K prompt and 0.4 % of prefill, 2026-10-30; its design §11.3).
+inline constexpr const char* kExpertRamLayoutDefaults = "exclusive for Qwen3.8-Flash-Next, full for the 122B";
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
@@ -841,10 +847,10 @@ struct EngineOptions {
     // Less than every expert needs selects the SSD tier: the experts not in RAM are read from the
     // artifact when used. Empty: what the RAM ledger leaves after the reserve and every other pin.
     std::optional<std::uint64_t> expert_ram_bytes;
-    // Qwen3.8-Flash-Next (--expert-ram-layout), without expert_ram_bytes: Exclusive keeps in RAM only the experts
-    // VRAM does not hold (plus shadows for a prefill's loan and the KV growth), Full a copy of every expert. Exclusive
-    // is the default since it decodes at Full's speed (design §19.3.7, 2026-10-29) with 4-6 GiB less RAM.
-    ExpertRamLayout expert_ram_layout = ExpertRamLayout::Exclusive;
+    // Offloaded experts (--expert-ram-layout), without expert_ram_bytes: Exclusive keeps in RAM only the experts VRAM
+    // does not hold (plus shadows for a prefill's loan and the KV growth), Full a copy of every expert. Empty: the
+    // model's default (kExpertRamLayoutDefaults).
+    std::optional<ExpertRamLayout> expert_ram_layout;
     // Qwen3.8-Flash-Next (--expert-pin-mib): at most this much of the experts' RAM page-locked for
     // the GPU; the rest stays in RAM unpinned and the CPU serves it. Empty: what Windows lets the
     // process page-lock (the GPU's shared memory) after every other pin; no limit elsewhere.

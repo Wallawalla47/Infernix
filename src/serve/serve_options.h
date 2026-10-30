@@ -77,7 +77,7 @@ struct ServeOptions {
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint64_t ram_free_bytes           = kDefaultRamFreeBytes;
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
-    ExpertRamLayout expert_ram_layout = EngineOptions{}.expert_ram_layout; // --expert-ram-layout
+    std::optional<ExpertRamLayout> expert_ram_layout; // --expert-ram-layout (empty: the model's default)
     std::optional<std::uint64_t> expert_pin_bytes; // --expert-pin-mib; empty: what the OS lets it pin
     std::uint32_t media_preprocess_threads = 0;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;

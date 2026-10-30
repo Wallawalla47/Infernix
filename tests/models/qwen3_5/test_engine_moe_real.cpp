@@ -1,4 +1,5 @@
 #include "models/qwen3_5/proposal_head.h"
+#include "models/qwen3_5/program/planning/startup.h"
 #include "infernix/engine.h"
 #include "graph_prepare_probe.h"
 
@@ -27,11 +28,16 @@ infernix::EngineOptions engine_options(const char* artifact) {
     // The append check resumes from the decode-computed endpoint, which only free-cache-resume
     // publishes; the test asks for it, as the prefix tests do, whatever the artifact qualifies.
     options.fast_path_candidates      = {infernix::FastPath::FreeCacheResume};
+    // Offloaded experts (122B-A10B): this engine keeps in RAM only the experts VRAM does not hold (its
+    // --expert-ram-layout option, design §11.3), so the prefix restores and vision windows lend frames whose
+    // experts have only their RAM shadows; the maximum configuration runs the default (full).
+    options.expert_ram_layout         = infernix::ExpertRamLayout::Exclusive;
     return options;
 }
 
 infernix::EngineOptions maximum_engine_options(const char* artifact) {
     infernix::EngineOptions options     = engine_options(artifact);
+    options.expert_ram_layout.reset();
     options.max_context               = 262144;
     options.kv_capacity               = infernix::KvCapacityPolicy::explicit_capacity(262144);
     options.speculative.backend       = infernix::SpeculativeBackend::Mtp;
@@ -272,13 +278,15 @@ int exercise_maximum_configuration(const char* artifact) {
         return 1;
     }
 
-    // Offloaded experts (122B-A10B): the text KV is elastic. Its first 32,768 tokens are backed at
-    // startup, so a 40,960-token prompt runs only if the pool grows from the expert frames; run twice
+    // Offloaded experts (122B-A10B): the text KV is elastic. Its first kElasticKvBaseTokens (4,096) tokens are
+    // backed at startup, so a 40,960-token prompt runs only if the pool grows from the expert frames; run twice
     // (the second after the first's pages were released), the greedy outputs must agree.
     if (const auto& cache = memory.expert_cache; cache && cache->kv_capacity_pages != 0) {
-        if (cache->kv_backed_pages != 512 || cache->kv_capacity_pages < 4096 || cache->kv_backed_bytes == 0) {
-            std::cerr << "122B elastic KV did not start at its 32,768-token base: " << cache->kv_backed_pages << " of "
-                      << cache->kv_capacity_pages << " pages backed\n";
+        constexpr std::uint32_t kBaseTokens = infernix::models::qwen3_5::detail::kElasticKvBaseTokens;
+        constexpr std::uint32_t kBasePages  = kBaseTokens / 64; // 64-token pages
+        if (cache->kv_backed_pages != kBasePages || cache->kv_capacity_pages < 4096 || cache->kv_backed_bytes == 0) {
+            std::cerr << "122B elastic KV did not start at its " << kBaseTokens << "-token base: " << cache->kv_backed_pages
+                      << " of " << cache->kv_capacity_pages << " pages backed\n";
             return 1;
         }
         const std::vector<infernix::TokenId> sentence = engine.tokenize_text(
@@ -304,9 +312,9 @@ int exercise_maximum_configuration(const char* artifact) {
         // OR-14). A short request on that row must neither fault (a read of an unmapped page past its
         // length) nor change its bits (a read of a stale mapped one) against the same request before
         // the pool grew.
-        if (between->kv_backed_pages != 512) {
+        if (between->kv_backed_pages != kBasePages) {
             std::cerr << "122B elastic KV: the long request's release left " << between->kv_backed_pages
-                      << " pages backed, not the base 512, so the post-shrink table check did not run\n";
+                      << " pages backed, not the base " << kBasePages << ", so the post-shrink table check did not run\n";
             return 1;
         }
         const std::vector<infernix::TokenId> short_after = short_run();
@@ -318,7 +326,7 @@ int exercise_maximum_configuration(const char* artifact) {
         const std::vector<infernix::TokenId> again = run();
         const auto final_cache                      = engine.memory_summary().expert_cache;
         std::cout << "elastic KV: " << between->kv_backed_pages << " pages backed after the first long request, "
-                  << final_cache->kv_backed_pages << " after the second (base 512, capacity "
+                  << final_cache->kv_backed_pages << " after the second (base " << kBasePages << ", capacity "
                   << final_cache->kv_capacity_pages << "); expert frames " << final_cache->frames << '\n';
         if (grown.size() != 4 || grown != again || final_cache->kv_backed_pages > final_cache->kv_capacity_pages) {
             std::cerr << "122B elastic KV: the long prompt's outputs differ between the grown pool and the regrown "

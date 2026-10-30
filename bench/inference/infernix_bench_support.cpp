@@ -477,9 +477,10 @@ std::string usage_text(std::string_view program) {
         << (infernix::kDefaultRamFreeBytes >> 20) << ")\n"
         << "  --expert-ram-mib <N|auto>   Qwen3.8-Flash-Next: Host RAM for the routed experts (default auto);\n"
         << "                              less than all of them need reads the rest from the artifact\n"
-        << "  --expert-ram-layout <L>     Qwen3.8-Flash-Next: exclusive (RAM holds only the experts VRAM does not)\n"
+        << "  --expert-ram-layout <L>     offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): exclusive\n"
+        << "                              (RAM holds only the experts VRAM does not)\n"
         << "                              or full (a RAM copy of every expert); default "
-        << infernix::expert_ram_layout_name(infernix::EngineOptions{}.expert_ram_layout) << "\n"
+        << infernix::kExpertRamLayoutDefaults << "\n"
         << "  --expert-pin-mib <N|auto>   Qwen3.8-Flash-Next: at most this much of the experts' RAM page-locked;\n"
         << "                              the rest stays in RAM for the CPU (default auto: what Windows allows)\n"
         << "  --vram-headroom-mib <N|auto> Qwen3.8-Flash-Next: VRAM the expert cache leaves free for the\n"
@@ -1084,7 +1085,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " expert_stripe=" << (env.expert_stripe_path.empty() ? "none" : env.expert_stripe_path)
         << " ram_free_mib=" << (env.ram_free_bytes >> 20)
         << " expert_ram_mib=" << mib_or_auto(env.expert_ram_bytes)
-        << " expert_ram_layout=" << infernix::expert_ram_layout_name(env.expert_ram_layout)
+        << " expert_ram_layout="
+        << (env.expert_ram_layout ? infernix::expert_ram_layout_name(*env.expert_ram_layout) : "default")
         << " expert_pin_mib=" << mib_or_auto(env.expert_pin_bytes)
         << " rope_yarn_factor=" << env.rope_yarn_factor
         << " kv_cache=" << kv_cache_name(env.kv_cache)
@@ -1243,7 +1245,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"ram_free_mib\": " << (env.ram_free_bytes >> 20) << ",\n"
         << "    \"expert_ram_mib\": "
         << (env.expert_ram_bytes ? std::to_string(*env.expert_ram_bytes >> 20) : "null") << ",\n"
-        << "    \"expert_ram_layout\": \"" << infernix::expert_ram_layout_name(env.expert_ram_layout) << "\",\n"
+        << "    \"expert_ram_layout\": \""
+        << (env.expert_ram_layout ? infernix::expert_ram_layout_name(*env.expert_ram_layout) : "default") << "\",\n"
         << "    \"expert_pin_mib\": "
         << (env.expert_pin_bytes ? std::to_string(*env.expert_pin_bytes >> 20) : "null") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"

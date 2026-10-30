@@ -1023,6 +1023,59 @@ That is the same class as Flash-Next's 69.3 / 73.3 GiB. The pinned total (~63.6 
 76 GiB ceiling, so no record is unpinned. With less RAM the SSD tier serves the rest from the
 artifact in place.
 
+### 11.3 Exclusive RAM layout (`--expert-ram-layout exclusive`, 2026-10-30)
+
+**Rule.** Flash-Next's layout (its design §19.3.7), in the shared engine (`ExpertOffload::plan_exclusive`,
+`memory_plan.h` `plan_exclusive_tier`). The Program sizes its frames after its fixed allocations, so the engine
+sizes the tier at start, once the frames are known; the banks load as the SSD tier's with the RAM ledger's share
+as its budget. The tier pins every expert the warm start leaves out of the frames, plus the shadows (RAM copies of
+VRAM experts, the tier's shadow floor):
+- the largest prefill loan: the stream's ring (2 × 256 + 1 records) and the widest pass workspace;
+- a sixteenth of the frames for the copies decode's swaps hold then (Flash-Next's measurement);
+- the elastic KV's growth (its reserved range less the startup pages).
+
+The warm start seeds half the frames, never those the shadows cover. Unlike Flash-Next there are no stream read
+slots, since the 122B runs no layer walk and its stream never lends them, and the reserve is not counted twice.
+A budget short of the slots, or banks of several record sizes, keeps the plain SSD tier. `full` stays the 122B's
+default (the owner asked for the option; its cost below); Flash-Next keeps `exclusive`.
+
+**Measured** (RTX 5090, i9-13900K, 96 GB; Ornith-1.5-122B-NVFP4, INT8 KV, MTP auto; `infernix_bench -pg
+"1280,256;32768,16" -r 3 --max-ctx 34816`; 4,993 frames, 0 SSD reads in every run). The decode split is pinned
+(`INFERNIX_TMP_LINK_SHARE` 85/256), because the measured rule picks 1/3 or 1/4 from a CPU rate that read up to
+15 % higher on the tier's copies than on the banks (below); A B C C B A:
+
+| Layout | Expert RAM | Decode after 1,280 tokens | Decode after 32,768 | Prefill 32K |
+|---|---:|---:|---:|---:|
+| full | 60.8 GiB | 107.69 tok/s | 99.38 | 6,987 |
+| exclusive, half the frames seeded | 56.9 | 107.82 (+0.1 %) | 98.36 (−1.0 %, both pairs) | 6,963 (−0.4 %) |
+| exclusive, every unshadowed frame seeded | 51.1 | 107.31 | 94.94 (−4.5 %) | 6,957 |
+
+The real tests pass in the exclusive layout: invariance (none, MTP), preemption (MTP) and the MoE test, whose
+262,144-token engine keeps the plain tier (its KV shadows exceed the budget) with every expert in VRAM or RAM.
+
+**The tier's CPU rate.** Right after the tier's fill the CPU team read 5,536-6,027 one-column experts/s against
+the banks' 9,515-10,770, so decode kept half its misses on the link: 76.5 against 100.9 tok/s (−24 %, before the
+fix). Flash-Next's Program had met the same slow memory after the fill (Dense8 9,377 against 18,942 experts/s 5 s
+later) and measures twice; the engine now does too (a 4 s pause, the better reading stands): 10,390-12,805. The
+fix also serves the plain SSD tier, which read the same low rate (§0.1's 4,887 experts/s).
+
+**Side streams at the greatest priority** (the staging fork, shared-expert and split streams, as Flash-Next's
+Program): full layout, A B B A, 101.24 against 101.04 tok/s after 1,280 tokens and 101.73 against 100.72 after
+32,768, every pair; flat (76.52 against 76.54) while the slow rate kept half the misses on the link. Kept.
+
+**Copy-engine staging of decode misses (rejected, probe only).** The SM-driven stage kernel reads a 5.06 MiB record
+at 23.1 GB/s (229.8 µs). A handoff in which the host sees the layer's plan, issues `cudaMemcpyAsync` and a kernel
+on the copy stream frees the waiting consumer took 249.2 µs for one record and 455.2 against 451.6 µs for two; with
+a promotion batch in flight (one H2D copy engine, FIFO) 629-2,195 µs against 390-724 µs for the SM path
+(`.local/redesign-2026-10-28/phase2/ce_handoff_probe.cu`). The copy engine's higher rate does not survive the
+handoff and the promotions' queue.
+
+**Open: the decode split.** The full layout at a pinned share, A B B A: 85/256 108.82 / 100.08 tok/s (after 1,280 /
+32,768 tokens), 64/256 112.18 (+3.1 %) / 95.10 (−5.0 %). The rule's divisor 3 (M / 3, floored) decoded 101.3-101.5
+after 1,280 tokens in the same session, so the share form (M × s >> 8, floored) is the finer split and its best
+value depends on the context. Not built: a split by context needs its own A/B over real contexts (the 32K figures
+are 16 tokens after the prompt).
+
 ---
 
 ## 12. Speculative decoding
