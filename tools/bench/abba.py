@@ -13,6 +13,11 @@ and/or arguments (--fast-path, options); the bench binary may differ per arm too
   expected switch values (a positive control that the arm really ran), the PCIe link probe must read
   at least --min-link-gbs, the CPU expert team rate must lie within --cpu-rate-tolerance of the run's
   median, and the configured fast paths and n-gram residency must match the arm;
+* guards the PCIe link *width*, which is a different question from the probe rate: a card sitting in
+  an x8 slot instead of an x16 one (or a link that trained down mid-run) changes what the arms are
+  measuring, and a bandwidth probe alone cannot tell the two apart. The discarded warm-up's report
+  must show `--expect-width` (the run refuses to start otherwise), and every sample's own probe must
+  match it -- or, with no explicit width, match the width the run's other reports show;
 * varies the prompt per block when the arm file lists corpus offsets (a repeated prompt flatters a
   warm expert cache);
 * reports, per metric and arm against the control: pairs where the arm was better, the median paired
@@ -29,6 +34,7 @@ Arm file (JSON):
       "corpus_offsets": [0, 40000, 80000],         # optional: --corpus-offset per block, rotating
       "metrics": [{"name": "decode_output_tok_s", "higher_is_better": true},
                   {"name": "prefill_tok_s", "higher_is_better": true}],
+      "expect_width": 16,                          # optional: refuse to start at another link width
       "test": "pg1280,256",                        # optional: the test label to read (default: first)
       "control": "base",
       "arms": [
@@ -45,7 +51,10 @@ frozen expert cache, and the metrics "replay_ms_per_round" (device time less CPU
 round), "replay_device_ms", "replay_wait_ms" and "replay_less_waits_ms" (all lower is better) are read
 from each process's log; use them for exact sub-1 % items.
 
-Usage: abba.py ARMS.json --out DIR [--blocks 6] [--timeout 1800]
+Several runs of the same arm file, kept in separate --out directories, are compared afterwards with
+`join_reports.py`, which joins stored reports across link widths and builds.
+
+Usage: abba.py ARMS.json --out DIR [--blocks 6] [--timeout 1800] [--expect-width 16]
 Writes DIR/report.md and DIR/summary.json, and keeps every process's JSON report and logs.
 """
 
@@ -70,6 +79,58 @@ CPU_RATE_RE = re.compile(r"CPU expert team: (\d+) workers[^,]*, ([0-9.]+) expert
 # INFERNIX_TMP_REPLAY_BENCH's release line (models/qwen4_exp/program/program_impl.h release()).
 REPLAY_RE = re.compile(r"replay bench: (\d+) rounds, ([0-9.]+) ms device time, ([0-9.]+) ms CPU waits, "
                        r"(-?[0-9.]+) ms less waits \((-?[0-9.]+) ms a round\)")
+
+
+@dataclass(frozen=True)
+class Link:
+    """The PCIe link an `infernix_bench` report's probe recorded, taken right after its measured runs
+    (an idle GPU drops its link generation, so the bench probes while the device is still loaded)."""
+
+    generation: int | None = None
+    width: int | None = None
+    max_generation: int | None = None
+    max_width: int | None = None
+
+    def __str__(self) -> str:
+        gen = f"gen{self.generation}" if self.generation else "gen?"
+        width = f"x{self.width}" if self.width else "x?"
+        return f"{gen} {width}"
+
+    @property
+    def order(self) -> tuple[int, int]:
+        """Narrowest and slowest first, so a ratio reads as the better link over the worse one."""
+        return (self.width or 0, self.generation or 0)
+
+    @property
+    def full(self) -> str:
+        """The reading beside the device's own maximum: `gen5 x8 of gen5 x16`."""
+        if self.max_width is None and self.max_generation is None:
+            return str(self)
+        return f"{self} of gen{self.max_generation or '?'} x{self.max_width or '?'}"
+
+
+def link_of(report: dict[str, Any] | None) -> Link:
+    """A report's machine probe. `infernix_bench` writes an unmeasured 0 as null, so None is honest."""
+    machine = (report or {}).get("machine") or {}
+
+    def number(name: str) -> int | None:
+        value = machine.get(name)
+        return int(value) if isinstance(value, (int, float)) and value else None
+
+    return Link(number("pcie_generation"), number("pcie_width"),
+                number("pcie_max_generation"), number("pcie_max_width"))
+
+
+def link_problem(link: Link, expect_width: int | None) -> str | None:
+    """What this link fails to show about a run meant to run at `expect_width`, or None."""
+    if expect_width is None:
+        return None
+    if link.width is None:
+        return (f"no PCIe link width in the report, so it cannot be checked against x{expect_width} "
+                "(the probe needs a device the bench can query)")
+    if link.width != expect_width:
+        return f"link width {link} (expected x{expect_width})"
+    return None
 
 
 @dataclass
@@ -185,7 +246,8 @@ def parse_switches(record: str) -> dict[str, str]:
     return out
 
 
-def check_sample(sample: Sample, arm: Arm, min_link_gbs: float) -> None:
+def check_sample(sample: Sample, arm: Arm, min_link_gbs: float,
+                 expect_width: int | None = None) -> None:
     if sample.returncode != 0 or sample.report is None:
         sample.problems.append(f"exit {sample.returncode} or no report")
         return
@@ -206,6 +268,35 @@ def check_sample(sample: Sample, arm: Arm, min_link_gbs: float) -> None:
     link = LINK_RE.findall(sample.log_text)
     if link and float(link[-1]) < min_link_gbs:
         sample.problems.append(f"link probe {link[-1]} GB/s below {min_link_gbs}")
+    problem = link_problem(link_of(sample.report), expect_width)
+    if problem:
+        sample.problems.append(problem)
+
+
+def apply_link_guard(samples: list[Sample], expect_width: int | None) -> dict[str, Any]:
+    """Exclude the samples whose report shows another PCIe link width than the run's, and describe the
+    link the run was made on.
+
+    Without an expectation the run's width is the one its reports mostly record (the first seen wins a
+    tie) and every disagreeing sample is excluded here. Under --expect-width the expectation is the
+    authority and check_sample has already marked each mismatched sample, so nothing new is excluded
+    here and the run's majority width must not outrank it; the evidence is still collected for the
+    report.
+    """
+    pairs = [(s, link_of(s.report)) for s in samples]
+    widths = [link.width for _, link in pairs if link.width is not None]
+    run_width = expect_width if expect_width is not None else (
+        statistics.mode(widths) if widths else None)
+    run_link = next((link for _, link in pairs if link.width == run_width), None)
+    if expect_width is None and run_width is not None:
+        for sample, link in pairs:
+            if link.width is not None and link.width != run_width:
+                sample.problems.append(
+                    f"link width x{link.width} differs from this run's x{run_width} "
+                    "(the card moved, or the link retrained, mid-run)")
+    return {"run": str(run_link) if run_link else None, "width": run_width, "expected": expect_width,
+            "widths": sorted(set(widths)),
+            "without_probe": sum(1 for s, link in pairs if s.report is not None and link.width is None)}
 
 
 def cpu_rate(sample: Sample) -> float | None:
@@ -276,7 +367,8 @@ def run_sample(arm: Arm, config: dict[str, Any], out: Path, tag: str, extra: lis
 
 
 def analyse(samples: list[Sample], arms: dict[str, Arm], control: str, metrics: list[dict[str, Any]],
-            test: str | None, cpu_tolerance: float) -> dict[str, Any]:
+            test: str | None, cpu_tolerance: float, expect_width: int | None = None) -> dict[str, Any]:
+    link = apply_link_guard(samples, expect_width)
     rates = [r for r in (cpu_rate(s) for s in samples) if r]
     if rates:
         median_rate = statistics.median(rates)
@@ -288,7 +380,7 @@ def analyse(samples: list[Sample], arms: dict[str, Arm], control: str, metrics: 
     by_block: dict[int, dict[str, Sample]] = {}
     for s in valid:
         by_block.setdefault(s.block, {})[s.arm] = s
-    results: dict[str, Any] = {"metrics": {}, "excluded": [
+    results: dict[str, Any] = {"link": link, "metrics": {}, "excluded": [
         {"arm": s.arm, "block": s.block, "problems": s.problems} for s in samples if s.problems]}
     for metric in metrics:
         name = metric["name"]
@@ -348,6 +440,21 @@ def write_report(out: Path, results: dict[str, Any], config: dict[str, Any], noi
                  alpha: float) -> None:
     lines = ["# ABBA report", "", f"Control: `{config['control']}`. Samples are fresh processes; "
              "ratios are arm / control per block.", ""]
+    link = results.get("link") or {}
+    if link:
+        if link.get("run"):
+            note = f"PCIe link: `{link['run']}`"
+            if link.get("expected") is not None:
+                note += f", guarded at x{link['expected']}"
+        elif link.get("width"):
+            note = f"PCIe link: no report probed the guarded x{link['width']}"
+        else:
+            note = "PCIe link: no report carried a width probe"
+        if len(link.get("widths", [])) > 1:
+            note += " — its reports disagreed on width: " + ", ".join(f"x{w}" for w in link["widths"])
+        if link.get("without_probe"):
+            note += f"; {link['without_probe']} report(s) carried no probe"
+        lines += [note, ""]
     noisy = False
     for name, metric in results["metrics"].items():
         higher = metric["higher_is_better"]
@@ -385,7 +492,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--blocks", type=int, default=6)
     parser.add_argument("--timeout", type=float, default=1800.0, help="seconds per process")
-    parser.add_argument("--min-link-gbs", type=float, default=20.0)
+    parser.add_argument("--min-link-gbs", type=float, default=20.0,
+                        help="the measured host-to-device rate every process must at least reach")
+    parser.add_argument("--expect-width", type=int, default=None, metavar="N",
+                        help="refuse to start, and drop any sample whose report shows another width, "
+                             "unless every report's PCIe probe reads xN (8, 16, ...)")
     parser.add_argument("--cpu-rate-tolerance", type=float, default=0.15)
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--no-noise-arm", action="store_true")
@@ -397,6 +508,7 @@ def main(argv: list[str] | None = None) -> int:
     control = config["control"]
     if control not in arms:
         raise SystemExit(f"control arm {control!r} is not in the arm file")
+    expect_width = args.expect_width if args.expect_width is not None else config.get("expect_width")
     noise = None
     if not args.no_noise_arm:
         noise = control + "-again"
@@ -407,7 +519,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.no_warmup:
         print("warm-up process (discarded)", flush=True)
-        run_sample(arms[control], config, args.out, "warmup", [], args.timeout)
+        warm = run_sample(arms[control], config, args.out, "warmup", [], args.timeout)
+        warm_link = link_of(warm.report)
+        print(f"link probe in the warm-up report: {warm_link.full}", flush=True)
+        problem = link_problem(warm_link, expect_width)
+        if problem:
+            print(f"abba.py: refusing to start: {problem}", file=sys.stderr, flush=True)
+            return 4
 
     samples: list[Sample] = []
     for block, order in enumerate(schedule(list(arms), args.blocks)):
@@ -416,13 +534,13 @@ def main(argv: list[str] | None = None) -> int:
             tag = f"b{block:02d}-{position}-{name}"
             sample = run_sample(arms[name], config, args.out, tag, extra, args.timeout)
             sample.block, sample.order = block, position
-            check_sample(sample, arms[name], args.min_link_gbs)
+            check_sample(sample, arms[name], args.min_link_gbs, expect_width)
             samples.append(sample)
             status = "ok" if not sample.problems else "; ".join(sample.problems)
             print(f"block {block} {name}: {sample.seconds:.0f} s, {status}", flush=True)
 
     results = analyse(samples, arms, control, config.get("metrics", [{"name": "decode_output_tok_s"}]),
-                      config.get("test"), args.cpu_rate_tolerance)
+                      config.get("test"), args.cpu_rate_tolerance, expect_width)
     write_report(args.out, results, config, noise, args.alpha)
     print((args.out / "report.md").read_text(encoding="utf-8"))
     return 0
