@@ -43,6 +43,13 @@ int expect_ptr(void* actual, void* expected, const char* label) {
     return 1;
 }
 
+int expect_no_last_error(const char* label) {
+    const cudaError_t err = cudaGetLastError();
+    if (err == cudaSuccess) { return 0; }
+    std::cerr << label << " left the runtime's last error set: " << cudaGetErrorString(err) << '\n';
+    return 1;
+}
+
 } // namespace
 
 int main() {
@@ -204,6 +211,20 @@ int main() {
     }
     failures += expect_size(pinned.size(), 128, "pinned.size");
     std::memset(pinned.data(), 0x5a, pinned.size());
+
+    // A failed allocation is reported once, by its exception: the runtime's last error is consumed,
+    // so the next launch's error check does not abort a process that recovered from it (closed PR #46:
+    // a prefill workspace that did not fit, then the next request's launch).
+    constexpr std::size_t kImpossible = std::size_t{1} << 50;
+    failures += expect_throws<std::runtime_error>([] { infernix::DeviceBuffer huge(kImpossible); },
+                                                  "impossible device buffer");
+    failures += expect_no_last_error("a failed device buffer");
+    failures += expect_throws<std::runtime_error>([] { infernix::DeviceArena huge(kImpossible); },
+                                                  "impossible device arena");
+    failures += expect_no_last_error("a failed device arena");
+    failures += expect_throws<std::runtime_error>([] { infernix::PinnedHostBuffer huge(kImpossible); },
+                                                  "impossible pinned buffer");
+    failures += expect_no_last_error("a failed pinned buffer");
 
     return failures == 0 ? 0 : fail("arena test failed");
 }
