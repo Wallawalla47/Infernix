@@ -14,6 +14,8 @@
 #include "ops/softmax_attention/dense/causal_cache/vq2/operands.h"
 #include "ops/softmax_attention/dense/causal_cache/vq2/tile_io.cuh"
 
+#include <algorithm>
+
 namespace infernix::ops::detail {
 
 // Grouped attention over a vector-quantized cache for rows of up to eight columns (eight warps),
@@ -33,7 +35,7 @@ namespace infernix::ops::detail {
 //     compact code rows stream double-buffered and each tile is expanded once into the INT8 tile
 //     (the row scale repeated as each group scale). They keep the pairs a column reads from codes.
 // Every (key, column) pair is kept by exactly one CTA, and every CTA publishes a partial (an empty
-// one the neutral state) so the merge reads all window_splits + capacity splits. QK spreads the
+// one the neutral state) so the merge reads every split of the grid. QK spreads the
 // tile's 8-key column blocks, times the row tiles, over up to all the warps, which exchange row
 // maxima through shared memory; PV splits the dimensions over all the warps.
 template <KVCacheVqKeyCodec KeyCodec, int KeyRows>
@@ -89,6 +91,19 @@ inline constexpr std::uint32_t vq_kv_grouped_smem_bytes() {
 template <class G>
 inline constexpr int kVqParallelTile    = 2 * kCausalGroupedTokens<G>;
 inline constexpr int kVqMaxWindowSplits = 8;
+// The most window tiles one CTA reads, and so the most window CTAs a row takes: its sink tiles and the
+// tiles from its first column's recent window to its last key, at the smallest key tile (32) and the
+// widest CTA (16 columns).
+inline constexpr int kVqMaxWindowTiles =
+    kKVWindowSinkTokens / 32 + (kKVWindowRecentTokens + 16 + 31) / 32 + 1;
+
+// The grid's splits for rows of at most `visible` keys: room for every row's window CTAs (at most its
+// window tiles) and code CTAs (at most `capacity`) within its budget `row_splits`, and never fewer
+// than the plan's window_splits + capacity.
+inline int vq_grid_splits(int window_splits, int row_splits, int capacity, int visible) {
+    const int window_tiles = std::min(kVqMaxWindowTiles, (visible + 31) / 32);
+    return std::max(window_splits + capacity, std::min(row_splits, window_tiles + capacity));
+}
 
 // Warps of a grouped CTA of TokenTile columns: sixteen above 64 query rows.
 template <class G, int TokenTile>
@@ -109,8 +124,9 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
     __global__
     void vq_kv_grouped_kernel(const __nv_bfloat16* q, const std::int32_t* pos, VqKvCacheView cache,
                               std::int32_t full_width, std::int32_t logical_capacity,
-                              CausalKvPartition partition, std::int32_t window_splits, float scale,
-                              float* partial_acc, float* partial_m, float* partial_l) {
+                              CausalKvPartition partition, std::int32_t window_splits,
+                              std::int32_t row_splits, float scale, float* partial_acc,
+                              float* partial_m, float* partial_l) {
     using Shape                 = VqKvGroupedShape<KeyCodec, KeyRows>;
     constexpr int Wc            = kVqGroupedWarps<Geometry, TokenTile>;
     constexpr int RowCount      = TokenTile * Geometry::GroupSize;
@@ -257,14 +273,16 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
         code_tiles      = div_up(code_hi, Bc) - code_first_tile;
     }
     // Roles follow this row's tiles. The code tiles take the partition's split count; the window
-    // tiles, read serially from the exact window, take every split the codes leave, one tile each
-    // at most, and never fewer than the plan's window_splits. A long row therefore keeps the plan's
-    // roles, while a short one, whose code splits would sit empty, spreads its 25 window tiles
-    // over as many CTAs (k4v2, 24/4 heads: 8 window CTAs take 36 us at 1.3K keys, one 120 us).
-    const int splits       = static_cast<int>(gridDim.y);
+    // tiles, read serially from the exact window, take every split the codes leave of the row's
+    // budget, one tile each at most, and never fewer than the plan's window_splits. A long row
+    // therefore keeps the plan's roles, while a short one, whose code splits would sit empty,
+    // spreads its 25 window tiles over as many CTAs (k4v2, 24/4 heads: 8 window CTAs take 36 us at
+    // 1.3K keys, one 120 us). The budget is the plan's row_splits, never the grid: the grid follows
+    // the envelope (the batch's longest row, the graph profile's bucket), and a row's tile grouping,
+    // so its FP32 sums, must not (the reproducible route's row invariance).
     const int code_want    = code_tiles > 0 ? partition.active(code_hi) : 0;
-    const int window_cnt   = min(window_tiles, max(window_splits, splits - code_want));
-    const int code_cnt     = min(code_want, splits - window_cnt);
+    const int window_cnt   = min(window_tiles, max(window_splits, row_splits - code_want));
+    const int code_cnt     = min(code_want, row_splits - window_cnt);
     const bool window_role = split < window_cnt;
     if (window_role) {
         // The lowest splits take the tiles: a row shorter than the split count merges only its

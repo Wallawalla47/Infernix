@@ -23,6 +23,13 @@ namespace infernix::ops::detail {
 struct VqKvCausalPlan {
     Int8KvCausalPlan plan;
     int window_splits = 0;
+    // A row's split budget (window_splits + plan.partition.target): its window and code CTAs share it
+    // (vq_kv_grouped_kernel). Under the row-invariant partition it does not depend on the envelope or
+    // the other rows, so neither does a row's tile grouping.
+    int row_splits = 0;
+    // The grid's splits, and so the partials and the merge: enough for every row's budget in this
+    // envelope (window_splits + capacity, or the row budget up to its window tiles plus capacity).
+    int splits = 0;
     int parallel_tile = 8; // kCausalGroupedTokens or kVqParallelTile of the geometry
     // The prompt route's split plan and its FP32 partials must use the workspace bound the
     // planning call was given (CausalAttentionExecutionEnvelope::prompt_split_workspace_bytes),
@@ -63,8 +70,8 @@ inline constexpr int kVqGroupedKeyRows =
 
 template <class G, KVCacheVqKeyCodec Codec, int Tokens, bool MultiBatch, bool Masked, bool Parallel>
 void grouped(const CausalAttentionOperands& p, const VqKvCacheView& cache,
-             CausalKvPartition partition, int window_splits, CausalPartialView partial,
-             cudaStream_t stream) {
+             CausalKvPartition partition, int window_splits, int row_splits, int splits,
+             CausalPartialView partial, cudaStream_t stream) {
     using Shape            = VqKvGroupedShape<Codec, kVqGroupedKeyRows<G, Tokens, Codec>>;
     constexpr int kThreads = kVqGroupedWarps<G, Tokens> * 32;
     validate_vq_causal_operands<G>(p, cache);
@@ -76,7 +83,9 @@ void grouped(const CausalAttentionOperands& p, const VqKvCacheView& cache,
         !partial.maximum || !partial.sum)
         throw std::invalid_argument("VQ grouped attention: invalid schedule/partials");
     if (window_splits < 1 || window_splits > kVqMaxWindowSplits ||
-        window_splits + partition.capacity > CausalKvPartition::kMaxSplits)
+        row_splits != window_splits + partition.target ||
+        splits != vq_grid_splits(window_splits, row_splits, partition.capacity, p.visible_capacity) ||
+        splits > CausalKvPartition::kMaxSplits)
         throw std::invalid_argument("VQ grouped attention: invalid split count");
     // Verification trees arrive only on masked rows of three or more columns.
     constexpr bool TreeCapable = Masked && Tokens >= 3;
@@ -89,11 +98,10 @@ void grouped(const CausalAttentionOperands& p, const VqKvCacheView& cache,
         static const auto status = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::kArenaBytes);
         CUDA_CHECK(status);
-        const dim3 grid(G::KVHeads * (Parallel ? div_up(p.width, Tokens) : 1),
-                        window_splits + partition.capacity, p.batch);
+        const dim3 grid(G::KVHeads * (Parallel ? div_up(p.width, Tokens) : 1), splits, p.batch);
         CUDA_CHECK(pdl::launch_consumer({grid, dim3(kThreads), Shape::kArenaBytes, stream}, kernel,
                                         p.q, p.positions, cache, p.width, p.visible_capacity,
-                                        partition, window_splits, p.scale, partial.acc,
+                                        partition, window_splits, row_splits, p.scale, partial.acc,
                                         partial.maximum, partial.sum));
     };
     if constexpr (TreeCapable) {
@@ -106,31 +114,29 @@ void grouped(const CausalAttentionOperands& p, const VqKvCacheView& cache,
         launch.template operator()<false>();
     }
     launch_causal_natural_merge<G, VqMergeSchedule, MultiBatch, Masked, true>(
-        p, cache.valid_columns, vq_merge_partition(window_splits + partition.capacity), partial,
-        stream);
+        p, cache.valid_columns, vq_merge_partition(splits), partial, stream);
 }
 
 template <class G, KVCacheVqKeyCodec Codec>
 void grouped_routes(const CausalAttentionOperands& p, const VqKvCacheView& cache,
                     const VqKvCausalPlan& vq, CausalPartialView partial, cudaStream_t stream) {
     const CausalKvPartition partition = vq.plan.partition;
-    const int window_splits           = vq.window_splits;
     const auto batch = [&]<int Tokens, bool Parallel>() {
         const bool masked = cache.valid_columns != nullptr;
+        const auto run    = [&]<bool MultiBatch, bool Masked>() {
+            grouped<G, Codec, Tokens, MultiBatch, Masked, Parallel>(
+                p, cache, partition, vq.window_splits, vq.row_splits, vq.splits, partial, stream);
+        };
         if (p.batch == 1) {
             if (masked)
-                grouped<G, Codec, Tokens, false, true, Parallel>(p, cache, partition, window_splits,
-                                                                 partial, stream);
+                run.template operator()<false, true>();
             else
-                grouped<G, Codec, Tokens, false, false, Parallel>(p, cache, partition,
-                                                                  window_splits, partial, stream);
+                run.template operator()<false, false>();
         } else {
             if (masked)
-                grouped<G, Codec, Tokens, true, true, Parallel>(p, cache, partition, window_splits,
-                                                                partial, stream);
+                run.template operator()<true, true>();
             else
-                grouped<G, Codec, Tokens, true, false, Parallel>(p, cache, partition, window_splits,
-                                                                 partial, stream);
+                run.template operator()<true, false>();
         }
     };
     if (vq.plan.family == Int8KvFamily::ParallelGrouped) {

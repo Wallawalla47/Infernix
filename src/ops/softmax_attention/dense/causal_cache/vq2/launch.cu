@@ -51,6 +51,11 @@ VqKvCausalPlan make_vq_kv_causal_plan(int heads, int width, int batch,
         std::clamp(ctas - out.window_splits, 1, CausalKvPartition::kMaxSplits - out.window_splits);
     if (partition.balance_shift != 0) partition.balance_limit = partition.target << 8;
     partition.capacity = partition.bound(envelope.max_visible_keys);
+    // Every row's budget is the whole CTA share (the window and code splits), which a short row's
+    // window tiles take where its codes leave splits; the grid follows the envelope so it holds them.
+    out.row_splits = out.window_splits + partition.target;
+    out.splits     = vq_grid_splits(out.window_splits, out.row_splits, partition.capacity,
+                                    static_cast<int>(envelope.max_visible_keys));
     return out;
 }
 
@@ -64,9 +69,8 @@ void attention(const CausalAttentionOperands& p, const VqKvCacheView& cache,
         return;
     }
     auto scope         = workspace.scope();
-    const auto partial = allocate_causal_partials(workspace, plan.query_heads, plan.width,
-                                                  vq.window_splits + plan.partition.capacity,
-                                                  plan.batch);
+    const auto partial =
+        allocate_causal_partials(workspace, plan.query_heads, plan.width, vq.splits, plan.batch);
     vq_grouped_attention<Codec>(p, cache, vq, partial.view(), stream);
 }
 
@@ -128,8 +132,7 @@ std::size_t vq_kv_workspace_bytes(int heads, int kv_heads, int batch, int min_wi
         const auto vq = make_vq_kv_causal_plan(heads, width, batch, envelope);
         if (vq.plan.family == Int8KvFamily::Tiled) continue;
         WorkspaceLayoutBuilder layout;
-        (void)allocate_causal_partials(layout, heads, width,
-                                       vq.window_splits + vq.plan.partition.capacity, batch);
+        (void)allocate_causal_partials(layout, heads, width, vq.splits, batch);
         maximum = std::max(maximum, layout.peak_bytes(1));
     }
     if (batch == 1 && max_width > kGroupedMaxWidth) {
