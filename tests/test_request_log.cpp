@@ -990,8 +990,10 @@ int main() {
     }
 
     const auto limit_note = render_output_limit_note(262144, 8192);
-    failures += check(limit_note && limit_note->message.find(
-                                        "8,192 tokens of its 262,144 context") != std::string::npos,
+    failures += check(limit_note && limit_note->message ==
+                                        "output limit | a request that sets no output limit stops "
+                                        "after 8,192 tokens (--default-max-tokens), though its "
+                                        "context allows 262,144",
                       "no output-limit note at 32 times the default limit");
     failures +=
         check(render_output_limit_note(32768, 8192) && !render_output_limit_note(32767, 8192),

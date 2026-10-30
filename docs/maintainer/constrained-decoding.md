@@ -198,8 +198,8 @@ Each Frontend holds a compiler/cache bound to its vocabulary. A CompiledGrammar 
 OutputSession holds a shared reference.
 
 The constraint vocabulary index and compiler initialize thread-safely, once per Frontend. The Engine
-builds them on a startup thread beside model loading's end (`Frontend::warm_constraints`, logged as
-`constraint vocabulary index built in N s`), so the first constrained request no longer pays them in
+builds them on a startup thread beside model loading's end (`Frontend::warm_constraints`, logged at
+debug as `constraint vocabulary index built in N s`), so the first constrained request no longer pays them in
 its prepare; one that arrives while the build runs waits for it, as it would have built it itself
 (measured before the warm-up: `prepare` 0.85 s for the first constrained request against 0.00 s for
 every unconstrained one, the index and that tool set's grammar together). A tool set's grammar

@@ -489,6 +489,8 @@ enum class StartupPhase : std::uint8_t {
     ArtifactInspect,
     TargetPlan,
     WeightsMaterialize,
+    // A companion drafter's weights (--draft-model), read after the model's own.
+    DraftWeightsMaterialize,
     WeightsStagingPin,
     TargetFinalize,
     FrontendInitialize,

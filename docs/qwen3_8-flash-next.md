@@ -519,14 +519,15 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   27.1 GiB) would leave too little for the other programs, and recipes A and B (64.5 + 48.8 GiB) do
   not fit.
 
-The startup line names the choice: `n-gram table: in RAM (N MiB, locked for the CPU)`, or `n-gram table:
+The startup `RAM plan:` line names the choice (`n-gram table N GiB` in RAM, or `n-gram table read from its
+volume`); `--log-level debug` adds `n-gram table: in RAM (N MiB, locked for the CPU)`, or `n-gram table:
 read from its volume`, which `auto` follows with `(the RAM ledger keeps the experts resident first)`.
 If Windows will not lock the table, a warning says so: it still serves rows, but under memory
 pressure part of it may be paged out.
 The rows are the same bytes either way, so outputs do not change.
 
 A table read from its volume is timed at startup with a few hundred random 4 KiB reads, one at a
-time (about a second at most), and logged as `n-gram volume read probe: N reads/s`. Below 15,000
+time (about a second at most), and logged at debug as `n-gram volume read probe: N reads/s`. Below 15,000
 reads per second (healthy drives measured 17,000 to 80,000 here and 230,000 on a Samsung 9100 PRO;
 DRAM-less SSDs 300 to 5,700 in other users' logs) the line becomes a warning: a long prompt can spend
 minutes reading n-gram rows, and `--ngram-residency ram` (when the experts fit beside the table) or a

@@ -19,7 +19,9 @@
 #include <cstdint>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 namespace infernix::product {
 namespace {
@@ -31,8 +33,11 @@ constexpr std::size_t kStartupPhaseCount =
 constexpr auto kInteractiveRefresh = std::chrono::milliseconds(200);
 constexpr auto kPersistentRefresh  = std::chrono::seconds(10);
 
+// Info phases are persistent milestones. A Transient phase shows only as the terminal's transient
+// line while it runs; its persistent records, like a Debug phase's, are engine detail.
 enum class PhaseVisibility : std::uint8_t {
     Info,
+    Transient,
     Debug,
 };
 
@@ -56,6 +61,9 @@ PhasePresentation phase_presentation(StartupPhase phase) noexcept {
         return {"planning runtime", "runtime planned", PhaseVisibility::Debug, false, false};
     case StartupPhase::WeightsMaterialize:
         return {"loading weights", "weights ready", PhaseVisibility::Info, true, true};
+    case StartupPhase::DraftWeightsMaterialize:
+        return {"loading drafter weights", "drafter weights ready", PhaseVisibility::Info, true,
+                true};
     case StartupPhase::WeightsStagingPin:
         return {"pinning staging buffers", "staging buffers pinned", PhaseVisibility::Debug, false,
                 false};
@@ -67,9 +75,11 @@ PhasePresentation phase_presentation(StartupPhase phase) noexcept {
         return {"initializing runtime", "runtime initialized", PhaseVisibility::Debug, false,
                 false};
     case StartupPhase::HostContextPin:
-        return {"pinning host context", "host context pinned", PhaseVisibility::Info, true, false};
+        return {"pinning host context", "host context pinned", PhaseVisibility::Transient, true,
+                false};
     case StartupPhase::CudaGraphPrepare:
-        return {"preparing CUDA graphs", "CUDA graphs ready", PhaseVisibility::Info, false, false};
+        return {"preparing CUDA graphs", "CUDA graphs ready", PhaseVisibility::Transient, false,
+                false};
     case StartupPhase::PrefixCacheLoad:
         // "read", not "loaded": a file damaged part way through still completes the phase, and
         // the engine-ready summary reports whether the tier was restored.
@@ -230,7 +240,8 @@ struct StartupLogRenderer::Impl {
                 logger->debug("{}", begin_line(presentation, event));
             } else if (progress->enabled()) {
                 progress->update("  " + begin_line(presentation, event));
-            } else if (presentation.potentially_long) {
+            } else if (presentation.potentially_long &&
+                       presentation.visibility == PhaseVisibility::Info) {
                 logger->info("{}", begin_line(presentation, event));
             } else {
                 logger->debug("{}", begin_line(presentation, event));
@@ -251,6 +262,7 @@ struct StartupLogRenderer::Impl {
             }
             if (now - state.last_persistent < kPersistentRefresh) { return; }
             state.last_persistent = now;
+            if (presentation.visibility != PhaseVisibility::Info) { return; }
             if (event.progress_unit == StartupProgressUnit::Bytes && event.total != 0) {
                 logger->info("{}", progress_line_candidate(presentation, event, state,
                                                            static_cast<double>(event.current) /
@@ -306,17 +318,18 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
     const double total_seconds = impl_->engine_elapsed_ns != 0
                                      ? static_cast<double>(impl_->engine_elapsed_ns) * 1.0e-9
                                      : load.load_seconds;
-    impl_->logger->info("engine ready | {} | total {} | weights {} | CUDA sync {}",
+    impl_->logger->info("engine ready | {} | total {} | GPU weights {}",
                         format_pretty_text(load.model_name), format_pretty_duration(total_seconds),
-                        format_pretty_bytes(load.host_to_device_bytes), load.cuda_sync_mode);
+                        format_pretty_bytes(load.host_to_device_bytes));
     impl_->logger->debug(
         "load detail | architecture {} | artifact read {} | H2D {} | staging peak {} | device "
-        "objects {} | host objects {}",
+        "objects {} | host objects {} | CUDA sync {}",
         format_pretty_text(load.architecture), format_pretty_bytes(load.artifact_bytes_read),
         format_pretty_bytes(load.host_to_device_bytes),
         format_pretty_bytes(load.peak_staging_bytes), format_pretty_count(load.device_object_count),
-        format_pretty_count(load.host_object_count));
-    // The fast paths that run, and the configuration they are qualified for.
+        format_pretty_count(load.host_object_count), load.cuda_sync_mode);
+    // Whether fast paths run and what that means for a request's output; the paths themselves and
+    // the configuration they are qualified for are engine detail.
     if (!load.fast_path_configuration.empty()) {
         std::string paths;
         for (const std::string& path : load.fast_paths) {
@@ -330,15 +343,32 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
                                    std::to_string(load.prefill_chunk) + " fits)";
             }
         }
-        if (paths.empty()) {
-            paths = load.fast_paths_disabled ? "disabled (exact route)" : "none qualified";
-        }
-        paths += load.request_invariant ? " | request-invariant" : " | request-coupled";
-        impl_->logger->info("fast paths | {} | {}", paths, load.fast_path_configuration);
+        const std::string state =
+            !load.fast_paths.empty() ? "on (" + std::to_string(load.fast_paths.size()) + ")"
+            : load.fast_paths_disabled ? std::string("off")
+                                       : std::string("none qualified for this configuration");
+        impl_->logger->info("fast paths | {} | {}", state,
+                            load.request_invariant
+                                ? "request-invariant: a request's output never depends on other "
+                                  "requests"
+                                : "a request's output can depend on the requests running beside it");
+        impl_->logger->debug("fast paths | {} | qualified for {}", paths.empty() ? "none" : paths,
+                             load.fast_path_configuration);
     }
-    // The temporary A/B switches, so an arm can be checked from its log.
+    // The temporary A/B switches: the ones set, so an arm can be checked from its log; every
+    // switch's value with --log-level debug.
     if (!load.temporary_switches.empty()) {
-        impl_->logger->info("temporary switches | {}", load.temporary_switches);
+        std::string set;
+        for (std::size_t begin = 0; begin < load.temporary_switches.size();) {
+            const std::size_t end = std::min(load.temporary_switches.find(" | ", begin),
+                                             load.temporary_switches.size());
+            const std::string_view item =
+                std::string_view(load.temporary_switches).substr(begin, end - begin);
+            if (!item.ends_with("=unset")) { set += (set.empty() ? "" : " | ") + std::string(item); }
+            begin = end + 3;
+        }
+        if (!set.empty()) { impl_->logger->info("temporary switches | {}", set); }
+        impl_->logger->debug("temporary switches | {}", load.temporary_switches);
     }
     // Projections whose format and shape have no column-invariant route: decode and verification
     // stay request-invariant by running each once per column, which is much slower. Such an
@@ -388,27 +418,33 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
 
 void StartupLogRenderer::chat_template_roles(infernix::ChatTemplateRoleSupport roles,
                                              std::string_view active_override_path) {
-    std::string lowered;
-    if (roles.lowers_late_system()) { lowered += "a system message after the first"; }
+    std::vector<std::string> lowered;
+    if (roles.lowers_late_system()) {
+        lowered.emplace_back("a system message after the first (sent as a user message)");
+    }
     if (!roles.late_developer) {
-        if (!lowered.empty()) { lowered += ", "; }
-        lowered += "a developer message after the first";
+        lowered.emplace_back("a developer message after the first (sent as a user message)");
     }
     if (!roles.leading_developer) {
-        if (!lowered.empty()) { lowered += ", "; }
-        lowered += "a leading developer message";
+        lowered.emplace_back(roles.leading_system
+                                 ? "a leading developer message (sent as a system message)"
+                                 : "a leading developer message (sent as a user message)");
     }
     if (lowered.empty()) { return; }
+    std::string listed;
+    for (std::size_t index = 0; index < lowered.size(); ++index) {
+        listed += index == 0 ? "" : index + 1 == lowered.size() ? " or " : ", ";
+        listed += lowered[index];
+    }
     std::string override_note;
     if (!active_override_path.empty()) {
         override_note = " | override active: " + std::string(active_override_path);
     }
     impl_->logger->warn(
-        "active chat template cannot render {} at its input position; preparation lowers such a "
-        "turn to a role the template renders, keeping its text, part count and position | for "
-        "positional rendering pass --chat-template tools/chat_templates/qwen3_8.jinja (also in the "
-        "release zip's chat_templates folder){}",
-        lowered, override_note);
+        "chat template | the active template cannot render {}; each such message keeps its text "
+        "and position | to keep every role, pass --chat-template tools/chat_templates/qwen3_8.jinja "
+        "(also in the release zip's chat_templates folder){}",
+        listed, override_note);
 }
 
 } // namespace infernix::product

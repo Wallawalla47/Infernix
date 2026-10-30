@@ -167,7 +167,7 @@ public:
             const auto started = Clock::now();
             try {
                 frontend.warm_constraints();
-                publish_diagnostic(diagnostics_, DiagnosticLevel::Info,
+                publish_diagnostic(diagnostics_, DiagnosticLevel::Debug,
                                    "constraint vocabulary index built in %.3f s",
                                    std::chrono::duration<double>(Clock::now() - started).count());
             } catch (const std::exception& error) {

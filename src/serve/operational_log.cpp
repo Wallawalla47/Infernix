@@ -489,10 +489,10 @@ std::optional<OperationalRecord> render_output_limit_note(std::uint32_t max_cont
         return std::nullopt;
     }
     std::ostringstream out;
-    out << "output limit | a request that sets none stops after "
+    out << "output limit | a request that sets no output limit stops after "
         << product::format_pretty_count(static_cast<std::uint64_t>(default_max_tokens))
-        << " tokens of its " << product::format_pretty_count(max_context)
-        << " context (--default-max-tokens)";
+        << " tokens (--default-max-tokens), though its context allows "
+        << product::format_pretty_count(max_context);
     return OperationalRecord{.severity = OperationalSeverity::Info, .message = out.str()};
 }
 

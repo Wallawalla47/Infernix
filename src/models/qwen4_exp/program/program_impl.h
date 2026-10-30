@@ -1358,7 +1358,7 @@ public:
                         std::to_string(runtime::expert_offload::kPlainDivisorContext) + " context tokens, " +
                         std::to_string(plain_divisor(runtime::expert_offload::kPlainDivisorContext)) + " from there";
             }
-            diagnostic(line, DiagnosticLevel::Info);
+            diagnostic(line, DiagnosticLevel::Debug);
         }
         // The team's size and CPUs (INFERNIX_TMP_CPU_PLACEMENT; today unpinned). The engine thread is not
         // isolated: Dense8 +0.15 %, IQ3_S -0.14 % (2026-10-28).
@@ -1369,7 +1369,15 @@ public:
         const std::uint32_t cpu_jobs    = options_.cpu_expert_jobs;
         const std::uint32_t assist_jobs = options_.cpu_assist_jobs;
         if (cpu_workers > 0 && cpu_jobs > 0) {
-            if (!placement_.text.empty()) { diagnostic(placement_.text, DiagnosticLevel::Info); }
+            // An A/B arm of the placement shows it without debug logging.
+            if (!placement_.text.empty()) {
+                const auto& switches = temporary_switches::offload();
+                diagnostic(placement_.text,
+                           switches.placement != temporary_switches::OffloadSwitches::Placement::kDefault ||
+                                   switches.workers > 0
+                               ? DiagnosticLevel::Info
+                               : DiagnosticLevel::Debug);
+            }
             // The team's rate sets the decode miss split (design §19.3.12); the SSD tier's is measured
             // once its RAM is filled (below).
             if (!tier_) { measure_cpu_rate(record_stride); }
@@ -3232,7 +3240,20 @@ private:
         if (shadows > 0) {
             std::snprintf(shadow_text, sizeof(shadow_text), " and copies of the %u least-used in VRAM", shadows);
         }
+        const std::uint32_t on_ssd = keys - in_ram - released - unpinned;
         char line[640];
+        if (on_ssd == 0) {
+            std::snprintf(line, sizeof(line),
+                          "experts in RAM: %u (read in %.1f s); with the expert cache they hold all %u experts, so none "
+                          "is read from the model files",
+                          in_ram + unpinned, seconds, keys);
+        } else {
+            std::snprintf(line, sizeof(line),
+                          "experts in RAM: %u (read in %.1f s); %u of the %u experts are read from the model files when "
+                          "used",
+                          in_ram + unpinned, seconds, on_ssd, keys);
+        }
+        diagnostic(line);
         std::snprintf(line, sizeof(line),
                       "SSD expert tier: %u RAM slots (%.1f GiB) hold %u experts (%s)%s%s%s, read in %.1f s; %u of %u "
                       "experts are read from the artifact when used",
@@ -3241,8 +3262,8 @@ private:
                       : fill.source == SeedSource::Calibrated ? "the calibrated expert order"
                                                               : "spread across the layers",
                       released > 0 ? (", none of them among the " + std::to_string(released) + " in VRAM").c_str() : "",
-                      shadow_text, split, seconds, keys - in_ram - released - unpinned, keys);
-        diagnostic(line);
+                      shadow_text, split, seconds, on_ssd, keys);
+        diagnostic(line, DiagnosticLevel::Debug);
     }
 
     // The frames' warm start from the saved state or the calibrated order; returns how many experts
@@ -3675,7 +3696,7 @@ private:
             if (rate >= kSlowReadsPerSecond) {
                 std::snprintf(text, sizeof text, "n-gram volume read probe: %.0f reads/s (%.0f us per 4 KiB read, %zu reads)",
                               rate, 1e6 / rate, probe.reads);
-                diagnostic(text);
+                diagnostic(text, DiagnosticLevel::Debug);
             } else {
                 std::snprintf(text, sizeof text,
                               "n-gram volume reads are slow: %.0f reads/s (%zu reads; 17,000 and more is healthy), so a long "
@@ -4228,7 +4249,7 @@ private:
         if (chunk == chunk_) { return; }
         diagnostic("prefill chunk " + std::to_string(chunk_) + " -> " + std::to_string(chunk) + ": the expert cache can lend " +
                        std::to_string(lendable >> 20) + " MiB now (the output is the same on the exact route)",
-                   DiagnosticLevel::Info);
+                   DiagnosticLevel::Debug);
         chunk_     = chunk;
         wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
     }
@@ -5070,7 +5091,7 @@ private:
         diagnostic("MTP drafter pool: " + std::to_string(slots) + " of its " + std::to_string(E) +
                        " routed experts in a VRAM pool (" + std::to_string(plan_.drafter_pool >> 20) +
                        " MiB), the rest pinned in RAM; draft steps route among the pooled experts",
-                   DiagnosticLevel::Info);
+                   DiagnosticLevel::Debug);
     }
     // The pool's share of draft picks it held and its swaps since startup, at most every 10 seconds.
     void report_drafter_pool() {
@@ -5083,7 +5104,7 @@ private:
         std::snprintf(line, sizeof(line), "MTP drafter pool: %.1f %% of %llu draft picks pooled, %llu swaps",
                       100.0 * static_cast<double>(s.picks - s.misses) / static_cast<double>(s.picks),
                       static_cast<unsigned long long>(s.picks), static_cast<unsigned long long>(s.swaps));
-        diagnostic(line, DiagnosticLevel::Info);
+        diagnostic(line, DiagnosticLevel::Debug);
     }
 
     std::int32_t* mtp_host(std::size_t offset) const { return static_cast<std::int32_t*>(mtp_host_.data()) + offset; }
@@ -5714,15 +5735,12 @@ private:
         if (prefix_) { prefix_->index().set_cost(options_.prefix_cost); }
         char text[256];
         std::snprintf(text, sizeof(text),
-                      "host-to-device link: %.1f GB/s%s; decode promotes every %llu tokens; prefill CPU split up to "
+                      "PCIe link to the GPU: %.1f GB/s%s; decode promotes every %llu tokens; prefill CPU split up to "
                       "%d columns",
-                      rate / 1e9, options_.link_bytes_per_second > 0.0 ? " (set)" : " measured",
+                      rate / 1e9, options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured",
                       static_cast<unsigned long long>(promotion_interval()),
                       options_.prefill_cpu_split ? split_columns() : 0);
         diagnostic(text, DiagnosticLevel::Debug);
-        std::snprintf(text, sizeof(text), "PCIe link to the GPU: %.1f GB/s%s", rate / 1e9,
-                      options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured");
-        diagnostic(text);
     }
 
     // ---- the CPU expert team's rates (design §19.3.12) ----
@@ -5889,7 +5907,7 @@ private:
         pool_now_   = residency_->pool_bytes();
         diagnostic("KV pool grew to " + std::to_string(target) + " pages (" +
                    std::to_string(kv_vmm_->mapped_bytes() >> 20) + " MiB); expert cache " + std::to_string(frames) +
-                   " -> " + std::to_string(residency_->frames()) + " frames");
+                   " -> " + std::to_string(residency_->frames()) + " frames", DiagnosticLevel::Debug);
         return true;
     }
 
@@ -5933,7 +5951,7 @@ private:
         frames_now_ = residency_->frames();
         pool_now_   = residency_->pool_bytes();
         diagnostic("KV pool shrank to " + std::to_string(target) + " pages; expert cache " + std::to_string(frames) +
-                   " -> " + std::to_string(residency_->frames()) + " frames");
+                   " -> " + std::to_string(residency_->frames()) + " frames", DiagnosticLevel::Debug);
     }
     DeviceBuffer io_device_, logits32_, logits16_, sampled_, sample_pos_, configs_, token_counts_;
 

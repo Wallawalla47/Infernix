@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -282,6 +283,11 @@ int main(int argc, char** argv) {
         engine_options.speculative                       = options.speculative;
         engine_options.use_cuda_graph                    = options.use_cuda_graph;
         engine_options.route_trace_path                  = options.route_trace_path;
+        // Every Engine diagnostic, Debug included: the link probe and the CPU expert team's rates
+        // that tools/bench/abba.py checks are detail the products log only at debug.
+        engine_options.diagnostic_observer.callback = [](const infernix::Diagnostic& diagnostic) {
+            std::fprintf(stderr, "[engine] %s\n", diagnostic.message.c_str());
+        };
 
         infernix::bench::BenchEnvironment env;
         env.artifact_path            = options.artifact_path;

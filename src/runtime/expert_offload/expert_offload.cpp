@@ -234,7 +234,7 @@ void ExpertOffload::start(cudaStream_t compute, const std::function<void(std::ui
                     std::to_string(kPlainDivisorContext) + " context tokens, " +
                     std::to_string(plain_divisor(kPlainDivisorContext)) + " from there";
         }
-        diagnostic(line);
+        diagnostic(line, DiagnosticLevel::Debug);
     }
     // The prefill chunk the cache can lend a wide workspace for, from the frames it will start with,
     // before the SSD tier (whose tickets are sized by the chunk).
@@ -383,7 +383,7 @@ void ExpertOffload::plan_exclusive(const ExpertStore& store, HostExpertTier::Opt
                   static_cast<unsigned long long>(frames), static_cast<unsigned long long>(plan.shadows),
                   static_cast<unsigned long long>(loan), static_cast<double>((plan.slots + lists) * store.record_bytes()) / kGiB,
                   static_cast<double>(keys * store.record_bytes()) / kGiB);
-    diagnostic(line);
+    diagnostic(line, DiagnosticLevel::Debug);
 }
 
 const std::uint8_t* ExpertOffload::host_record(std::uint32_t layer, std::uint32_t expert) const {
@@ -408,13 +408,11 @@ void ExpertOffload::measure_link() {
     link_bytes_per_second_ = rate;
     char text[256];
     std::snprintf(text, sizeof(text),
-                  "host-to-device link: %.1f GB/s%s; decode promotes every %llu tokens; prefill CPU split up to %d columns",
-                  rate / 1e9, options_.link_bytes_per_second > 0.0 ? " (set)" : " measured",
+                  "PCIe link to the GPU: %.1f GB/s%s; decode promotes every %llu tokens; prefill CPU split up to %d "
+                  "columns",
+                  rate / 1e9, options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured",
                   static_cast<unsigned long long>(promotion_interval()), options_.prefill_cpu_split ? split_columns() : 0);
     diagnostic(text, DiagnosticLevel::Debug);
-    std::snprintf(text, sizeof(text), "PCIe link to the GPU: %.1f GB/s%s", rate / 1e9,
-                  options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured");
-    diagnostic(text);
 }
 
 double ExpertOffload::cpu_expert_rate() const noexcept {
@@ -627,7 +625,10 @@ void ExpertOffload::measure_cpu_rate_settled() {
                   "on the link: %s",
                   placement_.workers, moe::cpu_isa_name(moe::best_cpu_isa()), cpu_expert_rate_, cpu_column_rate_,
                   how.c_str(), kept);
-    diagnostic(text, DiagnosticLevel::Info);
+    // An A/B arm of the link share shows its choice without debug logging.
+    diagnostic(text, temporary_switches::offload().link_share != OffloadSwitches::LinkShare::kDivisor
+                         ? DiagnosticLevel::Info
+                         : DiagnosticLevel::Debug);
     if (moe::best_cpu_isa() == moe::CpuIsa::kScalar) {
         diagnostic("the CPU has no AVX2: the CPU expert team computes experts with scalar code, so the GPU serves "
                    "most misses over PCIe",
@@ -790,7 +791,13 @@ void ExpertOffload::create_stream() {
 void ExpertOffload::create_cpu_service() {
     const std::uint32_t workers = placement_.workers, jobs = options_.cpu_expert_jobs;
     if (workers == 0 || jobs == 0) { return; }
-    if (!placement_.text.empty()) { diagnostic(placement_.text); }
+    // An A/B arm of the placement shows it without debug logging.
+    if (!placement_.text.empty()) {
+        const OffloadSwitches& switches = temporary_switches::offload();
+        diagnostic(placement_.text, switches.placement != OffloadSwitches::Placement::kDefault || switches.workers > 0
+                                        ? DiagnosticLevel::Info
+                                        : DiagnosticLevel::Debug);
+    }
     if (!tier_) { measure_cpu_rate_settled(); } // the tier's rates follow its fill (start)
     const int decode_columns = std::max(moe::kMaxCpuColumns, setup_.lanes * setup_.max_width);
     const bool assist        = options_.cpu_assist_jobs > 0 && decode_columns < kAssistMaxColumns;
@@ -901,7 +908,7 @@ void ExpertOffload::size_frames(cudaStream_t compute, const std::function<void(s
     {
         const std::uint64_t experts = static_cast<std::uint64_t>(setup_.layout.layers) * setup_.layout.experts;
         char line[192];
-        std::snprintf(line, sizeof(line), "expert cache: %u VRAM frames (%.1f GiB) for %llu routed experts (%.0f %%)",
+        std::snprintf(line, sizeof(line), "expert cache: %u experts in VRAM (%.1f GiB) of the %llu routed experts (%.0f %%)",
                       sizing_.frames,
                       static_cast<double>(sizing_.frames) * static_cast<double>(residency_->frame_bytes()) / kLedgerGiB,
                       static_cast<unsigned long long>(experts),
@@ -1205,7 +1212,19 @@ void ExpertOffload::warm_start(cudaStream_t compute) {
     }
     const double seconds     = tier_seconds + std::chrono::duration<double>(Clock::now() - began).count();
     const std::uint32_t in_ram = filled - released + refilled;
+    const std::uint32_t on_ssd = keys - in_ram - released - unpinned;
     char line[600];
+    if (on_ssd == 0) {
+        std::snprintf(line, sizeof(line),
+                      "experts in RAM: %u (read in %.1f s); with the expert cache they hold all %u experts, so none is "
+                      "read from the model files",
+                      in_ram + unpinned, seconds, keys);
+    } else {
+        std::snprintf(line, sizeof(line),
+                      "experts in RAM: %u (read in %.1f s); %u of the %u experts are read from the model files when used",
+                      in_ram + unpinned, seconds, on_ssd, keys);
+    }
+    diagnostic(line);
     std::snprintf(line, sizeof(line),
                   "SSD expert tier: %u RAM slots (%.1f GiB) hold %u experts (%s) and copies of %u of the least-used in "
                   "VRAM, %u unpinned records %u more, read in %.1f s; %u of %u experts are read from the artifact when used",
@@ -1213,8 +1232,8 @@ void ExpertOffload::warm_start(cudaStream_t compute) {
                   seed == Seed::Saved        ? "the saved ranking, then the last session's use counts"
                   : seed == Seed::Calibrated ? "the calibrated expert order"
                                              : "spread across the layers",
-                  shadows, tier_->unpinned_records(), unpinned, seconds, keys - in_ram - released - unpinned, keys);
-    diagnostic(line);
+                  shadows, tier_->unpinned_records(), unpinned, seconds, on_ssd, keys);
+    diagnostic(line, DiagnosticLevel::Debug);
 }
 
 void ExpertOffload::save_state() noexcept {

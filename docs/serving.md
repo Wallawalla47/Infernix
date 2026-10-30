@@ -1661,7 +1661,13 @@ Run `./build/apps/infernix-serve --help` for the exact option contract.
 Serve writes human-readable operational records to stderr using
 `YYYY-MM-DD HH:MM:SS.mmm  LEVEL  message`. Normal output covers material startup milestones,
 readiness, request lifecycle, fixed-interval throughput, and shutdown; `--log-level debug` exposes
-internal startup and resource-planning detail. Engine runtime diagnostics are ordinary records
+internal startup and resource-planning detail. At startup that means the weights' load (and a
+`--draft-model` drafter's, as `drafter weights ready`), where the model sits in RAM and VRAM, the
+expert cache's warm start, whether fast paths run (`fast paths | on (N) | ...`), any temporary
+`INFERNIX_TMP_*` switch that is set, the context capacity, output limit and prefix cache, and
+warnings; the measured PCIe link and CPU expert rates, staging, CUDA graph capture, the fast
+paths' names, every temporary switch's value, the RAM and VRAM ledgers and the KV pool's growth
+are `debug`. Engine runtime diagnostics are ordinary records
 prefixed `engine |`: a Device KV lease extended by releasing retained cache is `debug`; a lease
 that cannot grow, recovery from out of memory or a failed request, and a failed prefix-cache save
 are warnings or errors; the prefix-cache save at shutdown is `info`. FFmpeg's media-decoding

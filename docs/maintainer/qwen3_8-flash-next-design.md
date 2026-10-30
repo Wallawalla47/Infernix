@@ -8901,7 +8901,7 @@ elastic pool does the same job with no kernel change:
 - The Program measures the host-to-device rate at startup, by copying expert records from the
   pinned banks into the miss staging slots before any call uses them: best of three, 64 records,
   a few tens of milliseconds (`core/link_probe`; `ProgramOptions::link_bytes_per_second` fixes it
-  in tests). The diagnostic line `host-to-device link: ...` reports it and the choices below.
+  in tests). The Debug diagnostic `PCIe link to the GPU: ...` reports it and the choices below.
 - It rescales the link-bound costs from the reference rate at which they were fitted (27.5 GB/s): the
   prefix cost's restore rate and the walk-span cost.
 - The decode miss split keeps misses / d of a call's misses on the link, d = max(1, floor(1.65 + C t))

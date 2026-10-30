@@ -3,9 +3,9 @@
 // Temporary A/B switches (INFERNIX_TMP_*): the one place that reads them. Every switch is registered
 // in temporary_switches.cpp (name, the models it acts on, what it does), all of them are read
 // together once per process from the environment, and the default (unset) is the behaviour without
-// the switch. The Engine records describe() for its model in LoadSummary::temporary_switches, which
-// the startup log prints as one `temporary switches | ...` line, so an A/B arm can be checked from
-// its log; op benches print describe() themselves. A switch stays only until its A/B is decided:
+// the switch. The Engine records describe() for its model in LoadSummary::temporary_switches, whose
+// set switches the startup log prints as one `temporary switches | ...` line (every switch's value
+// at debug), so an A/B arm can be checked from its log; op benches print describe() themselves. A switch stays only until its A/B is decided:
 // then its registration, its readers and the losing arm go together.
 //
 // Readers parse the raw value. They throw std::invalid_argument on a malformed value (a bad arm

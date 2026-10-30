@@ -164,7 +164,7 @@ void ProgramImpl::capture_graph_set() {
     std::snprintf(line, sizeof(line),
                   "CUDA graphs: captured %u at startup in %.2f s, %.0f MiB of device memory",
                   graph_set_.captured, seconds, static_cast<double>(graph_set_.bytes) / (1 << 20));
-    diagnostic(line);
+    diagnostic(line, DiagnosticLevel::Debug);
 }
 
 } // namespace detail

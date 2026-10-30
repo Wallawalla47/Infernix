@@ -716,7 +716,19 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     auto backing = artifact::materialize(reader, std::move(data->materialization), device, observer);
     std::optional<artifact::MaterializedArtifact> draft_backing;
     if (data->draft_materialization) {
-        draft_backing = artifact::materialize(*data->draft_reader, std::move(*data->draft_materialization), device, observer);
+        // The drafter's weight load reports as its own phase, so the log tells it from the model's.
+        StartupObserver draft_observer;
+        if (observer != nullptr && observer->callback) {
+            draft_observer.callback = [observer](const StartupEvent& event) {
+                StartupEvent renamed = event;
+                if (renamed.phase == StartupPhase::WeightsMaterialize) {
+                    renamed.phase = StartupPhase::DraftWeightsMaterialize;
+                }
+                observer->callback(renamed);
+            };
+        }
+        draft_backing = artifact::materialize(*data->draft_reader, std::move(*data->draft_materialization), device,
+                                              &draft_observer);
     }
     std::vector<BoundWeight> bound;
     bound.reserve(data->pending.size());

@@ -402,7 +402,9 @@ standard a path is certified against is under revision and is not published here
   whether the routed experts take 4-bit activations, and the KV format. A configuration names
   kernels, never a checkpoint, so every artifact that runs the same kernels shares its paths. A path runs only
   in the configurations the registry (6.7) lists, so each configuration gets the fast paths that
-  meet its own budget and no others; startup logs the selection (`fast paths | ...`) and
+  meet its own budget and no others; startup logs how many run and whether outputs stay
+  request-invariant (`fast paths | on (N) | ...`), `--log-level debug` names them and the
+  configuration (`fast paths | <names> | qualified for <configuration>`), and
   `LoadSummary::fast_paths` reports it. A fast path stays deterministic for a fixed configuration
   and keeps every invariant the exact route guarantees: exact token constraints, sampling and
   speculative acceptance; Replay recovery and prefix-cache equivalence; masked-prefix and
@@ -1325,8 +1327,8 @@ without `preemption`).
   2048 and 1024 tokens, each clamped and rounded to whole prompt-attention waves as the chunk is
   (3584 and 1792 on the RTX 5090 with 24 heads), then down to a multiple of the chunk, and keeps
   the widest whose larger prefill buffers and workspace keep the KV capacity (an explicit one
-  whole, an automatic one down to every lane's full context); the `fast paths |` startup line
-  reports it. Beside a lane that waits to decode the step stays one chunk, so that lane's stall
+  whole, an automatic one down to every lane's full context); the debug `fast paths |` startup
+  line reports it. Beside a lane that waits to decode the step stays one chunk, so that lane's stall
   is unchanged. Only the pass boundaries move, and every boundary stays on the chunk grid from the
   step's start: a wide step ends where a chunk-wide prefill would realize the lane's next flexible
   prefix-cache tap, and exact taps split it where they split a chunk, so snapshots land at the same

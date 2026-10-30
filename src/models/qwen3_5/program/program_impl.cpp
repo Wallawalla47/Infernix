@@ -349,7 +349,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             offload->engine().report("elastic text KV: " + std::to_string(kv_base_pages) + " of " +
                                      std::to_string(decoder->text_kv.page_pool().capacity_pages()) +
                                      " pages backed at startup (" + std::to_string(kv_vmm->mapped_bytes() >> 20) +
-                                     " MiB); the rest grows from the expert frames as requests need it");
+                                         " MiB); the rest grows from the expert frames as requests need it",
+                                     DiagnosticLevel::Debug);
         }
         device.synchronize();
     }

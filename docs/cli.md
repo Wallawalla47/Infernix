@@ -26,7 +26,8 @@ throughput, GPU memory, token IDs when requested, and speculative-decoding stati
 stderr as unprefixed product output, so stdout can be redirected independently. On a terminal,
 weight materialization is one transient progress line followed by a compact Engine-ready summary.
 Redirected stderr contains persistent readable progress for long loads and no carriage returns or
-ANSI escapes. `--log-level debug` exposes every startup phase. FFmpeg's media-decoding messages are
+ANSI escapes. `--log-level debug` exposes every startup phase and the engine detail that normal
+output leaves out (the same split as [Serve's](serving.md#server-options)). FFmpeg's media-decoding messages are
 records prefixed `media |`: FFmpeg errors are warnings and everything milder is `debug`. Option and
 local prompt/message input failures remain direct command diagnostics:
 
@@ -391,7 +392,7 @@ with `blocking`. Against `spin`, output tok/s was 1.8 % lower with `yield` and 1
 INFERNIX_CUDA_SYNC=blocking ./build/apps/infernix models/qwen3_8_27b_nvfp4.ninfer --prompt "Hello"
 ```
 
-The Engine-ready log reports the selected mode. Empty or unrecognized values, or failure to apply
+The `load detail` record (`--log-level debug`) reports the selected mode. Empty or unrecognized values, or failure to apply
 the schedule, fail startup. This controls device scheduling (including stream synchronization);
 it does not override individual CUDA event creation flags.
 

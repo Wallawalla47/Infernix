@@ -651,15 +651,16 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     // --draft-tokens auto where its policy does not run: the configuration's fastest fixed length.
     if (const std::uint32_t fixed = models::qwen3_5::resolve_auto_draft_length(instance->parameters, options)) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "--draft-tokens auto: %s is not selected for this artifact (or fast paths are "
-                           "disabled), so every round drafts %u, its fastest fixed length",
+                           "--draft-tokens auto: each round drafts %u tokens, the fastest fixed length here (%s, "
+                           "which adapts the length, %s)",
+                           fixed,
                            options.speculative.backend == SpeculativeBackend::Mtp ? "adaptive-mtp" : "adaptive-dflash",
-                           fixed);
+                           options.fast_paths ? "is not qualified for this artifact" : "is off with the fast paths");
     }
     // TEMPORARY (MTP drafting package A/B): what the switches resolved to (their values are in the
     // startup log's temporary switches line).
     if (options.speculative.backend == SpeculativeBackend::Mtp) {
-        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "mtp drafting | %s",
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug, "mtp drafting | %s",
                            models::qwen3_5::mtp_draft_switch_report(instance->parameters, options).c_str());
     }
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);

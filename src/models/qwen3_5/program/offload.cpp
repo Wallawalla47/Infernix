@@ -128,7 +128,7 @@ void ProgramOffload::create_drafter_pool(cudaStream_t compute) {
         diagnostic_("MTP drafter pool: " + std::to_string(slots) + " of its " + std::to_string(E) +
                         " routed experts in a VRAM pool (" + std::to_string(bytes >> 20) +
                         " MiB), the rest pinned in RAM; draft steps route among the pooled experts",
-                    DiagnosticLevel::Info);
+                    DiagnosticLevel::Debug);
     }
 }
 
@@ -142,7 +142,7 @@ void ProgramOffload::report_drafter_pool() {
     std::snprintf(line, sizeof(line), "MTP drafter pool: %.1f %% of %llu draft picks pooled, %llu swaps",
                   100.0 * static_cast<double>(s.picks - s.misses) / static_cast<double>(s.picks),
                   static_cast<unsigned long long>(s.picks), static_cast<unsigned long long>(s.swaps));
-    diagnostic_(line, DiagnosticLevel::Info);
+    diagnostic_(line, DiagnosticLevel::Debug);
 }
 
 void ProgramOffload::build_experts() {

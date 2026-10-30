@@ -28,7 +28,8 @@ rotation for more arms). It discards a warm-up process, adds a noise arm (the co
 the prompt per block with `--corpus-offset` when the arm file lists offsets, and drops any sample
 whose startup evidence is wrong: an arm's switch missing from the `temporary switches` record, a
 requested fast path absent from the report, a PCIe link probe below `--min-link-gbs`, or a CPU expert
-team rate off the run's median. Per metric and arm it reports pairs better than the control, the
+team rate off the run's median (the probe and the rate are read from the `[engine]` lines
+`infernix_bench` writes to stderr, which include the Engine's debug diagnostics). Per metric and arm it reports pairs better than the control, the
 median and worst paired ratio, the ratio of pooled means and an exact Wilcoxon signed-rank p-value
 with Holm's correction; a resolved difference in the noise arm marks the whole run noisy. The arm
 file format is in the script's docstring.

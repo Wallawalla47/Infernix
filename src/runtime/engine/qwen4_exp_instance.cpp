@@ -355,7 +355,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
             ngram_in_ram = true;
         }
     }
-    report(options, DiagnosticLevel::Info,
+    report(options, DiagnosticLevel::Debug,
            std::string("n-gram table: ") +
                (ngram_in_ram ? "in RAM (" + std::to_string(models::qwen4_exp::NgramVolume::resident_bytes(table) >> 20) +
                                    " MiB, locked for the CPU)"
@@ -389,9 +389,27 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         program_options.later_pinned_bytes    = ram.later_pinned_bytes;
     }
     {
-        // The plan in one line (candidates §22: compare with Basalt's and Strata's totals).
+        // The plan in one line, and with each choice's reason at Debug (candidates §22: compare with
+        // Basalt's and Strata's totals).
         constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+        const double other_gib =
+            static_cast<double>(ram.ledger.planned - demand.pageable * (ngram_in_ram ? 1 : 0) - demand.prefix_cache) / kGiB;
+        const double free_gib = static_cast<double>(ledger_left_bytes(ram.ledger) + demand.reserve) / kGiB;
+        char table_text[64] = "read from its volume";
+        if (ngram_in_ram) {
+            std::snprintf(table_text, sizeof(table_text), "%.1f GiB",
+                          static_cast<double>(models::qwen4_exp::NgramVolume::resident_bytes(table)) / kGiB);
+        }
+        char prefix_text[64] = "off";
+        if (cache.enabled) {
+            std::snprintf(prefix_text, sizeof(prefix_text), "%.1f GiB", static_cast<double>(prefix_bytes) / kGiB);
+        }
         char line[512];
+        std::snprintf(line, sizeof(line),
+                      "RAM plan: experts %.1f GiB, n-gram table %s, prefix cache %s, other %.1f GiB; %.1f GiB left free "
+                      "for other programs",
+                      static_cast<double>(ram.ledger.expert_ram) / kGiB, table_text, prefix_text, other_gib, free_gib);
+        report(options, DiagnosticLevel::Info, line);
         std::snprintf(line, sizeof(line),
                       "RAM plan: experts %.1f GiB (%s), n-gram table %.1f GiB (%s), prefix cache %.1f GiB (%s), other %.1f "
                       "GiB; %.1f GiB left free for other programs (--ram-free-mib %.1f)",
@@ -399,11 +417,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                       !tier ? "every expert" : exclusive ? "those not in VRAM, and shadows for a prefill's loan" : "the SSD tier",
                       ngram_in_ram ? static_cast<double>(models::qwen4_exp::NgramVolume::resident_bytes(table)) / kGiB : 0.0,
                       ngram_in_ram ? "RAM" : "volume", static_cast<double>(prefix_bytes) / kGiB,
-                      !cache.enabled ? "off" : prefix_auto ? "auto" : "set",
-                      static_cast<double>(ram.ledger.planned - demand.pageable * (ngram_in_ram ? 1 : 0) - demand.prefix_cache) / kGiB,
-                      static_cast<double>(ledger_left_bytes(ram.ledger) + demand.reserve) / kGiB,
+                      !cache.enabled ? "off" : prefix_auto ? "auto" : "set", other_gib, free_gib,
                       static_cast<double>(demand.reserve) / kGiB);
-        report(options, DiagnosticLevel::Info, line);
+        report(options, DiagnosticLevel::Debug, line);
     }
 
     const auto device_plan =
