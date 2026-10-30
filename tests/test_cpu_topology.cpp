@@ -1,9 +1,11 @@
 // The host's physical cores (core/cpu_topology.h), which the temporary CPU placement switches
 // (runtime/expert_offload/placement.h) give one expert worker each: every logical CPU belongs
 // to exactly one core, a core's first thread is in it, and a thread restricted to one core's CPU runs
-// there and gets its old mask back.
+// there and gets its old mask back. Also the process's logical CPUs and the default CPU expert team they
+// allow (GitHub issue #48: 16 workers on 16 vCPUs starved the engine thread).
 
 #include "core/cpu_topology.h"
+#include "runtime/expert_offload/placement.h"
 
 #include <bit>
 #include <cstdint>
@@ -24,10 +26,23 @@ void check(bool ok, const char* what) {
 } // namespace
 
 int main() {
+    // The default team leaves four logical CPUs, keeps at least one worker and never grows.
+    using infernix::runtime::expert_offload::default_workers;
+    check(default_workers(16, 16) == 12, "16 GGUF workers on 16 logical CPUs become 12");
+    check(default_workers(16, 32) == 16, "a 32-CPU host keeps 16 workers");
+    check(default_workers(6, 8) == 4, "6 NVFP4 workers on 8 logical CPUs become 4");
+    check(default_workers(6, 4) == 1 && default_workers(16, 2) == 1, "a tiny host keeps one worker");
+    check(default_workers(16, 0) == 16, "an unknown CPU count keeps the configured team");
+    check(default_workers(0, 16) == 0, "a disabled team stays off");
+    const std::uint32_t process = infernix::process_logical_cpus();
+    const unsigned machine      = std::thread::hardware_concurrency();
+    check(process >= 1, "the process may run on at least one logical CPU");
+    check(machine == 0 || process <= machine, "the process's logical CPUs are at most the machine's");
+
     const auto cores = infernix::physical_cores();
     if (cores.empty()) {
-        std::printf("no CPU topology on this platform or machine; nothing to check\n");
-        return 0;
+        std::printf("no CPU topology on this platform or machine; no core to check\n");
+        return g_failures == 0 ? 0 : 1;
     }
     std::uint64_t seen = 0;
     bool disjoint = true, nonempty = true;

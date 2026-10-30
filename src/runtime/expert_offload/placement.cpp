@@ -45,9 +45,20 @@ std::int32_t link_share_256(const OffloadSwitches& switches, double link_bytes_p
 
 CpuPlacement cpu_placement(const OffloadSwitches& switches, std::uint32_t configured, bool engine_isolate) {
     CpuPlacement out;
-    out.workers = switches.workers > 0 ? switches.workers : configured;
+    const std::uint32_t logical = process_logical_cpus();
+    out.workers                 = switches.workers > 0 ? switches.workers : default_workers(configured, logical);
+    // A default team cut down by a small host says so at startup.
+    const std::string capped = switches.workers == 0 && out.workers < configured
+                                   ? " (" + std::to_string(configured) + " by default; the process has " +
+                                         std::to_string(logical) + " logical CPUs and the team leaves " +
+                                         std::to_string(kReservedCpus) + " to the engine)"
+                                   : std::string();
     if (switches.placement == OffloadSwitches::Placement::kDefault && !engine_isolate) {
-        if (switches.workers > 0) { out.text = "CPU expert team: " + std::to_string(out.workers) + " workers (INFERNIX_TMP_CPU_PLACEMENT), unpinned"; }
+        if (switches.workers > 0) {
+            out.text = "CPU expert team: " + std::to_string(out.workers) + " workers (INFERNIX_TMP_CPU_PLACEMENT), unpinned";
+        } else if (!capped.empty()) {
+            out.text = "CPU expert team: " + std::to_string(out.workers) + " workers" + capped + ", unpinned";
+        }
         return out;
     }
     std::vector<PhysicalCore> cores = physical_cores();
@@ -92,7 +103,7 @@ CpuPlacement cpu_placement(const OffloadSwitches& switches, std::uint32_t config
         break;
     }
     }
-    out.text = "CPU expert team placement: " + std::to_string(out.workers) + " workers, " + mode + ";";
+    out.text = "CPU expert team placement: " + std::to_string(out.workers) + " workers" + capped + ", " + mode + ";";
     if (switches.placement == OffloadSwitches::Placement::kPhysical) {
         for (std::uint32_t w = 0; w < out.workers; ++w) { out.text += " w" + std::to_string(w) + ":" + cpu_list(out.cpus[w]); }
         if (out.workers > cores.size()) { out.text += " (workers past the physical cores run unpinned)"; }

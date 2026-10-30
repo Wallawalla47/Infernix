@@ -454,6 +454,10 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   workers measured slower: the CPU and the PCIe stage share the host's memory bandwidth.
   The GSQ-RCO IQ3_S artifact's CPU route decodes its GGUF blocks before multiplying, so it is
   compute-bound and starts 16 workers instead (decode 98.4 tok/s with six, 103.7 with 16).
+  Either way the team leaves four of the process's logical CPUs to the engine, the CUDA runtime
+  and the OS: a 16-vCPU host runs 12 workers. With 16 workers on 16 logical CPUs the spinning
+  threads starved each other and the IQ3_S decoded 61-87 tok/s, against 189-217 with 8 (the
+  startup log notes a reduced team).
 - On Windows the engine opts its process out of power throttling. Windows otherwise slows a
   process it considers in the background (a server whose console is not in front, a job without a
   window) and moves its threads to efficiency cores; a hidden run decoded 37.6 tok/s at 8K throttled
