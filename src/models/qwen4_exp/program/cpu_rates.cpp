@@ -168,8 +168,10 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
         how += share;
     }
     char kept[160];
+    const bool switched = temporary_switches::offload().link_share != temporary_switches::OffloadSwitches::LinkShare::kDivisor;
     if (const int share = pcie_share(); share > 0) {
-        std::snprintf(kept, sizeof(kept), "%d/256 (INFERNIX_TMP_LINK_SHARE; the divisor rule's 1/%d)", share, pcie_divisor());
+        std::snprintf(kept, sizeof(kept), "%d/256 (%s; the divisor rule's 1/%d)", share,
+                      switched ? "INFERNIX_TMP_LINK_SHARE" : "the share form", pcie_divisor());
     } else {
         std::snprintf(kept, sizeof(kept), "1/%d", pcie_divisor());
     }
@@ -183,7 +185,7 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
                                                                                : "",
                   cpu_expert_rate_, cpu_column_rate_, how.c_str(), kept);
     // An A/B arm of the link share shows its choice without debug logging.
-    diagnostic(text, pcie_share() > 0 ? DiagnosticLevel::Info : DiagnosticLevel::Debug);
+    diagnostic(text, switched ? DiagnosticLevel::Info : DiagnosticLevel::Debug);
     if (measured && !quiet) {
         diagnostic("the CPU expert team's rates were measured while other processes kept the CPU busy (" +
                        std::to_string(static_cast<int>(100.0 * last_share + 0.5)) +

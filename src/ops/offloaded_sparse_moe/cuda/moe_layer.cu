@@ -13,6 +13,7 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
+#include "core/temporary_switches.h"
 
 #include "ops/common/canonical_math.h"
 #include "ops/common/mbarrier.cuh"
@@ -25,6 +26,7 @@
 #include "ops/ggml/ggml_narrow_mma.cuh"
 #include "ops/ggml/ggml_tile.cuh"
 #include "ops/fp8_block/fp8_exact.h"
+#include "ops/offloaded_sparse_moe/cuda/a16_limbs.cuh"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 #include "ops/offloaded_sparse_moe/nvfp4_a8.h"
 #include "infernix/ops/lossless_linear.h"
@@ -1815,6 +1817,7 @@ void launch_expert_pass_a4r(const bf16* x, const MoeDispatch& dispatch, const Mo
 #include "ops/offloaded_sparse_moe/cuda/fp8_expert.cuh"
 #include "ops/offloaded_sparse_moe/cuda/lossless_expert.cuh"
 #include "ops/offloaded_sparse_moe/cuda/narrow_ring_a16.cuh"
+#include "ops/offloaded_sparse_moe/cuda/narrow_a16_mma.cuh"
 
 // One pass of the narrow kernels in the source's arithmetic, for a call of `columns` columns. W4A4
 // jobs of any width take the one-column kernels (one pass per column over the staged weights); W4A16 jobs
@@ -1860,6 +1863,11 @@ void launch_pass(int columns, const bf16* x, const MoeDispatch& dispatch, const 
     if (layout.x_acts != nullptr) {
         launch_ring_pass(columns, dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream,
                          phase, part);
+        return;
+    }
+    if (a16_nmma_call(source, columns, layout)) {
+        launch_expert_pass_a16_nmma(columns, dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs,
+                                    stream, phase, part);
         return;
     }
     if (source.activation == moe::ExpertActivation::kA16) {
@@ -2787,12 +2795,15 @@ void require_fetch_channel(const MoeExpertSource& source, std::int32_t max_jobs)
 
 // The call's routing-independent preparation, before any fork of its passes: the narrow ring's x (its job words
 // and counters cleared), a ggml bank's x limbs (on the 8-bit route its codes) and its jobs' gate/up CTA counts,
-// or an NVFP4 bank's 8-bit codes, each encoded once per call.
-// Whether prepare_x launches anything for the call (a ring, a ggml bank or an 8-bit NVFP4 call).
+// an NVFP4 bank's 8-bit codes, or an NVFP4 W4A16 call's x limbs for the tensor-core narrow kernels (with its jobs'
+// gate/up CTA counts), each encoded once per call.
+// Whether prepare_x launches anything for the call (a ring, a ggml bank, an 8-bit NVFP4 call or a tensor-core
+// narrow call).
 bool prepares_x(const Tensor& x, const MoeExpertSource& source, const moe::wide::ExpertsWorkspace& layout) {
     const int columns   = static_cast<int>(x.ne[1]);
     const bool nvfp4_a8 = nvfp4_a8_call(source, columns);
-    return (layout.x_acts != nullptr && !nvfp4_a8) || ggml_bank(source) || nvfp4_a8 || nvfp4_a8_wide_call(source, columns);
+    return (layout.x_acts != nullptr && !nvfp4_a8) || ggml_bank(source) || nvfp4_a8 || nvfp4_a8_wide_call(source, columns) ||
+           a16_nmma_call(source, columns, layout);
 }
 
 void prepare_x(const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs,
@@ -2807,6 +2818,8 @@ void prepare_x(const Tensor& x, const MoeExpertSource& source, std::int32_t max_
         launch_encode_x_ggml(x, static_cast<int>(max_jobs), layout, stream);
     } else if (nvfp4_a8 || nvfp4_a8_wide) {
         launch_encode_x_nvfp4_a8(x, source, layout, stream);
+    } else if (a16_nmma_call(source, columns, layout)) {
+        launch_prepare_a16_nmma(x, static_cast<int>(max_jobs), layout, stream);
     }
 }
 

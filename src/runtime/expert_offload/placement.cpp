@@ -30,7 +30,8 @@ std::int32_t link_share_256(const OffloadSwitches& switches, double link_bytes_p
                             double record_bytes) noexcept {
     double share = 0.0;
     switch (switches.link_share) {
-    case OffloadSwitches::LinkShare::kDivisor: return 0;
+    case OffloadSwitches::LinkShare::kDivisor:
+    case OffloadSwitches::LinkShare::kForcedDivisor: return 0;
     case OffloadSwitches::LinkShare::kFixed: share = switches.link_share_fixed; break;
     case OffloadSwitches::LinkShare::kAuto: {
         const double cpu = cpu_expert_rate * record_bytes; // bytes/s the CPU team serves

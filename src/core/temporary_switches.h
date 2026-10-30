@@ -58,12 +58,13 @@ struct GwShape {
 // GPU's). Unlike the other switches, a malformed value is ignored (the default runs) and listed by
 // describe(); runtime/expert_offload/expert_offload.h applies them (link_share_256, cpu_placement).
 //
-//   INFERNIX_TMP_LINK_SHARE       auto | <share in (0, 1]>   Strata's measured link share instead of
-//                                 the divisor rule (Flash-Next §19.3.12): the link keeps
+//   INFERNIX_TMP_LINK_SHARE       auto | <share in (0, 1]> | divisor   Strata's measured link share instead
+//                                 of the default split (Flash-Next §19.3.12): the link keeps
 //                                 floor(M s) of a call's M host-memory misses, s = L / (L + 1.85 R)
 //                                 (L the startup link probe, R the CPU-rate probe's experts/s times
 //                                 the record bytes), rounded to 0.05 within [0.10, 0.60] as Strata
-//                                 does; a number fixes s.
+//                                 does; a number fixes s; `divisor` keeps Flash-Next's NVFP4 W4A16
+//                                 banks on the divisor rule instead of the share form.
 //   INFERNIX_TMP_CPU_PLACEMENT    physical | physical-set [,<workers>]   the CPU expert team one worker
 //                                 per physical core, P-cores first, no SMT siblings: "physical" pins
 //                                 worker i to core i's first logical CPU, "physical-set" lets every
@@ -72,7 +73,7 @@ struct GwShape {
 //   INFERNIX_TMP_STAGING_SLOTS    8..512     the staging slots instead of the width rule (a call whose
 //                                 jobs exceed them is not forked).
 struct OffloadSwitches {
-    enum class LinkShare : std::uint8_t { kDivisor, kAuto, kFixed };
+    enum class LinkShare : std::uint8_t { kDivisor, kAuto, kFixed, kForcedDivisor };
     LinkShare link_share    = LinkShare::kDivisor;
     double link_share_fixed = 0.0;
 

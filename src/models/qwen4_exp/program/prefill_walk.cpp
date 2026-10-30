@@ -16,7 +16,7 @@
 // stream lease after the ring. Each advance_prefill call enqueues about one call's work (a few
 // layers of every chunk) and synchronizes, so cancellation and other lanes interleave as between
 // chunk-major calls; the walk's own state stays valid across them. A span ends before a call too
-// narrow to stream (the prompt's last joins a span of two or more streamed calls as an MoE group of its own) and at kWalkMaxTokens. A prefix tap due at an inner chunk end is captured in place
+// narrow to stream (the prompt's last joins a span of one or more streamed calls as an MoE group of its own) and at kWalkMaxTokens. A prefix tap due at an inner chunk end is captured in place
 // (walk_plan_taps): each layer's state is copied once the walk has enqueued that layer of the chunk,
 // before the next chunk overwrites it, and the snapshot is committed after the span. Ending the span
 // there instead would stream every non-resident expert once more per tap (a cold 128K prompt's taps
@@ -78,9 +78,14 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
         ++end;
         tokens.push_back(total);
     }
-    // One streamed call and a narrow last call do not walk: the streamed call keeps its gated stream and
-    // copy-ahead (walking them measured no faster, 2026-10-27: pp4125 IQ3_S 0.999x, Dense8 1.000x).
-    if (end - first < 2U) { return first; }
+    // One streamed call alone does not walk: it keeps its gated stream and copy-ahead. With the prompt's narrow
+    // last call after it, the two walk: as its own call the last one stages its misses again right after the
+    // streamed call (FP4-Local pp16413, a 29-token last call after 16,384 tokens: 299 ms, mostly CPU-served
+    // misses; walked 6,999 -> 7,684 tok/s, 2026-10-30; pp4125 on IQ3_S and Dense8 1.000x, 2026-10-27).
+    static const bool no_join = temporary_switches::flag("INFERNIX_TMP_WALK_NO_JOIN"); // the decode A/B's old order
+    const bool one_then_last = !no_join && end - first == 1U && end + 1 == lane.calls.size() &&
+                               lane.calls[end] - from >= kWalkJoinMinTokens;
+    if (end - first < 2U && !one_then_last) { return first; }
     // The prompt's last call, too narrow to stream, joins a
     // span of streamed calls (as its own MoE group, walk_begin), so its experts are read from the span's ring
     // instead of being staged again right after it. It also puts a divergence inside that last call (a /v1/decide
@@ -277,8 +282,8 @@ void ProgramImpl::walk_prefetch_rows(Lane& lane, std::uint32_t index, std::size_
         }
         const std::uint32_t from  = lane.calls[call - 1];
         const std::uint32_t width = lane.calls[call] - from;
-        // A narrow call joins only as the prompt's last, after two streamed calls (walk_span_end).
-        const bool narrow_last = call + 1 == lane.calls.size() && k >= 2 && width >= kWalkJoinMinTokens;
+        // A narrow call joins only as the prompt's last, after a streamed call (walk_span_end).
+        const bool narrow_last = call + 1 == lane.calls.size() && k >= 1 && width >= kWalkJoinMinTokens;
         if ((width < static_cast<std::uint32_t>(kStreamMinColumns) && !narrow_last) || tokens + width > kWalkMaxTokens) {
             f.done = true;
             break;
