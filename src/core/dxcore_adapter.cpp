@@ -7,11 +7,16 @@
 #include <cstring>
 
 namespace infernix {
-namespace {
 
 // The DXCore interfaces this file calls, declared as WSL's DirectX headers lay them out
 // (dxcore_interface.h, include/wsl/winadapter.h: IUnknown without a destructor, x86-64 System V
 // calls). Only the virtual functions' order and signatures matter; later slots are not called.
+// They live in a named namespace, never an anonymous one: no class in this program derives from
+// them, so GCC (-O2 and up, -fdevirtualize) would take a TU-local hierarchy as closed and compile
+// every call into __cxa_pure_virtual (every WSL2 startup with offloaded experts aborted with "pure
+// virtual method called", GitHub issue #34, 2026-10-30).
+namespace dxcore_abi {
+
 using HResult = std::int32_t;
 
 struct Guid {
@@ -84,6 +89,12 @@ struct AdapterFactory : Unknown {
                                         void** list)                                          = 0;
     virtual HResult get_adapter_by_luid(const Luid& luid, const Guid& id, void** adapter) = 0;
 };
+
+} // namespace dxcore_abi
+
+using namespace dxcore_abi;
+
+namespace {
 
 constexpr std::uint32_t kNvidiaVendor = 0x10de;
 
