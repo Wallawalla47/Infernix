@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <limits>
@@ -40,8 +41,27 @@ namespace {
 constexpr std::size_t kStackBytes         = 256;
 constexpr std::size_t kLosslessStackBytes = 1536;
 
-DeviceContext initialize_device(const EngineOptions& options) {
+// --vram-past-budget sizes Qwen3.8-Flash-Next's expert cache past the OS budget. The driver loads a kernel's code
+// lazily, at its first launch, so the code of the sampler, prefill and drafter kernels is allocated after the cache
+// has taken the budget and lands past it, where the context fails ("unspecified launch failure", 5 of 7 warmups or
+// first long requests at --vram-headroom-mib 128, 2 of 6 decode runs at 256; none of 16 without the flag, and none
+// of 30 with every module loaded first). Loading every module at context creation puts the code (382 MiB with the
+// whole binary; about 100 MiB is what a request launches) inside the budget, ahead of the cache. It costs 7 % of
+// single-lane decode (128.2 against 137.9 tok/s, flag off, ABBA over six runs) and 2 % of two-lane decode, so only
+// the flag pays it. The user's own CUDA_MODULE_LOADING stands.
+void load_kernels_eagerly() {
+    constexpr const char* kName = "CUDA_MODULE_LOADING";
+    if (std::getenv(kName) != nullptr) { return; }
+#ifdef _WIN32
+    _putenv_s(kName, "EAGER");
+#else
+    setenv(kName, "EAGER", 0);
+#endif
+}
+
+DeviceContext initialize_device(const EngineOptions& options, bool code_before_cache) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
+    if (code_before_cache) { load_kernels_eagerly(); }
     DeviceContext device(options.device);
     const std::size_t stack = options.lossless ? kLosslessStackBytes : kStackBytes;
     device.bind_to_current_thread();
@@ -263,7 +283,7 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(normalize(std::move(engine_options))),
-          device(initialize_device(options)) {
+          device(initialize_device(options, architecture == models::Architecture::Qwen4Exp && options.vram_past_budget)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         // The lossless ops' rounding mode is process-wide device state: every lossless Engine sets it, so
         // a noise twin never leaks into a later lossless run.
