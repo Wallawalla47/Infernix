@@ -30,7 +30,8 @@ __device__ __forceinline__ float f16_value(std::uint16_t word) {
 }
 
 // The exact value of one chunk element, kappa * d * sub * code, for formats without a min term
-// whose |sub * code| < 2^13 (IQ4_XS, IQ4_NL, Q8_0): with d's 11 significant bits it is exact in binary32.
+// whose |sub * code| < 2^13 (IQ4_XS, IQ4_NL, Q8_0; IQ3_S: |code| <= 15, sub <= 31): with d's 11 significant bits
+// it is exact in binary32.
 template <QType F>
 __device__ __forceinline__ void chunk_values(const std::uint8_t* row, int index, float (&v)[8]) {
     const ggml::Chunk c = ggml::row_chunk<F>(row, index);
@@ -107,10 +108,10 @@ void ggml_embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStr
     // Rows in 16-byte vectors when every row starts on a 16-byte boundary, else in 8-byte ones
     // (IQ4_XS rows are 136-byte blocks).
     const bool wide = row_bytes % 16 == 0 && reinterpret_cast<std::uintptr_t>(data) % 16 == 0;
-    require(row_bytes % 8 == 0 && reinterpret_cast<std::uintptr_t>(data) % 8 == 0, "table rows must be 8-byte aligned");
     const auto smem = static_cast<std::size_t>(row_bytes);
     switch (table.qtype) {
     case QType::GGML_IQ4_XS:
+        require(row_bytes % 8 == 0 && reinterpret_cast<std::uintptr_t>(data) % 8 == 0, "table rows must be 8-byte aligned");
         if (wide) {
             embedding_kernel<QType::GGML_IQ4_XS, uint4><<<columns, kThreads, smem, stream>>>(id, data, vocab, hidden,
                                                                                                row_bytes, o, fault);
@@ -119,11 +120,21 @@ void ggml_embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStr
                                                                                                row_bytes, o, fault);
         }
         break;
+    case QType::GGML_IQ3_S: // the GSQ-RCO IQ3_XXS imports' table: 110-byte blocks, so rows of 4- or 2-byte vectors
+        require(reinterpret_cast<std::uintptr_t>(data) % 4 == 0, "table rows must be 4-byte aligned");
+        if (row_bytes % 4 == 0) {
+            embedding_kernel<QType::GGML_IQ3_S, unsigned int><<<columns, kThreads, smem, stream>>>(
+                id, data, vocab, hidden, row_bytes, o, fault);
+        } else {
+            embedding_kernel<QType::GGML_IQ3_S, unsigned short><<<columns, kThreads, smem, stream>>>(
+                id, data, vocab, hidden, row_bytes, o, fault);
+        }
+        break;
     default:
         // Other formats' products can exceed 24 significant bits (Q6_K), so they would need the
-        // int128 path; only IQ4_XS tables are registered (a GGUF's Q8_0 embedding is imported as
+        // int128 path; only IQ4_XS and IQ3_S tables are registered (a GGUF's Q8_0 embedding is imported as
         // q8_g32_fp16, which ops::embedding gathers).
-        throw std::invalid_argument("ggml_embedding: table format has no embedding route (IQ4_XS)");
+        throw std::invalid_argument("ggml_embedding: table format has no embedding route (IQ4_XS, IQ3_S)");
     }
     check_launch("embedding");
 }

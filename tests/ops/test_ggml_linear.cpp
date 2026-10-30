@@ -964,6 +964,8 @@ INFERNIX_OP_TEST(ggml_linear) {
         for (const Scales scales : {Scales::Narrow, Scales::Wide, Scales::Wider, Scales::Edge}) {
             run_embedding(QType::GGML_IQ4_XS, 300, 2560, scales, rng);
             run_embedding(QType::GGML_IQ4_XS, 50, 256, scales, rng);
+            run_embedding(QType::GGML_IQ3_S, 300, 2560, scales, rng);
+            run_embedding(QType::GGML_IQ3_S, 50, 256, scales, rng);
             for (const QType q : {QType::GGML_IQ4_NL, QType::GGML_Q8_0}) {
                 run_ple(q, 16, 160, 1, scales, rng);
                 run_ple(q, 16, 160, 37, scales, rng);
