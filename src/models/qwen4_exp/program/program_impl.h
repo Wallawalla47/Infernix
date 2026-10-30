@@ -62,6 +62,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <mutex>
@@ -2259,10 +2260,15 @@ public:
         // Host phases of a chunk for nsys attribution (the GPU side is in the CUDA trace).
         const nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                             static_cast<std::uint64_t>(width));
+        // A call wide enough to stream reads its n-gram rows behind the gate once it is enqueued (run_rows_behind);
+        // the others, and a call the stream turns down, read them first.
+        // FP4-Local from a volume (2026-10-30, three interleaved runs): pp16413 6,829 -> 6,999 tok/s, pp4096
+        // 2,727 -> 2,802 (every pair ahead).
+        const bool rows_behind = expert_stream_ && width >= kStreamMinColumns && !walk_.active;
         {
             const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
-                                               static_cast<std::uint64_t>(width));
-            stage_sequence(index, begin, width, lane.history);
+                                               static_cast<std::uint64_t>(rows_behind ? 0 : width));
+            stage_sequence(index, begin, width, lane.history, !rows_behind);
         }
         const auto chunk = stage_mtp_chunk(lane, index, begin, width);
         // A resumed lane's first call waits per layer for its restore; any call waits per layer for
@@ -2270,7 +2276,17 @@ public:
         next_waits_ = prefix_waits(lane);
         const bool streamed = !walk_.active && stream_chunk(width);
         score_column_       = begin;
-        run(1, width, 1, chunk ? &*chunk : nullptr, stage_vision(lane, static_cast<std::uint32_t>(begin), width), streamed);
+        const execution::VisionInput* vision = stage_vision(lane, static_cast<std::uint32_t>(begin), width);
+        if (rows_behind && streamed) {
+            run_rows_behind(lane, begin, width, chunk ? &*chunk : nullptr, vision);
+        } else {
+            if (rows_behind) {
+                const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
+                                                   static_cast<std::uint64_t>(width));
+                stage_ngram(lane, lane.history, begin, width, 0);
+            }
+            run(1, width, 1, chunk ? &*chunk : nullptr, vision, streamed);
+        }
         if (last && !prefilling_besides(index)) {
             return_stream_lease();
             return_wide_work();
@@ -4022,13 +4038,20 @@ private:
     }
 
     // Runs one eager Forward call over the staged inputs (prefill chunks, forced tokens); logits of
-    // `logit_columns` columns land in logits32_.
+    // `logit_columns` columns land in logits32_. With `gate` the n-gram rows are not staged yet: the call
+    // uploads the rest of the layout, and ple.layer's upload takes the rows once the gate's word is published.
     void run(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
              const execution::MtpChunk* chunk = nullptr, const execution::VisionInput* vision = nullptr,
-             bool streamed = false) {
+             bool streamed = false, const execution::NgramRowGate* gate = nullptr) {
         const cudaStream_t s = device_.stream;
         // Read by the SMs, so it never queues on the copy engine behind expert promotions (W7).
-        upload_pinned(io_device_.p, io_host_.data(), io_layout_.bytes, s);
+        if (gate != nullptr) {
+            upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
+            upload_pinned(static_cast<std::byte*>(io_device_.p) + io_layout_.mtp_ids, host_io() + io_layout_.mtp_ids,
+                          io_layout_.bytes - io_layout_.mtp_ids, s);
+        } else {
+            upload_pinned(io_device_.p, io_host_.data(), io_layout_.bytes, s);
+        }
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this call
         residency_->before_round(s);
         // A call the CPU can share (design §19.3.12) gates the stream on each layer's routing.
@@ -4039,7 +4062,7 @@ private:
         }
         const WideWork wide(*this, batch * width);
         try {
-            forward_call(batch, width, logit_columns, nullptr, chunk, vision, nullptr, streamed);
+            forward_call(batch, width, logit_columns, nullptr, chunk, vision, gate, streamed);
             if (dflash2_) { dflash2_call_context(batch, width); }
         } catch (...) {
             // A failed call (an unreadable record, say) still returns the stream's slots: left
@@ -4051,6 +4074,43 @@ private:
         if (streamed) { expert_stream_->end(); }
         split_call_ = false;
         residency_->enqueue_route_download(s, batch * width);
+    }
+
+    // run() for a streamed prefill call staged without its n-gram rows: a helper thread reads them into the io
+    // layout and publishes the gate's word while this thread enqueues the call, so the GPU embeds and runs the
+    // layers before ple.layer (its experts streaming) during the read, where it otherwise waited for the whole
+    // read before the call's first kernel (FP4-Local pp16413 from a volume: 74 ms). The helper owns the row
+    // scratch (window_, row_ids_), the n-gram volume and the lane's n-gram counters until it is joined; this
+    // thread touches none of them meanwhile, and its own host waits (a split call's routing, the stream's
+    // bounce) cannot block the helper's publish. A failed read publishes zero rows (the call's results are
+    // discarded with its error). The same rows and the same arithmetic: no bit changes.
+    void run_rows_behind(Lane& lane, std::int32_t begin, std::int32_t width, const execution::MtpChunk* chunk,
+                         const execution::VisionInput* vision) {
+        const std::uint32_t word = next_gate_word();
+        const execution::NgramRowGate gate{
+            .pinned_rows = host_io() + io_layout_.ngram,
+            .ready       = gate_ready(),
+            .expected    = reinterpret_cast<const std::uint32_t*>(static_cast<std::byte*>(io_device_.p) + io_layout_.gate)};
+        std::exception_ptr failed;
+        std::thread reader([&, word] {
+            try {
+                const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
+                                                   static_cast<std::uint64_t>(width));
+                stage_ngram(lane, lane.history, begin, width, 0);
+            } catch (...) {
+                failed = std::current_exception();
+                std::memset(host_io() + io_layout_.ngram, 0, io_prefix(width) - io_layout_.ngram);
+            }
+            publish_pinned_word(gate_ready(), word);
+        });
+        try {
+            run(1, width, 1, chunk, vision, true, &gate);
+        } catch (...) {
+            reader.join();
+            throw;
+        }
+        reader.join();
+        if (failed) { std::rethrow_exception(failed); }
     }
 
     // ---- prefill expert streaming (design §19.3.8 F2, F3) ----
@@ -5776,11 +5836,20 @@ private:
 
     // INFERNIX_TMP_LINK_SHARE (Strata's L / (L + 1.85 R), R = C x the record's bytes): the link's share
     // of a call's misses in 256ths instead of misses / d (0: the divisor rule; a fixed d wins).
+    // Without the switch, NVFP4 W4A16 banks take the share form of the 122B's split (placement.h
+    // decode_link_share_256): FP4-Local's 67/256 against the divisor rule's 1/3 decoded the community struct fixture
+    // +4.4 % and short context +1.6 %, but after a 16K prompt -0.8 % (DFlash2 auto, two pairs each, 2026-10-30).
+    // INFERNIX_TMP_LINK_SHARE=divisor keeps them on the divisor rule.
     [[nodiscard]] int pcie_share() const noexcept {
         if (options_.cpu_pcie_divisor > 0) { return 0; }
-        return runtime::expert_offload::link_share_256(
-            temporary_switches::offload(), link_bytes_per_second_, cpu_expert_rate(),
-            static_cast<double>(parameters_.layers.front().moe.bank->planes.record_stride));
+        const auto& switches = temporary_switches::offload();
+        const auto& bank     = *parameters_.layers.front().moe.bank;
+        const auto record    = static_cast<double>(bank.planes.record_stride);
+        if (switches.link_share == temporary_switches::OffloadSwitches::LinkShare::kDivisor &&
+            bank.activation == ops::offloaded_moe::ExpertActivation::kA16 && bank.planes.gate_up_format == QType::NVFP4_MUL) {
+            return runtime::expert_offload::decode_link_share_256(link_bytes_per_second_, cpu_expert_rate(), record);
+        }
+        return runtime::expert_offload::link_share_256(switches, link_bytes_per_second_, cpu_expert_rate(), record);
     }
 
     [[nodiscard]] int pcie_divisor() const noexcept {
@@ -6362,6 +6431,9 @@ private:
     // 6 % slower, so the priors stand. Re-checked on the GSQ-RCO IQ3_S import with the tensor-core expert
     // kernels (2026-10-29, full layout, 2 runs each): 16K steady state 252.3 / 260.4 / 249.5 tok/s at costs
     // 0.15 / 0.31 / 0.5 (2.61 drafts, 2.01 accepted a round at 0.31), the struct fixture flat within its noise.
+    // Re-checked on NVIDIA FP4-Local with the tensor-core narrow experts (2026-10-30, two runs each): 0.15 / 0.20 /
+    // 0.25 / 0.40 / 0.50 against 0.31 after a 16K prompt 0.981 / 0.984 / 0.991 / 0.974 / 0.954x, at short context
+    // 0.973 / 0.989 / 1.002 / 0.990 / 0.963x, on the struct fixture 0.982 / 0.988 / 0.993 / 1.016 / 1.019x.
     static constexpr double kDFlashDraftCost    = 0.31;
     static constexpr double kDFlashProposalCost = 0.1;
     // The online draft cost (width_cost): sample decay (about 50 rounds), the rounds and the share of

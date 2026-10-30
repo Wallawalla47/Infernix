@@ -272,6 +272,13 @@ inline constexpr int kLosslessChunkColumns = 2048;
 inline constexpr std::size_t kCpuCallBytes = 2304; // 2 words + 512 indices, rounded to 256
 
 [[nodiscard]] std::int32_t max_tiles(std::int32_t max_jobs, std::int32_t entries);
+// Calls whose narrow W4A16 jobs (at most kMaxColumns columns each) take the tensor-core narrow kernels
+// (moe_layer.cu's a16_nmma_call): decode and verification calls of up to eight lanes, at most
+// kA16NmmaCallColumns columns, whose x limbs, exponents and per-job gate/up CTA counts the workspace then holds
+// under the A4 residual wide routes too (the exact wide route's workspace has them already). Their wider jobs
+// keep the wide route; wider calls' narrow jobs the dp4a kernels.
+inline constexpr int kA16NmmaCallColumns = 64;
+INFERNIX_WIDE_HD constexpr bool a16_nmma_columns(int columns) { return columns <= kA16NmmaCallColumns; }
 // `columns` is the call's T (entries = top_k * T); the activation and W4A16 wide route select the planes.
 // `shape` is the bank's geometry (MoeExpertSource::shape; shape_supported).
 [[nodiscard]] std::size_t experts_workspace_bytes(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t entries,

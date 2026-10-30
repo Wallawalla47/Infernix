@@ -170,6 +170,7 @@ struct Offsets {
     std::size_t lossless;                              // kLossless
     std::size_t x_acts, h_acts, ring_jobs, ring_counters; // the narrow ring (ring_call)
     bool has_ring;
+    bool has_nmma; // the A4 residual routes' x limbs, x_emax and job_ctas for a16_nmma_columns calls
     std::size_t end;
 };
 
@@ -205,7 +206,14 @@ Offsets offsets(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t en
         // The narrow route still needs its h rows (BF16 h of every entry) and exponents, and a ring
         // call (ring_call) its x exponents.
         o.h_rows = take(e * h_row);
-        if (ring_call(shape, activation, wide_a16, columns)) { o.x_emax = take(t * sizeof(std::int32_t)); }
+        // A decode or verification call's narrow jobs take the tensor-core narrow kernels, which read the call's x
+        // limbs and their gate/up CTA counts.
+        o.has_nmma = shape == kFlashNextShape && a16_nmma_columns(columns) && !ring_call(shape, activation, wide_a16, columns);
+        if (ring_call(shape, activation, wide_a16, columns) || o.has_nmma) { o.x_emax = take(t * sizeof(std::int32_t)); }
+        if (o.has_nmma) {
+            o.x_limbs  = take(t * x_row);
+            o.job_ctas = take(j * sizeof(std::uint32_t));
+        }
         o.h_emax        = take(e * sizeof(std::int32_t));
         o.x_terms_plane = take(e * static_cast<std::size_t>(x_terms_row_bytes(shape, terms.x)));
         o.x_row_scale   = take(t * sizeof(float));
@@ -576,7 +584,9 @@ ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, s
         w.lossless = reinterpret_cast<std::uint8_t*>(p + o.lossless);
     } else if (activation == ExpertActivation::kA16 && residual_terms(wide_a16).x != 0) {
         w.h_rows      = reinterpret_cast<std::uint8_t*>(p + o.h_rows);
-        w.x_emax      = o.has_ring ? reinterpret_cast<std::int32_t*>(p + o.x_emax) : nullptr;
+        w.x_emax      = o.has_ring || o.has_nmma ? reinterpret_cast<std::int32_t*>(p + o.x_emax) : nullptr;
+        w.x_limbs     = o.has_nmma ? reinterpret_cast<std::uint8_t*>(p + o.x_limbs) : nullptr;
+        w.job_ctas    = o.has_nmma ? reinterpret_cast<std::uint32_t*>(p + o.job_ctas) : nullptr;
         w.h_emax      = reinterpret_cast<std::int32_t*>(p + o.h_emax);
         w.x_terms_plane = reinterpret_cast<std::uint8_t*>(p + o.x_terms_plane);
         w.x_row_scale = reinterpret_cast<float*>(p + o.x_row_scale);

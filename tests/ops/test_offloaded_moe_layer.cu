@@ -195,11 +195,16 @@ private:
 // With narrow == kA4Residual (W4A16 only; expert-a4-residual-decode) the GPU narrow kernels and every
 // CPU service compute experts of at most eight columns with the two-term arithmetic, so those outputs
 // equal expert_forward_a4r's for every placement, staging pass and CPU share (the wide ones stay exact).
+// `wide` is the W4A16 wide route the workspace is carved for: a call of at most eight columns has no wide job, so
+// kA4Residual (FP4-Local's default) changes only the workspace its narrow kernels read.
 void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                 moe::ExpertActivation activation = moe::ExpertActivation::kA4,
-                moe::NarrowA16 narrow = moe::NarrowA16::kExact) {
+                moe::NarrowA16 narrow = moe::NarrowA16::kExact, moe::WideA16 wide = moe::WideA16::kExact) {
     const bool a16 = activation == moe::ExpertActivation::kA16;
-    if (a16) { std::printf("--- W4A16 experts%s\n", narrow == moe::NarrowA16::kA4Residual ? ", two-term narrow route" : ""); }
+    if (a16) {
+        std::printf("--- W4A16 experts%s%s\n", narrow == moe::NarrowA16::kA4Residual ? ", two-term narrow route" : "",
+                    wide == moe::WideA16::kA4Residual ? ", A4 residual workspace" : "");
+    }
     std::mt19937 rng(seed);
     const std::size_t stride = moe::kRecordBytes;
     std::vector<fixtures::Expert> bank;
@@ -304,7 +309,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     std::uint8_t* d_staging = nullptr;
     cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
     void* d_workspace = nullptr;
-    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(infernix::ops::offloaded_moe::kFlashNextShape, max_jobs, top_k * columns, columns, activation)),
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(infernix::ops::offloaded_moe::kFlashNextShape, max_jobs,
+                                                                                    top_k * columns, columns, activation, wide)),
                "cudaMalloc");
     std::uint16_t* d_out = nullptr;
     cuda_check(cudaMalloc(&d_out, expected.size() * sizeof(std::uint16_t)), "cudaMalloc");
@@ -552,6 +558,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                                                              : infernix::ops::MoeCpuChannel{}};
         source.activation           = activation;
         source.narrow_a16           = narrow;
+        source.wide_a16             = wide;
         source.heartbeat_timeout_ns = config.fetch == Responder::Mode::kSilent ? kSilentHeartbeatTimeoutNs : kTestHeartbeatTimeoutNs;
         if (config.service != nullptr) {
             // The CPU wait warms these into L2 while the host works; no output may change.
@@ -1621,8 +1628,8 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
             test_tail_skip(96, 16, 10, 8, 409); // two verify rows: past the fork route, wide experts never skipped
         }
         // W4A16 experts (§16.2.1): decode, verification, several columns per expert, many misses, and
-        // a short prompt's call (experts of more than eight columns on the narrow kernels). Calls of
-        // four columns take the one-column kernels and of five or more the multi-column ones.
+        // a short prompt's call. The narrow jobs of calls of at most 64 columns take the tensor-core narrow
+        // kernels; a wider call's narrow jobs the dp4a multi-column kernels.
         constexpr auto kA16 = moe::ExpertActivation::kA16;
         test_layer(12, 1, 10, 41, kA16);
         test_layer(24, 8, 10, 43, kA16);
@@ -1631,6 +1638,15 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
         test_layer(9, 12, 3, 71, kA16);
         test_layer(96, 10, 10, 59, kA16);
         test_layer(512, 512, 10, 61, kA16);
+        // Calls of up to 64 columns (several lanes' rounds): narrow jobs on the tensor-core kernels, wider ones wide.
+        test_layer(48, 16, 10, 151, kA16);
+        test_layer(96, 64, 10, 153, kA16);
+        // The tensor-core narrow kernels in the workspace of FP4-Local's default A4 residual wide route.
+        constexpr auto kExactNarrow = moe::NarrowA16::kExact;
+        constexpr auto kResidualWide = moe::WideA16::kA4Residual;
+        test_layer(12, 1, 10, 141, kA16, kExactNarrow, kResidualWide);
+        test_layer(24, 8, 10, 143, kA16, kExactNarrow, kResidualWide);
+        test_layer(9, 3, 3, 147, kA16, kExactNarrow, kResidualWide);
         // The two-term narrow route (expert-a4-residual-decode): GPU kernels and CPU-served misses alike,
         // for every placement, staging pass, CPU share and SSD-tier read of the configurations above.
         constexpr auto kTwoTerm = moe::NarrowA16::kA4Residual;
