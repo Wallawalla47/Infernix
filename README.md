@@ -353,8 +353,6 @@ Install `nvidia-container-toolkit` then run:
 docker build -t infernix .
 docker run --rm --gpus '"device=0"' infernix  
 ```
-Change to `--gpus '"device=0,1"'` for more gpus.
-
 ### Podman
 
 Install `nvidia-container-toolkit` then run:
@@ -362,7 +360,6 @@ Install `nvidia-container-toolkit` then run:
 podman build -t infernix .
 podman run --rm --device nvidia.com/gpu=0 infernix
 ```
-Add `--device nvidia.com/gpu=1` and so on for more gpus.
 
 ## Models
 
