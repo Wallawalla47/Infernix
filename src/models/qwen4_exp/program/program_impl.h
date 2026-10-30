@@ -2623,13 +2623,13 @@ public:
             publish_pinned_word(gate_ready(), word);
         }
         run_decode(batch, round_positions[0], graph, screened);
-        GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch) - io_layout_.ngram};
+        if (gated) {
+            read_behind_gate(lanes_[lanes[0]], word, io_prefix(batch) - io_layout_.ngram,
+                             [&] { stage_decode_rows(round_lanes, round_positions); });
+        }
+        residency_->enqueue_route_download(device_.stream, batch);
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].state_tokens; }
-        sample(round_lanes, round_positions, [&] {
-            if (!gated) { return; }
-            read_behind_gate(lanes_[lanes[0]], word, [&] { stage_decode_rows(round_lanes, round_positions); });
-            release_gate.owner = nullptr;
-        });
+        sample(round_lanes, round_positions);
         deferred_ = {.columns = batch, .tokens = 1, .live = false, .pending = true};
         runtime::ExecutionTiming timing;
         timing.submit_host_ns = elapsed_ns(start);
@@ -3644,8 +3644,8 @@ private:
         return static_cast<std::uint32_t>(&lane - lanes_.data());
     }
 
-    // Publishes a gated round's word if the round ends before its rows are read: the rows are
-    // zeroed (the round's results are discarded with the error), so the enqueued gate passes.
+    // Publishes a gated round's word if reading its rows fails: the rows are zeroed (the round's
+    // results are discarded with the error), so the enqueued gate passes and the stream drains.
     struct GateRelease {
         ProgramImpl* owner = nullptr;
         std::uint32_t word = 0;
@@ -4003,13 +4003,20 @@ private:
         return word;
     }
 
-    // After a gated launch: submits the queued work, reads the rows (`read`), releases the gate and
-    // counts the reads toward `lane` (the round's first row).
-    void read_behind_gate(Lane& lane, std::uint32_t word, const std::function<void()>& read) {
+    // Right after a gated launch: submits it, reads the rows (`read`, into the io's first `bytes` of
+    // n-gram rows), releases the gate and counts the reads toward `lane` (the round's first row).
+    // Until the word is published the GPU waits on this thread, so nothing may be queued before it:
+    // a call that waits for the device deadlocks the round. A kernel's first launch is one, as the
+    // driver loads its code then and, with the process past its OS budget, waits for the device
+    // to do so (the sampler and acceptance kernels queued here before 2026-10-30: the gate trapped
+    // after kPinnedGateTimeoutNs in 5 of 7 --vram-past-budget starts).
+    void read_behind_gate(Lane& lane, std::uint32_t word, std::size_t bytes, const std::function<void()>& read) {
+        GateRelease release_gate{this, word, bytes};
         device_.flush();
         const NgramVolume::Counters before = volume_.counters();
         read();
         const NgramVolume::Counters& after = volume_.counters();
+        release_gate.owner = nullptr;
         publish_pinned_word(gate_ready(), word);
         ++lane.gate.rounds;
         lane.gate.reads += after.reads - before.reads;
@@ -4389,7 +4396,6 @@ private:
         } else {
             replay(graph, [&] { decode_graph_body(batch, screened); });
         }
-        residency_->enqueue_route_download(s, batch);
     }
 
     // screened-lm-head: whether a round of these rows and `columns` logit columns takes the screened head.
@@ -4766,9 +4772,7 @@ private:
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
         residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
         replay(graph, [&] { verify_graph_body(batch, W, screened); });
-        // From here an enqueued gate waits for `word`: an error before it is published still
-        // publishes it (over zeroed rows), so the stream drains and the error keeps its class.
-        GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch * W) - io_layout_.ngram};
+        if (gated) { read_behind_gate(lanes_[lanes[0]], word, io_prefix(batch * W) - io_layout_.ngram, read_rows); }
         residency_->enqueue_route_download(s, batch * W);
 
         // Acceptance on the device, from the logits plain decode samples (FP32, or BF16: design 16.5); the
@@ -4860,10 +4864,6 @@ private:
         }
         CUDA_CHECK(cudaMemcpyAsync(spec_host(spec_layout_.licensed), licensed.data,
                                    4ULL * (spec_layout_.commit - spec_layout_.licensed), cudaMemcpyDeviceToHost, s));
-        if (gated) {
-            read_behind_gate(lanes_[lanes[0]], word, read_rows);
-            release_gate.owner = nullptr;
-        }
         device_.synchronize();
         check_expert_error();
 
@@ -5550,9 +5550,7 @@ private:
     }
 
     // Samples the next token of each row from read_logits (row b = column b) into pending_tokens_.
-    // `before_wait` runs on the host after the sampling work is queued, before its wait.
-    void sample(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> positions,
-                const std::function<void()>& before_wait = {}) {
+    void sample(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> positions) {
         const cudaStream_t s = device_.stream;
         const auto batch     = static_cast<std::int32_t>(lanes.size());
         // The sampler reads the FP32 logits, or BF16 (design §16.5); a constraint masks them in place (the prompt
@@ -5577,7 +5575,6 @@ private:
                         ops::kSamplePurposeDecode, *work_, s);
         }
         CUDA_CHECK(cudaMemcpyAsync(host_sampled_.data(), sampled_.p, 4ULL * batch, cudaMemcpyDeviceToHost, s));
-        if (before_wait) { before_wait(); }
         device_.synchronize();
         check_expert_error();
         const auto* tokens = static_cast<const std::int32_t*>(host_sampled_.data());
