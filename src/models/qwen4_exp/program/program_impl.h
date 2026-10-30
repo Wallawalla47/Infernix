@@ -5834,9 +5834,11 @@ private:
     // INFERNIX_TMP_LINK_SHARE (Strata's L / (L + 1.85 R), R = C x the record's bytes): the link's share
     // of a call's misses in 256ths instead of misses / d (0: the divisor rule; a fixed d wins).
     // Without the switch, NVFP4 W4A16 banks take the share form of the 122B's split (placement.h
-    // decode_link_share_256): FP4-Local's 67/256 against the divisor rule's 1/3 decoded the community struct fixture
-    // +4.4 % and short context +1.6 %, but after a 16K prompt -0.8 % (DFlash2 auto, two pairs each, 2026-10-30).
-    // INFERNIX_TMP_LINK_SHARE=divisor keeps them on the divisor rule.
+    // decode_link_share_256): FP4-Local's 67/256 against the divisor rule's 1/3, with the tensor-core narrow experts,
+    // decoded the community struct fixture +6.3 %, short context +5.4 % and after a 16K prompt +0.1 % (DFlash2 auto,
+    // three interleaved pairs each, every struct and short-context pair ahead, 2026-10-30; with the dp4a experts the
+    // rule had been level or ahead). INFERNIX_TMP_LINK_SHARE=divisor keeps them on the divisor rule. GGUF and W4A4
+    // banks keep the rule (unmeasured).
     [[nodiscard]] int pcie_share() const noexcept {
         if (options_.cpu_pcie_divisor > 0) { return 0; }
         const auto& switches = temporary_switches::offload();

@@ -360,7 +360,7 @@ int test_cli_contract() {
 
 int test_measurement_contract() {
     int failures = 0;
-    const infernix::SpeculativeOptions mtp5{infernix::SpeculativeBackend::Mtp, 5};
+    const infernix::SpeculativeOptions mtp5{.backend = infernix::SpeculativeBackend::Mtp, .draft_tokens = 5};
     const qb::BenchTest pp{qb::TestKind::Prefill, 512, 0, "pp512"};
     const qb::BenchTest tg{qb::TestKind::Decode, 0, 128, "tg128"};
     const qb::BenchTest combined{qb::TestKind::PrefillDecode, 2048, 128, "pp2048+tg128"};
@@ -390,7 +390,7 @@ int test_measurement_contract() {
             (void)qb::resolve_max_context(matrix, std::optional<std::uint32_t>(2048), mtp5, true);
         },
         "undersized context");
-    const infernix::SpeculativeOptions dflash2{infernix::SpeculativeBackend::DFlash2, 15};
+    const infernix::SpeculativeOptions dflash2{.backend = infernix::SpeculativeBackend::DFlash2, .draft_tokens = 15};
     failures +=
         expect_u32(combined.required_context(dflash2), 2176, "DFlash2 uses no MTP lookahead KV");
     failures += expect_u32(qb::decode_graph_prime_required_context(dflash2), 33,

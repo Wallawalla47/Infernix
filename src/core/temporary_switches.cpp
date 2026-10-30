@@ -45,9 +45,6 @@ constexpr Registration kSwitches[] = {
     // Debug diagnostic: the prefill projection inputs' FP16 headroom scan, written to this path
     // (models/qwen4_exp/execution/activation_scan.cpp).
     {"INFERNIX_TMP_ACTIVATION_SCAN", Scope::Qwen4Exp, Kind::Value},
-    // Flash-Next prefill: =1 one streamed call and the prompt's narrow last call run chunk-major, as before
-    // 2026-10-30 (prefill_walk.cpp walk_span_end). Same bits.
-    {"INFERNIX_TMP_WALK_NO_JOIN", Scope::Qwen4Exp, Kind::Flag},
     // Offloaded experts: =<n> (1-64) runs a routing-sequence predictor beside the expert cache whose next
     // n experts per layer and lane each eviction spares while another resident is left
     // (runtime/expert_offload/route_predictor.h; candidates §13 PUB-22; A/B only after its replay
