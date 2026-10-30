@@ -298,10 +298,11 @@ struct Call {
     int envelope_keys            = 0;     // visible-key envelope (0: the cache capacity); above
                                           // 32K it selects the 8-column verification CTAs
     bool prompt_pv8              = false; // the prompt kernel's 8-bit PV form
+    bool row_invariant           = false; // the reproducible route's row-invariant partition
 };
 
 int run_call(const Geometry& g, KvCacheStorage storage, const Call& c, const std::string& name,
-             bool stale_window = false) {
+             bool stale_window = false, std::vector<std::uint16_t>* captured = nullptr) {
     const int batch      = static_cast<int>(c.prefix.size());
     const int width      = c.width;
     const int max_prefix = *std::max_element(c.prefix.begin(), c.prefix.end());
@@ -343,6 +344,7 @@ int run_call(const Geometry& g, KvCacheStorage storage, const Call& c, const std
     ops::CausalAttentionExecutionEnvelope envelope{1, static_cast<std::uint32_t>(capacity)};
     envelope.fast_prompt_kernel = true;
     envelope.fast_prompt_pv8    = c.prompt_pv8;
+    envelope.row_invariant_partition = c.row_invariant;
     const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
         geometry, storage, envelope, batch, width, width, test_execution());
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
@@ -376,6 +378,7 @@ int run_call(const Geometry& g, KvCacheStorage storage, const Call& c, const std
     cuda_synchronize();
     std::vector<std::uint16_t> out(q_count);
     dout.copy_to_host(out.data(), q_count * 2);
+    if (captured != nullptr) *captured = out;
     const Snapshot after = cache.snapshot();
 
     // Oracle over evenly spaced valid columns of every row.
@@ -557,6 +560,38 @@ INFERNIX_OP_TEST(vq_attention) {
                                  "stale window W=3", true);
             failures += run_call(g, storage, Call{.width = 300, .prefix = {1500}, .seed = 52, .oracle_columns = 24},
                                  "stale window prompt W=300", true);
+            // Row invariance (the reproducible route): a row's output is bit-identical whatever
+            // the batch's envelope or the other rows (here a 17,000-key row beside it).
+            for (const int w : {1, 4, 8}) {
+                for (const int prefix : {300, 1300, 3200}) {
+                    const std::string what =
+                        "row-invariant W=" + std::to_string(w) + " prefix=" + std::to_string(prefix);
+                    std::vector<std::uint16_t> alone, wide, paired;
+                    Call c{.width = w, .prefix = {prefix}, .seed = 81u + w, .row_invariant = true};
+                    failures += run_call(g, storage, c, what + " alone", false, &alone);
+                    c.envelope_keys = 17000;
+                    failures += run_call(g, storage, c, what + " envelope=17000", false, &wide);
+                    Call pair{.width = w, .prefix = {prefix, 17000}, .seed = 81u + w, .row_invariant = true};
+                    failures += run_call(g, storage, pair, what + " beside 17000", false, &paired);
+                    const auto differing = [&](const std::vector<std::uint16_t>& other) {
+                        std::size_t count = 0;
+                        for (std::size_t i = 0; i < alone.size(); ++i) count += alone[i] != other[i];
+                        return count;
+                    };
+                    const std::string label =
+                        what + " " + g.name + " " + (storage == KvCacheStorage::Vq2 ? "vq2" : "k4v2");
+                    if (const std::size_t n = differing(wide); n != 0) {
+                        std::cerr << label << ": " << n << " of " << alone.size()
+                                  << " outputs differ under a 17,000-key envelope\n";
+                        ++failures;
+                    }
+                    if (const std::size_t n = differing(paired); n != 0) {
+                        std::cerr << label << ": " << n << " of " << alone.size()
+                                  << " outputs differ beside a 17,000-key row\n";
+                        ++failures;
+                    }
+                }
+            }
             // Cached entry (the MTP final-token form) and a cached prompt.
             failures += run_call(g, storage, Call{.width = 1, .prefix = {2500}, .seed = 61, .cached = true},
                                  "cached W=1");
