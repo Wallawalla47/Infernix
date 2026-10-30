@@ -160,9 +160,11 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 | `AB_ALT_EXE` | the treatment executable; another build puts a second Infernix build in the alt arm |
 | `AB_TREATMENT_ENV` / `AB_ALT_ENV` / `AB_CONTROL_ENV` | none; `NAME=VALUE ...` set for that arm's serve only (a temporary `INFERNIX_TMP_*` A/B switch). No serve inherits the runner's own `INFERNIX_TMP_*` variables |
 | `AB_CONTROL_LABEL` / `AB_TREATMENT_LABEL` / `AB_ALT_LABEL` | none (the report calls the arms "NInfer + Windows port", "Infernix" and "Infernix, alternative") |
-| `AB_CONTROL_KIND` | `serve`; `strata` runs the control arm as a Strata server (below) |
+| `AB_CONTROL_KIND` | `serve`; `strata` or `basalt` runs the control arm as that engine's own server (below) |
 | `AB_STRATA_DIR` / `AB_STRATA_CONFIG` | none, required for a Strata control / its `strata-unsloth-ud-q4_k_xl.json` |
+| `AB_STRATA_PYTHON` | `.venv\Scripts\python.exe` in `AB_STRATA_DIR` (a release's bundled `python\python.exe` otherwise) |
 | `AB_STRATA_EXTRA_ARGS` | none (engine arguments added to the Strata config's) |
+| `AB_BASALT_EXE` / `AB_BASALT_CONFIG` | none, required for a Basalt control: its `bin\basalt.exe` / its `basalt_config.json` |
 | `AB_REQUEST_TIMEOUT_S` | `1200` (per request; raise it for an engine that queues requests one at a time) |
 | `AB_TEMPERATURE` | `1.0`; `0` replays greedily (see Sampling) |
 | `AB_HOST` / `AB_PORT` | `127.0.0.1` / `8080` |
@@ -173,19 +175,22 @@ The launch bat's serve line may start `infernix-serve` or `ninfer-serve` (deploy
 before the rename). A run is marked invalid (non-zero exit, warning in the report) if any
 workload request fails.
 
-### Strata as the control arm
+### Strata or Basalt as the control arm
 
-`AB_CONTROL_KIND=strata` compares Infernix with [Strata](https://github.com/Niko1221/Strata) on
-Qwen3.8-Flash-Next. The runner starts Strata's own server (`serve\server.py --engine strata`) with
-the Strata config plus `AB_STRATA_EXTRA_ARGS`, waits until it answers a request (it returns 503
-while its engine starts), and needs `--ctx` (no calibration). The treatment's launch line comes
-from `AB_LAUNCH_BAT` as usual.
+`AB_CONTROL_KIND=strata` compares Infernix with [Strata](https://github.com/Niko1221/Strata) (or a
+fork with the same front end, such as strata-nvfp4) on Qwen3.8-Flash-Next. The runner starts
+Strata's own server (`serve\server.py --engine strata`, under `AB_STRATA_PYTHON`) with the Strata
+config plus `AB_STRATA_EXTRA_ARGS`. `AB_CONTROL_KIND=basalt` starts
+[Basalt](https://github.com/jesdga95/basalt)'s `basalt serve --config` with a copy of
+`AB_BASALT_CONFIG` on the runner's host and port. Either way the runner waits until the server
+answers a request for its served model (both return 503 while their engine starts), and needs
+`--ctx` (no calibration). The treatment's launch line comes from `AB_LAUNCH_BAT` as usual.
 
-Strata writes no request log of this kind, so after its arm the runner writes `request_log.jsonl`
+Neither writes a request log of this kind, so after its arm the runner writes `request_log.jsonl`
 from the client's rows: prompt and output tokens from each response's `usage`; cached tokens,
-prefilled tokens and drafts from Strata's per-request `timings` (`cache_n`, `prompt_n`, `draft_n`,
-`draft_n_accepted`), with verify rounds = output tokens − accepted drafts. Only counts are taken;
-times come from the client's clock, as for every arm.
+prefilled tokens and drafts from the engine's per-request `timings` in llama.cpp's names (`cache_n`,
+`prompt_n`, `draft_n`, `draft_n_accepted`), with verify rounds = output tokens − accepted drafts.
+Only counts are taken; times come from the client's clock, as for every arm.
 The report also flags when the client's context guard had to clear old tool results to keep a
 prompt 24K tokens under `--max-context`.
 
