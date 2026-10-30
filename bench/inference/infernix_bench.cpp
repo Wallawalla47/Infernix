@@ -360,7 +360,10 @@ int main(int argc, char** argv) {
             env.machine.h2d_bytes_per_second = measure_h2d(options.device);
         }
         env.prefill_chunk = engine.options().prefill_chunk; // the model's default when unset
-        // auto resolves to a ceiling, or on Qwen3.5/3.6 without adaptive-mtp to a fixed length.
+        // --spec auto resolves to the artifact's drafter (or none); --draft-tokens auto to a ceiling,
+        // or on Qwen3.5/3.6 without adaptive-mtp to a fixed length.
+        env.speculative.backend           = engine.options().speculative.backend;
+        env.speculative.backend_auto      = engine.options().speculative.backend_auto;
         env.speculative.draft_tokens      = engine.options().speculative.draft_tokens;
         env.speculative.draft_tokens_auto = engine.options().speculative.draft_tokens_auto;
         fill_cuda_environment(env, options.device);

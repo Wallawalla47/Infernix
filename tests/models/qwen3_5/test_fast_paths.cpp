@@ -299,6 +299,26 @@ int main() {
                               q::dflash_width_costs(resident32, SpeculativeBackend::DFlash2).per_draft == 0.15,
                           "offloaded experts price a draft column at 0.72 of a plain round");
     }
+    // --spec auto takes the bundled drafter measured fastest: with offloaded experts MTP (DFlash2's auto
+    // decodes plain there), else DFlash2 (the Qwen3.8-27Bs), then MTP (the 35B-A3B beside DFlash, the
+    // Qwen3.6-27Bs alone), then DFlash; none without a drafter worth binding.
+    {
+        const q::BundledDrafters all{.mtp = true, .dflash = true, .dflash2 = true};
+        const q::BundledDrafters qwen3_8_27b{.mtp = true, .dflash2 = true};
+        const q::BundledDrafters qwen3_6_35b{.mtp = true, .dflash = true};
+        failures += check(q::auto_speculative_backend(true, qwen3_8_27b) == SpeculativeBackend::Mtp &&
+                              q::auto_speculative_backend(true, all) == SpeculativeBackend::Mtp &&
+                              q::auto_speculative_backend(true, {.dflash2 = true}) == SpeculativeBackend::None &&
+                              q::auto_speculative_backend(true, {}) == SpeculativeBackend::None,
+                          "--spec auto with offloaded experts did not take MTP alone");
+        failures += check(q::auto_speculative_backend(false, qwen3_8_27b) == SpeculativeBackend::DFlash2 &&
+                              q::auto_speculative_backend(false, all) == SpeculativeBackend::DFlash2 &&
+                              q::auto_speculative_backend(false, qwen3_6_35b) == SpeculativeBackend::Mtp &&
+                              q::auto_speculative_backend(false, {.mtp = true}) == SpeculativeBackend::Mtp &&
+                              q::auto_speculative_backend(false, {.dflash = true}) == SpeculativeBackend::DFlash &&
+                              q::auto_speculative_backend(false, {}) == SpeculativeBackend::None,
+                          "--spec auto did not rank resident drafters DFlash2, MTP, DFlash");
+    }
     failures += check(q::dflash_auto_ceiling(int8_24, SpeculativeBackend::DFlash2) == 15 &&
                           q::dflash_auto_ceiling({16, ActivationClass::A16, KvCacheStorage::Int8Group64},
                                                  SpeculativeBackend::DFlash) == 7,

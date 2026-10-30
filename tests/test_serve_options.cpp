@@ -418,6 +418,37 @@ int main() {
                           "serve options did not preserve DFlash2 configuration");
     }
 
+    // --spec auto leaves the drafter to the Engine (backend none until it reads the artifact), with an
+    // automatic draft length and no drafter-specific cut; --draft-model and the drafter flags ride along.
+    {
+        const ServeOptions automatic =
+            parse({"infernix-serve", "model.ninfer", "--spec", "auto", "--draft-tokens", "auto", "--lm-head-draft",
+                   "--draft-model", "drafter.infernix", "--ngram-draft-tokens", "auto", "--draft-tree-nodes", "auto"});
+        failures += check(automatic.speculative.backend_auto &&
+                              automatic.speculative.backend == infernix::SpeculativeBackend::None &&
+                              automatic.speculative.draft_tokens_auto &&
+                              automatic.speculative.proposal_head == infernix::ProposalHead::Optimized &&
+                              automatic.speculative.draft_model == "drafter.infernix",
+                          "--spec auto did not leave the drafter to the Engine with its settings");
+        failures += check(!parse({"infernix-serve", "model.ninfer", "--spec", "auto", "--draft-tokens", "auto", "--spec",
+                                  "mtp", "--draft-tokens", "3"})
+                               .speculative.backend_auto,
+                          "a later --spec mtp kept --spec auto");
+        failures += check(parse_error({"infernix-serve", "model.ninfer", "--spec", "auto", "--draft-tokens", "3"})
+                                  .find("--draft-tokens auto") != std::string::npos &&
+                              parse_error({"infernix-serve", "model.ninfer", "--spec", "auto"})
+                                  .find("--draft-tokens auto") != std::string::npos,
+                          "--spec auto was accepted without --draft-tokens auto");
+        failures += check(parse_error({"infernix-serve", "model.ninfer", "--spec", "auto", "--draft-tokens", "auto",
+                                       "--spec-min-p", "0.5"})
+                                  .find("--spec-min-p") != std::string::npos,
+                          "--spec auto was accepted with one drafter's --spec-min-p");
+        failures += check(!parse_error({"infernix-serve", "model.ninfer", "--spec", "automatic", "--draft-tokens",
+                                        "auto"})
+                               .empty(),
+                          "an unknown --spec value was accepted");
+    }
+
     const ServeOptions dflash_vision = parse(
         {"infernix-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15", "--vision"});
     failures += check(dflash_vision.enable_vision &&

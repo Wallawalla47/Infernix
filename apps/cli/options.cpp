@@ -181,7 +181,7 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--logits-dtype fp32|bf16]\n"
-           "       [--spec mtp|dflash|dflash2 --draft-tokens "
+           "       [--spec mtp|dflash|dflash2|auto --draft-tokens "
            "N|auto]\n"
            "       [--draft-model FILE]\n"
            "       [--lm-head-draft] [--spec-min-p P] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
@@ -326,7 +326,12 @@ std::string usage_text(const char* argv0) {
            "                           always keep it in host memory)\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
-           "  --spec mtp|dflash|dflash2 speculative backend\n"
+           "  --spec mtp|dflash|dflash2|auto\n"
+           "                           speculative backend. auto (with --draft-tokens auto):\n"
+           "                           the drafter measured fastest for the artifact:\n"
+           "                           Qwen3.8-Flash-Next dflash2 with --draft-model, else\n"
+           "                           mtp; offloaded-expert Qwen3.5 (122B) mtp; other\n"
+           "                           Qwen3.5/3.6 dflash2, then mtp, then dflash, as bundled\n"
            "  --draft-tokens N|auto    drafts per round: mtp 1-7 (Qwen3.5/3.6 1-5),\n"
            "                           dflash/dflash2 1-15 (Qwen3.8-Flash-Next dflash2 1-7)\n"
            "                             N     every round drafts and verifies N\n"
@@ -336,8 +341,9 @@ std::string usage_text(const char* argv0) {
            "                                   and verifies as many as the drafts'\n"
            "                                   probabilities favour (Qwen3.5/3.6: where\n"
            "                                   qualified, else the fastest fixed length)\n"
-           "  --draft-model FILE       Qwen3.8-Flash-Next dflash2: the DFlash2 drafter's\n"
-           "                           companion artifact (Qwen3.5/3.6 artifacts bundle theirs)\n"
+           "  --draft-model FILE       Qwen3.8-Flash-Next dflash2 (or auto): the DFlash2\n"
+           "                           drafter's companion artifact (Qwen3.5/3.6 artifacts\n"
+           "                           bundle theirs)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
            "  --spec-min-p P           mtp (on Qwen3.8-Flash-Next with a fixed --draft-tokens N\n"
            "                           only), Qwen3.8-Flash-Next dflash2: one-request rounds\n"
@@ -511,7 +517,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--logits-dtype") {
             options.logits_dtype = product::parse_logits_dtype(value(arg));
         } else if (arg == "--spec") {
-            options.speculative.backend = product::parse_speculative_backend(value(arg));
+            product::apply_speculative_backend(options.speculative, value(arg));
         } else if (arg == "--draft-tokens") {
             product::apply_draft_tokens(options.speculative, value(arg));
         } else if (arg == "--draft-model") {

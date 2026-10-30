@@ -89,7 +89,7 @@ infernix_bench --weights <artifact.ninfer>
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2>] [--use-original-int8-prefill-kernel]
           [--use-original-nvfp4-prefill-kernel] [--prefill-split-workspace-mib <n>]
           [--reproducible] [--fast-path <name>]...
-          [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
+          [--spec <mtp|dflash|dflash2|auto> --draft-tokens <n|auto>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
 ```
@@ -118,8 +118,9 @@ Example:
 ```
 
 Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (MTP K=1..5, DFlash/DFlash2
-K=1..15); `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
-enabled by default.
+K=1..15), or let the Engine pick the artifact's drafter with `--spec auto --draft-tokens auto` (the
+report records the backend it chose); `--lm-head-draft` selects the optimized proposal head. CUDA
+Graph decode is enabled by default.
 
 `--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with

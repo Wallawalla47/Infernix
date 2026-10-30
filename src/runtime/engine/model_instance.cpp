@@ -199,6 +199,63 @@ bool artifact_offloads_experts(const artifact::Reader& reader) {
     return reader.directory().bindings.contains("text/layers/0/moe/experts");
 }
 
+models::qwen3_5::BundledDrafters artifact_drafters(const artifact::Reader& reader) {
+    const auto& components = reader.directory().components;
+    return {.mtp     = components.contains("mtp"),
+            .dflash  = components.contains("dflash"),
+            .dflash2 = components.contains("dflash2")};
+}
+
+void resolve_auto_speculative_backend(EngineOptions& options, models::Architecture architecture,
+                                      bool offloaded_experts, const models::qwen3_5::BundledDrafters& drafters) {
+    SpeculativeOptions& speculative = options.speculative;
+    if (!speculative.backend_auto || options.purpose != EnginePurpose::Generation) { return; }
+    // The choice follows each drafter's --draft-tokens auto measurement; a fixed length or a cut tuned
+    // for one drafter would not mean the same for another.
+    if (!speculative.draft_tokens_auto) {
+        throw std::invalid_argument("--spec auto chooses the drafter: it takes --draft-tokens auto");
+    }
+    if (speculative.draft_min_p) {
+        throw std::invalid_argument("--spec-min-p tunes one drafter's cut: --spec auto takes none");
+    }
+    const char* why = nullptr;
+    if (architecture == models::Architecture::Qwen4Exp) {
+        // Inco AI's DFlash2 drafter (a companion artifact) decoded 8-26 % faster than the MTP layer on every
+        // conversion measured (README "Qwen3.8-Flash-Next: DFlash2 against MTP", 2026-10-20).
+        if (!speculative.draft_model.empty()) {
+            speculative.backend = SpeculativeBackend::DFlash2;
+            why                 = "the --draft-model drafter, Qwen3.8-Flash-Next's fastest measured";
+        } else {
+            speculative.backend = drafters.mtp ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
+            why = "the DFlash2 drafter, about 10 % faster on Qwen3.8-Flash-Next, needs --draft-model FILE";
+        }
+    } else {
+        speculative.backend = models::qwen3_5::auto_speculative_backend(offloaded_experts, drafters);
+        why                 = "the fastest measured of the drafters the artifact bundles";
+    }
+    speculative.backend_auto = false;
+    const char* chosen       = "mtp";
+    switch (speculative.backend) {
+    case SpeculativeBackend::Mtp: break;
+    case SpeculativeBackend::DFlash: chosen = "dflash"; break;
+    case SpeculativeBackend::DFlash2: chosen = "dflash2"; break;
+    case SpeculativeBackend::None:
+        // Nothing to draft with: plain decode, and every drafter setting goes with the drafter (copy
+        // proposals stay where the model verifies them alone).
+        speculative.draft_tokens            = 0;
+        speculative.draft_tokens_auto       = false;
+        speculative.proposal_head           = ProposalHead::Full;
+        speculative.draft_tree_auto         = false;
+        speculative.draft_tree_nodes        = {};
+        speculative.ngram_draft_tokens_auto = false;
+        chosen                              = "plain decode";
+        why = (drafters.mtp || drafters.dflash || drafters.dflash2) ? "none of the artifact's drafters beats it here"
+                                                                     : "the artifact bundles no drafter";
+        break;
+    }
+    publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "--spec auto: %s (%s)", chosen, why);
+}
+
 EngineOptions normalize_engine_options(EngineOptions options, models::Architecture architecture,
                                        bool offloaded_experts) {
     switch (options.purpose) {
@@ -218,6 +275,11 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+    }
+    // The Engine resolves --spec auto from the artifact's drafters first (resolve_auto_speculative_backend);
+    // an unresolved one means it could not read them.
+    if (options.speculative.backend_auto) {
+        throw std::invalid_argument("--spec auto chooses from the artifact's drafters, which could not be read");
     }
 
     ContextCacheOptions& cache = options.context_cache;
@@ -302,7 +364,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
                                options.speculative.backend == SpeculativeBackend::DFlash2;
     if (options.speculative.draft_tokens_auto) {
         if (options.speculative.backend != SpeculativeBackend::Mtp && !block_drafter) {
-            throw std::invalid_argument("--draft-tokens auto requires --spec mtp, dflash or dflash2");
+            throw std::invalid_argument("--draft-tokens auto requires --spec mtp, dflash, dflash2 or auto");
         }
         if (options.speculative.draft_tokens == 0 && (qwen4_exp || !block_drafter)) {
             options.speculative.draft_tokens = qwen4_exp ? 7U : 5U;

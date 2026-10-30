@@ -90,6 +90,18 @@ struct FastPathConfiguration {
 // Whether the path passed the acceptance gate in this configuration (the registry, section 6.7).
 [[nodiscard]] bool fast_path_qualified(FastPath path, const FastPathConfiguration& configuration);
 
+// The drafter components an artifact bundles beside its text.
+struct BundledDrafters {
+    bool mtp     = false;
+    bool dflash  = false;
+    bool dflash2 = false;
+};
+
+// --spec auto: the bundled drafter measured fastest overall with --draft-tokens auto (README "Recommended
+// settings per model"), or None where the artifact bundles none worth binding.
+[[nodiscard]] SpeculativeBackend auto_speculative_backend(bool offloaded_experts,
+                                                          const BundledDrafters& drafters) noexcept;
+
 // Whether --draft-tokens auto decodes without the drafter: where none of its draft lengths was measured
 // faster than plain decode. The engine then turns speculation off before it binds the drafter
 // (normalize_engine_options), so the drafter's VRAM stays with the expert cache.

@@ -316,6 +316,10 @@ measured overall, and `auto` picks the draft length):
 | Qwen3.6-27B (NVFP4, groupwise) | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length where its configuration registers `adaptive-mtp` (startup reports it), else 3 every round |
 | Ornith-1.5-122B (and its UNCENSORED conversion) | `--spec mtp --draft-tokens auto` | 2 confidence-gated drafts: 14 % faster than plain decode at one request, about 6 % slower while two decode together; DFlash2's `auto` decodes plain |
 
+`--spec auto --draft-tokens auto` makes the table's drafter choice by itself from the artifact's drafters
+(on Flash-Next DFlash2 when `--draft-model` names its drafter, else MTP) and reports it at startup;
+`--lm-head-draft`, `--draft-model` and `--ngram-draft-tokens auto` are still given where the table lists them.
+
 Flash-Next keeps in RAM only the routed experts VRAM does not hold by default (`--expert-ram-layout
 exclusive`); `--expert-ram-layout full` keeps a copy of every expert, 4-6 GiB more RAM on Dense8 and IQ3_S at
 the same decode and prefill speed ([guide](docs/qwen3_8-flash-next.md)). The Qwen3.5-122B-A10B keeps every

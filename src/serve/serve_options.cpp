@@ -492,7 +492,13 @@ std::string serve_usage_text(const char* argv0) {
            "                             state (default fp32: exact)\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
-           "  --spec mtp|dflash|dflash2    speculative decoding backend\n"
+           "  --spec mtp|dflash|dflash2|auto\n"
+           "                             speculative decoding backend. auto (with\n"
+           "                             --draft-tokens auto): the drafter measured fastest\n"
+           "                             for the artifact: Qwen3.8-Flash-Next dflash2 with\n"
+           "                             --draft-model, else mtp; offloaded-expert Qwen3.5\n"
+           "                             (122B) mtp; other Qwen3.5/3.6 dflash2, then mtp,\n"
+           "                             then dflash, as bundled (startup reports the choice)\n"
            "  --draft-tokens N|auto      drafts per round: mtp 1-7 (Qwen3.5/3.6 1-5),\n"
            "                             dflash/dflash2 1-15 (Qwen3.8-Flash-Next\n"
            "                             dflash2 1-7)\n"
@@ -504,9 +510,9 @@ std::string serve_usage_text(const char* argv0) {
            "                                     drafts' probabilities favour (Qwen3.5/3.6:\n"
            "                                     where qualified, else the fastest fixed\n"
            "                                     length)\n"
-           "  --draft-model FILE         Qwen3.8-Flash-Next dflash2: the DFlash2 drafter's\n"
-           "                             companion artifact (Qwen3.5/3.6 artifacts bundle\n"
-           "                             theirs)\n"
+           "  --draft-model FILE         Qwen3.8-Flash-Next dflash2 (or auto): the DFlash2\n"
+           "                             drafter's companion artifact (Qwen3.5/3.6 artifacts\n"
+           "                             bundle theirs)\n"
            "  --lm-head-draft            use the optimized proposal head\n"
            "  --spec-min-p P             mtp (on Qwen3.8-Flash-Next with a fixed\n"
            "                             --draft-tokens N only) and Qwen3.8-Flash-Next dflash2:\n"
@@ -967,8 +973,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--logits-dtype") {
             options.logits_dtype = product::parse_logits_dtype(require_value("--logits-dtype"));
         } else if (arg == "--spec") {
-            options.speculative.backend =
-                product::parse_speculative_backend(require_value("--spec"));
+            product::apply_speculative_backend(options.speculative, require_value("--spec"));
         } else if (arg == "--draft-tokens") {
             product::apply_draft_tokens(options.speculative, require_value("--draft-tokens"));
         } else if (arg == "--draft-model") {

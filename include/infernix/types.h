@@ -427,6 +427,13 @@ draft_tree_auto_widths(std::uint32_t draft_tokens) noexcept {
 
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
+    // --spec auto (backend None until the Engine resolves it; requires draft_tokens_auto and no
+    // draft_min_p): startup chooses, among the drafters the artifact can run, the one measured fastest
+    // overall: Qwen3.8-Flash-Next DFlash2 with a draft_model, else MTP; a Qwen3.5-family artifact with
+    // offloaded experts MTP; any other Qwen3.5-family artifact DFlash2, then MTP, then DFlash, as
+    // bundled. Without one the Engine decodes plain. Engine::options() then reports false and the
+    // chosen backend.
+    bool backend_auto = false;
     // Startup-fixed K: MTP 1..7 (Qwen3.5/3.6 1..5); DFlash and DFlash2 1..15 (query width K+1).
     // With draft_tokens_auto it is the most a round may draft; 0 there takes the model's most
     // (Qwen3.8-Flash-Next 7, Qwen3.5/3.6 5), which Engine::options() reports.

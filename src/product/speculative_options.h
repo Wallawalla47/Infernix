@@ -19,6 +19,18 @@ namespace infernix::product {
     throw std::invalid_argument("invalid speculative backend: " + std::string(value));
 }
 
+// Applies a --spec value: "auto" lets the Engine choose the drafter from the artifact (backend None
+// until it resolves it), anything else names one.
+inline void apply_speculative_backend(SpeculativeOptions& options, std::string_view value) {
+    options.backend_auto = value == "auto";
+    options.backend      = options.backend_auto ? SpeculativeBackend::None : parse_speculative_backend(value);
+}
+
+// A drafter is requested: a named backend, or --spec auto's.
+[[nodiscard]] inline bool speculation_requested(const SpeculativeOptions& options) noexcept {
+    return options.backend != SpeculativeBackend::None || options.backend_auto;
+}
+
 [[nodiscard]] inline const char* speculative_backend_name(SpeculativeBackend backend) noexcept {
     switch (backend) {
     case SpeculativeBackend::None:
@@ -156,12 +168,12 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
          options.ngram_min_match > 64)) {
         throw std::invalid_argument("ngram drafts must be 1..63 with a minimum match of 4..64");
     }
-    if (options.ngram_draft_tokens_auto && options.backend == SpeculativeBackend::None) {
-        throw std::invalid_argument("--ngram-draft-tokens auto requires --spec mtp, dflash or dflash2");
+    if (options.ngram_draft_tokens_auto && !speculation_requested(options)) {
+        throw std::invalid_argument("--ngram-draft-tokens auto requires --spec mtp, dflash, dflash2 or auto");
     }
     if (draft_tree_enabled(options)) {
-        if (options.backend == SpeculativeBackend::None) {
-            throw std::invalid_argument("--draft-tree-nodes requires --spec mtp, dflash or dflash2");
+        if (!speculation_requested(options)) {
+            throw std::invalid_argument("--draft-tree-nodes requires --spec mtp, dflash, dflash2 or auto");
         }
         if (options.draft_tree_auto &&
             std::any_of(options.draft_tree_nodes.begin(), options.draft_tree_nodes.end(),
@@ -175,25 +187,34 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             }
         }
     }
+    // --spec auto chooses the drafter, so the draft length and the drafter's own cut follow it.
+    if (options.backend_auto && !options.draft_tokens_auto) {
+        throw std::invalid_argument("--spec auto chooses the drafter: it takes --draft-tokens auto");
+    }
+    if (options.backend_auto && options.draft_min_p) {
+        throw std::invalid_argument("--spec-min-p tunes one drafter's cut: --spec auto takes none");
+    }
     if (options.draft_min_p && options.backend != SpeculativeBackend::Mtp &&
         options.backend != SpeculativeBackend::DFlash2) {
         throw std::invalid_argument("--spec-min-p requires --spec mtp or dflash2");
     }
     // auto with dflash or dflash2: the block drafters' per-round verify width.
-    if (options.draft_tokens_auto && options.backend == SpeculativeBackend::None) {
-        throw std::invalid_argument("--draft-tokens auto requires --spec mtp, dflash or dflash2");
+    if (options.draft_tokens_auto && !speculation_requested(options)) {
+        throw std::invalid_argument("--draft-tokens auto requires --spec mtp, dflash, dflash2 or auto");
     }
-    if (!options.draft_model.empty() && options.backend != SpeculativeBackend::DFlash2) {
-        throw std::invalid_argument("--draft-model is a DFlash2 drafter: it requires --spec dflash2");
+    // With --spec auto it makes Qwen3.8-Flash-Next draft with DFlash2.
+    if (!options.draft_model.empty() && options.backend != SpeculativeBackend::DFlash2 && !options.backend_auto) {
+        throw std::invalid_argument("--draft-model is a DFlash2 drafter: it requires --spec dflash2 or auto");
     }
     if (options.draft_tree_paths < 2 || options.draft_tree_paths > 8) {
         throw std::invalid_argument("--draft-tree-paths must be in [2,8]");
     }
+    if (options.backend_auto) { return; }
     switch (options.backend) {
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {
             throw std::invalid_argument(
-                "--draft-tokens and --lm-head-draft require --spec mtp|dflash|dflash2");
+                "--draft-tokens and --lm-head-draft require --spec mtp|dflash|dflash2|auto");
         }
         return;
     case SpeculativeBackend::Mtp:

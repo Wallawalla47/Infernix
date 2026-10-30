@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -314,10 +315,12 @@ public:
     }
 
     // Options are checked before the artifact is opened; defaults that depend on the model (the
-    // hybrid prefix cache's) need the artifact's architecture, read once here. An unreadable
-    // artifact is reported by the (Qwen3.5) model construction, after option validation.
+    // hybrid prefix cache's, --spec auto's drafter) need the artifact's architecture and drafters, read
+    // once here. An unreadable artifact is reported by the (Qwen3.5) model construction, after option
+    // validation.
     EngineOptions normalize(EngineOptions engine_options) {
         bool offloaded_experts = false;
+        std::optional<models::qwen3_5::BundledDrafters> drafters;
         try {
             const artifact::Reader reader(engine_options.artifact_path);
             if (runtime::artifact_is_qwen4_exp(reader)) {
@@ -325,8 +328,12 @@ public:
             } else {
                 offloaded_experts = runtime::artifact_offloads_experts(reader);
             }
+            drafters = runtime::artifact_drafters(reader);
         } catch (const std::exception&) {}
         runtime::validate_engine_options(engine_options, architecture, offloaded_experts);
+        if (drafters) {
+            runtime::resolve_auto_speculative_backend(engine_options, architecture, offloaded_experts, *drafters);
+        }
         return runtime::normalize_engine_options(std::move(engine_options), architecture, offloaded_experts);
     }
 

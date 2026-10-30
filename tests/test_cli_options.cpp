@@ -88,6 +88,18 @@ int run_tests() {
                       "--spec-min-p accepted a value above 1");
     failures += check(infernix::cli::usage_text("infernix").find("--spec-min-p") != std::string::npos,
                       "CLI help omits --spec-min-p");
+    // --spec auto: the Engine chooses the drafter; it needs an automatic draft length.
+    const auto automatic = parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "auto",
+                                  "--draft-tokens", "auto", "--lm-head-draft"});
+    failures += check(automatic.speculative.backend_auto &&
+                          automatic.speculative.backend == infernix::SpeculativeBackend::None &&
+                          automatic.speculative.draft_tokens_auto,
+                      "--spec auto did not leave the drafter to the Engine");
+    failures += check(rejects([] {
+                          (void)parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "auto",
+                                       "--draft-tokens", "3"});
+                      }),
+                      "--spec auto was accepted with a fixed draft length");
     failures += check(
         parse({"infernix", "model.ninfer", "--prompt", "hello", "--grammar-file", "answer.gbnf"})
                 .grammar_path == "answer.gbnf",

@@ -502,6 +502,22 @@ bool fast_path_qualified(FastPath path, const FastPathConfiguration& configurati
     });
 }
 
+SpeculativeBackend auto_speculative_backend(bool offloaded_experts, const BundledDrafters& drafters) noexcept {
+    // Offloaded experts (Qwen3.5-122B-A10B, Ornith-1.5-122B, which bundle MTP and DFlash2): MTP's two gated
+    // drafts were 14 % faster than plain decode at one request (auto_fixed_draft_tokens), while DFlash2's auto
+    // decodes plain there (auto_drafts_nothing), so its drafter is not worth binding.
+    if (offloaded_experts) { return drafters.mtp ? SpeculativeBackend::Mtp : SpeculativeBackend::None; }
+    // Resident: DFlash2 where bundled (the Qwen3.8-27Bs: groupwise at one request DFlash2's 7 drafts 54 % faster
+    // than MTP's 3 on code and 40 % on docs; NVFP4 DFlash2 7 ahead of MTP 3 in every category of
+    // docs/performance/qwen3.8-27b.md but Story, level there), then MTP (the Qwen3.6-35B-A3B: MTP auto 8-28 %
+    // faster than DFlash auto with several requests and on sampled docs, model-quality.md 6.7; the Qwen3.6-27Bs
+    // bundle MTP alone), then DFlash.
+    if (drafters.dflash2) { return SpeculativeBackend::DFlash2; }
+    if (drafters.mtp) { return SpeculativeBackend::Mtp; }
+    if (drafters.dflash) { return SpeculativeBackend::DFlash; }
+    return SpeculativeBackend::None;
+}
+
 bool auto_drafts_nothing(bool offloaded_experts, SpeculativeBackend backend) noexcept {
     // Qwen3.5-122B-A10B (the Qwen3.5 artifact with offloaded experts): each verify column brings its
     // own expert misses, about 10 ms a column against 13.8 ms a plain token (2026-10-22, one request,

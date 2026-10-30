@@ -421,6 +421,77 @@ int main() {
                                   .speculative.backend == infernix::SpeculativeBackend::Mtp,
                           "a fixed draft length lost its drafter with offloaded experts");
     }
+    // --spec auto: the Engine picks the drafter from the artifact (Qwen3.8-Flash-Next: DFlash2 with a
+    // --draft-model, else MTP; the Qwen3.5 family's measured order) before normalization, which refuses
+    // an unresolved auto; without a drafter it decodes plain and drops every drafter setting.
+    {
+        using infernix::SpeculativeBackend;
+        using infernix::models::Architecture;
+        using infernix::runtime::resolve_auto_speculative_backend;
+        const infernix::models::qwen3_5::BundledDrafters mtp_dflash2{.mtp = true, .dflash2 = true};
+        EngineOptions options;
+        options.speculative.backend_auto      = true;
+        options.speculative.draft_tokens_auto = true;
+        options.speculative.proposal_head     = infernix::ProposalHead::Optimized;
+        const auto resolved = [&](EngineOptions in, Architecture architecture, bool offloaded,
+                                  const infernix::models::qwen3_5::BundledDrafters& drafters) {
+            resolve_auto_speculative_backend(in, architecture, offloaded, drafters);
+            return in;
+        };
+        EngineOptions flash_next_dflash2           = options;
+        flash_next_dflash2.speculative.draft_model = "drafter.infernix";
+        const EngineOptions with_drafter           = resolved(flash_next_dflash2, Architecture::Qwen4Exp, false, {.mtp = true});
+        const EngineOptions without_drafter        = resolved(options, Architecture::Qwen4Exp, false, {.mtp = true});
+        failures += check(with_drafter.speculative.backend == SpeculativeBackend::DFlash2 &&
+                              !with_drafter.speculative.backend_auto &&
+                              without_drafter.speculative.backend == SpeculativeBackend::Mtp &&
+                              without_drafter.speculative.draft_tokens_auto &&
+                              without_drafter.speculative.proposal_head == infernix::ProposalHead::Optimized,
+                          "--spec auto on Qwen3.8-Flash-Next did not take DFlash2 with --draft-model, else MTP");
+        failures += check(resolved(options, Architecture::Qwen3_5, false, mtp_dflash2).speculative.backend ==
+                                  SpeculativeBackend::DFlash2 &&
+                              resolved(options, Architecture::Qwen3_5, true, mtp_dflash2).speculative.backend ==
+                                  SpeculativeBackend::Mtp,
+                          "--spec auto on a Qwen3.5 artifact did not take its measured drafter");
+        EngineOptions trees                    = options;
+        trees.speculative.draft_tree_auto      = true;
+        trees.speculative.ngram_draft_tokens_auto = true;
+        const EngineOptions plain = resolved(trees, Architecture::Qwen3_5, false, {});
+        failures += check(plain.speculative.backend == SpeculativeBackend::None && !plain.speculative.backend_auto &&
+                              !plain.speculative.draft_tokens_auto &&
+                              plain.speculative.proposal_head == infernix::ProposalHead::Full &&
+                              !plain.speculative.draft_tree_auto && !plain.speculative.ngram_draft_tokens_auto,
+                          "--spec auto without a drafter kept drafter settings");
+        failures += check(normalize_engine_options(plain).speculative.backend == SpeculativeBackend::None &&
+                              normalize_engine_options(resolved(options, Architecture::Qwen3_5, false, mtp_dflash2))
+                                      .speculative.backend == SpeculativeBackend::DFlash2,
+                          "a resolved --spec auto did not normalize");
+        bool rejected = false;
+        try {
+            (void)normalize_engine_options(options);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an unresolved --spec auto was normalized");
+        for (const bool fixed : {true, false}) {
+            EngineOptions bad = options;
+            if (fixed) {
+                bad.speculative.draft_tokens_auto = false;
+                bad.speculative.draft_tokens      = 3;
+            } else {
+                bad.speculative.draft_min_p = 0.5F;
+            }
+            rejected = false;
+            try {
+                (void)resolved(bad, Architecture::Qwen3_5, false, mtp_dflash2);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, fixed ? "--spec auto was resolved with a fixed draft length"
+                                              : "--spec auto was resolved with --spec-min-p");
+        }
+        EngineOptions scoring = options;
+        scoring.purpose       = infernix::EnginePurpose::CausalScoring;
+        failures += check(normalize_engine_options(resolved(scoring, Architecture::Qwen3_5, false, mtp_dflash2))
+                                  .speculative.backend == SpeculativeBackend::None,
+                          "causal scoring did not drop --spec auto");
+    }
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

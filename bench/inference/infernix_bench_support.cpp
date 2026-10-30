@@ -538,7 +538,9 @@ std::string usage_text(std::string_view program) {
         << "  --prefill-split-workspace-mib <n>  prompt-attention split workspace (default: "
         << kDefaultPrefillSplitWorkspaceMiB << ";\n"
         << "                              128-384 recommended, 0 = no splitting)\n"
-        << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
+        << "  --spec <mtp|dflash|dflash2|auto>  speculative backend (default: none); auto (with\n"
+        << "                             --draft-tokens auto) lets the Engine pick the artifact's\n"
+        << "                             fastest measured drafter, which the report records\n"
         << "  --draft-tokens <n>|auto    MTP 1..7 (Qwen3.5/3.6 1..5); DFlash/DFlash2 1..15\n"
         << "                             (Qwen3.8-Flash-Next DFlash2 1..7); n drafts n every round,\n"
         << "                             auto lets MTP (and Qwen3.8-Flash-Next DFlash2) pick each\n"
@@ -757,7 +759,7 @@ BenchOptions parse_args(int argc, char** argv) {
             if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
             options.fast_path_candidates.push_back(*path);
         } else if (arg == "--spec") {
-            options.speculative.backend = product::parse_speculative_backend(value("--spec"));
+            product::apply_speculative_backend(options.speculative, value("--spec"));
         } else if (arg == "--draft-tokens") {
             product::apply_draft_tokens(options.speculative, value("--draft-tokens"));
         } else if (arg == "--draft-model") {

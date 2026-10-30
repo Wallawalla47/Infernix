@@ -424,6 +424,8 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
     VRAM, so the expert cache gets about 710 fewer frames.
   - Greedy output is the same as without it when one request runs at a time. For several lanes,
     see `--max-concurrency` below.
+- `--spec auto --draft-tokens auto` chooses between the two: DFlash2 when `--draft-model` names its
+  drafter, else MTP (startup reports which).
 - `--ngram-draft-tokens 7` verifies copy proposals. It works alone or beside MTP; a longer copy
   proposal replaces a round's MTP drafts. On code-editing prompts it accepts most drafts; on prose
   it finds none and costs nothing. In the agentic replay (`bench/agentic_ab`, greedy, seed 42, two
