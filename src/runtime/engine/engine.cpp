@@ -52,6 +52,29 @@ DeviceContext initialize_device(const EngineOptions& options) {
     return device;
 }
 
+// Options are checked before the artifact is opened; defaults that depend on the model (the hybrid
+// prefix cache's, --spec auto's drafter) need the artifact's architecture and drafters, read once
+// here. An unreadable artifact is reported by the (Qwen3.5) model construction, after option
+// validation.
+EngineOptions normalize_options(EngineOptions engine_options, models::Architecture& architecture) {
+    bool offloaded_experts = false;
+    std::optional<models::qwen3_5::BundledDrafters> drafters;
+    try {
+        const artifact::Reader reader(engine_options.artifact_path);
+        if (runtime::artifact_is_qwen4_exp(reader)) {
+            architecture = models::Architecture::Qwen4Exp;
+        } else {
+            offloaded_experts = runtime::artifact_offloads_experts(reader);
+        }
+        drafters = runtime::artifact_drafters(reader);
+    } catch (const std::exception&) {}
+    runtime::validate_engine_options(engine_options, architecture, offloaded_experts);
+    if (drafters) {
+        runtime::resolve_auto_speculative_backend(engine_options, architecture, offloaded_experts, *drafters);
+    }
+    return runtime::normalize_engine_options(std::move(engine_options), architecture, offloaded_experts);
+}
+
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
                                                         SamplingMode mode, RequestOptions options) {
     if (options.execution.thinking.budget && *options.execution.thinking.budget == 0) {
@@ -314,27 +337,8 @@ public:
         finalize_phase.complete();
     }
 
-    // Options are checked before the artifact is opened; defaults that depend on the model (the
-    // hybrid prefix cache's, --spec auto's drafter) need the artifact's architecture and drafters, read
-    // once here. An unreadable artifact is reported by the (Qwen3.5) model construction, after option
-    // validation.
     EngineOptions normalize(EngineOptions engine_options) {
-        bool offloaded_experts = false;
-        std::optional<models::qwen3_5::BundledDrafters> drafters;
-        try {
-            const artifact::Reader reader(engine_options.artifact_path);
-            if (runtime::artifact_is_qwen4_exp(reader)) {
-                architecture = models::Architecture::Qwen4Exp;
-            } else {
-                offloaded_experts = runtime::artifact_offloads_experts(reader);
-            }
-            drafters = runtime::artifact_drafters(reader);
-        } catch (const std::exception&) {}
-        runtime::validate_engine_options(engine_options, architecture, offloaded_experts);
-        if (drafters) {
-            runtime::resolve_auto_speculative_backend(engine_options, architecture, offloaded_experts, *drafters);
-        }
-        return runtime::normalize_engine_options(std::move(engine_options), architecture, offloaded_experts);
+        return normalize_options(std::move(engine_options), architecture);
     }
 
     ~Impl() noexcept {
@@ -436,6 +440,21 @@ Engine::Engine(EngineOptions options) {
     StartupPhaseScope startup_phase(startup_observer, StartupPhase::EngineStartup);
     impl_ = std::make_shared<Impl>(std::move(options));
     startup_phase.complete();
+}
+
+EnginePlan Engine::plan(EngineOptions engine_options) {
+    models::Architecture architecture = models::Architecture::Qwen3_5;
+    EngineOptions options             = normalize_options(std::move(engine_options), architecture);
+    // The start's CUDA context and stack reserve come first there too, so the free memory the plan
+    // reads is the free memory a start would read.
+    DeviceContext device = initialize_device(options);
+    EnginePlan plan;
+    if (architecture == models::Architecture::Qwen4Exp) {
+        (void)runtime::construct_qwen4_exp(options, device, &plan);
+    } else {
+        (void)runtime::construct_model(options, device, &plan);
+    }
+    return plan;
 }
 
 Engine::~Engine()                            = default;

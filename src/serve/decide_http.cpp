@@ -115,7 +115,9 @@ void HttpServer::handle_decide(const httplib::Request& req, httplib::Response& r
         try {
             run.prepared.emplace(service_->prepare(
                 run.generation, GenerationConsumerMode::Aggregate,
-                infernix::GenerationObservationOptions{.phase_timings = true}, disconnected));
+                infernix::GenerationObservationOptions{.phase_timings = true,
+                                                       .progress      = progress_observer(req_id)},
+                disconnected));
             run.media = run.prepared->media;
             run.lifecycle = begin_request(make_request_log_context(
                 req_id, "decide", run.generation, metadata, *run.prepared));

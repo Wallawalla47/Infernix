@@ -1,4 +1,5 @@
 #include "test_temp_path.h"
+#include "serve/generation_service.h"
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
@@ -82,6 +83,25 @@ int main() {
     failures += check(missing_yarn_rejected, "missing serving YaRN factor accepted");
     failures += check(serve_usage_text("infernix-serve").find("--rope-yarn-factor") != std::string::npos,
                       "serving help omits YaRN");
+    // --plan FILE: the start's options as given, plus where the plan goes; the Engine's options are the
+    // start's (make_engine_options), so the plan sizes that start.
+    {
+        const ServeOptions planned = parse({"infernix-serve", "model.ninfer", "--plan", "plan.json", "--max-context",
+                                            "65536", "--max-concurrency", "2", "--kv-dtype", "int8", "--lossless"});
+        const infernix::EngineOptions engine = make_engine_options(planned);
+        failures += check(planned.plan_path == std::filesystem::path("plan.json") && planned.max_context == 65536 &&
+                              planned.max_concurrency == 2,
+                          "--plan keeps the other launch options");
+        failures += check(engine.artifact_path == std::filesystem::path("model.ninfer") && engine.max_context == 65536 &&
+                              engine.max_concurrency == 2 && engine.kv_cache == infernix::KvCacheStorage::Int8Group64 &&
+                              engine.lossless && !engine.fast_paths,
+                          "the planned Engine options are the start's");
+        failures += check(parse({"infernix-serve", "model.ninfer"}).plan_path.empty(), "no --plan: a start");
+        failures += check(!parse_error({"infernix-serve", "model.ninfer", "--plan"}).empty(),
+                          "--plan without a file accepted");
+        failures += check(serve_usage_text("infernix-serve").find("--plan FILE") != std::string::npos,
+                          "serving help omits --plan");
+    }
     const auto archive = parse({"infernix-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                 "5", "--ngram-draft-tokens", "63", "--ngram-archive-mib", "512",
                                 "--ngram-session-mib", "128", "--ngram-native-sessions"});

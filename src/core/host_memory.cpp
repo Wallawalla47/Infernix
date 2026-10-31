@@ -220,4 +220,30 @@ ResidentHostBuffer::~ResidentHostBuffer() {
 #endif
 }
 
+AddressReservation::AddressReservation(std::size_t bytes) : size_(bytes) {
+    if (bytes == 0) { return; }
+#ifdef _WIN32
+    void* p = ::VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_NOACCESS);
+    if (p == nullptr) {
+        throw std::runtime_error("reserving " + std::to_string(bytes) + " bytes of address space failed (Windows error " +
+                                 std::to_string(::GetLastError()) + ")");
+    }
+#else
+    void* p = ::mmap(nullptr, bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) {
+        throw std::runtime_error("reserving " + std::to_string(bytes) + " bytes of address space failed");
+    }
+#endif
+    data_ = static_cast<std::byte*>(p);
+}
+
+AddressReservation::~AddressReservation() {
+    if (data_ == nullptr) { return; }
+#ifdef _WIN32
+    (void)::VirtualFree(data_, 0, MEM_RELEASE);
+#else
+    (void)::munmap(data_, size_);
+#endif
+}
+
 } // namespace infernix

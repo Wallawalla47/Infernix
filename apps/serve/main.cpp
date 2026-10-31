@@ -7,8 +7,11 @@
 #include "serve/operational_log.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
+#include "serve/plan_report.h"
 #include "serve/serve_options.h"
 #include "serve/stop_control.h"
+
+#include "infernix/engine.h"
 
 #include <spdlog/logger.h>
 
@@ -19,6 +22,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -214,6 +218,37 @@ std::string binary_identity(const char* argv0) {
     return out;
 }
 
+// --plan FILE: the Engine's sizing of the start these options describe (infernix::Engine::plan), as
+// JSON in FILE. No port is bound and no weight is loaded; the Engine's diagnostics (its RAM plan) are
+// logged as a start logs them.
+int run_plan(const infernix::serve::ServeOptions& options, const std::shared_ptr<spdlog::logger>& logger) {
+    using namespace infernix::serve;
+    std::string body;
+    int status = kPlanFailedExitStatus;
+    try {
+        const infernix::EnginePlan plan = infernix::Engine::plan(
+            make_engine_options(options, {}, infernix::product::engine_diagnostic_observer(logger)));
+        body   = render_plan_json(plan);
+        status = plan.fits ? kPlanFitsExitStatus : kPlanDoesNotFitExitStatus;
+        if (plan.fits) {
+            logger->info("plan: the model fits with these options");
+        } else {
+            logger->warn("plan: the model does not fit with these options: {}", plan.error);
+        }
+    } catch (const std::exception& error) {
+        body = render_plan_error_json(error.what());
+        logger->error("plan: no plan could be made: {}", error.what());
+    }
+    std::ofstream file(options.plan_path, std::ios::binary | std::ios::trunc);
+    file << body;
+    file.flush();
+    if (!file) {
+        logger->error("plan: cannot write {}", options.plan_path.string());
+        return kPlanFailedExitStatus;
+    }
+    return status;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -249,6 +284,7 @@ int main(int argc, char** argv) {
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
     infernix::product::StartupLogRenderer startup_log(logging);
     infernix::serve::OperationalLog operational_log(logger);
+    if (!options.plan_path.empty()) { return run_plan(options, logger); }
     // Stop prompts use the transient bottom line beneath the statistics panel; output without one
     // (redirected, or not a terminal) logs them instead.
     const std::shared_ptr<infernix::product::TerminalProgress> console_line =

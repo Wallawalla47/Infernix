@@ -410,7 +410,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
             {.phase_timings = true,
              .scheduling    = scheduling_observer(req_id, metadata.http_request_id),
-             .first_token   = first_token_observer()},
+             .first_token   = first_token_observer(),
+             .progress      = progress_observer(req_id)},
             [&req] { return client_disconnected(req); });
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
@@ -446,7 +447,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                                      cancelled](const GenerationRequest& next) {
             return service_->prepare_continuation(
                 next, consumer_mode,
-                {.phase_timings = true, .scheduling = scheduling_observer(req_id, http_request_id)},
+                {.phase_timings = true,
+                 .scheduling    = scheduling_observer(req_id, http_request_id),
+                 .progress      = progress_observer(req_id)},
                 cancelled);
         });
     };

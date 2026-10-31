@@ -77,9 +77,14 @@ public:
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
 
 private:
+    // A generation request from its submission to the Engine to its terminal record; it is listed in
+    // live.active (live_requests_) until done() or failure(), or its destruction.
     class RequestLifecycle {
     public:
         RequestLifecycle(HttpServer& owner, RequestLogContext context);
+        ~RequestLifecycle();
+        RequestLifecycle(const RequestLifecycle&)            = delete;
+        RequestLifecycle& operator=(const RequestLifecycle&) = delete;
 
         void done(const GenerationOutcome& outcome);
         void failure(const RequestFailure& failure);
@@ -122,6 +127,8 @@ private:
     [[nodiscard]] infernix::GenerationSchedulingObserver
     scheduling_observer(std::uint64_t request_id, std::string http_request_id);
     [[nodiscard]] infernix::GenerationFirstTokenObserver first_token_observer();
+    // The Engine's progress observations of request `request_id`, into live.active.
+    [[nodiscard]] infernix::GenerationProgressObserver progress_observer(std::uint64_t request_id);
     void record_request_rejected(const RequestRejectionLogContext& context);
     void record_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void record_request_failure(const RequestLogContext& context, const RequestFailure& failure);
@@ -149,6 +156,8 @@ private:
     JsonlRequestLog request_jsonl_;
     Metrics metrics_;
     RequestHistory metrics_json_history_;
+    // The generation requests in flight (GET /metrics?format=json live.active).
+    LiveRequests live_requests_;
     std::unique_ptr<ConsoleStatsPanel> console_stats_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};

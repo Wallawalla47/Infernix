@@ -126,6 +126,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--seed"},
     ServeOptionArity{"--greedy", false},
     ServeOptionArity{"--log-level"},
+    ServeOptionArity{"--plan"},
 };
 
 const ServeOptionArity* find_option(std::string_view name) noexcept {
@@ -271,6 +272,11 @@ std::string serve_usage_text(const char* argv0) {
            "                             names the artifact; keys in a [serve] table apply only\n"
            "                             here, [cli] only to infernix. Options on the command\n"
            "                             line override the file\n"
+           "  --plan FILE                size a start with these options on this machine\n"
+           "                             without loading the model (no port is bound, no\n"
+           "                             weight is uploaded), write the plan to FILE as\n"
+           "                             JSON and exit: 0 it fits, 3 it does not (the\n"
+           "                             plan's error says why), 1 no plan could be made\n"
            "\n"
            "MODEL & CONTEXT\n"
            "  --max-context N            max context tokens per request (default 8192)\n"
@@ -1095,6 +1101,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.greedy = true;
         } else if (arg == "--log-level") {
             options.log_level = product::parse_log_level(require_value("--log-level"));
+        } else if (arg == "--plan") {
+            options.plan_path = require_value("--plan");
+            if (options.plan_path.empty()) { throw std::invalid_argument("--plan must name a file"); }
         } else {
             throw std::logic_error("serve option " + arg + " has no parser");
         }

@@ -63,10 +63,8 @@ ExpertRamPlan plan_expert_ram(const EngineOptions& options, const expert_offload
     out.ledger = expert_offload::plan_host_memory(snapshot, demand);
     report_engine(options, DiagnosticLevel::Info, out.ledger.summary());
     report_engine(options, DiagnosticLevel::Debug, out.ledger.describe());
-    if (out.ledger.cap_too_large) {
-        throw std::runtime_error("--expert-ram-mib " + std::to_string(*options.expert_ram_bytes >> 20) +
-                                 " asks for more Host RAM than is free or pinnable now (" + out.ledger.describe() +
-                                 "); lower it, use auto, or free Host memory");
+    if (std::string refusal = expert_ram_refusal(options, out.ledger); !refusal.empty()) {
+        throw std::runtime_error(refusal);
     }
     // The SSD tier: the banks stay in the artifact; the Program pins RAM slots for the experts the
     // ledger leaves room for (less their lock overhead) and reads the rest on use.
@@ -77,14 +75,47 @@ ExpertRamPlan plan_expert_ram(const EngineOptions& options, const expert_offload
         out.expert_unpinned_bytes = out.ledger.expert_pageable;
         out.later_pinned_bytes    = demand.prefix_cache + demand.later_pinned + expert_offload::kPinRoomMarginBytes;
     }
-    // A small reserve trims other programs' working sets; keep Infernix's own pageable memory
-    // resident so its heap and driver pages never hard-fault from the page file.
+    return out;
+}
+
+std::string expert_ram_refusal(const EngineOptions& options, const expert_offload::HostMemoryLedger& ledger) {
+    if (!ledger.cap_too_large) { return {}; }
+    return "--expert-ram-mib " + std::to_string(options.expert_ram_bytes.value_or(0) >> 20) +
+           " asks for more Host RAM than is free or pinnable now (" + ledger.describe() +
+           "); lower it, use auto, or free Host memory";
+}
+
+void reserve_expert_working_set(const EngineOptions& options, const expert_offload::HostMemoryDemand& demand) {
+    // Keep Infernix's own pageable memory resident so its heap and driver pages never hard-fault from
+    // the page file.
     if (const auto refused = reserve_process_working_set(demand.process_growth); !refused.empty()) {
         report_engine(options, DiagnosticLevel::Warning,
                       "Windows would not guarantee Infernix " + std::to_string(demand.process_growth >> 20) +
                           " MiB of resident working memory (" + refused +
                           "); everything still works, but if RAM runs short Windows may move some of it to the "
                           "page file and responses slow down");
+    }
+}
+
+ExpertVramCheck size_expert_vram(const EngineOptions& options, const std::string& model, const VramSnapshot& before,
+                                 std::uint64_t fixed, std::uint32_t graphs, std::uint64_t frame_bytes,
+                                 std::uint32_t max_frames, const std::string& contributors) {
+    expert_offload::VramDemand demand;
+    demand.headroom    = options.vram_headroom_bytes;
+    demand.graphs      = graphs;
+    demand.fixed       = fixed;
+    demand.frame_bytes = frame_bytes; // an average frame of the per-size pools
+    demand.max_frames  = max_frames;
+    ExpertVramCheck out;
+    out.sizing = expert_offload::size_expert_frames(before, demand);
+    const auto& check = out.sizing;
+    if (check.frame_bytes < 0) {
+        out.refusal =
+            model + " does not fit in device memory: " + std::to_string(mib(before.device_free)) + " MiB free; " +
+            contributors + "; reserve " + std::to_string(mib(check.reserve)) + "; headroom " +
+            std::to_string(mib(check.headroom)) + " (" + check.describe() +
+            "). Lower --max-context, --max-concurrency or --prefill-chunk, use --kv-dtype int8, lower "
+            "--vram-headroom-mib, or free VRAM";
     }
     return out;
 }
@@ -93,21 +124,9 @@ expert_offload::VramSizing check_expert_vram(const EngineOptions& options, const
                                              const VramSnapshot& before, std::uint64_t fixed, std::uint32_t graphs,
                                              std::uint64_t frame_bytes, std::uint32_t max_frames,
                                              const std::string& contributors) {
-    expert_offload::VramDemand demand;
-    demand.headroom    = options.vram_headroom_bytes;
-    demand.graphs      = graphs;
-    demand.fixed       = fixed;
-    demand.frame_bytes = frame_bytes; // an average frame of the per-size pools
-    demand.max_frames  = max_frames;
-    const auto check   = expert_offload::size_expert_frames(before, demand);
-    if (check.frame_bytes < 0) {
-        throw std::runtime_error(
-            model + " does not fit in device memory: " + std::to_string(mib(before.device_free)) + " MiB free; " +
-            contributors + "; reserve " + std::to_string(mib(check.reserve)) + "; headroom " +
-            std::to_string(mib(check.headroom)) + " (" + check.describe() +
-            "). Lower --max-context, --max-concurrency or --prefill-chunk, use --kv-dtype int8, lower "
-            "--vram-headroom-mib, or free VRAM");
-    }
+    ExpertVramCheck sized = size_expert_vram(options, model, before, fixed, graphs, frame_bytes, max_frames, contributors);
+    if (!sized.refusal.empty()) { throw std::runtime_error(sized.refusal); }
+    const auto& check = sized.sizing;
     if (check.frames < kFewExpertFrames) {
         report_engine(options, DiagnosticLevel::Warning,
                       "decode will be slow: only " + std::to_string(check.frames) + " expert frames fit in VRAM (" +

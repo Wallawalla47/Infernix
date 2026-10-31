@@ -75,6 +75,11 @@ infernix_add_test(infernix_metrics_test
 infernix_add_test(infernix_metrics_contract_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_metrics_contract.cpp"
   LIBRARIES infernix_serve)
+
+# infernix-serve --plan's JSON (docs/serving.md, "Sizing a start without loading").
+infernix_add_test(infernix_plan_report_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_plan_report.cpp"
+  LIBRARIES infernix_serve)
 infernix_add_test(infernix_prefix_miss_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_prefix_miss.cpp"
   LIBRARIES infernix_serve)

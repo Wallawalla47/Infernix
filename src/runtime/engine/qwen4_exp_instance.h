@@ -46,6 +46,10 @@ struct ConstructedQwen4Exp {
 // True when the artifact's text component is Qwen4ExpForCausalLM.
 [[nodiscard]] bool artifact_is_qwen4_exp(const artifact::Reader& reader);
 
-[[nodiscard]] ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device);
+// With `plan` (Engine::plan) the construction stops at its VRAM check, before any weight is read:
+// the RAM plan and the device plan land in *plan and the result is empty. A start's memory refusals
+// become EnginePlan::fits false; anything else throws as a start would.
+[[nodiscard]] ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device,
+                                                      EnginePlan* plan = nullptr);
 
 } // namespace infernix::runtime

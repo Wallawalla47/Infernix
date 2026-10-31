@@ -210,11 +210,11 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
                                                             options_.response_store_max_bytes),
       operational_log_(logger), request_jsonl_(options_.request_log_jsonl, options_.artifact_path,
                                                std::move(logger), options_.request_log_rotation) {
-    if (options_.log_stats_panel && panel != nullptr && panel->enabled()) {
-        console_stats_ = std::make_unique<ConsoleStatsPanel>(
-            std::move(panel), options_.speculative.ngram_draft_tokens != 0 ||
-                                  options_.speculative.ngram_draft_tokens_auto);
-    }
+    // Always aggregated (GET /metrics?format=json reports them); drawn only on a terminal panel.
+    const bool draw_panel = options_.log_stats_panel && panel != nullptr && panel->enabled();
+    console_stats_        = std::make_unique<ConsoleStatsPanel>(
+        draw_panel ? std::move(panel) : nullptr, options_.speculative.ngram_draft_tokens != 0 ||
+                                                     options_.speculative.ngram_draft_tokens_auto);
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
@@ -229,19 +229,27 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
 HttpServer::RequestLifecycle::RequestLifecycle(HttpServer& owner, RequestLogContext context)
     : owner_(&owner), context_(std::move(context)) {
     owner_->record_request_start(context_);
+    owner_->live_requests_.begin(context_.id, context_.label, context_.protocol, context_.prompt_tokens,
+                                 context_.started);
 }
+
+HttpServer::RequestLifecycle::~RequestLifecycle() { owner_->live_requests_.end(context_.id); }
 
 bool HttpServer::RequestLifecycle::claim(State terminal) noexcept {
     State expected = State::Pending;
     return state_.compare_exchange_strong(expected, terminal, std::memory_order_acq_rel);
 }
 
+// A request leaves live.active once its terminal record is written (a poll in between lists it in
+// both live.active and requests).
 void HttpServer::RequestLifecycle::done(const GenerationOutcome& outcome) {
     if (claim(State::Done)) { owner_->record_request_done(context_, outcome); }
+    owner_->live_requests_.end(context_.id);
 }
 
 void HttpServer::RequestLifecycle::failure(const RequestFailure& failure) {
     if (claim(State::Error)) { owner_->record_request_failure(context_, failure); }
+    owner_->live_requests_.end(context_.id);
 }
 
 void HttpServer::RequestLifecycle::response_failure(const RequestFailure& failure) {
@@ -270,6 +278,12 @@ void HttpServer::record_request_rejected(const RequestRejectionLogContext& conte
 infernix::GenerationFirstTokenObserver HttpServer::first_token_observer() {
     return [this](const infernix::GenerationFirstTokenObservation& observation) {
         metrics_.first_token(observation);
+    };
+}
+
+infernix::GenerationProgressObserver HttpServer::progress_observer(std::uint64_t request_id) {
+    return [this, request_id](const infernix::GenerationProgressObservation& observation) {
+        live_requests_.progress(request_id, observation);
     };
 }
 
@@ -327,9 +341,11 @@ std::string HttpServer::metrics_json_body() const {
                                     .cancelled = counts.cancelled,
                                     .failed    = counts.failed,
                                     .rejected  = counts.rejected};
+    snapshot.active              = live_requests_.rows(LiveRequests::Clock::now());
     snapshot.requests            = metrics_json_history_.rows();
     snapshot.rates_valid         = metrics_json_history_.rates(snapshot.decode_tokens_per_second,
                                                                snapshot.prefill_tokens_per_second);
+    snapshot.session_stats       = console_stats_->snapshot();
     return render_metrics_json(snapshot);
 }
 

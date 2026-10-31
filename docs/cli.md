@@ -426,6 +426,9 @@ and CUDA Graph allowance, while leaving the default 1 GiB automatic headroom
 unallocated. It does not probe allocations or resize the pool at request time. The single-request
 CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
+`infernix-serve ... --plan FILE` runs this sizing for a server's options without loading the model
+and writes the weights, KV capacity, reservation, RAM plan and the largest `--max-context` that fits
+as JSON ([Sizing a start without loading](serving.md#sizing-a-start-without-loading)).
 
 At Engine startup Infernix reserves model weights, persistent sequence state, one phase-reused
 Program workspace, and a separate CUDA Graph driver allowance. With Vision enabled, that one

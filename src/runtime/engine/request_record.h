@@ -227,6 +227,8 @@ struct RequestRecord {
     std::condition_variable cv;
     std::optional<GenerationStart> stream_start;
     std::optional<PromptProgress> stream_progress;
+    // GenerationObservationOptions::progress: the newest position not yet delivered (coalesced).
+    std::optional<GenerationProgressObservation> live_progress;
     std::vector<StreamEvent> events;
     GenerationResult result;
     std::exception_ptr error;

@@ -24,6 +24,11 @@ infernix_add_test(infernix_kv_capacity_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_kv_capacity.cpp"
   LIBRARIES infernix_runtime_support)
 
+# Engine::plan's shared steps (infernix-serve --plan): the start's capacity resolution and refusals.
+infernix_add_test(infernix_engine_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_engine_plan.cpp"
+  LIBRARIES infernix_engine infernix_runtime_support infernix_core)
+
 infernix_add_test(infernix_sampling_defaults_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_sampling_defaults.cpp"
   LIBRARIES infernix_engine infernix_core)

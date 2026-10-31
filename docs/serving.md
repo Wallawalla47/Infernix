@@ -72,6 +72,94 @@ kept. Ctrl+C with console text selected only copies the text. Windows ends the
 process about 5 seconds after its console window is closed, so stop with Ctrl+C when a large Host
 tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 
+### Sizing a start without loading
+
+```bash
+./build/apps/infernix-serve models/qwen3_8_27b_nvfp4.ninfer --max-context 240000 --max-concurrency 2 \
+  --kv-dtype fp8 --spec mtp --draft-tokens 3 --plan plan.json
+```
+
+`--plan FILE` parses the options exactly as a start does and runs the Engine's own startup sizing for
+them on this GPU and machine (`infernix::Engine::plan`): the same option checks, RAM ledger, VRAM
+checks and Program capacity curve. It opens a CUDA context on `--device` but binds no port, reads no
+weight into VRAM or pinned RAM, and allocates no KV cache, workspace, expert cache or CUDA Graph (the
+weights are bound at their planned offsets in reserved, inaccessible address space, so the planner
+sees the shapes and formats a loaded model has). From the artifact it reads the directory, the
+resources and the few scale words the binding needs, and it logs the Engine's diagnostics (its RAM
+plan) as a start does. It writes one JSON object to `FILE` and exits:
+
+| Exit | Meaning |
+|---:|---|
+| `0` | a start with these options fits now |
+| `3` | it does not: `fits` is `false` and `error` is the message the start would refuse with |
+| `1` | no plan could be made (invalid options, an unreadable artifact); `FILE` then holds `{"schema": 1, "error": "..."}` when it can be written |
+
+Free memory is read live, so another process's VRAM and RAM count as used: with another server on the
+GPU, `gpu.free_bytes` is far below `gpu.total_bytes`.
+
+```json
+{"schema": 1, "fits": true, "estimated": true, "architecture": "Qwen3_5ForCausalLM", "error": null,
+ "gpu": {"name": "NVIDIA GeForce RTX 5090", "total_bytes": 34162343936, "free_bytes": 32697745408, "budget_bytes": 32945209344},
+ "vram": {"weights_bytes": 20826889216, "kv_bytes": 9703640064, "kv_tokens": 276544,
+          "minimum_reservation_bytes": 9513152768, "bytes_per_page_group": 2245632, "page_group_tokens": 64,
+          "workspace_bytes": 201055232, "graph_allowance_bytes": 83886080, "expert_cache_bytes": null,
+          "expert_frames": null, "headroom_bytes": 1073741824, "planned_bytes": 31622297856, "left_bytes": 1705728},
+ "ram": {"total_bytes": 102827114496, "available_bytes": 78017282048, "ram_free_bytes": 8589934592,
+         "experts_bytes": null, "pinned_bytes": null, "host_context_bytes": 8589934592, "ngram_bytes": null,
+         "ngram_residency": null, "tier": null, "expert_ram_layout": null, "planned_bytes": 8589934592,
+         "left_bytes": 60837412864},
+ "max_context": 262144}
+```
+
+(The command above on NInfer's official NVFP4 `qwen3_8_27b_nvfp4-official.ninfer`, an RTX 5090 with
+nothing else on it, Windows, 2026-10-31.) Sizes are bytes; `null` marks a quantity the architecture or
+the options do not have. On that machine a start with the same options reports the same capacity:
+the plan's `kv_tokens` matched the start's `capacity` line on the 27B (222,272 tokens, INT8 KV, two
+lanes) and on Qwen3.8-Flash-Next (524,416), and a context above `max_context` was refused with the
+plan's `error`.
+
+| Field | Meaning |
+|---|---|
+| `fits`, `error` | whether a start passes its memory checks now, and otherwise the first check's refusal in the start's words (the dense weights against free VRAM with offloaded experts, the KV capacity's reservation, Qwen3.8-Flash-Next's expert-cache check, the pinned weights against free RAM, an `--expert-ram-mib` the ledger cannot give) |
+| `gpu` | the device's `name` and `total_bytes`, its `free_bytes` now (on Windows with a video-memory budget, the budget less this process's use), and that budget, `budget_bytes`, where Windows reports one |
+| `vram.weights_bytes` | the dense weights' device arena (with offloaded experts everything but the routed experts) |
+| `vram.kv_bytes`, `kv_tokens` | the KV cache's payload and token capacity as the start sizes them (Qwen3.8-Flash-Next: the KV at `--max-context`; its pool starts smaller and grows from the expert cache) |
+| `vram.minimum_reservation_bytes` | the least the Program needs beside the weights at these options: persistent state, the smallest KV a start accepts, workspace and CUDA Graph allowance (Qwen3.8-Flash-Next: its fixed allocations) |
+| `vram.bytes_per_page_group`, `page_group_tokens` | Qwen3.5 family: each further 64-token KV page group's bytes, the capacity curve's slope |
+| `vram.workspace_bytes`, `graph_allowance_bytes` | the Program workspace and the CUDA Graph allowance (Qwen3.8-Flash-Next: the expert cache's reserve for graph executables) |
+| `vram.expert_frames`, `expert_cache_bytes` | offloaded experts: the VRAM expert cache's frames and bytes |
+| `vram.headroom_bytes` | VRAM left free for the display and other programs (`--vram-headroom-mib` or the automatic headroom) |
+| `vram.planned_bytes`, `left_bytes` | everything planned on the device, and what free VRAM leaves beside it, the headroom and the expert cache's reserve |
+| `ram.total_bytes`, `available_bytes`, `ram_free_bytes` | physical RAM, what is available now, and the reserve (`--ram-free-mib`) |
+| `ram.experts_bytes`, `tier`, `expert_ram_layout` | offloaded experts: the RAM the ledger gives the routed experts; `full` when none is read from the SSD (all in RAM, or with the exclusive layout in RAM or VRAM), `ssd` when part are; and `full` or `exclusive` |
+| `ram.pinned_bytes` | the weights the load pins in RAM (offloaded experts, the token embedding with them or with `--embedding-host`, an offloaded vision tower) |
+| `ram.host_context_bytes` | the prefix cache's pinned Host tier (`--host-context-mib`, or its automatic size) |
+| `ram.ngram_bytes`, `ngram_residency` | Qwen3.8-Flash-Next's n-gram table: in RAM (`ram`, the whole table) or read from its volume (`volume`, the row cache's bytes) |
+| `ram.planned_bytes`, `left_bytes` | everything planned in RAM, and what available RAM leaves beside it and the reserve |
+| `max_context` | the largest `--max-context` a start accepts with the other options as given: whose smallest reservation fits beside the weights (Qwen3.8-Flash-Next: whose device plan still passes the expert-cache check), within the model's positions (with YaRN); an explicit `--kv-capacity` equal to `--max-context` (the default with `--no-prefix-reuse`) follows it. `null` when no context fits or a check before the capacity's (the RAM ledger's, the dense weights') refused the start |
+
+What is exact and what is estimated (`estimated` is always `true`):
+
+- The start's own code computes everything from the artifact and the options: the weights' bytes,
+  the capacity curve, workspace and graph allowance, the RAM ledger (experts, tier, pins, Host tier,
+  n-gram table) and Qwen3.8-Flash-Next's device plan and expert-frame sizing. Qwen3.8-Flash-Next's
+  start makes these checks before it reads any weight, so `fits` is the start's own decision; its
+  Program then re-plans with the fast paths the loaded weights select, so its actual frames can
+  differ slightly from `expert_frames`.
+- The Qwen3.5 family's capacity is resolved against the free VRAM read where a start reads it, less
+  the weights' arena the plan did not upload (and an overlay vision window's staging). A start reads
+  it after the upload, which may differ by the driver's allocation granularity; an automatic
+  `kv_tokens` and `kv_bytes` follow from it.
+- The CUDA Graph allowance is the planned one. When a start's graphs need more, an automatic KV
+  capacity retries once with 1 GiB more headroom (fewer KV pages); the plan cannot see that.
+- A Qwen3.5 model with offloaded experts (Qwen3.5-122B-A10B) sizes its expert frames from a live
+  reading once the Program's allocations exist. The plan takes the weights, the Program's
+  reservation less its graph allowance (the elastic KV region whole, as with every lane's context
+  full), the expert engine's staging and tables and the MTP drafter's expert pool from the free VRAM
+  now; the cache starts larger while contexts are short. Few frames slow decode but do not refuse
+  the start.
+- Anything that changes between the plan and the start (another program's memory) changes the start.
+
 ## Endpoints
 
 | Method and path | Behavior |
@@ -1529,6 +1617,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | Option | Meaning | Default |
 |---|---|---:|
 | `--config FILE` | read options, and the artifact path, from a TOML file ([Configuration file](#configuration-file)); command-line options override it | unset |
+| `--plan FILE` | size a start with the other options on this machine without loading the model, write the plan to `FILE` as JSON and exit `0` (fits), `3` (does not fit) or `1` (no plan) ([Sizing a start without loading](#sizing-a-start-without-loading)) | unset: start the server |
 | `--host H` | listen address | `127.0.0.1` |
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
@@ -1824,7 +1913,7 @@ An unknown `format` is a `400`, never a silent fallback.
 curl 'http://127.0.0.1:8080/metrics?format=json'
 ```
 
-The document carries `schema`, `time`, `engine`, `live`, `totals`, and `requests`. It exists because
+The document carries `schema`, `time`, `engine`, `live`, `totals`, `requests` and `session_stats`. It exists because
 the text exposition cannot carry per-request records: a request id or a per-row timing in a label
 would make the series cardinality unbounded.
 
@@ -1832,19 +1921,44 @@ would make the series cardinality unbounded.
 |---|---|
 | `schema` | `infernix.telemetry/1`; additive-only within v1 |
 | `engine` | model id, architecture, weight and KV formats, speculative backend, context and concurrency limits |
-| `live` | engine phase (`idle`, `reading`, `generating`), request counts by phase, and the interval prefill/decode rates. A rate is `null` until the throughput reporter has produced one |
+| `live` | engine phase (`idle`, `reading`, `generating`), request counts by phase, the interval prefill/decode rates, and `active`, the generation requests in flight. A rate is `null` until the throughput reporter has produced one |
 | `totals` | monotonic counters since startup, plus terminal request counts |
 | `requests` | the last 128 settled generation requests (completed, cancelled, failed), oldest first; requests rejected before generation appear only in `totals.rejected` |
+| `session_stats` | the console statistics panel's figures as numbers, also without a terminal: `completed`, `failed`, `cancelled`, `rejected`, the model `drafter` (`null` until one drafted), `ngram_enabled`, `recent_window` (10), and two rows, `session` (every completed request) and `recent` (the last ten). Each row has `requests`, mean `ttft_s`, `prompt_tokens`, `cached_tokens` and `cache_hit_rate`, `prefill_tokens`, `prefill_s` and `prefill_tok_s`, `decode_tokens`, `decode_s`, `decode_tok_s` (aggregate) and `batch`, the model drafter's `drafted`, `accepted`, `acceptance` and `accepted_per_round`, the n-gram drafter's `ngram_drafted`, `ngram_accepted`, `ngram_acceptance` and `ngram_rounds`, the archive's `archive_drafted`, `archive_accepted` and `archive_acceptance`, and the VRAM expert cache's `expert_lookups`, `expert_hits` and `expert_hit_rate`; a ratio or rate is `null` while its denominator is zero. The [launcher](launcher.md)'s dashboard shows them |
 
-Each request row carries its id, completion time in Unix seconds, protocol, finish reason, token
-counts, cache reuse, TTFT/prompt/decode milliseconds, total seconds, speculative draft and accept
-counts, and the Qwen3.8-Flash-Next expert-cache lookups. Time sums the engine does not accumulate
-(`prompt_ms` and `decode_ms` at the totals level) are `null`. There is no `hardware` object: the
-engine measures no GPU telemetry, and an absent block is honest where a zero would not be.
+Each request row carries its id, completion time in Unix seconds, `label` (the request's
+`X-Infernix-Request-Label`, or `null` without one), protocol, finish reason, token counts, cache
+reuse, TTFT/prompt/decode milliseconds, total seconds, speculative draft and accept counts, and the
+Qwen3.8-Flash-Next expert-cache lookups. Time sums the engine does not accumulate (`prompt_ms` and
+`decode_ms` at the totals level) are `null`. There is no `hardware` object: the engine measures no
+GPU telemetry, and an absent block is honest where a zero would not be.
+
+`live.active` lists every generation request the server holds, whatever its protocol and whether it
+streams, oldest first, from its submission to the Engine (after prompt preparation) until its
+terminal record: a poll at that moment may see it both here and in `requests`. A request that
+continues after a server-side tool search keeps its entry and shows its latest generation. Each
+entry is:
+
+| Field | Meaning |
+|---|---|
+| `id` | the server request id (the `id` of its row in `requests` once it ends) |
+| `label` | its `X-Infernix-Request-Label`, or `null` |
+| `protocol` | as in `requests` (`openai_chat_completions`, `openai_responses`, `anthropic_messages`, `decide`) |
+| `phase` | `queued` until the Engine admits it, `prefill` until its first output token, then `decode` |
+| `prompt_tokens` | its prompt's tokens |
+| `cached_tokens` | the prompt tokens the prefix cache supplied (0 while queued) |
+| `processed_tokens` | prompt tokens done, the cached ones included; `prompt_tokens` once the prompt is done |
+| `output_tokens` | tokens generated so far |
+| `elapsed_ms` | milliseconds since the server took the request (before media acquisition and tokenization) |
+
+The figures come from the Engine's progress observations, published at admission, after each
+prefill unit and at each committed output, and taken by the request's own thread within about 10 ms;
+a poll reads them without touching the Engine. A request rejected before submission never appears.
 
 The route follows the server's API-key authentication. The document contains no prompt, completion,
-tool argument, header value, key, or client address. `requests` is a bounded window, not a durable
-log; use `--request-log-jsonl` when every request must be retained.
+tool argument, key, or client address, and no header value but the client's own request label
+(`X-Infernix-Request-Label`, accepted only as printable ASCII of at most 128 bytes). `requests` is a
+bounded window, not a durable log; use `--request-log-jsonl` when every request must be retained.
 
 ## Structured request log
 

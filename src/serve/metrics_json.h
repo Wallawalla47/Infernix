@@ -1,10 +1,12 @@
 #pragma once
 
 // The JSON representation of GET /metrics?format=json. The key names are a consumer contract:
-// monitor.py's frozen Strata mapping reads them directly (see docs/serving.md). Every string in
-// the types below is engine-authored (protocol and finish are server constants); no request text
-// is copied into them.
+// monitor.py's frozen Strata mapping and the launcher read them directly (see docs/serving.md).
+// Every string in the types below is engine-authored (protocol, finish and phase are server
+// constants) except a request's label, the client's own X-Infernix-Request-Label (printable ASCII,
+// at most 128 bytes; request_label); no request text is copied into them.
 
+#include "serve/console_stats.h"
 #include "serve/generation_service.h"
 #include "serve/request_events.h"
 
@@ -12,7 +14,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -30,6 +34,7 @@ inline constexpr std::size_t kMetricsRequestLimit = 128;
 struct MetricsJsonRequest {
     std::uint64_t id                      = 0;
     double time_unix                      = 0.0;
+    std::string label; // X-Infernix-Request-Label; empty: none (rendered null)
     std::string protocol;
     std::string finish;
     std::int64_t prompt_tokens            = 0;
@@ -55,6 +60,58 @@ struct MetricsJsonCounts {
     std::uint64_t rejected  = 0;
 };
 
+// Where a request in flight stands: queued until the Engine admits it, then prefill until its first
+// output token, then decode.
+enum class ActiveRequestPhase : std::uint8_t { Queued, Prefill, Decode };
+
+[[nodiscard]] const char* active_request_phase_name(ActiveRequestPhase phase) noexcept;
+
+// One request in flight, as live.active lists it. The token counts are its current generation's (a
+// request continuing after a server-side tool shows its latest generation).
+struct MetricsJsonActiveRequest {
+    std::uint64_t id = 0;
+    std::string label; // X-Infernix-Request-Label; empty: none (rendered null)
+    std::string protocol;
+    ActiveRequestPhase phase       = ActiveRequestPhase::Queued;
+    std::uint32_t prompt_tokens    = 0;
+    std::uint32_t cached_tokens    = 0;
+    // Prompt tokens done, the cached ones included; prompt_tokens once the prompt is done.
+    std::uint32_t processed_tokens = 0;
+    std::uint32_t output_tokens    = 0;
+    double elapsed_ms              = 0.0;
+};
+
+// The generation requests in flight: from their submission to the Engine (after prompt preparation)
+// until their terminal record, fed by the Engine's progress observations
+// (infernix::GenerationObservationOptions::progress). Thread-safe; a poll copies at most
+// --max-concurrency + --max-pending-requests rows.
+class LiveRequests {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    // `started`: when the server took the request (its preparation's start); a default time point
+    // stands for now.
+    void begin(std::uint64_t id, std::string label, std::string protocol, std::uint32_t prompt_tokens,
+               Clock::time_point started);
+    // The request's newest position; ignored once it has ended.
+    void progress(std::uint64_t id, const infernix::GenerationProgressObservation& observation);
+    void end(std::uint64_t id) noexcept;
+    // Oldest first (by server request id).
+    [[nodiscard]] std::vector<MetricsJsonActiveRequest> rows(Clock::time_point now) const;
+
+private:
+    struct Entry {
+        std::string label;
+        std::string protocol;
+        Clock::time_point started;
+        bool admitted = false;
+        infernix::GenerationProgressObservation position;
+    };
+
+    mutable std::mutex mutex_;
+    std::map<std::uint64_t, Entry> entries_;
+};
+
 struct MetricsJsonSnapshot {
     std::string instance_id;
     std::string model;
@@ -71,7 +128,12 @@ struct MetricsJsonSnapshot {
     double decode_tokens_per_second  = 0.0;
     double prefill_tokens_per_second = 0.0;
     bool rates_valid                 = false;
+    // The requests in flight (LiveRequests::rows), rendered as live.active.
+    std::vector<MetricsJsonActiveRequest> active;
     std::vector<MetricsJsonRequest> requests;
+    // The console statistics panel's aggregates (session and last ten), rendered as
+    // `session_stats`; absent when not supplied.
+    std::optional<ConsoleStatsSnapshot> session_stats;
 };
 
 enum class MetricsFormat : std::uint8_t { Prometheus, Json, Invalid };

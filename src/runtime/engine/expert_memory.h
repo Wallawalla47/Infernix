@@ -62,18 +62,35 @@ struct ExpertRamPlan {
 inline constexpr std::uint64_t kMinAutoHostContextBytes = 1ULL << 30;
 [[nodiscard]] std::uint64_t auto_host_context_bytes(std::uint64_t left_bytes) noexcept;
 
-// Plans `demand` against `snapshot`, reports the ledger (an Info summary, Debug details), refuses an
-// --expert-ram-mib the ledger cannot give (std::runtime_error), and asks Windows to keep the
-// process's pageable growth resident (a Warning when it will not). `always_tier`: the banks load as the
-// SSD tier's even where every expert fits in RAM, the ledger's share being the tier's budget (an engine
-// that sizes the exclusive RAM layout at start, ExpertOffload).
+// Plans `demand` against `snapshot`, reports the ledger (an Info summary, Debug details) and refuses
+// an --expert-ram-mib the ledger cannot give (std::runtime_error, expert_ram_refusal's message).
+// `always_tier`: the banks load as the SSD tier's even where every expert fits in RAM, the ledger's
+// share being the tier's budget (an engine that sizes the exclusive RAM layout at start, ExpertOffload).
+// A start then calls reserve_expert_working_set; a plan (Engine::plan) does not.
 [[nodiscard]] ExpertRamPlan plan_expert_ram(const EngineOptions& options, const expert_offload::HostMemoryDemand& demand,
                                             const HostMemorySnapshot& snapshot, bool always_tier = false);
 
+// The refusal of an --expert-ram-mib that `ledger` cannot give (HostMemoryLedger::cap_too_large);
+// empty otherwise.
+[[nodiscard]] std::string expert_ram_refusal(const EngineOptions& options, const expert_offload::HostMemoryLedger& ledger);
+
+// A small reserve trims other programs' working sets: asks Windows to keep the process's pageable
+// growth (demand.process_growth) resident (a Warning when it will not).
+void reserve_expert_working_set(const EngineOptions& options, const expert_offload::HostMemoryDemand& demand);
+
 // The VRAM check before the weights are read: `fixed` (the dense weights and the Program's fixed
 // allocations) and the graph reserve for `graphs` executables must leave the expert cache room for
-// at least one frame of `frame_bytes` (std::runtime_error naming `model` and `contributors`
-// otherwise); fewer than kFewExpertFrames frames is a Warning. Returns the sizing.
+// at least one frame of `frame_bytes`. size_expert_vram returns the sizing and, when they do not,
+// the refusal naming `model` and `contributors`; check_expert_vram throws it (std::runtime_error)
+// and warns of fewer than kFewExpertFrames frames.
+struct ExpertVramCheck {
+    expert_offload::VramSizing sizing;
+    std::string refusal; // empty: it fits
+};
+[[nodiscard]] ExpertVramCheck size_expert_vram(const EngineOptions& options, const std::string& model,
+                                               const VramSnapshot& before, std::uint64_t fixed, std::uint32_t graphs,
+                                               std::uint64_t frame_bytes, std::uint32_t max_frames,
+                                               const std::string& contributors);
 [[nodiscard]] expert_offload::VramSizing check_expert_vram(const EngineOptions& options, const std::string& model,
                                                            const VramSnapshot& before, std::uint64_t fixed,
                                                            std::uint32_t graphs, std::uint64_t frame_bytes,

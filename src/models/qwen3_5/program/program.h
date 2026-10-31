@@ -61,6 +61,12 @@ public:
     [[nodiscard]] std::uint32_t max_concurrency() const noexcept;
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
+    // The KV pages' payload (text KV and the drafter's paged KV) and the CUDA Graph allowance, both
+    // inside device_reservation_bytes.
+    [[nodiscard]] std::size_t kv_payload_bytes() const noexcept;
+    [[nodiscard]] std::size_t graph_allowance_bytes() const noexcept;
+    // The widest speculative round's drafts (0 without speculation).
+    [[nodiscard]] std::uint32_t draft_window() const noexcept;
     [[nodiscard]] std::size_t host_capacity_bytes() const noexcept;
     // Whether automatic tree widths are active: requested and verifiable by the target.
     [[nodiscard]] bool draft_tree_auto() const noexcept;

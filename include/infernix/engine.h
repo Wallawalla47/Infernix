@@ -73,6 +73,13 @@ public:
     explicit Engine(EngineOptions options);
     ~Engine();
 
+    // Sizes a start with `options` on this machine without loading the model (EnginePlan): the same
+    // option checks and memory plans, on a CUDA context of options.device but with no weight read
+    // into device or pinned memory and no Program. A start that would not fit returns with
+    // EnginePlan::fits false and the refusing check's message; anything else a start would refuse
+    // (invalid options, an unreadable artifact) throws as the constructor does.
+    [[nodiscard]] static EnginePlan plan(EngineOptions options);
+
     Engine(Engine&&) noexcept;
     Engine& operator=(Engine&&) noexcept;
 

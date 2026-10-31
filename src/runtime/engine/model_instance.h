@@ -71,6 +71,11 @@ struct ConstructedModel {
 void validate_engine_options(const EngineOptions& options, models::Architecture architecture,
                              bool offloaded_experts = false);
 
-[[nodiscard]] ConstructedModel construct_model(EngineOptions& options, DeviceContext& device);
+// With `plan` (Engine::plan) the construction stops before the Program: the weights are bound
+// plan-only (models::qwen3_5::plan_model), the capacity curve is resolved against the free memory
+// less the weights, and the sizing lands in *plan; the result is then empty. A start's memory
+// refusals become EnginePlan::fits false; anything else throws as a start would.
+[[nodiscard]] ConstructedModel construct_model(EngineOptions& options, DeviceContext& device,
+                                               EnginePlan* plan = nullptr);
 
 } // namespace infernix::runtime

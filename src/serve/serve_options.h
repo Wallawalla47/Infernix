@@ -33,6 +33,9 @@ struct RequestLogRotation {
 
 struct ServeOptions {
     bool help_requested = false;
+    // --plan FILE: size a start with these options without loading the model (Engine::plan), write
+    // the plan to FILE as JSON (serve/plan_report.h) and exit.
+    std::filesystem::path plan_path;
     std::string artifact_path;
     std::filesystem::path chat_template_path;
     std::filesystem::path ngram_volume_path;
