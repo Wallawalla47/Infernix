@@ -54,12 +54,16 @@ inline std::size_t granularity(int device) {
     return bytes;
 }
 
-inline void set_access(CUdeviceptr va, std::size_t bytes, int device) {
+inline CUresult try_set_access(CUdeviceptr va, std::size_t bytes, int device) {
     CUmemAccessDesc access{};
     access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     access.location.id   = device;
     access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    check(cuMemSetAccess(va, bytes, &access, 1), "cuMemSetAccess");
+    return cuMemSetAccess(va, bytes, &access, 1);
+}
+
+inline void set_access(CUdeviceptr va, std::size_t bytes, int device) {
+    check(try_set_access(va, bytes, device), "cuMemSetAccess");
 }
 
 } // namespace infernix::vmm
