@@ -11873,6 +11873,35 @@ measured).
 - More CPU workers did not help: 8, 11 and 14 against 6 (dp4a build) 0.999, 0.994 and 0.995x after a 16K prompt,
   8 workers 1.019x at short context and 0.982x on the struct fixture.
 
+### 19.3.44 Tensor-core narrow W4A4 experts (2026-10-31; same bits; default)
+
+**Why.** Dense8's 4-bit expert route decoded slower than its own `--a16-activations` route (2-6 % fewer rounds a
+second, 2026-10-31): its narrow jobs ran the one-column kernels (§19.3.21) at every width up to eight columns, a pass
+per column of half2 products over a staged 46 KB slice, A4(x) re-encoded per column in every CTA between six
+barriers, while the W4A16 banks had the tensor-core narrow kernels of §19.3.40.
+
+**What** (`narrow_a4_mma.cuh`, calls of at most eight columns, banks whose every expert shares its gate and up input
+scales: `MoeExpertSource::a4_shared_input`, set at load; NVIDIA's exports always do, other banks keep the one-column
+kernels). Per 16-element block one `mma.m16n8k16` s8 product of the doubled E2M1 codes (A: the record word's rows g
+and g + 8; B: column g's codes) gives P_b exactly for up to eight columns, folded as (P_b Sw) Sa into the same int64
+sums as `unit_sums`, so every output equals the one-column kernels' and the CPU engine's bit for bit. Gate/up CTAs
+of eight warps, two a row group, each streaming half of K through a three-stage ring (the halves add exactly); each
+CTA quantizes its job's A4(x) into shared memory while its rings fill and its two A4 blocks of h with the down input
+scale. Down: a warp a row group, its units copied before the PDL wait. Shared memory is sized by the call's columns
+so three gate/up CTAs fit an SM at one to three columns. Registers 80 (gate/up) and 71 (down), no spills.
+
+**Rejected on the way.** A once-per-call A4(x) encode kernel before the passes with one warp a row group over its
+whole K: op T = 1 45.6 against the one-column kernels' 41.6 us (a launch on the critical path, half the warps in
+flight), though already ahead end to end (d16k +3.7 %).
+
+**Measured** (RTX 5090, `infernix_offloaded_moe_wide_bench --activation a4 --cold --placement frames`, output hashes
+equal; this form against the one-column kernels): T = 1 41.6 / 41.6 us, T = 2 59.9 / 55.9, T = 3 72.1 / 72.3, T = 6
+183 / 189, T = 8 204 / 211. T = 2's 7 % is the down pass (800 CTAs at three an SM, its 23 KB of resident units a
+CTA), whose weight copies the engine overlaps with gate/up under PDL and the op bench does not. Dense8 decode
+(`infernix_bench`, DFlash2 auto, INT8 KV, fresh expert state, six interleaved runs each over two builds of this form):
+after a 16K prompt +5.4 % and +4.8 %, the struct fixture +3.1 % and +3.0 %, every run ahead; conv +0.1 % and -1.9 %
+(the old arm bimodal at 182-197 tok/s, the new one 186-188).
+
 ---
 
 ## 20. Documentation and authority changes

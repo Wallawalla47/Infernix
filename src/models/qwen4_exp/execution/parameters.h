@@ -64,6 +64,8 @@ struct MoeParameters {
     LinearParameters shared_down;    // [H, I_shared]
     const ExpertBank* bank = nullptr;
     const ops::offloaded_moe::ExpertScales* device_scales = nullptr; // [E]
+    // A W4A4 bank whose every expert's gate and up input scales are equal (MoeExpertSource::a4_shared_input).
+    bool a4_shared_input = false;
     // The lossless route's (TextConfig::lossless): each NVFP4 matrix's weight multiplier in alpha_* (an
     // A4 bank's alpha also folds in its input scale); [E], null without the route. The design reference
     // (TextConfig::design_reference) adds a W4A4 bank's input scales in input_*.

@@ -7,7 +7,8 @@
 // experts are wide over several 64-column tiles and the tail stays narrow), then times one
 // moe_experts call as the prefill path issues it: 64 staging slots with the double-buffered
 // overlap stream. Experts with more than eight columns take the wide route; the rest the narrow
-// one (W4A4: the one-column kernels, a pass per column; W4A16: those in calls of at most four
+// one (W4A4: the tensor-core narrow kernels in calls of at most eight columns, else, or with --split-scales, the
+// one-column kernels, a pass per column; W4A16: those in calls of at most four
 // columns, the multi-column kernels above). --cold flushes the L2 before each
 // call, as decode finds a layer's experts (a small T's few experts would otherwise stay L2-resident
 // across repeats). Placement:
@@ -414,6 +415,9 @@ void run_point(Fixture& fixture, int tokens, const Options& options, bench::L2Fl
         if ((staged && options.placement == "frames") || (!staged && options.placement == "staged")) { continue; }
         ops::MoeExpertSource source = fixture.source(staged);
         source.wide_a16             = options.wide_a16;
+        // W4A4 experts sharing their input scales (the default here, as in NVIDIA's exports) take the tensor-core
+        // narrow kernels in calls of at most eight columns (--split-scales: the one-column kernels).
+        source.a4_shared_input = !options.a16 && !options.split_scales;
         source.narrow_a16           = options.narrow_a16;
         Tensor tx(x.p, DType::BF16, {g_geometry.shape.hidden, tokens});
         Tensor out(outputs.p, DType::BF16, {g_geometry.shape.hidden, entries});

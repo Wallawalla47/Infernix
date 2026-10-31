@@ -287,6 +287,9 @@ struct MoeExpertSource {
     offloaded_moe::NarrowA16 narrow_a16 = offloaded_moe::NarrowA16::kExact;
     // With kLossless: the design reference's expert activations (offloaded_moe::LosslessExpertDesign).
     offloaded_moe::LosslessExpertDesign lossless_design = offloaded_moe::LosslessExpertDesign::kNone;
+    // W4A4 banks whose every expert shares its gate and up input scales (every NVIDIA export): their narrow jobs
+    // then take the tensor-core narrow kernels (one A4 x per entry); otherwise the one-column kernels.
+    bool a4_shared_input = false;
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
     MoeCpuChannel cpu;
