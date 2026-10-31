@@ -612,10 +612,12 @@ private:
         };
         std::optional<GenerationStart> start;
         std::optional<PromptProgress> progress;
+        std::optional<GenerationProgressObservation> position;
         std::vector<typename Request::StreamEvent> events;
         for (;;) {
             start.reset();
             progress.reset();
+            position.reset();
             events.clear();
             bool done = false;
             {
@@ -628,6 +630,8 @@ private:
                 request->stream_start.reset();
                 progress = std::move(request->stream_progress);
                 request->stream_progress.reset();
+                position = std::move(request->live_progress);
+                request->live_progress.reset();
                 events.swap(request->events);
                 done = request->response_done;
             }
@@ -666,6 +670,12 @@ private:
                         }
                     } catch (...) { fail_consumer(); }
                 }
+            }
+            // The newest position, after the events it may follow (a first-token observation).
+            if (position && caller_error == nullptr) {
+                try {
+                    request->observation.progress(*position);
+                } catch (...) { fail_consumer(); }
             }
 
             if (caller_error == nullptr) {
@@ -752,6 +762,7 @@ private:
                             std::uint32_t accepted_tokens) {
         if (accepted_tokens == 0) { return std::nullopt; }
         cumulative_stats_.generated_tokens += accepted_tokens;
+        publish_progress_observation(request);
         const bool observe_wall =
             request->observation.phase_timings || request->observation.live_timings;
         const bool need_now         = !request->first_token || observe_wall;
@@ -848,11 +859,29 @@ private:
         request->cv.notify_one();
     }
 
+    // GenerationObservationOptions::progress: the request's position now, replacing any the consumer
+    // has not taken yet (it is delivered at the consumer's next wakeup, without a notification).
+    void publish_progress_observation(const std::shared_ptr<Request>& request) {
+        if (!request->observation.progress || !request->admitted_begin) { return; }
+        const BeginSummary& begin = *request->admitted_begin;
+        const GenerationProgressObservation observation{
+            .prompt_tokens           = begin.prompt_tokens,
+            .reused_prompt_tokens    = begin.reused_prompt_tokens,
+            .processed_prompt_tokens = begin.reused_prompt_tokens + request->computed_prompt_tokens,
+            .generated_tokens        = static_cast<std::uint32_t>(std::min<std::size_t>(
+                request->generated.size(), std::numeric_limits<std::uint32_t>::max())),
+        };
+        std::lock_guard lock(request->mutex);
+        if (request->response_done) { return; }
+        request->live_progress = observation;
+    }
+
     void publish_generation_start(const std::shared_ptr<Request>& request, BeginSummary begin) {
         if (request->admitted_begin) {
             throw std::logic_error("request admission published generation start twice");
         }
         request->admitted_begin = begin;
+        publish_progress_observation(request);
         if (request->observation.phase_timings || request->observation.live_timings ||
             request->observation.prompt_progress) {
             if (!request->admitted_at) {
@@ -1508,7 +1537,10 @@ private:
         if (progress.complete && request->computed_prompt_tokens != suffix_tokens) {
             throw std::logic_error("completed prefill did not reach the admitted prompt frontier");
         }
-        if (progress.processed_prompt_tokens != 0) { publish_prompt_progress(request); }
+        if (progress.processed_prompt_tokens != 0) {
+            publish_prompt_progress(request);
+            publish_progress_observation(request);
+        }
         // Between a long prompt's calls (Qwen4Exp: after each layer-walk span) the frames it borrows
         // can be returned, so a request waiting for KV growth need not wait for the whole prompt
         // (GitHub #24: admitted after the first 65,536-token span instead of expiring in the queue).

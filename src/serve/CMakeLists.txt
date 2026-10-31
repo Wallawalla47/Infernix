@@ -27,6 +27,7 @@ add_library(infernix_serve STATIC
   request_log.cpp
   metrics.cpp
   metrics_json.cpp
+  plan_report.cpp
   http_server.cpp
   openai_responses_http.cpp
   serve_options.cpp

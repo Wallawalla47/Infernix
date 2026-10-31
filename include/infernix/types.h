@@ -1604,9 +1604,26 @@ struct GenerationFirstTokenObservation {
 
 using GenerationFirstTokenObserver = std::function<void(const GenerationFirstTokenObservation&)>;
 
+// A request's latest position, for a live view of the requests in flight (a server's metrics). The
+// Engine worker publishes it at admission, after each completed prefill unit and at each committed
+// output, and keeps only the newest: wait() delivers it on the consumer thread, in either consumer
+// mode, at its next wakeup (within about 10 ms), so a consumer sees the latest state rather than
+// every step. Nothing is published before admission. processed_prompt_tokens counts the reused
+// prefix, as PromptProgress does; generated_tokens counts accepted tokens, as
+// GenerationTimingObservation does.
+struct GenerationProgressObservation {
+    std::uint32_t prompt_tokens           = 0;
+    std::uint32_t reused_prompt_tokens    = 0;
+    std::uint32_t processed_prompt_tokens = 0;
+    std::uint32_t generated_tokens        = 0;
+};
+
+using GenerationProgressObserver = std::function<void(const GenerationProgressObservation&)>;
+
 // Observation affects only request publication. It never changes model execution, output
 // semantics, scheduling, or cache selection. Live output timings and prompt progress require a
-// Streaming consumer; phase timings and scheduling observations also support Aggregate consumers.
+// Streaming consumer; phase timings and the scheduling, first-token and progress observers also
+// support Aggregate consumers.
 struct GenerationObservationOptions {
     bool phase_timings   = false;
     bool live_timings    = false;
@@ -1614,6 +1631,8 @@ struct GenerationObservationOptions {
     // Optional for either consumer mode. No scheduling events are retained when unset.
     GenerationSchedulingObserver scheduling;
     GenerationFirstTokenObserver first_token;
+    // Optional for either consumer mode; nothing is published when unset.
+    GenerationProgressObserver progress;
 };
 
 class CancellationView {
@@ -1992,6 +2011,94 @@ struct MemorySummary {
     std::size_t kv_payload_bytes                  = 0;
     // With offloaded experts (beside runtime_reservation_bytes, which excludes them).
     std::optional<ExpertCacheMemorySummary> expert_cache;
+};
+
+// Engine::plan's device: the free memory it planned against is read live, so another process's use
+// counts as used.
+struct EnginePlanGpu {
+    std::string name;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t free_bytes  = 0;
+    // The OS's video-memory budget for this process (Windows WDDM), when it reports one.
+    std::optional<std::uint64_t> budget_bytes;
+};
+
+// Engine::plan's device memory. Empty optionals are quantities the architecture does not have.
+struct EnginePlanVram {
+    // The dense weights' device arena (with offloaded experts: everything but the routed experts).
+    std::uint64_t weights_bytes = 0;
+    // The KV cache's payload and token capacity as the start would size them (0 when nothing fits).
+    std::uint64_t kv_bytes  = 0;
+    std::uint32_t kv_tokens = 0;
+    // The least device memory the Program needs beside the weights at these options (its persistent
+    // buffers, the smallest KV a start accepts, its workspace and CUDA Graph allowance).
+    std::uint64_t minimum_reservation_bytes = 0;
+    // Qwen3.5 family: each further KV page group's bytes and tokens (the capacity curve's slope).
+    std::optional<std::uint64_t> bytes_per_page_group;
+    std::optional<std::uint32_t> page_group_tokens;
+    std::optional<std::uint64_t> workspace_bytes;
+    std::optional<std::uint64_t> graph_allowance_bytes;
+    // Offloaded experts: the VRAM expert cache's frames and bytes.
+    std::optional<std::uint64_t> expert_cache_bytes;
+    std::optional<std::uint32_t> expert_frames;
+    // Left free for the display and other programs (--vram-headroom-mib or the automatic headroom).
+    std::uint64_t headroom_bytes = 0;
+    // Everything planned on the device (weights, the Program's reservation, expert frames), and what
+    // the free memory leaves beside it and the headroom (0 when it does not fit).
+    std::uint64_t planned_bytes = 0;
+    std::uint64_t left_bytes    = 0;
+};
+
+enum class EnginePlanExpertTier : std::uint8_t {
+    // No routed expert is read from the artifact: every one is in RAM, or with the exclusive RAM
+    // layout in RAM or in the VRAM expert cache.
+    Full,
+    Ssd, // RAM holds part of the experts; the rest is read from the artifact on use
+};
+
+// Engine::plan's Host memory.
+struct EnginePlanRam {
+    std::uint64_t total_bytes     = 0;
+    std::uint64_t available_bytes = 0;
+    // The reserve left free for the system (--ram-free-mib).
+    std::uint64_t ram_free_bytes = 0;
+    // Offloaded experts: the RAM the routed experts take.
+    std::optional<std::uint64_t> experts_bytes;
+    // The weights the load pins in RAM (offloaded experts, the token embedding, an offloaded vision
+    // tower); empty when it pins none.
+    std::optional<std::uint64_t> pinned_bytes;
+    // The prefix cache's Host tier; empty without the prefix cache.
+    std::optional<std::uint64_t> host_context_bytes;
+    // Qwen3.8-Flash-Next's n-gram table: its bytes in RAM (the whole table, or the row cache of a table
+    // read from its volume) and where it is read from.
+    std::optional<std::uint64_t> ngram_bytes;
+    std::optional<NgramResidency> ngram_residency; // Ram or Volume once resolved
+    std::optional<EnginePlanExpertTier> tier;
+    // Offloaded experts: the RAM layout the start takes (--expert-ram-layout, or the model's default).
+    std::optional<ExpertRamLayout> expert_ram_layout;
+    // Everything planned in RAM, and what available memory leaves beside it and the reserve.
+    std::uint64_t planned_bytes = 0;
+    std::uint64_t left_bytes    = 0;
+};
+
+// Engine::plan: the Engine's startup sizing of a set of options on this machine, made as a start
+// makes it (the same option checks, RAM ledger, VRAM checks and capacity curves) but without reading
+// the weights into device or pinned memory or allocating the Program, its KV cache, workspace,
+// expert frames or CUDA Graphs. What a start measures only once those exist (the free memory after
+// the weights, the CUDA Graphs' actual cost, the expert frames of a Qwen3.5 model with offloaded
+// experts) is estimated from the plan.
+struct EnginePlan {
+    // Whether a start would pass its memory checks now; `error` holds the refusing check's own
+    // message otherwise.
+    bool fits = true;
+    std::string error;
+    std::string architecture;
+    EnginePlanGpu gpu;
+    EnginePlanVram vram;
+    EnginePlanRam ram;
+    // The largest --max-context whose smallest reservation (and for Qwen3.8-Flash-Next, one expert
+    // frame) fits beside the weights with the other options as given; empty when not computed.
+    std::optional<std::uint32_t> max_context;
 };
 
 // A count and total of durations, and the longest since Engine::reset_execution_maxima().

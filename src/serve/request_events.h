@@ -4,6 +4,7 @@
 #include "serve/generation_service.h"
 #include "serve/request.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -34,6 +35,10 @@ struct RequestLogContext {
     infernix::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;
     infernix::PromptPreparationStats preparation;
+    // The prepared prompt's tokens and when the server took the request (PreparedRequest::started):
+    // the live view's (LiveRequests) first figures before the Engine admits it.
+    std::uint32_t prompt_tokens = 0;
+    std::chrono::steady_clock::time_point started{};
 };
 
 struct RequestLogMetadata {

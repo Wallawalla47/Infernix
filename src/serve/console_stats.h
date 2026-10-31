@@ -2,7 +2,9 @@
 
 // Session statistics panel pinned beneath the scrolling operational console log. It aggregates the
 // same completed-request measurements the `req#N done` records print, over the whole session and
-// over the most recent requests, and redraws product::TerminalPanel after every change.
+// over the most recent requests, and redraws product::TerminalPanel after every change. The
+// aggregates also feed `session_stats` in GET /metrics?format=json, so they accumulate without a
+// terminal panel too (a null panel draws nothing).
 
 #include "serve/request_events.h"
 

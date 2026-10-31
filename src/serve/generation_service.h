@@ -111,6 +111,8 @@ struct PreparedRequest {
     std::vector<std::string> tool_schema_params;
     infernix::GenerationHandle generation;
     infernix::ResolvedSamplingParameters sampling;
+    // When the server took the request (its ingress reservation, before media acquisition).
+    std::chrono::steady_clock::time_point started{};
     // Service input acquisition/bookkeeping; Engine timings own prompt and constraint preparation.
     double service_prepare_seconds = 0.0;
     double acquisition_seconds = 0.0;
@@ -133,6 +135,12 @@ struct PreparedRequest {
     // continuation, readouts, token constraints, no prefix reuse).
     std::optional<infernix::PromptInput> next_turn;
 };
+
+// The Engine's options for serving with `options`: the one mapping a start (GenerationService) and
+// --plan (infernix::Engine::plan) both use, so a plan sizes exactly the start it stands for.
+[[nodiscard]] infernix::EngineOptions make_engine_options(const ServeOptions& options,
+                                                          StartupObserver startup_observer      = {},
+                                                          DiagnosticObserver diagnostic_observer = {});
 
 // What the HTTP routes ask of generation. GenerationService answers it over the Engine; a test of
 // the routes answers it with its own.

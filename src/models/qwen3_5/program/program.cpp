@@ -37,6 +37,18 @@ std::size_t SequencePlan::workspace_capacity_bytes() const noexcept {
     return impl_ != nullptr ? impl_->workspace.capacity : 0;
 }
 
+std::size_t SequencePlan::kv_payload_bytes() const noexcept {
+    return impl_ != nullptr ? impl_->persistent.kv_payload_bytes : 0;
+}
+
+std::size_t SequencePlan::graph_allowance_bytes() const noexcept {
+    return impl_ != nullptr ? impl_->graph_allowance_bytes : 0;
+}
+
+std::uint32_t SequencePlan::draft_window() const noexcept {
+    return impl_ != nullptr ? impl_->draft_window : 0;
+}
+
 std::size_t SequencePlan::host_capacity_bytes() const noexcept {
     return impl_ ? impl_->context_cache.host_capacity_bytes.value_or(0) : 0;
 }

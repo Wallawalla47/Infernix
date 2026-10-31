@@ -47,11 +47,20 @@ private:
     friend LoadPlan plan_load(const artifact::Reader&, LoadOptions);
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
+    friend std::unique_ptr<Model> plan_model(LoadPlan&&);
 };
 
 [[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options = {});
 [[nodiscard]] std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                                        const StartupObserver* observer = nullptr);
+// The Model materialize_model gives, for Engine::plan's sizing only: the same configuration,
+// bindings and expert banks, with every device and pinned weight bound at its planned offset in an
+// address reservation (artifact::materialize_geometry), so nothing is uploaded, pinned or allocated
+// and no weight byte may ever be read (an access faults). Offloaded experts must be planned with
+// LoadOptions::stream_experts (their scales are read from the artifact, as the SSD tier reads them);
+// overlay vision assets are not made. Its execution::Parameters serve the sequence planner; it never
+// runs.
+[[nodiscard]] std::unique_ptr<Model> plan_model(LoadPlan&& plan);
 [[nodiscard]] std::unique_ptr<Model> load_model(const std::filesystem::path& path,
                                                 LoadOptions options, DeviceContext& device,
                                                 const StartupObserver* observer = nullptr);

@@ -349,61 +349,67 @@ std::uint64_t token_4gram_hash(const infernix::TokenId* tokens) {
 
 } // namespace
 
+infernix::EngineOptions make_engine_options(const ServeOptions& options, StartupObserver startup_observer,
+                                            DiagnosticObserver diagnostic_observer) {
+    infernix::EngineOptions engine_options;
+    engine_options.artifact_path            = options.artifact_path;
+    engine_options.chat_template_path       = options.chat_template_path;
+    engine_options.ngram_volume_path        = options.ngram_volume_path;
+    engine_options.ngram_residency          = options.ngram_residency;
+    engine_options.expert_stripe_path       = options.expert_stripe_path;
+    engine_options.expert_state_path        = options.expert_state ? *options.expert_state
+                                                                   : std::filesystem::path(options.artifact_path +
+                                                                                           ".expert-state");
+    engine_options.expert_state_off         = options.expert_state && options.expert_state->empty(); // --expert-state off
+    engine_options.thinking_budget_message  = options.thinking_budget_message;
+    engine_options.route_trace_path        = options.route_trace;
+    engine_options.device                   = options.device;
+    engine_options.max_context              = options.max_context;
+    engine_options.rope_yarn_factor          = options.rope_yarn_factor;
+    engine_options.kv_capacity              = options.kv_capacity;
+    engine_options.vram_headroom_bytes      = options.vram_headroom_bytes;
+    engine_options.vram_past_budget         = options.vram_past_budget;
+    engine_options.expert_tail_skip         = options.expert_tail_skip;
+    engine_options.expert_a4_activations    = options.expert_a4_activations;
+    engine_options.a8_activations           = options.a8_activations;
+    engine_options.embedding_host           = options.embedding_host;
+    engine_options.max_concurrency          = options.max_concurrency;
+    engine_options.max_pending_requests     = options.max_pending_requests;
+    engine_options.pending_timeout_ms       = options.pending_timeout_ms;
+    engine_options.prefill_chunk            = options.prefill_chunk;
+    engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
+    engine_options.prefill_split_workspace_mib  = options.prefill_split_workspace_mib;
+    engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
+    // The lossless route runs no fast path.
+    engine_options.fast_paths                    = options.fast_paths && !options.lossless;
+    engine_options.lossless                      = options.lossless;
+    engine_options.fast_path_candidates          = options.fast_path_candidates;
+    engine_options.kv_cache                  = options.kv_cache;
+    engine_options.logits_dtype              = options.logits_dtype;
+    engine_options.enable_vision             = options.enable_vision;
+    engine_options.vision_offload            = options.vision_offload;
+    engine_options.vision_max_merged_tokens  = options.vision_max_merged_tokens;
+    engine_options.use_cuda_graph            = options.use_cuda_graph;
+    engine_options.speculative              = options.speculative;
+    engine_options.context_cache            = options.context_cache;
+    engine_options.context_cost.preset_path = options.context_cost_presets;
+    engine_options.media_cache_bytes        = options.media_cache_bytes;
+    engine_options.media_live_bytes         = options.media_live_bytes;
+    engine_options.ram_free_bytes           = options.ram_free_bytes;
+    engine_options.expert_ram_bytes         = options.expert_ram_bytes;
+    engine_options.expert_ram_layout        = options.expert_ram_layout;
+    engine_options.expert_pin_bytes         = options.expert_pin_bytes;
+    engine_options.media_preprocess_threads = options.media_preprocess_threads;
+    engine_options.startup_observer         = std::move(startup_observer);
+    engine_options.diagnostic_observer      = std::move(diagnostic_observer);
+    return engine_options;
+}
+
 GenerationService::GenerationService(ServeOptions options, StartupObserver startup_observer,
                                      DiagnosticObserver diagnostic_observer)
     : options_(std::move(options)) {
-    infernix::EngineOptions engine_options;
-    engine_options.artifact_path            = options_.artifact_path;
-    engine_options.chat_template_path       = options_.chat_template_path;
-    engine_options.ngram_volume_path        = options_.ngram_volume_path;
-    engine_options.ngram_residency          = options_.ngram_residency;
-    engine_options.expert_stripe_path       = options_.expert_stripe_path;
-    engine_options.expert_state_path        = options_.expert_state ? *options_.expert_state
-                                                                    : std::filesystem::path(options_.artifact_path +
-                                                                                            ".expert-state");
-    engine_options.expert_state_off         = options_.expert_state && options_.expert_state->empty(); // --expert-state off
-    engine_options.thinking_budget_message  = options_.thinking_budget_message;
-    engine_options.route_trace_path        = options_.route_trace;
-    engine_options.device                   = options_.device;
-    engine_options.max_context              = options_.max_context;
-    engine_options.rope_yarn_factor          = options_.rope_yarn_factor;
-    engine_options.kv_capacity              = options_.kv_capacity;
-    engine_options.vram_headroom_bytes      = options_.vram_headroom_bytes;
-    engine_options.vram_past_budget         = options_.vram_past_budget;
-    engine_options.expert_tail_skip         = options_.expert_tail_skip;
-    engine_options.expert_a4_activations    = options_.expert_a4_activations;
-    engine_options.a8_activations           = options_.a8_activations;
-    engine_options.embedding_host           = options_.embedding_host;
-    engine_options.max_concurrency          = options_.max_concurrency;
-    engine_options.max_pending_requests     = options_.max_pending_requests;
-    engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
-    engine_options.prefill_chunk            = options_.prefill_chunk;
-    engine_options.original_int8_prefill_kernel = options_.original_int8_prefill_kernel;
-    engine_options.prefill_split_workspace_mib  = options_.prefill_split_workspace_mib;
-    engine_options.original_nvfp4_prefill_kernel = options_.original_nvfp4_prefill_kernel;
-    // The lossless route runs no fast path.
-    engine_options.fast_paths                    = options_.fast_paths && !options_.lossless;
-    engine_options.lossless                      = options_.lossless;
-    engine_options.fast_path_candidates          = options_.fast_path_candidates;
-    engine_options.kv_cache                  = options_.kv_cache;
-    engine_options.logits_dtype              = options_.logits_dtype;
-    engine_options.enable_vision             = options_.enable_vision;
-    engine_options.vision_offload            = options_.vision_offload;
-    engine_options.vision_max_merged_tokens  = options_.vision_max_merged_tokens;
-    engine_options.use_cuda_graph            = options_.use_cuda_graph;
-    engine_options.speculative              = options_.speculative;
-    engine_options.context_cache            = options_.context_cache;
-    engine_options.context_cost.preset_path = options_.context_cost_presets;
-    engine_options.media_cache_bytes        = options_.media_cache_bytes;
-    engine_options.media_live_bytes         = options_.media_live_bytes;
-    engine_options.ram_free_bytes           = options_.ram_free_bytes;
-    engine_options.expert_ram_bytes         = options_.expert_ram_bytes;
-    engine_options.expert_ram_layout        = options_.expert_ram_layout;
-    engine_options.expert_pin_bytes         = options_.expert_pin_bytes;
-    engine_options.media_preprocess_threads = options_.media_preprocess_threads;
-    engine_options.startup_observer         = std::move(startup_observer);
-    engine_options.diagnostic_observer      = std::move(diagnostic_observer);
-    engine_           = std::make_unique<infernix::Engine>(std::move(engine_options));
+    engine_ = std::make_unique<infernix::Engine>(
+        make_engine_options(options_, std::move(startup_observer), std::move(diagnostic_observer)));
     if (!options_.request_log_jsonl.empty()) {
         prefix_misses_ = std::make_unique<PrefixMissTracker>(
             [engine = engine_.get()](std::span<const infernix::TokenId> ids) { return engine->detokenize(ids); });
@@ -490,6 +496,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         throw_invalid_input(error, "vision_disabled");
     }
     prepared.lifetime = acquire_request_lifetime(deadline_policy, admitted);
+    prepared.started  = prepared.lifetime->started;
 
     try {
         const auto acquisition_started = Clock::now();

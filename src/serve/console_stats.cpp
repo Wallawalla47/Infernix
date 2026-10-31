@@ -305,6 +305,8 @@ ConsoleStatsSnapshot ConsoleStatsPanel::snapshot() const {
 }
 
 void ConsoleStatsPanel::publish_locked() {
+    // Without a terminal panel the statistics still accumulate for /metrics?format=json.
+    if (!panel_) { return; }
     // Publishing under the statistics lock keeps concurrent updates from drawing out of order.
     panel_->update(render_console_stats_panel(state_));
 }

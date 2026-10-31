@@ -62,6 +62,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             .prompt_progress = request.stream && request.return_progress,
             .scheduling      = scheduling_observer(req_id, metadata.http_request_id),
             .first_token     = first_token_observer(),
+            .progress        = progress_observer(req_id),
         };
         prepared = service_->prepare(
             request.generation,

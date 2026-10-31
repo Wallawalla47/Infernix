@@ -87,4 +87,23 @@ private:
     std::string lock_failure_;
 };
 
+// A range of this process's address space reserved with no memory behind it: nothing is committed
+// and any access faults. A plan-only materialization (artifact::materialize_geometry) binds weights
+// at addresses inside one, so their views have the shape and offsets a load gives them while no
+// byte is read, uploaded or pinned. Zero bytes reserves nothing (data() is null).
+class AddressReservation {
+public:
+    explicit AddressReservation(std::size_t bytes);
+    ~AddressReservation();
+    AddressReservation(const AddressReservation&)            = delete;
+    AddressReservation& operator=(const AddressReservation&) = delete;
+
+    [[nodiscard]] std::byte* data() const noexcept { return data_; }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+private:
+    std::byte* data_  = nullptr;
+    std::size_t size_ = 0;
+};
+
 } // namespace infernix
