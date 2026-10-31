@@ -161,15 +161,17 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix,
     out.experts      = b.parameter(p + "experts", {e, h, c.moe.intermediate}, input, std::nullopt, experts);
     // parse_config chose the arithmetic. A W4A4 bank (§16.2) permits 4-bit activations and carries
     // its activation scales; an A16-only bank is W4A16 (design §16.2.1) and has none. A bank whose
-    // 4-bit activations are optional permits them and carries its scales, which only W4A4 reads.
-    // 16-bit activations everywhere bind every Use A16Only and leave stored scales unread.
+    // 4-bit activations are optional permits them and carries its scales, which only W4A4 reads; so does a
+    // W4A4 bank run with 16-bit activations (--a16-activations). 16-bit activations everywhere bind every Use
+    // A16Only and leave stored scales unread.
     const bool a4_permitted = b.weights.at(out.experts.index).policy != ops::LinearPolicy::A16Only;
     if (!c.moe.a16_experts) {
         if (!a4_permitted) { throw ArtifactError(p + "experts: 4-bit activations need a Use that permits them"); }
         out.input_scales = b.parameter(p + "expert_input_scales", {e, 3}, {}, QType::FP32, Residency::Values);
-    } else if (c.moe.a4_optional) {
+    } else if (c.moe.a4_optional || c.moe.a4_native) {
         if (!b.stored(p + "expert_input_scales")) {
-            throw ArtifactError(p + "expert_input_scales: optional 4-bit activations need the activation scales");
+            throw ArtifactError(p + "expert_input_scales: a bank that permits 4-bit activations needs its activation "
+                                    "scales");
         }
     } else if (a4_permitted) {
         throw ArtifactError(p + "experts: a bank that permits 4-bit activations needs its activation scales");

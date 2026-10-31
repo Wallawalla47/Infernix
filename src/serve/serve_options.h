@@ -56,6 +56,7 @@ struct ServeOptions {
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
+    bool expert_a16_activations    = false; // EngineOptions::expert_a16_activations (--a16-activations)
     bool a8_activations            = false; // EngineOptions::a8_activations
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t max_concurrency      = 1;

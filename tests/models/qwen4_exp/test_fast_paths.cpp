@@ -76,10 +76,22 @@ int main() {
                               q::fast_path_applies(FastPath::QsaPrepareFused, config, options),
                           "qsa-prepare-fused is qualified exactly where its kernel runs");
     }
-    for (const FastPath path : {FastPath::Q8SlicedK, FastPath::GdnConvFused, FastPath::QsaPrepareFused}) {
-        failures += check(!q::fast_path_qualified(path, {DenseKernels::Q8, false, KvCacheStorage::Int8Group64}),
-                          "a kernel path stays unqualified with 16-bit expert activations");
+    // Dense8 at 16-bit expert activations (--a16-activations, --a8-activations) keeps Dense8's paths: they change
+    // no expert kernel.
+    for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                                    KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                                    KvCacheStorage::Q4KeyVq2Value}) {
+        for (const FastPath path : {FastPath::Q8SlicedK, FastPath::GdnConvFused, FastPath::QsaPrepareFused,
+                                    FastPath::AdaptiveSpeculation, FastPath::DFlash2Pairs, FastPath::FreeCacheResume,
+                                    FastPath::Preemption, FastPath::SampledMtpDrafts}) {
+            failures += check(q::fast_path_qualified(path, {DenseKernels::Q8, false, kv}) ==
+                                  q::fast_path_qualified(path, {DenseKernels::Q8, true, kv}),
+                              "Dense8's paths are registered alike at either expert activation precision");
+        }
     }
+    failures += check(!q::fast_path_applies(FastPath::ExpertA4Residual, {DenseKernels::Q8, false, KvCacheStorage::Int8Group64},
+                                            options),
+                      "Dense8's 16-bit expert banks take no two-term A4 activations");
     // fp8-a8-pair runs on recipe C (FP8 dense, 16-bit expert activations) where its own decode gate
     // passed; INT8, which fails its tail, by the owner's decision (2026-10-24).
     for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
@@ -465,8 +477,15 @@ int main() {
                                        Refused{kBf16, false, QType::FP8_E4M3FN_B128},
                                        Refused{kBf16, true, QType::NVFP4_MUL}}) {
             failures += check(!routes(refused.dense, refused.a4, refused.experts, 0).any(),
-                              "Dense8, the official FP8 import and recipe A have no 8-bit activation route");
+                              "Dense8 and recipe A on their 4-bit expert route, and the official FP8 import, have no "
+                              "8-bit activation route");
         }
+        // Under --a8-activations, Dense8's and recipe A's W4A4 banks load as 16-bit banks (parse_config), whose
+        // 8-bit route they then take; their Q8 and BF16 dense projections keep their routes.
+        const q::A8Routes dense8_a16 = routes(DenseKernels::Q8, false, QType::NVFP4_MUL, 0);
+        failures += check(dense8_a16.nvfp4_experts && dense8_a16.experts_prefill && !dense8_a16.mxfp8_dense &&
+                              !dense8_a16.ggml_dense && !dense8_a16.ggml_dense_prefill,
+                          "Dense8 with 16-bit expert banks takes their experts' 8-bit decode and prefill routes only");
         // The decode flags; the MXFP8 pair replaces f16-accumulate-prefill, in prefill calls only.
         auto fp4_local_fast =
             q::FastPathSelection{.configuration = {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64},

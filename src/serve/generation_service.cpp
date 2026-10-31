@@ -372,6 +372,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.vram_past_budget         = options_.vram_past_budget;
     engine_options.expert_tail_skip         = options_.expert_tail_skip;
     engine_options.expert_a4_activations    = options_.expert_a4_activations;
+    engine_options.expert_a16_activations   = options_.expert_a16_activations;
     engine_options.a8_activations           = options_.a8_activations;
     engine_options.embedding_host           = options_.embedding_host;
     engine_options.max_concurrency          = options_.max_concurrency;

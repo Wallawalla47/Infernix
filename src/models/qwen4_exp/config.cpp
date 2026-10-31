@@ -299,7 +299,11 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         out.text.lossless         = options.lossless;
         out.text.design_reference = options.lossless && options.reference;
         out.text.design_kv        = out.text.design_reference ? options.reference_kv : KvCacheStorage::BFloat16;
-        out.text.moe.a16_experts = out.text.moe.a4_optional ? !options.expert_a4_activations : !scales;
+        // Banks that are W4A4 by their checkpoint (scales, not optional) run 16-bit activations only when asked
+        // (--a16-activations, or --a8-activations, whose 8-bit route runs on the 16-bit banks).
+        out.text.moe.a4_native   = scales && !out.text.moe.a4_optional;
+        out.text.moe.a16_experts = out.text.moe.a4_optional ? !options.expert_a4_activations
+                                                            : !scales || options.expert_a16_activations;
         if (options.rope_yarn_factor > 1.0F && out.text.rope.theta <= 1.0F) {
             throw ArtifactError("YaRN needs a RoPE theta above 1");
         }

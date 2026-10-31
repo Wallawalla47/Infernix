@@ -67,6 +67,7 @@ struct Options {
     bool lossless                       = false;
     bool reference                      = false; // the design reference (with lossless)
     bool expert_a4_activations          = false;
+    bool expert_a16_activations         = false;
     bool fast_paths                     = true;
     std::vector<infernix::FastPath> fast_path_candidates;
     std::optional<std::filesystem::path> ngram_volume;
@@ -94,6 +95,8 @@ std::string usage_text() {
            "       [--expert-a4-activations] (nvidia/Qwen3.8-Flash-Next-FP4-Local only: routed\n"
            "        experts with 4-bit activations, using the activation scales NVIDIA\n"
            "        calibrated for them; default 16-bit)\n"
+           "       [--a16-activations] (Qwen3.8-Flash-Next artifacts whose routed experts are\n"
+           "        NVIDIA's W4A4 NVFP4: 16-bit activations instead of the checkpoint's 4-bit)\n"
            "       [--reproducible] (score the reproducible route; by default the qualified fast\n"
            "        paths run, as in infernix-serve)\n"
            "       [--fast-path NAME]... (qualification: also run this fast path, qualified or\n"
@@ -167,6 +170,8 @@ Options parse_options(int argc, char** argv) {
             out.reference = true;
         } else if (option == "--expert-a4-activations") {
             out.expert_a4_activations = true;
+        } else if (option == "--a16-activations") {
+            out.expert_a16_activations = true;
         } else if (option == "--ngram-volume") {
             out.ngram_volume = std::filesystem::path(value("--ngram-volume"));
         } else if (option == "--reproducible") {
@@ -322,6 +327,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.lossless                      = options.lossless;
     engine_options.reference                     = options.reference;
     engine_options.expert_a4_activations         = options.expert_a4_activations;
+    engine_options.expert_a16_activations        = options.expert_a16_activations;
     // The lossless route runs no fast path.
     engine_options.fast_paths           = options.fast_paths && !options.lossless;
     engine_options.fast_path_candidates = options.fast_path_candidates;
@@ -611,6 +617,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"lossless", options.lossless},
           {"reference", options.reference},
           {"expert_a4_activations", options.expert_a4_activations},
+          {"expert_a16_activations", options.expert_a16_activations},
           {"fast_paths", load.fast_paths},
           {"fast_path_configuration", load.fast_path_configuration},
           {"stride_tokens", options.stride},

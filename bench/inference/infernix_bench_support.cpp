@@ -489,6 +489,9 @@ std::string usage_text(std::string_view program) {
         << "  --expert-tail-skip <1..9>   Qwen3.8-Flash-Next: skip a VRAM-missing expert every token of a decode\n"
         << "                              round routes at top-10 rank R or lower (faster, lower quality; changes\n"
         << "                              the output; default off, Strata's default 7)\n"
+        << "  --a16-activations           Qwen3.8-Flash-Next artifacts whose routed experts are NVIDIA's W4A4\n"
+        << "                              NVFP4 (Dense8, recipe A): 16-bit activations instead of the\n"
+        << "                              checkpoint's 4-bit ones (changes the output; default off)\n"
         << "  --expert-a4-activations     nvidia/Qwen3.8-Flash-Next-FP4-Local only: routed experts with 4-bit\n"
         << "                              (NVFP4) activations, using the activation scales NVIDIA calibrated\n"
         << "                              for them (changes the output; default: 16-bit, as NVIDIA serves it)\n"
@@ -638,6 +641,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.expert_tail_skip = parse_u32(value("--expert-tail-skip"), "expert-tail-skip");
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
+        } else if (arg == "--a16-activations") {
+            options.expert_a16_activations = true;
         } else if (arg == "--a8-activations") {
             options.a8_activations = true;
         } else if (arg == "--embedding-host") {
@@ -1080,6 +1085,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " fast_paths=" << fast_path_list(env) << " temporary_switches=\""
         << env.load.temporary_switches << '"' << " expert_tail_skip=" << env.expert_tail_skip
         << " expert_a4_activations=" << (env.expert_a4_activations ? "on" : "off")
+        << " expert_a16_activations=" << (env.expert_a16_activations ? "on" : "off")
         << " a8_activations=" << (env.a8_activations ? "on" : "off")
         << " expert_state=" << env.expert_state
         << " ngram_volume=" << (env.ngram_volume_path.empty() ? "default" : env.ngram_volume_path)
@@ -1239,6 +1245,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"temporary_switches\": \"" << json_escape(env.load.temporary_switches) << "\",\n"
         << "    \"expert_tail_skip\": " << env.expert_tail_skip << ",\n"
         << "    \"expert_a4_activations\": " << (env.expert_a4_activations ? "true" : "false") << ",\n"
+        << "    \"expert_a16_activations\": " << (env.expert_a16_activations ? "true" : "false") << ",\n"
         << "    \"a8_activations\": " << (env.a8_activations ? "true" : "false") << ",\n"
         << "    \"expert_state\": \"" << json_escape(env.expert_state) << "\",\n"
         << "    \"ngram_volume\": \"" << json_escape(env.ngram_volume_path) << "\",\n"

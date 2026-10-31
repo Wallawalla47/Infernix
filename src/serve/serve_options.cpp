@@ -54,6 +54,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--lossless", false},
     ServeOptionArity{"--fast-path", true, true},
     ServeOptionArity{"--expert-a4-activations", false},
+    ServeOptionArity{"--a16-activations", false},
     ServeOptionArity{"--a8-activations", false},
     ServeOptionArity{"--embedding-host", false},
     ServeOptionArity{"--context-cost-presets"},
@@ -310,6 +311,12 @@ std::string serve_usage_text(const char* argv0) {
            "                             the activation scales NVIDIA calibrated for them.\n"
            "                             Changes the output. No other artifact supports it\n"
            "                             (default: 16-bit activations, as NVIDIA serves it)\n"
+           "  --a16-activations          Qwen3.8-Flash-Next artifacts whose routed experts are\n"
+           "                             NVIDIA's W4A4 NVFP4 (Dense8, recipe A): run them with\n"
+           "                             16-bit activations instead of the 4-bit activations\n"
+           "                             the checkpoint specifies. Changes the output; the\n"
+           "                             default follows NVIDIA and is recommended (default:\n"
+           "                             off; other artifacts already run 16-bit)\n"
            "  --a8-activations           8-bit activations where they measured faster: decode\n"
            "                             and verification calls of GGUF dense projections and\n"
            "                             routed experts (GGUF and NVFP4 W4A16 banks, CPU-served\n"
@@ -318,9 +325,11 @@ std::string serve_usage_text(const char* argv0) {
            "                             projections and those experts (the same codec), a\n"
            "                             groupwise Q4 MLP gate/up (int8 per token) and MXFP8\n"
            "                             dense projections (two E4M3 terms per 32 values).\n"
-           "                             Other calls keep their routes. Approximate: changes the\n"
-           "                             output; --reproducible and artifacts without such a\n"
-           "                             route refuse it (default: off)\n"
+           "                             NVIDIA's W4A4 experts (Dense8, recipe A) take the 8-bit\n"
+           "                             route in place of their 4-bit one. Other calls keep\n"
+           "                             their routes. Approximate: changes the output;\n"
+           "                             --reproducible and artifacts without such a route\n"
+           "                             refuse it (default: off)\n"
            "  --embedding-host           Qwen3.5-family artifacts: keep the token embedding in\n"
            "                             pinned host memory, read zero-copy, so its VRAM\n"
            "                             (1.18 GiB on the 27B) goes to the KV and prefix caches.\n"
@@ -768,6 +777,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.fast_path_candidates.push_back(*path);
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
+        } else if (arg == "--a16-activations") {
+            options.expert_a16_activations = true;
         } else if (arg == "--a8-activations") {
             options.a8_activations = true;
         } else if (arg == "--embedding-host") {

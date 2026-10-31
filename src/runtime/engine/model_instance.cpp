@@ -347,6 +347,16 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     if (options.expert_a4_activations && !qwen4_exp) {
         throw std::invalid_argument("--expert-a4-activations applies to nvidia/Qwen3.8-Flash-Next-FP4-Local only");
     }
+    if (options.expert_a16_activations) {
+        if (!qwen4_exp) { throw std::invalid_argument("--a16-activations applies to Qwen3.8-Flash-Next artifacts only"); }
+        if (options.expert_a4_activations || options.a8_activations) {
+            throw std::invalid_argument("--a16-activations runs the routed experts with 16-bit activations: it excludes "
+                                        "--expert-a4-activations and --a8-activations");
+        }
+        if (options.lossless) {
+            throw std::invalid_argument("the lossless route sets its own activations: it refuses --a16-activations");
+        }
+    }
     // An approximation whose output depends on the cache state: never on the exact route.
     if (options.expert_tail_skip != 0 && !options.fast_paths) {
         throw std::invalid_argument("--expert-tail-skip is approximate; the reproducible route (--reproducible) refuses it");

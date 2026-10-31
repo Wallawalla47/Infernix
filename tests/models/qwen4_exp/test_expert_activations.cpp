@@ -1,8 +1,9 @@
 // Qwen3.8-Flash-Next's routed-expert arithmetic as parse_config resolves it (design §6.1.2): W4A4 for
 // banks that carry activation scales, W4A16 for banks without; banks whose 4-bit activations are
 // optional (NVIDIA FP4-Local's `expert_a4_activations: optional`) run W4A16 unless
-// --expert-a4-activations asks for W4A4. Every other artifact refuses the option. Host only, on a
-// synthetic directory.
+// --expert-a4-activations asks for W4A4. Every other artifact refuses the option. W4A4 banks run W4A16
+// when --a16-activations (or --a8-activations, through the same load option) asks for it; it leaves the other
+// banks unchanged. Host only, on a synthetic directory.
 
 #include "artifact/schema.h"
 #include "models/qwen4_exp/config.h"
@@ -57,6 +58,7 @@ struct Case {
     bool expert_a4;                    // LoadOptions::expert_a4_activations
     int expected;                     // 1: W4A16, 0: W4A4, -1: refused
     const char* refusal = "";          // a fragment of the refusal
+    bool expert_a16 = false;           // LoadOptions::expert_a16_activations
 };
 
 } // namespace
@@ -71,6 +73,9 @@ int main() {
         {"optional bank, option", "optional", true, true, 0},
         {"optional bank without scales", "optional", false, false, -1, "activation scales"},
         {"unknown marker", "required", true, false, -1, "must be optional"},
+        {"W4A4 bank, 16-bit activations", std::nullopt, true, false, 1, "", true},
+        {"weight-only bank, 16-bit activations", std::nullopt, false, false, 1, "", true},
+        {"optional bank, 16-bit activations", "optional", true, false, 1, "", true},
     };
     int failures = 0;
     for (const Case& c : cases) {
@@ -80,11 +85,15 @@ int main() {
         directory.components["text"].config = std::move(config);
         if (c.scales) { directory.bindings[kScales] = artifact::Binding{}; }
         models::LoadOptions options;
-        options.expert_a4_activations = c.expert_a4;
+        options.expert_a4_activations  = c.expert_a4;
+        options.expert_a16_activations = c.expert_a16;
         try {
             const models::qwen4_exp::Config parsed = parse_config(directory, options);
             const int got       = parsed.text.moe.a16_experts ? 1 : 0;
-            if (got != c.expected || parsed.text.moe.a4_optional != (c.marker == "optional")) {
+            // A bank is W4A4 by its checkpoint when it carries scales that are not optional, whatever ran.
+            const bool native = c.scales && c.marker != "optional";
+            if (got != c.expected || parsed.text.moe.a4_optional != (c.marker == "optional") ||
+                parsed.text.moe.a4_native != native) {
                 std::fprintf(stderr, "FAIL %s: resolved %s\n", c.name, got ? "W4A16" : "W4A4");
                 ++failures;
             }

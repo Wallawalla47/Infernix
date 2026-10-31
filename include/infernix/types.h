@@ -809,6 +809,13 @@ struct EngineOptions {
     // default 16-bit activations. Other artifacts refuse it, as does the lossless route without the
     // design reference.
     bool expert_a4_activations         = false;
+    // Qwen3.8-Flash-Next artifacts whose routed experts are W4A4 by their checkpoint (NVIDIA's NVFP4 recipes A and
+    // B, Dense8): run them with 16-bit activations (--a16-activations), the arithmetic of the weight-only banks
+    // (design §16.2.1), instead of the 4-bit activations at NVIDIA's calibrated scales. Changes the output; the
+    // engine warns at launch that the default follows NVIDIA's specification and is recommended. Artifacts whose
+    // experts already run 16-bit activations accept it unchanged; --expert-a4-activations, --a8-activations
+    // and the lossless route refuse it.
+    bool expert_a16_activations        = false;
     // The 8-bit activation routes (--a8-activations; approximate, opt-in, never a default), each where it
     // measured faster than the route it replaces (or is being measured; docs/maintainer/qwen3_8-flash-next-design.md
     // §19.3.31). Decode and verification calls: int8 codes with an FP32 scale per 32 values (llama.cpp's Q8_1
@@ -818,10 +825,11 @@ struct EngineOptions {
     // same routed experts (calls of more than 128 columns, in place of expert-a4-residual's A4 terms where that
     // runs); a groupwise Q4 MLP gate/up's int8 activations per token (q4-w4a8's route, calls of 256 or more
     // columns); MXFP8 dense projections' two E4M3 terms per 32 values (fp8-a8-pair-block32's route, in place of
-    // f16-accumulate-prefill). Every other call keeps its route. An artifact with none of these (the
-    // NVFP4 Qwen3.8-27B, whose FP8 and NVFP4 projections already take the activations their artifact permits, the
-    // 35B-A3B, Flash-Next Dense8 and the official FP8 import), the reproducible route and the lossless route
-    // refuse it.
+    // f16-accumulate-prefill). Flash-Next routed experts that are W4A4 by their checkpoint (Dense8, recipe A) take
+    // the 8-bit route in place of their 4-bit one (the engine warns at launch, as for expert_a16_activations).
+    // Every other call keeps its route. An artifact with none of these (the NVFP4 Qwen3.8-27B, whose FP8 and NVFP4
+    // projections already take the activations their artifact permits, the 35B-A3B and the official FP8 import),
+    // the reproducible route and the lossless route refuse it.
     bool a8_activations                = false;
     // Qwen3.5-family artifacts (--embedding-host): keep the token embedding in pinned host memory and
     // gather its rows zero-copy, as artifacts with offloaded experts already do, so its VRAM (1.18 GiB on

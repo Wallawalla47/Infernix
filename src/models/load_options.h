@@ -27,6 +27,9 @@ struct LoadOptions {
     KvCacheStorage reference_kv = KvCacheStorage::BFloat16;
     // Qwen4Exp: routed expert banks whose 4-bit activations are optional run them (W4A4).
     bool expert_a4_activations = false;
+    // Qwen4Exp: banks that are W4A4 by their checkpoint run 16-bit activations instead
+    // (EngineOptions::expert_a16_activations, or a8_activations, whose 8-bit route runs on the 16-bit banks).
+    bool expert_a16_activations = false;
     // Offloaded routed expert banks (Qwen4Exp, Qwen3.5 with offloaded experts) stay in the artifact
     // and are read in place by the SSD expert tier (Flash-Next design §19.3.7) instead of being
     // pinned in host memory.
@@ -112,6 +115,8 @@ struct LoadOptions {
             .reference                = options.reference,
             .reference_kv             = options.reference ? options.kv_cache : KvCacheStorage::BFloat16,
             .expert_a4_activations    = options.expert_a4_activations,
+            .expert_a16_activations   = architecture == Architecture::Qwen4Exp &&
+                                      (options.expert_a16_activations || options.a8_activations),
             .draft_model              = options.speculative.draft_model,
             // The screens are Qwen4Exp's (a Qwen3.5 Program compares these options with its loaded ones).
             .proposal_head_screen     = architecture == Architecture::Qwen4Exp &&

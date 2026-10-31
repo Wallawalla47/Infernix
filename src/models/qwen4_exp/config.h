@@ -70,8 +70,12 @@ struct MoeConfig {
     std::uint32_t shared_intermediate = 0;
     // The routed experts' arithmetic (parse_config): W4A16 when the banks carry no activation scales
     // (design §16.2.1), else W4A4 (§16.2); banks whose 4-bit activations are optional run W4A16
-    // unless LoadOptions::expert_a4_activations asks for W4A4.
+    // unless LoadOptions::expert_a4_activations asks for W4A4, and W4A4 banks run W4A16 when
+    // LoadOptions::expert_a16_activations asks for it.
     bool a16_experts = false;
+    // The banks are W4A4 by their checkpoint: they carry activation scales that are not optional (NVIDIA's
+    // NVFP4 recipes A and B), whatever a16_experts resolved to.
+    bool a4_native = false;
     // The text config's expert_a4_activations: optional (NVIDIA FP4-Local, design §6.1.2): the banks
     // carry their calibrated activation scales and permit 4-bit activations, but default to 16-bit.
     bool a4_optional = false;

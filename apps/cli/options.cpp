@@ -133,6 +133,7 @@ constexpr std::array kCliOptions{
     CliOption{"--lossless", false},
     CliOption{"--fast-path", true, true},
     CliOption{"--expert-a4-activations", false},
+    CliOption{"--a16-activations", false},
     CliOption{"--a8-activations", false},
     CliOption{"--embedding-host", false},
     CliOption{"--stop-token-id", true, true},
@@ -190,7 +191,8 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--chat-template FILE] [--ngram-volume FILE] [--ngram-residency auto|ram|volume]\n"
-           "       [--expert-state FILE|off] [--expert-stripe FILE] [--expert-a4-activations] [--a8-activations]\n"
+           "       [--expert-state FILE|off] [--expert-stripe FILE] [--expert-a4-activations] [--a16-activations]\n"
+           "       [--a8-activations]\n"
            "       [--embedding-host]\n"
            "       [--ram-free-mib N] [--expert-ram-mib N|auto] [--expert-ram-layout exclusive|full]\n"
            "       [--expert-pin-mib N|auto]\n"
@@ -302,6 +304,10 @@ std::string usage_text(const char* argv0) {
            "                           (docs/maintainer/lossless-route.md)\n"
            "  --fast-path NAME         also run this fast path, qualified or not\n"
            "                           (qualification runs; repeatable)\n"
+           "  --a16-activations        Qwen3.8-Flash-Next artifacts whose routed experts are\n"
+           "                           NVIDIA's W4A4 NVFP4 (Dense8, recipe A): run them with\n"
+           "                           16-bit activations instead of the checkpoint's 4-bit\n"
+           "                           ones. Changes the output; the default is recommended\n"
            "  --expert-a4-activations  nvidia/Qwen3.8-Flash-Next-FP4-Local only: run its\n"
            "                           routed experts with 4-bit (NVFP4) activations, using\n"
            "                           the activation scales NVIDIA calibrated for them.\n"
@@ -603,6 +609,8 @@ Options parse_options(int argc, char** argv) {
             options.fast_path_candidates.push_back(*path);
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
+        } else if (arg == "--a16-activations") {
+            options.expert_a16_activations = true;
         } else if (arg == "--a8-activations") {
             options.a8_activations = true;
         } else if (arg == "--embedding-host") {

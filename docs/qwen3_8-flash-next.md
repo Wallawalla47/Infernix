@@ -868,16 +868,33 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
     MXFP8 dense projections take two E4M3 terms per 32 activation values (`fp8-a8-pair-block32`'s route,
     in place of `f16-accumulate-prefill`). Recipe C's FP8 dense projections take those two terms in
     prefill by default already.
+  - Recipes A and B (Dense8): NVIDIA's W4A4 experts load as 16-bit banks (as with `--a16-activations`)
+    and take the 8-bit route in place of their 4-bit one, and the engine warns at launch that the
+    default follows NVIDIA's specification.
   - Every other call keeps its route: the Q8, FP8 and BF16 dense projections and heads in decode (their
-    8-bit routes were slower than the exact ones and were removed), the MTP drafter's experts, and W4A4
-    and block-FP8 experts (with expert-a4-residual-decode on, the W4A16 experts keep its two A4 terms in
-    decode and their exact or A4 wide routes in prefill).
+    8-bit routes were slower than the exact ones and were removed), the MTP drafter's experts, FP4-Local's
+    experts under `--expert-a4-activations`, and block-FP8 experts (with expert-a4-residual-decode on, the
+    W4A16 experts keep its two A4 terms in decode and their exact or A4 wide routes in prefill).
   - The output changes; `--reproducible` and `--lossless` refuse it, as does an artifact with none of
-    these routes (recipes A and B and the official FP8 artifact).
+    these routes (the official FP8 artifact).
   - Measured 2026-10-27 (decode, RTX 5090): IQ3_S +15.8 % after a 16K prompt and +14.1 % in the A/B;
-    FP4-Local +2.5 % and the uncensored NVFP4 +1.5 % with the since-removed dense routes still on (the
-    flag as it stands is not re-measured). The prefill routes are not measured yet. None is
-    quality-tested yet ([design §19.3.31](maintainer/qwen3_8-flash-next-design.md)).
+    FP4-Local +2.5 % and the uncensored NVFP4 +1.5 % with the since-removed dense routes still on. None
+    is quality-tested yet ([design §19.3.31](maintainer/qwen3_8-flash-next-design.md)).
+  - Measured 2026-10-31 (RTX 5090, INT8 KV, DFlash2 auto, one request, 1,024 output tokens; the README
+    benchmark's prompts): IQ3_S reaches the first token 7 % sooner at 8K, 23 % at 128K and 22 % at
+    250K (13.99 against 18.10 s at 128K) and decodes level at 8K, 5 % faster at 128K and 11 % at 250K.
+    Dense8 runs 4 %, 7 % and 1 % more decode rounds a second at 8K, 128K and 250K (output 9 %, 13 % and
+    36 % faster, partly from different text), but its 16-bit-bank prefill reads 128K and 250K prompts
+    28 % slower than its 4-bit route (15.53 against 12.16 s at 128K). In the agentic replay (three seeds)
+    it decodes 5.8 % faster and reads uncached prompts 15.7 % slower, the same wall time.
+- <a id="a16-activations"></a>**`--a16-activations`** (off by default) runs NVIDIA's W4A4 experts
+  (recipes A and B, Dense8) with 16-bit activations: the stored NVFP4 codes, block scales and
+  multipliers on the weight-only banks' exact arithmetic (design §16.2.1), the activation scales left
+  unread. The output changes, and the engine warns at launch. Measured 2026-10-31 on Dense8 (as above):
+  5 %, 6 % and 2 % more decode rounds a second than the 4-bit route at 8K, 128K and 250K (the 16-bit
+  banks' tensor-core narrow kernels), the first token level at 8K but 38 % and 37 % later at 128K and
+  250K (16.73 against 12.16 s at 128K), since only the 4-bit route reads the prompt on FP4 tensor cores. Artifacts whose experts already run 16-bit accept it unchanged;
+  `--expert-a4-activations`, `--a8-activations` and `--lossless` refuse it.
 - On a system without CUDA virtual memory management the cache cannot resize: the headroom with a
   display is then 1 GiB, and a warning names the headroom to set when free VRAM runs short.
 - `--kv-capacity auto` means `--max-context` x `--max-concurrency`, the same as omitting it.

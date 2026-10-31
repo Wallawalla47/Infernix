@@ -68,6 +68,7 @@ struct BenchOptions {
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
+    bool expert_a16_activations    = false; // EngineOptions::expert_a16_activations
     bool a8_activations            = false; // EngineOptions::a8_activations
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::string corpus_path{kDefaultCorpusPath};
@@ -193,6 +194,7 @@ struct BenchEnvironment {
     bool fast_paths                    = true;
     std::uint32_t expert_tail_skip     = 0; // approximate: changes the output when set
     bool expert_a4_activations         = false; // FP4-Local W4A4 experts (changes the output)
+    bool expert_a16_activations        = false; // W4A4 banks with 16-bit activations (changes the output)
     bool a8_activations                = false; // --a8-activations (changes the output)
     // Qwen3.8-Flash-Next placement (they move its throughput): empty paths and budgets are the defaults.
     std::string ngram_volume_path;
