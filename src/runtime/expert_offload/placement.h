@@ -66,6 +66,9 @@ struct CpuPlacement {
     std::vector<std::uint64_t> cpus;    // per worker its logical CPUs (empty: every worker unpinned)
     std::uint64_t engine  = 0;          // the engine thread's logical CPUs (0: unpinned)
     std::string text;                   // the startup line ("" with the default placement)
+    // Log `text` at Info, not Debug: a switch set the team (an A/B arm shows it), or the host cut
+    // the default team (default_workers below the configured count).
+    bool announce = false;
 };
 // The placement of a team of `configured` workers under the switches (by default unpinned; without
 // INFERNIX_TMP_CPU_PLACEMENT's count, default_workers of the process's logical CPUs). With

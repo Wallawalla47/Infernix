@@ -218,7 +218,10 @@ The real loading test accepts an explicit artifact path and optional component s
 ```
 
 Add `--host-only` to check semantic binding without uploading weights. This does not construct a
-Program or establish native Op support.
+Program or establish native Op support. `--vision --vision-offload` checks the overlay window the
+offloaded Vision tower borrows from the device weights, and `--embedding-host` that the token
+embedding stays in pinned host memory; together they cover the combination the server runs with
+`--vision-offload on --embedding-host`.
 
 The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
 runs the real engine:

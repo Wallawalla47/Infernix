@@ -54,6 +54,7 @@ CpuPlacement cpu_placement(const OffloadSwitches& switches, std::uint32_t config
                                          std::to_string(logical) + " logical CPUs and the team leaves " +
                                          std::to_string(kReservedCpus) + " to the engine)"
                                    : std::string();
+    out.announce = switches.placement != OffloadSwitches::Placement::kDefault || switches.workers > 0 || !capped.empty();
     if (switches.placement == OffloadSwitches::Placement::kDefault && !engine_isolate) {
         if (switches.workers > 0) {
             out.text = "CPU expert team: " + std::to_string(out.workers) + " workers (INFERNIX_TMP_CPU_PLACEMENT), unpinned";

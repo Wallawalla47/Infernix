@@ -440,7 +440,9 @@ void StartupLogRenderer::chat_template_roles(infernix::ChatTemplateRoleSupport r
     if (!active_override_path.empty()) {
         override_note = " | override active: " + std::string(active_override_path);
     }
-    impl_->logger->warn(
+    // Debug: nothing is wrong and nothing is lost unless a client sends such a turn; the serve says so
+    // at Info on the first request that has one (OperationalLog::request_start).
+    impl_->logger->debug(
         "chat template | the active template cannot render {}; each such message keeps its text "
         "and position | to keep every role, pass --chat-template tools/chat_templates/qwen3_8.jinja "
         "(also in the release zip's chat_templates folder){}",

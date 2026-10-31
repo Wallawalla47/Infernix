@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM nvidia/cuda:13.1.2-devel-ubuntu24.04 AS build
+FROM docker.io/nvidia/cuda:13.1.2-devel-ubuntu24.04 AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
@@ -26,7 +26,7 @@ RUN cmake -S . -B /build -G Ninja \
         -DINFERNIX_BUILD_BENCHMARKS=OFF \
     && cmake --build /build --parallel --target infernix infernix-serve
 
-FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
+FROM docker.io/nvidia/cuda:13.1.2-runtime-ubuntu24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \

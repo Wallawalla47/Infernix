@@ -56,6 +56,21 @@ void check_selection(const qwen::LoadPlan& plan, const LoadOptions& options) {
         require(weights.draft->token_embedding == weights.text.token_embedding,
                 "draft embedding did not share target");
     }
+    if (options.embedding_host) {
+        const auto& embedding = plan.parameter(weights.text.token_embedding);
+        require(embedding.residency == artifact::Residency::HostPinned,
+                "--embedding-host left the token embedding on the device");
+        for (const auto& part : embedding.binding.parts) {
+            for (const auto& item : plan.materialization().device_objects) {
+                require(item.object.index != part.object.index,
+                        "host-resident token embedding was planned on the device");
+            }
+        }
+    }
+    if (options.overlay_vision()) {
+        require(plan.vision_overlay_layout().has_value(),
+                "offloaded Vision has no overlay window in the device weights");
+    }
     if (!options.vision) {
         require(plan.resources().preprocessor_config_json.empty() &&
                     plan.resources().video_preprocessor_config_json.empty(),
@@ -184,6 +199,10 @@ int main(int argc, char** argv) {
                 path = value();
             } else if (arg == "--vision") {
                 options.vision = true;
+            } else if (arg == "--vision-offload") {
+                options.vision_offload = true;
+            } else if (arg == "--embedding-host") {
+                options.embedding_host = true;
             } else if (arg == "--host-only") {
                 host_only = true;
             } else if (arg == "--scoring") {
@@ -211,8 +230,9 @@ int main(int argc, char** argv) {
                     throw std::invalid_argument("unknown proposal head");
                 }
             } else if (arg == "--help") {
-                std::cout << "--artifact PATH [--vision] [--speculative none|mtp|dflash|dflash2]\n"
-                             "[--proposal full|optimized] [--host-only] [--scoring]\n";
+                std::cout << "--artifact PATH [--vision [--vision-offload]] [--embedding-host]\n"
+                             "[--speculative none|mtp|dflash|dflash2] [--proposal full|optimized]\n"
+                             "[--host-only] [--scoring]\n";
                 return 0;
             } else {
                 throw std::invalid_argument("unknown argument " + arg);

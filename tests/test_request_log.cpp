@@ -2,13 +2,17 @@
 #include "serve/request_log.h"
 
 #include <nlohmann/json.hpp>
+#include <spdlog/logger.h>
+#include <spdlog/sinks/ostream_sink.h>
 
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -339,6 +343,32 @@ int main() {
             "req#7 started | openai-chat non-stream | 2 messages | max output 4,096 | thinking "
             "xhigh, budget 256 | media 1, prepared 120 ms | preserve thinking",
         "pretty request-start record mismatch");
+    {
+        // A request whose instruction roles the template lowered says so once per process, at info;
+        // a request without one adds nothing.
+        std::ostringstream stream;
+        auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(stream);
+        sink->set_pattern("%l %v");
+        auto logger = std::make_shared<spdlog::logger>("operational-test", sink);
+        logger->set_level(spdlog::level::info);
+        const OperationalLog log(logger);
+        RequestLogContext plain = context;
+        plain.preparation.instruction_role_lowerings = 0;
+        log.request_start(plain);
+        log.request_start(context);
+        log.request_start(context);
+        logger->flush();
+        const std::string text = stream.str();
+        const std::string note =
+            "info chat template | req#7: 2 system or developer messages were sent under another role, since "
+            "the artifact's template cannot place them there (a later one as user, a leading developer one "
+            "as system; text and position unchanged; later requests count theirs in --request-log-jsonl) | "
+            "to keep every role, pass --chat-template tools/chat_templates/qwen3_8.jinja";
+        const std::size_t first = text.find("chat template |");
+        failures += check(text.find(note) != std::string::npos &&
+                              text.find("chat template |", first + 1) == std::string::npos,
+                          "the chat template role note is missing, unclear or repeated");
+    }
     RequestLogContext default_thinking = context;
     default_thinking.requested_reasoning_effort.reset();
     default_thinking.thinking_budget.reset();

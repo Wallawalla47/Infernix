@@ -521,6 +521,19 @@ void OperationalLog::write(OperationalRecord record) const {
 
 void OperationalLog::request_start(const RequestLogContext& context) const {
     write(render_request_start(context));
+    // The artifact's chat template refused a system or developer turn where the client put it (the
+    // published Flash-Next artifacts store the checkpoint's template, which takes system only first).
+    // Said once, when it first happens: most clients send one leading system message and never meet it.
+    if (const std::size_t lowered = context.preparation.instruction_role_lowerings;
+        lowered != 0 && !role_lowering_noted_.exchange(true)) {
+        logger_->info("chat template | req#{}: {} system or developer {} sent under another role, since the "
+                      "artifact's template cannot place {} there (a later one as user, a leading developer "
+                      "one as system; text and position unchanged; later requests count theirs in "
+                      "--request-log-jsonl) | to keep every role, pass --chat-template "
+                      "tools/chat_templates/qwen3_8.jinja (also in the release zip's chat_templates folder)",
+                      context.id, lowered, lowered == 1 ? "message was" : "messages were",
+                      lowered == 1 ? "it" : "them");
+    }
 }
 
 void OperationalLog::request_rejected(const RequestRejectionLogContext& context) const {
