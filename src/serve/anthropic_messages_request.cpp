@@ -1399,13 +1399,17 @@ void parse_thinking(const Json& body, GenerationRequest& request) {
     } else if (type == "enabled") {
         request.enable_thinking         = true;
         const std::optional<int> budget = optional_int(thinking, "budget_tokens");
-        if (!budget || *budget < 1024) {
-            bad_request("thinking.budget_tokens must be an integer of at least 1024", "thinking");
+        // Unlike the Anthropic API, budget_tokens may be absent (ZCode sends none): thinking is on with the
+        // server's default budget (--default-thinking-budget, none unless set), as with adaptive.
+        if (budget) {
+            if (*budget < 1024) {
+                bad_request("thinking.budget_tokens must be an integer of at least 1024", "thinking");
+            }
+            // Unlike the Anthropic API, a budget at or above max_tokens is accepted: the output limit
+            // is reached before the budget, so it never takes effect. Clients such as Qwen Code send
+            // a fixed budget while shrinking max_tokens to the context window left.
+            request.thinking_budget = static_cast<std::uint32_t>(*budget);
         }
-        // Unlike the Anthropic API, a budget at or above max_tokens is accepted: the output limit
-        // is reached before the budget, so it never takes effect. Clients such as Qwen Code send
-        // a fixed budget while shrinking max_tokens to the context window left.
-        request.thinking_budget = static_cast<std::uint32_t>(*budget);
     } else {
         bad_request("thinking.type must be 'disabled', 'adaptive', or 'enabled'", "thinking");
     }
