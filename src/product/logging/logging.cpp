@@ -7,8 +7,13 @@
 #include <spdlog/formatter.h>
 #include <spdlog/logger.h>
 #include <spdlog/pattern_formatter.h>
+#include <spdlog/details/periodic_worker.h>
+#include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+
+#include <chrono>
+#include <memory>
 
 #ifndef _WIN32
 #    include <sys/ioctl.h>
@@ -554,6 +559,31 @@ struct LoggingRuntime::Impl {
         logger->set_formatter(std::make_unique<PrettyLogFormatter>(options.presentation));
         logger->set_level(level);
         logger->flush_on(spdlog::level::warn);
+        // An optional second sink duplicates every record to a file, beside (never instead of) the
+        // console. Its own plain pattern drops the colour and cursor control the logger adds around
+        // a record, so the level and timestamp land bare; a record that colours its own message text
+        // (the serve panels with --log-colours, see OperationalLog::write) keeps those escapes, since
+        // the pattern wraps the payload rather than rewriting it. A one-second background flush keeps
+        // the file fresh under the warn-only policy. A file that cannot be opened downgrades to console-only.
+        if (!options.log_file.empty()) {
+            try {
+                auto file_sink =
+                    std::make_shared<spdlog::sinks::basic_file_sink_mt>(options.log_file, false);
+                file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
+                logger->sinks().push_back(std::move(file_sink));
+                std::weak_ptr<spdlog::logger> logger_weak = logger;
+                file_flusher = std::make_unique<spdlog::details::periodic_worker>(
+                    [logger_weak] {
+                        if (const std::shared_ptr<spdlog::logger> owner = logger_weak.lock()) {
+                            owner->flush();
+                        }
+                    },
+                    std::chrono::seconds(1));
+            } catch (const std::exception& failure) {
+                report_logging_error("log file unavailable, continuing console-only: " +
+                                     std::string(failure.what()));
+            }
+        }
         logger->set_error_handler([sink](const std::string& message) noexcept {
             sink->clear();
             report_logging_error(message);
@@ -569,6 +599,9 @@ struct LoggingRuntime::Impl {
     Impl& operator=(const Impl&) = delete;
 
     std::shared_ptr<spdlog::logger> logger;
+    // Declared after logger so it is destroyed first: the background flush thread joins while the
+    // logger it observes is still alive.
+    std::unique_ptr<spdlog::details::periodic_worker> file_flusher;
     std::shared_ptr<TerminalProgress> progress;
     std::shared_ptr<TerminalPanel> panel;
     media::decode::LibraryLogHandler previous_media_log;
