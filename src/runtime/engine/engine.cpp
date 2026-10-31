@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/nvtx.h"
+#include "core/io_priority.h"
 #include "core/power_throttling.h"
 #include "core/startup.h"
 #include "core/temporary_switches.h"
@@ -431,6 +432,21 @@ Engine::Engine(EngineOptions options) {
                                     "Windows refused the power-throttling exemption (error %lu): run in a "
                                     "background window, the host threads may be slowed many times over",
                                     *refused);
+    }
+    // Before the artifact is read: an inherited low I/O priority throttles every direct read.
+    if (const auto io = raise_low_io_priority()) {
+        if (io->after >= kIoPriorityNormal) {
+            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                        "raised the I/O priority this process inherited (%d, below normal) to normal: "
+                                        "Windows throttles low-priority reads",
+                                        io->before);
+        } else {
+            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                                        "this process inherited I/O priority %d (below normal) and Windows refused to "
+                                        "raise it: model, n-gram and SSD-tier reads may be several times slower; start "
+                                        "the engine from a normal-priority process",
+                                        io->before);
+        }
     }
     StartupObserver startup_observer = options.startup_observer;
     StartupPhaseScope startup_phase(startup_observer, StartupPhase::EngineStartup);
