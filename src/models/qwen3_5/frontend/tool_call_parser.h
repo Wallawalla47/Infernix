@@ -109,7 +109,8 @@ public:
     // Feeds the next bytes of the generated content stream; `tool_call_tokens` are relative to
     // this piece. A token's bytes may continue in the next piece.
     [[nodiscard]] std::string feed(GeneratedText content);
-    // The constrained calls' steps read since the last take, in generation order.
+    // The constrained calls' steps read since the last take, in generation order. A call whose
+    // closing lines end the output completes in finish(), so take its last step after that.
     [[nodiscard]] std::vector<ToolCallDelta> take_call_deltas();
     // The assistant prefix a request continues is the client's text: each `<tool_call>` spelled
     // in it is the opener of the call it continues.

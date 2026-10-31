@@ -951,6 +951,11 @@ PublishedOutput OutputSession::commit_preview() {
                 : fi::GeneratedText{};
         fi::ToolCallOutputDecoder::Terminal terminal =
             impl_->tool_call_output.finish(impl_->preview_finish_reason, open_reasoning);
+        // A call whose closing lines ended the output completes at the end: its last raw value
+        // could have gone on until then.
+        for (ToolCallDelta& delta : impl_->tool_call_output.take_call_deltas()) {
+            output.tool_calls().push_back(std::move(delta));
+        }
         impl_->tool_calls      = std::move(terminal.tool_calls);
         impl_->tool_call_parse = terminal.diagnostics;
         if (!terminal.content.empty()) {

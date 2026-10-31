@@ -367,9 +367,12 @@ On the unconstrained route, string parameters preserve function/tool-call marker
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
 so a standalone `</parameter>` ends a value only when whitespace and then another parameter, the
 function's closer, or the end of the output follow it; any other one is value text, such as a shell
-command that echoes the markup. An unmatched nested parameter opener, or a quoted closer that is
-followed by the next token, cannot be represented unambiguously and makes that tool-call region
-ordinary content. Later content is still examined:
+command that echoes the markup. When the call's own closers follow it and then other text that is
+not another call, a later closer that ends the call (before the next `<tool_call>` token) makes those
+closing lines value text: a file whose content documents the call format keeps them, and so does a
+command such as `echo '</parameter></function>'`. An unmatched nested parameter opener, or a quoted
+closer followed by another parameter's opener, cannot be represented unambiguously and makes that
+tool-call region ordinary content. Later content is still examined:
 the first tool-call region (any accepted marker form) that parses becomes the structured turn, and any
 quoted markup before it stays ordinary content. A marker inside Markdown code of the answer is a
 quoted example and stays content even when it is a complete call, on this route and on the
@@ -472,7 +475,12 @@ that lists the string `"null"` beside null is rejected, since its raw text is th
 values use JSON; any other top-level string/non-string union (such as string/integer) is rejected
 because the Qwen parameter format cannot distinguish those branches. Such unions inside JSON objects
 or arrays are supported.
-Raw values cannot contain the delimiter `\n</parameter>`; unsatisfiable required values are rejected.
+A raw value holds the delimiter `\n</parameter>` only inside the whole call's closing lines
+(`\n</parameter>\n</function>\n</tool_call>`) that more value text follows, as in a file that documents
+the call format: the call ends where the output then ends or the next call's token begins, so a
+streamed call's last fragment arrives with that next token or with the end of the turn. A value
+cannot hold `\n</parameter>` followed by a parameter opener; a string with a length bound or a pattern
+cannot hold the closing lines either. Unsatisfiable required values are rejected.
 Integer arguments use signed 64-bit values; number arguments use finite binary64-compatible
 representations. Unsupported schemas fail with HTTP 400 before generation.
 

@@ -29,8 +29,9 @@ constexpr std::string_view kCallClose     = "</function>\n</tool_call>";
 // Masking the token there instead would change what the model writes. The companion reads only the
 // canonical framing the grammar emits: `<tool_call>` (the token) `\n<function=NAME>\n`, then
 // `<parameter=NAME>\nVALUE\n</parameter>\n` per parameter, then `</function>\n</tool_call>`, and `\n`
-// before the next call's token. A value ends at its first `\n</parameter>` (a raw value cannot hold
-// it, a JSON value cannot spell it).
+// before the next call's token. A value ends at its first `\n</parameter>` (a JSON value cannot
+// spell it), except that a raw value goes on when text other than the next call's token follows the
+// whole call's closing lines (the grammar's raw string rule).
 class ToolCallRules final : public text::GrammarStateConstraint {
 public:
     ToolCallRules(std::shared_ptr<const std::vector<std::string>> vocabulary,
@@ -197,22 +198,38 @@ private:
                 cursor = {.phase = Phase::ValueStart};
                 break;
             case Phase::ValueStart: cursor = {.phase = Phase::Value}; break;
-            case Phase::Value:
-                // `\n` occurs in the terminator only at its start.
-                if (byte == kValueEnd[cursor.matched]) {
-                    if (++cursor.matched == kValueEnd.size()) { cursor = {.phase = Phase::AfterValue}; }
-                } else {
-                    cursor.matched = byte == kValueEnd[0] ? 1 : 0;
-                }
-                break;
+            case Phase::Value: value_byte(cursor, byte); break;
             case Phase::AfterValue: cursor = {.phase = Phase::Parameters}; break;
             case Phase::CallClose:
                 if (++cursor.matched == kCallClose.size()) { cursor = {.phase = Phase::AfterCall}; }
                 break;
-            case Phase::AfterCall: break; // the `\n` before the next call's token
+            case Phase::AfterCall:
+                // The `\n` before the next call's token. Other text after the call's closers is the
+                // last raw value's (the grammar reads those closers as value text then), and the call
+                // goes on with its names.
+                if (cursor.matched == 0 && byte == '\n') {
+                    cursor.matched = 1;
+                    break;
+                }
+                {
+                    const bool newline = cursor.matched != 0;
+                    cursor             = {.phase = Phase::Value};
+                    if (newline) { value_byte(cursor, '\n'); }
+                    value_byte(cursor, byte);
+                }
+                break;
             }
         }
         return true;
+    }
+
+    // A raw value's byte; `\n` occurs in its terminator only at its start.
+    static void value_byte(Cursor& cursor, char byte) {
+        if (byte == kValueEnd[cursor.matched]) {
+            if (++cursor.matched == kValueEnd.size()) { cursor = {.phase = Phase::AfterValue}; }
+        } else {
+            cursor.matched = byte == kValueEnd[0] ? 1 : 0;
+        }
     }
 
     std::shared_ptr<const std::vector<std::string>> vocabulary_;

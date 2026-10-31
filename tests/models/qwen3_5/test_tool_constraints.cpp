@@ -190,7 +190,8 @@ void basic_contracts(infernix::text::GrammarCompiler& compiled) {
     const auto two = reordered + "\n" + call("later");
     for (std::size_t cut = 0; cut < two.size(); ++cut) {
         frontend::ToolCallOutputDecoder decoder(basic, 64);
-        (void)feed(decoder, std::string_view(two).substr(0, cut));
+        // The engine reports where a token starts even when the cut falls inside its bytes.
+        (void)feed(decoder, two, 0, cut);
         const auto result = decoder.finish(infernix::FinishReason::OutputLimit);
         require(result.tool_calls.size() == (cut >= reordered.size() ? 1 : 0),
                 "non-strict truncation lost a completed call");
@@ -304,11 +305,68 @@ void quoted_calls(infernix::text::GrammarCompiler& compiled) {
     }
 }
 
+// A raw value holds the whole call's closing lines when more value text follows (a file that documents
+// the call format, Strata #4701, where the value was cut there): the grammar keeps the value open
+// after them, the call still ends at its own closers before the end or the next call's token, and the
+// decoder publishes the whole value, its streamed steps concatenating to the call. Text after closers
+// with no later closer cannot end the output, and a bounded string keeps the plain exclusion.
+void quoted_closers(infernix::text::GrammarCompiler& compiled) {
+    const std::string closers  = "\n</parameter>\n</function>\n</tool_call>";
+    const std::string document = "A call ends with:" + closers + "\nThen the reply goes on.";
+    for (const bool strict : {false, true}) {
+        const auto bound = contract(schema({{"type", "string"}}), strict);
+        require(accepts(compiled, *bound, call(document)), "the grammar cut a value at quoted closing lines");
+        require(accepts(compiled, *bound, "Writing.\n" + call(document) + "\n" + call("b")),
+                "a value with quoted closing lines and a following call were refused");
+        require(accepts(compiled, *bound, call("a")), "a plain call no longer ends at its closers");
+        require(!accepts(compiled, *bound, call("a") + "\nThat wrote it."), "a call ended with prose after it");
+        for (const std::size_t width : {std::size_t{1}, std::size_t{5}, std::size_t{4096}}) {
+            const std::string text = "Writing.\n" + call(document);
+            frontend::ToolCallOutputDecoder decoder(bound, 64);
+            std::string streamed;
+            const auto take = [&] {
+                for (const infernix::ToolCallDelta& delta : decoder.take_call_deltas()) { streamed += delta.arguments; }
+            };
+            for (std::size_t at = 0; at < text.size(); at += width) {
+                (void)feed(decoder, text, at, width);
+                take();
+            }
+            const auto terminal = decoder.finish();
+            take();
+            require(terminal.tool_calls.size() == 1 &&
+                        Json::parse(terminal.tool_calls[0].arguments_json) == Json{{"x", document}} &&
+                        streamed == terminal.tool_calls[0].arguments_json,
+                    "the decoder cut a value at quoted closing lines or streamed it differently");
+        }
+        // Drafts through the closers: the text after them is admitted, and so is the end after the
+        // value's own closers.
+        auto matcher = frontend::compile_tool_grammar(compiled, *bound, kToolCall, {}, {});
+        for (const std::int32_t token : tokens("<tool_call>\n<function=call>\n<parameter=x>\na" + closers)) {
+            matcher->accept(token);
+        }
+        matcher->confirm();
+        const auto drafts        = tokens("\nb" + closers);
+        const std::size_t stride = matcher->mask_words();
+        std::vector<std::uint32_t> words(stride * (drafts.size() + 1));
+        require(matcher->masks(drafts, words) == 0, "a lookahead through quoted closing lines found a dead end");
+        for (std::size_t p = 0; p < drafts.size(); ++p) {
+            const auto token = static_cast<std::size_t>(drafts[p]);
+            require((words[p * stride + token / 32] >> (token % 32) & 1U) != 0,
+                    "a lookahead refused the value text after quoted closing lines");
+        }
+        require((words[drafts.size() * stride + kEos / 32] >> (kEos % 32) & 1U) != 0,
+                "a value's own closers after quoted ones did not admit the end");
+    }
+    const auto bounded = contract(schema({{"type", "string"}, {"maxLength", 100}}), true);
+    require(!accepts(compiled, *bounded, call(document)), "a bounded string held quoted closing lines");
+}
+
 void run() {
     auto compiled = compiler();
     basic_contracts(compiled);
     selected_contracts(compiled);
     quoted_calls(compiled);
+    quoted_closers(compiled);
     infernix::ToolChoice required;
     required.mode = infernix::ToolChoiceMode::Required;
     auto fixed =
