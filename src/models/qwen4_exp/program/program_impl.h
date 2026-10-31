@@ -1370,14 +1370,9 @@ public:
         const std::uint32_t cpu_jobs    = options_.cpu_expert_jobs;
         const std::uint32_t assist_jobs = options_.cpu_assist_jobs;
         if (cpu_workers > 0 && cpu_jobs > 0) {
-            // An A/B arm of the placement shows it without debug logging.
+            // An A/B arm of the placement, or a team the host cut, shows without debug logging.
             if (!placement_.text.empty()) {
-                const auto& switches = temporary_switches::offload();
-                diagnostic(placement_.text,
-                           switches.placement != temporary_switches::OffloadSwitches::Placement::kDefault ||
-                                   switches.workers > 0
-                               ? DiagnosticLevel::Info
-                               : DiagnosticLevel::Debug);
+                diagnostic(placement_.text, placement_.announce ? DiagnosticLevel::Info : DiagnosticLevel::Debug);
             }
             // The team's rate sets the decode miss split (design §19.3.12); the SSD tier's is measured
             // once its RAM is filled (below).
@@ -3687,12 +3682,16 @@ private:
         } catch (...) {}
     }
 
-    // Times a few hundred random 4 KiB reads of a volume that is read on use and says so: a drive
-    // that serves them slowly (a DRAM-less SSD at 5,000 reads/s against 17,000-80,000 on the owner's
-    // drives and 230,000 on a Samsung 9100 PRO) makes a long prompt spend minutes reading n-gram rows.
-    // It never changes placement; the table stays where the ledger put it.
+    // Times random 4 KiB reads of a volume that is read on use, as a prompt chunk's misses are read
+    // (NgramVolume::probe_reads), and says when a long prompt would wait on them. A 128K-token prompt
+    // read 1.27M blocks (about 10 a token, design §19.3.8 F9); at the 1.11M reads/s of a Samsung 990
+    // PRO or an Optane P5800X that is about a second and prefill ran at the same speed on both, while
+    // one thread's ~213K reads/s left 5.9 s exposed and prefill 19 % slower (F7). Below 200K reads/s a
+    // 100K-token prompt waits 5 s or more. It never changes placement; the table stays where the
+    // ledger put it.
     void probe_ngram_volume() const noexcept {
-        constexpr double kSlowReadsPerSecond = 15000.0;
+        constexpr double kSlowReadsPerSecond = 200000.0;
+        constexpr double kReadsPerPromptToken = 10.0;
         if (options_.ngram_in_ram) {
             try {
                 if (const std::string why = volume_.resident_lock_failure(); !why.empty()) {
@@ -3708,17 +3707,21 @@ private:
             const NgramVolume::ReadProbe probe = volume_.probe_reads();
             if (probe.reads == 0) { return; }
             const double rate = probe.reads_per_second();
-            char text[320];
+            // Seconds a 100K-token prompt spends reading rows at this rate.
+            const double per_100k = 1e5 * kReadsPerPromptToken / rate;
+            char text[480];
             if (rate >= kSlowReadsPerSecond) {
-                std::snprintf(text, sizeof text, "n-gram volume read probe: %.0f reads/s (%.0f us per 4 KiB read, %zu reads)",
-                              rate, 1e6 / rate, probe.reads);
+                std::snprintf(text, sizeof text,
+                              "n-gram volume read probe: %.0f reads/s (%zu threads, %zu reads in flight each; %zu reads), "
+                              "about %.1f s of reads per 100K prompt tokens",
+                              rate, NgramVolume::kReadThreads, NgramVolume::kParallelInFlight, probe.reads, per_100k);
                 diagnostic(text, DiagnosticLevel::Debug);
             } else {
                 std::snprintf(text, sizeof text,
-                              "n-gram volume reads are slow: %.0f reads/s (%zu reads; 17,000 and more is healthy), so a long "
-                              "prompt can spend minutes reading n-gram rows; keep the table in RAM with --ngram-residency ram "
-                              "if the experts fit beside it, or move the volume to a faster drive",
-                              rate, probe.reads);
+                              "n-gram volume reads are slow: %.0f reads/s (%zu reads; fast NVMe drives read over 1,000,000), "
+                              "so a 100K-token prompt spends about %.0f s reading n-gram rows; keep the table in RAM with "
+                              "--ngram-residency ram if the experts fit beside it, or move the volume to a faster drive",
+                              rate, probe.reads, per_100k);
                 diagnostic(text, DiagnosticLevel::Warning);
             }
         } catch (...) {}

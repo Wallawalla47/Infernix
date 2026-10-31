@@ -220,6 +220,8 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         for (auto& pending : out->pending) {
             const auto rank = overlay_evict_rank(pending.reference.name);
             if (rank == 0) { continue; }
+            // --embedding-host keeps the token embedding in pinned host memory: nothing to evict.
+            if (rank == kEvictRankEmbedding && options.embedding_host) { continue; }
             for (const auto& part : pending.reference.binding.parts) {
                 binder.mark_device_evictable(part.object, rank);
             }

@@ -2,6 +2,7 @@
 
 #include "serve/request_events.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -77,6 +78,8 @@ public:
 
 private:
     std::shared_ptr<spdlog::logger> logger_;
+    // The first request whose instruction roles the chat template lowered has said so.
+    mutable std::atomic<bool> role_lowering_noted_{false};
 };
 
 } // namespace infernix::serve

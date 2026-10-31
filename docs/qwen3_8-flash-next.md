@@ -528,12 +528,16 @@ If Windows will not lock the table, a warning says so: it still serves rows, but
 pressure part of it may be paged out.
 The rows are the same bytes either way, so outputs do not change.
 
-A table read from its volume is timed at startup with a few hundred random 4 KiB reads, one at a
-time (about a second at most), and logged at debug as `n-gram volume read probe: N reads/s`. Below 15,000
-reads per second (healthy drives measured 17,000 to 80,000 here and 230,000 on a Samsung 9100 PRO;
-DRAM-less SSDs 300 to 5,700 in other users' logs) the line becomes a warning: a long prompt can spend
-minutes reading n-gram rows, and `--ngram-residency ram` (when the experts fit beside the table) or a
-faster drive fixes it. The probe only reports; it never changes where the table lives.
+A table read from its volume is timed at startup with up to 16,384 random 4 KiB reads, issued the way
+a prompt chunk reads its rows (8 threads with 16 reads in flight each; milliseconds on a fast drive, a
+few seconds at most on a slow one), and logged
+at debug as `n-gram volume read probe: N reads/s`. A 128K-token prompt reads about 1.27M blocks; a
+Samsung 990 PRO and an Optane P5800X both read about 1.1M a second this way and prefilled at the same
+speed. Below 200,000 reads per second, where a 100K-token prompt spends 5 s or more reading rows, the
+line becomes a warning with that estimate; `--ngram-residency ram` (when the experts fit beside the
+table) or a faster drive fixes it. Reads one at a time measure the drive's latency, which the engine
+never waits on alone: they put a 990 PRO at 12,000-17,000 a second, which is why earlier builds warned
+about healthy drives. The probe only reports; it never changes where the table lives.
 
 ## N-gram table formats
 
@@ -616,8 +620,9 @@ leading System message is never touched (so the ordinary single leading System b
 conversation's prefix-cache anchor, stays byte-identical). The text, the number of turns and their
 positions stay as they arrived, only the role changes, so such a request never fails on the
 template. Each generation request shows its lowered turns as `instruction_role_lowerings` in the
-preparation block of `--request-log-jsonl`, and both programs state once at startup which roles
-the loaded template lowers. One consequence to know: a lowered turn counts as a user query for a
+preparation block of `--request-log-jsonl`; `infernix-serve` says so at info the first time a request
+has such a turn (most clients send one leading System message and never do), and both programs list
+the roles the loaded template lowers at startup with `--log-level debug`. One consequence to know: a lowered turn counts as a user query for a
 template that takes its thinking history from the last user turn, so `preserve_thinking: false` can
 then drop earlier `<think>` blocks that `qwen3_8.jinja` keeps. Passing
 `--chat-template tools/chat_templates/qwen3_8.jinja` (the file is also in the Windows release

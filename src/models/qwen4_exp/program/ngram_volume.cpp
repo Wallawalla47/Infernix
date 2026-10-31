@@ -5,9 +5,11 @@
 #include <chrono>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace infernix::models::qwen4_exp {
 namespace {
@@ -155,40 +157,15 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
     first_miss_.push_back(misses_.size());
     const std::size_t blocks = offsets_.size();
     if (blocks >= kParallelBlocks) {
-        // Each thread reads a contiguous range of the blocks into its own ring and copies their rows
-        // to `out` (distinct indices); the cache is filled afterwards on this thread, from `out`.
-        const std::size_t ring_bytes = kParallelInFlight * table_.block_bytes;
-        if (parallel_ring_ == nullptr) {
-            parallel_storage_.assign(kReadThreads * ring_bytes + 4096, std::byte{0});
-            const auto base = reinterpret_cast<std::uintptr_t>(parallel_storage_.data());
-            parallel_ring_  = parallel_storage_.data() + ((4096 - base % 4096) % 4096);
-        }
-        // In sorted order, each thread one contiguous range: a scattered order (candidates BX-04) measured flat
-        // (removed 2026-10-28).
-        std::vector<std::exception_ptr> errors(kReadThreads);
-        std::vector<std::thread> threads;
-        threads.reserve(kReadThreads);
-        for (std::size_t t = 0; t < kReadThreads; ++t) {
-            const std::size_t lo = blocks * t / kReadThreads, hi = blocks * (t + 1) / kReadThreads;
-            threads.emplace_back([&, t, lo, hi] {
-                try {
-                    file_.read_direct_blocks(
-                        std::span<const std::uint64_t>(offsets_.data() + lo, hi - lo), table_.block_bytes,
-                        std::span<std::byte>(parallel_ring_ + t * ring_bytes, ring_bytes),
-                        [&](std::size_t b, std::span<const std::byte> block) {
-                            for (std::size_t m = first_miss_[lo + b]; m < first_miss_[lo + b + 1]; ++m) {
-                                const auto i = static_cast<std::size_t>(misses_[m] & 0xFFFFFFFFULL);
-                                std::memcpy(out.data() + i * row_bytes,
-                                            block.data() + (rows[i] % table_.rows_per_block) * row_bytes, row_bytes);
-                            }
-                        });
-                } catch (...) { errors[t] = std::current_exception(); }
-            });
-        }
-        for (auto& thread : threads) { thread.join(); }
-        for (const auto& error : errors) {
-            if (error) { std::rethrow_exception(error); }
-        }
+        // Each thread copies its blocks' rows to `out` (distinct indices); the cache is filled
+        // afterwards on this thread, from `out`.
+        read_parallel(offsets_, [&](std::size_t b, std::span<const std::byte> block) {
+            for (std::size_t m = first_miss_[b]; m < first_miss_[b + 1]; ++m) {
+                const auto i = static_cast<std::size_t>(misses_[m] & 0xFFFFFFFFULL);
+                std::memcpy(out.data() + i * row_bytes, block.data() + (rows[i] % table_.rows_per_block) * row_bytes,
+                            row_bytes);
+            }
+        });
         for (const std::uint64_t miss : misses_) {
             const auto i           = static_cast<std::size_t>(miss & 0xFFFFFFFFULL);
             const std::size_t slot = slot_of(rows[i]);
@@ -230,24 +207,62 @@ bool NgramVolume::cached(std::span<const std::uint32_t> rows) const noexcept {
     return true;
 }
 
+std::byte* NgramVolume::parallel_rings() const {
+    if (parallel_ring_ == nullptr) {
+        parallel_storage_.assign(kReadThreads * kParallelInFlight * table_.block_bytes + 4096, std::byte{0});
+        const auto base = reinterpret_cast<std::uintptr_t>(parallel_storage_.data());
+        parallel_ring_  = parallel_storage_.data() + ((4096 - base % 4096) % 4096);
+    }
+    return parallel_ring_;
+}
+
+void NgramVolume::read_parallel(std::span<const std::uint64_t> offsets,
+                                const std::function<void(std::size_t, std::span<const std::byte>)>& consume) const {
+    const std::size_t ring_bytes = kParallelInFlight * table_.block_bytes;
+    std::byte* const rings       = parallel_rings();
+    const std::size_t blocks     = offsets.size();
+    // In the given (sorted) order, each thread one contiguous range: a scattered order (candidates BX-04)
+    // measured flat (removed 2026-10-28).
+    std::vector<std::exception_ptr> errors(kReadThreads);
+    std::vector<std::thread> threads;
+    threads.reserve(kReadThreads);
+    for (std::size_t t = 0; t < kReadThreads; ++t) {
+        const std::size_t lo = blocks * t / kReadThreads, hi = blocks * (t + 1) / kReadThreads;
+        if (lo == hi) { continue; }
+        threads.emplace_back([&, t, lo, hi] {
+            try {
+                file_.read_direct_blocks(offsets.subspan(lo, hi - lo), table_.block_bytes,
+                                         std::span<std::byte>(rings + t * ring_bytes, ring_bytes),
+                                         [&](std::size_t b, std::span<const std::byte> block) { consume(lo + b, block); });
+            } catch (...) { errors[t] = std::current_exception(); }
+        });
+    }
+    for (auto& thread : threads) { thread.join(); }
+    for (const auto& error : errors) {
+        if (error) { std::rethrow_exception(error); }
+    }
+}
+
 NgramVolume::ReadProbe NgramVolume::probe_reads(std::size_t reads, double max_seconds) const {
     ReadProbe probe;
     if (resident_ || table_.blocks == 0) { return probe; }
-    const std::span<std::byte> block(ring_, table_.block_bytes);
     // A different set of blocks each start, so the drive's own cache cannot answer the same ones.
     std::uint64_t state = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) | 1U;
+    std::vector<std::uint64_t> offsets;
+    std::size_t round   = kReadThreads * kParallelInFlight;
     const auto start    = std::chrono::steady_clock::now();
-    for (; probe.reads < reads; ++probe.reads) {
-        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
-        const std::uint64_t at = table_.header_bytes + (state >> 33U) % table_.blocks * table_.block_bytes;
-        if (file_.read_direct(at, block) != block.size()) {
-            throw std::runtime_error("short n-gram volume read in the read-rate probe");
+    while (probe.reads < reads) {
+        offsets.resize(std::min(round, reads - probe.reads));
+        for (std::uint64_t& at : offsets) {
+            state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+            at    = table_.header_bytes + (state >> 33U) % table_.blocks * table_.block_bytes;
         }
+        std::sort(offsets.begin(), offsets.end()); // as read_rows reads a call's blocks
+        read_parallel(offsets, [](std::size_t, std::span<const std::byte>) {});
+        probe.reads += offsets.size();
         probe.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        if (probe.seconds >= max_seconds) {
-            ++probe.reads;
-            break;
-        }
+        if (probe.seconds >= max_seconds) { break; }
+        round *= 2;
     }
     return probe;
 }
