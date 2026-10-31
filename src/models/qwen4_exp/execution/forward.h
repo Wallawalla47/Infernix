@@ -32,6 +32,12 @@ namespace infernix::models::qwen4_exp::execution {
 // the Program stages the chunk's RoPE positions per sub-chunk of this many cells.
 inline constexpr std::int32_t kMtpChunkColumns = 512;
 
+// Faults the Forward's own kernels report in the experts' error word (ForwardExperts::error) instead
+// of trapping (core DeviceFault), as layer << 16 | code like the MoE's: codes above the MoE's
+// (ops/offloaded_sparse_moe/cpu/fetch_request.h) and every errno.
+inline constexpr std::uint32_t kErrorRowGateTimeout = 0xFF10; // the n-gram rows were not published within kPinnedGateTimeoutNs
+inline constexpr std::uint32_t kErrorTokenId        = 0xFF11; // an id outside the vocabulary reached the token embedding
+
 // Program-owned recurrent state of every slot.
 struct ForwardState {
     LinearAttentionStatePool* gdn = nullptr; // one layer per GDN block
@@ -76,7 +82,8 @@ struct ForwardExperts {
     // experts without a CPU job are read through.
     std::vector<const std::uint8_t* const*> host_tables;
     std::vector<ops::MoeFetchChannel> fetch;
-    // Mapped word a call that could not serve an expert writes (ops::MoeExpertSource::error); the
+    // Mapped word a call that could not serve an expert writes (ops::MoeExpertSource::error), and the
+    // token embedding and the n-gram gate their faults (kErrorTokenId, kErrorRowGateTimeout); the
     // Program checks it after each synchronization. Null: none.
     std::uint32_t* error = nullptr;
     // TEMPORARY (INFERNIX_TMP_REPLAY_BENCH): device word the CPU waits add their nanoseconds to

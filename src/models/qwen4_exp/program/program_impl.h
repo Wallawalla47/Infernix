@@ -1289,9 +1289,9 @@ public:
         // After the tier (whose pinned slots are the probe's source when the banks stay in the
         // artifact), before the CPU service and the split take the measured rate.
         measure_link();
-        expert_error_ = PinnedHostBuffer(64);
-        std::memset(expert_error_.data(), 0, 64);
-        experts.error = static_cast<std::uint32_t*>(expert_error_.data());
+        device_error_ = PinnedHostBuffer(64);
+        std::memset(device_error_.data(), 0, 64);
+        experts.error = static_cast<std::uint32_t*>(device_error_.data());
         // TEMPORARY (INFERNIX_TMP_REPLAY_BENCH): the replay bench's round clock and CPU-wait word.
         if (temporary_switches::integer("INFERNIX_TMP_REPLAY_BENCH", -1, -1, std::int64_t{1} << 40) >= 0) {
             replay_clock_ = std::make_unique<RoundClock>();
@@ -1407,7 +1407,7 @@ public:
                     .ggml_a8     = cpu_ggml_a8(),
                     .nvfp4_a8    = cpu_narrow_a16() == ops::offloaded_moe::NarrowA16::kA8,
                     .records     = tier_.get(), // tier mode: SSD-only jobs read through the tier
-                    // Reported when it happens; check_expert_error then stops the Engine with it.
+                    // Reported when it happens; check_device_error then stops the Engine with it.
                     .on_failure  = [this](const std::string& why) {
                         diagnostic("Qwen3.8-Flash-Next: the CPU expert service stopped serving misses: " + why,
                                    DiagnosticLevel::Error);
@@ -2306,7 +2306,7 @@ public:
                 const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
                 device_.synchronize();
             }
-            check_expert_error();
+            check_device_error();
             const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                     static_cast<std::uint64_t>(width));
             trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
@@ -2689,7 +2689,7 @@ public:
             const auto chunk = stage_mtp_chunk(lane, index, begin, static_cast<std::int32_t>(stride));
             run(1, static_cast<std::int32_t>(stride), 1, chunk ? &*chunk : nullptr);
             device_.synchronize();
-            check_expert_error();
+            check_device_error();
             trace_round(RouteTraceKind::ForcedTokens, 1, static_cast<std::int32_t>(stride), stride,
                         kDecodePromotionsPerLayer, static_cast<std::uint32_t>(begin));
             residency_->after_round(device_.stream, static_cast<std::int32_t>(stride), kDecodePromotionsPerLayer, {},
@@ -3327,12 +3327,13 @@ private:
     }
 
 public:
-    // After every synchronization of a round with MoE layers: a call that could not serve an expert
-    // (design §19.3.7: an unreadable record, a host service that stopped answering) left undefined
-    // outputs, so the round's requests fail and the engine keeps serving. Prefix-cache entries the
-    // round may have published are dropped when the lanes are released.
-    void check_expert_error() {
-        auto* word           = static_cast<volatile std::uint32_t*>(expert_error_.data());
+    // After every synchronization of a round: a call that could not serve an expert (design §19.3.7:
+    // an unreadable record, a host service that stopped answering), an n-gram gate whose rows were
+    // never published or a token id outside the vocabulary left undefined outputs, so the round's
+    // requests fail and the engine keeps serving (no device trap: the context survives). Prefix-cache
+    // entries the round may have published are dropped when the lanes are released.
+    void check_device_error() {
+        auto* word           = static_cast<volatile std::uint32_t*>(device_error_.data());
         std::uint32_t value  = *word;
         if (value == 0 && runtime::expert_offload::testing::take_expert_fault()) { value = EIO; } // layer 0
         if (value == 0) { return; }
@@ -3350,6 +3351,15 @@ public:
             }
         }
         const std::uint32_t code = value & 0xFFFFU;
+        if (code == execution::kErrorTokenId) {
+            throw runtime::RecoverableExecutionError("Qwen3.8-Flash-Next: a token id outside the vocabulary reached the "
+                                                     "token embedding");
+        }
+        if (code == execution::kErrorRowGateTimeout) {
+            throw runtime::RecoverableExecutionError(
+                "Qwen3.8-Flash-Next layer " + std::to_string(value >> 16U) + ": the n-gram rows were not published within " +
+                std::to_string(kPinnedGateTimeoutNs / 1000000000ULL) + " s (the host thread reading them stalled)");
+        }
         std::string what         = code == ops::offloaded_moe::kErrorUnservedRecord ? "an SSD-only expert had no path to it"
                                    : code == ops::offloaded_moe::kErrorHostSilent   ? "the CPU expert service stopped answering"
                                    : code == ops::offloaded_moe::kErrorFetchSilent  ? "the SSD expert tier's read agent stopped answering"
@@ -4041,7 +4051,8 @@ private:
     // a call that waits for the device deadlocks the round. A kernel's first launch is one, as the
     // driver loads its code then and, with the process past its OS budget, waits for the device
     // to do so (the sampler and acceptance kernels queued here before 2026-10-30: the gate trapped
-    // after kPinnedGateTimeoutNs in 5 of 7 --vram-past-budget starts).
+    // after kPinnedGateTimeoutNs in 5 of 7 --vram-past-budget starts; since 2026-10-31 a gate past
+    // its bound fails the round with kErrorRowGateTimeout and the context survives).
     void read_behind_gate(Lane& lane, std::uint32_t word, std::size_t bytes, const std::function<void()>& read) {
         GateRelease release_gate{this, word, bytes};
         device_.flush();
@@ -5008,7 +5019,7 @@ private:
         CUDA_CHECK(cudaMemcpyAsync(spec_host(spec_layout_.licensed), licensed.data,
                                    4ULL * (spec_layout_.commit - spec_layout_.licensed), cudaMemcpyDeviceToHost, s));
         device_.synchronize();
-        check_expert_error();
+        check_device_error();
 
         const std::int32_t* licensed_host = spec_host(spec_layout_.licensed);
         for (std::int32_t b = 0; b < batch; ++b) {
@@ -5719,7 +5730,7 @@ private:
         }
         CUDA_CHECK(cudaMemcpyAsync(host_sampled_.data(), sampled_.p, 4ULL * batch, cudaMemcpyDeviceToHost, s));
         device_.synchronize();
-        check_expert_error();
+        check_device_error();
         const auto* tokens = static_cast<const std::int32_t*>(host_sampled_.data());
         for (std::int32_t b = 0; b < batch; ++b) { pending_tokens_[b] = tokens[b]; }
         if (constrained) {
@@ -6249,7 +6260,7 @@ private:
         const auto& l = tier_->controller().losses();
         return l.unpublished + l.no_slot + l.unworthy + l.residents_evicted;
     }
-    PinnedHostBuffer expert_error_{1}; // mapped u32: ops::MoeExpertSource::error of every call
+    PinnedHostBuffer device_error_{1}; // mapped u32: every call's MoE error word and Forward's faults (check_device_error)
     // TEMPORARY (INFERNIX_TMP_REPLAY_BENCH, candidates §8.5 CF-03): decode rounds' device time and the
     // CPU waits' nanoseconds (ops::MoeExpertSource::wait_ns), reported at each lane's release.
     std::unique_ptr<RoundClock> replay_clock_;
