@@ -107,7 +107,8 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 - **Same launch configuration.** The treatment runs the deploy folder's launch bat
   (`AB_LAUNCH_BAT`, default the official-artifact launcher) plus `AB_TREATMENT_EXTRA_FLAGS`
   (default none). The control runs the same flags minus the ones its `--help` does not
-  advertise.
+  advertise, plus `AB_CONTROL_EXTRA_FLAGS` where its own drafter or flag names differ (NInfer's
+  `--proposal-head optimized` for Infernix's `--lm-head-draft`, say).
 - **Same host RAM.** Both builds size their pinned Host tier with `--host-context-mib`, so the
   control gets the treatment's value unchanged.
 - **Same context.** NInfer keeps a fixed 1 GiB of VRAM spare under `--kv-capacity auto`, so it
@@ -155,8 +156,9 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 | `AB_MODEL` | the model path in the launch bat |
 | `AB_TREATMENT_EXE` | `build-windows\apps\Release\infernix-serve.exe` in this checkout |
 | `AB_CONTROL_EXE` | `bench\agentic_ab\control\build\apps\Release\ninfer-serve.exe` |
-| `AB_TREATMENT_EXTRA_FLAGS` | none |
-| `AB_ALT_EXTRA_FLAGS` | none (added to the treatment's flags) |
+| `AB_TREATMENT_EXTRA_FLAGS` | none; `--switch --name=value ...`, a value replacing the bat's |
+| `AB_ALT_EXTRA_FLAGS` | none (added to the treatment's flags, the same form) |
+| `AB_CONTROL_EXTRA_FLAGS` | none (added to the control's flags, the same form; each must be in its `--help`) |
 | `AB_ALT_EXE` | the treatment executable; another build puts a second Infernix build in the alt arm |
 | `AB_TREATMENT_ENV` / `AB_ALT_ENV` / `AB_CONTROL_ENV` | none; `NAME=VALUE ...` set for that arm's serve only (a temporary `INFERNIX_TMP_*` A/B switch). No serve inherits the runner's own `INFERNIX_TMP_*` variables |
 | `AB_CONTROL_LABEL` / `AB_TREATMENT_LABEL` / `AB_ALT_LABEL` | none (the report calls the arms "NInfer + Windows port", "Infernix" and "Infernix, alternative") |

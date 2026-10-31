@@ -60,10 +60,27 @@ TREATMENT_EXE = os.environ.get("AB_TREATMENT_EXE",
 CONTROL_EXE = os.environ.get("AB_CONTROL_EXE",
                              os.path.join(HERE, "control", "build", "apps", "Release",
                                           "ninfer-serve.exe"))
+# Flags one arm adds to (or, with a value, sets over) the launch bat's: "--switch --name=value ...".
+def _extra_flags(name):
+    return [(item.partition("=")[0], item.partition("=")[2] if "=" in item else None)
+            for item in os.environ.get(name, "").split()]
+
+
+def apply_extras(flags, extras):
+    for flag, value in extras:
+        if value is not None:
+            flags = set_flag(flags, flag, value)
+        elif flag not in dict(flags):
+            flags = flags + [(flag, None)]
+    return flags
+
+
 # Infernix flags the launch bat does not already carry.
-TREATMENT_EXTRA_FLAGS = os.environ.get("AB_TREATMENT_EXTRA_FLAGS", "").split()
+TREATMENT_EXTRA_FLAGS = _extra_flags("AB_TREATMENT_EXTRA_FLAGS")
 # What the alt arm adds to the treatment's flags, and the build it runs (default the treatment's).
-ALT_EXTRA_FLAGS = os.environ.get("AB_ALT_EXTRA_FLAGS", "").split()
+ALT_EXTRA_FLAGS = _extra_flags("AB_ALT_EXTRA_FLAGS")
+# The control's own flags over the shared ones (an NInfer control whose drafter or flag names differ).
+CONTROL_EXTRA_FLAGS = _extra_flags("AB_CONTROL_EXTRA_FLAGS")
 ALT_EXE = os.environ.get("AB_ALT_EXE") or TREATMENT_EXE
 # Environment variables set for one arm's serve only ("NAME=VALUE NAME=VALUE"), e.g. a temporary
 # INFERNIX_TMP_* switch; every arm's serve starts without the INFERNIX_TMP_* variables it does not set.
@@ -934,28 +951,26 @@ def main():
     bat_ctx = int(dict(bat_flags).get("--max-context") or 220000)
     base = without(bat_flags, {"--request-log-jsonl"})
     base = set_flag(set_flag(base, "--host", HOST), "--port", str(PORT))
-    treat_flags = list(base)
-    for extra in TREATMENT_EXTRA_FLAGS:
-        if extra not in dict(treat_flags):
-            treat_flags.append((extra, None))
-    alt_flags = list(treat_flags)
-    for extra in ALT_EXTRA_FLAGS:
-        if extra not in dict(alt_flags):
-            alt_flags.append((extra, None))
+    treat_flags = apply_extras(list(base), TREATMENT_EXTRA_FLAGS)
+    alt_flags = apply_extras(list(treat_flags), ALT_EXTRA_FLAGS)
     if EXTERNAL:  # these engines take their own config, not serve flags
         ctrl_flags, dropped = [], []
         if not args.ctx:
             raise SystemExit("AB_CONTROL_KIND=%s needs --ctx (no calibration against it)" % CONTROL_KIND)
     else:
         ctrl_supported = help_flags(CONTROL_EXE)
-        ctrl_flags = [f for f in base if f[0] in ctrl_supported]
+        ctrl_flags = apply_extras([f for f in base if f[0] in ctrl_supported], CONTROL_EXTRA_FLAGS)
         dropped = [f[0] for f in treat_flags if f[0] not in ctrl_supported]
+        unknown = [f for f, _ in CONTROL_EXTRA_FLAGS if f not in ctrl_supported]
+        if unknown:
+            raise SystemExit("AB_CONTROL_EXTRA_FLAGS names flags the control's --help does not advertise: %s"
+                             % ", ".join(unknown))
 
     plans = {seed: workload.build_plan(seed=seed, scale=args.scale) for seed in seeds}
     log("model: %s" % model)
     log("treatment flags: %s" % flag_str(treat_flags))
     if "alt" in arms:
-        log("alt flags: treatment + %s" % " ".join(ALT_EXTRA_FLAGS))
+        log("alt flags: treatment + %s" % flag_str(ALT_EXTRA_FLAGS))
     log("control drops (not in its --help): %s" % ", ".join(dropped))
     if CONTROL_KIND == "strata":
         log("control: Strata %s + %s" % (STRATA_CONFIG, " ".join(STRATA_EXTRA_ARGS)))
@@ -983,6 +998,7 @@ def main():
               "alt_label": ALT_LABEL or None, "control_label": CONTROL_LABEL or None,
               "treatment_label": TREATMENT_LABEL or None,
               "control_flags_base": ctrl_flags, "dropped_for_control": dropped,
+              "control_extra_flags": CONTROL_EXTRA_FLAGS,
               "scale": args.scale, "agent_max_tokens": AGENT_MAX_TOKENS, "sampling": SAMPLING,
               "bat_max_context": bat_ctx, "control_kind": CONTROL_KIND,
               "strata_config": STRATA_CONFIG if CONTROL_KIND == "strata" else None,
