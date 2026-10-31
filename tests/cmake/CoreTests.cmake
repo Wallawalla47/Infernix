@@ -104,6 +104,10 @@ infernix_add_test(infernix_cpu_topology_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cpu_topology.cpp"
   LIBRARIES infernix_core)
 
+infernix_add_test(infernix_io_priority_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_io_priority.cpp"
+  LIBRARIES infernix_core)
+
 if(NOT WIN32)
   # The WSL2 adapter facts through DXCore (skips outside WSL2 or without a CUDA device).
   infernix_add_test(infernix_dxcore_adapter_test
