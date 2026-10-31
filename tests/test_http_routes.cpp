@@ -94,6 +94,84 @@ int main() {
         listener.join();
     }
 
+    // Idle sockets must not starve admission (the pool-sizing half of the keep-alive fix):
+    // cpp-httplib parks one pool worker per open connection for its whole idle window, so a
+    // pool sized only to admission lets idle connections block new requests. The ceiling
+    // above the base (--max-http-clients territory) must absorb them.
+    {
+        httplib::Server server;
+        server.Get("/ping", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content("pong", "text/plain");
+        });
+        server.set_keep_alive_timeout(30);
+        // Two base workers, four headroom workers: hold every base worker with an idle
+        // connection and a request must still be admitted through the headroom.
+        server.new_task_queue = [] { return new httplib::ThreadPool(2, 6, 16); };
+        const int port = server.bind_to_any_port("127.0.0.1");
+        failures += check(port > 0, "pool test server could not bind a loopback port");
+        if (port > 0) {
+            std::thread listener([&server] { server.listen_after_bind(); });
+            server.wait_until_ready();
+            std::vector<httplib::Client> idle_clients;
+            bool all_warm = true;
+            for (int i = 0; i < 4; ++i) {
+                idle_clients.emplace_back("127.0.0.1", port);
+                idle_clients.back().set_keep_alive(true);
+                const auto warm = idle_clients.back().Get("/ping");
+                all_warm = all_warm && warm && warm->status == 200;
+            }
+            failures += check(all_warm, "idle connections could not each get their warm-up response");
+            // All four connections are now open and idle, holding four workers.
+            httplib::Client fresh("127.0.0.1", port);
+            fresh.set_read_timeout(5, 0);
+            const auto admitted = fresh.Get("/ping");
+            failures += check(admitted && admitted->status == 200,
+                              "idle keep-alive connections must not starve request admission");
+            server.stop();
+            listener.join();
+        }
+    }
+
+    // The ceiling is a real bound (the pool-full case): with every worker held and the queue
+    // full, a further connection is refused by the accept loop — closed without a response,
+    // not crashed or wedged. ThreadPool(base 1, ceiling 2, queue 1): A and B park the two
+    // workers as idle keep-alive sockets, C occupies the single queue slot, D is overflow.
+    {
+        httplib::Server server;
+        server.Get("/ping", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content("pong", "text/plain");
+        });
+        server.set_keep_alive_timeout(30);
+        server.new_task_queue = [] { return new httplib::ThreadPool(1, 2, 1); };
+        const int port = server.bind_to_any_port("127.0.0.1");
+        failures += check(port > 0, "pool-full test server could not bind a loopback port");
+        if (port > 0) {
+            std::thread listener([&server] { server.listen_after_bind(); });
+            server.wait_until_ready();
+            httplib::Client a("127.0.0.1", port);
+            httplib::Client b("127.0.0.1", port);
+            a.set_keep_alive(true);
+            b.set_keep_alive(true);
+            const auto warm_a = a.Get("/ping");
+            const auto warm_b = b.Get("/ping");
+            failures += check(warm_a && warm_b && warm_a->status == 200 && warm_b->status == 200,
+                              "the two ceiling connections must be served");
+            // C is accepted but queued behind the two parked workers: no worker frees within
+            // its read timeout, so it goes unanswered while the ceiling is held.
+            httplib::Client c("127.0.0.1", port);
+            c.set_read_timeout(0, 300000);
+            const auto queued = c.Get("/ping");
+            failures += check(!queued, "a connection queued behind a full pool must go unanswered");
+            // D arrives with the queue full too: the accept loop refuses it outright.
+            httplib::Client d("127.0.0.1", port);
+            d.set_read_timeout(0, 300000);
+            const auto refused = d.Get("/ping");
+            failures += check(!refused, "a connection beyond pool and queue must be refused");
+            server.stop();
+            listener.join();
+        }
+    }
+
     if (failures == 0) { std::cout << "http routes tests passed\n"; }
     return failures == 0 ? 0 : 1;
 }
