@@ -4557,6 +4557,11 @@ binding) and `prefix/prefix_program.cpp` (the Program side).
   (`ForwardBatch::layer_waits[1]`). The tail page's planes of a layer are copied with that layer
   (`DeviceKVPagePool::copy_to_host_records` gained the plane-range form). An endpoint hands its
   partial page over as the snapshot's Device tail; a tap keeps it and the lane's later writes wait.
+  So do another request's: before a page a pending tap or boundary reads returns to the pool (the
+  lane's release, the block's eviction once published), the compute stream waits on that capture's
+  last event (`PrefixCache::order_page_reuse`). Until 2026-10-31 it did not, and a release inside
+  the copy window could put another request's KV into the snapshot (candidates TM-01; ninferpro
+  `33feac42d2`).
   The Host tier is therefore required: `--host-context-mib 0` or Device snapshot slots are refused
   (decided default 0 slots; packed slots are a later option).
 - **Restores** are one batch per admission on the restore stream, in forward order: a decoder
