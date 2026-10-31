@@ -245,6 +245,7 @@ int main(int argc, char** argv) {
     logging_options.presentation = infernix::product::LogPresentation::Service;
     logging_options.color        = options.log_colours ? infernix::product::LogColorMode::Always
                                                        : infernix::product::LogColorMode::Never;
+    logging_options.log_file     = options.log_file;
     infernix::product::LoggingRuntime logging(logging_options);
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
     infernix::product::StartupLogRenderer startup_log(logging);
