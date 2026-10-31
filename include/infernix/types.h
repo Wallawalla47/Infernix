@@ -235,11 +235,14 @@ enum class FastPath : std::uint8_t {
     // Qwen3.8-Flash-Next GGUF imports: dense projections of prefill calls of 32 or more columns run on
     // BF16 tensor cores (each code exact in BF16, x as stored, FP32 sums of each sub-block scaled by
     // d * sub; ops::LinearRoutes::GgmlBf16Wide) instead of the exact A16 integer tiles, and the GGUF
-    // expert banks' MoE calls of 4,096 or more columns the same arithmetic, each K stage of an expert's
-    // codes decoded into shared memory (offloaded_moe::wide::kGgmlStageDecodeMinColumns).
-    // A prompt's arithmetic then depends on where its calls start and how the layer walk groups them
-    // (a narrower tail call stays exact), which prefix-cache resumes share between requests. Without
-    // it every GGUF projection and expert is exact.
+    // expert banks' MoE calls of 512 or more columns the same arithmetic, each K stage of an expert's
+    // codes decoded into shared memory (offloaded_moe::wide::kGgmlStageDecodeMinColumns; an expert taking
+    // at most eight of a call's columns keeps the exact narrow kernels). A prompt's arithmetic then
+    // depends on where its calls start, on how the layer walk groups its chunks into MoE calls (a group's
+    // total columns choose the experts' route) and on how many of a call's columns each expert takes (a
+    // narrower tail call stays exact), all of which a prefix-cache resume changes: a resumed prompt reads
+    // within this route's error of its cold run rather than equal to it. Without it every GGUF projection
+    // and expert is exact.
     GgmlBf16Prefill,
     // Qwen3.8-Flash-Next with row-FP8 (recipe C) or MXFP8 (NVIDIA FP4-Local) dense weights: dense
     // projections of prefill calls of 256 or more columns run on FP16 Tensor Cores at twice the
@@ -762,7 +765,8 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     // Prompt tokens per prefill call, a multiple of 128; 0 takes the model's default: 16,384 for
     // Qwen3.8-Flash-Next (its exact-route prefill measured identical across chunks), 1,024
-    // otherwise.
+    // otherwise. With fast paths, Qwen3.8-Flash-Next runs a call that starts before position 16,384
+    // at most 4,096 tokens wide and one before 131,072 at most 8,192; the chunk caps every call.
     std::uint32_t prefill_chunk        = 0;
     // INT8 KV prefills with the fast prompt-attention kernel and rounds prefill_chunk down to whole
     // prompt-attention waves. True selects the original INT8 prompt kernel at the requested chunk;

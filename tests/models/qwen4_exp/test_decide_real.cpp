@@ -5,8 +5,9 @@
 //   readout      A prompt's readout names its greedy first token and 15 others: the top token is the
 //                one generated, no named token outscores it, and a resumed prompt reads what its cold
 //                run reads (within rounding: their prefill calls differ; with expert-a4-residual or its
-//                narrow form alone, whose expert arithmetic depends on an expert's column count, its
-//                top token). With
+//                narrow form alone, whose expert arithmetic depends on an expert's column count, or
+//                ggml-bf16-prefill, whose arithmetic depends on how the calls are cut and walked, its top
+//                token). With
 //                INFERNIX_DECIDE_DUMP=DIR the prompt ids and readout are written there for the FP64
 //                oracle of the gate, which log-softmaxes the forward test's FP32 logits of the same
 //                prompt rounded to BF16.
@@ -107,7 +108,7 @@ infernix::GenerationResult run(infernix::Engine& engine, const std::vector<infer
     return engine.generate(engine.prepare_tokens(prompt), options);
 }
 
-int readout(infernix::Engine& engine, bool dump) {
+int readout(infernix::Engine& engine, bool dump, std::size_t suffix) {
     int failures = 0;
     const std::vector<infernix::TokenId> prompt = synthetic_tokens(700, 11);
     const auto cold = run(engine, prompt, greedy(1, false));
@@ -139,7 +140,7 @@ int readout(infernix::Engine& engine, bool dump) {
 
     // A prompt resumed from the cache reads (within rounding) what its cold run reads.
     (void)run(engine, prompt, greedy(2, true)); // publishes the prompt's blocks, taps and endpoint
-    const std::vector<infernix::TokenId> longer = concat(prompt, synthetic_tokens(150, 13));
+    const std::vector<infernix::TokenId> longer = concat(prompt, synthetic_tokens(suffix, 13));
     infernix::RequestOptions cold_longer        = greedy(1, false);
     cold_longer.execution.readout_tokens      = named;
     infernix::RequestOptions warm_longer        = cold_longer;
@@ -164,13 +165,26 @@ int readout(infernix::Engine& engine, bool dump) {
     // order against exact): the claim is rounding again.
     const std::vector<std::string>& paths = engine.load_summary().fast_paths;
     const auto has = [&](const char* name) { return std::find(paths.begin(), paths.end(), name) != paths.end(); };
+    std::string selected;
+    for (const std::string& path : paths) { selected += (selected.empty() ? "" : ",") + path; }
+    std::printf("        fast paths: %s; top token cold %d, resumed %d; worst %.6f nats\n",
+                selected.empty() ? "none" : selected.c_str(), a.readout ? a.readout->top_token : -1,
+                b.readout ? b.readout->top_token : -1, worst);
+    // ggml-bf16-prefill (a GGUF import's prefill projections and experts on BF16 tensor cores) makes a prompt's
+    // arithmetic depend on how its calls are cut and walked (infernix/types.h), which a resume changes: the cold
+    // 850-token prompt's chunks [0,512) and [512,850) form one 850-column MoE group (BF16 experts), while the resumed
+    // run's [512,850) is a 338-column call (exact experts, below 512). On the GSQ-RCO IQ3_S import (2026-10-31) that read
+    // up to 0.20 nats with the path alone and 0.47 with gdn-f16-accumulate beside it, 0 without it (the exact route,
+    // each other registered path alone or all together), the top token the same in every arm. With it the claim is the
+    // top token too.
     const bool narrow_terms = has("expert-a4-residual-decode");
     const bool wide_terms   = has("expert-a4-residual") || has("expert-a4-residual-3");
-    const bool width_arithmetic = narrow_terms != wide_terms || has("expert-a4-residual-3");
+    const bool width_arithmetic = narrow_terms != wide_terms || has("expert-a4-residual-3") || has("ggml-bf16-prefill");
     const bool same_top = a.readout && b.readout && a.readout->top_token == b.readout->top_token;
     if (width_arithmetic) {
-        failures += check(same_top, "readout: resumed reads cold's top token (expert-a4-residual or its narrow form "
-                                    "alone; worst " + std::to_string(worst) + " nats)");
+        failures += check(same_top, "readout: resumed reads cold's top token (a width-dependent path: expert-a4-residual "
+                                    "or its narrow form alone, or ggml-bf16-prefill; worst " + std::to_string(worst) +
+                                    " nats)");
     } else {
         failures += check(same_top && worst <= 0.05,
                           "readout: resumed equals cold within 0.05 nats (worst " + std::to_string(worst) + ")");
@@ -297,14 +311,15 @@ int prefetch(infernix::Engine& engine) {
 }
 
 int run_mode(const char* artifact, const char* ngram, bool mtp, const std::vector<infernix::FastPath>& candidates,
-             bool fast_paths) {
+             bool fast_paths, bool readout_only, std::size_t suffix) {
     std::printf("== %s%s\n", mtp ? "MTP drafter (--spec mtp, 3 drafts)" : "plain decode", fast_paths ? "" : ", fast paths off");
     infernix::EngineOptions options = base_options(artifact, ngram, mtp);
     options.fast_paths = fast_paths;
     options.fast_path_candidates.insert(options.fast_path_candidates.end(), candidates.begin(), candidates.end());
     infernix::Engine engine(options);
     int failures = 0;
-    failures += readout(engine, !mtp && std::getenv("INFERNIX_DECIDE_DUMP") != nullptr);
+    failures += readout(engine, !mtp && std::getenv("INFERNIX_DECIDE_DUMP") != nullptr, suffix);
+    if (readout_only) { return failures; }
     failures += forced(engine);
     failures += chain(engine, mtp ? 12U : 6U, mtp ? "chain (MTP verify)" : "chain");
     failures += cross(engine);
@@ -325,15 +340,20 @@ int main(int argc, char** argv) {
         return 77;
     }
     const char* ngram = std::getenv("INFERNIX_QWEN4_NGRAM");
-    bool plain = true, mtp = true, fast_paths = true;
+    bool plain = true, mtp = true, fast_paths = true, readout_only = false;
+    std::size_t suffix = 150;
     // --fast-path NAME (repeatable): also run that fast path, qualified or not (the readout's resume
-    // claim follows the selected expert paths). --no-fast-paths: the exact route alone.
+    // claim follows the selected expert paths). --no-fast-paths: the exact route alone (with --fast-path,
+    // only the named paths). --readout-only: the readout scenario alone. --readout-suffix N: the tokens the
+    // readout's longer prompt adds past its 700 (default 150).
     std::vector<infernix::FastPath> candidates;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--mtp") { plain = false; }
         if (arg == "--plain") { mtp = false; }
         if (arg == "--no-fast-paths") { fast_paths = false; }
+        if (arg == "--readout-only") { readout_only = true; }
+        if (arg == "--readout-suffix" && i + 1 < argc) { suffix = static_cast<std::size_t>(std::stoul(argv[++i])); }
         if (arg == "--fast-path" && i + 1 < argc) {
             const auto path = infernix::parse_fast_path(argv[++i]);
             if (!path) {
@@ -345,8 +365,8 @@ int main(int argc, char** argv) {
     }
     try {
         int failures = 0;
-        if (plain) { failures += run_mode(artifact, ngram, false, candidates, fast_paths); }
-        if (mtp) { failures += run_mode(artifact, ngram, true, candidates, fast_paths); }
+        if (plain) { failures += run_mode(artifact, ngram, false, candidates, fast_paths, readout_only, suffix); }
+        if (mtp) { failures += run_mode(artifact, ngram, true, candidates, fast_paths, readout_only, suffix); }
         std::printf(failures == 0 ? "qwen4_exp decide checks passed\n" : "FAIL: %d checks failed\n", failures);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
