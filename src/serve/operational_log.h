@@ -2,6 +2,7 @@
 
 #include "serve/request_events.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -64,7 +65,7 @@ public:
     void warmup_started() const;
     void warmup_complete(double seconds) const;
     void warmup_failure(double seconds, std::string_view detail) const;
-    void bind_failure(std::string_view host, int port) const;
+    void bind_failure(std::string_view host, int port, std::string_view reason) const;
     void listen_failure(std::string_view host, int port) const;
     void server_ready(std::string_view host, int port, std::string_view model_id,
                       bool auth_enabled) const;
@@ -77,6 +78,8 @@ public:
 
 private:
     std::shared_ptr<spdlog::logger> logger_;
+    // The first request whose instruction roles the chat template lowered has said so.
+    mutable std::atomic<bool> role_lowering_noted_{false};
 };
 
 } // namespace infernix::serve

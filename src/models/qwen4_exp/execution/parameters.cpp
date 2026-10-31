@@ -365,6 +365,10 @@ Parameters::Parameters(const Model& source) : model(source) {
         out.moe.bank           = &banks[i];
         out.moe.device_scales  = reinterpret_cast<const ops::offloaded_moe::ExpertScales*>(
             static_cast<const std::byte*>(scales_.p) + per_layer * i);
+        out.moe.a4_shared_input =
+            banks[i].activation == ops::offloaded_moe::ExpertActivation::kA4 && !banks[i].scales.empty() &&
+            std::all_of(banks[i].scales.begin(), banks[i].scales.end(),
+                        [](const ops::offloaded_moe::ExpertScales& s) { return s.input_up == s.input_gate; });
         if (c.lossless) {
             out.moe.lossless_scales = reinterpret_cast<const ops::offloaded_moe::ExpertScales*>(
                 static_cast<const std::byte*>(lossless_scales_.p) + per_layer * i);

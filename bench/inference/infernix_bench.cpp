@@ -276,6 +276,7 @@ int main(int argc, char** argv) {
         engine_options.vram_past_budget    = options.vram_past_budget;
         engine_options.expert_tail_skip    = options.expert_tail_skip;
         engine_options.expert_a4_activations = options.expert_a4_activations;
+        engine_options.expert_a16_activations = options.expert_a16_activations;
         engine_options.a8_activations        = options.a8_activations;
         engine_options.embedding_host        = options.embedding_host;
         engine_options.context_cache.enabled            = false;
@@ -301,6 +302,7 @@ int main(int argc, char** argv) {
         env.fast_paths                   = options.fast_paths;
         env.expert_tail_skip             = options.expert_tail_skip;
         env.expert_a4_activations        = options.expert_a4_activations;
+        env.expert_a16_activations       = options.expert_a16_activations;
         env.a8_activations               = options.a8_activations;
         env.ngram_volume_path            = options.ngram_volume_path;
         env.ngram_residency              = options.ngram_residency;

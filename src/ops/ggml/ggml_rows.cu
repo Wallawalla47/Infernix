@@ -45,10 +45,14 @@ __device__ __forceinline__ void chunk_values(const std::uint8_t* row, int index,
 template <QType F>
 __global__ void __launch_bounds__(kThreads)
     embedding_kernel(const std::int32_t* __restrict__ ids, const std::uint8_t* __restrict__ table, int vocab, int hidden,
-                     int row_bytes, std::uint16_t* __restrict__ out) {
+                     int row_bytes, std::uint16_t* __restrict__ out, DeviceFault fault) {
     const int t  = blockIdx.x;
     const int id = ids[t];
-    if (id < 0 || id >= vocab) { __trap(); }
+    if (id < 0 || id >= vocab) {
+        for (int i = threadIdx.x; i < hidden; i += blockDim.x) { out[static_cast<std::size_t>(t) * hidden + i] = 0; }
+        if (threadIdx.x == 0 && fault.word != nullptr) { *reinterpret_cast<volatile std::uint32_t*>(fault.word) = fault.value; }
+        return;
+    }
     const std::uint8_t* row = table + static_cast<std::size_t>(id) * row_bytes;
     for (int i = threadIdx.x; i < hidden / 8; i += blockDim.x) {
         float v[8];
@@ -80,7 +84,7 @@ __global__ void __launch_bounds__(kThreads)
 
 } // namespace
 
-void ggml_embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+void ggml_embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream, DeviceFault fault) {
     require(ids.data != nullptr && ids.dtype == DType::I32 && ids.is_contiguous(), "ids must be contiguous I32 [T]");
     require(out.data != nullptr && out.dtype == DType::BF16 && out.is_contiguous(), "out must be contiguous BF16 [H, T]");
     require(table.layout == QuantLayout::GgmlRows && table.qdata != nullptr, "table must be a ggml_rows_v1 Weight");
@@ -92,7 +96,7 @@ void ggml_embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStr
     const auto* id      = static_cast<const std::int32_t*>(ids.data);
     switch (table.qtype) {
     case QType::GGML_IQ4_XS:
-        embedding_kernel<QType::GGML_IQ4_XS><<<columns, kThreads, 0, stream>>>(id, data, vocab, hidden, row_bytes, o);
+        embedding_kernel<QType::GGML_IQ4_XS><<<columns, kThreads, 0, stream>>>(id, data, vocab, hidden, row_bytes, o, fault);
         break;
     default:
         // Other formats' products can exceed 24 significant bits (Q6_K), so they would need the

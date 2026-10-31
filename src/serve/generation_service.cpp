@@ -371,6 +371,7 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     engine_options.vram_past_budget         = options.vram_past_budget;
     engine_options.expert_tail_skip         = options.expert_tail_skip;
     engine_options.expert_a4_activations    = options.expert_a4_activations;
+    engine_options.expert_a16_activations   = options.expert_a16_activations;
     engine_options.a8_activations           = options.a8_activations;
     engine_options.embedding_host           = options.embedding_host;
     engine_options.max_concurrency          = options.max_concurrency;

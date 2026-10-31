@@ -212,6 +212,12 @@ How failures end:
   in-process: the server prints `CUDA_CHECK(...) failed` with the error and aborts (a non-zero
   status other than 2), without final request-log records for the requests in flight.
 
+The listener's port is its own: a second server cannot bind it beside a running one (Windows sets
+`SO_EXCLUSIVEADDRUSE`, which also refuses a wildcard bind beside another program's `127.0.0.1`
+listener; Linux sets `SO_REUSEADDR` but not `SO_REUSEPORT`). A restart binds at once after a stop. A
+port in use stops the start before the model loads, with `cannot bind HOST:PORT: the port is in use
+...`, and status 1.
+
 `infernix-serve` exits with status 0 after an orderly stop (Ctrl+C or a termination signal), 130
 when a further Ctrl+C exits before that stop finished, 2 after an Engine-wide failure while
 serving, and 1 for an invalid command line, any startup, bind, warm-up or listen failure, or
@@ -455,14 +461,22 @@ On the unconstrained route, string parameters preserve function/tool-call marker
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
 so a standalone `</parameter>` ends a value only when whitespace and then another parameter, the
 function's closer, or the end of the output follow it; any other one is value text, such as a shell
-command that echoes the markup. An unmatched nested parameter opener, or a quoted closer that is
-followed by the next token, cannot be represented unambiguously and makes that tool-call region
-ordinary content. Later content is still examined:
+command that echoes the markup. When the call's own closers follow it and then other text that is
+not another call, a later closer that ends the call (before the next `<tool_call>` token) makes those
+closing lines value text: a file whose content documents the call format keeps them, and so does a
+command such as `echo '</parameter></function>'`. An unmatched nested parameter opener, or a quoted
+closer followed by another parameter's opener, cannot be represented unambiguously and makes that
+tool-call region ordinary content. Later content is still examined:
 the first tool-call region (any accepted marker form) that parses becomes the structured turn, and any
-quoted markup before it stays ordinary content. A marker inside a Markdown code fence (```` ``` ```` or
-`~~~`) or inline code of the answer is a quoted example and stays content even when it is a complete
-call; only the text before the marker decides, so streamed and complete responses agree. A marker
-after a closed fence, or after a sentence on the same line, still opens a call.
+quoted markup before it stays ordinary content. A marker inside Markdown code of the answer is a
+quoted example and stays content even when it is a complete call, on this route and on the
+constrained route below. Code follows CommonMark's rules without lists or block quotes: a
+```` ``` ```` or `~~~` fence, from its opening line until a line of the same character at least as
+long with nothing after it; an indented code block (four or more columns of indentation after a blank
+line, a heading or the start of the answer; right after a line of text an indented line continues
+that paragraph); and a code span, closed only by a backtick run of its opening length. Only the text
+before the marker decides, so streamed and complete responses agree. A marker after a closed fence,
+or after a sentence on the same line, still opens a call.
 
 By default the unconstrained parser keeps that all-or-nothing behaviour. With
 `--tolerant-tool-calls` the server recovers a call instead when the model adds a suffix after a
@@ -522,7 +536,8 @@ OpenAI `allowed_tools` supports `auto` and `required`. Selection changes generat
 while all declarations retain their original order in the prompt. Requests with tools enable
 **basic structural constraints by default**, including ordinary `auto` calls without `strict`.
 The model can answer normally or start a tool call; a call must use the model's tool framing and a
-declared function name.
+declared function name. A `<tool_call>` token inside Markdown code of the answer (the rules above)
+is a quoted example: the answer goes on as text and the token's spelling publishes as content.
 
 Non-strict parameter names and order remain open. Their schema supplies the existing value
 normalization hints; it is not compiled as a strict constraint. Open objects, root unions, and
@@ -554,7 +569,12 @@ that lists the string `"null"` beside null is rejected, since its raw text is th
 values use JSON; any other top-level string/non-string union (such as string/integer) is rejected
 because the Qwen parameter format cannot distinguish those branches. Such unions inside JSON objects
 or arrays are supported.
-Raw values cannot contain the delimiter `\n</parameter>`; unsatisfiable required values are rejected.
+A raw value holds the delimiter `\n</parameter>` only inside the whole call's closing lines
+(`\n</parameter>\n</function>\n</tool_call>`) that more value text follows, as in a file that documents
+the call format: the call ends where the output then ends or the next call's token begins, so a
+streamed call's last fragment arrives with that next token or with the end of the turn. A value
+cannot hold `\n</parameter>` followed by a parameter opener; a string with a length bound or a pattern
+cannot hold the closing lines either. Unsatisfiable required values are rejected.
 Integer arguments use signed 64-bit values; number arguments use finite binary64-compatible
 representations. Unsupported schemas fail with HTTP 400 before generation.
 
@@ -587,8 +607,9 @@ role changes: the text, the number of turns and their positions stay as they arr
 leading system turn is never touched, so the conversation's prefix-cache anchor is unchanged. A
 template that refuses a system turn at every position is stating its own rule about instructions
 rather than placing one, and the request fails as that template asks. The lowered turn count is
-`instruction_role_lowerings` in the preparation block of `--request-log-jsonl`, and both
-`infernix-serve` and `infernix` state the lowering once at startup. Pass
+`instruction_role_lowerings` in the preparation block of `--request-log-jsonl`; `infernix-serve` logs
+a `chat template` line at info the first time a request has a lowered turn, and both `infernix-serve`
+and `infernix` list the roles the loaded template lowers at startup with `--log-level debug`. Pass
 `--chat-template tools/chat_templates/qwen3_8.jinja` to render every turn under its real role. A
 lowered turn counts as a user query for a template that selects its thinking history from the last
 user turn, so `preserve_thinking: false` can drop earlier `<think>` blocks that the maintained
@@ -1644,8 +1665,9 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--lossless` | run the lossless route: every operation of the model's Hugging Face forward pass computed exactly and rounded once to the dtype it has there (weights decoded exactly, sums exact, logits correctly rounded to `--logits-dtype`, FP32 by default), so a request's output depends on the request and the artifact alone: not on the build, the prefill chunk, prefill or decode, other requests, the prefix cache or preemption. Text requests with `--kv-dtype bf16` (whose pages then hold V as BF16) and no speculation; no fast path runs, so it is slower than the reproducible route. Sampled tokens are drawn by Gumbel-max keyed by the seed, position and token ([definition](maintainer/lossless-route.md)) | off |
 | `--fast-path NAME` | also run this fast path (a name from the [registry](maintainer/model-quality.md#67-fast-path-registry)), qualified for the configuration or not; repeatable. For qualification and timing runs (with `--reproducible`, it times one path against the reproducible route): a path that cannot apply to the loaded model fails startup | none |
 | `--expert-a4-activations` | [nvidia/Qwen3.8-Flash-Next-FP4-Local](qwen3_8-flash-next.md#nvidia-fp4-local-checkpoint) only: run the routed experts with 4-bit NVFP4 activations (W4A4) at the activation scales NVIDIA calibrated for this checkpoint, instead of the 16-bit activations NVIDIA serves it with. Changes the output (a saved prefix-cache file from the other setting is not loaded). Every other artifact refuses it: their experts' arithmetic is fixed by the conversion | off: 16-bit expert activations |
-| `--a8-activations` | Approximate: 8-bit activations instead of a projection's own arithmetic where that measured faster (a route stays only where it does). Decode and verification calls: int8 codes with an FP32 scale per 32 values (as llama.cpp's Q8_1) in a GGUF import's dense projections (calls of up to 31 columns) and in routed experts (GGUF blocks, NVFP4 W4A16 banks; calls of up to 128 columns) with their CPU-served misses. Prefill calls: on the same codec, a GGUF import's dense projections (32 or more columns) and those routed experts (more than 128 columns, in place of `expert-a4-residual`'s A4 terms where that runs); a groupwise Q4 MLP gate/up with int8 activations per token (the groupwise 27B artifacts with Q4 gate/up; 256 or more columns); MXFP8 dense projections with two E4M3 terms per 32 values (NVIDIA FP4-Local). Every other call keeps its route: the Q8, FP8, NVFP4 and BF16 dense projections (the NVFP4 27B's FP8 and NVFP4 sites already take the 8- and 4-bit activations their artifact permits), resident experts, and W4A4 and block-FP8 experts ([guide](qwen3_8-flash-next.md#a8-activations)). Changes the output (a saved prefix-cache file from the other setting is not loaded); `--reproducible`, `--lossless` and artifacts with none of these routes refuse it (the NVFP4 Qwen3.8-27B, the Qwen3.6-35B-A3B, Flash-Next Dense8 and the official FP8 import among them) | off |
-| `--embedding-host` | Qwen3.5-family artifacts: keep the token embedding in pinned host memory and read its rows zero-copy, as artifacts with offloaded experts always do, so its VRAM (1.18 GiB on the 27B) goes to the KV and prefix caches. Same output; a prompt chunk reads its rows over PCIe | off: in VRAM |
+| `--a16-activations` | Qwen3.8-Flash-Next artifacts whose routed experts are NVIDIA's W4A4 NVFP4 (Dense8 and recipe A): run them with 16-bit activations, the weight-only banks' exact arithmetic, instead of the 4-bit activations the checkpoint specifies at NVIDIA's calibrated scales. Changes the output, and the engine warns at launch: the default follows NVIDIA's specification and reads long prompts faster (Dense8, RTX 5090, 2026-10-31: 128K prompts 16.7 s against 12.2 s; decode rounds 2-6 % faster; [guide](qwen3_8-flash-next.md#a16-activations)). Artifacts whose experts already run 16-bit accept it unchanged; `--expert-a4-activations`, `--a8-activations` and `--lossless` refuse it | off |
+| `--a8-activations` | Approximate: 8-bit activations instead of a projection's own arithmetic where that measured faster (a route stays only where it does). Decode and verification calls: int8 codes with an FP32 scale per 32 values (as llama.cpp's Q8_1) in a GGUF import's dense projections (calls of up to 31 columns) and in routed experts (GGUF blocks, NVFP4 W4A16 banks; calls of up to 128 columns) with their CPU-served misses. Prefill calls: on the same codec, a GGUF import's dense projections (32 or more columns) and those routed experts (more than 128 columns, in place of `expert-a4-residual`'s A4 terms where that runs); a groupwise Q4 MLP gate/up with int8 activations per token (the groupwise 27B artifacts with Q4 gate/up; 256 or more columns); MXFP8 dense projections with two E4M3 terms per 32 values (NVIDIA FP4-Local). Every other call keeps its route: the Q8, FP8, NVFP4 and BF16 dense projections (the NVFP4 27B's FP8 and NVFP4 sites already take the 8- and 4-bit activations their artifact permits), resident experts, and block-FP8 experts; NVIDIA's W4A4 experts (Dense8, recipe A) take the 8-bit route in place of their 4-bit one, with a launch warning (on Dense8 it decodes 5-9 % faster but reads long prompts 28 % slower) ([guide](qwen3_8-flash-next.md#a8-activations)). Changes the output (a saved prefix-cache file from the other setting is not loaded); `--reproducible`, `--lossless` and artifacts with none of these routes refuse it (the NVFP4 Qwen3.8-27B, the Qwen3.6-35B-A3B and the official FP8 import among them) | off |
+| `--embedding-host` | Qwen3.5-family artifacts: keep the token embedding in pinned host memory and read its rows zero-copy, as artifacts with offloaded experts always do, so its VRAM (1.18 GiB on the 27B) goes to the KV and prefix caches. Same output; a prompt chunk reads its rows over PCIe. With `--vision-offload on` the encode window then borrows only the output head and whichever proposal head and MTP drafter the artifact has, so an image whose window needs more is refused (on the 27B the largest image `--vision-max-merged 12288` admits still fits) | off: in VRAM |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | `on` |
 | `--log-colours on\|off` | colour the console statistics lines; never applies to file logs | `off` |

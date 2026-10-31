@@ -375,10 +375,18 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   (Dense8, INT8 KV, RTX 5090, 2026-10-16: 32K prompts 5,570 / 9,640 / 11,210 tok/s at chunks
   1,024 / 4,096 / 16,384, 64K prompts 5,700 / 9,890 / 11,270; tg512 unchanged; 26 fewer expert
   frames of ~8,560). A smaller `--prefill-chunk` only shrinks the prefill workspace. A long
-  prompt's prefill workspace is lent from the expert cache; a chunk whose workspace the cache could
-  never lend (more than three quarters of its frames, e.g. 65,536 tokens under the SSD tier, ~27
-  GiB) is halved at startup until it can, with a warning, since the output does not depend on the
-  chunk.
+  prompt's prefill workspace is lent from the expert cache (at most three quarters of the frames of
+  its largest frame pool; a GGUF import keeps a pool per record size), which also gives its frames to
+  the KV pool as contexts grow. A chunk whose workspace the cache cannot lend is cut at startup to
+  the widest one it can (a multiple of 128 tokens), with a warning: 65,536 tokens under the SSD tier
+  wanted ~27 GiB, and the IQ3_S import's 16,384 does not fit on a 32 GB card. A prompt whose
+  contexts have grown since runs its calls at the widest chunk the cache lends then. Calls of
+  different widths can round differently, so the chunk can change a near-tie token.
+  `--reproducible` keeps one chunk: the one the cache lends with every lane's context full (a lower
+  `--max-context` or `--max-concurrency` leaves it wider), sized as if 3 GiB of VRAM were in use
+  before loading, so the same options on the same GPU always get the same chunk. If other programs
+  hold more and the cache cannot lend that chunk, a warning names the narrower one this launch uses;
+  `--prefill-chunk` at that value pins it on every launch.
 - **`--spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto
   --lm-head-draft` (recommended)** drafts with Inco AI's DFlash2 drafter, a separate 776 MB
   companion artifact ([Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix)) that runs beside any Flash-Next
@@ -528,12 +536,16 @@ If Windows will not lock the table, a warning says so: it still serves rows, but
 pressure part of it may be paged out.
 The rows are the same bytes either way, so outputs do not change.
 
-A table read from its volume is timed at startup with a few hundred random 4 KiB reads, one at a
-time (about a second at most), and logged at debug as `n-gram volume read probe: N reads/s`. Below 15,000
-reads per second (healthy drives measured 17,000 to 80,000 here and 230,000 on a Samsung 9100 PRO;
-DRAM-less SSDs 300 to 5,700 in other users' logs) the line becomes a warning: a long prompt can spend
-minutes reading n-gram rows, and `--ngram-residency ram` (when the experts fit beside the table) or a
-faster drive fixes it. The probe only reports; it never changes where the table lives.
+A table read from its volume is timed at startup with up to 16,384 random 4 KiB reads, issued the way
+a prompt chunk reads its rows (8 threads with 16 reads in flight each; milliseconds on a fast drive, a
+few seconds at most on a slow one), and logged
+at debug as `n-gram volume read probe: N reads/s`. A 128K-token prompt reads about 1.27M blocks; a
+Samsung 990 PRO and an Optane P5800X both read about 1.1M a second this way and prefilled at the same
+speed. Below 200,000 reads per second, where a 100K-token prompt spends 5 s or more reading rows, the
+line becomes a warning with that estimate; `--ngram-residency ram` (when the experts fit beside the
+table) or a faster drive fixes it. Reads one at a time measure the drive's latency, which the engine
+never waits on alone: they put a 990 PRO at 12,000-17,000 a second, which is why earlier builds warned
+about healthy drives. The probe only reports; it never changes where the table lives.
 
 ## N-gram table formats
 
@@ -616,8 +628,9 @@ leading System message is never touched (so the ordinary single leading System b
 conversation's prefix-cache anchor, stays byte-identical). The text, the number of turns and their
 positions stay as they arrived, only the role changes, so such a request never fails on the
 template. Each generation request shows its lowered turns as `instruction_role_lowerings` in the
-preparation block of `--request-log-jsonl`, and both programs state once at startup which roles
-the loaded template lowers. One consequence to know: a lowered turn counts as a user query for a
+preparation block of `--request-log-jsonl`; `infernix-serve` says so at info the first time a request
+has such a turn (most clients send one leading System message and never do), and both programs list
+the roles the loaded template lowers at startup with `--log-level debug`. One consequence to know: a lowered turn counts as a user query for a
 template that takes its thinking history from the last user turn, so `preserve_thinking: false` can
 then drop earlier `<think>` blocks that `qwen3_8.jinja` keeps. Passing
 `--chat-template tools/chat_templates/qwen3_8.jinja` (the file is also in the Windows release
@@ -868,16 +881,33 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
     MXFP8 dense projections take two E4M3 terms per 32 activation values (`fp8-a8-pair-block32`'s route,
     in place of `f16-accumulate-prefill`). Recipe C's FP8 dense projections take those two terms in
     prefill by default already.
+  - Recipes A and B (Dense8): NVIDIA's W4A4 experts load as 16-bit banks (as with `--a16-activations`)
+    and take the 8-bit route in place of their 4-bit one, and the engine warns at launch that the
+    default follows NVIDIA's specification.
   - Every other call keeps its route: the Q8, FP8 and BF16 dense projections and heads in decode (their
-    8-bit routes were slower than the exact ones and were removed), the MTP drafter's experts, and W4A4
-    and block-FP8 experts (with expert-a4-residual-decode on, the W4A16 experts keep its two A4 terms in
-    decode and their exact or A4 wide routes in prefill).
+    8-bit routes were slower than the exact ones and were removed), the MTP drafter's experts, FP4-Local's
+    experts under `--expert-a4-activations`, and block-FP8 experts (with expert-a4-residual-decode on, the
+    W4A16 experts keep its two A4 terms in decode and their exact or A4 wide routes in prefill).
   - The output changes; `--reproducible` and `--lossless` refuse it, as does an artifact with none of
-    these routes (recipes A and B and the official FP8 artifact).
+    these routes (the official FP8 artifact).
   - Measured 2026-10-27 (decode, RTX 5090): IQ3_S +15.8 % after a 16K prompt and +14.1 % in the A/B;
-    FP4-Local +2.5 % and the uncensored NVFP4 +1.5 % with the since-removed dense routes still on (the
-    flag as it stands is not re-measured). The prefill routes are not measured yet. None is
-    quality-tested yet ([design §19.3.31](maintainer/qwen3_8-flash-next-design.md)).
+    FP4-Local +2.5 % and the uncensored NVFP4 +1.5 % with the since-removed dense routes still on. None
+    is quality-tested yet ([design §19.3.31](maintainer/qwen3_8-flash-next-design.md)).
+  - Measured 2026-10-31 (RTX 5090, INT8 KV, DFlash2 auto, one request, 1,024 output tokens; the README
+    benchmark's prompts): IQ3_S reaches the first token 7 % sooner at 8K, 23 % at 128K and 22 % at
+    250K (13.99 against 18.10 s at 128K) and decodes level at 8K, 5 % faster at 128K and 11 % at 250K.
+    Dense8 runs 4 %, 7 % and 1 % more decode rounds a second at 8K, 128K and 250K (output 9 %, 13 % and
+    36 % faster, partly from different text), but its 16-bit-bank prefill reads 128K and 250K prompts
+    28 % slower than its 4-bit route (15.53 against 12.16 s at 128K). In the agentic replay (three seeds)
+    it decodes 5.8 % faster and reads uncached prompts 15.7 % slower, the same wall time.
+- <a id="a16-activations"></a>**`--a16-activations`** (off by default) runs NVIDIA's W4A4 experts
+  (recipes A and B, Dense8) with 16-bit activations: the stored NVFP4 codes, block scales and
+  multipliers on the weight-only banks' exact arithmetic (design §16.2.1), the activation scales left
+  unread. The output changes, and the engine warns at launch. Measured 2026-10-31 on Dense8 (as above):
+  5 %, 6 % and 2 % more decode rounds a second than the 4-bit route at 8K, 128K and 250K (the 16-bit
+  banks' tensor-core narrow kernels), the first token level at 8K but 38 % and 37 % later at 128K and
+  250K (16.73 against 12.16 s at 128K), since only the 4-bit route reads the prompt on FP4 tensor cores. Artifacts whose experts already run 16-bit accept it unchanged;
+  `--expert-a4-activations`, `--a8-activations` and `--lossless` refuse it.
 - On a system without CUDA virtual memory management the cache cannot resize: the headroom with a
   display is then 1 GiB, and a warning names the headroom to set when free VRAM runs short.
 - `--kv-capacity auto` means `--max-context` x `--max-concurrency`, the same as omitting it.
@@ -890,7 +920,7 @@ warms up over the first few hundred tokens of a session.
 The speed figures in this guide were measured before 2026-10-07 on an artifact converted from
 `RadixArk/Qwen3.8-Flash-Next-NVFP4` instead of NVIDIA's checkpoint. Re-measured on NVIDIA's, the
 README's context-length decode came out 1.6-4.1 % lower and the agentic replay level; the
-[README benchmarks](../README.md#qwen38-flash-next-nvfp4-infernix-vs-strata-and-strata-nvfp4) are the current figures.
+[README benchmarks](../README.md#qwen38-flash-next-nvfp4-infernix-vs-strata-strata-nvfp4-and-basalt) are the current figures.
 Recipe A (bit-exact) decodes about 18 % slower than recipe B and reaches the first token 6-8 %
 later at 8K, level from 128K (the bit-exact
 [model card's performance table](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix#performance)).

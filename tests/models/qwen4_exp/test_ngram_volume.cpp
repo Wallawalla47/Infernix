@@ -267,14 +267,17 @@ int main() {
         check(!volume.cached(with_new), "cached() reports a row not yet read");
         check(!volume.cached(std::vector<std::uint32_t>{static_cast<std::uint32_t>(kRows)}), "cached() rejects a row past the table");
 
-        // The startup read-rate probe times real reads and leaves the row cache and counters alone;
-        // a zero time limit stops it after its first read.
+        // The startup read-rate probe times real reads on the large-call route and leaves the row cache
+        // and counters alone; a zero time limit stops it after its first round.
         before                  = volume.counters();
         const auto probe        = volume.probe_reads(64, 60.0);
+        const auto rounds       = volume.probe_reads(1000, 60.0);
         const auto limited      = volume.probe_reads(1'000'000, 0.0);
         check(probe.reads == 64 && probe.seconds > 0.0 && probe.reads_per_second() > 0.0,
               "the read probe completes its reads and times them");
-        check(limited.reads == 1, "the read probe stops at its time limit");
+        check(rounds.reads == 1000, "the read probe completes a count that is not a whole number of rounds");
+        check(limited.reads == q4::NgramVolume::kReadThreads * q4::NgramVolume::kParallelInFlight,
+              "the read probe stops at its time limit after its first round");
         check(volume.counters().rows == before.rows && volume.counters().reads == before.reads &&
                   volume.counters().hits == before.hits && volume.cached(many) && !volume.cached(with_new),
               "the read probe leaves the counters and the row cache unchanged");

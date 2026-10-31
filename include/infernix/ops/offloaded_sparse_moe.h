@@ -151,9 +151,9 @@ void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& ro
 /// Calls of at least wide_from columns (prefill; 0: none) take wide_jobs as their cap instead.
 /// moe_experts returns after placing the host's outputs. The arithmetic is the same exact W4A4,
 /// so where an expert is computed never changes a bit. The wait lasts as long as the host's
-/// heartbeat word keeps changing; when it stops for MoeExpertSource::heartbeat_timeout_ns the call writes
-/// kErrorHostSilent to the source's error word and leaves its CPU outputs unwritten (without an
-/// error word, or without a heartbeat after 2 s, it traps).
+/// heartbeat word keeps changing; when it stops for MoeExpertSource::heartbeat_timeout_ns (2 s without
+/// a heartbeat) the call writes kErrorHostSilent to the source's error word and leaves its CPU outputs
+/// unwritten; without an error word that goes unreported, as the fetch channel's failures do.
 struct MoeCpuChannel {
     offloaded_moe::MissRequest* request = nullptr; // mapped host memory
     std::uint16_t* x                    = nullptr; // mapped BF16 [H, kMaxCpuXColumns]
@@ -287,6 +287,9 @@ struct MoeExpertSource {
     offloaded_moe::NarrowA16 narrow_a16 = offloaded_moe::NarrowA16::kExact;
     // With kLossless: the design reference's expert activations (offloaded_moe::LosslessExpertDesign).
     offloaded_moe::LosslessExpertDesign lossless_design = offloaded_moe::LosslessExpertDesign::kNone;
+    // W4A4 banks whose every expert shares its gate and up input scales (every NVIDIA export): their narrow jobs
+    // then take the tensor-core narrow kernels (one A4 x per entry); otherwise the one-column kernels.
+    bool a4_shared_input = false;
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
     MoeCpuChannel cpu;
