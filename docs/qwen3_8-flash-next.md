@@ -890,7 +890,7 @@ warms up over the first few hundred tokens of a session.
 The speed figures in this guide were measured before 2026-10-07 on an artifact converted from
 `RadixArk/Qwen3.8-Flash-Next-NVFP4` instead of NVIDIA's checkpoint. Re-measured on NVIDIA's, the
 README's context-length decode came out 1.6-4.1 % lower and the agentic replay level; the
-[README benchmarks](../README.md#qwen38-flash-next-nvfp4-infernix-vs-strata-and-strata-nvfp4) are the current figures.
+[README benchmarks](../README.md#qwen38-flash-next-nvfp4-infernix-vs-strata-strata-nvfp4-and-basalt) are the current figures.
 Recipe A (bit-exact) decodes about 18 % slower than recipe B and reaches the first token 6-8 %
 later at 8K, level from 128K (the bit-exact
 [model card's performance table](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix#performance)).
