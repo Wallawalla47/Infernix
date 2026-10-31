@@ -2455,7 +2455,7 @@ __global__ void __launch_bounds__(kThreads)
     if (threadIdx.x == 0) {
         // The wait lasts while the host's heartbeat changes (an SSD-served job may take seconds);
         // without a heartbeat it is bounded at 2 s. A silent host fails the call through its error
-        // word, or traps when it has none.
+        // word (unreported without one), never a trap: that would lose the context.
         const auto* done  = reinterpret_cast<const volatile std::uint32_t*>(source.cpu.done);
         const auto* beat  = reinterpret_cast<const volatile std::uint32_t*>(source.cpu.heartbeat);
         std::uint32_t seen = beat != nullptr ? *beat : 0;
@@ -2469,7 +2469,6 @@ __global__ void __launch_bounds__(kThreads)
                 seen  = *beat;
                 since = now;
             } else if (now - since > limit) {
-                if (beat == nullptr || source.error == nullptr) { asm volatile("trap;"); }
                 report_error(source, offloaded_moe::kErrorHostSilent);
                 silent = true;
                 break;

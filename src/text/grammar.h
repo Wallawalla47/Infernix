@@ -29,14 +29,19 @@ struct ReasoningFraming {
     std::string_view separator;
 };
 
-// A request's companion to its grammar for a rule the context-free grammar cannot express (Qwen
-// tool calls: a parameter name used once per call). It reads the tokens the matcher accepts and
-// refuses tokens from its own state; the session keeps both in one transaction.
+// A request's companion to its grammar for rules the context-free grammar cannot express (Qwen
+// tool calls: a parameter name used once per call; a call token quoted in Markdown code is text).
+// It reads the tokens the matcher accepts and refuses tokens from its own state; the session keeps
+// both in one transaction.
 class GrammarStateConstraint {
 public:
     virtual ~GrammarStateConstraint() = default;
     // Clears the bits of the tokens refused in the current state.
     virtual void filter(std::span<std::uint32_t> mask) = 0;
+    // Whether `token` is text the matcher does not see in the current state: the session advances
+    // only the companion with it. Only a token the matcher admits there (a token-level dispatch tag
+    // of free text) may be one, so the masks stay the matcher's.
+    [[nodiscard]] virtual bool literal(std::int32_t /*token*/) const noexcept { return false; }
     // Advances by one token; false (state unchanged) when the token is refused.
     [[nodiscard]] virtual bool accept(std::int32_t token) = 0;
     // The current state becomes the committed one; discard() returns to it.

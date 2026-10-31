@@ -7,6 +7,7 @@
 // walk's spans (none for a cut
 // between walk-eligible calls, one for a cut that leaves a narrow call inside the walk, one per
 // 65,536 tokens); Δ accounting against an independent enumeration of call widths; determinism;
+// the remaining calls planned again at a narrower chunk (segment_ends) keep the exact taps' ends;
 // refused inputs; Vision span membership. The oracle for
 // random plans re-derives the calls from the kept taps with a plain loop and re-runs the admission
 // rule with its own cost sum.
@@ -216,6 +217,24 @@ int main() {
                 ++bad;
                 check(false, "random plan F=" + std::to_string(F) + " n=" + std::to_string(n) + " c=" +
                                  std::to_string(c) + " taps=" + std::to_string(taps.size()));
+            }
+            // The remaining calls planned again at a narrower chunk from a call boundary (the default
+            // route's cut when the cache shrinks mid-prompt): the oracle's grid from there, every kept
+            // exact tap past it still ending a call.
+            const std::size_t done = std::uniform_int_distribution<std::size_t>(0, plan.ends.size() - 1)(rng);
+            const std::uint32_t from = done == 0 ? F : plan.ends[done - 1];
+            const std::uint32_t narrower = std::uniform_int_distribution<std::uint32_t>(1, c)(rng);
+            std::vector<std::uint32_t> remaining;
+            for (const auto& t : plan.taps) {
+                if (t.placement == pc::TapPlacement::Exact && t.position > from) { remaining.push_back(t.position); }
+            }
+            const std::vector<std::uint32_t> again = q4::segment_ends(from, n, narrower, remaining);
+            bool replanned = again == oracle_ends(from, n, narrower, remaining);
+            for (const std::uint32_t p : remaining) { replanned = replanned && contains(again, p); }
+            if (!replanned && bad < 5) {
+                ++bad;
+                check(false, "replanned F=" + std::to_string(from) + " n=" + std::to_string(n) + " c=" +
+                                 std::to_string(narrower) + " cuts=" + std::to_string(remaining.size()));
             }
         }
 

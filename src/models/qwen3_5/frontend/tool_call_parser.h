@@ -29,22 +29,46 @@ struct ParsedToolCallOutput {
     ToolCallParseDiagnostics diagnostics;
 };
 
-// The Markdown code state of answer text read so far: an open ``` or ~~~ fence, and the
-// backticks of the current paragraph. A tool-call marker of free output inside a fence or inline
-// code is a quoted example and stays text. Only the text before a marker decides, so streamed
-// and whole outputs agree.
+// The Markdown code state of answer text read so far, by CommonMark's code rules without container
+// blocks (lists, block quotes): a ``` or ~~~ fence, open from its opening line (up to three columns
+// of indentation, a run of at least three, and no backtick in a backtick fence's info string) until
+// a line of the same character, at least as long, with nothing after it; an indented code block
+// (four or more columns, after a blank line, a heading or the start of the text); and a code span of
+// the current paragraph, closed only by a backtick run of its opening length (a backslash outside a
+// span makes the next backtick text). A tool-call marker inside code is a quoted example and stays
+// text. Only the text before a marker decides, so streamed and whole outputs agree; the state is
+// fixed-size, so a copy costs nothing.
 class MarkdownCodeTracker {
 public:
     void feed(std::string_view text);
-    // Whether the next byte lies inside a code fence or inline code.
+    // Whether the next byte lies inside a fence (its opening line included), an indented code block
+    // or a code span.
     [[nodiscard]] bool in_code() const noexcept;
 
 private:
-    void end_line();
+    // Where the current line is: its indentation, then outside a fence an indented code line, the
+    // opening run of a possible fence (and its info string), the hashes of a possible heading (and
+    // its text), or paragraph text; inside a fence a possible closing run (and the blanks after it),
+    // or code.
+    enum class Line : std::uint8_t { Indent, Indented, Run, Info, Hashes, Heading, Text, Closer, CloserTail, Code };
 
-    std::string line_;            // the current, unfinished line
-    char fence_          = '\0'; // the open fence's character, '\0' when none is open
-    std::uint32_t ticks_ = 0;     // backticks of the current paragraph's finished lines
+    void byte(char c);
+    void end_line();
+    void text_byte(char c);
+    // The open span once the backtick run in progress ends (0: none).
+    [[nodiscard]] std::uint32_t open_span() const noexcept;
+
+    char fence_              = '\0';  // the open fence's character, '\0' when none is open
+    std::uint32_t fence_run_ = 0;     // its opening run
+    bool paragraph_          = false; // the last non-blank line was paragraph text (it takes no indented code)
+    std::uint32_t span_      = 0;     // the paragraph's open code span: its backtick run (0: none)
+    Line line_               = Line::Indent;
+    std::uint32_t indent_    = 0;     // the line's columns of leading spaces and tabs
+    char run_char_           = '\0';  // the character of the line's first run (Run, Info)
+    std::uint32_t run_       = 0;     // the length of that run, or of the hashes, or of a closing run
+    bool info_backtick_      = false; // a backtick in the info string (Info): no fence then
+    std::uint32_t ticks_     = 0;     // the backtick run in progress
+    bool escaped_            = false; // the previous byte was a backslash outside a span
 };
 
 // Parse Qwen's XML-like tool-call format. In tolerant mode, a complete function call is
@@ -85,7 +109,8 @@ public:
     // Feeds the next bytes of the generated content stream; `tool_call_tokens` are relative to
     // this piece. A token's bytes may continue in the next piece.
     [[nodiscard]] std::string feed(GeneratedText content);
-    // The constrained calls' steps read since the last take, in generation order.
+    // The constrained calls' steps read since the last take, in generation order. A call whose
+    // closing lines end the output completes in finish(), so take its last step after that.
     [[nodiscard]] std::vector<ToolCallDelta> take_call_deltas();
     // The assistant prefix a request continues is the client's text: each `<tool_call>` spelled
     // in it is the opener of the call it continues.

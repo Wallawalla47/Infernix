@@ -664,7 +664,10 @@ prefill route width-invariant; several are not (GDN: the decode update at one co
 kernel to 15, the chunked kernel from 16; Q8 dense SIMT to 8 columns, MMA tiles beyond; BF16 dense by
 width; QSA attention split or unsplit; the hyper-connection mix fused at decode widths), and a resume
 at a prompt's end left the cold bits (`infernix_qwen4_exp_resume_cold_real_test`: mean |dlogprob|
-0.0011). Width-invariant prefill routes would restore 16-token resumes (planned).
+0.0011). Width-invariant prefill routes would restore 16-token resumes (planned). Wide calls over one
+grid already are: prompts whose calls of 1,024 to 12,288 tokens start on the same grid and end in the
+same last call gave the same bits on every Flash-Next configuration and KV format
+(`infernix_qwen4_exp_prefill_width_real_test`, 2026-10-31; design, the prefill chunk fit).
 Its kernel path `q8-sliced-k` (below) couples requests too: its routes depend on the round's width;
 so does `ggml-bf16-prefill`, whose routes depend on a prompt's call boundaries and MoE grouping.
 

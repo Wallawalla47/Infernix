@@ -52,9 +52,11 @@ struct DFlash2ProposalCall {
 class DFlash2 {
 public:
     // `ring` holds one layer view per drafter layer (capacity = the window). `head` selects the
-    // proposal head (--lm-head-draft) or the text head; max_context bounds every frontier.
+    // proposal head (--lm-head-draft) or the text head; max_context bounds every frontier. An anchor
+    // outside the vocabulary writes kErrorTokenId to the Program's `error` word (ForwardExperts::error).
     DFlash2(const Parameters& parameters, const DFlash2Config& config, ProposalHead head, DeviceContext& device,
-            WorkspaceArena& work, std::vector<CyclicKVCacheLayerView> ring, std::uint32_t max_context);
+            WorkspaceArena& work, std::vector<CyclicKVCacheLayerView> ring, std::uint32_t max_context,
+            std::uint32_t* error);
 
     void materialize(const DFlash2ContextCall& call);
     void propose(const DFlash2ProposalCall& call);
@@ -85,6 +87,7 @@ private:
     WorkspaceArena& work_;
     std::vector<CyclicKVCacheLayerView> ring_;
     std::uint32_t max_context_ = 0;
+    std::uint32_t* error_      = nullptr;
 };
 
 } // namespace infernix::models::qwen4_exp::execution

@@ -978,6 +978,8 @@ public:
         vocab_         = dim(c_.vocab_size);
         token_domain_  = plan_.token_domain;
         chunk_         = plan_.chunk;
+        smallest_chunk_ = plan_.chunk;
+        nominal_chunk_ = plan_.chunk;
         mtp_k_         = plan_.mtp_k;
         dflash_k_      = plan_.dflash_k;
         max_width_     = plan_.max_width;
@@ -1192,12 +1194,15 @@ public:
             experts.split_events = overlap_.split_events;
         }
         // The prefill chunk the expert cache can lend a wide workspace for, from the frames the
-        // cache will start with (sized below with the same demand); before the SSD tier, whose
-        // tickets are sized by the chunk. A cache of several frame pools lends from one, which the
-        // check after the cache is sized accounts for.
+        // cache would start with now (sized below with the same demand, after the allocations
+        // between); before the SSD tier, whose tickets are sized by the chunk.
+        const std::int32_t planned_chunk = chunk_;
+        const std::size_t planned_work   = wide_work_;
         if (options_.expert_cache) {
-            const std::uint64_t frames = size_expert_frames(vram_->query(), expert_frame_demand(record_stride)).frames;
-            fit_wide_work_to_cache(frames - frames / 4, record_stride);
+            const VramDemand demand = expert_frame_demand(residency_->frame_bytes());
+            const VramSnapshot now  = vram_->query();
+            fit_wide_work_to_cache(size_expert_frames(now, demand).frames,
+                                   size_expert_frames(nominal_snapshot(now), demand).frames);
         }
         // The SSD expert tier (design §19.3.7): the banks were not pinned; RAM slots hold the
         // records the tier keeps and the rest are read from the artifact when a round needs them.
@@ -1255,8 +1260,9 @@ public:
             fetch_channel_ = std::make_unique<ops::offloaded_moe::FetchChannel>();
             tier.fetch     = fetch_channel_.get();
             // A layer walk's step calls ceil(layers / n) layers once per chunk of its n-chunk span (one
-            // tier round per step): at most layers + n - 1 layer calls.
-            tier.layer_calls = store->layers() + kWalkMaxTokens / static_cast<std::uint32_t>(std::max(chunk_, 1)) + 1U;
+            // tier round per step): at most layers + n - 1 layer calls, with the narrowest chunk the KV
+            // pool's growth cuts the default route's to.
+            tier.layer_calls = store->layers() + kWalkMaxTokens / static_cast<std::uint32_t>(std::max(smallest_chunk_, 1)) + 1U;
             // An expert stripe on a second drive: each record's tail is read from it while its head
             // is read from the artifact, at the same depth per drive.
             const ExpertStore* records = &*store;
@@ -1287,9 +1293,9 @@ public:
         // After the tier (whose pinned slots are the probe's source when the banks stay in the
         // artifact), before the CPU service and the split take the measured rate.
         measure_link();
-        expert_error_ = PinnedHostBuffer(64);
-        std::memset(expert_error_.data(), 0, 64);
-        experts.error = static_cast<std::uint32_t*>(expert_error_.data());
+        device_error_ = PinnedHostBuffer(64);
+        std::memset(device_error_.data(), 0, 64);
+        experts.error = static_cast<std::uint32_t*>(device_error_.data());
         // TEMPORARY (INFERNIX_TMP_REPLAY_BENCH): the replay bench's round clock and CPU-wait word.
         if (temporary_switches::integer("INFERNIX_TMP_REPLAY_BENCH", -1, -1, std::int64_t{1} << 40) >= 0) {
             replay_clock_ = std::make_unique<RoundClock>();
@@ -1405,7 +1411,7 @@ public:
                     .ggml_a8     = cpu_ggml_a8(),
                     .nvfp4_a8    = cpu_narrow_a16() == ops::offloaded_moe::NarrowA16::kA8,
                     .records     = tier_.get(), // tier mode: SSD-only jobs read through the tier
-                    // Reported when it happens; check_expert_error then stops the Engine with it.
+                    // Reported when it happens; check_device_error then stops the Engine with it.
                     .on_failure  = [this](const std::string& why) {
                         diagnostic("Qwen3.8-Flash-Next: the CPU expert service stopped serving misses: " + why,
                                    DiagnosticLevel::Error);
@@ -1449,9 +1455,26 @@ public:
             }
             sizing_.frames = grown.frames;
             start_vram_monitor(demand);
-            // The pool the workspace is lent from (one of several for a GGUF import's record sizes).
-            if (grown.frames > 0) {
-                fit_wide_work_to_cache(residency_->lend_capacity_bytes() / residency_->lend_pitch(), residency_->lend_pitch());
+            const std::uint32_t nominal = size_expert_frames(nominal_snapshot(sizing_.snapshot), demand).frames;
+            const std::uint64_t lends   = fit_wide_work_to_cache(grown.frames, nominal > slack ? nominal - slack : 0U);
+            if (chunk_ != planned_chunk) {
+                const bool narrows = options_.free_cache_resume && smallest_chunk_ < chunk_;
+                diagnostic("prefill chunk " + std::to_string(planned_chunk) + " needs " + std::to_string(planned_work >> 20) +
+                               " MiB of workspace, more than the expert cache can lend" +
+                               (options_.free_cache_resume ? "" : " with the KV pool at its capacity") + " (" +
+                               std::to_string(lends >> 20) + " MiB); prefilling at " + std::to_string(chunk_) + " tokens" +
+                               (narrows ? ", and down to " + std::to_string(smallest_chunk_) + " as contexts fill the KV pool" : ""),
+                           DiagnosticLevel::Warning);
+            }
+            if (options_.reproducible && options_.vram_in_use_before_load && chunk_ < nominal_chunk_) {
+                diagnostic("the expert cache is smaller than the one the reproducible route fits its prefill chunk to (" +
+                               std::to_string(*options_.vram_in_use_before_load >> 20) + " MiB of VRAM were in use before "
+                               "loading, against a nominal " + std::to_string(kNominalInUseBytes >> 20) +
+                               "): this launch prefills at " + std::to_string(chunk_) + " tokens instead of " +
+                               std::to_string(nominal_chunk_) + ", so its output can differ from a launch that fits " +
+                               std::to_string(nominal_chunk_) + " (free VRAM, or set --prefill-chunk " +
+                               std::to_string(chunk_) + " on every launch)",
+                           DiagnosticLevel::Warning);
             }
         }
         for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
@@ -2234,6 +2257,7 @@ public:
                 (lane.next_call < lane.calls.size() ? ", ending at " + std::to_string(lane.calls[lane.next_call]) : "") +
                 ", state " + std::to_string(lane.state_tokens) + ", prompt end " + std::to_string(lane.prefill_end) + ")");
         }
+        fit_calls_to_cache();
         if (const std::size_t end = walk_span_end(lane, index); end > lane.next_call) {
             walk_begin(lane, index, end);
             return walk_step(lane, index, start);
@@ -2296,7 +2320,7 @@ public:
                 const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
                 device_.synchronize();
             }
-            check_expert_error();
+            check_device_error();
             const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                     static_cast<std::uint64_t>(width));
             trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
@@ -2679,7 +2703,7 @@ public:
             const auto chunk = stage_mtp_chunk(lane, index, begin, static_cast<std::int32_t>(stride));
             run(1, static_cast<std::int32_t>(stride), 1, chunk ? &*chunk : nullptr);
             device_.synchronize();
-            check_expert_error();
+            check_device_error();
             trace_round(RouteTraceKind::ForcedTokens, 1, static_cast<std::int32_t>(stride), stride,
                         kDecodePromotionsPerLayer, static_cast<std::uint32_t>(begin));
             residency_->after_round(device_.stream, static_cast<std::int32_t>(stride), kDecodePromotionsPerLayer, {},
@@ -3317,12 +3341,13 @@ private:
     }
 
 public:
-    // After every synchronization of a round with MoE layers: a call that could not serve an expert
-    // (design §19.3.7: an unreadable record, a host service that stopped answering) left undefined
-    // outputs, so the round's requests fail and the engine keeps serving. Prefix-cache entries the
-    // round may have published are dropped when the lanes are released.
-    void check_expert_error() {
-        auto* word           = static_cast<volatile std::uint32_t*>(expert_error_.data());
+    // After every synchronization of a round: a call that could not serve an expert (design §19.3.7:
+    // an unreadable record, a host service that stopped answering), an n-gram gate whose rows were
+    // never published or a token id outside the vocabulary left undefined outputs, so the round's
+    // requests fail and the engine keeps serving (no device trap: the context survives). Prefix-cache
+    // entries the round may have published are dropped when the lanes are released.
+    void check_device_error() {
+        auto* word           = static_cast<volatile std::uint32_t*>(device_error_.data());
         std::uint32_t value  = *word;
         if (value == 0 && runtime::expert_offload::testing::take_expert_fault()) { value = EIO; } // layer 0
         if (value == 0) { return; }
@@ -3340,6 +3365,15 @@ public:
             }
         }
         const std::uint32_t code = value & 0xFFFFU;
+        if (code == execution::kErrorTokenId) {
+            throw runtime::RecoverableExecutionError("Qwen3.8-Flash-Next: a token id outside the vocabulary reached the "
+                                                     "token embedding");
+        }
+        if (code == execution::kErrorRowGateTimeout) {
+            throw runtime::RecoverableExecutionError(
+                "Qwen3.8-Flash-Next layer " + std::to_string(value >> 16U) + ": the n-gram rows were not published within " +
+                std::to_string(kPinnedGateTimeoutNs / 1000000000ULL) + " s (the host thread reading them stalled)");
+        }
         std::string what         = code == ops::offloaded_moe::kErrorUnservedRecord ? "an SSD-only expert had no path to it"
                                    : code == ops::offloaded_moe::kErrorHostSilent   ? "the CPU expert service stopped answering"
                                    : code == ops::offloaded_moe::kErrorFetchSilent  ? "the SSD expert tier's read agent stopped answering"
@@ -3455,6 +3489,9 @@ private:
     static constexpr std::int32_t kServedCallColumns = 8;
     // Prefill calls up to this many columns run in the static workspace; wider ones in the wide arena.
     static constexpr std::int32_t kStaticWorkColumns = 512;
+    // The grid a fitted prefill chunk lands on: --prefill-chunk's (serve_options), which also keeps the
+    // reproducible route's chunk on the GDN grid (kGdnGrid).
+    static constexpr std::int32_t kChunkFitGrid = 128;
 
     // A one-row call's lane as staged (for the residency's route predictor, INFERNIX_TMP_ROUTE_PROTECT).
     [[nodiscard]] std::span<const std::int32_t> staged_lane() const noexcept { return {host_lanes_.data(), 1}; }
@@ -4028,7 +4065,8 @@ private:
     // a call that waits for the device deadlocks the round. A kernel's first launch is one, as the
     // driver loads its code then and, with the process past its OS budget, waits for the device
     // to do so (the sampler and acceptance kernels queued here before 2026-10-30: the gate trapped
-    // after kPinnedGateTimeoutNs in 5 of 7 --vram-past-budget starts).
+    // after kPinnedGateTimeoutNs in 5 of 7 --vram-past-budget starts; since 2026-10-31 a gate past
+    // its bound fails the round with kErrorRowGateTimeout and the context survives).
     void read_behind_gate(Lane& lane, std::uint32_t word, std::size_t bytes, const std::function<void()>& read) {
         GateRelease release_gate{this, word, bytes};
         device_.flush();
@@ -4266,31 +4304,125 @@ private:
         return demand;
     }
 
-    // A prefill chunk whose wide workspace the expert cache could never lend (more than the three
-    // quarters of its frames serving may give up) would allocate it for every long prompt, which
-    // fails on a full card after admission (a 65,536-token chunk on the SSD tier wanted 27 GiB).
-    // Prefill then runs at the widest halving of the chunk that can be lent (or the static arena's
-    // width): its exact route is chunk-invariant, so only speed changes. The buffers planned for the
-    // wider chunk stay as they are. `lendable` counts frames of `stride` bytes the cache can lend (a
-    // cache of several frame pools lends from one: ExpertResidency::lend_capacity_bytes).
-    void fit_wide_work_to_cache(std::uint64_t lendable, std::uint64_t stride) {
-        if (wide_work_ == 0 || lendable == 0 || stride == 0) { return; }
-        const auto frames_for        = [&](std::size_t bytes) { return (bytes + stride - 1) / stride; };
-        if (frames_for(wide_work_) < lendable) { return; }
-        const std::int32_t requested = chunk_;
-        const std::size_t needed     = wide_work_;
-        std::int32_t chunk           = chunk_ / 2;
-        while (chunk > plan_.static_columns &&
-               frames_for(workspace_bytes(c_, options_, plan_, plan_.lanes, chunk)) >= lendable) {
-            chunk /= 2;
+    // The widest prefill chunk of at most `limit` columns whose wide workspace `fits`: `limit` itself,
+    // else the widest multiple of kChunkFitGrid below it, else the static arena's width. The workspace
+    // grows with the chunk, so the widest fitting width is the fastest one the cache can lend: on IQ3_S at
+    // one lane of 40,960 tokens, where 16,384 did not fit, the old halving's 8,192 prefilled a 32K prompt
+    // at 7,692 tok/s against 7,792 at the fitted 13,440 (2026-10-31).
+    template <typename Fits>
+    [[nodiscard]] std::int32_t widest_fitting_chunk(std::int32_t limit, const Fits& fits) const {
+        if (limit <= plan_.static_columns || fits(limit)) { return std::max(limit, plan_.static_columns); }
+        for (std::int32_t chunk = (limit - 1) / kChunkFitGrid * kChunkFitGrid; chunk > plan_.static_columns;
+             chunk -= kChunkFitGrid) {
+            if (fits(chunk)) { return chunk; }
         }
-        chunk_     = std::max(chunk, plan_.static_columns);
+        return plan_.static_columns;
+    }
+
+    // The expert frames the KV pool takes at most, grown from its base pages to its capacity (grow_kv:
+    // the bytes it maps, and a chunk per pool over so the pools unmap that much); none when either
+    // cannot resize.
+    [[nodiscard]] std::uint32_t kv_growth_frames() const {
+        if (!kv_vmm_ || !residency_->elastic()) { return 0; }
+        const std::uint64_t added  = kv_mapped_bytes(plan_, pool_->capacity_pages()) - kv_mapped_bytes(plan_, plan_.kv_base_pages);
+        const std::uint64_t stride = residency_->frame_bytes();
+        return static_cast<std::uint32_t>((added + residency_->pools() * ExpertResidency::kChunkBytes + stride - 1) / stride);
+    }
+
+    // The widest chunk of at most `limit` columns whose wide workspace a cache lending `lends` holds
+    // with a frame to spare.
+    [[nodiscard]] std::int32_t chunk_lent_by(std::int32_t limit, const ExpertResidency::LendCapacity& lends) const {
+        return widest_fitting_chunk(limit, [&](std::int32_t chunk) {
+            return lends.pitch != 0 &&
+                   (workspace_bytes(c_, options_, plan_, plan_.lanes, chunk) + lends.pitch - 1) / lends.pitch < lends.frames;
+        });
+    }
+
+    // A prefill chunk whose wide workspace the expert cache could not lend would allocate it for long
+    // prompts, which fails on a full card after admission (a 65,536-token chunk on the SSD tier wanted
+    // 27 GiB). Prefill then runs at the widest chunk the cache of `frames` frames lends; the buffers
+    // planned for the wider chunk stay as they are. The cache shrinks as the KV pool grows
+    // (kv_growth_frames), smallest at the pool's capacity. Without free cache resume (the reproducible
+    // route; an Engine without prefix reuse, as infernix_bench's) the chunk never moves and is fitted
+    // there; with it, to the cache now, cut at a prompt's calls as the pool grows (fit_calls_to_cache):
+    // the chunk the full pool leaves cost a 32K prompt 3.0 % at 4 lanes of 262K on IQ3_S (5,120
+    // against 8,192 tokens, 2026-10-31). Several prefill routes round with the call's width
+    // (model-quality.md 6.7), so the reproducible route's chunk is fitted to the `nominal` frames
+    // (nominal_snapshot) too, and the narrower chunk taken. A cache of several frame pools (a GGUF
+    // import's record sizes) lends from one (ExpertResidency::lend_capacity). Returns the bytes the
+    // cache lends for the chunk.
+    std::uint64_t fit_wide_work_to_cache(std::uint32_t frames, std::uint32_t nominal) {
+        if (wide_work_ == 0 || frames == 0) { return 0; }
+        const std::uint32_t growth = kv_growth_frames();
+        const auto now             = residency_->lend_capacity(frames);
+        const auto smallest        = residency_->lend_capacity(frames - std::min(frames, growth));
+        const auto nominal_lends   = residency_->lend_capacity(nominal - std::min(nominal, growth));
+        smallest_chunk_            = chunk_lent_by(std::min(smallest_chunk_, chunk_), smallest);
+        if (options_.reproducible) {
+            nominal_chunk_  = chunk_lent_by(nominal_chunk_, nominal_lends);
+            smallest_chunk_ = std::min(smallest_chunk_, nominal_chunk_);
+        }
+        chunk_     = options_.free_cache_resume ? chunk_lent_by(chunk_, now) : smallest_chunk_;
         wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
-        diagnostic("prefill chunk " + std::to_string(requested) + " needs " + std::to_string(needed >> 20) +
-                       " MiB of workspace, more than the expert cache can lend (" +
-                       std::to_string((lendable * stride) >> 20) + " MiB); prefilling at " + std::to_string(chunk_) +
-                       " tokens (the output is the same)",
-                   DiagnosticLevel::Warning);
+        const bool nominal_binds = options_.reproducible && chunk_ == nominal_chunk_;
+        const auto& lent         = options_.free_cache_resume ? now : nominal_binds ? nominal_lends : smallest;
+        return lent.frames * lent.pitch;
+    }
+
+    // The reproducible route fits its chunk to the frames a launch would size with kNominalInUseBytes in
+    // use before loading, an attached display's headroom and no OS budget below free memory: a function
+    // of the GPU, the options and the artifact, not of what other programs held at launch. Without the
+    // launch's figure (a Program built outside an Engine) the snapshot stands.
+    static constexpr std::uint64_t kNominalInUseBytes = 3ULL << 30;
+    [[nodiscard]] VramSnapshot nominal_snapshot(VramSnapshot s) const noexcept {
+        if (!options_.vram_in_use_before_load) { return s; }
+        const std::uint64_t used = *options_.vram_in_use_before_load;
+        s.device_free = used >= kNominalInUseBytes ? s.device_free + (used - kNominalInUseBytes)
+                                                   : s.device_free - std::min(s.device_free, kNominalInUseBytes - used);
+        s.has_budget  = false;
+        s.display     = DisplayState::Attached;
+        return s;
+    }
+
+    // A prompt's calls planned at a chunk the cache no longer lends: the KV pool grew since its binding
+    // (its own pages; another lane's; a queued request's, for which hybrid_reclaim took the leases back
+    // between calls, issue #24). Before a call lends its workspace, every prefilling lane's remaining
+    // calls are planned again at the widest chunk the cache lends now (prefix::segment_ends, cut at
+    // their exact taps), as is the chunk of later bindings (refit_chunk_for_binding raises it again).
+    // Default route only, where calls may end anywhere.
+    void fit_calls_to_cache() {
+        if (!options_.free_cache_resume || !options_.expert_cache || wide_work_ == 0 || residency_->frames() == 0) { return; }
+        if (stream_lease_.valid() || work_lease_.valid() || wide_fallback_.p != nullptr || wide_active_) { return; }
+        const std::uint64_t pitch    = residency_->lend_pitch();
+        const std::uint64_t lendable = residency_->lendable_bytes();
+        const std::size_t need       = pending_wide_bytes(0);
+        if (need == 0 || need + pitch <= lendable) { return; }
+        const std::int32_t chunk = widest_fitting_chunk(chunk_, [&](std::int32_t width) {
+            return workspace_bytes(c_, options_, plan_, plan_.lanes, width) + pitch <= lendable;
+        });
+        diagnostic("prefill chunk " + std::to_string(chunk_) + " -> " + std::to_string(chunk) +
+                       " for the prompts in progress: the expert cache can lend " + std::to_string(lendable >> 20) +
+                       " MiB now",
+                   DiagnosticLevel::Debug);
+        chunk_     = chunk;
+        wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
+        std::vector<std::uint32_t> cuts;
+        for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
+            Lane& lane = lanes_[i];
+            if (lane.phase != Phase::Prefill || lane.next_call >= lane.calls.size()) { continue; }
+            // A call in flight has advanced next_call; its end is where the next call starts.
+            const std::uint32_t from = lane.next_call > 0 ? lane.calls[lane.next_call - 1] : lane.state_tokens;
+            const std::uint32_t end  = lane.calls.back();
+            cuts.clear();
+            for (const runtime::prefix_cache::PlannedTap& tap : lane.prefix.taps) {
+                if (tap.placement == runtime::prefix_cache::TapPlacement::Exact && tap.position > from && tap.position < end) {
+                    cuts.push_back(tap.position);
+                }
+            }
+            const auto ends = prefix::segment_ends(from, end, static_cast<std::uint32_t>(chunk_), cuts);
+            lane.calls.resize(lane.next_call);
+            lane.calls.insert(lane.calls.end(), ends.begin(), ends.end());
+        }
     }
 
     // The expert cache can shrink after load (elastic KV growth, the VRAM monitor, a vision loan) until
@@ -4310,15 +4442,12 @@ private:
         }
         const std::uint64_t pitch    = residency_->lend_pitch();
         const std::uint64_t lendable = residency_->lendable_bytes();
-        const auto fits              = [&](std::int32_t chunk) {
-            return workspace_bytes(c_, options_, plan_, plan_.lanes, chunk) + pitch + reserved <= lendable;
-        };
-        std::int32_t chunk = loaded_chunk_;
-        while (chunk > plan_.static_columns && !fits(chunk)) { chunk /= 2; }
-        chunk = std::max(chunk, plan_.static_columns);
+        const std::int32_t chunk     = widest_fitting_chunk(loaded_chunk_, [&](std::int32_t width) {
+            return workspace_bytes(c_, options_, plan_, plan_.lanes, width) + pitch + reserved <= lendable;
+        });
         if (chunk == chunk_) { return; }
         diagnostic("prefill chunk " + std::to_string(chunk_) + " -> " + std::to_string(chunk) + ": the expert cache can lend " +
-                       std::to_string(lendable >> 20) + " MiB now (the output is the same on the exact route)",
+                       std::to_string(lendable >> 20) + " MiB now",
                    DiagnosticLevel::Debug);
         chunk_     = chunk;
         wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
@@ -4928,7 +5057,7 @@ private:
         CUDA_CHECK(cudaMemcpyAsync(spec_host(spec_layout_.licensed), licensed.data,
                                    4ULL * (spec_layout_.commit - spec_layout_.licensed), cudaMemcpyDeviceToHost, s));
         device_.synchronize();
-        check_expert_error();
+        check_device_error();
 
         const std::int32_t* licensed_host = spec_host(spec_layout_.licensed);
         for (std::int32_t b = 0; b < batch; ++b) {
@@ -5639,7 +5768,7 @@ private:
         }
         CUDA_CHECK(cudaMemcpyAsync(host_sampled_.data(), sampled_.p, 4ULL * batch, cudaMemcpyDeviceToHost, s));
         device_.synchronize();
-        check_expert_error();
+        check_device_error();
         const auto* tokens = static_cast<const std::int32_t*>(host_sampled_.data());
         for (std::int32_t b = 0; b < batch; ++b) { pending_tokens_[b] = tokens[b]; }
         if (constrained) {
@@ -5670,6 +5799,12 @@ private:
 
     std::int32_t vocab_ = 0, token_domain_ = 0, chunk_ = 0, columns_ = 0;
     std::int32_t loaded_chunk_ = 0; // the chunk fitted at load, the most a runtime re-fit may restore
+    // The chunk the cache lends with the KV pool at its capacity (fit_wide_work_to_cache): the
+    // reproducible route's, and the narrowest the pool's growth cuts the default route's to; and the
+    // one the nominal cache lends there (nominal_snapshot), which the reproducible route's matches
+    // unless the launch's cache is smaller.
+    std::int32_t smallest_chunk_ = 0;
+    std::int32_t nominal_chunk_  = 0;
     std::int32_t width_ = 0, span_ = 0, di_ = 0, r_ = 0;
     std::uint32_t kv_pages_ = 0;
 
@@ -6166,7 +6301,7 @@ private:
         const auto& l = tier_->controller().losses();
         return l.unpublished + l.no_slot + l.unworthy + l.residents_evicted;
     }
-    PinnedHostBuffer expert_error_{1}; // mapped u32: ops::MoeExpertSource::error of every call
+    PinnedHostBuffer device_error_{1}; // mapped u32: every call's MoE error word and Forward's faults (check_device_error)
     // TEMPORARY (INFERNIX_TMP_REPLAY_BENCH, candidates §8.5 CF-03): decode rounds' device time and the
     // CPU waits' nanoseconds (ops::MoeExpertSource::wait_ns), reported at each lane's release.
     std::unique_ptr<RoundClock> replay_clock_;

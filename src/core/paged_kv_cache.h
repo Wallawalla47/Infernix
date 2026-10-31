@@ -138,6 +138,8 @@ public:
     DeviceKVPageHandle() noexcept = default;
 
     [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
+    // The same page of the same pool, under the same lease.
+    friend bool operator==(const DeviceKVPageHandle&, const DeviceKVPageHandle&) = default;
 
 private:
     friend class DeviceKVPagePool;

@@ -12,9 +12,6 @@ double CallCost::call_seconds(std::uint32_t width) const noexcept {
     return width <= served_columns ? served_call_seconds : model.call_seconds(width);
 }
 
-namespace {
-
-// Call ends of [frontier, n) cut at `cuts` (sorted, inside the range).
 std::vector<std::uint32_t> segment_ends(std::uint32_t frontier, std::uint32_t n, std::uint32_t chunk,
                                         std::span<const std::uint32_t> cuts) {
     std::vector<std::uint32_t> ends;
@@ -29,6 +26,8 @@ std::vector<std::uint32_t> segment_ends(std::uint32_t frontier, std::uint32_t n,
     segment(n);
     return ends;
 }
+
+namespace {
 
 // Every call's fixed cost, and a span for each run of walk-eligible calls (cut at walk_max_tokens).
 double seconds_of(std::uint32_t frontier, std::span<const std::uint32_t> ends, const CallCost& cost) {
