@@ -378,12 +378,15 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   prompt's prefill workspace is lent from the expert cache (at most three quarters of the frames of
   its largest frame pool; a GGUF import keeps a pool per record size), which also gives its frames to
   the KV pool as contexts grow. A chunk whose workspace the cache cannot lend is cut at startup to
-  the widest one it can (a multiple of 128 tokens), with a warning, since the output does not depend
-  on the chunk: 65,536 tokens under the SSD tier wanted ~27 GiB, and the IQ3_S import's 16,384 does
-  not fit on a 32 GB card. A prompt whose contexts have grown since runs its calls at the widest
-  chunk the cache lends then. Under `--reproducible` the chunk never moves, so the startup cut is
-  the chunk the cache lends with every lane's context full, and a lower `--max-context` or
-  `--max-concurrency` leaves it wider.
+  the widest one it can (a multiple of 128 tokens), with a warning: 65,536 tokens under the SSD tier
+  wanted ~27 GiB, and the IQ3_S import's 16,384 does not fit on a 32 GB card. A prompt whose
+  contexts have grown since runs its calls at the widest chunk the cache lends then. Calls of
+  different widths can round differently, so the chunk can change a near-tie token.
+  `--reproducible` keeps one chunk: the one the cache lends with every lane's context full (a lower
+  `--max-context` or `--max-concurrency` leaves it wider), sized as if 3 GiB of VRAM were in use
+  before loading, so the same options on the same GPU always get the same chunk. If other programs
+  hold more and the cache cannot lend that chunk, a warning names the narrower one this launch uses;
+  `--prefill-chunk` at that value pins it on every launch.
 - **`--spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto
   --lm-head-draft` (recommended)** drafts with Inco AI's DFlash2 drafter, a separate 776 MB
   companion artifact ([Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix)) that runs beside any Flash-Next

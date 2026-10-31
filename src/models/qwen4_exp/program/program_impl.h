@@ -979,6 +979,7 @@ public:
         token_domain_  = plan_.token_domain;
         chunk_         = plan_.chunk;
         smallest_chunk_ = plan_.chunk;
+        nominal_chunk_ = plan_.chunk;
         mtp_k_         = plan_.mtp_k;
         dflash_k_      = plan_.dflash_k;
         max_width_     = plan_.max_width;
@@ -1198,7 +1199,10 @@ public:
         const std::int32_t planned_chunk = chunk_;
         const std::size_t planned_work   = wide_work_;
         if (options_.expert_cache) {
-            fit_wide_work_to_cache(size_expert_frames(vram_->query(), expert_frame_demand(residency_->frame_bytes())).frames);
+            const VramDemand demand = expert_frame_demand(residency_->frame_bytes());
+            const VramSnapshot now  = vram_->query();
+            fit_wide_work_to_cache(size_expert_frames(now, demand).frames,
+                                   size_expert_frames(nominal_snapshot(now), demand).frames);
         }
         // The SSD expert tier (design §19.3.7): the banks were not pinned; RAM slots hold the
         // records the tier keeps and the rest are read from the artifact when a round needs them.
@@ -1451,15 +1455,25 @@ public:
             }
             sizing_.frames = grown.frames;
             start_vram_monitor(demand);
-            const std::uint64_t lends = fit_wide_work_to_cache(grown.frames);
+            const std::uint32_t nominal = size_expert_frames(nominal_snapshot(sizing_.snapshot), demand).frames;
+            const std::uint64_t lends   = fit_wide_work_to_cache(grown.frames, nominal > slack ? nominal - slack : 0U);
             if (chunk_ != planned_chunk) {
                 const bool narrows = options_.free_cache_resume && smallest_chunk_ < chunk_;
                 diagnostic("prefill chunk " + std::to_string(planned_chunk) + " needs " + std::to_string(planned_work >> 20) +
                                " MiB of workspace, more than the expert cache can lend" +
                                (options_.free_cache_resume ? "" : " with the KV pool at its capacity") + " (" +
                                std::to_string(lends >> 20) + " MiB); prefilling at " + std::to_string(chunk_) + " tokens" +
-                               (narrows ? ", and down to " + std::to_string(smallest_chunk_) + " as contexts fill the KV pool" : "") +
-                               " (the output is the same)",
+                               (narrows ? ", and down to " + std::to_string(smallest_chunk_) + " as contexts fill the KV pool" : ""),
+                           DiagnosticLevel::Warning);
+            }
+            if (options_.reproducible && options_.vram_in_use_before_load && chunk_ < nominal_chunk_) {
+                diagnostic("the expert cache is smaller than the one the reproducible route fits its prefill chunk to (" +
+                               std::to_string(*options_.vram_in_use_before_load >> 20) + " MiB of VRAM were in use before "
+                               "loading, against a nominal " + std::to_string(kNominalInUseBytes >> 20) +
+                               "): this launch prefills at " + std::to_string(chunk_) + " tokens instead of " +
+                               std::to_string(nominal_chunk_) + ", so its output can differ from a launch that fits " +
+                               std::to_string(nominal_chunk_) + " (free VRAM, or set --prefill-chunk " +
+                               std::to_string(chunk_) + " on every launch)",
                            DiagnosticLevel::Warning);
             }
         }
@@ -4326,24 +4340,48 @@ private:
 
     // A prefill chunk whose wide workspace the expert cache could not lend would allocate it for long
     // prompts, which fails on a full card after admission (a 65,536-token chunk on the SSD tier wanted
-    // 27 GiB). Prefill then runs at the widest chunk the cache of `frames` frames lends: its exact
-    // route is chunk-invariant, so only speed changes, and the buffers planned for the wider chunk stay
-    // as they are. The cache shrinks as the KV pool grows (kv_growth_frames), smallest at the pool's
-    // capacity. Without free cache resume (the reproducible route; an Engine without prefix reuse, as
-    // infernix_bench's) the chunk never moves and is fitted there; with it, to the cache now, cut at a
-    // prompt's calls as the pool grows (fit_calls_to_cache): the
-    // chunk the full pool leaves cost a 32K prompt 3.0 % at 4 lanes of 262K on IQ3_S (5,120 against
-    // 8,192 tokens, 2026-10-31). A cache of several frame pools (a GGUF import's record sizes) lends
-    // from one (ExpertResidency::lend_capacity). Returns the bytes the cache lends for the chunk.
-    std::uint64_t fit_wide_work_to_cache(std::uint32_t frames) {
+    // 27 GiB). Prefill then runs at the widest chunk the cache of `frames` frames lends; the buffers
+    // planned for the wider chunk stay as they are. The cache shrinks as the KV pool grows
+    // (kv_growth_frames), smallest at the pool's capacity. Without free cache resume (the reproducible
+    // route; an Engine without prefix reuse, as infernix_bench's) the chunk never moves and is fitted
+    // there; with it, to the cache now, cut at a prompt's calls as the pool grows (fit_calls_to_cache):
+    // the chunk the full pool leaves cost a 32K prompt 3.0 % at 4 lanes of 262K on IQ3_S (5,120
+    // against 8,192 tokens, 2026-10-31). Several prefill routes round with the call's width
+    // (model-quality.md 6.7), so the reproducible route's chunk is fitted to the `nominal` frames
+    // (nominal_snapshot) too, and the narrower chunk taken. A cache of several frame pools (a GGUF
+    // import's record sizes) lends from one (ExpertResidency::lend_capacity). Returns the bytes the
+    // cache lends for the chunk.
+    std::uint64_t fit_wide_work_to_cache(std::uint32_t frames, std::uint32_t nominal) {
         if (wide_work_ == 0 || frames == 0) { return 0; }
-        const auto now      = residency_->lend_capacity(frames);
-        const auto smallest = residency_->lend_capacity(frames - std::min(frames, kv_growth_frames()));
-        smallest_chunk_     = chunk_lent_by(std::min(smallest_chunk_, chunk_), smallest);
-        chunk_              = options_.free_cache_resume ? chunk_lent_by(chunk_, now) : smallest_chunk_;
-        wide_work_          = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
-        const auto& lent    = options_.free_cache_resume ? now : smallest;
+        const std::uint32_t growth = kv_growth_frames();
+        const auto now             = residency_->lend_capacity(frames);
+        const auto smallest        = residency_->lend_capacity(frames - std::min(frames, growth));
+        const auto nominal_lends   = residency_->lend_capacity(nominal - std::min(nominal, growth));
+        smallest_chunk_            = chunk_lent_by(std::min(smallest_chunk_, chunk_), smallest);
+        if (options_.reproducible) {
+            nominal_chunk_  = chunk_lent_by(nominal_chunk_, nominal_lends);
+            smallest_chunk_ = std::min(smallest_chunk_, nominal_chunk_);
+        }
+        chunk_     = options_.free_cache_resume ? chunk_lent_by(chunk_, now) : smallest_chunk_;
+        wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
+        const bool nominal_binds = options_.reproducible && chunk_ == nominal_chunk_;
+        const auto& lent         = options_.free_cache_resume ? now : nominal_binds ? nominal_lends : smallest;
         return lent.frames * lent.pitch;
+    }
+
+    // The reproducible route fits its chunk to the frames a launch would size with kNominalInUseBytes in
+    // use before loading, an attached display's headroom and no OS budget below free memory: a function
+    // of the GPU, the options and the artifact, not of what other programs held at launch. Without the
+    // launch's figure (a Program built outside an Engine) the snapshot stands.
+    static constexpr std::uint64_t kNominalInUseBytes = 3ULL << 30;
+    [[nodiscard]] VramSnapshot nominal_snapshot(VramSnapshot s) const noexcept {
+        if (!options_.vram_in_use_before_load) { return s; }
+        const std::uint64_t used = *options_.vram_in_use_before_load;
+        s.device_free = used >= kNominalInUseBytes ? s.device_free + (used - kNominalInUseBytes)
+                                                   : s.device_free - std::min(s.device_free, kNominalInUseBytes - used);
+        s.has_budget  = false;
+        s.display     = DisplayState::Attached;
+        return s;
     }
 
     // A prompt's calls planned at a chunk the cache no longer lends: the KV pool grew since its binding
@@ -4364,7 +4402,7 @@ private:
         });
         diagnostic("prefill chunk " + std::to_string(chunk_) + " -> " + std::to_string(chunk) +
                        " for the prompts in progress: the expert cache can lend " + std::to_string(lendable >> 20) +
-                       " MiB now (the output is the same on the exact route)",
+                       " MiB now",
                    DiagnosticLevel::Debug);
         chunk_     = chunk;
         wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
@@ -4409,7 +4447,7 @@ private:
         });
         if (chunk == chunk_) { return; }
         diagnostic("prefill chunk " + std::to_string(chunk_) + " -> " + std::to_string(chunk) + ": the expert cache can lend " +
-                       std::to_string(lendable >> 20) + " MiB now (the output is the same on the exact route)",
+                       std::to_string(lendable >> 20) + " MiB now",
                    DiagnosticLevel::Debug);
         chunk_     = chunk;
         wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
@@ -5762,8 +5800,11 @@ private:
     std::int32_t vocab_ = 0, token_domain_ = 0, chunk_ = 0, columns_ = 0;
     std::int32_t loaded_chunk_ = 0; // the chunk fitted at load, the most a runtime re-fit may restore
     // The chunk the cache lends with the KV pool at its capacity (fit_wide_work_to_cache): the
-    // reproducible route's, and the narrowest the pool's growth cuts the default route's to.
+    // reproducible route's, and the narrowest the pool's growth cuts the default route's to; and the
+    // one the nominal cache lends there (nominal_snapshot), which the reproducible route's matches
+    // unless the launch's cache is smaller.
     std::int32_t smallest_chunk_ = 0;
+    std::int32_t nominal_chunk_  = 0;
     std::int32_t width_ = 0, span_ = 0, di_ = 0, r_ = 0;
     std::uint32_t kv_pages_ = 0;
 
