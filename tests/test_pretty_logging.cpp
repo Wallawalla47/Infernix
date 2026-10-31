@@ -9,6 +9,7 @@
 #ifdef _WIN32
 #    include <fcntl.h>
 #    include <io.h>
+#    include <process.h>
 #else
 #    include <unistd.h>
 #endif
@@ -18,7 +19,10 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <regex>
 #include <stdexcept>
 #include <string>
@@ -36,6 +40,7 @@ inline int port_close(int fd)      { return _close(fd); }
 inline int port_read(int fd, void* buffer, unsigned long count) {
     return _read(fd, buffer, static_cast<unsigned int>(count));
 }
+inline int port_pid() { return _getpid(); }
 #else
 inline int port_pipe(int fds[2])   { return ::pipe(fds); }
 inline int port_dup(int fd)        { return ::dup(fd); }
@@ -44,6 +49,7 @@ inline int port_close(int fd)      { return ::close(fd); }
 inline int port_read(int fd, void* buffer, std::size_t count) {
     return static_cast<int>(::read(fd, buffer, count));
 }
+inline int port_pid() { return static_cast<int>(::getpid()); }
 #endif
 
 class StderrCapture {
@@ -505,5 +511,66 @@ int main() {
     }
     failures += check(!decode::set_library_log_handler({}),
                       "the logging runtime left its FFmpeg route installed after it ended");
+
+    // --log-file: each record reaches the file in its plain pattern as it is logged, read here while
+    // the logger is open and unflushed (as an abort would leave it), beside the console's record.
+    {
+        const std::filesystem::path path =
+            std::filesystem::temp_directory_path() /
+            ("infernix-log-file-test-" + std::to_string(port_pid()) + ".log");
+        std::filesystem::remove(path);
+        std::string file_text;
+        std::string console;
+        {
+            StderrCapture capture;
+            {
+                infernix::product::LoggingRuntime logging(
+                    {.logger_name  = "infernix-serve",
+                     .level        = infernix::product::LogLevel::Debug,
+                     .color        = infernix::product::LogColorMode::Never,
+                     .presentation = infernix::product::LogPresentation::Service,
+                     .log_file     = path.string()});
+                logging.logger()->info("engine ready | sample");
+                logging.logger()->debug("engine | detail");
+                std::ifstream in(path, std::ios::binary);
+                file_text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            }
+            console = capture.finish();
+        }
+        std::filesystem::remove(path);
+        const std::string stamp = R"(\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\] )";
+        failures += check(std::regex_match(file_text, std::regex(stamp + R"(\[info\] engine ready \| sample\r?\n)" +
+                                                                  stamp + R"(\[debug\] engine \| detail\r?\n)")),
+                          "--log-file must hold every record in its plain pattern before any flush");
+        failures += check(console.find("engine ready | sample") != std::string::npos &&
+                              console.find("engine | detail") != std::string::npos,
+                          "--log-file must keep the console's records");
+    }
+    // A log file that cannot be opened (its folder is a file) leaves the console logging, with a warning.
+    {
+        const std::filesystem::path blocker =
+            std::filesystem::temp_directory_path() /
+            ("infernix-log-file-blocker-" + std::to_string(port_pid()));
+        { std::ofstream(blocker) << "not a folder"; }
+        std::string console;
+        {
+            StderrCapture capture;
+            {
+                infernix::product::LoggingRuntime logging(
+                    {.logger_name  = "infernix-serve",
+                     .color        = infernix::product::LogColorMode::Never,
+                     .presentation = infernix::product::LogPresentation::Service,
+                     .log_file     = (blocker / "serve.log").string()});
+                logging.logger()->info("engine ready | sample");
+                logging.flush();
+            }
+            console = capture.finish();
+        }
+        std::filesystem::remove(blocker);
+        failures += check(console.find("  WARN  log file | ") != std::string::npos &&
+                              console.find("(logging to the console only)") != std::string::npos &&
+                              console.find("engine ready | sample") != std::string::npos,
+                          "a log file that cannot be opened must warn and keep the console logging");
+    }
     return failures == 0 ? 0 : 1;
 }

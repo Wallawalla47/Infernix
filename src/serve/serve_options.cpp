@@ -628,7 +628,7 @@ std::string serve_usage_text(const char* argv0) {
            "  --log-level L              pretty stderr verbosity (trace|debug|info|warning|\n"
            "                             error|critical|off; default info)\n"
            "  --log-file PATH            also append plain timestamped log records to PATH\n"
-           "                             beside the console (flushed about once a second)\n"
+           "                             beside the console (each written as it is logged)\n"
            "  --cors                     send permissive CORS headers for browser UIs\n"
            "  --usage-chunk-choice       give the streamed usage chunk a zero-delta choice so\n"
            "                             strict parsers that reject choices:[] accept it\n"
