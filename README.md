@@ -192,6 +192,12 @@ follows and the others round to 8 bits. None of the NVFP4 engines had a lossy op
 that could be turned off. Measured quality (KL divergence against an exact reference) follows in a
 later update.
 
+**Infernix with 8-bit expert activations** (the opt-in `--a8-activations`, closer to the others'
+arithmetic in decode; not the comparison above): context length TTFT 1.88 / 15.53 / 30.58 s and
+decode 199 / 185 / 268 tok/s at ~8K / ~128K / ~250K; replay mean TTFT 3.4 s, output 175 tok/s at one
+request (+5 % on Basalt), wall time 5.7 min. Decode gains 5-9 %, but prompts read up to 28 % slower
+than on the default 4-bit route, so the default stays the faster choice for agents.
+
 ### Qwen3.8-Flash-Next IQ3_S: Infernix vs Strata and Basalt
 
 All three run ISTA-DASLab's GSQ-RCO `IQ3_S` GGUF: Infernix its [bit-exact conversion](#models) with
@@ -240,6 +246,17 @@ ranks 7th or lower (route tail skip; faster, but different answers). It was turn
 runs (`STRATA_ROUTE_TAIL_SKIP=0`) because it changes which experts the model uses and can degrade
 quality, so the default would not be a like-for-like comparison. The engines' 8-bit activations
 cannot be turned off. Measured quality follows in a later update.
+
+**Infernix with 8-bit activations** (the opt-in `--a8-activations`, the others' arithmetic; not the
+comparison above):
+
+| | TTFT ~8K / ~128K / ~250K | Decode tok/s | Replay: mean TTFT | Replay: output tok/s | Replay: wall time |
+|---|---:|---:|---:|---:|---:|
+| Infernix `--a8-activations` | 1.30 / 13.99 / 27.68 s | 224 / 211 / 278 | 2.9 s | 208 | 5.2 min |
+| Basalt (as above) | 1.35 / 13.47 / 27.98 s | 380 / 298 / 339 | 3.7 s | 296 | 4.4 min |
+
+With 8-bit activations Infernix reads prompts about as fast as Basalt, but Basalt still decodes
+about 1.4 times as fast.
 
 ### Qwen3.8-Flash-Next: DFlash2 against MTP
 
