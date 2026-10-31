@@ -1207,6 +1207,7 @@ ops::MoeExpertSource Forward::expert_source(const MoeParameters& p, std::uint32_
     }
     source.error   = experts_.error;
     source.wait_ns = experts_.wait_ns;
+    source.a4_shared_input = p.a4_shared_input;
     // The layer's frame pool: its pitch is the layer's own record stride.
     const std::uint64_t pitch = experts_.frame_pitches.empty() ? 0 : experts_.frame_pitches.at(layer);
     const auto& planes = p.bank->planes;
