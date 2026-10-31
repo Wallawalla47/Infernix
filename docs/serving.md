@@ -124,6 +124,12 @@ How failures end:
   in-process: the server prints `CUDA_CHECK(...) failed` with the error and aborts (a non-zero
   status other than 2), without final request-log records for the requests in flight.
 
+The listener's port is its own: a second server cannot bind it beside a running one (Windows sets
+`SO_EXCLUSIVEADDRUSE`, which also refuses a wildcard bind beside another program's `127.0.0.1`
+listener; Linux sets `SO_REUSEADDR` but not `SO_REUSEPORT`). A restart binds at once after a stop. A
+port in use stops the start before the model loads, with `cannot bind HOST:PORT: the port is in use
+...`, and status 1.
+
 `infernix-serve` exits with status 0 after an orderly stop (Ctrl+C or a termination signal), 130
 when a further Ctrl+C exits before that stop finished, 2 after an Engine-wide failure while
 serving, and 1 for an invalid command line, any startup, bind, warm-up or listen failure, or
