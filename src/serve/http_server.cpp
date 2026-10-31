@@ -10,7 +10,9 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/logger.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <mutex>
@@ -204,23 +206,35 @@ std::string_view canonical_api_path(std::string_view path) noexcept {
     return path;
 }
 
+httplib::TaskQueue* new_http_worker_pool(const ServeOptions& options) {
+    const std::size_t queued_requests =
+        static_cast<std::size_t>(options.max_concurrency) + options.max_pending_requests;
+    const std::size_t worker_count = queued_requests + 1;
+    // cpp-httplib runs each accepted connection's keep-alive loop as one pool task, so an
+    // idle pooled socket occupies its worker for the whole idle window. The base pool is
+    // sized to request admission; the extra workers are headroom so idle sockets cannot
+    // starve it. Self-limiting twice over: headroom workers appear only when the pool is
+    // saturated, are reclaimed once the queue is quiet, and any one socket can hold one
+    // for at most keep_alive_timeout_sec (graceful retirement usually ends it sooner).
+    constexpr std::size_t kIdleSocketWorkerHeadroom = 64;
+    return new httplib::ThreadPool(worker_count, worker_count + kIdleSocketWorkerHeadroom, queued_requests);
+}
+
 HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger,
                        std::shared_ptr<product::TerminalPanel> panel)
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
                                                             options_.response_store_max_bytes),
       operational_log_(logger), request_jsonl_(options_.request_log_jsonl, options_.artifact_path,
-                                               std::move(logger), options_.request_log_rotation) {
+                                               std::move(logger), options_.request_log_rotation),
+      // Half the ceiling retires before the silent close; at least one second, so the smallest
+      // legal ceiling (1 s) does not retire every connection on every request.
+      keep_alive_retirement_(std::chrono::seconds(std::max<std::uint32_t>(1, options_.keep_alive_timeout_sec / 2))) {
     // Always aggregated (GET /metrics?format=json reports them); drawn only on a terminal panel.
     const bool draw_panel = options_.log_stats_panel && panel != nullptr && panel->enabled();
     console_stats_        = std::make_unique<ConsoleStatsPanel>(
         draw_panel ? std::move(panel) : nullptr, options_.speculative.ngram_draft_tokens != 0 ||
                                                      options_.speculative.ngram_draft_tokens_auto);
-    const std::size_t queued_requests =
-        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
-    const std::size_t worker_count = queued_requests + 1;
-    server_.new_task_queue         = [queued_requests, worker_count] {
-        return new httplib::ThreadPool(worker_count, worker_count, queued_requests);
-    };
+    server_.new_task_queue = [this] { return new_http_worker_pool(options_); };
     server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
@@ -438,6 +452,20 @@ void HttpServer::stop_stats_reporter() {
 }
 
 void HttpServer::register_routes() {
+    // HTTP keep-alive window after a response finishes (cpp-httplib defaults to 5 s, which
+    // silently closes pooled connections between agent turns; clients then race the close).
+    // The timeout close is silent — no response is in flight to carry a close signal — so it
+    // is a moderate hard ceiling, and long-idle connections retire gracefully first: a request
+    // arriving after half the ceiling of idleness gets `Connection: close` on its response,
+    // and the client opens fresh next time (the path nginx/Node document for this race). The
+    // pre-routing handler below marks each request's arrival; post-routing runs after the
+    // server has set its own keep-alive headers, so it can also drop the Keep-Alive reuse
+    // hint a retirement contradicts.
+    server_.set_keep_alive_timeout(options_.keep_alive_timeout_sec);
+    server_.set_post_routing_handler([this](const httplib::Request& request,
+                                            httplib::Response& response) {
+        keep_alive_retirement_.respond(request, response);
+    });
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
         return handle_unrendered_http_error(options_, request, response);
     });
@@ -456,6 +484,7 @@ void HttpServer::register_routes() {
     }
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        keep_alive_retirement_.arrived(req);
         ensure_http_request_id(req, res);
         if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;

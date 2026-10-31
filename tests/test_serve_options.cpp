@@ -544,6 +544,8 @@ int main() {
                                            "12",
                                            "--pending-timeout-ms",
                                            "2500",
+                                           "--keep-alive-timeout-sec",
+                                           "90",
                                            "--max-context",
                                            "4096",
                                            "--kv-capacity",
@@ -582,6 +584,17 @@ int main() {
                       "--max-pending-requests did not reach serving options");
     failures += check(configured.pending_timeout_ms == 2500,
                       "--pending-timeout-ms did not reach serving options");
+    failures += check(configured.keep_alive_timeout_sec == 90,
+                      "--keep-alive-timeout-sec did not reach serving options");
+    failures += check(parse_error({"infernix-serve", "model.ninfer"}).empty() &&
+                          parse({"infernix-serve", "model.ninfer"}).keep_alive_timeout_sec == 45,
+                      "--keep-alive-timeout-sec is not the moderate default by default");
+    for (const char* bad : {"0", "3601", "-1", "abc"}) {
+        const std::string error =
+            parse_error({"infernix-serve", "model.ninfer", "--keep-alive-timeout-sec", bad});
+        failures += check(error.find("keep-alive-timeout-sec") != std::string::npos,
+                          "--keep-alive-timeout-sec accepted an invalid value");
+    }
     failures += check(configured.log_stats_interval_ms == 0,
                       "--log-stats-interval-ms did not disable periodic reporting");
     failures += check(!configured.log_stats_panel &&
@@ -622,6 +635,17 @@ int main() {
                       "--ram-free-mib must default to 8 GiB");
     failures += check(parse({"infernix-serve", "model.ninfer", "--ram-free-mib", "4096"}).ram_free_bytes == (4096ULL << 20),
                       "--ram-free-mib must set the RAM left free");
+    // --log-file: duplicate console records to a plain timestamped file (console-only by default).
+    failures += check(parse({"infernix-serve", "model.ninfer"}).log_file.empty(),
+                      "--log-file must default to console-only");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--log-file", "logs/console.log"}).log_file == "logs/console.log",
+                      "--log-file must set the duplicate path");
+    failures += check(!parse_error({"infernix-serve", "model.ninfer", "--log-file", ""}).empty(),
+                      "an empty --log-file path must be refused");
+    failures += check(!parse_error({"infernix-serve", "model.ninfer", "--log-file"}).empty(),
+                      "a missing --log-file value must be refused");
+    failures += check(serve_usage_text("infernix-serve").find("--log-file") != std::string::npos,
+                      "serving help must list --log-file");
 
     for (const auto& [mib, bytes] : std::vector<std::pair<std::string, std::size_t>>{
              {"146.822265625", 153954304},

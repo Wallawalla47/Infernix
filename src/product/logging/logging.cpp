@@ -7,6 +7,7 @@
 #include <spdlog/formatter.h>
 #include <spdlog/logger.h>
 #include <spdlog/pattern_formatter.h>
+#include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
@@ -554,6 +555,26 @@ struct LoggingRuntime::Impl {
         logger->set_formatter(std::make_unique<PrettyLogFormatter>(options.presentation));
         logger->set_level(level);
         logger->flush_on(spdlog::level::warn);
+        // An optional second sink duplicates every record to a file, beside (never instead of) the
+        // console. Its own plain pattern drops the colour and cursor control the logger adds around
+        // a record, so the level and timestamp land bare; a record that colours its own message text
+        // (the serve panels with --log-colours, see OperationalLog::write) keeps those escapes, since
+        // the pattern wraps the payload rather than rewriting it. Every record is written through as
+        // it is logged: a failed CUDA_CHECK aborts without flushing stdio buffers, and the records
+        // just before it are the ones a bug report needs (stderr is unbuffered, so flushing costs
+        // the console nothing). A file that cannot be opened leaves the console logging, with a
+        // warning.
+        if (!options.log_file.empty()) {
+            try {
+                auto file_sink =
+                    std::make_shared<spdlog::sinks::basic_file_sink_mt>(options.log_file, false);
+                file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
+                logger->sinks().push_back(std::move(file_sink));
+                logger->flush_on(spdlog::level::trace);
+            } catch (const std::exception& failure) {
+                logger->warn("log file | {} (logging to the console only)", failure.what());
+            }
+        }
         logger->set_error_handler([sink](const std::string& message) noexcept {
             sink->clear();
             report_logging_error(message);

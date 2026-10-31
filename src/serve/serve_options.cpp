@@ -46,6 +46,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--max-concurrency"},
     ServeOptionArity{"--max-pending-requests"},
     ServeOptionArity{"--pending-timeout-ms"},
+    ServeOptionArity{"--keep-alive-timeout-sec"},
     ServeOptionArity{"--prefill-chunk"},
     ServeOptionArity{"--use-original-int8-prefill-kernel", false},
     ServeOptionArity{"--prefill-split-workspace-mib"},
@@ -61,6 +62,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--log-stats-interval-ms"},
     ServeOptionArity{"--log-colours"},
     ServeOptionArity{"--log-stats-panel"},
+    ServeOptionArity{"--log-file"},
     ServeOptionArity{"--max-request-mib"},
     ServeOptionArity{"--media-cache-mib"},
     ServeOptionArity{"--media-live-mib"},
@@ -608,6 +610,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             pre-parse)\n"
            "  --max-pending-requests N   max queued requests (default 16)\n"
            "  --pending-timeout-ms N     queue timeout in ms (default 30000)\n"
+           "  --keep-alive-timeout-sec N seconds an HTTP connection stays open after its response\n"
+           "                             (default 45; idle past N/2 retires gracefully with\n"
+           "                             Connection: close on the next response)\n"
            "  --request-log-jsonl FILE   append full-precision server/request records\n"
            "  --request-log-max-mib N    rotate FILE when it reaches N MiB: it becomes\n"
            "                             FILE.1, older files shift up (default: one file\n"
@@ -628,6 +633,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             terminals only)\n"
            "  --log-level L              pretty stderr verbosity (trace|debug|info|warning|\n"
            "                             error|critical|off; default info)\n"
+           "  --log-file PATH            also append plain timestamped log records to PATH\n"
+           "                             beside the console (each written as it is logged)\n"
            "  --cors                     send permissive CORS headers for browser UIs\n"
            "  --usage-chunk-choice       give the streamed usage chunk a zero-delta choice so\n"
            "                             strict parsers that reject choices:[] accept it\n"
@@ -763,6 +770,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
+        } else if (arg == "--keep-alive-timeout-sec") {
+            options.keep_alive_timeout_sec = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--keep-alive-timeout-sec"), "keep-alive-timeout-sec"));
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
@@ -818,6 +828,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 options.log_stats_panel = false;
             } else {
                 throw std::invalid_argument("--log-stats-panel accepts on or off");
+            }
+        } else if (arg == "--log-file") {
+            options.log_file = require_value("--log-file");
+            if (options.log_file.empty()) {
+                throw std::invalid_argument("--log-file needs a path");
             }
         } else if (arg == "--max-request-mib") {
             const std::uint64_t mib =
@@ -1180,6 +1195,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.pending_timeout_ms == 0) {
         throw std::invalid_argument("--pending-timeout-ms must be positive");
+    }
+    // 1..3600 s; 0 would make every pooled connection die on the spot and rejoin the race
+    // the option exists to remove.
+    if (options.keep_alive_timeout_sec == 0 || options.keep_alive_timeout_sec > 3600) {
+        throw std::invalid_argument("--keep-alive-timeout-sec must be in [1,3600]");
     }
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");

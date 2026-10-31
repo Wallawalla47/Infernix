@@ -65,6 +65,15 @@ struct ServeOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
+    // HTTP keep-alive: how long a finished response's connection stays open for the next
+    // request (the HTTP server's own pool, not TCP keepalive). The cpp-httplib default of 5 s
+    // silently closes pooled connections between agent turns, so clients race the close.
+    // This is the hard ceiling; the graceful retirement (Connection: close on the response
+    // after an idle past half the ceiling) is the normal death of a long-idle pooled
+    // connection. It stays moderate so idle sockets, which hold a worker each, release them
+    // promptly; the worker pool keeps headroom so they cannot starve request admission.
+    // See HttpServer::register_routes and KeepAliveRetirement.
+    std::uint32_t keep_alive_timeout_sec = 45;
     std::uint32_t prefill_chunk        = 0; // 0: the model's default (EngineOptions)
     bool original_int8_prefill_kernel  = false;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
@@ -141,6 +150,7 @@ struct ServeOptions {
     SamplingOverrides sampling_overrides;
     bool greedy                 = false; // --greedy: force temperature 0 (exact argmax)
     product::LogLevel log_level = product::LogLevel::Info;
+    std::string log_file; // --log-file PATH: duplicate log records to a plain file beside the console
 
     // Exact process argv for the server-start record. Secret-bearing option values are redacted
     // while parsing; this is provenance only and never affects execution.

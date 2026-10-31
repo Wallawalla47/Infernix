@@ -29,6 +29,7 @@ add_library(infernix_serve STATIC
   metrics_json.cpp
   plan_report.cpp
   http_server.cpp
+  keep_alive_retirement.cpp
   openai_responses_http.cpp
   serve_options.cpp
   stop_control.cpp
