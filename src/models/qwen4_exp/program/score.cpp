@@ -77,7 +77,7 @@ ScoreResult ProgramImpl::causal_score(PreparedPrompt&& prompt, std::uint32_t fir
             }
         }
         scoring_ = false;
-        check_expert_error();
+        check_device_error();
 
         // Position p's logits (p in [first_target - 1, n - 2]) predict token p + 1.
         const cudaStream_t s = device_.stream;

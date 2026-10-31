@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/execution/dflash2.h"
+#include "models/qwen4_exp/execution/forward.h"
 
 #include "core/nvtx.h"
 #include "infernix/ops/attn_input_proj.h"
@@ -39,9 +40,9 @@ void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceA
 }
 
 // Token rows: BF16, or a GGUF import's IQ4_XS rows decoded exactly (as Forward embeds them).
-void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t s) {
+void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t s, std::uint32_t* error) {
     if (table.layout == QuantLayout::GgmlRows) {
-        ops::ggml_embedding(ids, table, out, s);
+        ops::ggml_embedding(ids, table, out, s, DeviceFault{.word = error, .value = kErrorTokenId});
     } else {
         ops::embedding(ids, table, out, s);
     }
@@ -58,9 +59,10 @@ void require_q8(const Weight& weight, const char* name) {
 } // namespace
 
 DFlash2::DFlash2(const Parameters& parameters, const DFlash2Config& config, ProposalHead head, DeviceContext& device,
-                 WorkspaceArena& work, std::vector<CyclicKVCacheLayerView> ring, std::uint32_t max_context)
+                 WorkspaceArena& work, std::vector<CyclicKVCacheLayerView> ring, std::uint32_t max_context,
+                 std::uint32_t* error)
     : parameters_(parameters), p_(parameters.dflash2.value()), config_(config), text_(parameters.model.config().text),
-      head_(head), device_(device), work_(work), ring_(std::move(ring)), max_context_(max_context) {
+      head_(head), device_(device), work_(work), ring_(std::move(ring)), max_context_(max_context), error_(error) {
     if (ring_.size() != config_.layers || p_.layers.size() != config_.layers) {
         throw std::invalid_argument("Qwen4Exp DFlash2: one context ring layer per drafter layer");
     }
@@ -176,7 +178,7 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
     Tensor residual = work_.alloc(DType::BF16, {H, W, B});
     {
         Tensor flat = residual.view({H, columns});
-        embed_tokens(ids.view({columns}), parameters_.token_embedding, flat, s);
+        embed_tokens(ids.view({columns}), parameters_.token_embedding, flat, s, error_);
     }
     const ops::SlidingWindowAttentionExecutionEnvelope envelope{0, max_context_};
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(D)));

@@ -4,9 +4,11 @@
 #include "text/grammar.h"
 
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <iostream>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <tuple>
 #include <vector>
@@ -188,7 +190,8 @@ void basic_contracts(infernix::text::GrammarCompiler& compiled) {
     const auto two = reordered + "\n" + call("later");
     for (std::size_t cut = 0; cut < two.size(); ++cut) {
         frontend::ToolCallOutputDecoder decoder(basic, 64);
-        (void)feed(decoder, std::string_view(two).substr(0, cut));
+        // The engine reports where a token starts even when the cut falls inside its bytes.
+        (void)feed(decoder, two, 0, cut);
         const auto result = decoder.finish(infernix::FinishReason::OutputLimit);
         require(result.tool_calls.size() == (cut >= reordered.size() ? 1 : 0),
                 "non-strict truncation lost a completed call");
@@ -253,10 +256,117 @@ void selected_contracts(infernix::text::GrammarCompiler& compiled) {
     }
 }
 
+// A `<tool_call>` token inside Markdown code of an auto answer is a quoted example on the constrained
+// route as on the free one (Strata measured 9 of 9 such examples run as calls before): the grammar
+// stays in the answer's text there, so the answer goes on, and the decoder publishes the token's
+// spelling as content, at every chunking. A call outside code still opens, and a lookahead through
+// a quoted token finds no dead end.
+void quoted_calls(infernix::text::GrammarCompiler& compiled) {
+    const std::vector<std::string> quoted{"Format:\n```xml\n" + call("a") + "\n```\nDone.",
+                                          "````markdown\n```xml\n" + call("a") + "\n```\n````\nDone.",
+                                          "Use `" + call("a") + "` like this.",
+                                          "Example:\n\n    " + call("a") + "\n\nDone."};
+    const std::vector<std::string> real{"```\ncode\n```\n" + call("a"), "Example:\n    " + call("a"),
+                                        "Use `x` then " + call("a")};
+    for (const bool strict : {false, true}) {
+        const auto bound = contract(schema({{"type", "string"}}), strict);
+        for (const std::string& text : quoted) {
+            require(accepts(compiled, *bound, text), "the constraint opened a call at a token quoted in Markdown code");
+            for (const std::size_t width : {std::size_t{1}, std::size_t{3}, std::size_t{7}, text.size()}) {
+                frontend::ToolCallOutputDecoder decoder(bound, 64);
+                std::string content;
+                for (std::size_t at = 0; at < text.size(); at += width) { content += feed(decoder, text, at, width); }
+                const auto terminal = decoder.finish();
+                require(terminal.tool_calls.empty() && content + terminal.content == text,
+                        "the decoder read a quoted call token as a call or lost bytes");
+            }
+        }
+        for (const std::string& text : real) {
+            require(accepts(compiled, *bound, text), "the constraint refused a call outside Markdown code");
+            frontend::ToolCallOutputDecoder decoder(bound, 64);
+            (void)feed(decoder, text);
+            require(decoder.finish().tool_calls.size() == 1, "a call outside Markdown code did not open");
+        }
+        require(!accepts(compiled, *bound, "Use it: " + std::string(frontend::kToolCallOpen) + "` here."),
+                "a call token outside Markdown code did not open a call");
+        // Drafts through a quoted token: after it the answer's text goes on (inside a call the
+        // backtick that follows would be refused).
+        auto matcher      = frontend::compile_tool_grammar(compiled, *bound, kToolCall, {}, {});
+        const auto drafts = tokens("Use `" + std::string(frontend::kToolCallOpen) + "` here.");
+        const auto after  = static_cast<std::size_t>(std::find(drafts.begin(), drafts.end(), kToolCall) - drafts.begin()) + 1;
+        const std::size_t stride = matcher->mask_words();
+        std::vector<std::uint32_t> words(stride * (drafts.size() + 1));
+        require(matcher->masks(drafts, words) == 0, "a lookahead through a quoted call token found a dead end");
+        for (std::size_t p = after; p < drafts.size(); ++p) {
+            const auto token = static_cast<std::size_t>(drafts[p]);
+            require((words[p * stride + token / 32] >> (token % 32) & 1U) != 0,
+                    "a lookahead refused the answer's text after a quoted call token");
+        }
+    }
+}
+
+// A raw value holds the whole call's closing lines when more value text follows (a file that documents
+// the call format, Strata #4701, where the value was cut there): the grammar keeps the value open
+// after them, the call still ends at its own closers before the end or the next call's token, and the
+// decoder publishes the whole value, its streamed steps concatenating to the call. Text after closers
+// with no later closer cannot end the output, and a bounded string keeps the plain exclusion.
+void quoted_closers(infernix::text::GrammarCompiler& compiled) {
+    const std::string closers  = "\n</parameter>\n</function>\n</tool_call>";
+    const std::string document = "A call ends with:" + closers + "\nThen the reply goes on.";
+    for (const bool strict : {false, true}) {
+        const auto bound = contract(schema({{"type", "string"}}), strict);
+        require(accepts(compiled, *bound, call(document)), "the grammar cut a value at quoted closing lines");
+        require(accepts(compiled, *bound, "Writing.\n" + call(document) + "\n" + call("b")),
+                "a value with quoted closing lines and a following call were refused");
+        require(accepts(compiled, *bound, call("a")), "a plain call no longer ends at its closers");
+        require(!accepts(compiled, *bound, call("a") + "\nThat wrote it."), "a call ended with prose after it");
+        for (const std::size_t width : {std::size_t{1}, std::size_t{5}, std::size_t{4096}}) {
+            const std::string text = "Writing.\n" + call(document);
+            frontend::ToolCallOutputDecoder decoder(bound, 64);
+            std::string streamed;
+            const auto take = [&] {
+                for (const infernix::ToolCallDelta& delta : decoder.take_call_deltas()) { streamed += delta.arguments; }
+            };
+            for (std::size_t at = 0; at < text.size(); at += width) {
+                (void)feed(decoder, text, at, width);
+                take();
+            }
+            const auto terminal = decoder.finish();
+            take();
+            require(terminal.tool_calls.size() == 1 &&
+                        Json::parse(terminal.tool_calls[0].arguments_json) == Json{{"x", document}} &&
+                        streamed == terminal.tool_calls[0].arguments_json,
+                    "the decoder cut a value at quoted closing lines or streamed it differently");
+        }
+        // Drafts through the closers: the text after them is admitted, and so is the end after the
+        // value's own closers.
+        auto matcher = frontend::compile_tool_grammar(compiled, *bound, kToolCall, {}, {});
+        for (const std::int32_t token : tokens("<tool_call>\n<function=call>\n<parameter=x>\na" + closers)) {
+            matcher->accept(token);
+        }
+        matcher->confirm();
+        const auto drafts        = tokens("\nb" + closers);
+        const std::size_t stride = matcher->mask_words();
+        std::vector<std::uint32_t> words(stride * (drafts.size() + 1));
+        require(matcher->masks(drafts, words) == 0, "a lookahead through quoted closing lines found a dead end");
+        for (std::size_t p = 0; p < drafts.size(); ++p) {
+            const auto token = static_cast<std::size_t>(drafts[p]);
+            require((words[p * stride + token / 32] >> (token % 32) & 1U) != 0,
+                    "a lookahead refused the value text after quoted closing lines");
+        }
+        require((words[drafts.size() * stride + kEos / 32] >> (kEos % 32) & 1U) != 0,
+                "a value's own closers after quoted ones did not admit the end");
+    }
+    const auto bounded = contract(schema({{"type", "string"}, {"maxLength", 100}}), true);
+    require(!accepts(compiled, *bounded, call(document)), "a bounded string held quoted closing lines");
+}
+
 void run() {
     auto compiled = compiler();
     basic_contracts(compiled);
     selected_contracts(compiled);
+    quoted_calls(compiled);
+    quoted_closers(compiled);
     infernix::ToolChoice required;
     required.mode = infernix::ToolChoiceMode::Required;
     auto fixed =

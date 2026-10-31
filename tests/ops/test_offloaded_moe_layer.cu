@@ -197,20 +197,26 @@ private:
 // equal expert_forward_a4r's for every placement, staging pass and CPU share (the wide ones stay exact).
 // `wide` is the W4A16 wide route the workspace is carved for: a call of at most eight columns has no wide job, so
 // kA4Residual (FP4-Local's default) changes only the workspace its narrow kernels read.
+// `shared_input` (W4A4): every expert shares its gate and up input scales, as NVIDIA's exports do, and the source says
+// so (MoeExpertSource::a4_shared_input), so calls of at most eight columns take the tensor-core narrow kernels;
+// otherwise every third expert keeps separate scales and the one-column kernels run.
 void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                 moe::ExpertActivation activation = moe::ExpertActivation::kA4,
-                moe::NarrowA16 narrow = moe::NarrowA16::kExact, moe::WideA16 wide = moe::WideA16::kExact) {
+                moe::NarrowA16 narrow = moe::NarrowA16::kExact, moe::WideA16 wide = moe::WideA16::kExact,
+                bool shared_input = false) {
     const bool a16 = activation == moe::ExpertActivation::kA16;
     if (a16) {
         std::printf("--- W4A16 experts%s%s\n", narrow == moe::NarrowA16::kA4Residual ? ", two-term narrow route" : "",
                     wide == moe::WideA16::kA4Residual ? ", A4 residual workspace" : "");
+    } else if (shared_input) {
+        std::printf("--- W4A4 experts sharing their gate and up input scales (the tensor-core narrow kernels)\n");
     }
     std::mt19937 rng(seed);
     const std::size_t stride = moe::kRecordBytes;
     std::vector<fixtures::Expert> bank;
     std::vector<moe::ExpertScales> scales;
     for (int e = 0; e < experts; ++e) {
-        bank.push_back(a16 ? fixtures::random_a16_expert(rng) : fixtures::random_expert(rng, e % 3 == 0));
+        bank.push_back(a16 ? fixtures::random_a16_expert(rng) : fixtures::random_expert(rng, !shared_input && e % 3 == 0));
         scales.push_back(bank.back().scales);
     }
     // Pinned host bank of every record; every third expert also resident in a device frame.
@@ -559,6 +565,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         source.activation           = activation;
         source.narrow_a16           = narrow;
         source.wide_a16             = wide;
+        source.a4_shared_input      = !a16 && shared_input;
         source.heartbeat_timeout_ns = config.fetch == Responder::Mode::kSilent ? kSilentHeartbeatTimeoutNs : kTestHeartbeatTimeoutNs;
         if (config.service != nullptr) {
             // The CPU wait warms these into L2 while the host works; no output may change.
@@ -776,10 +783,11 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
             cuda_check(cudaMemset(d_frame_base + static_cast<std::size_t>(resident) * stride, 0, 3 * stride), "cudaMemset");
         }
     }
-    if (experts == 12 && g_idle_checks != IdleChecks::kOnly) {
-        // A CPU channel whose host never answers and whose heartbeat stands still: the wait gives up
-        // after heartbeat_timeout_ns and reports it in the error word instead of trapping, and the
-        // device stays usable.
+    for (const bool heartbeat : {true, false}) {
+        if (experts != 12 || g_idle_checks == IdleChecks::kOnly) { break; }
+        // A CPU channel whose host never answers and whose heartbeat stands still (or which has none:
+        // then the wait is bounded at 2 s): the wait gives up and reports it in the error word instead
+        // of trapping, and the device stays usable.
         const auto mapped = [](std::size_t bytes) {
             void* p = nullptr;
             cuda_check(cudaHostAlloc(&p, bytes, cudaHostAllocMapped | cudaHostAllocPortable), "cudaHostAlloc");
@@ -802,8 +810,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                             .staging_slots = 3};
         source.activation           = activation;
         source.heartbeat_timeout_ns = kSilentHeartbeatTimeoutNs;
-        source.cpu = {.request = request, .x = cx, .y = cy, .done = words, .status = words + 1, .heartbeat = words + 2,
-                      .sequence = sequence, .layer = 7, .max_jobs = 8, .max_columns = 64};
+        source.cpu = {.request = request, .x = cx, .y = cy, .done = words, .status = words + 1,
+                      .heartbeat = heartbeat ? words + 2 : nullptr, .sequence = sequence, .layer = 7, .max_jobs = 8,
+                      .max_columns = 64};
         *reinterpret_cast<volatile std::uint32_t*>(error_host) = 0;
         source.error = error_device;
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
@@ -813,7 +822,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         const cudaError_t status = cudaDeviceSynchronize();
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         const std::uint32_t error = *reinterpret_cast<volatile std::uint32_t*>(error_host);
-        std::printf("silent CPU host: %s after %.2f s, error word %#x\n", cudaGetErrorString(status), seconds, error);
+        std::printf("silent CPU host (%s heartbeat): %s after %.2f s, error word %#x\n", heartbeat ? "a still" : "no",
+                    cudaGetErrorString(status), seconds, error);
         check(status == cudaSuccess && error == (7U << 16U | moe::kErrorHostSilent),
               "a silent CPU host fails the call through its error word, without a trap");
         cuda_check(cudaMemset(d_out, 0, 16), "a device that is still usable");
@@ -1622,6 +1632,18 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
         test_layer(400, 64, 10, 23); // more than 256 jobs: the plan ranks in several chunks
         test_layer(512, 512, 10, 29);  // a short prompt's call: ~10 columns per expert, hundreds of narrow jobs
         test_layer(512, 2048, 10, 31); // a wider call: x published from thousands of columns
+        {
+            // W4A4 experts sharing their input scales: calls of at most eight columns on the tensor-core narrow
+            // kernels (one to five columns per job, misses staged, forked and CPU-served), wider calls as before.
+            constexpr auto kA4 = moe::ExpertActivation::kA4;
+            constexpr auto kNarrow = moe::NarrowA16::kExact;
+            constexpr auto kWide = moe::WideA16::kExact;
+            test_layer(12, 1, 10, 211, kA4, kNarrow, kWide, true);
+            test_layer(24, 8, 10, 213, kA4, kNarrow, kWide, true);
+            test_layer(9, 5, 3, 217, kA4, kNarrow, kWide, true);
+            test_layer(9, 4, 3, 219, kA4, kNarrow, kWide, true);
+            test_layer(9, 12, 3, 223, kA4, kNarrow, kWide, true);
+        }
         if (g_idle_checks != IdleChecks::kOnly) {
             test_tail_skip(48, 1, 10, 7, 401);  // decode: one column, Strata's default rank
             test_tail_skip(48, 6, 10, 5, 403);  // MTP verification width: an expert skips only if every column ranks it low

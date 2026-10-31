@@ -61,18 +61,29 @@ struct DeviceContext {
 // other streams (for example expert promotions), which share the copy engine in FIFO order.
 void upload_pinned(void* device_dst, const void* pinned_src, std::size_t bytes, cudaStream_t stream);
 
+// Where a kernel reports a fault instead of trapping (a bounded wait that passed its bound, an input
+// outside its domain): it stores `value` into the mapped pinned `word` and lets its stream drain,
+// and the word's owner reads it after the round and fails that round. A trap would lose the context
+// and every lane with it, and on sm_120 one has hung the driver until a power cycle (Basalt #161).
+// With a null word the fault goes unreported and the kernel's outputs are undefined.
+struct DeviceFault {
+    std::uint32_t* word = nullptr;
+    std::uint32_t value = 0;
+};
+
 // upload_pinned behind a host gate: the copy waits in stream order until the pinned word
 // `pinned_ready` equals the device word `device_expected` (staged earlier in stream order), so the
 // host may write `pinned_src` after the launch and then release it with publish_pinned_word. The
 // host's values must strictly increase, so a word left from an earlier round never matches.
 // `bytes` and both buffers are 16-byte multiples/aligned. When `wait_stats` (device U64) is set,
 // a wait that found the word unpublished adds its nanoseconds and 1 to the two words at
-// `wait_stats + 2 * *wait_row` (row 0 when `wait_row` is null). A wait longer than
-// kPinnedGateTimeoutNs traps (the context is lost): it bounds a producer bug, not a slow read.
+// `wait_stats + 2 * *wait_row` (row 0 when `wait_row` is null). A wait longer than `timeout_ns`
+// reports `fault` and skips the copy: the bound is a producer bug's, not a slow read's.
 inline constexpr std::uint64_t kPinnedGateTimeoutNs = 120ULL * 1000 * 1000 * 1000;
 void upload_pinned_when(void* device_dst, const void* pinned_src, std::size_t bytes,
                         const std::uint32_t* pinned_ready, const std::uint32_t* device_expected,
-                        std::uint64_t* wait_stats, const std::int32_t* wait_row, cudaStream_t stream);
+                        std::uint64_t* wait_stats, const std::int32_t* wait_row, DeviceFault fault,
+                        cudaStream_t stream, std::uint64_t timeout_ns = kPinnedGateTimeoutNs);
 
 // Releases the gates waiting for `value`: orders every earlier store to pinned memory (including
 // non-temporal ones) before the word's store.

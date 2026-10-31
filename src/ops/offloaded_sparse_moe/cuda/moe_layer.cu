@@ -1818,9 +1818,12 @@ void launch_expert_pass_a4r(const bf16* x, const MoeDispatch& dispatch, const Mo
 #include "ops/offloaded_sparse_moe/cuda/lossless_expert.cuh"
 #include "ops/offloaded_sparse_moe/cuda/narrow_ring_a16.cuh"
 #include "ops/offloaded_sparse_moe/cuda/narrow_a16_mma.cuh"
+#include "ops/offloaded_sparse_moe/cuda/narrow_a4_mma.cuh"
 
 // One pass of the narrow kernels in the source's arithmetic, for a call of `columns` columns. W4A4
-// jobs of any width take the one-column kernels (one pass per column over the staged weights); W4A16 jobs
+// jobs take the tensor-core narrow kernels in calls of at most kMaxColumns columns of a bank whose experts share
+// their gate and up input scales (narrow_a4_mma.cuh), else the one-column kernels (one pass per column over the
+// staged weights); W4A16 jobs
 // under NarrowA16::kA4Residual the two-term one-column kernels; other W4A16
 // jobs take them in calls of at most kA16OneColumnCalls columns, else the multi-column kernels, and
 // ring calls (moe::wide::ring_call: the workspace has their x_acts) the narrow ring. Under NarrowA16::kA8
@@ -1886,6 +1889,11 @@ void launch_pass(int columns, const bf16* x, const MoeDispatch& dispatch, const 
                                                            h_plane, outputs, stream, phase, part);
             }
         });
+        return;
+    }
+    if (a4_nmma_call(source, columns, layout)) {
+        launch_expert_pass_a4_nmma(x, columns, dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs,
+                                   stream, phase, part);
         return;
     }
     launch_expert_pass(x, dispatch, source, top_k, job_records, flags, base, jobs, layout.h_blocks, columns_out, outputs,
@@ -2447,7 +2455,7 @@ __global__ void __launch_bounds__(kThreads)
     if (threadIdx.x == 0) {
         // The wait lasts while the host's heartbeat changes (an SSD-served job may take seconds);
         // without a heartbeat it is bounded at 2 s. A silent host fails the call through its error
-        // word, or traps when it has none.
+        // word (unreported without one), never a trap: that would lose the context.
         const auto* done  = reinterpret_cast<const volatile std::uint32_t*>(source.cpu.done);
         const auto* beat  = reinterpret_cast<const volatile std::uint32_t*>(source.cpu.heartbeat);
         std::uint32_t seen = beat != nullptr ? *beat : 0;
@@ -2461,7 +2469,6 @@ __global__ void __launch_bounds__(kThreads)
                 seen  = *beat;
                 since = now;
             } else if (now - since > limit) {
-                if (beat == nullptr || source.error == nullptr) { asm volatile("trap;"); }
                 report_error(source, offloaded_moe::kErrorHostSilent);
                 silent = true;
                 break;
