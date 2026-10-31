@@ -19,6 +19,7 @@ add_library(infernix_core STATIC
   host_load.cpp
   host_memory.cpp
   host_worker_pool.cpp
+  io_priority.cpp
   link_probe.cu
   power_throttling.cpp
   temporary_switches.cpp

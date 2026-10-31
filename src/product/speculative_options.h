@@ -13,17 +13,34 @@
 namespace infernix::product {
 
 [[nodiscard]] inline SpeculativeBackend parse_speculative_backend(std::string_view value) {
+    if (value == "off") { return SpeculativeBackend::None; }
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
-    throw std::invalid_argument("invalid speculative backend: " + std::string(value));
+    throw std::invalid_argument("invalid speculative backend (auto, off, mtp, dflash or dflash2): " + std::string(value));
 }
 
 // Applies a --spec value: "auto" lets the Engine choose the drafter from the artifact (backend None
-// until it resolves it), anything else names one.
+// until it resolves it), "off" decodes plain, anything else names one.
 inline void apply_speculative_backend(SpeculativeOptions& options, std::string_view value) {
     options.backend_auto = value == "auto";
     options.backend      = options.backend_auto ? SpeculativeBackend::None : parse_speculative_backend(value);
+}
+
+// The CLI's and the server's speculation without --spec: as --spec auto --draft-tokens auto, the drafter
+// measured fastest among those the artifact can run (Qwen3.8-Flash-Next's DFlash2 drafter when --draft-model
+// names it or its companion artifact lies beside the model), plain decode without one and on the lossless
+// route. A fixed --draft-tokens or a --spec-min-p tunes one drafter, so it still needs --spec.
+inline void apply_default_speculation(SpeculativeOptions& options) {
+    if (options.draft_tokens != 0 && !options.draft_tokens_auto) {
+        throw std::invalid_argument("--draft-tokens N tunes one drafter: it needs --spec mtp, dflash or dflash2 "
+                                    "(without --spec, speculation is auto and takes --draft-tokens auto)");
+    }
+    if (options.draft_min_p) {
+        throw std::invalid_argument("--spec-min-p tunes one drafter's cut: it needs --spec mtp or dflash2");
+    }
+    options.backend_auto      = true;
+    options.draft_tokens_auto = true;
 }
 
 // A drafter is requested: a named backend, or --spec auto's.
@@ -213,8 +230,7 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     switch (options.backend) {
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {
-            throw std::invalid_argument(
-                "--draft-tokens and --lm-head-draft require --spec mtp|dflash|dflash2|auto");
+            throw std::invalid_argument("--draft-tokens and --lm-head-draft need a drafter: --spec off takes neither");
         }
         return;
     case SpeculativeBackend::Mtp:

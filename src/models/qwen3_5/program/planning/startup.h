@@ -24,6 +24,8 @@
 
 namespace infernix::models::qwen3_5::detail {
 
+struct ProgramOffloadOptions;
+
 using TensorLayout                              = TensorRegion;
 
 // Where a speculative round's proposals come from: the backend's neural drafter, n-gram copies
@@ -248,6 +250,9 @@ struct SequencePlanningInputs {
     int device                        = 0;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
+    // Offloaded experts: the offload engine's staging and tables (ProgramOffload::fixed_bytes), allocated
+    // when the Program starts it; 0 otherwise.
+    std::uint64_t offload_fixed_bytes = 0;
 };
 
 struct SequencePlanImpl {
@@ -282,6 +287,7 @@ struct SequencePlanImpl {
     PersistentLayout persistent;
     WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;
+    std::uint64_t offload_fixed_bytes    = 0; // SequencePlanningInputs::offload_fixed_bytes
     std::size_t device_reservation_bytes = 0;
 };
 
@@ -292,10 +298,12 @@ struct SequencePlannerImpl {
 };
 
 // `idle_prefill_width` plans an idle-wide-prefill width (one of idle_prefill_widths_impl); zero
-// plans prefill steps of the chunk only.
+// plans prefill steps of the chunk only. `offload` (offloaded experts): the options of the Program's
+// offload engine, whose staging and tables the plan reserves (offload_fixed_bytes).
 [[nodiscard]] std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
-                           const EngineOptions& options, std::uint32_t idle_prefill_width = 0);
+                           const EngineOptions& options, std::uint32_t idle_prefill_width = 0,
+                           const ProgramOffloadOptions* offload = nullptr);
 // The idle-wide-prefill widths a plan may take, widest first (planning/idle_prefill.h); empty
 // unless the fast path is selected and some width is wider than the chunk.
 [[nodiscard]] std::vector<std::uint32_t>

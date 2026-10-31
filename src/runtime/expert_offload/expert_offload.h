@@ -373,10 +373,10 @@ public:
 
 private:
     void measure_link();
-    // One reading of the CPU team's rates (cpu_rate_note_ and cpu_rate_busy_share_ describe it); false without
-    // expert records in RAM (the reference rates stand).
-    [[nodiscard]] bool measure_cpu_rate();
-    // The rates the decode split takes: readings until they settle, the best standing, and their report.
+    // One reading of the CPU team's rates; nullopt without expert records in RAM (the reference rates stand).
+    [[nodiscard]] std::optional<CpuRateReading> measure_cpu_rate();
+    // The rates the decode split takes: readings until they settle (settle_cpu_rates), the best standing, and their
+    // report.
     void measure_cpu_rate_settled();
     // INFERNIX_TMP_CPU_PROBE_DETAIL=1 (candidates §11.2 OR-08): the team's rates on the same 32 records
     // where they live (the tier's slots or the registered banks), in registered VirtualAlloc copies and
@@ -423,8 +423,6 @@ private:
     std::unique_ptr<CpuSplitPolicy> split_;
     double link_bytes_per_second_ = kReferenceLinkBytesPerSecond;
     double cpu_expert_rate_ = 0.0, cpu_column_rate_ = 0.0; // 0 until measured
-    std::string cpu_rate_note_;         // how the last reading was taken (the report's parenthesis)
-    double cpu_rate_busy_share_ = -1.0; // the last reading's other-process CPU share when busy, else < 0
     bool failed_round_ = false;
 
     // The fork / overlap stream and its events (start, staged[2], consumed[2]; the fork uses the first two).

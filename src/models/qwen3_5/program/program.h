@@ -103,9 +103,10 @@ private:
     std::unique_ptr<detail::SequencePlannerImpl> impl_;
 
     friend SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
-                                                 const EngineOptions&);
+                                                 const EngineOptions&, const detail::ProgramOffloadOptions*);
     friend SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
-                                                 const EngineOptions&, std::uint32_t);
+                                                 const EngineOptions&, std::uint32_t,
+                                                 const detail::ProgramOffloadOptions*);
 };
 
 class RequestBasePlan {
@@ -501,13 +502,17 @@ private:
                                                    const detail::ProgramOffloadOptions*);
 };
 
+// `offload`: an artifact with offloaded experts plans the offload engine's staging and tables among the
+// fixed device bytes (ProgramOffload::fixed_bytes), with the options create_program will take.
 [[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
-                                                    const EngineOptions&);
+                                                    const EngineOptions&,
+                                                    const detail::ProgramOffloadOptions* offload = nullptr);
 // Plans prefill steps up to `idle_prefill_width` tokens while no other lane waits to decode: one
 // of idle_prefill_widths(parameters, options).
 [[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
                                                     const EngineOptions&,
-                                                    std::uint32_t idle_prefill_width);
+                                                    std::uint32_t idle_prefill_width,
+                                                    const detail::ProgramOffloadOptions* offload = nullptr);
 // The idle-wide-prefill widths to try, widest first: startup plans the widest whose runtime
 // reservation keeps the KV capacity (runtime/engine/model_instance.cpp). Empty unless the fast
 // path is selected and some width is wider than the effective chunk.

@@ -9,6 +9,7 @@
 
 #include "core/vram_budget.h"
 #include "models/load_options.h"
+#include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/load.h"
 #include "runtime/expert_offload/memory_plan.h"
 #include "models/qwen4_exp/program/fast_paths.h"
@@ -22,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <limits>
@@ -151,6 +153,31 @@ void validate(const EngineOptions& options) {
 } // namespace
 
 bool artifact_is_qwen4_exp(const artifact::Reader& reader) { return models::qwen4_exp::is_qwen4_exp(reader); }
+
+std::vector<std::filesystem::path> dflash2_companions_beside(const std::filesystem::path& artifact_path,
+                                                             const artifact::Directory& target) {
+    std::vector<std::filesystem::path> out;
+    const std::filesystem::path folder =
+        artifact_path.has_parent_path() ? artifact_path.parent_path() : std::filesystem::path(".");
+    std::error_code error;
+    for (std::filesystem::directory_iterator it(folder, error), end; !error && it != end; it.increment(error)) {
+        const std::filesystem::path& path = it->path();
+        std::string extension             = path.extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::error_code ignored;
+        if ((extension != ".infernix" && extension != ".ninfer") || !it->is_regular_file(ignored) ||
+            std::filesystem::equivalent(path, artifact_path, ignored)) {
+            continue;
+        }
+        try {
+            const artifact::Reader reader(path); // a continuation part or an unreadable file throws
+            if (models::qwen4_exp::dflash2_companion_fits(reader.directory(), target)) { out.push_back(path); }
+        } catch (const std::exception&) {}
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
 
 Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> source, const EngineOptions& options)
     : model(std::move(source)), parameters(*model),

@@ -334,8 +334,9 @@ int main() {
                       "default KV capacity is not sized to free VRAM for the hybrid cache");
     failures += check(!defaults.context_cache.host_capacity_bytes.has_value(),
                       "default Host context capacity was resolved before Engine startup");
-    failures += check(defaults.speculative.backend == infernix::SpeculativeBackend::None,
-                      "speculative decoding is not disabled by default");
+    failures += check(defaults.speculative.backend == infernix::SpeculativeBackend::None &&
+                          defaults.speculative.backend_auto && defaults.speculative.draft_tokens_auto,
+                      "speculative decoding is not --spec auto --draft-tokens auto by default");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
                           defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
                       "Responses store defaults mismatch");
@@ -457,6 +458,17 @@ int main() {
                                   "mtp", "--draft-tokens", "3"})
                                .speculative.backend_auto,
                           "a later --spec mtp kept --spec auto");
+        // The default: a --draft-model alone makes auto take it; --spec off decodes plain; one drafter's fixed
+        // length still needs its --spec.
+        const ServeOptions companion = parse({"infernix-serve", "model.ninfer", "--draft-model", "drafter.infernix"});
+        failures += check(companion.speculative.backend_auto && companion.speculative.draft_model == "drafter.infernix",
+                          "--draft-model without --spec did not ride with the default --spec auto");
+        const ServeOptions off = parse({"infernix-serve", "model.ninfer", "--spec", "off"});
+        failures += check(!off.speculative.backend_auto && off.speculative.backend == infernix::SpeculativeBackend::None,
+                          "--spec off did not decode plain");
+        failures += check(parse_error({"infernix-serve", "model.ninfer", "--draft-tokens", "3"}).find("--spec") !=
+                              std::string::npos,
+                          "a fixed --draft-tokens without --spec was accepted");
         failures += check(parse_error({"infernix-serve", "model.ninfer", "--spec", "auto", "--draft-tokens", "3"})
                                   .find("--draft-tokens auto") != std::string::npos &&
                               parse_error({"infernix-serve", "model.ninfer", "--spec", "auto"})
