@@ -10429,18 +10429,39 @@ bit-identical greedy output, plain decode 397.4 → 398.6 tok/s (every four-bloc
   import (7 frame pools, the largest ~7.4 GiB of a 23.7 GiB cache) 16,384 needs 7,014 MiB against
   5,652 lendable, and halving gave 8,192; 12,288 prefilled a 32K prompt 0.8 % faster (two ABBA
   slots: 7,753 / 7,751 against 7,686 / 7,690 tok/s). The first version fitted the startup cache
-  (13,824 in the bench, 13,056 serving 2 x 262K) and failed: a binding re-fits before its own KV
-  growth (`grow_kv` after `refit_chunk_for_binding`; the reproducible route never re-fits), the
-  32K prompt's 522 MiB of KV shrank the lending pool, and the 5,917 MiB lease fell back to a
-  `cudaMalloc` that failed. Halving had worked only by its slack, and was itself unsafe at 4 lanes
-  x 262K once their contexts filled. Measured (INT8 KV, RTX 5090, a 32K prompt at one lane of 40,960
+  (13,824 in the bench, 13,056 serving 2 x 262K) and failed in the bench, whose chunk never moves:
+  the 32K prompt's 522 MiB of KV shrank the lending pool, and the 5,917 MiB lease fell back to a
+  `cudaMalloc` that failed. Serving would fail the same way, as a binding re-fits before its own KV
+  growth (`grow_kv` after `refit_chunk_for_binding`). Halving had worked only by its slack, and was
+  itself unsafe at 4 lanes x 262K once their contexts filled. Measured (INT8 KV, RTX 5090,
+  `infernix_bench`, a 32K prompt at one lane of 40,960
   tokens, two runs per arm in ABBA order): the fit gives 13,440 there, 7,793 / 7,792 tok/s against
   7,692 / 7,691 at 8,192 (+1.3 %) and 7,753 / 7,747 at 12,288, and its prompt's 522 MiB of KV
   growth no longer fails the lease; `--reproducible` ran at the fitted chunk. Serving fits 9,088 at
   2 x 262,144 (not timed; between 8,192 and 12,288) and 5,120 at 4 x 262,144, which prefills 3.0 %
   slower than 8,192 (7,462 / 7,464 against 7,690 / 7,694 tok/s) where 8,192 could not be lent once
-  the four contexts filled. A default-route re-fit that counts the binding's own KV growth would keep
-  the wider chunk until the contexts fill (not built).
+  the four contexts filled.
+- So the cut at the full pool is kept only where the chunk never moves: without free cache resume,
+  the reproducible route and an Engine without prefix reuse (`infernix_bench`, so the numbers above
+  measure that fit). It also sizes the SSD tier's tickets, the narrowest chunk the pool's growth
+  reaches. The default route starts at the widest chunk the startup cache lends, and before a
+  prefill call lends its workspace
+  (`fit_calls_to_cache`, no lease held) a cache that no longer lends the prefilling lanes' remaining
+  calls cuts the chunk to what it lends then and plans those calls again (`prefix::segment_ends`
+  from the lane's next call, cut at its kept exact taps; free cache resume lets calls end anywhere).
+  A re-fit at the binding alone would not do: the binding's own growth comes after it, other lanes
+  grow before its first call, and a queued request grows the pool between its calls once
+  `hybrid_reclaim` has taken the leases back (issue #24). Measured through `infernix-serve` (INT8
+  KV, the DFlash2 companion, RTX 5090; distinct ~32K-token prompts with one output token, rated by
+  the response's `timings`; two starts per arm, alternated; a peer's CPU-only renders overlapped
+  the first two). At 4 x 262,144 the start fitted 12,800 and the first prompt's KV growth cut it
+  to 12,288 at a call; the pool then grew to 1,600 pages with no further cut. Against
+  `--prefill-chunk 5120` (the full-pool fit): sequential prompts 6,520 against 6,329 tok/s
+  (+3.0 %), but by position -1.9, +2.4 and +9.3 %, as the 5,120 starts slowed with each prompt
+  (6,670, 6,362, 5,954) and the default's did not; rounds of four at once 6,784 against 6,579
+  (+3.1 %; the clean pair +4.9 %). No request failed. At one lane of 40,960 the start fitted
+  13,184 (12,800 at the full pool), and three prompts' 476 MiB of KV came from spare memory with
+  no cut.
 - The cache can shrink after startup (elastic KV growth, the VRAM monitor, a vision loan) until it no
   longer lends that chunk's workspace, which then failed every later long prompt; and the failed
   allocation left its error as the runtime's last, which aborted the next launch check (closed PR
