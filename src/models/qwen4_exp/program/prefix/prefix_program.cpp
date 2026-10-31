@@ -91,7 +91,7 @@ void ProgramImpl::create_prefix_cache() {
     config.taps       = options_.prefix_taps;
     config.kv_pages   = kv_pages_;
     prefix_           = std::make_unique<prefix::PrefixCache>(config, *pool_, kv_geometry_, *lane_image_,
-                                                            options_.prefix_host_bytes);
+                                                            options_.prefix_host_bytes, device_.stream);
     if (mtp_) {
         // The MR3 flush cell's inputs: token, cell, slot and table row.
         // id, cell, slot, row, then the cell's RoPE position and its pooled-block start (3 each).
@@ -989,6 +989,9 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
         // have its restore landing in its private page and state slot: whatever reuses them next runs
         // on the compute stream, so that stream waits for the restore (free once it has landed).
         if (lane.prefix.restore) { prefix_->order_after_restore(*lane.prefix.restore, device_.stream); }
+        // A tap or boundary taken just before the release (a cancel, a failure, a pause) may still be
+        // copying the lane's partial page, and release() returns the lane's pages to the pool next.
+        prefix_->order_page_reuse(lane.pages);
         if (!lane.prefix.path.empty()) { prefix_->index().release_path(lane.prefix.path); }
         prefix_->poll();
     } catch (...) {}
