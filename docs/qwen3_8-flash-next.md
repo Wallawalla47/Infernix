@@ -375,13 +375,15 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   (Dense8, INT8 KV, RTX 5090, 2026-10-16: 32K prompts 5,570 / 9,640 / 11,210 tok/s at chunks
   1,024 / 4,096 / 16,384, 64K prompts 5,700 / 9,890 / 11,270; tg512 unchanged; 26 fewer expert
   frames of ~8,560). A smaller `--prefill-chunk` only shrinks the prefill workspace. A long
-  prompt's prefill workspace is lent from the expert cache, which also gives its frames to the KV
-  pool as contexts grow. A chunk whose workspace the cache could not lend with every lane's context
-  full (more than three quarters of the frames of its largest frame pool; a GGUF import keeps a
-  pool per record size) is cut at startup to the widest chunk it can lend there (a multiple of 128
-  tokens), with a warning, since the output does not depend on the chunk. 65,536 tokens under the
-  SSD tier wanted ~27 GiB; the IQ3_S import's 16,384 does not fit on a 32 GB card, and a lower
-  `--max-context` or `--max-concurrency` leaves a wider chunk.
+  prompt's prefill workspace is lent from the expert cache (at most three quarters of the frames of
+  its largest frame pool; a GGUF import keeps a pool per record size), which also gives its frames to
+  the KV pool as contexts grow. A chunk whose workspace the cache cannot lend is cut at startup to
+  the widest one it can (a multiple of 128 tokens), with a warning, since the output does not depend
+  on the chunk: 65,536 tokens under the SSD tier wanted ~27 GiB, and the IQ3_S import's 16,384 does
+  not fit on a 32 GB card. A prompt whose contexts have grown since runs its calls at the widest
+  chunk the cache lends then. Under `--reproducible` the chunk never moves, so the startup cut is
+  the chunk the cache lends with every lane's context full, and a lower `--max-context` or
+  `--max-concurrency` leaves it wider.
 - **`--spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto
   --lm-head-draft` (recommended)** drafts with Inco AI's DFlash2 drafter, a separate 776 MB
   companion artifact ([Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix)) that runs beside any Flash-Next

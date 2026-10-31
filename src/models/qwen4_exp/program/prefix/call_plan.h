@@ -51,6 +51,12 @@ struct CallPlan {
 [[nodiscard]] CallPlan plan_calls(std::uint32_t frontier, std::uint32_t prompt_tokens, std::uint32_t chunk,
                                   std::span<const runtime::prefix_cache::PlannedTap> taps, const CallCost& cost);
 
+// Call ends of [frontier, n), `chunk`-token calls and one remainder call between consecutive cuts (sorted,
+// inside the range): a plan's calls, or its remaining calls planned again at a narrower chunk with its
+// kept exact taps as `cuts`.
+[[nodiscard]] std::vector<std::uint32_t> segment_ends(std::uint32_t frontier, std::uint32_t n, std::uint32_t chunk,
+                                                      std::span<const std::uint32_t> cuts);
+
 // Whether a frontier lies strictly inside one of the spans (a Vision item's tokens).
 [[nodiscard]] bool inside_exclusion(std::uint32_t frontier,
                                     std::span<const runtime::prefix_cache::TapExclusion> exclusions) noexcept;

@@ -978,6 +978,7 @@ public:
         vocab_         = dim(c_.vocab_size);
         token_domain_  = plan_.token_domain;
         chunk_         = plan_.chunk;
+        smallest_chunk_ = plan_.chunk;
         mtp_k_         = plan_.mtp_k;
         dflash_k_      = plan_.dflash_k;
         max_width_     = plan_.max_width;
@@ -1255,8 +1256,9 @@ public:
             fetch_channel_ = std::make_unique<ops::offloaded_moe::FetchChannel>();
             tier.fetch     = fetch_channel_.get();
             // A layer walk's step calls ceil(layers / n) layers once per chunk of its n-chunk span (one
-            // tier round per step): at most layers + n - 1 layer calls.
-            tier.layer_calls = store->layers() + kWalkMaxTokens / static_cast<std::uint32_t>(std::max(chunk_, 1)) + 1U;
+            // tier round per step): at most layers + n - 1 layer calls, with the narrowest chunk the KV
+            // pool's growth cuts the default route's to.
+            tier.layer_calls = store->layers() + kWalkMaxTokens / static_cast<std::uint32_t>(std::max(smallest_chunk_, 1)) + 1U;
             // An expert stripe on a second drive: each record's tail is read from it while its head
             // is read from the artifact, at the same depth per drive.
             const ExpertStore* records = &*store;
@@ -1451,10 +1453,13 @@ public:
             start_vram_monitor(demand);
             const std::uint64_t lends = fit_wide_work_to_cache(grown.frames);
             if (chunk_ != planned_chunk) {
+                const bool narrows = options_.free_cache_resume && smallest_chunk_ < chunk_;
                 diagnostic("prefill chunk " + std::to_string(planned_chunk) + " needs " + std::to_string(planned_work >> 20) +
-                               " MiB of workspace, more than the expert cache can lend with the KV pool at its capacity (" +
-                               std::to_string(lends >> 20) + " MiB); prefilling at " + std::to_string(chunk_) +
-                               " tokens (the output is the same)",
+                               " MiB of workspace, more than the expert cache can lend" +
+                               (options_.free_cache_resume ? "" : " with the KV pool at its capacity") + " (" +
+                               std::to_string(lends >> 20) + " MiB); prefilling at " + std::to_string(chunk_) + " tokens" +
+                               (narrows ? ", and down to " + std::to_string(smallest_chunk_) + " as contexts fill the KV pool" : "") +
+                               " (the output is the same)",
                            DiagnosticLevel::Warning);
             }
         }
@@ -2238,6 +2243,7 @@ public:
                 (lane.next_call < lane.calls.size() ? ", ending at " + std::to_string(lane.calls[lane.next_call]) : "") +
                 ", state " + std::to_string(lane.state_tokens) + ", prompt end " + std::to_string(lane.prefill_end) + ")");
         }
+        fit_calls_to_cache();
         if (const std::size_t end = walk_span_end(lane, index); end > lane.next_call) {
             walk_begin(lane, index, end);
             return walk_step(lane, index, start);
@@ -4298,26 +4304,76 @@ private:
         return static_cast<std::uint32_t>((added + residency_->pools() * ExpertResidency::kChunkBytes + stride - 1) / stride);
     }
 
-    // A prefill chunk whose wide workspace the expert cache could not lend at its smallest would
-    // allocate it for long prompts, which fails on a full card after admission (a 65,536-token chunk on
-    // the SSD tier wanted 27 GiB). The cache of `frames` frames is smallest with the KV pool grown to
-    // its capacity (kv_growth_frames), and a prompt's own pages are taken after its binding re-fits the
-    // chunk (the reproducible route never re-fits): on IQ3_S a 13,824-token chunk fitted to the
-    // startup cache could not be lent once a 32K prompt's KV had grown (2026-10-31). Prefill then runs
-    // at the widest chunk the cache lends there (widest_fitting_chunk): its exact route is
-    // chunk-invariant, so only speed changes. The buffers planned for the wider chunk stay as they are.
-    // A cache of several frame pools (a GGUF import's record sizes) lends from one
-    // (ExpertResidency::lend_capacity). Returns the bytes the cache lends at its smallest.
+    // The widest chunk of at most `limit` columns whose wide workspace a cache lending `lends` holds
+    // with a frame to spare.
+    [[nodiscard]] std::int32_t chunk_lent_by(std::int32_t limit, const ExpertResidency::LendCapacity& lends) const {
+        return widest_fitting_chunk(limit, [&](std::int32_t chunk) {
+            return lends.pitch != 0 &&
+                   (workspace_bytes(c_, options_, plan_, plan_.lanes, chunk) + lends.pitch - 1) / lends.pitch < lends.frames;
+        });
+    }
+
+    // A prefill chunk whose wide workspace the expert cache could not lend would allocate it for long
+    // prompts, which fails on a full card after admission (a 65,536-token chunk on the SSD tier wanted
+    // 27 GiB). Prefill then runs at the widest chunk the cache of `frames` frames lends: its exact
+    // route is chunk-invariant, so only speed changes, and the buffers planned for the wider chunk stay
+    // as they are. The cache shrinks as the KV pool grows (kv_growth_frames), smallest at the pool's
+    // capacity. Without free cache resume (the reproducible route; an Engine without prefix reuse, as
+    // infernix_bench's) the chunk never moves and is fitted there; with it, to the cache now, cut at a
+    // prompt's calls as the pool grows (fit_calls_to_cache): the
+    // chunk the full pool leaves cost a 32K prompt 3.0 % at 4 lanes of 262K on IQ3_S (5,120 against
+    // 8,192 tokens, 2026-10-31). A cache of several frame pools (a GGUF import's record sizes) lends
+    // from one (ExpertResidency::lend_capacity). Returns the bytes the cache lends for the chunk.
     std::uint64_t fit_wide_work_to_cache(std::uint32_t frames) {
         if (wide_work_ == 0 || frames == 0) { return 0; }
-        const auto smallest   = residency_->lend_capacity(frames - std::min(frames, kv_growth_frames()));
-        const auto frames_for = [&](std::size_t bytes) { return (bytes + smallest.pitch - 1) / smallest.pitch; };
-        if (smallest.pitch != 0 && frames_for(wide_work_) < smallest.frames) { return smallest.frames * smallest.pitch; }
-        chunk_     = widest_fitting_chunk(chunk_, [&](std::int32_t chunk) {
-            return smallest.pitch != 0 && frames_for(workspace_bytes(c_, options_, plan_, plan_.lanes, chunk)) < smallest.frames;
+        const auto now      = residency_->lend_capacity(frames);
+        const auto smallest = residency_->lend_capacity(frames - std::min(frames, kv_growth_frames()));
+        smallest_chunk_     = chunk_lent_by(std::min(smallest_chunk_, chunk_), smallest);
+        chunk_              = options_.free_cache_resume ? chunk_lent_by(chunk_, now) : smallest_chunk_;
+        wide_work_          = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
+        const auto& lent    = options_.free_cache_resume ? now : smallest;
+        return lent.frames * lent.pitch;
+    }
+
+    // A prompt's calls planned at a chunk the cache no longer lends: the KV pool grew since its binding
+    // (its own pages; another lane's; a queued request's, for which hybrid_reclaim took the leases back
+    // between calls, issue #24). Before a call lends its workspace, every prefilling lane's remaining
+    // calls are planned again at the widest chunk the cache lends now (prefix::segment_ends, cut at
+    // their exact taps), as is the chunk of later bindings (refit_chunk_for_binding raises it again).
+    // Default route only, where calls may end anywhere.
+    void fit_calls_to_cache() {
+        if (!options_.free_cache_resume || !options_.expert_cache || wide_work_ == 0 || residency_->frames() == 0) { return; }
+        if (stream_lease_.valid() || work_lease_.valid() || wide_fallback_.p != nullptr || wide_active_) { return; }
+        const std::uint64_t pitch    = residency_->lend_pitch();
+        const std::uint64_t lendable = residency_->lendable_bytes();
+        const std::size_t need       = pending_wide_bytes(0);
+        if (need == 0 || need + pitch <= lendable) { return; }
+        const std::int32_t chunk = widest_fitting_chunk(chunk_, [&](std::int32_t width) {
+            return workspace_bytes(c_, options_, plan_, plan_.lanes, width) + pitch <= lendable;
         });
+        diagnostic("prefill chunk " + std::to_string(chunk_) + " -> " + std::to_string(chunk) +
+                       " for the prompts in progress: the expert cache can lend " + std::to_string(lendable >> 20) +
+                       " MiB now (the output is the same on the exact route)",
+                   DiagnosticLevel::Debug);
+        chunk_     = chunk;
         wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
-        return smallest.frames * smallest.pitch;
+        std::vector<std::uint32_t> cuts;
+        for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
+            Lane& lane = lanes_[i];
+            if (lane.phase != Phase::Prefill || lane.next_call >= lane.calls.size()) { continue; }
+            // A call in flight has advanced next_call; its end is where the next call starts.
+            const std::uint32_t from = lane.next_call > 0 ? lane.calls[lane.next_call - 1] : lane.state_tokens;
+            const std::uint32_t end  = lane.calls.back();
+            cuts.clear();
+            for (const runtime::prefix_cache::PlannedTap& tap : lane.prefix.taps) {
+                if (tap.placement == runtime::prefix_cache::TapPlacement::Exact && tap.position > from && tap.position < end) {
+                    cuts.push_back(tap.position);
+                }
+            }
+            const auto ends = prefix::segment_ends(from, end, static_cast<std::uint32_t>(chunk_), cuts);
+            lane.calls.resize(lane.next_call);
+            lane.calls.insert(lane.calls.end(), ends.begin(), ends.end());
+        }
     }
 
     // The expert cache can shrink after load (elastic KV growth, the VRAM monitor, a vision loan) until
@@ -5694,6 +5750,9 @@ private:
 
     std::int32_t vocab_ = 0, token_domain_ = 0, chunk_ = 0, columns_ = 0;
     std::int32_t loaded_chunk_ = 0; // the chunk fitted at load, the most a runtime re-fit may restore
+    // The chunk the cache lends with the KV pool at its capacity (fit_wide_work_to_cache): the
+    // reproducible route's, and the narrowest the pool's growth cuts the default route's to.
+    std::int32_t smallest_chunk_ = 0;
     std::int32_t width_ = 0, span_ = 0, di_ = 0, r_ = 0;
     std::uint32_t kv_pages_ = 0;
 
