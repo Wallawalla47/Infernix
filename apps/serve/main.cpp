@@ -7,6 +7,7 @@
 #include "serve/operational_log.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
+#include "serve/http_transport.h"
 #include "serve/serve_options.h"
 #include "serve/stop_control.h"
 
@@ -287,7 +288,8 @@ int main(int argc, char** argv) {
     try {
         infernix::serve::HttpServer server(options, logger, logging.terminal_panel());
         if (!server.bind()) {
-            operational_log.bind_failure(options.host, options.port);
+            const int error = infernix::serve::probe_bind_error(options.host, options.port);
+            operational_log.bind_failure(options.host, options.port, infernix::serve::bind_failure_reason(error));
             return 1;
         }
 
