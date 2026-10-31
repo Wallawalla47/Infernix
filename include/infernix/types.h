@@ -765,8 +765,7 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     // Prompt tokens per prefill call, a multiple of 128; 0 takes the model's default: 16,384 for
     // Qwen3.8-Flash-Next (its exact-route prefill measured identical across chunks), 1,024
-    // otherwise. With fast paths, Qwen3.8-Flash-Next runs a call that starts before position 16,384
-    // at most 4,096 tokens wide and one before 131,072 at most 8,192; the chunk caps every call.
+    // otherwise.
     std::uint32_t prefill_chunk        = 0;
     // INT8 KV prefills with the fast prompt-attention kernel and rounds prefill_chunk down to whole
     // prompt-attention waves. True selects the original INT8 prompt kernel at the requested chunk;
