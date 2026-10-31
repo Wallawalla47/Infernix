@@ -1636,17 +1636,25 @@ int test_damaged_parameter_opener() {
     return failures;
 }
 
-// A call opener inside a Markdown code fence or inline code of the answer is a quoted example:
-// it stays text, with no byte lost, while calls at the top level still fire. Only the text before
-// an opener decides, so every streamed chunking agrees with the whole output.
+// A call opener inside Markdown code of the answer (CommonMark's fences, indented code blocks and
+// code spans) is a quoted example: it stays text, with no byte lost, while calls at the top level
+// still fire, on the free and the constrained route alike. Only the text before an opener decides,
+// so every streamed chunking agrees with the whole output.
 int test_markdown_quoted_calls() {
     const std::vector<std::string> definitions = {
         tool_definition("write", Json{{"path", Json{{"type", "string"}}}})};
-    const auto contract = contract_from_definitions(definitions);
-    const auto call     = tool_call("write", {{"path", "/tmp/a.txt"}});
+    const auto free_contract = contract_from_definitions(definitions);
+    const auto constrained   = fi::select_tool_call_contract(free_contract, infernix::ToolChoice{});
+    const auto call          = tool_call("write", {{"path", "/tmp/a.txt"}});
+    // The call as an indented code block: every line indented four columns.
+    std::string indented = "    " + call;
+    for (std::size_t at = indented.find('\n'); at != std::string::npos; at = indented.find('\n', at + 1)) {
+        indented.insert(at + 1, "    ");
+    }
     // (calls, content) of one output.
     using Outcome  = std::pair<std::size_t, std::string>;
-    const auto run = [&](const std::string& text, bool tolerant, std::size_t width) {
+    using Contract = std::shared_ptr<const fi::ToolCallOutputContract>;
+    const auto run = [&](const Contract& contract, const std::string& text, bool tolerant, std::size_t width) {
         fi::ToolCallOutputDecoder decoder(contract, 64, tolerant);
         std::string content;
         for (std::size_t at = 0; at < text.size(); at += width) {
@@ -1656,12 +1664,12 @@ int test_markdown_quoted_calls() {
         return Outcome(terminal.tool_calls.size(), content + terminal.content);
     };
     int failures       = 0;
-    const auto outcome = [&](const std::string& text, bool tolerant) {
+    const auto outcome = [&](const Contract& contract, const std::string& text, bool tolerant) {
         const auto whole = parse(text, 64, *contract, tolerant);
         Outcome reference(whole.tool_calls.size(), whole.content);
         const std::vector<std::size_t> widths{1, 2, 3, 5, 7, 64, text.size()};
         for (const std::size_t width : widths) {
-            if (run(text, tolerant, width) != reference) {
+            if (run(contract, text, tolerant, width) != reference) {
                 failures += fail("a streamed chunking of width " + std::to_string(width) +
                                  " disagrees with the whole output: " + text.substr(0, 40));
             }
@@ -1671,32 +1679,48 @@ int test_markdown_quoted_calls() {
     const std::vector<std::string> quoted{
         "Format:\n```xml\n" + call + "\n```\nDone.", "Format:\n~~~\n" + call + "\n~~~\nDone.",
         "Use `" + call + "` like this.", "Use `x`, then `\n" + call + "`", "```\n" + call,
-        "Text\n\n```python\nx = 1\n```\n```\n" + call};
+        "Text\n\n```python\nx = 1\n```\n```\n" + call,
+        // A shorter run, or a run with an info string, does not close a fence (Strata #4702).
+        "````markdown\n```xml\n" + call + "\n```\n````\nDone.", "```\n```python\n" + call + "\n```",
+        // An indented code block after a blank line or a heading (Strata #4703). When only the opener's
+        // line is indented, the bare `<function=...>` after the quoted token is its wrapper's text.
+        "Example:\n\n" + indented + "\n\nDone.", "Example:\n\n    " + call + "\n\nDone.", "# Format\n    " + call,
+        // A code span closes only on a run of its own length.
+        "Use ``a`" + call + "`` like this."};
     const std::vector<std::string> real{call,
                                         "Let me do it.\n\n" + call,
                                         "Let me do it. " + call,
                                         "```\ncode\n```\n" + call,
                                         "`a` and `b` " + call,
-                                        "~~~\nx\n~~~\n\n" + call};
-    for (const bool tolerant : {false, true}) {
+                                        "~~~\nx\n~~~\n\n" + call,
+                                        "```\nx\n`````\n" + call,
+                                        // Right after text an indented line continues the paragraph.
+                                        "Example:\n    " + call,
+                                        // Indented four columns, a run of backticks is code, not a fence.
+                                        "Text\n\n    ```\n" + call,
+                                        "Use ``a`b`` then " + call,
+                                        "Run \\` first, then " + call};
+    const std::vector<std::pair<Contract, bool>> routes{{free_contract, false}, {free_contract, true}, {constrained, false}};
+    for (const auto& [contract, tolerant] : routes) {
+        const std::string route = contract->constrained ? " (constrained)" : tolerant ? " (tolerant)" : " (strict)";
         for (const std::string& body : quoted) {
-            const Outcome got = outcome(body, tolerant);
+            const Outcome got = outcome(contract, body, tolerant);
             failures += check(got.first == 0 && got.second == body,
-                              "a call quoted in Markdown code became a call or lost bytes: " +
+                              "a call quoted in Markdown code became a call or lost bytes" + route + ": " +
                                   body.substr(0, 30));
         }
         for (const std::string& body : real) {
-            failures += check(outcome(body, tolerant).first == 1,
-                              "a top-level call after closed Markdown code did not fire: " +
+            failures += check(outcome(contract, body, tolerant).first == 1,
+                              "a top-level call after closed Markdown code did not fire" + route + ": " +
                                   body.substr(0, 30));
         }
-        failures += check(outcome(call + "\n" + call, tolerant).first == 2,
-                          "two top-level calls did not both fire");
+        failures += check(outcome(contract, call + "\n" + call, tolerant).first == 2,
+                          "two top-level calls did not both fire" + route);
         // A quoted example before the real call stays text; the call still fires.
         const std::string mixed = "Example:\n```\n" + call + "\n```\nNow for real.\n\n" + call;
-        const Outcome both      = outcome(mixed, tolerant);
+        const Outcome both      = outcome(contract, mixed, tolerant);
         failures += check(both.first == 1 && both.second.starts_with("Example:\n```\n<tool_call>"),
-                          "a quoted example before a real call was not kept as text");
+                          "a quoted example before a real call was not kept as text" + route);
     }
     return failures;
 }

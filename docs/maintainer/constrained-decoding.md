@@ -394,11 +394,19 @@ not close the argument set from properties or enforce required or value assertio
 schemas and open objects do not trigger the strict compiler. Argument values keep the existing
 normalization hints. A call names each argument once: an open name set has no context-free uniqueness
 rule, so the grammar session carries a companion (`text::GrammarStateConstraint`, the Qwen frontend's
-`ParameterNameConstraint` in `tool_grammar.cpp`) that follows the canonical framing of the tokens the
+`ToolCallRules` in `tool_grammar.cpp`) that follows the canonical framing of the tokens the
 matcher accepts and clears, in every lookahead mask, the tokens that would complete a name the call
 has used. It shares the matcher's transaction (lookahead, accept, confirm, discard and the assistant
-continuation) and runs only when a non-strict tool is declared. Strict arguments generate in declared
-order, which forbids repeats already.
+continuation); the name rule runs only when a non-strict tool is declared. Strict arguments generate
+in declared order, which forbids repeats already.
+
+The same companion keeps a quoted call token in the answer's text. Before the first call of an Auto
+grammar without a JSON answer, it tracks the text's Markdown code (`MarkdownCodeTracker`, the rules
+the output decoder applies): a `<tool_call>` token inside a fence, an indented code block or a code
+span is `literal` there, so the session advances the companion alone and the matcher stays in free
+text (where the token is a dispatch tag the mask admits anyway). The decoder publishes its spelling
+as content, streamed or whole. Masking the token inside code instead would change what the model
+writes; until 2026-10-31 the grammar opened a call at any such token (candidates SY-01, TM-03).
 
 Because names never repeat and every value's encoding is known from its parameter before its bytes
 arrive, the output decoder reads constrained calls once as they are generated
@@ -517,9 +525,9 @@ separator belongs to the content and is kept. JSON mode uses the same boundary r
 JSON's ignorable whitespace.
 
 The tool grammars open every call with the model's `<tool_call>` token: Auto's free text is a
-`TokenTagDispatch` on that token, Required and the JSON union start with `Token`, and each further
-call is `\n` and the token. A `<tool_call>` spelled with ordinary tokens is free text, as the output
-decoder reads it. With a content constraint, tool-marker extraction is off and a legal `<tool_call>`
+`TokenTagDispatch` on that token (outside Markdown code: the companion above takes a token inside
+code as text), Required and the JSON union start with `Token`, and each further call is `\n` and the
+token. A `<tool_call>` spelled with ordinary tokens is free text, as the output decoder reads it. With a content constraint, tool-marker extraction is off and a legal `<tool_call>`
 string in the content publishes as content. Chat content/tool constraints cannot be combined with `output.raw=true` or
 options that publish special-token text; a raw token/text grammar publishes all its new text and hides
 the terminating EOS.
