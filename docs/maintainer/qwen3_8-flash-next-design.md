@@ -1007,9 +1007,9 @@ Each exchange has the same structure:
 - **Bounded spins.** Every device spin has an iteration bound worth about 2 s. On expiry the thread
   writes `agent_error`, skips the computation (outputs are undefined), and the engine worker turns
   that round into an Engine-wide failure ([engine architecture §7.4](engine-architecture.md)). Host
-  agents have a 2 s watchdog on `round_done` progress. Exception (planned, n-gram S2, §12.3): the
-  gate before `ple_embed` (`upload_pinned_when`) traps after 120 s, above Windows' 60 s disk
-  timeout (decided default, 2026-10-04).
+  agents have a 2 s watchdog on `round_done` progress. Exception (n-gram S2, §12.3): the gate
+  before `ple_embed` (`upload_pinned_when`) waits up to 120 s, above Windows' 60 s disk timeout,
+  then reports through the device error word and skips its copy (a trap until 2026-10-31).
 
 ### 8.3 Per-layer kernel sequence and time budget
 
@@ -2130,6 +2130,17 @@ layer 1, is the only reader.
 **Decided (default, 2026-10-04):** gate trap 120 s, above Windows' 60 s disk timeout, verified once
 with a 3-5 s producer delay on an otherwise idle GPU (2 s if WDDM preemption fails); an internal
 process-wide fault seam for the engine test; S3 only past its threshold; S4 parked.
+
+**Changed (2026-10-31, candidates BH-01):** the bound stays 120 s, but a gate past it writes
+`layer << 16 | kErrorRowGateTimeout` to the Program's device error word (`core::DeviceFault`) and
+skips its copy instead of trapping, so the round drains and fails its requests
+(`check_device_error`) while the context, the other lanes and the Engine survive. The 2026-10-04
+choice weighed a 120 s trap against a 2 s one, not a fall-through at the same bound. New reasons: the
+trap fired in 5 of 7 `--vram-past-budget` starts before 75e25b5c; on sm_120 a deliberate trap was
+followed by Xid 109 and a hung driver until a power cycle (Basalt #161, which made the same change);
+and a trap names no site (#48's `cudaErrorIllegalInstruction`). The GGUF token embedding's id check
+(`kErrorTokenId`, zeros for that column) and the CPU expert wait without a heartbeat (2 s, then
+`kErrorHostSilent`) changed the same way; no device trap remains.
 
 ### 12.4 Exposure and its acceptance
 
@@ -5944,7 +5955,7 @@ a round later. A D2H bubble > 15 µs (events) would become an SM-write kernel li
 |---|---|---|
 | 1 | Core reader, CPU: new `tests/test_read_only_file.cpp` (`tests/cmake/CoreTests.cmake`) | Closed-form block pattern; 1, 63, 64, 65, 1,000 offsets in random order with repeats; rings of 1, 4, 64; each index consumed once with its bytes; a past-EOF offset throws after draining |
 | 2 | `NgramVolume`, CPU: new `tests/models/qwen4_exp/test_ngram_volume.cpp` | Synthetic volume (60-byte header, row r byte k = f(r, k)), oracle f. Random rows; duplicates and two rows of one block make one read (counters); > 64 blocks wrap the ring; hit after miss; two ids on one cache slot; id ≥ rows throws `out_of_range`; size mismatch throws at open |
-| 3 | Gate primitive, GPU (`tests/test_device.cpp`) | 2,560, 12,800, 327,680 B; a host producer writes poison, waits 2 ms, writes data, publishes; copy equals data, wait count > 0 and wait ≥ the delay; eager, and a graph replayed with three sequences and new data, the old word left in place (stale-word rejection). The trap is not tested (it destroys the context). Once, with the GPU otherwise idle (a TDR resets the display GPU): a 3-5 s producer delay, to confirm WDDM preemption for the 120 s trap |
+| 3 | Gate primitive, GPU (`tests/test_device.cpp`) | 2,560, 12,800, 327,680 B; a host producer writes poison, waits 2 ms, writes data, publishes; copy equals data, wait count > 0 and wait ≥ the delay; eager, and a graph replayed with three sequences and new data, the old word left in place (stale-word rejection). The trap was not tested (it destroyed the context); since 2026-10-31 a word never published, past a 50 ms test bound, must store the fault, skip the copy and leave the next gate working. Once, with the GPU otherwise idle (a TDR resets the display GPU): a 3-5 s producer delay, to confirm WDDM preemption for the 120 s trap |
 | 4 | Assemble op, GPU (`tests/ops/test_speculative_round.cpp`) | B = 1-8, W = 2-16, extents 0..K, mixed `from_device`, S ≥ the largest device extent; oracle a host loop of `verify()`'s rule (1122-1135); exact |
 | 5 | Engine, real artifact, GPU: new `tests/models/qwen4_exp/test_engine_ngram_gate_real.cpp`, skip 77 without `INFERNIX_QWEN4_ARTIFACT`; volume from `INFERNIX_QWEN4_NGRAM` (default `<artifact>.ngram`), as in `infernix_qwen4_exp_forward_real_test`; one Engine, MTP, C = 2 | Internal seam `qwen4_exp::testing::set_ngram_faults({delay_us, poison, fail_round})`, process-wide, read per gated round, never set by product code. (a) Delay 5 ms + poison (constant FP8 fill, `sfence`, wait, real rows): ids equal faults-off, gate waits > 0 every gated round. (b) A second request admitted mid-decode puts a prefill gather between gated rounds: ids equal faults-off. (c) `system_error` at gated round N: the request fails with it, no hang (test timeout), no sticky CUDA error; runs last since the worker ends |
 | 6 | Product checks, CLI | `--print-token-ids` equal to the baseline build: code and story at C = 1, plain and `--spec mtp`; the MTP pair at C = 2; MTP ids still equal plain at C = 1 |
@@ -6025,7 +6036,8 @@ unmeasured on G:) would hit a request's first gated round, and the slow-read war
   wait_row, stream)` and `publish_pinned_word` (`core/device`), as designed: ≤ 16 CTAs of 256
   threads, 32 KiB each; every CTA's thread 0 polls with `__nanosleep(200)`, then
   `__threadfence_system()`, then `__ldcv` loads in batches of eight 16-byte vectors; a wait records
-  its ns and a count in `wait_stats[2 * *wait_row]` (CTA 0); trap after 120 s. Test cases in
+  its ns and a count in `wait_stats[2 * *wait_row]` (CTA 0); trap after 120 s (since 2026-10-31:
+  a `DeviceFault` word and no copy, §12.3). Test cases in
   `infernix_device_test`: 2,560 / 12,800 / 327,680 B with a 2 ms producer delay over poison, a
   pre-published word (no wait), three graph replays with the old word left published, and a
   misaligned size. The 3-5 s producer-delay TDR probe was not run.
@@ -7935,8 +7947,8 @@ R7 and R8 implemented on `claude/fn-memory-tier` (from the integration branch, 2
   could not release ring slots) and at most `kMaxFetch` = 512 jobs. Tier records are read with
   `.cv` loads (their host slots are rewritten; the full-mode bank keeps `.cs`). Waits: the CPU
   wait and the fetch poller end when the host's heartbeat has not changed for 10 s and write
-  `kErrorHostSilent` (the CPU service) or `kErrorFetchSilent` (the fetch responder; no trap unless
-  the source has no error word); host failures write their
+  `kErrorHostSilent` (the CPU service) or `kErrorFetchSilent` (the fetch responder; never a trap,
+  unreported when the source has no error word, since 2026-10-31); host failures write their
   errno; an SSD-only expert with no path writes `kErrorUnservedRecord`. Tests (layer test): SSD-only
   sets served by CPU jobs (caps 8 and 256, fork, zero staging) and by the fetch channel (serial
   passes of 1 and 3 slots, overlap, fork, landing, with CPU jobs taking the narrow ones), a
@@ -11983,7 +11995,7 @@ When the implementation lands:
 | Prefix cache: drafter state wrong after a resume; copy-engine FIFO (restores ahead of inputs: H2D FIFO measured, §19.2; bulk D2H ahead of per-round readbacks: unverified, prefix M0) | Lower acceptance, invisible at C = 1 greedy; stalled rounds | Bitwise drafter oracle D1, `mtp_cells`, counters; restores after the call's inputs; M0 decides `download_pinned` (§19.3.1) |
 | Vision: M-RoPE plumbing in every attention call, invisible below 2,051 tokens; lending across three streams; new BF16 routes also change Qwen3.5 and Quasar vision | Silent output change; corrupt frames; slower images | Bitwise text logits against HEAD, index-key taps, a mandatory > 2K case; load serial, lease waits, C = 2 stress; routes measured first, Qwen3.5 requalified (§19.3.2) |
 | Q8: T > 8 costs rest on one measured MMA point; K1b's redundant partial reads; Phase 1b moves tg512 baselines | Smaller gains | M1 sweep with per-shape thresholds; last-arriver fallback; identical-id workloads (§19.3.3) |
-| N-gram gate: a long spin under WDDM relies on compute preemption; a TDR resets the whole GPU | Display and other sessions reset | 120 s trap verified once with a 3-5 s delay on an idle GPU, else 2 s (§12.3) |
+| N-gram gate: a long spin under WDDM relies on compute preemption; a TDR resets the whole GPU | Display and other sessions reset | 120 s bound verified once with a 3-5 s delay on an idle GPU, else 2 s; past it the round fails through the error word, not a trap (§12.3) |
 | Gains near noise (n-gram) and a ±30 % C > 1 model (verification ~20 % optimistic) | Inconclusive steps | Measure-first gates (S0; S3 at ≥ 0.15 ms; concurrency S2 table); ABBA; S6 + S7 only if they beat the gate everywhere |
 | Tracks edit the same code | Conflicts, silent regressions | §19.3.0's rules and merge order: `ProgramImpl` declared in `program_impl.h` first (`54deaa2bc`); concurrency owns `cpu_plan`, `cpu_wait` and `stage_kernel` (S3-S5 before Q8 Phase 2 and prefix P7; one `cpu_wait` grid for copying and L2 warming); Q8 Phase 0 before S6, whose −1 skip covers the small dispatch and `moe_combine`; n-gram S1 owns `read_rows` (vision V6 adds no copy); vision's io-placement assertion and the text bit-identity gate after every merge; the prefix tier reserves Vision's pageable media budget (vision rev 2 pins only the tower) |
 | Concurrency S7: greedy output at C > 1 differs from C = 1 at near-ties once B·W > 8 | Concurrency-dependent output | Asked at the decision point after S5 (+20-30 % at C = 2, model); otherwise the gate stays (§19.3.5) |

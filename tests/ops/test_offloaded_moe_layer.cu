@@ -776,10 +776,11 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
             cuda_check(cudaMemset(d_frame_base + static_cast<std::size_t>(resident) * stride, 0, 3 * stride), "cudaMemset");
         }
     }
-    if (experts == 12 && g_idle_checks != IdleChecks::kOnly) {
-        // A CPU channel whose host never answers and whose heartbeat stands still: the wait gives up
-        // after heartbeat_timeout_ns and reports it in the error word instead of trapping, and the
-        // device stays usable.
+    for (const bool heartbeat : {true, false}) {
+        if (experts != 12 || g_idle_checks == IdleChecks::kOnly) { break; }
+        // A CPU channel whose host never answers and whose heartbeat stands still (or which has none:
+        // then the wait is bounded at 2 s): the wait gives up and reports it in the error word instead
+        // of trapping, and the device stays usable.
         const auto mapped = [](std::size_t bytes) {
             void* p = nullptr;
             cuda_check(cudaHostAlloc(&p, bytes, cudaHostAllocMapped | cudaHostAllocPortable), "cudaHostAlloc");
@@ -802,8 +803,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                             .staging_slots = 3};
         source.activation           = activation;
         source.heartbeat_timeout_ns = kSilentHeartbeatTimeoutNs;
-        source.cpu = {.request = request, .x = cx, .y = cy, .done = words, .status = words + 1, .heartbeat = words + 2,
-                      .sequence = sequence, .layer = 7, .max_jobs = 8, .max_columns = 64};
+        source.cpu = {.request = request, .x = cx, .y = cy, .done = words, .status = words + 1,
+                      .heartbeat = heartbeat ? words + 2 : nullptr, .sequence = sequence, .layer = 7, .max_jobs = 8,
+                      .max_columns = 64};
         *reinterpret_cast<volatile std::uint32_t*>(error_host) = 0;
         source.error = error_device;
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
@@ -813,7 +815,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         const cudaError_t status = cudaDeviceSynchronize();
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         const std::uint32_t error = *reinterpret_cast<volatile std::uint32_t*>(error_host);
-        std::printf("silent CPU host: %s after %.2f s, error word %#x\n", cudaGetErrorString(status), seconds, error);
+        std::printf("silent CPU host (%s heartbeat): %s after %.2f s, error word %#x\n", heartbeat ? "a still" : "no",
+                    cudaGetErrorString(status), seconds, error);
         check(status == cudaSuccess && error == (7U << 16U | moe::kErrorHostSilent),
               "a silent CPU host fails the call through its error word, without a trap");
         cuda_check(cudaMemset(d_out, 0, 16), "a device that is still usable");

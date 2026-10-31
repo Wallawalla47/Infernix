@@ -351,8 +351,10 @@ constexpr int kGateThreads         = 256;
 __global__ void __launch_bounds__(kGateThreads)
     upload_pinned_when_kernel(uint4* __restrict__ dst, const uint4* __restrict__ src, std::size_t vectors,
                               const std::uint32_t* ready, const std::uint32_t* expected, std::uint64_t* stats,
-                              const std::int32_t* row) {
+                              const std::int32_t* row, DeviceFault fault, std::uint64_t timeout_ns) {
+    __shared__ bool timed_out;
     if (threadIdx.x == 0) {
+        timed_out                = false;
         const std::uint32_t want = *expected;
         const auto* word         = reinterpret_cast<const volatile std::uint32_t*>(ready);
         if (*word != want) {
@@ -361,9 +363,13 @@ __global__ void __launch_bounds__(kGateThreads)
             do {
                 __nanosleep(200);
                 asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
-                if (now - start > kPinnedGateTimeoutNs) { asm volatile("trap;"); }
+                if (now - start > timeout_ns) {
+                    if (fault.word != nullptr) { *reinterpret_cast<volatile std::uint32_t*>(fault.word) = fault.value; }
+                    timed_out = true;
+                    break;
+                }
             } while (*word != want);
-            if (stats != nullptr && blockIdx.x == 0) {
+            if (!timed_out && stats != nullptr && blockIdx.x == 0) {
                 std::uint64_t* at = stats + 2 * (row != nullptr ? *row : 0);
                 atomicAdd(reinterpret_cast<unsigned long long*>(at), static_cast<unsigned long long>(now - start));
                 atomicAdd(reinterpret_cast<unsigned long long*>(at + 1), 1ULL);
@@ -372,6 +378,7 @@ __global__ void __launch_bounds__(kGateThreads)
         __threadfence_system();
     }
     __syncthreads();
+    if (timed_out) { return; }
     constexpr int kBatch     = 8;
     const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
     for (std::size_t base = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x; base < vectors;
@@ -394,16 +401,16 @@ __global__ void __launch_bounds__(kGateThreads)
 
 void upload_pinned_when(void* device_dst, const void* pinned_src, std::size_t bytes, const std::uint32_t* pinned_ready,
                         const std::uint32_t* device_expected, std::uint64_t* wait_stats, const std::int32_t* wait_row,
-                        cudaStream_t stream) {
+                        DeviceFault fault, cudaStream_t stream, std::uint64_t timeout_ns) {
     if (bytes == 0) { return; }
     if (bytes % 16 != 0 || (reinterpret_cast<std::uintptr_t>(device_dst) | reinterpret_cast<std::uintptr_t>(pinned_src)) % 16 != 0) {
         throw std::invalid_argument("upload_pinned_when: bytes and buffers must be 16-byte multiples");
     }
     const auto ctas = static_cast<unsigned int>(
         std::min<std::size_t>((bytes + kGateCtaBytes - 1) / kGateCtaBytes, kGateMaxCtas));
-    upload_pinned_when_kernel<<<ctas, kGateThreads, 0, stream>>>(static_cast<uint4*>(device_dst),
-                                                                 static_cast<const uint4*>(pinned_src), bytes / 16,
-                                                                 pinned_ready, device_expected, wait_stats, wait_row);
+    upload_pinned_when_kernel<<<ctas, kGateThreads, 0, stream>>>(
+        static_cast<uint4*>(device_dst), static_cast<const uint4*>(pinned_src), bytes / 16, pinned_ready,
+        device_expected, wait_stats, wait_row, fault, timeout_ns);
     CUDA_CHECK(cudaGetLastError());
 }
 
