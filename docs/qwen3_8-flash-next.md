@@ -620,8 +620,9 @@ leading System message is never touched (so the ordinary single leading System b
 conversation's prefix-cache anchor, stays byte-identical). The text, the number of turns and their
 positions stay as they arrived, only the role changes, so such a request never fails on the
 template. Each generation request shows its lowered turns as `instruction_role_lowerings` in the
-preparation block of `--request-log-jsonl`, and both programs state once at startup which roles
-the loaded template lowers. One consequence to know: a lowered turn counts as a user query for a
+preparation block of `--request-log-jsonl`; `infernix-serve` says so at info the first time a request
+has such a turn (most clients send one leading System message and never do), and both programs list
+the roles the loaded template lowers at startup with `--log-level debug`. One consequence to know: a lowered turn counts as a user query for a
 template that takes its thinking history from the last user turn, so `preserve_thinking: false` can
 then drop earlier `<think>` blocks that `qwen3_8.jinja` keeps. Passing
 `--chat-template tools/chat_templates/qwen3_8.jinja` (the file is also in the Windows release

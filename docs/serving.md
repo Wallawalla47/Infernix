@@ -499,8 +499,9 @@ role changes: the text, the number of turns and their positions stay as they arr
 leading system turn is never touched, so the conversation's prefix-cache anchor is unchanged. A
 template that refuses a system turn at every position is stating its own rule about instructions
 rather than placing one, and the request fails as that template asks. The lowered turn count is
-`instruction_role_lowerings` in the preparation block of `--request-log-jsonl`, and both
-`infernix-serve` and `infernix` state the lowering once at startup. Pass
+`instruction_role_lowerings` in the preparation block of `--request-log-jsonl`; `infernix-serve` logs
+a `chat template` line at info the first time a request has a lowered turn, and both `infernix-serve`
+and `infernix` list the roles the loaded template lowers at startup with `--log-level debug`. Pass
 `--chat-template tools/chat_templates/qwen3_8.jinja` to render every turn under its real role. A
 lowered turn counts as a user query for a template that selects its thinking history from the last
 user turn, so `preserve_thinking: false` can drop earlier `<think>` blocks that the maintained
