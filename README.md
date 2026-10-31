@@ -14,8 +14,9 @@ Infernix is a C++/CUDA inference engine that serves Qwen models on one NVIDIA RT
 `main` at `6b066a54`, one RTX 5090 (PCIe Gen5 x8), 2026-10-30/31, against each engine's latest
 version, every engine native on Windows under the same 84 GiB RAM budget. Context columns: one
 request at a time, ~8K to ~250K tokens. Replay: an agentic coding workload, two requests at once.
-The other engines compute with 8-bit (in places 4-bit) activations, Infernix with 16-bit; see each
-section's notes. Details: [Benchmarks](#benchmarks).
+Activation precision differs: the other engines round to 8 bits what Infernix keeps at 16 (every
+activation on IQ3_S; all but the NVFP4 routed experts, which Infernix runs at the checkpoint's own
+4 bits and the others at 8 in decode); see each section's notes. Details: [Benchmarks](#benchmarks).
 
 | Infernix vs | Time to first token | Decode tok/s | Replay: mean time to first token | Replay: wall time |
 |---|---|---|---|---|
@@ -53,8 +54,9 @@ n-gram table is read from NVMe.
 - **On the IQ3_S GGUF** Infernix decodes 3-12 % faster than Strata and needs a third less replay
   time, but Basalt decodes about 1.5× as fast as Infernix and finishes the replay 26 % sooner
   ([benchmarks](#qwen38-flash-next-iq3_s-infernix-vs-strata-and-basalt)).
-- **16-bit activations by default**, where Strata and Basalt compute with 8-bit (and in places 4-bit)
-  activations; measured quality for every engine follows in a later update. Perplexity was 4.654
+- **16-bit activations by default** where Strata and Basalt round them to 8 bits (on NVIDIA's NVFP4
+  weights the routed experts take the checkpoint's own 4-bit activations, which the others compute
+  at 8 bits in decode); measured quality for every engine follows in a later update. Perplexity was 4.654
   against Strata 0.1.45's 4.844 on the same token ids (2026-10-19).
 - **DFlash2 drafting** with Inco AI's drafter
   ([Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix),
@@ -179,12 +181,14 @@ strata-nvfp4 on 9-14, Basalt on 0-1 and Infernix on 1.
 
 | | Infernix | Strata v0.2.8 | strata-nvfp4 | Basalt |
 |---|---|---|---|---|
-| Activations in matrix multiplies | 16-bit | **8-bit** | **8-bit**; prompt experts' gate/up two 4-bit terms per value | **8-bit**; prompt chunks of 1,024+ tokens **4-bit** in the experts |
+| Routed experts' activations (4-bit in the checkpoint) | 4-bit with NVIDIA's calibrated scales, as the checkpoint specifies | 8-bit | 8-bit; in the prompt, gate/up two 4-bit terms per value | 8-bit; prompt chunks of 1,024+ tokens 4-bit |
+| Other activations (BF16 in the checkpoint) | 16-bit | **8-bit** | **8-bit** | **8-bit** |
 | Dense layers (BF16 in the checkpoint) | 8-bit (Dense8; the bit-exact conversion keeps BF16) | 8-bit | 8-bit | **6-bit** (Basalt measures +10 % KL divergence from it) |
 | n-gram table (FP8 in the checkpoint) | FP8 | FP8 | FP8 | re-blocked to 8-bit |
 
-NVIDIA's checkpoint itself specifies 4-bit activations for the experts, so the 4-bit prompt paths
-are within its own precision class. None of the NVFP4 engines had a lossy option on by default
+NVIDIA's checkpoint specifies 4-bit activations for the routed experts, which Infernix follows and
+the others compute more finely in decode; it keeps every other activation in BF16, which Infernix
+follows and the others round to 8 bits. None of the NVFP4 engines had a lossy option on by default
 that could be turned off. Measured quality (KL divergence against an exact reference) follows in a
 later update.
 
