@@ -302,15 +302,18 @@ int main() {
         }
     }
 
-    // A template that cannot render an instruction role where it arrives is stated once, with
-    // the role each such message is sent under.
-    {
+    // A template that cannot render an instruction role where it arrives is stated once at debug,
+    // with the role each such message is sent under; at info startup says nothing (the serve says it
+    // when a request first has such a turn).
+    for (const infernix::product::LogLevel level :
+         {infernix::product::LogLevel::Info, infernix::product::LogLevel::Debug}) {
         std::string output;
         {
             StderrCapture capture;
             {
                 infernix::product::LoggingRuntime logging(
                     {.logger_name  = "infernix-serve",
+                     .level        = level,
                      .color        = infernix::product::LogColorMode::Never,
                      .presentation = infernix::product::LogPresentation::Service});
                 infernix::product::StartupLogRenderer startup(logging);
@@ -323,15 +326,18 @@ int main() {
             }
             output = capture.finish();
         }
+        const bool debug = level == infernix::product::LogLevel::Debug;
         failures += check(
-            line_count(output) == 1 &&
-                output.find("  WARN  chat template | the active template cannot render a system "
-                            "message after the first (sent as a user message), a developer message "
-                            "after the first (sent as a user message) or a leading developer "
-                            "message (sent as a system message); each such message keeps its text "
-                            "and position | to keep every role, pass --chat-template ") !=
-                    std::string::npos,
-            "the chat template role notice is unclear or repeated");
+            debug ? line_count(output) == 1 &&
+                        output.find("chat template | the active template cannot render a system "
+                                    "message after the first (sent as a user message), a developer message "
+                                    "after the first (sent as a user message) or a leading developer "
+                                    "message (sent as a system message); each such message keeps its text "
+                                    "and position | to keep every role, pass --chat-template ") !=
+                            std::string::npos
+                  : output.empty(),
+            debug ? "the chat template role notice is unclear or repeated at debug"
+                  : "the chat template role notice shows at info");
     }
 
     // A Host tier smaller than the saved file warns with what was kept and what the file needs.
