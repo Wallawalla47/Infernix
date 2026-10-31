@@ -25,6 +25,18 @@ namespace infernix::models::qwen3_5::detail {
 
 static_assert(std::is_nothrow_move_assignable_v<SpeculativeStats>);
 
+namespace {
+
+// A spill guard over `source` that has read free memory (none without a source).
+std::optional<SpillGuard> begun_spill_guard(VramBudgetSource* source) {
+    if (source == nullptr) { return std::nullopt; }
+    std::optional<SpillGuard> guard(std::in_place, *source);
+    guard->begin();
+    return guard;
+}
+
+} // namespace
+
 ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const SequencePlanImpl& plan,
                          DeviceContext& device_in, const StartupObserver& startup_observer,
                          const ProgramOffloadOptions* offload_options)
@@ -47,7 +59,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
-      persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
+      spill_source(offload_options != nullptr
+                       ? open_vram_budget_source(device_in.device, offload_options->engine.vram_past_budget)
+                       : nullptr),
+      spill_guard(begun_spill_guard(spill_source.get())), persistent(plan.persistent.bytes),
+      workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
       round_host(plan.causal_scoring
                      ? std::nullopt
@@ -314,30 +330,42 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
     }
     device.synchronize();
+    if (spill_guard) {
+        // The fixed allocations: the persistent and workspace arenas and the elastic text KV's base pages
+        // (the rest of its region is reserved, not backed).
+        const std::uint64_t fixed = plan.persistent.bytes + plan.workspace.capacity + (kv_vmm ? kv_vmm->mapped_bytes() : 0U);
+        if (const std::uint64_t spilled = spill_guard->end(fixed); spilled != 0) {
+            throw std::runtime_error(
+                std::to_string(spilled >> 20) +
+                " MiB of the Program's VRAM allocations were placed in shared system memory by the driver's sysmem "
+                "fallback: free VRAM, or lower --max-context, --max-concurrency or --prefill-chunk. Setting the NVIDIA "
+                "Control Panel 'CUDA - Sysmem Fallback Policy' to 'Prefer No Sysmem Fallback' for this program makes "
+                "this fail at allocation instead. Readings: " + spill_guard->readings(fixed) + ".");
+        }
+        spill_guard.reset();
+        spill_source.reset();
+    }
     if (offload_options != nullptr) {
         // Offloaded experts (design §9.2): the engine after every fixed allocation, its frames sized
         // from what they leave less the graphs' allowance, started before the graphs capture the
         // experts' sources.
-        const OffloadGeometry geometry{
-            .lanes       = static_cast<std::int32_t>(max_concurrency),
-            .max_width   = static_cast<std::int32_t>(draft_window + 1U),
-            .columns     = static_cast<std::int32_t>(std::max<std::uint32_t>(
-                std::max(idle_prefill_width, prefill_chunk), max_concurrency * (draft_window + 1U))),
-            .chunk       = static_cast<std::int32_t>(prefill_chunk),
-            .speculative = speculative_backend != SpeculativeBackend::None || ngram_draft_window != 0,
-            .mtp_draft_tokens   = speculative_backend == SpeculativeBackend::Mtp ? neural_draft_window : 0U,
-            .ngram_draft_tokens = ngram_draft_window,
-            .graph_bound = static_cast<std::uint32_t>(
-                (graph_allowance_bytes + runtime::expert_offload::kGraphExecutableBytes - 1) /
-                runtime::expert_offload::kGraphExecutableBytes),
-            .wide_pass_bytes = std::max(workspace_plan.text_prefill_wide, workspace_plan.mtp_prefill_wide),
-            .wide_pass_ladder = workspace_plan.prefill_wide_ladder,
-            .kv_growth_bytes = kv_vmm ? kv_vmm->reserved_bytes() - kv_vmm->mapped_bytes() : 0U,
-            .expert_wide     = execution_schedule.expert_wide,
-            .expert_narrow   = execution_schedule.a8_experts ? ops::offloaded_moe::NarrowA16::kA8
-                                                             : ops::offloaded_moe::NarrowA16::kExact,
-            .router_mma      = execution_schedule.router_mma,
-            .device      = device.device};
+        OffloadGeometry geometry =
+            offload_round_geometry(max_concurrency, draft_window, prefill_chunk, idle_prefill_width, speculative_backend,
+                                   neural_draft_window, ngram_draft_window, device.device);
+        geometry.graph_bound = static_cast<std::uint32_t>(
+            (graph_allowance_bytes + runtime::expert_offload::kGraphExecutableBytes - 1) /
+            runtime::expert_offload::kGraphExecutableBytes);
+        geometry.wide_pass_bytes  = std::max(workspace_plan.text_prefill_wide, workspace_plan.mtp_prefill_wide);
+        geometry.wide_pass_ladder = workspace_plan.prefill_wide_ladder;
+        geometry.kv_growth_bytes  = kv_vmm ? kv_vmm->reserved_bytes() - kv_vmm->mapped_bytes() : 0U;
+        geometry.expert_wide      = execution_schedule.expert_wide;
+        geometry.expert_narrow    = execution_schedule.a8_experts ? ops::offloaded_moe::NarrowA16::kA8
+                                                                  : ops::offloaded_moe::NarrowA16::kExact;
+        geometry.router_mma       = execution_schedule.router_mma;
+        // The plan reserved the engine's staging and tables (make_sequence_planner with these options).
+        if (ProgramOffload::fixed_bytes(parameters, geometry, offload_options->engine) != plan.offload_fixed_bytes) {
+            throw std::logic_error("the offload engine's staging and tables differ from the sequence plan's reservation");
+        }
         offload = std::make_unique<ProgramOffload>(parameters, geometry, offload_options->engine,
                                                    offload_options->diagnostic);
         offload->start(device.stream);

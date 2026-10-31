@@ -207,7 +207,8 @@ models::qwen3_5::BundledDrafters artifact_drafters(const artifact::Reader& reade
 }
 
 void resolve_auto_speculative_backend(EngineOptions& options, models::Architecture architecture,
-                                      bool offloaded_experts, const models::qwen3_5::BundledDrafters& drafters) {
+                                      bool offloaded_experts, const models::qwen3_5::BundledDrafters& drafters,
+                                      const std::vector<std::filesystem::path>& dflash2_companions) {
     SpeculativeOptions& speculative = options.speculative;
     if (!speculative.backend_auto || options.purpose != EnginePurpose::Generation) { return; }
     // The choice follows each drafter's --draft-tokens auto measurement; a fixed length or a cut tuned
@@ -218,16 +219,36 @@ void resolve_auto_speculative_backend(EngineOptions& options, models::Architectu
     if (speculative.draft_min_p) {
         throw std::invalid_argument("--spec-min-p tunes one drafter's cut: --spec auto takes none");
     }
-    const char* why = nullptr;
-    if (architecture == models::Architecture::Qwen4Exp) {
+    std::string why;
+    if (options.lossless) {
+        // No speculation is lossless (docs/maintainer/lossless-route.md).
+        speculative.backend = SpeculativeBackend::None;
+        speculative.draft_model.clear();
+        why = "the lossless route runs no speculation";
+    } else if (architecture == models::Architecture::Qwen4Exp) {
         // Inco AI's DFlash2 drafter (a companion artifact) decoded 8-26 % faster than the MTP layer on every
-        // conversion measured (README "Qwen3.8-Flash-Next: DFlash2 against MTP", 2026-10-20).
+        // conversion measured (README "Qwen3.8-Flash-Next: DFlash2 against MTP", 2026-10-20): the --draft-model
+        // drafter, else one companion found alone beside the artifact, else MTP where the artifact bundles it.
         if (!speculative.draft_model.empty()) {
             speculative.backend = SpeculativeBackend::DFlash2;
             why                 = "the --draft-model drafter, Qwen3.8-Flash-Next's fastest measured";
+        } else if (dflash2_companions.size() == 1) {
+            speculative.backend     = SpeculativeBackend::DFlash2;
+            speculative.draft_model = dflash2_companions.front();
+            why = "the DFlash2 drafter beside the artifact, " + speculative.draft_model.filename().string() +
+                  ", Qwen3.8-Flash-Next's fastest measured";
         } else {
             speculative.backend = drafters.mtp ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
-            why = "the DFlash2 drafter, about 10 % faster on Qwen3.8-Flash-Next, needs --draft-model FILE";
+            if (dflash2_companions.empty()) {
+                why = "the DFlash2 drafter, about 10 % faster on Qwen3.8-Flash-Next, needs --draft-model FILE or its "
+                      "companion artifact in the model's folder";
+            } else {
+                why = "several DFlash2 drafters lie beside the artifact (";
+                for (std::size_t i = 0; i < dflash2_companions.size(); ++i) {
+                    why += (i > 0 ? ", " : "") + dflash2_companions[i].filename().string();
+                }
+                why += "): name one with --draft-model";
+            }
         }
     } else {
         speculative.backend = models::qwen3_5::auto_speculative_backend(offloaded_experts, drafters);
@@ -249,11 +270,16 @@ void resolve_auto_speculative_backend(EngineOptions& options, models::Architectu
         speculative.draft_tree_nodes        = {};
         speculative.ngram_draft_tokens_auto = false;
         chosen                              = "plain decode";
-        why = (drafters.mtp || drafters.dflash || drafters.dflash2) ? "none of the artifact's drafters beats it here"
-                                                                     : "the artifact bundles no drafter";
+        if (options.lossless) { break; }
+        if (architecture == models::Architecture::Qwen4Exp) {
+            why = "the artifact bundles no MTP drafter, and " + why;
+        } else {
+            why = (drafters.mtp || drafters.dflash || drafters.dflash2) ? "none of the artifact's drafters beats it here"
+                                                                         : "the artifact bundles no drafter";
+        }
         break;
     }
-    publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "--spec auto: %s (%s)", chosen, why);
+    publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "--spec auto: %s (%s)", chosen, why.c_str());
 }
 
 EngineOptions normalize_engine_options(EngineOptions options, models::Architecture architecture,
@@ -751,7 +777,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     std::optional<StartupPhaseScope> program;
     for (int attempt = 0;; ++attempt) {
         if (!planning) { planning.emplace(options.startup_observer, StartupPhase::TargetFinalize); }
-        auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
+        const models::qwen3_5::detail::ProgramOffloadOptions* offload = offload_options ? &*offload_options : nullptr;
+        auto planner = models::qwen3_5::make_sequence_planner(instance->parameters, device, options, offload);
         if (expert_ram && options.kv_capacity.mode == KvCapacityMode::Automatic) {
             // Every lane's full context in whole pages (a lane's last page holds its context's tail).
             const std::uint64_t page   = planner.capacity_curve().main_page_tokens;
@@ -776,7 +803,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
             for (const std::uint32_t width :
                  models::qwen3_5::idle_prefill_widths(instance->parameters, options)) {
                 auto wide = models::qwen3_5::make_sequence_planner(instance->parameters, device,
-                                                                   options, width);
+                                                                   options, width, offload);
                 if (const auto fitted =
                         resolve_kv_capacity_beside(kv_policy, wide.capacity_curve(),
                                                    free_bytes, headroom, resolution, lane_page_groups)) {

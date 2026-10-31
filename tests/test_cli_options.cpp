@@ -100,6 +100,23 @@ int run_tests() {
                                        "--draft-tokens", "3"});
                       }),
                       "--spec auto was accepted with a fixed draft length");
+    // Without --spec the CLI speculates as --spec auto --draft-tokens auto; --spec off decodes plain, and a
+    // setting of one drafter still needs its --spec.
+    const auto unspecified = parse({"infernix", "model.ninfer", "--prompt", "hello", "--lm-head-draft"});
+    failures += check(unspecified.speculative.backend_auto && unspecified.speculative.draft_tokens_auto &&
+                          unspecified.speculative.backend == infernix::SpeculativeBackend::None,
+                      "the CLI's default speculation is not --spec auto --draft-tokens auto");
+    const auto off = parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "off"});
+    failures += check(!off.speculative.backend_auto && !off.speculative.draft_tokens_auto &&
+                          off.speculative.backend == infernix::SpeculativeBackend::None,
+                      "--spec off did not decode plain");
+    failures += check(rejects([] { (void)parse({"infernix", "model.ninfer", "--prompt", "hello", "--draft-tokens", "3"}); }) &&
+                          rejects([] { (void)parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec-min-p", "0.5"}); }) &&
+                          rejects([] {
+                              (void)parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "off",
+                                           "--draft-tokens", "auto"});
+                          }),
+                      "a drafter's setting was accepted without its --spec");
     failures += check(
         parse({"infernix", "model.ninfer", "--prompt", "hello", "--grammar-file", "answer.gbnf"})
                 .grammar_path == "answer.gbnf",
@@ -172,7 +189,7 @@ int run_tests() {
                           ngram_auto.speculative.ngram_draft_tokens == 0,
                       "CLI did not select the automatic ngram window");
     failures += check(rejects([] {
-                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x",
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "off",
                                        "--ngram-draft-tokens", "auto"});
                       }),
                       "CLI admitted an automatic ngram window without a neural drafter");
@@ -206,9 +223,10 @@ int run_tests() {
                       }),
                       "CLI admitted --draft-tokens Auto");
     failures += check(rejects([&] {
-                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--draft-tokens", "auto"});
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "off",
+                                       "--draft-tokens", "auto"});
                       }),
-                      "CLI admitted --draft-tokens auto without --spec");
+                      "CLI admitted --draft-tokens auto with --spec off");
     // Qwen3.8-Flash-Next's DFlash2 drafter: a companion artifact by path, and the automatic length.
     const auto companion = parse({"infernix-cli", "model.infernix", "--prompt", "x", "--spec", "dflash2",
                                   "--draft-tokens", "auto", "--draft-model", "drafter.infernix", "--lm-head-draft"});

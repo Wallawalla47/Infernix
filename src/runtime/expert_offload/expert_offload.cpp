@@ -61,11 +61,6 @@ constexpr int kNarrowColumns = moe::kMaxCpuColumns;
 constexpr double kQuietShare = 0.25;
 constexpr auto kRetryPause   = std::chrono::milliseconds(500);
 constexpr auto kRetryBudget  = std::chrono::seconds(20);
-// The settled rate measurement (measure_cpu_rate_settled): the pause before each further reading (as Flash-Next's
-// Program waits for its tier), the most readings, and the gain over the best that asks for another.
-constexpr std::chrono::seconds kRateSettle{4};
-constexpr int kRateSettleReadings  = 3;
-constexpr double kRateSettleGain   = 0.10;
 
 class SplitPolicy final : public CpuSplitPolicy {
 public:
@@ -472,7 +467,7 @@ std::uint64_t ExpertOffload::promotion_interval() const noexcept {
 // DRAM reads compete with the CPU's): experts per second on one-column jobs and expert columns per
 // second on kNarrowColumns-column jobs, the best of three batches each, retried while other processes
 // load the CPU (§19.3.28).
-bool ExpertOffload::measure_cpu_rate() {
+std::optional<CpuRateReading> ExpertOffload::measure_cpu_rate() {
     const std::uint32_t L = setup_.layout.layers, E = setup_.layout.experts;
     std::vector<std::vector<std::uint32_t>> held(L); // per layer, the experts with a host copy
     bool measured = L > 0;
@@ -482,133 +477,111 @@ bool ExpertOffload::measure_cpu_rate() {
         }
         measured = !held[l].empty();
     }
+    if (!measured) { return std::nullopt; }
+    const ExpertBank& front = *setup_.banks.front();
+    const moe::ExpertShape shape = front.shape();
+    // The service's team and placement (its worker 0, the service thread, is this thread here).
+    moe::CpuExpertTeam team({.workers    = static_cast<int>(placement_.workers),
+                             .max_jobs   = kRateJobs,
+                             .activation = front.activation,
+                             .narrow_a16 = options_.narrow_a16,
+                             .ggml       = ggml_format(front).valid(),
+                             .nvfp4_a8   = options_.narrow_a16 == moe::NarrowA16::kA8, // the misses' route sets the rates
+                             .shape      = shape,
+                             .cpus       = placement_.cpus});
+    const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
+    const auto H = static_cast<std::size_t>(shape.hidden);
+    std::vector<std::uint16_t> x(H * kNarrowColumns);
+    std::vector<std::uint16_t> y(H * kRateJobs * kNarrowColumns);
+    for (std::size_t i = 0; i < x.size(); ++i) { x[i] = static_cast<std::uint16_t>(0x3C00U + (i * 7919U) % 640U); }
+    std::vector<moe::CpuExpertJob> jobs(kRateJobs);
+    const auto fill = [&](int round, int columns) {
+        for (int k = 0; k < kRateJobs; ++k) {
+            const std::uint32_t layer = static_cast<std::uint32_t>(round * kRateJobs + k) % L;
+            const ExpertBank& bank    = *setup_.banks[layer];
+            const auto& experts       = held[layer];
+            const std::uint32_t expert =
+                experts[(static_cast<std::uint32_t>(round) * 131U + static_cast<std::uint32_t>(k) * 37U) % experts.size()];
+            auto& job  = jobs[static_cast<std::size_t>(k)];
+            job.record = host_record(layer, expert);
+            job.ggml   = ggml_format(bank);
+            job.a8     = options_.narrow_a16 == moe::NarrowA16::kA8 && !job.ggml.valid();
+            job.scales = job.ggml.valid() ? moe::ExpertScales{} : bank.scales[expert];
+            job.ncols  = columns;
+            for (int c = 0; c < columns; ++c) {
+                job.x[c] = x.data() + static_cast<std::size_t>(c) * H;
+                job.y[c] = y.data() + (static_cast<std::size_t>(k) * kNarrowColumns + c) * H;
+            }
+        }
+    };
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const std::uint64_t source_stride = front.planes.record_stride; // at most the staging pitch
+    const auto rate = [&](int columns, int first_round) {
+        fill(first_round + kRateRepeats * kRateRounds, columns); // warm-up round
+        team.run(jobs);
+        double best = 0.0;
+        for (int repeat = 0; repeat < kRateRepeats; ++repeat) {
+            for (int i = 0; i < kLoadCopies; ++i) {
+                const auto& first = held.front();
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(staging_.p) + (i % staging_slots_) * record_stride_,
+                                           host_record(0, first[static_cast<std::size_t>(i) % first.size()]),
+                                           source_stride, cudaMemcpyHostToDevice, stream));
+            }
+            const auto start = std::chrono::steady_clock::now();
+            for (int r = 0; r < kRateRounds; ++r) {
+                fill(first_round + repeat * kRateRounds + r, columns);
+                team.run(jobs);
+            }
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            best = std::max(best, kRateRounds * kRateJobs / seconds);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        return best;
+    };
+    const auto began = std::chrono::steady_clock::now();
+    CpuRateReading reading;
     int attempts = 0;
     bool quiet   = true;
     double first_share = 0.0, last_share = 0.0;
-    if (measured) {
-        const ExpertBank& front = *setup_.banks.front();
-        const moe::ExpertShape shape = front.shape();
-        // The service's team and placement (its worker 0, the service thread, is this thread here).
-        moe::CpuExpertTeam team({.workers    = static_cast<int>(placement_.workers),
-                                 .max_jobs   = kRateJobs,
-                                 .activation = front.activation,
-                                 .narrow_a16 = options_.narrow_a16,
-                                 .ggml       = ggml_format(front).valid(),
-                                 .nvfp4_a8   = options_.narrow_a16 == moe::NarrowA16::kA8, // the misses' route sets the rates
-                                 .shape      = shape,
-                                 .cpus       = placement_.cpus});
-        const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
-        const auto H = static_cast<std::size_t>(shape.hidden);
-        std::vector<std::uint16_t> x(H * kNarrowColumns);
-        std::vector<std::uint16_t> y(H * kRateJobs * kNarrowColumns);
-        for (std::size_t i = 0; i < x.size(); ++i) { x[i] = static_cast<std::uint16_t>(0x3C00U + (i * 7919U) % 640U); }
-        std::vector<moe::CpuExpertJob> jobs(kRateJobs);
-        const auto fill = [&](int round, int columns) {
-            for (int k = 0; k < kRateJobs; ++k) {
-                const std::uint32_t layer = static_cast<std::uint32_t>(round * kRateJobs + k) % L;
-                const ExpertBank& bank    = *setup_.banks[layer];
-                const auto& experts       = held[layer];
-                const std::uint32_t expert =
-                    experts[(static_cast<std::uint32_t>(round) * 131U + static_cast<std::uint32_t>(k) * 37U) % experts.size()];
-                auto& job  = jobs[static_cast<std::size_t>(k)];
-                job.record = host_record(layer, expert);
-                job.ggml   = ggml_format(bank);
-                job.a8     = options_.narrow_a16 == moe::NarrowA16::kA8 && !job.ggml.valid();
-                job.scales = job.ggml.valid() ? moe::ExpertScales{} : bank.scales[expert];
-                job.ncols  = columns;
-                for (int c = 0; c < columns; ++c) {
-                    job.x[c] = x.data() + static_cast<std::size_t>(c) * H;
-                    job.y[c] = y.data() + (static_cast<std::size_t>(k) * kNarrowColumns + c) * H;
-                }
-            }
-        };
-        cudaStream_t stream = nullptr;
-        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        const std::uint64_t source_stride = front.planes.record_stride; // at most the staging pitch
-        const auto rate = [&](int columns, int first_round) {
-            fill(first_round + kRateRepeats * kRateRounds, columns); // warm-up round
-            team.run(jobs);
-            double best = 0.0;
-            for (int repeat = 0; repeat < kRateRepeats; ++repeat) {
-                for (int i = 0; i < kLoadCopies; ++i) {
-                    const auto& first = held.front();
-                    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(staging_.p) + (i % staging_slots_) * record_stride_,
-                                               host_record(0, first[static_cast<std::size_t>(i) % first.size()]),
-                                               source_stride, cudaMemcpyHostToDevice, stream));
-                }
-                const auto start = std::chrono::steady_clock::now();
-                for (int r = 0; r < kRateRounds; ++r) {
-                    fill(first_round + repeat * kRateRounds + r, columns);
-                    team.run(jobs);
-                }
-                const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-                best = std::max(best, kRateRounds * kRateJobs / seconds);
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-            }
-            return best;
-        };
-        const auto began = std::chrono::steady_clock::now();
-        double expert_rate = 0.0, column_rate = 0.0;
-        for (;;) {
-            const HostCpuTimes before = host_cpu_times();
-            const double experts      = rate(1, 0);
-            const double columns      = rate(kNarrowColumns, (kRateRepeats + 1) * kRateRounds) * kNarrowColumns;
-            const double others       = other_process_cpu_share(before, host_cpu_times());
-            if (attempts == 0) { first_share = others; }
-            last_share = others;
-            ++attempts;
-            expert_rate = std::max(expert_rate, experts);
-            column_rate = std::max(column_rate, columns);
-            quiet       = others < kQuietShare;
-            if (quiet || std::chrono::steady_clock::now() - began >= kRetryBudget) { break; }
-            std::this_thread::sleep_for(kRetryPause);
-        }
-        cpu_expert_rate_ = expert_rate;
-        cpu_column_rate_ = column_rate;
-        (void)set_current_thread_cpus(caller_cpus);
-        CUDA_CHECK(cudaStreamDestroy(stream));
+    for (;;) {
+        const HostCpuTimes before = host_cpu_times();
+        const double experts      = rate(1, 0);
+        const double columns      = rate(kNarrowColumns, (kRateRepeats + 1) * kRateRounds) * kNarrowColumns;
+        const double others       = other_process_cpu_share(before, host_cpu_times());
+        if (attempts == 0) { first_share = others; }
+        last_share = others;
+        ++attempts;
+        reading.experts = std::max(reading.experts, experts);
+        reading.columns = std::max(reading.columns, columns);
+        quiet           = others < kQuietShare;
+        if (quiet || std::chrono::steady_clock::now() - began >= kRetryBudget) { break; }
+        std::this_thread::sleep_for(kRetryPause);
     }
-    std::string how = measured ? (tier_ ? "measured on the SSD tier's RAM copies" : "measured")
-                               : "reference: no expert records in RAM yet";
+    (void)set_current_thread_cpus(caller_cpus);
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    reading.note = tier_ ? "measured on the SSD tier's RAM copies" : "measured";
     char share[160];
-    if (measured && attempts > 1) {
+    if (attempts > 1) {
         std::snprintf(share, sizeof(share), " after %d attempts: other processes used %.0f %% of the CPU at first, %.0f %% last",
                       attempts, 100.0 * first_share, 100.0 * last_share);
-        how += share;
-    } else if (measured) {
+    } else {
         std::snprintf(share, sizeof(share), "; other processes used %.0f %% of the CPU", 100.0 * last_share);
-        how += share;
     }
-    cpu_rate_note_       = how;
-    cpu_rate_busy_share_ = measured && !quiet ? last_share : -1.0;
-    return measured;
+    reading.note += share;
+    reading.busy_share = quiet ? -1.0 : last_share;
+    return reading;
 }
 
-// The CPU team's rates, settled: right after the banks' load or the tier's fill (tens of GiB of direct reads), or
-// while the OS clears memory another process freed, memory is slow for some seconds (the 122B read 4,923-6,027
-// experts/s there against 9,515-12,805 settled, 2026-10-30, and the low reading kept half its decode misses on the
-// link for the session: decode -24 to -40 %; Flash-Next's Program measures twice for its tier). After a pause the
-// rates are measured again, and again while a reading beats the best by more than kRateSettleGain, at most
-// kRateSettleReadings readings; the best stands.
+// The CPU team's rates, settled (placement.h settle_cpu_rates), right after the banks' load or the tier's fill.
 void ExpertOffload::measure_cpu_rate_settled() {
-    int readings        = 1;
-    const bool measured = measure_cpu_rate();
+    const SettledCpuRates rates = settle_cpu_rates([this] { return measure_cpu_rate(); });
+    const bool measured         = !rates.readings.empty();
     if (measured) {
-        double best_experts = cpu_expert_rate_, best_columns = cpu_column_rate_;
-        while (readings < kRateSettleReadings) {
-            std::this_thread::sleep_for(kRateSettle);
-            (void)measure_cpu_rate();
-            ++readings;
-            const bool improved = cpu_expert_rate_ > best_experts * (1.0 + kRateSettleGain);
-            best_experts        = std::max(best_experts, cpu_expert_rate_);
-            best_columns        = std::max(best_columns, cpu_column_rate_);
-            if (!improved) { break; }
-        }
-        cpu_expert_rate_ = best_experts;
-        cpu_column_rate_ = best_columns;
+        cpu_expert_rate_ = rates.experts;
+        cpu_column_rate_ = rates.columns;
     }
-    std::string how = cpu_rate_note_;
-    if (readings > 1) { how += "; the best of " + std::to_string(readings) + " readings"; }
+    const std::string how = measured ? rates.note + rates.readings_text() : "reference: no expert records in RAM yet";
     char kept[160];
     const double ct = cpu_expert_rate() * static_cast<double>(setup_.banks.front()->planes.record_stride) /
                       link_bytes_per_second_;
@@ -635,9 +608,9 @@ void ExpertOffload::measure_cpu_rate_settled() {
                    DiagnosticLevel::Warning);
     }
     if (measured && temporary_switches::flag("INFERNIX_TMP_CPU_PROBE_DETAIL")) { cpu_probe_detail(); }
-    if (measured && cpu_rate_busy_share_ >= 0.0) {
+    if (measured && rates.busy_share >= 0.0) {
         diagnostic("the CPU expert team's rates were measured while other processes kept the CPU busy (" +
-                       std::to_string(static_cast<int>(100.0 * cpu_rate_busy_share_ + 0.5)) +
+                       std::to_string(static_cast<int>(100.0 * rates.busy_share + 0.5)) +
                        " %); the decode miss split follows them for this session and may leave decode slower; start "
                        "the engine when the machine is quieter",
                    DiagnosticLevel::Warning);

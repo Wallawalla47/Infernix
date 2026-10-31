@@ -81,7 +81,9 @@ infernix-serve Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.in
 ```
 
 - `--spec dflash2 --draft-model FILE` loads the drafter beside the main artifact (any Flash-Next
-  artifact; Infernix checks that the drafter was made for this model).
+  artifact; Infernix checks that the drafter was made for this model). Builds from 2026-10-31
+  speculate even without `--spec` (`--spec auto`) and take this drafter when it is the only one in
+  the main artifact's folder (else the model's MTP drafter); startup says which.
 - `--draft-tokens auto` (recommended): every round drafts the block of 7 the drafter was trained
   with (8 columns: the last accepted token and 7 drafts) and verifies only as many of them as the
   drafter's own probabilities, calibrated per request, make worthwhile. `--draft-tokens N` (1-7)
@@ -96,8 +98,9 @@ infernix-serve Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.in
 
 DFlash2 replaces MTP: the main artifact's MTP drafter is not loaded (no `--spec mtp`), so the
 expert cache gets that VRAM back, less the drafter's 776 MB and a 40 MiB context ring per request
-lane. With `--max-concurrency 2` or more, rounds of two or more requests decode without drafts
-(as MTP's do without the `adaptive-speculation` fast path); a request decoding alone speculates.
+lane. With `--max-concurrency 2` or more, a request decoding alone speculates as above, rounds of two
+requests share one proposal and verify up to two drafts each (the default `dflash2-pairs` fast path),
+and rounds of three or more decode without drafts.
 
 ## Quantization
 

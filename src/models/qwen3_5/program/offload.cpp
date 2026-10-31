@@ -76,6 +76,22 @@ runtime::expert_offload::OffloadSetup offload_setup(const execution::Parameters&
     return setup;
 }
 
+OffloadGeometry offload_round_geometry(std::uint32_t max_concurrency, std::uint32_t draft_window,
+                                       std::uint32_t prefill_chunk, std::uint32_t idle_prefill_width,
+                                       SpeculativeBackend backend, std::uint32_t neural_draft_window,
+                                       std::uint32_t ngram_draft_window, int device) {
+    return OffloadGeometry{
+        .lanes       = static_cast<std::int32_t>(max_concurrency),
+        .max_width   = static_cast<std::int32_t>(draft_window + 1U),
+        .columns     = static_cast<std::int32_t>(std::max<std::uint32_t>(std::max(idle_prefill_width, prefill_chunk),
+                                                                      max_concurrency * (draft_window + 1U))),
+        .chunk       = static_cast<std::int32_t>(prefill_chunk),
+        .speculative = backend != SpeculativeBackend::None || ngram_draft_window != 0,
+        .mtp_draft_tokens   = backend == SpeculativeBackend::Mtp ? neural_draft_window : 0U,
+        .ngram_draft_tokens = ngram_draft_window,
+        .device             = device};
+}
+
 std::uint64_t ProgramOffload::fixed_bytes(const execution::Parameters& parameters, const OffloadGeometry& geometry,
                                           const expert_offload::OffloadOptions& options) {
     return expert_offload::ExpertOffload::fixed_bytes(offload_setup(parameters, geometry), options);

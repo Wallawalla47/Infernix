@@ -144,11 +144,13 @@ of 580 or later; on Linux, build from source
 ([quick start](https://github.com/Wallawalla47/Infernix#quick-start-linux)).
 
 ```bat
-infernix-serve.exe Swift-Qwen3.8-27B-NVFP4-NInfer.ninfer --host 127.0.0.1 --port 8080 --max-context 240000 --max-concurrency 2 --spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15 --ngram-min-match 12 --kv-dtype int8 --preserve-thinking --host-context-mib 52000 --pending-timeout-ms 900000 --prefill-chunk 4096 --kv-capacity auto --vram-headroom-mib 0 --log-colours on --ngram-archive-mib 2048 --ngram-session-mib 256 --ngram-native-sessions --request-log-jsonl log.json --default-thinking-budget 16384 --thinking-budget-message "Considering the limited time available to the user, I must stop thinking now. Time to act:" --tolerant-tool-calls
+infernix-serve.exe Swift-Qwen3.8-27B-NVFP4-NInfer.ninfer --host 127.0.0.1 --port 8080 --max-context 240000 --max-concurrency 2 --spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto --kv-dtype int8 --preserve-thinking --host-context-mib 52000 --pending-timeout-ms 900000 --prefill-chunk 4096 --kv-capacity auto --vram-headroom-mib 0 --log-colours on --ngram-archive-mib 2048 --ngram-session-mib 256 --ngram-native-sessions --request-log-jsonl log.json --default-thinking-budget 16384 --thinking-budget-message "Considering the limited time available to the user, I must stop thinking now. Time to act:" --tolerant-tool-calls
 ```
 
-It runs DFlash2 speculative decoding with 7 draft tokens, the indexed proposal head
-(`--lm-head-draft`) and n-gram copy drafting, int8 KV, and the hybrid prefix cache with a
+It runs DFlash2 speculative decoding (`--draft-tokens auto`: a block of 15 drafts verified at the
+width their probabilities favour, 7 in rounds of several requests), the indexed proposal head
+(`--lm-head-draft`) and n-gram copy drafting (`--ngram-draft-tokens auto`: the window measured fastest
+for this configuration), int8 KV, and the hybrid prefix cache with a
 52,000 MiB tier in system RAM (`--host-context-mib`). `--kv-capacity auto` sizes the KV pool to the
 free VRAM. Lower `--host-context-mib` on a machine with less system RAM, and on a single 32 GB GPU
 stop any other resident model first. Add `--prefix-cache-file PATH` to keep the prefix cache across
@@ -161,7 +163,8 @@ restarts. `infernix-serve.exe --help` lists every option.
 
 **With NInfer:** the artifact also runs on [NInfer](https://github.com/Neroued/ninfer) and on
 [ninfer-custom](https://github.com/Wallawalla47/ninfer-custom) with `ninfer-serve` and the same
-command; drop any option that engine's `ninfer-serve --help` does not list.
+command, with fixed draft lengths in place of `auto` (`--draft-tokens 7 --ngram-draft-tokens 15
+--ngram-min-match 12`); drop any option that engine's `ninfer-serve --help` does not list.
 
 ## Tested
 

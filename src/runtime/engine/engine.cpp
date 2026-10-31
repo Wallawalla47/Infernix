@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/nvtx.h"
+#include "core/io_priority.h"
 #include "core/power_throttling.h"
 #include "core/startup.h"
 #include "core/temporary_switches.h"
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <limits>
@@ -27,6 +29,7 @@
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace infernix {
 namespace {
@@ -317,22 +320,36 @@ public:
     // Options are checked before the artifact is opened; defaults that depend on the model (the
     // hybrid prefix cache's, --spec auto's drafter) need the artifact's architecture and drafters, read
     // once here. An unreadable artifact is reported by the (Qwen3.5) model construction, after option
-    // validation.
+    // validation, or here when --spec auto (the CLI's and server's default) needs its drafters.
     EngineOptions normalize(EngineOptions engine_options) {
         bool offloaded_experts = false;
         std::optional<models::qwen3_5::BundledDrafters> drafters;
+        std::vector<std::filesystem::path> dflash2_companions;
+        std::exception_ptr unreadable;
         try {
             const artifact::Reader reader(engine_options.artifact_path);
             if (runtime::artifact_is_qwen4_exp(reader)) {
                 architecture = models::Architecture::Qwen4Exp;
+                const SpeculativeOptions& speculative = engine_options.speculative;
+                if (speculative.backend_auto && speculative.draft_model.empty() && !engine_options.lossless &&
+                    engine_options.purpose == EnginePurpose::Generation) {
+                    dflash2_companions = runtime::dflash2_companions_beside(engine_options.artifact_path,
+                                                                            reader.directory());
+                }
             } else {
                 offloaded_experts = runtime::artifact_offloads_experts(reader);
             }
             drafters = runtime::artifact_drafters(reader);
-        } catch (const std::exception&) {}
+        } catch (const std::exception&) {
+            unreadable = std::current_exception();
+        }
         runtime::validate_engine_options(engine_options, architecture, offloaded_experts);
         if (drafters) {
-            runtime::resolve_auto_speculative_backend(engine_options, architecture, offloaded_experts, *drafters);
+            runtime::resolve_auto_speculative_backend(engine_options, architecture, offloaded_experts, *drafters,
+                                                      dflash2_companions);
+        } else if (engine_options.speculative.backend_auto &&
+                   engine_options.purpose == EnginePurpose::Generation && unreadable) {
+            std::rethrow_exception(unreadable);
         }
         return runtime::normalize_engine_options(std::move(engine_options), architecture, offloaded_experts);
     }
@@ -431,6 +448,21 @@ Engine::Engine(EngineOptions options) {
                                     "Windows refused the power-throttling exemption (error %lu): run in a "
                                     "background window, the host threads may be slowed many times over",
                                     *refused);
+    }
+    // Before the artifact is read: an inherited low I/O priority throttles every direct read.
+    if (const auto io = raise_low_io_priority()) {
+        if (io->after >= kIoPriorityNormal) {
+            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                        "raised the I/O priority this process inherited (%d, below normal) to normal: "
+                                        "Windows throttles low-priority reads",
+                                        io->before);
+        } else {
+            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                                        "this process inherited I/O priority %d (below normal) and Windows refused to "
+                                        "raise it: model, n-gram and SSD-tier reads may be several times slower; start "
+                                        "the engine from a normal-priority process",
+                                        io->before);
+        }
     }
     StartupObserver startup_observer = options.startup_observer;
     StartupPhaseScope startup_phase(startup_observer, StartupPhase::EngineStartup);

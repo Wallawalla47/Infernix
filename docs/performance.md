@@ -21,6 +21,10 @@ not product support. C is configured request concurrency; K is the number of dra
 | Qwen3.8-27B / `groupwise-int` | [8K–256K](performance/qwen3.8-27b.md#no-speculation-context-profile) | [MTP3; DFlash2 K=7](performance/qwen3.8-27b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash2 C=1](performance/qwen3.8-27b.md#corpus-makespan) | [C=1, 2, 4, 8](performance/qwen3.8-27b.md#decode-saturation) |
 | Qwen3.8-27B / `nvfp4` | [8K–256K](performance/qwen3.8-27b.md#no-speculation-context-profile) | [MTP3; DFlash2 K=7](performance/qwen3.8-27b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash2 C=1](performance/qwen3.8-27b.md#corpus-makespan) | [C=1, 2, 4, 8](performance/qwen3.8-27b.md#decode-saturation) |
 
+Each page dates its runs (the Qwen3.6-35B-A3B page 2026-09-07, the Qwen3.8-27B page 2026-09-28/29, the
+Qwen3.6-27B page per run); later releases changed these models' decode routes, so the figures describe those
+runs' builds, not the current one.
+
 Qwen3.8-Flash-Next has no row: its published figures are the README's
 comparisons with [Strata, strata-nvfp4 and Basalt](../README.md#qwen38-flash-next-nvfp4-infernix-vs-strata-strata-nvfp4-and-basalt)
 and [Strata and Basalt on IQ3_S](../README.md#qwen38-flash-next-iq3_s-infernix-vs-strata-and-basalt), measured with that
