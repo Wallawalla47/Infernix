@@ -31,6 +31,8 @@ struct ServeOptions {
     // Whether `flag` takes a value; nullopt when the help does not list it.
     [[nodiscard]] std::optional<bool> takes_value(std::string_view flag) const;
     [[nodiscard]] bool known(std::string_view flag) const;
+    // Whether `flag`'s argument names `value` among its "a|b|c" choices.
+    [[nodiscard]] bool lists_value(std::string_view flag, std::string_view value) const;
 };
 
 // Runs `executable --help` (cached by path and modification time).

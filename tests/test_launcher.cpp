@@ -97,10 +97,13 @@ void test_help() {
         "  --use-original-int8-prefill-kernel\n"
         "                             prefill INT8 KV with the original prompt kernel at\n"
         "                             the requested chunk\n"
-        "  --reproducible             run the reproducible route\n";
-    const std::vector<ServeOption> options = parse_serve_help(help);
-    check(options.size() == 4, "four options parsed");
-    if (options.size() == 4) {
+        "  --reproducible             run the reproducible route\n"
+        "  --spec auto|off|mtp|dflash|dflash2\n"
+        "                             speculative decoding\n";
+    const ServeOptions serve{.found = true, .options = parse_serve_help(help)};
+    const std::vector<ServeOption>& options = serve.options;
+    check(options.size() == 5, "five options parsed");
+    if (options.size() == 5) {
         check(options[0].flag == "--help" && !options[0].arg, "--help with its alias, no argument");
         check(options[1].flag == "--max-context" && options[1].arg == "N" && options[1].section == "MODEL & CONTEXT",
               "argument and section");
@@ -108,6 +111,12 @@ void test_help() {
               "a description on the following lines is joined");
         check(options[3].flag == "--reproducible" && !options[3].arg, "a switch takes no value");
     }
+    check(serve.lists_value("--spec", "auto") && serve.lists_value("--spec", "off") &&
+              serve.lists_value("--spec", "dflash2"),
+          "the first, a middle and the last choice are listed");
+    check(!serve.lists_value("--spec", "dflash2x") && !serve.lists_value("--spec", "of") &&
+              !serve.lists_value("--max-context", "N|") && !serve.lists_value("--no-such-flag", "off"),
+          "a prefix, an unlisted value and an unknown flag are not");
 }
 
 std::string volume_header(std::uint32_t row_bytes, const std::uint8_t id[16], std::uint16_t scale, std::uint16_t tag) {
