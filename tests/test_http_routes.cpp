@@ -2,10 +2,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -95,20 +98,44 @@ int main() {
         listener.join();
     }
 
-    // Idle retirement (the client-races-the-silent-close fix): a request arriving after the
-    // retirement threshold gets its response stamped `Connection: close` — and stripped of the
-    // server's own Keep-Alive reuse hint; a back-to-back request keeps the pool warm, and the
-    // request after a retirement answers on a fresh connection.
+    // Idle retirement (the client-races-the-silent-close fix): a connection idle past the
+    // threshold since its last response ended gets its next response stamped `Connection: close`,
+    // stripped of the server's own Keep-Alive reuse hint, and the request after it answers
+    // unstamped on a fresh connection. A response that takes longer than the threshold, computed
+    // before its headers or streamed after them, is not idleness: the request right after it keeps
+    // the connection.
     {
+        using namespace std::chrono_literals;
+        constexpr auto kThreshold = 300ms, kLong = 450ms;
         httplib::Server server;
         server.Get("/ping", [](const httplib::Request&, httplib::Response& res) {
             res.set_content("pong", "text/plain");
         });
+        server.Get("/computed", [kLong](const httplib::Request&, httplib::Response& res) {
+            std::this_thread::sleep_for(kLong);
+            res.set_content("computed", "text/plain");
+        });
+        server.Get("/streamed", [kLong](const httplib::Request&, httplib::Response& res) {
+            res.set_chunked_content_provider("text/plain", [kLong](std::size_t, httplib::DataSink& sink) {
+                std::this_thread::sleep_for(kLong);
+                sink.write("streamed", 8);
+                sink.done();
+                return true;
+            });
+        });
         server.set_keep_alive_timeout(30);
-        infernix::serve::KeepAliveRetirement retirement(std::chrono::seconds(1));
+        infernix::serve::KeepAliveRetirement retirement(kThreshold);
+        std::mutex ports_mutex;
+        std::vector<int> ports; // each request's client port: one connection or several
+        server.set_pre_routing_handler([&](const httplib::Request& request, httplib::Response&) {
+            retirement.arrived(request);
+            std::lock_guard lock(ports_mutex);
+            ports.push_back(request.remote_port);
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
         server.set_post_routing_handler([&retirement](const httplib::Request& request,
                                                        httplib::Response& response) {
-            retirement.handle(request, response);
+            retirement.respond(request, response);
         });
         const int port = server.bind_to_any_port("127.0.0.1");
         failures += check(port > 0, "keep-alive test server could not bind a loopback port");
@@ -117,38 +144,50 @@ int main() {
             server.wait_until_ready();
             httplib::Client client("127.0.0.1", port);
             client.set_keep_alive(true);
-            const auto warm = client.Get("/ping");
-            failures += check(warm && warm->status == 200 &&
-                                  !warm->has_header("Connection"),
-                              "a back-to-back keep-alive response must not retire the connection");
-            std::this_thread::sleep_for(std::chrono::milliseconds(1300));
+            const auto kept = [](const httplib::Result& result, const char* body) {
+                return result && result->status == 200 && result->body == body && !result->has_header("Connection");
+            };
+            const bool warm           = kept(client.Get("/ping"), "pong");
+            const bool computed       = kept(client.Get("/computed"), "computed");
+            const bool after_computed = kept(client.Get("/ping"), "pong");
+            const bool streamed       = kept(client.Get("/streamed"), "streamed");
+            const bool after_streamed = kept(client.Get("/ping"), "pong");
+            failures += check(warm && computed && after_computed,
+                              "a response computed past the threshold must not count as idleness");
+            failures += check(streamed && after_streamed,
+                              "a response streamed past the threshold must not count as idleness");
+            std::this_thread::sleep_for(kLong);
             const auto retired = client.Get("/ping");
             failures += check(retired && retired->status == 200 &&
                                   retired->get_header_value("Connection") == "close",
                               "the response after a long idle must retire the connection");
             failures += check(retired && !retired->has_header("Keep-Alive"),
                               "a retired response must not also invite reuse");
-            const auto next = client.Get("/ping");
-            failures += check(next && next->status == 200 && !next->has_header("Connection"),
-                              "the request after a retirement must answer unstamped on a fresh connection");
+            const bool next = kept(client.Get("/ping"), "pong");
+            failures += check(next, "the request after a retirement must answer unstamped");
+            std::lock_guard lock(ports_mutex);
+            failures += check(ports.size() == 7 && std::count(ports.begin(), ports.end() - 1, ports.front()) == 6 &&
+                                  ports.back() != ports.front(),
+                              "the requests up to the retirement must share one connection and the next open another");
             server.stop();
             listener.join();
         }
     }
 
     // Idle sockets must not starve admission (the pool-sizing half of the keep-alive fix):
-    // cpp-httplib parks one pool worker per open connection for its whole idle window, so a
-    // pool sized only to admission lets idle connections block new requests. Headroom workers
-    // beyond the base must absorb them.
+    // cpp-httplib parks one pool worker per open connection for its whole idle window, so the
+    // server's pool keeps headroom beyond request admission. With one lane and one waiting
+    // request (three base workers), four idle connections must still leave room for a new one.
     {
         httplib::Server server;
         server.Get("/ping", [](const httplib::Request&, httplib::Response& res) {
             res.set_content("pong", "text/plain");
         });
         server.set_keep_alive_timeout(30);
-        // Two base workers, four headroom workers: hold every base worker with an idle
-        // connection and a request must still be admitted through the headroom.
-        server.new_task_queue = [] { return new httplib::ThreadPool(2, 6, 16); };
+        infernix::serve::ServeOptions pool_options;
+        pool_options.max_concurrency      = 1;
+        pool_options.max_pending_requests = 1;
+        server.new_task_queue = [&pool_options] { return infernix::serve::new_http_worker_pool(pool_options); };
         const int port = server.bind_to_any_port("127.0.0.1");
         failures += check(port > 0, "pool test server could not bind a loopback port");
         if (port > 0) {
@@ -163,7 +202,7 @@ int main() {
                 all_warm = all_warm && warm && warm->status == 200;
             }
             failures += check(all_warm, "idle connections could not each get their warm-up response");
-            // All four connections are now open and idle, holding four workers.
+            // All four connections are now open and idle, each holding a worker.
             httplib::Client fresh("127.0.0.1", port);
             fresh.set_read_timeout(5, 0);
             const auto admitted = fresh.Get("/ping");

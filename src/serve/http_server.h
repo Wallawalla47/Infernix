@@ -54,6 +54,10 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 [[nodiscard]] std::string api_route_pattern(std::string_view endpoint);
 [[nodiscard]] std::string_view canonical_api_path(std::string_view path) noexcept;
 
+// The HTTP server's worker pool (its new_task_queue, owned by the server): a worker for every
+// admitted or waiting request and one more, plus headroom for idle keep-alive connections.
+[[nodiscard]] httplib::TaskQueue* new_http_worker_pool(const ServeOptions& options);
+
 class HttpServer {
 public:
     // `panel` is the console panel for the session statistics; it is drawn only when enabled by
@@ -151,8 +155,9 @@ private:
     Metrics metrics_;
     RequestHistory metrics_json_history_;
     std::unique_ptr<ConsoleStatsPanel> console_stats_;
+    // Before server_, which it outlives: a response records its end when the server destroys it.
+    KeepAliveRetirement keep_alive_retirement_;
     httplib::Server server_;
-    std::unique_ptr<KeepAliveRetirement> keep_alive_retirement_;
     std::atomic<std::uint64_t> request_seq_{0};
     std::mutex stats_mutex_;
     std::condition_variable stats_cv_;
