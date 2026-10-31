@@ -1370,14 +1370,9 @@ public:
         const std::uint32_t cpu_jobs    = options_.cpu_expert_jobs;
         const std::uint32_t assist_jobs = options_.cpu_assist_jobs;
         if (cpu_workers > 0 && cpu_jobs > 0) {
-            // An A/B arm of the placement shows it without debug logging.
+            // An A/B arm of the placement, or a team the host cut, shows without debug logging.
             if (!placement_.text.empty()) {
-                const auto& switches = temporary_switches::offload();
-                diagnostic(placement_.text,
-                           switches.placement != temporary_switches::OffloadSwitches::Placement::kDefault ||
-                                   switches.workers > 0
-                               ? DiagnosticLevel::Info
-                               : DiagnosticLevel::Debug);
+                diagnostic(placement_.text, placement_.announce ? DiagnosticLevel::Info : DiagnosticLevel::Debug);
             }
             // The team's rate sets the decode miss split (design §19.3.12); the SSD tier's is measured
             // once its RAM is filled (below).
