@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -92,6 +93,41 @@ int main() {
                           "a doubled prefix must not shift the route's capture groups");
         server.stop();
         listener.join();
+    }
+
+    // Idle retirement (the client-races-the-silent-close fix): a request arriving after the
+    // graceful-idle threshold gets its response stamped `Connection: close`; a back-to-back
+    // request keeps the pool warm, and the request after a retirement answers on a fresh
+    // connection. The httplib default (0) must stamp nothing.
+    {
+        httplib::Server server;
+        server.Get("/ping", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content("pong", "text/plain");
+        });
+        server.set_keep_alive_timeout(30);
+        server.set_keep_alive_graceful_idle(1);
+        const int port = server.bind_to_any_port("127.0.0.1");
+        failures += check(port > 0, "keep-alive test server could not bind a loopback port");
+        if (port > 0) {
+            std::thread listener([&server] { server.listen_after_bind(); });
+            server.wait_until_ready();
+            httplib::Client client("127.0.0.1", port);
+            client.set_keep_alive(true);
+            const auto warm = client.Get("/ping");
+            failures += check(warm && warm->status == 200 &&
+                                  !warm->has_header("Connection"),
+                              "a back-to-back keep-alive response must not retire the connection");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1300));
+            const auto retired = client.Get("/ping");
+            failures += check(retired && retired->status == 200 &&
+                                  retired->get_header_value("Connection") == "close",
+                              "the response after a long idle must retire the connection");
+            const auto next = client.Get("/ping");
+            failures += check(next && next->status == 200 && !next->has_header("Connection"),
+                              "the request after a retirement must answer unstamped on a fresh connection");
+            server.stop();
+            listener.join();
+        }
     }
 
     if (failures == 0) { std::cout << "http routes tests passed\n"; }

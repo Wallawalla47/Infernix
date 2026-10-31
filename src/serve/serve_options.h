@@ -61,6 +61,14 @@ struct ServeOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
+    // HTTP keep-alive: how long a finished response's connection stays open for the next
+    // request (the HTTP server's own pool, not TCP keepalive). The cpp-httplib default of 5 s
+    // silently closes pooled connections between agent turns, so clients race the close.
+    // This is the hard ceiling only: the silent timeout close is the one path no header can
+    // announce, so it sits far above any plausible turn gap (600 s), while the graceful
+    // retirement (Connection: close on the response after an idle past half the ceiling) is
+    // the normal death of a long-idle pooled connection. See HttpServer::register_routes.
+    std::uint32_t keep_alive_timeout_sec = 600;
     std::uint32_t prefill_chunk        = 0; // 0: the model's default (EngineOptions)
     bool original_int8_prefill_kernel  = false;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
