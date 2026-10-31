@@ -462,8 +462,16 @@ string `"null"` beside null is rejected, since its raw text would be the same. T
 strict argument with the types the parameter's schema admits (`type`, enum/const values, local
 `$ref`, `allOf`, `anyOf`/`oneOf`), the same domain that chose its encoding.
 
-A raw string argument ends at `\n</parameter>`, which must not occur in the value. Grammar and parser
-use the same delimiter rule and strict output generates only losslessly representable values; a
+A raw string argument ends at `\n</parameter>`, which occurs in the value only inside the whole
+call's closing lines, `\n</parameter>\n</function>\n</tool_call>`, that more value text follows (a
+document quoting them; candidates SY-04, Strata #4701). The free string rule is a segment without the
+delimiter, then any number of those closing lines and another segment (`xml_string` in the vendored
+converter), so the matcher keeps both readings after the closers until the next token decides: the
+end of the output or the next call's `<tool_call>` token (which no value holds) closes the call, other
+text continues the value. The companion and `ConstrainedToolStream` follow the same rule; the stream
+holds the call's last fragment until then. Strings with a length bound or a pattern keep the plain
+exclusion. Grammar and parser use the same delimiter rule and strict output generates only
+losslessly representable values; a
 required const/enum value that cannot be represented returns an explicit error instead of being
 changed. A string's pattern/length and the delimiter exclusion hold together. The outer framing has no
 optional whitespace, so value whitespace is never pushed outside the schema. Nested JSON uses the

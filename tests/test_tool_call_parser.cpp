@@ -275,13 +275,20 @@ int test_parameter_delimiters_in_values() {
         }
     }
 
-    // Markup the grammar could continue from stays ambiguous, so those calls still fall back.
+    // Markup the grammar could continue from stays ambiguous, so that call still falls back.
     failures += check_rejected(tool_call("bash", {{"command", "echo '<parameter=unterminated>'"}}),
                                contract, Reason::MalformedStructure,
                                "unbalanced nested parameter open was silently repaired");
-    failures += check_rejected(tool_call("bash", {{"command", "echo '</parameter></function>'"}}),
-                               contract, Reason::MalformedStructure,
-                               "a closer followed by a function closer was guessed to be text");
+    // A closer followed by the call's own closers and then text is value text when a later closer
+    // ends the call (SY-04): only that reading parses the whole output, and the constrained route
+    // reads such a value the same way.
+    {
+        const std::string command = "echo '</parameter></function>'";
+        const auto parsed         = parse(tool_call("bash", {{"command", command}}), 64, contract);
+        failures += check(parsed.tool_calls.size() == 1 &&
+                              Json::parse(parsed.tool_calls.front().arguments_json).at("command") == command,
+                          "a value quoting the call's closing tags was cut or demoted");
+    }
 
     // Tolerant truncation: a closer at the region end still closes the value, and a quoted closer
     // inside a value the budget cut stays part of the kept partial value.
@@ -2011,7 +2018,11 @@ int test_constrained_call_streaming() {
         StreamedCalls streamed;
         (void)feed(decoder, "c\n</parameter>\n</function>\n</tool_call>");
         streamed.take(decoder);
+        // Closing lines that end the output close the call only at its end.
+        failures += check(streamed.calls.size() == 1 && streamed.complete.size() == 1 && !streamed.complete[0],
+                          "a call completed before the token after its closing lines");
         const auto terminal = decoder.finish(infernix::FinishReason::StopToken);
+        streamed.take(decoder);
         failures += check(terminal.tool_calls.size() == 1 && terminal.tool_calls[0].arguments_json == R"({"path":"abc"})" &&
                               streamed.calls.size() == 1 && streamed.calls[0].arguments_json == R"({"path":"abc"})",
                           "a continued call did not stream from its start");
@@ -2100,6 +2111,74 @@ int test_reference_and_value_type_hints() {
     return failures;
 }
 
+// A file whose content documents the call format holds the call's own closing lines and then more
+// text (Strata #4701): those lines are value text, so the file keeps every byte, on the free route
+// (strict and tolerant, whole and at every chunking) and the constrained one, whose streamed steps
+// concatenate to the call. Without a later closer, or with another call after the prose, a call
+// still ends at its first closers, as before.
+int test_quoted_call_closers() {
+    const std::vector<std::string> definitions = {tool_definition(
+        "write_file", Json{{"path", Json{{"type", "string"}}}, {"content", Json{{"type", "string"}}}})};
+    const auto free_contract = contract_from_definitions(definitions);
+    const auto constrained   = fi::select_tool_call_contract(free_contract, infernix::ToolChoice{});
+    using Contract           = std::shared_ptr<const fi::ToolCallOutputContract>;
+    const std::string document =
+        "# Format\nA call ends with:\n</parameter>\n</function>\n</tool_call>\nThen the reply goes on.";
+    const std::string call      = tool_call("write_file", {{"path", "/tmp/format.md"}, {"content", document}});
+    const std::string arguments = Json{{"path", "/tmp/format.md"}, {"content", document}}.dump();
+    int failures                = 0;
+    const std::vector<std::pair<Contract, bool>> routes{{free_contract, false}, {free_contract, true}, {constrained, false}};
+    for (const auto& [contract, tolerant] : routes) {
+        const std::string route = contract->constrained ? " (constrained)" : tolerant ? " (tolerant)" : " (strict)";
+        const std::string text  = "Writing it.\n" + call;
+        if (!contract->constrained) {
+            const auto whole = parse(text, 64, *contract, tolerant);
+            failures += check(whole.tool_calls.size() == 1 && Json::parse(whole.tool_calls[0].arguments_json) ==
+                                                                   Json::parse(arguments),
+                              "the whole parse cut a file at its quoted closing lines" + route);
+        }
+        for (const std::size_t width : {std::size_t{1}, std::size_t{3}, std::size_t{7}, text.size()}) {
+            fi::ToolCallOutputDecoder decoder(contract, 64, tolerant);
+            StreamedCalls streamed;
+            std::string visible;
+            for (std::size_t at = 0; at < text.size(); at += width) {
+                visible += feed(decoder, text, at, width);
+                streamed.take(decoder);
+            }
+            const auto terminal = decoder.finish(infernix::FinishReason::StopToken);
+            streamed.take(decoder);
+            failures += check(terminal.tool_calls.size() == 1 &&
+                                  Json::parse(terminal.tool_calls[0].arguments_json) == Json::parse(arguments) &&
+                                  visible + terminal.content == "Writing it.",
+                              "a file was cut at its quoted closing lines" + route + ", width " + std::to_string(width));
+            if (contract->constrained && terminal.tool_calls.size() == 1) {
+                failures += check(streamed.ordered && streamed.calls.size() == 1 && streamed.complete[0] &&
+                                      streamed.calls[0].arguments_json == terminal.tool_calls[0].arguments_json,
+                                  "the streamed steps of a file holding closing lines differ, width " + std::to_string(width));
+            }
+        }
+    }
+    // Prose after a call with no later closer: strict demotes it to text, tolerant keeps it cut there.
+    const std::string plain   = tool_call("write_file", {{"path", "/tmp/a"}, {"content", "x"}});
+    const std::string trailed = plain + "\nThat wrote the file.";
+    failures += check(parse(trailed, 64, *free_contract).tool_calls.empty(), "strict kept a call with trailing prose");
+    const auto kept = parse(trailed, 64, *free_contract, true);
+    failures += check(kept.tool_calls.size() == 1 && Json::parse(kept.tool_calls[0].arguments_json)["content"] == "x",
+                      "tolerant did not keep a call before trailing prose");
+    // Another call after the prose: the first call's closers stay its closers (no value holds the
+    // `<tool_call>` token), as before: strict takes the second call, tolerant the first.
+    const std::string two = plain + "\nNext one.\n" + tool_call("write_file", {{"path", "/tmp/b"}, {"content", "y"}});
+    const auto strict_two = parse(two, 64, *free_contract);
+    failures += check(strict_two.tool_calls.size() == 1 &&
+                          Json::parse(strict_two.tool_calls[0].arguments_json)["path"] == "/tmp/b",
+                      "strict read prose between two calls differently");
+    const auto tolerant_two = parse(two, 64, *free_contract, true);
+    failures += check(tolerant_two.tool_calls.size() == 1 &&
+                          Json::parse(tolerant_two.tool_calls[0].arguments_json)["content"] == "x",
+                      "tolerant let a value swallow the next call");
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_constrained_call_streaming();
@@ -2145,6 +2224,7 @@ int main() {
     failures += test_damaged_parameter_opener();
     failures += test_open_reasoning_recovery();
     failures += test_markdown_quoted_calls();
+    failures += test_quoted_call_closers();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

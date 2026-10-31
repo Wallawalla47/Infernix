@@ -814,6 +814,44 @@ private:
                (!bare_close_.empty() && starts_with_at(text_, pos, bare_close_));
     }
 
+    // Where the call's own closers that follow `pos` (whitespace between) end: the function close,
+    // then any call and wrapper closes; npos when no function close follows.
+    std::size_t after_call_close(std::size_t pos) const {
+        skip_format_whitespace(text_, pos);
+        if (!consume(pos, "</function>") && !consume(pos, "</invoke>") &&
+            (bare_close_.empty() || !consume(pos, bare_close_))) {
+            return std::string_view::npos;
+        }
+        for (;;) {
+            skip_format_whitespace(text_, pos);
+            if (!consume(pos, "</tool_call>") && !consume(pos, "</function_calls>")) { return pos; }
+        }
+    }
+
+    // Whether the output ends at `pos`, or another call begins there.
+    bool call_boundary(std::size_t pos) const {
+        skip_format_whitespace(text_, pos);
+        return pos >= text_.size() || tool_call_at(pos) || starts_with_at(text_, pos, "<function") ||
+               starts_with_at(text_, pos, "<invoke");
+    }
+
+    // A closer at `scan` that the call's own closers follow, and then text that is no other call,
+    // quotes those closing lines (a document showing a call's format) when a later closer, before
+    // the next `<tool_call>` token (which no value holds), ends the call at a boundary: the value
+    // goes on. The constrained grammar reads them the same way.
+    bool quoted_call_close(std::size_t scan, std::string_view required_close) const {
+        const std::size_t after = after_call_close(scan + required_close.size());
+        if (after == std::string_view::npos || call_boundary(after)) { return false; }
+        const auto token        = std::lower_bound(tool_calls_.begin(), tool_calls_.end(), base_ + after);
+        const std::size_t limit = token == tool_calls_.end() ? text_.size() : *token - base_;
+        for (std::size_t later = text_.find(required_close, after); later < limit;
+             later = text_.find(required_close, later + 1)) {
+            const std::size_t end = after_call_close(later + required_close.size());
+            if (end != std::string_view::npos && call_boundary(end)) { return true; }
+        }
+        return false;
+    }
+
     // Tolerant: a parameter opener that lost its keyword, `<=NAME>`, for a parameter the call's tool
     // declares (Strata PR #3960: drifting low-bit quants write it after a `</parameter>`). Without
     // the repair the previous `</parameter>` is followed by no grammar token, so the next parameter
@@ -863,7 +901,7 @@ private:
         if (!tolerant_ || !region_ends_with_call_close()) { return false; }
         for (std::size_t scan = value_begin; scan < text_.size(); ++scan) {
             if (starts_with_at(text_, scan, required_close) &&
-                closes_parameter(scan + required_close.size())) {
+                closes_parameter(scan + required_close.size()) && !quoted_call_close(scan, required_close)) {
                 value_end = scan;
                 close_len = required_close.size();
                 return true;
@@ -879,8 +917,12 @@ private:
         while (scan < text_.size()) {
             if (starts_with_at(text_, scan, required_close)) {
                 // Closers of parameters the value quotes whole always balance their openers; only
-                // the outermost one must be followed by the grammar's next token.
-                if (depth != 1 || closes_parameter(scan + required_close.size())) { --depth; }
+                // the outermost one must be followed by the grammar's next token, and not quote the
+                // call's own closing lines.
+                if (depth != 1 || (closes_parameter(scan + required_close.size()) &&
+                                   !quoted_call_close(scan, required_close))) {
+                    --depth;
+                }
                 if (depth == 0) {
                     value_end = scan;
                     close_len = required_close.size();
@@ -1025,6 +1067,8 @@ constexpr std::string_view kParameterOpen = "<parameter=";
 constexpr std::string_view kValueEnd      = "\n</parameter>";
 constexpr std::string_view kJsonValueEnd  = "</parameter>\n";
 constexpr std::string_view kCallClose     = "</function>\n</tool_call>";
+// A raw value's terminator and the whole call's closing lines: value text when more text follows.
+constexpr std::string_view kQuotedClose = "\n</parameter>\n</function>\n</tool_call>";
 
 // A JSON string's characters without its quotes. Valid UTF-8 escapes character by character, so
 // the pieces of a value concatenate to the encoding of the whole.
@@ -1042,25 +1086,43 @@ void append_json_string_body(std::string& out, std::string_view text) {
 // streams as its JSON string and a strict JSON value verbatim; a value whose JSON depends on all of it
 // (a non-strict value of a declared non-string type, or of no declared type) is published when it
 // closes. The grammar's companion names each parameter once per call, so a published key never
-// repeats. Only complete calls are returned; an interrupted turn leaves the last call unfinished.
+// repeats. A raw value that the whole call's closing lines follow stays open until the next byte
+// decides: the next call's token or the end of the output closes the call, other text continues the
+// value (the grammar's reading of a document that quotes them). Only complete calls are returned; an
+// interrupted turn leaves the last call unfinished.
 class ConstrainedToolStream {
 public:
     enum class Status { Complete, Incomplete, Invalid };
 
     explicit ConstrainedToolStream(const Contract& contract) : contract_(contract) {}
 
-    // The next region bytes; the region starts at its first `<tool_call>` token.
-    void feed(std::string_view bytes) {
-        for (const char byte : bytes) {
+    // The next region bytes; the region starts at its first `<tool_call>` token, and `tokens` are the
+    // offsets in `bytes` at which a `<tool_call>` token starts.
+    void feed(std::string_view bytes, std::span<const std::size_t> tokens) {
+        auto token = tokens.begin();
+        for (std::size_t at = 0; at < bytes.size(); ++at) {
             if (invalid_) { return; }
-            step(byte);
+            while (token != tokens.end() && *token < at) { ++token; }
+            step(bytes[at], token != tokens.end() && *token == at);
         }
         flush_string();
     }
 
+    // The end of the output: closing lines still open close their call.
+    void end() {
+        if (closing_ && phase_ == Phase::Opener && !invalid_) {
+            close_value();
+            complete_call();
+        }
+    }
+
+    // Whether a call's closing lines were read and the next byte would decide what they are.
+    [[nodiscard]] bool closing() const noexcept { return closing_ && phase_ == Phase::Opener; }
+
     [[nodiscard]] Status status() const noexcept {
         if (invalid_) { return Status::Invalid; }
-        return phase_ == Phase::Opener && matched_ == 0 && !calls_.empty() ? Status::Complete : Status::Incomplete;
+        return phase_ == Phase::Opener && matched_ == 0 && !closing_ && !calls_.empty() ? Status::Complete
+                                                                                         : Status::Incomplete;
     }
 
     [[nodiscard]] std::vector<GeneratedToolCall>& calls() noexcept { return calls_; }
@@ -1093,9 +1155,27 @@ private:
         return true;
     }
 
-    void step(char byte) {
+    void step(char byte, bool token) {
         switch (phase_) {
         case Phase::Opener:
+            if (closing_) {
+                // After the closing lines: `\n` and the next call's token close the call; other
+                // text continues its last value.
+                if (matched_ == 0 && byte == '\n') {
+                    matched_ = 1;
+                    return;
+                }
+                if (matched_ == 0 && token) { // no value holds the token, and no call follows without `\n`
+                    invalid_ = true;
+                    return;
+                }
+                if (!token) {
+                    continue_value(byte);
+                    return;
+                }
+                close_value();
+                complete_call(); // the `\n` already matched the next opener's
+            }
             if (!calls_.empty() && !contract_.parallel) {
                 invalid_ = true;
             } else if (match(calls_.empty() ? kFirstOpener : kNextOpener, byte)) {
@@ -1134,6 +1214,7 @@ private:
                     invalid_ = true;
                 }
             } else if (byte == kParameterOpen[1]) {
+                if (closing_) { close_value(); } // another parameter: the value ended
                 phase_   = Phase::ParameterOpen;
                 matched_ = 2;
             } else if (byte == kCallClose[1]) {
@@ -1150,7 +1231,13 @@ private:
             }
             return;
         case Phase::CallClose:
-            if (match(kCallClose, byte)) { complete_call(); }
+            if (match(kCallClose, byte)) {
+                if (closing_) {
+                    phase_ = Phase::Opener; // the next byte decides
+                } else {
+                    complete_call();
+                }
+            }
             return;
         case Phase::ParameterName:
             if (byte == '>') {
@@ -1286,11 +1373,13 @@ private:
             emit(std::string_view(&byte, 1));
             return;
         }
-        // A raw value ends at its first `\n</parameter>`; `\n` occurs in it only at its start.
+        // A raw value ends at a `\n</parameter>` (`\n` occurs in it only at its start), unless it
+        // begins closing lines that more value text follows: the framing after it decides.
         if (byte == kValueEnd[held_]) {
             if (++held_ == kValueEnd.size()) {
-                held_ = 0;
-                end_raw_value();
+                held_    = 0;
+                closing_ = true;
+                phase_   = Phase::ValueClose;
             }
             return;
         }
@@ -1303,7 +1392,9 @@ private:
         }
     }
 
-    void end_raw_value() {
+    // The raw value whose terminator was read ends there.
+    void close_value() {
+        closing_ = false;
         if (mode_ == ValueMode::String) {
             flush_string(true);
             emit("\"");
@@ -1317,14 +1408,26 @@ private:
             }
         }
         value_.clear();
-        phase_ = Phase::ValueClose;
+    }
+
+    // The closing lines read since the raw value's terminator are its text, and `byte` (after a
+    // `\n` the next opener would have begun with, when one was read) continues it.
+    void continue_value(char byte) {
+        const bool newline = matched_ != 0;
+        closing_           = false;
+        matched_           = 0;
+        held_              = 0;
+        phase_             = Phase::Value;
+        value_.append(kQuotedClose);
+        if (newline) { value_byte('\n'); }
+        value_byte(byte);
     }
 
     // Publishes a string value's bytes read so far, short of a possible terminator.
     // A feed may end inside a code point (a token can carry part of one), so a trailing incomplete
     // UTF-8 sequence waits for its continuation bytes unless the value has ended (`all`).
     void flush_string(bool all = false) {
-        if (phase_ != Phase::Value || mode_ != ValueMode::String || value_.empty()) { return; }
+        if ((!all && phase_ != Phase::Value) || mode_ != ValueMode::String || value_.empty()) { return; }
         std::size_t complete = value_.size();
         if (!all) {
             std::size_t lead = value_.size();
@@ -1359,6 +1462,7 @@ private:
     Phase phase_         = Phase::Opener;
     std::size_t matched_ = 0;
     bool invalid_        = false;
+    bool closing_        = false; // a raw value's terminator was read; the framing after it decides
     std::string name_; // the function or parameter name being read
     const Contract::Tool* tool_           = nullptr;
     const Contract::Parameter* parameter_ = nullptr;
@@ -1627,7 +1731,7 @@ std::string ToolCallOutputDecoder::feed(GeneratedText content) {
     fed_content_ = true;
     if (saw_tool_marker_) {
         append_region(content, 0);
-        if (stream_) { stream_->feed(text); }
+        if (stream_) { stream_->feed(text, content.tool_call_tokens); }
         return {};
     }
 
@@ -1678,7 +1782,10 @@ std::string ToolCallOutputDecoder::feed(GeneratedText content) {
                 // A constrained region opens only at the token its grammar emits.
                 if (contract_->constrained) {
                     stream_ = std::make_unique<ConstrainedToolStream>(*contract_);
-                    stream_->feed(std::string_view(tool_region_).substr(region_tool_calls_.front()));
+                    const std::size_t first = region_tool_calls_.front();
+                    std::vector<std::size_t> tokens;
+                    for (const std::size_t at : region_tool_calls_) { tokens.push_back(at - first); }
+                    stream_->feed(std::string_view(tool_region_).substr(first), tokens);
                 }
                 break;
             }
@@ -1730,7 +1837,9 @@ void ToolCallOutputDecoder::initialize_continuation(std::string_view prefix) {
     if (stream_) {
         // The call the prefix began streams with the generation's first output, prefix included,
         // so its deltas still concatenate to its arguments.
-        if (!stream_->calls().empty() || stream_->status() == ConstrainedToolStream::Status::Invalid)
+        // Closing lines at the prefix's end complete its call unless value text follows them.
+        if (!stream_->calls().empty() || stream_->closing() ||
+            stream_->status() == ConstrainedToolStream::Status::Invalid)
             throw RequestError(RequestErrorKind::InvalidToolConstraint,
                                "tool continuation must contain no completed or malformed calls");
     } else if (saw_tool_marker_) {
@@ -1766,6 +1875,7 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reaso
     }
 
     if (stream_) {
+        stream_->end(); // a call whose closing lines ended the output completes now
         const auto status      = stream_->status();
         const bool interrupted = reason == FinishReason::OutputLimit ||
                                  reason == FinishReason::ContextCapacity ||

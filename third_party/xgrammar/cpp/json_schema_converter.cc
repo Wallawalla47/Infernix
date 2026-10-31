@@ -3666,8 +3666,21 @@ void XMLToolCallingConverter::AddBasicRules() {
   if (json_format_ == JSONFormat::kQwenXML) {
     auto saved = excludes_;
     excludes_.push_back("\n</parameter>");
-    builder_.UpdateRuleBody(kXMLString, ExcludingString(R"([^\uD800-\uDFFF]*)", kXMLString, false));
+    const std::string segment_name = kXMLString + "_segment";
+    const int32_t segment = builder_.AddRuleWithHint(
+        segment_name, ExcludingString(R"([^\uD800-\uDFFF]*)", segment_name, false)
+    );
     excludes_ = std::move(saved);
+    // Infernix: a raw value holds its terminator only inside the whole call's closing lines that
+    // more value text follows (a document quoting them). The matcher keeps both readings until the
+    // output ends or the next call's token begins, and only the closing one completes there.
+    const int32_t quoted_close = Sequence(
+        {ByteString("\n</parameter>\n</function>\n</tool_call>"), RuleRef(segment)}
+    );
+    builder_.UpdateRuleBody(
+        kXMLString,
+        Sequence({RuleRef(segment), Repeat(kXMLString + "_quoted_close", quoted_close, 0, -1)})
+    );
   } else {
     auto string_excludes = excludes_;
     string_excludes.push_back(xml_wrapper_.parameter_suffix);
@@ -3796,6 +3809,10 @@ int32_t XMLToolCallingConverter::GenerateString(
         excluded.push_back("\n</parameter>");
         return AddSubGrammar(
             StringConstraints(patterns, spec.min_length, spec.max_length, excluded, false));
+      }
+      // Infernix: a free string is the raw string rule, which also holds quoted closing lines.
+      if (!spec.pattern && spec.min_length == 0 && spec.max_length == -1) {
+        return RuleRef(kXMLString);
       }
       std::string regex = spec.pattern ? SchemaStringPattern(*spec.pattern)
           : R"([^\uD800-\uDFFF])" + std::string("{") + std::to_string(spec.min_length) + "," +
