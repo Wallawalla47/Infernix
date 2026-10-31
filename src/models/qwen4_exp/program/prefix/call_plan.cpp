@@ -12,14 +12,13 @@ double CallCost::call_seconds(std::uint32_t width) const noexcept {
     return width <= served_columns ? served_call_seconds : model.call_seconds(width);
 }
 
-std::vector<std::uint32_t> segment_ends(std::uint32_t frontier, std::uint32_t n, const CallWidths& chunk,
+std::vector<std::uint32_t> segment_ends(std::uint32_t frontier, std::uint32_t n, std::uint32_t chunk,
                                         std::span<const std::uint32_t> cuts) {
     std::vector<std::uint32_t> ends;
     std::uint32_t begin = frontier;
     const auto segment  = [&](std::uint32_t end) {
         while (begin < end) {
-            const std::uint32_t width = chunk.at(begin);
-            begin                     = end - begin > width ? begin + width : end;
+            begin = end - begin > chunk ? begin + chunk : end;
             ends.push_back(begin);
         }
     };
@@ -54,9 +53,9 @@ double seconds_of(std::uint32_t frontier, std::span<const std::uint32_t> ends, c
 
 } // namespace
 
-CallPlan plan_calls(std::uint32_t frontier, std::uint32_t prompt_tokens, const CallWidths& chunk,
+CallPlan plan_calls(std::uint32_t frontier, std::uint32_t prompt_tokens, std::uint32_t chunk,
                     std::span<const pc::PlannedTap> taps, const CallCost& cost) {
-    if (chunk.chunk == 0 || frontier >= prompt_tokens) {
+    if (chunk == 0 || frontier >= prompt_tokens) {
         throw std::invalid_argument("Qwen4Exp call plan: an empty suffix or a zero chunk");
     }
     CallPlan out;
