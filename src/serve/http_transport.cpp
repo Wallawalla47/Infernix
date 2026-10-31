@@ -4,16 +4,21 @@
 #include "text/json_input.h"
 
 #if defined(__linux__)
+#    include <netdb.h>
 #    include <netinet/tcp.h>
 #    include <sys/socket.h>
+#    include <unistd.h>
 #elif defined(_WIN32)
 #    include <winsock2.h>
 #    include <ws2tcpip.h>
 #endif
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <stdexcept>
+#include <string>
+#include <system_error>
 #include <utility>
 
 namespace infernix::serve {
@@ -209,15 +214,16 @@ bool SseTransport::poll(Clock::time_point now) {
     return false;
 }
 
+// The listener's port is its own: no second server binds beside it (candidates SR-09). cpp-httplib's
+// default options would allow that (SO_REUSEPORT on Linux; SO_REUSEADDR on Windows, where any socket
+// may then bind an address in use), and the kernel would split or misroute the connections: an old
+// build answering a timed A/B, or every local client reaching another program.
 void configure_http_server_socket(socket_t socket) noexcept {
-    httplib::default_socket_options(socket);
 #if defined(__linux__)
     const int enabled = 1;
-    // cpp-httplib sets only SO_REUSEPORT. The listener's options pass to the connections it
-    // accepts, and Linux binds over their TIME_WAIT remnants only when both sides share a reuse
-    // option, so another server that sets just SO_REUSEADDR (llama.cpp, vLLM, uvicorn) could not
-    // bind this port for about a minute after Infernix stops, nor Infernix after it (upstream
-    // #341). With both set, either kind binds at once.
+    // SO_REUSEADDR alone binds over the TIME_WAIT remnants of an earlier server's connections,
+    // as servers that set just SO_REUSEADDR (llama.cpp, vLLM, uvicorn) do (upstream #341), but
+    // never beside a listener. SO_REUSEPORT would let a second listener share the port.
     set_socket_option(socket, SOL_SOCKET, SO_REUSEADDR, enabled);
     set_socket_option(socket, SOL_SOCKET, SO_KEEPALIVE, enabled);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, kKeepAliveIdleSeconds);
@@ -225,10 +231,14 @@ void configure_http_server_socket(socket_t socket) noexcept {
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPCNT, kKeepAliveProbeCount);
     set_socket_option(socket, IPPROTO_TCP, TCP_USER_TIMEOUT, kTcpUserTimeoutMilliseconds);
 #elif defined(_WIN32)
-    // The same liveness on Windows: keepalive probes find a silently dead peer, and TCP_MAXRTMS
-    // (Windows' TCP_USER_TIMEOUT) bounds how long unacknowledged stream writes are retried, so
-    // the SSE liveness gate sees a failed write instead of the retransmission window.
+    // Only SO_EXCLUSIVEADDRUSE refuses a bind beside another listener on Windows, including a
+    // wildcard bind beside another program's 127.0.0.1 listener (Strata #4255: local clients then
+    // reached that program while the server reported ready). The same liveness as on Linux:
+    // keepalive probes find a silently dead peer, and TCP_MAXRTMS (Windows' TCP_USER_TIMEOUT)
+    // bounds how long unacknowledged stream writes are retried, so the SSE liveness gate sees a
+    // failed write instead of the retransmission window.
     const DWORD enabled = 1;
+    set_socket_option(socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, enabled);
     set_socket_option(socket, SOL_SOCKET, SO_KEEPALIVE, enabled);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, static_cast<DWORD>(kKeepAliveIdleSeconds));
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPINTVL,
@@ -236,6 +246,59 @@ void configure_http_server_socket(socket_t socket) noexcept {
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPCNT, static_cast<DWORD>(kKeepAliveProbeCount));
     set_socket_option(socket, IPPROTO_TCP, TCP_MAXRTMS,
                       static_cast<DWORD>(kTcpUserTimeoutMilliseconds));
+#else
+    httplib::set_socket_opt(socket, SOL_SOCKET, SO_REUSEADDR, 1);
+#endif
+}
+
+int probe_bind_error(const std::string& host, int port) {
+    addrinfo hints{};
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags    = AI_PASSIVE;
+    addrinfo* found   = nullptr;
+    const std::string service = std::to_string(port);
+    if (::getaddrinfo(host.empty() ? nullptr : host.c_str(), service.c_str(), &hints, &found) != 0) { return 0; }
+    int error = 0;
+    for (const addrinfo* at = found; at != nullptr && error == 0; at = at->ai_next) {
+        const socket_t probe = ::socket(at->ai_family, at->ai_socktype, at->ai_protocol);
+        if (probe == INVALID_SOCKET) { continue; }
+        configure_http_server_socket(probe);
+        if (::bind(probe, at->ai_addr, static_cast<int>(at->ai_addrlen)) != 0) {
+#if defined(_WIN32)
+            error = ::WSAGetLastError();
+#else
+            error = errno;
+#endif
+        }
+#if defined(_WIN32)
+        ::closesocket(probe);
+#else
+        ::close(probe);
+#endif
+    }
+    ::freeaddrinfo(found);
+    return error;
+}
+
+std::string bind_failure_reason(int error) {
+    if (error == 0) { return "the operating system gave no reason"; }
+#if defined(_WIN32)
+    if (error == WSAEADDRINUSE) {
+        return "the port is in use (another server, an earlier infernix-serve say, holds it): stop it or choose "
+               "another --port";
+    }
+    if (error == WSAEACCES) {
+        return "Windows refused the port: it may be in use by another server, or in a range Windows reserves "
+               "(netsh int ipv4 show excludedportrange protocol=tcp); choose another --port";
+    }
+    return std::system_category().message(error);
+#else
+    if (error == EADDRINUSE) {
+        return "the port is in use (another server, an earlier infernix-serve say, holds it): stop it or choose "
+               "another --port";
+    }
+    return std::generic_category().message(error);
 #endif
 }
 
