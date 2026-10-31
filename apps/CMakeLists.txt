@@ -42,6 +42,15 @@ target_include_directories(infernix-serve PRIVATE
 target_link_libraries(infernix-serve PRIVATE infernix_serve infernix_product_config infernix_product_logging)
 infernix_stage_runtime_dlls(infernix-serve)
 
+# The launcher: web UI and model-switching endpoint in front of infernix-serve (docs/launcher.md).
+add_executable(infernix-launcher launcher/main.cpp)
+add_dependencies(infernix-launcher infernix_build_id_stamp)
+target_sources(infernix-launcher PRIVATE ${INFERNIX_BUILD_ID_HEADER})
+infernix_internal_includes(infernix-launcher)
+target_include_directories(infernix-launcher PRIVATE ${CMAKE_BINARY_DIR}/generated)
+target_link_libraries(infernix-launcher PRIVATE infernix_launcher ${INFERNIX_CURL_TARGET})
+infernix_stage_runtime_dlls(infernix-launcher)
+
 add_executable(infernix-perplexity
   perplexity/main.cpp
   perplexity/corpus.cpp

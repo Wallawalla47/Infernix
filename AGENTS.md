@@ -62,6 +62,11 @@ Keep these ownership boundaries visible when selecting a design:
 - The v3 container (`.infernix`, or `.ninfer` from NInfer) is the only C++ product artifact; CLI,
   serving, and inference benchmarks use the public Engine. Infernix has no Python model-inference
   route or installed/exported C++ SDK.
+- The launcher (`infernix-launcher`, `src/launcher`, web UI in `apps/launcher/web`) runs no
+  inference: it supervises one `infernix-serve` process per loaded model, proxies its HTTP
+  endpoints, switches models on request, downloads artifacts and keeps per-model launch parameters.
+  It links neither the Engine nor CUDA; what it shows of a server comes from the server's own HTTP
+  endpoints and log.
 - Core owns physical primitives and raw transfers; artifact owns generic framing and
   materialization; Ops own closed mathematical and state-transition implementations.
 - Models own fixed mathematics, config interpretation, logical parameter binding, frontend

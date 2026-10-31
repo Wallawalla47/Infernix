@@ -7,6 +7,7 @@ run the CLI or HTTP server.
 
 | Document | Purpose |
 |---|---|
+| [Launcher](launcher.md) | the web interface and model-switching endpoint: downloads, model folders, model configurations, dashboard, chat, usage, updates, connecting coding tools |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Qwen3.8-Flash-Next](qwen3_8-flash-next.md) | requirements, conversion (recipes A and B, the GSQ-RCO IQ3_S GGUF import), recommended flags, the n-gram table in RAM, measured speed and quality of the offloaded-expert model |
