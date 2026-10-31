@@ -12,6 +12,10 @@ On this page: [configuration](#configuration-and-runs), [context profile](#no-sp
 Measured on 2026-09-07 at revision `487f89773f07cb18a2fb841fe0971ec9634d409b`. All 11 measurement
 points and 485 formal requests completed without request, CUDA, or out-of-memory failures.
 
+**Not re-measured since:** later releases changed the 35B's decode route (among them the `adaptive-mtp`
+fast path behind `--draft-tokens auto` and the default `--spec auto`), so these figures describe that
+revision, not the current one. The [README](../../README.md) lists the current recommended settings.
+
 | Setting | Value |
 |---|---|
 | Model / weights | `qwen3.6-35b-a3b` / `groupwise-int` |
