@@ -704,7 +704,7 @@ prefix::CallPlan ProgramImpl::plan_prefill(const qwen3_5::PreparedPromptData& pr
                           planned.end());
         }
     }
-    return prefix::plan_calls(frontier, n, static_cast<std::uint32_t>(chunk_), planned, call_cost());
+    return prefix::plan_calls(frontier, n, call_widths(), planned, call_cost());
 }
 
 HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
