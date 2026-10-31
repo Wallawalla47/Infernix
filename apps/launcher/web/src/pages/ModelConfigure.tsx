@@ -268,13 +268,20 @@ function ConcurrencyField({ form }: { form: FormContext }) {
   );
 }
 
-function SpecField({ model, form }: { model: ModelArtifact; form: FormContext }) {
+/** `specArg` is the server's --spec placeholder ("off|mtp|...|auto"). A server that offers `off`
+ * speculates when --spec is absent, so Off must be written out; an older one decodes plainly without
+ * the flag, and refuses `off`. */
+function SpecField({ model, form, specArg }: { model: ModelArtifact; form: FormContext; specArg: string | null | undefined }) {
   const current = getFlagString(form.args, "--spec", form.takesValue);
+  const offIsExplicit = (specArg ?? "").split("|").includes("off");
   const options: { value: string; label: string }[] = [{ value: "auto", label: "Auto (fastest measured drafter)" }];
   if (model.has_mtp) options.push({ value: "mtp", label: "MTP" });
   if (model.has_dflash) options.push({ value: "dflash", label: "DFlash" });
   if (model.has_dflash2 || model.accepts_draft_model) options.push({ value: "dflash2", label: "DFlash2" });
-  const value = current.length > 0 ? current : UNSET;
+  // UNSET is the Off item; without the flag the server's own default applies.
+  const value = current === "off" ? UNSET : current.length > 0 ? current : offIsExplicit ? "auto" : UNSET;
+  const choose = (next: string) =>
+    form.setArgs(setFlag(form.args, "--spec", next === UNSET ? (offIsExplicit ? "off" : null) : next, form.takesValue));
   return (
     <div className="flex flex-col gap-3 py-2.5 sm:flex-row sm:items-center sm:justify-between">
       <div>
@@ -284,10 +291,7 @@ function SpecField({ model, form }: { model: ModelArtifact; form: FormContext })
         </div>
       </div>
       <div className="sm:w-60">
-        <Select
-          value={value}
-          onValueChange={(next) => form.setArgs(setFlag(form.args, "--spec", next === UNSET ? null : next, form.takesValue))}
-        >
+        <Select value={value} onValueChange={choose}>
           <SelectTrigger aria-label="Speculative decoding">
             <SelectValue />
           </SelectTrigger>
@@ -867,7 +871,7 @@ export function ModelConfigurePage() {
             </Section>
 
             <Section icon={Sparkles} title="Speculative decoding" description="Drafters propose tokens the model verifies; output is unchanged.">
-              {available("--spec") ? <SpecField model={model} form={form} /> : null}
+              {available("--spec") ? <SpecField model={model} form={form} specArg={optionMap?.get("--spec")} /> : null}
               {model.accepts_draft_model && available("--draft-model") && library ? (
                 <DrafterField model={model} form={form} library={library} />
               ) : null}

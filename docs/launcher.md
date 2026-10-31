@@ -164,6 +164,10 @@ Turning on **Vision** checks at once: the vision tower takes VRAM a 27B's defaul
 without, so the default context no longer fits beside it (on a 32 GB GPU the official NVFP4 27B
 fits 177,856 tokens with `--vision` against 222,272 without).
 
+**Speculative decoding.** **Off** writes `--spec off` when the server lists `off` among its `--spec`
+values (such a server speculates when `--spec` is absent, and the field then shows **Auto**);
+with an older server, which decodes plainly without the flag and refuses `off`, Off removes it.
+
 **Idle unload.** Minutes without requests after which this configuration's server is stopped (the
 next request loads it again); **Settings → Idle unload** is the default for configurations that do
 not set their own, and 0 keeps it loaded. The dashboard shows when the loaded model will unload.
