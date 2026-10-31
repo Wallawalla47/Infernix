@@ -1260,9 +1260,10 @@ public:
             fetch_channel_ = std::make_unique<ops::offloaded_moe::FetchChannel>();
             tier.fetch     = fetch_channel_.get();
             // A layer walk's step calls ceil(layers / n) layers once per chunk of its n-chunk span (one
-            // tier round per step): at most layers + n - 1 layer calls, with the narrowest chunk the KV
-            // pool's growth cuts the default route's to.
-            tier.layer_calls = store->layers() + kWalkMaxTokens / static_cast<std::uint32_t>(std::max(smallest_chunk_, 1)) + 1U;
+            // tier round per step): at most layers + n - 1 layer calls, with the narrowest call of the
+            // narrowest chunk the KV pool's growth cuts the default route's to.
+            const prefix::CallWidths narrowest{static_cast<std::uint32_t>(std::max(smallest_chunk_, 1)), options_.free_cache_resume};
+            tier.layer_calls = store->layers() + kWalkMaxTokens / std::max(narrowest.narrowest(), 1U) + 1U;
             // An expert stripe on a second drive: each record's tail is read from it while its head
             // is read from the artifact, at the same depth per drive.
             const ExpertStore* records = &*store;
@@ -1906,8 +1907,7 @@ public:
             }
             // A state cached at the paused frontier itself leaves nothing to replay.
             selection->plan = selection->frontier < r.target
-                                  ? prefix::plan_calls(selection->frontier, r.target, static_cast<std::uint32_t>(chunk_), {},
-                                                       call_cost())
+                                  ? prefix::plan_calls(selection->frontier, r.target, call_widths(), {}, call_cost())
                                   : prefix::CallPlan{};
             prefix_pin(*selection);
         }
@@ -1989,7 +1989,7 @@ public:
             lane.reservation = std::move(*reservation);
             tables_->publish(lane.row.handle(), 0, std::span<const DeviceKVPageLease>(lane.pages), device_.stream);
             reset_slot(index);
-            lane.calls = prefix::plan_calls(0, r.target, static_cast<std::uint32_t>(chunk_), {}, call_cost()).ends;
+            lane.calls = prefix::plan_calls(0, r.target, call_widths(), {}, call_cost()).ends;
         }
         lane.next_call = 0;
         clear_prompt_uses(lane);
@@ -4384,6 +4384,12 @@ private:
         return s;
     }
 
+    // A prompt's call widths: on the default route narrower before positions 16,384 and 131,072
+    // (prefix::CallWidths); the reproducible route's calls stay on the chunk's grid (resume_grid).
+    [[nodiscard]] prefix::CallWidths call_widths() const noexcept {
+        return {static_cast<std::uint32_t>(chunk_), options_.free_cache_resume};
+    }
+
     // A prompt's calls planned at a chunk the cache no longer lends: the KV pool grew since its binding
     // (its own pages; another lane's; a queued request's, for which hybrid_reclaim took the leases back
     // between calls, issue #24). Before a call lends its workspace, every prefilling lane's remaining
@@ -4419,7 +4425,7 @@ private:
                     cuts.push_back(tap.position);
                 }
             }
-            const auto ends = prefix::segment_ends(from, end, static_cast<std::uint32_t>(chunk_), cuts);
+            const auto ends = prefix::segment_ends(from, end, call_widths(), cuts);
             lane.calls.resize(lane.next_call);
             lane.calls.insert(lane.calls.end(), ends.begin(), ends.end());
         }

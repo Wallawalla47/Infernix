@@ -11982,6 +11982,30 @@ CTA), whose weight copies the engine overlaps with gate/up under PDL and the op 
 after a 16K prompt +5.4 % and +4.8 %, the struct fixture +3.1 % and +3.0 %, every run ahead; conv +0.1 % and -1.9 %
 (the old arm bimodal at 182-197 tok/s, the new one 186-188).
 
+### 19.3.45 Prefill call widths by position (2026-10-31; default route; placement and call grid)
+
+**Why.** A sweep of one width throughout (Dense8, INT8 KV, `--max-context 262144`, DFlash2 auto, four sessions a
+width, rotated order; time to first token) found no single best chunk: 4,096 led at 8K (1.80 s against the fitted
+16,384's 1.88 s) and lost at 250K (25.06 against 24.15 s); 8,192 led at 128K (11.97 against 12.18 s) and lost
+slightly at 250K (24.35 s). Decode was unchanged within its run-to-run spread at every width.
+
+**What** (`prefix::CallWidths`, every call plan and re-plan of the default route, i.e. with free-cache-resume): a
+call that starts before position 16,384 runs at most 4,096 tokens, one before 131,072 at most 8,192, later ones at
+the chunk; the chunk (fitted, or `--prefill-chunk`) caps every call. The reproducible route keeps one chunk (its
+resumes sit on the chunk grid). The layer walk's stream lease is sized for the narrowest call width: sized for the
+chunk's count of calls (§19.3.42's `walk_span_end`), it cut a span of narrower calls short, and every extra span
+streams the non-resident experts once more (a first form without this fix: 128K 14.44 s, 250K 27.56 s). The SSD
+tier's layer-call bound counts the same narrowest width.
+
+**Measured** (RTX 5090, the same rig, against the fitted chunk throughout, on one build):
+- Dense8, four sessions an arm: 8K 1.88 -> 1.82 s, 128K 12.22 -> 11.94 s, 250K 24.25 -> 24.01 s; a schedule that
+  returns to the chunk at 64K: 1.82 / 11.90 / 24.27 s.
+- IQ3_S (GSQ-RCO), three sessions an arm: 8K 1.39 -> 1.35 s, 128K 18.50 -> 18.05 s, 250K 36.77 -> 36.11 s.
+- Decode: no consistent change (tokens a round and rounds a second move together with the generated text).
+
+**Open.** One width of 12,288 throughout prefilled 128K in 14.62 s (+20 %) and 250K in 26.73 s; not explained (its
+walk spans fit the cap).
+
 ---
 
 ## 20. Documentation and authority changes
