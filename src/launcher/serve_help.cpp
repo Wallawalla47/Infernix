@@ -91,6 +91,20 @@ bool ServeOptions::known(std::string_view flag) const {
     return false;
 }
 
+bool ServeOptions::lists_value(std::string_view flag, std::string_view value) const {
+    for (const ServeOption& option : options) {
+        if (option.flag != flag || !option.arg) { continue; }
+        std::string_view choices = *option.arg;
+        while (!choices.empty()) {
+            const std::size_t bar = choices.find('|');
+            if (choices.substr(0, bar) == value) { return true; }
+            if (bar == std::string_view::npos) { break; }
+            choices.remove_prefix(bar + 1);
+        }
+    }
+    return false;
+}
+
 ServeOptions load_serve_options(const std::filesystem::path& executable) {
     static std::mutex mutex;
     static std::string cached_key;

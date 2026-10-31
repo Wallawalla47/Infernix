@@ -322,7 +322,7 @@ export const SPEC_CONTROLS: Control[] = [
     kind: "auto",
     flag: "--draft-tokens",
     label: "Draft tokens",
-    help: "Drafts verified per round; auto lets the drafter's calibrated probabilities pick the fastest width each round.",
+    help: "Drafts verified per round; auto lets the drafter's calibrated probabilities pick the fastest width each round. Speculative decoding Auto takes auto.",
     placeholder: "number",
   },
   {
@@ -336,7 +336,7 @@ export const SPEC_CONTROLS: Control[] = [
     kind: "number",
     flag: "--spec-min-p",
     label: "Draft minimum probability",
-    help: "Verify drafts up to the first whose drafter probability is below P (0 verifies all). Refused with --draft-tokens auto on Flash-Next MTP.",
+    help: "Verify drafts up to the first whose drafter probability is below P (0 verifies all). Refused with speculative decoding Auto, and with --draft-tokens auto on Flash-Next MTP.",
     placeholder: "0",
     min: 0,
     max: 1,

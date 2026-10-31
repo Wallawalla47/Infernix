@@ -2046,13 +2046,19 @@ Json Launcher::props_json(const std::string& config_id, const ScannedModel& mode
             slots = std::stoi(*value);
         } catch (const std::exception&) {}
     }
+    // Without --spec, a server that lists off among its --spec values runs --spec auto, which
+    // speculates with the artifact's bundled drafter or --draft-model's; an older server decodes plainly.
     const std::optional<std::string> spec = flag_value(args, "--spec");
+    const bool speculative =
+        spec ? *spec != "off" && *spec != "none"
+             : serve_options().lists_value("--spec", "off") && !has_flag(args, "--lossless") &&
+                   (model.has_mtp || model.has_dflash || model.has_dflash2 || has_flag(args, "--draft-model"));
     return {{"default_generation_settings",
              {{"id", 0},
               {"id_task", -1},
               // --max-context bounds each request, as llama.cpp's per-slot n_ctx does.
               {"n_ctx", context},
-              {"speculative", spec && *spec != "off" && *spec != "none"},
+              {"speculative", speculative},
               {"is_processing", loaded && router_->in_flight() > 0},
               {"params", {{"n_predict", -1}, {"max_tokens", default_output_tokens(args, context)}}}}},
             {"total_slots", slots},
