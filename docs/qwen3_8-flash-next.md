@@ -374,7 +374,12 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   chunks of 1,024, 4,096 and 12,288, and wide chunks prefill long prompts faster at no decode cost
   (Dense8, INT8 KV, RTX 5090, 2026-10-16: 32K prompts 5,570 / 9,640 / 11,210 tok/s at chunks
   1,024 / 4,096 / 16,384, 64K prompts 5,700 / 9,890 / 11,270; tg512 unchanged; 26 fewer expert
-  frames of ~8,560). A smaller `--prefill-chunk` only shrinks the prefill workspace. A long
+  frames of ~8,560). A smaller `--prefill-chunk` only shrinks the prefill workspace. Outside
+  `--reproducible`, a call that starts early in the prompt runs narrower, at most 4,096 tokens before
+  position 16,384 and 8,192 before 131,072, and the chunk from there: early calls read a short context,
+  so width gains them little (Dense8, INT8 KV, RTX 5090, 2026-10-31, against 16,384 throughout:
+  time to first token at 8K 1.88 → 1.82 s, 128K 12.22 → 11.94 s, 250K 24.25 → 24.01 s; decode
+  unchanged). `--prefill-chunk` caps every call's width. A long
   prompt's prefill workspace is lent from the expert cache (at most three quarters of the frames of
   its largest frame pool; a GGUF import keeps a pool per record size), which also gives its frames to
   the KV pool as contexts grow. A chunk whose workspace the cache cannot lend is cut at startup to

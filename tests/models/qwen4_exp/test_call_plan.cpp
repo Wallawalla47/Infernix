@@ -2,7 +2,8 @@
 // test U2), host only. Checks: the cold grid for F = 0 and the shifted grid after a resume; calls
 // cover [F, n) in order without overlap or gaps and never exceed the chunk; kept exact taps end a
 // call; boundary taps are kept at any cost; an automatic tap is kept when the call it starts is
-// CPU-served and it adds at most the split budget (the generation opener's tail) and demoted to
+// CPU-served and it adds at most the split budget (and the default route's calls widen by position:
+// CallWidths::by_position) (the generation opener's tail) and demoted to
 // flexible otherwise (a split before a GPU-staged call, even one that only shifts the grid); the layer
 // walk's spans (none for a cut
 // between walk-eligible calls, one for a cut that leaves a narrow call inside the walk, one per
@@ -87,6 +88,29 @@ int main() {
         check(q4::plan_calls(300, 10000, 4096, {}, cost).ends == std::vector<std::uint32_t>{4396, 8492, 10000},
               "a resume steps by the chunk from its frontier");
         check(q4::plan_calls(9999, 10000, 4096, {}, cost).ends == std::vector<std::uint32_t>{10000}, "a one-token suffix");
+
+        // The default route's widths by position (CallWidths::by_position): 4,096 before 16,384, 8,192 before
+        // 131,072, the chunk after; a call's width follows where it starts, and never exceeds the chunk.
+        {
+            const q4::CallWidths positional{16384, true};
+            check(positional.at(0) == 4096 && positional.at(16383) == 4096 && positional.at(16384) == 8192 &&
+                      positional.at(131071) == 8192 && positional.at(131072) == 16384 && positional.narrowest() == 4096,
+                  "positional widths step at 16,384 and 131,072");
+            check(q4::CallWidths{2048, true}.at(200000) == 2048 && q4::CallWidths{6144, true}.at(0) == 4096 &&
+                      q4::CallWidths{6144, true}.at(20000) == 6144 && q4::CallWidths{16384, false}.at(0) == 16384,
+                  "positional widths never exceed the chunk; without by_position the chunk throughout");
+            // A cold 150,000-token prompt: 4 calls of 4,096, 14 of 8,192, then 16,384-token calls from 131,072.
+            std::vector<std::uint32_t> want;
+            for (std::uint32_t at = 0; at < 150000;) {
+                at = std::min(at + (at < 16384 ? 4096U : at < 131072 ? 8192U : 16384U), 150000U);
+                want.push_back(at);
+            }
+            check(q4::plan_calls(0, 150000, positional, {}, cost).ends == want && want.size() == 4 + 14 + 2,
+                  "a cold prompt's calls widen with position");
+            // A resume at 15,000 starts with a 4,096-token call (it starts before 16,384), then 8,192.
+            check(q4::segment_ends(15000, 40000, positional, {}) == std::vector<std::uint32_t>{19096, 27288, 35480, 40000},
+                  "a resume's width follows its own start");
+        }
 
         // The generation opener 5 tokens before the end: one CPU-served call more, kept.
         {
