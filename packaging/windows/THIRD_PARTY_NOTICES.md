@@ -18,6 +18,7 @@ package, under the file name given here.
 | spdlog, with its bundled {fmt} | [gabime/spdlog](https://github.com/gabime/spdlog), [fmtlib/fmt](https://github.com/fmtlib/fmt) | MIT | `spdlog-LICENSE.txt`, `fmt-LICENSE.txt` |
 | utf8proc | [JuliaStrings/utf8proc](https://github.com/JuliaStrings/utf8proc) | MIT; Unicode data under the Unicode licence | `utf8proc-LICENSE.txt` |
 | CUDA runtime (`cudart_static`) | NVIDIA CUDA Toolkit 13 | NVIDIA CUDA Toolkit EULA (the runtime is a redistributable component) | — |
+| The launcher's web UI (in `infernix-launcher.exe`): React, React Router, TanStack Query and Virtual, Radix UI, Recharts (with its d3 modules), lucide-react, sonner, clsx, tailwind-merge, class-variance-authority, Tailwind CSS | npm packages bundled by [`apps/launcher/web`](https://github.com/Wallawalla47/Infernix/tree/main/apps/launcher/web) | MIT, ISC and Apache-2.0 (each package's own) | `launcher-web-ui-LICENSES.txt` |
 
 ## Shipped as separate DLLs
 

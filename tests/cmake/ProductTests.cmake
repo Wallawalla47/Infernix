@@ -90,6 +90,18 @@ infernix_add_test(infernix_console_stats_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_console_stats.cpp"
   LIBRARIES infernix_serve infernix_product_logging)
 
+infernix_add_test(infernix_launcher_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_launcher.cpp"
+  LIBRARIES infernix_launcher)
+
+# A stand-in infernix-serve for the launcher's watchdog and web UI checks (docs/launcher.md).
+add_executable(infernix_launcher_fake_serve "${CMAKE_CURRENT_LIST_DIR}/../launcher_fake_serve.cpp")
+target_link_libraries(infernix_launcher_fake_serve PRIVATE infernix::json infernix::httplib Threads::Threads)
+if(WIN32)
+  target_compile_definitions(infernix_launcher_fake_serve PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_link_libraries(infernix_launcher_fake_serve PRIVATE ws2_32)
+endif()
+
 infernix_add_test(infernix_stop_control_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_stop_control.cpp"
   LIBRARIES infernix_serve)
