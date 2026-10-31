@@ -151,9 +151,9 @@ void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& ro
 /// Calls of at least wide_from columns (prefill; 0: none) take wide_jobs as their cap instead.
 /// moe_experts returns after placing the host's outputs. The arithmetic is the same exact W4A4,
 /// so where an expert is computed never changes a bit. The wait lasts as long as the host's
-/// heartbeat word keeps changing; when it stops for MoeExpertSource::heartbeat_timeout_ns the call writes
-/// kErrorHostSilent to the source's error word and leaves its CPU outputs unwritten (without an
-/// error word, or without a heartbeat after 2 s, it traps).
+/// heartbeat word keeps changing; when it stops for MoeExpertSource::heartbeat_timeout_ns (2 s without
+/// a heartbeat) the call writes kErrorHostSilent to the source's error word and leaves its CPU outputs
+/// unwritten; without an error word that goes unreported, as the fetch channel's failures do.
 struct MoeCpuChannel {
     offloaded_moe::MissRequest* request = nullptr; // mapped host memory
     std::uint16_t* x                    = nullptr; // mapped BF16 [H, kMaxCpuXColumns]

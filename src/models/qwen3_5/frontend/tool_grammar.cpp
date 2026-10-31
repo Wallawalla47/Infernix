@@ -1,4 +1,5 @@
 #include "models/qwen3_5/frontend/tool_grammar.h"
+#include "models/qwen3_5/frontend/tool_call_parser.h"
 #include "text/json_schema.h"
 
 #include "grammar_builder.h"
@@ -20,26 +21,31 @@ constexpr std::string_view kParameterOpen = "<parameter=";
 constexpr std::string_view kValueEnd      = "\n</parameter>";
 constexpr std::string_view kCallClose     = "</function>\n</tool_call>";
 
-// The one rule of the constrained tool route the grammar cannot state: a call names each parameter
-// once. Non-strict names are open (the grammar orders strict ones already), so a streamed call could
-// otherwise repeat a key it has published. The companion reads only the canonical framing the grammar
-// emits: `<tool_call>` (the token) `\n<function=NAME>\n`, then `<parameter=NAME>\nVALUE\n</parameter>\n`
-// per parameter, then `</function>\n</tool_call>`, and `\n` before the next call's token. A value
-// ends at its first `\n</parameter>` (a raw value cannot hold it, a JSON value cannot spell it).
-class ParameterNameConstraint final : public text::GrammarStateConstraint {
+// The rules of the constrained tool route the grammar cannot state. `names`: a call names each
+// parameter once. Non-strict names are open (the grammar orders strict ones already), so a streamed
+// call could otherwise repeat a key it has published. `quotes`: in the answer's free text, a
+// `<tool_call>` token inside Markdown code is a quoted example (MarkdownCodeTracker, as the parser
+// reads it), so the matcher does not see it and the text goes on; elsewhere it opens a call.
+// Masking the token there instead would change what the model writes. The companion reads only the
+// canonical framing the grammar emits: `<tool_call>` (the token) `\n<function=NAME>\n`, then
+// `<parameter=NAME>\nVALUE\n</parameter>\n` per parameter, then `</function>\n</tool_call>`, and `\n`
+// before the next call's token. A value ends at its first `\n</parameter>` (a JSON value cannot
+// spell it), except that a raw value goes on when text other than the next call's token follows the
+// whole call's closing lines (the grammar's raw string rule).
+class ToolCallRules final : public text::GrammarStateConstraint {
 public:
-    ParameterNameConstraint(std::shared_ptr<const std::vector<std::string>> vocabulary,
-                            std::shared_ptr<const std::vector<std::int32_t>> tag_ends,
-                            std::int32_t tool_call, const text::ReasoningFraming& reasoning, bool combined)
+    ToolCallRules(std::shared_ptr<const std::vector<std::string>> vocabulary,
+                  std::shared_ptr<const std::vector<std::int32_t>> tag_ends, std::int32_t tool_call,
+                  const text::ReasoningFraming& reasoning, bool combined, bool names, bool quotes)
         : vocabulary_(std::move(vocabulary)), tag_ends_(std::move(tag_ends)), tool_call_(tool_call),
           reasoning_close_(reasoning.close_token), separator_(reasoning.separator.size()),
-          body_phase_(combined ? Phase::Branch : Phase::Text) {
+          body_phase_(combined ? Phase::Branch : Phase::Text), names_rule_(names), quotes_rule_(quotes) {
         cursor_.phase = reasoning_close_ ? Phase::Reasoning : body_phase_;
         committed_    = {cursor_, names_};
     }
 
     void filter(std::span<std::uint32_t> mask) override {
-        if (!in_call(cursor_.phase)) { return; }
+        if (!names_rule_ || !in_call(cursor_.phase)) { return; }
         // Only a token holding '>' completes a name; outside a name or a started opener it must also
         // hold the whole opener. Value tokens need no simulation.
         const bool any = cursor_.phase == Phase::Name || (cursor_.phase == Phase::Parameters && cursor_.matched != 0);
@@ -53,6 +59,10 @@ public:
             Names names{&names_};
             if (!step(cursor, names, id)) { word &= ~bit; }
         }
+    }
+
+    [[nodiscard]] bool literal(std::int32_t token) const noexcept override {
+        return quoted(cursor_, token);
     }
 
     bool accept(std::int32_t token) override {
@@ -92,6 +102,7 @@ private:
         Phase phase           = Phase::Text;
         std::uint32_t matched = 0; // bytes of the current literal matched
         std::string name;
+        MarkdownCodeTracker code; // the free text's Markdown code state (`quotes`)
     };
 
     // The current call's names: a simulation reads the committed ones and keeps its own additions.
@@ -121,7 +132,15 @@ private:
 
     static bool in_call(Phase phase) noexcept { return phase >= Phase::Header; }
 
+    bool quoted(const Cursor& cursor, std::int32_t token) const noexcept {
+        return quotes_rule_ && token == tool_call_ && cursor.phase == Phase::Text && cursor.code.in_code();
+    }
+
     bool step(Cursor& cursor, Names& names, std::int32_t token) const {
+        if (quoted(cursor, token)) {
+            cursor.code.feed(kToolCallOpen); // text, spelled as the decoder publishes it
+            return true;
+        }
         if (token == tool_call_) {
             // The token opens a call from free text, a combined grammar's first token, or after a call.
             if (cursor.phase == Phase::Text || cursor.phase == Phase::Branch || cursor.phase == Phase::AfterCall) {
@@ -135,7 +154,12 @@ private:
             return true;
         }
         if (token < 0 || static_cast<std::size_t>(token) >= vocabulary_->size()) { return true; }
-        return feed(cursor, names, (*vocabulary_)[static_cast<std::size_t>(token)]);
+        const std::string& bytes = (*vocabulary_)[static_cast<std::size_t>(token)];
+        if (cursor.phase == Phase::Text) {
+            if (quotes_rule_) { cursor.code.feed(bytes); }
+            return true;
+        }
+        return feed(cursor, names, bytes);
     }
 
     // False when the bytes repeat a parameter name of the call.
@@ -169,27 +193,43 @@ private:
                     cursor.name.push_back(byte);
                     break;
                 }
-                if (names.contains(cursor.name)) { return false; }
+                if (names_rule_ && names.contains(cursor.name)) { return false; }
                 names.added.push_back(std::move(cursor.name));
                 cursor = {.phase = Phase::ValueStart};
                 break;
             case Phase::ValueStart: cursor = {.phase = Phase::Value}; break;
-            case Phase::Value:
-                // `\n` occurs in the terminator only at its start.
-                if (byte == kValueEnd[cursor.matched]) {
-                    if (++cursor.matched == kValueEnd.size()) { cursor = {.phase = Phase::AfterValue}; }
-                } else {
-                    cursor.matched = byte == kValueEnd[0] ? 1 : 0;
-                }
-                break;
+            case Phase::Value: value_byte(cursor, byte); break;
             case Phase::AfterValue: cursor = {.phase = Phase::Parameters}; break;
             case Phase::CallClose:
                 if (++cursor.matched == kCallClose.size()) { cursor = {.phase = Phase::AfterCall}; }
                 break;
-            case Phase::AfterCall: break; // the `\n` before the next call's token
+            case Phase::AfterCall:
+                // The `\n` before the next call's token. Other text after the call's closers is the
+                // last raw value's (the grammar reads those closers as value text then), and the call
+                // goes on with its names.
+                if (cursor.matched == 0 && byte == '\n') {
+                    cursor.matched = 1;
+                    break;
+                }
+                {
+                    const bool newline = cursor.matched != 0;
+                    cursor             = {.phase = Phase::Value};
+                    if (newline) { value_byte(cursor, '\n'); }
+                    value_byte(cursor, byte);
+                }
+                break;
             }
         }
         return true;
+    }
+
+    // A raw value's byte; `\n` occurs in its terminator only at its start.
+    static void value_byte(Cursor& cursor, char byte) {
+        if (byte == kValueEnd[cursor.matched]) {
+            if (++cursor.matched == kValueEnd.size()) { cursor = {.phase = Phase::AfterValue}; }
+        } else {
+            cursor.matched = byte == kValueEnd[0] ? 1 : 0;
+        }
     }
 
     std::shared_ptr<const std::vector<std::string>> vocabulary_;
@@ -198,6 +238,8 @@ private:
     std::optional<std::int32_t> reasoning_close_;
     std::size_t separator_;
     Phase body_phase_;
+    bool names_rule_;
+    bool quotes_rule_;
     Cursor cursor_;
     std::vector<std::string> names_;
     Snapshot committed_;
@@ -298,12 +340,14 @@ compile_tool_grammar(text::GrammarCompiler& compiler, const Contract& contract,
         }
         identity["qwen_tools"].push_back(std::move(entry));
     }
-    // The grammar orders a strict tool's parameters, so only non-strict calls need the companion.
+    // The grammar orders a strict tool's parameters, so only non-strict calls need the name rule; only
+    // a grammar with free text before its calls (an auto choice without a JSON answer) needs quotes.
     std::unique_ptr<text::GrammarStateConstraint> companion;
-    if (std::any_of(contract.tools.begin(), contract.tools.end(), [](const auto& tool) { return !tool.strict; })) {
-        companion = std::make_unique<ParameterNameConstraint>(compiler.vocabulary(), compiler.tag_end_tokens(),
-                                                              tool_call_token, reasoning,
-                                                              body.has_value() && !contract.required);
+    const bool names  = std::any_of(contract.tools.begin(), contract.tools.end(), [](const auto& tool) { return !tool.strict; });
+    const bool quotes = !contract.tools.empty() && !contract.required && !body;
+    if (names || quotes) {
+        companion = std::make_unique<ToolCallRules>(compiler.vocabulary(), compiler.tag_end_tokens(), tool_call_token,
+                                                    reasoning, body.has_value() && !contract.required, names, quotes);
     }
     return compiler.compile_model(
         identity.dump(), [&] { return build(contract, body, tool_call_token); }, reasoning,

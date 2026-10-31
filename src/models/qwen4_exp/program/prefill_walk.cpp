@@ -499,7 +499,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
             const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
             device_.synchronize();
         }
-        check_expert_error();
+        check_device_error();
         PrefillProgress out;
         out.summary                 = prefill_summary(lane);
         out.processed_prompt_tokens = 0;
@@ -530,7 +530,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
             const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
             device_.synchronize();
         }
-        check_expert_error();
+        check_device_error();
         const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                 static_cast<std::uint64_t>(width));
         // The route log holds the span's last chunk (every chunk routes nearly every expert).

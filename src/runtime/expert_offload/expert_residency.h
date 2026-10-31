@@ -163,6 +163,12 @@ public:
     [[nodiscard]] std::uint32_t lend_layers() const noexcept;
     // What serving never gives up aside, the most bytes that pool lends with no lease out.
     [[nodiscard]] std::uint64_t lend_capacity_bytes() const noexcept;
+    // The same were the cache `frames` frames, split among the pools as resize splits them (a cache
+    // the KV pool's growth has shrunk): the most frames one pool lends with no lease out, and its pitch.
+    struct LendCapacity {
+        std::uint64_t frames = 0, pitch = 0;
+    };
+    [[nodiscard]] LendCapacity lend_capacity(std::uint32_t frames) const;
     // The layers whose experts a lease's frames held (its pool's).
     [[nodiscard]] std::uint32_t lease_layers(const FrameLease& lease) const noexcept {
         return lease.valid() ? static_cast<std::uint32_t>(pools_[lease.pool].layers.size()) : 0U;

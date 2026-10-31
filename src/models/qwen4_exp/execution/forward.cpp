@@ -82,10 +82,11 @@ void project_ggml_split(const Tensor& x, std::span<const ops::GgmlSegment> segme
     ops::ggml_linear(x, split, parts, nullptr, 0, work, s, routes);
 }
 
-// Token rows: BF16, or a GGUF import's IQ4_XS rows decoded exactly.
-void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t s) {
+// Token rows: BF16, or a GGUF import's IQ4_XS rows decoded exactly (an id outside the vocabulary
+// writes kErrorTokenId to `error`).
+void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t s, std::uint32_t* error) {
     if (table.layout == QuantLayout::GgmlRows) {
-        ops::ggml_embedding(ids, table, out, s);
+        ops::ggml_embedding(ids, table, out, s, DeviceFault{.word = error, .value = kErrorTokenId});
     } else {
         ops::embedding(ids, table, out, s);
     }
@@ -286,7 +287,7 @@ void Forward::embed(const ForwardBatch& batch, Tensor& residual) {
     const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size);
     auto scope = work_.scope();
     Tensor x0  = work_.alloc(DType::BF16, {H, T});
-    embed_tokens(batch.ids, parameters_.token_embedding, x0, s);
+    embed_tokens(batch.ids, parameters_.token_embedding, x0, s, experts_.error);
     if (batch.vision != nullptr && batch.vision->columns.data != nullptr) {
         ops::scatter(batch.vision->embeddings, batch.vision->columns, x0, s);
     }
@@ -539,9 +540,11 @@ Tensor Forward::ple_embedding(const PleParameters& p, const ForwardBatch& batch)
     const cudaStream_t s = device_.stream;
     const std::int32_t T = batch.ids.ne[0];
     if (const NgramRowGate* gate = batch.ngram_gate) {
-        // ple_embed is a plain launch (no PDL), so stream order holds it behind the copy.
+        // ple_embed is a plain launch (no PDL), so stream order holds it behind the copy. A host that
+        // never publishes fails the round through the error word, and the stream drains.
+        const DeviceFault fault{.word = experts_.error, .value = config_.ple.layer << 16U | kErrorRowGateTimeout};
         upload_pinned_when(batch.ngram_rows.data, gate->pinned_rows, batch.ngram_rows.bytes(), gate->ready,
-                           gate->expected, gate->wait_stats, gate->wait_row, s);
+                           gate->expected, gate->wait_stats, gate->wait_row, fault, s);
     }
     const NgramRowFormat format = batch.ngram_format.value_or(config_.ple.table.format);
     Tensor e;
@@ -1258,7 +1261,7 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
         auto scope = work_.scope();
         // Input fusion: R = fc_hidden(per stream of RMSNorm_{S*H}(rows)) + fc_embedding(RMSNorm_H(embed(id))).
         Tensor x0 = work_.alloc(DType::BF16, {H, T});
-        embed_tokens(call.ids, parameters_.token_embedding, x0, s);
+        embed_tokens(call.ids, parameters_.token_embedding, x0, s, experts_.error);
         if (call.vision != nullptr && call.vision->columns.data != nullptr) {
             ops::scatter(call.vision->embeddings, call.vision->columns, x0, s);
         }

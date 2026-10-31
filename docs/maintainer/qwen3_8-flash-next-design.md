@@ -1007,9 +1007,9 @@ Each exchange has the same structure:
 - **Bounded spins.** Every device spin has an iteration bound worth about 2 s. On expiry the thread
   writes `agent_error`, skips the computation (outputs are undefined), and the engine worker turns
   that round into an Engine-wide failure ([engine architecture §7.4](engine-architecture.md)). Host
-  agents have a 2 s watchdog on `round_done` progress. Exception (planned, n-gram S2, §12.3): the
-  gate before `ple_embed` (`upload_pinned_when`) traps after 120 s, above Windows' 60 s disk
-  timeout (decided default, 2026-10-04).
+  agents have a 2 s watchdog on `round_done` progress. Exception (n-gram S2, §12.3): the gate
+  before `ple_embed` (`upload_pinned_when`) waits up to 120 s, above Windows' 60 s disk timeout,
+  then reports through the device error word and skips its copy (a trap until 2026-10-31).
 
 ### 8.3 Per-layer kernel sequence and time budget
 
@@ -2130,6 +2130,17 @@ layer 1, is the only reader.
 **Decided (default, 2026-10-04):** gate trap 120 s, above Windows' 60 s disk timeout, verified once
 with a 3-5 s producer delay on an otherwise idle GPU (2 s if WDDM preemption fails); an internal
 process-wide fault seam for the engine test; S3 only past its threshold; S4 parked.
+
+**Changed (2026-10-31, candidates BH-01):** the bound stays 120 s, but a gate past it writes
+`layer << 16 | kErrorRowGateTimeout` to the Program's device error word (`core::DeviceFault`) and
+skips its copy instead of trapping, so the round drains and fails its requests
+(`check_device_error`) while the context, the other lanes and the Engine survive. The 2026-10-04
+choice weighed a 120 s trap against a 2 s one, not a fall-through at the same bound. New reasons: the
+trap fired in 5 of 7 `--vram-past-budget` starts before 75e25b5c; on sm_120 a deliberate trap was
+followed by Xid 109 and a hung driver until a power cycle (Basalt #161, which made the same change);
+and a trap names no site (#48's `cudaErrorIllegalInstruction`). The GGUF token embedding's id check
+(`kErrorTokenId`, zeros for that column) and the CPU expert wait without a heartbeat (2 s, then
+`kErrorHostSilent`) changed the same way; no device trap remains.
 
 ### 12.4 Exposure and its acceptance
 
@@ -4546,6 +4557,11 @@ binding) and `prefix/prefix_program.cpp` (the Program side).
   (`ForwardBatch::layer_waits[1]`). The tail page's planes of a layer are copied with that layer
   (`DeviceKVPagePool::copy_to_host_records` gained the plane-range form). An endpoint hands its
   partial page over as the snapshot's Device tail; a tap keeps it and the lane's later writes wait.
+  So do another request's: before a page a pending tap or boundary reads returns to the pool (the
+  lane's release, the block's eviction once published), the compute stream waits on that capture's
+  last event (`PrefixCache::order_page_reuse`). Until 2026-10-31 it did not, and a release inside
+  the copy window could put another request's KV into the snapshot (candidates TM-01; ninferpro
+  `33feac42d2`).
   The Host tier is therefore required: `--host-context-mib 0` or Device snapshot slots are refused
   (decided default 0 slots; packed slots are a later option).
 - **Restores** are one batch per admission on the restore stream, in forward order: a decoder
@@ -5944,7 +5960,7 @@ a round later. A D2H bubble > 15 µs (events) would become an SM-write kernel li
 |---|---|---|
 | 1 | Core reader, CPU: new `tests/test_read_only_file.cpp` (`tests/cmake/CoreTests.cmake`) | Closed-form block pattern; 1, 63, 64, 65, 1,000 offsets in random order with repeats; rings of 1, 4, 64; each index consumed once with its bytes; a past-EOF offset throws after draining |
 | 2 | `NgramVolume`, CPU: new `tests/models/qwen4_exp/test_ngram_volume.cpp` | Synthetic volume (60-byte header, row r byte k = f(r, k)), oracle f. Random rows; duplicates and two rows of one block make one read (counters); > 64 blocks wrap the ring; hit after miss; two ids on one cache slot; id ≥ rows throws `out_of_range`; size mismatch throws at open |
-| 3 | Gate primitive, GPU (`tests/test_device.cpp`) | 2,560, 12,800, 327,680 B; a host producer writes poison, waits 2 ms, writes data, publishes; copy equals data, wait count > 0 and wait ≥ the delay; eager, and a graph replayed with three sequences and new data, the old word left in place (stale-word rejection). The trap is not tested (it destroys the context). Once, with the GPU otherwise idle (a TDR resets the display GPU): a 3-5 s producer delay, to confirm WDDM preemption for the 120 s trap |
+| 3 | Gate primitive, GPU (`tests/test_device.cpp`) | 2,560, 12,800, 327,680 B; a host producer writes poison, waits 2 ms, writes data, publishes; copy equals data, wait count > 0 and wait ≥ the delay; eager, and a graph replayed with three sequences and new data, the old word left in place (stale-word rejection). The trap was not tested (it destroyed the context); since 2026-10-31 a word never published, past a 50 ms test bound, must store the fault, skip the copy and leave the next gate working. Once, with the GPU otherwise idle (a TDR resets the display GPU): a 3-5 s producer delay, to confirm WDDM preemption for the 120 s trap |
 | 4 | Assemble op, GPU (`tests/ops/test_speculative_round.cpp`) | B = 1-8, W = 2-16, extents 0..K, mixed `from_device`, S ≥ the largest device extent; oracle a host loop of `verify()`'s rule (1122-1135); exact |
 | 5 | Engine, real artifact, GPU: new `tests/models/qwen4_exp/test_engine_ngram_gate_real.cpp`, skip 77 without `INFERNIX_QWEN4_ARTIFACT`; volume from `INFERNIX_QWEN4_NGRAM` (default `<artifact>.ngram`), as in `infernix_qwen4_exp_forward_real_test`; one Engine, MTP, C = 2 | Internal seam `qwen4_exp::testing::set_ngram_faults({delay_us, poison, fail_round})`, process-wide, read per gated round, never set by product code. (a) Delay 5 ms + poison (constant FP8 fill, `sfence`, wait, real rows): ids equal faults-off, gate waits > 0 every gated round. (b) A second request admitted mid-decode puts a prefill gather between gated rounds: ids equal faults-off. (c) `system_error` at gated round N: the request fails with it, no hang (test timeout), no sticky CUDA error; runs last since the worker ends |
 | 6 | Product checks, CLI | `--print-token-ids` equal to the baseline build: code and story at C = 1, plain and `--spec mtp`; the MTP pair at C = 2; MTP ids still equal plain at C = 1 |
@@ -6025,7 +6041,8 @@ unmeasured on G:) would hit a request's first gated round, and the slow-read war
   wait_row, stream)` and `publish_pinned_word` (`core/device`), as designed: ≤ 16 CTAs of 256
   threads, 32 KiB each; every CTA's thread 0 polls with `__nanosleep(200)`, then
   `__threadfence_system()`, then `__ldcv` loads in batches of eight 16-byte vectors; a wait records
-  its ns and a count in `wait_stats[2 * *wait_row]` (CTA 0); trap after 120 s. Test cases in
+  its ns and a count in `wait_stats[2 * *wait_row]` (CTA 0); trap after 120 s (since 2026-10-31:
+  a `DeviceFault` word and no copy, §12.3). Test cases in
   `infernix_device_test`: 2,560 / 12,800 / 327,680 B with a 2 ms producer delay over poison, a
   pre-published word (no wait), three graph replays with the old word left published, and a
   misaligned size. The 3-5 s producer-delay TDR probe was not run.
@@ -7935,8 +7952,8 @@ R7 and R8 implemented on `claude/fn-memory-tier` (from the integration branch, 2
   could not release ring slots) and at most `kMaxFetch` = 512 jobs. Tier records are read with
   `.cv` loads (their host slots are rewritten; the full-mode bank keeps `.cs`). Waits: the CPU
   wait and the fetch poller end when the host's heartbeat has not changed for 10 s and write
-  `kErrorHostSilent` (the CPU service) or `kErrorFetchSilent` (the fetch responder; no trap unless
-  the source has no error word); host failures write their
+  `kErrorHostSilent` (the CPU service) or `kErrorFetchSilent` (the fetch responder; never a trap,
+  unreported when the source has no error word, since 2026-10-31); host failures write their
   errno; an SSD-only expert with no path writes `kErrorUnservedRecord`. Tests (layer test): SSD-only
   sets served by CPU jobs (caps 8 and 256, fork, zero staging) and by the fetch channel (serial
   passes of 1 and 3 slots, overlap, fork, landing, with CPU jobs taking the narrow ones), a
@@ -10416,19 +10433,82 @@ bit-identical greedy output, plain decode 397.4 → 398.6 tok/s (every four-bloc
   T = 2 / 4 / 8: 11.62 / 14.41 / 18.10 -> 12.37 / 15.96 / 23.95 us; Q8 9.60 / 12.02 / 16.01 -> 11.35 / 14.83 /
   20.92 us): each of its CTAs forms m from the partials again, 4x v4's reads. Not adopted; m formed once
   (K1a's last CTA) is the untried variant.
-- A prefill chunk whose wide workspace the expert cache could never lend is halved at startup (a
-  warning; exact route chunk-invariant): a 65,536-token chunk on the SSD tier had wanted 27 GiB,
+- A prefill chunk whose wide workspace the expert cache could never lend is cut at startup (a
+  warning; not chunk-invariant, as several prefill routes round with the call's width, model-quality.md
+  6.7): a 65,536-token chunk on the SSD tier had wanted 27 GiB,
   failed `cudaMalloc` after admission and took the Engine down (GitHub #5 comment); now it prefills at
-  32,768 and served a 49K-token prompt. A failed fallback allocation fails the prompt's requests, not
-  the Engine.
+  a lendable chunk and served a 49K-token prompt. A failed fallback allocation fails the prompt's
+  requests, not the Engine.
+- Since 2026-10-31 the cut is the widest multiple of 128 tokens (`--prefill-chunk`'s grid) whose
+  workspace the cache lends at its smallest: the KV pool grown to its capacity
+  (`kv_growth_frames`: its mapped bytes over the base and a 64 MiB chunk per frame pool), the
+  smaller cache split among the pools as `resize` splits it, three quarters of the largest pool's
+  frames (`ExpertResidency::lend_capacity`). It was halving against the startup cache. On the IQ3_S
+  import (7 frame pools, the largest ~7.4 GiB of a 23.7 GiB cache) 16,384 needs 7,014 MiB against
+  5,652 lendable, and halving gave 8,192; 12,288 prefilled a 32K prompt 0.8 % faster (two ABBA
+  slots: 7,753 / 7,751 against 7,686 / 7,690 tok/s). The first version fitted the startup cache
+  (13,824 in the bench, 13,056 serving 2 x 262K) and failed in the bench, whose chunk never moves:
+  the 32K prompt's 522 MiB of KV shrank the lending pool, and the 5,917 MiB lease fell back to a
+  `cudaMalloc` that failed. Serving would fail the same way, as a binding re-fits before its own KV
+  growth (`grow_kv` after `refit_chunk_for_binding`). Halving had worked only by its slack, and was
+  itself unsafe at 4 lanes x 262K once their contexts filled. Measured (INT8 KV, RTX 5090,
+  `infernix_bench`, a 32K prompt at one lane of 40,960
+  tokens, two runs per arm in ABBA order): the fit gives 13,440 there, 7,793 / 7,792 tok/s against
+  7,692 / 7,691 at 8,192 (+1.3 %) and 7,753 / 7,747 at 12,288, and its prompt's 522 MiB of KV
+  growth no longer fails the lease; `--reproducible` ran at the fitted chunk. Serving fits 9,088 at
+  2 x 262,144 (not timed; between 8,192 and 12,288) and 5,120 at 4 x 262,144, which prefills 3.0 %
+  slower than 8,192 (7,462 / 7,464 against 7,690 / 7,694 tok/s) where 8,192 could not be lent once
+  the four contexts filled.
+- So the cut at the full pool is kept only where the chunk never moves: without free cache resume,
+  the reproducible route and an Engine without prefix reuse (`infernix_bench`, so the numbers above
+  measure that fit). It also sizes the SSD tier's tickets, the narrowest chunk the pool's growth
+  reaches. The default route starts at the widest chunk the startup cache lends, and before a
+  prefill call lends its workspace
+  (`fit_calls_to_cache`, no lease held) a cache that no longer lends the prefilling lanes' remaining
+  calls cuts the chunk to what it lends then and plans those calls again (`prefix::segment_ends`
+  from the lane's next call, cut at its kept exact taps; free cache resume lets calls end anywhere).
+  A re-fit at the binding alone would not do: the binding's own growth comes after it, other lanes
+  grow before its first call, and a queued request grows the pool between its calls once
+  `hybrid_reclaim` has taken the leases back (issue #24). Measured through `infernix-serve` (INT8
+  KV, the DFlash2 companion, RTX 5090; distinct ~32K-token prompts with one output token, rated by
+  the response's `timings`; two starts per arm, alternated; a peer's CPU-only renders overlapped
+  the first two). At 4 x 262,144 the start fitted 12,800 and the first prompt's KV growth cut it
+  to 12,288 at a call; the pool then grew to 1,600 pages with no further cut. Against
+  `--prefill-chunk 5120` (the full-pool fit): sequential prompts 6,520 against 6,329 tok/s
+  (+3.0 %), but by position -1.9, +2.4 and +9.3 %, as the 5,120 starts slowed with each prompt
+  (6,670, 6,362, 5,954) and the default's did not; rounds of four at once 6,784 against 6,579
+  (+3.1 %; the clean pair +4.9 %). No request failed. At one lane of 40,960 the start fitted
+  13,184 (12,800 at the full pool), and three prompts' 476 MiB of KV came from spare memory with
+  no cut.
+- The reproducible route cannot take that cut: its prefill routes round with the call's width, so a
+  chunk that follows other requests' KV would make a request's bits depend on them (a 12,900-token
+  prompt's last call is 100 tokens at 12,800, split QSA, and 612 at 12,288). Its fixed chunk had a
+  launch dependence of its own: the frames, and so the chunk, followed the free VRAM a launch
+  measured, so the same options on the same GPU could fit another chunk when another program held
+  memory. Since 2026-10-31 it is fitted to the frames a launch would size with a nominal 3 GiB in use
+  before loading (`kNominalInUseBytes`: other programs, the driver, the CUDA context; this machine
+  measured 1,396 MiB with no display), an attached display's headroom and no OS budget below free
+  memory (`nominal_snapshot`), and to the launch's own frames; the narrower is taken, with a warning
+  naming both when the launch's cache is the smaller. On IQ3_S with INT8 KV (1,396 MiB in use
+  before loading here) it fits 4,096 at 4 x 262,144 (5,120 from the launch's own frames) and 11,648
+  at one lane of 40,960, with no warning; the default route is unchanged (12,800, down to 5,120).
+  The narrower chunk was not timed (5,120 against 8,192 cost 3.0 % above).
+- Wide prefill calls keep a request's bits over one call grid (`infernix_qwen4_exp_prefill_width_real_test`,
+  2026-10-31): reproducible-route prompts of 6,144-25,276 tokens whose calls start on one grid and
+  end in the same last call, at chunks 1,024 / 3,072 / 6,144 (and 2,048 / 12,288 on IQ3_S), read
+  out 256 next-token log-probabilities and the top token bit-identical in all 296 comparisons: IQ3_S,
+  Dense8, recipe A, recipe C, FP4-Local and the FP8 import with INT8 KV, and IQ3_S with BF16, FP8,
+  NVFP4, K8V4, VQ2 and K4V2 KV. The layer walk grouped those calls differently and changed nothing.
+  So the reproducible route could merge whole calls of its grid into wider ones as the cache lends
+  them, keeping each request's last call (not built).
 - The cache can shrink after startup (elastic KV growth, the VRAM monitor, a vision loan) until it no
   longer lends that chunk's workspace, which then failed every later long prompt; and the failed
   allocation left its error as the runtime's last, which aborted the next launch check (closed PR
   #46). Since 2026-10-30 (review TK-02) a binding made while no lane prefills re-fits the chunk to
-  what the cache can lend then, less the binding's own vision loan, up to the startup chunk (halving;
-  at nothing lendable the static arena's width), on the default route only: the reproducible route's
-  taps and resumes sit on the chunk grid, so its chunk stays fixed. `DeviceBuffer` now consumes the
-  failed allocation's error.
+  what the cache can lend then, less the binding's own vision loan, up to the startup chunk (the
+  widest that fits; at nothing lendable the static arena's width), on the default route only: the
+  reproducible route's taps and resumes sit on the chunk grid, so its chunk stays fixed.
+  `DeviceBuffer` now consumes the failed allocation's error.
 - GitHub #24 through the layer walk: after each walk span the Program reports that its lent frames are
   returnable and the Engine re-runs admission, so a request waiting for KV growth is admitted after
   the span instead of after the whole prompt. Scenario (exact route, C = 2, `--max-context 190000`):
@@ -11971,7 +12051,7 @@ When the implementation lands:
 | Prefix cache: drafter state wrong after a resume; copy-engine FIFO (restores ahead of inputs: H2D FIFO measured, §19.2; bulk D2H ahead of per-round readbacks: unverified, prefix M0) | Lower acceptance, invisible at C = 1 greedy; stalled rounds | Bitwise drafter oracle D1, `mtp_cells`, counters; restores after the call's inputs; M0 decides `download_pinned` (§19.3.1) |
 | Vision: M-RoPE plumbing in every attention call, invisible below 2,051 tokens; lending across three streams; new BF16 routes also change Qwen3.5 and Quasar vision | Silent output change; corrupt frames; slower images | Bitwise text logits against HEAD, index-key taps, a mandatory > 2K case; load serial, lease waits, C = 2 stress; routes measured first, Qwen3.5 requalified (§19.3.2) |
 | Q8: T > 8 costs rest on one measured MMA point; K1b's redundant partial reads; Phase 1b moves tg512 baselines | Smaller gains | M1 sweep with per-shape thresholds; last-arriver fallback; identical-id workloads (§19.3.3) |
-| N-gram gate: a long spin under WDDM relies on compute preemption; a TDR resets the whole GPU | Display and other sessions reset | 120 s trap verified once with a 3-5 s delay on an idle GPU, else 2 s (§12.3) |
+| N-gram gate: a long spin under WDDM relies on compute preemption; a TDR resets the whole GPU | Display and other sessions reset | 120 s bound verified once with a 3-5 s delay on an idle GPU, else 2 s; past it the round fails through the error word, not a trap (§12.3) |
 | Gains near noise (n-gram) and a ±30 % C > 1 model (verification ~20 % optimistic) | Inconclusive steps | Measure-first gates (S0; S3 at ≥ 0.15 ms; concurrency S2 table); ABBA; S6 + S7 only if they beat the gate everywhere |
 | Tracks edit the same code | Conflicts, silent regressions | §19.3.0's rules and merge order: `ProgramImpl` declared in `program_impl.h` first (`54deaa2bc`); concurrency owns `cpu_plan`, `cpu_wait` and `stage_kernel` (S3-S5 before Q8 Phase 2 and prefix P7; one `cpu_wait` grid for copying and L2 warming); Q8 Phase 0 before S6, whose −1 skip covers the small dispatch and `moe_combine`; n-gram S1 owns `read_rows` (vision V6 adds no copy); vision's io-placement assertion and the text bit-identity gate after every merge; the prefix tier reserves Vision's pageable media budget (vision rev 2 pins only the tower) |
 | Concurrency S7: greedy output at C > 1 differs from C = 1 at near-ties once B·W > 8 | Concurrency-dependent output | Asked at the decision point after S5 (+20-30 % at C = 2, model); otherwise the gate stays (§19.3.5) |

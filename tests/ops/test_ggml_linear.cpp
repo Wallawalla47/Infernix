@@ -14,6 +14,7 @@
 // rounded once to BF16.
 
 #include "ops/op_family.h"
+#include "core/arena.h"
 #include "core/device.h"
 #include "core/ggml_format.h"
 #include "infernix/ops/ggml_linear.h"
@@ -791,13 +792,45 @@ void run_embedding(QType q, int vocab, int hidden, Scales scales, std::mt19937& 
     weight.layout = QuantLayout::GgmlRows;
     Tensor tids(dids.p, DType::I32, {columns});
     Tensor tout(dout.p, DType::BF16, {hidden, columns});
-    ops::ggml_embedding(tids, weight, tout, nullptr);
+    PinnedHostBuffer fault(64);
+    auto* word = static_cast<std::uint32_t*>(fault.data());
+    *reinterpret_cast<volatile std::uint32_t*>(word) = 0;
+    constexpr std::uint32_t kFault = 0xFF11;
+    ops::ggml_embedding(tids, weight, tout, nullptr, DeviceFault{.word = word, .value = kFault});
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<std::uint16_t> actual(expected.size());
     dout.copy_to_host(actual.data(), actual.size() * 2, 0);
     std::size_t mismatches = 0;
     for (std::size_t i = 0; i < actual.size(); ++i) { mismatches += !same_value(actual[i], expected[i]); }
     check(mismatches == 0, label + ": " + std::to_string(mismatches) + " of " + std::to_string(actual.size()) + " outputs differ");
+    check(*reinterpret_cast<volatile std::uint32_t*>(word) == 0, label + ": in-vocabulary ids reported a fault");
+
+    // Ids outside [0, vocab) embed zeros and report the fault instead of trapping; the other columns
+    // keep their rows and the context stays usable.
+    const std::vector<std::int32_t> bad = {ids[0], vocab, -1, INT32_MAX, ids[1]};
+    const auto bad_columns = static_cast<int>(bad.size());
+    dids.copy_from_host(bad.data(), bad.size() * 4, 0);
+    CUDA_CHECK(cudaMemset(dout.p, 0xFF, static_cast<std::size_t>(hidden) * bad_columns * 2));
+    Tensor bad_ids(dids.p, DType::I32, {bad_columns});
+    Tensor bad_out(dout.p, DType::BF16, {hidden, bad_columns});
+    ops::ggml_embedding(bad_ids, weight, bad_out, nullptr, DeviceFault{.word = word, .value = kFault});
+    const cudaError_t status = cudaDeviceSynchronize();
+    check(status == cudaSuccess, label + ": an id outside the vocabulary failed the context (" + cudaGetErrorString(status) + ")");
+    if (status != cudaSuccess) { return; }
+    std::vector<std::uint16_t> got(static_cast<std::size_t>(hidden) * bad_columns);
+    dout.copy_to_host(got.data(), got.size() * 2, 0);
+    std::size_t wrong = 0;
+    for (int t = 0; t < bad_columns; ++t) {
+        const int source = t == 0 ? 0 : t == bad_columns - 1 ? 1 : -1; // the expected column, or none (zeros)
+        for (int i = 0; i < hidden; ++i) {
+            const std::uint16_t want = source < 0 ? std::uint16_t{0}
+                                                  : expected[static_cast<std::size_t>(source) * hidden + i];
+            wrong += !same_value(got[static_cast<std::size_t>(t) * hidden + i], want);
+        }
+    }
+    check(wrong == 0 && *reinterpret_cast<volatile std::uint32_t*>(word) == kFault,
+          label + ": ids outside the vocabulary did not embed zeros and report the fault (" + std::to_string(wrong) +
+              " outputs differ)");
 }
 
 // ple_embed_iq4_nl: rows U8 [row_bytes, heads, T] to out BF16 [heads * W, T], element by element.

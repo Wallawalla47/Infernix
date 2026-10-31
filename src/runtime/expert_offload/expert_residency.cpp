@@ -1012,6 +1012,16 @@ std::uint64_t ExpertResidency::lend_capacity_bytes() const noexcept {
     return static_cast<std::uint64_t>(pool.frames - pool.frames / 4) * pool.pitch;
 }
 
+ExpertResidency::LendCapacity ExpertResidency::lend_capacity(std::uint32_t frames) const {
+    const auto split = split_frames(frames);
+    LendCapacity best;
+    for (std::size_t p = 0; p < pools_.size(); ++p) {
+        const std::uint64_t lendable = split[p] - split[p] / 4;
+        if (lendable * pools_[p].pitch > best.frames * best.pitch) { best = {lendable, pools_[p].pitch}; }
+    }
+    return best;
+}
+
 std::uint32_t ExpertResidency::lend_layers() const noexcept {
     return static_cast<std::uint32_t>(pools_[lend_pool()].layers.size());
 }
