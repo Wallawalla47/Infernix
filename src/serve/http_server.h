@@ -3,6 +3,7 @@
 #include "serve/console_stats.h"
 #include "serve/decide.h"
 #include "serve/generation_service.h"
+#include "serve/keep_alive_retirement.h"
 #include "serve/metrics.h"
 #include "serve/metrics_json.h"
 #include "serve/openai_common.h"
@@ -151,6 +152,7 @@ private:
     RequestHistory metrics_json_history_;
     std::unique_ptr<ConsoleStatsPanel> console_stats_;
     httplib::Server server_;
+    std::unique_ptr<KeepAliveRetirement> keep_alive_retirement_;
     std::atomic<std::uint64_t> request_seq_{0};
     std::mutex stats_mutex_;
     std::condition_variable stats_cv_;
