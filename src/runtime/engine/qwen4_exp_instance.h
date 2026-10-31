@@ -13,6 +13,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <vector>
 
 namespace infernix {
 struct DeviceContext;
@@ -45,6 +46,12 @@ struct ConstructedQwen4Exp {
 
 // True when the artifact's text component is Qwen4ExpForCausalLM.
 [[nodiscard]] bool artifact_is_qwen4_exp(const artifact::Reader& reader);
+
+// The DFlash2 companion artifacts beside a Qwen3.8-Flash-Next artifact: the .infernix and .ninfer entries in
+// its folder whose one component is a DFlash2 drafter converted for it, by file name (--spec auto takes one
+// found alone).
+[[nodiscard]] std::vector<std::filesystem::path> dflash2_companions_beside(const std::filesystem::path& artifact_path,
+                                                                           const artifact::Directory& target);
 
 [[nodiscard]] ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device);
 

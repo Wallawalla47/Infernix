@@ -182,7 +182,7 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--logits-dtype fp32|bf16]\n"
-           "       [--spec mtp|dflash|dflash2|auto --draft-tokens "
+           "       [--spec auto|off|mtp|dflash|dflash2 --draft-tokens "
            "N|auto]\n"
            "       [--draft-model FILE]\n"
            "       [--lm-head-draft] [--spec-min-p P] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
@@ -331,13 +331,16 @@ std::string usage_text(const char* argv0) {
            "                           PCIe (default: in VRAM; offloaded-expert artifacts\n"
            "                           always keep it in host memory)\n"
            "\n"
-           "SPECULATIVE DECODING (off by default)\n"
-           "  --spec mtp|dflash|dflash2|auto\n"
-           "                           speculative backend. auto (with --draft-tokens auto):\n"
-           "                           the drafter measured fastest for the artifact:\n"
-           "                           Qwen3.8-Flash-Next dflash2 with --draft-model, else\n"
-           "                           mtp; offloaded-expert Qwen3.5 (122B) mtp; other\n"
-           "                           Qwen3.5/3.6 dflash2, then mtp, then dflash, as bundled\n"
+           "SPECULATIVE DECODING (auto by default)\n"
+           "  --spec auto|off|mtp|dflash|dflash2\n"
+           "                           speculative backend. auto (the default, with\n"
+           "                           --draft-tokens auto): the drafter measured fastest for\n"
+           "                           the artifact: Qwen3.8-Flash-Next dflash2 with\n"
+           "                           --draft-model or its companion artifact alone in the\n"
+           "                           model's folder, else mtp; offloaded-expert Qwen3.5\n"
+           "                           (122B) mtp; other Qwen3.5/3.6 dflash2, then mtp, then\n"
+           "                           dflash, as bundled; plain decode without one and on\n"
+           "                           --lossless. off: plain decode\n"
            "  --draft-tokens N|auto    drafts per round: mtp 1-7 (Qwen3.5/3.6 1-5),\n"
            "                           dflash/dflash2 1-15 (Qwen3.8-Flash-Next dflash2 1-7)\n"
            "                             N     every round drafts and verifies N\n"
@@ -348,8 +351,8 @@ std::string usage_text(const char* argv0) {
            "                                   probabilities favour (Qwen3.5/3.6: where\n"
            "                                   qualified, else the fastest fixed length)\n"
            "  --draft-model FILE       Qwen3.8-Flash-Next dflash2 (or auto): the DFlash2\n"
-           "                           drafter's companion artifact (Qwen3.5/3.6 artifacts\n"
-           "                           bundle theirs)\n"
+           "                           drafter's companion artifact (auto finds one alone\n"
+           "                           beside the model; Qwen3.5/3.6 artifacts bundle theirs)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
            "  --spec-min-p P           mtp (on Qwen3.8-Flash-Next with a fixed --draft-tokens N\n"
            "                           only), Qwen3.8-Flash-Next dflash2: one-request rounds\n"
@@ -422,6 +425,7 @@ Options parse_options(int argc, char** argv) {
     options.config_path       = std::move(program.config_path);
     options.config_arguments  = program.config_arguments;
     bool kv_capacity_explicit = false;
+    bool spec_explicit        = false; // without --spec: product::apply_default_speculation
 
     const std::vector<std::string>& arguments = program.arguments;
     for (std::size_t i = 0; i < arguments.size(); ++i) {
@@ -524,6 +528,7 @@ Options parse_options(int argc, char** argv) {
             options.logits_dtype = product::parse_logits_dtype(value(arg));
         } else if (arg == "--spec") {
             product::apply_speculative_backend(options.speculative, value(arg));
+            spec_explicit = true;
         } else if (arg == "--draft-tokens") {
             product::apply_draft_tokens(options.speculative, value(arg));
         } else if (arg == "--draft-model") {
@@ -682,6 +687,7 @@ Options parse_options(int argc, char** argv) {
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
+    if (!spec_explicit) { product::apply_default_speculation(options.speculative); }
     product::validate_speculative_cli_options(options.speculative);
     if (options.enable_thinking == false && options.reasoning_effort &&
         *options.reasoning_effort != ReasoningEffort::None) {
