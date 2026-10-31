@@ -2205,6 +2205,10 @@ public:
 
   Server &set_keep_alive_max_count(size_t count);
   Server &set_keep_alive_timeout(time_t sec);
+  // Stamp `Connection: close` on the response to a request that arrives after
+  // this much idleness, so long-idle pooled connections retire knowingly
+  // instead of racing the silent keep-alive timeout close. 0 (default) off.
+  Server &set_keep_alive_graceful_idle(time_t sec);
   template <class Rep, class Period>
   Server &
   set_keep_alive_timeout(const std::chrono::duration<Rep, Period> &duration);
@@ -2290,6 +2294,7 @@ protected:
 
   size_t keep_alive_max_count_ = CPPHTTPLIB_KEEPALIVE_MAX_COUNT;
   time_t keep_alive_timeout_sec_ = CPPHTTPLIB_KEEPALIVE_TIMEOUT_SECOND;
+  time_t keep_alive_graceful_idle_sec_ = 0;
   time_t read_timeout_sec_ = CPPHTTPLIB_SERVER_READ_TIMEOUT_SECOND;
   time_t read_timeout_usec_ = CPPHTTPLIB_SERVER_READ_TIMEOUT_USECOND;
   time_t write_timeout_sec_ = CPPHTTPLIB_SERVER_WRITE_TIMEOUT_SECOND;
@@ -6420,14 +6425,17 @@ private:
 };
 
 inline bool keep_alive(const std::atomic<socket_t> &svr_sock, socket_t sock,
-                       time_t keep_alive_timeout_sec) {
+                       time_t keep_alive_timeout_sec, time_t &idle_sec) {
   using namespace std::chrono;
 
   const auto interval_usec =
       CPPHTTPLIB_KEEPALIVE_TIMEOUT_CHECK_INTERVAL_USECOND;
 
   // Avoid expensive `steady_clock::now()` call for the first time
-  if (select_read(sock, 0, interval_usec) > 0) { return true; }
+  if (select_read(sock, 0, interval_usec) > 0) {
+    idle_sec = 0;
+    return true;
+  }
 
   const auto start = steady_clock::now() - microseconds{interval_usec};
   const auto timeout = seconds{keep_alive_timeout_sec};
@@ -6445,6 +6453,9 @@ inline bool keep_alive(const std::atomic<socket_t> &svr_sock, socket_t sock,
         break; // Timeout
       }
     } else {
+      // How long the connection sat idle before this request arrived.
+      idle_sec = static_cast<time_t>(
+          duration_cast<seconds>(steady_clock::now() - start).count());
       return true; // Ready for read
     }
   }
@@ -6456,12 +6467,22 @@ template <typename T>
 inline bool
 process_server_socket_core(const std::atomic<socket_t> &svr_sock, socket_t sock,
                            size_t keep_alive_max_count,
-                           time_t keep_alive_timeout_sec, T callback) {
+                           time_t keep_alive_timeout_sec,
+                           time_t keep_alive_graceful_idle_sec, T callback) {
   assert(keep_alive_max_count > 0);
   auto ret = false;
   auto count = keep_alive_max_count;
-  while (count > 0 && keep_alive(svr_sock, sock, keep_alive_timeout_sec)) {
-    auto close_connection = count == 1;
+  while (count > 0) {
+    time_t idle_sec = 0;
+    if (!keep_alive(svr_sock, sock, keep_alive_timeout_sec, idle_sec)) {
+      break;
+    }
+    // A request that arrives after a long idle gets its response stamped with
+    // `Connection: close` (0 disables), so the client retires the socket
+    // knowingly instead of racing the silent timeout close.
+    const auto graceful_close = keep_alive_graceful_idle_sec > 0 &&
+                                idle_sec >= keep_alive_graceful_idle_sec;
+    auto close_connection = count == 1 || graceful_close;
     auto connection_closed = false;
     ret = callback(close_connection, connection_closed);
     if (!ret || connection_closed) { break; }
@@ -6474,11 +6495,14 @@ template <typename T>
 inline bool
 process_server_socket(const std::atomic<socket_t> &svr_sock, socket_t sock,
                       size_t keep_alive_max_count,
-                      time_t keep_alive_timeout_sec, time_t read_timeout_sec,
-                      time_t read_timeout_usec, time_t write_timeout_sec,
-                      time_t write_timeout_usec, T callback) {
+                      time_t keep_alive_timeout_sec,
+                      time_t keep_alive_graceful_idle_sec,
+                      time_t read_timeout_sec, time_t read_timeout_usec,
+                      time_t write_timeout_sec, time_t write_timeout_usec,
+                      T callback) {
   return process_server_socket_core(
       svr_sock, sock, keep_alive_max_count, keep_alive_timeout_sec,
+      keep_alive_graceful_idle_sec,
       [&](bool close_connection, bool &connection_closed) {
         SocketStream strm(sock, read_timeout_sec, read_timeout_usec,
                           write_timeout_sec, write_timeout_usec);
@@ -10361,10 +10385,12 @@ template <typename T>
 inline bool process_server_socket_ssl(
     const std::atomic<socket_t> &svr_sock, tls::session_t session,
     socket_t sock, size_t keep_alive_max_count, time_t keep_alive_timeout_sec,
+    time_t keep_alive_graceful_idle_sec,
     time_t read_timeout_sec, time_t read_timeout_usec, time_t write_timeout_sec,
     time_t write_timeout_usec, T callback) {
   return process_server_socket_core(
       svr_sock, sock, keep_alive_max_count, keep_alive_timeout_sec,
+      keep_alive_graceful_idle_sec,
       [&](bool close_connection, bool &connection_closed) {
         SSLSocketStream strm(sock, session, read_timeout_sec, read_timeout_usec,
                              write_timeout_sec, write_timeout_usec);
@@ -12960,6 +12986,11 @@ inline Server &Server::set_keep_alive_timeout(time_t sec) {
   return *this;
 }
 
+inline Server &Server::set_keep_alive_graceful_idle(time_t sec) {
+  keep_alive_graceful_idle_sec_ = sec;
+  return *this;
+}
+
 template <class Rep, class Period>
 inline Server &Server::set_keep_alive_timeout(
     const std::chrono::duration<Rep, Period> &duration) {
@@ -14458,6 +14489,7 @@ inline bool Server::process_and_close_socket(socket_t sock) {
   auto ret = serve_guarded([&]() {
     return detail::process_server_socket(
         svr_sock_, sock, keep_alive_max_count_, keep_alive_timeout_sec_,
+        keep_alive_graceful_idle_sec_,
         read_timeout_sec_, read_timeout_usec_, write_timeout_sec_,
         write_timeout_usec_,
         [&](Stream &strm, bool close_connection, bool &connection_closed) {
@@ -17869,7 +17901,8 @@ inline bool SSLServer::process_and_close_socket(socket_t sock) {
   ret = serve_guarded([&]() {
     return detail::process_server_socket_ssl(
         svr_sock_, session, sock, keep_alive_max_count_,
-        keep_alive_timeout_sec_, read_timeout_sec_, read_timeout_usec_,
+        keep_alive_timeout_sec_, keep_alive_graceful_idle_sec_,
+        read_timeout_sec_, read_timeout_usec_,
         write_timeout_sec_, write_timeout_usec_,
         [&](Stream &strm, bool close_connection, bool &connection_closed) {
           return process_request(

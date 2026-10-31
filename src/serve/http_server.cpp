@@ -422,6 +422,14 @@ void HttpServer::stop_stats_reporter() {
 }
 
 void HttpServer::register_routes() {
+    // HTTP keep-alive window after a response finishes (cpp-httplib defaults to 5 s, which
+    // silently closes pooled connections between agent turns; clients then race the close).
+    // The timeout close is silent — no response is in flight to carry a close signal — so it
+    // is only the hard ceiling; long-idle connections retire gracefully instead: a request
+    // arriving after half the ceiling of idleness gets `Connection: close` on its response,
+    // and the client opens fresh next time (the path nginx/Node document for this race).
+    server_.set_keep_alive_timeout(options_.keep_alive_timeout_sec);
+    server_.set_keep_alive_graceful_idle(options_.keep_alive_timeout_sec / 2);
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
         return handle_unrendered_http_error(options_, request, response);
     });
