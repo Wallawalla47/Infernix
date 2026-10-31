@@ -3043,7 +3043,7 @@ model estimates for recipe B at C=1 unless marked otherwise.
 | **H8** | **Prompt-seeded cache** (built 2026-10-18 as counts only, credit 256, no promotions: §19.3.27). Prefill already routes every prompt token. At the end of prefill, the prompt's per-layer expert counts seed the LFRU state, and the top uncached experts are promoted while the copy engine is otherwise idle, before the first decode token (MoE-Infinity's request-level activation idea). | Fewer cold misses in the first hundreds of decode tokens after a topic switch | Low | M1 replay with prefill routing: hit rate of the first 256 decode tokens with and without seeding |
 | **H9** | **Draft trees** (the existing DFlash2-style tree verification over MTP top-2 at the first one or two positions) | +10-25% accepted tokens per round in the literature. Here each extra column adds ~2 distinct experts per layer, ~0.2 ms with recipe B, so a tree must add more than ~12% accepted tokens to pay. | More columns, so more misses on rejected branches | M7 cost model: chosen per round only when expected tokens/s rise |
 | **H11** | **Exclusive residency** (an expert lives in VRAM *or* RAM) for 64 GB hosts | Supports smaller machines | Write-back and eviction complexity | Outside the current product scope |
-| **H12** | **BF16 GDN recurrent state** (opt-in; changes numerics) | Halves 6.3 MB of state traffic per layer and sequence: ~2% at C=1, ~5% at C=8. Measured on DGX Spark for this model: +6.8% at 1 stream, +8.5% at 8. | The reference keeps FP32 state. INT8 state lost up to 21.6 accuracy points in the literature unless quantized with decay awareness, so BF16 is the floor. | Off by default. Adopted as an option only if it passes the §16.3 recipe-B thresholds against FP32 state. |
+| **H12** | **BF16 GDN recurrent state** (opt-in; changes numerics) | Halves 6.3 MB of state traffic per layer and sequence: ~2% at C=1, ~5% at C=8. Measured on DGX Spark for this model: +6.8% at 1 stream, +8.5% at 8. | The reference keeps FP32 state. INT8 state lost up to 21.6 accuracy points in the literature unless quantized with decay awareness, so a 16-bit state is the narrowest considered. | Superseded by an FP16 state, `fp16-gdn-state` (FP16 pool and prefix-cache images, an FP32 master state per call): registered on the Qwen3.5 27Bs (+0.7 %, [model-quality §6.7](model-quality.md#67-fast-path-registry)); on Flash-Next a candidate only (`--fast-path fp16-gdn-state`), so its default keeps FP32 state. |
 | **H13** | **MTP dense weights in 8 bits** (recipe B's rule applied to the drafter) | MTP dense weights are read three times per round: −0.17 ms per round, ~2.5% of an MTP round | Changes only draft acceptance, never output | M7: acceptance unchanged within noise, and a round-time gain ≥ 2% |
 
 Considered and rejected:
@@ -7459,9 +7459,10 @@ measured results are under "Status" at the end of this section.
     start's spare slots hold shadows of the least-used seeds. A prefill's loan then takes shadowed
     experts, and give-back leaves the returned frames free for decode's landings (the SSD tier's
     refill of the victims left Dense8 none: 0 landings a request against ~1,000 in the full layout).
-  - The SSD tier's CPU rate is measured twice at startup, 4 s apart, keeping the faster reading: right
+  - The SSD tier's CPU rate was measured twice at startup, 4 s apart, keeping the faster reading: right
     after the tier fill the first read 9,377 against 18,942 experts/s five seconds later on Dense8, and the
-    plan sent decode misses to the link on it (Dense8 decode 0.738x, 0.898x once fixed).
+    plan sent decode misses to the link on it (Dense8 decode 0.738x, 0.898x once fixed). Both layouts now
+    read until the rates settle (§19.3.12, §19.3.28).
   - Measured (2026-10-27, ABBA 3 pairs each, decode after 8K / 1,280-token prompts, against the full layout):
     IQ3_S 0.908x (RAM 41.0 against 48.0 GiB of experts; ~460 loan victims a request lost to the SSD and read
     back), Dense8 0.892x, 0.920x without the refill (49.1 against 64.4 GiB). With the refill gone and 128
@@ -8956,9 +8957,14 @@ elastic pool does the same job with no kernel change:
   real records from the pinned banks (across layers, past the last-level cache) while the link
   copies records into the staging slots (the staging's DRAM reads compete with the CPU's). An
   attempt during which other processes used 25 % or more of the CPU is repeated after 0.5 s, for
-  up to 20 s, and the best rates stand (§19.3.28). The SSD
-  tier measures it on its RAM copies once its startup fill is done, and the channels' divisor
-  follows (2026-10-11: with the i9-13900K's 6-worker NVFP4 rate of 21,000 experts/s as the
+  up to 20 s, and the best rates stand (§19.3.28). Memory is slow for some seconds after the
+  banks' load, the tier's fill or another process freeing tens of GiB, so the readings repeat
+  until they settle (`runtime/expert_offload/placement.h` `settle_cpu_rates`, shared with the
+  Qwen3.5-122B's `ExpertOffload`): a second reading 4 s after the first, a third if the second beat
+  the first by more than 10 %; the best of each rate stands (§19.3.28). Both layouts measure once
+  the experts' warm start is done, the full layout on the pinned banks and the SSD tier on its RAM
+  copies, and the CPU channels' divisor or share follows (the service starts on the reference;
+  2026-10-11: with the i9-13900K's 6-worker NVFP4 rate of 21,000 experts/s as the
   reference, the FP8 artifact's 4.69 MiB records gave d = 5); before any host record exists the
   reference stands. The prefill CPU split below keeps its fitted
   rates; on measured ones (lower under the link's load: 6 workers 17,000 experts/s and 46,000
@@ -11116,6 +11122,16 @@ Not done: re-measuring later in a session (the divisor would have to move to a d
 graphs read, as the one-column divisor does); a session that starts under a load lasting more than
 20 s keeps the busy reading until restarted, as the warning says.
 
+**Settled readings (2026-10-31).** A slow reading also comes without any CPU load: right after the
+tier's fill (Dense8 9,377 against 18,942 experts/s 5 s later, 2026-10-27), and in the Qwen3.5-122B's
+full layout right after another session's tens-of-GiB runs ended (4,923 against 9,515-12,805 settled,
+decode −40 %, 2026-10-30). The tier had read twice, 4 s apart; the full layout read once. Both now take
+the 122B's rule (`placement.h` `settle_cpu_rates`): a second reading 4 s after the first, a third 4 s
+later only if the second beat the first's experts/s by more than 10 %; the best of each rate stands, the
+startup line lists each reading's experts/s, and the busy warning stays only when every reading was busy.
+The full layout's reading moved from before the
+CPU service's creation to after the warm start, beside the tier's, and pays the 4 s pause.
+
 ### 19.3.29 IQ3_S prefill: BF16 tiles over the decoded planes, one-pass walk MoE calls (2026-10-19)
 
 **The gap.** At 128K tokens the GSQ-RCO IQ3_S import reached its first token in 29.4 s on
@@ -11758,8 +11774,8 @@ first-use capture would. Bits are unchanged.
   reserved room for `graph_bound` executables anyway; an elastic pool reserves 128 MiB, and the control law takes
   what the set uses beyond it from the frames at a later boundary (during the first requests before). The startup
   line reports the count, the time and the drop in free memory; the route trace's graph records come before the
-  first round. Estimated (candidates NU-04, not measured): 13 executables at C = 1 and 43 at C = 8 with MTP and
-  n-gram drafts, 0.2-0.6 s of startup and 26-110 MiB up front.
+  first round. Measured (above): 17 executables on IQ3_S and 37-53 on Dense8, 2.3-2.4 s of startup and 44-76 MiB up
+  front, against the estimate of 13-43 executables, 0.2-0.6 s and 26-110 MiB (candidates NU-04).
 
 **Prior check.** D14 (candidates §7.6, 2026-10-23) captured graphs before READY through warm-up requests
 (`INFERNIX_TMP_WARMUP_GRAPHS`, serve) and rejected a synthetic pre-READY round because it would need staged, gated
@@ -11767,8 +11783,8 @@ and sampled state of lanes that never ran. This capture launches nothing, so it 
 
 **Test and A/B.** `infernix_qwen4_exp_startup_capture_real_test`: reproducible-route ids equal to first-use capture
 (each prompt alone, then two together) and no graph captured after startup on either route, plain, MTP and DFlash2.
-A/B (pending): a fresh process per run, the first requests' TTFT and round times, startup time and idle VRAM, and
-reproducible ids on IQ3_S, Dense8 MTP and Dense8 DFlash2 auto.
+A/B: a fresh process per run against capture at first use, the first request's decode, startup time and idle VRAM
+(results at the head of this section).
 
 ### 19.3.38 The verification GDN middle in one kernel (2026-10-29; exact, same bits; default)
 

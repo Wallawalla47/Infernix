@@ -424,4 +424,14 @@ DFlash2Config parse_dflash2_config(const artifact::Directory& companion, const T
     }
 }
 
+bool dflash2_companion_fits(const artifact::Directory& companion, const artifact::Directory& target) noexcept {
+    try {
+        if (!companion.companion || !target.components.contains("text")) { return false; }
+        (void)parse_dflash2_config(companion, text(target.component("text").config));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 } // namespace infernix::models::qwen4_exp

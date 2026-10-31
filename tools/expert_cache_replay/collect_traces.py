@@ -41,7 +41,7 @@ MANIFEST = REPOSITORY / 'examples' / 'cli' / 'manifest.json'
 MODEL_ID = 'calibration'
 # The speculative arms calibrated_order.py mixes (NInfer's method drafts MTP 3 and DFlash 7).
 ARM_FLAGS = {
-    'plain': [],
+    'plain': ['--spec', 'off'],
     'mtp': ['--spec', 'mtp', '--draft-tokens', '3'],
     'dflash2': ['--spec', 'dflash2', '--draft-tokens', '7'],
 }

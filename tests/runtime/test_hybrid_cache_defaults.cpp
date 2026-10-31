@@ -434,8 +434,9 @@ int main() {
         options.speculative.draft_tokens_auto = true;
         options.speculative.proposal_head     = infernix::ProposalHead::Optimized;
         const auto resolved = [&](EngineOptions in, Architecture architecture, bool offloaded,
-                                  const infernix::models::qwen3_5::BundledDrafters& drafters) {
-            resolve_auto_speculative_backend(in, architecture, offloaded, drafters);
+                                  const infernix::models::qwen3_5::BundledDrafters& drafters,
+                                  const std::vector<std::filesystem::path>& companions = {}) {
+            resolve_auto_speculative_backend(in, architecture, offloaded, drafters, companions);
             return in;
         };
         EngineOptions flash_next_dflash2           = options;
@@ -448,6 +449,24 @@ int main() {
                               without_drafter.speculative.draft_tokens_auto &&
                               without_drafter.speculative.proposal_head == infernix::ProposalHead::Optimized,
                           "--spec auto on Qwen3.8-Flash-Next did not take DFlash2 with --draft-model, else MTP");
+        // A companion found alone beside the artifact is taken; several, none and the lossless route fall back.
+        const EngineOptions beside = resolved(options, Architecture::Qwen4Exp, false, {.mtp = true}, {"dir/drafter.infernix"});
+        failures += check(beside.speculative.backend == SpeculativeBackend::DFlash2 &&
+                              beside.speculative.draft_model == std::filesystem::path("dir/drafter.infernix"),
+                          "--spec auto did not take the DFlash2 companion beside the artifact");
+        const EngineOptions two = resolved(options, Architecture::Qwen4Exp, false, {.mtp = true}, {"a.infernix", "b.infernix"});
+        failures += check(two.speculative.backend == SpeculativeBackend::Mtp && two.speculative.draft_model.empty(),
+                          "--spec auto chose between two DFlash2 companions instead of falling back to MTP");
+        const EngineOptions no_mtp = resolved(options, Architecture::Qwen4Exp, false, {});
+        failures += check(no_mtp.speculative.backend == SpeculativeBackend::None && !no_mtp.speculative.draft_tokens_auto,
+                          "--spec auto without a companion or an MTP drafter did not decode plain");
+        EngineOptions lossless = flash_next_dflash2;
+        lossless.lossless      = true;
+        const EngineOptions exact = resolved(lossless, Architecture::Qwen4Exp, false, {.mtp = true});
+        failures += check(exact.speculative.backend == SpeculativeBackend::None && exact.speculative.draft_model.empty() &&
+                              resolved(lossless, Architecture::Qwen3_5, false, mtp_dflash2).speculative.backend ==
+                                  SpeculativeBackend::None,
+                          "--spec auto speculated on the lossless route");
         failures += check(resolved(options, Architecture::Qwen3_5, false, mtp_dflash2).speculative.backend ==
                                   SpeculativeBackend::DFlash2 &&
                               resolved(options, Architecture::Qwen3_5, true, mtp_dflash2).speculative.backend ==

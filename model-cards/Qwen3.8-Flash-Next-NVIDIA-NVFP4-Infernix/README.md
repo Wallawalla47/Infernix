@@ -75,7 +75,8 @@ infernix-serve <this model's part 1>.infernix --spec dflash2 \
   --draft-model <dir>/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto
 ```
 
-It needs an Infernix build whose `--help` lists `--draft-model`; see the drafter's card for details.
+It needs an Infernix build whose `--help` lists `--draft-model`; builds from 2026-10-31 also find it
+in the model's folder by themselves when no `--spec` is given. See the drafter's card for details.
 
 ## PLE n-gram tables
 
@@ -167,9 +168,18 @@ The n-gram volume's 8.19 includes its 4 KiB block padding; the table itself is 8
 ```text
 infernix-serve Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix-00001-of-00003.infernix \
   --ngram-volume <nvme>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram \
-  --max-context 262144 --kv-dtype int8 \
-  --spec mtp --draft-tokens auto --lm-head-draft --max-concurrency 2
+  --max-context 262144 --kv-dtype int8 --max-concurrency 2 \
+  --spec dflash2 --draft-model <dir>/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix \
+  --draft-tokens auto --lm-head-draft --vram-past-budget
 ```
+
+This is the recommended configuration: DFlash2 drafting with
+[Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix)
+and the proposal head. Without the drafter, `--spec mtp --draft-tokens auto --lm-head-draft` drafts
+with the model's MTP layer, about 10 % slower. `--vram-past-budget` (Windows) also gives the expert
+cache the ~0.6 GiB of VRAM the per-process budget withholds; leave it out when another program
+needs that memory. Infernix builds from 2026-10-31 speculate even without `--spec` (`--spec auto`):
+with DFlash2 when its drafter is the only one in the model's folder, else with MTP.
 
 It serves the OpenAI Chat Completions and Responses APIs and the Anthropic Messages API. The
 [Flash-Next guide](https://github.com/Wallawalla47/Infernix/blob/main/docs/qwen3_8-flash-next.md)

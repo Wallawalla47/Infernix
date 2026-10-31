@@ -656,6 +656,13 @@ int test_thinking_and_count_tokens() {
     body["thinking"]["budget_tokens"] = 1023;
     failures += check(api_param([&] { (void)parse(body); }) == "thinking",
                       "Thinking budget below 1024 was accepted");
+    // Without budget_tokens (ZCode 3.16.3) enabled Thinking takes the server's default budget, as adaptive does.
+    body["thinking"]                    = Json{{"type", "enabled"}};
+    const GenerationRequest unbudgeted  = parse(body).generation;
+    const infernix::RequestOptions take = to_request_options(unbudgeted, server, semantics(unbudgeted), true);
+    failures += check(unbudgeted.enable_thinking == true && !unbudgeted.thinking_budget &&
+                          take.execution.thinking.budget == 777,
+                      "enabled Thinking without budget_tokens was refused or skipped the server's default budget");
     body["thinking"] = Json{{"type", "future"}};
     failures += check(api_param([&] { (void)parse(body); }) == "thinking",
                       "unknown Thinking mode defaulted to enabled");

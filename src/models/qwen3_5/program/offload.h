@@ -58,6 +58,15 @@ struct OffloadGeometry {
     int device = 0;
 };
 
+// The round geometry the offload engine sizes its staging and tables by (lanes, max_width, columns, chunk,
+// speculative and the drafts' windows), from a sequence plan's concurrency, draft window and prefill widths.
+// The plan reserves ProgramOffload::fixed_bytes of it and the Program builds its geometry from it, so the two
+// agree; the Program sets the other fields once its own allocations exist.
+[[nodiscard]] OffloadGeometry offload_round_geometry(std::uint32_t max_concurrency, std::uint32_t draft_window,
+                                                     std::uint32_t prefill_chunk, std::uint32_t idle_prefill_width,
+                                                     SpeculativeBackend backend, std::uint32_t neural_draft_window,
+                                                     std::uint32_t ngram_draft_window, int device);
+
 // What the Engine instance resolved for a Program with offloaded experts (runtime/engine/
 // model_instance.cpp): the engine's options (EngineOptions and the RAM ledger's tier) and where its
 // diagnostics go.
