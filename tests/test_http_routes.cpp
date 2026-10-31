@@ -175,9 +175,9 @@ int main() {
     }
 
     // Idle sockets must not starve admission (the pool-sizing half of the keep-alive fix):
-    // cpp-httplib parks one pool worker per open connection for its whole idle window, so the
-    // server's pool keeps headroom beyond request admission. With one lane and one waiting
-    // request (three base workers), four idle connections must still leave room for a new one.
+    // cpp-httplib parks one pool worker per open connection for its whole idle window, so a
+    // pool sized only to admission lets idle connections block new requests. The ceiling
+    // above the base (--max-http-clients territory) must absorb them.
     {
         httplib::Server server;
         server.Get("/ping", [](const httplib::Request&, httplib::Response& res) {
@@ -208,6 +208,46 @@ int main() {
             const auto admitted = fresh.Get("/ping");
             failures += check(admitted && admitted->status == 200,
                               "idle keep-alive connections must not starve request admission");
+            server.stop();
+            listener.join();
+        }
+    }
+
+    // The ceiling is a real bound (the pool-full case): with every worker held and the queue
+    // full, a further connection is refused by the accept loop — closed without a response,
+    // not crashed or wedged. ThreadPool(base 1, ceiling 2, queue 1): A and B park the two
+    // workers as idle keep-alive sockets, C occupies the single queue slot, D is overflow.
+    {
+        httplib::Server server;
+        server.Get("/ping", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content("pong", "text/plain");
+        });
+        server.set_keep_alive_timeout(30);
+        server.new_task_queue = [] { return new httplib::ThreadPool(1, 2, 1); };
+        const int port = server.bind_to_any_port("127.0.0.1");
+        failures += check(port > 0, "pool-full test server could not bind a loopback port");
+        if (port > 0) {
+            std::thread listener([&server] { server.listen_after_bind(); });
+            server.wait_until_ready();
+            httplib::Client a("127.0.0.1", port);
+            httplib::Client b("127.0.0.1", port);
+            a.set_keep_alive(true);
+            b.set_keep_alive(true);
+            const auto warm_a = a.Get("/ping");
+            const auto warm_b = b.Get("/ping");
+            failures += check(warm_a && warm_b && warm_a->status == 200 && warm_b->status == 200,
+                              "the two ceiling connections must be served");
+            // C is accepted but queued behind the two parked workers: no worker frees within
+            // its read timeout, so it goes unanswered while the ceiling is held.
+            httplib::Client c("127.0.0.1", port);
+            c.set_read_timeout(0, 300000);
+            const auto queued = c.Get("/ping");
+            failures += check(!queued, "a connection queued behind a full pool must go unanswered");
+            // D arrives with the queue full too: the accept loop refuses it outright.
+            httplib::Client d("127.0.0.1", port);
+            d.set_read_timeout(0, 300000);
+            const auto refused = d.Get("/ping");
+            failures += check(!refused, "a connection beyond pool and queue must be refused");
             server.stop();
             listener.join();
         }

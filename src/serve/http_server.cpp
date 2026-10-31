@@ -211,13 +211,15 @@ httplib::TaskQueue* new_http_worker_pool(const ServeOptions& options) {
         static_cast<std::size_t>(options.max_concurrency) + options.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
     // cpp-httplib runs each accepted connection's keep-alive loop as one pool task, so an
-    // idle pooled socket occupies its worker for the whole idle window. The base pool is
-    // sized to request admission; the extra workers are headroom so idle sockets cannot
-    // starve it. Self-limiting twice over: headroom workers appear only when the pool is
-    // saturated, are reclaimed once the queue is quiet, and any one socket can hold one
-    // for at most keep_alive_timeout_sec (graceful retirement usually ends it sooner).
-    constexpr std::size_t kIdleSocketWorkerHeadroom = 64;
-    return new httplib::ThreadPool(worker_count, worker_count + kIdleSocketWorkerHeadroom, queued_requests);
+    // open connection — idle or not — occupies its worker for the whole idle window. Stock
+    // sizes the pool max_n == base, capping both workers and, with them, simultaneous
+    // connections; the keep-alive window makes that cap worth stating openly rather than
+    // leaving hardwired: base workers keep request admission permanently reachable, and
+    // connections up to --max-http-clients hold a worker each, with the rest queueing
+    // (max_pending_requests deep) before the accept loop starts refusing them.
+    const std::size_t worker_ceiling =
+        std::max(worker_count, static_cast<std::size_t>(options.max_http_clients));
+    return new httplib::ThreadPool(worker_count, worker_ceiling, queued_requests);
 }
 
 HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger,
@@ -460,7 +462,8 @@ void HttpServer::register_routes() {
     // and the client opens fresh next time (the path nginx/Node document for this race). The
     // pre-routing handler below marks each request's arrival; post-routing runs after the
     // server has set its own keep-alive headers, so it can also drop the Keep-Alive reuse
-    // hint a retirement contradicts.
+    // hint a retirement contradicts. Idle connections hold a worker each — bounded by the
+    // pool ceiling (--max-http-clients), not by the window.
     server_.set_keep_alive_timeout(options_.keep_alive_timeout_sec);
     server_.set_post_routing_handler([this](const httplib::Request& request,
                                             httplib::Response& response) {

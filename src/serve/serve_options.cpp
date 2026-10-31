@@ -47,6 +47,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--max-pending-requests"},
     ServeOptionArity{"--pending-timeout-ms"},
     ServeOptionArity{"--keep-alive-timeout-sec"},
+    ServeOptionArity{"--max-http-clients"},
     ServeOptionArity{"--prefill-chunk"},
     ServeOptionArity{"--use-original-int8-prefill-kernel", false},
     ServeOptionArity{"--prefill-split-workspace-mib"},
@@ -614,8 +615,11 @@ std::string serve_usage_text(const char* argv0) {
            "  --max-pending-requests N   max queued requests (default 16)\n"
            "  --pending-timeout-ms N     queue timeout in ms (default 30000)\n"
            "  --keep-alive-timeout-sec N seconds an HTTP connection stays open after its response\n"
-           "                             (default 45; idle past N/2 retires gracefully with\n"
+           "                             (default 60; idle past N/2 retires gracefully with\n"
            "                             Connection: close on the next response)\n"
+           "  --max-http-clients N       ceiling on simultaneous open HTTP connections, each of\n"
+           "                             which holds a request worker while open (default 64;\n"
+           "                             raised to the admission size if smaller)\n"
            "  --request-log-jsonl FILE   append full-precision server/request records\n"
            "  --request-log-max-mib N    rotate FILE when it reaches N MiB: it becomes\n"
            "                             FILE.1, older files shift up (default: one file\n"
@@ -776,6 +780,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--keep-alive-timeout-sec") {
             options.keep_alive_timeout_sec = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--keep-alive-timeout-sec"), "keep-alive-timeout-sec"));
+        } else if (arg == "--max-http-clients") {
+            options.max_http_clients = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--max-http-clients"), "max-http-clients"));
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
@@ -1203,6 +1210,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     // the option exists to remove.
     if (options.keep_alive_timeout_sec == 0 || options.keep_alive_timeout_sec > 3600) {
         throw std::invalid_argument("--keep-alive-timeout-sec must be in [1,3600]");
+    }
+    // Smaller values are legal but clamped up to the admission size at startup — an
+    // HTTP surface smaller than admitted requests would refuse connections the
+    // concurrency options just promised to serve.
+    if (options.max_http_clients == 0) {
+        throw std::invalid_argument("--max-http-clients must be positive");
     }
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
