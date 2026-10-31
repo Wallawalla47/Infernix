@@ -38,6 +38,7 @@ struct LoggingOptions {
     LogLevel level               = LogLevel::Info;
     LogColorMode color           = LogColorMode::Auto;
     LogPresentation presentation = LogPresentation::Service;
+    std::string log_file; // empty => console only; else plain records are appended here beside the console
 };
 
 [[nodiscard]] LogLevel parse_log_level(std::string_view value);

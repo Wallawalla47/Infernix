@@ -1561,6 +1561,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | `on` |
 | `--log-colours on\|off` | colour the console statistics lines; never applies to file logs | `off` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
+| `--log-file PATH` | duplicate the console log records to a plain timestamped file (appended; no colour or panel control, flushed about once a second) beside, never instead of, the console; a file that cannot be opened downgrades to console-only | none |
 | `--device N` | CUDA device index | `0` |
 | `--ram-free-mib N` | physical Host RAM in MiB that everything Infernix keeps in RAM (weights, offloaded experts, the n-gram table, the prefix cache's Host tier) leaves free for other programs; startup refuses a lock that would take it, and Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger | `8192` |
 | `--expert-ram-mib N\|auto` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB on Flash-Next, 60.75 GiB on the 122B) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |

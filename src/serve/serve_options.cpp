@@ -60,6 +60,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--log-stats-interval-ms"},
     ServeOptionArity{"--log-colours"},
     ServeOptionArity{"--log-stats-panel"},
+    ServeOptionArity{"--log-file"},
     ServeOptionArity{"--max-request-mib"},
     ServeOptionArity{"--media-cache-mib"},
     ServeOptionArity{"--media-live-mib"},
@@ -610,6 +611,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             terminals only)\n"
            "  --log-level L              pretty stderr verbosity (trace|debug|info|warning|\n"
            "                             error|critical|off; default info)\n"
+           "  --log-file PATH            also append plain timestamped log records to PATH\n"
+           "                             beside the console (flushed about once a second)\n"
            "  --cors                     send permissive CORS headers for browser UIs\n"
            "  --usage-chunk-choice       give the streamed usage chunk a zero-delta choice so\n"
            "                             strict parsers that reject choices:[] accept it\n"
@@ -797,6 +800,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 options.log_stats_panel = false;
             } else {
                 throw std::invalid_argument("--log-stats-panel accepts on or off");
+            }
+        } else if (arg == "--log-file") {
+            options.log_file = require_value("--log-file");
+            if (options.log_file.empty()) {
+                throw std::invalid_argument("--log-file needs a path");
             }
         } else if (arg == "--max-request-mib") {
             const std::uint64_t mib =
