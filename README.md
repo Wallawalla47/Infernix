@@ -1,4 +1,9 @@
-# Infernix
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/infernix-logo-dark.svg">
+    <img src="docs/assets/infernix-logo-light.svg" alt="Infernix" width="200">
+  </picture>
+</h1>
 
 > **AI disclaimer:** everything added since the fork from NInfer, including most of this README, was
 > written with AI (mostly Claude Opus 5.5 and Qwen3.8-27B running on Infernix). It is likely to be
@@ -260,6 +265,36 @@ differ between the arms (2.63 s against 2.04 s of queueing per turn); without th
 was sooner on 249 of 255 turns (0.29 s against 0.52 s). Quality is level: perplexity 4.468 against
 NInfer's 4.479 on the 1.04M-token corpus (16K context, INT8 KV; NInfer `81c8ce09`).
 
+## Infernix Launcher (beta)
+
+> **Beta:** the launcher is new and still changing. Please report problems as
+> [issues](https://github.com/Wallawalla47/Infernix/issues).
+
+<p align="center">
+  <img src="docs/assets/launcher-dashboard.png" alt="The launcher's dashboard: the loaded model, its inference gauges and the computer's load" width="720">
+</p>
+
+`infernix-launcher` puts a web interface and one API endpoint in front of `infernix-serve`, so models
+run without command lines:
+
+- **Models**: finds the `.infernix` and `.ninfer` models, DFlash2 drafters and n-gram volumes on your
+  drives, and downloads the published ones (resumable, checksummed).
+- **Configurations**: each model starts from its recommended settings; change any option, keep
+  several named configurations, and check whether one fits your GPU and RAM before loading it.
+- **One endpoint for every model**: coding tools connect once (OpenAI-compatible `/v1`,
+  Anthropic-compatible `/v1/messages`) and see every model; the launcher loads whichever one a
+  request names. **Connect** has settings for Claude Code, Codex, Zed, Qwen Code and Hermes.
+- **Watching it run**: live gauges for decode and prefill speed, cache hits and system load, the
+  server's console, an event log, token usage by model and client, and a chat with image input.
+- **Watchdog**: restarts a server that crashes or locks up, and explains a load that does not fit,
+  with suggested changes.
+
+To use it, build as in the quick start below and run `infernix-launcher.exe` from the folder of
+`infernix-serve.exe`: it opens `http://127.0.0.1:1234` in your browser. Add your model folders (or
+download a model) under **Models**, press **Load**, and point your tools at the addresses on
+**Connect**. Settings and configurations persist in `infernix-launcher.json` beside the launcher. The
+[launcher guide](docs/launcher.md) covers everything else.
+
 ## Quick start (Windows)
 
 Prerequisites: Visual Studio 2026 (or 2022, MSVC 14.44) with its C++ CMake tools (they bring Ninja),
@@ -275,7 +310,11 @@ build_native.bat build
 ```
 
 The server is `build-windows\apps\Release\infernix-serve.exe`, with its DLLs beside it.
-Qwen3.8-Flash-Next ([guide](docs/qwen3_8-flash-next.md#run)):
+
+**The easy way: the launcher.** Run `infernix-launcher.exe`, beside the server: see
+[Infernix Launcher](#infernix-launcher-beta).
+
+To run the server directly instead, Qwen3.8-Flash-Next ([guide](docs/qwen3_8-flash-next.md#run)):
 
 ```bat
 infernix-serve.exe Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 262144 --spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft --max-concurrency 2
@@ -348,7 +387,8 @@ cmake --preset release
 cmake --build build -j
 ```
 
-The server is `build/apps/infernix-serve`, with the same options. Under WSL2 use the Windows NVIDIA
+The server is `build/apps/infernix-serve`, with the same options, and the launcher
+`build/apps/infernix-launcher`. Under WSL2 use the Windows NVIDIA
 driver (install none inside WSL) and copy models into the Linux filesystem; `/mnt/` reads are slow.
 
 ## Models
@@ -425,7 +465,7 @@ behind a VRAM expert cache, as for Flash-Next ([guide](docs/qwen3_5-122b.md)).
 
 ## Documentation
 
-[CLI](docs/cli.md), [serving](docs/serving.md), [Qwen3.8-Flash-Next](docs/qwen3_8-flash-next.md),
+[Launcher](docs/launcher.md), [CLI](docs/cli.md), [serving](docs/serving.md), [Qwen3.8-Flash-Next](docs/qwen3_8-flash-next.md),
 [Qwen3.5-122B-A10B](docs/qwen3_5-122b.md), [perplexity](docs/perplexity.md),
 [performance](docs/performance.md) and the [documentation map](docs/README.md).
 
