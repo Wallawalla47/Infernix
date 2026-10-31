@@ -10416,19 +10416,39 @@ bit-identical greedy output, plain decode 397.4 → 398.6 tok/s (every four-bloc
   T = 2 / 4 / 8: 11.62 / 14.41 / 18.10 -> 12.37 / 15.96 / 23.95 us; Q8 9.60 / 12.02 / 16.01 -> 11.35 / 14.83 /
   20.92 us): each of its CTAs forms m from the partials again, 4x v4's reads. Not adopted; m formed once
   (K1a's last CTA) is the untried variant.
-- A prefill chunk whose wide workspace the expert cache could never lend is halved at startup (a
+- A prefill chunk whose wide workspace the expert cache could never lend is cut at startup (a
   warning; exact route chunk-invariant): a 65,536-token chunk on the SSD tier had wanted 27 GiB,
   failed `cudaMalloc` after admission and took the Engine down (GitHub #5 comment); now it prefills at
-  32,768 and served a 49K-token prompt. A failed fallback allocation fails the prompt's requests, not
-  the Engine.
+  a lendable chunk and served a 49K-token prompt. A failed fallback allocation fails the prompt's
+  requests, not the Engine.
+- Since 2026-10-31 the cut is the widest multiple of 128 tokens (`--prefill-chunk`'s grid) whose
+  workspace the cache lends at its smallest: the KV pool grown to its capacity
+  (`kv_growth_frames`: its mapped bytes over the base and a 64 MiB chunk per frame pool), the
+  smaller cache split among the pools as `resize` splits it, three quarters of the largest pool's
+  frames (`ExpertResidency::lend_capacity`). It was halving against the startup cache. On the IQ3_S
+  import (7 frame pools, the largest ~7.4 GiB of a 23.7 GiB cache) 16,384 needs 7,014 MiB against
+  5,652 lendable, and halving gave 8,192; 12,288 prefilled a 32K prompt 0.8 % faster (two ABBA
+  slots: 7,753 / 7,751 against 7,686 / 7,690 tok/s). The first version fitted the startup cache
+  (13,824 in the bench, 13,056 serving 2 x 262K) and failed: a binding re-fits before its own KV
+  growth (`grow_kv` after `refit_chunk_for_binding`; the reproducible route never re-fits), the
+  32K prompt's 522 MiB of KV shrank the lending pool, and the 5,917 MiB lease fell back to a
+  `cudaMalloc` that failed. Halving had worked only by its slack, and was itself unsafe at 4 lanes
+  x 262K once their contexts filled. Measured (INT8 KV, RTX 5090, a 32K prompt at one lane of 40,960
+  tokens, two runs per arm in ABBA order): the fit gives 13,440 there, 7,793 / 7,792 tok/s against
+  7,692 / 7,691 at 8,192 (+1.3 %) and 7,753 / 7,747 at 12,288, and its prompt's 522 MiB of KV
+  growth no longer fails the lease; `--reproducible` ran at the fitted chunk. Serving fits 9,088 at
+  2 x 262,144 (not timed; between 8,192 and 12,288) and 5,120 at 4 x 262,144, which prefills 3.0 %
+  slower than 8,192 (7,462 / 7,464 against 7,690 / 7,694 tok/s) where 8,192 could not be lent once
+  the four contexts filled. A default-route re-fit that counts the binding's own KV growth would keep
+  the wider chunk until the contexts fill (not built).
 - The cache can shrink after startup (elastic KV growth, the VRAM monitor, a vision loan) until it no
   longer lends that chunk's workspace, which then failed every later long prompt; and the failed
   allocation left its error as the runtime's last, which aborted the next launch check (closed PR
   #46). Since 2026-10-30 (review TK-02) a binding made while no lane prefills re-fits the chunk to
-  what the cache can lend then, less the binding's own vision loan, up to the startup chunk (halving;
-  at nothing lendable the static arena's width), on the default route only: the reproducible route's
-  taps and resumes sit on the chunk grid, so its chunk stays fixed. `DeviceBuffer` now consumes the
-  failed allocation's error.
+  what the cache can lend then, less the binding's own vision loan, up to the startup chunk (the
+  widest that fits; at nothing lendable the static arena's width), on the default route only: the
+  reproducible route's taps and resumes sit on the chunk grid, so its chunk stays fixed.
+  `DeviceBuffer` now consumes the failed allocation's error.
 - GitHub #24 through the layer walk: after each walk span the Program reports that its lent frames are
   returnable and the Engine re-runs admission, so a request waiting for KV growth is admitted after
   the span instead of after the whole prompt. Scenario (exact route, C = 2, `--max-context 190000`):
