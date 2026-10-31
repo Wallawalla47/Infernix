@@ -952,16 +952,23 @@ ParsedToolCallOutput fallback(std::string_view text, ToolCallParseDiagnostics di
     return out;
 }
 
-// A bare opener right after a `<tool_call>` spelled with ordinary tokens (only format whitespace
-// between) belongs to that spelled wrapper, which is text.
-bool after_spelled_wrapper(GeneratedText output, std::size_t at) {
+// Where a `<tool_call>` spelling that ends right before `at` (only format whitespace between)
+// starts; npos when none does.
+std::size_t wrapper_before(std::string_view text, std::size_t at) {
     std::size_t end = at;
-    while (end != 0 && is_format_whitespace(output.text[end - 1])) { --end; }
-    if (end < kToolCallOpen.size()) { return false; }
-    const std::size_t wrapper = end - kToolCallOpen.size();
-    return output.text.substr(wrapper, kToolCallOpen.size()) == kToolCallOpen &&
-           !std::binary_search(output.tool_call_tokens.begin(), output.tool_call_tokens.end(),
-                               wrapper);
+    while (end != 0 && is_format_whitespace(text[end - 1])) { --end; }
+    if (end < kToolCallOpen.size() || text.substr(end - kToolCallOpen.size(), kToolCallOpen.size()) != kToolCallOpen) {
+        return std::string_view::npos;
+    }
+    return end - kToolCallOpen.size();
+}
+
+// A bare opener right after a `<tool_call>` spelled with ordinary tokens belongs to that spelled
+// wrapper, which is text.
+bool after_spelled_wrapper(GeneratedText output, std::size_t at) {
+    const std::size_t wrapper = wrapper_before(output.text, at);
+    return wrapper != std::string_view::npos &&
+           !std::binary_search(output.tool_call_tokens.begin(), output.tool_call_tokens.end(), wrapper);
 }
 
 // The first call opener at or after `from`: a `<tool_call>` token, or for free output a bare
@@ -1374,39 +1381,135 @@ private:
 };
 
 void MarkdownCodeTracker::feed(std::string_view text) {
-    for (const char byte : text) {
-        if (byte == '\n') {
-            end_line();
-        } else {
-            line_.push_back(byte);
-        }
+    for (const char c : text) { byte(c); }
+}
+
+void MarkdownCodeTracker::byte(char c) {
+    const auto blank = [](char b) { return b == ' ' || b == '\t' || b == '\r'; };
+    if (c == '\n') {
+        end_line();
+        return;
     }
+    switch (line_) {
+    case Line::Indent:
+        if (c == ' ') {
+            ++indent_;
+        } else if (c == '\t') {
+            indent_ = indent_ / 4 * 4 + 4;
+        } else if (c == '\r' || c == '\f' || c == '\v') {
+            // still a blank line
+        } else if (fence_ != '\0') {
+            line_ = indent_ <= 3 && c == fence_ ? Line::Closer : Line::Code;
+            run_  = 1;
+        } else if (indent_ >= 4 && !paragraph_) {
+            line_ = Line::Indented;
+        } else {
+            line_     = indent_ <= 3 && (c == '`' || c == '~') ? Line::Run
+                        : indent_ <= 3 && c == '#'           ? Line::Hashes
+                                                             : Line::Text;
+            run_char_ = c;
+            run_      = 1;
+            text_byte(c);
+        }
+        return;
+    case Line::Closer:
+        if (c == fence_) {
+            ++run_;
+        } else {
+            line_ = run_ >= fence_run_ && blank(c) ? Line::CloserTail : Line::Code;
+        }
+        return;
+    case Line::CloserTail:
+        if (!blank(c)) { line_ = Line::Code; }
+        return;
+    case Line::Code:
+    case Line::Indented: return;
+    case Line::Run:
+        if (c == run_char_) {
+            ++run_;
+        } else {
+            line_          = run_ >= 3 ? Line::Info : Line::Text;
+            info_backtick_ = c == '`';
+        }
+        break;
+    case Line::Info: info_backtick_ = info_backtick_ || c == '`'; break;
+    case Line::Hashes:
+        if (c == '#') {
+            ++run_;
+        } else if (run_ <= 6 && blank(c)) {
+            line_ = Line::Heading;
+            span_ = 0; // a heading ends the paragraph before it, and any span left open there
+        } else {
+            line_ = Line::Text;
+        }
+        break;
+    case Line::Heading:
+    case Line::Text: break;
+    }
+    text_byte(c);
+}
+
+// Code spans: a run opens one, and only a run of the same length closes it.
+void MarkdownCodeTracker::text_byte(char c) {
+    if (c == '`') {
+        if (escaped_ && ticks_ == 0) {
+            escaped_ = false; // \` is a backtick of text
+        } else {
+            ++ticks_;
+        }
+        return;
+    }
+    span_    = open_span();
+    ticks_   = 0;
+    escaped_ = span_ == 0 && c == '\\' && !escaped_;
+}
+
+std::uint32_t MarkdownCodeTracker::open_span() const noexcept {
+    if (ticks_ == 0) { return span_; }
+    if (span_ == 0) { return ticks_; }
+    return ticks_ == span_ ? 0 : span_;
 }
 
 void MarkdownCodeTracker::end_line() {
-    std::string_view line(line_);
-    const std::size_t first = line.find_first_not_of(" \t\r\f\v");
-    line = first == std::string_view::npos ? std::string_view{} : line.substr(first);
-    const auto run_of_three = [](std::string_view text, char fence) {
-        return text.size() >= 3 && text[0] == fence && text[1] == fence && text[2] == fence;
-    };
+    const bool opener = (line_ == Line::Run && run_ >= 3) ||
+                        (line_ == Line::Info && (run_char_ == '~' || !info_backtick_));
     if (fence_ != '\0') {
-        if (run_of_three(line, fence_)) { fence_ = '\0'; }
-    } else if (!line.empty() && (line[0] == '`' || line[0] == '~') && run_of_three(line, line[0]) &&
-               line.substr(3).find(std::string(3, line[0])) == std::string_view::npos) {
-        // A ``` or ~~~ opener whose run is not closed on the same line (that is inline code).
-        fence_ = line[0];
-    } else if (line.empty()) {
-        ticks_ = 0; // a blank line ends the paragraph and any inline code left open in it
+        if ((line_ == Line::Closer && run_ >= fence_run_) || line_ == Line::CloserTail) {
+            fence_     = '\0';
+            fence_run_ = 0;
+        }
+    } else if (opener) {
+        fence_     = run_char_;
+        fence_run_ = run_;
+        paragraph_ = false;
+        span_      = 0;
+    } else if (line_ == Line::Text || line_ == Line::Run || line_ == Line::Info ||
+               (line_ == Line::Hashes && run_ > 6)) {
+        span_      = open_span(); // a paragraph's span continues on its next line
+        paragraph_ = true;
     } else {
-        ticks_ += static_cast<std::uint32_t>(std::count(line_.begin(), line_.end(), '`'));
+        // A blank line, an indented code line or a heading: no paragraph continues past it.
+        paragraph_ = false;
+        span_      = 0;
     }
-    line_.clear();
+    line_          = Line::Indent;
+    indent_        = 0;
+    run_char_      = '\0';
+    run_           = 0;
+    info_backtick_ = false;
+    ticks_         = 0;
+    escaped_       = false;
 }
 
 bool MarkdownCodeTracker::in_code() const noexcept {
-    return fence_ != '\0' ||
-           (ticks_ + static_cast<std::uint32_t>(std::count(line_.begin(), line_.end(), '`'))) % 2 == 1;
+    if (fence_ != '\0') { return true; } // a marker after a closing run makes it no closer
+    switch (line_) {
+    case Line::Indent: return (indent_ >= 4 && !paragraph_) || open_span() != 0;
+    case Line::Indented: return true;
+    case Line::Run: return run_ >= 3 || open_span() != 0;
+    case Line::Info: return run_char_ == '~' || !info_backtick_ || open_span() != 0;
+    default: return open_span() != 0;
+    }
 }
 
 ParsedToolCallOutput parse_qwen_tool_call_output(GeneratedText output,
@@ -1414,17 +1517,27 @@ ParsedToolCallOutput parse_qwen_tool_call_output(GeneratedText output,
                                                  const ToolCallOutputContract& contract,
                                                  bool tolerant, MarkdownCodeTracker code) {
     const std::string_view source = output.text;
-    // A marker of free output inside Markdown code is a quoted example, never a call. Candidates
-    // only move forward, so the tracker reads each byte once.
+    // A marker inside Markdown code is a quoted example, never a call, on the constrained route too
+    // (its grammar keeps such a token in the answer text). Candidates only move forward, so the
+    // tracker reads each byte once.
     std::size_t tracked = 0;
     const auto quoted   = [&](std::size_t at) {
-        if (contract.constrained) { return false; }
         code.feed(source.substr(tracked, at - tracked));
         tracked = at;
         return code.in_code();
     };
+    // A bare opener right after a quoted `<tool_call>` token belongs to that wrapper, which is text,
+    // as after one spelled with ordinary tokens (the streamed decoder sees only the spelling).
+    std::size_t quoted_token = std::string::npos;
+    const auto skipped       = [&](std::size_t at) {
+        const bool token = std::binary_search(output.tool_call_tokens.begin(), output.tool_call_tokens.end(), at);
+        if (!token && quoted_token != std::string::npos && wrapper_before(source, at) == quoted_token) { return true; }
+        if (!quoted(at)) { return false; }
+        if (token) { quoted_token = at; }
+        return true;
+    };
     std::size_t candidate = next_call_marker(output, contract, 0);
-    while (candidate != std::string::npos && quoted(candidate)) {
+    while (candidate != std::string::npos && skipped(candidate)) {
         candidate = next_call_marker(output, contract, candidate + 1);
     }
     if (candidate == std::string::npos) { return fallback(source); }
@@ -1538,11 +1651,12 @@ std::string ToolCallOutputDecoder::feed(GeneratedText content) {
         publish(pending_tag_);
         pending_tag_.clear();
     };
-    // A quoted marker inside Markdown code of free output is text.
+    // A marker inside Markdown code is quoted text, on both routes: the constrained grammar keeps
+    // such a `<tool_call>` token in the answer text (tool_grammar.cpp).
     const auto quoted = [&] {
         MarkdownCodeTracker before_marker = code_;
         before_marker.feed(trailing_whitespace_);
-        return bare_markers && before_marker.in_code();
+        return before_marker.in_code();
     };
     const auto open_region = [&] {
         region_code_ = code_;

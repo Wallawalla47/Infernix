@@ -198,9 +198,21 @@ public:
     xgrammar::GrammarMatcher matcher;
     int vocabulary;
     std::size_t words;
-    int tentative = 0;
+    int tentative = 0; // tokens the matcher accepted since the last confirm (its rollback)
     std::unique_ptr<GrammarStateConstraint> companion;
     ConstraintObservation observed;
+
+    // Advances by one token: the matcher, unless the companion takes the token as text, then the
+    // companion. Refused (nothing advanced): nullopt; else whether the matcher advanced.
+    std::optional<bool> advance(std::int32_t token) {
+        const bool literal = companion && companion->literal(token);
+        if (!literal && (matcher.IsTerminated() || !matcher.AcceptToken(token))) { return std::nullopt; }
+        if (companion && !companion->accept(token)) {
+            if (!literal) { matcher.Rollback(1); }
+            return std::nullopt;
+        }
+        return !literal;
+    }
 
     void fill(std::span<std::uint32_t> target) {
         if (matcher.IsTerminated()) {
@@ -251,8 +263,7 @@ GrammarCompiler::compile_model(std::string_view identity,
     session->observed.cache = cache_access(access);
     session->companion      = std::move(companion);
     for (const std::int32_t token : continuation) {
-        if (!session->matcher.AcceptToken(token) ||
-            (session->companion && !session->companion->accept(token)))
+        if (!session->advance(token))
             throw RequestError(RequestErrorKind::InvalidToolConstraint,
                                "assistant continuation is not a prefix of the tool grammar");
     }
@@ -362,14 +373,15 @@ std::uint64_t GrammarSession::masks(std::span<const std::int32_t> drafts,
             if (position == drafts.size()) { break; }
             // Rejected proposals are expected; advance only through the allowed token set.
             const auto draft = drafts[position];
-            if (reachable && !impl_->matcher.IsTerminated() && draft >= 0 &&
-                draft < impl_->vocabulary && (mask[draft / 32] & (1u << (draft % 32))) != 0 &&
-                impl_->matcher.AcceptToken(draft)) {
-                ++advanced;
-                // The filtered mask admitted the draft, so the companion follows it.
-                if (impl_->companion && !impl_->companion->accept(draft)) { reachable = false; }
-            } else {
+            std::optional<bool> moved;
+            if (reachable && !impl_->matcher.IsTerminated() && draft >= 0 && draft < impl_->vocabulary &&
+                (mask[draft / 32] & (1u << (draft % 32))) != 0) {
+                moved = impl_->advance(draft);
+            }
+            if (!moved) {
                 reachable = false;
+            } else if (*moved) {
+                ++advanced;
             }
         }
     } catch (...) {
@@ -388,11 +400,9 @@ void GrammarSession::accept(std::int32_t token) { accept(std::span(&token, 1)); 
 void GrammarSession::accept(std::span<const std::int32_t> tokens) {
     WorkTimer timer(impl_->observed.timings_collected, impl_->observed.matcher_seconds);
     for (const auto token : tokens) {
-        if (impl_->matcher.IsTerminated() || !impl_->matcher.AcceptToken(token))
-            throw std::logic_error("selected token violates the request grammar");
-        ++impl_->tentative;
-        if (impl_->companion && !impl_->companion->accept(token))
-            throw std::logic_error("selected token violates the request grammar");
+        const std::optional<bool> moved = impl_->advance(token);
+        if (!moved) throw std::logic_error("selected token violates the request grammar");
+        if (*moved) ++impl_->tentative;
     }
 }
 

@@ -4,9 +4,11 @@
 #include "text/grammar.h"
 
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <iostream>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <tuple>
 #include <vector>
@@ -253,10 +255,60 @@ void selected_contracts(infernix::text::GrammarCompiler& compiled) {
     }
 }
 
+// A `<tool_call>` token inside Markdown code of an auto answer is a quoted example on the constrained
+// route as on the free one (Strata measured 9 of 9 such examples run as calls before): the grammar
+// stays in the answer's text there, so the answer goes on, and the decoder publishes the token's
+// spelling as content, at every chunking. A call outside code still opens, and a lookahead through
+// a quoted token finds no dead end.
+void quoted_calls(infernix::text::GrammarCompiler& compiled) {
+    const std::vector<std::string> quoted{"Format:\n```xml\n" + call("a") + "\n```\nDone.",
+                                          "````markdown\n```xml\n" + call("a") + "\n```\n````\nDone.",
+                                          "Use `" + call("a") + "` like this.",
+                                          "Example:\n\n    " + call("a") + "\n\nDone."};
+    const std::vector<std::string> real{"```\ncode\n```\n" + call("a"), "Example:\n    " + call("a"),
+                                        "Use `x` then " + call("a")};
+    for (const bool strict : {false, true}) {
+        const auto bound = contract(schema({{"type", "string"}}), strict);
+        for (const std::string& text : quoted) {
+            require(accepts(compiled, *bound, text), "the constraint opened a call at a token quoted in Markdown code");
+            for (const std::size_t width : {std::size_t{1}, std::size_t{3}, std::size_t{7}, text.size()}) {
+                frontend::ToolCallOutputDecoder decoder(bound, 64);
+                std::string content;
+                for (std::size_t at = 0; at < text.size(); at += width) { content += feed(decoder, text, at, width); }
+                const auto terminal = decoder.finish();
+                require(terminal.tool_calls.empty() && content + terminal.content == text,
+                        "the decoder read a quoted call token as a call or lost bytes");
+            }
+        }
+        for (const std::string& text : real) {
+            require(accepts(compiled, *bound, text), "the constraint refused a call outside Markdown code");
+            frontend::ToolCallOutputDecoder decoder(bound, 64);
+            (void)feed(decoder, text);
+            require(decoder.finish().tool_calls.size() == 1, "a call outside Markdown code did not open");
+        }
+        require(!accepts(compiled, *bound, "Use it: " + std::string(frontend::kToolCallOpen) + "` here."),
+                "a call token outside Markdown code did not open a call");
+        // Drafts through a quoted token: after it the answer's text goes on (inside a call the
+        // backtick that follows would be refused).
+        auto matcher      = frontend::compile_tool_grammar(compiled, *bound, kToolCall, {}, {});
+        const auto drafts = tokens("Use `" + std::string(frontend::kToolCallOpen) + "` here.");
+        const auto after  = static_cast<std::size_t>(std::find(drafts.begin(), drafts.end(), kToolCall) - drafts.begin()) + 1;
+        const std::size_t stride = matcher->mask_words();
+        std::vector<std::uint32_t> words(stride * (drafts.size() + 1));
+        require(matcher->masks(drafts, words) == 0, "a lookahead through a quoted call token found a dead end");
+        for (std::size_t p = after; p < drafts.size(); ++p) {
+            const auto token = static_cast<std::size_t>(drafts[p]);
+            require((words[p * stride + token / 32] >> (token % 32) & 1U) != 0,
+                    "a lookahead refused the answer's text after a quoted call token");
+        }
+    }
+}
+
 void run() {
     auto compiled = compiler();
     basic_contracts(compiled);
     selected_contracts(compiled);
+    quoted_calls(compiled);
     infernix::ToolChoice required;
     required.mode = infernix::ToolChoiceMode::Required;
     auto fixed =

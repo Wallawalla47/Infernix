@@ -371,10 +371,15 @@ command that echoes the markup. An unmatched nested parameter opener, or a quote
 followed by the next token, cannot be represented unambiguously and makes that tool-call region
 ordinary content. Later content is still examined:
 the first tool-call region (any accepted marker form) that parses becomes the structured turn, and any
-quoted markup before it stays ordinary content. A marker inside a Markdown code fence (```` ``` ```` or
-`~~~`) or inline code of the answer is a quoted example and stays content even when it is a complete
-call; only the text before the marker decides, so streamed and complete responses agree. A marker
-after a closed fence, or after a sentence on the same line, still opens a call.
+quoted markup before it stays ordinary content. A marker inside Markdown code of the answer is a
+quoted example and stays content even when it is a complete call, on this route and on the
+constrained route below. Code follows CommonMark's rules without lists or block quotes: a
+```` ``` ```` or `~~~` fence, from its opening line until a line of the same character at least as
+long with nothing after it; an indented code block (four or more columns of indentation after a blank
+line, a heading or the start of the answer; right after a line of text an indented line continues
+that paragraph); and a code span, closed only by a backtick run of its opening length. Only the text
+before the marker decides, so streamed and complete responses agree. A marker after a closed fence,
+or after a sentence on the same line, still opens a call.
 
 By default the unconstrained parser keeps that all-or-nothing behaviour. With
 `--tolerant-tool-calls` the server recovers a call instead when the model adds a suffix after a
@@ -434,7 +439,8 @@ OpenAI `allowed_tools` supports `auto` and `required`. Selection changes generat
 while all declarations retain their original order in the prompt. Requests with tools enable
 **basic structural constraints by default**, including ordinary `auto` calls without `strict`.
 The model can answer normally or start a tool call; a call must use the model's tool framing and a
-declared function name.
+declared function name. A `<tool_call>` token inside Markdown code of the answer (the rules above)
+is a quoted example: the answer goes on as text and the token's spelling publishes as content.
 
 Non-strict parameter names and order remain open. Their schema supplies the existing value
 normalization hints; it is not compiled as a strict constraint. Open objects, root unions, and
