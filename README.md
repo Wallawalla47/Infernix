@@ -21,13 +21,18 @@ section's notes. Details: [Benchmarks](#benchmarks).
 |---|---|---|---|---|
 | [Strata](https://github.com/Niko1221/Strata) v0.2.8, same NVIDIA NVFP4 weights (Infernix: Dense8) | 1.4-1.6× sooner | +7-15 % | 3.3 s vs 12.3 s | 5.7 vs 12.9 min |
 | [strata-nvfp4](https://github.com/sergqwer/strata-nvfp4) 0.2.0-beta-nvfp4.3, same weights | 1.3× sooner | level at 8K, +5 % and +14 % at 128K and 250K | 3.3 s vs 10.8 s | 5.7 vs 11.7 min |
-| [Basalt](https://github.com/jesdga95/basalt) `c08284cb`, NVIDIA NVFP4 (its pack) | 5-8× sooner | Basalt 3-13 % faster | 3.3 s vs 7.2 s | 5.7 vs 8.9 min |
+| [Basalt](https://github.com/jesdga95/basalt) `c08284cb`, NVIDIA NVFP4 (its pack) | 5-8× sooner† | Basalt 3-13 % faster | 3.3 s vs 7.2 s | 5.7 vs 8.9 min |
 | Strata* v0.2.8, same IQ3_S GGUF | 15 % sooner at 8K, level at 128K-250K | +3-12 % | 3.1 s vs 6.9 s | 5.5 vs 8.1 min |
 | Basalt `c08284cb`, IQ3_S (its pack) | Basalt 4 % sooner at 8K, 1.3× at 128K-250K | Basalt 1.4-1.7× faster | 3.1 s vs 3.7 s | Basalt sooner: 5.5 vs 4.4 min |
 | [NInfer](https://github.com/Neroued/ninfer) `1882c6adb` (Windows port), 27B NVFP4 | 9 % sooner at 8K, 1.6-1.8× at 128K-230K | own drafters +11-17 %; no drafting +2-3 % | 1.9 s vs 2.5 s (median 0.59 vs 0.93 s) | 12.7 vs 16.4 min |
 
 \* Strata's default route tail skip (it skips some missed experts) was turned off for these runs
 because it changes which experts run; see the [IQ3_S section](#qwen38-flash-next-iq3_s-infernix-vs-strata-and-basalt).
+
+† Basalt's NVFP4 pack reads its 50.7 GiB n-gram table from the SSD on every prompt: within the RAM
+budget the table does not fit beside its experts (in RAM it pushed 28 % of them out and the first
+request failed). On IQ3_S, whose table fits in RAM, Basalt is the soonest. Not model loading: Basalt
+loads its model during its first request, and every engine's first request is an uncounted warm-up.
 
 ## Why Infernix
 
@@ -136,7 +141,10 @@ their NVFP4 pack, with the model's MTP drafter (Strata: what its setup writes fo
 `--prefill auto:32768` tip for 96 GB PCs; strata-nvfp4: its bundled `--spec 6 --spec-min-p 0.7`);
 [Basalt](https://github.com/jesdga95/basalt) `c08284cb` its published NVFP4 pack with MTP windows of
 8. Basalt reads its 50.7 GiB n-gram table from the SSD here: keeping it in RAM pushed 28 % of the
-experts out to the SSD and the first request failed, so its time to the first token is long.
+experts out to the SSD and the first request failed, so its time to the first token is long (its
+own A/B on IQ3_S: reading the table from the SSD made a 128K prompt 5× slower). Model loading is not
+in these figures: Basalt loads its model during its first request, and every session starts with an
+uncounted warm-up request.
 
 **Context length** (Infernix: two sessions pooled):
 
