@@ -243,4 +243,8 @@ struct Config {
 // the target's text config.
 [[nodiscard]] DFlash2Config parse_dflash2_config(const artifact::Directory& companion, const TextConfig& target);
 
+// Whether `companion` is a DFlash2 drafter for `target`'s text (parse_dflash2_config accepts it); false for any
+// other artifact or a malformed one.
+[[nodiscard]] bool dflash2_companion_fits(const artifact::Directory& companion, const artifact::Directory& target) noexcept;
+
 } // namespace infernix::models::qwen4_exp

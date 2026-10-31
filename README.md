@@ -101,7 +101,8 @@ Setup and tuning: the [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next.md).
 
 ### And also
 
-- **Speculative decoding**: MTP, DFlash, DFlash2 and n-gram drafting, with exact sampling.
+- **Speculative decoding**: MTP, DFlash, DFlash2 and n-gram drafting, with exact sampling; on by
+  default, with the drafter measured fastest for each model (`--spec auto`).
 - **KV formats**: `int8`, `bf16`, `fp8`, `nvfp4`, `k8v4`, `vq2` and `k4v2`.
 - **Vision**: images and video; the vision encoder can stay in system RAM.
 - **Conversion**: Hugging Face, NVIDIA ModelOpt, Quasar and GGUF sources; Q4-Q8, FP8, NVFP4 and
@@ -403,8 +404,10 @@ measured overall, and `auto` picks the draft length):
 | Qwen3.6-27B (NVFP4, groupwise) | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length where its configuration registers `adaptive-mtp` (startup reports it), else 3 every round |
 | Ornith-1.5-122B (and its UNCENSORED conversion) | `--spec mtp --draft-tokens auto` | 2 confidence-gated drafts: 14 % faster than plain decode at one request, about 6 % slower while two decode together; DFlash2's `auto` decodes plain |
 
-`--spec auto --draft-tokens auto` makes the table's drafter choice by itself from the artifact's drafters
-(on Flash-Next DFlash2 when `--draft-model` names its drafter, else MTP) and reports it at startup;
+Without `--spec`, `infernix-serve` and `infernix` speculate as `--spec auto --draft-tokens auto`: they make the
+table's drafter choice by themselves from the artifact's drafters and report it at startup. On Flash-Next that is
+DFlash2 when `--draft-model` names its drafter or the drafter's companion artifact is the only one in the model's
+folder, else MTP; without a drafter, and on `--lossless`, they decode plain. `--spec off` decodes plain;
 `--lm-head-draft`, `--draft-model` and `--ngram-draft-tokens auto` are still given where the table lists them.
 
 Flash-Next keeps in RAM only the routed experts VRAM does not hold by default (`--expert-ram-layout

@@ -500,14 +500,17 @@ std::string serve_usage_text(const char* argv0) {
            "                             but resume host-restored snapshots from a rounded\n"
            "                             state (default fp32: exact)\n"
            "\n"
-           "SPECULATIVE DECODING (off by default)\n"
-           "  --spec mtp|dflash|dflash2|auto\n"
-           "                             speculative decoding backend. auto (with\n"
-           "                             --draft-tokens auto): the drafter measured fastest\n"
-           "                             for the artifact: Qwen3.8-Flash-Next dflash2 with\n"
-           "                             --draft-model, else mtp; offloaded-expert Qwen3.5\n"
-           "                             (122B) mtp; other Qwen3.5/3.6 dflash2, then mtp,\n"
-           "                             then dflash, as bundled (startup reports the choice)\n"
+           "SPECULATIVE DECODING (auto by default)\n"
+           "  --spec auto|off|mtp|dflash|dflash2\n"
+           "                             speculative decoding backend. auto (the default,\n"
+           "                             with --draft-tokens auto): the drafter measured\n"
+           "                             fastest for the artifact: Qwen3.8-Flash-Next dflash2\n"
+           "                             with --draft-model or its companion artifact alone\n"
+           "                             in the model's folder, else mtp; offloaded-expert\n"
+           "                             Qwen3.5 (122B) mtp; other Qwen3.5/3.6 dflash2, then\n"
+           "                             mtp, then dflash, as bundled; plain decode without\n"
+           "                             one and on --lossless (startup reports the choice).\n"
+           "                             off: plain decode\n"
            "  --draft-tokens N|auto      drafts per round: mtp 1-7 (Qwen3.5/3.6 1-5),\n"
            "                             dflash/dflash2 1-15 (Qwen3.8-Flash-Next\n"
            "                             dflash2 1-7)\n"
@@ -520,8 +523,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                     where qualified, else the fastest fixed\n"
            "                                     length)\n"
            "  --draft-model FILE         Qwen3.8-Flash-Next dflash2 (or auto): the DFlash2\n"
-           "                             drafter's companion artifact (Qwen3.5/3.6 artifacts\n"
-           "                             bundle theirs)\n"
+           "                             drafter's companion artifact (auto finds one alone\n"
+           "                             beside the model; Qwen3.5/3.6 artifacts bundle theirs)\n"
            "  --lm-head-draft            use the optimized proposal head\n"
            "  --spec-min-p P             mtp (on Qwen3.8-Flash-Next with a fixed\n"
            "                             --draft-tokens N only) and Qwen3.8-Flash-Next dflash2:\n"
@@ -669,6 +672,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool kv_capacity_explicit        = false;
     bool request_log_keep_explicit = false;
     bool host_context_explicit     = false;
+    bool spec_explicit             = false; // without --spec: product::apply_default_speculation
     // Last prefix-cache flag seen, for the --no-prefix-reuse error.
     const char* cache_option_flag = nullptr;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
@@ -985,6 +989,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.logits_dtype = product::parse_logits_dtype(require_value("--logits-dtype"));
         } else if (arg == "--spec") {
             product::apply_speculative_backend(options.speculative, require_value("--spec"));
+            spec_explicit = true;
         } else if (arg == "--draft-tokens") {
             product::apply_draft_tokens(options.speculative, require_value("--draft-tokens"));
         } else if (arg == "--draft-model") {
@@ -1177,6 +1182,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.prefill_split_workspace_mib > kMaximumPrefillSplitWorkspaceMiB) {
         throw std::invalid_argument("--prefill-split-workspace-mib must be in [0,16384]");
     }
+    if (!spec_explicit) { product::apply_default_speculation(options.speculative); }
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_offload == VisionOffload::On && !options.enable_vision) {
         throw std::invalid_argument("--vision-offload on requires --vision");
