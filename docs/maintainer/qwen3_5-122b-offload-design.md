@@ -1116,7 +1116,8 @@ measured share 63-68/256; greedy outputs equal in all 10 pairs):
 ended: its single reading in the full layout found 4,923 experts/s, kept half its misses on the link and decoded
 52.4 tok/s. The share rule would have taken 107/256 from that reading. The engine now measures in both layouts
 until the readings settle (§11.3's pause, again while a reading beats the best by 10 %, at most three), and the
-best stands.
+best stands. The rule is `placement.h` `settle_cpu_rates`, which Flash-Next's Program takes in both its layouts too
+(2026-10-31); the busy warning stays only when every reading was busy.
 
 ---
 
