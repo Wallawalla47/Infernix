@@ -791,12 +791,9 @@ void ExpertOffload::create_stream() {
 void ExpertOffload::create_cpu_service() {
     const std::uint32_t workers = placement_.workers, jobs = options_.cpu_expert_jobs;
     if (workers == 0 || jobs == 0) { return; }
-    // An A/B arm of the placement shows it without debug logging.
+    // An A/B arm of the placement, or a team the host cut, shows without debug logging.
     if (!placement_.text.empty()) {
-        const OffloadSwitches& switches = temporary_switches::offload();
-        diagnostic(placement_.text, switches.placement != OffloadSwitches::Placement::kDefault || switches.workers > 0
-                                        ? DiagnosticLevel::Info
-                                        : DiagnosticLevel::Debug);
+        diagnostic(placement_.text, placement_.announce ? DiagnosticLevel::Info : DiagnosticLevel::Debug);
     }
     if (!tier_) { measure_cpu_rate_settled(); } // the tier's rates follow its fill (start)
     const int decode_columns = std::max(moe::kMaxCpuColumns, setup_.lanes * setup_.max_width);
