@@ -1201,8 +1201,10 @@ completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, 
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
 `model_context_window_exceeded`.
 
-Thinking supports `disabled`, `adaptive`, and `enabled`. Enabled Thinking requires
-`budget_tokens >= 1024`, and that budget is passed to Engine. Unlike the Anthropic API, a budget at
+Thinking supports `disabled`, `adaptive`, and `enabled`. Enabled Thinking takes
+`budget_tokens >= 1024`, and that budget is passed to Engine. Unlike the Anthropic API,
+`budget_tokens` may be omitted (ZCode sends none): Thinking is then on with the server's default
+budget (`--default-thinking-budget`, none unless set), as with `adaptive`. A budget at
 or above `max_tokens` is accepted: the output limit ends thinking before the budget can, so the
 budget takes no effect. Clients such as Qwen Code send a fixed budget while shrinking `max_tokens`
 to the context left. Visible
