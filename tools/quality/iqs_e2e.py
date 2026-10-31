@@ -305,10 +305,10 @@ def check_specdist(args) -> dict:
                "Continue the story: The door opened and", "Give a random number between 1 and 50."]
     if not args.spec_args:
         raise ValueError("specdist needs the speculation arguments (--spec-arg)")
-    # serve loads no speculative backend without --spec, so the plain arm is the server arguments alone
+    # serve speculates by default (--spec auto), so the plain arm says --spec off
     with server(args.serve, args.artifact, args.server_args + args.spec_args, args.log, concurrency=8) as client:
         with_spec = sample(client, prompts, args.samples)
-    with server(args.serve, args.artifact, args.server_args, args.log, concurrency=8) as client:
+    with server(args.serve, args.artifact, args.server_args + ["--spec", "off"], args.log, concurrency=8) as client:
         without = sample(client, prompts, args.samples)
     tests = [homogeneity(a, b) for a, b in zip(with_spec, without)]
     alpha = 1e-3 / len(prompts)

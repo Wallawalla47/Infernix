@@ -792,6 +792,8 @@ def server_command(
                 "--lm-head-draft",
             ]
         )
+    else:
+        command.extend(["--spec", "off"])  # serve speculates by default (--spec auto)
     if spec.sampling_mode == "greedy":
         command.append("--greedy")
     else:

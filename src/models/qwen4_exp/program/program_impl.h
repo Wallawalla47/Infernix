@@ -1381,9 +1381,8 @@ public:
             if (!placement_.text.empty()) {
                 diagnostic(placement_.text, placement_.announce ? DiagnosticLevel::Info : DiagnosticLevel::Debug);
             }
-            // The team's rate sets the decode miss split (design §19.3.12); the SSD tier's is measured
-            // once its RAM is filled (below).
-            if (!tier_) { measure_cpu_rate(record_stride); }
+            // The team's rate sets the decode miss split (design §19.3.12): the service starts on the
+            // reference rates, and its channels take the measured split after the warm start (below).
             // Decode and verification calls are CPU-served up to decode_columns; prefill calls up to
             // kAssistMaxColumns take the assist cap (wider chunks stream or stage on the GPU).
             const int decode_columns = std::max(ops::offloaded_moe::kMaxCpuColumns, lanes * max_width_);
@@ -1496,19 +1495,11 @@ public:
             }
         }
         warm_start_experts();
-        // The SSD tier has no records in RAM before its fill: the CPU team's rates are measured on its
-        // RAM copies now, so the decode miss divisor follows this record size and CPU, not the reference.
-        if (tier_ && cpu_service_) {
-            // Right after the tier's fill (tens of GiB of direct reads) the machine's memory is slow for a few seconds:
-            // Dense8's probe read 9,377 experts/s there and 18,942 5 s later in the same process, on the same records
-            // (2026-10-27), and the low reading kept half the decode misses on the link instead of a third for the
-            // whole session (decode -26 %). The rates are measured again after a pause; the better reading stands.
-            measure_cpu_rate(record_stride);
-            const double first_experts = cpu_expert_rate_, first_columns = cpu_column_rate_;
-            std::this_thread::sleep_for(kTierRateSettle);
-            measure_cpu_rate(record_stride);
-            cpu_expert_rate_ = std::max(cpu_expert_rate_, first_experts);
-            cpu_column_rate_ = std::max(cpu_column_rate_, first_columns);
+        // The CPU team's rates, read until they settle (cpu_rates.cpp) on the pinned banks or the SSD tier's
+        // RAM copies (it has none before its fill), so the decode miss split follows this record size and CPU,
+        // not the reference.
+        if (cpu_service_) {
+            measure_cpu_rate_settled(record_stride);
             for (auto& channel : experts.cpu) {
                 channel.pcie_divisor = pcie_divisor();
                 channel.pcie_share   = pcie_share();
@@ -3437,8 +3428,6 @@ private:
     // experts); the rest stay free for the fill phase's landing (S4), so a workload unlike the saved state
     // still fills quickly.
     static constexpr std::chrono::minutes kExpertStateInterval{10};
-    // The pause before the SSD tier's second CPU rate reading (the first follows the tier's fill).
-    static constexpr std::chrono::seconds kTierRateSettle{4};
     std::chrono::steady_clock::time_point expert_state_saved_{};
     std::uint64_t expert_state_routed_ = 0;
 
@@ -5948,12 +5937,16 @@ private:
     // For cpu_expert_workers workers, measured at startup while the link copies records (the staging's
     // DRAM reads compete with the CPU's): experts per second on one-column jobs (memory-bound, as
     // decode's misses are) and expert columns per second on 8-column jobs (the narrow route's widest).
-    // The decode miss divisor and the prefill CPU split both use them. The SSD tier measures them on
-    // its RAM copies once filled; until then (and without any host record) the reference rates stand
-    // (ProgramOptions::cpu_split_*_rate, the i9-13900K at 6 workers on NVFP4 records).
+    // The decode miss divisor and the prefill CPU split both use them. They are measured once the
+    // experts' warm start is done, on the pinned banks or the SSD tier's filled RAM copies; until then
+    // (and without any host record) the reference rates stand (ProgramOptions::cpu_split_*_rate, the
+    // i9-13900K at 6 workers on NVFP4 records).
     double cpu_expert_rate_ = 0.0; // 0 until measured
     double cpu_column_rate_ = 0.0;
-    void measure_cpu_rate(std::uint64_t record_stride);
+    // One reading (nullopt without expert records in RAM), and the readings until they settle
+    // (runtime/expert_offload/placement.h settle_cpu_rates) with their report.
+    [[nodiscard]] std::optional<runtime::expert_offload::CpuRateReading> measure_cpu_rate(std::uint64_t record_stride);
+    void measure_cpu_rate_settled(std::uint64_t record_stride);
     [[nodiscard]] double cpu_expert_rate() const noexcept {
         return cpu_expert_rate_ > 0.0 ? cpu_expert_rate_ : options_.cpu_split_expert_rate;
     }

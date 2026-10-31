@@ -265,18 +265,20 @@ MemorySummary Program::memory_summary() const noexcept { return impl_->memory_su
 void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
 
 SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
-                                      DeviceContext& device, const EngineOptions& options) {
-    return SequencePlanner(detail::make_sequence_planner_impl(parameters, device, options));
+                                      DeviceContext& device, const EngineOptions& options,
+                                      const detail::ProgramOffloadOptions* offload) {
+    return SequencePlanner(detail::make_sequence_planner_impl(parameters, device, options, 0, offload));
 }
 
 SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
                                       DeviceContext& device, const EngineOptions& options,
-                                      std::uint32_t idle_prefill_width) {
+                                      std::uint32_t idle_prefill_width,
+                                      const detail::ProgramOffloadOptions* offload) {
     if (idle_prefill_width == 0) {
         throw std::invalid_argument("an idle prefill width must be positive");
     }
     return SequencePlanner(
-        detail::make_sequence_planner_impl(parameters, device, options, idle_prefill_width));
+        detail::make_sequence_planner_impl(parameters, device, options, idle_prefill_width, offload));
 }
 
 std::vector<std::uint32_t> idle_prefill_widths(const execution::Parameters& parameters,
