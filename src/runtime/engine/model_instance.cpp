@@ -751,7 +751,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     std::optional<StartupPhaseScope> program;
     for (int attempt = 0;; ++attempt) {
         if (!planning) { planning.emplace(options.startup_observer, StartupPhase::TargetFinalize); }
-        auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
+        const models::qwen3_5::detail::ProgramOffloadOptions* offload = offload_options ? &*offload_options : nullptr;
+        auto planner = models::qwen3_5::make_sequence_planner(instance->parameters, device, options, offload);
         if (expert_ram && options.kv_capacity.mode == KvCapacityMode::Automatic) {
             // Every lane's full context in whole pages (a lane's last page holds its context's tail).
             const std::uint64_t page   = planner.capacity_curve().main_page_tokens;
@@ -776,7 +777,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
             for (const std::uint32_t width :
                  models::qwen3_5::idle_prefill_widths(instance->parameters, options)) {
                 auto wide = models::qwen3_5::make_sequence_planner(instance->parameters, device,
-                                                                   options, width);
+                                                                   options, width, offload);
                 if (const auto fitted =
                         resolve_kv_capacity_beside(kv_policy, wide.capacity_curve(),
                                                    free_bytes, headroom, resolution, lane_page_groups)) {
