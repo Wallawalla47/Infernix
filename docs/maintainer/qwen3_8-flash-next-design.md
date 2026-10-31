@@ -10434,7 +10434,8 @@ bit-identical greedy output, plain decode 397.4 → 398.6 tok/s (every four-bloc
   20.92 us): each of its CTAs forms m from the partials again, 4x v4's reads. Not adopted; m formed once
   (K1a's last CTA) is the untried variant.
 - A prefill chunk whose wide workspace the expert cache could never lend is cut at startup (a
-  warning; exact route chunk-invariant): a 65,536-token chunk on the SSD tier had wanted 27 GiB,
+  warning; not chunk-invariant, as several prefill routes round with the call's width, model-quality.md
+  6.7): a 65,536-token chunk on the SSD tier had wanted 27 GiB,
   failed `cudaMalloc` after admission and took the Engine down (GitHub #5 comment); now it prefills at
   a lendable chunk and served a 49K-token prompt. A failed fallback allocation fails the prompt's
   requests, not the Engine.
@@ -10479,6 +10480,27 @@ bit-identical greedy output, plain decode 397.4 → 398.6 tok/s (every four-bloc
   (+3.1 %; the clean pair +4.9 %). No request failed. At one lane of 40,960 the start fitted
   13,184 (12,800 at the full pool), and three prompts' 476 MiB of KV came from spare memory with
   no cut.
+- The reproducible route cannot take that cut: its prefill routes round with the call's width, so a
+  chunk that follows other requests' KV would make a request's bits depend on them (a 12,900-token
+  prompt's last call is 100 tokens at 12,800, split QSA, and 612 at 12,288). Its fixed chunk had a
+  launch dependence of its own: the frames, and so the chunk, followed the free VRAM a launch
+  measured, so the same options on the same GPU could fit another chunk when another program held
+  memory. Since 2026-10-31 it is fitted to the frames a launch would size with a nominal 3 GiB in use
+  before loading (`kNominalInUseBytes`: other programs, the driver, the CUDA context; this machine
+  measured 1,396 MiB with no display), an attached display's headroom and no OS budget below free
+  memory (`nominal_snapshot`), and to the launch's own frames; the narrower is taken, with a warning
+  naming both when the launch's cache is the smaller. On IQ3_S with INT8 KV (1,396 MiB in use
+  before loading here) it fits 4,096 at 4 x 262,144 (5,120 from the launch's own frames) and 11,648
+  at one lane of 40,960, with no warning; the default route is unchanged (12,800, down to 5,120).
+  The narrower chunk was not timed (5,120 against 8,192 cost 3.0 % above).
+- Wide prefill calls keep a request's bits over one call grid (`infernix_qwen4_exp_prefill_width_real_test`,
+  2026-10-31): reproducible-route prompts of 6,144-25,276 tokens whose calls start on one grid and
+  end in the same last call, at chunks 1,024 / 3,072 / 6,144 (and 2,048 / 12,288 on IQ3_S), read
+  out 256 next-token log-probabilities and the top token bit-identical in all 296 comparisons: IQ3_S,
+  Dense8, recipe A, recipe C, FP4-Local and the FP8 import with INT8 KV, and IQ3_S with BF16, FP8,
+  NVFP4, K8V4, VQ2 and K4V2 KV. The layer walk grouped those calls differently and changed nothing.
+  So the reproducible route could merge whole calls of its grid into wider ones as the cache lends
+  them, keeping each request's last call (not built).
 - The cache can shrink after startup (elastic KV growth, the VRAM monitor, a vision loan) until it no
   longer lends that chunk's workspace, which then failed every later long prompt; and the failed
   allocation left its error as the runtime's last, which aborted the next launch check (closed PR

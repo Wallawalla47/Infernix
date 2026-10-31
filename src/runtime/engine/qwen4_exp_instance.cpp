@@ -460,6 +460,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.fp16_gdn_state     = fast.selected(FastPath::Fp16GdnState);
     program_options.block_verification = fast.selected(FastPath::BlockVerification);
     program_options.gumbel_sampling    = !options.fast_paths;
+    program_options.reproducible       = !options.fast_paths;
+    program_options.vram_in_use_before_load = before.device_total - std::min(before.device_total, before.device_free);
     program_options.bf16_logits        = options.logits_dtype == LogitsDtype::BF16;
     // Routed experts that are W4A4 by their checkpoint, run here with 16-bit activations (--a16-activations) or on
     // the 8-bit route (--a8-activations): the default follows NVIDIA's specification, so the launch says so.

@@ -372,6 +372,11 @@ struct ProgramOptions {
     // the expert frames are made (design §19.3.7); empty selects it from the display state.
     std::optional<std::uint64_t> vram_headroom;
     bool vram_past_budget = false; // EngineOptions::vram_past_budget
+    // Device memory in use before the Engine loaded (other programs, the driver, the CUDA context);
+    // empty when unknown. The reproducible route fits its prefill chunk as if a nominal amount were
+    // (ProgramImpl::nominal_snapshot), so other programs' memory at launch does not move it.
+    std::optional<std::uint64_t> vram_in_use_before_load;
+    bool reproducible = false; // the reproducible route (EngineOptions::fast_paths off)
     // EngineOptions::expert_tail_skip (approximate, 0: off): execution::ForwardExperts::tail_skip_rank.
     std::uint32_t expert_tail_skip = 0;
     bool expert_cache = true;
