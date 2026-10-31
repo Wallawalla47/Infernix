@@ -2,7 +2,9 @@
 #include "serve/request.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -309,6 +311,93 @@ bool socket_option_equals(NativeSocket socket, int level, int option, T expected
            size == static_cast<SocketLength>(sizeof(actual)) && actual == expected;
 }
 
+// A boolean socket option, whichever width the platform reports it in.
+bool socket_flag(NativeSocket socket, int level, int option) {
+    int actual        = 0;
+    SocketLength size = sizeof(actual);
+    if (::getsockopt(socket, level, option, reinterpret_cast<char*>(&actual), &size) != 0) { return false; }
+    return size == 1 ? (actual & 0xFF) != 0 : actual != 0;
+}
+
+// A listening IPv4 socket on `address`:`port` (0: any free port), configured as the HTTP listener or
+// left with no options (another program's); kNoSocket when it cannot bind.
+NativeSocket listen_on(std::uint32_t address, std::uint16_t port, bool configured) {
+    const NativeSocket socket = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (socket == kNoSocket) { return kNoSocket; }
+    if (configured) { infernix::serve::configure_http_server_socket(socket); }
+    sockaddr_in at{};
+    at.sin_family      = AF_INET;
+    at.sin_addr.s_addr = htonl(address);
+    at.sin_port        = htons(port);
+    if (::bind(socket, reinterpret_cast<const sockaddr*>(&at), sizeof(at)) != 0 || ::listen(socket, 32) != 0) {
+        close_socket(socket);
+        return kNoSocket;
+    }
+    return socket;
+}
+
+std::uint16_t port_of(NativeSocket socket) {
+    sockaddr_in at{};
+    SocketLength size = sizeof(at);
+    return ::getsockname(socket, reinterpret_cast<sockaddr*>(&at), &size) == 0 ? ntohs(at.sin_port) : 0;
+}
+
+// The HTTP listener's port is its own (candidates SR-09): a second listener with the same options
+// cannot bind it, nor a wildcard listener beside it or beside another program's loopback listener (the
+// Strata #4255 shape, where local clients reached the other program); and a restart right after the
+// listener served connections and closed them first (their TIME_WAIT on its side) binds at once.
+int test_exclusive_port() {
+    int failures = 0;
+#    if defined(_WIN32)
+    WSADATA winsock{};
+    if (::WSAStartup(MAKEWORD(2, 2), &winsock) != 0) { return check(false, "failed to start Winsock for the port test"); }
+    struct WinsockCleanup {
+        ~WinsockCleanup() { ::WSACleanup(); }
+    } cleanup;
+#    endif
+    std::uint16_t port = 0;
+    {
+        Socket first(listen_on(INADDR_LOOPBACK, 0, true));
+        if (!first.valid() || (port = port_of(first.get())) == 0) {
+            return check(false, "failed to bind the HTTP listener for the port test");
+        }
+        {
+            const Socket second(listen_on(INADDR_LOOPBACK, port, true));
+            failures += check(!second.valid(), "a second HTTP listener bound a port in use");
+        }
+        {
+            const Socket wildcard(listen_on(INADDR_ANY, port, true));
+            failures += check(!wildcard.valid(), "a wildcard HTTP listener bound beside a loopback one");
+        }
+        // infernix-serve's startup message: the probe finds the bind's error, and says what to do.
+        const int error = infernix::serve::probe_bind_error("127.0.0.1", port);
+        failures += check(error != 0 && infernix::serve::bind_failure_reason(error).find("--port") != std::string::npos,
+                          "the bind probe did not find why a port in use cannot be bound");
+        sockaddr_in at{};
+        at.sin_family      = AF_INET;
+        at.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        at.sin_port        = htons(port);
+        for (int connection = 0; connection < 32; ++connection) {
+            const Socket client(::socket(AF_INET, SOCK_STREAM, 0));
+            if (!client.valid() ||
+                ::connect(client.get(), reinterpret_cast<const sockaddr*>(&at), sizeof(at)) != 0) {
+                return failures + check(false, "failed to connect to the HTTP listener for the port test");
+            }
+            const Socket accepted(::accept(first.get(), nullptr, nullptr)); // closed first, below
+            failures += check(accepted.valid(), "failed to accept a connection for the port test");
+        }
+    }
+    {
+        const Socket restarted(listen_on(INADDR_LOOPBACK, port, true));
+        failures += check(restarted.valid(), "a restart could not bind the port right after it served connections");
+    }
+    const Socket foreign(listen_on(INADDR_LOOPBACK, 0, false));
+    const Socket hijack(foreign.valid() ? listen_on(INADDR_ANY, port_of(foreign.get()), true) : kNoSocket);
+    failures += check(foreign.valid() && !hijack.valid(),
+                      "a wildcard HTTP listener bound beside another program's loopback listener");
+    return failures;
+}
+
 int test_inherited_socket_liveness() {
     int failures = 0;
 #    if defined(_WIN32)
@@ -346,6 +435,10 @@ int test_inherited_socket_liveness() {
     if (!accepted.valid()) { return check(false, "failed to accept HTTP liveness test socket"); }
 
 #    if defined(_WIN32)
+    // The port is the listener's alone: SO_EXCLUSIVEADDRUSE, never SO_REUSEADDR.
+    failures += check(socket_flag(listener.get(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE) &&
+                          !socket_flag(listener.get(), SOL_SOCKET, SO_REUSEADDR),
+                      "HTTP listener lacks SO_EXCLUSIVEADDRUSE or has SO_REUSEADDR");
     // Windows reports SO_KEEPALIVE as a one-byte BOOLEAN and TCP_MAXRTMS stands for
     // TCP_USER_TIMEOUT.
     failures += check(socket_option_equals<char>(accepted.get(), SOL_SOCKET, SO_KEEPALIVE, 1),
@@ -361,10 +454,11 @@ int test_inherited_socket_liveness() {
         "accepted HTTP socket did not inherit TCP_MAXRTMS");
 #    else
 #        if defined(__linux__)
-    // Both reuse options, so a server setting either one binds the port right after a stop.
-    failures += check(socket_option_equals(listener.get(), SOL_SOCKET, SO_REUSEADDR, 1) &&
-                          socket_option_equals(listener.get(), SOL_SOCKET, SO_REUSEPORT, 1),
-                      "HTTP listener lacks SO_REUSEADDR or SO_REUSEPORT");
+    // SO_REUSEADDR binds over an earlier server's TIME_WAIT remnants; SO_REUSEPORT would let a
+    // second listener share the port.
+    failures += check(socket_flag(listener.get(), SOL_SOCKET, SO_REUSEADDR) &&
+                          !socket_flag(listener.get(), SOL_SOCKET, SO_REUSEPORT),
+                      "HTTP listener lacks SO_REUSEADDR or has SO_REUSEPORT");
 #        endif
     failures += check(socket_option_equals(accepted.get(), SOL_SOCKET, SO_KEEPALIVE, 1),
                       "accepted HTTP socket did not inherit SO_KEEPALIVE");
@@ -390,6 +484,16 @@ int main() {
                    test_schema_number_precision();
 #if defined(__linux__) || defined(_WIN32)
     failures += test_inherited_socket_liveness();
+    failures += test_exclusive_port();
+    const std::string in_use = infernix::serve::bind_failure_reason(
+#    if defined(_WIN32)
+        WSAEADDRINUSE
+#    else
+        EADDRINUSE
+#    endif
+    );
+    failures += check(in_use.find("in use") != std::string::npos && in_use.find("--port") != std::string::npos,
+                      "a bind failure on a port in use does not say so");
 #endif
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

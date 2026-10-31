@@ -80,7 +80,13 @@ RequestJson parse_json_body(const httplib::Request& request);
 [[nodiscard]] bool client_disconnected(const httplib::Request& request);
 
 void prepare_sse_response(httplib::Response& response);
+// The listener's options: its port is exclusively its own (no second server binds beside it), and the
+// connections it accepts inherit TCP keepalive and a bound on unacknowledged writes.
 void configure_http_server_socket(socket_t socket) noexcept;
+// Why the listener cannot bind `host`:`port`: the error a socket with the listener's options gets
+// binding it now (cpp-httplib's bind keeps no error; 0 when none does), and what it means for the user.
+[[nodiscard]] int probe_bind_error(const std::string& host, int port);
+[[nodiscard]] std::string bind_failure_reason(int error);
 void set_owned_json_content(httplib::Response& response, std::string body,
                             std::shared_ptr<RequestLifetime> lifetime);
 
