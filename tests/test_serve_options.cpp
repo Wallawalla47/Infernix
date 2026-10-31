@@ -158,6 +158,9 @@ int main() {
     failures += check(parse({"infernix-serve", "model.ninfer", "--expert-a4-activations"}).expert_a4_activations &&
                           !parse({"infernix-serve", "model.ninfer"}).expert_a4_activations,
                       "--expert-a4-activations did not parse (default off)");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--a16-activations"}).expert_a16_activations &&
+                          !parse({"infernix-serve", "model.ninfer"}).expert_a16_activations,
+                      "--a16-activations did not parse (default off)");
     failures += check(parse({"infernix-serve", "model.ninfer", "--a8-activations"}).a8_activations &&
                           !parse({"infernix-serve", "model.ninfer"}).a8_activations,
                       "--a8-activations did not parse (default off)");

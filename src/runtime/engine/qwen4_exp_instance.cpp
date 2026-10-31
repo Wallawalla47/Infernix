@@ -461,6 +461,18 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.block_verification = fast.selected(FastPath::BlockVerification);
     program_options.gumbel_sampling    = !options.fast_paths;
     program_options.bf16_logits        = options.logits_dtype == LogitsDtype::BF16;
+    // Routed experts that are W4A4 by their checkpoint, run here with 16-bit activations (--a16-activations) or on
+    // the 8-bit route (--a8-activations): the default follows NVIDIA's specification, so the launch says so.
+    if (const auto& moe = instance->model->config().text.moe; moe.a4_native && moe.a16_experts) {
+        report(options, DiagnosticLevel::Warning,
+               std::string(options.a8_activations ? "--a8-activations" : "--a16-activations") +
+                   ": this artifact's routed experts are NVIDIA's W4A4 NVFP4, which the checkpoint specifies with "
+                   "4-bit activations at NVIDIA's calibrated scales; they now run with " +
+                   (options.a8_activations ? "8-bit" : "16-bit") +
+                   " activations instead, which changes the output and reads long prompts more slowly. The default "
+                   "4-bit route follows NVIDIA's specification, is faster on prompts and is the recommended "
+                   "configuration");
+    }
     // --a8-activations (LOSSY, opt-in; design §19.3.31): the 8-bit activation routes of this artifact
     // (models::qwen4_exp::A8Routes), in decode and verification calls and in prefill calls, or a refusal where it
     // has none. Every other call keeps its route.

@@ -505,8 +505,8 @@ their request-coupling paths are listed like the others (since 2026-10-22). The 
 | `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2); groupwise 27B and 35B-A3B, every format (2026-10-22, below) |
 | `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2); groupwise 27B and 35B-A3B, every format (2026-10-22, below) |
 | `preemption` | every Qwen3.5 artifact | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2); groupwise 27B and 35B-A3B, every format (2026-10-22, below) |
-| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8, IQ3_S, FP8, recipe A, recipe C (since 2026-10-21) and NVIDIA FP4-Local (16- and 4-bit expert activations), every format |
-| Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
+| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8 (4- and 16-bit expert activations), IQ3_S, FP8, recipe A, recipe C (since 2026-10-21) and NVIDIA FP4-Local (16- and 4-bit expert activations), every format |
+| Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves); Q8 dense, 16-bit experts (Dense8 under `--a16-activations` or `--a8-activations`), below |
 | `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, every KV format (INT8 fails its decode tail, below; registered by the owner's decision, 2026-10-24) |
 | `fp8-a8-pair-block32` | the same, its two terms scaled per 32-value block (it takes precedence over `fp8-a8-pair`) | wherever `fp8-a8-pair` is, by the owner's decision (2026-10-25) ahead of its gate: tied in speed (recipe C, INT8 KV, pp4096 and pp16384 within 0.03 %, 4 blocks) and never less precise (a value is exact within 2^14 of its block's maximum instead of its column's); its route runs on FP4-Local's MXFP8 dense prefill under the `--a8-activations` opt-in only |
 | `q5-ksplit-mma`, `fp16-gdn-state` (Qwen3.5) | the groupwise artifacts' Q5 projections; every GDN state pool | by the owner's decision (2026-10-25) ahead of their gates, where measured faster with INT8 KV (MTP 3 decode, 3 blocks): groupwise 27B `q5-ksplit-mma` +4.5 % and `fp16-gdn-state` +0.7 %, NVFP4 27B `fp16-gdn-state` +0.7 %; not the 35B-A3B (no gain beyond spread) |
@@ -807,7 +807,17 @@ Recipe A (BF16 dense, 4-bit experts) is registered for the three coupling paths 
 without runs of its own, at the owner's request (2026-10-18): `free-cache-resume` takes FP8's timing
 (the same dense kernels), `adaptive-speculation` Dense8's and IQ3_S's (4-bit experts streamed as
 Dense8's), `preemption` IQ3_S's and FP8's, and the quality verdicts Dense8's. Its exact-route
-equivalences were not run on the artifact. Recipe C first failed (2026-10-18): its real tests
+equivalences were not run on the artifact.
+
+Dense8 at 16-bit expert activations (Q8 dense, 16-bit experts: NVIDIA's W4A4 banks loaded as 16-bit
+banks under `--a16-activations`, and `--a8-activations`, which takes its 8-bit route from there) is
+registered for Dense8's paths (`adaptive-speculation`, `dflash2-pairs`, `free-cache-resume`,
+`preemption`, `sampled-mtp-drafts`, `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused`) by the
+kernel rule (6.1, item 2), without runs of its own (2026-10-31): those paths change only the dense,
+attention, GDN and scheduling kernels, which are Dense8's at either expert precision, and the experts'
+W4A16 kernels are the ones recipe C and FP4-Local qualified. Without these entries the options dropped
+every path: the agentic replay reused 63 % of prompt tokens from the cache instead of 84 % (no endpoint
+snapshots) and decoded 21 % fewer rounds a second. Recipe C first failed (2026-10-18): its real tests
 diverged on the exact route at token 29 (a resumed request against a cold one, and concurrent
 against solo), so its exact route was not request-invariant, and its joint gate failed the p99.9 KL
 ratio (1.33) against the 16-bit reference. A bisect (2026-10-20, plain decode at
