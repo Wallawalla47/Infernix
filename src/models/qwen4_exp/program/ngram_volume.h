@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -50,16 +51,21 @@ public:
     // Whether every row is in the host cache, so read_rows would read nothing from the volume.
     [[nodiscard]] bool cached(std::span<const std::uint32_t> rows) const noexcept;
 
-    // Times up to `reads` unbuffered reads of random blocks, one at a time (the latency a missed row
-    // costs), for a startup warning about a drive too slow to serve the table. It stops after
-    // `max_seconds`, touches neither the row cache nor the counters, and reads nothing for a
-    // resident table.
+    // Times up to `reads` unbuffered reads of random blocks the way a prompt chunk's misses are read
+    // (kReadThreads threads, kParallelInFlight blocks in flight each), for a startup warning about a
+    // drive too slow to serve the table. A read at a time measures latency instead, which the engine
+    // never waits on alone: a Samsung 990 PRO read 12,300 a second that way and 1.11M this way, as fast
+    // as an Optane P5800X in prefill (design §19.3.8 F9). Rounds double from kReadThreads *
+    // kParallelInFlight reads; it stops after the round that reaches `max_seconds`, touches neither
+    // the row cache nor the counters, and reads nothing for a resident table.
     struct ReadProbe {
         std::size_t reads = 0;
         double seconds    = 0.0;
         [[nodiscard]] double reads_per_second() const noexcept { return seconds > 0.0 ? static_cast<double>(reads) / seconds : 0.0; }
     };
-    [[nodiscard]] ReadProbe probe_reads(std::size_t reads = 256, double max_seconds = 2.0) const;
+    [[nodiscard]] ReadProbe probe_reads(std::size_t reads = 16384, double max_seconds = 2.0) const;
+    static constexpr std::size_t kReadThreads      = 8;  // threads of a large call
+    static constexpr std::size_t kParallelInFlight = 16; // blocks in flight per thread of a large call
 
     // Row traffic since the volume was opened: rows requested, rows served by the host cache, 4 KiB
     // blocks read from the volume, and the wall time of the calls' volume reads.
@@ -76,14 +82,18 @@ public:
 private:
     static constexpr unsigned kCacheBits  = 20; // 2^20 rows, ~170 MB with 160-byte rows
     static constexpr std::size_t kInFlight         = 64;  // blocks read at once (one thread)
-    static constexpr std::size_t kReadThreads      = 8;   // threads of a large call
-    static constexpr std::size_t kParallelInFlight = 16;  // blocks in flight per thread of a large call
     static constexpr std::size_t kParallelBlocks = 512; // distinct blocks that make a call large
 
     // The direct-mapped cache slot of a row.
     static std::size_t slot_of(std::uint32_t row) noexcept {
         return static_cast<std::size_t>((row * 2654435761U) >> (32U - kCacheBits));
     }
+    // The kReadThreads rings of kParallelInFlight blocks a large call reads into (allocated on first use).
+    std::byte* parallel_rings() const;
+    // Reads the blocks at `offsets` on kReadThreads threads, each a contiguous range into its own ring;
+    // consume(i, block) runs on the thread that read block i.
+    void read_parallel(std::span<const std::uint64_t> offsets,
+                       const std::function<void(std::size_t, std::span<const std::byte>)>& consume) const;
 
     ReadOnlyFile file_;
     NgramTableConfig table_;
