@@ -7459,9 +7459,10 @@ measured results are under "Status" at the end of this section.
     start's spare slots hold shadows of the least-used seeds. A prefill's loan then takes shadowed
     experts, and give-back leaves the returned frames free for decode's landings (the SSD tier's
     refill of the victims left Dense8 none: 0 landings a request against ~1,000 in the full layout).
-  - The SSD tier's CPU rate is measured twice at startup, 4 s apart, keeping the faster reading: right
+  - The SSD tier's CPU rate was measured twice at startup, 4 s apart, keeping the faster reading: right
     after the tier fill the first read 9,377 against 18,942 experts/s five seconds later on Dense8, and the
-    plan sent decode misses to the link on it (Dense8 decode 0.738x, 0.898x once fixed).
+    plan sent decode misses to the link on it (Dense8 decode 0.738x, 0.898x once fixed). Both layouts now
+    read until the rates settle (§19.3.12, §19.3.28).
   - Measured (2026-10-27, ABBA 3 pairs each, decode after 8K / 1,280-token prompts, against the full layout):
     IQ3_S 0.908x (RAM 41.0 against 48.0 GiB of experts; ~460 loan victims a request lost to the SSD and read
     back), Dense8 0.892x, 0.920x without the refill (49.1 against 64.4 GiB). With the refill gone and 128
@@ -8956,9 +8957,14 @@ elastic pool does the same job with no kernel change:
   real records from the pinned banks (across layers, past the last-level cache) while the link
   copies records into the staging slots (the staging's DRAM reads compete with the CPU's). An
   attempt during which other processes used 25 % or more of the CPU is repeated after 0.5 s, for
-  up to 20 s, and the best rates stand (§19.3.28). The SSD
-  tier measures it on its RAM copies once its startup fill is done, and the channels' divisor
-  follows (2026-10-11: with the i9-13900K's 6-worker NVFP4 rate of 21,000 experts/s as the
+  up to 20 s, and the best rates stand (§19.3.28). Memory is slow for some seconds after the
+  banks' load, the tier's fill or another process freeing tens of GiB, so the readings repeat
+  until they settle (`runtime/expert_offload/placement.h` `settle_cpu_rates`, shared with the
+  Qwen3.5-122B's `ExpertOffload`): a second reading 4 s after the first, a third if the second beat
+  the first by more than 10 %; the best of each rate stands (§19.3.28). Both layouts measure once
+  the experts' warm start is done, the full layout on the pinned banks and the SSD tier on its RAM
+  copies, and the CPU channels' divisor or share follows (the service starts on the reference;
+  2026-10-11: with the i9-13900K's 6-worker NVFP4 rate of 21,000 experts/s as the
   reference, the FP8 artifact's 4.69 MiB records gave d = 5); before any host record exists the
   reference stands. The prefill CPU split below keeps its fitted
   rates; on measured ones (lower under the link's load: 6 workers 17,000 experts/s and 46,000
@@ -11115,6 +11121,16 @@ generator runs):
 Not done: re-measuring later in a session (the divisor would have to move to a device word the
 graphs read, as the one-column divisor does); a session that starts under a load lasting more than
 20 s keeps the busy reading until restarted, as the warning says.
+
+**Settled readings (2026-10-31).** A slow reading also comes without any CPU load: right after the
+tier's fill (Dense8 9,377 against 18,942 experts/s 5 s later, 2026-10-27), and in the Qwen3.5-122B's
+full layout right after another session's tens-of-GiB runs ended (4,923 against 9,515-12,805 settled,
+decode −40 %, 2026-10-30). The tier had read twice, 4 s apart; the full layout read once. Both now take
+the 122B's rule (`placement.h` `settle_cpu_rates`): a second reading 4 s after the first, a third 4 s
+later only if the second beat the first's experts/s by more than 10 %; the best of each rate stands, the
+startup line lists each reading's experts/s, and the busy warning stays only when every reading was busy.
+The full layout's reading moved from before the
+CPU service's creation to after the warm start, beside the tier's, and pays the 4 s pause.
 
 ### 19.3.29 IQ3_S prefill: BF16 tiles over the decoded planes, one-pass walk MoE calls (2026-10-19)
 
