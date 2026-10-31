@@ -111,7 +111,8 @@ Setup and tuning: the [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next.md).
 ## Benchmarks
 
 One machine: RTX 5090 (32 GB) on **PCIe Gen5 x8**, Core i9-13900K, 96 GB DDR5, Windows 11. Gen5 x16
-should be faster, most of all for Flash-Next, whose expert misses cross PCIe every token. Infernix
+makes Flash-Next's prompts up to twice as fast and its decode 2-7 % faster
+([measured on another machine](#pcie-gen5-x8-against-x16)). Infernix
 is `main` at [`6b066a54`](https://github.com/Wallawalla47/Infernix/commit/6b066a54) built from
 source; every engine runs natively on Windows as an OpenAI-compatible server driven by the same
 client, which times the first token from sending the request to the first streamed token
@@ -311,6 +312,24 @@ Infernix's drafter. Without a thinking cap the replies run longer than in earlie
 table, so wall times are not comparable with them. Quality is level: perplexity 4.468 against
 NInfer's 4.479 on the 1.04M-token corpus (16K context, INT8 KV; NInfer `81c8ce09`, 2026-10-19).
 
+### PCIe Gen5 x8 against x16
+
+Measured by [siganos](https://github.com/Wallawalla47/Infernix/issues/45) on one machine, with only
+the link width changed: RTX 5090, Ryzen 9 7950X, 94 GiB DDR5, Linux, Infernix `d8e52a85`,
+Qwen3.8-Flash-Next NVIDIA NVFP4 Dense8, INT8 KV, `infernix_bench` (means of 3-5 runs, tok/s per
+request). Prompts gain the most; decode only 2-7 %.
+
+| Workload | Requests | x8 | x16 | x16 / x8 |
+|---|---:|---:|---:|---:|
+| Decode (`tg512`), plain | 1 | 112.8 | 115.2 | 1.02× |
+| Decode, MTP 4 drafts, `--lm-head-draft` | 1 | 158.9 | 170.1 | 1.07× |
+| Decode, DFlash2 `auto`, `--lm-head-draft` | 1 | 225.9 | 230.1 | 1.02× |
+| Decode, plain | 2 | 91.4 | 95.8 | 1.05× |
+| Decode, DFlash2 `auto` (difference within noise) | 2 | 111.8 | 119.2 | 1.07× |
+| Prompt (`pp4096`), `--prefill-chunk 4096` | 1 | 2,426 | 4,277 | 1.76× |
+| Prompt, `--prefill-chunk 1024` | 1 | 2,170 | 4,319 | 1.99× |
+| Host-to-device copy | | 28.9 GB/s | 57.8 GB/s | 2.00× |
+
 ## Quick start (Windows)
 
 Prerequisites: Visual Studio 2026 (or 2022, MSVC 14.44) with its C++ CMake tools (they bring Ninja),
@@ -401,6 +420,20 @@ cmake --build build -j
 
 The server is `build/apps/infernix-serve`, with the same options. Under WSL2 use the Windows NVIDIA
 driver (install none inside WSL) and copy models into the Linux filesystem; `/mnt/` reads are slow.
+
+The [`Dockerfile`](Dockerfile) builds the same server in a CUDA 13 image for Docker or Podman, with
+the NVIDIA Container Toolkit installed on the host. Mount the folder that holds the model and
+publish the port:
+
+```bash
+docker build -t infernix .
+```
+
+```bash
+docker run --rm --gpus device=0 -v /models:/models -p 8080:8080 infernix infernix-serve /models/<artifact>.infernix --host 0.0.0.0 --port 8080
+```
+
+Podman takes the same commands, with `--device nvidia.com/gpu=0` in place of `--gpus device=0`.
 
 ## Models
 
