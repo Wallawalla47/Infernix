@@ -61,6 +61,21 @@ struct ServeOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
+    // HTTP keep-alive: how long a finished response's connection stays open for the next
+    // request (the HTTP server's own pool, not TCP keepalive). The cpp-httplib default of 5 s
+    // closes pooled connections between agent turns, so long-idle reuse pays a reconnect and
+    // can race the close. The timeout close itself is graceful (FIN-first drain; clients that
+    // probe pooled sockets before reuse simply reconnect), and a request that does land
+    // re-arms the window — nothing else needs to retire a connection deliberately. Moderate
+    // by default: an open connection holds a request worker, bounded by max_http_clients.
+    std::uint32_t keep_alive_timeout_sec = 60;
+    // Ceiling on simultaneous open HTTP connections. cpp-httplib runs each connection's
+    // keep-alive loop as a pool task, so an open connection — idle or not — holds a worker;
+    // the pool already enforced this bound with max_n hardwired to the admission size. Base
+    // (admission-sized) workers stay permanently reachable; connections up to this ceiling
+    // hold a worker each; beyond it, connections queue (max_pending_requests deep) and are
+    // then refused. Values below the admission requirement are raised to it at startup.
+    std::uint32_t max_http_clients = 64;
     std::uint32_t prefill_chunk        = 0; // 0: the model's default (EngineOptions)
     bool original_int8_prefill_kernel  = false;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
