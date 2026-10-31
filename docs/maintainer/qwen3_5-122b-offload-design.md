@@ -1000,7 +1000,12 @@ must still win (its "restored" line).
   elastic pool, §0.1; before it, the whole `--max-context × --max-concurrency` KV was allocated at
   startup).
 - **Inherited from Flash-Next.** One `plan_device` ledger function, the spill guard, the VMM frame
-  pool that follows free VRAM, and `--vram-past-budget` (~120 more frames here).
+  pool that follows free VRAM, and `--vram-past-budget` (~120 more frames here). Until 2026-10-31 the
+  sequence plan left out the engine's staging and tables (`ProgramOffload::fixed_bytes`, ~324 MiB: the
+  frames absorbed them unplanned) and only the dense weights had the spill guard (candidates RF-04). The plan
+  now reserves them, from the same round geometry the Program starts the engine with
+  (`offload_round_geometry`, checked at startup), and the Program's persistent and workspace arenas and the
+  elastic KV's base pages pass the spill guard before the engine starts.
 - **Second frame pool.** Flash-Next keeps one frame pool per record stride. Here the shared-expert
   and drafter banks are resident outside it, so there is one stride. Since 2026-10-27 the drafter pool
   (candidates §22 VM-01 variant B; Flash-Next design §19.3.35) pins the drafter's routed bank in RAM instead and

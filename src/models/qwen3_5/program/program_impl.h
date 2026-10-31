@@ -531,6 +531,11 @@ public:
     std::size_t graph_measured_bytes = 0;
     const WorkspacePlan workspace_plan;
 
+    // Offloaded experts (the 122B, candidates RF-04): free device memory before the fixed allocations below,
+    // which the constructor checks once they are made: memory the driver placed in shared system memory (the
+    // Windows sysmem fallback) fails the startup, as Qwen3.8-Flash-Next's Program does. Declared before them.
+    std::unique_ptr<VramBudgetSource> spill_source;
+    std::optional<SpillGuard> spill_guard;
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;

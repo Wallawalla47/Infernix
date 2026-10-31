@@ -8,6 +8,7 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/planning/idle_prefill.h"
 #include "models/qwen3_5/program/internal.h"
+#include "models/qwen3_5/program/offload.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
 #include "models/qwen3_5/program/speculative/dflash_width_policy.h"
@@ -1331,6 +1332,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->multiprocessor_count = inputs.multiprocessor_count;
     impl->context_cache        = inputs.context_cache;
     impl->kv_storage           = inputs.kv_storage;
+    impl->offload_fixed_bytes  = inputs.offload_fixed_bytes;
     impl->persistent           = persistent_layout(*impl);
     if (impl->context_cache.enabled) {
         // The whole Host budget is the slab pool that KV blocks and state snapshots share
@@ -1411,11 +1413,14 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             "CUDA Graph allowance");
     }
 
-    // An elastic text KV region counts whole: the frames give it back as it grows.
+    // An elastic text KV region counts whole: the frames give it back as it grows. Offloaded experts add the
+    // engine's staging and tables (candidates RF-04: the frames used to absorb them unplanned).
     impl->device_reservation_bytes = checked_add(
-        checked_add(checked_add(impl->persistent.bytes, impl->persistent.text_kv_region_bytes, "elastic KV region"),
-                    impl->workspace.capacity, "sequence memory plan"),
-        impl->graph_allowance_bytes, "sequence graph allowance");
+        checked_add(checked_add(checked_add(impl->persistent.bytes, impl->persistent.text_kv_region_bytes,
+                                            "elastic KV region"),
+                                impl->workspace.capacity, "sequence memory plan"),
+                    impl->graph_allowance_bytes, "sequence graph allowance"),
+        impl->offload_fixed_bytes, "offloaded experts' staging and tables");
     return impl;
 }
 
@@ -1657,7 +1662,8 @@ std::uint32_t resolve_auto_ngram_impl(const Model& model, EngineOptions& options
 
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
-                           const EngineOptions& options, std::uint32_t idle_prefill_width) {
+                           const EngineOptions& options, std::uint32_t idle_prefill_width,
+                           const ProgramOffloadOptions* offload) {
     validate_target_options(parameters, device, options);
     if (idle_prefill_width != 0) {
         const std::vector<std::uint32_t> widths = idle_prefill_widths_impl(parameters, options);
@@ -1750,6 +1756,14 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .multiprocessor_count = device.multiprocessor_count(),
         .context_cache        = options.context_cache,
     };
+    if (offload != nullptr) {
+        inputs.offload_fixed_bytes = ProgramOffload::fixed_bytes(
+            parameters,
+            offload_round_geometry(inputs.max_concurrency, inputs.draft_window, inputs.prefill_chunk,
+                                   inputs.idle_prefill_width, inputs.speculative_backend, inputs.neural_draft_window,
+                                   inputs.ngram_draft_window, inputs.device),
+            offload->engine);
+    }
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
     const auto maximum_pages          = static_cast<std::uint32_t>(
