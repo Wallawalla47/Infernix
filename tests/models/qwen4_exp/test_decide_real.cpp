@@ -17,7 +17,8 @@
 //                equal what a readout of the same two tokens implies.
 //   coalesce     (plain) Two requests submitted together share a 1,024-token prefix nothing has
 //                cached: the second waits for the first's snapshot at the divergence, resumes from
-//                it, and generates what an uncached run generates (same call boundaries).
+//                it, and generates what an uncached run generates (same call boundaries). The first
+//                ends one token past the divergence, a call no layer walk joins.
 //   prefetch     (plain) While both lanes decode, the waiting head's Host-only blocks are copied to
 //                the Device; it then resumes at its tap and generates what an uncached run does.
 //
@@ -249,8 +250,13 @@ int cross(infernix::Engine& engine) {
 }
 
 int coalesce(infernix::Engine& engine) {
+    // The leader's prompt ends one token past the divergence. A narrower last call of two or more tokens joins
+    // the streamed calls' layer walk on artifacts whose prefill walks it (IQ3_S, FP4-Local; design §30's walk
+    // join), and a sibling cannot coalesce inside a running span (prefix_await_sibling): it then prefills the
+    // shared part itself, the trade that join made. A one-token last call stays its own call, so the span ends
+    // at the divergence on every artifact.
     const std::vector<infernix::TokenId> shared = synthetic_tokens(1024, 51);
-    const auto first                          = concat(shared, synthetic_tokens(40, 52));
+    const auto first                          = concat(shared, synthetic_tokens(1, 52));
     const auto second                         = concat(shared, synthetic_tokens(40, 53));
     const auto reference                      = run(engine, second, greedy(16, false)).generated_token_ids;
     infernix::GenerationHandle leader   = engine.submit(engine.prepare_tokens(first), greedy(1, true));
@@ -290,9 +296,11 @@ int prefetch(infernix::Engine& engine) {
     return failures + check(waited.generated_token_ids == reference, "prefetch: the head equals an uncached run");
 }
 
-int run_mode(const char* artifact, const char* ngram, bool mtp, const std::vector<infernix::FastPath>& candidates) {
-    std::printf("== %s\n", mtp ? "MTP drafter (--spec mtp, 3 drafts)" : "plain decode");
+int run_mode(const char* artifact, const char* ngram, bool mtp, const std::vector<infernix::FastPath>& candidates,
+             bool fast_paths) {
+    std::printf("== %s%s\n", mtp ? "MTP drafter (--spec mtp, 3 drafts)" : "plain decode", fast_paths ? "" : ", fast paths off");
     infernix::EngineOptions options = base_options(artifact, ngram, mtp);
+    options.fast_paths = fast_paths;
     options.fast_path_candidates.insert(options.fast_path_candidates.end(), candidates.begin(), candidates.end());
     infernix::Engine engine(options);
     int failures = 0;
@@ -317,14 +325,15 @@ int main(int argc, char** argv) {
         return 77;
     }
     const char* ngram = std::getenv("INFERNIX_QWEN4_NGRAM");
-    bool plain = true, mtp = true;
+    bool plain = true, mtp = true, fast_paths = true;
     // --fast-path NAME (repeatable): also run that fast path, qualified or not (the readout's resume
-    // claim follows the selected expert paths).
+    // claim follows the selected expert paths). --no-fast-paths: the exact route alone.
     std::vector<infernix::FastPath> candidates;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--mtp") { plain = false; }
         if (arg == "--plain") { mtp = false; }
+        if (arg == "--no-fast-paths") { fast_paths = false; }
         if (arg == "--fast-path" && i + 1 < argc) {
             const auto path = infernix::parse_fast_path(argv[++i]);
             if (!path) {
@@ -336,8 +345,8 @@ int main(int argc, char** argv) {
     }
     try {
         int failures = 0;
-        if (plain) { failures += run_mode(artifact, ngram, false, candidates); }
-        if (mtp) { failures += run_mode(artifact, ngram, true, candidates); }
+        if (plain) { failures += run_mode(artifact, ngram, false, candidates, fast_paths); }
+        if (mtp) { failures += run_mode(artifact, ngram, true, candidates, fast_paths); }
         std::printf(failures == 0 ? "qwen4_exp decide checks passed\n" : "FAIL: %d checks failed\n", failures);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
