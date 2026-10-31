@@ -11,7 +11,8 @@ Infernix is a C++/CUDA inference engine that serves Qwen models on one NVIDIA RT
 
 ## Headline results
 
-`main` at `6b066a54`, one RTX 5090 (PCIe Gen5 x8), 2026-10-30/31, against each engine's latest
+`main` at `fb491903` on NVIDIA's NVFP4 weights and `6b066a54` on the others (no change since applies
+to them), one RTX 5090 (PCIe Gen5 x8), 2026-10-30/31, against each engine's latest
 version, every engine native on Windows under the same 84 GiB RAM budget. Context columns: one
 request at a time, ~8K to ~250K tokens. Replay: an agentic coding workload, two requests at once.
 Activation precision differs: the other engines round to 8 bits what Infernix keeps at 16 (every
@@ -20,9 +21,9 @@ activation on IQ3_S; all but the NVFP4 routed experts, which Infernix runs at th
 
 | Infernix vs | Time to first token | Decode tok/s | Replay: mean time to first token | Replay: wall time |
 |---|---|---|---|---|
-| [Strata](https://github.com/Niko1221/Strata) v0.2.8, same NVIDIA NVFP4 weights (Infernix: Dense8) | 1.4-1.6× sooner | +7-15 % | 3.3 s vs 12.3 s | 5.7 vs 12.9 min |
-| [strata-nvfp4](https://github.com/sergqwer/strata-nvfp4) 0.2.0-beta-nvfp4.3, same weights | 1.3× sooner | level at 8K, +5 % and +14 % at 128K and 250K | 3.3 s vs 10.8 s | 5.7 vs 11.7 min |
-| [Basalt](https://github.com/jesdga95/basalt) `c08284cb`, NVIDIA NVFP4 (its pack) | 5-8× sooner† | Basalt 3-13 % faster | 3.3 s vs 7.2 s | 5.7 vs 8.9 min |
+| [Strata](https://github.com/Niko1221/Strata) v0.2.8, same NVIDIA NVFP4 weights (Infernix: Dense8) | 1.4-1.6× sooner | +10-15 % to 128K, 4 % behind at 250K | 3.1 s vs 12.3 s | 5.7 vs 12.9 min |
+| [strata-nvfp4](https://github.com/sergqwer/strata-nvfp4) 0.2.0-beta-nvfp4.3, same weights | 1.3× sooner | level to +3 % | 3.1 s vs 10.8 s | 5.7 vs 11.7 min |
+| [Basalt](https://github.com/jesdga95/basalt) `c08284cb`, NVIDIA NVFP4 (its pack) | 5-8× sooner† | Basalt 7-23 % faster | 3.1 s vs 7.2 s | 5.7 vs 8.9 min |
 | Strata* v0.2.8, same IQ3_S GGUF | 15 % sooner at 8K, level at 128K-250K | +3-12 % | 3.1 s vs 6.9 s | 5.5 vs 8.1 min |
 | Basalt `c08284cb`, IQ3_S (its pack) | Basalt 4 % sooner at 8K, 1.3× at 128K-250K | Basalt 1.4-1.7× faster | 3.1 s vs 3.7 s | Basalt sooner: 5.5 vs 4.4 min |
 | [NInfer](https://github.com/Neroued/ninfer) `1882c6adb` (Windows port), 27B NVFP4 | 9 % sooner at 8K, 1.6-1.8× at 128K-230K | own drafters +11-17 %; no drafting +2-3 % | 1.9 s vs 2.5 s (median 0.59 vs 0.93 s) | 12.7 vs 16.4 min |
@@ -47,9 +48,9 @@ n-gram table is read from NVMe.
   [Strata](https://github.com/Niko1221/Strata) v0.2.8 and
   [strata-nvfp4](https://github.com/sergqwer/strata-nvfp4) from 8K to 250K tokens, and 5-8× sooner
   than [Basalt](https://github.com/jesdga95/basalt), which reads its n-gram table from the SSD
-  here; in the agentic replay 3.3 s against 7.2-12.3 s and 35-55 % less wall time. Decode is ahead
-  of Strata, level with strata-nvfp4 at 8K and ahead at longer contexts, and behind Basalt by 3-13 %
-  (level on one request in the replay)
+  here; in the agentic replay 3.1 s against 7.2-12.3 s and 36-56 % less wall time. Decode is 10-15 %
+  ahead of Strata to 128K (4 % behind at 250K, where accepted drafts vary most), level with
+  strata-nvfp4 (0-3 % ahead), and behind Basalt by 7-23 % (level on one request in the replay)
   ([benchmarks](#qwen38-flash-next-nvfp4-infernix-vs-strata-strata-nvfp4-and-basalt)).
 - **On the IQ3_S GGUF** Infernix decodes 3-12 % faster than Strata and needs a third less replay
   time, but Basalt decodes about 1.5× as fast as Infernix and finishes the replay 26 % sooner
@@ -114,7 +115,10 @@ Setup and tuning: the [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next.md).
 One machine: RTX 5090 (32 GB) on **PCIe Gen5 x8**, Core i9-13900K, 96 GB DDR5, Windows 11. Gen5 x16
 makes Flash-Next's prompts up to twice as fast and its decode 2-7 % faster
 ([measured on another machine](#pcie-gen5-x8-against-x16)). Infernix
-is `main` at [`6b066a54`](https://github.com/Wallawalla47/Infernix/commit/6b066a54) built from
+is `main` at [`fb491903`](https://github.com/Wallawalla47/Infernix/commit/fb491903) for its default
+route on NVIDIA's NVFP4 weights (re-run after the tensor-core narrow W4A4 experts of 2026-10-31) and
+[`6b066a54`](https://github.com/Wallawalla47/Infernix/commit/6b066a54) for IQ3_S, the
+`--a8-activations` rows and the 27B (no change since applies to them), built from
 source; every engine runs natively on Windows as an OpenAI-compatible server driven by the same
 client, which times the first token from sending the request to the first streamed token
 (2026-10-30/31, GPU power limit 517.5 W, clocks checked before every session).
@@ -154,27 +158,35 @@ uncounted warm-up request.
 
 | Context | TTFT: Infernix | Strata | strata-nvfp4 | Basalt | Decode tok/s: Infernix | Strata | strata-nvfp4 | Basalt |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| ~8K | **1.88 s** | 2.67 s | 2.48 s | 9.55 s | 178 | 159 | 177 | **202** |
-| ~128K | **12.17 s** | 18.83 s | 15.34 s | 92.94 s | 168 | 146 | 161 | **173** |
-| ~250K | **23.90 s** | 37.55 s | 31.78 s | 125.92 s | 195 | 183 | 172 | **216** |
+| ~8K | **1.88 s** | 2.67 s | 2.48 s | 9.55 s | 183 | 159 | 177 | **202** |
+| ~128K | **12.22 s** | 18.83 s | 15.34 s | 92.94 s | 161 | 146 | 161 | **173** |
+| ~250K | **23.90 s** | 37.55 s | 31.78 s | 125.92 s | 175 | 183 | 172 | **216** |
 
 Decode varies most at ~250K, where each request's thinking decides how many drafts are accepted
-(per request: Infernix 151-246, Basalt 190-242 tok/s).
+(per request: Infernix 160-195, Basalt 190-242 tok/s; on `6b066a54` Infernix measured 151-246 there,
+mean 195). Against `6b066a54` the decode rounds a second rose 10 % at ~8K and ~250K and fell 2 % at
+~128K, while the drafts accepted a round moved with the generated text; tok/s changed within that
+run-to-run spread (183 / 161 / 175 against 178 / 168 / 195).
 
 **Agentic replay** (three seeds):
 
 | Metric | Strata | strata-nvfp4 | Basalt | Infernix | vs Strata | vs strata-nvfp4 | vs Basalt |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Mean TTFT | 12.3 s (10.8-13.9) | 10.8 s (9.2-12.0) | 7.2 s (6.4-7.9) | **3.3 s** (3.3-3.4) | −73 % | −69 % | −54 % |
-| Median TTFT | 9.92 s | 7.62 s | 3.81 s | **2.17 s** | −78 % | −72 % | −43 % |
-| 90th-percentile TTFT | 25.9 s | 24.7 s | 17.5 s | **7.8 s** | −69 % | −68 % | −55 % |
-| Mean TTFT, new long prompts | 11.8 s | 10.2 s | 20.8 s | **6.1 s** | −48 % | −39 % | −70 % |
-| Prompt tokens from cache | 46.1 % | 53.2 % | 83.1 % | **84.2 %** | +38.1 pt | +31.0 pt | +1.1 pt |
-| Prefill tok/s, no cache hit | 5,159 | 5,701 | 2,108 | **7,380-7,515** | +46 % | +29 % | 3.5× |
-| Output tok/s, one request | 116 (114-120) | 110 (108-113) | **166** (160-170) | **166** (165-167) | +43 % | +51 % | level |
-| Output tok/s, batched | 67 | 69 | 129 | **145** (141-149) | 2.2× | 2.1× | +12 % |
-| Tokens per round | 2.26 | 2.21 | 2.37 | **2.61** | +16 % | +19 % | +11 % |
-| Wall time | 12.9 min (12.0-13.8) | 11.7 min (11.0-12.9) | 8.9 min (8.6-9.1) | **5.7 min** (5.5-6.2) | −55 % | −51 % | −35 % |
+| Mean TTFT | 12.3 s (10.8-13.9) | 10.8 s (9.2-12.0) | 7.2 s (6.4-7.9) | **3.1 s** (2.9-3.5) | −74 % | −71 % | −56 % |
+| Median TTFT | 9.92 s | 7.62 s | 3.81 s | **2.04 s** | −79 % | −73 % | −46 % |
+| 90th-percentile TTFT | 25.9 s | 24.7 s | 17.5 s | **7.1 s** | −71 % | −71 % | −59 % |
+| Mean TTFT, new long prompts | 11.8 s | 10.2 s | 20.8 s | **6.1 s** | −48 % | −38 % | −70 % |
+| Prompt tokens from cache | 46.1 % | 53.2 % | 83.1 % | **84.5 %** | +38.4 pt | +31.2 pt | +1.4 pt |
+| Prefill tok/s, no cache hit | 5,170 | 5,847 | 2,349 | **7,480-7,689** | +45 % | +30 % | 3.3× |
+| Output tok/s, one request | 116 (114-120) | 110 (108-113) | **166** (160-170) | **166** (165-169) | +43 % | +51 % | level |
+| Output tok/s, batched | 67 | 69 | 129 | **149** (142-157) | 2.2× | 2.2× | +15 % |
+| Tokens per round | 2.26 | 2.21 | 2.37 | **2.61** | +15 % | +19 % | +11 % |
+| Wall time | 12.9 min (12.0-13.8) | 11.7 min (11.0-12.9) | 8.9 min (8.6-9.1) | **5.7 min** (5.4-5.9) | −56 % | −51 % | −36 % |
+
+Against `6b066a54` (3.3 s mean and 2.17 s median TTFT, 5.7 min) the replay is level within its seeds'
+ranges. The prefill row's other engines read differently from the earlier table (5,159 / 5,701 /
+2,108) because it compares the prompts every joined run prefilled cold, a set that moves with each
+run's cache.
 
 Strata re-prefilled the whole prompt on 15-17 of the 41 continuing main-session turns per seed,
 strata-nvfp4 on 9-14, Basalt on 0-1 and Infernix on 1.
@@ -195,9 +207,9 @@ that could be turned off. Measured quality (KL divergence against an exact refer
 later update.
 
 **Infernix with 8-bit expert activations** (the opt-in `--a8-activations`, closer to the others'
-arithmetic in decode; not the comparison above): context length TTFT 1.88 / 15.53 / 30.58 s and
-decode 199 / 185 / 268 tok/s at ~8K / ~128K / ~250K; replay mean TTFT 3.4 s, output 175 tok/s at one
-request (+5 % on Basalt), wall time 5.7 min. Decode gains 5-9 %, but prompts read up to 28 % slower
+arithmetic in decode; not the comparison above; measured on `6b066a54`): context length TTFT
+1.88 / 15.53 / 30.58 s and decode 199 / 185 / 268 tok/s at ~8K / ~128K / ~250K; replay mean TTFT
+3.4 s, output 175 tok/s at one request (+5 % on Basalt), wall time 5.7 min. Decode gains 5-9 %, but prompts read up to 28 % slower
 than on the default 4-bit route, so the default stays the faster choice for agents.
 
 ### Qwen3.8-Flash-Next IQ3_S: Infernix vs Strata and Basalt
