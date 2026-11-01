@@ -51,9 +51,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 # The link reading and its wording come from abba.py, so the two tools cannot disagree about what a
 # report's probe says: one guard, read at two moments (per process, and per stored report).
-import abba
+from tools.bench import abba  # noqa: E402
 
 REPORT_ARTIFACT_TYPE = "infernix_bench_report"
 DEFAULT_METRICS = ("decode_output_tok_s", "output_tok_s", "prefill_tok_s", "load_seconds")
