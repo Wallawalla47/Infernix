@@ -32,9 +32,11 @@ std::optional<ExpertCacheTotals> Program::expert_cache_totals() const noexcept {
 
 void Program::set_maintenance_waker(std::function<void()> waker) { impl_->set_maintenance_waker(std::move(waker)); }
 
-// A verification round's expert-cache update may wait for the next round's proposal (ProgramImpl::DeferredRound):
-// the entry points that can touch the expert cache, launch a forward or report on it settle it first; decode settles
-// it while its proposal drafts, commit defers it, and planning and accessors leave it.
+// A verification round's expert-cache update may wait for the next round's proposal (ProgramImpl::DeferredRound), and
+// a DFlash2 verification's commit waits on the device behind a host gate until commit() (ProgramImpl::CommitGate):
+// the entry points that can touch the expert cache, launch a forward or report on it release the gate with no
+// committed column and settle the update first; decode settles it while its proposal drafts, commit defers it, and
+// planning and accessors leave both.
 void Program::maintain() {
     impl_->settle_deferred();
     impl_->apply_vram_target(true);

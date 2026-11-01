@@ -77,4 +77,21 @@ void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaS
     detail::increment_token_counts_launch(token_ids, token_counts, stream);
 }
 
+void increment_licensed_token_counts(const Tensor& licensed_tokens, const Tensor& licensed_counts,
+                                     const SamplingConfig* configs, cudaStream_t stream) {
+    if (licensed_tokens.dtype != DType::I32 || licensed_tokens.ne[0] <= 0 || licensed_tokens.ne[1] <= 0 ||
+        licensed_tokens.ne[2] != 1 || licensed_tokens.ne[3] != 1 || !licensed_tokens.is_contiguous() ||
+        licensed_tokens.data == nullptr) {
+        throw std::invalid_argument(
+            "increment_licensed_token_counts: licensed_tokens must be a contiguous non-empty I32 [K+1,B]");
+    }
+    if (licensed_counts.dtype != DType::I32 || licensed_counts.ne[0] != licensed_tokens.ne[1] ||
+        licensed_counts.ne[1] != 1 || licensed_counts.ne[2] != 1 || licensed_counts.ne[3] != 1 ||
+        !licensed_counts.is_contiguous() || licensed_counts.data == nullptr) {
+        throw std::invalid_argument("increment_licensed_token_counts: licensed_counts must be a contiguous I32 [B]");
+    }
+    if (configs == nullptr) { throw std::invalid_argument("increment_licensed_token_counts: configs is null"); }
+    detail::increment_licensed_token_counts_launch(licensed_tokens, licensed_counts, configs, stream);
+}
+
 } // namespace infernix::ops
