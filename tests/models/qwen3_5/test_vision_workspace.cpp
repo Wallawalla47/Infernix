@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "models/load_options.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -142,24 +143,23 @@ int main() {
         }
         CUDA_CHECK(status);
         infernix::DeviceContext device;
-        infernix::models::LoadOptions selected;
-        selected.vision        = true;
-        selected.speculative   = infernix::SpeculativeBackend::Mtp;
-        selected.proposal_head = infernix::ProposalHead::Optimized;
-        auto model             = qwen::load_model(artifact, selected, device);
+        infernix::EngineOptions base;
+        base.prefill_chunk                         = 1024;
+        base.kv_cache                              = infernix::KvCacheStorage::Fp8E4M3Row256;
+        base.speculative.backend                   = infernix::SpeculativeBackend::Mtp;
+        base.speculative.draft_tokens              = 3;
+        base.speculative.proposal_head             = infernix::ProposalHead::Optimized;
+        base.enable_vision                         = true;
+        base.use_cuda_graph                        = false;
+        base.context_cache.hybrid.device_snapshot_slots = 1;
+        // The planner refuses options whose components differ from the loaded ones.
+        auto model = qwen::load_model(
+            artifact, infernix::models::load_options(base, infernix::models::Architecture::Qwen3_5), device);
         const qwen::execution::Parameters parameters(*model);
         const auto capacity = [&](std::uint32_t max_context) {
-            infernix::EngineOptions options;
-            options.max_context         = max_context;
-            options.kv_capacity         = infernix::KvCapacityPolicy::explicit_capacity(max_context);
-            options.prefill_chunk       = 1024;
-            options.kv_cache            = infernix::KvCacheStorage::Fp8E4M3Row256;
-            options.speculative.backend = infernix::SpeculativeBackend::Mtp;
-            options.speculative.draft_tokens         = 3;
-            options.speculative.proposal_head        = infernix::ProposalHead::Optimized;
-            options.enable_vision                    = true;
-            options.use_cuda_graph                   = false;
-            options.context_cache.hybrid.device_snapshot_slots = 1;
+            infernix::EngineOptions options = base;
+            options.max_context             = max_context;
+            options.kv_capacity             = infernix::KvCapacityPolicy::explicit_capacity(max_context);
             auto planner     = qwen::make_sequence_planner(parameters, device, options);
             const auto pages = planner.capacity_curve().minimum_main_page_groups;
             return std::move(planner).finalize(pages).workspace_capacity_bytes();
