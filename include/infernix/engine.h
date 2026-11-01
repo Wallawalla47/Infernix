@@ -96,9 +96,13 @@ public:
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
 
-    // Artifact-tokenizer decoding of token ids, special tokens included. The bytes of a character
-    // that the ids cut are returned as they are (not necessarily valid UTF-8).
+    // Artifact-tokenizer decoding of token ids, special tokens included. A character the ids cut
+    // makes this throw: what it returns is always valid UTF-8.
     [[nodiscard]] std::string detokenize(std::span<const TokenId> token_ids) const;
+
+    // The same ids joined to the artifact's bytes without that validation, for a caller that
+    // handles an incomplete character itself (a window cut between two bytes of one character).
+    [[nodiscard]] std::string detokenize_bytes(std::span<const TokenId> token_ids) const;
 
     // The token ids of a text chat rendered with the artifact's chat template, whatever their number: unlike
     // prepare(), no max_context or capacity limit applies (a measurement tool cuts its windows from them).
