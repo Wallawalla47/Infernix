@@ -52,6 +52,9 @@ void sigmoid_mul_ggml_encoded(const Tensor& gate, const Tensor& x, const std::in
 /** The I32 words of one 8-bit encoded column of K = k for these segments. */
 [[nodiscard]] std::int32_t ggml_a8_encoded_column_words(std::span<const GgmlSegment> segments, std::int32_t k);
 
+/** Whether these segments' 8-bit columns carry slice code sums (a Q4_K or Q5_K segment's min term). */
+[[nodiscard]] bool ggml_a8_sums(std::span<const GgmlSegment> segments);
+
 /**
  * gated_rmsnorm over rows of 128, x [128, H T] (z the same shape, weight [128]), whose output, read as [128 H, T], is
  * encoded for the segments' projection into `encoded` (I32 [ggml_a8_encoded_column_words(segments, 128 H), T]).

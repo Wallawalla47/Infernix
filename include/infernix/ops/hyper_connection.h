@@ -52,6 +52,17 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
                           std::int32_t rank, float eps, Tensor& x, Tensor* inject,
                           WorkspaceArena& workspace, cudaStream_t stream);
 
+/// `--a8-activations` (LOSSY, opt-in): hyper_connection_mix (the same x and inject bits) that also writes x's 8-bit
+/// columns for a GGUF projection of x on ggml_linear's 8-bit narrow route (ops/ggml/ggml_a8.h's codec: the words
+/// ggml_linear would encode from x without a permutation; `encoded` I32 [ggml_a8_encoded_column_words(segments, H),
+/// T], `sums` as the projection's segments need them), where its fused route serves the call with its two-to-sixteen-
+/// column kernels. Returns false, writing nothing, where it does not: the caller then mixes with hyper_connection_mix
+/// and the projection encodes x itself.
+[[nodiscard]] bool hyper_connection_mix_a8_encoded(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
+                                                   const Weight& up, std::int32_t streams, std::int32_t rank, float eps,
+                                                   Tensor& x, Tensor* inject, Tensor& encoded, bool sums,
+                                                   WorkspaceArena& workspace, cudaStream_t stream);
+
 /// `--a8-activations` (LOSSY, opt-in): rewrites a BF16 Contiguous W_down or W_up [n, k] in its own bytes as
 /// Q8_G32_FP16 RowSplit (row_split_k128_v1: int8 codes [n, padded_k], padded_k = k rounded up to 128, then
 /// the FP16 scales [n, padded_k / 32]) and updates `w` to describe it, so hyper_connection_mix takes its Q8

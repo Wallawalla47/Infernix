@@ -276,6 +276,27 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
     detail::hc_collapse(u, normalized, streams, x, stream);
 }
 
+bool hyper_connection_mix_a8_encoded(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
+                                     const Weight& up, std::int32_t streams, std::int32_t rank, float eps, Tensor& x,
+                                     Tensor* inject, Tensor& encoded, bool sums, WorkspaceArena& workspace,
+                                     cudaStream_t stream) {
+    const std::int32_t T = residual.ne[1], hidden = x.ne[0];
+    if (!contiguous_2d(residual, DType::BF16) || !contiguous_2d(x, DType::BF16) || x.ne[1] != T ||
+        residual.ne[0] != streams * hidden || !detail::hc_mix_fused_supported(down, up, hidden, streams, rank, T) ||
+        !detail::hc_mix_fused_a8_supported(norm_weight, T)) {
+        return false;
+    }
+    require(encoded.dtype == DType::I32 && encoded.is_contiguous() && encoded.ne[1] == T && encoded.ne[2] == 1 &&
+                encoded.ne[3] == 1 && encoded.ne[0] >= static_cast<std::int64_t>(hidden / 32 * (sums ? 10 : 9)),
+            "mix's 8-bit copy must be contiguous I32 [the projection's column words, T]");
+    require(down.n == rank + (inject != nullptr ? streams : 0) && eps > 0, "mix shapes disagree");
+    auto scope                = workspace.scope();
+    const DeviceSpan partials = workspace.alloc_bytes(detail::hc_mix_fused_workspace_bytes(down.n, streams, T));
+    detail::hc_mix_fused(residual, norm_weight, down, up, streams, rank, eps, x, inject, partials.data, stream,
+                         {static_cast<std::int32_t*>(encoded.data), static_cast<std::int32_t>(encoded.ne[0]), sums});
+    return true;
+}
+
 std::size_t hyper_connection_mix_workspace_capacity_bytes(const Weight& down, const Weight& up, LinearPolicy policy,
                                                           std::int32_t streams, std::int32_t rank,
                                                           std::int32_t max_tokens) {
