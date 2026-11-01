@@ -10,7 +10,7 @@ Product commands and prerequisites are in the
 
 The root `CMakeLists.txt` owns language/toolchain constraints, build options and top-level
 composition. Architecture selection and validation happen before `project()` detects CUDA; the
-toolkit-version warning follows it.
+toolkit-version check follows it.
 The default configuration is Release. Ninja links and archives share the single-slot
 `infernix_link` pool; compilation uses the build command's parallelism.
 
@@ -26,10 +26,12 @@ libjpeg belong to model media decoding and remain required when apps are disable
 only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
 pytest suites and conversion/evaluation scripts run separately from CMake and CTest.
 
-CUDA 13.4 and Python 3.11 describe the maintained environment, not configuration version gates.
-An older CUDA compiler configures with a warning: CUDA 13.2 miscompiles at least one `sm_120a`
-kernel (the `--a8-activations` row kernel stops with an illegal instruction), and the toolkits
-before 13.4 are untested.
+CUDA 13.4 and Python 3.11 describe the maintained environment. CUDA 13.4 is also a configuration
+gate: an older CUDA compiler stops the configuration. CUDA 13.2 miscompiles `sm_120a` code (the
+`--a8-activations` row kernel `rows_mma_kernel<GGML_IQ4_NL, BF16, 1>` stops with an illegal
+instruction, #48; another engine measured silently wrong output, Strata #4879), the toolkits
+before 13.4 are untested, and a miscompiled build need not announce itself. The startup log prints
+the nvcc version beside the build id (`build <id> (CUDA 13.4.x)`).
 CMake also discovers FFmpeg without imposing library version floors. Actual language/API support
 is exercised by compilation and tests. The libcurl 7.85 minimum has a concrete API basis:
 media acquisition uses `CURLOPT_PROTOCOLS_STR` and `CURLOPT_REDIR_PROTOCOLS_STR`, introduced in

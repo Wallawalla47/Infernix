@@ -14,13 +14,16 @@ endif()
 
 project(infernix LANGUAGES C CXX CUDA)
 
-# CUDA 13.4 is the toolkit Infernix is built and tested with. An older one still configures, but
-# CUDA 13.2 miscompiles at least one sm_120a kernel, and the toolkits before 13.4 are untested.
+# CUDA 13.4 is the oldest toolkit Infernix accepts: it is the one Infernix is built and tested with.
+# CUDA 13.2 miscompiles sm_120a code: one of Infernix's kernels into an illegal instruction (#48),
+# and another engine's into silently wrong output (Strata #4879); the toolkits before 13.4 are
+# untested, and a wrong build would not announce itself.
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.4)
-  message(WARNING
+  message(FATAL_ERROR
     "CUDA ${CMAKE_CUDA_COMPILER_VERSION} is older than 13.4, the toolkit Infernix is built and "
-    "tested with. CUDA 13.2 miscompiles at least one sm_120a kernel (it fails at run time with "
-    "an illegal instruction); use CUDA 13.4 or later.")
+    "tested with. CUDA 13.2 miscompiles sm_120a code (an illegal instruction in one Infernix "
+    "kernel, silently wrong output in another engine's), and older toolkits are untested. Install "
+    "CUDA 13.4 or later and point CMAKE_CUDA_COMPILER at its nvcc.")
 endif()
 
 # --- Global settings ---------------------------------------------------------

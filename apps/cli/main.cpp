@@ -331,7 +331,9 @@ int main(int argc, char** argv) {
          .level        = cli.log_level,
          .presentation = infernix::product::LogPresentation::Tool});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
-#ifdef INFERNIX_BUILD_ID
+#if defined(INFERNIX_BUILD_ID) && defined(INFERNIX_CUDA_COMPILER_VERSION)
+    logger->info("build {} (CUDA {})", INFERNIX_BUILD_ID, INFERNIX_CUDA_COMPILER_VERSION);
+#elif defined(INFERNIX_BUILD_ID)
     logger->info("build {}", INFERNIX_BUILD_ID);
 #endif
     if (cli.config_path) {

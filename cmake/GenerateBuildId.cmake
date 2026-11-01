@@ -82,6 +82,11 @@ endif()
 string(REPLACE "\"" "\\\"" _id_escaped "${_id}")
 # Single string (not a list) so file(WRITE) does not inject a ';' list separator.
 set(_content "// Auto-generated at build time by cmake/GenerateBuildId.cmake -- do not edit.\n#define INFERNIX_BUILD_ID \"${_id_escaped}\"\n")
+# The nvcc that compiled the kernels (-DCUDA_COMPILER_VERSION, CMake's CMAKE_CUDA_COMPILER_VERSION), which
+# the startup log prints beside the id: a toolkit's miscompile is otherwise invisible in a report.
+if(CUDA_COMPILER_VERSION)
+  string(APPEND _content "#define INFERNIX_CUDA_COMPILER_VERSION \"${CUDA_COMPILER_VERSION}\"\n")
+endif()
 
 if(EXISTS "${OUT}")
   file(READ "${OUT}" _existing)
