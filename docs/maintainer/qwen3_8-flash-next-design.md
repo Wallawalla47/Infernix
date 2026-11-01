@@ -3839,6 +3839,33 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
   tail commits, the drafter's catch-up), so the policy overlaps that work. A discarded round skips
   it. Greedy ids are unchanged. tg512: plain 88.70 → **89.96**, MTP max 4 133.54 → **138.70**.
   Cold CLI: code 65.5 plain / 83.7 MTP, story 64.4 / 66.5.
+- **DFlash2: the cache update behind the next proposal (adopted 2026-11-01).**
+  - **Problem.** On a DFlash2 round (MTP off) the update (~234 µs of host time on IQ3_S with
+    `--a8-activations`) is longer than the commit graph it overlaps (180 µs), so the GPU idled
+    ~60 µs before the next round's 620 µs proposal was launched (graph-level nsys, 292 rounds).
+  - **Change.** Such a commit leaves the update pending (`DeferredRound::to_proposal`); the next
+    round's proposal settles it in its `while_drafting` window, after the proposal is enqueued.
+    Every other path settles it first: each forward's launch before `before_round`, the
+    registration of the next update, a commit that releases a row, and the Program's other entry
+    points (`maintain`, binding, context, reclaim and prefetch, pause, replay, prefill, forced
+    tokens, prefix-cache attach and save, scoring; `finish`, `abort` and shutdown drop it if it
+    throws). The update reads the round's routes, live columns, width and lanes, which nothing
+    rewrites before it runs. Expert placement is bitwise invariant, so no output depends on it.
+  - **Checks** (IQ3_S, DFlash2 `auto`, `--lm-head-draft`, against the old placement in the same
+    build). `--reproducible` CLI: greedy (299 tokens) and seed-7 T 0.6 (277) ids and text equal,
+    and equal with `--vram-headroom-mib 3072` (11,136 against 12,576 frames). Default route greedy
+    and sampled: equal. Real tests pass: startup capture and resume against cold (DFlash2), expert
+    fault, VRAM pressure (ids under resizes equal), speculative sampling (every DFlash2 section).
+    `infernix-perplexity --reference` scored one text cold and after another text: all four
+    windows' total NLL equal bit for bit (the reference route never speculates; it only meets the
+    settle-first guards).
+  - **Speed** (`infernix_bench`, warm state, three interleaved reps, wall time after the prefill;
+    old → new): struct (greedy, ~7.5 tokens a round) 15.062 → **14.884 s** (+1.2 %) and with
+    `--a8-activations` 13.480 → **13.304 s** (+1.3 %), separated ranges; conv (T 0.6, ~3 tokens a
+    round) 4.855 → 4.840 s (+0.3 %, overlapping) and with `--a8-activations` 4.628 → 4.627 (flat).
+    The bench's `decode_output_tok_s` and the serve's per-request decode rate count the Program's
+    `decode()` calls but not `commit()`, so moving the update from commit into the next decode
+    lowers them (conv 254.2 → 249.4) while wall time improves; compare such changes by wall time.
 - **Few-row Q8 route for the hyper-connection down projections (adopted).**
   - **Problem.** The MTP-round profile showed the [324, 10240] and [320, 10240] projections
     (96 calls per token) on 41 eight-row CTAs at ~0.4 TB/s: 9.5 µs per call, ~0.9 ms per round,
@@ -7181,7 +7208,7 @@ Unchanged by Strata:
 | BF16X2 activations, finite q8_1 scales | Not our numerics (BF16 activations; saturating A4 encoders) |
 | Draft vocabulary per language | 131K proposal rows: 99.09 % held-out coverage, worst domain 97.53 %; full-head fallback |
 | Window routing, batched PLE, one-graph draft chain, GDN commit split, sub-warp packing | Have |
-| GPU-side commit/draft overlap | ~0 until the next draft is enqueued before `settle_round` |
+| GPU-side commit/draft overlap | On DFlash2 the next proposal is now enqueued before the cache update settles (§19.2, "DFlash2: the cache update behind the next proposal": +1.2-1.3 % on long accepted runs); the drafter's catch-up and pre-draft on a second stream beside the commit kernels measured within chance (removed 2026-10-28) |
 | Dropping the drafter catch-up on stale K/V | ≤ ~1 % of a B ≥ 2 round; relaxing MR5/MR6 breaks E1 for sampled requests |
 | 256-repeat stop, `/metrics` | No loop observed; `max_tokens` defaults to 8192; it truncates legitimate output and changes an external contract. The request log covers metrics |
 | Q8 vision weights, lower vision token cap | Below upstream precision; we have `--vision-max-merged` |
