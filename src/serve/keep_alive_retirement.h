@@ -20,6 +20,14 @@ namespace infernix::serve {
 // close` on its response, the client stops reusing that socket, and the next
 // request opens a fresh connection.
 //
+// A stamp alone is decoration: pooled clients exist that ignore the header, and
+// RFC 9112 obliges a server that sends it to close. So a retired response is also
+// served through a content provider that cancels itself after the last byte —
+// the public-API lever that makes the vendored server end the connection loop and
+// take the graceful (FIN-first, drained) close path itself. HEAD is the exception
+// the library leaves without a lever (its provider never runs): it stays unstamped
+// and falls back to the timeout close.
+//
 // This is the whole mechanism on the Infernix side of the vendored server. A
 // connection (keyed by peer address and port) is idle from the end of its last
 // response, its whole body written (a stream's last chunk, not its headers), to the
@@ -36,12 +44,22 @@ public:
     void arrived(const httplib::Request& request);
 
     // Post-routing, which runs after the server has set its own keep-alive headers
-    // and before it writes the response: a retiring response gets `Connection: close`
-    // and drops the server's `Keep-Alive` hint (a response must not both invite reuse
-    // and announce its end). Every response also records when it has been written.
+    // and before it writes the response: a retiring response gets `Connection: close`,
+    // drops the server's `Keep-Alive` hint (a response must not both invite reuse
+    // and announce its end), and is served through a provider that closes the socket
+    // behind it. Every response also records when it has been written.
     void respond(const httplib::Request& request, httplib::Response& response);
 
 private:
+    // Stamps the close and converts the response to a provider that reports itself
+    // canceled after the last body byte, so the response reaches the client complete
+    // and the server then closes the socket. The plain-body path keeps its
+    // Content-Length framing byte-for-byte; a stream keeps its own provider and gets
+    // the cancel only after that provider reports done(); an empty body uses the
+    // without-length provider, which emits no framing of its own. Requires a
+    // non-HEAD request — the library skips providers on HEAD, which would stamp a
+    // close the server would not perform.
+    static void close_after_response(httplib::Response& response);
     struct Connection {
         std::chrono::steady_clock::time_point finished; // the last response's end, or a request's arrival
         bool retire = false;                            // the request in flight retires the connection

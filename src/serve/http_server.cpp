@@ -459,13 +459,13 @@ void HttpServer::register_routes() {
     // HTTP keep-alive window after a response finishes (cpp-httplib defaults to 5 s, which
     // silently closes pooled connections between agent turns; clients then race the close).
     // The timeout close is silent — no response is in flight to carry a close signal — so it
-    // is a moderate hard ceiling, and long-idle connections retire gracefully first: a request
-    // arriving after half the ceiling of idleness gets `Connection: close` on its response,
-    // and the client opens fresh next time (the path nginx/Node document for this race). The
-    // pre-routing handler below marks each request's arrival; post-routing runs after the
-    // server has set its own keep-alive headers, so it can also drop the Keep-Alive reuse
-    // hint a retirement contradicts. Idle connections hold a worker each — bounded by the
-    // pool ceiling (--max-http-clients), not by the window.
+    // is a moderate hard ceiling, and long-idle connections retire knowingly first: a request
+    // arriving after half the ceiling of idleness gets `Connection: close` that the server
+    // honors by closing behind the response, and the client opens fresh next time (the path
+    // nginx/Node document for this race). The pre-routing handler below marks each request's
+    // arrival; post-routing runs after the server has set its own keep-alive headers, so it
+    // can also drop the Keep-Alive reuse hint a retirement contradicts. Idle connections hold
+    // a worker each — bounded by the pool ceiling (--max-http-clients), not by the window.
     server_.set_keep_alive_timeout(options_.keep_alive_timeout_sec);
     server_.set_post_routing_handler([this](const httplib::Request& request,
                                             httplib::Response& response) {
