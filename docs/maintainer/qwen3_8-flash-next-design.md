@@ -3924,6 +3924,22 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
     −4.3 % with acceptance 2.874 → 2.759. The 8-bit route is not column-invariant, so changed
     drafts change its greedy text (five of the six CLI prompts differed); that arm compares
     different texts, and the six prompts pooled +0.6 % on it.
+- **GGUF token embedding: each row staged in 16-byte reads (adopted 2026-11-01).**
+  - **Problem.** The IQ4_XS embedding (`ggml_embedding`, a GGUF import's token table in pinned
+    host memory) runs twice a round, for the drafter's block and the verification's columns, at
+    16.2 µs each: every eight-element chunk read its scale, sub-scale and codes from the table
+    separately, about a thousand small requests across the link per 1.4 KB row.
+  - **Change.** A CTA copies its row into shared memory in 16-byte vectors (8-byte ones when the
+    rows are not 16-byte aligned), decodes from there with the same function and stores each chunk
+    as one 16-byte write. Same bits (the exact-oracle test passes at both alignments).
+  - **Result.** 16.2 → 7.4 µs a call in the engine (node-level nsys), ~18 µs a round.
+    `infernix_bench` against the previous build (three reps, identical texts and acceptance):
+    −0.20 to +0.16 %, within run-to-run spread; the saving is below what that A/B resolves.
+  - **Rejected.** The same 16-byte vectors for the dense BF16 embedding of the NVFP4 and FP8
+    artifacts: 9.95 → 10.94 µs. Its 2-byte loads already coalesce into 64-byte requests, and the
+    read is bound by the bytes the link returns per round trip (8 rows, 48 KB). Reading fewer rows
+    is what remains: seven of the drafter's eight are the mask token, which a device-resident copy
+    would serve (est. 5-7 µs a round on Dense8, 3-4 on IQ3_S).
 - **Few-row Q8 route for the hyper-connection down projections (adopted).**
   - **Problem.** The MTP-round profile showed the [324, 10240] and [320, 10240] projections
     (96 calls per token) on 41 eight-row CTAs at ~0.4 TB/s: 9.5 µs per call, ~0.9 ms per round,
