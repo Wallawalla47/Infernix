@@ -8,4 +8,5 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/ggml_linear_a8_rows.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_linear_a8_tiled.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_linear_a8_wide.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/ggml_quantize.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_rows.cu")

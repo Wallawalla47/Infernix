@@ -83,10 +83,12 @@ inline void check_launch(const char* what) {
 // The column tiles of 8 a warp holds for a call of `columns` columns (NT of the mma kernels).
 [[nodiscard]] constexpr int column_tiles_for(int columns) { return columns <= 8 ? 1 : columns <= 16 ? 2 : 4; }
 
-// Up to kMax segments in one launch (ggml_linear.cu's RowsGroup): CTAs [first[i], first[i + 1]) take segment
-// i's rows into out[i] (n[i] rows per column); a mixed launch's format[i] picks F0 (0) or F1 (1).
+// Up to kMax segments in one launch (ggml_linear.cu's RowsGroup, which takes 4): CTAs [first[i], first[i + 1]) take
+// segment i's rows into out[i] (n[i] rows per column); a mixed launch's format[i] picks F0 (0) or F1 (1). Six: a QSA
+// layer's input projection with its indexer (--a8-activations' Q6_K repack) cuts into q, gate, k, v, index q and
+// index k.
 struct A8Group {
-    static constexpr int kMax = 4;
+    static constexpr int kMax = 6;
     const std::uint8_t* data[kMax] = {};
     void* out[kMax]                = {};
     int rows[kMax]                 = {};
