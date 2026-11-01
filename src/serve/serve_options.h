@@ -70,9 +70,12 @@ struct ServeOptions {
     // closes pooled connections between agent turns, so long-idle reuse pays a reconnect and
     // can race the close. The timeout close itself is graceful (FIN-first drain; clients that
     // probe pooled sockets before reuse simply reconnect), and a request that does land
-    // re-arms the window — nothing else needs to retire a connection deliberately. Moderate
-    // by default: an open connection holds a request worker, bounded by max_http_clients.
-    std::uint32_t keep_alive_timeout_sec = 60;
+    // re-arms the window — nothing else needs to retire a connection deliberately. Clients
+    // that reuse a pooled socket without probing it lose that race whenever the server closes
+    // first: Bun's fetch (opencode) keeps idle sockets for its 5-minute idle timeout and does
+    // not read the Keep-Alive hint, so the default outlasts it and the client always closes
+    // first. An open connection holds a request worker, bounded by max_http_clients.
+    std::uint32_t keep_alive_timeout_sec = 360;
     // Ceiling on simultaneous open HTTP connections. cpp-httplib runs each connection's
     // keep-alive loop as a pool task, so an open connection — idle or not — holds a worker;
     // the pool already enforced this bound with max_n hardwired to the admission size. Base
