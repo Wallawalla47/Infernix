@@ -25,6 +25,7 @@
 // 256, 300 and 1025 (each tile width, full and partial token tiles). A BF16 W_up takes the separate steps.
 
 #include "infernix/ops/hyper_connection.h"
+#include "ops/ggml/ggml_a8.h"
 #include "ops/op_family.h"
 #include "ops/hyper_connection/hyper_connection_up_collapse.h"
 #include "ops/linear/linear_test_common.h"
@@ -37,6 +38,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -458,6 +460,73 @@ void up_collapse_bit_identity(Codec codec, cudaStream_t stream) {
     }
 }
 
+// hyper_connection_mix_a8_encoded (--a8-activations): x and inject bit for bit hyper_connection_mix's, and the 8-bit
+// columns word for word ops/ggml/ggml_a8.h's codec over that x (what ggml_linear's 8-bit route encodes), with and
+// without slice sums, at the fused route's two-to-sixteen-column widths; a one-column call is declined.
+void a8_encoded(Codec codec, cudaStream_t stream) {
+    namespace a8 = infernix::ggml::a8;
+    Problem p = make_problem(true, codec);
+    const std::size_t capacity = infernix::ops::hyper_connection_mix_workspace_capacity_bytes(
+        p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only, kS, kRank, 16);
+    infernix::WorkspaceArena ws(capacity);
+    const Tensor w(p.norm_device->p, DType::BF16, {kW});
+    for (const bool sums : {false, true}) {
+        const int stride = static_cast<int>((a8::column_words(kH, sums) + 3) / 4 * 4);
+        for (const int T : {1, 2, 3, 4, 5, 8, 16}) {
+            const std::string tag = std::string(codec == Codec::Q8 ? "q8" : "bf16") + " a8 copy" + (sums ? " sums" : "") +
+                                    " T=" + std::to_string(T);
+            const auto r      = residual(T, 5000U + static_cast<std::uint32_t>(T));
+            const Result want = run(p, r, T, true, ws, stream);
+            Device rd(r.size() * 2), xd(static_cast<std::size_t>(kH) * T * 2), id(static_cast<std::size_t>(kS) * T * 4),
+                ed(static_cast<std::size_t>(stride) * T * 4);
+            t::cuda_check(cudaMemcpy(rd.p, r.data(), r.size() * 2, cudaMemcpyHostToDevice), "residual");
+            const Tensor R(rd.p, DType::BF16, {kW, T});
+            Tensor x(xd.p, DType::BF16, {kH, T}), inj(id.p, DType::FP32, {kS, T}), encoded(ed.p, DType::I32, {stride, T});
+            const bool served = infernix::ops::hyper_connection_mix_a8_encoded(R, w, p.down_w, p.up_w, kS, kRank, kEps, x,
+                                                                               &inj, encoded, sums, ws, stream);
+            t::cuda_check(cudaStreamSynchronize(stream), "a8 mix");
+            if (T == 1) {
+                check(!served, tag + ": a one-column call is declined");
+                continue;
+            }
+            check(served, tag + ": served");
+            Result got;
+            got.x.resize(static_cast<std::size_t>(kH) * T);
+            got.inject.resize(static_cast<std::size_t>(kS) * T);
+            std::vector<std::int32_t> words(static_cast<std::size_t>(stride) * T);
+            t::cuda_check(cudaMemcpy(got.x.data(), xd.p, got.x.size() * 2, cudaMemcpyDeviceToHost), "x");
+            t::cuda_check(cudaMemcpy(got.inject.data(), id.p, got.inject.size() * 4, cudaMemcpyDeviceToHost), "inject");
+            t::cuda_check(cudaMemcpy(words.data(), ed.p, words.size() * 4, cudaMemcpyDeviceToHost), "words");
+            check(got.x == want.x && got.inject == want.inject, tag + ": x and inject are hyper_connection_mix's bits");
+            std::size_t bad = 0;
+            for (int c = 0; c < T; ++c) {
+                const std::int32_t* column = words.data() + static_cast<std::size_t>(c) * stride;
+                for (int s = 0; s < kH / 32; ++s) {
+                    const std::uint16_t* v = want.x.data() + static_cast<std::size_t>(c) * kH + 32 * s;
+                    unsigned key           = 0;
+                    for (int j = 0; j < 32; ++j) { key = std::max(key, static_cast<unsigned>(v[j] & 0x7FFFU)); }
+                    const a8::SliceScale sc = a8::slice_scale(key);
+                    int sum                 = 0;
+                    for (int g = 0; g < 8; ++g) {
+                        std::uint32_t word = 0;
+                        for (int j = 0; j < 4; ++j) {
+                            const int q = a8::code(v[4 * g + j], sc.inv);
+                            sum += q;
+                            word |= (static_cast<std::uint32_t>(q) & 0xFFU) << (8 * j);
+                        }
+                        bad += static_cast<std::uint32_t>(column[s * a8::kSliceWords + g]) != word ? 1U : 0U;
+                    }
+                    float d = 0.0F;
+                    std::memcpy(&d, column + a8::scales_offset(kH) + s, 4);
+                    bad += !(d == sc.d || (std::isnan(d) && std::isnan(sc.d))) ? 1U : 0U;
+                    if (sums) { bad += column[a8::sums_offset(kH) + s] != sum ? 1U : 0U; }
+                }
+            }
+            check(bad == 0, tag + ": every word is the codec's (" + std::to_string(bad) + " differ)");
+        }
+    }
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(hyper_connection) {
@@ -508,6 +577,8 @@ INFERNIX_OP_TEST(hyper_connection) {
         up_collapse_bit_identity(Codec::Q8, stream);
         repack_q8(true, stream);
         repack_q8(false, stream);
+        a8_encoded(Codec::Q8, stream);
+        a8_encoded(Codec::Bf16, stream);
         // Shapes that disagree are refused.
         {
             Problem p = make_problem(true, Codec::Q8);

@@ -304,6 +304,8 @@ std::int32_t ggml_a8_encoded_column_words(std::span<const GgmlSegment> segments,
     return a8_linear_column_words(k, a8_linear_sums(segments));
 }
 
+bool ggml_a8_sums(std::span<const GgmlSegment> segments) { return a8_linear_sums(segments); }
+
 void gated_rmsnorm_ggml_a8_encoded(const Tensor& x, const Tensor& weight, const Tensor& z, RmsGate gate, float eps,
                                    const std::int32_t* input_perm, std::int32_t perm_block,
                                    std::span<const GgmlSegment> segments, Tensor& encoded, cudaStream_t stream) {

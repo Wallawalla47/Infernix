@@ -387,9 +387,15 @@ private:
     void lossless_head(const Tensor& residuals, Tensor& logits);
     // The block's mixed input (into `into` when given, else the workspace).
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into = nullptr);
-    // The layer's token mixer (GDN or QSA attention) over its mixed input.
-    Tensor mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa);
-    Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
+    // The attention half's mix, and (--a8-activations, where it applies) its mixer input projection's 8-bit columns
+    // into x_a8 (empty otherwise).
+    Tensor mix_mixer_input(const BlockParameters& block, Tensor& residual, Tensor& inject, Tensor& x_a8);
+    [[nodiscard]] std::vector<ops::GgmlSegment> mixer_input_segments(const BlockParameters& block) const;
+    // The layer's token mixer (GDN or QSA attention) over its mixed input (and, when given, the 8-bit columns of
+    // its GGUF input projection, mix_mixer_input's).
+    Tensor mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa, const Tensor* xa_a8 = nullptr);
+    Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch,
+               const Tensor* x_a8 = nullptr);
     // INFERNIX_TMP_ACTIVATION_SCAN: scans a prefill call's projection input (no-op when off).
     void scan_input(const Tensor& x, std::uint32_t layer, ActivationScan::Site site);
     // One QSA block's attention through `layer` and `tails`. Index keys go to `key_records` when
@@ -408,7 +414,7 @@ private:
         const Tensor& table_rows;
         std::int32_t batch = 0, width = 0;
     };
-    Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call);
+    Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call, const Tensor* x_a8 = nullptr);
     // `route_columns` >= 0: a layer walk's grouped call, whose route log keeps its last that many
     // columns. With inject and residual, the output is injected into the residual streams (and not
     // returned).

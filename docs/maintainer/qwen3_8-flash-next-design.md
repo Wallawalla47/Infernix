@@ -11381,7 +11381,11 @@ way); the output is the sum times kappa, rounded once. The scale is FP32, not ll
 `ggml_linear_a8.cu`): calls of 1-31 columns (decode and verification); prefill widths take (4) below. The
 encoder takes four threads per slice (input permutation honoured); a GDN layer's gated norm instead writes its
 output projection's 8-bit columns itself (`gated_rmsnorm_ggml_a8_encoded`, the encoder's words, so the same
-bits; no encoding launch). 1-2-column row-layout calls
+bits; no encoding launch), and so does the attention half's hyper-connection mix for the mixer's input projection
+(`hyper_connection_mix_a8_encoded`, 2-16 columns on the fused v4 route): its up-collapse CTAs pair into clusters of
+two, the halves of a 32-element slice, which exchange their maxima and code sums through distributed shared memory
+(one CTA a slice, 32 features, gave 80 CTAs at H 2,560 and was slower than the launch it saved). 1-2-column
+row-layout calls
 and tiled Q6_K/IQ4_XS calls of 1-4 columns run a dp4a rows kernel (the exact route's lanes per row, each slice
 decoded once for every column, the lane's other weight blocks prefetched into L2 before its PDL wait; at the
 [2560, 6144] output projections the tiled mma had too few row tiles to fill the device), every other call the
