@@ -623,13 +623,16 @@ cmake --build build -j --target infernix_gdn_gating_proj_bench
 
 `infernix_dynamic_grouped_conv_prepare_bench` measures the complete BF16
 `rmsnorm_dynamic_grouped_conv_prepare` contract at every registered `B=1..8`. Each timed call
-includes RMSNorm, the `[1280,5120]` coefficient projection, the input-side two-tap grouped
-convolution, and both public output writes. Every sample follows a 256 MiB L2 eviction; the report
-contains complete-Op latency, useful coefficient-projection TFLOP/s, and exact workspace capacity.
+includes RMSNorm, the `[H/4,H]` coefficient projection, the input-side two-tap grouped
+convolution, and both public output writes. `--hidden` selects the drafter geometry: 5120
+(Qwen3.8-27B's, the default), 2560 (Qwen3.8-Flash-Next's, whose calls of at most 16 columns take the
+one-kernel route) or 3072. Every sample follows a 256 MiB L2 eviction; the report contains
+complete-Op latency, useful coefficient-projection TFLOP/s, and exact workspace capacity.
 
 ```bash
 cmake --build build -j --target infernix_dynamic_grouped_conv_prepare_bench
 ./build/bench/infernix_dynamic_grouped_conv_prepare_bench --warmup 10 --repeat 80
+./build/bench/infernix_dynamic_grouped_conv_prepare_bench --hidden 2560 --width 8 --batch 1
 ```
 
 ## Gated DeltaNet Op benchmark

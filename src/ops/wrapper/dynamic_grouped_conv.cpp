@@ -148,6 +148,9 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
     require_kernel_projection_weight(kernel_projection_weight, hidden);
     const std::size_t weight_bytes = static_cast<std::size_t>(coefficient_rows(hidden)) *
                                      static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
+    // A shape whose route takes no scratch has no live workspace, so the caller's arena may hold its tensors.
+    const bool scratch = detail::bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+                             hidden, width, width, batch_size, batch_size) != 0;
     require_disjoint(std::array<Range, 7>{{
                          {residual.data, residual.bytes(), "residual"},
                          {norm_weight.data, norm_weight.bytes(), "norm_weight"},
@@ -155,7 +158,7 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
                          {kernel_projection_weight.qdata, weight_bytes, "kernel_projection_weight"},
                          {prepared.data, prepared.bytes(), "prepared"},
                          {finish_delta.data, finish_delta.bytes(), "finish_delta"},
-                         {workspace.base(), workspace.capacity(), "workspace"},
+                         {workspace.base(), scratch ? workspace.capacity() : 0, "workspace"},
                      }},
                      kPrepareOp);
 

@@ -13,9 +13,9 @@ namespace infernix::ops {
 
 /**
  * Returns the transient capacity required by rmsnorm_dynamic_grouped_conv_prepare at hidden width
- * H (5120 or 2560) for every width/batch pair in the inclusive intervals. Width endpoints lie in
- * [2,16], batch endpoints in [1,8]. Capacity covers every shape-selected route in the requested
- * domain.
+ * H (5120, 2560 or 3072) for every width/batch pair in the inclusive intervals. Width endpoints lie
+ * in [2,16], batch endpoints in [1,8]. Capacity covers every shape-selected route in the requested
+ * domain. It is zero where every such route needs none (H 2560 with W x B <= 16: one kernel).
  */
 [[nodiscard]] std::size_t rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
     std::int32_t hidden, std::int32_t min_width, std::int32_t max_width,
@@ -60,7 +60,8 @@ namespace infernix::ops {
  *
  * Workspace:
  *   Caller-owned call-scoped storage sized by the capacity query above. The implementation does
- *   not allocate or retain device memory.
+ *   not allocate or retain device memory. A shape whose capacity is zero leaves the workspace
+ *   unused, so it may then hold the call's tensors.
  */
 void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& norm_weight,
                                           float eps, const Tensor& base_kernel,
