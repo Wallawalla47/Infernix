@@ -2,12 +2,8 @@
 
 import json
 import math
-import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "bench"))
-
-import abba  # noqa: E402
+from tools.bench import abba
 
 
 def test_wilcoxon_exact_matches_known_values():

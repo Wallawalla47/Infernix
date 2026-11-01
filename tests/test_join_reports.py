@@ -1,12 +1,11 @@
 """tools/bench/join_reports.py: report join, link-width guards and comparability notes (no GPU)."""
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "bench"))
-
-import join_reports  # noqa: E402
+from tools.bench import join_reports
 
 
 def report(width=8, *, generation=5, decode=100.0, stddev=0.5, prefill=None, load=13.5, h2d=28.9,
@@ -298,3 +297,23 @@ def test_explicit_runs_win_over_the_root_and_keep_their_labels(tmp_path, capsys)
     assert {r["mean"]: r["group"] for r in decoded} == {120.0: "x16again", 100.0: "narrow"}
     assert "20261028-103019Z-x16" not in markdown  # the root's other run was not joined
     capsys.readouterr()
+
+
+def test_both_invocation_routes_import_and_share_one_abba():
+    """The link rules come from `tools.bench.abba`, so both ways of starting the tool must reach the
+    same copy: `python tools/bench/join_reports.py` has no package, and `python -m
+    tools.bench.join_reports` has the package but not the directory on `sys.path`."""
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "tools" / "bench" / "join_reports.py"
+
+    for argv in ([sys.executable, "-m", "tools.bench.join_reports"], [sys.executable, str(script)]):
+        started = subprocess.run(argv + ["--help"], cwd=repo_root, capture_output=True, text=True)
+        assert started.returncode == 0, f"{argv[1]} failed: {started.stderr}"
+
+    shared = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, 'tools/bench');"
+         "import join_reports; import tools.bench.join_reports as packaged;"
+         "print(packaged.abba is join_reports.abba)"],
+        cwd=repo_root, capture_output=True, text=True)
+    assert shared.stdout.strip() == "True", f"two copies of abba: {shared.stderr}"
