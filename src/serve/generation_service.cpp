@@ -412,8 +412,12 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_ = std::make_unique<infernix::Engine>(
         make_engine_options(options_, std::move(startup_observer), std::move(diagnostic_observer)));
     if (!options_.request_log_jsonl.empty()) {
+        // The bytes, not the validated text: a window starts and ends on a token, so its first and
+        // last character are usually cut, and the tracker replaces those bytes itself.
         prefix_misses_ = std::make_unique<PrefixMissTracker>(
-            [engine = engine_.get()](std::span<const infernix::TokenId> ids) { return engine->detokenize(ids); });
+            [engine = engine_.get()](std::span<const infernix::TokenId> ids) {
+                return engine->detokenize_bytes(ids);
+            });
     }
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
@@ -701,9 +705,14 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.expert_cache                = result.expert_cache;
     outcome.ngram_archive               = result.ngram_archive;
     if (prefix_misses_ != nullptr && !prepared.prompt_ids.empty()) {
-        outcome.prefix_miss = prefix_misses_->settle(
-            outcome.engine_request_id, prepared.prompt_ids, outcome.generated_token_ids,
-            outcome.reused_prompt_tokens, outcome.computed_prefill_tokens);
+        // The optional diagnosis cannot fail this request any more than a cut window can: whatever
+        // it gives up on, the finished generation and its own context stay intact.
+        const auto settlement = settle_prefix_miss(
+            *prefix_misses_, outcome.engine_request_id, prepared.prompt_ids,
+            outcome.generated_token_ids, outcome.reused_prompt_tokens,
+            outcome.computed_prefill_tokens);
+        outcome.prefix_miss                     = std::move(settlement.miss);
+        outcome.prefix_miss_diagnostic_failed   = settlement.diagnostic_failed;
     }
 
     outcome.tool_calls      = std::move(result.tool_calls);
