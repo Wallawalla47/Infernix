@@ -96,10 +96,10 @@ int lanes_for(int slices) {
     return lanes;
 }
 
-// One output row per `Lanes` lanes, kRowsWarps warps a CTA, every column of a call of at most kRowsMaxColumns
-// in one pass (each slice decoded once). Tiled (ggml_tiles16_v1): a row's blocks are 16 apart, so slice s's
+// One output row per `Lanes` lanes, kRowsWarps warps a CTA, every column of a call of at most MaxC columns in
+// one pass (each slice decoded once). Tiled (ggml_tiles16_v1): a row's blocks are 16 apart, so slice s's
 // row pointer is offset by s / 8 * 15 blocks (ggml_linear.cu's tiled rows_kernel).
-template <QType F, bool OutF32, int Lanes, bool Tiled>
+template <QType F, bool OutF32, int Lanes, bool Tiled, int MaxC>
 __global__ void __launch_bounds__(kRowsThreads)
     rows_kernel(A8Group g, int slices, const std::int32_t* __restrict__ encoded, int stride, int columns) {
     constexpr int kRowsPerWarp        = 32 / Lanes;
@@ -122,20 +122,27 @@ __global__ void __launch_bounds__(kRowsThreads)
     };
     const int k = 32 * slices;
     // A programmatic dependent of the encoder: the lane's first slice is read from the immutable weights while
-    // the encoder still runs.
+    // the encoder still runs, and its other slices' blocks are prefetched into L2.
     fast::Slice first{};
-    if (active && part < slices) { first = fast::slice<F>(row_of(part), part); }
+    if (active && part < slices) {
+        first = fast::slice<F>(row_of(part), part);
+        for (int s = part + Lanes; s < slices; s += Lanes) {
+            const std::uint8_t* block = row_of(s) + static_cast<std::size_t>(s / static_cast<int>(ggml_block_elems(F) / 32)) * kBlockBytes;
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(block));
+            if constexpr (kBlockBytes > 128) { asm volatile("prefetch.global.L2 [%0];" ::"l"(block + 128)); }
+        }
+    }
     pdl::wait_for_dependencies();
-    float acc[kRowsMaxColumns];
+    float acc[MaxC];
 #pragma unroll
-    for (int c = 0; c < kRowsMaxColumns; ++c) { acc[c] = 0.0F; }
+    for (int c = 0; c < MaxC; ++c) { acc[c] = 0.0F; }
     if (active) {
         for (int s = part; s < slices; s += Lanes) {
             const fast::Slice ws = s == part ? first : fast::slice<F>(row_of(s), s);
             const float wd       = weight_scale(ws.d);
             [[maybe_unused]] const float wmin = fast::kMin<F> ? weight_scale(ws.dmin) : 0.0F;
 #pragma unroll
-            for (int c = 0; c < kRowsMaxColumns; ++c) {
+            for (int c = 0; c < MaxC; ++c) {
                 if (c < columns) { // uniform across the warp
                     const std::int32_t* column = encoded + static_cast<std::size_t>(c) * stride;
                     const int4* codes          = reinterpret_cast<const int4*>(column + s * a8::kSliceWords);
@@ -150,7 +157,7 @@ __global__ void __launch_bounds__(kRowsThreads)
     }
     const int kappa = ggml::kappa_log2(F);
 #pragma unroll
-    for (int c = 0; c < kRowsMaxColumns; ++c) {
+    for (int c = 0; c < MaxC; ++c) {
         if (c < columns) {
 #pragma unroll
             for (int offset = Lanes / 2; offset >= 1; offset >>= 1) {
@@ -169,8 +176,8 @@ __global__ void __launch_bounds__(kRowsThreads)
     }
 }
 
-template <QType F, bool OutF32, bool Tiled>
-void launch_rows(A8Group g, const Columns& in, cudaStream_t stream) {
+template <QType F, bool OutF32, bool Tiled, int MaxC>
+void launch_rows_columns(A8Group g, const Columns& in, cudaStream_t stream) {
     const int slices  = in.k / 32;
     const int lanes   = lanes_for(slices);
     const int per_cta = kRowsWarps * (32 / lanes);
@@ -179,8 +186,8 @@ void launch_rows(A8Group g, const Columns& in, cudaStream_t stream) {
     const dim3 grid(g.first[g.count]);
 #define INFERNIX_GGML_A8_LANES(LN)                                                                                     \
     case LN:                                                                                                           \
-        CUDA_CHECK(pdl::launch_consumer({grid, dim3(kRowsThreads), 0, stream}, rows_kernel<F, OutF32, LN, Tiled>, g,   \
-                                        slices, in.encoded, in.stride, in.columns));                                   \
+        CUDA_CHECK(pdl::launch_consumer({grid, dim3(kRowsThreads), 0, stream}, rows_kernel<F, OutF32, LN, Tiled, MaxC>,\
+                                        g, slices, in.encoded, in.stride, in.columns));                                \
         break;
     switch (lanes) {
         INFERNIX_GGML_A8_LANES(4)
@@ -194,14 +201,32 @@ void launch_rows(A8Group g, const Columns& in, cudaStream_t stream) {
     check_launch("rows");
 }
 
-// A group of one format and layout: the rows kernel where the exact route takes its own (Rows at 1-2
-// columns; Tiles16 Q6_K and IQ4_XS at one column, ggml_linear.cu's tiled_rows_route), else the mma route.
+// The rows kernel with a column capacity of 2, 4 or 8 (the call's columns rounded up).
+template <QType F, bool OutF32, bool Tiled>
+void launch_rows(A8Group g, const Columns& in, cudaStream_t stream) {
+    if (in.columns <= kRowsMaxColumns) {
+        launch_rows_columns<F, OutF32, Tiled, kRowsMaxColumns>(g, in, stream);
+    } else if (in.columns <= 4) {
+        launch_rows_columns<F, OutF32, Tiled, 4>(g, in, stream);
+    } else if (in.columns <= kTiledRowsMaxColumns) {
+        launch_rows_columns<F, OutF32, Tiled, kTiledRowsMaxColumns>(g, in, stream);
+    } else {
+        throw std::logic_error("ggml_linear (a8): the rows kernel takes at most kTiledRowsMaxColumns columns");
+    }
+}
+
+// A group of one format and layout: the rows kernel at Rows calls of 1-2 columns (where the exact route takes
+// its own) and Tiles16 Q6_K and IQ4_XS calls of 1-kTiledRowsMaxColumns, else the mma route. At the IQ3_S
+// import's [2560, 6144] output projections the tiled mma has too few row tiles to fill the device (RTX 5090, cold:
+// Q6_K 23.2 -> 14.9-17.0 us at 2-4 columns on the rows kernel, IQ4_XS 17.0 -> 10.9-15.5); at 5-8 columns the rows
+// kernel measured faster alone (Q6_K 25.2 -> 23.1 at 8) but slower in decode (IQ3_S struct verification +1.7 % a
+// step, the mma's pre-wait units hiding its weights behind the encoder), so it stops at four.
 template <bool OutF32>
 void launch_group(QType format, GgmlLayout layout, const A8Group& g, const Columns& in, cudaStream_t stream) {
     if (layout == GgmlLayout::Tiles16) {
-        if (in.columns == 1 && format == QType::GGML_Q6_K) {
+        if (in.columns <= kTiledRowsMaxColumns && format == QType::GGML_Q6_K) {
             launch_rows<QType::GGML_Q6_K, OutF32, true>(g, in, stream);
-        } else if (in.columns == 1 && format == QType::GGML_IQ4_XS) {
+        } else if (in.columns <= kTiledRowsMaxColumns && format == QType::GGML_IQ4_XS) {
             launch_rows<QType::GGML_IQ4_XS, OutF32, true>(g, in, stream);
         } else {
             launch_mma_tiled(format, g, in, OutF32, stream);
@@ -236,6 +261,14 @@ void add_segment(A8Group& g, const GgmlSegment& s, std::span<Tensor* const> outs
     ++g.count;
 }
 
+bool sums_of(std::span<const GgmlSegment> segments) {
+    return std::any_of(segments.begin(), segments.end(),
+                       [](const GgmlSegment& s) { return s.format == QType::GGML_Q4_K || s.format == QType::GGML_Q5_K; });
+}
+
+// Every segment's rows over the call's encoded columns.
+void run(const Columns& in, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs, cudaStream_t stream);
+
 } // namespace
 } // namespace a8_linear
 
@@ -244,15 +277,16 @@ std::size_t a8_linear_workspace_bytes(std::int32_t k, std::int32_t columns, bool
     return (bytes + 255) / 256 * 256;
 }
 
+bool a8_linear_sums(std::span<const GgmlSegment> segments) { return a8_linear::sums_of(segments); }
+
+std::int32_t a8_linear_column_words(std::int32_t k, bool sums) { return a8_linear::column_stride(k, sums); }
+
 void ggml_linear_a8(const Tensor& x, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs,
                     const std::int32_t* input_perm, std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream) {
     using namespace a8_linear;
     const int k = x.ne[0], columns = x.ne[1];
     require(columns >= 1 && columns <= kA8MaxColumns, "the 8-bit route takes calls of 1-31 columns");
-    const DType dtype = outs.front()->dtype;
-    const bool sums   = std::any_of(segments.begin(), segments.end(), [](const GgmlSegment& s) {
-        return s.format == QType::GGML_Q4_K || s.format == QType::GGML_Q5_K;
-    });
+    const bool sums  = sums_of(segments);
     const int stride = column_stride(k, sums);
     Tensor encoded   = workspace.alloc(DType::I32, {stride, columns});
     // The encoder's 16-byte loads wherever the columns allow them.
@@ -262,7 +296,37 @@ void ggml_linear_a8(const Tensor& x, std::span<const GgmlSegment> segments, std:
                                     encode_kernel, static_cast<const std::uint16_t*>(x.data), k, input_perm, perm_block,
                                     static_cast<std::int32_t*>(encoded.data), stride, columns, sums ? 1 : 0, vec));
     check_launch("encode");
-    const Columns in{.encoded = static_cast<const std::int32_t*>(encoded.data), .stride = stride, .k = k, .columns = columns};
+    run({.encoded = static_cast<const std::int32_t*>(encoded.data), .stride = stride, .k = k, .columns = columns}, segments,
+        outs, stream);
+}
+
+void ggml_linear_a8_encoded(const Tensor& encoded, std::int32_t k, std::span<const GgmlSegment> segments,
+                            std::span<Tensor* const> outs, cudaStream_t stream) {
+    using namespace a8_linear;
+    const int columns = encoded.ne[1];
+    require(columns >= 1 && columns <= kA8MaxColumns, "the 8-bit route takes calls of 1-31 columns");
+    require(encoded.dtype == DType::I32 && encoded.is_contiguous() && encoded.ne[0] == column_stride(k, sums_of(segments)),
+            "8-bit encoded columns must be contiguous I32 [a8_linear_column_words(k, sums), T]");
+    require(!segments.empty() && !outs.empty() && k > 0 && k % 32 == 0, "a projection of K a multiple of 32");
+    for (const GgmlSegment& s : segments) {
+        require(s.output >= 0 && static_cast<std::size_t>(s.output) < outs.size() && s.data != nullptr && s.rows > 0,
+                "a segment's output index, weights and rows");
+        const Tensor& out = *outs[static_cast<std::size_t>(s.output)];
+        require((out.dtype == DType::BF16 || out.dtype == DType::FP32) && out.is_contiguous() && out.ne[1] == columns &&
+                    s.out_offset >= 0 && s.out_offset + s.rows <= out.ne[0],
+                "an output must be contiguous BF16 or FP32 [N, T] holding its segments' rows");
+    }
+    run({.encoded = static_cast<const std::int32_t*>(encoded.data), .stride = static_cast<int>(encoded.ne[0]), .k = k,
+         .columns = columns},
+        segments, outs, stream);
+}
+
+namespace a8_linear {
+namespace {
+
+void run(const Columns& in, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs, cudaStream_t stream) {
+    const int k = in.k, columns = in.columns;
+    const DType dtype = outs.front()->dtype;
     // A call of exactly two mixed-capable formats in one layout (BF16 outputs, at most A8Group::kMax segments)
     // runs in one launch.
     const GgmlLayout layout0 = segments.front().layout;
@@ -305,5 +369,8 @@ void ggml_linear_a8(const Tensor& x, std::span<const GgmlSegment> segments, std:
         }
     }
 }
+
+} // namespace
+} // namespace a8_linear
 
 } // namespace infernix::ops

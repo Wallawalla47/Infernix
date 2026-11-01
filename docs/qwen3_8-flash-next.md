@@ -885,8 +885,17 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
   - Recipes A and B (Dense8): NVIDIA's W4A4 experts load as 16-bit banks (as with `--a16-activations`)
     and take the 8-bit route in place of their 4-bit one, and the engine warns at launch that the
     default follows NVIDIA's specification.
-  - Every other call keeps its route: the Q8, FP8 and BF16 dense projections and heads in decode (their
-    8-bit routes were slower than the exact ones and were removed), the MTP drafter's experts, FP4-Local's
+  - On a GGUF import (IQ3_S) it also changes weights at load and scheduling (2026-11-01): the BF16
+    hyper-connection matrices become 8-bit (`q8_g32_fp16`), the hyper-connection mix and the GDN gated norm write
+    the next projection's 8-bit codes themselves, the CPU team takes 24 workers, the side streams yield to the
+    resident expert pass, and the shared expert runs beside the router. No weight goes below 8 bits. Measured
+    2026-11-01 (RTX 5090, IQ3_S, DFlash2 auto, INT8 KV, one request, 8,448 context; Basalt's own bench prompts as
+    token ids: `conv`, 1,200 tokens at temperature 0.6, and `struct`, greedy to EOS; against the 2026-10-31 build
+    in the same block): `conv` 11.37 → 10.08 ms a round, 236.7 → 263.7 tok/s; `struct` 15.33 → 14.05 ms,
+    507.3 → 557.7 tok/s. Basalt measured 7.9-9.0 and 12.0 ms a window on the same prompts (288-334 and 618-622
+    tok/s), so it is still faster. The default route's output and speed are unchanged.
+  - Every other call keeps its route: the Q8, FP8 and BF16 dense projections (a GGUF import's as above) and heads
+    in decode (their 8-bit routes were slower than the exact ones and were removed), the MTP drafter's experts, FP4-Local's
     experts under `--expert-a4-activations`, and block-FP8 experts (with expert-a4-residual-decode on, the
     W4A16 experts keep its two A4 terms in decode and their exact or A4 wide routes in prefill).
   - The output changes; `--reproducible` and `--lossless` refuse it, as does an artifact with none of

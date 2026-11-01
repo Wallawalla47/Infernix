@@ -3839,6 +3839,64 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
   tail commits, the drafter's catch-up), so the policy overlaps that work. A discarded round skips
   it. Greedy ids are unchanged. tg512: plain 88.70 → **89.96**, MTP max 4 133.54 → **138.70**.
   Cold CLI: code 65.5 plain / 83.7 MTP, story 64.4 / 66.5.
+- **DFlash2: the cache update behind the next proposal (adopted 2026-11-01).**
+  - **Problem.** On a DFlash2 round (MTP off) the update (~234 µs of host time on IQ3_S with
+    `--a8-activations`) is longer than the commit graph it overlaps (180 µs), so the GPU idled
+    ~60 µs before the next round's 620 µs proposal was launched (graph-level nsys, 292 rounds).
+  - **Change.** Such a commit leaves the update pending (`DeferredRound::to_proposal`); the next
+    round's proposal settles it in its `while_drafting` window, after the proposal is enqueued.
+    Every other path settles it first: each forward's launch before `before_round`, the
+    registration of the next update, a commit that releases a row, and the Program's other entry
+    points (`maintain`, binding, context, reclaim and prefetch, pause, replay, prefill, forced
+    tokens, prefix-cache attach and save, scoring; `finish`, `abort` and shutdown drop it if it
+    throws). The update reads the round's routes, live columns, width and lanes, which nothing
+    rewrites before it runs. Expert placement is bitwise invariant, so no output depends on it.
+  - **Checks** (IQ3_S, DFlash2 `auto`, `--lm-head-draft`, against the old placement in the same
+    build). `--reproducible` CLI: greedy (299 tokens) and seed-7 T 0.6 (277) ids and text equal,
+    and equal with `--vram-headroom-mib 3072` (11,136 against 12,576 frames). Default route greedy
+    and sampled: equal. Real tests pass: startup capture and resume against cold (DFlash2), expert
+    fault, VRAM pressure (ids under resizes equal), speculative sampling (every DFlash2 section).
+    `infernix-perplexity --reference` scored one text cold and after another text: all four
+    windows' total NLL equal bit for bit (the reference route never speculates; it only meets the
+    settle-first guards).
+  - **Speed** (`infernix_bench`, warm state, three interleaved reps, wall time after the prefill;
+    old → new): struct (greedy, ~7.5 tokens a round) 15.062 → **14.884 s** (+1.2 %) and with
+    `--a8-activations` 13.480 → **13.304 s** (+1.3 %), separated ranges; conv (T 0.6, ~3 tokens a
+    round) 4.855 → 4.840 s (+0.3 %, overlapping) and with `--a8-activations` 4.628 → 4.627 (flat).
+    The bench's `decode_output_tok_s` and the serve's per-request decode rate then counted the
+    Program's `decode()` calls but not `commit()`, so moving the update from commit into the next
+    decode lowered them (conv 254.2 → 249.4) while wall time improved. Both count the commits
+    since (`docs/performance/methodology.md`).
+- **DFlash2: the commit enqueued behind a host gate (adopted 2026-11-01).**
+  - **Problem.** With temporary NVTX ranges at every host step of a round (IQ3_S,
+    `--a8-activations`, conv, graph-level nsys), the GPU idled ~124 µs between the verification's
+    results and the commit graph: the host's sync, then three launches onto the drained stream
+    (the token-count increment 49 µs, the count upload 14 µs, the graph 25 µs). A first launch on
+    an idle stream costs ~50-60 µs of host time on WDDM, whichever kernel it is (greedy rounds
+    have no increment: their count upload then took 62 µs), against 7-10 µs for a kernel launched
+    while the GPU is busy.
+  - **Change.** A graphed commit reads its counts behind a host gate, as its graph's first node
+    (`upload_pinned_when` on the Program's commit word; the verification stages the word with its
+    inputs). A DFlash2 round without MTP whose commit graph is instantiated launches that graph
+    right after its results, while the verification still runs, and the host waits for the
+    results on an event instead of the stream; `commit()` writes the counts and publishes the
+    word before it records the rows. Every other graphed commit publishes it before its launch.
+    Sampled rounds count their licensed tokens on the device before the results' copy (Op
+    `increment_licensed_token_counts`), so no launch is left between the sync and the commit.
+    Every other Program entry point, `discard` and the failure paths release a held gate with
+    zero counts, which the fold, QSA tails, PLE commit and drafter context treat as a strict
+    no-op per row. A timed-out gate fails the round (`kErrorCommitGateTimeout`). Same bits.
+  - **Rejected.** The gate as a kernel launched before the graph: under CUPTI graph tracing a
+    graph launch waits for the stream's earlier work, so nsys hung 120 s on the first held round;
+    inside the graph it profiles normally. The verification's two input uploads as graph nodes:
+    its 330 µs graph launch then started the GPU later (idle 72 → 222 µs a round, round +46 µs).
+  - **Trace.** GPU idle 188 → 72 µs a round; round 10,170 → 10,098 µs (one traced run each).
+    The commit graph's span grew 180 → 206 µs, as it now waits at its gate inside the graph.
+  - **Speed** (`infernix_bench`, 3c235c7f against the new build, three interleaved reps, wall
+    time after the prefill): conv 4.874 → **4.853 s** (+0.44 %, ranges touching) and with
+    `--a8-activations` 4.650 → **4.625 s** (+0.53 %); struct 14.882 → **14.843 s** (+0.27 %) and
+    with `--a8-activations` 13.310 → **13.256 s** (+0.41 %), separated ranges. About 40-50 µs a
+    round, less than the trace's 72.
 - **Few-row Q8 route for the hyper-connection down projections (adopted).**
   - **Problem.** The MTP-round profile showed the [324, 10240] and [320, 10240] projections
     (96 calls per token) on 41 eight-row CTAs at ~0.4 TB/s: 9.5 µs per call, ~0.9 ms per round,
@@ -6124,8 +6182,8 @@ reads the environment once, at construction:
 - **Per-request line** (`S0 req=...`, printed at finish). It gives the arm, the MTP and plain round
   counts, the n-gram rows and reads per round, and a **wall-clock decode rate**: decode tokens over
   the time from the first `decode()` entry to the last commit return. `infernix_bench`'s decode rate
-  divides by the time inside `decode()` only, so it omits commit and scheduler time, where the
-  commit-site flush acts.
+  then divided by the time inside `decode()` only, so it omitted commit and scheduler time, where the
+  commit-site flush acts (since 2026-11-01 it counts commit too; scheduler time stays out).
 - **Phases.** With `INFERNIX_TMP_PHASES=1`, the line adds the mean µs and count of every consecutive
   host-point and GPU-event pair.
   - Host points: decode entry, drafts enqueued, draft sync return, verify staged, verify launched,
@@ -7181,7 +7239,7 @@ Unchanged by Strata:
 | BF16X2 activations, finite q8_1 scales | Not our numerics (BF16 activations; saturating A4 encoders) |
 | Draft vocabulary per language | 131K proposal rows: 99.09 % held-out coverage, worst domain 97.53 %; full-head fallback |
 | Window routing, batched PLE, one-graph draft chain, GDN commit split, sub-warp packing | Have |
-| GPU-side commit/draft overlap | ~0 until the next draft is enqueued before `settle_round` |
+| GPU-side commit/draft overlap | On DFlash2 the next proposal is now enqueued before the cache update settles and the commit before the Engine's decision, behind a host gate (§19.2: +1.2-1.3 % and +0.3-0.5 % on long accepted runs); the drafter's catch-up and pre-draft on a second stream beside the commit kernels measured within chance (removed 2026-10-28) |
 | Dropping the drafter catch-up on stale K/V | ≤ ~1 % of a B ≥ 2 round; relaxing MR5/MR6 breaks E1 for sampled requests |
 | 256-repeat stop, `/metrics` | No loop observed; `max_tokens` defaults to 8192; it truncates legitimate output and changes an external contract. The request log covers metrics |
 | Q8 vision weights, lower vision token cap | Below upstream precision; we have `--vision-max-merged` |
@@ -11379,9 +11437,17 @@ way); the output is the sum times kappa, rounded once. The scale is FP32, not ll
 
 **Routes.** (1) Dense projections (`LinearRoutes::GgmlA8`, widened to 16 bits; `ops::ggml_linear` →
 `ggml_linear_a8.cu`): calls of 1-31 columns (decode and verification); prefill widths take (4) below. The
-encoder takes four threads per slice (input permutation honoured); 1-2-column row-layout calls
-and 1-column tiled Q6_K/IQ4_XS calls run a dp4a rows kernel (the exact route's lanes per row, each slice
-decoded once for both columns), every other call the tensor-core form of the exact tiled kernels with one
+encoder takes four threads per slice (input permutation honoured); a GDN layer's gated norm instead writes its
+output projection's 8-bit columns itself (`gated_rmsnorm_ggml_a8_encoded`, the encoder's words, so the same
+bits; no encoding launch), and so does the attention half's hyper-connection mix for the mixer's input projection
+(`hyper_connection_mix_a8_encoded`, 2-16 columns on the fused v4 route): its up-collapse CTAs pair into clusters of
+two, the halves of a 32-element slice, which exchange their maxima and code sums through distributed shared memory
+(one CTA a slice, 32 features, gave 80 CTAs at H 2,560 and was slower than the launch it saved). 1-2-column
+row-layout calls
+and tiled Q6_K/IQ4_XS calls of 1-4 columns run a dp4a rows kernel (the exact route's lanes per row, each slice
+decoded once for every column, the lane's other weight blocks prefetched into L2 before its PDL wait; at the
+[2560, 6144] output projections the tiled mma had too few row tiles to fill the device), every other call the
+tensor-core form of the exact tiled kernels with one
 int8 plane: one m16n8k32 s8 MMA per slice (two masked ones for 16-element sub-scales), FP32 accumulators,
 NT = 1, 2 or 4 column tiles of eight so a call of up to 31 columns reads and decodes its weights once, the
 exact route's CTA shapes and one-wave occupancy rule, mixed two-format launches. A call's bits are
@@ -11390,11 +11456,41 @@ width (the split and NT set the order). (2) Routed experts
 (`MoeGgmlBank::a8`, `cuda/ggml_expert_a8.cuh`): a call of at most 128 columns runs every job on the 8-bit
 kernels (passes of eight columns), so no wide tile reads the x limbs the route's codes replace; wider calls
 take (7) below. Gate/up: four intermediates per CTA, 16 lanes per row taking slices s ≡ lane
-(mod 16); down: four lanes per row; both add their lanes' partials by a butterfly. (3) CPU-served misses:
+(mod 16); down: four lanes per row; both add their lanes' partials by a butterfly. Each CTA first copies its weight
+rows into shared memory with cp.async (the down CTA before its PDL wait), so all of a CTA's bytes are in flight at
+once instead of one slice's a lane (the decode of a few columns was memory-latency bound). (3) CPU-served misses:
 the miss request carries the call's choice (`MissRequest::a8`) and the CPU route's 8-bit functions follow
 the GPU kernels' order (slice s to partial s mod P, P = 16 for gate/up and 4 for down rows, ascending, then
 the butterfly), so a CPU-served miss returns the GPU's bits and placement changes no output. The startup CPU
-rates are measured on the 8-bit route when it is on.
+rates are measured on the 8-bit route when it is on. Scheduling under the GGUF 8-bit expert route (2026-11-01,
+IQ3_S, DFlash2 auto, the route's resident pass the critical leg of most layers): the CPU team takes 24 workers
+(16 otherwise); the staging, shared-expert and split streams take the device's least stream priority (the greatest
+otherwise, 2026-10-29), so the resident pass keeps its SMs; and the shared expert is queued on its stream right
+after the routed experts' early encoding, beside the router and the plan, a nearly idle device, instead of after
+the plan beside the resident pass. A GGUF import's BF16 hyper-connection matrices are repacked to Q8_G32_FP16 at
+load (`ops::hyper_connection_repack_q8`), so every mix reads half the bytes.
+
+**Toward Basalt's speed (2026-11-01, IQ3_S, DFlash2 auto, Basalt's conv and struct prompts; every arm A/B'd
+interleaved, 2 reps).** Adopted, in order: the hyper-connection Q8 repack with a 24-worker CPU team (9de63059), the
+expert rows in shared memory (390806df), the rows kernel for narrow tiled calls with L2 prefetch and the gated-norm
+producer (3867c564), side streams at the least priority with the shared expert early (ba651d71) and the mix's 8-bit
+producer (e2625acc): conv 11.37 → 10.08 ms a round, struct 15.33 → 14.05 (Basalt 7.9-9.0 and 12.0 ms a window).
+Withdrawn by the owner: requantizing the BF16 GDN control and QSA indexer projections to Q6_K at load so they run
+inside the input projection's 8-bit launch (struct -2.0 %, conv -0.4 % a round; 90f233a2, reverted): the flag may
+take weights to 8 bits, not below. An 8-bit copy would need a GGUF Q8_0 path in the 8-bit kernels and their mixed
+pairs. Rejected, with their reasons, so they are not retried as they were: every miss
+on the CPU (conv +4.5 %, struct +2.1 %); each dense CTA encoding its columns (+1.0 / +4.6 %: occupancy and repeated
+encodes); a lane's expert slices decoded up front (+2.5 / +4.4 %: registers); smaller CPU work items (flat); a
+side-stream L2 prefetch of the output projections (+1.0 / +0.8 %: the fork and join cost more than the DRAM trip they
+hide); persistent and bounds variants of the expert gate/up kernel (flat: it reads at ~78 % of the practical DRAM
+rate alone); MTP drafting instead of DFlash2 (-12 % tok/s); a router that launches the plan at once (struct +1.9 %);
+the mix's 8-bit producer at 32 features a CTA (+0.4 / +0.3 %: 80 CTAs); that producer's dependents launched after its
+weight loop (struct +0.5 %); the tiled mma instead of the rows kernel for large calls (no faster at any size); and
+Basalt's two-stage head for the Q6_K head (a 2-bit screen fitted at load, sampled rows included: conv 1.4 % faster a
+round but 3.3 % fewer tok/s from lower acceptance, struct 0.6 % slower although the head itself fell from ~317 to
+147 us under nsys, the cause unresolved). The remaining gap is spread over the per-layer chain
+(the router and plan launches, the GDN and QSA middles, the hyper-connection mixes) and the round tail (the
+DFlash2 drafter, the recurrent fold, the head).
 
 **Expected gain** (from the traces, not measured). Per launch the exact kernels already match Basalt's (gate/up
 31 against 33 µs, dense tiles 18-20 against 20 µs) and the resident expert pass reads near the DRAM bound, so

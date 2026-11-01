@@ -35,8 +35,9 @@ inline constexpr std::int32_t kMtpChunkColumns = 512;
 // Faults the Forward's own kernels report in the experts' error word (ForwardExperts::error) instead
 // of trapping (core DeviceFault), as layer << 16 | code like the MoE's: codes above the MoE's
 // (ops/offloaded_sparse_moe/cpu/fetch_request.h) and every errno.
-inline constexpr std::uint32_t kErrorRowGateTimeout = 0xFF10; // the n-gram rows were not published within kPinnedGateTimeoutNs
-inline constexpr std::uint32_t kErrorTokenId        = 0xFF11; // an id outside the vocabulary reached the token embedding
+inline constexpr std::uint32_t kErrorRowGateTimeout    = 0xFF10; // the n-gram rows were not published within kPinnedGateTimeoutNs
+inline constexpr std::uint32_t kErrorTokenId           = 0xFF11; // an id outside the vocabulary reached the token embedding
+inline constexpr std::uint32_t kErrorCommitGateTimeout = 0xFF12; // a gated commit was not released within kPinnedGateTimeoutNs
 
 // Program-owned recurrent state of every slot.
 struct ForwardState {
@@ -96,6 +97,10 @@ struct ForwardExperts {
     // input, joined before the combine) while the routed experts compute. Null: in order.
     cudaStream_t shared_stream = nullptr;
     std::array<cudaEvent_t, 4> shared_events{};
+    // With the routed experts' early encoding fork (an 8-bit GGUF bank), the shared expert follows the encoding on
+    // shared_stream at once, beside the router and the route's plan, instead of after the plan beside the routed
+    // experts (ProgramOptions::shared_expert_early).
+    bool shared_early = false;
     // Decode and verification calls compute their staged misses on this stream while the overlap stream
     // stages their down rows (ops::MoeExpertSource::split_stream). Null: not split.
     cudaStream_t split_stream = nullptr;
@@ -383,9 +388,15 @@ private:
     void lossless_head(const Tensor& residuals, Tensor& logits);
     // The block's mixed input (into `into` when given, else the workspace).
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into = nullptr);
-    // The layer's token mixer (GDN or QSA attention) over its mixed input.
-    Tensor mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa);
-    Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
+    // The attention half's mix, and (--a8-activations, where it applies) its mixer input projection's 8-bit columns
+    // into x_a8 (empty otherwise).
+    Tensor mix_mixer_input(const BlockParameters& block, Tensor& residual, Tensor& inject, Tensor& x_a8);
+    [[nodiscard]] std::vector<ops::GgmlSegment> mixer_input_segments(const BlockParameters& block) const;
+    // The layer's token mixer (GDN or QSA attention) over its mixed input (and, when given, the 8-bit columns of
+    // its GGUF input projection, mix_mixer_input's).
+    Tensor mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa, const Tensor* xa_a8 = nullptr);
+    Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch,
+               const Tensor* x_a8 = nullptr);
     // INFERNIX_TMP_ACTIVATION_SCAN: scans a prefill call's projection input (no-op when off).
     void scan_input(const Tensor& x, std::uint32_t layer, ActivationScan::Site site);
     // One QSA block's attention through `layer` and `tails`. Index keys go to `key_records` when
@@ -404,7 +415,7 @@ private:
         const Tensor& table_rows;
         std::int32_t batch = 0, width = 0;
     };
-    Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call);
+    Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call, const Tensor* x_a8 = nullptr);
     // `route_columns` >= 0: a layer walk's grouped call, whose route log keeps its last that many
     // columns. With inject and residual, the output is injected into the residual streams (and not
     // returned).

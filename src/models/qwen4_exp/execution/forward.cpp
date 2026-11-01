@@ -313,8 +313,9 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
         auto scope = work_.scope();
         if (block.ple) { ple(*block.ple, residual, batch); }
         Tensor inject = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
-        Tensor xa     = mix(block.attn_hc, residual, &inject);
-        Tensor y      = mixer(layer, batch, xa);
+        Tensor xa_a8;
+        Tensor xa     = mix_mixer_input(block, residual, inject, xa_a8);
+        Tensor y      = mixer(layer, batch, xa, xa_a8.data != nullptr ? &xa_a8 : nullptr);
         // The attention half's inject, then the MLP half's mix. One fused Op folding the inject into the
         // mixer's reads (candidates §7.3 D6) measured flat (removed 2026-10-28).
         ops::hyper_connection_inject(y, inject, residual, s);
@@ -365,13 +366,59 @@ void Forward::capture_draft_features(std::uint32_t layer, const Tensor& residual
     ops::hyper_connection_stream_mean(residual, dim(config_.hc.streams), out, device_.stream);
 }
 
-Tensor Forward::mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa) {
+// The GGUF input projection call of a layer's mixer (gdn() and attention() make the same one): its segments, or none
+// when the mixer projects otherwise (another format, an input permutation).
+std::vector<ops::GgmlSegment> Forward::mixer_input_segments(const BlockParameters& block) const {
+    std::vector<ops::GgmlSegment> segments;
+    if (const auto* g = std::get_if<GdnParameters>(&block.mixer)) {
+        if (!g->projection.is_ggml() || g->projection.input_perm != nullptr) { return segments; }
+        segments = g->projection.ggml;
+        if (g->control.is_ggml() && g->control.input_perm == nullptr) {
+            segments.insert(segments.end(), g->control.ggml.begin(), g->control.ggml.end());
+        }
+        return segments;
+    }
+    const auto& a = std::get<AttentionParameters>(block.mixer);
+    if (!a.projection.is_ggml() || a.projection.input_perm != nullptr ||
+        (a.index_projection && (!a.index_projection->is_ggml() || a.index_projection->input_perm != nullptr))) {
+        return segments;
+    }
+    segments = a.projection.ggml;
+    if (a.index_projection) { segments.insert(segments.end(), a.index_projection->ggml.begin(), a.index_projection->ggml.end()); }
+    return segments;
+}
+
+// The attention half's mix. Under --a8-activations, where the mixer's GGUF input projection runs on the 8-bit route and
+// the fused mix serves the call, the mix also writes the projection's 8-bit columns into x_a8 (the same words the
+// projection would encode, so the same bits; no encoding launch); x_a8 stays empty otherwise.
+Tensor Forward::mix_mixer_input(const BlockParameters& block, Tensor& residual, Tensor& inject, Tensor& x_a8) {
+    const auto& p        = block.attn_hc;
+    const std::int32_t T = residual.ne[1], H = dim(config_.hidden_size);
+    if (scan_ == nullptr && !eager_chunk_) {
+        const std::vector<ops::GgmlSegment> segments = mixer_input_segments(block);
+        if (!segments.empty() && ops::ggml_a8_takes_encoded(segments, H, T, dense_routes(), nullptr, 0)) {
+            Tensor x     = work_.alloc(DType::BF16, {H, T});
+            Tensor words = work_.alloc(DType::I32, {ops::ggml_a8_encoded_column_words(segments, H), T});
+            if (ops::hyper_connection_mix_a8_encoded(residual, p.norm, p.down.weight, p.up.weight, dim(config_.hc.streams),
+                                                     dim(config_.hc.rank), config_.rms_norm_eps, x,
+                                                     p.combine ? &inject : nullptr, words, ops::ggml_a8_sums(segments),
+                                                     work_, device_.stream)) {
+                x_a8 = words;
+                return x;
+            }
+            return mix(p, residual, &inject, &x);
+        }
+    }
+    return mix(p, residual, &inject);
+}
+
+Tensor Forward::mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa, const Tensor* xa_a8) {
     const auto& block           = parameters_.layers[layer];
     const std::int32_t T        = batch.ids.ne[0];
     const std::uint32_t compact = config_.compact_layer_indices[layer];
     scan_layer_                 = layer;
     if (config_.layer_types[layer] == MixerKind::Gdn) {
-        return gdn(std::get<GdnParameters>(block.mixer), xa, compact, batch);
+        return gdn(std::get<GdnParameters>(block.mixer), xa, compact, batch, xa_a8);
     }
     // A verification call records the raw index keys for the tail commit.
     const AttentionCall call{.layer       = kv_.layers.at(compact),
@@ -388,7 +435,7 @@ Tensor Forward::mixer(std::uint32_t layer, const ForwardBatch& batch, const Tens
                              .table_rows       = batch.table_rows,
                              .batch            = batch.batch,
                              .width            = batch.width};
-    return attention(std::get<AttentionParameters>(block.mixer), xa, call);
+    return attention(std::get<AttentionParameters>(block.mixer), xa, call, xa_a8);
 }
 
 void Forward::layer_mixer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, Tensor& xm, Tensor& inject) {
@@ -596,7 +643,8 @@ void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& 
                          batch.slots, batch.verify != nullptr ? Tensor{} : batch.slots, residual, s);
 }
 
-Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch) {
+Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch,
+                    const Tensor* x_a8) {
     const cudaStream_t s = device_.stream;
     const auto& g        = config_.gdn;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size);
@@ -638,13 +686,21 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         }
         const std::int32_t bounds[] = {0, C, C + VW, C + VW + 2 * NV};
         Tensor* parts[]             = {&qkv, &z, &ab};
-        project_ggml_split(x, segments, bounds, parts, work_, s, dense_routes());
+        if (x_a8 != nullptr) {
+            ops::ggml_linear_a8_encoded(*x_a8, H, ops::ggml_split_segments(segments, H, bounds), parts, s);
+        } else {
+            project_ggml_split(x, segments, bounds, parts, work_, s, dense_routes());
+        }
     } else {
         if (ggml) {
             // A GGUF import's projection (its control projection BF16): qkv and z in their own tensors.
             const std::int32_t bounds[] = {0, C, C + VW};
             Tensor* parts[]             = {&qkv, &z};
-            project_ggml_split(x, p.projection.ggml, bounds, parts, work_, s, dense_routes());
+            if (x_a8 != nullptr) {
+                ops::ggml_linear_a8_encoded(*x_a8, H, ops::ggml_split_segments(p.projection.ggml, H, bounds), parts, s);
+            } else {
+                project_ggml_split(x, p.projection.ggml, bounds, parts, work_, s, dense_routes());
+            }
         } else if (p.projection.weight.qtype == QType::Q8_G32_FP16 ||
                    p.projection.weight.qtype == QType::FP8_E4M3FN_G32_E8M0) {
             // Q8 (Dense8) and MXFP8 (FP4-Local): the projection writes q/k/v and z to their
@@ -738,6 +794,17 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     const Tensor gates = z.view({DV, NV * T});
     const ops::RmsGate gate_kind = g.output_gate == GateActivation::Sigmoid ? ops::RmsGate::Sigmoid : ops::RmsGate::Silu;
     Tensor y = work_.alloc(DType::BF16, {H, T});
+    if (!(scan_ != nullptr && eager_chunk_) && p.output.is_ggml() &&
+        ops::ggml_a8_takes_encoded(p.output.ggml, VW, T, dense_routes(), p.output.input_perm, p.output.perm_block)) {
+        // --a8-activations: the gated norm writes the output projection's 8-bit columns (no encoding launch; the
+        // same words, so the same bits).
+        Tensor encoded = work_.alloc(DType::I32, {ops::ggml_a8_encoded_column_words(p.output.ggml, VW), T});
+        ops::gated_rmsnorm_ggml_a8_encoded(rows, p.norm, gates, gate_kind, config_.rms_norm_eps, p.output.input_perm,
+                                           p.output.perm_block, p.output.ggml, encoded, s);
+        Tensor* const outs[] = {&y};
+        ops::ggml_linear_a8_encoded(encoded, VW, p.output.ggml, outs, s);
+        return y;
+    }
     if (producer_encodes(p.output, VW, T, dense_routes(), scan_ != nullptr && eager_chunk_)) {
         // The gated norm writes the output projection's input encoded (no encoding launch).
         ops::GgmlEncodedColumns encoded = alloc_encoded(work_, VW, T);
@@ -754,7 +821,7 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     return y;
 }
 
-Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call) {
+Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call, const Tensor* x_a8) {
     const cudaStream_t s = device_.stream;
     const auto& a        = config_.attention;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size);
@@ -784,7 +851,11 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
         const std::int32_t bounds[] = {0, QW, 2 * QW, 2 * QW + KW, 2 * QW + 2 * KW, 2 * QW + 2 * KW + IH * ID,
                                        2 * QW + 2 * KW + index_rows};
         Tensor* parts[] = {&qf, &gate, &kf, &vf, &iqf, &ik};
-        project_ggml_split(x, segments, bounds, parts, work_, s, dense_routes());
+        if (x_a8 != nullptr) {
+            ops::ggml_linear_a8_encoded(*x_a8, H, ops::ggml_split_segments(segments, H, bounds), parts, s);
+        } else {
+            project_ggml_split(x, segments, bounds, parts, work_, s, dense_routes());
+        }
     } else if (Tensor qf = q.view({QW, T}), kf = k.view({KW, T}), vf = v.view({KW, T}), iqf = iq.view({IH * ID, T});
                !p.index_projection && !p.projection.is_ggml() &&
                ops::linear_qsa_group_supported(p.projection.weight, std::array<const Tensor*, 6>{&qf, &gate, &kf, &vf, &iqf, &ik}.data(),
@@ -1064,11 +1135,20 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     // W4A16 bank) forks nothing: the empty fork and join alone cost Dense8 MTP decode 1.4 %. 16K decode, 3 runs each
     // (2026-10-29): IQ3_S 265.5 -> 267.7 tok/s with the fork, Dense8 243.9 either way.
     const bool early = side && ops::moe_experts_prepares(x, source, max_jobs, expert_ws.data, outputs);
+    // ForwardExperts::shared_early: the shared expert follows the encoding on the side stream at once, beside the
+    // router and the route's plan (a nearly idle device), instead of after the plan beside the routed experts. Its
+    // scoped workspace lies past every buffer this call allocated, and this stream allocates nothing until the join.
+    const bool shared_early = early && experts_.shared_early && scan_ == nullptr;
     if (early) {
         CUDA_CHECK(cudaEventRecord(experts_.shared_events[2], s));
         CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[2], 0));
         ops::moe_experts_prepare(x, source, max_jobs, expert_ws.data, outputs, experts_.shared_stream);
         CUDA_CHECK(cudaEventRecord(experts_.shared_events[3], experts_.shared_stream));
+        if (shared_early) {
+            shared_swiglu(x, p.shared_gate_up, product, work_, experts_.shared_stream, dense_routes());
+            project(product, p.shared_down, shared, work_, experts_.shared_stream, dense_routes());
+            CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], experts_.shared_stream));
+        }
     }
     const Tensor* rows[] = {&p.router, &p.shared_score};
     if (fast_.router_mma && T >= kRouterMmaMinColumns) {
@@ -1160,7 +1240,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     cudaStream_t shared_s = s;
     if (early) { CUDA_CHECK(cudaStreamWaitEvent(s, experts_.shared_events[3], 0)); }
-    if (side) {
+    if (side && !shared_early) {
         CUDA_CHECK(cudaEventRecord(experts_.shared_events[0], s));
         CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[0], 0));
         shared_s = experts_.shared_stream;
@@ -1174,13 +1254,15 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         for (std::int32_t e = 0; e < E; ++e) { guess_columns_[static_cast<std::size_t>(e)] = guessed[e + 1] - guessed[e]; }
         (void)streaming->plan_ahead(layer + 1, guess_columns_, ExpertStream::ahead_rows(T), 0);
     }
-    scan_input(x, layer, ActivationScan::Site::SharedInput);
-    shared_swiglu(x, p.shared_gate_up, product, work_, shared_s, dense_routes());
-    scan_input(product, layer, ActivationScan::Site::SharedDown);
-    project(product, p.shared_down, shared, work_, shared_s, dense_routes());
+    if (!shared_early) {
+        scan_input(x, layer, ActivationScan::Site::SharedInput);
+        shared_swiglu(x, p.shared_gate_up, product, work_, shared_s, dense_routes());
+        scan_input(product, layer, ActivationScan::Site::SharedDown);
+        project(product, p.shared_down, shared, work_, shared_s, dense_routes());
+    }
     ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
     if (side) {
-        CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], shared_s));
+        if (!shared_early) { CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], shared_s)); }
         CUDA_CHECK(cudaStreamWaitEvent(s, experts_.shared_events[1], 0));
     }
     if (inject != nullptr) {

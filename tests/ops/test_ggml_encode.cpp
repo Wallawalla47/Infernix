@@ -92,6 +92,7 @@ struct Case {
     int columns;
     int perm_block; // 0: no permutation
     bool non_finite;
+    bool tiled = false; // the 8-bit cases: ggml_tiles16_v1 rows (the bytes are random either way)
 };
 
 int run_case(const Case& c, bool rmsnorm, ops::RmsGate gate, std::mt19937& rng) {
@@ -145,6 +146,50 @@ int run_case(const Case& c, bool rmsnorm, ops::RmsGate gate, std::mt19937& rng) 
         ++failures;
     }
     return failures;
+}
+
+// --a8-activations: gated_rmsnorm_ggml_a8_encoded then ggml_linear_a8_encoded against gated_rmsnorm then ggml_linear on
+// the 8-bit narrow route (LinearRoutes::GgmlA8), bit for bit.
+int run_a8_case(const Case& c, ops::RmsGate gate, std::mt19937& rng) {
+    const int d = 128, k = d * c.heads, t = c.columns, rows = c.tiled ? 64 : 72; // tiled: whole 16-row tiles a segment
+    const std::string label = "a8 gated_rmsnorm q" + std::to_string(static_cast<int>(c.q0)) + "/" +
+                              std::to_string(static_cast<int>(c.q1)) + " K=" + std::to_string(k) + " T=" + std::to_string(t) +
+                              " perm_block=" + std::to_string(c.perm_block) + (c.non_finite ? " non-finite" : "") +
+                              (gate == ops::RmsGate::Sigmoid ? " sigmoid" : "");
+    std::vector<std::uint16_t> x = normal_bf16(static_cast<std::size_t>(k) * t, 2.0F, rng);
+    const std::vector<std::uint16_t> z = normal_bf16(x.size(), 1.5F, rng), weight = normal_bf16(d, 0.5F, rng);
+    if (c.non_finite) { x[static_cast<std::size_t>(k) + 37] = 0x7F80U; } // +Inf in column 1
+    std::vector<std::int32_t> perm(c.perm_block > 0 ? static_cast<std::size_t>(k / c.perm_block) : 1, 0);
+    for (std::size_t i = 0; i < perm.size(); ++i) { perm[i] = static_cast<std::int32_t>(i); }
+    std::shuffle(perm.begin(), perm.end(), rng);
+    Projection p = make_projection(c.q0, c.q1, rows, k, rng);
+    for (auto& s : p.segments) { s.layout = c.tiled ? ops::GgmlLayout::Tiles16 : ops::GgmlLayout::Rows; }
+    const std::int32_t* input_perm = nullptr;
+    DeviceBuffer dx = to_device(x), dz = to_device(z), dw = to_device(weight), dperm = to_device(perm);
+    if (c.perm_block > 0) { input_perm = static_cast<const std::int32_t*>(dperm.p); }
+    if (!ops::ggml_a8_takes_encoded(p.segments, k, t, ops::LinearRoutes::GgmlA8, input_perm, c.perm_block)) {
+        std::cerr << label << ": the 8-bit route does not take the producer's columns\n";
+        return 1;
+    }
+    const int words = ops::ggml_a8_encoded_column_words(p.segments, k);
+    DeviceBuffer staged(x.size() * 2), expected(static_cast<std::size_t>(rows) * t * 2), got(expected.bytes);
+    DeviceBuffer encoded_words(static_cast<std::size_t>(words) * t * 4);
+    expected.fill(0xff);
+    got.fill(0x7f);
+    WorkspaceArena work(ops::ggml_linear_workspace_bytes(k, t) + (1 << 20));
+    int multiprocessors = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, 0));
+    const Tensor tx(dx.p, DType::BF16, {d, c.heads * t}), tz(dz.p, DType::BF16, {d, c.heads * t}), tw(dw.p, DType::BF16, {d});
+    Tensor normed(staged.p, DType::BF16, {d, c.heads * t});
+    Tensor texpected(expected.p, DType::BF16, {rows, t}), tgot(got.p, DType::BF16, {rows, t});
+    Tensor encoded(encoded_words.p, DType::I32, {words, t});
+    ops::gated_rmsnorm(tx, tw, tz, gate, 1.0e-6F, normed, DeviceExecutionView{nullptr, multiprocessors});
+    ops::ggml_linear(normed.view({k, t}), p.segments, texpected, input_perm, c.perm_block, work, nullptr, ops::LinearRoutes::GgmlA8);
+    ops::gated_rmsnorm_ggml_a8_encoded(tx, tw, tz, gate, 1.0e-6F, input_perm, c.perm_block, p.segments, encoded, nullptr);
+    Tensor* const outs[] = {&tgot};
+    ops::ggml_linear_a8_encoded(encoded, k, p.segments, outs, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return compare(label, expected, got, static_cast<std::size_t>(rows) * t);
 }
 
 // The gated-norm producer and the projection captured in a graph behind a kernel that rewrites the producer's input
@@ -212,6 +257,16 @@ INFERNIX_OP_TEST(ggml_encode) {
         failures += run_case({iq3, iq3, 48, 5, 0, true}, rmsnorm, ops::RmsGate::Silu, rng);
     }
     failures += run_graph_case(rng);
+    // The 8-bit producer: the GDN output projection's shape and order (Q6_K tiled, blocks of 128 permuted) at its
+    // decode and verification widths, a format with slice sums, a mixed launch and a non-finite column.
+    for (const int t : {1, 2, 3, 4, 5, 8, 9, 16, 31}) {
+        failures += run_a8_case({q6, q6, 48, t, 128, false, true}, ops::RmsGate::Silu, rng);
+    }
+    failures += run_a8_case({iq4, iq4, 48, 4, 0, false, true}, ops::RmsGate::Sigmoid, rng);
+    failures += run_a8_case({q4, q4, 32, 6, 128, false, false}, ops::RmsGate::Silu, rng);
+    failures += run_a8_case({iq4, q6, 48, 7, 0, false, true}, ops::RmsGate::Silu, rng);
+    failures += run_a8_case({iq3, iq3, 64, 3, 128, false, false}, ops::RmsGate::Sigmoid, rng);
+    failures += run_a8_case({q6, q6, 48, 5, 128, true, true}, ops::RmsGate::Silu, rng);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " ggml_encode\n";
     return failures == 0 ? 0 : 1;
 }

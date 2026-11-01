@@ -1,6 +1,12 @@
 #include "models/qwen4_exp/execution/parameters.h"
 
 #include "core/weight_view.h"
+#include "infernix/ops/hyper_connection.h"
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <vector>
 
 #include <array>
 #include <limits>
@@ -268,7 +274,7 @@ private:
 
 } // namespace
 
-Parameters::Parameters(const Model& source) : model(source) {
+Parameters::Parameters(const Model& source, bool hc_q8) : model(source) {
     const Prepare prepare(source);
     const auto& w = source.weights();
     const auto& c = source.config().text;
@@ -416,6 +422,28 @@ Parameters::Parameters(const Model& source) : model(source) {
         vision = with_context("vision", [&] { return prepare.vision(*w.vision); });
         if (vision->merger_fc2.weight.n != static_cast<std::int32_t>(model.config().text.hidden_size)) {
             throw std::invalid_argument("Qwen4Exp vision: the merger's output width differs from the text hidden size");
+        }
+    }
+    if (hc_q8) {
+        std::vector<Weight*> targets{&final_mixer.down.weight, &final_mixer.up.weight};
+        for (auto& block : layers) {
+            for (auto* hc : {&block.attn_hc, &block.mlp_hc}) {
+                targets.push_back(&hc->down.weight);
+                targets.push_back(&hc->up.weight);
+            }
+        }
+        std::size_t scratch_bytes = 0;
+        for (const Weight* t : targets) { scratch_bytes = std::max(scratch_bytes, ops::hyper_connection_repack_q8_scratch_bytes(*t)); }
+        if (scratch_bytes > 0) {
+            DeviceBuffer scratch(scratch_bytes);
+            for (Weight* t : targets) {
+                if (ops::hyper_connection_repack_q8_scratch_bytes(*t) == 0) { continue; }
+                ops::hyper_connection_repack_q8(*t, scratch.p, nullptr);
+                ++hc_q8_repacked;
+            }
+            if (cudaStreamSynchronize(nullptr) != cudaSuccess) {
+                throw std::runtime_error("Qwen4Exp: the hyper-connection Q8 repack failed");
+            }
         }
     }
 }

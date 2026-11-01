@@ -40,8 +40,13 @@ void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
         InputRows == 4096 && ((TileColumns > 24 && TileColumns <= 40) || TileColumns > 48)
             ? Cache::cg
             : Cache::ca;
+    // Flash-Next's attention output projection at its eight-column block (2560 rows: 160 CTAs, one a
+    // row tile) double-buffers its weight stages: cold 11.0 against 11.6-12.7 us (2026-11-01); 16 K
+    // warps or four were slower, and its MLP down projection was no faster with either change (the
+    // other drafters' shapes were not timed).
+    constexpr int Stages = Rows == 2560 && InputRows == 4096 && TileColumns == 8 ? 2 : 1;
     using Geometry    = Q8LinearGeometry<Rows, InputRows>;
-    using Schedule    = Q8A16SlicedKMmaSchedule<TileColumns, Warps, 1, Warps == 8 ? 2 : 3,
+    using Schedule    = Q8A16SlicedKMmaSchedule<TileColumns, Warps, Stages, Warps == 8 ? 2 : 3,
                                                 Q8ScaleAccess::Shared, Activation>;
     LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), Rows};
     launch_q8_a16_sliced_k_mma<

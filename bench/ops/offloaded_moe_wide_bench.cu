@@ -31,7 +31,10 @@
 //                                   [--repeat 10] [--seed N]
 //                                   [--columns-per-expert C] [--split-scales] [--geometry flash-next|122b]
 //                                   [--bank nvfp4|ggml] [--formats iq3_s,iq4_nl] [--ggml-wide exact|bf16|a8]
+//                                   [--staging-slots 64]
 //
+// --staging-slots 0 (frames only) runs one pass over every job with no staging, the shape of a decode call's
+// resident pass.
 // --columns-per-expert C routes uniformly instead (every used expert gets exactly C columns while
 // 10 T / C <= 512); --split-scales gives every expert distinct gate and up input scales, which keeps
 // experts of more than eight columns off the wide route (W4A4 only).
@@ -84,6 +87,7 @@ struct Options {
     QType ggml_gate_up     = QType::GGML_IQ3_S;
     QType ggml_down        = QType::GGML_IQ4_NL;
     bool ggml_a8           = false; // --ggml-wide a8
+    int staging_slots      = kStagingSlots; // 0: one pass over every job, no staging (a decode call's resident pass)
 };
 
 // The layer under test (--geometry, --bank).
@@ -196,12 +200,20 @@ Options parse_options(int argc, char** argv) {
             if (ggml_wide != "exact" && ggml_wide != "bf16" && ggml_wide != "a8") {
                 throw std::invalid_argument("--ggml-wide takes exact, bf16 or a8");
             }
+        } else if (arg == "--staging-slots") {
+            options.staging_slots = std::stoi(value());
+            if (options.staging_slots < 0 || options.staging_slots > kStagingSlots) {
+                throw std::invalid_argument("--staging-slots takes 0 .. 64");
+            }
         } else {
             throw std::invalid_argument("unknown option " + arg);
         }
     }
     if (options.placement != "frames" && options.placement != "staged" && options.placement != "both") {
         throw std::invalid_argument("--placement takes frames, staged or both");
+    }
+    if (options.staging_slots == 0 && options.placement != "frames") {
+        throw std::invalid_argument("--staging-slots 0 takes --placement frames (no record is staged)");
     }
     if (options.ggml) {
         if (options.geometry_122b || options.a16 || options.narrow_a16 != moe::NarrowA16::kExact) {
@@ -415,6 +427,7 @@ void run_point(Fixture& fixture, int tokens, const Options& options, bench::L2Fl
         if ((staged && options.placement == "frames") || (!staged && options.placement == "staged")) { continue; }
         ops::MoeExpertSource source = fixture.source(staged);
         source.wide_a16             = options.wide_a16;
+        source.staging_slots        = options.staging_slots;
         // W4A4 experts sharing their input scales (the default here, as in NVIDIA's exports) take the tensor-core
         // narrow kernels in calls of at most eight columns (--split-scales: the one-column kernels).
         source.a4_shared_input = !options.a16 && !options.split_scales;
@@ -471,7 +484,7 @@ int main(int argc, char** argv) {
                     options.narrow_a16 == moe::NarrowA16::kA4Residual ? "a4r"
                     : options.narrow_a16 == moe::NarrowA16::kA8 || options.ggml_a8 ? "a8"
                                                                                     : "exact",
-                    wide_name(options.wide_a16), kStagingSlots);
+                    wide_name(options.wide_a16), options.staging_slots);
         Fixture fixture(options.seed, options.a16, options.split_scales, options.ggml_a8);
         std::unique_ptr<bench::L2FlushBuffer> flush;
         if (options.cold) { flush = std::make_unique<bench::L2FlushBuffer>(256ULL << 20); }
