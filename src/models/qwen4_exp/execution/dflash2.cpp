@@ -48,6 +48,20 @@ void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStrea
     }
 }
 
+// The norm and dynamic-conv prepare in an arena of its own carved from `work`; a call that needs no
+// scratch (the fused route: H 2560, at most 16 columns) runs in `work` itself, as an arena cannot be empty.
+void prepare(const Tensor& residual, const Tensor& norm, float eps, const Tensor& base, const Weight& projection,
+             Tensor& prepared, Tensor& delta, WorkspaceArena& work, cudaStream_t s) {
+    const std::size_t bytes = ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+        residual.ne[0], residual.ne[1], residual.ne[1], residual.ne[2], residual.ne[2]);
+    if (bytes == 0) {
+        ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm, eps, base, projection, prepared, delta, work, s);
+        return;
+    }
+    WorkspaceArena scratch(work.alloc_bytes(bytes));
+    ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm, eps, base, projection, prepared, delta, scratch, s);
+}
+
 // The fused Ops take Q8_G32_FP16 RowSplit projections (the official companion recipe's).
 void require_q8(const Weight& weight, const char* name) {
     if (weight.qtype != QType::Q8_G32_FP16 || weight.layout != QuantLayout::RowSplit) {
@@ -191,13 +205,8 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
             auto scope       = work_.scope();
             Tensor prepared  = work_.alloc(DType::BF16, {H, W, B});
             Tensor delta     = work_.alloc(DType::BF16, {G, 2, W, B});
-            {
-                WorkspaceArena scratch(work_.alloc_bytes(
-                    ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(H, W, W, B, B)));
-                ops::rmsnorm_dynamic_grouped_conv_prepare(residual, layer.input_norm, config_.rms_norm_eps,
-                                                          layer.attention_base, layer.attention_projection.weight,
-                                                          prepared, delta, scratch, s);
-            }
+            prepare(residual, layer.input_norm, config_.rms_norm_eps, layer.attention_base,
+                    layer.attention_projection.weight, prepared, delta, work_, s);
             Tensor q = work_.alloc(DType::BF16, {D, Hq, W, B});
             Tensor k = work_.alloc(DType::BF16, {D, Hk, W, B});
             Tensor v = work_.alloc(DType::BF16, {D, Hk, W, B});
@@ -219,13 +228,8 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
             auto scope      = work_.scope();
             Tensor prepared = work_.alloc(DType::BF16, {H, W, B});
             Tensor delta    = work_.alloc(DType::BF16, {G, 2, W, B});
-            {
-                WorkspaceArena scratch(work_.alloc_bytes(
-                    ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(H, W, W, B, B)));
-                ops::rmsnorm_dynamic_grouped_conv_prepare(residual, layer.post_attention_norm, config_.rms_norm_eps,
-                                                          layer.mlp_base, layer.mlp_projection.weight, prepared, delta,
-                                                          scratch, s);
-            }
+            prepare(residual, layer.post_attention_norm, config_.rms_norm_eps, layer.mlp_base,
+                    layer.mlp_projection.weight, prepared, delta, work_, s);
             Tensor product = work_.alloc(DType::BF16, {I, W, B});
             {
                 Tensor flat = product.view({I, columns});
