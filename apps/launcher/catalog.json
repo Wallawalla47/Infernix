@@ -235,6 +235,54 @@
       "notes": "Its repository carries no n-gram volume."
     },
     {
+      "repo": "wallawalla47/Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local-Infernix",
+      "title": "Huihui Qwen3.8-Flash-Next abliterated FP4-Local",
+      "family": "qwen3.8-flash-next",
+      "kind": "model",
+      "description": "NVIDIA FP4-Local with Huihui's abliteration (refusals removed; see its card) transferred into 96 MXFP8 projections by edp1096, every weight bit-exact. Perplexity 3.4939 against FP4-Local's 3.4865.",
+      "recommended": false,
+      "source_repo": "edp1096/Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local",
+      "tags": [
+        "NVFP4",
+        "MXFP8",
+        "uncensored",
+        "MoE"
+      ],
+      "approx_bytes": 77375558912,
+      "drafter_repo": "wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix",
+      "ngram_options": [
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix",
+          "file": "Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram",
+          "format": "nvfp4",
+          "bytes": 29127258112,
+          "recommended": true
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix",
+          "file": "Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram",
+          "format": "fp8",
+          "bytes": 52429058048,
+          "recommended": false
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix",
+          "file": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram",
+          "format": "iq4_nl",
+          "bytes": 29127258112,
+          "recommended": false
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix",
+          "file": "Qwen3.8-Flash-Next-BF16.ngram",
+          "format": "bf16",
+          "bytes": 109227196416,
+          "recommended": false
+        }
+      ],
+      "notes": "Its repository carries no n-gram volume; NVIDIA FP4-Local's is the table it stores."
+    },
+    {
       "repo": "wallawalla47/Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix",
       "title": "Swift 1.5 Qwen3.8-Flash-Next NVFP4 Dense8",
       "family": "qwen3.8-flash-next",

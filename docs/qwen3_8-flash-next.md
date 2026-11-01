@@ -338,6 +338,15 @@ NVFP4 terms in decode and verification calls with 16-bit expert activations, on 
 CPU-served misses alike (exact sums, so where an expert runs changes no bit). Its exact route is
 deterministic and gives each request the same bits alone and with up to eight concurrent requests.
 
+Derivatives that keep FP4-Local's formats and n-gram table convert with the same recipe and bind
+FP4-Local's volume with `--ngram-reuse` instead of `--ngram-out`. edp1096's
+[Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local](https://huggingface.co/edp1096/Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local)
+(Huihui's abliteration transferred into 96 MXFP8 projections: each layer's attention or GDN output
+projection and its shared expert's down projection) is one: its artifact differs from FP4-Local's in
+those 96 objects only, verifies with no mismatch against its checkpoint, and scores 3.4939 on the
+quick corpus against FP4-Local's 3.4865 on the same build (BF16 KV, reproducible route; mean KL
+from FP4-Local 0.018, top-1 agreement 95.2 %).
+
 ## Run
 
 ```text

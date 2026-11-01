@@ -1,0 +1,16 @@
+{
+  "_comment": "Infernix does not read this file. It lets the Hugging Face Hub count downloads of this repository, which it does through requests for config.json. Give infernix-serve the first part.",
+  "format": "infernix-v3",
+  "engine": "https://github.com/Wallawalla47/Infernix",
+  "artifact": "Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local-Infernix-00001-of-00003.infernix",
+  "parts": [
+    "Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local-Infernix-00001-of-00003.infernix",
+    "Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local-Infernix-00002-of-00003.infernix",
+    "Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local-Infernix-00003-of-00003.infernix"
+  ],
+  "ngram_volume": {
+    "recommended": "Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram",
+    "repository": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix",
+    "note": "not in this repository; see NGRAM-VOLUME.md"
+  }
+}
