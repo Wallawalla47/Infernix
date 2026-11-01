@@ -43,6 +43,7 @@ constexpr std::array kShapes{
     ShapeEntry{320, 10240, select_q8_n320_k10240},
     ShapeEntry{10240, 320, select_q8_n10240_k320},
     ShapeEntry{2560, 640, select_q8_n2560_k640},
+    ShapeEntry{2560, 12800, select_q8_n2560_k12800},
     // NInfer's tunings for its own 2560-wide groupings.
     shape<Q8N6144K2560>(select_q8_n6144_k2560),   shape<Q8N10240K2560>(select_q8_n10240_k2560),
     shape<Q8N12288K2560>(select_q8_n12288_k2560),

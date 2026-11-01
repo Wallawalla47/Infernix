@@ -213,7 +213,8 @@ enum class LinearRoutes : std::uint16_t {
  * `[3072,1024]` and `[248320,3072]` at every positive T with 16-bit activations under every policy,
  * each with a column-invariant route. The current NVFP4
  * problems register the five non-vocabulary FP8 geometries and accept every positive T. Q8 also
- * registers `[5120,25600]` at every positive T. BF16 registers the text problems `[14336,5120]`,
+ * registers the DFlash2 drafters' feature projections `[5120,25600]` and `[2560,12800]` at every
+ * positive T. BF16 registers the text problems `[14336,5120]`,
  * `[5120,6144]` and `[256,5120]` and the Vision tower problems `[1152,1536]`, `[3456,1152]`,
  * `[1152,1152]`, `[4304,1152]`, `[1152,4304]`, `[4608,4608]`, `[2560,4608]` and `[5120,4608]`,
  * each at every positive T. Text and MTP packed-weight problems accept every positive column

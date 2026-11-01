@@ -35,6 +35,8 @@ constexpr std::array kGeometries{
     Geometry{16384, 2560, 313U}, Geometry{2560, 6144, 317U},  Geometry{1280, 2560, 337U},
     Geometry{2560, 640, 347U},   Geometry{12800, 2560, 349U}, Geometry{13952, 2560, 353U},
     Geometry{2560, 2560, 359U},
+    // Its DFlash2 drafter's feature projection (sliced-K routes to 96 columns).
+    Geometry{2560, 12800, 383U},
     // Shapes NInfer tunes for its own 2560-wide groupings (not Flash-Next recipe B packings).
     Geometry{6144, 2560, 367U},  Geometry{10240, 2560, 373U}, Geometry{12288, 2560, 379U},
     // An unregistered geometry on the runtime-shape route (predicated SIMT, then MMA tiles).
@@ -123,7 +125,7 @@ int q8_a16_column_invariance() {
           std::pair{Geometry{2560, 6144, 431U}, 8},   std::pair{Geometry{1280, 2560, 433U}, 48},
           std::pair{Geometry{2560, 640, 439U}, 16},   std::pair{Geometry{12800, 2560, 443U}, 8},
           std::pair{Geometry{13952, 2560, 449U}, 8},  std::pair{Geometry{2560, 2560, 457U}, 8},
-          std::pair{Geometry{2560, 4096, 409U}, 8}}) {
+          std::pair{Geometry{2560, 12800, 461U}, 8}, std::pair{Geometry{2560, 4096, 409U}, 8}}) {
         const auto host = make_q8_g32_fp16_weight(shape.n, shape.k, shape.seed);
         std::vector<std::uint16_t> activation(static_cast<std::size_t>(shape.k) * kColumns);
         std::uint32_t state = shape.seed;
