@@ -468,6 +468,20 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         last = activity(port)[-1]
         check("an unknown name goes to the loaded model", status == 200 and last["routed_by"] == "loaded" and
               last["model_key"] == named_id, str(last)[:160])
+        # The web UI's chat names no model for "the loaded model"; the stand-in, as infernix-serve,
+        # refuses a request without one.
+        nameless = {key: value for key, value in chat("", 8, True).items() if key != "model"}
+        status, _, _, pieces = stream(port, "/v1/chat/completions", nameless)
+        text = "".join(piece for _, piece in pieces)
+        served += "[DONE]" in text
+        last = activity(port)[-1]
+        check("a request that names no model goes to the loaded model, sent with its id",
+              status == 200 and "[DONE]" in text and last["routed_by"] == "loaded" and last["model_key"] == named_id,
+              f"{status} {text[:160]}")
+        nameless = {key: value for key, value in chat("", 8).items() if key != "model"}
+        status, body = call(port, "POST", "/v1/messages", nameless, headers={"anthropic-version": "2023-06-01"})
+        served += status == 200
+        check("...an Anthropic one too", status == 200 and (body or {}).get("model") == named_alias, str(body)[:160])
         call(port, "PUT", "/launcher/api/settings", {"pin_loaded": True})
         status, _ = call(port, "POST", "/v1/chat/completions", chat("fake-main", 8))
         served += status == 200

@@ -703,6 +703,18 @@ int main(int argc, char** argv) {
         return [protocol](const httplib::Request& request, httplib::Response& response) {
             Json body = Json::parse(request.body, nullptr, false);
             if (!body.is_object()) { body = Json::object(); }
+            // As infernix-serve: every protocol requires a model.
+            const auto model = body.find("model");
+            if (model == body.end() || !model->is_string() || model->get<std::string>().empty()) {
+                response.status = 400;
+                response.set_content(protocol == "anthropic"
+                                         ? R"({"type":"error","error":{"type":"invalid_request_error",)"
+                                           R"("message":"missing required field: model"}})"
+                                         : R"({"error":{"message":"missing required field: model",)"
+                                           R"("type":"invalid_request_error","param":"model","code":null}})",
+                                     "application/json");
+                return;
+            }
             generate(protocol, body, request.get_header_value("X-Infernix-Request-Label"), response);
         };
     };

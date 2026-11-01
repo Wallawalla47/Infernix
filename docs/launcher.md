@@ -259,7 +259,9 @@ OpenAI and Anthropic SDKs.
   4. An unknown name goes to the loaded model, else the default model (like `infernix-serve
      --any-model-name`), or is refused with `model_not_found` when the setting is **Reject**.
 
-  The dashboard and the event log show which rule chose the model.
+  The dashboard and the event log show which rule chose the model. A request that names no model
+  (the Chat page's **Loaded model** sends none) follows the same rules and reaches the server with
+  the chosen configuration's model id, since `infernix-serve` requires one.
 - **Switching**: requests queue in arrival order. While requests for another model wait, the loaded
   model takes no new requests; once its running requests finish (or after the drain timeout, which
   cancels them) it stops and the next model starts. They fail with HTTP 503 (Anthropic: 529

@@ -212,6 +212,13 @@ std::string json_body_model(const std::string& body, bool& stream, bool& parsed)
     } catch (const Json::exception&) { return {}; }
 }
 
+// A JSON object body with its `model` set.
+std::string body_with_model(const std::string& body, const std::string& model) {
+    Json value     = Json::parse(body);
+    value["model"] = model;
+    return value.dump();
+}
+
 int pick_free_port() {
     httplib::Server probe;
     const int port = probe.bind_to_any_port("127.0.0.1");
@@ -2240,7 +2247,22 @@ void Launcher::handle_generation(const Request& request, Response& response, Api
         }
         return;
     }
-    call.key                     = key;
+    call.key          = key;
+    std::string alias = *key;
+    {
+        std::lock_guard lock(library_mutex_);
+        if (const std::optional<ConfigRef> ref = find_config_locked(*key)) {
+            alias = effective_alias(ref->id, *ref->model, library_);
+        }
+    }
+    // infernix-serve requires a model (the web UI's chat sends none for "the loaded model"): a request
+    // that names none goes out naming the configuration it was routed to.
+    std::optional<Request> named;
+    if (name.empty()) {
+        named.emplace(request);
+        named->body = body_with_model(request.body, alias);
+    }
+    const Request& forwarded     = named ? *named : request;
     const std::uint64_t activity = activity_begin(request, call);
     call.id                      = activity;
     const auto finished          = [this, activity](const ProxyOutcome& outcome) {
@@ -2264,23 +2286,16 @@ void Launcher::handle_generation(const Request& request, Response& response, Api
     if (stream) {
         if (std::shared_ptr<Router::Lease> ready = router_->try_acquire(*key)) {
             activity_update(activity, "running", 0, std::nullopt);
-            proxy(request, response, std::move(ready), call, finished);
+            proxy(forwarded, response, std::move(ready), call, finished);
             return;
         }
         if (Router::Refusal held; router_->held(*key, held)) {
             refuse(held);
             return;
         }
-        std::string alias = *key;
-        {
-            std::lock_guard lock(library_mutex_);
-            if (const std::optional<ConfigRef> ref = find_config_locked(*key)) {
-                alias = effective_alias(ref->id, *ref->model, library_);
-            }
-        }
         const std::string config_id = *key;
         proxy_after_load(
-            request, response,
+            forwarded, response,
             [this, config_id, activity](const std::function<bool()>& cancelled, Router::Refusal& refusal) {
                 std::shared_ptr<Router::Lease> lease = router_->acquire(config_id, cancelled, refusal);
                 if (lease) { activity_update(activity, "running", 0, std::nullopt); }
@@ -2297,7 +2312,7 @@ void Launcher::handle_generation(const Request& request, Response& response, Api
         return;
     }
     activity_update(activity, "running", 0, std::nullopt);
-    proxy(request, response, std::move(lease), call, finished);
+    proxy(forwarded, response, std::move(lease), call, finished);
 }
 
 std::optional<std::string> Launcher::route_request(const std::string& name, std::string& routed_by) const {
