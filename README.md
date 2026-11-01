@@ -398,7 +398,7 @@ download a model) under **Models**, press **Load**, and point your tools at the 
 ## Quick start (Windows)
 
 Prerequisites: Visual Studio 2026 (or 2022, MSVC 14.44) with its C++ CMake tools (they bring Ninja),
-the CUDA 13 toolkit, and FFmpeg, libjpeg-turbo and curl from vcpkg (`x64-windows`, at `C:\vcpkg`;
+the CUDA 13.4 toolkit or later (CMake warns about an older one), and FFmpeg, libjpeg-turbo and curl from vcpkg (`x64-windows`, at `C:\vcpkg`;
 `vcpkg install libjpeg-turbo:x64-windows` adds libjpeg-turbo to an existing tree); adjust the paths at
 the top of `build_native.bat`. It builds with Ninja Multi-Config (about 30 % faster than the Visual
 Studio generator); a `build-windows` tree from the Visual Studio generator is configured afresh on its
@@ -482,9 +482,9 @@ DLLs beside `infernix-serve.exe` and install the Visual C++ redistributable if m
 
 ## Quick start (Linux)
 
-64-bit Linux and WSL2 (tested on Ubuntu 24.04, CUDA 13.4, GCC 13.3). Prerequisites: CUDA 13, CMake
-3.28+, a C++20 compiler, Ninja, `pkg-config`, and the FFmpeg, libjpeg-turbo and curl development
-packages:
+64-bit Linux and WSL2 (tested on Ubuntu 24.04, CUDA 13.4, GCC 13.3). Prerequisites: CUDA 13.4 or
+later (CMake warns about an older toolkit: CUDA 13.2 miscompiles a kernel), CMake 3.28+, a C++20
+compiler, Ninja, `pkg-config`, and the FFmpeg, libjpeg-turbo and curl development packages:
 
 ```bash
 sudo apt-get install -y build-essential cmake ninja-build pkg-config libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libjpeg-turbo8-dev libcurl4-openssl-dev
@@ -496,7 +496,7 @@ The server is `build/apps/infernix-serve`, with the same options, and the launch
 `build/apps/infernix-launcher`. Under WSL2 use the Windows NVIDIA
 driver (install none inside WSL) and copy models into the Linux filesystem; `/mnt/` reads are slow.
 
-The [`Dockerfile`](Dockerfile) builds the same server in a CUDA 13 image for Docker or Podman, with
+The [`Dockerfile`](Dockerfile) builds the same server in a CUDA 13.4 image for Docker or Podman, with
 the NVIDIA Container Toolkit installed on the host. Mount the folder that holds the model and
 publish the port:
 
