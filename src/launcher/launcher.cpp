@@ -2437,6 +2437,13 @@ void Launcher::register_routes() {
     server_.set_read_timeout(std::chrono::minutes(5));
     server_.set_write_timeout(std::chrono::minutes(10));
     server_.set_keep_alive_max_count(1000);
+    // Clients reach the models through this server, so its keep-alive window is the one their
+    // pools meet (the proxy opens a fresh connection to infernix-serve for every request). As
+    // infernix-serve's default: longer than Bun's 5-minute fetch idle timeout, so opencode-style
+    // clients, which reuse a pooled socket without checking it, never write onto one this server
+    // has closed (cpp-httplib's default of 5 s closed it between almost every pair of turns). An
+    // idle connection holds one of the pool's 512 workers.
+    server_.set_keep_alive_timeout(std::chrono::seconds(360));
     if (settings.cors) {
         server_.set_default_headers({{"Access-Control-Allow-Origin", "*"},
                                      {"Access-Control-Allow-Headers", "*"},

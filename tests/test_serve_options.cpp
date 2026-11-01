@@ -591,8 +591,8 @@ int main() {
     failures += check(configured.max_http_clients == 32,
                       "--max-http-clients did not reach serving options");
     failures += check(parse_error({"infernix-serve", "model.ninfer"}).empty() &&
-                          parse({"infernix-serve", "model.ninfer"}).keep_alive_timeout_sec == 60,
-                      "--keep-alive-timeout-sec is not the moderate default by default");
+                          parse({"infernix-serve", "model.ninfer"}).keep_alive_timeout_sec == 360,
+                      "--keep-alive-timeout-sec does not outlast a 5-minute client pool by default");
     failures += check(parse_error({"infernix-serve", "model.ninfer"}).empty() &&
                           parse({"infernix-serve", "model.ninfer"}).max_http_clients == 64,
                       "--max-http-clients is not 64 by default");

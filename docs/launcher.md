@@ -281,6 +281,11 @@ OpenAI and Anthropic SDKs.
   in the same response. A load that fails, or an error answer from the server, then arrives as one
   error event in the client's protocol (OpenAI `{"error": ...}`, Anthropic `event: error`) instead of
   an HTTP error status. A non-streaming request receives no bytes until its model is ready.
+- **Pooled connections** stay open 6 minutes after a response, as `infernix-serve`'s
+  `--keep-alive-timeout-sec` default ([serving](serving.md)): longer than Bun's 5-minute `fetch` idle
+  timeout, so a client that reuses a pooled socket without checking it (opencode) closes it itself
+  rather than writing onto one the launcher has already closed. Each forwarded request takes its
+  own connection to the server.
 - Every forwarded request carries `X-Infernix-Request-Label: launcher-<n>` (unless the client sent
   its own label), which ties the server's per-request figures to the launcher's record, and the
   answer carries `X-Infernix-Request-Id: <n>`.
