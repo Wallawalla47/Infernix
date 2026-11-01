@@ -455,8 +455,9 @@ void HttpServer::register_routes() {
     // closes pooled connections between agent turns; clients then pay a reconnect — or race
     // the close if their pool outlives it). The library's timeout close is already graceful
     // (drain_and_close_socket: a half-close, then a bounded drain), and a live request re-arms
-    // the window on both sides, so no per-response retirement is needed; the window is a
-    // moderate default and long-turn deployments raise it. Idle connections hold a worker
+    // the window on both sides, so no per-response retirement is needed. The default outlasts
+    // the pooled clients that do not probe a socket before reusing it (Bun's fetch: 5 minutes),
+    // so the client, not the server, ends an idle connection. Idle connections hold a worker
     // each — bounded by the pool ceiling (--max-http-clients), not by the window.
     server_.set_keep_alive_timeout(options_.keep_alive_timeout_sec);
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
