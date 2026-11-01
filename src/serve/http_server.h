@@ -3,7 +3,6 @@
 #include "serve/console_stats.h"
 #include "serve/decide.h"
 #include "serve/generation_service.h"
-#include "serve/keep_alive_retirement.h"
 #include "serve/metrics.h"
 #include "serve/metrics_json.h"
 #include "serve/openai_common.h"
@@ -55,7 +54,7 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 [[nodiscard]] std::string_view canonical_api_path(std::string_view path) noexcept;
 
 // The HTTP server's worker pool (its new_task_queue, owned by the server): a worker for every
-// admitted or waiting request and one more, plus headroom for idle keep-alive connections.
+// admitted or waiting request and one more, growing to --max-http-clients open connections.
 [[nodiscard]] httplib::TaskQueue* new_http_worker_pool(const ServeOptions& options);
 
 class HttpServer {
@@ -164,8 +163,6 @@ private:
     // The generation requests in flight (GET /metrics?format=json live.active).
     LiveRequests live_requests_;
     std::unique_ptr<ConsoleStatsPanel> console_stats_;
-    // Before server_, which it outlives: a response records its end when the server destroys it.
-    KeepAliveRetirement keep_alive_retirement_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};
     std::mutex stats_mutex_;
