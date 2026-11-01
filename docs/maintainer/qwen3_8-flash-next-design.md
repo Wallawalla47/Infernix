@@ -3863,9 +3863,10 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
     old → new): struct (greedy, ~7.5 tokens a round) 15.062 → **14.884 s** (+1.2 %) and with
     `--a8-activations` 13.480 → **13.304 s** (+1.3 %), separated ranges; conv (T 0.6, ~3 tokens a
     round) 4.855 → 4.840 s (+0.3 %, overlapping) and with `--a8-activations` 4.628 → 4.627 (flat).
-    The bench's `decode_output_tok_s` and the serve's per-request decode rate count the Program's
-    `decode()` calls but not `commit()`, so moving the update from commit into the next decode
-    lowers them (conv 254.2 → 249.4) while wall time improves; compare such changes by wall time.
+    The bench's `decode_output_tok_s` and the serve's per-request decode rate then counted the
+    Program's `decode()` calls but not `commit()`, so moving the update from commit into the next
+    decode lowered them (conv 254.2 → 249.4) while wall time improved. Both count the commits
+    since (`docs/performance/methodology.md`).
 - **Few-row Q8 route for the hyper-connection down projections (adopted).**
   - **Problem.** The MTP-round profile showed the [324, 10240] and [320, 10240] projections
     (96 calls per token) on 41 eight-row CTAs at ~0.4 TB/s: 9.5 µs per call, ~0.9 ms per round,
@@ -6151,8 +6152,8 @@ reads the environment once, at construction:
 - **Per-request line** (`S0 req=...`, printed at finish). It gives the arm, the MTP and plain round
   counts, the n-gram rows and reads per round, and a **wall-clock decode rate**: decode tokens over
   the time from the first `decode()` entry to the last commit return. `infernix_bench`'s decode rate
-  divides by the time inside `decode()` only, so it omits commit and scheduler time, where the
-  commit-site flush acts.
+  then divided by the time inside `decode()` only, so it omitted commit and scheduler time, where the
+  commit-site flush acts (since 2026-11-01 it counts commit too; scheduler time stays out).
 - **Phases.** With `INFERNIX_TMP_PHASES=1`, the line adds the mean µs and count of every consecutive
   host-point and GPU-event pair.
   - Host points: decode entry, drafts enqueued, draft sync return, verify staged, verify launched,

@@ -1665,9 +1665,11 @@ struct PreparationControl {
 };
 
 // Request-stage wall timings retained for end-to-end latency/rate reporting. Prefill/decode are
-// Program execution elapsed time and include Device completion waits; total also includes queueing
-// and other request lifetime. They are not Host-work phases. GenerationEngineTiming below is the
-// direct, mutually-exclusive Host observation contract.
+// Program execution elapsed time and include Device completion waits: prefill is the prompt's calls
+// and the commit of its first token, decode each later round's decode and commit calls (the Engine's
+// work between them is not counted); total also includes queueing and other request lifetime. They
+// are not Host-work phases. GenerationEngineTiming below is the direct, mutually-exclusive Host
+// observation contract.
 struct GenerationTimings {
     double prepare_seconds     = 0.0;
     double first_token_seconds = 0.0;
