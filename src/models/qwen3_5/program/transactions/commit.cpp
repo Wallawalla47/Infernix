@@ -387,6 +387,7 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
                                  std::span<const runtime::CommitDecision> decisions,
                                  runtime::CommitObservation observation,
                                  runtime::ExecutionTiming* failed_timing) {
+    const auto started = Clock::now();
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
     std::array<SequenceHandle, kMaximumConcurrency> members{};
     const auto input_rows       = ContractAccess::rows(pending);
@@ -474,6 +475,18 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
 
         for (std::size_t row = 0; row < row_count; ++row) {
             if (!discarded[row]) { settle_unit(lanes[row]); }
+        }
+        // A round's commit is part of its execution: its span joins its rows' decode time (the prefill's for the
+        // prefill's first token), as the decode and prefill calls charge theirs.
+        const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        for (std::size_t row = 0; row < row_count; ++row) {
+            GenerationTimings& charged = discarded[row] ? timings[row] : requests[lanes[row]].timings;
+            if (pending_kinds[row] == PendingKind::Begin) {
+                charged.prefill_seconds += seconds;
+            } else {
+                charged.decode_seconds += seconds;
+                charged.decode_share_seconds += seconds / static_cast<double>(row_count);
+            }
         }
         CommitResult out;
         out.row_count = row_count;

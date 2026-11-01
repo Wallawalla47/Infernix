@@ -2729,6 +2729,7 @@ public:
     }
 
     CommitResult commit(PendingBatch&& pending, std::span<const runtime::CommitDecision> decisions) {
+        const auto start = Clock::now();
         if (ContractAccess::owner(pending) != this || ContractAccess::transaction(pending) != pending_transaction_ ||
             pending_transaction_ == 0) {
             throw std::logic_error("Qwen4Exp: commit of a foreign or stale pending batch");
@@ -2744,7 +2745,7 @@ public:
                 throw std::logic_error("Qwen4Exp: a commit decision is invalid");
             }
         }
-        if (round_width_ > 1) { return commit_verified(std::move(pending), decisions); }
+        if (round_width_ > 1) { return commit_verified(std::move(pending), decisions, start); }
         CommitResult out;
         out.row_count = rows.size();
         // After a plain decode round the drafter writes the round's cell (its pending cell moves
@@ -2773,7 +2774,6 @@ public:
                 lane.prefix.withdraw =
                     pending.row_failure(row) == runtime::PendingRowFailure::NonFiniteLogits;
                 lane.constraint_round.clear();
-                out.rows[row].timings     = timings(lane);
                 out.rows[row].speculative = lane.speculative;
                 out.rows[row].disposition = d.failed ? runtime::CommitDisposition::FailedReleased
                                                      : runtime::CommitDisposition::CancelledReleased;
@@ -2812,8 +2812,12 @@ public:
         }
         settle_round();
         if (replay_clock_) { replay_clock_->end(device_.stream); }
+        charge_commit(rows, start, plain_round_);
         for (std::size_t row = 0; row < rows.size(); ++row) {
-            if (decisions[row].cancelled || decisions[row].failed) { release(ContractAccess::lane(rows[row])); }
+            if (decisions[row].cancelled || decisions[row].failed) {
+                out.rows[row].timings = timings(lanes_[ContractAccess::lane(rows[row])]);
+                release(ContractAccess::lane(rows[row]));
+            }
         }
         plain_round_ = false;
         ContractAccess::consume(pending);
@@ -3842,6 +3846,21 @@ private:
         out.decode_share_seconds = static_cast<double>(lane.decode_share_ns) * 1e-9;
         out.vision_seconds       = vision_seconds_of(lane);
         return out;
+    }
+
+    // A round's commit is part of its execution: its host span joins its rows' decode time (the prefill's for the
+    // prefill's first token), as decode() and the prefill calls charge theirs.
+    void charge_commit(std::span<const SequenceHandle> rows, Clock::time_point start, bool decode_round) {
+        const std::uint64_t ns = elapsed_ns(start);
+        for (const auto& row : rows) {
+            Lane& lane = lanes_[ContractAccess::lane(row)];
+            if (decode_round) {
+                lane.decode_ns += ns;
+                lane.decode_share_ns += ns / rows.size();
+            } else {
+                lane.prefill_ns += ns;
+            }
+        }
     }
 
     void release(std::uint32_t index) noexcept {
@@ -5204,7 +5223,8 @@ private:
     // Commits a verification round: each row keeps its first accepted_tokens licensed tokens, so
     // the model state advances by that many columns (the anchor and the accepted drafts before the
     // last kept token). The GDN fold, the QSA tails and the PLE history replay those columns' records.
-    CommitResult commit_verified(PendingBatch&& pending, std::span<const runtime::CommitDecision> decisions) {
+    CommitResult commit_verified(PendingBatch&& pending, std::span<const runtime::CommitDecision> decisions,
+                                 Clock::time_point start) {
         const cudaStream_t s = device_.stream;
         const auto rows      = ContractAccess::rows(pending);
         const auto batch     = static_cast<std::int32_t>(rows.size());
@@ -5224,7 +5244,6 @@ private:
                 lane.prefix.withdraw = pending.row_failure(static_cast<std::size_t>(row)) ==
                                        runtime::PendingRowFailure::NonFiniteLogits;
                 lane.constraint_round.clear();
-                out.rows[row].timings     = timings(lane);
                 out.rows[row].speculative = lane.speculative;
                 out.rows[row].disposition = d.failed ? runtime::CommitDisposition::FailedReleased
                                                      : runtime::CommitDisposition::CancelledReleased;
@@ -5284,9 +5303,13 @@ private:
         }
         if (!deferred_.to_proposal || releases) { settle_round(); }
         if (replay_clock_) { replay_clock_->end(device_.stream); }
+        charge_commit(rows, start, true);
         for (std::int32_t row = 0; row < batch; ++row) {
             const auto& d = decisions[static_cast<std::size_t>(row)];
-            if (d.cancelled || d.failed) { release(ContractAccess::lane(rows[row])); }
+            if (d.cancelled || d.failed) {
+                out.rows[row].timings = timings(lanes_[ContractAccess::lane(rows[row])]);
+                release(ContractAccess::lane(rows[row]));
+            }
         }
         ContractAccess::consume(pending);
         pending_transaction_ = 0;

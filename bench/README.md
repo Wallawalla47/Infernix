@@ -1404,7 +1404,9 @@ intentionally separate: replay reuses captured addresses without advancing the h
 
 `reps` contains request samples in repetition-major order, with explicit `repetition` and `row`.
 `output_tok_s` divides each repetition's actual outputs by its wall time.
-`decode_output_tok_s` counts actual outputs after the first token, allowing early grammar EOS.
+`decode_output_tok_s` counts actual outputs after the first token, allowing early grammar EOS, over
+the Program's decode time (each round's decode and commit calls; reports before 2026-11-01 left the
+commits out, up to ~4 % higher on speculative routes).
 `decode_engine_tok_s` uses the Program's speculative round statistics, so it also describes work performed by a final partially
 committed speculative round. Reports also contain the command and machine information needed to
 interpret a local measurement.
