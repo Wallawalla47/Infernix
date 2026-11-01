@@ -1,7 +1,7 @@
 """The launcher against the stand-in server (no GPU): its features and its watchdog.
 
 python -I tools/launcher/launcher_check.py --launcher <infernix-launcher> --fake <infernix_launcher_fake_serve>
-    --models <dir> [--groups features,watchdog]
+    --models <dir> [--groups features,watchdog,windowless]
 Runs on Windows and Linux. <dir> holds at least one supported artifact (only its header is read;
 nothing in it is changed). Each group starts its own launcher with its memory and logs in a fresh
 temporary folder (printed; removed afterwards unless --keep).
@@ -13,6 +13,7 @@ features: model ids, named configurations, environment, script export and import
 watchdog: crash, lock-up, stall, the restart limit, idle servers, loads that do not fit, the RAM
           floor (about 6 GiB of RAM for a few seconds; --skip-ram leaves it out), the event log and
           the request-content log (about three minutes).
+windowless: (Windows) a launcher started on a console without a window stops its server in order.
 """
 
 from __future__ import annotations
@@ -98,14 +99,17 @@ def wait_for(predicate, timeout: float, step: float = 0.5):
 
 
 class Launcher:
-    def __init__(self, exe: Path, fake: Path, data: Path, port: int) -> None:
+    def __init__(self, exe: Path, fake: Path, data: Path, port: int, windowless: bool = False) -> None:
         self.exe, self.fake, self.data, self.port = exe, fake, data, port
+        self.windowless = windowless  # Windows: a console without a window, as some programs start it
         self.proc: subprocess.Popen | None = None
         self.out = None
 
     def start(self) -> None:
         kwargs = {}
-        if WINDOWS:
+        if WINDOWS and self.windowless:
+            kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+        elif WINDOWS:
             startup = subprocess.STARTUPINFO()
             startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startup.wShowWindow = 0
@@ -176,13 +180,13 @@ def first_model(port: int) -> dict:
     return next(m for m in library["models"] if m["family"] != "unknown")
 
 
-def run_group(name: str, options, settings: dict, body) -> None:
+def run_group(name: str, options, settings: dict, body, windowless: bool = False) -> None:
     """Starts a launcher on a fresh data folder and runs `body(launcher, port)` against it."""
     data = Path(tempfile.mkdtemp(prefix=f"infernix-launcher-{name}-"))
     log(f"== {name}: data folder {data}")
     (data / "infernix-launcher.json").write_text(json.dumps({"schema": 1, "settings": {
         "model_dirs": [options.models], "open_browser": False, **settings}}), encoding="utf-8")
-    launcher = Launcher(Path(options.launcher), Path(options.fake), data, options.port)
+    launcher = Launcher(Path(options.launcher), Path(options.fake), data, options.port, windowless)
     try:
         launcher.start()
         check(f"{name}: the launcher starts with the stand-in server", True)
@@ -805,13 +809,37 @@ def watchdog(launcher: Launcher, port: int, data: Path, skip_ram: bool) -> None:
     check("the stop is in the event log", "shutting down" in text)
 
 
+# ---------------------------------------------------------------------------------------------
+# A console without a window (Windows)
+
+
+def windowless(launcher: Launcher, port: int, data: Path) -> None:
+    """Started by a program that gives it a console without a window, the launcher still shares its
+    console with the server, so an unload stops the server in order instead of at the stop timeout."""
+    model = first_model(port)
+    key, alias = model["key"], model["config"]["alias"]
+    call(port, "PUT", f"/launcher/api/models/{key}/config",
+         {"args": list(model["config"]["default_args"]) + ["--fake-load-ms", "300"]})
+    status, _ = call(port, "POST", "/v1/chat/completions", chat(alias, 8))
+    check("windowless: a request loads the model", status == 200, str(status))
+    started = time.monotonic()
+    call(port, "POST", "/launcher/api/unload", {})
+    idle = wait_for(lambda: instance(port)["state"] == "idle", 30, 0.1)
+    seconds = time.monotonic() - started
+    # The stand-in writes "server stopped" only when the stop signal reaches it (not when ended).
+    check("windowless: an unload stops the server in order", bool(idle) and "server stopped" in serve_log(port),
+          f"idle after {seconds:.1f} s (stop timeout 10 s)")
+    code = launcher.stop()
+    check("windowless: an orderly stop", code == 0, str(code))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--launcher", required=True)
     parser.add_argument("--fake", required=True)
     parser.add_argument("--models", required=True)
     parser.add_argument("--port", type=int, default=1238)
-    parser.add_argument("--groups", default="features,watchdog")
+    parser.add_argument("--groups", default="features,watchdog,windowless")
     parser.add_argument("--skip-ram", action="store_true")
     parser.add_argument("--keep", action="store_true", help="keep the temporary folders")
     options = parser.parse_args()
@@ -822,6 +850,8 @@ def main() -> int:
         run_group("watchdog", options, {"hang_timeout_s": 10, "stall_timeout_s": 10, "load_timeout_s": 60,
                                         "drain_timeout_s": 5, "stop_timeout_s": 10},
                   lambda launcher, port, data: watchdog(launcher, port, data, options.skip_ram))
+    if "windowless" in groups and WINDOWS:
+        run_group("windowless", options, {"load_timeout_s": 60, "stop_timeout_s": 10}, windowless, windowless=True)
     failed = [r for r in results if not r[1]]
     log(f"SUMMARY: {len(results) - len(failed)} passed, {len(failed)} failed")
     for name, _, detail in failed:
