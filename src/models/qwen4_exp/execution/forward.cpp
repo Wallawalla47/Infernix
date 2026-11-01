@@ -738,6 +738,17 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     const Tensor gates = z.view({DV, NV * T});
     const ops::RmsGate gate_kind = g.output_gate == GateActivation::Sigmoid ? ops::RmsGate::Sigmoid : ops::RmsGate::Silu;
     Tensor y = work_.alloc(DType::BF16, {H, T});
+    if (!(scan_ != nullptr && eager_chunk_) && p.output.is_ggml() &&
+        ops::ggml_a8_takes_encoded(p.output.ggml, VW, T, dense_routes(), p.output.input_perm, p.output.perm_block)) {
+        // --a8-activations: the gated norm writes the output projection's 8-bit columns (no encoding launch; the
+        // same words, so the same bits).
+        Tensor encoded = work_.alloc(DType::I32, {ops::ggml_a8_encoded_column_words(p.output.ggml, VW), T});
+        ops::gated_rmsnorm_ggml_a8_encoded(rows, p.norm, gates, gate_kind, config_.rms_norm_eps, p.output.input_perm,
+                                           p.output.perm_block, p.output.ggml, encoded, s);
+        Tensor* const outs[] = {&y};
+        ops::ggml_linear_a8_encoded(encoded, VW, p.output.ggml, outs, s);
+        return y;
+    }
     if (producer_encodes(p.output, VW, T, dense_routes(), scan_ != nullptr && eager_chunk_)) {
         // The gated norm writes the output projection's input encoded (no encoding launch).
         ops::GgmlEncodedColumns encoded = alloc_encoded(work_, VW, T);
