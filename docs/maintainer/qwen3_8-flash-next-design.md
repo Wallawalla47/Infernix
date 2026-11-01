@@ -11419,6 +11419,25 @@ mixes then write the input projection's 8-bit columns too. Measured (2026-11-01,
 e2625acc): conv -0.4 % ms a round, struct -2.0 %; the weights change, so the sampled conv text (and its draft
 acceptance) changes too.
 
+**Toward Basalt's speed (2026-11-01, IQ3_S, DFlash2 auto, Basalt's conv and struct prompts; every arm A/B'd
+interleaved, 2 reps).** Adopted, in order: the hyper-connection Q8 repack with a 24-worker CPU team (9de63059), the
+expert rows in shared memory (390806df), the rows kernel for narrow tiled calls with L2 prefetch and the gated-norm
+producer (3867c564), side streams at the least priority with the shared expert early (ba651d71), the mix's 8-bit
+producer (e2625acc) and the Q6_K side projections (90f233a2): conv 11.42 → 10.07 ms a round, struct 15.31 → 13.74
+(Basalt 7.9-9.0 and 12.0 ms a window). Rejected, with their reasons, so they are not retried as they were: every miss
+on the CPU (conv +4.5 %, struct +2.1 %); each dense CTA encoding its columns (+1.0 / +4.6 %: occupancy and repeated
+encodes); a lane's expert slices decoded up front (+2.5 / +4.4 %: registers); smaller CPU work items (flat); a
+side-stream L2 prefetch of the output projections (+1.0 / +0.8 %: the fork and join cost more than the DRAM trip they
+hide); persistent and bounds variants of the expert gate/up kernel (flat: it reads at ~78 % of the practical DRAM
+rate alone); MTP drafting instead of DFlash2 (-12 % tok/s); a router that launches the plan at once (struct +1.9 %);
+the mix's 8-bit producer at 32 features a CTA (+0.4 / +0.3 %: 80 CTAs); that producer's dependents launched after its
+weight loop (struct +0.5 %); the tiled mma instead of the rows kernel for large calls (no faster at any size); and
+Basalt's two-stage head for the Q6_K head (a 2-bit screen fitted at load, sampled rows included: conv 1.4 % faster a
+round but 3.3 % fewer tok/s from lower acceptance, struct 0.6 % slower although the head itself fell from ~317 to
+147 us under nsys, the cause unresolved). The remaining gap is spread over the per-layer chain
+(the router and plan launches, the GDN and QSA middles, the hyper-connection mixes) and the round tail (the
+DFlash2 drafter, the recurrent fold, the head).
+
 **Expected gain** (from the traces, not measured). Per launch the exact kernels already match Basalt's (gate/up
 31 against 33 µs, dense tiles 18-20 against 20 µs) and the resident expert pass reads near the DRAM bound, so
 the route should buy a few per cent, not close the round gap, whose larger parts are structural (the staged
