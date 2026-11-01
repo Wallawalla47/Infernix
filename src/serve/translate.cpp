@@ -356,8 +356,8 @@ infernix::RequestOptions to_request_options(const GenerationRequest& request,
     if (semantics.enable_thinking != false) {
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
-        // Without a budget, the answer room (thinking_answer_room_budget) is set once the prompt
-        // length, and so the room the context leaves, is known.
+        // The budget as set; GenerationService settles it against the answer room
+        // (settle_thinking_budget) once the prompt length, and so the room the context leaves, is known.
         // A token constraint owns every output step, so the guard's injected close has no room.
         if (request.token_constraint.empty()) { options.execution.thinking.loop = server.reasoning_loop; }
     }
@@ -404,6 +404,21 @@ std::optional<std::uint32_t> thinking_answer_room_budget(const ServeOptions& ser
         std::min(std::max(static_cast<std::uint32_t>(kThinkingAnswerRoomMinReserve), output_limit / 4U),
                  output_limit / 2U);
     return output_limit - reserve;
+}
+
+std::optional<std::uint32_t> settle_thinking_budget(const ServeOptions& server,
+                                                    std::optional<std::uint32_t> request_budget,
+                                                    std::uint32_t output_limit) {
+    const std::optional<std::uint32_t> room = thinking_answer_room_budget(server, output_limit);
+    if (request_budget) {
+        // The client's own budget stands unless the limit would end thinking before it.
+        return room && *request_budget >= output_limit ? room : request_budget;
+    }
+    if (server.default_thinking_budget) {
+        // The server's default serves every max_tokens a client sends: it never takes the answer's room.
+        return room ? std::min(*server.default_thinking_budget, *room) : server.default_thinking_budget;
+    }
+    return room;
 }
 
 } // namespace infernix::serve

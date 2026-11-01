@@ -657,17 +657,26 @@ two of them must agree). There, a positive N caps that request's thinking, `0` d
 Add `--default-thinking-budget 512` to the startup command to cap model-origin thinking at 512
 tokens for every thinking-enabled request.
 
-`max_tokens` counts the thinking, so a request that thinks for its whole output limit ends with
-no answer (a harness that sends `max_completion_tokens: 8192` on every request hits this on hard
-tasks). A thinking request with no budget of its own and no `--default-thinking-budget` therefore
-gets one when its output limit is at least 1,024: thinking closes early enough to leave the
-answer a quarter of that limit (at least 256 tokens, at most half), through the same early close
-as any budget. 8,192 leaves 2,048 for the answer, 1,024 leaves 256. The output limit is
-`max_tokens`, or the room the prompt leaves in `--max-context` when that is less: a client that
-sends `max_tokens` 32,000 with a 250,000-token prompt at 262,144 context can emit 12,145 tokens,
-so thinking closes after 9,109 rather than running to the end of the context. Below 1,024
-nothing changes, and `--no-thinking-answer-room` lets thinking use all of the output limit again.
-The request log's `thinking_budget` shows the budget a request ran with.
+`max_tokens` counts the thinking, as in the OpenAI and Anthropic APIs, so a request that thinks
+for its whole output limit ends with no answer (a harness that sends `max_completion_tokens: 8192`
+on every request hits this on hard tasks). The answer room prevents that when the output limit is
+at least 1,024: thinking closes early enough to leave the answer a quarter of that limit (at
+least 256 tokens, at most half), through the same early close as any budget. 8,192 leaves 2,048
+for the answer, 1,024 leaves 256. It applies to:
+
+- a thinking request with no budget at all;
+- `--default-thinking-budget`, which it caps: with `--default-thinking-budget 16384`, a request
+  with the default `max_tokens` of 8,192 thinks for at most 6,144 tokens, and one that sends
+  32,768 for the full 16,384;
+- a request's own budget at or above its output limit, which the limit would reach first (clients
+  such as Qwen Code send a fixed budget while shrinking `max_tokens` to the context left).
+
+A request's own budget below its output limit stands as sent. The output limit is `max_tokens`,
+or the room the prompt leaves in `--max-context` when that is less: a client that sends
+`max_tokens` 32,000 with a 250,000-token prompt at 262,144 context can emit 12,145 tokens, so
+thinking closes after 9,109 rather than running to the end of the context. Below 1,024 the budget
+is as set, and `--no-thinking-answer-room` lets thinking use all of the output limit again. The
+request log's `thinking_budget` shows the budget a request ran with.
 
 At the cap boundary, Engine first honors a natural `</think>`, stop condition, cancellation, or
 total output/context limit. If thinking remains open, it commits Qwen's canonical early-close
@@ -1293,9 +1302,10 @@ Thinking supports `disabled`, `adaptive`, and `enabled`. Enabled Thinking takes
 `budget_tokens >= 1024`, and that budget is passed to Engine. Unlike the Anthropic API,
 `budget_tokens` may be omitted (ZCode sends none): Thinking is then on with the server's default
 budget (`--default-thinking-budget`, none unless set), as with `adaptive`. A budget at
-or above `max_tokens` is accepted: the output limit ends thinking before the budget can, so the
-budget takes no effect. Clients such as Qwen Code send a fixed budget while shrinking `max_tokens`
-to the context left. Visible
+or above `max_tokens` is accepted, and the answer room ([Chat Completions](#openai-chat-completions))
+takes its place: the
+output limit would end thinking first, with no answer. Clients such as Qwen Code send a fixed
+budget while shrinking `max_tokens` to the context left. Visible
 Thinking is returned with an opaque compatibility signature; SSE emits its `signature_delta`
 before closing the block. Request lowering reconstructs the local prompt from the visible
 `thinking` text and treats `signature` as non-semantic transport metadata, so retained history
@@ -1708,8 +1718,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--ngram-session-mib N` | one conversation's share of the n-gram archive; no effect without `--ngram-archive-mib` | `128` |
 | `--ngram-native-sessions` | also recognize Kilo, Codex and Claude session metadata as conversation identities; requires `--ngram-archive-mib` | off |
 | `--default-max-tokens N` | output limit when omitted by a request; startup logs an `output limit` note when `--max-context` is at least four times it | `8192` |
-| `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
-| `--no-thinking-answer-room` | without a budget, thinking may use all of the output limit (by default, from an output limit of 1,024, it closes early enough to leave a quarter for the answer; the limit is `max_tokens` or the context the prompt leaves, whichever is less) | answer room on |
+| `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests, lowered by the answer room where it would leave the answer less | unset |
+| `--no-thinking-answer-room` | thinking may use all of the output limit (by default, from an output limit of 1,024, it closes early enough to leave a quarter for the answer: with no budget, under `--default-thinking-budget`, or with a request budget at or above the limit; the limit is `max_tokens` or the context the prompt leaves, whichever is less) | answer room on |
 | `--thinking-budget-message S` | text committed when a thinking budget ends thinking, replacing Qwen's early-close guidance; the close marker is appended when `S` lacks it, and `S` may contain `</think>` only as that final close | Qwen guidance |
 | `--reasoning-loop MODE` | `off`, `stop` or `conclude`: reasoning-loop guard for thinking requests without a token constraint (details under [OpenAI Chat Completions](#openai-chat-completions)) | `off` |
 | `--vision` | enable media input and load Vision GPU allocations | off |

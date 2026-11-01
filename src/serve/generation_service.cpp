@@ -533,14 +533,13 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         if (!prepared.enable_thinking) {
             request_options.execution.thinking.budget.reset();
             prepared.thinking_budget.reset();
-        } else if (semantics.enable_thinking != false &&
-                   !request_options.execution.thinking.budget) {
+        } else if (semantics.enable_thinking != false) {
             // The answer room follows the limit the request actually has: a prompt that leaves
             // less context than max_tokens would otherwise think to the end of the context.
-            request_options.execution.thinking.budget = thinking_answer_room_budget(
-                options_, effective_output_limit(
-                              request_options.execution.requested_output_tokens,
-                              engine_->options().max_context, prompt.summary().prompt_tokens));
+            request_options.execution.thinking.budget = settle_thinking_budget(
+                options_, request.thinking_budget,
+                effective_output_limit(request_options.execution.requested_output_tokens,
+                                       engine_->options().max_context, prompt.summary().prompt_tokens));
             prepared.thinking_budget = request_options.execution.thinking.budget;
         }
         prepared.prompt_tokens           = static_cast<int>(prompt.summary().prompt_tokens);

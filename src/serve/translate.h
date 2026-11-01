@@ -58,12 +58,21 @@ infernix::RequestOptions to_request_options(const GenerationRequest& req, const 
 std::uint32_t effective_output_limit(std::uint32_t requested_output_tokens,
                                      std::uint32_t max_context, std::uint32_t prompt_tokens);
 
-// The thinking budget ServeOptions::thinking_answer_room gives a thinking request without one of
-// its own: thinking closes early enough to leave the answer a quarter of output_limit (at least
-// kThinkingAnswerRoomMinReserve, at most half), from kThinkingAnswerRoomMinTokens. output_limit is
-// the effective limit, not max_tokens: a prompt that leaves less room than max_tokens still gets
-// its answer room. Empty below the threshold or with the room off.
+// The answer room's thinking budget (ServeOptions::thinking_answer_room): thinking closes early
+// enough to leave the answer a quarter of output_limit (at least kThinkingAnswerRoomMinReserve, at
+// most half), from kThinkingAnswerRoomMinTokens. output_limit is the effective limit, not
+// max_tokens: a prompt that leaves less room than max_tokens still gets its answer room. Empty
+// below the threshold or with the room off.
 std::optional<std::uint32_t> thinking_answer_room_budget(const ServeOptions& server,
                                                          std::uint32_t output_limit);
+
+// The budget a thinking request runs with once its effective output limit is known. The answer
+// room is the budget of a request with none, caps --default-thinking-budget, and replaces a
+// request's own budget at or above output_limit (the limit would end thinking first, with no
+// answer); a request's own budget below output_limit stands. Where the answer room is empty, the
+// budget is the request's own, else the server default, else none.
+std::optional<std::uint32_t> settle_thinking_budget(const ServeOptions& server,
+                                                    std::optional<std::uint32_t> request_budget,
+                                                    std::uint32_t output_limit);
 
 } // namespace infernix::serve

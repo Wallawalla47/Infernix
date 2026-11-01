@@ -123,12 +123,13 @@ struct ServeOptions {
     // or have its Claude-specific parts replaced by a short local-agent preamble.
     ClaudeCodePrompt claude_code_prompt = ClaudeCodePrompt::AsSent;
     std::optional<std::uint32_t> default_thinking_budget;
-    // A thinking request without a budget (its own or --default-thinking-budget) and at least
-    // kThinkingAnswerRoomMinTokens of output limit (max_tokens, or the context the prompt leaves
-    // when that is less) gets a budget that leaves a quarter of that limit (at least
-    // kThinkingAnswerRoomMinReserve, at most half) for the answer: the limit counts the thinking,
-    // so a long thought would otherwise end the request with no answer. See
-    // thinking_answer_room_budget. --no-thinking-answer-room turns it off.
+    // The answer room: from kThinkingAnswerRoomMinTokens of output limit (max_tokens, or the context
+    // the prompt leaves when that is less), thinking closes early enough to leave a quarter of that
+    // limit (at least kThinkingAnswerRoomMinReserve, at most half) for the answer, whether the
+    // request has no budget, the server's default_thinking_budget, or a budget of its own at or above
+    // the limit: the limit counts the thinking, so a long thought would otherwise end the request
+    // with no answer. A request's own budget below the limit stands. See settle_thinking_budget.
+    // --no-thinking-answer-room turns it off.
     bool thinking_answer_room = true;
     // End-of-thinking message fed to the model when it hits the thinking budget; empty
     // preserves the model's built-in control suffix.
