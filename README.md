@@ -16,99 +16,126 @@ Infernix is a C++/CUDA inference engine that serves Qwen models on one NVIDIA RT
 
 ## Headline results
 
-`main` at `fb491903` on NVIDIA's NVFP4 weights and `6b066a54` on the others (no change since applies
-to them), one RTX 5090 (PCIe Gen5 x8), 2026-10-30/31, against each engine's latest
-version, every engine native on Windows under the same 84 GiB RAM budget. Context columns: one
-request at a time, ~8K to ~250K tokens. Replay: an agentic coding workload, two requests at once.
-Activation precision differs: the other engines round to 8 bits what Infernix keeps at 16 (every
-activation on IQ3_S; all but the NVFP4 routed experts, which Infernix runs at the checkpoint's own
-4 bits and the others at 8 in decode); see each section's notes. Details: [Benchmarks](#benchmarks).
+One RTX 5090 on PCIe Gen5 x8, 2026-10-30/31. Every engine ran its latest version at the time,
+natively on Windows, with its own recommended settings and drafter and the same 84 GiB RAM budget.
+**Context**: one request, ~8K to ~250K tokens. **Replay**: an agentic coding workload, two requests
+at a time. Full tables and methods: [Benchmarks](#benchmarks).
 
-| Infernix vs | Time to first token | Decode tok/s | Replay: mean time to first token | Replay: wall time |
+**Speed without precision shortcuts.** Infernix keeps every activation at the precision the
+checkpoint specifies (16 bits where the others round to 8), runs every routed expert (no expert tail
+skipping) and computes the full output head (no 2-bit screen). Basalt, which computes with fewer
+bits (6-bit dense layers on NVFP4; 8-bit activations and a 2-bit head screen on IQ3_S), has the
+highest decode tok/s. On NVIDIA's NVFP4 weights Infernix still reaches the first token 5-8× sooner
+and finishes the agentic workload 36 % sooner. On the IQ3_S GGUF Basalt is ahead overall (4.4
+against 5.5 min); with the same 8-bit activations Infernix matches its first tokens, but Basalt still
+decodes faster. Measured quality for every engine follows in a later update.
+
+| Infernix vs | First token | Decode | Replay: mean first token | Replay: wall time |
 |---|---|---|---|---|
-| [Strata](https://github.com/Niko1221/Strata) v0.2.8, same NVIDIA NVFP4 weights (Infernix: Dense8) | 1.4-1.6× sooner | +10-15 % to 128K, 4 % behind at 250K | 3.1 s vs 12.3 s | 5.7 vs 12.9 min |
-| [strata-nvfp4](https://github.com/sergqwer/strata-nvfp4) 0.2.0-beta-nvfp4.3, same weights | 1.3× sooner | level to +3 % | 3.1 s vs 10.8 s | 5.7 vs 11.7 min |
-| [Basalt](https://github.com/jesdga95/basalt) `c08284cb`, NVIDIA NVFP4 (its pack) | 5-8× sooner† | Basalt 7-23 % faster | 3.1 s vs 7.2 s | 5.7 vs 8.9 min |
-| Strata* v0.2.8, same IQ3_S GGUF | 15 % sooner at 8K, level at 128K-250K | +3-12 % | 3.1 s vs 6.9 s | 5.5 vs 8.1 min |
-| Basalt `c08284cb`, IQ3_S (its pack) | Basalt 4 % sooner at 8K, 1.3× at 128K-250K | Basalt 1.4-1.7× faster | 3.1 s vs 3.7 s | Basalt sooner: 5.5 vs 4.4 min |
-| [NInfer](https://github.com/Neroued/ninfer) `1882c6adb` (Windows port), 27B NVFP4 | 9 % sooner at 8K, 1.6-1.8× at 128K-230K | own drafters +11-17 %; no drafting +2-3 % | 1.9 s vs 2.5 s (median 0.59 vs 0.93 s) | 12.7 vs 16.4 min |
+| **Qwen3.8-Flash-Next, NVIDIA's NVFP4 weights** | | | | |
+| [Strata](https://github.com/Niko1221/Strata) v0.2.8 | 1.4-1.6× sooner | +10-15 % to 128K, −4 % at 250K | 3.1 s vs 12.3 s | 5.7 vs 12.9 min |
+| [strata-nvfp4](https://github.com/sergqwer/strata-nvfp4) 0.2.0-beta-nvfp4.3 | 1.3× sooner | level to +3 % | 3.1 s vs 10.8 s | 5.7 vs 11.7 min |
+| [Basalt](https://github.com/jesdga95/basalt) `c08284cb` | 5-8× sooner¹ | Basalt 7-23 % faster² | 3.1 s vs 7.2 s | 5.7 vs 8.9 min |
+| **Qwen3.8-Flash-Next, ISTA-DASLab's IQ3_S GGUF** | | | | |
+| Strata v0.2.8³ | 15 % sooner at 8K, level from 128K | +3-12 % | 3.1 s vs 6.9 s | 5.5 vs 8.1 min |
+| Basalt `c08284cb` | Basalt 4 % sooner at 8K, 1.3× from 128K⁴ | Basalt 1.4-1.7× faster⁴ | 3.1 s vs 3.7 s | Basalt sooner: 4.4 vs 5.5 min⁴ |
+| **Qwen3.8-27B, the same NVFP4 artifact in both** | | | | |
+| [NInfer](https://github.com/Neroued/ninfer) `1882c6adb` | 9 % sooner at 8K, 1.6-1.8× from 128K | +11-17 % (own drafters), +2-3 % without | 1.9 s vs 2.5 s | 12.7 vs 16.4 min |
 
-\* Strata's default route tail skip (it skips some missed experts) was turned off for these runs
-because it changes which experts run; see the [IQ3_S section](#qwen38-flash-next-iq3_s-infernix-vs-strata-and-basalt).
+1. Basalt reads its 50.7 GiB n-gram table from the SSD here: it does not fit in the RAM budget beside
+   its experts.
+2. Basalt runs NVIDIA's BF16 dense layers at **6 bits** (+10 % KL divergence by its own measure) and
+   every activation outside the experts at **8 bits**; Infernix keeps 16.
+3. Strata's default route tail skip (it skips some missed experts) was off: it changes which experts
+   run.
+4. Strata and Basalt compute **every activation at 8 bits** on IQ3_S, and Basalt takes the logits
+   outside the top 64 from a **2-bit copy** of the output head; Infernix keeps 16 bits and the GGUF's
+   head. At 8 bits (`--a8-activations`) Infernix reaches the first token as soon as Basalt, which
+   still decodes 1.2-1.7× as fast.
 
-† Basalt's NVFP4 pack reads its 50.7 GiB n-gram table from the SSD on every prompt: within the RAM
-budget the table does not fit beside its experts (in RAM it pushed 28 % of them out and the first
-request failed). On IQ3_S, whose table fits in RAM, Basalt is the soonest. Not model loading: Basalt
-loads its model during its first request, and every engine's first request is an uncounted warm-up.
+### Activation precision
+
+Infernix computes each model at the activation precision its checkpoint specifies; options change
+it:
+
+| Weights | Default | Options |
+|---|---|---|
+| NVIDIA NVFP4 Flash-Next (Dense8 and the bit-exact conversion) | Routed experts **4-bit** (W4A4 with NVIDIA's calibrated scales), because NVIDIA's checkpoint specifies it; everything else 16-bit | `--a8-activations`: experts 8-bit. `--a16-activations`: experts 16-bit on the stored 4-bit weights |
+| NVIDIA FP4-Local Flash-Next | 16-bit, as NVIDIA serves it | `--expert-a4-activations`: experts 4-bit. `--a8-activations`: experts 8-bit |
+| Uncensored NVFP4 Flash-Next | 16-bit (weight-only NVFP4 experts) | `--a8-activations`: experts 8-bit |
+| IQ3_S GGUF Flash-Next | 16-bit everywhere | `--a8-activations`: dense projections and experts 8-bit, as Strata and Basalt |
+| Qwen3.8-27B NVFP4 | 4-bit at its NVFP4 layers, as the artifact specifies (NInfer the same) | none |
+
+On NVIDIA's NVFP4 weights Strata, strata-nvfp4 and Basalt run the experts at 8 bits in decode and
+every other activation at 8 bits. The options on Dense8 (RTX 5090, one request):
+
+| Experts' activations | First token at ~8K / ~128K / ~250K | Decode rounds a second | Agentic replay |
+|---|---|---|---|
+| 4-bit (default) | 1.9 / 12.2 / 23.9 s | | 5.7 min |
+| 8-bit, `--a8-activations` | level / 28 % / 28 % later | 1-7 % more | decode 6 % faster, uncached prompts 16 % slower: 5.7 min |
+| 16-bit, `--a16-activations` | level / 38 % / 37 % later | 2-6 % more | not run |
+
+Only the 4-bit route reads prompts on the RTX 5090's FP4 tensor cores, which makes it the fastest
+for agents. Both options change the output; their quality is not measured yet.
 
 ## Why Infernix
 
 ### Qwen3.8-Flash-Next on one RTX 5090
 
-Its 24,576 routed experts (63 GiB at NVFP4) live in pinned system RAM; the hot ones are cached in
-VRAM, part of each layer's misses is computed on the CPU while the rest cross PCIe, and the 52 GB
-n-gram table is read from NVMe.
+The 24,576 routed experts (63 GiB at NVFP4) live in pinned RAM, the hot ones cached in VRAM; each
+layer's misses are split between the CPU and the PCIe link, and the 52 GB n-gram table is read from
+NVMe.
 
-- **Soonest to the first token on NVIDIA's NVFP4 weights**: 1.3-1.6× sooner than
-  [Strata](https://github.com/Niko1221/Strata) v0.2.8 and
-  [strata-nvfp4](https://github.com/sergqwer/strata-nvfp4) from 8K to 250K tokens, and 5-8× sooner
-  than [Basalt](https://github.com/jesdga95/basalt), which reads its n-gram table from the SSD
-  here; in the agentic replay 3.1 s against 7.2-12.3 s and 36-56 % less wall time. Decode is 10-15 %
-  ahead of Strata to 128K (4 % behind at 250K, where accepted drafts vary most), level with
-  strata-nvfp4 (0-3 % ahead), and behind Basalt by 7-23 % (level on one request in the replay)
+- **Soonest first token** on NVIDIA's NVFP4 weights: 1.3-1.6× sooner than Strata and strata-nvfp4
+  from 8K to 250K tokens; 36-56 % less wall time than every other engine in an agentic replay
   ([benchmarks](#qwen38-flash-next-nvfp4-infernix-vs-strata-strata-nvfp4-and-basalt)).
-- **On the IQ3_S GGUF** Infernix decodes 3-12 % faster than Strata and needs a third less replay
-  time, but Basalt decodes about 1.5× as fast as Infernix and finishes the replay 26 % sooner
-  ([benchmarks](#qwen38-flash-next-iq3_s-infernix-vs-strata-and-basalt)).
-- **16-bit activations by default** where Strata and Basalt round them to 8 bits (on NVIDIA's NVFP4
-  weights the routed experts take the checkpoint's own 4-bit activations, which the others compute
-  at 8 bits in decode); measured quality for every engine follows in a later update. Perplexity was 4.654
-  against Strata 0.1.45's 4.844 on the same token ids (2026-10-19).
+- **Activations as the checkpoint specifies**: 16-bit wherever it keeps BF16 (all of them on GGUF),
+  where Strata and Basalt use 8 bits ([activation precision](#activation-precision)).
 - **DFlash2 drafting** with Inco AI's drafter
   ([Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix),
-  776 MB, any conversion): 8-11 % faster than the model's MTP drafter (26 % on sampled code), with
-  VRAM for 330 more cached experts ([benchmarks](#qwen38-flash-next-dflash2-against-mtp)).
-- **Long context**: 262K tokens natively, up to 1M with YaRN; a 250K prompt prefills in about 24 s.
+  776 MB, any conversion): 8-11 % faster than MTP, 26 % on sampled code
+  ([benchmarks](#qwen38-flash-next-dflash2-against-mtp)).
+- **Long context**: 262K tokens natively, 1M with YaRN; a 250K prompt prefills in about 24 s.
 - **Less RAM than the model?** An SSD expert tier reads what does not fit.
 - **Uncensored too**:
   [Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix)
-  keeps orcarouter's abliterated weights bit-exact (perplexity 4.772) and decodes about as fast as
-  Dense8.
+  keeps orcarouter's abliterated NVFP4 experts and FP8 projections bit-exact (perplexity 4.772).
 
 Setup and tuning: the [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next.md).
 
 ### Qwen3.8-27B: faster prefill and decode
 
-- **Hybrid prefix cache** for Qwen's linear-attention layers: content-addressed KV in 64-token
-  blocks, recurrent-state snapshots where prompts get reused, and GPU, RAM and file tiers. In an
-  agentic workload against NInfer `1882c6adb` (both serve 91 % of prompt tokens from cache) it
-  reaches the first token 36 % sooner at the median and finishes 21 % sooner
-  ([benchmarks](#qwen38-27b-infernix-vs-ninfer)).
+Against NInfer on the same artifact ([benchmarks](#qwen38-27b-infernix-vs-ninfer)):
+
+- **Hybrid prefix cache** for Qwen's linear-attention layers (64-token KV blocks, recurrent-state
+  snapshots, GPU, RAM and file tiers): in an agentic replay the median first token comes 36 %
+  sooner and the work finishes 21 % sooner.
 - **Faster prefill**: 1.6-1.8× NInfer's on long prompts.
-- **Faster decode**: DFlash2 trees and n-gram copy drafting beside DFlash2 and MTP.
-- **Smaller KV**: `vq2` and `k4v2` hold three to four times the context of INT8.
+- **Faster decode**: DFlash2 with n-gram copy drafts, 11-17 % ahead of NInfer's MTP; draft trees
+  (`--draft-tree-nodes`) are an option on top.
+- **Smaller KV**: `k4v2` and `vq2` hold 2.7 and 4 times the context of INT8.
 
 ### Built for agents
 
-- **APIs**: OpenAI Chat Completions and Responses, Anthropic Messages, streaming, and the options
+- **APIs**: OpenAI Chat Completions and Responses, Anthropic Messages and streaming, with the options
   Claude Code, Qwen Code, Codex, Zed and GitHub Copilot send.
-- **Robust tool calling**: the XML call forms agents emit, tolerant recovery of broken calls
-  (`--tolerant-tool-calls`), calls stranded in unclosed thinking, and quoted calls kept as text.
-- **Deferred tools**: `defer_loading` with regex/BM25 tool search, `tool_reference` and the
-  Responses `tool_search` tool, so large MCP catalogs stay out of the prompt.
-- **Constrained decoding**: JSON object and Schema output, strict tool arguments and choice, GBNF,
-  regex and choice grammars, with every model and drafter.
+- **Tool calling**: the XML forms agents emit, recovery of broken calls (`--tolerant-tool-calls`),
+  and deferred tools (`defer_loading`, regex/BM25 tool search, `tool_reference`) that keep large MCP
+  catalogs out of the prompt.
+- **Constrained decoding**: JSON object and Schema, strict tool arguments, GBNF, regex and choice
+  grammars, with every model and drafter.
 - **Thinking control**: budgets with a wrap-up message, effort levels and a repetition guard
   (`--reasoning-loop`).
-- **Concurrency**: one to eight requests, with preemption under memory pressure.
-- **Resilience**: the prefix cache persists across restarts (`--prefix-cache-save-mins` saves it
-  periodically); on Flash-Next a failed expert read fails only the requests running at the time.
-- **`/v1/decide`**: decisions from token probabilities (yes/no, choice, score, number, point, box).
+- **Concurrency and resilience**: one to eight requests with preemption under memory pressure; the
+  prefix cache persists across restarts; a failed Flash-Next expert read fails only the requests
+  running then.
+- **`/v1/decide`**: decisions from token probabilities (yes/no, choice, score, number, scalar, point
+  and box).
 
 ### And also
 
-- **Speculative decoding**: MTP, DFlash, DFlash2 and n-gram drafting, with exact sampling; on by
-  default, with the drafter measured fastest for each model (`--spec auto`).
+- **Speculative decoding**: MTP, DFlash, DFlash2 and n-gram drafting with exact sampling, on by
+  default with the drafter measured fastest for each model (`--spec auto`).
 - **KV formats**: `int8`, `bf16`, `fp8`, `nvfp4`, `k8v4`, `vq2` and `k4v2`.
 - **Vision**: images and video; the vision encoder can stay in system RAM.
 - **Conversion**: Hugging Face, NVIDIA ModelOpt, Quasar and GGUF sources; Q4-Q8, FP8, NVFP4 and
@@ -117,49 +144,17 @@ Setup and tuning: the [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next.md).
 
 ## Benchmarks
 
-One machine: RTX 5090 (32 GB) on **PCIe Gen5 x8**, Core i9-13900K, 96 GB DDR5, Windows 11. Gen5 x16
-makes Flash-Next's prompts up to twice as fast and its decode 2-7 % faster
-([measured on another machine](#pcie-gen5-x8-against-x16)). Infernix
-is `main` at [`fb491903`](https://github.com/Wallawalla47/Infernix/commit/fb491903) for its default
-route on NVIDIA's NVFP4 weights (re-run after the tensor-core narrow W4A4 experts of 2026-10-31) and
-[`6b066a54`](https://github.com/Wallawalla47/Infernix/commit/6b066a54) for IQ3_S, the
-`--a8-activations` rows and the 27B (no change since applies to them), built from
-source; every engine runs natively on Windows as an OpenAI-compatible server driven by the same
-client, which times the first token from sending the request to the first streamed token
-(2026-10-30/31, GPU power limit 517.5 W, clocks checked before every session).
-
-- **Context length**: one request, greedy, 1,024 output tokens; three ~8K prompts and two each of
-  ~128K and ~250K (~230K on the 27B). Two Infernix sessions bracket the other engines' (pooled);
-  the others run one session each.
-- **Agentic replay** ([`bench/agentic_ab`](bench/agentic_ab/README.md)): three coding-agent sessions
-  and eleven subagents with tool calls, compactions, retries and aborts, up to eight requests in
-  flight, temperature 1.0, 68 requests per seed. Every engine serves two requests at once; every arm
-  replays the same observations. Cells: means over seeds (range in brackets); comparison columns:
-  the mean of per-seed differences. Every engine completed every request.
-- **Settings**: each engine's own recommended configuration for this PC (its setup, probe or example
-  config) and its own drafter, with the same rules for all: INT8 KV; 262,144 tokens on Flash-Next;
-  an 8 GiB conversation or prefix cache; one RAM budget of 84 GiB of the 96 (a server that takes
-  more is stopped; every engine stayed below it); every n-gram table on the same kind of drive
-  (Samsung 990 PRO); no thinking caps (answer room off everywhere); and every switchable option
-  that computes below the checkpoint's own precision or changes which experts run turned off
-  (marked * where that differs from the engine's default). Every engine verifies every draft.
+RTX 5090 (32 GB) on **PCIe Gen5 x8**, Core i9-13900K, 96 GB DDR5, Windows 11; Gen5 x16 reads
+Flash-Next's prompts up to twice as fast ([measured](#pcie-gen5-x8-against-x16)). TTFT: time to the
+first token; bold: best in its row. Methods and every engine's settings are at the end of each
+section and [below](#how-the-benchmarks-were-run).
 
 ### Qwen3.8-Flash-Next NVFP4: Infernix vs Strata, strata-nvfp4 and Basalt
 
-Infernix runs the [Dense8 conversion](#models) of NVIDIA's checkpoint with Inco AI's DFlash2 drafter
-(`--spec auto`, draft length auto, `--lm-head-draft`, `--vram-past-budget`);
-[Strata](https://github.com/Niko1221/Strata) v0.2.8 and
-[strata-nvfp4](https://github.com/sergqwer/strata-nvfp4) 0.2.0-beta-nvfp4.3 NVIDIA's checkpoint as
-their NVFP4 pack, with the model's MTP drafter (Strata: what its setup writes for this PC plus its
-`--prefill auto:32768` tip for 96 GB PCs; strata-nvfp4: its bundled `--spec 6 --spec-min-p 0.7`);
-[Basalt](https://github.com/jesdga95/basalt) `c08284cb` its published NVFP4 pack with MTP windows of
-8. Basalt reads its 50.7 GiB n-gram table from the SSD here: keeping it in RAM pushed 28 % of the
-experts out to the SSD and the first request failed, so its time to the first token is long (its
-own A/B on IQ3_S: reading the table from the SSD made a 128K prompt 5× slower). Model loading is not
-in these figures: Basalt loads its model during its first request, and every session starts with an
-uncounted warm-up request.
+Infernix runs the [Dense8 conversion](#models) of NVIDIA's checkpoint with Inco AI's DFlash2 drafter;
+the others run NVIDIA's checkpoint as their own NVFP4 packs with the model's MTP drafter.
 
-**Context length** (Infernix: two sessions pooled):
+**Context length** (one request):
 
 | Context | TTFT: Infernix | Strata | strata-nvfp4 | Basalt | Decode tok/s: Infernix | Strata | strata-nvfp4 | Basalt |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -167,13 +162,7 @@ uncounted warm-up request.
 | ~128K | **12.22 s** | 18.83 s | 15.34 s | 92.94 s | 161 | 146 | 161 | **173** |
 | ~250K | **23.90 s** | 37.55 s | 31.78 s | 125.92 s | 175 | 183 | 172 | **216** |
 
-Decode varies most at ~250K, where each request's thinking decides how many drafts are accepted
-(per request: Infernix 160-195, Basalt 190-242 tok/s; on `6b066a54` Infernix measured 151-246 there,
-mean 195). Against `6b066a54` the decode rounds a second rose 10 % at ~8K and ~250K and fell 2 % at
-~128K, while the drafts accepted a round moved with the generated text; tok/s changed within that
-run-to-run spread (183 / 161 / 175 against 178 / 168 / 195).
-
-**Agentic replay** (three seeds):
+**Agentic replay** (two requests at a time, three seeds):
 
 | Metric | Strata | strata-nvfp4 | Basalt | Infernix | vs Strata | vs strata-nvfp4 | vs Basalt |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -188,45 +177,49 @@ run-to-run spread (183 / 161 / 175 against 178 / 168 / 195).
 | Tokens per round | 2.26 | 2.21 | 2.37 | **2.61** | +15 % | +19 % | +11 % |
 | Wall time | 12.9 min (12.0-13.8) | 11.7 min (11.0-12.9) | 8.9 min (8.6-9.1) | **5.7 min** (5.4-5.9) | −56 % | −51 % | −36 % |
 
-Against `6b066a54` (3.3 s mean and 2.17 s median TTFT, 5.7 min) the replay is level within its seeds'
-ranges. The prefill row's other engines read differently from the earlier table (5,159 / 5,701 /
-2,108) because it compares the prompts every joined run prefilled cold, a set that moves with each
-run's cache.
+- **First tokens**: the prefix cache reuses what the others re-read (whole prompts re-prefilled on
+  continuing turns per seed: Strata 15-17 of 41, strata-nvfp4 9-14, Basalt 0-1, Infernix 1).
+  Basalt's are slow here because it reads its n-gram table from the SSD (its own A/B on IQ3_S: 5×
+  slower at 128K).
+- **Decode**: Basalt is 7-23 % faster on one request, with coarser arithmetic (below); in the replay
+  it is level at one request and Infernix leads by 15 % at two. At ~250K each request's thinking
+  decides how many drafts are accepted (per request: Infernix 160-195 tok/s, Basalt 190-242).
 
-Strata re-prefilled the whole prompt on 15-17 of the 41 continuing main-session turns per seed,
-strata-nvfp4 on 9-14, Basalt on 0-1 and Infernix on 1.
-
-**What each engine computes** (none of these options is switchable unless noted):
+**What each engine computes** (not switchable unless noted):
 
 | | Infernix | Strata v0.2.8 | strata-nvfp4 | Basalt |
 |---|---|---|---|---|
-| Routed experts' activations (4-bit in the checkpoint) | 4-bit with NVIDIA's calibrated scales, as the checkpoint specifies | 8-bit | 8-bit; in the prompt, gate/up two 4-bit terms per value | 8-bit; prompt chunks of 1,024+ tokens 4-bit |
+| Routed experts' activations (4-bit in the checkpoint) | 4-bit with NVIDIA's calibrated scales, as the checkpoint specifies (8 or 16 by option) | 8-bit | 8-bit; in the prompt, gate/up two 4-bit terms per value | 8-bit; prompt chunks of 1,024+ tokens 4-bit |
 | Other activations (BF16 in the checkpoint) | 16-bit | **8-bit** | **8-bit** | **8-bit** |
-| Dense layers (BF16 in the checkpoint) | 8-bit (Dense8; the bit-exact conversion keeps BF16) | 8-bit | 8-bit | **6-bit** (Basalt measures +10 % KL divergence from it) |
+| Dense layers (BF16 in the checkpoint) | 8-bit (Dense8; the bit-exact conversion keeps BF16) | 8-bit | 8-bit | **6-bit** (+10 % KL divergence by Basalt's measure) |
 | n-gram table (FP8 in the checkpoint) | FP8 | FP8 | FP8 | re-blocked to 8-bit |
 
-NVIDIA's checkpoint specifies 4-bit activations for the routed experts, which Infernix follows and
-the others compute more finely in decode; it keeps every other activation in BF16, which Infernix
-follows and the others round to 8 bits. None of the NVFP4 engines had a lossy option on by default
-that could be turned off. Measured quality (KL divergence against an exact reference) follows in a
-later update.
+None of these engines has a lossy default that could be turned off. Measured quality (KL divergence
+against an exact reference) follows in a later update.
 
-**Infernix with 8-bit expert activations** (the opt-in `--a8-activations`, closer to the others'
-arithmetic in decode; not the comparison above; measured on `6b066a54`): context length TTFT
-1.88 / 15.53 / 30.58 s and decode 199 / 185 / 268 tok/s at ~8K / ~128K / ~250K; replay mean TTFT
-3.4 s, output 175 tok/s at one request (+5 % on Basalt), wall time 5.7 min. Decode gains 5-9 %, but prompts read up to 28 % slower
-than on the default 4-bit route, so the default stays the faster choice for agents.
+**Infernix with 8-bit expert activations** (`--a8-activations`; an option, not the comparison above):
+
+| Infernix | TTFT ~8K / ~128K / ~250K | Decode tok/s | Replay: mean TTFT | Replay: output tok/s, one request | Replay: wall time |
+|---|---:|---:|---:|---:|---:|
+| 4-bit (default) | 1.88 / 12.22 / 23.90 s | 183 / 161 / 175 | 3.1 s | 166 | 5.7 min |
+| `--a8-activations` | 1.88 / 15.53 / 30.58 s | 199 / 185 / 268 | 3.4 s | 175 | 5.7 min |
+
+Against its own session's default (on `81bcdaef`'s build) the 8-bit route runs 1-7 % more decode
+rounds a second (tok/s rises 9-36 %, partly from different text and drafts) but reads long prompts
+28 % slower, so the default stays the faster choice for agents.
+
+*Settings*: Infernix `--spec dflash2`, draft length auto, `--lm-head-draft`, `--vram-past-budget`.
+Strata: its setup's configuration for this PC plus its `--prefill auto:32768` tip for 96 GB PCs.
+strata-nvfp4: its bundled `--spec 6 --spec-min-p 0.7`. Basalt: its NVFP4 pack, MTP windows of 8,
+n-gram table on the SSD (in RAM it pushed 28 % of the experts out and the first request failed).
+Basalt loads its model during its first request; every session starts with an uncounted warm-up.
 
 ### Qwen3.8-Flash-Next IQ3_S: Infernix vs Strata and Basalt
 
 All three run ISTA-DASLab's GSQ-RCO `IQ3_S` GGUF: Infernix its [bit-exact conversion](#models) with
-the GGUF's IQ4_NL n-gram table and the DFlash2 drafter (settings as above), Strata* v0.2.8 the GGUF
-with its setup's configuration (`--spec 4 --spec-min-p 0.5 --pool-workers 15`, every expert in RAM,
-`--prefill auto:32768`), Basalt `c08284cb` its published IQ3_S pack with the n-gram table in RAM.
-Infernix reads its table from the SSD: in RAM it would cost a RAM copy of 6.2 GiB of experts, and
-that measured 4 % sooner to the first token but 3-7 % slower decode.
+the DFlash2 drafter, Strata* the GGUF, Basalt its IQ3_S pack.
 
-**Context length** (Infernix: two sessions pooled):
+**Context length** (one request):
 
 | Context | TTFT: Infernix | Strata* | Basalt | Decode tok/s: Infernix | Strata* | Basalt |
 |---|---:|---:|---:|---:|---:|---:|
@@ -234,7 +227,7 @@ that measured 4 % sooner to the first token but 3-7 % slower decode.
 | ~128K | 18.10 s | 17.97 s | **13.47 s** | 201 | 196 | **298** |
 | ~250K | 35.59 s | 36.56 s | **27.98 s** | 250 | 223 | **339** |
 
-**Agentic replay** (three seeds):
+**Agentic replay** (two requests at a time, three seeds):
 
 | Metric | Strata* | Basalt | Infernix | vs Strata* | vs Basalt |
 |---|---:|---:|---:|---:|---:|
@@ -249,44 +242,39 @@ that measured 4 % sooner to the first token but 3-7 % slower decode.
 | Tokens per round | 2.17 | 2.48 | **2.64** | +22 % | +7 % |
 | Wall time | 8.1 min (7.7-8.5) | **4.4 min** (4.2-4.6) | 5.5 min (5.1-6.2) | −32 % | +26 % |
 
-Basalt decodes IQ3_S about 1.5 times as fast as Infernix and finishes the replay 26 % sooner;
-Infernix still reaches the first token soonest on the replay's short continuing turns.
-
-**What each engine computes:**
+Infernix beats Strata on decode and wall time and reaches the first token soonest on short
+continuing turns. Basalt decodes about 1.5× as fast and finishes 26 % sooner, with 8-bit
+activations and a 2-bit screen of its output head:
 
 | | Infernix | Strata* v0.2.8 | Basalt |
 |---|---|---|---|
-| Activations in matrix multiplies | 16-bit | **8-bit** | **8-bit** |
-| Experts that run | every routed expert | every routed expert (route tail skip **off**, see below) | every routed expert |
-| Output head | the GGUF's | the GGUF's | logits outside the top 64 from a **2-bit copy** of the head (the choices themselves exact; Basalt measures +1.1 % KL divergence) |
+| Activations in matrix multiplies | 16-bit (8 by option) | **8-bit** | **8-bit** |
+| Experts that run | every routed expert | every routed expert (route tail skip **off**) | every routed expert |
+| Output head | the GGUF's | the GGUF's | logits outside the top 64 from a **2-bit copy** (the choices themselves exact; +1.1 % KL divergence by Basalt's measure) |
 
 \* Strata's default for this weight set skips a missed expert that every token of a verify window
-ranks 7th or lower (route tail skip; faster, but different answers). It was turned off for these
-runs (`STRATA_ROUTE_TAIL_SKIP=0`) because it changes which experts the model uses and can degrade
-quality, so the default would not be a like-for-like comparison. The engines' 8-bit activations
-cannot be turned off. Measured quality follows in a later update.
+ranks 7th or lower: faster, but different answers. It was off (`STRATA_ROUTE_TAIL_SKIP=0`) because it
+changes which experts run. The 8-bit activations of Strata and Basalt cannot be turned off.
 
-**Infernix with 8-bit activations** (the opt-in `--a8-activations`, the others' arithmetic; not the
+**Infernix with 8-bit activations** (`--a8-activations`, the others' arithmetic; an option, not the
 comparison above):
 
 | | TTFT ~8K / ~128K / ~250K | Decode tok/s | Replay: mean TTFT | Replay: output tok/s | Replay: wall time |
 |---|---:|---:|---:|---:|---:|
+| Infernix (16-bit, default) | 1.40 / 18.10 / 35.59 s | 229 / 201 / 250 | 3.1 s | 201 | 5.5 min |
 | Infernix `--a8-activations` | 1.30 / 13.99 / 27.68 s | 224 / 211 / 278 | 2.9 s | 208 | 5.2 min |
 | Basalt (as above) | 1.35 / 13.47 / 27.98 s | 380 / 298 / 339 | 3.7 s | 296 | 4.4 min |
 
-With 8-bit activations Infernix reads prompts about as fast as Basalt, but Basalt still decodes
-about 1.4 times as fast.
+At the same 8 bits Infernix reads prompts as fast as Basalt; Basalt still decodes 1.2-1.7× as fast.
+
+*Settings*: Infernix as on NVFP4, its IQ4_NL n-gram table on the SSD (in RAM it would displace 6.2
+GiB of experts: 4 % sooner to the first token, 3-7 % slower decode). Strata: its setup's
+`--spec 4 --spec-min-p 0.5 --pool-workers 15`, every expert in RAM, `--prefill auto:32768`. Basalt:
+n-gram table in RAM.
 
 ### Qwen3.8-Flash-Next: DFlash2 against MTP
 
-One request with each drafter, both `--draft-tokens auto --lm-head-draft`: the model's MTP drafter
-(`--spec mtp`) and Inco AI's DFlash2
-([Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix),
-`--spec dflash2 --draft-model FILE`). Prompts: 24 slices of 1,280 tokens of Infernix's sources
-(code) and Markdown docs at `e59fa1c7`, each continued for 384 tokens, greedy or sampled
-(temperature 1.0, top-k 20, top-p 0.95); INT8 KV; `infernix_decode_quality_gen` (2026-10-20). Cells:
-decode tok/s, the mean of the runs (Dense8 code: DFlash2 209-217, MTP 186-203; other repeats within
-4 %).
+Decode tok/s at one request (repeats within 4 %; Dense8 code: DFlash2 209-217, MTP 186-203):
 
 | Conversion | Text | Plain | MTP | **DFlash2** | DFlash2 vs MTP |
 |---|---|---:|---:|---:|---:|
@@ -298,24 +286,23 @@ decode tok/s, the mean of the runs (Dense8 code: DFlash2 209-217, MTP 186-203; o
 | GSQ-RCO IQ3_S | docs, greedy | | 192 | **210** | +9 % |
 | GSQ-RCO IQ3_S | docs, sampled | | 167 | **183** | +10 % |
 
-DFlash2 drafts a block of seven in one pass and reports each draft's probability; `auto` verifies
-only the drafts worth their verification columns, which cost about a third of a plain round each
-in expert misses here (all seven every round was slower than MTP). It also takes less VRAM:
-9,070 cached experts against MTP's 8,740 on Dense8 (IQ3_S 12,432 against 12,288). Greedy output is
-the same with either drafter; sampling keeps its distribution.
+DFlash2 drafts seven tokens in one pass with a probability for each, and `auto` verifies only those
+worth their cost in expert misses. It also leaves VRAM for more cached experts (Dense8 9,070 against
+MTP's 8,740; IQ3_S 12,432 against 12,288). Greedy output is the same with either drafter; sampling
+keeps its distribution.
+
+*Settings*: both `--draft-tokens auto --lm-head-draft`, with `--spec mtp` or `--spec dflash2
+--draft-model FILE`. 24 prompts of 1,280 tokens from Infernix's sources (code) and Markdown docs at
+`e59fa1c7`, each continued for 384 tokens, greedy or sampled (temperature 1.0, top-k 20, top-p 0.95);
+INT8 KV; `infernix_decode_quality_gen` (2026-10-20).
 
 ### Qwen3.8-27B: Infernix vs NInfer
 
-Both serve NInfer's [Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer)
-with INT8 KV at 240,000 tokens and two lanes. NInfer is `master` at
-[`1882c6adb`](https://github.com/Neroued/ninfer/commit/1882c6adb) (2026-10-29) with a Windows port
-(Win32 I/O, an IOCP read queue, MSVC fixes; its greedy text matched the previous port's exactly on
-the four prompts checked). Each runs its own recommended drafter: NInfer its RTX 5090 example
-(MTP 3 with the optimized proposal head, automatic capacity, 256 MiB headroom, 1,024-token prefill
-chunks), Infernix DFlash2 with draft length auto, the proposal head and n-gram drafts. Neither caps
-thinking.
+Both serve NInfer's [Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer),
+so both compute the same arithmetic (4-bit activations at its NVFP4 layers, as the artifact
+specifies), each with its own recommended drafter.
 
-**Context length**:
+**Context length** (one request):
 
 | Context | TTFT: Infernix | NInfer | Drafting tok/s: Infernix | NInfer | No drafting tok/s: Infernix | NInfer |
 |---|---:|---:|---:|---:|---:|---:|
@@ -323,10 +310,7 @@ thinking.
 | ~128K | **18.61 s** | 29.88 s | **210** | 182 | **68.4** | 66.5 |
 | ~230K | **47.04 s** | 84.43 s | **187** | 169 | **60.3** | 58.7 |
 
-The drafting columns follow each engine's accepted drafts (Infernix 3.5-4.9 tokens per round, NInfer
-2.9-3.4); without drafting Infernix decodes 2-3 % faster.
-
-**Agentic replay** (five seeds):
+**Agentic replay** (two requests at a time, five seeds):
 
 | Metric | NInfer | Infernix | vs NInfer |
 |---|---:|---:|---:|
@@ -342,17 +326,22 @@ The drafting columns follow each engine's accepted drafts (Infernix 3.5-4.9 toke
 | Tokens per round | 2.68 | **3.68** | +38 % |
 | Wall time | 16.4 min (14.0-19.0) | **12.7 min** (11.7-13.6) | −21 % |
 
-Both engines decode the same number of rounds per second (59.8 against 59.9); the output lead is
-Infernix's drafter. Without a thinking cap the replies run longer than in earlier versions of this
-table, so wall times are not comparable with them. Quality is level: perplexity 4.468 against
-NInfer's 4.479 on the 1.04M-token corpus (16K context, INT8 KV; NInfer `81c8ce09`, 2026-10-19).
+Both decode the same rounds a second (59.8 against 59.9): Infernix's output lead is its drafter (3.5-4.9
+tokens a round against 2.9-3.4). Quality is level: perplexity 4.468 against NInfer's 4.479 on the
+1.04M-token corpus (16K context, INT8 KV; NInfer `81c8ce09`, 2026-10-19).
+
+*Settings*: INT8 KV, 240,000 tokens, two lanes. NInfer `master` at
+[`1882c6adb`](https://github.com/Neroued/ninfer/commit/1882c6adb) (2026-10-29) with a Windows port
+(Win32 I/O, an IOCP read queue, MSVC fixes; greedy text identical to the previous port's on four
+prompts), run as its RTX 5090 example: MTP 3 with the optimized proposal head, automatic capacity,
+256 MiB headroom, 1,024-token prefill chunks. Infernix: DFlash2, draft length auto, the proposal
+head and n-gram drafts. Neither caps thinking, so wall times are not comparable with earlier
+versions of this table.
 
 ### PCIe Gen5 x8 against x16
 
-Measured by [siganos](https://github.com/Wallawalla47/Infernix/issues/45) on one machine, with only
-the link width changed: RTX 5090, Ryzen 9 7950X, 94 GiB DDR5, Linux, Infernix `d8e52a85`,
-Qwen3.8-Flash-Next NVIDIA NVFP4 Dense8, INT8 KV, `infernix_bench` (means of 3-5 runs, tok/s per
-request). Prompts gain the most; decode only 2-7 %.
+Measured by [siganos](https://github.com/Wallawalla47/Infernix/issues/45) with only the link width
+changed. Prompts gain the most; decode only 2-7 %.
 
 | Workload | Requests | x8 | x16 | x16 / x8 |
 |---|---:|---:|---:|---:|
@@ -364,6 +353,37 @@ request). Prompts gain the most; decode only 2-7 %.
 | Prompt (`pp4096`), `--prefill-chunk 4096` | 1 | 2,426 | 4,277 | 1.76× |
 | Prompt, `--prefill-chunk 1024` | 1 | 2,170 | 4,319 | 1.99× |
 | Host-to-device copy | | 28.9 GB/s | 57.8 GB/s | 2.00× |
+
+*Setup*: RTX 5090, Ryzen 9 7950X, 94 GiB DDR5, Linux, Infernix `d8e52a85`, Qwen3.8-Flash-Next NVIDIA
+NVFP4 Dense8, INT8 KV, `infernix_bench` (means of 3-5 runs, tok/s per request).
+
+### How the benchmarks were run
+
+- **Versions**: Infernix `main` built from source at
+  [`fb491903`](https://github.com/Wallawalla47/Infernix/commit/fb491903) for the default route on
+  NVIDIA's NVFP4 weights, and at [`6b066a54`](https://github.com/Wallawalla47/Infernix/commit/6b066a54)
+  for IQ3_S, the 27B and the `--a8-activations` rows (on Dense8 with
+  [`81bcdaef`](https://github.com/Wallawalla47/Infernix/commit/81bcdaef)'s 8-bit expert route added).
+  Later builds were not re-measured. On `6b066a54` the NVFP4 default was within run-to-run spread
+  (decode 178 / 168 / 195 tok/s; replay 3.3 s mean TTFT, 5.7 min). The other engines were each the
+  latest version when they ran; Strata has since released v0.2.9 and Basalt has moved past `c08284cb`.
+- **Client**: every engine served the OpenAI API natively on Windows to the same client, which times
+  the first token from sending the request to the first streamed token (GPU power limit 517.5 W,
+  clocks checked before every session).
+- **Context length**: greedy, 1,024 output tokens; three ~8K prompts and two each of ~128K and
+  ~250K (~230K on the 27B). Two Infernix sessions bracket the others' one each (pooled).
+- **Agentic replay** ([`bench/agentic_ab`](bench/agentic_ab/README.md)): three coding-agent sessions
+  and eleven subagents with tool calls, compactions, retries and aborts, up to eight requests in
+  flight, temperature 1.0, 68 requests per seed; every engine replays the same observations two
+  requests at a time and completed every request. Cells are means over seeds (range in brackets);
+  comparison columns the mean of per-seed differences. The prefill row covers the prompts every run
+  prefilled cold, a set that moves with each run's cache.
+- **Rules for every engine**: its own recommended configuration for this PC and its own drafter;
+  INT8 KV; 262,144 tokens on Flash-Next; an 8 GiB conversation or prefix cache; an 84 GiB RAM budget
+  of the 96 (a server above it is stopped; none was); n-gram tables on the same kind of drive
+  (Samsung 990 PRO); no thinking caps; every draft verified; and every switchable option that
+  computes below the checkpoint's precision or changes which experts run turned off (* where that
+  differs from the default).
 
 ## Infernix Launcher (beta)
 
