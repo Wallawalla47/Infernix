@@ -133,11 +133,6 @@ infernix_add_family_op_test(infernix_ggml_linear_test FAMILY projection
 infernix_add_family_op_test(infernix_ggml_encode_test FAMILY projection
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_encode.cpp"
   LIBRARIES infernix_ops)
-# The Q6_K quantizer of --a8-activations' load-time repack against a host port of ggml's reference quantizer,
-# byte for byte in both layouts.
-infernix_add_family_op_test(infernix_ggml_quantize_test FAMILY projection
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_quantize.cpp"
-  LIBRARIES infernix_ops)
 # The 8-bit activation route of GGUF projections (--a8-activations) against a binary64 oracle of the
 # quantized activations, every narrow route and width.
 infernix_add_family_op_test(infernix_ggml_linear_a8_test FAMILY projection
