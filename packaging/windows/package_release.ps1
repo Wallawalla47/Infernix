@@ -54,13 +54,13 @@ foreach ($exe in $Executables) {
 # The build id this tree last stamped (infernix-serve prints it only once a model starts), which
 # every packaged executable must carry: one linked before the stamp would hold an older id.
 $stamp = "$BuildDir\..\..\generated\infernix_build_id.h"
-if (-not (Test-Path $stamp)) { throw "no stamped build id at $stamp: build the Release apps first" }
+if (-not (Test-Path $stamp)) { throw "no stamped build id at ${stamp}: build the Release apps first" }
 if ((Get-Content -Raw $stamp) -notmatch '#define INFERNIX_BUILD_ID "([^"]+)"') { throw "no build id in $stamp" }
 $build = $Matches[1]
 if ($build -like '*-dirty') { throw "build $build has uncommitted changes: commit and rebuild before packaging" }
 foreach ($exe in $Executables) {
     & findstr.exe /m /c:"$build" "$BuildDir\$exe" | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "$exe does not carry build $build: rebuild it" }
+    if ($LASTEXITCODE -ne 0) { throw "$exe does not carry build ${build}: rebuild it" }
 }
 
 $name  = "infernix-$($build -replace '^windows-', '')-windows-x64"
