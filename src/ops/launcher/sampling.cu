@@ -16,6 +16,18 @@ __global__ void increment_token_counts_kernel(const std::int32_t* token_ids, std
     if (index < count) { atomicAdd(&token_counts[token_ids[index]], 1); }
 }
 
+// One CTA per row: its licensed prefix, the count read here.
+__global__ void increment_licensed_token_counts_kernel(const std::int32_t* licensed_tokens, const std::int32_t* counts,
+                                                       const SamplingConfig* configs, std::int32_t width) {
+    const int row               = blockIdx.x;
+    std::int32_t* token_counts  = configs[row].token_counts;
+    if (token_counts == nullptr) { return; }
+    const std::int32_t licensed = min(max(counts[row], 0), width);
+    for (int j = threadIdx.x; j < licensed; j += blockDim.x) {
+        atomicAdd(&token_counts[licensed_tokens[static_cast<std::int64_t>(row) * width + j]], 1);
+    }
+}
+
 std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain, std::int32_t columns) {
     return make_sampling_workspace_layout(token_domain, columns).bytes;
 }
@@ -73,6 +85,14 @@ void increment_token_counts_launch(const Tensor& token_ids, Tensor& token_counts
     increment_token_counts_kernel<<<div_up(count, kBlock), kBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(token_ids.data), count,
         static_cast<std::int32_t*>(token_counts.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void increment_licensed_token_counts_launch(const Tensor& licensed_tokens, const Tensor& licensed_counts,
+                                            const SamplingConfig* configs, cudaStream_t stream) {
+    increment_licensed_token_counts_kernel<<<licensed_tokens.ne[1], 32, 0, stream>>>(
+        static_cast<const std::int32_t*>(licensed_tokens.data), static_cast<const std::int32_t*>(licensed_counts.data),
+        configs, licensed_tokens.ne[0]);
     CUDA_CHECK(cudaGetLastError());
 }
 

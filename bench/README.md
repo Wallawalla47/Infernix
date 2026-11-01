@@ -474,7 +474,9 @@ cmake --build build -j --target infernix_ggml_linear_bench infernix_offloaded_mo
 kinds: `--activation a8` gives NVFP4 W4A16 banks `NarrowA16::kA8` with `WideA16::kA8` (against `--activation a16`,
 the exact W4A16 wide route, or `a16x2`, expert-a4-residual), and `--bank ggml --formats GU,DOWN --ggml-wide
 exact|bf16|a8` GGUF records at Flash-Next's geometry (`bf16` takes the BF16 stage-decode tiles from 4,096 columns,
-`kGgmlStageDecodeMinColumns`, the exact tiles below it).
+`kGgmlStageDecodeMinColumns`, the exact tiles below it). `--staging-slots 0` (frames only) runs one pass over every
+job with no staging, the shape of a decode call's resident pass; with `--cold` and decode widths it times the narrow
+expert kernels as decode and verification find them.
 
 ```bash
 ./build/bench/infernix_offloaded_moe_wide_bench --activation a16 --tokens 512,2048,4096 --placement frames
@@ -482,6 +484,7 @@ exact|bf16|a8` GGUF records at Flash-Next's geometry (`bf16` takes the BF16 stag
 ./build/bench/infernix_offloaded_moe_wide_bench --activation a8 --geometry 122b --tokens 512,2048,4096 --placement frames
 ./build/bench/infernix_offloaded_moe_wide_bench --bank ggml --formats iq3_s,iq4_nl --ggml-wide exact --tokens 512,2048,4096 --placement frames
 ./build/bench/infernix_offloaded_moe_wide_bench --bank ggml --formats iq3_s,iq4_nl --ggml-wide a8 --tokens 512,2048,4096 --placement frames
+./build/bench/infernix_offloaded_moe_wide_bench --bank ggml --formats iq3_s,iq4_nl --ggml-wide a8 --tokens 1,2,4,8 --placement frames --staging-slots 0 --cold
 ```
 
 ## LinearTopK Op benchmark
@@ -1401,7 +1404,9 @@ intentionally separate: replay reuses captured addresses without advancing the h
 
 `reps` contains request samples in repetition-major order, with explicit `repetition` and `row`.
 `output_tok_s` divides each repetition's actual outputs by its wall time.
-`decode_output_tok_s` counts actual outputs after the first token, allowing early grammar EOS.
+`decode_output_tok_s` counts actual outputs after the first token, allowing early grammar EOS, over
+the Program's decode time (each round's decode and commit calls; reports before 2026-11-01 left the
+commits out, up to ~4 % higher on speculative routes).
 `decode_engine_tok_s` uses the Program's speculative round statistics, so it also describes work performed by a final partially
 committed speculative round. Reports also contain the command and machine information needed to
 interpret a local measurement.

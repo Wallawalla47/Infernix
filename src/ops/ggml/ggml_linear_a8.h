@@ -38,6 +38,11 @@ void ggml_linear_a8(const Tensor& x, std::span<const GgmlSegment> segments, std:
 // The bytes ggml_linear_a8 allocates from its workspace for `columns` columns of K = k.
 [[nodiscard]] std::size_t a8_linear_workspace_bytes(std::int32_t k, std::int32_t columns, bool sums);
 
+// Whether the segments' columns carry slice code sums (a Q4_K or Q5_K segment's min term), and the words of one
+// encoded column of K = k (codes, slice scales, then the sums where `sums`; ggml_linear_a8's column stride).
+[[nodiscard]] bool a8_linear_sums(std::span<const GgmlSegment> segments);
+[[nodiscard]] std::int32_t a8_linear_column_words(std::int32_t k, bool sums);
+
 // The wide route (ggml_linear_a8_wide.cu), for a call of kA8WideMinColumns or more columns of K a multiple of 64
 // with ggml_linear's validated arguments: the segments' decoded planes (at most kA8WidePlaneBytes) and the encoded
 // columns of batches of up to kA8WideBatchColumns.

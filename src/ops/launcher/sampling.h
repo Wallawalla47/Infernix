@@ -18,6 +18,9 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
 void increment_token_counts_launch(const Tensor& token_ids, Tensor& token_counts,
                                    cudaStream_t stream);
 
+void increment_licensed_token_counts_launch(const Tensor& licensed_tokens, const Tensor& licensed_counts,
+                                            const SamplingConfig* configs, cudaStream_t stream);
+
 [[nodiscard]] std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain,
                                                          std::int32_t columns);
 

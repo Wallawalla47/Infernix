@@ -89,18 +89,29 @@ __device__ __forceinline__ std::uint32_t ld_u32_a4(const std::uint8_t* p) {
     return __ldg(reinterpret_cast<const unsigned int*>(p));
 }
 
+// How slice() reads a row's bytes: GlobalLoads by the read-only path (the row in global memory),
+// SharedLoads by plain loads (a CTA's copy of the row in shared memory). The same bytes either way.
+struct GlobalLoads {
+    __device__ static std::uint32_t u16(const std::uint8_t* p) { return ld_u16(p); }
+    __device__ static std::uint32_t u32(const std::uint8_t* p) { return ld_u32_a4(p); }
+};
+struct SharedLoads {
+    __device__ static std::uint32_t u16(const std::uint8_t* p) { return *reinterpret_cast<const unsigned short*>(p); }
+    __device__ static std::uint32_t u32(const std::uint8_t* p) { return *reinterpret_cast<const unsigned int*>(p); }
+};
+
 // N little-endian words at a 2-byte-aligned address: N aligned 4-byte loads (and a further one when
 // the address is not 4-byte aligned, never past the words' last byte otherwise) and funnel shifts,
 // half the load instructions of N ld_u32_a2 (decode at one or two columns is bound by the LSU queue).
-template <int N>
+template <int N, class L = GlobalLoads>
 __device__ __forceinline__ void ld_words_a2(const std::uint8_t* p, std::uint32_t (&out)[N]) {
     const auto at        = reinterpret_cast<std::uintptr_t>(p);
     const unsigned shift = static_cast<unsigned>(at & 3U) * 8U;
     const auto* w        = reinterpret_cast<const std::uint8_t*>(at & ~std::uintptr_t{3});
     std::uint32_t v[N + 1];
 #pragma unroll
-    for (int i = 0; i < N; ++i) { v[i] = ld_u32_a4(w + 4 * i); }
-    v[N] = shift != 0 ? ld_u32_a4(w + 4 * N) : 0U;
+    for (int i = 0; i < N; ++i) { v[i] = L::u32(w + 4 * i); }
+    v[N] = shift != 0 ? L::u32(w + 4 * N) : 0U;
 #pragma unroll
     for (int i = 0; i < N; ++i) { out[i] = __funnelshift_r(v[i], v[i + 1], shift); }
 }
@@ -145,149 +156,9 @@ __device__ __forceinline__ int2 iq4nl_values(std::uint32_t q4) {
                      static_cast<int>(__byte_perm(tmp[0], tmp[1], 0x7531)));
 }
 
-// Slice s (elements 32s..32s+31) of a row of F blocks.
-template <QType F>
-__device__ __forceinline__ Slice slice(const std::uint8_t* row, int s) {
-    Slice o;
-    o.min  = 0;
-    o.dmin = 0;
-    if constexpr (F == QType::GGML_Q2_0) {
-        const std::uint8_t* b = row + (s / 2) * 18;
-        o.d    = static_cast<std::uint16_t>(ld_u16(b));
-        o.sub0 = o.sub1 = 1;
-        std::uint32_t qw[2];
-        ld_words_a2<2>(b + 2 + 8 * (s % 2), qw);
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const std::uint32_t w = qw[h];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const std::uint32_t v = (w >> (8 * j)) & 0xFFU; // four 2-bit codes, element 4i+k at bits 2k
-                const std::uint32_t e = (v & 3U) | (((v >> 2) & 3U) << 8) | (((v >> 4) & 3U) << 16) | (((v >> 6) & 3U) << 24);
-                o.q[4 * h + j] = sub_bytes4(e, 0x01010101U);
-            }
-        }
-    } else if constexpr (F == QType::GGML_IQ4_NL) {
-        const std::uint8_t* b = row + s * 18;
-        o.d    = static_cast<std::uint16_t>(ld_u16(b));
-        o.sub0 = o.sub1 = 1;
-        std::uint32_t qs[4];
-        ld_words_a2<4>(b + 2, qs);
-#pragma unroll
-        for (int w = 0; w < 4; ++w) {
-            const int2 v = iq4nl_values(qs[w]);
-            o.q[w]     = v.x;
-            o.q[w + 4] = v.y;
-        }
-    } else if constexpr (F == QType::GGML_IQ4_XS) {
-        const std::uint8_t* b = row + (s / 8) * 136;
-        const int ib = s % 8;
-        o.d = static_cast<std::uint16_t>(ld_u16(b));
-        const std::uint32_t scales_h = ld_u16(b + 2);
-        const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
-        o.sub0 = o.sub1 = ls - 32;
-        const std::uint8_t* qs = b + 8 + 16 * ib;
-#pragma unroll
-        for (int w = 0; w < 4; ++w) {
-            const int2 v = iq4nl_values(ld_u32_a4(qs + 4 * w));
-            o.q[w]     = v.x;
-            o.q[w + 4] = v.y;
-        }
-    } else if constexpr (F == QType::GGML_Q4_K || F == QType::GGML_Q5_K) {
-        constexpr int kBytes = F == QType::GGML_Q4_K ? 144 : 176;
-        const std::uint8_t* b = row + (s / 8) * kBytes;
-        const int sb = s % 8, ch = sb / 2, shift = 4 * (sb % 2);
-        o.d    = static_cast<std::uint16_t>(ld_u16(b));
-        o.dmin = static_cast<std::uint16_t>(ld_u16(b + 2));
-        int sc, m;
-        scale_min_k4(sb, b + 4, sc, m);
-        o.sub0 = o.sub1 = sc;
-        o.min           = m;
-        const std::uint8_t* qs = b + (F == QType::GGML_Q4_K ? 16 : 48) + 32 * ch;
-#pragma unroll
-        for (int w = 0; w < 8; ++w) {
-            std::uint32_t v = (ld_u32_a4(qs + 4 * w) >> shift) & 0x0F0F0F0FU;
-            if constexpr (F == QType::GGML_Q5_K) { v |= ((ld_u32_a4(b + 16 + 4 * w) >> sb) & 0x01010101U) << 4; }
-            o.q[w] = static_cast<int>(v);
-        }
-    } else if constexpr (F == QType::GGML_Q6_K) {
-        const std::uint8_t* b = row + (s / 8) * 210;
-        const int sb = s % 8, half = sb / 4, quarter = sb % 4;
-        o.d = static_cast<std::uint16_t>(ld_u16(b + 208));
-        const std::uint8_t* ql = b + 64 * half + 32 * (quarter & 1);
-        const std::uint8_t* qh = b + 128 + 32 * half;
-        const int lshift = quarter >= 2 ? 4 : 0, hshift = 2 * quarter;
-        const std::uint32_t subs = ld_u16(b + 192 + 8 * half + 2 * quarter);
-        o.sub0 = static_cast<std::int8_t>(subs & 0xFFU);
-        o.sub1 = static_cast<std::int8_t>(subs >> 8);
-        std::uint32_t lw[8], hw[8];
-        ld_words_a2<8>(ql, lw);
-        ld_words_a2<8>(qh, hw);
-#pragma unroll
-        for (int w = 0; w < 8; ++w) {
-            const std::uint32_t lo = (lw[w] >> lshift) & 0x0F0F0F0FU;
-            const std::uint32_t hi = ((hw[w] >> hshift) & 0x03030303U) << 4;
-            o.q[w] = sub_bytes4(lo | hi, 0x20202020U);
-        }
-    } else if constexpr (F == QType::GGML_IQ2_S) {
-        const std::uint8_t* b = row + (s / 8) * 82;
-        const int ib = s % 8;
-        o.d = static_cast<std::uint16_t>(ld_u16(b));
-        const int qh = b[66 + ib], sc = b[74 + ib];
-        o.sub0 = 2 * (sc & 0xF) + 1;
-        o.sub1 = 2 * (sc >> 4) + 1;
-        const std::uint32_t qs = ld_u32_a2(b + 2 + 4 * ib), signs = ld_u32_a2(b + 34 + 4 * ib);
-#pragma unroll
-        for (int l = 0; l < 4; ++l) {
-            const int index = ((qs >> (8 * l)) & 0xFF) | ((qh << (8 - 2 * l)) & 0x300);
-            const std::uint64_t grid = __ldg(reinterpret_cast<const unsigned long long*>(d_iq2s_grid) + index);
-            const unsigned sign      = (signs >> (8 * l)) & 0xFFU;
-            o.q[2 * l]     = apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
-            o.q[2 * l + 1] = apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
-        }
-    } else if constexpr (F == QType::GGML_IQ3_XXS) {
-        const std::uint8_t* b = row + (s / 8) * 98;
-        const int ib = s % 8;
-        o.d = static_cast<std::uint16_t>(ld_u16(b));
-        const std::uint32_t aux = ld_u32_a2(b + 66 + 4 * ib);
-        o.sub0 = o.sub1 = 2 * static_cast<int>(aux >> 28) + 1;
-        std::uint32_t qw[2];
-        ld_words_a2<2>(b + 2 + 8 * ib, qw);
-        const std::uint32_t qs0 = qw[0], qs1 = qw[1];
-#pragma unroll
-        for (int l = 0; l < 4; ++l) {
-            const std::uint32_t qs = l < 2 ? qs0 : qs1;
-            const int i1 = (qs >> (16 * (l % 2))) & 0xFF, i2 = (qs >> (16 * (l % 2) + 8)) & 0xFF;
-            const unsigned sign = __ldg(d_ksigns_iq2xs + ((aux >> (7 * l)) & 127));
-            o.q[2 * l]     = apply_signs4(__ldg(d_iq3xxs_grid + i1), sign & 0xFU);
-            o.q[2 * l + 1] = apply_signs4(__ldg(d_iq3xxs_grid + i2), sign >> 4);
-        }
-    } else if constexpr (F == QType::GGML_IQ3_S) {
-        const std::uint8_t* b = row + (s / 8) * 110;
-        const int sb = s % 8;
-        o.d = static_cast<std::uint16_t>(ld_u16(b));
-        const int qh = b[66 + sb];
-        o.sub0 = o.sub1 = 2 * ((b[106 + sb / 2] >> (4 * (sb % 2))) & 0xF) + 1;
-        std::uint32_t qw[2];
-        ld_words_a2<2>(b + 2 + 8 * sb, qw);
-        const std::uint32_t qs0 = qw[0], qs1 = qw[1];
-        const std::uint32_t signs = ld_u32_a2(b + 74 + 4 * sb);
-#pragma unroll
-        for (int l = 0; l < 4; ++l) {
-            const std::uint32_t qs = l < 2 ? qs0 : qs1;
-            const int i1 = ((qs >> (16 * (l % 2))) & 0xFF) | ((qh << (8 - 2 * l)) & 256);
-            const int i2 = ((qs >> (16 * (l % 2) + 8)) & 0xFF) | ((qh << (7 - 2 * l)) & 256);
-            const unsigned sign = (signs >> (8 * l)) & 0xFFU;
-            o.q[2 * l]     = apply_signs4(__ldg(d_iq3s_grid + i1), sign & 0xFU);
-            o.q[2 * l + 1] = apply_signs4(__ldg(d_iq3s_grid + i2), sign >> 4);
-        }
-    }
-    return o;
-}
-
-// The codebooks a chunk decode reads (F's grid; IQ3_XXS's sign table too): the device tables by
-// __ldg (DeviceCodebook) or a CTA's copy in shared memory (SharedCodebook), the same values, so a
-// decode gives the same integers from either. Formats without a table read neither.
+// The codebooks a decode reads (F's grid; IQ3_XXS's sign table too): the device tables by __ldg
+// (DeviceCodebook) or a CTA's copy in shared memory (SharedCodebook), the same values, so a decode
+// gives the same integers from either. Formats without a table read neither.
 template <QType F>
 inline constexpr int kGridWords = F == QType::GGML_IQ3_S     ? 512
                                   : F == QType::GGML_IQ3_XXS ? 256
@@ -337,6 +208,153 @@ struct SharedCodebook {
     }
     __device__ __forceinline__ unsigned sign(int i) const { return signs[i]; }
 };
+
+// Four bytes at a 2-byte-aligned address, read through L.
+template <class L>
+__device__ __forceinline__ std::uint32_t u32_a2(const std::uint8_t* p) {
+    return L::u16(p) | (L::u16(p + 2) << 16);
+}
+
+// Slice s (elements 32s..32s+31) of a row of F blocks, its bytes read through L and its codebook
+// through cb (a row and codebook in shared memory: SharedLoads and SharedCodebook).
+template <QType F, class Codebook = DeviceCodebook<F>, class L = GlobalLoads>
+__device__ __forceinline__ Slice slice(const std::uint8_t* row, int s, const Codebook& cb = Codebook{}) {
+    Slice o;
+    o.min  = 0;
+    o.dmin = 0;
+    if constexpr (F == QType::GGML_Q2_0) {
+        const std::uint8_t* b = row + (s / 2) * 18;
+        o.d    = static_cast<std::uint16_t>(L::u16(b));
+        o.sub0 = o.sub1 = 1;
+        std::uint32_t qw[2];
+        ld_words_a2<2, L>(b + 2 + 8 * (s % 2), qw);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const std::uint32_t w = qw[h];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const std::uint32_t v = (w >> (8 * j)) & 0xFFU; // four 2-bit codes, element 4i+k at bits 2k
+                const std::uint32_t e = (v & 3U) | (((v >> 2) & 3U) << 8) | (((v >> 4) & 3U) << 16) | (((v >> 6) & 3U) << 24);
+                o.q[4 * h + j] = sub_bytes4(e, 0x01010101U);
+            }
+        }
+    } else if constexpr (F == QType::GGML_IQ4_NL) {
+        const std::uint8_t* b = row + s * 18;
+        o.d    = static_cast<std::uint16_t>(L::u16(b));
+        o.sub0 = o.sub1 = 1;
+        std::uint32_t qs[4];
+        ld_words_a2<4, L>(b + 2, qs);
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const int2 v = iq4nl_values(qs[w]);
+            o.q[w]     = v.x;
+            o.q[w + 4] = v.y;
+        }
+    } else if constexpr (F == QType::GGML_IQ4_XS) {
+        const std::uint8_t* b = row + (s / 8) * 136;
+        const int ib = s % 8;
+        o.d = static_cast<std::uint16_t>(L::u16(b));
+        const std::uint32_t scales_h = L::u16(b + 2);
+        const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
+        o.sub0 = o.sub1 = ls - 32;
+        const std::uint8_t* qs = b + 8 + 16 * ib;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const int2 v = iq4nl_values(L::u32(qs + 4 * w));
+            o.q[w]     = v.x;
+            o.q[w + 4] = v.y;
+        }
+    } else if constexpr (F == QType::GGML_Q4_K || F == QType::GGML_Q5_K) {
+        constexpr int kBytes = F == QType::GGML_Q4_K ? 144 : 176;
+        const std::uint8_t* b = row + (s / 8) * kBytes;
+        const int sb = s % 8, ch = sb / 2, shift = 4 * (sb % 2);
+        o.d    = static_cast<std::uint16_t>(L::u16(b));
+        o.dmin = static_cast<std::uint16_t>(L::u16(b + 2));
+        int sc, m;
+        scale_min_k4(sb, b + 4, sc, m);
+        o.sub0 = o.sub1 = sc;
+        o.min           = m;
+        const std::uint8_t* qs = b + (F == QType::GGML_Q4_K ? 16 : 48) + 32 * ch;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            std::uint32_t v = (L::u32(qs + 4 * w) >> shift) & 0x0F0F0F0FU;
+            if constexpr (F == QType::GGML_Q5_K) { v |= ((L::u32(b + 16 + 4 * w) >> sb) & 0x01010101U) << 4; }
+            o.q[w] = static_cast<int>(v);
+        }
+    } else if constexpr (F == QType::GGML_Q6_K) {
+        const std::uint8_t* b = row + (s / 8) * 210;
+        const int sb = s % 8, half = sb / 4, quarter = sb % 4;
+        o.d = static_cast<std::uint16_t>(L::u16(b + 208));
+        const std::uint8_t* ql = b + 64 * half + 32 * (quarter & 1);
+        const std::uint8_t* qh = b + 128 + 32 * half;
+        const int lshift = quarter >= 2 ? 4 : 0, hshift = 2 * quarter;
+        const std::uint32_t subs = L::u16(b + 192 + 8 * half + 2 * quarter);
+        o.sub0 = static_cast<std::int8_t>(subs & 0xFFU);
+        o.sub1 = static_cast<std::int8_t>(subs >> 8);
+        std::uint32_t lw[8], hw[8];
+        ld_words_a2<8, L>(ql, lw);
+        ld_words_a2<8, L>(qh, hw);
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            const std::uint32_t lo = (lw[w] >> lshift) & 0x0F0F0F0FU;
+            const std::uint32_t hi = ((hw[w] >> hshift) & 0x03030303U) << 4;
+            o.q[w] = sub_bytes4(lo | hi, 0x20202020U);
+        }
+    } else if constexpr (F == QType::GGML_IQ2_S) {
+        const std::uint8_t* b = row + (s / 8) * 82;
+        const int ib = s % 8;
+        o.d = static_cast<std::uint16_t>(L::u16(b));
+        const int qh = b[66 + ib], sc = b[74 + ib];
+        o.sub0 = 2 * (sc & 0xF) + 1;
+        o.sub1 = 2 * (sc >> 4) + 1;
+        const std::uint32_t qs = u32_a2<L>(b + 2 + 4 * ib), signs = u32_a2<L>(b + 34 + 4 * ib);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int index = ((qs >> (8 * l)) & 0xFF) | ((qh << (8 - 2 * l)) & 0x300);
+            const std::uint64_t grid = cb.grid64(index);
+            const unsigned sign      = (signs >> (8 * l)) & 0xFFU;
+            o.q[2 * l]     = apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
+            o.q[2 * l + 1] = apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
+        }
+    } else if constexpr (F == QType::GGML_IQ3_XXS) {
+        const std::uint8_t* b = row + (s / 8) * 98;
+        const int ib = s % 8;
+        o.d = static_cast<std::uint16_t>(L::u16(b));
+        const std::uint32_t aux = u32_a2<L>(b + 66 + 4 * ib);
+        o.sub0 = o.sub1 = 2 * static_cast<int>(aux >> 28) + 1;
+        std::uint32_t qw[2];
+        ld_words_a2<2, L>(b + 2 + 8 * ib, qw);
+        const std::uint32_t qs0 = qw[0], qs1 = qw[1];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const std::uint32_t qs = l < 2 ? qs0 : qs1;
+            const int i1 = (qs >> (16 * (l % 2))) & 0xFF, i2 = (qs >> (16 * (l % 2) + 8)) & 0xFF;
+            const unsigned sign = cb.sign((aux >> (7 * l)) & 127);
+            o.q[2 * l]     = apply_signs4(cb.grid32(i1), sign & 0xFU);
+            o.q[2 * l + 1] = apply_signs4(cb.grid32(i2), sign >> 4);
+        }
+    } else if constexpr (F == QType::GGML_IQ3_S) {
+        const std::uint8_t* b = row + (s / 8) * 110;
+        const int sb = s % 8;
+        o.d = static_cast<std::uint16_t>(L::u16(b));
+        const int qh = b[66 + sb];
+        o.sub0 = o.sub1 = 2 * ((b[106 + sb / 2] >> (4 * (sb % 2))) & 0xF) + 1;
+        std::uint32_t qw[2];
+        ld_words_a2<2, L>(b + 2 + 8 * sb, qw);
+        const std::uint32_t qs0 = qw[0], qs1 = qw[1];
+        const std::uint32_t signs = u32_a2<L>(b + 74 + 4 * sb);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const std::uint32_t qs = l < 2 ? qs0 : qs1;
+            const int i1 = ((qs >> (16 * (l % 2))) & 0xFF) | ((qh << (8 - 2 * l)) & 256);
+            const int i2 = ((qs >> (16 * (l % 2) + 8)) & 0xFF) | ((qh << (7 - 2 * l)) & 256);
+            const unsigned sign = (signs >> (8 * l)) & 0xFFU;
+            o.q[2 * l]     = apply_signs4(cb.grid32(i1), sign & 0xFU);
+            o.q[2 * l + 1] = apply_signs4(cb.grid32(i2), sign >> 4);
+        }
+    }
+    return o;
+}
 
 // Chunk p (elements 8p..8p+7, words 2p and 2p+1 of slice()'s q) of slice s of a row of F blocks,
 // with the sub-scale of the slice half that holds it and the slice's scale words: the integers of

@@ -5,10 +5,11 @@
 // at T columns, each with its own weights (48 layers' weights far exceed the L2, so every call reads
 // its weights from DRAM, as decode does; the graph, as decode's, keeps host launch time out), and
 // reports the time per call. The bandwidth figure counts one call's weights once. The FNV-1a hash of
-// the last call's outputs identifies the result bits.
+// the last call's outputs identifies the result bits. --a8 times hyper_connection_mix_a8_encoded instead (the mix
+// also writing x's 8-bit columns for a GGUF projection under --a8-activations; 2-16 columns).
 //
 //   infernix_hyper_connection_bench [--columns 1,2,5] [--codec q8|bf16] [--layers 48] [--warmup 5] [--repeat 50]
-//                                   [--seed N]
+//                                   [--seed N] [--a8]
 
 #include "infernix/ops/hyper_connection.h"
 
@@ -42,6 +43,7 @@ constexpr int kWidth   = kStreams * kHidden;
 struct Options {
     std::vector<int> columns{1, 2, 5};
     bool bf16          = false;
+    bool a8            = false;
     int layers         = 48;
     int warmup         = 5;
     int repeat         = 50;
@@ -82,6 +84,8 @@ Options parse_options(int argc, char** argv) {
             options.repeat = std::stoi(value());
         } else if (arg == "--seed") {
             options.seed = static_cast<std::uint32_t>(std::stoul(value()));
+        } else if (arg == "--a8") {
+            options.a8 = true;
         } else {
             throw std::invalid_argument("unknown option " + arg);
         }
@@ -173,10 +177,21 @@ int main(int argc, char** argv) {
             const Tensor tw(norm.p, DType::BF16, {kWidth});
             Tensor tx(x.p, DType::BF16, {kHidden, columns});
             Tensor ti(inject.p, DType::FP32, {kStreams, columns});
+            // --a8: the mix also writes x's 8-bit columns (slice sums on), 800 words a column.
+            DeviceBuffer words(options.a8 ? sizeof(std::int32_t) * 800 * columns : 4);
+            Tensor tw8(words.p, DType::I32, {800, columns});
             bench::TimedGraph graph;
             graph.capture(context.stream, [&](cudaStream_t s) {
                 for (int l = 0; l < options.layers; ++l) {
                     auto scope = workspace.scope();
+                    if (options.a8) {
+                        if (!ops::hyper_connection_mix_a8_encoded(tr, tw, downs[static_cast<std::size_t>(l)]->weight,
+                                                                  ups[static_cast<std::size_t>(l)]->weight, kStreams,
+                                                                  kRank, 1e-6F, tx, &ti, tw8, true, workspace, s)) {
+                            throw std::invalid_argument("--a8: the fused route does not serve this width");
+                        }
+                        continue;
+                    }
                     ops::hyper_connection_mix(tr, tw, downs[static_cast<std::size_t>(l)]->weight,
                                               ups[static_cast<std::size_t>(l)]->weight, ops::LinearPolicy::A16Only,
                                               kStreams, kRank, 1e-6F, tx, &ti, workspace, s);

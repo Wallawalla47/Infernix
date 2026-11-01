@@ -929,6 +929,52 @@ int increment_counts_contract() {
     return failures;
 }
 
+// Rows of a [K+1 = 4, B = 3] acceptance: row 0 licenses 2 tokens, row 1 has no count array, row 2's
+// count is past the width (clamped to 4); the oracle adds each row's licensed prefix on the host.
+int increment_licensed_counts_contract() {
+    constexpr std::int32_t kWidth = 4, kDomain = 8;
+    const std::vector<std::int32_t> licensed{3, 5, 0, 0, /**/ 1, 1, 0, 0, /**/ 2, 2, 7, 6};
+    const std::vector<std::int32_t> counts{2, 2, 9};
+    const std::vector<std::vector<std::int32_t>> initial{{0, 1, 0, 0, 0, 0, 0, 0}, {}, {1, 0, 0, 0, 0, 0, 0, 3}};
+    std::vector<std::vector<std::int32_t>> expected = initial;
+    for (std::size_t row = 0; row < counts.size(); ++row) {
+        if (expected[row].empty()) { continue; }
+        const std::int32_t n = std::clamp(counts[row], 0, kWidth);
+        for (std::int32_t j = 0; j < n; ++j) { ++expected[row][static_cast<std::size_t>(licensed[row * kWidth + j])]; }
+    }
+    std::vector<std::unique_ptr<GuardedDeviceBuffer>> device_counts;
+    std::vector<ops::SamplingConfig> configs(counts.size());
+    for (std::size_t row = 0; row < counts.size(); ++row) {
+        if (initial[row].empty()) {
+            device_counts.push_back(nullptr);
+            continue;
+        }
+        auto buffer = std::make_unique<GuardedDeviceBuffer>(kDomain * sizeof(std::int32_t));
+        buffer->copy_from_host(initial[row].data(), buffer->bytes());
+        configs[row].token_counts = static_cast<std::int32_t*>(buffer->data());
+        device_counts.push_back(std::move(buffer));
+    }
+    DeviceBuffer device_licensed = to_device(licensed);
+    DeviceBuffer device_row_counts = to_device(counts);
+    DeviceBuffer device_configs  = to_device(configs);
+    const Tensor licensed_tensor(device_licensed.p, DType::I32, {kWidth, static_cast<std::int32_t>(counts.size())});
+    const Tensor counts_tensor(device_row_counts.p, DType::I32, {static_cast<std::int32_t>(counts.size())});
+    ops::increment_licensed_token_counts(licensed_tensor, counts_tensor,
+                                         static_cast<const ops::SamplingConfig*>(device_configs.p), nullptr);
+    cuda_synchronize();
+
+    int failures = 0;
+    for (std::size_t row = 0; row < counts.size(); ++row) {
+        if (!device_counts[row]) { continue; }
+        const std::string name = "increment licensed token counts row " + std::to_string(row);
+        failures += verify_exact(name.c_str(), from_device<std::int32_t>(device_counts[row]->data(), kDomain), expected[row]);
+        failures += device_counts[row]->verify_guards(name + " guards");
+    }
+    failures += verify_exact("increment licensed token counts read-only tokens",
+                             from_device<std::int32_t>(device_licensed, licensed.size()), licensed);
+    return failures;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(sampling) {
@@ -964,6 +1010,7 @@ INFERNIX_OP_TEST(sampling) {
     failures += workspace_route_rng_contract();
     failures += fp32_gumbel_route_contract();
     failures += increment_counts_contract();
+    failures += increment_licensed_counts_contract();
     failures += grammar_mask_contract();
     failures += nonfinite_contract();
 

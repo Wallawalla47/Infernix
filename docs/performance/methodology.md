@@ -104,6 +104,11 @@ chunk's submit time); the two do not mix. It does not include HTTP transport and
 streaming TTFT measured by the [Serve TTFT client](../../tools/bench/ttft/README.md).
 The three decode rates have different time denominators and must not share an unlabeled column.
 Committed decode tokens exclude the first completion token produced by prefill.
+`decode_seconds` is the Program's time in the request's decode rounds, each round's decode and
+commit calls with their device waits; `prefill_seconds` covers the prompt's calls and the commit of
+its first token. Neither counts the Engine's scheduling between calls. Before 2026-11-01 neither
+counted a commit, which on speculative routes put the decode phase rate up to ~4 % above one timed
+from the rounds' wall clock; the two do not mix.
 
 Single-request tables report arithmetic mean ± sample standard deviation of per-request values.
 Category rows pool 3 fixtures × 5 seeds: their deviation includes differences between fixtures.
