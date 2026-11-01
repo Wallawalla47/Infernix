@@ -620,6 +620,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                         ? "; the " + std::to_string(instance->parameters.hc_q8_repacked) +
                               " hyper-connection matrices repacked to 8-bit weights at load"
                         : std::string()) +
+                   (instance->parameters.q6_repacked > 0
+                        ? "; " + std::to_string(instance->parameters.q6_repacked) +
+                              " BF16 GDN control and QSA indexer projections requantized to Q6_K at load"
+                        : std::string()) +
                    "; every other call keeps its route");
     }
 

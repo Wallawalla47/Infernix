@@ -134,8 +134,10 @@ class Parameters {
 public:
     // hc_q8 (--a8-activations, LOSSY, opt-in): every block's and the final mixer's BF16 hyper-connection matrices
     // are rewritten in their own bytes as Q8_G32_FP16 RowSplit (ops::hyper_connection_repack_q8), so each mix reads
-    // half the weight bytes; the MTP drafter keeps its own. The Model's views of those matrices are not BF16
-    // afterwards: only these Parameters may read them.
+    // half the weight bytes; the MTP drafter keeps its own. A GGUF import's BF16 GDN control and QSA indexer
+    // projections are rewritten likewise as Q6_K tiles (ops::ggml_quantize_q6_k) where they can join their input
+    // projection's 8-bit launch. The Model's views of those matrices are not BF16 afterwards: only these Parameters
+    // may read them.
     explicit Parameters(const Model& model, bool hc_q8 = false);
     ~Parameters();
     Parameters(const Parameters&)            = delete;
@@ -156,6 +158,7 @@ public:
     DraftHeadParameters draft_head;
     std::optional<qwen3_5::execution::VisionParameters> vision; // --vision (shared tower types)
     std::uint32_t hc_q8_repacked = 0; // matrices the hc_q8 repack rewrote
+    std::uint32_t q6_repacked    = 0; // GDN control and QSA indexer projections it rewrote as Q6_K
 
 private:
     // Device copy of every layer's ExpertScales, [layers][E], and the lossless route's.

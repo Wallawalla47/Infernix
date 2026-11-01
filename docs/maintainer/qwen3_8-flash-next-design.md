@@ -11410,7 +11410,14 @@ IQ3_S, DFlash2 auto, the route's resident pass the critical leg of most layers):
 otherwise, 2026-10-29), so the resident pass keeps its SMs; and the shared expert is queued on its stream right
 after the routed experts' early encoding, beside the router and the plan, a nearly idle device, instead of after
 the plan beside the resident pass. A GGUF import's BF16 hyper-connection matrices are repacked to Q8_G32_FP16 at
-load (`ops::hyper_connection_repack_q8`), so every mix reads half the bytes.
+load (`ops::hyper_connection_repack_q8`), so every mix reads half the bytes. Its BF16 GDN control projections (a and
+b, [96, 2560]) and QSA indexers ([640, 2560]) are requantized at load to Q6_K tiles in their own bytes by ggml's
+reference quantizer (`ops::ggml_quantize_q6_k`), where the layer's GGUF input projection holds at most one format
+besides Q6_K (an 8-bit launch mixes two; the IQ3_S import: 43 of 48), so they run inside that projection's one
+8-bit launch (up to six segments a launch) instead of a BF16 launch and its split copies, and the QSA layers'
+mixes then write the input projection's 8-bit columns too. Measured (2026-11-01, IQ3_S, DFlash2 auto, against
+e2625acc): conv -0.4 % ms a round, struct -2.0 %; the weights change, so the sampled conv text (and its draft
+acceptance) changes too.
 
 **Expected gain** (from the traces, not measured). Per launch the exact kernels already match Basalt's (gate/up
 31 against 33 µs, dense tiles 18-20 against 20 µs) and the resident expert pass reads near the DRAM bound, so
