@@ -798,8 +798,14 @@ returns to the pool, so a recomputed block never occupies two pages. Pinning the
 private page would turn evictable cache, which admission counted as room, into a second resident
 page per block: a long replay in a pool sized to one context would then exhaust it before its first
 decode unit. Only a copy that is already pinned leaves the page private (`Duplicate`, freed at
-finish). KV-write elision, which maps the existing pages and discards those writes, is an optional
-optimisation (§12.4).
+finish). A Host-only node likewise adopts the recomputed page as its Device copy.
+A recomputation need not repeat the earlier bits: the default route's kernels depend on the call's
+width, and a resume recomputes on another call grid. So when an unpinned node adopts the page, its
+Host copy of the earlier computation goes, and the write-through backs the new page; otherwise Host
+restores and saved files would serve the earlier bits beside snapshots taken from the new page. A
+pinned node keeps its Host copy, whose slab a restore copy may be reading. `--reproducible`
+recomputes identical bits, so there the drop changes nothing but a Host write. KV-write elision,
+which maps the existing pages and discards those writes, is an optional optimisation (§12.4).
 
 ### 7.6 Block commit (prefill and decode)
 

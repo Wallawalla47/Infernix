@@ -424,7 +424,14 @@ Parameters::Parameters(const Model& source, bool hc_q8) : model(source) {
             throw std::invalid_argument("Qwen4Exp vision: the merger's output width differs from the text hidden size");
         }
     }
-    if (hc_q8) {
+    // Only a GGUF import's (its dense projections are ggml blocks) hyper-connection matrices are repacked: the 8-bit
+    // mix was measured faster there (design §19.3.31) and never on NVIDIA's artifacts' BF16 matrices, and an 8-bit
+    // route stays only where it measured faster.
+    const bool ggml_import = std::any_of(layers.begin(), layers.end(), [](const BlockParameters& block) {
+        if (const auto* gdn = std::get_if<GdnParameters>(&block.mixer)) { return gdn->projection.is_ggml(); }
+        return std::get<AttentionParameters>(block.mixer).projection.is_ggml();
+    });
+    if (hc_q8 && ggml_import) {
         std::vector<Weight*> targets{&final_mixer.down.weight, &final_mixer.up.weight};
         for (auto& block : layers) {
             for (auto* hc : {&block.attn_hc, &block.mlp_hc}) {

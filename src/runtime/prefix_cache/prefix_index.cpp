@@ -595,18 +595,26 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
     if (const auto existing = find_child(parent, lookup_hash, block_tokens, extra)) {
         Node& node = nodes_[existing->index];
         InsertResult result{*existing, false, false};
+        const bool unpinned = node.pins == 0;
         if (attach && node.device == CopyState::Absent) {
             // A host-only block recomputed by this sequence regains its Device copy.
             node.device_id = device_id;
             set_device(node, CopyState::Resident);
             result.device_attached = true;
-        } else if (attach && node.device == CopyState::Resident && node.pins == 0) {
+        } else if (attach && node.device == CopyState::Resident && unpinned) {
             // A block recomputed by this sequence whose Device copy nobody maps: the sequence's page
             // replaces it, so the two never hold two pages for one block (the sequence pins its
             // own, and an evictable copy would otherwise become pinned beside it).
             result.replaced_device_id = node.device_id;
             node.device_id            = device_id;
             result.device_attached    = true;
+        }
+        if (result.device_attached && unpinned && node.host == CopyState::Resident) {
+            // A recomputation need not repeat the earlier bits (the default route's kernels depend on
+            // the call's width), so the Host copy of the earlier computation goes: Host restores and
+            // saved files would otherwise serve it beside snapshots taken from the new page. The write
+            // through backs the new page. A pinned node's slab may be under a restore copy, and keeps.
+            drop_node_host_copy(existing->index);
         }
         ++node.pins;
         refresh_node(existing->index);

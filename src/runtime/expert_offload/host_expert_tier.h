@@ -401,7 +401,9 @@ private:
     std::uint32_t prefill_pending_ = 0;
     std::condition_variable prefill_done_;
     std::atomic<std::uint32_t> in_flight_{0}; // demands and prefill reads not yet completed
-    std::vector<std::uint32_t> round_ticket_of_key_; // ticket + 1 of a key demanded this round, 0 none
+    // Ticket + 1 of a key demanded this round, 0 none. The engine thread (demands) and the read agent
+    // (read-ahead adoption) both publish entries, each after filling its ticket (release / acquire).
+    std::vector<std::atomic<std::uint32_t>> round_ticket_of_key_;
     // Stream slots: the lent tier slots (stream slot s is slot stream_slot_[s]), queued reads
     // (key, stream slot), the free stream slots (all guarded by mutex_), and each stream slot's
     // state (0 pending, 1 landed, 2 failed).

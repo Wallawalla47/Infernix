@@ -9,6 +9,7 @@ add_custom_target(infernix_build_id_stamp ALL
   COMMAND ${CMAKE_COMMAND}
           -DSRC_DIR=${CMAKE_SOURCE_DIR}
           -DOUT=${INFERNIX_BUILD_ID_HEADER}
+          -DCUDA_COMPILER_VERSION=${CMAKE_CUDA_COMPILER_VERSION}
           -P ${CMAKE_SOURCE_DIR}/cmake/GenerateBuildId.cmake
   BYPRODUCTS ${INFERNIX_BUILD_ID_HEADER}
   COMMENT "Stamping INFERNIX build id from git (build-time)"

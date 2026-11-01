@@ -24,6 +24,9 @@ inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 inline constexpr std::uint32_t kDefaultRequestLogKeep     = 4;
 inline constexpr std::uint32_t kMaximumRequestLogKeep     = 1000;
+// Seconds an idle connection stays open past the Keep-Alive timeout the server advertises, so a
+// client that retires its pooled connection at the advertised deadline always closes first.
+inline constexpr std::uint32_t kKeepAliveBufferSec = 10;
 
 // Size-based rotation of the request JSONL log.
 struct RequestLogRotation {
@@ -66,15 +69,18 @@ struct ServeOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     // HTTP keep-alive: how long a finished response's connection stays open for the next
-    // request (the HTTP server's own pool, not TCP keepalive). The cpp-httplib default of 5 s
-    // closes pooled connections between agent turns, so long-idle reuse pays a reconnect and
-    // can race the close. The timeout close itself is graceful (FIN-first drain; clients that
-    // probe pooled sockets before reuse simply reconnect), and a request that does land
-    // re-arms the window — nothing else needs to retire a connection deliberately. Clients
-    // that reuse a pooled socket without probing it lose that race whenever the server closes
-    // first: Bun's fetch (opencode) keeps idle sockets for its 5-minute idle timeout and does
-    // not read the Keep-Alive hint, so the default outlasts it and the client always closes
-    // first. An open connection holds a request worker, bounded by max_http_clients.
+    // request (the HTTP server's own pool, not TCP keepalive), advertised as
+    // `Keep-Alive: timeout=`; the close follows it by kKeepAliveBufferSec. The cpp-httplib
+    // default of 5 s closes pooled connections between agent turns, so long-idle reuse pays a
+    // reconnect and can race the close. The timeout close itself is graceful (FIN-first drain),
+    // and a request that does land re-arms the window — nothing else needs to retire a
+    // connection deliberately. A client that probes a pooled socket before reuse can still
+    // write a request between its probe and a close in flight, and loses it (a POST is not
+    // retried), so the server must not close first: clients that read the Keep-Alive header
+    // retire before the buffered close; clients that do not are outlasted by the window, which
+    // must exceed their pools' idle timeout (Bun's fetch, opencode's client: 5 minutes on a
+    // minute wheel, so 4-5). An open connection holds a request worker, bounded by
+    // max_http_clients.
     std::uint32_t keep_alive_timeout_sec = 360;
     // Ceiling on simultaneous open HTTP connections. cpp-httplib runs each connection's
     // keep-alive loop as a pool task, so an open connection — idle or not — holds a worker;

@@ -2,6 +2,7 @@
 #include "core/weight.h"
 #include "infernix/ops/embedding.h"
 #include "ops/op_tester.h"
+#include "core/arena.h" // PinnedHostBuffer
 #include "core/device.h"
 #include "core/decode_graph.h"
 
@@ -605,6 +606,46 @@ int run_quantized_case(const char* label, Table& table, const std::vector<std::i
     return failures;
 }
 
+// Ids outside [0, vocab) (vocab, -1 and INT32_MAX, inside the call) embed zeros in their columns and
+// report the fault word instead of reading outside the table; every other column keeps the bits it
+// gets in an all-valid call, which reports nothing.
+int check_out_of_range_ids(const std::string& label, const Weight& weight, std::int32_t d,
+                           const std::vector<std::int32_t>& valid) {
+    constexpr std::uint32_t kFault = 0xFF11;
+    const std::size_t columns      = valid.size(); // at least five: valid ids at both ends
+    std::vector<std::int32_t> ids  = valid;
+    const std::int32_t outside[]   = {weight.shape[0], -1, std::numeric_limits<std::int32_t>::max()};
+    for (std::size_t i = 0; i < std::size(outside); ++i) ids[1 + i * (columns - 3) / 2] = outside[i];
+    PinnedHostBuffer fault(64);
+    auto* word     = static_cast<std::uint32_t*>(fault.data());
+    const auto run = [&](const std::vector<std::int32_t>& selected) {
+        *reinterpret_cast<volatile std::uint32_t*>(word) = 0;
+        GuardedDeviceBuffer device_ids(selected.size() * sizeof(std::int32_t));
+        device_ids.copy_from_host(selected.data(), selected.size() * sizeof(std::int32_t));
+        GuardedDeviceBuffer output(static_cast<std::size_t>(d) * selected.size() * 2);
+        output.fill(0x7d);
+        Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(selected.size())});
+        Tensor result(output.data(), DType::BF16, {d, static_cast<std::int32_t>(selected.size())});
+        ops::embedding(input, weight, result, nullptr, DeviceFault{.word = word, .value = kFault});
+        cuda_synchronize();
+        return std::pair(guarded_to_host<std::uint16_t>(output, static_cast<std::size_t>(d) * selected.size()),
+                         *reinterpret_cast<volatile std::uint32_t*>(word));
+    };
+    const auto [reference, quiet] = run(valid);
+    const auto [got, reported]    = run(ids);
+    std::vector<std::uint16_t> expected = reference;
+    for (std::size_t t = 0; t < columns; ++t) {
+        if (ids[t] != valid[t]) std::fill_n(expected.begin() + static_cast<std::ptrdiff_t>(t * d), d, std::uint16_t{0});
+    }
+    int failures = verify_exact((label + " out-of-range ids").c_str(), got, expected);
+    if (quiet != 0 || reported != kFault) {
+        std::cerr << label << ": fault word " << quiet << " for valid ids and " << reported
+                  << " with ids outside the table (expected 0 and " << kFault << ")\n";
+        ++failures;
+    }
+    return failures;
+}
+
 template <typename Table>
 int qualify_dflash2(const char* format, Table& table, std::size_t aligned_offset) {
     int failures = 0;
@@ -631,6 +672,7 @@ int test_q6() {
     failures += run_quantized_case("embedding Q6 [248320,5120] T=7", table, repeated_ids(7), kQ6D);
     failures +=
         run_quantized_case("embedding Q6 [248320,5120] T=128", table, repeated_ids(128), kQ6D);
+    failures += check_out_of_range_ids("embedding Q6 [248320,5120] T=5", table.weight(), kQ6D, repeated_ids(5));
     return failures;
 }
 
@@ -638,6 +680,11 @@ int test_q8() {
     int failures = 0;
     for (const std::int32_t d : {kQ8VisionD, kQ8TextD}) {
         Q8Table table(d);
+        // Each kernel route: D 2048 grouped (T <= 6) and row (T > 6), D 5120 packed by 10 and by 5.
+        for (const std::size_t t : {5u, d == 5120 ? 129u : 7u}) {
+            failures += check_out_of_range_ids("embedding Q8 [248320," + std::to_string(d) + "] T=" + std::to_string(t),
+                                               table.weight(), d, repeated_ids(t));
+        }
         if (d == 5120) {
             failures += qualify_dflash2("Q8 [248320,5120]", table, 2);
             continue;
@@ -647,6 +694,12 @@ int test_q8() {
                                       "] T=" + std::to_string(static_cast<unsigned long long>(t));
             failures += run_quantized_case(label.c_str(), table, repeated_ids(t), d);
         }
+    }
+    {
+        // A code plane off a 4-byte boundary takes the scalar kernel.
+        Q8Table table(kQ8TextD, 2);
+        failures += check_out_of_range_ids("embedding Q8 [248320,5120] codes+2 T=5", table.weight(), kQ8TextD,
+                                           repeated_ids(5));
     }
     return failures;
 }
@@ -694,6 +747,10 @@ int test_fp8() {
     Fp8Table table;
     int failures = 0;
     failures += qualify_dflash2("FP8 [248320,5120]", table, 4);
+    for (const std::size_t t : {5u, 177u}) { // ten and five blocks a token
+        failures += check_out_of_range_ids("embedding FP8 [248320,5120] T=" + std::to_string(t), table.weight(), kFp8D,
+                                           dflash2_ids(t));
+    }
     const std::vector<std::int32_t> ids = {0};
     GuardedDeviceBuffer device_ids(sizeof(std::int32_t));
     device_ids.copy_from_host(ids.data(), sizeof(std::int32_t));
@@ -759,6 +816,7 @@ int test_dense() {
     failures += device_table.verify_guards("embedding BF16 table");
     failures += verify_exact("embedding BF16 table",
                              guarded_to_host<std::uint16_t>(device_table, table.size()), table);
+    failures += check_out_of_range_ids("embedding BF16 [2304,1152]", weight, kDenseD, ids);
     return failures;
 }
 

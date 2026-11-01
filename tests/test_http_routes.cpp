@@ -2,8 +2,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <exception>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -94,6 +96,43 @@ int main() {
                           "a doubled prefix must not shift the route's capture groups");
         server.stop();
         listener.join();
+    }
+
+    // The server advertises its keep-alive timeout and closes an idle connection only after the
+    // buffer: a request 1.5 s after the first, past the advertised 1 s, still arrives on the same
+    // connection (the same client port), so a client that retires at the advertised deadline
+    // always closes first.
+    {
+        httplib::Server server;
+        std::vector<int> ports;
+        std::mutex ports_mutex;
+        server.Get("/ping", [&](const httplib::Request& req, httplib::Response& res) {
+            const std::lock_guard<std::mutex> lock(ports_mutex);
+            ports.push_back(req.remote_port);
+            res.set_content("pong", "text/plain");
+        });
+        server.set_keep_alive_timeout(1);
+        server.set_keep_alive_timeout_buffer(2);
+        const int port = server.bind_to_any_port("127.0.0.1");
+        failures += check(port > 0, "keep-alive buffer test server could not bind a loopback port");
+        if (port > 0) {
+            std::thread listener([&server] { server.listen_after_bind(); });
+            server.wait_until_ready();
+            httplib::Client client("127.0.0.1", port);
+            client.set_keep_alive(true);
+            const auto first = client.Get("/ping");
+            failures += check(first && first->status == 200 &&
+                                  first->get_header_value("Keep-Alive").starts_with("timeout=1,"),
+                              "the response must advertise the keep-alive timeout, not the buffered close");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+            const auto second = client.Get("/ping");
+            failures += check(second && second->status == 200, "the request after the advertised timeout failed");
+            const std::lock_guard<std::mutex> lock(ports_mutex);
+            failures += check(ports.size() == 2 && ports[0] == ports[1],
+                              "an idle connection must stay open past the advertised timeout until the buffer ends");
+            server.stop();
+            listener.join();
+        }
     }
 
     // Idle sockets must not starve admission (the pool-sizing half of the keep-alive fix):

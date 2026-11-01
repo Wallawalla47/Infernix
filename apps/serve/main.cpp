@@ -330,7 +330,9 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-#ifdef INFERNIX_BUILD_ID
+#if defined(INFERNIX_BUILD_ID) && defined(INFERNIX_CUDA_COMPILER_VERSION)
+        logger->info("build {} (CUDA {})", INFERNIX_BUILD_ID, INFERNIX_CUDA_COMPILER_VERSION);
+#elif defined(INFERNIX_BUILD_ID)
         logger->info("build {}", INFERNIX_BUILD_ID);
 #endif
         if (options.config_path) {
