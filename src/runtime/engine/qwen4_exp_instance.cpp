@@ -605,6 +605,15 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         // (IQ3_S, DFlash2 auto, the hyper-connection repack on): -3.6 % conv and -3.3 % struct per decode step,
         // 28 no faster (2026-11-01). default_workers still caps it at the process's logical CPUs less four.
         if (a8.ggml_experts) { program_options.cpu_ggml_expert_workers = 24; }
+        // Its resident pass is the critical leg of most layers, so the side streams (staging, shared expert, split)
+        // yield to it: their least priority against the default's greatest, -1.2 % conv and -1.9 % struct per decode
+        // step (IQ3_S, DFlash2 auto, 2026-11-01; the default route measured the greatest faster on 2026-10-29), and
+        // the shared expert runs beside the router and the plan, a nearly idle device, rather than beside the
+        // resident pass: a further -0.7 % conv and -0.5 % struct.
+        if (a8.ggml_experts) {
+            program_options.side_streams_least_priority = true;
+            program_options.shared_expert_early         = true;
+        }
         report(options, DiagnosticLevel::Info,
                "--a8-activations (approximate): " + a8.describe() +
                    (instance->parameters.hc_q8_repacked > 0

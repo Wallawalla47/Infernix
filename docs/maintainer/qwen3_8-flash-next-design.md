@@ -11400,7 +11400,13 @@ once instead of one slice's a lane (the decode of a few columns was memory-laten
 the miss request carries the call's choice (`MissRequest::a8`) and the CPU route's 8-bit functions follow
 the GPU kernels' order (slice s to partial s mod P, P = 16 for gate/up and 4 for down rows, ascending, then
 the butterfly), so a CPU-served miss returns the GPU's bits and placement changes no output. The startup CPU
-rates are measured on the 8-bit route when it is on.
+rates are measured on the 8-bit route when it is on. Scheduling under the GGUF 8-bit expert route (2026-11-01,
+IQ3_S, DFlash2 auto, the route's resident pass the critical leg of most layers): the CPU team takes 24 workers
+(16 otherwise); the staging, shared-expert and split streams take the device's least stream priority (the greatest
+otherwise, 2026-10-29), so the resident pass keeps its SMs; and the shared expert is queued on its stream right
+after the routed experts' early encoding, beside the router and the plan, a nearly idle device, instead of after
+the plan beside the resident pass. A GGUF import's BF16 hyper-connection matrices are repacked to Q8_G32_FP16 at
+load (`ops::hyper_connection_repack_q8`), so every mix reads half the bytes.
 
 **Expected gain** (from the traces, not measured). Per launch the exact kernels already match Basalt's (gate/up
 31 against 33 µs, dense tiles 18-20 against 20 µs) and the resident expert pass reads near the DRAM bound, so

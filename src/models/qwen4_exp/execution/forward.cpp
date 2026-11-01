@@ -1075,11 +1075,20 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     // W4A16 bank) forks nothing: the empty fork and join alone cost Dense8 MTP decode 1.4 %. 16K decode, 3 runs each
     // (2026-10-29): IQ3_S 265.5 -> 267.7 tok/s with the fork, Dense8 243.9 either way.
     const bool early = side && ops::moe_experts_prepares(x, source, max_jobs, expert_ws.data, outputs);
+    // ForwardExperts::shared_early: the shared expert follows the encoding on the side stream at once, beside the
+    // router and the route's plan (a nearly idle device), instead of after the plan beside the routed experts. Its
+    // scoped workspace lies past every buffer this call allocated, and this stream allocates nothing until the join.
+    const bool shared_early = early && experts_.shared_early && scan_ == nullptr;
     if (early) {
         CUDA_CHECK(cudaEventRecord(experts_.shared_events[2], s));
         CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[2], 0));
         ops::moe_experts_prepare(x, source, max_jobs, expert_ws.data, outputs, experts_.shared_stream);
         CUDA_CHECK(cudaEventRecord(experts_.shared_events[3], experts_.shared_stream));
+        if (shared_early) {
+            shared_swiglu(x, p.shared_gate_up, product, work_, experts_.shared_stream, dense_routes());
+            project(product, p.shared_down, shared, work_, experts_.shared_stream, dense_routes());
+            CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], experts_.shared_stream));
+        }
     }
     const Tensor* rows[] = {&p.router, &p.shared_score};
     if (fast_.router_mma && T >= kRouterMmaMinColumns) {
@@ -1171,7 +1180,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     cudaStream_t shared_s = s;
     if (early) { CUDA_CHECK(cudaStreamWaitEvent(s, experts_.shared_events[3], 0)); }
-    if (side) {
+    if (side && !shared_early) {
         CUDA_CHECK(cudaEventRecord(experts_.shared_events[0], s));
         CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[0], 0));
         shared_s = experts_.shared_stream;
@@ -1185,13 +1194,15 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         for (std::int32_t e = 0; e < E; ++e) { guess_columns_[static_cast<std::size_t>(e)] = guessed[e + 1] - guessed[e]; }
         (void)streaming->plan_ahead(layer + 1, guess_columns_, ExpertStream::ahead_rows(T), 0);
     }
-    scan_input(x, layer, ActivationScan::Site::SharedInput);
-    shared_swiglu(x, p.shared_gate_up, product, work_, shared_s, dense_routes());
-    scan_input(product, layer, ActivationScan::Site::SharedDown);
-    project(product, p.shared_down, shared, work_, shared_s, dense_routes());
+    if (!shared_early) {
+        scan_input(x, layer, ActivationScan::Site::SharedInput);
+        shared_swiglu(x, p.shared_gate_up, product, work_, shared_s, dense_routes());
+        scan_input(product, layer, ActivationScan::Site::SharedDown);
+        project(product, p.shared_down, shared, work_, shared_s, dense_routes());
+    }
     ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
     if (side) {
-        CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], shared_s));
+        if (!shared_early) { CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], shared_s)); }
         CUDA_CHECK(cudaStreamWaitEvent(s, experts_.shared_events[1], 0));
     }
     if (inject != nullptr) {
