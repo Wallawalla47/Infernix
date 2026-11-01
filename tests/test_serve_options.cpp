@@ -1009,6 +1009,35 @@ int main() {
         const auto no_room = parse({"infernix-serve", "model.ninfer", "--no-thinking-answer-room"});
         failures += check(!no_room.thinking_answer_room && !thinking_answer_room_budget(no_room, 8192),
                           "--no-thinking-answer-room did not let thinking use all of max_tokens");
+        // The settled budget: the answer room for a request with none, a cap on
+        // --default-thinking-budget, and in place of a request's own budget at or above its limit.
+        failures += check(settle_thinking_budget(defaults, std::nullopt, 8192) == 6144U &&
+                              !settle_thinking_budget(defaults, std::nullopt, 1023),
+                          "a request without any budget did not get the answer room");
+        const auto large_default =
+            parse({"infernix-serve", "model.ninfer", "--default-thinking-budget", "16384"});
+        failures += check(settle_thinking_budget(large_default, std::nullopt, 8192) == 6144U,
+                          "--default-thinking-budget 16384 left no answer at the default max_tokens");
+        failures += check(settle_thinking_budget(large_default, std::nullopt, 32768) == 16384U,
+                          "--default-thinking-budget was lowered where it leaves the answer its room");
+        failures += check(settle_thinking_budget(large_default, std::nullopt, 1023) == 16384U,
+                          "--default-thinking-budget changed below the answer room's threshold");
+        failures += check(settle_thinking_budget(large_default, std::nullopt, long_prompt) == 9109U,
+                          "--default-thinking-budget ignored the room the context leaves");
+        failures += check(settle_thinking_budget(defaults, 8192U, 8192) == 6144U &&
+                              settle_thinking_budget(large_default, 20000U, 8192) == 6144U,
+                          "a request budget at or above its output limit left no answer");
+        failures += check(settle_thinking_budget(large_default, 7000U, 8192) == 7000U &&
+                              settle_thinking_budget(defaults, 8191U, 8192) == 8191U,
+                          "a request budget below its output limit did not stand as sent");
+        failures += check(settle_thinking_budget(defaults, 20000U, 1023) == 20000U,
+                          "a request budget changed below the answer room's threshold");
+        const auto no_room_default = parse(
+            {"infernix-serve", "model.ninfer", "--default-thinking-budget", "16384", "--no-thinking-answer-room"});
+        failures += check(settle_thinking_budget(no_room_default, std::nullopt, 8192) == 16384U &&
+                              settle_thinking_budget(no_room_default, 20000U, 8192) == 20000U &&
+                              !settle_thinking_budget(no_room, std::nullopt, 8192),
+                          "--no-thinking-answer-room changed a budget");
     }
     request.enable_thinking = false;
     const auto non_thinking = resolve_prompt_semantics(request, thinking_budget);

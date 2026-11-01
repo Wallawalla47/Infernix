@@ -388,7 +388,7 @@ export const THINKING_CONTROLS: Control[] = [
     kind: "number",
     flag: "--default-thinking-budget",
     label: "Default thinking budget",
-    help: "Positive thinking-token cap for thinking requests that set none.",
+    help: "Positive thinking-token cap for thinking requests that set none. The output limit counts the thinking, so the cap is lowered where it would leave the answer less than a quarter of it.",
     placeholder: "unlimited",
     min: 1,
   },
@@ -404,7 +404,7 @@ export const THINKING_CONTROLS: Control[] = [
     kind: "switch",
     flag: "--no-thinking-answer-room",
     label: "Let thinking use the whole output limit",
-    help: "Without a budget, thinking may use all of the output limit instead of leaving a quarter for the answer.",
+    help: "Thinking may use all of the output limit instead of leaving a quarter for the answer (with no budget, under the default thinking budget, or with a request budget at or above the limit).",
   },
   {
     kind: "select",

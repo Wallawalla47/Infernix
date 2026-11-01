@@ -1405,9 +1405,10 @@ void parse_thinking(const Json& body, GenerationRequest& request) {
             if (*budget < 1024) {
                 bad_request("thinking.budget_tokens must be an integer of at least 1024", "thinking");
             }
-            // Unlike the Anthropic API, a budget at or above max_tokens is accepted: the output limit
-            // is reached before the budget, so it never takes effect. Clients such as Qwen Code send
-            // a fixed budget while shrinking max_tokens to the context window left.
+            // Unlike the Anthropic API, a budget at or above max_tokens is accepted, and the answer
+            // room takes its place (settle_thinking_budget): the output limit would end thinking
+            // first, with no answer. Clients such as Qwen Code send a fixed budget while shrinking
+            // max_tokens to the context window left.
             request.thinking_budget = static_cast<std::uint32_t>(*budget);
         }
     } else {
