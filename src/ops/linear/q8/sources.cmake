@@ -37,4 +37,5 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n320_k10240.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n10240_k320.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n2560_k640.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n2560_k12800.cu"
 )
