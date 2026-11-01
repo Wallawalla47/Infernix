@@ -132,7 +132,11 @@ struct BlockParameters {
 
 class Parameters {
 public:
-    explicit Parameters(const Model& model);
+    // hc_q8 (--a8-activations, LOSSY, opt-in): every block's and the final mixer's BF16 hyper-connection matrices
+    // are rewritten in their own bytes as Q8_G32_FP16 RowSplit (ops::hyper_connection_repack_q8), so each mix reads
+    // half the weight bytes; the MTP drafter keeps its own. The Model's views of those matrices are not BF16
+    // afterwards: only these Parameters may read them.
+    explicit Parameters(const Model& model, bool hc_q8 = false);
     ~Parameters();
     Parameters(const Parameters&)            = delete;
     Parameters& operator=(const Parameters&) = delete;
@@ -151,6 +155,7 @@ public:
     std::optional<DFlash2Parameters> dflash2;
     DraftHeadParameters draft_head;
     std::optional<qwen3_5::execution::VisionParameters> vision; // --vision (shared tower types)
+    std::uint32_t hc_q8_repacked = 0; // matrices the hc_q8 repack rewrote
 
 private:
     // Device copy of every layer's ExpertScales, [layers][E], and the lossless route's.

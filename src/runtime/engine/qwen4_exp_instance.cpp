@@ -180,7 +180,8 @@ std::vector<std::filesystem::path> dflash2_companions_beside(const std::filesyst
 }
 
 Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> source, const EngineOptions& options)
-    : model(std::move(source)), parameters(*model),
+    // --a8-activations: the hyper-connection matrices repacked to Q8 at load (execution::Parameters' hc_q8).
+    : model(std::move(source)), parameters(*model, options.a8_activations && !options.lossless && options.fast_paths),
       frontend(models::qwen3_5::make_frontend(model->resources(),
                                               {.chat_template_path      = options.chat_template_path,
                                                .architecture            = models::Architecture::Qwen4Exp,
@@ -600,8 +601,17 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                 "prefill)");
         }
         a8.apply(program_options.fast_paths);
+        // The 8-bit route's CPU-served GGUF misses take a larger team: 24 workers against 16 on the i9-13900K
+        // (IQ3_S, DFlash2 auto, the hyper-connection repack on): -3.6 % conv and -3.3 % struct per decode step,
+        // 28 no faster (2026-11-01). default_workers still caps it at the process's logical CPUs less four.
+        if (a8.ggml_experts) { program_options.cpu_ggml_expert_workers = 24; }
         report(options, DiagnosticLevel::Info,
-               "--a8-activations (approximate): " + a8.describe() + "; every other call keeps its route");
+               "--a8-activations (approximate): " + a8.describe() +
+                   (instance->parameters.hc_q8_repacked > 0
+                        ? "; the " + std::to_string(instance->parameters.hc_q8_repacked) +
+                              " hyper-connection matrices repacked to 8-bit weights at load"
+                        : std::string()) +
+                   "; every other call keeps its route");
     }
 
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);

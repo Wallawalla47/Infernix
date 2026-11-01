@@ -13,7 +13,9 @@
 // columns and leaves partial token tiles at 97, 129 and 193); column invariance of the fused route
 // (each column of a 16-column call bit-identical to that column alone, and a 5-column call equal to
 // the 16-column call's first five); one graph-captured call bit-identical to the eager call; the
-// workspace capacity covers every T. Criteria: the fused route rounds only x to BF16 (FP32
+// workspace capacity covers every T; hyper_connection_repack_q8 (--a8-activations) rewriting the BF16 problem's
+// matrices as Q8 (every code and scale exactly its rule), then the mix on them against the oracle over the
+// repacked values. Criteria: the fused route rounds only x to BF16 (FP32
 // intermediates), so |x - ref| <= 2^-8 |ref| + 2^-12 rms(ref), and injects to 1e-5 relative + 1e-6; the
 // composed route rounds Rn, z, m and u to BF16, so its bound is 2^-5 |ref| + 2^-6 rms(ref) and
 // injects to 2^-7 relative + 2^-9.
@@ -28,6 +30,7 @@
 #include "ops/linear/linear_test_common.h"
 #include "ops/op_tester.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -344,6 +347,75 @@ void compare(const Result& got, const Reference& ref, bool fused, bool inject, c
     }
 }
 
+// hyper_connection_repack_q8 (--a8-activations): a BF16 matrix rewritten as Q8 in its own bytes. Every code and
+// scale is compared exactly with the rule evaluated here (s = fl16(fl32(m / 127)), m the group's largest magnitude;
+// q = rne(fl32(v / s)) clamped to [-127, 127]; a zero group and the padding past K: 0), and the repacked values
+// decoded from the read-back bytes are returned for the oracle.
+std::vector<float> repack_and_check(infernix::Weight& w, const std::vector<float>& values, cudaStream_t stream,
+                                    const std::string& what) {
+    const int n = w.n, k = w.k;
+    const std::size_t scratch = infernix::ops::hyper_connection_repack_q8_scratch_bytes(w);
+    check(scratch > 0, what + ": repackable");
+    if (scratch == 0) { return values; }
+    Device s(scratch);
+    infernix::ops::hyper_connection_repack_q8(w, s.p, stream);
+    t::cuda_check(cudaStreamSynchronize(stream), "repack");
+    const int padded = w.padded_shape[1];
+    check(w.qtype == infernix::QType::Q8_G32_FP16 && w.layout == infernix::QuantLayout::RowSplit && padded % 128 == 0 &&
+              padded >= k && w.scales == static_cast<const std::uint8_t*>(w.qdata) + static_cast<std::size_t>(n) * padded,
+          what + ": a Q8_G32_FP16 RowSplit Weight with its scales after the codes");
+    const int groups = padded / 32;
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(n) * padded + static_cast<std::size_t>(n) * groups * 2);
+    t::cuda_check(cudaMemcpy(bytes.data(), w.qdata, bytes.size(), cudaMemcpyDeviceToHost), "read back");
+    std::vector<float> decoded(static_cast<std::size_t>(n) * k);
+    std::size_t bad = 0;
+    for (int r = 0; r < n; ++r) {
+        for (int g = 0; g < groups; ++g) {
+            float m = 0.0F;
+            for (int j = 0; j < 32; ++j) {
+                const int c = 32 * g + j;
+                if (c < k) { m = std::max(m, std::fabs(values[static_cast<std::size_t>(r) * k + c])); }
+            }
+            const std::uint16_t s16 = __half_as_ushort(__float2half_rn(m / 127.0F));
+            const float scale       = half_to_float(s16);
+            const std::size_t at    = static_cast<std::size_t>(n) * padded + (static_cast<std::size_t>(r) * groups + g) * 2;
+            const auto stored       = static_cast<std::uint16_t>(bytes[at] | (bytes[at + 1] << 8));
+            bad += stored != (scale > 0.0F ? s16 : std::uint16_t{0}) ? 1U : 0U;
+            for (int j = 0; j < 32; ++j) {
+                const int c = 32 * g + j;
+                int q       = 0;
+                if (c < k && scale > 0.0F) {
+                    q = static_cast<int>(std::nearbyint(values[static_cast<std::size_t>(r) * k + c] / scale));
+                    q = std::clamp(q, -127, 127);
+                }
+                const auto code = static_cast<std::int8_t>(bytes[static_cast<std::size_t>(r) * padded + c]);
+                bad += code != q ? 1U : 0U;
+                if (c < k) { decoded[static_cast<std::size_t>(r) * k + c] = static_cast<float>(q) * scale; }
+            }
+        }
+    }
+    check(bad == 0, what + ": every code and scale is the rule's (" + std::to_string(bad) + " differ)");
+    return decoded;
+}
+
+// A BF16 problem's matrices repacked, then the mix on them (its Q8 routes, fused and composed) against the FP64
+// oracle over the repacked values, with the Q8 problem's bounds.
+void repack_q8(bool inject, cudaStream_t stream) {
+    Problem p = make_problem(inject, Codec::Bf16);
+    const std::string tag = std::string("repacked q8 ") + (inject ? "inject" : "no inject");
+    const std::vector<float> down = repack_and_check(p.down_w, p.down_values, stream, tag + " down");
+    const std::vector<float> up   = repack_and_check(p.up_w, p.up_values, stream, tag + " up");
+    const std::size_t capacity    = infernix::ops::hyper_connection_mix_workspace_capacity_bytes(
+        p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only, kS, kRank, 129);
+    infernix::WorkspaceArena ws(capacity);
+    const std::vector<double> norm = p.norm_values(false);
+    for (const int T : {1, 8, 16, 17, 97, 129}) {
+        const auto r = residual(T, 3000U + static_cast<std::uint32_t>(T));
+        compare(run(p, r, T, inject, ws, stream), oracle(r, norm, down, p.down_rows, up, T), T <= 16, inject,
+                tag + " T=" + std::to_string(T));
+    }
+}
+
 // The fused up + collapse against the separate linear (A16Only) and collapse, bit for bit. m is of a
 // SiLU output's range and normalized of a normed residual's.
 void up_collapse_bit_identity(Codec codec, cudaStream_t stream) {
@@ -434,6 +506,8 @@ INFERNIX_OP_TEST(hyper_connection) {
             check(captured.x == five.x && captured.inject == five.inject, tag + ": a graph-captured call equals the eager call");
         }
         up_collapse_bit_identity(Codec::Q8, stream);
+        repack_q8(true, stream);
+        repack_q8(false, stream);
         // Shapes that disagree are refused.
         {
             Problem p = make_problem(true, Codec::Q8);
