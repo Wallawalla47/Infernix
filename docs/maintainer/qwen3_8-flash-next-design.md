@@ -3940,6 +3940,40 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
     read is bound by the bytes the link returns per round trip (8 rows, 48 KB). Reading fewer rows
     is what remains: seven of the drafter's eight are the mask token, which a device-resident copy
     would serve (est. 5-7 µs a round on Dense8, 3-4 on IQ3_S).
+- **DFlash2: sliced-K routes for the feature projection (adopted 2026-11-01).**
+  - **Problem.** The drafter's context feature projection, Q8 [2560, 12800] (five target taps), had
+    no tuned entry and ran the runtime-shape routes: the SIMT pair to 8 columns, 45.7 µs at the
+    commit graph's 8 columns (38-41 µs at 1-4, 64 at 5-7), and r32 MMA tiles beyond (80 CTAs:
+    122 µs at 16-64 columns).
+  - **Change.** Its own table (cold, graph-timed sweeps): sliced-K MMA with double-buffered stages,
+    8 K warps to 32 columns and 4 to 96 (64-column slices past 64), r32_t64 to 384 columns and
+    r64_t128 beyond (the MMA tiles share bits). Up to 32 columns a column's bits do not depend on
+    the call's width, so verification's column invariance (1-8) holds.
+  - **Result.** 23-25 µs at 1-8 columns, 27 µs at 16, 68 µs at 64 (from 122), 711 µs at 2,048
+    (from 844). Same relative L2 against the Op test's FP64 oracle as the SIMT route (1.64e-3 at
+    6 columns; the BF16 output rounding dominates), but different bits: drafts change at near
+    ties, so sampled `--reproducible` outputs may change (deterministic and request-invariant
+    still) and greedy outputs cannot. Paired greedy CLI check, six prompts (same text): four with
+    the same rounds, two with 2-4 more, pooled tokens a round 2.973 → 2.937. `infernix_bench`
+    against the previous build (three reps, wall after the prefill): greedy conv +0.31 % (rounds
+    427 → 417), struct +0.27 % (rounds 953 → 954), ranges separated.
+  - **Left.** A K split across CTAs: the 160 one-tile CTAs leave 10 SMs idle (~1.4 of 1.67 TB/s).
+    Two row tiles, `cg` activations and direct scales tied with the chosen schedule within the
+    timer's 2 µs step at 8 columns.
+- **linear_topk: each column's top sixteen in two launches (adopted 2026-11-01).**
+  - **Problem.** After its producer, the drafter's top-16 over the 131,072-row proposal head (7
+    columns) ran a counter clear and two passes of a CTA-wide merge sort of 512 keys, the last CTA
+    per column sorting a third time: 2.4 + 18.8 + 7.1 µs a round (node-level nsys).
+  - **Change.** A selection kernel per 4,096-key slice of a column: each thread sorts its sixteen
+    keys in registers, and warp and CTA butterflies keep the top sixteen of two sorted lists (the
+    elementwise maximum against the reversed other list is bitonic; a bitonic merge sorts it).
+    One warp per column merges the slices. No counters, so no clear and no atomics. Keys are
+    unique, so the result is a full sort's: same bits (the exact-oracle Op test passes on every
+    profile, ties included).
+  - **Result.** Engine trace: 28.2 → 9.2 µs a round (select 7.7 + final 1.6); the head kernel
+    unchanged (106.1 / 106.0 µs). Cold op: proposal head at 7 columns 131.5 → 115.0 µs; 27B's at
+    8 columns 237.9 → 219.4. `infernix_bench` (three reps, identical rounds and acceptance):
+    greedy +0.11 %, struct −0.09 %, overlapping ranges; ~0.1 % is below what that A/B resolves.
 - **Few-row Q8 route for the hyper-connection down projections (adopted).**
   - **Problem.** The MTP-round profile showed the [324, 10240] and [320, 10240] projections
     (96 calls per token) on 41 eight-row CTAs at ~0.4 TB/s: 9.5 µs per call, ~0.9 ms per round,
