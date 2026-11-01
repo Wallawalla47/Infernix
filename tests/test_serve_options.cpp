@@ -594,15 +594,17 @@ int main() {
                           parse({"infernix-serve", "model.ninfer"}).keep_alive_timeout_sec == 60,
                       "--keep-alive-timeout-sec is not the moderate default by default");
     failures += check(parse_error({"infernix-serve", "model.ninfer"}).empty() &&
-                          parse({"infernix-serve", "model.ninfer"}).max_http_clients == 64,
-                      "--max-http-clients is not 64 by default");
+                          parse({"infernix-serve", "model.ninfer"}).max_http_clients == 0,
+                      "--max-http-clients does not default to the built-in sizing (0)");
+    failures += check(parse_error({"infernix-serve", "model.ninfer", "--max-http-clients", "0"}).empty(),
+                      "--max-http-clients rejected 0, which selects the built-in sizing");
     for (const char* bad : {"0", "3601", "-1", "abc"}) {
         const std::string error =
             parse_error({"infernix-serve", "model.ninfer", "--keep-alive-timeout-sec", bad});
         failures += check(error.find("keep-alive-timeout-sec") != std::string::npos,
                           "--keep-alive-timeout-sec accepted an invalid value");
     }
-    for (const char* bad : {"0", "-1", "abc"}) {
+    for (const char* bad : {"-1", "abc"}) {
         const std::string error =
             parse_error({"infernix-serve", "model.ninfer", "--max-http-clients", bad});
         failures += check(error.find("max-http-clients") != std::string::npos,

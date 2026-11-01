@@ -209,14 +209,16 @@ std::string_view canonical_api_path(std::string_view path) noexcept {
 httplib::TaskQueue* new_http_worker_pool(const ServeOptions& options) {
     const std::size_t queued_requests =
         static_cast<std::size_t>(options.max_concurrency) + options.max_pending_requests;
-    const std::size_t worker_count = queued_requests + 1;
     // cpp-httplib runs each accepted connection's keep-alive loop as one pool task, so an
     // open connection — idle or not — occupies its worker for the whole idle window. Stock
-    // sizes the pool max_n == base, capping both workers and, with them, simultaneous
-    // connections; the keep-alive window makes that cap worth stating openly rather than
-    // leaving hardwired: base workers keep request admission permanently reachable, and
-    // connections up to --max-http-clients hold a worker each, with the rest queueing
-    // (max_pending_requests deep) before the accept loop starts refusing them.
+    // sizes the pool to the admitted-request count alone, so that many idle sockets park
+    // every worker and the next request queues behind them; twice that count admits an
+    // idle hold beside every admitted request without starving admission. The ceiling
+    // equals the base, as in the stock construction; beyond it connections queue
+    // (max_pending_requests deep) and the accept loop then refuses them. --max-http-clients
+    // (0: this formula) raises the ceiling for deployments expecting more simultaneous
+    // idle holds; values below the base clamp up.
+    const std::size_t worker_count   = queued_requests * 2;
     const std::size_t worker_ceiling =
         std::max(worker_count, static_cast<std::size_t>(options.max_http_clients));
     return new httplib::ThreadPool(worker_count, worker_ceiling, queued_requests);

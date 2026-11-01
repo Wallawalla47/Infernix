@@ -176,8 +176,10 @@ int main() {
 
     // Idle sockets must not starve admission (the pool-sizing half of the keep-alive fix):
     // cpp-httplib parks one pool worker per open connection for its whole idle window, so a
-    // pool sized only to admission lets idle connections block new requests. The ceiling
-    // above the base (--max-http-clients territory) must absorb them.
+    // pool sized to the admitted-request count alone lets that many idle sockets block new
+    // requests. The built-in sizing doubles it: with (max_concurrency 1, max_pending 1) the
+    // stock "+1" formula owns 3 workers — hold exactly that many idle connections and a new
+    // request still finds one of the doubled (4) workers.
     {
         httplib::Server server;
         server.Get("/ping", [](const httplib::Request&, httplib::Response& res) {
@@ -195,19 +197,92 @@ int main() {
             server.wait_until_ready();
             std::vector<httplib::Client> idle_clients;
             bool all_warm = true;
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 3; ++i) {
                 idle_clients.emplace_back("127.0.0.1", port);
                 idle_clients.back().set_keep_alive(true);
                 const auto warm = idle_clients.back().Get("/ping");
                 all_warm = all_warm && warm && warm->status == 200;
             }
             failures += check(all_warm, "idle connections could not each get their warm-up response");
-            // All four connections are now open and idle, each holding a worker.
+            // All three connections are now open and idle — every worker the stock "+1"
+            // formula would have built. A fourth request must still be admitted.
             httplib::Client fresh("127.0.0.1", port);
             fresh.set_read_timeout(5, 0);
             const auto admitted = fresh.Get("/ping");
             failures += check(admitted && admitted->status == 200,
                               "idle keep-alive connections must not starve request admission");
+            server.stop();
+            listener.join();
+        }
+    }
+
+    // Control: the same hold-and-admit probe against the stock "+1" pool (3 workers, ceiling
+    // == base for the (1,1) options above) must starve. If this block passes, the one above
+    // proves nothing about the doubling.
+    {
+        httplib::Server server;
+        server.Get("/ping", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content("pong", "text/plain");
+        });
+        server.set_keep_alive_timeout(30);
+        server.new_task_queue = [] { return new httplib::ThreadPool(3, 3, 2); };
+        const int port = server.bind_to_any_port("127.0.0.1");
+        failures += check(port > 0, "control-+1 test server could not bind a loopback port");
+        if (port > 0) {
+            std::thread listener([&server] { server.listen_after_bind(); });
+            server.wait_until_ready();
+            std::vector<httplib::Client> idle_clients;
+            bool all_warm = true;
+            for (int i = 0; i < 3; ++i) {
+                idle_clients.emplace_back("127.0.0.1", port);
+                idle_clients.back().set_keep_alive(true);
+                const auto warm = idle_clients.back().Get("/ping");
+                all_warm = all_warm && warm && warm->status == 200;
+            }
+            failures += check(all_warm, "control-+1: the three idle connections must be served");
+            httplib::Client fresh("127.0.0.1", port);
+            fresh.set_read_timeout(0, 500000);
+            const auto starved = fresh.Get("/ping");
+            failures += check(!starved,
+                              "control: the +1-formula pool must starve the fourth request");
+            server.stop();
+            listener.join();
+        }
+    }
+
+    // --max-http-clients raises the ceiling above the doubled base: with (1,1) the base is
+    // 4; hold every base worker with idle connections and a fifth request spawns within the
+    // raised ceiling (6).
+    {
+        httplib::Server server;
+        server.Get("/ping", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content("pong", "text/plain");
+        });
+        server.set_keep_alive_timeout(30);
+        infernix::serve::ServeOptions pool_options;
+        pool_options.max_concurrency      = 1;
+        pool_options.max_pending_requests = 1;
+        pool_options.max_http_clients     = 6; // base (0) would cap the pool at the doubled 4
+        server.new_task_queue = [&pool_options] { return infernix::serve::new_http_worker_pool(pool_options); };
+        const int port = server.bind_to_any_port("127.0.0.1");
+        failures += check(port > 0, "ceiling test server could not bind a loopback port");
+        if (port > 0) {
+            std::thread listener([&server] { server.listen_after_bind(); });
+            server.wait_until_ready();
+            std::vector<httplib::Client> idle_clients;
+            bool all_warm = true;
+            for (int i = 0; i < 4; ++i) {
+                idle_clients.emplace_back("127.0.0.1", port);
+                idle_clients.back().set_keep_alive(true);
+                const auto warm = idle_clients.back().Get("/ping");
+                all_warm = all_warm && warm && warm->status == 200;
+            }
+            failures += check(all_warm, "the four base-sized idle connections must be served");
+            httplib::Client fresh("127.0.0.1", port);
+            fresh.set_read_timeout(5, 0);
+            const auto admitted = fresh.Get("/ping");
+            failures += check(admitted && admitted->status == 200,
+                              "--max-http-clients must admit a request beyond the doubled base");
             server.stop();
             listener.join();
         }
@@ -248,6 +323,35 @@ int main() {
             d.set_read_timeout(0, 300000);
             const auto refused = d.Get("/ping");
             failures += check(!refused, "a connection beyond pool and queue must be refused");
+            server.stop();
+            listener.join();
+        }
+    }
+
+    // Control: the same overflow probe against an unbounded ceiling (base 1, ceiling 64,
+    // queue 1) must admit, not refuse — every dynamic request spawns its own worker. If
+    // this block refuses, the refusal above is not attributable to the ceiling.
+    {
+        httplib::Server server;
+        server.Get("/ping", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content("pong", "text/plain");
+        });
+        server.set_keep_alive_timeout(30);
+        server.new_task_queue = [] { return new httplib::ThreadPool(1, 64, 1); };
+        const int port = server.bind_to_any_port("127.0.0.1");
+        failures += check(port > 0, "control-unbounded test server could not bind a loopback port");
+        if (port > 0) {
+            std::thread listener([&server] { server.listen_after_bind(); });
+            server.wait_until_ready();
+            httplib::Client a("127.0.0.1", port);
+            a.set_keep_alive(true);
+            const auto warm_a = a.Get("/ping");
+            failures += check(warm_a && warm_a->status == 200, "control: the base connection must be served");
+            httplib::Client b("127.0.0.1", port);
+            b.set_read_timeout(5, 0);
+            const auto spawned = b.Get("/ping");
+            failures += check(spawned && spawned->status == 200,
+                              "control: an unbounded ceiling must admit where the bounded one refuses");
             server.stop();
             listener.join();
         }

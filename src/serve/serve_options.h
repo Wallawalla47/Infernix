@@ -71,16 +71,17 @@ struct ServeOptions {
     // This is the hard ceiling; the graceful retirement (Connection: close on the response
     // after an idle past half the ceiling) is the normal death of a long-idle pooled
     // connection. It stays moderate so idle sockets, which hold a worker each, release them
-    // promptly; the pool ceiling (max_http_clients) bounds how many hold one at once.
+    // promptly; the worker pool bounds how many hold one at once, and 0 — the default of
+    // max_http_clients — sizes it at twice the admission-plus-pending count.
     // See HttpServer::register_routes and KeepAliveRetirement.
     std::uint32_t keep_alive_timeout_sec = 60;
     // Ceiling on simultaneous open HTTP connections. cpp-httplib runs each connection's
-    // keep-alive loop as a pool task, so an open connection — idle or not — holds a worker;
-    // the pool already enforced this bound with max_n hardwired to the admission size. Base
-    // (admission-sized) workers stay permanently reachable; connections up to this ceiling
-    // hold a worker each; beyond it, connections queue (max_pending_requests deep) and are
-    // then refused. Values below the admission requirement are raised to it at startup.
-    std::uint32_t max_http_clients = 64;
+    // keep-alive loop as a pool task, so an open connection — idle or not — holds a worker.
+    // 0: the built-in sizing — workers and ceiling both twice the admitted-request count
+    // (new_http_worker_pool), so idle holds cannot starve admission. A value raises the
+    // ceiling above the base for more simultaneous idle holds; values below the base are
+    // raised to it.
+    std::uint32_t max_http_clients = 0;
     std::uint32_t prefill_chunk        = 0; // 0: the model's default (EngineOptions)
     bool original_int8_prefill_kernel  = false;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;

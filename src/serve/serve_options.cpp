@@ -618,8 +618,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             (default 60; idle past N/2 retires gracefully with\n"
            "                             Connection: close on the next response)\n"
            "  --max-http-clients N       ceiling on simultaneous open HTTP connections, each of\n"
-           "                             which holds a request worker while open (default 64;\n"
-           "                             raised to the admission size if smaller)\n"
+           "                             which holds a request worker while open (default: the\n"
+           "                             built-in sizing — workers and ceiling at twice the\n"
+           "                             admitted-request count; N raises the ceiling, values\n"
+           "                             below it are raised to it)\n"
            "  --request-log-jsonl FILE   append full-precision server/request records\n"
            "  --request-log-max-mib N    rotate FILE when it reaches N MiB: it becomes\n"
            "                             FILE.1, older files shift up (default: one file\n"
@@ -1211,12 +1213,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.keep_alive_timeout_sec == 0 || options.keep_alive_timeout_sec > 3600) {
         throw std::invalid_argument("--keep-alive-timeout-sec must be in [1,3600]");
     }
-    // Smaller values are legal but clamped up to the admission size at startup — an
-    // HTTP surface smaller than admitted requests would refuse connections the
-    // concurrency options just promised to serve.
-    if (options.max_http_clients == 0) {
-        throw std::invalid_argument("--max-http-clients must be positive");
-    }
+    // --max-http-clients: 0 (default) keeps the built-in sizing (workers and ceiling at
+    // twice the admitted-request count); smaller-than-base values are legal and clamped up
+    // at pool construction (new_http_worker_pool).
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
     }
