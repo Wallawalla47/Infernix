@@ -1172,9 +1172,11 @@ public:
         // CTAs retire: the tensor-core gate/up holds ~90 % of an SM's registers and shared memory, and the shared
         // expert's SwiGLU waited ~30 us a layer for an SM. IQ3_S full layout, 2 runs each (2026-10-29): 16K
         // 263.6 -> 265.3 tok/s, struct 456.5 -> 463.3; the shared stream alone 265.8 / 455.4. (With the dp4a
-        // kernels' smaller CTAs this measured 0.999x and was removed on 2026-10-28.)
-        int least_priority = 0, side_priority = 0;
-        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_priority, &side_priority));
+        // kernels' smaller CTAs this measured 0.999x and was removed on 2026-10-28.) The 8-bit GGUF expert route
+        // takes the least priority instead (ProgramOptions::side_streams_least_priority).
+        int least_priority = 0, greatest_priority = 0;
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority));
+        const int side_priority = options_.side_streams_least_priority ? least_priority : greatest_priority;
         CUDA_CHECK(cudaStreamCreateWithPriority(&overlap_.stream, cudaStreamNonBlocking, side_priority));
         for (auto& event : overlap_.events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
         experts.overlap_stream = overlap_.stream;
@@ -1183,6 +1185,7 @@ public:
         for (auto& event : overlap_.shared_events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
         experts.shared_stream = overlap_.shared_stream;
         experts.shared_events = overlap_.shared_events;
+        experts.shared_early  = options_.shared_expert_early;
         // The stream on which a forked call's staged misses compute (their down rows stage beside the gate/up pass;
         // Dense8 MTP decode +6.7 / +1.3 / +10.3 %, Ornith +1.6 / +8.0 / +4.6 %, IQ3_S within spread, 2026-10-27).
         {
