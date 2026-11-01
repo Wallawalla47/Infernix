@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "models/load_options.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
@@ -114,11 +115,17 @@ std::size_t expected_allowance(unsigned capacity, unsigned neural, unsigned ngra
 
 void verify_real_plan(const char* artifact) {
     infernix::DeviceContext device;
-    infernix::models::LoadOptions selected;
-    selected.vision        = false;
-    selected.speculative   = infernix::SpeculativeBackend::Mtp;
-    selected.proposal_head = infernix::ProposalHead::Optimized;
-    auto model             = qwen::load_model(artifact, selected, device);
+    infernix::EngineOptions base;
+    base.max_concurrency                       = 1;
+    base.prefill_chunk                         = 1024;
+    base.enable_vision                         = false;
+    base.kv_cache                              = infernix::KvCacheStorage::Nvfp4Group16;
+    base.speculative.backend                   = infernix::SpeculativeBackend::Mtp;
+    base.speculative.proposal_head             = infernix::ProposalHead::Optimized;
+    base.context_cache.hybrid.device_snapshot_slots = 1;
+    // The planner refuses options whose components differ from the loaded ones.
+    auto model = qwen::load_model(
+        artifact, infernix::models::load_options(base, infernix::models::Architecture::Qwen3_5), device);
     const qwen::execution::Parameters parameters(*model);
     unsigned cases = 0;
     for (unsigned capacity : {128U, 4090U, 4096U, 8192U, 32768U, 262144U}) {
@@ -126,19 +133,12 @@ void verify_real_plan(const char* artifact) {
             for (unsigned ngram : {0U, 1U, 2U, 3U, 4U, 5U, 15U, 31U, 32U, 33U, 47U, 63U}) {
                 std::array<std::size_t, 2> bytes{};
                 for (unsigned graphs = 0; graphs < 2; ++graphs) {
-                    infernix::EngineOptions options;
-                    options.max_context     = capacity;
-                    options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(capacity);
-                    options.max_concurrency = 1;
-                    options.prefill_chunk   = 1024;
-                    options.enable_vision   = false;
-                    options.kv_cache        = infernix::KvCacheStorage::Nvfp4Group16;
-                    options.speculative.backend              = infernix::SpeculativeBackend::Mtp;
-                    options.speculative.draft_tokens         = neural;
-                    options.speculative.ngram_draft_tokens   = ngram;
-                    options.speculative.proposal_head        = infernix::ProposalHead::Optimized;
-                    options.context_cache.hybrid.device_snapshot_slots = 1;
-                    options.use_cuda_graph                   = graphs != 0;
+                    infernix::EngineOptions options = base;
+                    options.max_context             = capacity;
+                    options.kv_capacity             = infernix::KvCapacityPolicy::explicit_capacity(capacity);
+                    options.speculative.draft_tokens       = neural;
+                    options.speculative.ngram_draft_tokens = ngram;
+                    options.use_cuda_graph                 = graphs != 0;
                     auto planner     = qwen::make_sequence_planner(parameters, device, options);
                     const auto pages = planner.capacity_curve().minimum_main_page_groups;
                     bytes[graphs] = std::move(planner).finalize(pages).device_reservation_bytes();
