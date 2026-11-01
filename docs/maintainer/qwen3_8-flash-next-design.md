@@ -11379,9 +11379,13 @@ way); the output is the sum times kappa, rounded once. The scale is FP32, not ll
 
 **Routes.** (1) Dense projections (`LinearRoutes::GgmlA8`, widened to 16 bits; `ops::ggml_linear` →
 `ggml_linear_a8.cu`): calls of 1-31 columns (decode and verification); prefill widths take (4) below. The
-encoder takes four threads per slice (input permutation honoured); 1-2-column row-layout calls
-and 1-column tiled Q6_K/IQ4_XS calls run a dp4a rows kernel (the exact route's lanes per row, each slice
-decoded once for both columns), every other call the tensor-core form of the exact tiled kernels with one
+encoder takes four threads per slice (input permutation honoured); a GDN layer's gated norm instead writes its
+output projection's 8-bit columns itself (`gated_rmsnorm_ggml_a8_encoded`, the encoder's words, so the same
+bits; no encoding launch). 1-2-column row-layout calls
+and tiled Q6_K/IQ4_XS calls of 1-4 columns run a dp4a rows kernel (the exact route's lanes per row, each slice
+decoded once for every column, the lane's other weight blocks prefetched into L2 before its PDL wait; at the
+[2560, 6144] output projections the tiled mma had too few row tiles to fill the device), every other call the
+tensor-core form of the exact tiled kernels with one
 int8 plane: one m16n8k32 s8 MMA per slice (two masked ones for 16-element sub-scales), FP32 accumulators,
 NT = 1, 2 or 4 column tiles of eight so a call of up to 31 columns reads and decodes its weights once, the
 exact route's CTA shapes and one-wave occupancy rule, mixed two-format launches. A call's bits are
@@ -11390,7 +11394,9 @@ width (the split and NT set the order). (2) Routed experts
 (`MoeGgmlBank::a8`, `cuda/ggml_expert_a8.cuh`): a call of at most 128 columns runs every job on the 8-bit
 kernels (passes of eight columns), so no wide tile reads the x limbs the route's codes replace; wider calls
 take (7) below. Gate/up: four intermediates per CTA, 16 lanes per row taking slices s ≡ lane
-(mod 16); down: four lanes per row; both add their lanes' partials by a butterfly. (3) CPU-served misses:
+(mod 16); down: four lanes per row; both add their lanes' partials by a butterfly. Each CTA first copies its weight
+rows into shared memory with cp.async (the down CTA before its PDL wait), so all of a CTA's bytes are in flight at
+once instead of one slice's a lane (the decode of a few columns was memory-latency bound). (3) CPU-served misses:
 the miss request carries the call's choice (`MissRequest::a8`) and the CPU route's 8-bit functions follow
 the GPU kernels' order (slice s to partial s mod P, P = 16 for gate/up and 4 for down rows, ascending, then
 the butterfly), so a CPU-served miss returns the GPU's bits and placement changes no output. The startup CPU

@@ -566,11 +566,69 @@ void columns() {
     }
 }
 
+// --team W (information only): the worker team of W workers on one IQ3_S/IQ4_NL job of 1, 2 and 4 columns, its record
+// hot (the same record every call, cached) and cold (each call the next of 96 records, 220 MiB, past any cache), and
+// two and four one-column jobs cold.
+void team_timing(int workers) {
+    std::mt19937 rng(20261101);
+    const QType gu = QType::GGML_IQ3_S, down = QType::GGML_IQ4_NL;
+    const moe::GgmlExpertFormat f{.gate_up = gu, .down = down, .gate_row_bytes = row_bytes(gu, H), .down_row_bytes = row_bytes(down, I)};
+    const std::size_t record = (2ULL * I * f.gate_row_bytes + static_cast<std::size_t>(H) * f.down_row_bytes + 63) / 64 * 64;
+    constexpr int kRecords = 96, kMaxJobs = 4, kMaxCols = 4;
+    std::vector<std::uint8_t> bank(record * kRecords);
+    random_rows(gu, 2 * I, H, rng, bank.data());
+    random_rows(down, H, I, rng, bank.data() + 2ULL * I * f.gate_row_bytes);
+    for (int e = 1; e < kRecords; ++e) { std::memcpy(bank.data() + e * record, bank.data(), record); }
+    std::vector<std::uint16_t> x(static_cast<std::size_t>(H) * kMaxCols), y(static_cast<std::size_t>(H) * kMaxCols * kMaxJobs);
+    std::normal_distribution<float> normal(0.0F, 1.0F);
+    for (auto& v : x) { v = bf16(normal(rng)); }
+    moe::CpuExpertTeam team({.workers = workers, .max_jobs = kMaxJobs, .activation = moe::ExpertActivation::kA16, .ggml = true,
+                             .ggml_a8 = true});
+    const auto time = [&](int n_jobs, int ncols, bool cold) {
+        std::vector<moe::CpuExpertJob> jobs(static_cast<std::size_t>(n_jobs));
+        int next = 0;
+        const auto fill = [&] {
+            for (int j = 0; j < n_jobs; ++j) {
+                auto& job  = jobs[static_cast<std::size_t>(j)];
+                job.record = bank.data() + (cold ? next++ % kRecords : 0) * record;
+                job.ggml   = f;
+                job.a8     = true;
+                job.ncols  = ncols;
+                for (int c = 0; c < ncols; ++c) {
+                    job.x[c] = x.data() + static_cast<std::size_t>(c) * H;
+                    job.y[c] = y.data() + static_cast<std::size_t>(j * kMaxCols + c) * H;
+                }
+            }
+        };
+        constexpr int kRepeats = 200;
+        std::vector<double> us;
+        for (int i = 0; i < kRepeats + 10; ++i) {
+            fill();
+            const auto t0 = std::chrono::steady_clock::now();
+            team.run(jobs);
+            if (i >= 10) { us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()); }
+        }
+        std::sort(us.begin(), us.end());
+        std::printf("team %2d workers: %d job(s) x %d column(s) %-4s median %7.1f us (p10 %7.1f, p90 %7.1f)\n", workers, n_jobs, ncols,
+                    cold ? "cold" : "hot", us[us.size() / 2], us[us.size() / 10], us[us.size() * 9 / 10]);
+    };
+    for (const int ncols : {1, 2, 4}) {
+        time(1, ncols, false);
+        time(1, ncols, true);
+    }
+    time(2, 1, true);
+    time(4, 1, true);
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(offloaded_moe_ggml_a8_cpu) {
     if (argc > 1 && std::string(argv[1]) == "--columns") {
         columns();
+        return 0;
+    }
+    if (argc > 2 && std::string(argv[1]) == "--team") {
+        team_timing(std::stoi(argv[2]));
         return 0;
     }
     // --isa NAME (cpu_isa_name, e.g. avx512-vnni): only that ISA's kernels against the GPU order and the oracle,

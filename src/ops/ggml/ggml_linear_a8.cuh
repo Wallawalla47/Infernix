@@ -60,6 +60,7 @@ constexpr int kEncodeThreads = 256;
 constexpr int kRowsThreads   = 128; // the rows kernel's CTA: four warps (the exact rows_kernel's)
 constexpr int kRowsWarps     = kRowsThreads / 32;
 constexpr int kRowsMaxColumns = 2;  // Rows-layout calls of at most this many columns take the rows kernel
+constexpr int kTiledRowsMaxColumns = 4; // Tiles16 Q6_K and IQ4_XS calls of at most this many take the rows kernel
 constexpr int kMmaMinColumns  = 3;  // a Rows-layout mixed (two-format) launch from this width (the exact route's)
 constexpr int kMmaMaxThreads  = 256;
 constexpr int kUnitSlices     = ggml::mma_rows::kUnitElems / 32; // a staged unit: 256 elements
