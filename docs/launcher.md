@@ -36,7 +36,9 @@ The console prints the addresses and the browser opens the web UI:
 
 Ctrl+C (or closing the console) stops the loaded model in order, so it saves its prefix cache and
 expert-cache state, pauses running downloads and exits. Only the launcher's own events and server
-errors appear in its console; the web UI shows the server's full log.
+errors appear in its console; the web UI shows the server's full log. On Windows the server shares
+the launcher's console, which carries the orderly stop; started without one (by a program or a
+shortcut that gives it none), the launcher makes a hidden console of its own.
 
 ## What it remembers
 
@@ -498,4 +500,5 @@ that fits up to 225,280 tokens of context. It crashes, locks up or stalls on req
 [`tools/launcher/launcher_check.py`](../tools/launcher/launcher_check.py) runs a launcher against it
 and checks the features (configurations, model ids, environment, script export and import, the fit
 plan, keep-alive streams, routes and the pin, prompt progress, usage, API keys and sign-in, chats,
-idle unload) and the watchdog, the event log and the request log.
+idle unload) and the watchdog, the event log and the request log, and, on Windows, that a launcher
+started on a console without a window still stops its server in order.

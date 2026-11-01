@@ -134,8 +134,8 @@ int main(int argc, char** argv) {
 
 #ifdef _WIN32
     // The managed server shares this console so an orderly stop (CTRL_BREAK) can reach it; started
-    // without one, the launcher makes a hidden one.
-    if (GetConsoleWindow() == nullptr && AllocConsole()) { ShowWindow(GetConsoleWindow(), SW_HIDE); }
+    // without one (a console without a window is one), the launcher makes a hidden one.
+    if (GetConsoleCP() == 0 && AllocConsole()) { ShowWindow(GetConsoleWindow(), SW_HIDE); }
     SetConsoleOutputCP(CP_UTF8);
     // Inherited by the server: a crash ends it at once instead of waiting on Windows' error
     // dialog, so the watchdog sees the crash.

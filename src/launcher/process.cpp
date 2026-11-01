@@ -196,11 +196,12 @@ std::unique_ptr<ChildProcess> ChildProcess::start(const std::filesystem::path& e
     std::wstring command_wide = wide(command);
     const std::wstring directory = working_dir.wstring();
 
-    // The launcher's console is shared (so CTRL_BREAK_EVENT can reach the child's own group); a
-    // launcher without one gives the child a hidden console of its own.
+    // The launcher's console is shared, with or without a window (a program may start the launcher on
+    // a console that has none), so CTRL_BREAK_EVENT can reach the child's own group. Only a launcher
+    // with no console at all gives the child a hidden console of its own.
     DWORD flags = CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT |
                   CREATE_SUSPENDED;
-    if (GetConsoleWindow() == nullptr) { flags |= CREATE_NO_WINDOW; }
+    if (GetConsoleCP() == 0) { flags |= CREATE_NO_WINDOW; }
     std::wstring environment = environment_block(env);
     PROCESS_INFORMATION info{};
     const BOOL created = CreateProcessW(executable.wstring().c_str(), command_wide.data(), nullptr, nullptr,
