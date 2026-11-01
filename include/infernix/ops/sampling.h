@@ -117,4 +117,11 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
 // [token_domain] committed count array. IDs must be in [0,token_domain).
 void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaStream_t stream);
 
+// increment_token_counts of each row's licensed tokens, with the counts read on the device: for every
+// row b whose device-resident configs[b].token_counts is non-null, adds licensed_tokens[0:L,b] with
+// L = clamp(licensed_counts[b],0,K+1). licensed_tokens is contiguous I32 [K+1,B] and licensed_counts
+// I32 [B] (a speculative acceptance's outputs); their ids must be in that row's count domain.
+void increment_licensed_token_counts(const Tensor& licensed_tokens, const Tensor& licensed_counts,
+                                     const SamplingConfig* configs, cudaStream_t stream);
+
 } // namespace infernix::ops

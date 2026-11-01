@@ -258,9 +258,10 @@ struct GateTraffic {
 inline constexpr std::size_t kGateStatsBytes     = 16;          // per lane: U64 wait ns, U64 waits
 inline constexpr std::uint64_t kSlowGatedReadNs  = 100000000;   // a gated round's reads warn past 100 ms
 
-// Device I32 arrays of a verification round, each with room for every lane and width.
+// Device I32 arrays of a verification round, each with room for every lane and width; `gate` is the
+// commit gate's expected word (CommitGate), uploaded with everything before `licensed`.
 struct SpecLayout {
-    std::size_t target = 0, drafts = 0, extents = 0, lengths = 0, anchors = 0, licensed = 0, counts = 0,
+    std::size_t target = 0, drafts = 0, extents = 0, lengths = 0, anchors = 0, gate = 0, licensed = 0, counts = 0,
                 accepted = 0, commit = 0, words = 0;
 };
 
@@ -681,6 +682,7 @@ public:
             d.spec.extents  = take(lanes);
             d.spec.lengths  = take(lanes);
             d.spec.anchors  = take(lanes);
+            d.spec.gate     = take(1);
             d.spec.licensed = take(cells);
             d.spec.counts   = take(lanes);
             d.spec.accepted = take(lanes);
@@ -1078,6 +1080,7 @@ public:
         }
         constraint_host_.assign(static_cast<std::size_t>(lanes * max_width_), -1);
         publish_pinned_word(gate_ready(), 0); // pinned memory starts undefined; 0 is never a round's word
+        publish_pinned_word(commit_gate_ready(), 0);
 
         execution::ForwardState state;
         state.gdn      = gdn_.get();
@@ -2830,6 +2833,7 @@ public:
         if (ContractAccess::owner(pending) != this || ContractAccess::transaction(pending) != pending_transaction_) {
             return out;
         }
+        abandon_commit_gate(); // before a release may wait for the device
         const auto rows = ContractAccess::rows(pending);
         for (const auto& row : rows) {
             const auto index = ContractAccess::lane(row);
@@ -2907,6 +2911,7 @@ public:
     // failure may have published into is emptied. False when that fails (the device itself failed;
     // the Engine then fails everything).
     bool recover_after_failure() noexcept {
+        abandon_commit_gate(); // a failed round's gated commit, before anything waits for the device
         try {
             for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
                 if (lanes_[i].phase != Phase::Free) { release(i); }
@@ -2930,6 +2935,7 @@ public:
     }
 
     void release_all() noexcept {
+        abandon_commit_gate(); // a failed round's gated commit, before anything waits for the device
         for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
             if (lanes_[i].phase != Phase::Free) { release(i); }
         }
@@ -3091,10 +3097,15 @@ private:
 
 public:
     // The Program's entry points that can touch the expert cache, launch a forward or report on it settle a deferred
-    // update first (program.cpp; DeferredRound). Planning and accessors do not.
-    void settle_deferred() { settle_round(); }
+    // update first (program.cpp; DeferredRound), after releasing a gated commit (CommitGate), as settling may wait for
+    // the device. Planning and accessors do neither.
+    void settle_deferred() {
+        abandon_commit_gate();
+        settle_round();
+    }
     // The same for an entry point that may not throw: an update that fails is dropped, as a failed round's is.
     void settle_deferred_or_drop() noexcept {
+        abandon_commit_gate();
         try {
             settle_round();
         } catch (...) {
@@ -3421,6 +3432,10 @@ public:
             throw runtime::RecoverableExecutionError(
                 "Qwen3.8-Flash-Next layer " + std::to_string(value >> 16U) + ": the n-gram rows were not published within " +
                 std::to_string(kPinnedGateTimeoutNs / 1000000000ULL) + " s (the host thread reading them stalled)");
+        }
+        if (code == execution::kErrorCommitGateTimeout) {
+            throw runtime::RecoverableExecutionError("Qwen3.8-Flash-Next: a verification round's commit was not released within " +
+                                                     std::to_string(kPinnedGateTimeoutNs / 1000000000ULL) + " s");
         }
         std::string what         = code == ops::offloaded_moe::kErrorUnservedRecord ? "an SSD-only expert had no path to it"
                                    : code == ops::offloaded_moe::kErrorHostSilent   ? "the CPU expert service stopped answering"
@@ -4122,6 +4137,46 @@ private:
         return word;
     }
 
+    // ---- the commit gate (verification rounds) ----
+    // A verification round's commit runs once the Engine has chosen each row's committed prefix. Launched by
+    // commit() after the host had read the round's results, it restarted a drained stream: the count upload's and
+    // the commit graph's launches (a first launch on an idle stream costs ~50 us of host time on WDDM) left the
+    // GPU idle ~90-120 us a round. A graphed commit therefore reads its counts behind this gate, as its graph's first
+    // node (upload_pinned_when, commit_body): the verification stages the round's word on the device with its
+    // inputs. A DFlash2 round without MTP whose commit graph is instantiated launches that graph right after its
+    // results, and the host waits for them on results_ready_ instead of the stream; commit() writes the counts and
+    // publishes the word. Any other graphed commit publishes it before launching its graph. Until the word is
+    // published the stream waits on this thread, so nothing may wait for the device meanwhile (read_behind_gate's
+    // rule): every other entry point, discard and the failure paths first release it with no committed column,
+    // which every commit kernel treats as a strict no-op for the row (a later commit() then commits as before).
+    // Same bits. (The gate is in the graph rather than a kernel launched before it: under CUPTI graph tracing a
+    // graph launch waits for the stream's earlier work, which a held kernel would never finish.)
+    std::uint32_t* commit_gate_ready() const { return static_cast<std::uint32_t*>(commit_gate_host_.data()); }
+
+    bool commit_ahead(std::int32_t batch, std::int32_t W) {
+        return !c_.lossless && dflash2_ && !mtp_ && !graph_set_.capturing && commit_graph(batch, W).executable.ready();
+    }
+
+    // A graphed verification's word, staged in spec_layout_.gate with its inputs.
+    void stage_commit_gate(std::int32_t batch, std::int32_t W) {
+        if (++commit_gate_sequence_ == 0) { ++commit_gate_sequence_; }
+        commit_gate_ = {.staged = true, .pending = false, .word = commit_gate_sequence_, .batch = batch, .width = W};
+        spec_host(spec_layout_.gate)[0] = static_cast<std::int32_t>(commit_gate_.word);
+    }
+
+    // Once the counts at spec_layout_.commit are written.
+    void release_commit_gate() noexcept {
+        publish_pinned_word(commit_gate_ready(), commit_gate_.word);
+        commit_gate_.staged  = false;
+        commit_gate_.pending = false;
+    }
+
+    void abandon_commit_gate() noexcept {
+        if (!commit_gate_.pending) { return; }
+        std::memset(spec_host(spec_layout_.commit), 0, 4ULL * static_cast<std::size_t>(commit_gate_.batch));
+        release_commit_gate();
+    }
+
     // Right after a gated launch: submits it, reads the rows (`read`, into the io's first `bytes` of
     // n-gram rows), releases the gate and counts the reads toward `lane` (the round's first row).
     // Until the word is published the GPU waits on this thread, so nothing may be queued before it:
@@ -4705,6 +4760,15 @@ private:
     void commit_body(std::int32_t batch, std::int32_t W, std::span<const ops::GdnReplayFoldRow> rows = {}) {
         const cudaStream_t s = device_.stream;
         auto* io             = static_cast<std::byte*>(io_device_.p);
+        // A graphed commit takes the counts behind the commit gate (CommitGate); an eager one has them uploaded.
+        if (rows.empty()) {
+            upload_pinned_when(spec_device(spec_layout_.commit), spec_host(spec_layout_.commit), (4ULL * batch + 15) / 16 * 16,
+                               commit_gate_ready(), reinterpret_cast<const std::uint32_t*>(spec_device(spec_layout_.gate)),
+                               nullptr, nullptr,
+                               DeviceFault{.word  = static_cast<std::uint32_t*>(device_error_.data()),
+                                           .value = execution::kErrorCommitGateTimeout},
+                               s);
+        }
         const Tensor commit_columns(spec_device(spec_layout_.commit), DType::I32, {batch});
         const Tensor slots(io + io_layout_.slots, DType::I32, {batch});
         const Tensor positions(io + io_layout_.positions, DType::I32, {W, batch});
@@ -5024,6 +5088,9 @@ private:
             read_rows();
             publish_pinned_word(gate_ready(), word);
         }
+        // A graphed commit's gate word goes up with the round's inputs (CommitGate).
+        const bool commit_early = commit_ahead(batch, W);
+        if (!c_.lossless) { stage_commit_gate(batch, W); }
         upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
         upload_pinned(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed, s);
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
@@ -5121,9 +5188,24 @@ private:
                                                   token_domain_, static_cast<const ops::SamplingConfig*>(configs_.p),
                                                   *work_, s);
         }
+        if (sparse) {
+            // The sparse acceptance leaves token counts to the caller (the greedy-draft Op counts each licensed token
+            // itself): each row's licensed tokens count before the next round's penalties.
+            ops::increment_licensed_token_counts(licensed, counts,
+                                                 static_cast<const ops::SamplingConfig*>(configs_.p), s);
+        }
         CUDA_CHECK(cudaMemcpyAsync(spec_host(spec_layout_.licensed), licensed.data,
                                    4ULL * (spec_layout_.commit - spec_layout_.licensed), cudaMemcpyDeviceToHost, s));
-        device_.synchronize();
+        if (commit_early) {
+            // The commit waits behind its gate (CommitGate); the host waits for the results only.
+            results_ready_.record(s);
+            commit_graph(batch, W).executable.launch(s);
+            commit_gate_.pending = true;
+            device_.flush(); // submitted while the verification still runs
+            results_ready_.synchronize();
+        } else {
+            device_.synchronize();
+        }
         check_device_error();
 
         const std::int32_t* licensed_host = spec_host(spec_layout_.licensed);
@@ -5138,13 +5220,6 @@ private:
                 live_[static_cast<std::size_t>(b * W + j)]           = j <= A ? 1 : 0;
             }
             pending_counts_[b] = L;
-            if (sparse && lane.sampling.token_counts != nullptr) {
-                // The sparse acceptance leaves token counts to the caller (the greedy-draft Op counts
-                // each licensed token itself): count them before the next round's penalties.
-                Tensor ids(spec_device(spec_layout_.licensed) + static_cast<std::size_t>(b) * W, DType::I32, {L});
-                Tensor token_counts(lane.sampling.token_counts, DType::I32, {token_domain_});
-                ops::increment_token_counts(ids, token_counts, s);
-            }
             if (constrained) {
                 take_constraint_draws(lane, static_cast<std::size_t>(b * W),
                                       std::span<const std::int32_t>(&pending_tokens_[static_cast<std::size_t>(b * W)],
@@ -5233,12 +5308,27 @@ private:
         out.row_count = rows.size();
         std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
         std::int32_t* commit = spec_host(spec_layout_.commit);
+        // The counts first: a commit behind the gate (CommitGate) starts on the device once they are published, while
+        // this thread records the rows.
+        for (std::int32_t row = 0; row < batch; ++row) {
+            const auto& d = decisions[static_cast<std::size_t>(row)];
+            const auto k  = d.cancelled || d.failed ? 0 : static_cast<std::int32_t>(d.accepted_tokens);
+            if (!(d.cancelled || d.failed) && (k < 1 || k > pending_counts_[row])) {
+                throw std::logic_error("Qwen4Exp: commit exceeds the licensed tokens");
+            }
+            commit[row] = k;
+        }
+        const bool graphed = !c_.lossless;
+        if (graphed && (!commit_gate_.staged || commit_gate_.batch != batch || commit_gate_.width != W)) {
+            throw std::logic_error("Qwen4Exp: the commit gate is not this round's");
+        }
+        const bool launched = commit_gate_.pending;
+        if (launched) { release_commit_gate(); }
         for (std::int32_t row = 0; row < batch; ++row) {
             const auto index = ContractAccess::lane(rows[row]);
             Lane& lane       = lanes_.at(index);
             const auto& d    = decisions[static_cast<std::size_t>(row)];
             fold_rows[row]   = {static_cast<std::int32_t>(index), static_cast<std::int32_t>(index), 0};
-            commit[row]      = 0;
             out.rows[row].speculative_counters = speculative_counters(lane.speculative);
             if (d.cancelled || d.failed) {
                 lane.prefix.withdraw = pending.row_failure(static_cast<std::size_t>(row)) ==
@@ -5249,8 +5339,7 @@ private:
                                                      : runtime::CommitDisposition::CancelledReleased;
                 continue;
             }
-            const auto k = static_cast<std::int32_t>(d.accepted_tokens);
-            if (k < 1 || k > pending_counts_[row]) { throw std::logic_error("Qwen4Exp: commit exceeds the licensed tokens"); }
+            const std::int32_t k = commit[row];
             commit_constraint_draws(lane, static_cast<std::size_t>(k));
             for (std::int32_t j = 0; j < k; ++j) {
                 const std::int32_t token = pending_tokens_[static_cast<std::size_t>(row * W + j)];
@@ -5258,7 +5347,6 @@ private:
                 if (lane.proposer) { lane.proposer->append(token); }
             }
             fold_rows[row].commit_columns = k;
-            commit[row]                   = k;
             lane.state_tokens += static_cast<std::uint32_t>(k);
             if (d.terminal) {
                 lane.phase                = Phase::Finishable;
@@ -5267,16 +5355,18 @@ private:
                 out.rows[row].disposition = runtime::CommitDisposition::Active;
             }
         }
-        upload_pinned(spec_device(spec_layout_.commit), commit, 4ULL * batch, s);
         // The fold, QSA tails and PLE commit (and on DFlash2 without MTP the drafter's context too) as one graph per
         // batch size and width, which reads every row's count and slot from the device, instead of three launches
-        // (four with the context's graph) on the host's turnaround each round (design §19.3.34). Same bits.
-        const bool graphed          = !c_.lossless;
+        // (four with the context's graph) on the host's turnaround each round (design §19.3.34). Same bits. The graph
+        // takes the counts behind the commit gate: published before its launch here, unless the verification launched
+        // it already (CommitGate).
         const bool context_in_graph = graphed && dflash2_ && !mtp_;
-        if (graphed) {
-            replay(commit_graph(batch, W), [&] { commit_body(batch, W); });
-        } else {
+        if (!graphed) {
+            upload_pinned(spec_device(spec_layout_.commit), commit, 4ULL * batch, s);
             commit_body(batch, W, std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), static_cast<std::size_t>(batch)));
+        } else if (!launched) {
+            release_commit_gate();
+            replay(commit_graph(batch, W), [&] { commit_body(batch, W); });
         }
         // The drafter's catch-up on a stream of greater priority beside these commit kernels, with the next
         // round's drafts pre-drafted there (candidates §13 SR-01), measured within chance (removed 2026-10-28).
@@ -6836,6 +6926,17 @@ private:
     PinnedHostBuffer gate_host_{64};
     std::uint32_t gate_sequence_ = 0;
     DeviceBuffer gate_stats_;
+    // The commit gate (CommitGate): its pinned ready word and last published value (strictly increasing, never 0),
+    // the verification results' event the host waits on instead of the stream, and the commit it holds.
+    PinnedHostBuffer commit_gate_host_{64};
+    std::uint32_t commit_gate_sequence_ = 0;
+    CudaCompletionEvent results_ready_{device_};
+    struct CommitGate {
+        bool staged        = false; // the verification staged `word`
+        bool pending       = false; // and launched its commit graph behind it
+        std::uint32_t word = 0;
+        std::int32_t batch = 0, width = 0;
+    } commit_gate_;
     // BF16 [1]: NgramTableConfig::fp8_scale, or FP32 [1]: NgramTableConfig::nvfp4_scale, when another
     // volume records it
     DeviceBuffer ngram_scale_;

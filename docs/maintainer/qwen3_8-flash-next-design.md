@@ -3867,6 +3867,36 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
     Program's `decode()` calls but not `commit()`, so moving the update from commit into the next
     decode lowered them (conv 254.2 → 249.4) while wall time improved. Both count the commits
     since (`docs/performance/methodology.md`).
+- **DFlash2: the commit enqueued behind a host gate (adopted 2026-11-01).**
+  - **Problem.** With temporary NVTX ranges at every host step of a round (IQ3_S,
+    `--a8-activations`, conv, graph-level nsys), the GPU idled ~124 µs between the verification's
+    results and the commit graph: the host's sync, then three launches onto the drained stream
+    (the token-count increment 49 µs, the count upload 14 µs, the graph 25 µs). A first launch on
+    an idle stream costs ~50-60 µs of host time on WDDM, whichever kernel it is (greedy rounds
+    have no increment: their count upload then took 62 µs), against 7-10 µs for a kernel launched
+    while the GPU is busy.
+  - **Change.** A graphed commit reads its counts behind a host gate, as its graph's first node
+    (`upload_pinned_when` on the Program's commit word; the verification stages the word with its
+    inputs). A DFlash2 round without MTP whose commit graph is instantiated launches that graph
+    right after its results, while the verification still runs, and the host waits for the
+    results on an event instead of the stream; `commit()` writes the counts and publishes the
+    word before it records the rows. Every other graphed commit publishes it before its launch.
+    Sampled rounds count their licensed tokens on the device before the results' copy (Op
+    `increment_licensed_token_counts`), so no launch is left between the sync and the commit.
+    Every other Program entry point, `discard` and the failure paths release a held gate with
+    zero counts, which the fold, QSA tails, PLE commit and drafter context treat as a strict
+    no-op per row. A timed-out gate fails the round (`kErrorCommitGateTimeout`). Same bits.
+  - **Rejected.** The gate as a kernel launched before the graph: under CUPTI graph tracing a
+    graph launch waits for the stream's earlier work, so nsys hung 120 s on the first held round;
+    inside the graph it profiles normally. The verification's two input uploads as graph nodes:
+    its 330 µs graph launch then started the GPU later (idle 72 → 222 µs a round, round +46 µs).
+  - **Trace.** GPU idle 188 → 72 µs a round; round 10,170 → 10,098 µs (one traced run each).
+    The commit graph's span grew 180 → 206 µs, as it now waits at its gate inside the graph.
+  - **Speed** (`infernix_bench`, 3c235c7f against the new build, three interleaved reps, wall
+    time after the prefill): conv 4.874 → **4.853 s** (+0.44 %, ranges touching) and with
+    `--a8-activations` 4.650 → **4.625 s** (+0.53 %); struct 14.882 → **14.843 s** (+0.27 %) and
+    with `--a8-activations` 13.310 → **13.256 s** (+0.41 %), separated ranges. About 40-50 µs a
+    round, less than the trace's 72.
 - **Few-row Q8 route for the hyper-connection down projections (adopted).**
   - **Problem.** The MTP-round profile showed the [324, 10240] and [320, 10240] projections
     (96 calls per token) on 41 eight-row CTAs at ~0.4 TB/s: 9.5 µs per call, ~0.9 ms per round,
@@ -7209,7 +7239,7 @@ Unchanged by Strata:
 | BF16X2 activations, finite q8_1 scales | Not our numerics (BF16 activations; saturating A4 encoders) |
 | Draft vocabulary per language | 131K proposal rows: 99.09 % held-out coverage, worst domain 97.53 %; full-head fallback |
 | Window routing, batched PLE, one-graph draft chain, GDN commit split, sub-warp packing | Have |
-| GPU-side commit/draft overlap | On DFlash2 the next proposal is now enqueued before the cache update settles (§19.2, "DFlash2: the cache update behind the next proposal": +1.2-1.3 % on long accepted runs); the drafter's catch-up and pre-draft on a second stream beside the commit kernels measured within chance (removed 2026-10-28) |
+| GPU-side commit/draft overlap | On DFlash2 the next proposal is now enqueued before the cache update settles and the commit before the Engine's decision, behind a host gate (§19.2: +1.2-1.3 % and +0.3-0.5 % on long accepted runs); the drafter's catch-up and pre-draft on a second stream beside the commit kernels measured within chance (removed 2026-10-28) |
 | Dropping the drafter catch-up on stale K/V | ≤ ~1 % of a B ≥ 2 round; relaxing MR5/MR6 breaks E1 for sampled requests |
 | 256-repeat stop, `/metrics` | No loop observed; `max_tokens` defaults to 8192; it truncates legitimate output and changes an external contract. The request log covers metrics |
 | Q8 vision weights, lower vision token cap | Below upstream precision; we have `--vision-max-merged` |

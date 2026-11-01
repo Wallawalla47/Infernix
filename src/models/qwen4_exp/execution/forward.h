@@ -35,8 +35,9 @@ inline constexpr std::int32_t kMtpChunkColumns = 512;
 // Faults the Forward's own kernels report in the experts' error word (ForwardExperts::error) instead
 // of trapping (core DeviceFault), as layer << 16 | code like the MoE's: codes above the MoE's
 // (ops/offloaded_sparse_moe/cpu/fetch_request.h) and every errno.
-inline constexpr std::uint32_t kErrorRowGateTimeout = 0xFF10; // the n-gram rows were not published within kPinnedGateTimeoutNs
-inline constexpr std::uint32_t kErrorTokenId        = 0xFF11; // an id outside the vocabulary reached the token embedding
+inline constexpr std::uint32_t kErrorRowGateTimeout    = 0xFF10; // the n-gram rows were not published within kPinnedGateTimeoutNs
+inline constexpr std::uint32_t kErrorTokenId           = 0xFF11; // an id outside the vocabulary reached the token embedding
+inline constexpr std::uint32_t kErrorCommitGateTimeout = 0xFF12; // a gated commit was not released within kPinnedGateTimeoutNs
 
 // Program-owned recurrent state of every slot.
 struct ForwardState {
