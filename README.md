@@ -24,11 +24,13 @@ at a time. Full tables and methods: [Benchmarks](#benchmarks).
 **Speed without precision shortcuts.** Infernix keeps every activation at the precision the
 checkpoint specifies (16 bits where the others round to 8), runs every routed expert (no expert tail
 skipping) and computes the full output head (no 2-bit screen). Basalt, which computes with fewer
-bits (6-bit dense layers on NVFP4; 8-bit activations and a 2-bit head screen on IQ3_S), has the
-highest decode tok/s. On NVIDIA's NVFP4 weights Infernix still reaches the first token 5-8× sooner
-and finishes the agentic workload 36 % sooner. On the IQ3_S GGUF Basalt is ahead overall (4.4
-against 5.5 min); with the same 8-bit activations Infernix matches its first tokens, but Basalt still
-decodes faster. Measured quality for every engine follows in a later update.
+bits (6-bit dense layers on NVFP4; on IQ3_S 8-bit activations, an 8-bit copy of the hyper-connection
+matrices and a 2-bit head screen), has the highest decode tok/s at Infernix's defaults. On NVIDIA's
+NVFP4 weights Infernix still reaches the first token 5-8× sooner and finishes the agentic workload
+36 % sooner, and with its experts at 8 bits as Basalt runs them it matches or passes Basalt's decode
+too. On the IQ3_S GGUF Basalt is ahead overall (4.4 against 5.5 min); with the same 8-bit
+activations Infernix matches its first tokens, but Basalt still decodes faster. Measured quality for
+every engine follows in a later update.
 
 | Infernix vs | First token | Decode | Replay: mean first token | Replay: wall time |
 |---|---|---|---|---|
@@ -45,13 +47,17 @@ decodes faster. Measured quality for every engine follows in a later update.
 1. Basalt reads its 50.7 GiB n-gram table from the SSD here: it does not fit in the RAM budget beside
    its experts.
 2. Basalt runs NVIDIA's BF16 dense layers at **6 bits** (+10 % KL divergence by its own measure) and
-   every activation outside the experts at **8 bits**; Infernix keeps 16.
+   every activation outside the experts at **8 bits**; Infernix keeps 16. With the experts at 8 bits
+   as Basalt runs them in decode (`--a8-activations`), Infernix decodes 199 / 185 / 268 tok/s
+   against Basalt's 202 / 173 / 216 at ~8K / ~128K / ~250K and 175 against 166 at one request in the
+   replay, and still reaches the first token 4-6× sooner.
 3. Strata's default route tail skip (it skips some missed experts) was off: it changes which experts
    run.
-4. Strata and Basalt compute **every activation at 8 bits** on IQ3_S, and Basalt takes the logits
-   outside the top 64 from a **2-bit copy** of the output head; Infernix keeps 16 bits and the GGUF's
-   head. At 8 bits (`--a8-activations`) Infernix reaches the first token as soon as Basalt, which
-   still decodes 1.2-1.7× as fast.
+4. All three hold the GGUF's weights as published, but Strata and Basalt compute **every activation
+   at 8 bits**, and Basalt's decode reads the BF16 hyper-connection matrices from an **8-bit copy**
+   and takes the logits outside the top 64 from a **2-bit copy** of the output head; Infernix keeps
+   16-bit activations, the BF16 matrices and the GGUF's head. At 8 bits (`--a8-activations`) Infernix
+   reaches the first token as soon as Basalt, which still decodes 1.2-1.7× as fast.
 
 ### Activation precision
 
@@ -164,18 +170,24 @@ the others run NVIDIA's checkpoint as their own NVFP4 packs with the model's MTP
 
 **Agentic replay** (two requests at a time, three seeds):
 
-| Metric | Strata | strata-nvfp4 | Basalt | Infernix | vs Strata | vs strata-nvfp4 | vs Basalt |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Mean TTFT | 12.3 s (10.8-13.9) | 10.8 s (9.2-12.0) | 7.2 s (6.4-7.9) | **3.1 s** (2.9-3.5) | −74 % | −71 % | −56 % |
-| Median TTFT | 9.92 s | 7.62 s | 3.81 s | **2.04 s** | −79 % | −73 % | −46 % |
-| 90th-percentile TTFT | 25.9 s | 24.7 s | 17.5 s | **7.1 s** | −71 % | −71 % | −59 % |
-| Mean TTFT, new long prompts | 11.8 s | 10.2 s | 20.8 s | **6.1 s** | −48 % | −38 % | −70 % |
-| Prompt tokens from cache | 46.1 % | 53.2 % | 83.1 % | **84.5 %** | +38.4 pt | +31.2 pt | +1.4 pt |
-| Prefill tok/s, no cache hit | 5,170 | 5,847 | 2,349 | **7,480-7,689** | +45 % | +30 % | 3.3× |
-| Output tok/s, one request | 116 (114-120) | 110 (108-113) | **166** (160-170) | **166** (165-169) | +43 % | +51 % | level |
-| Output tok/s, batched | 67 | 69 | 129 | **149** (142-157) | 2.2× | 2.2× | +15 % |
-| Tokens per round | 2.26 | 2.21 | 2.37 | **2.61** | +15 % | +19 % | +11 % |
-| Wall time | 12.9 min (12.0-13.8) | 11.7 min (11.0-12.9) | 8.9 min (8.6-9.1) | **5.7 min** (5.4-5.9) | −56 % | −51 % | −36 % |
+| Metric | Strata | strata-nvfp4 | Basalt | Infernix | Infernix 8-bit experts† | Infernix vs Strata | vs strata-nvfp4 | vs Basalt |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Mean TTFT | 12.3 s (10.8-13.9) | 10.8 s (9.2-12.0) | 7.2 s (6.4-7.9) | **3.1 s** (2.9-3.5) | 3.4 s (3.3-3.6) | −74 % | −71 % | −56 % |
+| Median TTFT | 9.92 s | 7.62 s | 3.81 s | **2.04 s** | 2.00 s | −79 % | −73 % | −46 % |
+| 90th-percentile TTFT | 25.9 s | 24.7 s | 17.5 s | **7.1 s** | 8.6 s | −71 % | −71 % | −59 % |
+| Mean TTFT, new long prompts | 11.8 s | 10.2 s | 20.8 s | **6.1 s** | 7.4 s | −48 % | −38 % | −70 % |
+| Prompt tokens from cache | 46.1 % | 53.2 % | 83.1 % | **84.5 %** | 84.5 % | +38.4 pt | +31.2 pt | +1.4 pt |
+| Prefill tok/s, no cache hit | 5,170 | 5,847 | 2,349 | **7,480-7,689** | 6,216-6,281 | +45 % | +30 % | 3.3× |
+| Output tok/s, one request | 116 (114-120) | 110 (108-113) | **166** (160-170) | **166** (165-169) | 175 (170-179) | +43 % | +51 % | level |
+| Output tok/s, batched | 67 | 69 | 129 | **149** (142-157) | 158 (147-171) | 2.2× | 2.2× | +15 % |
+| Tokens per round | 2.26 | 2.21 | 2.37 | **2.61** | 2.63 | +15 % | +19 % | +11 % |
+| Wall time | 12.9 min (12.0-13.8) | 11.7 min (11.0-12.9) | 8.9 min (8.6-9.1) | **5.7 min** (5.4-5.9) | 5.7 min (5.6-5.8) | −56 % | −51 % | −36 % |
+
+Bold and the comparison columns are the engines' defaults. † `--a8-activations`: the routed experts at
+8 bits, as the others run them in decode (every other activation stays 16-bit); same three seeds,
+on the build that added this route (`81bcdaef`). Against Basalt it reaches the first token 52 %
+sooner on average, decodes 5 % faster at one request and 22 % faster batched, and finishes 35 %
+sooner.
 
 - **First tokens**: the prefix cache reuses what the others re-read (whole prompts re-prefilled on
   continuing turns per seed: Strata 15-17 of 41, strata-nvfp4 9-14, Basalt 0-1, Infernix 1).
@@ -197,13 +209,16 @@ the others run NVIDIA's checkpoint as their own NVFP4 packs with the model's MTP
 None of these engines has a lossy default that could be turned off. Measured quality (KL divergence
 against an exact reference) follows in a later update.
 
-**Infernix with 8-bit expert activations** (`--a8-activations`; an option, not the comparison above):
+**Context length with 8-bit expert activations** (`--a8-activations`, closer to the others'
+arithmetic in decode):
 
-| Infernix | TTFT ~8K / ~128K / ~250K | Decode tok/s | Replay: mean TTFT | Replay: output tok/s, one request | Replay: wall time |
-|---|---:|---:|---:|---:|---:|
-| 4-bit (default) | 1.88 / 12.22 / 23.90 s | 183 / 161 / 175 | 3.1 s | 166 | 5.7 min |
-| `--a8-activations` | 1.88 / 15.53 / 30.58 s | 199 / 185 / 268 | 3.4 s | 175 | 5.7 min |
+| | TTFT ~8K / ~128K / ~250K | Decode tok/s |
+|---|---:|---:|
+| Infernix, 4-bit experts (default) | 1.88 / 12.22 / 23.90 s | 183 / 161 / 175 |
+| Infernix `--a8-activations` | 1.88 / 15.53 / 30.58 s | 199 / 185 / 268 |
+| Basalt (as above) | 9.55 / 92.94 / 125.92 s | 202 / 173 / 216 |
 
+With its experts at 8 bits Infernix decodes level with Basalt at ~8K and faster at ~128K and ~250K.
 Against its own session's default (on `81bcdaef`'s build) the 8-bit route runs 1-7 % more decode
 rounds a second (tok/s rises 9-36 %, partly from different text and drafts) but reads long prompts
 28 % slower, so the default stays the faster choice for agents.
@@ -243,12 +258,14 @@ the DFlash2 drafter, Strata* the GGUF, Basalt its IQ3_S pack.
 | Wall time | 8.1 min (7.7-8.5) | **4.4 min** (4.2-4.6) | 5.5 min (5.1-6.2) | −32 % | +26 % |
 
 Infernix beats Strata on decode and wall time and reaches the first token soonest on short
-continuing turns. Basalt decodes about 1.5× as fast and finishes 26 % sooner, with 8-bit
-activations and a 2-bit screen of its output head:
+continuing turns. Basalt decodes about 1.5× as fast and finishes 26 % sooner. All three hold the
+GGUF's weights as published (Basalt's pack copies them byte for byte); the differences are in what
+they compute:
 
 | | Infernix | Strata* v0.2.8 | Basalt |
 |---|---|---|---|
 | Activations in matrix multiplies | 16-bit (8 by option) | **8-bit** | **8-bit** |
+| Hyper-connection matrices (BF16 in the GGUF) | BF16 | BF16 (8-bit by option) | **8-bit copy** in decode |
 | Experts that run | every routed expert | every routed expert (route tail skip **off**) | every routed expert |
 | Output head | the GGUF's | the GGUF's | logits outside the top 64 from a **2-bit copy** (the choices themselves exact; +1.1 % KL divergence by Basalt's measure) |
 
