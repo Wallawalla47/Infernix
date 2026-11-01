@@ -132,9 +132,10 @@ struct BlockParameters {
 
 class Parameters {
 public:
-    // hc_q8 (--a8-activations, LOSSY, opt-in): every block's and the final mixer's BF16 hyper-connection matrices
-    // are rewritten in their own bytes as Q8_G32_FP16 RowSplit (ops::hyper_connection_repack_q8), so each mix reads
-    // half the weight bytes; the MTP drafter keeps its own. The Model's views of those matrices are not BF16
+    // hc_q8 (--a8-activations, LOSSY, opt-in): on a GGUF import, every block's and the final mixer's BF16
+    // hyper-connection matrices are rewritten in their own bytes as Q8_G32_FP16 RowSplit
+    // (ops::hyper_connection_repack_q8), so each mix reads half the weight bytes; the MTP drafter keeps its own.
+    // Other artifacts keep theirs (the repack was measured faster on a GGUF import only). The Model's views of those matrices are not BF16
     // afterwards: only these Parameters may read them.
     explicit Parameters(const Model& model, bool hc_q8 = false);
     ~Parameters();

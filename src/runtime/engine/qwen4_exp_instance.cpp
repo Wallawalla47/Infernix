@@ -180,7 +180,8 @@ std::vector<std::filesystem::path> dflash2_companions_beside(const std::filesyst
 }
 
 Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> source, const EngineOptions& options)
-    // --a8-activations: the hyper-connection matrices repacked to Q8 at load (execution::Parameters' hc_q8).
+    // --a8-activations: a GGUF import's hyper-connection matrices repacked to Q8 at load (execution::Parameters'
+    // hc_q8).
     : model(std::move(source)), parameters(*model, options.a8_activations && !options.lossless && options.fast_paths),
       frontend(models::qwen3_5::make_frontend(model->resources(),
                                               {.chat_template_path      = options.chat_template_path,
