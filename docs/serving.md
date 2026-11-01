@@ -474,9 +474,12 @@ constrained route below. Code follows CommonMark's rules without lists or block 
 ```` ``` ```` or `~~~` fence, from its opening line until a line of the same character at least as
 long with nothing after it; an indented code block (four or more columns of indentation after a blank
 line, a heading or the start of the answer; right after a line of text an indented line continues
-that paragraph); and a code span, closed only by a backtick run of its opening length. Only the text
-before the marker decides, so streamed and complete responses agree. A marker after a closed fence,
-or after a sentence on the same line, still opens a call.
+that paragraph); and a code span, closed only by a backtick run of its opening length. A marker at
+the start of a line (after at most three columns of indentation) is never inside a span opened on an
+earlier line: a response cannot know that such a backtick run is never closed (CommonMark then makes
+it text), and a stray backtick in a sentence before the call must not turn the call into text. Only
+the text before the marker decides, so streamed and complete responses agree. A marker after a closed
+fence, or after a sentence on the same line, still opens a call.
 
 By default the unconstrained parser keeps that all-or-nothing behaviour. With
 `--tolerant-tool-calls` the server recovers a call instead when the model adds a suffix after a

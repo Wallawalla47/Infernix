@@ -266,8 +266,10 @@ void quoted_calls(infernix::text::GrammarCompiler& compiled) {
                                           "````markdown\n```xml\n" + call("a") + "\n```\n````\nDone.",
                                           "Use `" + call("a") + "` like this.",
                                           "Example:\n\n    " + call("a") + "\n\nDone."};
+    // A span left open by a stray backtick on an earlier line does not reach the call at a line's start
+    // (Strata #4923).
     const std::vector<std::string> real{"```\ncode\n```\n" + call("a"), "Example:\n    " + call("a"),
-                                        "Use `x` then " + call("a")};
+                                        "Use `x` then " + call("a"), "Let me use `run_commands to check.\n" + call("a")};
     for (const bool strict : {false, true}) {
         const auto bound = contract(schema({{"type", "string"}}), strict);
         for (const std::string& text : quoted) {

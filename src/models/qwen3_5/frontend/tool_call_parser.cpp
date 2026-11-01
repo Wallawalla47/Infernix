@@ -1608,7 +1608,10 @@ void MarkdownCodeTracker::end_line() {
 bool MarkdownCodeTracker::in_code() const noexcept {
     if (fence_ != '\0') { return true; } // a marker after a closing run makes it no closer
     switch (line_) {
-    case Line::Indent: return (indent_ >= 4 && !paragraph_) || open_span() != 0;
+    // A span left open on an earlier line does not reach a line's start: a streamed reader cannot know
+    // that its run is never closed (CommonMark then makes it text), and a stray backtick in a preamble
+    // must not turn the call on the next line into text (Strata #4923).
+    case Line::Indent: return indent_ >= 4 && !paragraph_;
     case Line::Indented: return true;
     case Line::Run: return run_ >= 3 || open_span() != 0;
     case Line::Info: return run_char_ == '~' || !info_backtick_ || open_span() != 0;

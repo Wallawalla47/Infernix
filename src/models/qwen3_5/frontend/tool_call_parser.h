@@ -36,8 +36,9 @@ struct ParsedToolCallOutput {
 // (four or more columns, after a blank line, a heading or the start of the text); and a code span of
 // the current paragraph, closed only by a backtick run of its opening length (a backslash outside a
 // span makes the next backtick text). A tool-call marker inside code is a quoted example and stays
-// text. Only the text before a marker decides, so streamed and whole outputs agree; the state is
-// fixed-size, so a copy costs nothing.
+// text; a marker at a line's start (after at most three columns of indentation) is outside any span
+// opened on an earlier line, whose run may never close. Only the text before a marker decides, so
+// streamed and whole outputs agree; the state is fixed-size, so a copy costs nothing.
 class MarkdownCodeTracker {
 public:
     void feed(std::string_view text);
