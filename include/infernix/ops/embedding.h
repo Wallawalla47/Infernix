@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/device.h" // DeviceFault
 #include "core/weight.h"
 #include "core/tensor.h"
 
@@ -12,8 +13,9 @@ namespace infernix::ops {
  *
  *   ideal[d,t] = dequantize(table)[ids[t],d].
  *
- * `ids` is contiguous I32 [T], `out` is contiguous BF16 [D,T], and every id is in
- * [0,vocab). `table` has logical shape [vocab,D] and is contiguous BF16, Q6_G64_FP16
+ * `ids` is contiguous I32 [T] and `out` is contiguous BF16 [D,T]. An id outside [0,vocab) embeds
+ * zeros in its column and reports `fault` (core DeviceFault) instead of reading outside the table;
+ * every other column is unchanged. `table` has logical shape [vocab,D] and is contiguous BF16, Q6_G64_FP16
  * RowSplit, Q8_G32_FP16 RowSplit, or FP8_E4M3FN_ROW_BF16 RowScale. Dense BF16 values are copied
  * bit-exactly. For quantized tables, the oracle independently decodes each code and multiplies it
  * by the exact stored scale in FP64; the BF16 output is promoted and compared directly with that
@@ -24,6 +26,6 @@ namespace infernix::ops {
  * alignment. `out` must not overlap `ids` or any table plane.
  * There is no workspace or persistent state side effect.
  */
-void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream);
+void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream, DeviceFault fault = {});
 
 } // namespace infernix::ops
