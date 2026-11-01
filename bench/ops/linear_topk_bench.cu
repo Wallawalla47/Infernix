@@ -35,8 +35,7 @@ const char* profile_name(Profile profile) {
     return "q4-optimized";
 }
 
-void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
-    constexpr std::int32_t kHidden = 5120;
+void run(Profile profile, std::int32_t width, std::int32_t columns, int warmup, int repeat) {
     constexpr std::int32_t kTopK   = 16;
     const std::int32_t rows        = profile == Profile::Q4 ? 131072 : 248320;
     const QType qtype              = profile == Profile::Q8    ? QType::Q8_G32_FP16
@@ -44,9 +43,9 @@ void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
                                                                : QType::Q4_G64_FP16;
 
     PackedQuantizedWeight packed = profile == Profile::Fp8
-                                       ? make_fp8_weight(rows, kHidden)
-                                       : make_row_split_weight(qtype, rows, kHidden, kHidden, 501U);
-    DeviceBuffer hidden          = make_bf16(static_cast<std::size_t>(kHidden) * columns, 101U);
+                                       ? make_fp8_weight(rows, width)
+                                       : make_row_split_weight(qtype, rows, width, width, 501U);
+    DeviceBuffer hidden          = make_bf16(static_cast<std::size_t>(width) * columns, 101U);
     DeviceBuffer ids(static_cast<std::size_t>(kTopK) * columns * sizeof(std::int32_t));
     DeviceBuffer scores(static_cast<std::size_t>(kTopK) * columns * sizeof(float));
     DeviceBuffer id_map(
@@ -58,9 +57,9 @@ void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
     }
 
     const std::size_t workspace_bytes =
-        ops::linear_topk_workspace_capacity_bytes(qtype, rows, kHidden, columns, columns);
+        ops::linear_topk_workspace_capacity_bytes(qtype, rows, width, columns, columns);
     WorkspaceArena workspace(workspace_bytes);
-    Tensor hidden_tensor(hidden.p, DType::BF16, {kHidden, columns});
+    Tensor hidden_tensor(hidden.p, DType::BF16, {width, columns});
     Tensor ids_tensor(ids.p, DType::I32, {kTopK, columns});
     Tensor scores_tensor(scores.p, DType::FP32, {kTopK, columns});
     Tensor map_tensor(id_map.p, DType::I32, {rows});
@@ -84,8 +83,8 @@ void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
     const double weight_bytes  = static_cast<double>(packed.model_weight_bytes());
     const double effective_gbs = weight_bytes / timing.median_us / 1000.0;
     const double useful_tflops = 2.0 * static_cast<double>(profile == Profile::Q4 ? rows : 248077) *
-                                 kHidden * columns / timing.median_us / 1.0e6;
-    std::printf("%s,%d,%.3f,%.3f,%.3f,%.1f,%.2f,%zu,%zu\n", profile_name(profile), columns,
+                                 width * columns / timing.median_us / 1.0e6;
+    std::printf("%s,%d,%d,%.3f,%.3f,%.3f,%.1f,%.2f,%zu,%zu\n", profile_name(profile), width, columns,
                 timing.median_us, timing.min_us, timing.p95_us, effective_gbs, useful_tflops,
                 workspace.peak_used(), graph.nodes());
     CUDA_CHECK(cudaStreamDestroy(stream));
@@ -109,13 +108,15 @@ int main(int argc, char** argv) {
     try {
         std::string profile = "all";
         std::vector<int> columns;
-        int warmup = 8, repeat = 60;
+        int warmup = 8, repeat = 60, hidden = 5120;
         for (int i = 1; i < argc; ++i) {
             const std::string flag = argv[i];
             if (flag == "--help") {
                 std::printf(
-                    "usage: %s [--profile all|q8-full|fp8-full|q4-optimized] [--columns U,...] "
-                    "[--warmup N] [--repeat N]\n",
+                    "usage: %s [--profile all|q8-full|fp8-full|q4-optimized] [--hidden 5120|2560] "
+                    "[--columns U,...] [--warmup N] [--repeat N]\n"
+                    "  --hidden: the head width, Qwen3.8-27B's 5120 (default) or Qwen3.8-Flash-Next's 2560\n"
+                    "            (q8-full and q4-optimized).\n",
                     argv[0]);
                 return 0;
             }
@@ -123,6 +124,8 @@ int main(int argc, char** argv) {
             const std::string value = argv[++i];
             if (flag == "--profile")
                 profile = value;
+            else if (flag == "--hidden")
+                hidden = std::stoi(value);
             else if (flag == "--columns") {
                 std::istringstream input(value);
                 std::string item;
@@ -142,19 +145,23 @@ int main(int argc, char** argv) {
                 throw std::invalid_argument("unknown option: " + flag);
         }
         if (warmup < 0 || repeat < 1) throw std::invalid_argument("invalid timing counts");
+        if (hidden != 5120 && hidden != 2560) throw std::invalid_argument("--hidden must be 5120 or 2560");
         std::vector<Profile> profiles;
         if (profile == "all")
-            profiles = {Profile::Q8, Profile::Fp8, Profile::Q4};
+            profiles = hidden == 5120 ? std::vector{Profile::Q8, Profile::Fp8, Profile::Q4}
+                                      : std::vector{Profile::Q8, Profile::Q4};
         else
             profiles = {parse_profile(profile)};
+        if (hidden != 5120 && profiles.front() == Profile::Fp8)
+            throw std::invalid_argument("fp8-full registers H 5120 only");
         std::puts(
-            "profile,U,median_us,min_us,p95_us,logical_weight_GBs,useful_TFLOPs,workspace_bytes,"
+            "profile,H,U,median_us,min_us,p95_us,logical_weight_GBs,useful_TFLOPs,workspace_bytes,"
             "graph_nodes");
         for (auto selected : profiles) {
             if (!columns.empty()) {
-                for (int n : columns) run(selected, n, warmup, repeat);
+                for (int n : columns) run(selected, hidden, n, warmup, repeat);
             } else
-                for (int n = 1; n <= 120; ++n) run(selected, n, warmup, repeat);
+                for (int n = 1; n <= 120; ++n) run(selected, hidden, n, warmup, repeat);
         }
         return 0;
     } catch (const std::exception& error) {
