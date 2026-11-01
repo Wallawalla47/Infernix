@@ -11410,21 +11410,17 @@ IQ3_S, DFlash2 auto, the route's resident pass the critical leg of most layers):
 otherwise, 2026-10-29), so the resident pass keeps its SMs; and the shared expert is queued on its stream right
 after the routed experts' early encoding, beside the router and the plan, a nearly idle device, instead of after
 the plan beside the resident pass. A GGUF import's BF16 hyper-connection matrices are repacked to Q8_G32_FP16 at
-load (`ops::hyper_connection_repack_q8`), so every mix reads half the bytes. Its BF16 GDN control projections (a and
-b, [96, 2560]) and QSA indexers ([640, 2560]) are requantized at load to Q6_K tiles in their own bytes by ggml's
-reference quantizer (`ops::ggml_quantize_q6_k`), where the layer's GGUF input projection holds at most one format
-besides Q6_K (an 8-bit launch mixes two; the IQ3_S import: 43 of 48), so they run inside that projection's one
-8-bit launch (up to six segments a launch) instead of a BF16 launch and its split copies, and the QSA layers'
-mixes then write the input projection's 8-bit columns too. Measured (2026-11-01, IQ3_S, DFlash2 auto, against
-e2625acc): conv -0.4 % ms a round, struct -2.0 %; the weights change, so the sampled conv text (and its draft
-acceptance) changes too.
+load (`ops::hyper_connection_repack_q8`), so every mix reads half the bytes.
 
 **Toward Basalt's speed (2026-11-01, IQ3_S, DFlash2 auto, Basalt's conv and struct prompts; every arm A/B'd
 interleaved, 2 reps).** Adopted, in order: the hyper-connection Q8 repack with a 24-worker CPU team (9de63059), the
 expert rows in shared memory (390806df), the rows kernel for narrow tiled calls with L2 prefetch and the gated-norm
-producer (3867c564), side streams at the least priority with the shared expert early (ba651d71), the mix's 8-bit
-producer (e2625acc) and the Q6_K side projections (90f233a2): conv 11.42 → 10.07 ms a round, struct 15.31 → 13.74
-(Basalt 7.9-9.0 and 12.0 ms a window). Rejected, with their reasons, so they are not retried as they were: every miss
+producer (3867c564), side streams at the least priority with the shared expert early (ba651d71) and the mix's 8-bit
+producer (e2625acc): conv 11.37 → 10.08 ms a round, struct 15.33 → 14.05 (Basalt 7.9-9.0 and 12.0 ms a window).
+Withdrawn by the owner: requantizing the BF16 GDN control and QSA indexer projections to Q6_K at load so they run
+inside the input projection's 8-bit launch (struct -2.0 %, conv -0.4 % a round; 90f233a2, reverted): the flag may
+take weights to 8 bits, not below. An 8-bit copy would need a GGUF Q8_0 path in the 8-bit kernels and their mixed
+pairs. Rejected, with their reasons, so they are not retried as they were: every miss
 on the CPU (conv +4.5 %, struct +2.1 %); each dense CTA encoding its columns (+1.0 / +4.6 %: occupancy and repeated
 encodes); a lane's expert slices decoded up front (+2.5 / +4.4 %: registers); smaller CPU work items (flat); a
 side-stream L2 prefetch of the output projections (+1.0 / +0.8 %: the fork and join cost more than the DRAM trip they

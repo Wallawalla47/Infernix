@@ -1,8 +1,6 @@
 #include "models/qwen4_exp/execution/parameters.h"
 
-#include "core/device.h"
 #include "core/weight_view.h"
-#include "infernix/ops/ggml_quantize.h"
 #include "infernix/ops/hyper_connection.h"
 
 #include <cuda_runtime.h>
@@ -274,45 +272,6 @@ private:
     const Model& model_;
 };
 
-// --a8-activations: a GGUF import's BF16 projection of the mixer input beside its GGUF input projection (a GDN layer's
-// control, a QSA layer's indexer) rewritten in its own bytes as Q6_K tiles by ggml's reference quantizer, so the mixer
-// runs it inside that projection's 8-bit launch (no BF16 launch, no split copies): only where the input projection is
-// Tiles16 and holds at most one format besides Q6_K, as an 8-bit launch mixes two. Returns whether it did.
-bool requantize_side_projection(const LinearParameters& input, LinearParameters& side, DeviceBuffer& scratch) {
-    const Weight& w = side.weight;
-    if (!input.is_ggml() || side.is_ggml() || side.input_perm != nullptr || w.qtype != QType::BF16 ||
-        w.layout != QuantLayout::Contiguous || w.qdata == nullptr || w.k % 256 != 0 || w.n % 16 != 0 ||
-        (w.padded_shape[1] != 0 && w.padded_shape[1] != w.k)) {
-        return false;
-    }
-    QType other = QType::GGML_Q6_K;
-    for (const auto& s : input.ggml) {
-        if (s.layout != ops::GgmlLayout::Tiles16) { return false; }
-        if (s.format == QType::GGML_Q6_K) { continue; }
-        const bool mixable = s.format == QType::GGML_Q4_K || s.format == QType::GGML_Q5_K || s.format == QType::GGML_IQ4_XS;
-        if (!mixable || (other != QType::GGML_Q6_K && other != s.format)) { return false; }
-        other = s.format;
-    }
-    cudaPointerAttributes attributes{};
-    if (cudaPointerGetAttributes(&attributes, w.qdata) != cudaSuccess || attributes.type != cudaMemoryTypeDevice) {
-        (void)cudaGetLastError();
-        return false;
-    }
-    const std::size_t bytes = static_cast<std::size_t>(w.n) * w.k * 2;
-    if (scratch.bytes < bytes) { scratch = DeviceBuffer(bytes); }
-    // The Model's bytes, which only these Parameters read afterwards (as with the hyper-connection repack).
-    auto* data = static_cast<std::uint8_t*>(const_cast<void*>(w.qdata));
-    CUDA_CHECK(cudaMemcpy(scratch.p, data, bytes, cudaMemcpyDeviceToDevice));
-    ops::ggml_quantize_q6_k(Tensor(scratch.p, DType::BF16, {w.k, w.n}), ops::GgmlLayout::Tiles16, data, nullptr);
-    LinearParameters q;
-    q.ggml.push_back({QType::GGML_Q6_K, data, w.n, 0, 0, ops::GgmlLayout::Tiles16});
-    q.weight.qtype = QType::GGML_Q6_K;
-    q.weight.n     = w.n;
-    q.weight.k     = w.k;
-    side           = std::move(q);
-    return true;
-}
-
 } // namespace
 
 Parameters::Parameters(const Model& source, bool hc_q8) : model(source) {
@@ -486,15 +445,6 @@ Parameters::Parameters(const Model& source, bool hc_q8) : model(source) {
                 throw std::runtime_error("Qwen4Exp: the hyper-connection Q8 repack failed");
             }
         }
-        DeviceBuffer scratch;
-        for (auto& block : layers) {
-            if (auto* g = std::get_if<GdnParameters>(&block.mixer)) {
-                q6_repacked += requantize_side_projection(g->projection, g->control, scratch) ? 1U : 0U;
-            } else if (auto& a = std::get<AttentionParameters>(block.mixer); a.index_projection) {
-                q6_repacked += requantize_side_projection(a.projection, *a.index_projection, scratch) ? 1U : 0U;
-            }
-        }
-        if (cudaStreamSynchronize(nullptr) != cudaSuccess) { throw std::runtime_error("Qwen4Exp: the Q6_K repack failed"); }
     }
 }
 
