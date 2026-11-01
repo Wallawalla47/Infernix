@@ -752,6 +752,9 @@ def watchdog(launcher: Launcher, port: int, data: Path, skip_ram: bool) -> None:
             call(port, "PUT", "/launcher/api/settings", {"load_ram_floor_mib": floor})
             hogging = [a for a in base_args] + ["--fake-load-ms", "15000", "--fake-hog-mib", "6144"]
             call(port, "PUT", f"/launcher/api/models/{key}/config", {"args": hogging})
+            # A saved configuration applies at the next load.
+            call(port, "POST", "/launcher/api/unload", {})
+            wait_for(lambda: instance(port)["state"] in ("idle", "failed"), 30)
             status, body = call(port, "POST", "/v1/chat/completions", chat(alias, 8))
             incident = instance(port)["incident"] or {}
             check("the RAM floor ends a load and suggests changes",
