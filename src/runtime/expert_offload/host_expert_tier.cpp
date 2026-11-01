@@ -331,7 +331,7 @@ HostExpertTier::HostExpertTier(const ExpertStore& store, Options options)
       bounce_(options_.unpinned > 0 || pinned_.refused > 0 ? options_.bounce : 0),
       stream_bounce_(options_.unpinned > 0 || pinned_.refused > 0 ? options_.stream_bounce : 0),
       tier_(controller_config()), unpinned_of_(static_cast<std::size_t>(store.layers()) * store.experts(), -1),
-      round_ticket_of_key_(static_cast<std::size_t>(store.layers()) * store.experts(), 0) {
+      round_ticket_of_key_(static_cast<std::size_t>(store.layers()) * store.experts()) {
     // The controller's slots in its order (the ring, the prefetch list, then each class's), and the
     // bounce slots: the one region's last slots, or region 0's after the ring and the prefetch list.
     std::uint32_t resident = 0;
@@ -529,7 +529,7 @@ void HostExpertTier::begin_round(std::uint32_t allowance) {
     std::vector<expert_cache::Landing> landings;
     for (std::uint32_t t = 0; t < count; ++t) {
         Ticket& ticket = tickets_[t];
-        round_ticket_of_key_[ticket.key] = 0;
+        round_ticket_of_key_[ticket.key].store(0, std::memory_order_release);
         // A copied unpinned record is not admitted: its key keeps the unpinned record.
         if (ticket.state.load(std::memory_order_acquire) == 1 && !ticket.resident && !ticket.recycled &&
             ticket.copy_from == nullptr) {
@@ -597,7 +597,7 @@ std::uint32_t HostExpertTier::new_ticket(std::uint32_t key, std::int32_t fetch) 
     ticket.bytes     = nullptr;
     ticket.done.store(false, std::memory_order_relaxed);
     ticket.status.store(0, std::memory_order_relaxed);
-    round_ticket_of_key_[key] = t + 1;
+    round_ticket_of_key_[key].store(t + 1, std::memory_order_release);
     if (const std::int32_t slot = tier_.slot_of(key); slot >= 0) { // already in RAM: nothing to read
         ticket.slot     = static_cast<std::uint32_t>(slot);
         ticket.bytes    = slot_bytes(ticket.slot);
@@ -716,7 +716,9 @@ void HostExpertTier::stream_release(std::int32_t slot) {
 
 std::uint32_t HostExpertTier::demand(int layer, int expert) noexcept {
     const std::uint32_t key = this->key(static_cast<std::uint32_t>(layer), static_cast<std::uint32_t>(expert));
-    if (const std::uint32_t known = round_ticket_of_key_[key]; known != 0) { return known - 1; }
+    if (const std::uint32_t known = round_ticket_of_key_[key].load(std::memory_order_acquire); known != 0) {
+        return known - 1;
+    }
     const std::uint32_t t = new_ticket(key, -1);
     if (t == kNoTicket || tickets_[t].resident) { return t; }
     {
@@ -1039,7 +1041,7 @@ void HostExpertTier::agent_loop() {
                         Ticket& ticket = tickets_[t];
                         ticket.fetch    = static_cast<std::int32_t>(i);
                         fetch_ticket[i] = t;
-                        round_ticket_of_key_[k] = t + 1;
+                        round_ticket_of_key_[k].store(t + 1, std::memory_order_release);
                         const std::uint32_t state = ticket.state.load(std::memory_order_acquire);
                         if (state == 1) {
                             fetch->land(static_cast<std::uint32_t>(i), slot_bytes(ticket.slot));
@@ -1078,7 +1080,9 @@ void HostExpertTier::agent_loop() {
                     const auto next = static_cast<std::uint32_t>(request.layer) + 1;
                     for (std::uint32_t e = 0; e < store_.experts() && ahead.size() < options_.ahead; ++e) {
                         const std::uint32_t k = key(next, e);
-                        if (round_ticket_of_key_[k] != 0 || tier_.slot_of(k) >= 0) { continue; }
+                        if (round_ticket_of_key_[k].load(std::memory_order_acquire) != 0 || tier_.slot_of(k) >= 0) {
+                            continue;
+                        }
                         const std::uint32_t t = new_ahead_ticket(k);
                         if (t == kNoTicket) { break; }
                         ahead_of_key[k] = t + 1;
