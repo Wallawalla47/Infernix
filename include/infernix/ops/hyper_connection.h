@@ -52,6 +52,18 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
                           std::int32_t rank, float eps, Tensor& x, Tensor* inject,
                           WorkspaceArena& workspace, cudaStream_t stream);
 
+/// `--a8-activations` (LOSSY, opt-in): rewrites a BF16 Contiguous W_down or W_up [n, k] in its own bytes as
+/// Q8_G32_FP16 RowSplit (row_split_k128_v1: int8 codes [n, padded_k], padded_k = k rounded up to 128, then
+/// the FP16 scales [n, padded_k / 32]) and updates `w` to describe it, so hyper_connection_mix takes its Q8
+/// routes (half the weight bytes). A group of 32 has scale fl16(m / 127), m its largest magnitude, and codes
+/// rne(v / scale) clamped to [-127, 127] (a zero group: scale 0, codes 0); padding codes and scales are zero.
+/// `scratch`: device memory of at least hyper_connection_repack_q8_scratch_bytes(w), which receives the BF16
+/// matrix first. The matrix's bytes are not BF16 afterwards: nothing may read them through another Weight.
+void hyper_connection_repack_q8(Weight& w, void* scratch, cudaStream_t stream);
+
+/// The scratch hyper_connection_repack_q8 needs for `w` (BF16 Contiguous [n, k]); 0 when it cannot repack it.
+[[nodiscard]] std::size_t hyper_connection_repack_q8_scratch_bytes(const Weight& w);
+
 /// The workspace hyper_connection_mix needs for every T in [1, max_tokens].
 [[nodiscard]] std::size_t hyper_connection_mix_workspace_capacity_bytes(
     const Weight& down, const Weight& up, LinearPolicy policy, std::int32_t streams,
