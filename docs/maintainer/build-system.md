@@ -1,7 +1,7 @@
 # Build system
 
 Infernix builds from its source tree with CMake 3.28+ and C++/CUDA 20.
-The supported architecture is `sm_120a`; CUDA 13.1 is the validated development toolkit.
+The supported architecture is `sm_120a`; CUDA 13.4 is the validated development toolkit.
 Product commands and prerequisites are in the
 [README](../../README.md#quick-start-windows); test and measurement workflows live in
 [tests](../../tests/README.md) and [benchmarks](../../bench/README.md).
@@ -9,7 +9,8 @@ Product commands and prerequisites are in the
 ## Configuration
 
 The root `CMakeLists.txt` owns language/toolchain constraints, build options and top-level
-composition. Architecture selection and validation happen before `project()` detects CUDA.
+composition. Architecture selection and validation happen before `project()` detects CUDA; the
+toolkit-version warning follows it.
 The default configuration is Release. Ninja links and archives share the single-slot
 `infernix_link` pool; compilation uses the build command's parallelism.
 
@@ -25,7 +26,10 @@ libjpeg belong to model media decoding and remain required when apps are disable
 only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
 pytest suites and conversion/evaluation scripts run separately from CMake and CTest.
 
-CUDA 13.1 and Python 3.11 describe the maintained environment, not configuration version gates.
+CUDA 13.4 and Python 3.11 describe the maintained environment, not configuration version gates.
+An older CUDA compiler configures with a warning: CUDA 13.2 miscompiles at least one `sm_120a`
+kernel (the `--a8-activations` row kernel stops with an illegal instruction), and the toolkits
+before 13.4 are untested.
 CMake also discovers FFmpeg without imposing library version floors. Actual language/API support
 is exercised by compilation and tests. The libcurl 7.85 minimum has a concrete API basis:
 media acquisition uses `CURLOPT_PROTOCOLS_STR` and `CURLOPT_REDIR_PROTOCOLS_STR`, introduced in
