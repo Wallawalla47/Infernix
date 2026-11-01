@@ -3960,6 +3960,20 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
   - **Left.** A K split across CTAs: the 160 one-tile CTAs leave 10 SMs idle (~1.4 of 1.67 TB/s).
     Two row tiles, `cg` activations and direct scales tied with the chosen schedule within the
     timer's 2 µs step at 8 columns.
+- **linear_topk: each column's top sixteen in two launches (adopted 2026-11-01).**
+  - **Problem.** After its producer, the drafter's top-16 over the 131,072-row proposal head (7
+    columns) ran a counter clear and two passes of a CTA-wide merge sort of 512 keys, the last CTA
+    per column sorting a third time: 2.4 + 18.8 + 7.1 µs a round (node-level nsys).
+  - **Change.** A selection kernel per 4,096-key slice of a column: each thread sorts its sixteen
+    keys in registers, and warp and CTA butterflies keep the top sixteen of two sorted lists (the
+    elementwise maximum against the reversed other list is bitonic; a bitonic merge sorts it).
+    One warp per column merges the slices. No counters, so no clear and no atomics. Keys are
+    unique, so the result is a full sort's: same bits (the exact-oracle Op test passes on every
+    profile, ties included).
+  - **Result.** Engine trace: 28.2 → 9.2 µs a round (select 7.7 + final 1.6); the head kernel
+    unchanged (106.1 / 106.0 µs). Cold op: proposal head at 7 columns 131.5 → 115.0 µs; 27B's at
+    8 columns 237.9 → 219.4. `infernix_bench` (three reps, identical rounds and acceptance):
+    greedy +0.11 %, struct −0.09 %, overlapping ranges; ~0.1 % is below what that A/B resolves.
 - **Few-row Q8 route for the hyper-connection down projections (adopted).**
   - **Problem.** The MTP-round profile showed the [324, 10240] and [320, 10240] projections
     (96 calls per token) on 41 eight-row CTAs at ~0.4 TB/s: 9.5 µs per call, ~0.9 ms per round,

@@ -495,8 +495,9 @@ Q8 and row-FP8 full heads and the mapped Q4 optimized head. Its independent matr
 positive `--columns U` also exercises larger matrices; `--columns U,...` selects a representative
 set without a full sweep. Codes and stored scales vary across the physical head, including signs,
 so ranking is not timed only on identical weight rows. Each sample replays the complete Op in a
-CUDA Graph after a 256 MiB L2 eviction read; projection, partial-key reduction, workspace counter
-initialization, and final ids/scores publication are included. Defaults are 8 warmups and 60 samples.
+CUDA Graph after a 256 MiB L2 eviction read; projection, partial-key selection and final ids/scores
+publication are included. The head width is Qwen3.8-27B's 5120 unless `--hidden 2560` selects
+Qwen3.8-Flash-Next's (Q8 and Q4 heads). Defaults are 8 warmups and 60 samples.
 Reported logical bandwidth counts the encoded head once, useful FLOPs count candidate-eligible rows, and
 workspace bytes and Graph nodes describe the actual public call. These are Op measurements.
 
@@ -504,6 +505,7 @@ workspace bytes and Graph nodes describe the actual public call. These are Op me
 cmake --build build -j --target infernix_linear_topk_bench
 ./build/bench/infernix_linear_topk_bench
 ./build/bench/infernix_linear_topk_bench --profile q8-full --columns 7
+./build/bench/infernix_linear_topk_bench --profile q4-optimized --hidden 2560 --columns 1,7,8,16
 ./build/bench/infernix_linear_topk_bench --columns 1,7,16,24,64,120 --repeat 25
 ./build/bench/infernix_linear_topk_bench --profile fp8-full --columns 120
 ./build/bench/infernix_linear_topk_bench --profile q4-optimized --columns 129 --repeat 60

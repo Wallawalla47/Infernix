@@ -5,98 +5,171 @@
 #include "ops/common/score_id_order.cuh"
 #include "ops/linear_topk/linear_topk_workspace.h"
 
-#include <cub/block/block_merge_sort.cuh>
-
 #include <cstdint>
 
 namespace infernix::ops::detail {
 namespace {
 
-inline constexpr int kMergeThreads        = 256;
-inline constexpr int kMergeItemsPerThread = 2;
+// The selection: each CTA of 256 threads takes one column's slice of 4096 producer keys, 16 a thread,
+// sorts each thread's keys in registers and keeps the top sixteen through warp and CTA merges; one
+// warp per column then merges the slices' lists. Keys are unique (distinct ids), so the selected
+// keys and their order are those of a full sort whatever the merge tree.
+inline constexpr int kSelectThreads = 256;
+inline constexpr int kSelectWarps   = kSelectThreads / 32;
+static_assert(kLinearTopKSliceKeys == kSelectThreads * kLinearTopK, "one sixteen-key list a thread");
 
-using MergeSort = cub::BlockMergeSort<std::uint64_t, kMergeThreads, kMergeItemsPerThread>;
+using KeyList = std::uint64_t[kLinearTopK];
 
-__device__ __forceinline__ std::int64_t partial_offset(std::int32_t column, std::int32_t group,
-                                                       std::int32_t rank,
-                                                       std::int32_t group_stride) {
-    return (static_cast<std::int64_t>(column) * group_stride + group) * kLinearTopK + rank;
-}
-
-template <bool Finalize>
-__global__ __launch_bounds__(kMergeThreads, 2) void linear_topk_merge_kernel(
-    const std::uint64_t* __restrict__ input_keys, std::uint64_t* __restrict__ output_keys,
-    std::int32_t* __restrict__ group_done, std::int32_t* __restrict__ candidate_ids,
-    float* __restrict__ candidate_scores, std::int32_t input_groups, std::int32_t output_groups) {
-    pdl::enter();
-    const std::int32_t output_group = static_cast<std::int32_t>(blockIdx.x);
-    const std::int32_t column       = static_cast<std::int32_t>(blockIdx.y);
-    const int tid                   = static_cast<int>(threadIdx.x);
-
-    __shared__ typename MergeSort::TempStorage sort_storage;
-    __shared__ std::int32_t is_last;
-    std::uint64_t keys[kMergeItemsPerThread];
-
+// Sorts a thread's sixteen keys descending (bitonic network, unrolled into registers).
+__device__ __forceinline__ void sort_descending(KeyList& keys) {
 #pragma unroll
-    for (int item = 0; item < kMergeItemsPerThread; ++item) {
-        const int p             = tid * kMergeItemsPerThread + item;
-        const int local_partial = p / kLinearTopK;
-        const int rank          = p - local_partial * kLinearTopK;
-        const int input_group   = output_group * kLinearTopKMergeFanIn + local_partial;
-        keys[item]              = input_group < input_groups
-                                      ? input_keys[partial_offset(column, input_group, rank, input_groups)]
-                                      : 0;
-    }
-
-    MergeSort(sort_storage).Sort(keys, ScoreIdOrderGreater{});
+    for (int size = 2; size <= kLinearTopK; size <<= 1) {
 #pragma unroll
-    for (int item = 0; item < kMergeItemsPerThread; ++item) {
-        const int rank = tid * kMergeItemsPerThread + item;
-        if (rank < kLinearTopK) {
-            output_keys[partial_offset(column, output_group, rank, output_groups)] = keys[item];
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+#pragma unroll
+            for (int i = 0; i < kLinearTopK; ++i) {
+                const int j = i ^ stride;
+                if (j > i) {
+                    const std::uint64_t a = keys[i], b = keys[j];
+                    const bool swap       = (i & size) == 0 ? a < b : a > b;
+                    keys[i]               = swap ? b : a;
+                    keys[j]               = swap ? a : b;
+                }
+            }
         }
     }
-    if constexpr (!Finalize) { return; }
-    if (tid < kLinearTopK / kMergeItemsPerThread) { __threadfence(); }
-    __syncthreads();
-
-    if (tid == 0) { is_last = atomicAdd(group_done + column, 1) + 1 == output_groups; }
-    __syncthreads();
-    if (is_last == 0) { return; }
-
-#pragma unroll
-    for (int item = 0; item < kMergeItemsPerThread; ++item) {
-        const int p     = tid * kMergeItemsPerThread + item;
-        const int group = p / kLinearTopK;
-        const int rank  = p - group * kLinearTopK;
-        keys[item]      = group < output_groups
-                              ? output_keys[partial_offset(column, group, rank, output_groups)]
-                              : 0;
-    }
-    __syncthreads();
-    MergeSort(sort_storage).Sort(keys, ScoreIdOrderGreater{});
-
-#pragma unroll
-    for (int item = 0; item < kMergeItemsPerThread; ++item) {
-        const int rank = tid * kMergeItemsPerThread + item;
-        if (rank < kLinearTopK) {
-            const std::uint64_t key = keys[item];
-            const std::int64_t out  = static_cast<std::int64_t>(column) * kLinearTopK + rank;
-            candidate_ids[out]      = id_from_order_key(key);
-            candidate_scores[out]   = score_from_order_key(key);
-        }
-    }
-    if (tid == 0) { group_done[column] = 0; }
 }
 
-// Zeroes the per-column completion counters. The last merging CTA of each column already returns
-// its counter to zero; this establishes it for arena bytes another call reused in between, as a
-// kernel so the round stays one chain of kernel nodes.
-__global__ void linear_topk_clear_done_kernel(std::int32_t* __restrict__ group_done,
-                                              std::int32_t count) {
+// keys := the top sixteen of keys and other, descending (both descending): the elementwise maximum of
+// keys and reversed other is bitonic and holds them, and a bitonic merge sorts it.
+__device__ __forceinline__ void merge_top(KeyList& keys, const KeyList& other) {
+#pragma unroll
+    for (int i = 0; i < kLinearTopK; ++i) {
+        const std::uint64_t b = other[kLinearTopK - 1 - i];
+        keys[i]               = keys[i] > b ? keys[i] : b;
+    }
+#pragma unroll
+    for (int stride = kLinearTopK / 2; stride > 0; stride >>= 1) {
+#pragma unroll
+        for (int i = 0; i < kLinearTopK; ++i) {
+            if ((i & stride) == 0) {
+                const std::uint64_t a = keys[i], b = keys[i + stride];
+                keys[i]               = a < b ? b : a;
+                keys[i + stride]      = a < b ? a : b;
+            }
+        }
+    }
+}
+
+// Butterfly over lane masks [first, 1]: every lane of each 2*first-lane group ends with the group's top sixteen.
+__device__ __forceinline__ void butterfly_top(KeyList& keys, int first) {
+#pragma unroll
+    for (int mask = first; mask > 0; mask >>= 1) {
+        KeyList other;
+#pragma unroll
+        for (int i = 0; i < kLinearTopK; ++i) { other[i] = __shfl_xor_sync(0xffffffffu, keys[i], mask); }
+        merge_top(keys, other);
+    }
+}
+
+__device__ __forceinline__ void load_list(KeyList& keys, const std::uint64_t* __restrict__ source) {
+#pragma unroll
+    for (int i = 0; i < kLinearTopK; i += 2) {
+        const ulonglong2 pair = __ldcg(reinterpret_cast<const ulonglong2*>(source + i));
+        keys[i]               = pair.x;
+        keys[i + 1]           = pair.y;
+    }
+}
+
+__device__ __forceinline__ void clear_list(KeyList& keys) {
+#pragma unroll
+    for (int i = 0; i < kLinearTopK; ++i) { keys[i] = 0; }
+}
+
+// Grid (slices, columns): slice_keys[column][slice] := the slice's top sixteen keys, descending. Keys past the
+// column's end are the sentinel 0, below every key.
+__global__ __launch_bounds__(kSelectThreads) void linear_topk_select_kernel(
+    const std::uint64_t* __restrict__ partial_keys, std::uint64_t* __restrict__ slice_keys,
+    std::int32_t column_keys, std::int32_t slices) {
     pdl::enter();
-    for (int i = static_cast<int>(threadIdx.x); i < count; i += static_cast<int>(blockDim.x)) {
-        group_done[i] = 0;
+    const int slice  = static_cast<int>(blockIdx.x);
+    const int column = static_cast<int>(blockIdx.y);
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31, warp = tid >> 5;
+    const int first  = slice * kLinearTopKSliceKeys;
+    const int live   = min(kLinearTopKSliceKeys, column_keys - first);
+    const std::uint64_t* __restrict__ source = partial_keys + static_cast<std::int64_t>(column) * column_keys + first;
+
+    // Key pairs p = i * 256 + tid (16-byte reads; a column holds whole sixteen-key groups, so pairs are aligned).
+    KeyList keys;
+#pragma unroll
+    for (int i = 0; i < kLinearTopK / 2; ++i) {
+        const int k = 2 * (i * kSelectThreads + tid);
+        if (k + 1 < live) {
+            const ulonglong2 pair = __ldcg(reinterpret_cast<const ulonglong2*>(source + k));
+            keys[2 * i]           = pair.x;
+            keys[2 * i + 1]       = pair.y;
+        } else {
+            keys[2 * i]     = k < live ? __ldcg(source + k) : 0;
+            keys[2 * i + 1] = 0;
+        }
+    }
+    sort_descending(keys);
+    butterfly_top(keys, 16);
+
+    __shared__ std::uint64_t warp_lists[kSelectWarps][kLinearTopK];
+    if (lane == 0) {
+#pragma unroll
+        for (int i = 0; i < kLinearTopK; ++i) { warp_lists[warp][i] = keys[i]; }
+    }
+    __syncthreads();
+    if (warp != 0) { return; }
+    if (lane < kSelectWarps) {
+#pragma unroll
+        for (int i = 0; i < kLinearTopK; ++i) { keys[i] = warp_lists[lane][i]; }
+    } else {
+        clear_list(keys);
+    }
+    butterfly_top(keys, kSelectWarps / 2);
+    if (lane == 0) {
+        auto* out = reinterpret_cast<ulonglong2*>(slice_keys + (static_cast<std::int64_t>(column) * slices + slice) *
+                                                                   kLinearTopK);
+#pragma unroll
+        for (int i = 0; i < kLinearTopK; i += 2) { out[i / 2] = make_ulonglong2(keys[i], keys[i + 1]); }
+    }
+}
+
+// One warp per column: the slices' lists merged into the column's sixteen candidates.
+__global__ __launch_bounds__(32) void linear_topk_final_kernel(const std::uint64_t* __restrict__ slice_keys,
+                                                               std::int32_t* __restrict__ candidate_ids,
+                                                               float* __restrict__ candidate_scores,
+                                                               std::int32_t slices) {
+    pdl::enter();
+    const int column = static_cast<int>(blockIdx.x);
+    const int lane   = static_cast<int>(threadIdx.x);
+    const std::uint64_t* __restrict__ lists = slice_keys + static_cast<std::int64_t>(column) * slices * kLinearTopK;
+    KeyList keys;
+    if (lane < slices) {
+        load_list(keys, lists + lane * kLinearTopK);
+    } else {
+        clear_list(keys);
+    }
+    for (int slice = lane + 32; slice < slices; slice += 32) {
+        KeyList other;
+        load_list(other, lists + slice * kLinearTopK);
+        merge_top(keys, other);
+    }
+    butterfly_top(keys, 16);
+    if (lane == 0) {
+        auto* ids    = reinterpret_cast<int4*>(candidate_ids + static_cast<std::int64_t>(column) * kLinearTopK);
+        auto* scores = reinterpret_cast<float4*>(candidate_scores + static_cast<std::int64_t>(column) * kLinearTopK);
+#pragma unroll
+        for (int i = 0; i < kLinearTopK; i += 4) {
+            ids[i / 4]    = make_int4(id_from_order_key(keys[i]), id_from_order_key(keys[i + 1]),
+                                      id_from_order_key(keys[i + 2]), id_from_order_key(keys[i + 3]));
+            scores[i / 4] = make_float4(score_from_order_key(keys[i]), score_from_order_key(keys[i + 1]),
+                                        score_from_order_key(keys[i + 2]), score_from_order_key(keys[i + 3]));
+        }
     }
 }
 
@@ -105,43 +178,16 @@ __global__ void linear_topk_clear_done_kernel(std::int32_t* __restrict__ group_d
 void linear_topk_merge_launch(const LinearTopKWorkspace& workspace, Tensor& candidate_ids,
                               Tensor& candidate_scores, cudaStream_t stream) {
     CUDA_CHECK(pdl::launch_consumer(
-        {dim3(1), dim3(128), 0, stream}, linear_topk_clear_done_kernel,
-        static_cast<std::int32_t*>(workspace.group_done.data),
-        static_cast<std::int32_t>(workspace.group_done.bytes() / sizeof(std::int32_t))));
-    if (workspace.secondary_groups != 0) {
-        const dim3 first_grid(static_cast<unsigned>(workspace.merge_groups),
-                              static_cast<unsigned>(workspace.columns), 1U);
-        CUDA_CHECK(pdl::launch_consumer(
-            {dim3(first_grid), dim3(kMergeThreads), 0, stream}, linear_topk_merge_kernel<false>,
-            static_cast<const std::uint64_t*>(workspace.partial_keys.data),
-            static_cast<std::uint64_t*>(workspace.group_keys.data), nullptr, nullptr, nullptr,
-            workspace.producer_groups, workspace.merge_groups));
-        CUDA_CHECK(cudaGetLastError());
-
-        const dim3 final_grid(static_cast<unsigned>(workspace.secondary_groups),
-                              static_cast<unsigned>(workspace.columns), 1U);
-        CUDA_CHECK(pdl::launch_consumer(
-            {dim3(final_grid), dim3(kMergeThreads), 0, stream}, linear_topk_merge_kernel<true>,
-            static_cast<const std::uint64_t*>(workspace.group_keys.data),
-            static_cast<std::uint64_t*>(workspace.secondary_keys.data),
-            static_cast<std::int32_t*>(workspace.group_done.data),
-            static_cast<std::int32_t*>(candidate_ids.data),
-            static_cast<float*>(candidate_scores.data), workspace.merge_groups,
-            workspace.secondary_groups));
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
-
-    const dim3 grid(static_cast<unsigned>(workspace.merge_groups),
-                    static_cast<unsigned>(workspace.columns), 1U);
-    CUDA_CHECK(pdl::launch_consumer(
-        {dim3(grid), dim3(kMergeThreads), 0, stream}, linear_topk_merge_kernel<true>,
-        static_cast<const std::uint64_t*>(workspace.partial_keys.data),
-        static_cast<std::uint64_t*>(workspace.group_keys.data),
-        static_cast<std::int32_t*>(workspace.group_done.data),
-        static_cast<std::int32_t*>(candidate_ids.data), static_cast<float*>(candidate_scores.data),
-        workspace.producer_groups, workspace.merge_groups));
-    CUDA_CHECK(cudaGetLastError());
+        {dim3(static_cast<unsigned>(workspace.slices), static_cast<unsigned>(workspace.columns)),
+         dim3(kSelectThreads), 0, stream},
+        linear_topk_select_kernel, static_cast<const std::uint64_t*>(workspace.partial_keys.data),
+        static_cast<std::uint64_t*>(workspace.slice_keys.data), workspace.producer_groups * kLinearTopK,
+        workspace.slices));
+    CUDA_CHECK(pdl::launch_consumer({dim3(static_cast<unsigned>(workspace.columns)), dim3(32), 0, stream},
+                                    linear_topk_final_kernel,
+                                    static_cast<const std::uint64_t*>(workspace.slice_keys.data),
+                                    static_cast<std::int32_t*>(candidate_ids.data),
+                                    static_cast<float*>(candidate_scores.data), workspace.slices));
 }
 
 } // namespace infernix::ops::detail
