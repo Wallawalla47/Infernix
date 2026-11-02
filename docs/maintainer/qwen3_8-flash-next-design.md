@@ -12211,9 +12211,9 @@ configuration (model-quality.md §6.7: plain decode +6.6 %, pp32768 +5.7 %).
   operations in the same order, so every lane equals them bit for bit (`test_vector_canon`: SwiGLU exhaustively over
   BF16 gates for 64 up values incl. zeros, infinities, NaN and subnormals; the quantizer on E2M1 decision points, -0,
   NaN, infinities, subnormals and saturation, 13 blocks a call). The scalar ISA keeps the scalar functions (the
-  reference the ISA test compares against). SwiGLU serves the NVFP4 CPU routes (W4A4, W4A16, two-term A4, 8-bit)
-  and the GGUF ones (exact, and the 8-bit route's AVX2/AVX-VNNI and AVX-512 variants, which gather 16 rows of a
-  column first); block FP8 keeps the scalar function (below).
+  reference the ISA test compares against). SwiGLU serves every CPU expert route: the NVFP4 ones (W4A4, W4A16,
+  two-term A4, 8-bit), GGUF (exact, and the 8-bit route's AVX2/AVX-VNNI and AVX-512 variants, which gather 16 rows of
+  a column first) and block FP8.
 - *Per-job x encode* (§19.3.44's kernels): calls of four columns or more encode each job's x once
   (`encode_nmma4_kernel`, the gate/up pass its programmatic dependent; every gate/up CTA waits for it before it ends,
   idle ones too, so the pass's completion implies the encode's), narrower ones in each gate/up CTA.
@@ -12240,9 +12240,17 @@ state, three interleaved runs each; outputs equal in every arm: same tokens, rou
 - Vector SwiGLU in the GGUF and block-FP8 routes, against the same tree's build without it (GSQ-RCO IQ3_S, all experts
   in RAM; the official FP8 artifact on the SSD tier at 96 GB of RAM): IQ3_S level, conv 236.1 -> 235.5, after 16K
   260.9 -> 260.6 (-0.1 % in each pair), struct 495.8 -> 495.5 tok/s, the startup team rates indistinguishable. FP8
-  lost: conv 53.8 -> 53.5 and struct 64.5 -> 64.1 (-0.6 %, every pair) though the team's startup column rate was
-  1.9 % higher in every run; a second block with a GGUF-only build as a third arm: GGUF and FP8 conv level (pairs
-  -0.4, +0.2, 0.0 %), struct -0.3 % (0.0, +0.4, -1.1 %), GGUF only level (conv -0.1 %, struct +0.2 %).
+  level, after a first block that lost: there conv 53.8 -> 53.5 and struct 64.5 -> 64.1 (-0.6 %, every pair) though
+  the team's startup column rate was 1.9 % higher in every run, and the new build's SSD and n-gram reads were
+  2-3 % slower in every conv pair, which the change cannot cause. A second block with a GGUF-only build as a third
+  arm: GGUF and FP8 conv level (pairs -0.4, +0.2, 0.0 %), struct -0.3 % (0.0, +0.4, -1.1 %), GGUF only level (conv
+  -0.1 %, struct +0.2 %). A third, six pairs each in alternating order: conv 54.2 both (pairs +1.0, +0.1, -0.1,
+  -0.2, -0.4, -0.3 %), struct 65.5 -> 65.4 (+1.2, -0.5, -0.2, -0.2, -0.6, -0.3 %); speeds rose through the block,
+  and with the order balanced conv +0.0 %, struct -0.1 %. All 24 pairs together lean -0.2 %, most of it the first
+  block's. FP8 decode cannot gain: its team reads records at about 61 GB/s against the 72 GB/s the RAM probe
+  measures, so its one-column work is memory-bound. Op (the GGUF CPU test's `--columns` and `--rates fp8`, extended
+  for the run to FP8 records and 4- and 8-column jobs; same-code GGUF rows varied +-4 %): one thread 2-7 % faster at
+  2-8 columns, level at one; the 16-worker team 2-6 % faster at four and eight columns.
 - Per-job x encode from four columns: never encoding lost 0.4-0.6 % on every workload, encoding at every width was
   level (+0.2 / +0.2 / -0.2 %).
 
@@ -12261,9 +12269,6 @@ state, three interleaved runs each; outputs equal in every arm: same tokens, rou
   route's prefill, -0.4 % at pp4096 on the W4A16 two-term residual route. CPU prefetch distances other than the
   default: no effect. Quantizing each distinct x column once a CPU round: about 0.2 % of a round at 1.1 us a column,
   not built.
-- *Vector SwiGLU in the block-FP8 route.* SwiGLU is about 1 % of an FP8 expert's CPU time (11 us of the 1.3 ms a
-  worker spends on one, its sums exact 128-bit integers), and FP8 decode lost in both blocks (above) while the
-  GGUF-only build was level in the second, so the loss follows the FP8 change; its cause was not found. Not kept.
 
 **The op bench's run-to-run outputs.** `infernix_offloaded_moe_wide_bench` gave different output hashes from run to
 run at every width after a process's first (4,096 after 2,048: three hashes in six runs, W4A4 and the W4A16 two-term
