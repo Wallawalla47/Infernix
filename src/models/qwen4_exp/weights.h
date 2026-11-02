@@ -131,7 +131,7 @@ struct VisionWeights {
 };
 
 struct TextWeights {
-    WeightId token_embedding; // BF16, pinned host memory
+    WeightId token_embedding; // BF16, pinned host memory (packed at load: LoadOptions::pack_bf16)
     WeightId output_head;
     // The converter's 2-bit copy of output_head (screen/output_head, q2_g64_fp16 [V, H]), bound for the
     // screened-lm-head fast path when present and the head is one it rescores (LoadOptions::lm_head_screen,

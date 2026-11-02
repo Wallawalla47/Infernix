@@ -1,5 +1,7 @@
 #include "ops/op_family.h"
 #include "core/weight.h"
+#include "core/weight_view.h"
+#include "infernix/ops/bf16_p12.h"
 #include "infernix/ops/embedding.h"
 #include "ops/op_tester.h"
 #include "core/arena.h" // PinnedHostBuffer
@@ -820,6 +822,73 @@ int test_dense() {
     return failures;
 }
 
+// bf16_p12 (BF16 packed at load) at Flash-Next's D: a table holding escapes (zeros, tiny and large weights outside a
+// row's exponent window) gives the BF16 rows bit for bit, read from device memory and from mapped pinned host memory
+// (where the Qwen4Exp embedding lives), into aligned and two-byte-aligned outputs; out-of-range ids embed zeros.
+int test_p12() {
+    constexpr std::int32_t kRows = 4096, kD = 2560;
+    std::vector<std::uint16_t> table(static_cast<std::size_t>(kRows) * kD);
+    for (std::size_t i = 0; i < table.size(); ++i) {
+        float value = std::sin(static_cast<float>(i % 7919) * 0.37f) * 0.02f;
+        if (i % 1009 == 0) value = 0.0f;
+        if (i % 1013 == 0) value *= 0x1p-30f;
+        if (i % 1019 == 0) value *= 4096.0f;
+        table[i] = f32_to_bf16(value);
+    }
+    const std::vector<std::int32_t> ids = {0, kRows - 1, 17, 17, 1009, 1, 2048, 4000};
+
+    DeviceBuffer source(table.size() * 2), scratch(ops::bf16_p12_pack_scratch_bytes(kRows)), count(4);
+    source.copy_from_host(table.data(), table.size() * 2);
+    ops::bf16_p12_count(source.p, kRows, kD, scratch.p, static_cast<std::uint32_t*>(count.p), nullptr);
+    std::uint32_t escapes = 0;
+    count.copy_to_host(&escapes, 4);
+    const WeightGeometry g = bf16_p12_geometry(kRows, kD, escapes);
+    DeviceBuffer packed(g.bytes);
+    ops::bf16_p12_pack(source.p, kRows, kD, escapes, scratch.p, packed.p, nullptr);
+    cuda_synchronize();
+    int failures = 0;
+    if (escapes == 0) {
+        std::cerr << "embedding bf16_p12: the table holds no escapes\n";
+        ++failures;
+    }
+
+    // The same planes in mapped pinned host memory.
+    PinnedHostBuffer host(g.bytes);
+    packed.copy_to_host(host.data(), g.bytes);
+    void* mapped = nullptr;
+    cuda_check(cudaHostGetDevicePointer(&mapped, host.data(), 0), "mapped table");
+
+    for (const bool pinned : {false, true}) {
+        WeightParent parent;
+        parent.geometry = g;
+        parent.data = parent.device = static_cast<const std::byte*>(pinned ? mapped : packed.p);
+        const Weight weight = native_weight(
+            WeightView{{kRows, kD}, {{&parent, 0, static_cast<std::uint64_t>(kRows) * kD}}});
+        const std::string label = std::string("embedding bf16_p12 [4096,2560] ") + (pinned ? "pinned" : "device");
+        for (const std::size_t shift : {std::size_t{0}, std::size_t{2}}) {
+            std::vector<std::uint16_t> expected(static_cast<std::size_t>(kD) * ids.size());
+            for (std::size_t t = 0; t < ids.size(); ++t) {
+                std::copy_n(table.data() + static_cast<std::size_t>(ids[t]) * kD, kD, expected.data() + t * kD);
+            }
+            GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+            device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+            GuardedDeviceBuffer output(expected.size() * 2 + shift);
+            output.fill(0x7d);
+            Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+            Tensor result(static_cast<std::byte*>(output.data()) + shift, DType::BF16,
+                          {kD, static_cast<std::int32_t>(ids.size())});
+            ops::embedding(input, weight, result, nullptr);
+            cuda_synchronize();
+            std::vector<std::uint16_t> got(expected.size());
+            cuda_check(cudaMemcpy(got.data(), result.data, got.size() * 2, cudaMemcpyDeviceToHost), "read");
+            failures += verify_exact((label + (shift ? " shifted output" : "")).c_str(), got, expected);
+            failures += output.verify_guards((label + " output").c_str());
+        }
+        failures += check_out_of_range_ids(label, weight, kD, ids);
+    }
+    return failures;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(embedding) {
@@ -835,6 +904,7 @@ INFERNIX_OP_TEST(embedding) {
         failures += test_q8();
         failures += test_q8_2048_alignment();
         failures += test_fp8();
+        failures += test_p12();
     } catch (const std::exception& error) {
         std::cerr << "embedding test exception: " << error.what() << '\n';
         return 1;

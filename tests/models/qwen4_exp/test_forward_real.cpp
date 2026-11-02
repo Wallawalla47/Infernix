@@ -679,7 +679,7 @@ bool check_screened_heads(const q4::execution::Parameters& parameters, DeviceCon
                           const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens, std::int32_t context,
                           KvCacheStorage kv) {
     if (!parameters.output_head_screen || !parameters.draft_head.rows || !parameters.draft_head.screen ||
-        (parameters.output_head_q8 && parameters.output_head_q8->is_ggml())) {
+        (parameters.output_head_weight && parameters.output_head_weight->is_ggml())) {
         throw std::invalid_argument("--screened-heads needs the proposal head, both 2-bit screens and a BF16 or Q8 head");
     }
     const auto& c       = parameters.model.config().text;
@@ -756,9 +756,9 @@ bool check_screened_heads(const q4::execution::Parameters& parameters, DeviceCon
         auto scope = work.scope();
         // The LM head: exact (the text head's projection) against screened.
         Tensor exact(exact_buffer.p, DType::FP32, {V, cols}), screened(screened_buffer.p, DType::FP32, {V, cols});
-        if (parameters.output_head_q8) {
-            ops::projection_fp32(xs, parameters.output_head_q8->weight, exact, device.stream);
-            ops::screened_head_logits(xs, Tensor{}, parameters.output_head_q8->weight, *parameters.output_head_screen, valid,
+        if (parameters.output_head_weight) {
+            ops::projection_fp32(xs, parameters.output_head_weight->weight, exact, device.stream);
+            ops::screened_head_logits(xs, Tensor{}, parameters.output_head_weight->weight, *parameters.output_head_screen, valid,
                                       policy, screened, work, device.stream);
         } else {
             const Tensor* head[] = {&parameters.output_head};

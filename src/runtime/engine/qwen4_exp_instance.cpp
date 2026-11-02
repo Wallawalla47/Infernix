@@ -550,10 +550,25 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     guard.begin();
     auto model = models::qwen4_exp::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
-    if (const std::uint64_t spilled = guard.end(dense); spilled != 0) {
+    // What the weights hold once loaded: packed projections replace the estimate with their size.
+    const std::uint64_t loaded = model->device_weight_bytes();
+    if (const std::uint64_t spilled = guard.end(loaded); spilled != 0) {
         throw std::runtime_error(std::to_string(mib(spilled)) +
                                  " MiB of the dense weights were placed in shared system memory by the driver's "
-                                 "sysmem fallback: free VRAM and start again (" + guard.readings(dense) + ")");
+                                 "sysmem fallback: free VRAM and start again (" + guard.readings(loaded) + ")");
+    }
+    if (const auto& packed = model->packed(); packed.source_bytes != 0) {
+        char line[384];
+        std::snprintf(line, sizeof(line),
+                      "packed BF16 weights: %llu MiB -> %llu MiB device + %llu MiB pinned host (bf16_p12, %llu escapes) "
+                      "in %.0f ms (counts %.0f, allocation %.0f, packing %.0f, freeing the BF16 copies %.0f); %llu MiB "
+                      "freed",
+                      mib(packed.source_bytes), mib(packed.storage.bytes), mib(packed.host_bytes),
+                      static_cast<unsigned long long>(packed.escapes), packed.seconds * 1000.0,
+                      packed.phase_seconds[0] * 1000.0, packed.phase_seconds[1] * 1000.0,
+                      packed.phase_seconds[2] * 1000.0, packed.phase_seconds[3] * 1000.0,
+                      mib(packed.source_bytes - packed.storage.bytes - packed.host_bytes));
+        report(options, DiagnosticLevel::Debug, line);
     }
     const std::uint64_t after_weights = vram->query().device_free;
 

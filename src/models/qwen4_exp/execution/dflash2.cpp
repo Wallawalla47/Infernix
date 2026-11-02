@@ -39,7 +39,7 @@ void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceA
     ops::linear(x, p.weight, out, p.policy, work, s);
 }
 
-// Token rows: BF16, or a GGUF import's IQ4_XS rows decoded exactly (as Forward embeds them).
+// Token rows: BF16 (packed at load or not), or a GGUF import's IQ4_XS rows decoded exactly (as Forward embeds them).
 void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t s, std::uint32_t* error) {
     const DeviceFault fault{.word = error, .value = kErrorTokenId};
     if (table.layout == QuantLayout::GgmlRows) {
@@ -89,8 +89,8 @@ DFlash2::DFlash2(const Parameters& parameters, const DFlash2Config& config, Prop
     const bool fused = head_ == ProposalHead::Optimized
                            ? !parameters_.draft_head.rows->is_ggml() &&
                                  parameters_.draft_head.rows->weight.qtype == QType::Q4_G64_FP16 && rows == 131072
-                           : parameters_.output_head_q8 && !parameters_.output_head_q8->is_ggml() &&
-                                 parameters_.output_head_q8->weight.qtype == QType::Q8_G32_FP16;
+                           : parameters_.output_head_weight && !parameters_.output_head_weight->is_ggml() &&
+                                 parameters_.output_head_weight->weight.qtype == QType::Q8_G32_FP16;
     if (rows != dim(config_.head_rows) || fused != config_.fused_head) {
         throw std::logic_error("Qwen4Exp DFlash2: the bound head differs from the planned one");
     }
@@ -144,7 +144,7 @@ void DFlash2::head_candidates(const Tensor& hidden, Tensor& ids, Tensor& scores)
         if (head_ == ProposalHead::Optimized) {
             ops::linear_topk(hidden, head.rows->weight, head.token_ids, ids, scores, work_, s);
         } else {
-            ops::linear_topk(hidden, parameters_.output_head_q8->weight,
+            ops::linear_topk(hidden, parameters_.output_head_weight->weight,
                              dim(parameters_.model.resources().public_token_count), ids, scores, work_, s);
         }
         return;
@@ -159,10 +159,10 @@ void DFlash2::head_candidates(const Tensor& hidden, Tensor& ids, Tensor& scores)
         } else {
             ops::projection_fp32(hidden, head.rows->weight, logits, s);
         }
-    } else if (parameters_.output_head_q8 && parameters_.output_head_q8->is_ggml()) {
-        ops::ggml_linear(hidden, parameters_.output_head_q8->ggml, logits, nullptr, 0, work_, s, ops::LinearRoutes::Exact);
-    } else if (parameters_.output_head_q8) {
-        ops::projection_fp32(hidden, parameters_.output_head_q8->weight, logits, s);
+    } else if (parameters_.output_head_weight && parameters_.output_head_weight->is_ggml()) {
+        ops::ggml_linear(hidden, parameters_.output_head_weight->ggml, logits, nullptr, 0, work_, s, ops::LinearRoutes::Exact);
+    } else if (parameters_.output_head_weight) {
+        ops::projection_fp32(hidden, parameters_.output_head_weight->weight, logits, s);
     } else {
         const Tensor* rows_tensor[] = {&parameters_.output_head};
         ops::projection_fp32(hidden, rows_tensor, logits, s);

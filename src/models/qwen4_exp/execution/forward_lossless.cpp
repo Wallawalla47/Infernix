@@ -472,8 +472,8 @@ void Forward::lossless_head(const Tensor& residuals, Tensor& logits) {
     const cudaStream_t s = device_.stream;
     auto scope           = work_.scope();
     const Tensor x       = lossless_mix(parameters_.final_mixer, residuals, nullptr);
-    if (parameters_.output_head_q8) {
-        lossless_project(x, *parameters_.output_head_q8, 0, logits.ne[0], logits, 0);
+    if (parameters_.output_head_weight) {
+        lossless_project(x, *parameters_.output_head_weight, 0, logits.ne[0], logits, 0);
     } else {
         ops::lossless_linear(x, bf16_rows(parameters_.output_head), 0, logits.ne[0], logits, 0, work_, s);
     }

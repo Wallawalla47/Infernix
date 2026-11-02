@@ -280,14 +280,15 @@ Parameters::Parameters(const Model& source, bool hc_q8) : model(source) {
     const auto& c = source.config().text;
     const auto& embedding = source.weight(w.token_embedding);
     token_embedding = with_context(embedding.name, [&] { return device_native_weight(embedding.view); });
-    if (token_embedding.qtype != QType::BF16 &&
+    if (token_embedding.qtype != QType::BF16 && token_embedding.qtype != QType::BF16_P12 &&
         !(token_embedding.layout == QuantLayout::GgmlRows && token_embedding.qtype == QType::GGML_IQ4_XS)) {
-        throw std::invalid_argument(embedding.name + ": the token embedding must be BF16 or IQ4_XS rows");
+        throw std::invalid_argument(embedding.name + ": the token embedding must be BF16 (packed or not) or IQ4_XS rows");
     }
     const auto& head = source.weight(w.output_head);
     if (!head.view.parts.empty() && (head.view.parts.front().parent->geometry.format == QType::Q8_G32_FP16 ||
+                                     head.view.parts.front().parent->geometry.format == QType::BF16_P12 ||
                                      is_ggml_matrix_layout(head.view.parts.front().parent->geometry.layout))) {
-        output_head_q8 = prepare.linear({w.output_head});
+        output_head_weight = prepare.linear({w.output_head});
     } else {
         output_head = prepare.tensor(w.output_head);
     }

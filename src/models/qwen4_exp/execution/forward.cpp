@@ -82,7 +82,7 @@ void project_ggml_split(const Tensor& x, std::span<const ops::GgmlSegment> segme
     ops::ggml_linear(x, split, parts, nullptr, 0, work, s, routes);
 }
 
-// Token rows: BF16, or a GGUF import's IQ4_XS rows decoded exactly (an id outside the vocabulary
+// Token rows: BF16 (packed at load or not), or a GGUF import's IQ4_XS rows decoded exactly (an id outside the vocabulary
 // embeds zeros and writes kErrorTokenId to `error`).
 void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t s, std::uint32_t* error) {
     const DeviceFault fault{.word = error, .value = kErrorTokenId};
@@ -93,12 +93,12 @@ void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStrea
     }
 }
 
-// FP32 logits of the text head (BF16, Q8 or a GGUF import's ggml rows) for the columns of x.
+// FP32 logits of the text head (BF16, packed BF16, Q8 or a GGUF import's ggml rows) for the columns of x.
 void text_head_logits(const Parameters& parameters, const Tensor& x, Tensor& logits, WorkspaceArena& work, cudaStream_t s) {
-    if (parameters.output_head_q8 && parameters.output_head_q8->is_ggml()) {
-        ops::ggml_linear(x, parameters.output_head_q8->ggml, logits, nullptr, 0, work, s, ops::LinearRoutes::Exact);
-    } else if (parameters.output_head_q8) {
-        ops::projection_fp32(x, parameters.output_head_q8->weight, logits, s);
+    if (parameters.output_head_weight && parameters.output_head_weight->is_ggml()) {
+        ops::ggml_linear(x, parameters.output_head_weight->ggml, logits, nullptr, 0, work, s, ops::LinearRoutes::Exact);
+    } else if (parameters.output_head_weight) {
+        ops::projection_fp32(x, parameters.output_head_weight->weight, logits, s);
     } else {
         const Tensor* head[] = {&parameters.output_head};
         ops::projection_fp32(x, head, logits, s);
@@ -109,12 +109,12 @@ void text_head_logits(const Parameters& parameters, const Tensor& x, Tensor& log
 // 2-bit screen, and each column's near-best public rows with text_head_logits' bits (a BF16 or Q8 head).
 void screened_text_head_logits(const Parameters& parameters, const Tensor& x, Tensor& logits, WorkspaceArena& work,
                                cudaStream_t s) {
-    if (!parameters.output_head_screen || (parameters.output_head_q8 && parameters.output_head_q8->is_ggml())) {
+    if (!parameters.output_head_screen || (parameters.output_head_weight && parameters.output_head_weight->is_ggml())) {
         throw std::logic_error("Qwen4Exp forward: a screened head round needs the head's screen and a BF16 or Q8 head");
     }
     const std::int32_t valid = dim(parameters.model.resources().public_token_count);
-    if (parameters.output_head_q8) {
-        ops::screened_head_logits(x, Tensor{}, parameters.output_head_q8->weight, *parameters.output_head_screen, valid,
+    if (parameters.output_head_weight) {
+        ops::screened_head_logits(x, Tensor{}, parameters.output_head_weight->weight, *parameters.output_head_screen, valid,
                                   kScreenedHeadPolicy, logits, work, s);
     } else {
         ops::screened_head_logits(x, parameters.output_head, Weight{}, *parameters.output_head_screen, valid,
@@ -214,6 +214,8 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
     std::size_t bytes = 0;
     bytes += w * t * bf * 3;                                  // residual, normalized, mix logits
     bytes += (c.hc.rank + c.hc.streams) * t * (bf + 4) + c.hc.rank * t * bf;
+    // A packed mixer's matrices decoded for a call past its fused route (ops::hyper_connection_mix).
+    if (columns > 16) { bytes += (2 * std::size_t(c.hc.rank) + c.hc.streams) * w * bf + 512; }
     bytes += h * t * bf * 4;                                  // x, y, embedding, final
     bytes += std::size_t(c.ple.embed_dim) * t * bf * 2 + (w + h) * t * bf + w * t * bf * 2;
     bytes += std::size_t(c.gdn.conv_channels()) * t * bf * 2 + std::size_t(c.gdn.value_width()) * t * bf * 4;
@@ -1034,12 +1036,26 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         const bool whole_chain = T == 1;
         constexpr std::size_t kChainWarm = 40ULL << 20, kInputWarm = 16ULL << 20;
         std::array<std::pair<const void*, std::size_t>, 16> chain{};
-        std::size_t spans = 0;
+        std::size_t spans = 0, queued = 0;
+        const std::size_t budget = whole_chain ? kChainWarm : ~std::size_t{0};
         const auto add = [&](const void* data, std::size_t bytes) {
-            if (spans < chain.size()) { chain[spans++] = {data, bytes}; }
+            if (spans < chain.size()) {
+                chain[spans++] = {data, bytes};
+                queued += std::min(bytes, budget - queued);
+            }
         };
         // A linear's weights, at most `cap` bytes of them.
         const auto add_linear = [&](const LinearParameters& linear, std::int32_t k, std::size_t cap) {
+            if (linear.weight.qtype == QType::BF16_P12) {
+                // bf16_p12: the same leading rows of the code and exponent planes (two code bytes to one), as many
+                // as the cap and the chain's budget leave room for.
+                const std::size_t room = std::min(cap, budget - queued);
+                const std::size_t rows =
+                    std::min(static_cast<std::size_t>(linear.weight.n), room / (static_cast<std::size_t>(k) * 3 / 2));
+                add(linear.weight.qdata, rows * k);
+                add(linear.weight.qhigh, rows * k / 2);
+                return;
+            }
             if (linear.weight.qtype == QType::FP8_E4M3FN_G32_E8M0) {
                 // MXFP8: every stage of its route reads codes and group scales together, and the scale
                 // plane follows the codes, so it warms first (1/32 of the code bytes).

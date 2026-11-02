@@ -52,6 +52,11 @@ struct LoadOptions {
     // (runtime/expert_offload/drafter_pool.h), where the model can pool them: Qwen4Exp, and Qwen3.5 with offloaded
     // experts, each with its measured slot count (Config::mtp_expert_slots). False: the bank is device-resident.
     bool mtp_expert_pool = false;
+    // Qwen4Exp off the lossless route: the BF16 weights whose every reader takes bf16_p12 are packed losslessly at
+    // load (core/weight.h), and their BF16 copies freed; with --a8-activations the hyper-connection mixers stay BF16
+    // (a GGUF import repacks them to Q8, Parameters::hc_q8).
+    bool pack_bf16  = false;
+    bool pack_mixers = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -133,7 +138,9 @@ struct LoadOptions {
             // verification decides alone (the fast route, and the reproducible route, whose verification is
             // width-invariant and sampling Gumbel-max). No speculation is lossless.
             .mtp_expert_pool = !options.lossless && options.purpose == EnginePurpose::Generation &&
-                               options.speculative.backend == SpeculativeBackend::Mtp};
+                               options.speculative.backend == SpeculativeBackend::Mtp,
+            .pack_bf16       = architecture == Architecture::Qwen4Exp && !options.lossless,
+            .pack_mixers     = architecture == Architecture::Qwen4Exp && !options.lossless && !options.a8_activations};
 }
 
 } // namespace infernix::models

@@ -75,6 +75,10 @@ void hyper_connection_repack_q8(Weight& w, void* scratch, cudaStream_t stream);
 /// The scratch hyper_connection_repack_q8 needs for `w` (BF16 Contiguous [n, k]); 0 when it cannot repack it.
 [[nodiscard]] std::size_t hyper_connection_repack_q8_scratch_bytes(const Weight& w);
 
+/// Whether hyper_connection_mix takes a bf16_p12 W_down or W_up [n, k] (BF16 packed at load, include/infernix/ops/
+/// bf16_p12.h): its fused route reads them through their codec (the BF16 weights' bits); wider calls decode them into
+/// the workspace for the BF16 steps (the same bits again).
+[[nodiscard]] bool hyper_connection_bf16_p12_supported(std::int32_t n, std::int32_t k) noexcept;
 /// The workspace hyper_connection_mix needs for every T in [1, max_tokens].
 [[nodiscard]] std::size_t hyper_connection_mix_workspace_capacity_bytes(
     const Weight& down, const Weight& up, LinearPolicy policy, std::int32_t streams,

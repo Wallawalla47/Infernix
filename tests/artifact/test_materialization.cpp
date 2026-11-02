@@ -252,6 +252,34 @@ void pinned_block(DeviceContext& device) {
     require(backing.pinned_bytes_range().data() == parent.data, "the pinned range is not the block's host bytes");
 }
 
+// A transient device object (Binder::mark_device_transient: a representation the caller derives from it, then
+// frees): planned and placed in the second arena, uploaded as the main arena's objects are, and gone after
+// release_transient, its memory back to the device.
+void transient_arena(DeviceContext& device) {
+    constexpr std::size_t bytes = 3ULL * 64 * 1024 * 1024 + 1024;
+    Fixture fixture;
+    write_pattern_artifact(fixture, bytes);
+    Reader reader(fixture.entry);
+    const ObjectHandle large = reader.find("large");
+    Binder binder(reader);
+    (void)binder.parameter("large", {bytes / 2});
+    binder.mark_device_transient(large);
+    auto plan = std::move(binder).finish();
+    require(plan.device_objects.empty() && plan.device_capacity_bytes == 0 && plan.transient_objects.size() == 1 &&
+                plan.transient_capacity_bytes == bytes,
+            "a transient object was planned in the main arena");
+    auto backing = materialize(reader, std::move(plan), device);
+    require(backing.stats().device_object_count == 1 && backing.has_device(large),
+            "a transient object was not materialized");
+    require(device_holds_pattern(backing.device_parent(large).data, bytes), "a transient object's bytes differ");
+    std::size_t before = 0, after = 0, total = 0;
+    CUDA_CHECK(cudaMemGetInfo(&before, &total));
+    backing.release_transient();
+    CUDA_CHECK(cudaMemGetInfo(&after, &total));
+    require(!backing.has_device(large), "a released transient object kept its device parent");
+    require(after >= before + bytes - (32ULL << 20), "releasing the transient arena did not free its memory");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -277,6 +305,7 @@ int main(int argc, char** argv) {
         infernix::test::materialization_cuda_errors(device);
         staging_reuse(device);
         pinned_block(device);
+        transient_arena(device);
         std::cout << "artifact materialization checks passed\n";
         return 0;
     } catch (const std::exception& error) {

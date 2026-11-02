@@ -545,7 +545,9 @@ const char* kv_name(KvCacheStorage kv) {
 DenseKernels dense_kernels(QType qtype) noexcept {
     switch (qtype) {
     case QType::Q8_G32_FP16: return DenseKernels::Q8;
-    case QType::BF16: return DenseKernels::Bf16;
+    // bf16_p12 decodes to the BF16 weights and runs the BF16 kernels' arithmetic on them.
+    case QType::BF16:
+    case QType::BF16_P12: return DenseKernels::Bf16;
     case QType::FP8_E4M3FN_ROW_BF16: return DenseKernels::Fp8Row;
     case QType::FP8_E4M3FN_G32_E8M0: return DenseKernels::Mxfp8;
     case QType::NVFP4: return DenseKernels::Nvfp4;

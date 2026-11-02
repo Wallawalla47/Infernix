@@ -45,6 +45,10 @@ struct MaterializationPlan {
     std::uint64_t prior_read_bytes      = 0;
     std::uint64_t owned_value_bytes     = 0;
     std::vector<DevicePlacement> device_objects;
+    // Device objects of the second arena, which MaterializedArtifact::release_transient frees
+    // (Binder::mark_device_transient).
+    std::uint64_t transient_capacity_bytes = 0;
+    std::vector<DevicePlacement> transient_objects;
     std::vector<HostPlacement> host_objects;
     std::uint64_t pinned_capacity_bytes = 0;
     std::vector<PinnedPlacement> pinned_objects;
@@ -139,6 +143,11 @@ public:
 
     [[nodiscard]] const MaterializationStats& stats() const noexcept { return stats_; }
 
+    // Frees the transient arena (MaterializationPlan::transient_objects): those objects lose their
+    // device parents, so no view may still point at them. The caller orders every device access to
+    // them before this call.
+    void release_transient();
+
 private:
     friend MaterializedArtifact materialize(const Reader&, MaterializationPlan&&, DeviceContext&,
                                             const StartupObserver*, std::unique_ptr<EvictableWeightPool>);
@@ -160,11 +169,14 @@ private:
     void bind_host_objects(const Reader& reader, std::vector<HostPlacement>& placements);
 
     std::unique_ptr<DeviceArena> arena_;
+    std::unique_ptr<DeviceArena> transient_;
+    std::vector<ObjectHandle> transient_objects_;
     std::unique_ptr<RegisteredHostBuffer> pinned_;
     std::unique_ptr<EvictableWeightPool> eviction_pool_;
     // materialize_geometry: the address ranges the device and pinned objects are bound in (no
     // memory behind them).
     std::unique_ptr<AddressReservation> geometry_device_;
+    std::unique_ptr<AddressReservation> geometry_transient_;
     std::unique_ptr<AddressReservation> geometry_pinned_;
     std::vector<ObjectStorage> objects_;
     StreamSource stream_source_;

@@ -97,6 +97,12 @@ void Binder::mark_device_evictable(ObjectHandle object, std::uint32_t evict_rank
     demand.evict_rank = std::max(demand.evict_rank, evict_rank);
 }
 
+void Binder::mark_device_transient(ObjectHandle object) {
+    auto& demand = demands_.at(object.index);
+    if (!demand.device) { throw ArtifactError("a transient object requires a device demand"); }
+    demand.transient = true;
+}
+
 void Binder::require_pinned(ObjectHandle object, std::uint64_t alignment) {
     reader_.validate_object(object);
     const auto& geometry = reader_.geometry(object);
@@ -198,7 +204,17 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
     plan.owned_value_bytes = owned_value_bytes_;
     for (std::size_t i = 0; i < demands_.size(); ++i) {
         auto& demand = demands_[i];
-        if (demand.device && demand.evict_rank == 0) {
+        if (demand.transient && demand.evict_rank != 0) {
+            throw ArtifactError("a transient object cannot be ranked for eviction");
+        }
+        if (demand.device && demand.transient) {
+            const ObjectHandle handle{i};
+            const auto& geometry = reader_.geometry(handle);
+            const auto offset =
+                align_up(plan.transient_capacity_bytes, demand.alignment, "transient offset");
+            plan.transient_objects.push_back({handle, offset, geometry.bytes, demand.alignment});
+            plan.transient_capacity_bytes = checked_add(offset, geometry.bytes, "transient capacity");
+        } else if (demand.device && demand.evict_rank == 0) {
             const ObjectHandle handle{i};
             const auto& geometry = reader_.geometry(handle);
             const auto offset =
