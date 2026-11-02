@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <stdexcept>
+#include <utility>
 
 namespace infernix::models::qwen3_5::detail {
 
@@ -198,6 +199,41 @@ PagedKVCacheView ProgramImpl::mtp_kv_view(const SequenceState& state) const {
                ? decoder->mtp_cache()->execution_view(
                      backend_kv_addresses->execution_row(*state.kv->backend))
                : PagedKVCacheView{};
+}
+
+namespace {
+
+// The packed BF16 flags of a sequence's text and backend execution rows (null where none is bound).
+std::array<std::int32_t*, 2> unpackable_flags_of(const SequenceState& state, const PagedKVCache& text,
+                                                 const KVAddressSpaceStore& text_addresses, const PagedKVCache* backend,
+                                                 const KVAddressSpaceStore* backend_addresses) noexcept {
+    std::array<std::int32_t*, 2> flags{};
+    if (!state.kv) { return flags; }
+    if (const std::int32_t row = text_addresses.bound_row(state.kv->text); row >= 0) { flags[0] = text.unpackable(row); }
+    if (backend != nullptr && backend_addresses != nullptr && state.kv->backend) {
+        if (const std::int32_t row = backend_addresses->bound_row(*state.kv->backend); row >= 0) {
+            flags[1] = backend->unpackable(row);
+        }
+    }
+    return flags;
+}
+
+} // namespace
+
+void ProgramImpl::clear_unpackable(const SequenceState& state) const noexcept {
+    for (std::int32_t* flag : unpackable_flags_of(state, decoder->text_kv, *text_kv_addresses, backend_kv_cache(),
+                                                  backend_kv_addresses.get())) {
+        if (flag != nullptr) { *flag = 0; }
+    }
+}
+
+bool ProgramImpl::take_unpackable(const SequenceState& state) const noexcept {
+    bool set = false;
+    for (std::int32_t* flag : unpackable_flags_of(state, decoder->text_kv, *text_kv_addresses, backend_kv_cache(),
+                                                  backend_kv_addresses.get())) {
+        if (flag != nullptr) { set = std::exchange(*flag, 0) != 0 || set; }
+    }
+    return set;
 }
 
 void ProgramImpl::set_device_i32(Tensor& tensor, std::int32_t value) {

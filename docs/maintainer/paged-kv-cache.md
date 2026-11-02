@@ -272,6 +272,8 @@ where:
 - the INT8-G64 scale plane uses \(X=D/64\);
 - the FP8-E4M3FN-row256 scale plane uses \(X=1\);
 - the NVFP4-G16 code plane uses packed U8 \(X=D/2\), and its scale plane uses U8 \(X=D/16\);
+- the packed BF16 code plane uses U8 \(X=1.5D\) (a row's sign-and-fraction bytes and exponent nibbles), and its
+  scale plane holds the row's 8-byte side record, U8 \(X=8\);
 - \(H\) is the number of KV heads;
 - \(N_{physical}\) is the physical page count of that pool.
 
@@ -303,6 +305,7 @@ The physical payload per token/head of the D256 Main/MTP profiles is:
 | profile | K code + scale | V code + scale | K+V |
 |---|---:|---:|---:|
 | BF16 | 512 B | 512 B | 1024 B |
+| packed BF16 | 384 B + 8 B | 384 B + 8 B | 784 B |
 | INT8-G64 | 256 B + 8 B | 256 B + 8 B | 528 B |
 | FP8-E4M3FN-row256 | 256 B + 2 B | 256 B + 2 B | 516 B |
 | NVFP4-G16 | 128 B + 16 B | 128 B + 16 B | 288 B |
@@ -313,7 +316,12 @@ The physical payload per token/head of the D256 Main/MTP profiles is:
 The K/V code and scale planes have their own dtype, leading extent and group size; they still share
 page-group identity, frontier and lifetime. The capacity curve, the prefix cache's Host copies and
 the memory summary are all computed from this typed plane inventory; `2 * vector_bytes` must not be
-used in place of K8V4's asymmetric byte count.
+used in place of K8V4's asymmetric byte count. Packed BF16 holds BF16's values in 23 % fewer bytes (784 against 1024),
+so the same memory holds 1.31 times the tokens and attention reads 392 bytes a row instead of 512. A fixed-size
+lossless row cannot hold every row (pigeonhole): a row with more values outside its exponent window than its side
+record holds has no packed form, and the request that appended it fails (runtime::PendingRowFailure::UnpackableKv,
+withdrawing what it published); no row of 38 million in the 27B's and 35B-A3B's KV over 41K-83K-token prompts had one
+(candidates §41).
 
 ### 4.4 Logical position domain
 

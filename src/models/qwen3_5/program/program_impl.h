@@ -601,6 +601,12 @@ public:
     [[nodiscard]] std::int32_t* nonfinite_flag(std::uint32_t lane) const noexcept {
         return static_cast<std::int32_t*>(nonfinite_flags.data()) + lane;
     }
+    // Packed BF16 KV (--kv-dtype bf16p): one flag per execution table row of the text cache, then of the backend
+    // cache, which an append sets when a row has no packed form (PagedKVLayerView::unpackable). Cleared when a request
+    // is bound to its rows; a set flag fails the request at its next commit (runtime::PendingRowFailure::UnpackableKv).
+    std::optional<PinnedHostBuffer> unpackable_flags;
+    void clear_unpackable(const SequenceState& sequence) const noexcept;
+    [[nodiscard]] bool take_unpackable(const SequenceState& sequence) const noexcept;
 
     VisionHandoffState vision_handoff;
     std::array<SequenceState, kMaximumConcurrency> sequences;

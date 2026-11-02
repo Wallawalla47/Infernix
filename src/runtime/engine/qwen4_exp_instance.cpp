@@ -139,6 +139,11 @@ void validate(const EngineOptions& options) {
             throw std::invalid_argument("lossless generation takes bf16 KV and no --expert-tail-skip");
         }
     }
+    if (options.kv_cache == KvCacheStorage::Bf16Packed) {
+        // QSA's sparse readers take the bf16 rows directly; packed rows would save nothing there (QSA reads at most
+        // the indexer's budget of keys a query).
+        throw std::invalid_argument("--kv-dtype bf16p is Qwen3.5's: Qwen3.8-Flash-Next takes bf16 or a quantized KV");
+    }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }

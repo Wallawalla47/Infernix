@@ -18,6 +18,10 @@ struct Bf16KvCacheView {
     // Optional per-row ancestor masks of speculative verification trees ([B][W]; see
     // causal_softmax_attention).
     const std::uint32_t* tree_masks = nullptr;
+    // Packed BF16 storage (KvCacheStorage::Bf16Packed): each row's 8-byte side record (ops/kv_cache/bf16p_codec.cuh);
+    // null for the bf16 storage.
+    const std::uint8_t* key_side   = nullptr;
+    const std::uint8_t* value_side = nullptr;
 };
 
 using Bf16KvReadView  = Bf16KvCacheView<false>;
@@ -27,6 +31,7 @@ template <bool Writable>
 Bf16KvCacheView<Writable> bf16_kv_cache_view(const PagedKVBatchLayerView& cache,
                                              const Tensor* valid = nullptr,
                                              const Tensor* rows  = nullptr) {
+    const bool packed = cache.storage == KvCacheStorage::Bf16Packed;
     return {static_cast<typename Bf16KvCacheView<Writable>::Key*>(cache.k_pages.data),
             static_cast<typename Bf16KvCacheView<Writable>::Value*>(cache.v_pages.data),
             static_cast<const std::int32_t*>(cache.block_tables.data),
@@ -34,7 +39,10 @@ Bf16KvCacheView<Writable> bf16_kv_cache_view(const PagedKVBatchLayerView& cache,
             rows ? static_cast<const std::int32_t*>(rows->data) : nullptr,
             cache.block_tables.ne[0],
             cache.head_dim,
-            cache.num_kv_heads};
+            cache.num_kv_heads,
+            nullptr,
+            packed ? static_cast<const std::uint8_t*>(cache.k_scale_pages.data) : nullptr,
+            packed ? static_cast<const std::uint8_t*>(cache.v_scale_pages.data) : nullptr};
 }
 
 } // namespace infernix::ops::detail

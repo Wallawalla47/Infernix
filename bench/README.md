@@ -86,7 +86,7 @@ infernix_bench --weights <artifact.ninfer>
           [--grammar-file <path> | --json-schema-file <path> | --json-object | --regex <pattern> | --choice <text> ...]
           [--mixed-constraints]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2>] [--use-original-int8-prefill-kernel]
+          [--kv-dtype <bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2>] [--use-original-int8-prefill-kernel]
           [--use-original-nvfp4-prefill-kernel] [--prefill-split-workspace-mib <n>]
           [--reproducible] [--fast-path <name>]...
           [--spec <mtp|dflash|dflash2|auto> --draft-tokens <n|auto>] [--lm-head-draft]

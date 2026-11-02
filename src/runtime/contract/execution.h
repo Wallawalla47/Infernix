@@ -36,6 +36,11 @@ enum class PendingRowFailure : std::uint8_t {
     // the row's tokens are placeholders. The Program withdraws the prefix-cache entries the
     // request published (hybrid-prefix-cache-spec §7.8): its state may be non-finite too.
     NonFiniteLogits,
+    // The packed BF16 KV storage (--kv-dtype bf16p) met a K or V row of the request with no
+    // packed form (more values outside its exponent window than the row's record holds): its KV
+    // is not the bf16 storage's, so its tokens are not either. The Program withdraws what the
+    // request published, as for NonFiniteLogits.
+    UnpackableKv,
 };
 
 namespace testing {

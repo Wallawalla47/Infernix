@@ -52,6 +52,10 @@ enum class KvCacheStorage : std::uint8_t {
     Vq2,
     // Rotated 4-bit Lloyd-Max K codes, 2-bit vector V codes and the same exact recent-key window.
     Q4KeyVq2Value,
+    // BFloat16's K and V values packed losslessly to 12 bits a value and an 8-byte side record a row
+    // (ops/kv_cache/bf16p_codec.cuh): 23 % fewer bytes than BFloat16; a request appending a row with no
+    // packed form fails.
+    Bf16Packed,
 };
 
 // The vocabulary head's logits (EngineOptions::logits_dtype), which the sampler, greedy argmax, draft
@@ -79,6 +83,8 @@ enum class LogitsDtype : std::uint8_t {
         return "vq2";
     case KvCacheStorage::Q4KeyVq2Value:
         return "k4v2";
+    case KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     return "unknown";
 }

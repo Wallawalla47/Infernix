@@ -18,7 +18,22 @@ and V, the share of complete 512-value blocks that qualify, in the page's storag
           value), every value of the block within 15 of its channel's base;
 
 with the average bits per value each gives (12 for a qualifying block, 16 for a raw one, plus the
-metadata above and a 4-byte offset per page and KV head). The page size is 64 slots.
+metadata above and a 4-byte offset per page and KV head), and
+
+  row     UZ-40's bf16_p12 form chosen at append time, with no calibration: one base per head row (a slot's
+          head_dim values of one KV head), the lowest of the 15-binade windows holding most of the row's
+          nonzero exponents; each value stores its sign and seven fraction bits plus a 4-bit exponent code,
+          and the values outside the window (zeros among them) are the row's escapes, kept in E inline slots
+          of 3 bytes (column and BF16 bits). A row with more than E escapes stays raw. Reported for E = 2, 4,
+          6 and 8: the share of rows that fit and the bits a value of a fixed-size row (12 + (8 + 24 E) /
+          head_dim), and of the whole plane with the raw rows in a pool of their own;
+
+  bf16p   the shipped --kv-dtype bf16p (KvCacheStorage::Bf16Packed): the row rule with a 14-binade window of
+          normal exponents, zeros and subnormals coded without escapes, and E = 6 escapes in an 8-byte side
+          record (every D256 row 384 + 8 bytes); a row with more escapes has no packed form, and the request
+          that appends it fails: the share of rows that pack, for E = 2, 4, 6 and 8;
+
+The page size is 64 slots.
 
 V is stored as FP16 on the default route (--kv-dtype bf16: the append converts V's BF16 source with
 round-to-nearest). The 12-bit form keeps BF16's low byte, so it would store that BF16 source and
@@ -44,6 +59,8 @@ import numpy as np
 
 BLOCK = 512
 WINDOW = 15  # e - base <= 15: sixteen binades
+ROW_WINDOW = 15  # the row rule's codes 0-14 (15 escapes)
+ROW_SLOTS = (2, 4, 6, 8)
 PAGE = 64
 TARGET = 0.80  # PB-01 builds only if at least 80 % of K and V bytes qualify
 
@@ -59,8 +76,23 @@ class Count:
     spans: list = field(default_factory=list)  # per-plane span histograms (max e - min e), 0..255
     block_meta_bits: float = 0.0
     channel_meta_bits: float = 0.0
+    rows: int = 0
+    row_ok: dict = field(default_factory=lambda: {e: 0 for e in ROW_SLOTS})
+    row_escapes: int = 0  # escapes over every live row
+    # The shipped bf16p rule: one of the 16 codes marks exponent 0 (zeros and subnormals: the code byte is then the
+    # value), so they cost no escape, and the window of normal exponents is 14 binades.
+    row_ok_z: dict = field(default_factory=lambda: {e: 0 for e in ROW_SLOTS})
+    row_escapes_z: int = 0
+    dim: int = 0
 
     def add(self, other: "Count") -> None:
+        self.rows += other.rows
+        for e in ROW_SLOTS:
+            self.row_ok[e] += other.row_ok[e]
+            self.row_ok_z[e] += other.row_ok_z[e]
+        self.row_escapes += other.row_escapes
+        self.row_escapes_z += other.row_escapes_z
+        self.dim = other.dim or self.dim
         self.blocks += other.blocks
         self.block_ok += other.block_ok
         self.channel_ok += other.channel_ok
@@ -79,6 +111,18 @@ class Count:
             return float("nan")
         payload = 12.0 * ok + 16.0 * (self.blocks - ok)
         return payload / self.blocks + meta_bits / (self.blocks * BLOCK)
+
+    def row_bits(self, slots: int) -> tuple[float, float]:
+        """Bits a value of a fixed-size row, and of the plane with raw rows pooled apart."""
+        if not self.rows:
+            return (float("nan"), float("nan"))
+        fixed = 12.0 + (8.0 + 24.0 * slots) / self.dim
+        share = self.row_ok[slots] / self.rows
+        return fixed, share * fixed + (1.0 - share) * (16.0 + 32.0 / self.dim)
+
+    def bf16p_share(self, slots: int) -> float:
+        """The share of rows with a packed form under the shipped rule with `slots` escapes."""
+        return self.row_ok_z[slots] / self.rows if self.rows else float("nan")
 
     def span_percentiles(self) -> tuple[int, int, int]:
         if not self.spans:
@@ -131,6 +175,20 @@ def count_plane(path: Path, dtype: str, pages: int, heads: int, dim: int, tokens
     within = (exponent.astype(np.int16) - channel_base[:, :, None, :].astype(np.int16)) <= WINDOW
     channel_ok = within.reshape(pages, heads, blocks_per_page, BLOCK).all(axis=-1)
 
+    # The row rule: per (page, head, slot) row, the window [b, b + 14] (b in 1..240) holding most nonzero exponents.
+    row_live = np.broadcast_to(slot_live[:, None, :], (pages, heads, PAGE))
+    flat = exponent.reshape(-1, dim)[row_live.reshape(-1)]
+    histogram = np.zeros((flat.shape[0], 256), dtype=np.int32)
+    np.add.at(histogram, (np.repeat(np.arange(flat.shape[0]), dim), flat.reshape(-1).astype(np.int64)), 1)
+    histogram[:, 0] = 0  # zeros (and subnormals) always escape
+    histogram[:, 255] = 0
+    cumulative = np.concatenate([np.zeros((flat.shape[0], 1), dtype=np.int32), np.cumsum(histogram, axis=1)], axis=1)
+    windows = cumulative[:, 1 + ROW_WINDOW : 241 + ROW_WINDOW] - cumulative[:, 1:241]  # bases 1..240
+    escapes = dim - windows.max(axis=1)
+    zeros = np.count_nonzero(flat == 0, axis=1)
+    windows_z = cumulative[:, ROW_WINDOW : 240 + ROW_WINDOW] - cumulative[:, 1:241]  # [b, b + 13], b in 1..240
+    escapes_z = dim - zeros - windows_z.max(axis=1)
+
     span = (highest.astype(np.int16) - lowest.astype(np.int16))[block_live]
     live_blocks = int(np.count_nonzero(block_live))
     groups = pages * heads  # one 4-byte offset per page and KV head
@@ -144,12 +202,20 @@ def count_plane(path: Path, dtype: str, pages: int, heads: int, dim: int, tokens
         spans=[np.bincount(span, minlength=256)[:256]],
         block_meta_bits=live_blocks * 8.0 + groups * 32.0,
         channel_meta_bits=groups * (dim * 8.0 + 32.0) + live_blocks * 1.0,
+        rows=int(flat.shape[0]),
+        row_ok={e: int(np.count_nonzero(escapes <= e)) for e in ROW_SLOTS},
+        row_escapes=int(escapes.sum()),
+        row_ok_z={e: int(np.count_nonzero(escapes_z <= e)) for e in ROW_SLOTS},
+        row_escapes_z=int(escapes_z.sum()),
+        dim=dim,
     )
 
 
 HEADER = (
     f"{'layer':>6} {'model':>5} {'plane':>5} {'blocks':>9} {'zero%':>6} {'span p50/p90/p99':>17}"
     f" {'block ok%':>9} {'bits':>6} {'channel ok%':>11} {'bits':>6}"
+    f" {'esc/row':>7} " + " ".join(f"{f'row E{e} ok%':>11} {'fixed':>6} {'pooled':>6}" for e in ROW_SLOTS)
+    + f" {'bf16p esc/row':>13} " + " ".join(f"{f'bf16p E{e} ok%':>13}" for e in ROW_SLOTS)
 )
 
 
@@ -160,6 +226,14 @@ def line(layer: str, model_layer: str, plane: str, count: Count) -> str:
         f"{layer:>6} {model_layer:>5} {plane:>5} {count.blocks:>9} {zero:>6.2f} {f'{p50}/{p90}/{p99}':>17}"
         f" {100.0 * count.share(count.block_ok):>9.2f} {count.bits(count.block_ok, count.block_meta_bits):>6.2f}"
         f" {100.0 * count.share(count.channel_ok):>11.2f} {count.bits(count.channel_ok, count.channel_meta_bits):>6.2f}"
+        f" {count.row_escapes / count.rows if count.rows else float('nan'):>7.3f} "
+        + " ".join(
+            f"{100.0 * count.row_ok[e] / count.rows if count.rows else float('nan'):>11.2f}"
+            f" {count.row_bits(e)[0]:>6.2f} {count.row_bits(e)[1]:>6.2f}"
+            for e in ROW_SLOTS
+        )
+        + f" {count.row_escapes_z / count.rows if count.rows else float('nan'):>13.3f} "
+        + " ".join(f"{100.0 * count.bf16p_share(e):>13.4f}" for e in ROW_SLOTS)
     )
     if count.uncertain:
         text += f"  source unrecoverable: {100.0 * count.uncertain / count.values:.4f}% of values"
@@ -229,6 +303,11 @@ def main() -> int:
                         "block_bits": count.bits(count.block_ok, count.block_meta_bits),
                         "channel_ok": count.channel_ok,
                         "channel_bits": count.bits(count.channel_ok, count.channel_meta_bits),
+                        "rows": count.rows,
+                        "row_escapes": count.row_escapes,
+                        **{f"row_ok_e{e}": count.row_ok[e] for e in ROW_SLOTS},
+                        "bf16p_escapes": count.row_escapes_z,
+                        **{f"bf16p_ok_e{e}": count.row_ok_z[e] for e in ROW_SLOTS},
                         "unrecoverable_values": count.uncertain,
                     }
                 )

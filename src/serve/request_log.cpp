@@ -128,6 +128,8 @@ const char* kv_cache_json_name(infernix::KvCacheStorage storage) {
         return "vq2";
     case infernix::KvCacheStorage::Q4KeyVq2Value:
         return "k4v2";
+    case infernix::KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     return "unknown";
 }

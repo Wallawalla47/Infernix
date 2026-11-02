@@ -121,6 +121,11 @@ struct PagedKVStorageLayout {
                     {DType::U8, 64, DType::FP16, 1}};
         }
         break;
+    case KvCacheStorage::Bf16Packed:
+        // A row is 384 bytes of codes and exponent nibbles; the scale plane holds its 8-byte side record
+        // (ops/kv_cache/bf16p_codec.cuh).
+        if (head_dim == kD256KVCacheHeadDim) { return symmetric({DType::U8, 384, DType::U8, 8}); }
+        break;
     }
     throw std::invalid_argument("unsupported paged KV-cache storage geometry");
 }

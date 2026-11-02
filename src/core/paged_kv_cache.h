@@ -50,6 +50,9 @@ struct PagedKVLayerView {
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
     PagedKVWindowView window;
+    // Packed BF16 storage: the sequence's flag (device-visible host memory), which an append sets to 1 when a row
+    // has no packed form (ops/kv_cache/bf16p_codec.cuh); null where nothing reads it.
+    std::int32_t* unpackable = nullptr;
 };
 
 /** Non-owning multi-sequence view consumed by batched growing-cache Ops. */
@@ -63,6 +66,8 @@ struct PagedKVBatchLayerView {
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
     PagedKVWindowView window;
+    // Packed BF16 storage: one flag per execution table row, as PagedKVLayerView::unpackable.
+    std::int32_t* unpackable = nullptr;
 };
 
 /** Rebinds one checked single-sequence table row as a one-row batched view. */
