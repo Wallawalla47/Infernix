@@ -12248,10 +12248,13 @@ every reader takes bf16_p12 (`packable_objects`, `load.cpp`):
   the slice count only) with 16 K slices at T <= 32, the stream MMA to 128, the packed TMA MMA beyond. Op: 1.00-1.06x
   at T <= 8, 0.93x at 16, 0.87-0.94x at 17-32, 0.60-0.66x at 33-128, against the BF16 routes.
 - *Text head* [248320, 2560] (recipe A, FP8, FP4-Local; not while its 2-bit screen is bound, whose rescore reads BF16
-  rows): `ops::projection_fp32` reads it through the direct MMA with 4 K slices, 64 columns a pass (width-invariant).
+  rows; the screen is bound only with a KV format where screened-lm-head is qualified in some configuration, so
+  FP4-Local's head packs at the default BF16 KV, candidates IP-01): `ops::projection_fp32` reads it through the direct
+  MMA with 4 K slices, 64 columns a pass (width-invariant).
   Op: 562-577 against 705 us at T = 1-16 (1.24x), 589-853 against 2,325-3,048 us at T = 24-64.
-- *HC mixers* W_down + inject [324, 10240] and W_up [10240, 320] (recipe A, FP8, FP4-Local, IQ3_S; not under
-  `--a8-activations`, where a GGUF import repacks them to Q8): the fused route (T <= 16) reads them through a
+- *HC mixers* W_down + inject [324, 10240] and W_up [10240, 320] (recipe A, FP8, FP4-Local, IQ3_S; not on a GGUF
+  import under `--a8-activations`, which repacks them to Q8; the other artifacts' mixers pack under it too, candidates
+  IP-02): the fused route (T <= 16) reads them through a
   bf16_p12 codec that decodes each chunk once, right after the weight loads and before the programmatic-dependency wait
   (the producer's tail hides it; a chunk with escapes reads its row's escape range there), so the dot products widen
   BF16 words as the BF16 codec's do and x and inject keep the BF16 matrices' bits. Wider calls decode both matrices into the

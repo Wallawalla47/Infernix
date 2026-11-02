@@ -44,6 +44,10 @@ struct FastPathConfiguration {
 // Whether the path passed the acceptance gate in this configuration (the registry, section 6.7).
 [[nodiscard]] bool fast_path_qualified(FastPath path, const FastPathConfiguration& configuration);
 
+// Whether screened-lm-head is qualified in some configuration with this KV format: elsewhere it is never selected
+// unless asked for, so the loader need not bind the LM head's screen (which keeps the head from being packed).
+[[nodiscard]] bool screened_lm_head_qualified_with(KvCacheStorage kv) noexcept;
+
 struct FastPathSelection {
     FastPathConfiguration configuration;
     // In kFastPaths order.

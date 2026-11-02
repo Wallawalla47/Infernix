@@ -38,7 +38,8 @@ struct LoadOptions {
     std::filesystem::path draft_model;
     // Qwen4Exp: the artifact's 2-bit screens (--screen-heads), each bound when present for its consumer (an
     // artifact without them loads as before): the MTP drafter's proposal head (Generation with --spec mtp
-    // --lm-head-draft) and the LM head (Generation with fast paths, where screened-lm-head may be selected).
+    // --lm-head-draft) and the LM head (Generation with fast paths, where screened-lm-head may be selected; the Qwen4Exp
+    // instance clears it with a KV format where the path is qualified in no configuration).
     // screened_lm_head (the fast path asked for as a candidate) needs the LM head's screen: an artifact
     // without it is refused.
     bool proposal_head_screen = false;
@@ -53,10 +54,11 @@ struct LoadOptions {
     // experts, each with its measured slot count (Config::mtp_expert_slots). False: the bank is device-resident.
     bool mtp_expert_pool = false;
     // Qwen4Exp off the lossless route: the BF16 weights whose every reader takes bf16_p12 are packed losslessly at
-    // load (core/weight.h), and their BF16 copies freed; with --a8-activations the hyper-connection mixers stay BF16
-    // (a GGUF import repacks them to Q8, Parameters::hc_q8).
-    bool pack_bf16  = false;
-    bool pack_mixers = false;
+    // load (core/weight.h), and their BF16 copies freed.
+    bool pack_bf16 = false;
+    // Qwen4Exp --a8-activations with fast paths: a GGUF import's hyper-connection matrices are repacked to Q8 at load
+    // (execution::Parameters' hc_q8), so its mixers stay BF16 for that repack; every other artifact's mixers pack.
+    bool hc_q8_repack = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -140,7 +142,8 @@ struct LoadOptions {
             .mtp_expert_pool = !options.lossless && options.purpose == EnginePurpose::Generation &&
                                options.speculative.backend == SpeculativeBackend::Mtp,
             .pack_bf16       = architecture == Architecture::Qwen4Exp && !options.lossless,
-            .pack_mixers     = architecture == Architecture::Qwen4Exp && !options.lossless && !options.a8_activations};
+            .hc_q8_repack    = architecture == Architecture::Qwen4Exp && options.a8_activations && !options.lossless &&
+                            options.fast_paths};
 }
 
 } // namespace infernix::models

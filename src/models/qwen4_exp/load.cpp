@@ -404,11 +404,11 @@ bool packable_embedding(const artifact::Reader& reader, const TextConfig& c) {
 // ops::linear (execution/forward.cpp project(), whose L2 warm reads bf16_p12 planes too) — each layer's attention or
 // GDN input, control and output projections, the PLE key and value projections and the MTP layer's attention — and
 // the text head, which ops::projection_fp32 reads (unless its 2-bit screen is bound: the screened head's exact rescore
-// reads BF16 rows) — and, with LoadOptions::pack_mixers, the hyper-connection mixers' down, inject and up matrices,
-// which ops::hyper_connection_mix reads. An artifact object is packed (LoadOptions::pack_bf16) when every parameter on
-// it is one of them and device-resident, and it is a BF16 [n, k] matrix its Ops take packed: a projection with tuned
-// packed routes (ops::bf16_p12_linear_tuned), a head of a shape ops::bf16_p12_projection_fp32_supported takes, a mixer
-// matrix ops::hyper_connection_bf16_p12_supported takes.
+// reads BF16 rows) — and the hyper-connection mixers' down, inject and up matrices, which ops::hyper_connection_mix
+// reads (with `mixers`: not on a GGUF import, whose matrices LoadOptions::hc_q8_repack repacks to Q8). An artifact
+// object is packed (LoadOptions::pack_bf16) when every parameter on it is one of them and device-resident, and it is a
+// BF16 [n, k] matrix its Ops take packed: a projection with tuned packed routes (ops::bf16_p12_linear_tuned), a head of
+// a shape ops::bf16_p12_projection_fp32_supported takes, a mixer matrix ops::hyper_connection_bf16_p12_supported takes.
 std::vector<artifact::ObjectHandle> packable_objects(const TextWeights& w, const std::vector<PendingWeight>& pending,
                                                      const artifact::Reader& reader, bool mixers) {
     std::vector<bool> linear(pending.size(), false), head(pending.size(), false), mixer(pending.size(), false);
@@ -876,7 +876,8 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     }
     out->pending = std::move(bindings.weights);
     if (options.pack_bf16) {
-        out->packed_objects = packable_objects(out->weights, out->pending, reader, options.pack_mixers);
+        out->packed_objects = packable_objects(out->weights, out->pending, reader,
+                                               !(options.hc_q8_repack && out->config.text.ggml_weights));
         for (const auto object : out->packed_objects) {
             binder.mark_device_transient(object);
             out->packed_bytes += packed_estimate(reader.geometry(object));

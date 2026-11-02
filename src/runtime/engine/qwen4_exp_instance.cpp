@@ -186,8 +186,9 @@ std::vector<std::filesystem::path> dflash2_companions_beside(const std::filesyst
 
 Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> source, const EngineOptions& options)
     // --a8-activations: a GGUF import's hyper-connection matrices repacked to Q8 at load (execution::Parameters'
-    // hc_q8).
-    : model(std::move(source)), parameters(*model, options.a8_activations && !options.lossless && options.fast_paths),
+    // hc_q8; the loader left them unpacked for it).
+    : model(std::move(source)),
+      parameters(*model, models::load_options(options, models::Architecture::Qwen4Exp).hc_q8_repack),
       frontend(models::qwen3_5::make_frontend(model->resources(),
                                               {.chat_template_path      = options.chat_template_path,
                                                .architecture            = models::Architecture::Qwen4Exp,
@@ -215,6 +216,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const auto qwen4_load = [&](bool stream_experts) {
         auto load           = models::load_options(options, models::Architecture::Qwen4Exp);
         load.stream_experts = stream_experts;
+        // The LM head's screen is bound only with a KV format where screened-lm-head can be selected: a bound screen
+        // keeps the head from being packed (its exact rescore reads BF16 rows), so at BF16 KV, where the path is never
+        // selected, FP4-Local's head packs instead (candidates IP-01).
+        load.lm_head_screen = load.lm_head_screen && models::qwen4_exp::screened_lm_head_qualified_with(options.kv_cache);
         return load;
     };
     auto plan = models::qwen4_exp::plan_load(reader, qwen4_load(false));

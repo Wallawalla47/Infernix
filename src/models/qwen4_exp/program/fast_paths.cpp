@@ -709,6 +709,14 @@ bool fast_path_qualified(FastPath path, const FastPathConfiguration& configurati
     });
 }
 
+bool screened_lm_head_qualified_with(KvCacheStorage kv) noexcept {
+    // Packed BF16 KV is qualified as bf16 (fast_path_configuration).
+    const KvCacheStorage qualified = kv == KvCacheStorage::Bf16Packed ? KvCacheStorage::BFloat16 : kv;
+    return std::any_of(kQualified.begin(), kQualified.end(), [&](const Qualification& entry) {
+        return entry.path == FastPath::ScreenedLmHead && entry.configuration.kv == qualified;
+    });
+}
+
 bool FastPathSelection::selected(FastPath path) const noexcept {
     return std::find(paths.begin(), paths.end(), path) != paths.end();
 }
