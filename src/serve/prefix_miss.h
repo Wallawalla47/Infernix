@@ -5,7 +5,6 @@
 
 #include "infernix/types.h"
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -21,7 +20,7 @@ namespace infernix::serve {
 // Tokens [first, first + token_ids.size()) of one context and their text. The text always holds
 // valid UTF-8: a window cut between two bytes of one character replaces that character's bytes with
 // U+FFFD, and a decoder that rejects the window outright costs this window's text alone, which then
-// holds one U+FFFD (the tracker counts both under `diagnostic_failures`).
+// holds one U+FFFD (and its settlement says the diagnosis failed).
 struct PrefixMissWindow {
     std::uint32_t first = 0;
     std::vector<infernix::TokenId> token_ids;
@@ -49,6 +48,13 @@ struct PrefixMiss {
 
 [[nodiscard]] const char* prefix_miss_kind_name(PrefixMiss::Kind kind) noexcept;
 
+// What settling a request recorded: its miss record, if any, and whether its own diagnosis gave up
+// somewhere (a window text the decoder rejected, or a std::exception it absorbed).
+struct PrefixMissSettlement {
+    std::optional<PrefixMiss> miss;
+    bool diagnostic_failed = false;
+};
+
 class PrefixMissTracker {
 public:
     // Joins the ids of a window into the text to record. It returns the artifact's bytes for them,
@@ -62,20 +68,16 @@ public:
                                std::uint32_t min_tokens = 4096, std::uint32_t window = 64);
 
     // A settled request: its miss record, if any, against the earlier contexts; then its own
-    // context joins them. A diagnosis that cannot be carried out (a window text that could not be
-    // decoded, a comparison that threw) costs the record it was building, never the settled request
-    // and never its own context; prefer settle_prefix_miss, which also absorbs a std::exception
-    // escaping here.
-    [[nodiscard]] std::optional<PrefixMiss> settle(std::uint64_t engine_request_id,
-                                                   std::span<const infernix::TokenId> prompt,
-                                                   std::span<const infernix::TokenId> output,
-                                                   std::uint32_t reused_tokens,
-                                                   std::uint32_t computed_prefill_tokens);
-
-    // Window texts the tracker could not decode and diagnoses it gave up on.
-    [[nodiscard]] std::uint64_t diagnostic_failures() const noexcept {
-        return diagnostic_failures_.load(std::memory_order_relaxed);
-    }
+    // context joins them. The diagnosis is optional and never fails the finished generation it only
+    // describes: whatever it cannot carry out (a window text the decoder rejects, a std::exception)
+    // costs the record it was building and sets `diagnostic_failed`, and no std::exception escapes.
+    // The flag is this request's own: settling holds the tracker's lock throughout. Anything a
+    // decoder throws that is not a std::exception is a programming error and propagates.
+    [[nodiscard]] PrefixMissSettlement settle(std::uint64_t engine_request_id,
+                                              std::span<const infernix::TokenId> prompt,
+                                              std::span<const infernix::TokenId> output,
+                                              std::uint32_t reused_tokens,
+                                              std::uint32_t computed_prefill_tokens);
 
 private:
     struct Context {
@@ -83,11 +85,12 @@ private:
         std::vector<infernix::TokenId> tokens;
     };
 
-    [[nodiscard]] PrefixMissWindow window(std::span<const infernix::TokenId> tokens,
-                                          std::size_t at) const;
+    [[nodiscard]] PrefixMissWindow window(std::span<const infernix::TokenId> tokens, std::size_t at,
+                                          bool& failed) const;
     [[nodiscard]] std::optional<PrefixMiss> diagnose(std::span<const infernix::TokenId> prompt,
                                                      std::uint32_t reused_tokens,
-                                                     std::uint32_t computed_prefill_tokens) const;
+                                                     std::uint32_t computed_prefill_tokens,
+                                                     bool& failed) const;
 
     Detokenize detokenize_;
     std::size_t capacity_;
@@ -95,26 +98,6 @@ private:
     std::uint32_t window_;
     std::mutex mutex_;
     std::deque<Context> contexts_;
-    mutable std::atomic<std::uint64_t> diagnostic_failures_{0};
 };
-
-// What settling a request recorded: its miss, if any, and whether the diagnosis gave up somewhere
-// (a window text it could not decode, or a std::exception it absorbed). Nothing else escapes this
-// function: the optional diagnosis never reaches the finished generation it only describes, while a
-// failure stays observable through the flag and the tracker's own count. Anything a decoder throws
-// that is not a std::exception is a programming error and keeps propagating.
-//
-// The flag counts what the tracker abandoned while this request settled; concurrent requests share
-// one tracker, so a request can report another's abandoned window (never miss its own).
-struct PrefixMissSettlement {
-    std::optional<PrefixMiss> miss;
-    bool diagnostic_failed = false;
-};
-
-[[nodiscard]] PrefixMissSettlement
-settle_prefix_miss(PrefixMissTracker& tracker, std::uint64_t engine_request_id,
-                   std::span<const infernix::TokenId> prompt,
-                   std::span<const infernix::TokenId> output, std::uint32_t reused_tokens,
-                   std::uint32_t computed_prefill_tokens);
 
 } // namespace infernix::serve
