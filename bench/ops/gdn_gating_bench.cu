@@ -22,7 +22,7 @@ static DeviceBuffer make_f32(std::size_t n, std::uint32_t seed) {
         h[i]          = 2.0f * u - 1.0f;
     }
     DeviceBuffer d(n * sizeof(float));
-    cudaMemcpy(d.p, h.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+    upload(d.p, h.data(), n * sizeof(float));
     return d;
 }
 

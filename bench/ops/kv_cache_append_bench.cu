@@ -388,10 +388,8 @@ public:
         for (std::int32_t page = 0; page < static_cast<std::int32_t>(host_table.size()); ++page) {
             host_table[static_cast<std::size_t>(page)] = page;
         }
-        CUDA_CHECK(cudaMemcpy(positions_.p, host_positions.data(), positions_.bytes,
-                              cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(block_table_.p, host_table.data(), block_table_.bytes,
-                              cudaMemcpyHostToDevice));
+        bench::upload(positions_.p, host_positions.data(), positions_.bytes);
+        bench::upload(block_table_.p, host_table.data(), block_table_.bytes);
     }
 
     void launch(cudaStream_t stream) {
@@ -500,26 +498,22 @@ public:
                 host_positions[static_cast<std::size_t>(b * tokens + token)] = start + token;
             }
         }
-        CUDA_CHECK(cudaMemcpy(positions_.p, host_positions.data(), positions_.bytes,
-                              cudaMemcpyHostToDevice));
+        bench::upload(positions_.p, host_positions.data(), positions_.bytes);
         if (!cyclic) {
             std::vector<std::int32_t> host_table(kPagedPrefixCapacity / kPagedKVPageSize);
             for (std::int32_t page = 0; page < static_cast<std::int32_t>(host_table.size());
                  ++page) {
                 host_table[static_cast<std::size_t>(page)] = page;
             }
-            CUDA_CHECK(cudaMemcpy(block_table_.p, host_table.data(), block_table_.bytes,
-                                  cudaMemcpyHostToDevice));
+            bench::upload(block_table_.p, host_table.data(), block_table_.bytes);
         }
         const std::vector<std::int32_t> host_counts(static_cast<std::size_t>(batch), committed);
-        CUDA_CHECK(cudaMemcpy(commit_count_.p, host_counts.data(), commit_count_.bytes,
-                              cudaMemcpyHostToDevice));
+        bench::upload(commit_count_.p, host_counts.data(), commit_count_.bytes);
         std::vector<std::int32_t> host_selectors(static_cast<std::size_t>(batch));
         for (std::int32_t b = 0; b < batch; ++b) {
             host_selectors[static_cast<std::size_t>(b)] = cyclic ? b : 0;
         }
-        CUDA_CHECK(cudaMemcpy(selector_.p, host_selectors.data(), selector_.bytes,
-                              cudaMemcpyHostToDevice));
+        bench::upload(selector_.p, host_selectors.data(), selector_.bytes);
     }
 
     void launch(cudaStream_t stream) {

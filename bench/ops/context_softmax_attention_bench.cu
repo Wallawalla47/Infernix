@@ -214,18 +214,16 @@ public:
           output_tensor_(output_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens, 1}),
           context_view_(make_context_view(context_k_, context_v_, block_table_, context)),
           envelope_{static_cast<std::uint32_t>(context), static_cast<std::uint32_t>(context)} {
-        CUDA_CHECK(
-            cudaMemcpy(context_length_.p, &context_, sizeof(context_), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(valid_.p, &tokens_, sizeof(tokens_), cudaMemcpyHostToDevice));
+        bench::upload(context_length_.p, &context_, sizeof(context_));
+        bench::upload(valid_.p, &tokens_, sizeof(tokens_));
         const std::int32_t table_row = 0;
-        CUDA_CHECK(cudaMemcpy(table_row_.p, &table_row, sizeof(table_row), cudaMemcpyHostToDevice));
+        bench::upload(table_row_.p, &table_row, sizeof(table_row));
         std::vector<std::int32_t> table(
             static_cast<std::size_t>(paged_context(context) / kPagedKVPageSize));
         for (std::int32_t page = 0; page < static_cast<std::int32_t>(table.size()); ++page) {
             table[static_cast<std::size_t>(page)] = page;
         }
-        CUDA_CHECK(
-            cudaMemcpy(block_table_.p, table.data(), block_table_.bytes, cudaMemcpyHostToDevice));
+        bench::upload(block_table_.p, table.data(), block_table_.bytes);
     }
 
     void launch(cudaStream_t stream) {

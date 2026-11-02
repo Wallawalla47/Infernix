@@ -169,8 +169,13 @@ void rg16_row_sums(CpuIsa isa, const std::uint8_t* matrix, int blocks, int rg_be
                    const canon::A4Block* const* acts, int ncols, std::int64_t* out,
                    int prefetch_bytes = kDefaultPrefetchBytes);
 
-// Quantizes a BF16 vector of `n` (a multiple of 16) elements to A4 blocks.
-void quantize_a4(const std::uint16_t* v, int n, float input_scale, canon::A4Block* out);
+// Quantizes a BF16 vector of `n` (a multiple of 16) elements to A4 blocks: canon::quantize_a4_block
+// per block, eight blocks at a time in AVX2 on the vector ISAs, bit for bit.
+void quantize_a4(CpuIsa isa, const std::uint16_t* v, int n, float input_scale, canon::A4Block* out);
+
+// h[i] = canon::swiglu_bf16(g[i], u[i]) for i < n, eight at a time in AVX2 on the vector ISAs, bit
+// for bit (the SwiGLU of every NVFP4 CPU route).
+void swiglu_bf16_n(CpuIsa isa, const std::uint16_t* g, const std::uint16_t* u, int n, std::uint16_t* h);
 
 // Phase A for 16-intermediate units [unit_begin, unit_end): gate/up rows, SwiGLU, and A4 of h
 // with the down input scale. `x_gate[col]` / `x_up[col]` are x quantized with the gate and up

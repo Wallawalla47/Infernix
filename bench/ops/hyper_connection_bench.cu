@@ -124,7 +124,7 @@ struct BenchWeight {
         std::vector<__half> s(static_cast<std::size_t>(rows) * (padded / 32));
         for (auto& v : s) { v = __float2half(std::exp2(lg(rng))); }
         scales = DeviceBuffer(s.size() * sizeof(__half));
-        CUDA_CHECK(cudaMemcpy(scales.p, s.data(), scales.bytes, cudaMemcpyHostToDevice));
+        bench::upload(scales.p, s.data(), scales.bytes);
         weight.qtype       = QType::Q8_G32_FP16;
         weight.layout      = QuantLayout::RowSplit;
         weight.qdata       = data.p;
@@ -200,8 +200,8 @@ int main(int argc, char** argv) {
             const auto timing = bench::measure_graph(graph, context.stream, options.warmup, options.repeat);
             const double per = 1.0 / options.layers;
             std::vector<std::uint8_t> bytes(x.bytes + inject.bytes);
-            CUDA_CHECK(cudaMemcpy(bytes.data(), x.p, x.bytes, cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(bytes.data() + x.bytes, inject.p, inject.bytes, cudaMemcpyDeviceToHost));
+            bench::read_back(bytes.data(), x.p, x.bytes);
+            bench::read_back(bytes.data() + x.bytes, inject.p, inject.bytes);
             std::printf("T=%d | per call median %7.2f us (min %7.2f, p95 %7.2f) | %6.0f GB/s | output fnv1a %016llx\n",
                         columns, timing.median_us * per, timing.min_us * per, timing.p95_us * per,
                         (down.bytes + up.bytes) / (timing.median_us * per * 1e-6) / 1e9,

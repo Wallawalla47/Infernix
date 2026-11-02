@@ -491,12 +491,23 @@ int main() {
     failures += check(!q::fast_path_applies(FastPath::Q5KSplitMma,
                                             {24, ActivationClass::A4, KvCacheStorage::Int8Group64}, options),
                       "q5-ksplit-mma must not apply to 4-bit-activation artifacts");
+    // Both run on the KV formats below INT8's precision too (the owner's decision, 2026-11-01), not on BF16.
     failures += check(q::fast_path_qualified(FastPath::Q5KSplitMma, groupwise) &&
                           !q::fast_path_qualified(FastPath::Q5KSplitMma,
                                                   {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}),
                       "q5-ksplit-mma is qualified where it was measured faster only");
     failures += check(q::fast_path_qualified(FastPath::Fp16GdnState, groupwise),
                       "fp16-gdn-state is qualified on the groupwise 27B with INT8 KV");
+    for (const KvCacheStorage kv : {KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+                                    KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                                    KvCacheStorage::Q4KeyVq2Value}) {
+        failures += check(q::fast_path_qualified(FastPath::Q5KSplitMma, {24, ActivationClass::A16, kv, true}) &&
+                              q::fast_path_qualified(FastPath::Fp16GdnState, {24, ActivationClass::A16, kv, true}) &&
+                              q::fast_path_qualified(FastPath::Fp16GdnState, {24, ActivationClass::A4, kv}),
+                          "q5-ksplit-mma and fp16-gdn-state are qualified on the KV formats below INT8's precision");
+    }
+    failures += check(!q::fast_path_qualified(FastPath::Fp16GdnState, {16, ActivationClass::A16, KvCacheStorage::Vq2}),
+                      "fp16-gdn-state stays off the 35B-A3B");
     failures += check(!q::couples_requests(FastPath::Q5KSplitMma),
                       "q5-ksplit-mma must not couple requests");
 

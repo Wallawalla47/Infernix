@@ -563,20 +563,16 @@ public:
                     mapping_ == PageMapping::Identity ? linear : 2 * linear + 1;
             }
         }
-        CUDA_CHECK(cudaMemcpy(positions_.p, host_positions.data(), positions_.bytes,
-                              cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(block_table_.p, host_table.data(), block_table_.bytes,
-                              cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(valid_columns_.p, valid_columns.data(), valid_columns_.bytes,
-                              cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(table_rows_.p, table_rows.data(), table_rows_.bytes,
-                              cudaMemcpyHostToDevice));
+        bench::upload(positions_.p, host_positions.data(), positions_.bytes);
+        bench::upload(block_table_.p, host_table.data(), block_table_.bytes);
+        bench::upload(valid_columns_.p, valid_columns.data(), valid_columns_.bytes);
+        bench::upload(table_rows_.p, table_rows.data(), table_rows_.bytes);
         // Populate every represented cache row through the public codec, outside measurement.
         // A row view selects its own table while all physical planes remain shared.
         std::vector<std::int32_t> initial_positions(padded_);
         for (int pos = 0; pos < padded_; ++pos) initial_positions[pos] = pos;
         DeviceBuffer dp(std::size_t(padded_) * 4);
-        CUDA_CHECK(cudaMemcpy(dp.p, initial_positions.data(), dp.bytes, cudaMemcpyHostToDevice));
+        bench::upload(dp.p, initial_positions.data(), dp.bytes);
         Tensor positions(dp.p, DType::I32, {padded_});
         for (int row = 0; row < batch_; ++row) {
             auto initial_k =

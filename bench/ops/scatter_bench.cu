@@ -37,7 +37,7 @@ void run(std::int32_t d, std::int32_t vision_tokens, bool control, bool profile_
     std::vector<std::int32_t> indices(static_cast<std::size_t>(vision_tokens));
     std::iota(indices.begin(), indices.end(), 1);
     DeviceBuffer device_indices(indices.size() * sizeof(std::int32_t));
-    cudaMemcpy(device_indices.p, indices.data(), device_indices.bytes, cudaMemcpyHostToDevice);
+    upload(device_indices.p, indices.data(), device_indices.bytes);
     Tensor source_tensor(source.p, DType::BF16, {d, vision_tokens});
     Tensor destination_tensor(destination.p, DType::BF16, {d, prompt_tokens});
     Tensor indices_tensor(device_indices.p, DType::I32, {vision_tokens});

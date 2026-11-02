@@ -198,7 +198,7 @@ private:
 // `wide` is the W4A16 wide route the workspace is carved for: a call of at most eight columns has no wide job, so
 // kA4Residual (FP4-Local's default) changes only the workspace its narrow kernels read.
 // `shared_input` (W4A4): every expert shares its gate and up input scales, as NVIDIA's exports do, and the source says
-// so (MoeExpertSource::a4_shared_input), so calls of at most eight columns take the tensor-core narrow kernels;
+// so (MoeExpertSource::a4_shared_input), so every call's narrow jobs take the tensor-core narrow kernels;
 // otherwise every third expert keeps separate scales and the one-column kernels run.
 void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                 moe::ExpertActivation activation = moe::ExpertActivation::kA4,
@@ -468,10 +468,10 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     };
     // Outputs with the CPU engine's bits: every W4A16 output (its wide route is exact too), and the
     // W4A4 narrow route's (design §8.5): an expert with at most eight columns, or one whose gate and
-    // up projections keep separate input scales (the fixture's every third expert).
+    // up projections keep separate input scales (the fixture's every third expert, unless shared_input).
     std::vector<std::uint8_t> exact_outputs(static_cast<std::size_t>(top_k) * columns);
     for (std::size_t i = 0; i < exact_outputs.size(); ++i) {
-        exact_outputs[i] = a16 || expert_columns[ids[i]] <= moe::kMaxCpuColumns || ids[i] % 3 == 0;
+        exact_outputs[i] = a16 || expert_columns[ids[i]] <= moe::kMaxCpuColumns || (!shared_input && ids[i] % 3 == 0);
     }
     std::vector<std::uint16_t> placed;
     // The fork stream and its events, for the one-pass decode/verification route.
@@ -1633,8 +1633,9 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
         test_layer(512, 512, 10, 29);  // a short prompt's call: ~10 columns per expert, hundreds of narrow jobs
         test_layer(512, 2048, 10, 31); // a wider call: x published from thousands of columns
         {
-            // W4A4 experts sharing their input scales: calls of at most eight columns on the tensor-core narrow
-            // kernels (one to five columns per job, misses staged, forked and CPU-served), wider calls as before.
+            // W4A4 experts sharing their input scales: every call's narrow jobs on the tensor-core narrow kernels
+            // (one to eight columns per job, misses staged, forked and CPU-served; wider calls' wide jobs on the wide
+            // route): two-request rounds (16 columns), eight lanes (64) and a short prompt's call (512).
             constexpr auto kA4 = moe::ExpertActivation::kA4;
             constexpr auto kNarrow = moe::NarrowA16::kExact;
             constexpr auto kWide = moe::WideA16::kExact;
@@ -1643,6 +1644,9 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
             test_layer(9, 5, 3, 217, kA4, kNarrow, kWide, true);
             test_layer(9, 4, 3, 219, kA4, kNarrow, kWide, true);
             test_layer(9, 12, 3, 223, kA4, kNarrow, kWide, true);
+            test_layer(48, 16, 10, 225, kA4, kNarrow, kWide, true);
+            test_layer(96, 64, 10, 227, kA4, kNarrow, kWide, true);
+            test_layer(512, 512, 10, 229, kA4, kNarrow, kWide, true);
         }
         if (g_idle_checks != IdleChecks::kOnly) {
             test_tail_skip(48, 1, 10, 7, 401);  // decode: one column, Strata's default rank

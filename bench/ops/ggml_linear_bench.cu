@@ -247,7 +247,7 @@ void run_shape(const Shape& shape, const Options& options, bench::L2FlushBuffer*
             if (base == 0.0) { base = timing.median_us; }
             const double tops = 2.0 * rows * shape.k * static_cast<double>(tokens) / (timing.median_us * 1e-6) / 1e12;
             std::vector<std::uint8_t> bytes(out.bytes);
-            CUDA_CHECK(cudaMemcpy(bytes.data(), out.p, out.bytes, cudaMemcpyDeviceToHost));
+            bench::read_back(bytes.data(), out.p, out.bytes);
             std::uint64_t hash = 1469598103934665603ULL;
             for (const std::uint8_t b : bytes) { hash = (hash ^ b) * 1099511628211ULL; }
             std::printf("%-14s N=%6d K=%5d T=%5d route=%-5s median %10.1f us (min %10.1f, p95 %10.1f) | %7.1f TOPS | %.3fx the "

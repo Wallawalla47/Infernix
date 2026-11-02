@@ -155,9 +155,9 @@ public:
         const std::int32_t anchor = 42;
         const std::int32_t length = 4096;
         const std::int32_t valid  = block_size;
-        CUDA_CHECK(cudaMemcpy(anchor_.p, &anchor, sizeof(anchor), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(length_.p, &length, sizeof(length), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(valid_.p, &valid, sizeof(valid), cudaMemcpyHostToDevice));
+        bench::upload(anchor_.p, &anchor, sizeof(anchor));
+        bench::upload(length_.p, &length, sizeof(length));
+        bench::upload(valid_.p, &valid, sizeof(valid));
     }
 
     void launch(cudaStream_t stream) {

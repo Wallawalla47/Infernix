@@ -247,7 +247,7 @@ float bf16_value(std::uint16_t bits) {
 
 std::vector<std::uint16_t> download(const DeviceBuffer& buffer, std::size_t elements) {
     std::vector<std::uint16_t> host(elements);
-    CUDA_CHECK(cudaMemcpy(host.data(), buffer.p, elements * 2, cudaMemcpyDeviceToHost));
+    bench::read_back(host.data(), buffer.p, elements * 2);
     return host;
 }
 
@@ -481,8 +481,8 @@ void sweep_shape(const Shape& shape, const Options& options, std::FILE* csv,
                 form.run(xt, ot, ProjectionRoute::Tall, stream);
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 std::vector<float> a(static_cast<std::size_t>(shape.n) * t), b(a.size());
-                CUDA_CHECK(cudaMemcpy(a.data(), logits.p, a.size() * 4, cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(b.data(), other.p, b.size() * 4, cudaMemcpyDeviceToHost));
+                bench::read_back(a.data(), logits.p, a.size() * 4);
+                bench::read_back(b.data(), other.p, b.size() * 4);
                 const bool same = std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
                 const auto narrow = time_route([&](cudaStream_t s) { form.run(xt, lt, ProjectionRoute::Narrow, s); },
                                                flush, stream, options);

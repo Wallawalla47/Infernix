@@ -301,11 +301,12 @@ void gate_up_units_a16(CpuIsa isa, const ExpertShape& shape, const std::uint8_t*
         // Unit u is row groups 2u, 2u+1: rows 32u..32u+31, gate_i at even rows, up_i at odd rows.
         rg16_row_sums_a16(isa, record, shape.gate_up_blocks(), 2 * u, 2 * u + 2, x, ncols, s, prefetch_bytes);
         for (int c = 0; c < ncols; ++c) {
+            std::uint16_t g[16], p[16];
             for (int i = 0; i < 16; ++i) {
-                const std::uint16_t g = canon::a16_row_output(s[static_cast<std::size_t>(2 * i) * ncols + c], x_exp[c], scales.alpha_gate);
-                const std::uint16_t p = canon::a16_row_output(s[static_cast<std::size_t>(2 * i + 1) * ncols + c], x_exp[c], scales.alpha_up);
-                h[c][16 * u + i] = canon::swiglu_bf16(g, p);
+                g[i] = canon::a16_row_output(s[static_cast<std::size_t>(2 * i) * ncols + c], x_exp[c], scales.alpha_gate);
+                p[i] = canon::a16_row_output(s[static_cast<std::size_t>(2 * i + 1) * ncols + c], x_exp[c], scales.alpha_up);
             }
+            swiglu_bf16_n(isa, g, p, 16, &h[c][16 * u]);
         }
     }
 }

@@ -22,11 +22,13 @@
 
 #include "core/cpu_topology.h"
 #include "core/host_load.h"
+#include "core/temporary_switches.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <thread>
@@ -191,6 +193,10 @@ void ProgramImpl::measure_cpu_rate_settled(std::uint64_t record_stride) {
                       switched ? "INFERNIX_TMP_LINK_SHARE" : "the share form", pcie_divisor());
     } else {
         std::snprintf(kept, sizeof(kept), "1/%d", pcie_divisor());
+    }
+    if (const auto [wide_share, wide_from] = wide_link_share(); wide_from > 0) {
+        const std::size_t used = std::strlen(kept);
+        std::snprintf(kept + used, sizeof(kept) - used, ", %d/256 from %d columns", wide_share, wide_from);
     }
     char text[640];
     std::snprintf(text, sizeof(text),

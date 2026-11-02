@@ -118,7 +118,7 @@ DeviceBuffer varied(std::size_t n, unsigned seed) {
         v    = __float2bfloat16(static_cast<float>(seed >> 8) * (2.0f / 16777216.0f) - 1.0f);
     }
     DeviceBuffer buffer(n * 2);
-    CUDA_CHECK(cudaMemcpy(buffer.p, values.data(), n * 2, cudaMemcpyHostToDevice));
+    bench::upload(buffer.p, values.data(), n * 2);
     return buffer;
 }
 

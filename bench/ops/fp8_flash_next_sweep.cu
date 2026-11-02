@@ -295,7 +295,7 @@ float bf16_value(std::uint16_t bits) {
 template <class T>
 std::vector<T> download(const void* device, std::size_t elements) {
     std::vector<T> host(elements);
-    CUDA_CHECK(cudaMemcpy(host.data(), device, elements * sizeof(T), cudaMemcpyDeviceToHost));
+    bench::read_back(host.data(), device, elements * sizeof(T));
     return host;
 }
 
@@ -438,8 +438,8 @@ void checkpoint_like(const Weight& weight, DeviceBuffer& x, int n, int k, std::s
         const std::uint32_t r = next();
         bits = static_cast<std::uint16_t>(((r >> 31) << 15) | ((107U + (r >> 8) % 25U) << 7) | (r & 0x7FU));
     }
-    CUDA_CHECK(cudaMemcpy(const_cast<void*>(weight.qdata), codes.data(), codes.size(), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(x.p, values.data(), values.size() * 2, cudaMemcpyHostToDevice));
+    bench::upload(const_cast<void*>(weight.qdata), codes.data(), codes.size());
+    bench::upload(x.p, values.data(), values.size() * 2);
 }
 
 void sweep_shape(const Shape& shape, const std::vector<Candidate>& list, const Options& options, std::FILE* csv,

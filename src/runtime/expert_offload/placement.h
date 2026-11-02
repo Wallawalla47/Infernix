@@ -35,7 +35,8 @@ using temporary_switches::OffloadSwitches;
 // real code continued greedily with MTP auto decoded fastest at 64/256 (C t 2.06) after 1,536, 8,192 and 32,768
 // context tokens, 8.0-12.7 % faster than the divisor rule's 1/3 (M / 3), level with 43/256, 7-8 % slower at
 // 107/256. Flash-Next's Program takes it for NVFP4 W4A16 banks (FP4-Local 67/256: struct +6.3 %, short context
-// +5.4 %, after 16K +0.1 %, 2026-10-30) and keeps its divisor rule for the others.
+// +5.4 %, after 16K +0.1 %, 2026-10-30) and keeps its divisor rule for the others; calls of eight columns or more of
+// every NVFP4 bank keep 51/256 there (its wide_link_share, 2026-11-02).
 inline constexpr double kDecodeLinkWeight = 1.46;
 [[nodiscard]] inline std::int32_t decode_link_share_256(double link_bytes_per_second, double cpu_expert_rate,
                                                         double record_bytes) noexcept {

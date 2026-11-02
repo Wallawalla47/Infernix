@@ -174,6 +174,11 @@ struct MoeCpuChannel {
     // pcie_divisor (a share in 256ths: Strata's measured link share, a temporary A/B of the Flash-Next
     // design §19.3.12 divisor rule). One-column calls with a one-column divisor keep theirs.
     std::int32_t pcie_share             = 0;
+    // Calls of at least wide_share_from columns (0: none) keep (misses * wide_share) >> 8 on the stage instead (a
+    // share in 256ths): wide verification rounds, whose CPU experts cost less a column than the rules' one-column
+    // rate implies (Flash-Next's Program: NVFP4 banks 51/256 from eight columns).
+    std::int32_t wide_share             = 0;
+    std::int32_t wide_share_from        = 0;
     // One-column calls (plain decode) use this divisor instead (0: pcie_divisor). When
     // one_column_divisor_device is set, they read it there at execution instead (a device I32 the
     // caller rewrites between rounds, so captured graphs follow it: Qwen4Exp's plain decode by
