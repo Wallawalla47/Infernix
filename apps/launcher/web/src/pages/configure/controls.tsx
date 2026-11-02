@@ -221,6 +221,7 @@ export const KV_OPTIONS = [
   { value: "k8v4", label: "K8V4" },
   { value: "vq2", label: "VQ2 (2-bit, 3-4x context)" },
   { value: "k4v2", label: "K4V2 (4-bit K)" },
+  { value: "bf16p", label: "BF16 packed (exact, 23 % smaller)" },
   { value: "bf16", label: "BF16" },
 ];
 
@@ -229,7 +230,7 @@ export const MEMORY_CONTROLS: Control[] = [
     kind: "select",
     flag: "--kv-dtype",
     label: "KV cache format",
-    help: "Storage of the attention KV cache. INT8 holds twice BF16's context at the measured quality; vq2 and k4v2 hold three to four times INT8's.",
+    help: "Storage of the attention KV cache. INT8 holds twice BF16's context at the measured quality; vq2 and k4v2 hold three to four times INT8's. BF16 packed keeps BF16's exact values in 23 % less memory (a request whose KV row cannot be packed fails).",
     options: KV_OPTIONS.filter((option) => option.value !== "bf16"),
     unsetLabel: "BF16 (default)",
   },
