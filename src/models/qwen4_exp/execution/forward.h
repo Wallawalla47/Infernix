@@ -32,6 +32,11 @@ namespace infernix::models::qwen4_exp::execution {
 // the Program stages the chunk's RoPE positions per sub-chunk of this many cells.
 inline constexpr std::int32_t kMtpChunkColumns = 512;
 
+// Packed BF16 KV: attention calls of more columns than this (one sequence's prefill chunks, which run in the arena
+// lent from the expert frames, the Program's wide arena) unpack the sequence's K/V once a call
+// (ops::qsa_attention's `unpack`); the narrower ones decode as they gather. Same bits.
+inline constexpr std::int32_t kQsaUnpackColumns = 512;
+
 // Faults the Forward's own kernels report in the experts' error word (ForwardExperts::error) instead
 // of trapping (core DeviceFault), as layer << 16 | code like the MoE's: codes above the MoE's
 // (ops/offloaded_sparse_moe/cpu/fetch_request.h) and every errno.

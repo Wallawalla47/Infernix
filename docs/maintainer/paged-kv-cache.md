@@ -83,8 +83,8 @@ Main growing pool, and its draft context uses cyclic storage.
 | MTP | MTP persistent K/V and its code/scale planes | MTP KV frontier |
 | Draft Full | the selected draft's full-context K/V | draft context frontier |
 
-Main Text and MTP use the KV profile the Engine selects: BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16,
-K8V4, VQ2 or K4V2; Draft Full uses its own BF16 profile. The physical layout under the `BFloat16` name is
+Main Text and MTP use the KV profile the Engine selects: BF16, packed BF16, INT8-G64, FP8-E4M3FN-row256,
+NVFP4-G16, K8V4, VQ2 or K4V2; Draft Full uses its own BF16 profile. The physical layout under the `BFloat16` name is
 BF16 K and FP16 V, and the writer converts BF16 V to FP16 once; on the lossless route
 (`paged_kv_lossless_storage_layout`, [lossless route](lossless-route.md)) V is BF16 too, written bit for bit
 by `lossless_kv_append` and read only by the lossless attention. K8V4 is a closed asymmetric profile, not
@@ -321,7 +321,12 @@ so the same memory holds 1.31 times the tokens and attention reads 392 bytes a r
 lossless row cannot hold every row (pigeonhole): a row with more values outside its exponent window than its side
 record holds has no packed form, and the request that appended it fails (runtime::PendingRowFailure::UnpackableKv,
 withdrawing what it published); no row of 38 million in the 27B's and 35B-A3B's KV over 41K-83K-token prompts had one
-(candidates §41).
+(candidates §41). Every writer packs through `ops/kv_cache/bf16p_codec.cuh` (`kv_cache_append`, and Qwen3.8-Flash-Next's
+fused `qsa_prepare`), and every reader decodes a packed row to exactly the bf16 storage's K (BF16) and V (FP16) before
+its arithmetic (the dense causal attention's tiles, `softmax_attention/dense/causal_cache/bf16/packed_tile_io.cuh`;
+QSA's decode and prompt kernels, in shared memory, or for a prefill chunk a sequence unpacked once into scratch for
+`bf16`'s prompt kernel: [Flash-Next design §19.3.48](qwen3_8-flash-next-design.md)), so both storages give the same
+output bits.
 
 ### 4.4 Logical position domain
 

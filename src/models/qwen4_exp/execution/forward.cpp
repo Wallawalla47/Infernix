@@ -224,6 +224,9 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
                             std::size_t(c.qsa.index_heads + 1) * c.qsa.index_head_dim;
     bytes += qkv * t * bf * 2 + std::size_t(c.attention.query_width()) * t * bf * 2;
     bytes += ops::qsa_attention_workspace_bytes(qsa_geometry(c), columns, max_context, storage);
+    if (storage == KvCacheStorage::Bf16Packed && columns > kQsaUnpackColumns) {
+        bytes += ops::qsa_attention_unpack_bytes(qsa_geometry(c), max_context);
+    }
     bytes += (c.moe.experts + 1) * t * 4 + k * t * 8 + t * 4;           // FP32 router logits, routing
     bytes += ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t));
     // A gated call's copy-ahead guess (its routing and dispatch; gated calls are at most the CPU channel's width).
@@ -939,7 +942,8 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
                                              .head_dim      = layer.kv.head_dim,
                                              .num_kv_heads  = layer.kv.num_kv_heads,
                                              .storage       = layer.kv.storage,
-                                             .window        = layer.kv.window};
+                                             .window        = layer.kv.window,
+                                             .unpackable    = layer.kv.unpackable};
             ops::kv_cache_append_batch(append.k, append.v, call.positions.view({call.width, call.batch}),
                                        call.table_rows, view, s);
         }
@@ -951,9 +955,13 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
     Tensor out = work_.alloc(DType::BF16, {D, dim(a.heads), T});
     const std::size_t scratch = ops::qsa_attention_workspace_bytes(geometry, T, max_context_, layer.kv.storage);
     const DeviceSpan span     = work_.alloc_bytes(scratch);
+    void* unpack              = nullptr;
+    if (layer.kv.storage == KvCacheStorage::Bf16Packed && T > kQsaUnpackColumns && call.batch == 1) {
+        unpack = work_.alloc_bytes(ops::qsa_attention_unpack_bytes(geometry, max_context_)).data;
+    }
     ops::qsa_attention(qn, iq, layer, qsa_batch, geometry,
                        static_cast<float>(1.0 / std::sqrt(static_cast<double>(D))), max_context_, span.data,
-                       span.bytes, out, s, vq ? &append : nullptr);
+                       span.bytes, out, s, vq ? &append : nullptr, unpack);
     // Output gate: out * sigmoid(gate), then o_proj. Applying the gate in qsa_attention's split merge
     // (candidates §7.3 D7) measured flat (removed 2026-10-28).
     Tensor gated = out.view({QW, T});

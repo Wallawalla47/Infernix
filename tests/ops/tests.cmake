@@ -477,7 +477,7 @@ infernix_add_family_op_test(infernix_speculative_state_ops_test FAMILY sampling
 infernix_add_family_op_test(infernix_qsa_test FAMILY attention NO_TEST
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa.cpp"
   LIBRARIES infernix_ops)
-foreach(part index bf16 int8 fp8 nvfp4 k8v4 vq2 k4v2)
+foreach(part index bf16 bf16p int8 fp8 nvfp4 k8v4 vq2 k4v2)
   add_test(NAME infernix_qsa_${part}_test COMMAND ${infernix_qsa_test_COMMAND} --part ${part})
   set_tests_properties(infernix_qsa_${part}_test PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()

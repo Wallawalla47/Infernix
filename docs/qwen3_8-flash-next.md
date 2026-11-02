@@ -361,8 +361,10 @@ infernix <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8 --max
 infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8 --max-context 16384
 ```
 
-- `--kv-dtype` accepts every Infernix KV format: `int8` (recommended), `bf16`, `fp8`, `nvfp4`,
+- `--kv-dtype` accepts every Infernix KV format: `int8` (recommended), `bf16`, `bf16p`, `fp8`, `nvfp4`,
   `k8v4`, `vq2` and `k4v2`.
+  - `bf16p` holds `bf16`'s values exactly in 23 % less KV memory, with `bf16`'s output; a request
+    whose KV holds a row it cannot pack fails with an error (the Engine keeps serving).
   - `fp8`, `nvfp4` and `k8v4` measured within noise of `int8` in teacher-forced quality. `nvfp4`
     holds a context in 55 % of `int8`'s KV memory, which leaves more VRAM to the expert cache.
   - `vq2` and `k4v2` keep each sequence's recent and first tokens exact and quantize older ones
