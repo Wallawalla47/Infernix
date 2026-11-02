@@ -301,8 +301,9 @@ NVIDIA's quantization-aware distillation of the model, bit-exactly
 - `--screen-heads` adds 2-bit copies of `lm_head` (178.8 MB) and of the proposal head (94.4 MB),
   after every other object; every other tensor is unchanged. Only the screened heads read them: the
   MTP drafter's draft head with `--lm-head-draft` (decode +1.6 % at MTP 3), and the `screened-lm-head`
-  fast path for greedy rounds, on by default for this artifact with INT8 KV (decode +7.5 % plain, +3.7 %
-  at MTP 3; not yet quality-gated) and otherwise `--fast-path screened-lm-head`
+  fast path for greedy rounds, on by default for this artifact (16- and 4-bit expert activations) with INT8 KV
+  and every format below it (FP8, NVFP4, K8V4, VQ2, K4V2; decode +7.5 % plain, +3.7 % at MTP 3 on INT8; with
+  `--expert-a4-activations` +6.6 % plain; not yet quality-gated) and otherwise `--fast-path screened-lm-head`
   ([design §19.3.30](maintainer/qwen3_8-flash-next-design.md#19330-screened-heads-a-2-bit-screen-of-the-draft-and-lm-heads-2026-10-23-measured-2026-10-25)).
 
 ```text
@@ -326,7 +327,12 @@ Speed on the same day (RTX 5090, INT8 KV, n-gram rows read from the volume, one 
 repetitions): pp8192 3,352 and pp32768 11,299 tok/s (8,387 on the exact route; the
 `expert-a4-residual` fast path), tg256 110 plain and 150-162 with MTP; with
 `--expert-a4-activations` pp32768 11,985, tg256 135 plain and 216 with MTP. Dense8 in the same
-session: 11,531, 120 and 159.
+session: 11,531, 120 and 159. Since 2026-11-02, wide verification rounds give the CPU more of their misses and the
+4-bit route's CPU experts quantize and apply SwiGLU in AVX2 (the same bits); with DFlash2 auto and INT8 KV each step
+measured faster on its own: the 4-bit route's struct fixture +3.6 % and then +4.2 %, short context +0.3 % and +2.7 %,
+after a 16K prompt +0.7 % and +1.9 %, the default route's struct fixture +2.5 % and short context +0.7 %
+(Dense8's struct fixture +4.3 %)
+([design §19.3.47](maintainer/qwen3_8-flash-next-design.md#19347-fp4-locals-4-bit-route-wide-call-split-vector-cpu-kernels-2026-11-02-same-bits-default)).
 
 Its qualified fast paths (2026-10-21; on by default, `--reproducible` turns them off) are
 the request-coupling paths (two-row MTP rounds: two concurrent requests decode 84 -> 126 tok/s with

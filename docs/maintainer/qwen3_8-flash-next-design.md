@@ -12130,7 +12130,7 @@ d = floor(1.65 + C t) (§19.3.12; FP4-Local: C 19,100 experts/s, t 0.10 ms a 2.6
 banks now take the share form the Qwen3.5-122B's split took (`placement.h` `decode_link_share_256`: the link keeps
 (M s) >> 8 with s = 256 / (1 + 1.46 C t), 67/256 on FP4-Local), so a call's three misses all go to the CPU where the
 rule sent one over the link. `INFERNIX_TMP_LINK_SHARE=divisor` keeps the rule; GGUF and W4A4 banks keep it (not
-measured).
+measured). Calls of eight columns or more of every NVFP4 bank keep 51/256 instead (§19.3.47, 2026-11-02).
 
 **Measured** (FP4-Local, DFlash2 auto, the share form against `divisor`, three interleaved runs each):
 - with the tensor-core narrow experts (§19.3.40): short context 214.9 -> 226.5 tok/s (+5.4 %), after a 16K prompt
@@ -12155,8 +12155,8 @@ kernels). Per 16-element block one `mma.m16n8k16` s8 product of the doubled E2M1
 and g + 8; B: column g's codes) gives P_b exactly for up to eight columns, folded as (P_b Sw) Sa into the same int64
 sums as `unit_sums`, so every output equals the one-column kernels' and the CPU engine's bit for bit. Gate/up CTAs
 of eight warps, two a row group, each streaming half of K through a three-stage ring (the halves add exactly); each
-CTA quantizes its job's A4(x) into shared memory while its rings fill and its two A4 blocks of h with the down input
-scale. Down: a warp a row group, its units copied before the PDL wait. Shared memory is sized by the call's columns
+CTA quantizes its job's A4(x) into shared memory while its rings fill (from four columns it copies the rows a per-job
+encode kernel wrote, §19.3.47) and its two A4 blocks of h with the down input scale. Down: a warp a row group, its units copied before the PDL wait. Shared memory is sized by the call's columns
 so three gate/up CTAs fit an SM at one to three columns. Registers 80 (gate/up) and 71 (down), no spills.
 
 **Rejected on the way.** A once-per-call A4(x) encode kernel before the passes with one warp a row group over its
@@ -12188,6 +12188,80 @@ The agentic replay (Dense8, two lanes, seeds 42-44) lost: average time to first 
 the widths off gave 8.80k and 8.85k. Prompts of 50K-80K, which the rig did not cover, lose more than the others
 gain. Counting the walk's steps in chunk-wide calls (fewer decode interleavings per prompt) recovered the replay's
 32K+ cold prefill only to 7,848 of 8,039 tok/s and left those two prompts at 8.4k and 7.6k.
+
+### 19.3.47 FP4-Local's 4-bit route: wide-call split, vector CPU kernels (2026-11-02; same bits; default)
+
+**Why.** `--expert-a4-activations` decoded slower than FP4-Local's default W4A16 route (2026-11-01, DFlash2 auto,
+INT8 KV: conv -12 %, after a 16K prompt -7 %, the struct fixture -14 %, plain -8 %). Most of the conv and after-16K gap
+is rounds: the 4-bit route's text accepts fewer drafts. Per round, the struct fixture's eight-column rounds staged about
+twice the W4A16 route's link misses (stage kernels 7.1 against 4.1 ms a round): the divisor rule kept 1/3 of a call's
+misses on the link against the share form's 67/256 (§19.3.43), and the W4A4 CPU team, slower than W4A16's at one
+column, measured a lower rate. The screened head and `f16-accumulate-prefill` were not registered for the 4-bit
+configuration (model-quality.md §6.7: plain decode +6.6 %, pp32768 +5.7 %).
+
+**What.**
+- *Wide-call split* (`program_impl.h` wide_link_share, `MoeCpuChannel::wide_share`): NVFP4 banks keep 51/256 of a
+  call's host-memory misses on the link from eight columns, their one-column rule below (W4A4 the divisor rule,
+  W4A16 the share form). A CPU expert's cost past its first column is compute that the one-column rate the rules take
+  hides (team bench, one worker: W4A4 128 us a column past the first against 205 us for a one-column expert), so wide
+  verification rounds give the CPU more.
+- *Vector CPU kernels* (`w4a4_expert.cpp`): the A4 quantizer (eight blocks' maxima and E4M3 scales in one vector, each
+  block's codes in two: compare-counts against the E2M1 decision points, the sign by `vpsignd`) and SwiGLU (exp_c,
+  silu_c and the BF16 rounding on eight lanes) in AVX2 with FMA on every vector ISA, the scalar functions' IEEE
+  operations in the same order, so every lane equals them bit for bit (`test_vector_canon`: SwiGLU exhaustively over
+  BF16 gates for 64 up values incl. zeros, infinities, NaN and subnormals; the quantizer on E2M1 decision points, -0,
+  NaN, infinities, subnormals and saturation, 13 blocks a call). The scalar ISA keeps the scalar functions (the
+  reference the ISA test compares against). SwiGLU serves every NVFP4 CPU route (W4A4, W4A16, two-term A4, 8-bit).
+- *Per-job x encode* (§19.3.44's kernels): calls of four columns or more encode each job's x once
+  (`encode_nmma4_kernel`, the gate/up pass its programmatic dependent; every gate/up CTA waits for it before it ends,
+  idle ones too, so the pass's completion implies the encode's), narrower ones in each gate/up CTA.
+
+**Measured** (RTX 5090, i9-13900K, `infernix_bench`, FP4-Local, DFlash2 auto, INT8 KV, exclusive layout, fresh expert
+state, three interleaved runs each; outputs equal in every arm: same tokens, rounds and accepted drafts).
+- Split, 4-bit route, against the divisor rule at every width (61/256 from eight columns): struct 394.2 -> 408.5
+  tok/s (+3.6 %, every pair), after 16K 236.5 -> 238.2 (+0.7 %), conv 210.2 -> 210.7 (+0.3 %). With the vector CPU
+  kernels 51/256 was level with 61/256 (-0.1 / +0.1 / -0.2 %) and 72/256 lost struct 1.3 %. Rejected: 61/256 from six
+  columns (struct +3.9 %, after 16K -0.4 %), 41/256 from eight (struct +1.3 %), 73/256 at every width, the share
+  form's value at this rate (struct +4.1 %, conv +0.5 %, after 16K -0.6 %, every pair).
+- Split, W4A16 (the default route), against the share form at every width: 51/256 from eight columns struct 443.6 ->
+  454.9 (+2.5 %), conv 221.9 -> 223.5 (+0.7 %), every pair, after 16K 247.9 -> 248.1 (level); 61/256 struct +1.6 %,
+  conv +0.3 %, after 16K +0.2 %.
+- Split, Dense8 (NVIDIA's W4A4 experts), against the divisor rule at every width (`INFERNIX_TMP_LINK_SHARE=divisor`,
+  the same build): struct 404.1 -> 421.3 (+4.3 %, every pair), after 16K 234.0 -> 238.0 (+1.7 %: one low control
+  run, the other pairs level), conv 210.6 -> 211.6 (+0.5 %, two of three pairs). Recipe A, with the same bank kind,
+  was not run.
+- Vector CPU kernels: A4 of a 2,560-element column 7.65 -> 1.13 us, SwiGLU of 640 elements 10.98 -> 0.54 us; the
+  W4A4 team (records in DRAM) at six workers 19,850 -> 22,069 experts/s at one column (+11 %) and 40,619 -> 59,521
+  expert columns/s at eight (+47 %); W4A16 (SwiGLU only) +1.8 % and +5.3 %. 4-bit decode with both builds on the same
+  split: conv 211.2 -> 217.0 (+2.7 %), after 16K 237.1 -> 241.7 (+1.9 %), struct 409.5 -> 426.9 (+4.2 %), every pair
+  ahead; the engine's measured team rate 16.9k -> 18.5k experts/s.
+- Per-job x encode from four columns: never encoding lost 0.4-0.6 % on every workload, encoding at every width was
+  level (+0.2 / +0.2 / -0.2 %).
+
+**Rejected on the way.**
+- *Per-token A4(x).* FP4-Local's experts share one gate/up input scale in every layer (all 512), so a token's A4(x) is
+  the same for each of its experts: a bank flag let the narrow gate/up CTAs copy per-token rows encoded once per call.
+  Op bench (the encode on the timed path): T = 1-3 +2.0 us, T = 4 154 -> 143, T = 6 188 -> 176, T = 8 212 -> 199 us, a
+  512-token call 1,351 -> 1,318 us. End to end it lost in both forms: the rows encoded in `moe_experts_prepare`, which
+  the Program runs on its side stream (a fork and join a layer), struct -0.65 % (every pair), conv and after 16K level;
+  the rows encoded by extra CTAs of the fused route plan (no launch), struct -0.6 % (every pair), conv -0.7 %, after
+  16K +0.3 %. Removed.
+- *Wider calls' narrow jobs on the tensor-core kernels* (instead of the one-column kernels): op -12 to -44 %, but
+  pp1024 -1.0 %, -0.2 % and level, pp4096 -0.45 %, -0.2 % and level in three blocks of interleaved runs.
+- Reading encoded rows from L2 instead of shared memory (three gate/up CTAs an SM at every width): -1 to -4 % on every
+  workload. The wide GEMMs skipping 16-column MMA tiles past a work tile's last valid column: level on the 4-bit
+  route's prefill, -0.4 % at pp4096 on the W4A16 two-term residual route. CPU prefetch distances other than the
+  default: no effect. Quantizing each distinct x column once a CPU round: about 0.2 % of a round at 1.1 us a column,
+  not built.
+
+**The op bench's run-to-run outputs.** `infernix_offloaded_moe_wide_bench` gave different output hashes from run to
+run at every width after a process's first (4,096 after 2,048: three hashes in six runs, W4A4 and the W4A16 two-term
+residual route alike; 3,584-5,120 after 3,072). It uploaded each width's routing logits with a pageable `cudaMemcpy`
+on the legacy stream, which may return before its DMA lands, while its calls run on a non-blocking stream, so the
+router could read logits still landing: the varying runs' dispatch offsets differed at 509 of 513 experts, the others'
+not at all. With the uploads ordered against the call every width gave one hash in 3-6 runs, both routes; every op
+benchmark's fixture transfers now go through ordered helpers (bench/README.md, Benchmark inputs). The expert kernels
+were deterministic throughout; the Program's uploads settle the legacy stream already (`DeviceBuffer::copy_from_host`).
 
 ---
 
