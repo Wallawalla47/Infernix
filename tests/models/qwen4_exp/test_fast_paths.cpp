@@ -341,7 +341,8 @@ int main() {
     failures += check(infernix::parse_fast_path("dflash2-pairs") == FastPath::DFlash2Pairs, "dflash2-pairs parses");
     // f16-accumulate-prefill acts on the 8-bit-code dense projections (recipe C's row FP8, FP4-Local's
     // MXFP8, Dense8's Q8) only, sets its route flag, couples a prompt to its call boundaries, and is
-    // qualified only where it measured faster (FP4-Local, INT8 KV; the owner's decision, 2026-10-25).
+    // qualified only where it measured faster (FP4-Local, INT8 KV; the owner's decision, 2026-10-25) and on the
+    // KV formats below INT8's precision (the owner's decision, 2026-11-01).
     for (const DenseKernels dense : {DenseKernels::Fp8Row, DenseKernels::Mxfp8}) {
         failures += check(q::fast_path_applies(FastPath::F16AccumulatePrefill, {dense, false, KvCacheStorage::Int8Group64},
                                                options),
@@ -364,16 +365,18 @@ int main() {
             for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
                                   KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                                   KvCacheStorage::Q4KeyVq2Value}) {
-                const bool measured = dense == DenseKernels::Mxfp8 && !a4 && kv == KvCacheStorage::Int8Group64;
+                const bool measured = dense == DenseKernels::Mxfp8 && kv != KvCacheStorage::BFloat16;
                 failures += check(q::fast_path_qualified(FastPath::F16AccumulatePrefill, {dense, a4, kv}) == measured,
-                                  "f16-accumulate-prefill is qualified on FP4-Local with INT8 KV only");
+                                  "f16-accumulate-prefill is qualified on FP4-Local (16- and 4-bit expert activations) "
+                                  "with INT8 KV and below only");
             }
         }
     }
 
     // screened-lm-head screens generation's BF16 and 8-bit heads (a GGUF head has no exact rescore), is
-    // qualified only where it measured faster (FP4-Local, INT8 KV; the owner's decision, 2026-10-25), couples
-    // a request to the rows of its rounds, and changes no Forward flag (the Program decides it per round).
+    // qualified only where it measured faster (FP4-Local, INT8 KV; the owner's decision, 2026-10-25; its 4-bit expert
+    // activations since 2026-11-02) and on the KV formats below INT8's precision (2026-11-01), couples a request to
+    // the rows of its rounds, and changes no Forward flag (the Program decides it per round).
     for (const DenseKernels dense : {DenseKernels::Q8, DenseKernels::Bf16, DenseKernels::Fp8Row, DenseKernels::Mxfp8}) {
         failures += check(q::fast_path_applies(FastPath::ScreenedLmHead, {dense, false, KvCacheStorage::Int8Group64}, options),
                           "screened-lm-head applies to generation with a non-GGUF head");
@@ -391,9 +394,10 @@ int main() {
             for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
                                   KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                                   KvCacheStorage::Q4KeyVq2Value}) {
-                const bool measured = dense == DenseKernels::Mxfp8 && !a4 && kv == KvCacheStorage::Int8Group64;
+                const bool measured = dense == DenseKernels::Mxfp8 && kv != KvCacheStorage::BFloat16;
                 failures += check(q::fast_path_qualified(FastPath::ScreenedLmHead, {dense, a4, kv}) == measured,
-                                  "screened-lm-head is qualified on FP4-Local with INT8 KV only");
+                                  "screened-lm-head is qualified on FP4-Local (16- and 4-bit expert activations) with "
+                                  "INT8 KV and below only");
             }
         }
     }

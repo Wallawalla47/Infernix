@@ -509,9 +509,40 @@ constexpr std::array kQualified{
     // NVIDIA FP4-Local, INT8 KV: screened-lm-head, plain decode (pp1024+tg256) +7.5 % (4 of 4 blocks, worst
     // +7.2 %), MTP 3 with --lm-head-draft +3.7 % (4 of 4, worst +3.3 %); it runs where the artifact carries the
     // LM head's screen (select_fast_paths). f16-accumulate-prefill, pp32768 +5.3 % with the route's row raster
-    // and B fragments (3 of 3), pp4096 neutral.
+    // and B fragments (3 of 3), pp4096 neutral. The KV formats below INT8's precision (FP8, NVFP4, K8V4, VQ2,
+    // K4V2) take them too by the owner's decision of 2026-11-01: neither path's kernels read the KV cache.
     Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Q4KeyVq2Value}},
+    // FP4-Local with --expert-a4-activations (the same head and screen): screened-lm-head measured faster on INT8 KV
+    // (RTX 5090, 2026-11-02, interleaved runs, DFlash2 auto with --lm-head-draft unless plain): plain decode
+    // 117.3 -> 125.0 tok/s (+6.6 %, 2 of 2), the struct fixture 378.3 -> 386.9 (+2.3 %, 3 of 3, the same text and
+    // rounds: 20.24 -> 19.79 ms a round); without it the exact BF16 head took 706 us of a 9.5 ms round after a 16K
+    // prompt (the screen 135 us). The formats below INT8's precision by the owner's rule above.
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Q4KeyVq2Value}},
     Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, false, KvCacheStorage::Q4KeyVq2Value}},
+    // FP4-Local with --expert-a4-activations (the same MXFP8 dense kernels): f16-accumulate-prefill measured faster on
+    // INT8 KV (RTX 5090, 2026-11-02, interleaved): pp32768 11,891 -> 12,567 tok/s (+5.7 %, 2 of 2); pp1024 and pp4096
+    // within their spread. The formats below INT8's precision by the owner's rule above.
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, true, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* dense_name(DenseKernels dense) {

@@ -284,10 +284,26 @@ constexpr std::array kQualified{
     // groupwise 27B, INT8 KV: q5-ksplit-mma decode +4.5 % (3 of 3 blocks, +4.48 to +4.54 %), fp16-gdn-state
     // decode +0.7 % (3 of 3, at least +0.70 %); pp4096 neutral for both. NVFP4 27B, INT8 KV: fp16-gdn-state
     // decode +0.7 % (3 of 3, at least +0.67 %), pp8192 neutral. Not the 35B-A3B (fp16-gdn-state one block
-    // -3 %, q5-ksplit-mma neutral).
+    // -3 %, q5-ksplit-mma neutral). The KV formats below INT8's precision (FP8, NVFP4, K8V4, VQ2, K4V2) take them
+    // too by the owner's decision of 2026-11-01: neither path's kernels read the KV cache.
     Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
     Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
     Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
     // gdn-tree-closed-form by the owner's rule of 2026-10-25 (a path measured faster goes on before its gate), where
     // measured (ABBA, RTX 5090, INT8 KV, greedy pp1280+tg256, fixed trees of 16, 6 blocks): NVFP4 27B DFlash2
     // decode +1.19 % (6 of 6, at least +1.01 %; rounds 1.0-1.3 % shorter), 35B-A3B DFlash rounds 1.0-1.7 % shorter in
