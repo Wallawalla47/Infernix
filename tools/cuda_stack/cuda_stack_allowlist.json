@@ -801,6 +801,8 @@
   "__nv_static__qsa_prepare_cu__ZN8infernix3ops_GLOBAL__N__qsa_prepare_cu18qsa_prepare_kernelILNS_14KvCacheStorageE3ENS0_25KVCacheAppendFullGeometryILi4EEEEEvNS1_11PrepareArgsE": {"stack": 32, "local": 0, "stl": 40, "ldl": 30},
   "__nv_static__qsa_prepare_cu__ZN8infernix3ops_GLOBAL__N__qsa_prepare_cu18qsa_prepare_kernelILNS_14KvCacheStorageE4ENS0_25KVCacheAppendFullGeometryILi2EEEEEvNS1_11PrepareArgsE": {"stack": 32, "local": 0, "stl": 40, "ldl": 30},
   "__nv_static__qsa_prepare_cu__ZN8infernix3ops_GLOBAL__N__qsa_prepare_cu18qsa_prepare_kernelILNS_14KvCacheStorageE4ENS0_25KVCacheAppendFullGeometryILi4EEEEEvNS1_11PrepareArgsE": {"stack": 32, "local": 0, "stl": 40, "ldl": 30},
+  "__nv_static__qsa_prepare_cu__ZN8infernix3ops_GLOBAL__N__qsa_prepare_cu18qsa_prepare_kernelILNS_14KvCacheStorageE7ENS0_25KVCacheAppendFullGeometryILi2EEEEEvNS1_11PrepareArgsE": {"stack": 32, "local": 0, "stl": 40, "ldl": 30},
+  "__nv_static__qsa_prepare_cu__ZN8infernix3ops_GLOBAL__N__qsa_prepare_cu18qsa_prepare_kernelILNS_14KvCacheStorageE7ENS0_25KVCacheAppendFullGeometryILi4EEEEEvNS1_11PrepareArgsE": {"stack": 32, "local": 0, "stl": 40, "ldl": 30},
   "__nv_static__rows_cu__ZN8infernix3ops39_GLOBAL__N__rows_cu_b0d8788c12split_kernelEPK13__nv_bfloat16iNS1_12SplitTargetsE": {"stack": 104, "local": 0, "stl": 13, "ldl": 3},
   "__nv_static__rows_cu__ZN8infernix3ops39_GLOBAL__N__rows_cu_b0d8788c19split_vector_kernelEPK5uint4iNS1_12SplitTargetsE": {"stack": 104, "local": 0, "stl": 13, "ldl": 3},
   "__nv_static__sparse_moe_decode_kernels_cu__ZN8infernix3ops6detail_GLOBAL__N__sparse_moe_decode_kernels_cu25sparse_moe_d2_warp_kernelEPKfPiPfS6_": {"stack": 64, "local": 0, "stl": 43, "ldl": 32},
