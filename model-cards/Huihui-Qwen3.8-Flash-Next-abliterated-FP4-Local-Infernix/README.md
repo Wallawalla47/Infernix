@@ -185,7 +185,7 @@ mismatch and no tensor rounded; only the MTP drafter's 1,556 tensors are re-quan
   (slower).
 - **Disk:** ~77 GB for the artifact, plus the 29 GB n-gram volume on an NVMe drive.
 - **Engine:** [Infernix](https://github.com/Wallawalla47/Infernix) from GitHub `main` at commit
-  `257789da` or later (the same requirement as NVIDIA FP4-Local's artifact).
+  `51bdd498` or later (the same requirement as NVIDIA FP4-Local's artifact).
 
 ## Run
 
@@ -208,7 +208,7 @@ for the options, KV formats and requirements.
 ## Quality
 
 On the 1M-token perplexity corpus (quick: one stream per domain, 4K context, BF16 KV, reproducible
-route), against NVIDIA FP4-Local on the same Infernix build (2026-11-01, `main` `a94a9dd2`):
+route), against NVIDIA FP4-Local on the same Infernix build (2026-11-01, `main` `4ea9cd0a`):
 
 | Domain | This artifact | NVIDIA FP4-Local |
 |---|---:|---:|

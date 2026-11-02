@@ -55,7 +55,7 @@ n-gram volume on an NVMe drive and pass it with `--ngram-volume`. Any of the oth
 [Qwen3.8-Flash-Next n-gram tables](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix#ple-n-gram-tables)
 also runs this model.
 
-This version (2026-10-24) needs an Infernix build from GitHub `main` at commit `257789da` or later, which
+This version (2026-10-24) needs an Infernix build from GitHub `main` at commit `51bdd498` or later, which
 runs the vision MLPs in NVFP4; with an older build, update Infernix first.
 
 ## DFlash2 drafting

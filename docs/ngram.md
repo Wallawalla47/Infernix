@@ -46,7 +46,7 @@ a configuration without `adaptive-speculation`) every round would verify the who
 `Engine::options()` and the request log's `server_start` record report the resolved window.
 
 Measured 2026-10-22 on an RTX 5090 (INT8 KV, `infernix_decode_quality_gen`). The copy workload is
-24 of this repository's source files at a4a50233, each followed by the header of the same file with one
+24 of this repository's source files at e1507ff9, each followed by the header of the same file with one
 identifier renamed (`bench/decode_quality/copy_prompts.py`), continued greedily for 512 tokens. The
 other workloads are 1,280-token slices of code continued greedily and of Markdown docs sampled at
 temperature 1, 384 tokens each. Wall-clock tok/s:
