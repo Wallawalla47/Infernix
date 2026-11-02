@@ -50,10 +50,16 @@ struct WeightGeometry {
     // Expert-bank layouts only: one expert's record bytes and its 4 KiB-aligned pitch.
     std::uint64_t record_bytes  = 0;
     std::uint64_t record_stride = 0;
+    // bf16_p12 only: the escape list (u32 entries) after the row words (the scale plane).
+    std::uint64_t escape_offset = 0;
+    std::uint64_t escape_bytes  = 0;
 };
 
 [[nodiscard]] WeightGeometry weight_geometry(QType format, QuantLayout layout,
                                              std::span<const std::uint64_t> shape);
+// A bf16_p12 [n, k] matrix holding `escapes` escaped weights (QuantLayout::P12Rows): its geometry depends
+// on the data, so the packer, not the artifact, supplies the count.
+[[nodiscard]] WeightGeometry bf16_p12_geometry(std::uint64_t n, std::uint64_t k, std::uint64_t escapes);
 [[nodiscard]] std::uint64_t weight_element_count(std::span<const std::uint64_t> shape);
 
 struct WeightParent {

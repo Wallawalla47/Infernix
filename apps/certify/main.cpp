@@ -265,7 +265,8 @@ infernix::KvCacheStorage kv_storage(std::string_view name) {
     if (name == "k8v4") { return infernix::KvCacheStorage::Fp8KeyNvfp4Value; }
     if (name == "vq2") { return infernix::KvCacheStorage::Vq2; }
     if (name == "k4v2") { return infernix::KvCacheStorage::Q4KeyVq2Value; }
-    throw std::invalid_argument("--kv-dtype must be bf16, int8, fp8, nvfp4, k8v4, vq2 or k4v2");
+    if (name == "bf16p") { return infernix::KvCacheStorage::Bf16Packed; }
+    throw std::invalid_argument("--kv-dtype must be bf16, bf16p, int8, fp8, nvfp4, k8v4, vq2 or k4v2");
 }
 
 std::string artifact_path(const std::string& artifact) {

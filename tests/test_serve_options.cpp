@@ -372,11 +372,15 @@ int main() {
     failures += check(parse({"infernix-serve", "model.ninfer", "--kv-dtype", "k4v2"}).kv_cache ==
                           infernix::KvCacheStorage::Q4KeyVq2Value,
                       "--kv-dtype k4v2 did not select 4-bit K / 2-bit V KV");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--kv-dtype", "bf16p"}).kv_cache ==
+                          infernix::KvCacheStorage::Bf16Packed,
+                      "--kv-dtype bf16p did not select packed BF16 KV");
     const std::string kv_help = serve_usage_text("infernix-serve");
     failures += check(kv_help.find("nvfp4") != std::string::npos &&
                           kv_help.find("k8v4") != std::string::npos &&
                           kv_help.find("vq2") != std::string::npos &&
-                          kv_help.find("k4v2") != std::string::npos,
+                          kv_help.find("k4v2") != std::string::npos &&
+                          kv_help.find("bf16p") != std::string::npos,
                       "serve help omits a production KV storage mode");
 
     const ServeOptions model_alias =

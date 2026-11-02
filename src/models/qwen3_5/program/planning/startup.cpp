@@ -1547,7 +1547,8 @@ bool prefill_attention_runs_waves(const EngineOptions& options) {
     case KvCacheStorage::Fp8KeyNvfp4Value:
     case KvCacheStorage::Vq2:
     case KvCacheStorage::Q4KeyVq2Value: return true;
-    case KvCacheStorage::BFloat16: return false;
+    case KvCacheStorage::BFloat16:
+    case KvCacheStorage::Bf16Packed: return false;
     }
     return false;
 }

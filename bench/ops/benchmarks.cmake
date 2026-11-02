@@ -33,6 +33,7 @@ infernix_add_op_bench(infernix_argmax_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/a
 infernix_add_op_bench(infernix_causal_conv1d_silu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/causal_conv1d_silu_bench.cu")
 infernix_add_op_bench(infernix_linear_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_bench.cu")
 infernix_add_op_bench(infernix_bf16_flash_next_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/bf16_flash_next_sweep.cu")
+infernix_add_op_bench(infernix_bf16_p12_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/bf16_p12_sweep.cu")
 infernix_add_op_bench(infernix_fp8_flash_next_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/fp8_flash_next_sweep.cu")
 infernix_add_op_bench(infernix_mxfp8_flash_next_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/mxfp8_flash_next_sweep.cu")
 infernix_add_op_bench(infernix_linear_topk_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_topk_bench.cu")

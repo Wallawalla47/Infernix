@@ -4,6 +4,7 @@ target_sources(infernix_ops PRIVATE
 )
 
 include("${CMAKE_CURRENT_LIST_DIR}/bf16/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/bf16_p12/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/f16acc/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/fp8/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/mxfp8/sources.cmake")

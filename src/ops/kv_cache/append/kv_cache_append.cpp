@@ -204,6 +204,8 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
         detail::kv_cache_append_k8v4_launch(k, v, positions, cache, stream);
     } else if (cache.storage == KvCacheStorage::Nvfp4Group16) {
         detail::kv_cache_append_nvfp4_launch(k, v, positions, cache, stream);
+    } else if (cache.storage == KvCacheStorage::Bf16Packed) {
+        detail::kv_cache_append_bf16p_launch(k, v, positions, cache, stream);
     } else {
         detail::kv_cache_append_launch(k, v, positions, cache, stream);
     }
@@ -240,10 +242,10 @@ void kv_cache_append_batch(const Tensor& k, const Tensor& v, const Tensor& posit
         detail::kv_cache_append_vq_batch_launch(k, v, positions, Tensor{}, table_rows, cache, nullptr, stream);
         return;
     }
-    // INT8-G64 and FP8-row storage have a multi-row kernel; the other storages' batched launch
+    // INT8-G64, FP8-row and packed BF16 storage have a multi-row kernel; the other storages' batched launch
     // addresses one table row, so each row gets its own launch (its row still chosen on the device).
     if (batch == 1 || cache.storage == KvCacheStorage::Int8Group64 ||
-        cache.storage == KvCacheStorage::Fp8E4M3Row256) {
+        cache.storage == KvCacheStorage::Fp8E4M3Row256 || cache.storage == KvCacheStorage::Bf16Packed) {
         detail::kv_cache_append_batch_launch(k, v, positions, Tensor{}, table_rows, cache, stream);
         return;
     }

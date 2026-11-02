@@ -345,10 +345,14 @@ int run_tests() {
     failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "k4v2"})
                               .kv_cache == infernix::KvCacheStorage::Q4KeyVq2Value,
                       "--kv-dtype k4v2 did not select 4-bit K / 2-bit V KV");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "bf16p"})
+                              .kv_cache == infernix::KvCacheStorage::Bf16Packed,
+                      "--kv-dtype bf16p did not select packed BF16 KV");
     const std::string help = infernix::cli::usage_text("infernix-cli");
     failures +=
         check(help.find("nvfp4") != std::string::npos && help.find("k8v4") != std::string::npos &&
-                  help.find("vq2") != std::string::npos && help.find("k4v2") != std::string::npos,
+                  help.find("vq2") != std::string::npos && help.find("k4v2") != std::string::npos &&
+                  help.find("bf16p") != std::string::npos,
               "CLI help omits a production KV storage mode");
     failures += check(!k8v4.original_int8_prefill_kernel,
                       "the CLI original INT8 prefill kernel must default off");

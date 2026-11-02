@@ -65,6 +65,7 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
     if (text == "vq2") { return KvCacheStorage::Vq2; }
     if (text == "k4v2") { return KvCacheStorage::Q4KeyVq2Value; }
+    if (text == "bf16p") { return KvCacheStorage::Bf16Packed; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
@@ -181,7 +182,7 @@ std::string usage_text(const char* argv0) {
            " <model.infernix> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--logits-dtype fp32|bf16]\n"
+           "       [--kv-dtype bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--logits-dtype fp32|bf16]\n"
            "       [--spec auto|off|mtp|dflash|dflash2 --draft-tokens "
            "N|auto]\n"
            "       [--draft-model FILE]\n"
@@ -270,9 +271,12 @@ std::string usage_text(const char* argv0) {
            "                           Flash-Next, after the expert cache, for the display\n"
            "                           and other programs (auto: 1024 with a display on\n"
            "                           the GPU, else 256)\n"
-           "  --kv-dtype T             bf16 (default) | int8 | fp8 | nvfp4 | k8v4 | vq2 | k4v2;\n"
-           "                           bf16 stores K as BF16 and V as FP16 (exact for\n"
-           "                           2^-17 <= |v| < 2^16), with --lossless V as BF16\n"
+           "  --kv-dtype T             bf16 (default) | bf16p | int8 | fp8 | nvfp4 | k8v4 | vq2 |\n"
+           "                           k4v2; bf16 stores K as BF16 and V as FP16 (exact for\n"
+           "                           2^-17 <= |v| < 2^16), with --lossless V as BF16; bf16p\n"
+           "                           (Qwen3.5) stores bf16's values in 23 % fewer bytes (12\n"
+           "                           bits a value; same output as bf16; a request with a KV\n"
+           "                           row it cannot pack fails)\n"
            "  --logits-dtype T         fp32 (default) | bf16: the head's logits the sampler,\n"
            "                           greedy choice, draft acceptance and scoring read;\n"
            "                           bf16 rounds each once, as Transformers returns them\n"

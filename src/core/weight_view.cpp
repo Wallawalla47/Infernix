@@ -78,6 +78,28 @@ std::uint64_t weight_element_count(std::span<const std::uint64_t> shape) {
     return count;
 }
 
+WeightGeometry bf16_p12_geometry(std::uint64_t n, std::uint64_t k, std::uint64_t escapes) {
+    if (n == 0 || k == 0 || k % 8 != 0) { throw std::invalid_argument("bf16_p12 needs [n, k] with k a multiple of 8"); }
+    if (escapes >= (1ULL << 24)) { throw std::invalid_argument("bf16_p12 holds at most 2^24 - 1 escapes a parent"); }
+    WeightGeometry out;
+    out.format             = QType::BF16_P12;
+    out.layout             = QuantLayout::P12Rows;
+    out.shape              = {n, k};
+    out.elements           = mul(n, k);
+    out.padded_columns     = k;
+    out.code_bytes_per_row = k;
+    out.high_bytes_per_row = k / 2;
+    out.code_bytes         = out.elements;
+    out.high_offset        = aligned(out.code_bytes, 256);
+    out.high_bytes         = out.elements / 2;
+    out.scale_offset       = aligned(add(out.high_offset, out.high_bytes), 256);
+    out.scale_bytes        = mul(add(n, 1), 4);
+    out.escape_offset      = aligned(add(out.scale_offset, out.scale_bytes), 256);
+    out.escape_bytes       = mul(escapes, 4);
+    out.bytes              = add(out.escape_offset, out.escape_bytes);
+    return out;
+}
+
 WeightGeometry weight_geometry(QType format, QuantLayout layout,
                                std::span<const std::uint64_t> shape) {
     WeightGeometry out;
@@ -370,6 +392,18 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     if (g.shape.size() != 2 || view.shape[1] != g.shape[1]) {
         throw std::invalid_argument("quantized native Weight requires unchanged parent K");
     }
+    if (g.layout == QuantLayout::P12Rows) {
+        // A row range of the parent: each plane from its first row; the row words index the parent's
+        // whole escape list.
+        const std::uint64_t k = g.shape[1];
+        if (region.begin % k != 0) { throw std::invalid_argument("a bf16_p12 native Weight starts on a row"); }
+        const std::uint64_t row = region.begin / k;
+        out.qdata               = region.parent->data + mul(row, k);
+        out.qhigh               = region.parent->data + add(g.high_offset, mul(row, k / 2));
+        out.scales              = region.parent->data + add(g.scale_offset, mul(row, 4));
+        out.escapes             = region.parent->data + g.escape_offset;
+        return out;
+    }
     if (g.layout == QuantLayout::Rg16) {
         // The unit plane addresses whole 16-row groups; its consumers take the complete matrix.
         if (!is_complete_weight(view)) {
@@ -437,6 +471,7 @@ Weight device_native_weight(const WeightView& view, float input_divisor) {
     out.qdata   = rebase(out.qdata);
     out.qhigh   = rebase(out.qhigh);
     out.scales  = rebase(out.scales);
+    out.escapes = rebase(out.escapes);
     return out;
 }
 

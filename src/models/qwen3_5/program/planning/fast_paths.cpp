@@ -345,6 +345,7 @@ const char* kv_name(KvCacheStorage kv) {
     case KvCacheStorage::Fp8KeyNvfp4Value: return "k8v4";
     case KvCacheStorage::Vq2: return "vq2";
     case KvCacheStorage::Q4KeyVq2Value: return "k4v2";
+    case KvCacheStorage::Bf16Packed: return "bf16p";
     }
     return "unknown";
 }
@@ -400,7 +401,9 @@ FastPathConfiguration fast_path_configuration(const Model& model, const EngineOp
     const auto& attention = model.config().text.attention;
     return {.query_heads       = attention ? static_cast<std::uint32_t>(attention->num_attention_heads) : 0U,
             .activations       = activations,
-            .kv                = options.kv_cache,
+            // Packed BF16 KV gives attention bf16's K and V bits: it is qualified as bf16.
+            .kv                = options.kv_cache == KvCacheStorage::Bf16Packed ? KvCacheStorage::BFloat16
+                                                                                 : options.kv_cache,
             .q4_gate_up        = q4_gate_up,
             .offloaded_experts = model.offloaded_experts()};
 }
@@ -427,6 +430,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
         case KvCacheStorage::Vq2:
         case KvCacheStorage::Q4KeyVq2Value: return true;
         case KvCacheStorage::BFloat16:
+        case KvCacheStorage::Bf16Packed:
         case KvCacheStorage::Fp8E4M3Row256: return false;
         }
         return false;

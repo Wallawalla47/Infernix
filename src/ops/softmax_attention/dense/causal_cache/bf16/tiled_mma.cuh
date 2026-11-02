@@ -12,14 +12,17 @@ namespace infernix::ops::detail {
 // Split (the bf16-prompt-split fast path, candidates §10.3 KW-07): blockIdx.z of gridDim.z takes an
 // equal share of the CTA's own key blocks and publishes FP32 partials (unnormalized numerator, log2
 // maximum, sum) for bf16_kv_prompt_merge_kernel; rows past the valid tokens are left to the merge.
-template <typename Geometry, class Schedule, typename Metadata, bool Split = false>
+// Segmented (the packed storage's prompt route): the launch runs only the CTA's key blocks in
+// [segment.lo, segment.hi), resuming and suspending its state there (Bf16KvSegment), so the launches
+// of consecutive segments compute what one launch over all the blocks computes, bit for bit.
+template <typename Geometry, class Schedule, typename Metadata, bool Split = false, bool Segmented = false>
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     void bf16_kv_tiled_mma_kernel(const __nv_bfloat16* __restrict__ q,
                                   const __nv_bfloat16* __restrict__ cache_k,
                                   const __half* __restrict__ cache_v, Metadata metadata,
                                   const std::int32_t* __restrict__ positions, float scale,
                                   __nv_bfloat16* __restrict__ out, std::int32_t width,
-                                  CausalPartialView partial = {}) {
+                                  CausalPartialView partial = {}, Bf16KvSegment segment = {}) {
     constexpr int D             = Geometry::kHeadDim;   // 256
     constexpr int Br            = Schedule::kQueryRows; // 64 query rows
     constexpr int Bc            = Schedule::kKeyRows;   // 64 key cols
@@ -49,7 +52,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 
     if (q_head >= Geometry::QHeads || q0 >= width) { return; }
     if (q0 >= tokens) {
-        if constexpr (!Split) { causal_zero_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid, Threads); }
+        if constexpr (!Split) {
+            if (!Segmented || segment.lo == 0) {
+                causal_zero_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid, Threads);
+            }
+        }
         return;
     }
     const int base_pos              = positions[0];
@@ -132,6 +139,39 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         const int splits = static_cast<int>(gridDim.z), split = static_cast<int>(blockIdx.z);
         kb_lo            = split * n_block_max / splits;
         kb_hi            = (split + 1) * n_block_max / splits;
+    }
+    // Segmented: this segment's blocks, and whether the CTA's blocks begin before them (resume) or run past them
+    // (suspend). State field f of thread t of CTA c at ((c * Fields + f) * Threads + t): the accumulators, then the
+    // two rows' softmax state.
+    constexpr int Fields = PVNt * 4 + 6;
+    [[maybe_unused]] bool suspends = false;
+    [[maybe_unused]] float* state  = nullptr;
+    if constexpr (Segmented) {
+        const bool resumes = segment.lo > kb_lo;
+        suspends           = segment.hi < kb_hi;
+        kb_lo              = max(kb_lo, segment.lo);
+        kb_hi              = min(kb_hi, segment.hi);
+        if (kb_lo >= kb_hi) {
+            infernix::ops::cp_commit(); // Q's copy
+            infernix::ops::cp_wait<0>();
+            return;
+        }
+        const std::int64_t cta =
+            (static_cast<std::int64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x;
+        state = segment.state + cta * Fields * Threads + tid;
+        if (resumes) {
+#pragma unroll
+            for (int n = 0; n < PVNt; ++n) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) { acc[n][i] = state[(n * 4 + i) * Threads]; }
+            }
+            state0.maximum        = state[(PVNt * 4 + 0) * Threads];
+            state0.sum            = state[(PVNt * 4 + 1) * Threads];
+            state0.scaled_maximum = state[(PVNt * 4 + 2) * Threads];
+            state1.maximum        = state[(PVNt * 4 + 3) * Threads];
+            state1.sum            = state[(PVNt * 4 + 4) * Threads];
+            state1.scaled_maximum = state[(PVNt * 4 + 5) * Threads];
+        }
     }
 
     // Fold softmax_scale into the exp2 (FA-style): scores stay raw, so the
@@ -352,6 +392,22 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     for (int kb = kb_lo; kb < min(kb_hi, full_blocks); ++kb) step.template operator()<true>(kb);
     for (int kb = max(kb_lo, full_blocks); kb < kb_hi; ++kb) step.template operator()<false>(kb);
     if constexpr (Split) { infernix::ops::cp_wait<0>(); } // an empty split's Q copy
+    if constexpr (Segmented) {
+        if (suspends) {
+#pragma unroll
+            for (int n = 0; n < PVNt; ++n) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) { state[(n * 4 + i) * Threads] = acc[n][i]; }
+            }
+            state[(PVNt * 4 + 0) * Threads] = state0.maximum;
+            state[(PVNt * 4 + 1) * Threads] = state0.sum;
+            state[(PVNt * 4 + 2) * Threads] = state0.scaled_maximum;
+            state[(PVNt * 4 + 3) * Threads] = state1.maximum;
+            state[(PVNt * 4 + 4) * Threads] = state1.sum;
+            state[(PVNt * 4 + 5) * Threads] = state1.scaled_maximum;
+            return;
+        }
+    }
 
     state0.finish();
     state1.finish();

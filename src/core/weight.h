@@ -41,6 +41,9 @@ enum class QType : std::uint16_t {
     // E4M3FN codes with one FP32 multiplier per row (row_scale_v1): ModelOpt's per-tensor FP32
     // weight_scale kept exactly, written into each row of its matrix (tensor-formats.md).
     FP8_E4M3FN_ROW_F32 = 22,
+    // BF16 weights packed losslessly at load into 12 bits a weight (layout P12Rows; never stored in an
+    // artifact): every weight decodes to its BF16 bits (include/infernix/ops/bf16_p12.h).
+    BF16_P12 = 23,
 };
 
 // Whether `format` is a row-scaled FP8 format (row_scale_v1: BF16 or FP32 row multipliers).
@@ -76,6 +79,12 @@ enum class QuantLayout : std::uint16_t {
     // groups of 144-byte units, row-group major, block ascending), then (256-byte aligned) its FP32
     // multiplier: the Qwen3.5 NVFP4 output head.
     Rg16 = 11,
+    // bf16_p12 (BF16_P12 only): [n, k] with k a multiple of 8, as four planes (each 256-byte aligned):
+    // codes u8 [n, k] (sign << 7 | the 7 mantissa bits), nibbles u8 [n, k / 2] (weight 2j's exponent code in
+    // the low nibble: c < 15 is exponent base + c, 15 an escape), row words u32 [n + 1] (row r: its first
+    // escape << 8 | its base; word n: the escape count << 8), escapes u32 (column << 16 | the BF16 bits),
+    // each row's in column order.
+    P12Rows = 12,
 };
 
 // Whether `layout` stores a matrix of GGUF blocks (ggml_rows_v1 or ggml_tiles16_v1).
@@ -116,6 +125,9 @@ struct Weight {
     // A static FP8 A8 input: its FP32 activation scale s (codes e4m3(x * fl32(1 / s))), as stored;
     // 0 when the input has none.
     float input_scale = 0.0F;
+    // bf16_p12: the parent's escape list (qdata, qhigh and scales address this matrix's first row of
+    // their planes; the row words index this list from the parent's first escape).
+    const void* escapes = nullptr;
 };
 
 } // namespace infernix

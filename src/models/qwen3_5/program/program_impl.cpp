@@ -236,6 +236,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             *backend_kv_pages, backend->execution_tables(), max_concurrency + 1U,
             backend->execution_tables().logical_page_capacity());
     }
+    {
+        const auto text_rows = static_cast<std::size_t>(decoder->text_kv.execution_tables().row_count());
+        auto* backend        = backend_kv_cache();
+        const auto rows = text_rows + (backend ? static_cast<std::size_t>(backend->execution_tables().row_count()) : 0);
+        unpackable_flags.emplace(sizeof(std::int32_t) * rows);
+        auto* flags = static_cast<std::int32_t*>(unpackable_flags->data());
+        std::fill_n(flags, rows, 0);
+        decoder->text_kv.bind_unpackable(flags);
+        if (backend) { backend->bind_unpackable(flags + text_rows); }
+    }
 
     io = qwen3_5::RoundState(backing, plan.persistent.round);
     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
@@ -481,6 +491,8 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
             throw std::logic_error("causal score did not bind the unique Main KV row");
         }
         text_kv_addresses->ensure_mapped_to_tokens(*address, predictor_count, device.stream);
+        std::int32_t* const unpackable = decoder->text_kv.unpackable(0); // packed BF16 KV (unpackable_flags)
+        if (unpackable != nullptr) { *unpackable = 0; }
 
         const std::int32_t state_slot = state_store->physical_slot(*state);
         const auto flush              = [&] {
@@ -658,6 +670,11 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
         flush();
         if (output.logprobs.size() != scored_positions) {
             throw std::logic_error("causal score produced the wrong number of logprobs");
+        }
+        // flush() synchronized: the appends' flag is final.
+        if (unpackable != nullptr && std::exchange(*unpackable, 0) != 0) {
+            throw std::runtime_error("a K or V row of the scored text has more values outside its exponent window "
+                                     "than --kv-dtype bf16p can store exactly (--kv-dtype bf16 stores every row)");
         }
         cleanup();
         return output;

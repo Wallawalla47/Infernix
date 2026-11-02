@@ -349,6 +349,12 @@ int test_cli_contract() {
                               "VQ2 report name");
     failures += expect_string(qb::kv_cache_name(infernix::KvCacheStorage::Q4KeyVq2Value), "k4v2",
                               "K4V2 report name");
+    failures += expect(parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--kv-dtype",
+                                       "bf16p"})
+                               .kv_cache == infernix::KvCacheStorage::Bf16Packed,
+                       "packed BF16 KV");
+    failures += expect_string(qb::kv_cache_name(infernix::KvCacheStorage::Bf16Packed), "bf16p",
+                              "packed BF16 report name");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(

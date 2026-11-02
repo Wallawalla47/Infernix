@@ -2,6 +2,7 @@
 
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
 #include "ops/hyper_connection/hyper_connection_up_collapse.h"
+#include "ops/linear/bf16_p12/bf16_p12_dispatch.h"
 
 #include "core/pdl.cuh"
 
@@ -210,10 +211,12 @@ std::size_t composed_bytes(const Weight& down, const Weight& up, LinearPolicy po
     const auto width = static_cast<std::size_t>(up.n);
     const auto T     = static_cast<std::size_t>(max_tokens);
     (void)streams;
+    // bf16_p12 matrices run their linears decoded (hyper_connection_mix).
+    const auto format = [](const Weight& w) { return w.qtype == QType::BF16_P12 ? QType::BF16 : w.qtype; };
     return align256(width * T * 2) + align256(static_cast<std::size_t>(down.n) * T * 2) +
            align256(static_cast<std::size_t>(rank) * T * 2) + align256(width * T * 2) +
-           std::max(linear_workspace_capacity_bytes(down.qtype, down.n, down.k, policy, 1, max_tokens),
-                    linear_workspace_capacity_bytes(up.qtype, up.n, up.k, policy, 1, max_tokens));
+           std::max(linear_workspace_capacity_bytes(format(down), down.n, down.k, policy, 1, max_tokens),
+                    linear_workspace_capacity_bytes(format(up), up.n, up.k, policy, 1, max_tokens));
 }
 
 } // namespace
@@ -235,6 +238,32 @@ void hc_collapse(const Tensor& u, const Tensor& normalized, std::int32_t streams
 }
 
 } // namespace detail
+
+namespace {
+
+// A bf16_p12 weight's BF16 matrix decoded into the workspace (its bits), or the weight itself.
+Weight decoded_bf16(const Weight& w, WorkspaceArena& workspace, cudaStream_t stream) {
+    if (w.qtype != QType::BF16_P12) { return w; }
+    const DeviceSpan span = workspace.alloc_bytes(static_cast<std::size_t>(w.n) * static_cast<std::size_t>(w.k) * 2);
+    detail::bf16_p12_unpack(w, span.data, stream);
+    Weight out;
+    out.payload       = span.data;
+    out.payload_bytes = span.bytes;
+    out.qtype         = QType::BF16;
+    out.layout        = QuantLayout::Contiguous;
+    out.ndim          = 2;
+    out.n = out.shape[0] = out.padded_shape[0] = w.n;
+    out.k = out.shape[1] = out.padded_shape[1] = w.k;
+    out.qdata = span.data;
+    return out;
+}
+
+// decoded_bf16's bytes for a weight.
+std::size_t decoded_bytes(const Weight& w) {
+    return w.qtype == QType::BF16_P12 ? align256(static_cast<std::size_t>(w.n) * static_cast<std::size_t>(w.k) * 2) : 0;
+}
+
+} // namespace
 
 void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
                           const Weight& up, LinearPolicy policy, std::int32_t streams,
@@ -260,19 +289,23 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
         detail::hc_mix_fused(residual, norm_weight, down, up, streams, rank, eps, x, inject, partials.data, stream);
         return;
     }
+    // bf16_p12 weights past the fused route: decoded into the workspace (a mixer's matrices are a few MB), then the
+    // BF16 steps, which give those BF16 weights' bits.
+    const Weight down_bf16 = decoded_bf16(down, workspace, stream);
+    const Weight up_bf16   = decoded_bf16(up, workspace, stream);
     Tensor normalized = workspace.alloc(DType::BF16, {residual.ne[0], T});
     hyper_connection_norm(residual, norm_weight, streams, eps, normalized, stream);
     Tensor z = workspace.alloc(DType::BF16, {down.n, T});
-    linear(normalized, down, z, policy, workspace, stream);
+    linear(normalized, down_bf16, z, policy, workspace, stream);
     Tensor m = workspace.alloc(DType::BF16, {rank, T});
     hyper_connection_gates(z, rank, streams, m, inject, stream);
-    if (detail::hc_up_collapse_supported(up, hidden, streams, T)) {
+    if (detail::hc_up_collapse_supported(up_bf16, hidden, streams, T)) {
         // Q8 W_up beyond the fused decode route: u stays in the MMA tile (bit-identical, §19.3.23).
-        detail::hc_up_collapse(m, up, normalized, streams, x, stream);
+        detail::hc_up_collapse(m, up_bf16, normalized, streams, x, stream);
         return;
     }
     Tensor u = workspace.alloc(DType::BF16, {up.n, T});
-    linear(m, up, u, policy, workspace, stream);
+    linear(m, up_bf16, u, policy, workspace, stream);
     detail::hc_collapse(u, normalized, streams, x, stream);
 }
 
@@ -297,11 +330,16 @@ bool hyper_connection_mix_a8_encoded(const Tensor& residual, const Tensor& norm_
     return true;
 }
 
+bool hyper_connection_bf16_p12_supported(std::int32_t n, std::int32_t k) noexcept {
+    return n > 0 && k > 0 && k % 8 == 0 && k < 65536;
+}
+
 std::size_t hyper_connection_mix_workspace_capacity_bytes(const Weight& down, const Weight& up, LinearPolicy policy,
                                                           std::int32_t streams, std::int32_t rank,
                                                           std::int32_t max_tokens) {
     require(max_tokens > 0 && streams > 0 && rank > 0, "mix workspace needs positive T, streams and rank");
-    std::size_t bytes = composed_bytes(down, up, policy, streams, rank, max_tokens);
+    std::size_t bytes = composed_bytes(down, up, policy, streams, rank, max_tokens) + decoded_bytes(down) +
+                        decoded_bytes(up);
     for (std::int32_t T = 1; T <= std::min(max_tokens, detail::kHcMixFusedMaxColumns); ++T) {
         bytes = std::max(bytes, detail::hc_mix_fused_workspace_bytes(down.n, streams, T) + 256);
     }

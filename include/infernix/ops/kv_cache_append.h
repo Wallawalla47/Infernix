@@ -63,6 +63,20 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  * (the INT8-G64 codes of y and a tag hashing the position and the stored codes); no other slot
  * changes.
  *
+ * Packed BF16 (Bf16Packed) represents exactly the BF16 cache mode's values - K as BF16, V as
+ * FP16_RNE(BF16 input) - in 384 bytes a row and an 8-byte side record (the scale plane): per
+ * value its sign and seven fraction bits (256 bytes), then a nibble (128 bytes) - 0-13 its
+ * exponent minus base, 14 exponent 0 (a zero or subnormal), 15 an escape (an infinity, NaN or a
+ * normal value outside the window [base, base + 13]); the side record holds base, the escape
+ * count with bit 7 set when a value has exponent 0, and the escapes' exponents in column order,
+ * zero-padded. A row whose normal exponents span at most 14 binades takes base =
+ * clamp(lowest, 1, 240); a wider row takes the lowest base of the windows holding most of them. A
+ * V row keeps the BF16 input, which readers convert to FP16_RNE. A row with more than 6 escapes
+ * has no packed form: it is stored with its first 6 and the view's unpackable flag is set to 1
+ * (PagedKVLayerView::unpackable; for a batch view the flag of the sequence's table row; none when
+ * it is null), and what it appended is not the BF16 mode's values. The codec is
+ * ops/kv_cache/bf16p_codec.cuh.
+ *
  * INT8 and FP8 apply the fixed normalized D256 Hadamard preparation to K; NVFP4, K8V4 and the
  * vector-quantized formats apply it to both K and V. Every transform is evaluated in FP32 from represented BF16 source values. The
  * paired Q and output interpretation belongs to the causal softmax_attention contract. Transform

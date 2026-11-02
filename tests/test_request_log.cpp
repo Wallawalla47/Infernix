@@ -220,7 +220,8 @@ int main() {
         check(k8v4_server.at("engine").at("kv_cache") == "k8v4", "K8V4 KV report name missing");
     for (const auto& [storage, name] :
          {std::pair{infernix::KvCacheStorage::Vq2, "vq2"},
-          std::pair{infernix::KvCacheStorage::Q4KeyVq2Value, "k4v2"}}) {
+          std::pair{infernix::KvCacheStorage::Q4KeyVq2Value, "k4v2"},
+          std::pair{infernix::KvCacheStorage::Bf16Packed, "bf16p"}}) {
         options.kv_cache        = storage;
         engine_options.kv_cache = storage;
         memory.kv_cache         = storage;

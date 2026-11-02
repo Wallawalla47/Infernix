@@ -109,7 +109,8 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
     if (text == "vq2") { return KvCacheStorage::Vq2; }
     if (text == "k4v2") { return KvCacheStorage::Q4KeyVq2Value; }
-    throw std::invalid_argument("--kv-dtype must be bf16, int8, fp8, nvfp4, k8v4, vq2, or k4v2");
+    if (text == "bf16p") { return KvCacheStorage::Bf16Packed; }
+    throw std::invalid_argument("--kv-dtype must be bf16, bf16p, int8, fp8, nvfp4, k8v4, vq2, or k4v2");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -526,7 +527,7 @@ std::string usage_text(std::string_view program) {
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: 16384 for Qwen3.8-Flash-Next, 1024 otherwise)\n"
-        << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2>  KV cache storage (default: bf16)\n"
+        << "  --kv-dtype <bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2>  KV cache storage (default: bf16)\n"
         << "  --logits-dtype <fp32|bf16>  the head's logits (default: fp32; bf16 rounds each once,\n"
         << "                              as Transformers returns them, for comparisons)\n"
         << "  --use-original-int8-prefill-kernel  original INT8-KV prompt kernel at the\n"
@@ -1497,6 +1498,8 @@ std::string kv_cache_name(KvCacheStorage storage) {
         return "vq2";
     case KvCacheStorage::Q4KeyVq2Value:
         return "k4v2";
+    case KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     return "unknown";
 }

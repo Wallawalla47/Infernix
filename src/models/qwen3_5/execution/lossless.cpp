@@ -153,7 +153,8 @@ void attention_layer(A& a, const BlockParameters& block, const TextConfig& confi
     Tensor o = alloc(a, DType::BF16, {D, heads, T});
     // The design reference with a coded KV format: K and V through its production encoder, attention over the
     // stored rows (lossless-route.md §3b).
-    const bool codes    = design.active && design.kv != KvCacheStorage::BFloat16;
+    // Packed BF16 KV stores bf16's values exactly: no codec.
+    const bool codes    = design.active && design.kv != KvCacheStorage::BFloat16 && design.kv != KvCacheStorage::Bf16Packed;
     const DeviceSpan ws = a.alloc_bytes(
         cache != nullptr ? ops::lossless_paged_attention_workspace_bytes(heads, kv_heads, T / cache->sequences,
                                                                         cache->sequences, cache->key_capacity)

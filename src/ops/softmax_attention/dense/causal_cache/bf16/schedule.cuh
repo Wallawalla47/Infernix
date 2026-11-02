@@ -5,14 +5,15 @@
 
 namespace infernix::ops::detail {
 
-// Query rows pack token/head pairs. KV warps cooperate on disjoint key columns.
+// Query rows pack token/head pairs. KV warps cooperate on disjoint key columns. 96 query rows: the packed storage's
+// instances only (their queries stage across two of the tile ring's buffers; grouped_mma.cuh).
 template <int QueryRows, int KeyRows = 32, int KVWarps = 1, int MinBlocks = 2, int FixedWidth = 0>
 struct Bf16KvGroupedMmaSchedule {
-    static_assert(QueryRows == 16 || QueryRows == 32 || QueryRows == 64);
+    static_assert(QueryRows == 16 || QueryRows == 32 || QueryRows == 64 || QueryRows == 96);
     static_assert(KeyRows == 32 || KeyRows == 64);
     static_assert(KVWarps == 1 || KVWarps == 2 || KVWarps == 4);
     static_assert(KeyRows % (16 * KVWarps) == 0);
-    static_assert(QueryRows <= 2 * KeyRows);
+    static_assert(QueryRows <= 2 * KeyRows || (QueryRows == 96 && KVWarps == 1));
     static_assert(FixedWidth == 0 || FixedWidth == 1);
     static constexpr int kFixedWidth = FixedWidth;
     static constexpr int kQueryRows  = QueryRows;
@@ -49,12 +50,13 @@ struct Bf16KvMergeSchedule {
     static constexpr int kWarps   = Threads / 32;
 };
 
-template <class G, class S>
+// Buffers: K/V tile buffers (the packed storage's kernels pipeline two).
+template <class G, class S, int Buffers = 1>
 struct alignas(16) Bf16KvGroupedStorage {
     static constexpr int kStateRows = S::kWarpsKV > 1 ? S::kWarpsKV* S::kQueryRows : 1;
 
     union {
-        std::uint16_t qkv[2 * S::kKeyRows * G::kHeadDim];
+        std::uint16_t qkv[Buffers * 2 * S::kKeyRows * G::kHeadDim];
         float reduction[S::kWarpsKV > 1 ? kStateRows* G::kHeadDim : 1];
     };
 
@@ -68,6 +70,15 @@ struct alignas(16) Bf16KvGroupedStorage {
 template <class Geometry, class Schedule>
 inline constexpr int bf16_kv_tiled_shared_bytes =
     (Schedule::kQueryRows + 2 * Schedule::kKeyRows) * Geometry::kHeadDim * 2;
+
+// A segment of a tiled launch's key blocks [lo, hi) (the packed storage's prompt route, which unpacks its keys
+// segment by segment): a CTA whose blocks start before lo resumes its softmax state and accumulators from `state`, and
+// one whose blocks run past hi suspends them there, so the segments run the blocks of one launch in order, bit for bit.
+struct Bf16KvSegment {
+    int lo        = 0;
+    int hi        = 0;
+    float* state  = nullptr;
+};
 
 
 } // namespace infernix::ops::detail

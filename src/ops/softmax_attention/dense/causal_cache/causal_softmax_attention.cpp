@@ -302,6 +302,7 @@ constexpr std::int32_t kRowsPerCall = kMaximumBatchSize;
 bool verify_rows_attention(KvCacheStorage storage) {
     switch (storage) {
     case KvCacheStorage::BFloat16:
+    case KvCacheStorage::Bf16Packed:
     case KvCacheStorage::Int8Group64:
     case KvCacheStorage::Fp8E4M3Row256:
     case KvCacheStorage::Nvfp4Group16:
@@ -315,6 +316,7 @@ std::size_t cached_rows_workspace_bytes(KvCacheStorage storage, std::int32_t hea
                                         CausalAttentionExecutionEnvelope envelope, int sms) {
     switch (storage) {
     case KvCacheStorage::BFloat16:
+    case KvCacheStorage::Bf16Packed:
         return detail::bf16_kv_cached_rows_workspace_bytes(heads, call_batch, rows, envelope, sms);
     case KvCacheStorage::Int8Group64:
         return detail::int8_kv_cached_rows_workspace_bytes(heads, call_batch, rows, envelope, sms);
@@ -336,6 +338,7 @@ void cached_rows_attention(KvCacheStorage storage, const Tensor& q, const Tensor
                            DeviceExecutionView execution) {
     switch (storage) {
     case KvCacheStorage::BFloat16:
+    case KvCacheStorage::Bf16Packed:
         return detail::bf16_kv_cached_rows_attention(q, positions, valid, rows, scale, cache,
                                                      envelope, call_batch, workspace, out, execution);
     case KvCacheStorage::Int8Group64:
@@ -400,6 +403,11 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         const int sms = execution.multiprocessor_count;
         if (cache_storage == KvCacheStorage::BFloat16)
             return detail::bf16_kv_workspace_bytes(q_heads, batch_size, first, last, routed, sms);
+        if (cache_storage == KvCacheStorage::Bf16Packed)
+            return std::max(detail::bf16_kv_workspace_bytes(q_heads, batch_size, first, last, routed, sms),
+                            batch_size == 1 ? detail::bf16p_kv_prompt_workspace_bytes(
+                                                  q_heads, geometry.kv_heads, first, last, routed, sms)
+                                            : std::size_t{0});
         if (cache_storage == KvCacheStorage::Fp8E4M3Row256)
             return detail::fp8_kv_workspace_bytes(q_heads, batch_size, first, last, routed, sms);
         if (cache_storage == KvCacheStorage::Int8Group64)
@@ -563,7 +571,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         return;
     }
 
-    if (cache.storage == KvCacheStorage::BFloat16) {
+    if (cache.storage == KvCacheStorage::BFloat16 || cache.storage == KvCacheStorage::Bf16Packed) {
         detail::bf16_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
                                          tree_masks, scale, cache, envelope, workspace, out,
                                          execution);
@@ -614,7 +622,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     }
     validate_attention_tensors(q, positions, out, geometry, cache, envelope, scale, op);
 
-    if (cache.storage == KvCacheStorage::BFloat16) {
+    if (cache.storage == KvCacheStorage::BFloat16 || cache.storage == KvCacheStorage::Bf16Packed) {
         detail::bf16_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
                                          execution);
         return;

@@ -23,7 +23,12 @@
 // The up projection and collapse of more than 96 columns run as one kernel for a Q8 W_up; it claims the
 // bits of the separate linear and collapse, so it is compared with them exactly at T = 97, 128, 129, 192,
 // 256, 300 and 1025 (each tile width, full and partial token tiles). A BF16 W_up takes the separate steps.
+//
+// The BF16 problem's matrices packed at load (bf16_p12) give the BF16 matrices' x and inject bits, exactly, on the
+// fused route (its codec decodes the same chunks) and the composed route (the matrices decoded into the workspace).
 
+#include "core/weight_view.h"
+#include "infernix/ops/bf16_p12.h"
 #include "infernix/ops/hyper_connection.h"
 #include "ops/ggml/ggml_a8.h"
 #include "ops/op_family.h"
@@ -418,6 +423,52 @@ void repack_q8(bool inject, cudaStream_t stream) {
     }
 }
 
+// A BF16 matrix packed (the loader's count and pack passes) and bound as the loader binds it.
+struct PackedMatrix {
+    std::unique_ptr<Device> storage;
+    infernix::WeightParent parent;
+    infernix::Weight weight;
+    std::uint32_t escapes = 0;
+};
+
+std::unique_ptr<PackedMatrix> pack_matrix(const infernix::Weight& w, cudaStream_t stream) {
+    auto out = std::make_unique<PackedMatrix>();
+    Device scratch(infernix::ops::bf16_p12_pack_scratch_bytes(w.n)), count(4);
+    infernix::ops::bf16_p12_count(w.qdata, w.n, w.k, scratch.p, static_cast<std::uint32_t*>(count.p), stream);
+    t::cuda_check(cudaMemcpyAsync(&out->escapes, count.p, 4, cudaMemcpyDeviceToHost, stream), "escapes");
+    t::cuda_check(cudaStreamSynchronize(stream), "count");
+    const infernix::WeightGeometry g = infernix::bf16_p12_geometry(w.n, w.k, out->escapes);
+    out->storage                     = std::make_unique<Device>(g.bytes);
+    infernix::ops::bf16_p12_pack(w.qdata, w.n, w.k, out->escapes, scratch.p, out->storage->p, stream);
+    t::cuda_check(cudaStreamSynchronize(stream), "pack");
+    out->parent.geometry = g;
+    out->parent.data = out->parent.device = static_cast<const std::byte*>(out->storage->p);
+    const auto n = static_cast<std::uint64_t>(w.n), k = static_cast<std::uint64_t>(w.k);
+    out->weight  = infernix::native_weight(infernix::WeightView{{n, k}, {{&out->parent, 0, n * k}}});
+    return out;
+}
+
+void packed_bit_identity(bool inject, cudaStream_t stream) {
+    Problem p             = make_problem(inject, Codec::Bf16);
+    const std::string tag = std::string("bf16_p12 ") + (inject ? "inject" : "no inject");
+    const auto down = pack_matrix(p.down_w, stream), up = pack_matrix(p.up_w, stream);
+    check(down->escapes > 0 && up->escapes > 0, tag + ": the packed matrices hold escapes");
+    const infernix::Weight bf16_down = p.down_w, bf16_up = p.up_w;
+    const std::size_t capacity = infernix::ops::hyper_connection_mix_workspace_capacity_bytes(
+        down->weight, up->weight, infernix::ops::LinearPolicy::A16Only, kS, kRank, 193);
+    infernix::WorkspaceArena ws(capacity);
+    for (const int T : {1, 5, 16, 17, 64, 193}) {
+        const auto r = residual(T, 5000U + static_cast<std::uint32_t>(T));
+        p.down_w = bf16_down, p.up_w = bf16_up;
+        const Result want = run(p, r, T, inject, ws, stream);
+        p.down_w = down->weight, p.up_w = up->weight;
+        const Result got = run(p, r, T, inject, ws, stream);
+        check(got.x == want.x && got.inject == want.inject,
+              tag + " T=" + std::to_string(T) + ": the packed matrices give the BF16 matrices' bits");
+        check(ws.peak_used() <= capacity, tag + ": the workspace capacity covers T=" + std::to_string(T));
+    }
+}
+
 // The fused up + collapse against the separate linear (A16Only) and collapse, bit for bit. m is of a
 // SiLU output's range and normalized of a normed residual's.
 void up_collapse_bit_identity(Codec codec, cudaStream_t stream) {
@@ -579,6 +630,8 @@ INFERNIX_OP_TEST(hyper_connection) {
         repack_q8(false, stream);
         a8_encoded(Codec::Q8, stream);
         a8_encoded(Codec::Bf16, stream);
+        packed_bit_identity(true, stream);
+        packed_bit_identity(false, stream);
         // Shapes that disagree are refused.
         {
             Problem p = make_problem(true, Codec::Q8);

@@ -51,10 +51,11 @@ public:
 
 private:
     friend class PagedKVCache;
-    PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept;
+    PagedKVCacheView(const PagedKVCache& cache, Tensor block_table, std::int32_t* unpackable) noexcept;
 
     const PagedKVCache* cache_ = nullptr;
     Tensor block_table_;
+    std::int32_t* unpackable_ = nullptr;
 };
 
 class PagedKVCache {
@@ -87,9 +88,19 @@ public:
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
+    // Packed BF16 storage: `flags` (one std::int32_t per execution table row, device-visible host memory the caller
+    // owns) receive the appends' reports of rows with no packed form (PagedKVLayerView::unpackable).
+    void bind_unpackable(std::int32_t* flags) noexcept { unpackable_ = flags; }
+
+    // The flag of execution table row `row`; null when none is bound.
+    [[nodiscard]] std::int32_t* unpackable(std::int32_t row) const noexcept {
+        return unpackable_ == nullptr ? nullptr : unpackable_ + row;
+    }
+
 private:
     friend class PagedKVCacheView;
-    [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
+    [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table,
+                                              std::int32_t* unpackable) const;
 
     DeviceKVPagePool pages_;
     KVExecutionTablePool execution_tables_;
@@ -97,6 +108,7 @@ private:
     std::uint32_t max_context_ = 0;
     std::int32_t kv_heads_     = 0;
     PagedKVStorageLayout layer_storage_;
+    std::int32_t* unpackable_ = nullptr;
 };
 
 struct DecoderStateLayout {

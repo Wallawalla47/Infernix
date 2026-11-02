@@ -2,6 +2,7 @@
 
 #include "artifact/framing.h"
 #include "artifact/materializer.h"
+#include "core/host_memory.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/qwen4_exp/config.h"
@@ -33,6 +34,23 @@ struct InstanceInfo {
 
 class LoadPlan;
 
+// The BF16 projections packed losslessly at load (LoadOptions::pack_bf16; core/weight.h bf16_p12): one device
+// block of their planes and a parent per artifact object, which the bound views address in place of the
+// artifact's BF16 parents (freed after packing).
+struct PackedWeights {
+    DeviceBuffer storage;
+    // Objects packed into pinned host memory (the token embedding, gathered zero-copy), and their bytes.
+    std::unique_ptr<RegisteredHostBuffer> host_storage;
+    std::uint64_t host_bytes = 0;
+    std::vector<std::unique_ptr<WeightParent>> parents;
+    std::uint64_t source_bytes = 0; // the BF16 bytes they replace
+    std::uint64_t escapes      = 0;
+    double seconds             = 0; // packing's wall time
+    // Of which: counts (with the CUDA module load of the process's first kernel launch, ~2.4 s, which a load without
+    // packing pays later), the block's allocation, packing, freeing the BF16 copies.
+    double phase_seconds[4] = {};
+};
+
 class Model {
 public:
     ~Model();
@@ -55,6 +73,13 @@ public:
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
         return backing_.stats();
     }
+    [[nodiscard]] const PackedWeights& packed() const noexcept { return packed_; }
+    // The device bytes the dense weights hold once loaded: the artifact's device arena, the packed block and the
+    // DFlash2 companion's arena.
+    [[nodiscard]] std::uint64_t device_weight_bytes() const noexcept {
+        return backing_.stats().device_capacity_bytes + packed_.storage.bytes +
+               (draft_backing_ ? draft_backing_->stats().device_capacity_bytes : 0);
+    }
     // With vision offload: the pinned tower and its staging layout (no evictable pool: the encode
     // window borrows device memory from the expert cache, design §19.3.2).
     [[nodiscard]] const std::optional<qwen3_5::VisionOverlayAssets>& overlay_vision() const noexcept {
@@ -67,11 +92,13 @@ private:
     Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
           std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
           std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
-          std::optional<ExpertStore> expert_store, std::optional<artifact::MaterializedArtifact> draft_backing);
+          std::optional<ExpertStore> expert_store, std::optional<artifact::MaterializedArtifact> draft_backing,
+          PackedWeights packed);
 
     // Borrowers are declared after the backing they view, so they are destroyed first.
     artifact::MaterializedArtifact backing_;
     std::optional<artifact::MaterializedArtifact> draft_backing_; // the DFlash2 companion's weights
+    PackedWeights packed_;
     std::optional<ExpertStore> expert_store_; // the streamed banks' multipliers back banks_
     Config config_;
     LoadOptions options_;
