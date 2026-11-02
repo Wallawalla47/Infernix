@@ -26,6 +26,7 @@ constexpr int kNmma4GuWarps    = kNmma4Warps * kNmma4KSplit;
 constexpr int kNmma4GuThreads  = 32 * kNmma4GuWarps;   // a gate/up CTA
 constexpr int kNmma4StageUnits = 8;  // units per stage of a gate/up warp's ring (1,152 bytes)
 constexpr int kNmma4Depth      = 3;  // stages in a gate/up warp's ring
+constexpr int kNmma4EncodeMinColumns = 4; // calls from this width encode x once per job (encode_nmma4_kernel)
 
 template <class G>
 struct Nmma4Shape {
@@ -47,7 +48,9 @@ struct Nmma4Shape {
 };
 
 // Whether a call's W4A4 jobs take these kernels (launch_pass decides it): calls of at most kMaxColumns columns, which
-// have no wide jobs.
+// have no wide jobs. (Wider calls' narrow jobs here instead of on the one-column kernels: op -12 to -44 %, but
+// FP4-Local's prefill measured 0.2-1.0 % slower at pp1024 and pp4096 in two of three blocks and level in the third,
+// 2026-11-02.)
 inline bool a4_nmma_call(const MoeExpertSource& source, int columns, const moe::wide::ExpertsWorkspace& layout) {
     return source.activation == moe::ExpertActivation::kA4 && source.a4_shared_input && !ggml_bank(source) &&
            source.wide_a16 != moe::WideA16::kLossless && source.shape == moe::kFlashNextShape &&
@@ -100,12 +103,52 @@ struct Nmma4Args {
     canon::A4Block* h_blocks;    // [entries][kHBlocks]
     bf16* outputs;               // [entries][hidden]
     PassPhase phase;
+    // [entries][kXRowBytes]: each narrow entry's A4(x) as encode_nmma4_kernel writes it (the workspace's x plane,
+    // whose rows of wide entries the wide route fills in its own layout), or null: each gate/up CTA quantizes its
+    // job's columns itself (calls narrower than kNmma4EncodeMinColumns).
+    std::uint8_t* x_rows;
 };
+
+// One 16-element block b of one column's A4(x) with the job's input scale into an x row of this route's layout:
+// 8 code bytes at 8 b (element 2 j in byte j's low nibble), the scale word at kXCodeBytes + b.
+template <class G>
+__device__ __forceinline__ void nmma4_encode_block(const std::uint16_t* column, float input_scale, int b, std::uint8_t* row) {
+    const canon::A4Codes codes = canon::quantize_a4_codes(column + 16 * b, input_scale);
+    std::uint32_t w[2] = {0, 0};
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const std::uint32_t byte = static_cast<std::uint32_t>(codes.code[2 * j]) | (static_cast<std::uint32_t>(codes.code[2 * j + 1]) << 4);
+        w[j / 4] |= byte << (8 * (j % 4));
+    }
+    *reinterpret_cast<uint2*>(row + 8 * b) = make_uint2(w[0], w[1]);
+    row[Nmma4Shape<G>::kXCodeBytes + b]   = codes.scale_word;
+}
+
+// Each narrow job's columns' A4(x), once per call instead of in each of its kGateUpCtas gate/up CTAs (whose
+// quantization, columns x 160 blocks of 16 IEEE divisions each, delayed every CTA's first product: the gate/up
+// kernel took 23.3 -> 30.9 us from three to five columns against W4A16's 22.4 -> 24.0 in FP4-Local's decode,
+// 2026-11-02): CTA (job, c) encodes column c, one block a thread. The gate/up pass is its programmatic dependent.
+template <class G>
+__global__ void __launch_bounds__(G::kHidden / 16) encode_nmma4_kernel(Nmma4Args a) {
+    pdl::trigger_dependents(); // the gate/up pass may launch and start its weight copies; it reads x_rows after its wait
+    const MoeDispatch& dispatch = a.dispatch;
+    const int job = a.job_base + static_cast<int>(blockIdx.x), c = static_cast<int>(blockIdx.y);
+    if (job >= *dispatch.job_count || (a.cpu_flags != nullptr && a.cpu_flags[job] != 0)) { return; }
+    const int expert = dispatch.jobs[job];
+    if (pass_record(a.phase, a.source, expert, a.job_records, job) == nullptr) { return; } // another pass's job
+    const moe::ExpertScales scales = a.source.scales[expert];
+    const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
+    if (c >= count || moe::wide_route(count, scales)) { return; }
+    const int token = dispatch.entries[first + c] / a.top_k;
+    nmma4_encode_block<G>(a.x + static_cast<std::size_t>(token) * G::kHidden, scales.input_gate, static_cast<int>(threadIdx.x),
+                          a.x_rows + static_cast<std::size_t>(first + c) * Nmma4Shape<G>::kXRowBytes);
+}
 
 // A gate/up CTA's shared memory, sized at launch by the call's columns T (gate_up_nmma4_shared_bytes): the scale table,
 // the warps' rings (the second K half's sums reuse them once the K loop is done), then T rows of A4(x) (codes, then
 // scale words), whose memory the T rows of BF16 h reuse after the K loop. At one to three columns three CTAs fit an SM
-// (100 KB): two columns' 400 CTAs then take one wave of 510 slots instead of 1.2 waves of 340.
+// (100 KB): two columns' 400 CTAs then take one wave of 510 slots instead of 1.2 waves of 340. (Reading encoded rows
+// from L2 instead, so that three CTAs fit at every width, measured slower on every workload: 2026-11-02.)
 template <class G>
 struct Nmma4GateUpLayout {
     static constexpr int kScaled = 0;
@@ -143,13 +186,18 @@ __global__ void __launch_bounds__(kNmma4GuThreads) gate_up_nmma4_kernel(Nmma4Arg
     pdl::trigger_dependents();
     const MoeDispatch& dispatch = a.dispatch;
     const int job = a.job_base + static_cast<int>(blockIdx.y);
-    if (job >= *dispatch.job_count || (a.cpu_flags != nullptr && a.cpu_flags[job] != 0)) { return; }
+    // After an encode (x_rows), every CTA waits for it before it ends, an idle one too, so this grid's completion
+    // implies the encode's (the down pass's and stream order's contract).
+    const auto idle = [&] {
+        if (a.x_rows != nullptr) { pdl::wait_for_dependencies(); }
+    };
+    if (job >= *dispatch.job_count || (a.cpu_flags != nullptr && a.cpu_flags[job] != 0)) { return idle(); }
     const int expert           = dispatch.jobs[job];
     const std::uint8_t* record = pass_record(a.phase, a.source, expert, a.job_records, job);
-    if (record == nullptr) { return; }
+    if (record == nullptr) { return idle(); }
     const moe::ExpertScales scales = a.source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (moe::wide_route(count, scales)) { return; }
+    if (moe::wide_route(count, scales)) { return idle(); }
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     const int g = lane / 4, t = lane % 4;
     const int rg = warp % kNmma4Warps, k_half = warp / kNmma4Warps; // this warp's row group in the CTA and K half
@@ -166,22 +214,23 @@ __global__ void __launch_bounds__(kNmma4GuThreads) gate_up_nmma4_kernel(Nmma4Arg
         issue(k);
         ggml::tile::cp_async_commit();
     }
-    // The job's columns' A4(x) while the rings fill: one block of one column a thread.
-    for (int i = static_cast<int>(threadIdx.x); i < count * (G::kHidden / 16); i += kNmma4GuThreads) {
-        const int c = i / (G::kHidden / 16), b = i % (G::kHidden / 16);
-        const int token = dispatch.entries[first + c] / a.top_k;
-        const canon::A4Codes codes = canon::quantize_a4_codes(a.x + static_cast<std::size_t>(token) * G::kHidden + 16 * b,
-                                                              scales.input_gate);
-        std::uint32_t w[2] = {0, 0};
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const std::uint32_t byte = static_cast<std::uint32_t>(codes.code[2 * j]) | (static_cast<std::uint32_t>(codes.code[2 * j + 1]) << 4);
-            w[j / 4] |= byte << (8 * (j % 4));
-        }
-        *reinterpret_cast<uint2*>(sm.x[c] + 8 * b) = make_uint2(w[0], w[1]);
-        sm.x[c][S::kXCodeBytes + b] = codes.scale_word;
-    }
     nmma4_fill_scaled(sm.scaled, kNmma4GuThreads);
+    if (a.x_rows != nullptr) {
+        // The job's columns' A4(x) rows from encode_nmma4_kernel (this pass's primary) while the rings fill.
+        pdl::wait_for_dependencies();
+        constexpr int kWords = S::kXRowBytes / 16;
+        const auto* src = reinterpret_cast<const uint4*>(a.x_rows + static_cast<std::size_t>(first) * S::kXRowBytes);
+        for (int i = static_cast<int>(threadIdx.x); i < count * kWords; i += kNmma4GuThreads) {
+            *reinterpret_cast<uint4*>(sm.x[i / kWords] + 16 * (i % kWords)) = __ldcg(src + i);
+        }
+    } else {
+        // The job's columns' A4(x) while the rings fill: one block of one column a thread.
+        for (int i = static_cast<int>(threadIdx.x); i < count * (G::kHidden / 16); i += kNmma4GuThreads) {
+            const int c = i / (G::kHidden / 16), b = i % (G::kHidden / 16);
+            const int token = dispatch.entries[first + c] / a.top_k;
+            nmma4_encode_block<G>(a.x + static_cast<std::size_t>(token) * G::kHidden, scales.input_gate, b, sm.x[c]);
+        }
+    }
     __syncthreads(); // x and the scale table
     // Column g's codes (a thread past the job's columns reads its last one; its sums are not used) and columns 2 t and
     // 2 t + 1's scale words, from this half's first block.
@@ -327,8 +376,14 @@ void launch_expert_pass_a4_nmma(const bf16* x, int columns, const MoeDispatch& d
                                 PassPhase phase, PassPart part) {
     using G = moe::FlashNextExperts;
     using S = Nmma4Shape<G>;
+    static_assert(S::kXRowBytes == moe::wide::kXRowBytes, "the encoded rows are the workspace's x plane rows");
+    // Calls of kNmma4EncodeMinColumns columns or more encode each job's x once (encode_nmma4_kernel); narrower ones in
+    // each gate/up CTA. FP4-Local with per-job x (2026-11-02, DFlash2 auto, three interleaved runs each): never encoding
+    // lost 0.4-0.6 % on every workload, encoding at every width was level (conv +0.2 %, after a 16K prompt +0.2 %,
+    // struct -0.2 %); op bench: T = 1-3 0.88-0.95x the time without it, T = 4-8 level to 3 % faster.
+    const bool encoded = layout.x_plane != nullptr && std::min(columns, moe::kMaxColumns) >= kNmma4EncodeMinColumns;
     const Nmma4Args args{reinterpret_cast<const std::uint16_t*>(x), dispatch, source, top_k, job_records, flags, base,
-                         layout.h_blocks, outputs, phase};
+                         layout.h_blocks, outputs, phase, encoded ? layout.x_plane : nullptr};
     static const bool configured = [] {
         const auto set = [](auto kernel, std::size_t bytes) {
             return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)) ==
@@ -343,7 +398,14 @@ void launch_expert_pass_a4_nmma(const bf16* x, int columns, const MoeDispatch& d
     // A job has at most min(columns, kMaxColumns) columns, so both kernels' column buffers are sized by the call.
     const int call_columns = std::min(columns, moe::kMaxColumns);
     if (part != PassPart::Down) {
-        CUDA_CHECK(pdl::launch_with(pdl::Dependency::Serialized,
+        if (encoded) {
+            CUDA_CHECK(pdl::launch_with(pdl::Dependency::Serialized,
+                                        {dim3(jobs, call_columns), dim3(G::kHidden / 16), 0, stream},
+                                        encode_nmma4_kernel<G>, args));
+            check_launch("A4 tensor-core x encode");
+        }
+        // With the encode, a programmatic dependent of it: the CTAs fill their rings before their PDL wait.
+        CUDA_CHECK(pdl::launch_with(encoded ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized,
                                     {dim3(S::kGateUpCtas, jobs), dim3(kNmma4GuThreads), gate_up_nmma4_shared_bytes<G>(call_columns), stream},
                                     gate_up_nmma4_kernel<G>, args, call_columns));
         check_launch("A4 tensor-core gate/up");
