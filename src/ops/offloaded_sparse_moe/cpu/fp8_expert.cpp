@@ -353,12 +353,14 @@ void fp8_gate_up(CpuIsa isa, const std::uint8_t* record, const CpuLimbSlice* con
         const int i1 = std::min(i_end, i0 + kUnit);
         columns.row_sums(record, scales, kHidden, i0, i1, ncols, g, ge);
         columns.row_sums(record + kGateBytes, scales + kGateTiles, kHidden, i0, i1, ncols, u, ue);
-        for (int i = i0; i < i1; ++i) {
-            for (int c = 0; c < ncols; ++c) {
+        for (int c = 0; c < ncols; ++c) {
+            std::uint16_t gate[kUnit], value[kUnit];
+            for (int i = i0; i < i1; ++i) {
                 const std::size_t at = static_cast<std::size_t>(i - i0) * ncols + c;
-                h[c][i] = canon::swiglu_bf16(fp8b128::output_bf16(g[at], ge[i - i0], x_emax[c]),
-                                             fp8b128::output_bf16(u[at], ue[i - i0], x_emax[c]));
+                gate[i - i0]  = fp8b128::output_bf16(g[at], ge[i - i0], x_emax[c]);
+                value[i - i0] = fp8b128::output_bf16(u[at], ue[i - i0], x_emax[c]);
             }
+            swiglu_bf16_n(isa, gate, value, i1 - i0, &h[c][i0]);
         }
     }
 }
