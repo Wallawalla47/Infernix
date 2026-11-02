@@ -17,7 +17,6 @@ using infernix::TokenId;
 using infernix::serve::PrefixMiss;
 using infernix::serve::PrefixMissSettlement;
 using infernix::serve::PrefixMissTracker;
-using infernix::serve::settle_prefix_miss;
 
 namespace {
 
@@ -121,14 +120,14 @@ int main() {
     const std::vector<TokenId> answer = run(9000, 40);
 
     // A first request has nothing to compare with.
-    check(!tracker.settle(1, join(system, turn1), answer, 0, 350).has_value(), "first request explained");
+    check(!tracker.settle(1, join(system, turn1), answer, 0, 350).miss.has_value(), "first request explained");
 
     // The next turn appends to prompt + answer and reuses them: nothing to explain.
     const std::vector<TokenId> next = join(join(join(system, turn1), answer), run(7000, 120));
-    check(!tracker.settle(2, next, run(9500, 10), 390, 120).has_value(), "a reused append was explained");
+    check(!tracker.settle(2, next, run(9500, 10), 390, 120).miss.has_value(), "a reused append was explained");
 
     // The same append recomputed from scratch: the earlier context was a prefix, so it was evicted.
-    const auto evicted = tracker.settle(3, next, run(9600, 10), 0, 510);
+    const auto evicted = tracker.settle(3, next, run(9600, 10), 0, 510).miss;
     check(evicted && evicted->kind == PrefixMiss::Kind::Evicted && evicted->earlier_engine_request_id == 2 &&
               evicted->common_prefix_tokens == 510 && evicted->lost_reuse_tokens == 509 && !evicted->earlier &&
               !evicted->current,
@@ -136,7 +135,7 @@ int main() {
 
     // A client that drops the earlier answer (its reasoning, say) diverges at the answer's start.
     std::vector<TokenId> rewritten = join(join(system, turn1), run(7000, 120));
-    const auto diverged            = tracker.settle(4, rewritten, {}, 344, 126);
+    const auto diverged            = tracker.settle(4, rewritten, {}, 344, 126).miss;
     check(diverged && diverged->kind == PrefixMiss::Kind::Diverged && diverged->common_prefix_tokens == 350 &&
               diverged->earlier_context_tokens == 520 && diverged->lost_reuse_tokens == 6,
           "a rewrite was not recorded as a divergence at its first changed token");
@@ -146,11 +145,11 @@ int main() {
           "the divergence windows do not straddle the divergence");
 
     // Below min_tokens computed, nothing is compared.
-    check(!tracker.settle(5, rewritten, {}, 300, 99).has_value(), "a small recompute was explained");
+    check(!tracker.settle(5, rewritten, {}, 300, 99).miss.has_value(), "a small recompute was explained");
 
     // Sharing less than half the prompt with every earlier context explains nothing.
     const std::vector<TokenId> other = join(run(1000, 100), run(20000, 400));
-    check(!tracker.settle(6, other, {}, 0, 500).has_value(), "an unrelated prompt was explained");
+    check(!tracker.settle(6, other, {}, 0, 500).miss.has_value(), "an unrelated prompt was explained");
 
     // Only the last `contexts` are kept: with room for 3, a context two requests back still explains
     // an eviction; with room for 2 it is gone.
@@ -160,14 +159,14 @@ int main() {
         (void)recent.settle(1, a, {}, 0, 200);
         (void)recent.settle(2, run(40000, 200), {}, 0, 200);
         (void)recent.settle(3, run(50000, 200), {}, 0, 200);
-        const bool explained = recent.settle(4, join(a, run(60000, 50)), {}, 0, 250).has_value();
+        const bool explained = recent.settle(4, join(a, run(60000, 50)), {}, 0, 250).miss.has_value();
         check(explained == (room == 3), "the recent contexts kept do not follow the capacity");
     }
 
     // A window cutting a multi-byte character keeps valid UTF-8.
     PrefixMissTracker cut(decode, 2, 1, 2);
     (void)cut.settle(1, std::vector<TokenId>{1, 2, 3, 7, 8}, {}, 0, 5);
-    const auto broken = cut.settle(2, std::vector<TokenId>{1, 2, 3, 9, 8}, {}, 0, 5);
+    const auto broken = cut.settle(2, std::vector<TokenId>{1, 2, 3, 9, 8}, {}, 0, 5).miss;
     check(broken && broken->earlier && broken->earlier->text == "<2><3>\xef\xbf\xbd<8>",
           "a cut character was not replaced");
 
@@ -175,15 +174,15 @@ int main() {
     // before the recorded text was ever sanitized: the finished request must survive that and keep
     // its window and counters, and say that the diagnosis gave up. The earlier context is
     // {1,2,7,3} (an incomplete character at its end) in both cases, so that side always collapses
-    // to one U+FFFD; only this side of the divergence differs.
+    // to one U+FFFD; only this side of the divergence differs. The flag is the request's own: the
+    // next request, which nothing explains, reports none.
     struct CutCase {
         std::vector<TokenId> rewritten;
         std::string current_text;
-        std::uint64_t failures;
     };
     const std::vector<CutCase> cuts = {
-        {{1, 2, 9, 3}, "<1><2>\xe2\x82\xac<3>", 1}, // a complete character on this side
-        {{1, 2, 8, 7}, "\xef\xbf\xbd", 2},          // cut on both sides
+        {{1, 2, 9, 3}, "<1><2>\xe2\x82\xac<3>"}, // a complete character on this side
+        {{1, 2, 8, 7}, "\xef\xbf\xbd"},          // cut on both sides
     };
     for (const CutCase& cut : cuts) {
         PrefixMissTracker strict(strict_decode, 2, 1, 2);
@@ -191,7 +190,7 @@ int main() {
         bool threw = false;
         std::optional<PrefixMissSettlement> settled;
         try {
-            settled = settle_prefix_miss(strict, 2, cut.rewritten, {}, 0, 5);
+            settled = strict.settle(2, cut.rewritten, {}, 0, 5);
         } catch (const std::exception&) {
             threw = true;
         }
@@ -202,9 +201,10 @@ int main() {
                   record->earlier && record->earlier->first == 0 &&
                   record->earlier->token_ids == std::vector<TokenId>{1, 2, 7, 3} &&
                   record->earlier->text == "\xef\xbf\xbd" && record->current &&
-                  record->current->text == cut.current_text &&
-                  strict.diagnostic_failures() == cut.failures,
+                  record->current->text == cut.current_text,
               "a throwing decoder cost the record its window, its counters or its failure note");
+        const auto next = strict.settle(3, std::vector<TokenId>{20, 21, 22, 23}, {}, 0, 5);
+        check(!next.miss && !next.diagnostic_failed, "a later request reported an earlier request's failure");
     }
 
     // The route the serve takes: the bytes, then the replacement. Every run of bytes that cannot
@@ -212,20 +212,21 @@ int main() {
     {
         PrefixMissTracker bytes(raw_bytes, 2, 1, 2);
         (void)bytes.settle(1, std::vector<TokenId>{1, 2, 7, 3}, {}, 0, 5);
-        const auto record = bytes.settle(2, std::vector<TokenId>{1, 2, 8, 7}, {}, 0, 5);
+        const auto settled = bytes.settle(2, std::vector<TokenId>{1, 2, 8, 7}, {}, 0, 5);
+        const auto& record = settled.miss;
         check(record && record->earlier && record->earlier->text == "<1><2>\xef\xbf\xbd<3>",
               "a character truncated at the window's end did not become one U+FFFD");
         check(record && record->current &&
                   record->current->text == "<1><2>\xef\xbf\xbd\xef\xbf\xbd",
               "a leading continuation byte and a truncated character did not become two U+FFFD");
-        check(bytes.diagnostic_failures() == 0, "the byte route reported no diagnostic failure");
+        check(!settled.diagnostic_failed, "the byte route reported a diagnostic failure");
     }
 
     // A NUL is a byte of the window's text, not its end.
     {
         PrefixMissTracker nul(raw_bytes, 2, 1, 2);
         (void)nul.settle(1, std::vector<TokenId>{1, 2, 5, 9}, {}, 0, 5);
-        const auto record = nul.settle(2, std::vector<TokenId>{1, 2, 3, 9}, {}, 0, 5);
+        const auto record = nul.settle(2, std::vector<TokenId>{1, 2, 3, 9}, {}, 0, 5).miss;
         std::string expected = "<1><2>";
         expected += '\0';
         expected += "\xe2\x82\xac";
@@ -233,22 +234,23 @@ int main() {
               "a NUL byte did not survive the window's text with the bytes after it");
     }
 
-    // Concurrent settles share one tracker: nothing throws, and the contexts kept stay whole enough
-    // to explain a later request.
+    // Concurrent settles share one tracker: nothing throws or fails, and the contexts kept stay
+    // whole enough to explain a later request.
     {
         PrefixMissTracker shared(raw_bytes, 16, 100, 4);
         const std::vector<TokenId> base = run(700000, 300);
         std::atomic_flag threw;
+        std::atomic_flag failed;
         std::vector<std::thread> workers;
         for (int worker = 0; worker < 4; ++worker) {
-            workers.emplace_back([&] {
+            workers.emplace_back([&, worker] {
                 for (int round = 0; round < 50; ++round) {
                     const auto prompt =
                         join(base, run(static_cast<TokenId>(800000 + worker * 1000 + round), 20));
                     try {
-                        (void)settle_prefix_miss(shared,
-                                                 static_cast<std::uint64_t>(worker * 100 + round),
-                                                 prompt, {}, 0, 320);
+                        const auto settled = shared.settle(static_cast<std::uint64_t>(worker * 100 + round),
+                                                           prompt, {}, 0, 320);
+                        if (settled.diagnostic_failed) { failed.test_and_set(); }
                     } catch (const std::exception&) {
                         threw.test_and_set();
                     }
@@ -256,8 +258,8 @@ int main() {
             });
         }
         for (std::thread& worker : workers) { worker.join(); }
-        check(!threw.test(), "concurrent settles threw");
-        const auto after = shared.settle(999, join(base, run(900000, 20)), {}, 0, 320);
+        check(!threw.test() && !failed.test(), "concurrent settles threw or reported a failure");
+        const auto after = shared.settle(999, join(base, run(900000, 20)), {}, 0, 320).miss;
         check(after && after->kind == PrefixMiss::Kind::Diverged &&
                   after->common_prefix_tokens == 300 && after->earlier && after->current,
               "the contexts kept through concurrent settles no longer explain a divergence");

@@ -34,7 +34,8 @@ PrefixMissTracker::PrefixMissTracker(Detokenize detokenize, std::size_t contexts
                                      std::uint32_t min_tokens, std::uint32_t window)
     : detokenize_(std::move(detokenize)), capacity_(contexts), min_tokens_(min_tokens), window_(window) {}
 
-PrefixMissWindow PrefixMissTracker::window(std::span<const infernix::TokenId> tokens, std::size_t at) const {
+PrefixMissWindow PrefixMissTracker::window(std::span<const infernix::TokenId> tokens, std::size_t at,
+                                           bool& failed) const {
     const std::size_t first = at > window_ ? at - window_ : 0;
     const std::size_t last  = std::min(tokens.size(), at + window_);
     PrefixMissWindow out;
@@ -48,15 +49,17 @@ PrefixMissWindow PrefixMissTracker::window(std::span<const infernix::TokenId> to
         out.text = valid_utf8(detokenize_(out.token_ids));
     } catch (const std::exception&) {
         out.text = kUndecodable;
-        diagnostic_failures_.fetch_add(1, std::memory_order_relaxed);
+        failed   = true;
     }
     return out;
 }
 
-// The record explaining `prompt` against the earlier contexts, or none. The caller holds mutex_.
+// The record explaining `prompt` against the earlier contexts, or none; `failed` is set when a
+// window's text could not be decoded. The caller holds mutex_.
 std::optional<PrefixMiss> PrefixMissTracker::diagnose(std::span<const infernix::TokenId> prompt,
                                                       std::uint32_t reused_tokens,
-                                                      std::uint32_t computed_prefill_tokens) const {
+                                                      std::uint32_t computed_prefill_tokens,
+                                                      bool& failed) const {
     std::optional<PrefixMiss> miss;
     if (computed_prefill_tokens >= min_tokens_ && !prompt.empty()) {
         // The earlier context sharing the longest prefix (the latest on ties).
@@ -83,8 +86,8 @@ std::optional<PrefixMiss> PrefixMissTracker::diagnose(std::span<const infernix::
                 miss->computed_prefill_tokens   = computed_prefill_tokens;
                 miss->lost_reuse_tokens         = static_cast<std::uint32_t>(lost);
                 if (diverged) {
-                    miss->earlier = window(best->tokens, shared);
-                    miss->current = window(prompt, shared);
+                    miss->earlier = window(best->tokens, shared, failed);
+                    miss->current = window(prompt, shared, failed);
                 }
             }
         }
@@ -92,49 +95,33 @@ std::optional<PrefixMiss> PrefixMissTracker::diagnose(std::span<const infernix::
     return miss;
 }
 
-std::optional<PrefixMiss> PrefixMissTracker::settle(std::uint64_t engine_request_id,
-                                                    std::span<const infernix::TokenId> prompt,
-                                                    std::span<const infernix::TokenId> output,
-                                                    std::uint32_t reused_tokens,
-                                                    std::uint32_t computed_prefill_tokens) {
+PrefixMissSettlement PrefixMissTracker::settle(std::uint64_t engine_request_id,
+                                               std::span<const infernix::TokenId> prompt,
+                                               std::span<const infernix::TokenId> output,
+                                               std::uint32_t reused_tokens,
+                                               std::uint32_t computed_prefill_tokens) {
     std::lock_guard lock(mutex_);
-    // The diagnosis is optional: whatever it cannot establish, it leaves the settled request's own
-    // context in place for the requests that follow.
-    std::optional<PrefixMiss> miss;
+    // The diagnosis is optional: whatever it cannot establish costs its record and sets the flag,
+    // and the settled request's own context still joins the others for the requests that follow.
+    PrefixMissSettlement settled;
     try {
-        miss = diagnose(prompt, reused_tokens, computed_prefill_tokens);
+        settled.miss = diagnose(prompt, reused_tokens, computed_prefill_tokens, settled.diagnostic_failed);
     } catch (const std::exception&) {
-        miss.reset();
-        diagnostic_failures_.fetch_add(1, std::memory_order_relaxed);
+        settled.miss.reset();
+        settled.diagnostic_failed = true;
     }
-    Context context{.engine_request_id = engine_request_id, .tokens = {}};
-    context.tokens.reserve(prompt.size() + output.size());
-    context.tokens.insert(context.tokens.end(), prompt.begin(), prompt.end());
-    context.tokens.insert(context.tokens.end(), output.begin(), output.end());
-    contexts_.push_back(std::move(context));
-    while (contexts_.size() > capacity_) { contexts_.pop_front(); }
-    return miss;
-}
-
-PrefixMissSettlement settle_prefix_miss(PrefixMissTracker& tracker,
-                                        const std::uint64_t engine_request_id,
-                                        std::span<const infernix::TokenId> prompt,
-                                        std::span<const infernix::TokenId> output,
-                                        const std::uint32_t reused_tokens,
-                                        const std::uint32_t computed_prefill_tokens) {
-    const std::uint64_t before = tracker.diagnostic_failures();
-    std::optional<PrefixMiss> miss;
-    bool abandoned = false;
     try {
-        miss = tracker.settle(engine_request_id, prompt, output, reused_tokens,
-                              computed_prefill_tokens);
+        Context context{.engine_request_id = engine_request_id, .tokens = {}};
+        context.tokens.reserve(prompt.size() + output.size());
+        context.tokens.insert(context.tokens.end(), prompt.begin(), prompt.end());
+        context.tokens.insert(context.tokens.end(), output.begin(), output.end());
+        contexts_.push_back(std::move(context));
+        while (contexts_.size() > capacity_) { contexts_.pop_front(); }
     } catch (const std::exception&) {
-        // What the tracker itself could not attribute to one window: still only the diagnosis.
-        miss.reset();
-        abandoned = true;
+        // Out of memory for the kept context: later requests are compared without it.
+        settled.diagnostic_failed = true;
     }
-    return {.miss = std::move(miss),
-            .diagnostic_failed = abandoned || tracker.diagnostic_failures() != before};
+    return settled;
 }
 
 } // namespace infernix::serve

@@ -707,12 +707,11 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     if (prefix_misses_ != nullptr && !prepared.prompt_ids.empty()) {
         // The optional diagnosis cannot fail this request any more than a cut window can: whatever
         // it gives up on, the finished generation and its own context stay intact.
-        const auto settlement = settle_prefix_miss(
-            *prefix_misses_, outcome.engine_request_id, prepared.prompt_ids,
-            outcome.generated_token_ids, outcome.reused_prompt_tokens,
-            outcome.computed_prefill_tokens);
-        outcome.prefix_miss                     = std::move(settlement.miss);
-        outcome.prefix_miss_diagnostic_failed   = settlement.diagnostic_failed;
+        auto settlement = prefix_misses_->settle(outcome.engine_request_id, prepared.prompt_ids,
+                                                 outcome.generated_token_ids, outcome.reused_prompt_tokens,
+                                                 outcome.computed_prefill_tokens);
+        outcome.prefix_miss                   = std::move(settlement.miss);
+        outcome.prefix_miss_diagnostic_failed = settlement.diagnostic_failed;
     }
 
     outcome.tool_calls      = std::move(result.tool_calls);
