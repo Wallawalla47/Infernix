@@ -487,7 +487,7 @@ std::size_t Forward::moe_workspace_bytes(const TextConfig& c, std::int32_t colum
 
 void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits) {
     const cudaStream_t s = device_.stream;
-    const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size), W = dim(config_.residual_width());
+    const std::int32_t T = batch.ids.ne[0], W = dim(config_.residual_width());
     if (batch.residual_out.data != nullptr) {
         CUDA_CHECK(cudaMemcpyAsync(batch.residual_out.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s));
     }
@@ -542,20 +542,21 @@ void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits
                                    column, cudaMemcpyDeviceToDevice, s));
     }
     if (logits == nullptr) { return; }
-    auto scope    = work_.scope();
+    auto scope = work_.scope();
+    // The head's columns are gathered before the final mix, as the lossless route does (candidates TM-06): the mix then
+    // runs on those columns alone, so a prompt's first token no longer depends on the width of the call that ends the
+    // prompt (the mix routes by width), and a prefill call mixes one column instead of all of them.
+    Tensor last = work_.alloc(DType::BF16, {W, batch.logit_columns.ne[0]});
+    ops::gather_columns(residual, batch.logit_columns, last, s);
     if (config_.lossless) {
-        Tensor last = work_.alloc(DType::BF16, {W, batch.logit_columns.ne[0]});
-        ops::gather_columns(residual, batch.logit_columns, last, s);
         lossless_head(last, *logits);
         return;
     }
-    Tensor final_x = mix(parameters_.final_mixer, residual, nullptr);
-    Tensor last    = work_.alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
-    ops::gather_columns(final_x, batch.logit_columns, last, s);
+    const Tensor final_x = mix(parameters_.final_mixer, last, nullptr);
     if (batch.screened_head) {
-        screened_text_head_logits(parameters_, last, *logits, work_, s);
+        screened_text_head_logits(parameters_, final_x, *logits, work_, s);
     } else {
-        text_head_logits(parameters_, last, *logits, work_, s);
+        text_head_logits(parameters_, final_x, *logits, work_, s);
     }
 }
 
