@@ -69,7 +69,7 @@ n-gram volume is needed.
 - About 70 GiB of free host RAM for the all-in-RAM mode. With less, the RAM ledger keeps as many
   experts as fit and reads the rest from the artifact (the SSD expert tier); `--expert-ram-mib` sets
   the split. Windows caps page-locked memory at 80 % of RAM.
-- About 76 GB of disk. An Infernix build from `main` at or after commit `c17e24a8`.
+- About 76 GB of disk. An Infernix build from `main` at or after commit `20e3229a`.
 
 ## What is bit-exact and what is quantized
 

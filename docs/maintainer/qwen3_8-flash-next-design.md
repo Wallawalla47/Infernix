@@ -2136,7 +2136,7 @@ process-wide fault seam for the engine test; S3 only past its threshold; S4 park
 skips its copy instead of trapping, so the round drains and fails its requests
 (`check_device_error`) while the context, the other lanes and the Engine survive. The 2026-10-04
 choice weighed a 120 s trap against a 2 s one, not a fall-through at the same bound. New reasons: the
-trap fired in 5 of 7 `--vram-past-budget` starts before 75e25b5c; on sm_120 a deliberate trap was
+trap fired in 5 of 7 `--vram-past-budget` starts before c2afefb2; on sm_120 a deliberate trap was
 followed by Xid 109 and a hung driver until a power cycle (Basalt #161, which made the same change);
 and a trap names no site (#48's `cudaErrorIllegalInstruction`). The GGUF token embedding's id check
 (`kErrorTokenId`, zeros for that column) and the CPU expert wait without a heartbeat (2 s, then
@@ -3892,7 +3892,7 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
     its 330 µs graph launch then started the GPU later (idle 72 → 222 µs a round, round +46 µs).
   - **Trace.** GPU idle 188 → 72 µs a round; round 10,170 → 10,098 µs (one traced run each).
     The commit graph's span grew 180 → 206 µs, as it now waits at its gate inside the graph.
-  - **Speed** (`infernix_bench`, 3c235c7f against the new build, three interleaved reps, wall
+  - **Speed** (`infernix_bench`, afcb9ad7 against the new build, three interleaved reps, wall
     time after the prefill): conv 4.874 → **4.853 s** (+0.44 %, ranges touching) and with
     `--a8-activations` 4.650 → **4.625 s** (+0.53 %); struct 14.882 → **14.843 s** (+0.27 %) and
     with `--a8-activations` 13.310 → **13.256 s** (+0.41 %), separated ranges. About 40-50 µs a
@@ -3919,7 +3919,7 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
   - **Speed.** Cold op: 4.2 µs (one kernel) against 6.95 µs (three). Engine trace: proposal
     graph 592.6 → 572.2 µs a round. Paired greedy CLI check, six prompts, default route (same
     text): tokens per round equal or better on each, pooled 2.943 → 2.973 (+1.0 %).
-    `infernix_bench` (three reps, wall after the prefill, against 4190583a): greedy conv
+    `infernix_bench` (three reps, wall after the prefill, against 3b6a2fa2): greedy conv
     +0.46 %, struct +0.20 %, struct `--a8-activations` +0.30 %; greedy conv `--a8-activations`
     −4.3 % with acceptance 2.874 → 2.759. The 8-bit route is not column-invariant, so changed
     drafts change its greedy text (five of the six CLI prompts differed); that arm compares
@@ -7627,7 +7627,7 @@ measured results are under "Status" at the end of this section.
       (Dense8 4 %), unattributed; candidates §26.3 EX-01.
   - Built 2026-10-28 (owner's goal: exclusive at no speed cost, then the default as in Basalt; plan
     `.local/redesign-2026-10-28/REDESIGN-PROPOSAL.md` §6.4a). Measured on IQ3_S, 16,413-token prompt then 1,024 tokens
-    greedy, DFlash2 auto, 3 unprofiled runs each, against the same day's main (b36f35ae); ids equal in every run
+    greedy, DFlash2 auto, 3 unprofiled runs each, against the same day's main (530717b7); ids equal in every run
     (identical speculative statistics in all 18 runs):
     - **Slots per record size** (`HostTier` classes, `HostExpertTier` regions): a GGUF import's 7 record sizes
       (1.49-2.54 MiB, mean 1.96) each get a pool of slots of their own size, every layer the same share; the ring,
@@ -7649,14 +7649,14 @@ measured results are under "Status" at the end of this section.
       of ~2 MiB holding its frame until it lands; the full layout discards its victims), and loans early in a session
       (the warm start leaves RAM full of RAM-only experts, so only ~1,100 shadows fit where a 16K prefill's loan
       evicts ~1,000 experts: 208 a request still left without a copy and were read back).
-  - 2026-10-29 (with the tensor-core expert kernels, main 0689e1bb, then): **the warm start seeds half the frames**,
+  - 2026-10-29 (with the tensor-core expert kernels, main 1752e4f1, then): **the warm start seeds half the frames**,
     as the full layout does, instead of all but the loan reserve (68 % on IQ3_S). The free frames take the fill
     phase's landings: a 16K request landed 4,281 misses against 2,878 and CPU-served 12,407 against 13,990, the full
     layout's counts (4,255 and 12,445); RAM unchanged (47.4 GiB resident against the full layout's 51.9). IQ3_S, 2
     runs each: 16K decode 258.2 / 258.8 -> 264.2 / 264.6 tok/s (full 266.5 / 266.4), struct 455.0 / 455.5 ->
     457.7 / 457.4 (full 463.1 / 462.9); with this session's later route changes exclusive is 0.993x of full at 16K
     (266.2 / 266.1 against 267.7 / 268.4) and 0.987x on struct. Prefill stays 0.96x (6,521 against 6,801 at 16K).
-    Dense8 (seeds 4,554 of 9,109 frames, 6,217 before) against main 0689e1bb: struct exclusive 307.7 / 309.2 ->
+    Dense8 (seeds 4,554 of 9,109 frames, 6,217 before) against main 1752e4f1: struct exclusive 307.7 / 309.2 ->
     327.0 / 326.9 (full 354.3 / 354.5: still 0.92x, ~24,000 demotions a request, each a refill read of the artifact);
     16K MTP 3, 2 runs, 241.0 / 241.1 -> 242.7 / 242.6 (full 242.7 / 244.3). The prefill streams the same 34.2 GiB
     through the same lent frames in both layouts; full merges 277 adjacent records into fewer copies, exclusive copies
@@ -9372,7 +9372,7 @@ itself has no suffix to plan; it decodes at once.
 
 ### 19.3.14 QSA decode attention: staged tiles (2026-10-06)
 
-**Profile** (nsys, Gold `283613d8b`, dense8m, `int8` KV, 128 decoded tokens after 8K and 128K
+**Profile** (nsys, Gold `2b7a0dd50`, dense8m, `int8` KV, 128 decoded tokens after 8K and 128K
 prompts; `fn/prof/dprof`). The attention family is 2.4-4.8 % of a decode token's kernel time. Its
 largest part is K3b, `attention_kernel`:
 - 45 µs per call, 12-13 calls per main forward: 545 µs of a 14.8 ms plain token at 8K;
@@ -9404,7 +9404,7 @@ round-trip latencies. The softmax was serial: 12 threads made 63 `expf` calls ea
 `infernix_qsa_test`. All 12 calls matched bit for bit: bf16 and int8; W = 1, 5 and 40, the last with 8
 tiles per split; pool pages and host/lent page spaces. The FP64-oracle cases pass.
 
-**Measured** (RTX 5090, dense8m, `int8` KV, 2026-10-06, A = Gold `283613d8b`):
+**Measured** (RTX 5090, dense8m, `int8` KV, 2026-10-06, A = Gold `2b7a0dd50`):
 - **Greedy ids are identical, A against B**, on seven workloads: the four short prompts (dense QSA,
   96 tokens), the code prompt with MTP (295 tokens), and the ~40K prompt plain and MTP (selected
   blocks, 96 tokens).
@@ -9450,7 +9450,7 @@ The kernel was latency-chained, not memory-bound (DRAM 4.6 %).
 No per-(head, dimension) order changes, so outputs equal the previous kernel's.
 
 Results:
-- **Greedy ids** are identical, A (`cbcde52a4`) against B, on fourteen workloads: int8 and bf16, with
+- **Greedy ids** are identical, A (`2d57169f6`) against B, on fourteen workloads: int8 and bf16, with
   the short prompts, code MTP and ~40K plain and MTP.
 - **Op bench** (cold L2, graph, attention and merge), every storage:
 
@@ -9644,7 +9644,7 @@ from the committed window.
     +0.008 → +0.016 ± 0.010. The two builds differ from each other by KL 0.015.
   - Plain greedy ids therefore diverge after 9-87 tokens on all ten int8/bf16 workloads.
   - The MTP code output (W = 5) is identical.
-- **Speed** (ABBA, against the landed build `7a4a13b4d`):
+- **Speed** (ABBA, against the landed build `ff84b4bff`):
 
   | Workload | Before | After | Change |
   |---|---:|---:|---:|
@@ -9668,7 +9668,7 @@ from the committed window.
     beside others (W = 2: 42 splits) rounded differently from the same sequence alone (W = 1: 48).
   - The Qwen4Exp preemption and prefix-cache real tests caught it. "A equals its solo run" failed,
     with 2 of 1,200 tokens equal after the first difference. These tests had not run before
-    `a47578934` landed on Gold.
+    `a34f09b9a` landed on Gold.
   - **Now:** calls of at most 8 columns split by one 64-token tile per split, 33 for every width,
     as before round 1 for W ≤ 5. Wider calls keep the wave rule. `test_qsa` now checks that the
     last row of a 2-, 4- and 8-row decode call, and of a 2-row verification call, gives the same bits
@@ -9705,7 +9705,7 @@ faster, INT8 mixed, NVFP4 and K8V4 slower, so those keep the combined gather; en
 
 ### 19.3.16 Decode misses between the CPU and the link (2026-10-06)
 
-**Profile** (nsys, Gold `283613d8b`, int8 KV, 8K context, 128 tokens; `fn/rigs/prof/analyze_critical.py`
+**Profile** (nsys, Gold `2b7a0dd50`, int8 KV, 8K context, 128 tokens; `fn/rigs/prof/analyze_critical.py`
 and `analyze_misses.py`).
 - **The main stream is busy 89 % of decode.** `stage_kernel` takes 34 % of it and `cpu_wait_kernel`
   14 %. At 128K these become 42 % and 11 %.
@@ -9758,7 +9758,7 @@ identical. Change against cap 8:
 
 ### 19.3.17 Prefill: batched expert copies, no promotions between walk spans (2026-10-06)
 
-**Profile** (nsys, Gold `a1e40253a`, int8 KV; `fn/rigs/prof/analyze_pf.py`). Prefill under nsys runs
+**Profile** (nsys, Gold `71bc7b230`, int8 KV; `fn/rigs/prof/analyze_pf.py`). Prefill under nsys runs
 within 2-4 % of its bare rate.
 
 | Prompt | Span | Main stream busy | Largest idle gaps |
@@ -9788,7 +9788,7 @@ on the host instead of 316-416 ms, at the same 27.5 GB/s.
 - **A walk span that is not the prompt's last** promotes nothing; the last span still promotes for
   decode. That changed later in this section: no span promotes now.
 
-**Results** (ABBA, A = Gold `a1e40253a`, int8; both arms still on round 1's wave split rule):
+**Results** (ABBA, A = Gold `71bc7b230`, int8; both arms still on round 1's wave split rule):
 
 | Workload | Metric | A | B | Change |
 |---|---|---:|---:|---:|
@@ -9819,7 +9819,7 @@ the device waits: ~0.5 s per 64K span.
 - **Not covered.** The prompt's first span and chunk-major prefills are unchanged.
 - **Diagnostic.** The prefill stream line counts the chunks.
 
-**Prefetch results** (ABBAABBA, A = `b5bacdb15`):
+**Prefetch results** (ABBAABBA, A = `64a53bb48`):
 - pp128k: 17.14 → 16.71 s (−2.5 %).
 - pp32k, one span: 5.307 → 5.314 s (+0.1 %). A first ABBA showed +1.1 %; eight runs did not
   reproduce it.
@@ -9903,7 +9903,7 @@ rotations.
 - `infernix_qwen4_exp_forward_real_test` takes `--rope-yarn-factor` for teacher-forced scoring.
 
 **Gate** (RTX 5090, int8 KV, `qwen3_8_flash_next_nvfp4_dense8m`; rig `fn/rigs/qsaattn` yarn/yarn2).
-- **Factor 1 is unchanged.** Greedy ids are identical to Gold `b454cd836` for prose2k, code MTP and
+- **Factor 1 is unchanged.** Greedy ids are identical to Gold `fec3faa6b` for prose2k, code MTP and
   the ~40K walk prompt. Prefix-cache and preemption real tests pass.
 - **The ceiling holds.** `--max-ctx 300000` without a factor is refused.
 - **Quality.** Teacher-forced NLL over the same last 1,023 positions of one 327,680-token code and
@@ -10257,7 +10257,7 @@ while gate/up computes and finishes. Everything down reads before the wait (the 
 flags, the job records, the frames, the weights) was written before gate/up started; h, its output,
 is read after the wait, and every CTA waits, so down's completion implies gate/up's. Bits unchanged
 (logits byte-identical at `--chunk 1` and `4`; real tests pass). End to end (as above, against
-dd03c8136): plain 127.9 → 132.2 tok/s (+3.31 %, pairs +2.76..+3.66 %), MTP 154.1 → 157.6 (+2.26 %,
+eb0c7d36a): plain 127.9 → 132.2 tok/s (+3.31 %, pairs +2.76..+3.66 %), MTP 154.1 → 157.6 (+2.26 %,
 pairs +2.18..+2.32 %), identical speculative counts. The W4A16 pair (`gate_up_kernel_a16`,
 `down_kernel_a16`) follows the same contract: on the uncensored W4A16 artifact plain 125.9 → 129.5
 tok/s (+2.83 %, pairs +2.61..+3.05 %), MTP 141.8 → 144.0 (+1.50 %, pairs +1.41..+1.62 %), identical
@@ -10266,7 +10266,7 @@ speculative counts.
 gate/up stays an ordinary launch. Measured and rejected: the fork route's resident pass as a
 programmatic dependent of the plan kernel before it (`cpu_plan_kernel`/`fetch_plan_kernel` triggering
 at entry, gate/up staging its slice before the wait and waiting before its own trigger; a resident job
-is never a CPU job, so the pass reads nothing the plans write). Dense8, against 166158ff5: plain −0.17 %
+is never a CPU job, so the pass reads nothing the plans write). Dense8, against f94f45312: plain −0.17 %
 (pairs −0.35..+0.02 %), MTP −0.33 % (all four pairs negative): the early 400-CTA grid takes the SMs
 the plan and the fork stream's staging need.
 
@@ -10441,11 +10441,11 @@ relative L2 0.31-0.41 % per case, worst entry 2.0 %. End to end on the recipe C 
 1,637 tok/s (level), pp16384 6,175 → 6,380 (+3.3 %), pp32768 6,620 → 8,803 (+33 %), pp65536 6,730 →
 9,067 (+35 %); short prompts are bound by the walk's expert stream over the x8 link, from 32K the
 GEMMs are. The prefill gate (`fast_path_gate prefill --quick --kv int8`, chunks 896 / 1,792 / 3,584 /
-7,168, on main 4f0bb18f) failed on mean KL only: floor 6.107e-3, excess 7.95e-4 (95 % bound 8.92e-4)
+7,168, on main 15602c92) failed on mean KL only: floor 6.107e-3, excess 7.95e-4 (95 % bound 8.92e-4)
 against a budget of 6.11e-4; top-1, NLL (perplexity ratio 0.99983), p99.9 and every context band
 passed.
 
-*Term counts (2026-10-15, main 95a43dae).* Each side was screened at two and three terms (prefill
+*Term counts (2026-10-15, main d8af45a2).* Each side was screened at two and three terms (prefill
 gate at chunk 3,584 on INT8 KV, the reference and exact run shared; a choice rule fixed before the
 screens: the fastest variant whose KL bound is at most 0.7 of the budget, else the lowest ratio
 within budget). KL excess 95 % bound / budget and the whole expert call at 4,096 columns
@@ -10726,7 +10726,7 @@ at C = 2 on first-time text the GPU waited at the n-gram gate in none of 210 gat
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
 The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto
-Gold-Star-Infer 5fbfc3dbe. That branch carries NInfer's continuation/checkpoint Engine:
+Gold-Star-Infer f40fca5f1. That branch carries NInfer's continuation/checkpoint Engine:
 resource-pressure preemption with Snapshot/Replay recovery, unit reservations, and a two-step
 admission. Only the final commit of the port builds; the replayed commits in between do not
 compile on their own, because the new contract changed the Program surface under them.
@@ -11358,7 +11358,7 @@ release's in every request (the prefill's arithmetic moves greedy ties), no deco
 the decode expert-cache hit rate is the same (93.6 against 93.4 %). A same-text check settles it: the
 same workload on the exact route (`--reproducible`, four MTP drafts verified every round, so
 both builds write the same text in the same rounds), sessions ABBA: this branch (rebased on main
-dd18d403) 174.5 and 182.6 tok/s, the release 182.3 and 183.6; every request has the same text, rounds
+8ad767fe) 174.5 and 182.6 tok/s, the release 182.3 and 183.6; every request has the same text, rounds
 and decode cache hits in all four. The second branch session equals the release (rounds per second
 63.6 against 63.5 and 64.0); the first, started minutes after a build and its tests, was 4.4 % slower
 on every request, as the first session after the 11:49 build was in the run above. The serve log does
@@ -11548,12 +11548,12 @@ the plan beside the resident pass. A GGUF import's BF16 hyper-connection matrice
 load (`ops::hyper_connection_repack_q8`), so every mix reads half the bytes.
 
 **Toward Basalt's speed (2026-11-01, IQ3_S, DFlash2 auto, Basalt's conv and struct prompts; every arm A/B'd
-interleaved, 2 reps).** Adopted, in order: the hyper-connection Q8 repack with a 24-worker CPU team (9de63059), the
-expert rows in shared memory (390806df), the rows kernel for narrow tiled calls with L2 prefetch and the gated-norm
-producer (3867c564), side streams at the least priority with the shared expert early (ba651d71) and the mix's 8-bit
-producer (e2625acc): conv 11.37 → 10.08 ms a round, struct 15.33 → 14.05 (Basalt 7.9-9.0 and 12.0 ms a window).
+interleaved, 2 reps).** Adopted, in order: the hyper-connection Q8 repack with a 24-worker CPU team (8bd68e1b), the
+expert rows in shared memory (8723dd37), the rows kernel for narrow tiled calls with L2 prefetch and the gated-norm
+producer (dac63956), side streams at the least priority with the shared expert early (dd4264ce) and the mix's 8-bit
+producer (35277aef): conv 11.37 → 10.08 ms a round, struct 15.33 → 14.05 (Basalt 7.9-9.0 and 12.0 ms a window).
 Withdrawn by the owner: requantizing the BF16 GDN control and QSA indexer projections to Q6_K at load so they run
-inside the input projection's 8-bit launch (struct -2.0 %, conv -0.4 % a round; 90f233a2, reverted): the flag may
+inside the input projection's 8-bit launch (struct -2.0 %, conv -0.4 % a round; c1a4fa2b, reverted): the flag may
 take weights to 8 bits, not below. An 8-bit copy would need a GGUF Q8_0 path in the 8-bit kernels and their mixed
 pairs. Rejected, with their reasons, so they are not retried as they were: every miss
 on the CPU (conv +4.5 %, struct +2.1 %); each dense CTA encoding its columns (+1.0 / +4.6 %: occupancy and repeated
@@ -11769,7 +11769,7 @@ decision and job list 5,900, the compacted x publication 4,300 and the fence and
 - `moe_experts_prepare`: a call with an activation encoding (GGUF banks, 8-bit NVFP4 calls, the 122B ring) runs it
   on the shared-expert stream from the MoE input beside the router and the route; the passes wait on its event. A
   call without one forks nothing: the empty fork and join alone cost Dense8 MTP decode 1.4 % (243.9 -> 240.3).
-Measured against main `0689e1bb` built the same session (3 runs each, 16K steady state): IQ3_S full layout
+Measured against main `1752e4f1` built the same session (3 runs each, 16K steady state): IQ3_S full layout
 264.1 -> 267.7 tok/s (+1.4 %; 265.5 without the forked encode), Dense8 MTP 3 242.9 -> 243.9 (+0.4 %); 2 runs:
 IQ3_S struct full 463.4 / 461.8 -> 468.6 / 468.1, Dense8 struct full 352.1 / 353.6 -> 354.3 / 354.5. Ids equal.
 
@@ -12120,7 +12120,7 @@ unchanged; the decode after pp16413 unchanged (249.2 -> 249.8 tok/s, three pairs
 **Trade-off.** As for two or more streamed calls, a /v1/decide fan-out whose questions diverge in that last call
 cannot coalesce while the span runs (a running span's inner positions are not realizable taps,
 `prefix_await_sibling`). `infernix_qwen4_exp_decide_real_test`'s coalescing case (1,064-token prompts, one call, no
-walk) fails on FP4-Local with and without this change and on main 75e25b5c alike (leader 0, follower 0 reused
+walk) fails on FP4-Local with and without this change and on main c2afefb2 alike (leader 0, follower 0 reused
 tokens; not investigated here).
 
 ### 19.3.43 NVFP4 W4A16 banks split decode misses by the share form (2026-10-30; placement only; default)

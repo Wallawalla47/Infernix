@@ -219,7 +219,7 @@ tensor-core tiles are the limit there, against NVFP4's FP4 tensor cores.
 
 Converted with `tools.convert` (recipe `qwen3_8_flash_next_gsq_rco_iq3s`) and renamed into numbered
 parts with `tools.artifact.rename --numbered`; `artifact_id` `8fcdca815634481d9e1af0bf392713db`,
-the recipe as in Infernix `4ee28eb1`. The conversion report and the artifact's own provenance record the
+the recipe as in Infernix `1bd307c5`. The conversion report and the artifact's own provenance record the
 paths of the machine that converted it. The n-gram volume was written from the GGUF's `IQ4_NL`
 table.
 

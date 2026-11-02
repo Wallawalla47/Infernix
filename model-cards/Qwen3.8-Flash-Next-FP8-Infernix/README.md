@@ -218,7 +218,7 @@ programs while this model runs; a smaller value such as 2048 keeps more experts 
 
 Converted with `tools.convert` (recipe `qwen3_8_flash_next_fp8`, `--ngram-reuse` with the BF16
 volume) and renamed into numbered parts with `tools.artifact.rename --numbered`; `artifact_id`
-`fd83b9068589467cb776f0354139f63e`, the recipe as in Infernix `4ee28eb1`. The conversion report and the artifact's own
+`fd83b9068589467cb776f0354139f63e`, the recipe as in Infernix `1bd307c5`. The conversion report and the artifact's own
 provenance record the paths of the machine that converted it. The BF16 n-gram volume was written
 with `tools.flash_next.ngram_bf16` from the BF16 table of
 [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) and checked against it.

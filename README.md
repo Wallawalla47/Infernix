@@ -187,7 +187,7 @@ the others run NVIDIA's checkpoint as their own NVFP4 packs with the model's MTP
 
 Bold and the comparison columns are the engines' defaults. † `--a8-activations`: the routed experts at
 8 bits, as the others run them in decode (every other activation stays 16-bit); same three seeds,
-on the build that added this route (`81bcdaef`). Against Basalt it reaches the first token 52 %
+on the build that added this route (`9e82d344`). Against Basalt it reaches the first token 52 %
 sooner on average, decodes 5 % faster at one request and 22 % faster batched, and finishes 35 %
 sooner.
 
@@ -221,7 +221,7 @@ arithmetic in decode):
 | Basalt (as above) | 9.55 / 92.94 / 125.92 s | 202 / 173 / 216 |
 
 With its experts at 8 bits Infernix decodes level with Basalt at ~8K and faster at ~128K and ~250K.
-Against its own session's default (on `81bcdaef`'s build) the 8-bit route runs 1-7 % more decode
+Against its own session's default (on `9e82d344`'s build) the 8-bit route runs 1-7 % more decode
 rounds a second (tok/s rises 9-36 %, partly from different text and drafts) but reads long prompts
 28 % slower, so the default stays the faster choice for agents.
 
@@ -312,7 +312,7 @@ keeps its distribution.
 
 *Settings*: both `--draft-tokens auto --lm-head-draft`, with `--spec mtp` or `--spec dflash2
 --draft-model FILE`. 24 prompts of 1,280 tokens from Infernix's sources (code) and Markdown docs at
-`e59fa1c7`, each continued for 384 tokens, greedy or sampled (temperature 1.0, top-k 20, top-p 0.95);
+`08dda308`, each continued for 384 tokens, greedy or sampled (temperature 1.0, top-k 20, top-p 0.95);
 INT8 KV; `infernix_decode_quality_gen` (2026-10-20).
 
 ### Qwen3.8-27B: Infernix vs NInfer
@@ -373,17 +373,17 @@ changed. Prompts gain the most; decode only 2-7 %.
 | Prompt, `--prefill-chunk 1024` | 1 | 2,170 | 4,319 | 1.99× |
 | Host-to-device copy | | 28.9 GB/s | 57.8 GB/s | 2.00× |
 
-*Setup*: RTX 5090, Ryzen 9 7950X, 94 GiB DDR5, Linux, Infernix `d8e52a85`, Qwen3.8-Flash-Next NVIDIA
+*Setup*: RTX 5090, Ryzen 9 7950X, 94 GiB DDR5, Linux, Infernix `5fd177ea`, Qwen3.8-Flash-Next NVIDIA
 NVFP4 Dense8, INT8 KV, `infernix_bench` (means of 3-5 runs, tok/s per request).
 
 ### How the benchmarks were run
 
 - **Versions**: Infernix `main` built from source at
-  [`fb491903`](https://github.com/Wallawalla47/Infernix/commit/fb491903) for the default route on
-  NVIDIA's NVFP4 weights, and at [`6b066a54`](https://github.com/Wallawalla47/Infernix/commit/6b066a54)
+  [`0dfad1d6`](https://github.com/Wallawalla47/Infernix/commit/0dfad1d6) for the default route on
+  NVIDIA's NVFP4 weights, and at [`c6f6486c`](https://github.com/Wallawalla47/Infernix/commit/c6f6486c)
   for IQ3_S, the 27B and the `--a8-activations` rows (on Dense8 with
-  [`81bcdaef`](https://github.com/Wallawalla47/Infernix/commit/81bcdaef)'s 8-bit expert route added).
-  Later builds were not re-measured. On `6b066a54` the NVFP4 default was within run-to-run spread
+  [`9e82d344`](https://github.com/Wallawalla47/Infernix/commit/9e82d344)'s 8-bit expert route added).
+  Later builds were not re-measured. On `c6f6486c` the NVFP4 default was within run-to-run spread
   (decode 178 / 168 / 195 tok/s; replay 3.3 s mean TTFT, 5.7 min). The other engines were each the
   latest version when they ran; Strata has since released v0.2.9 and Basalt has moved past `c08284cb`.
 - **Client**: every engine served the OpenAI API natively on Windows to the same client, which times

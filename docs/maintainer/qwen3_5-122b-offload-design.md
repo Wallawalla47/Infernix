@@ -1,6 +1,6 @@
 # Qwen3.5-122B-A10B with offloaded experts on one RTX 5090: implementation plan
 
-**Status: in progress (2026-10-22): runs end to end on the RTX 5090 (§0), on main 3d1931c7.** This is a temporary planning document for running
+**Status: in progress (2026-10-22): runs end to end on the RTX 5090 (§0), on main a0527d1d.** This is a temporary planning document for running
 [ornith-ai/Ornith-1.5-122B-NVFP4](https://huggingface.co/ornith-ai/Ornith-1.5-122B-NVFP4) (revision
 `f049036f`), a training instance of `Qwen3_5MoeForCausalLM` at the Qwen3.5-122B-A10B geometry, with
 its routed experts in host RAM behind a VRAM expert cache, as Qwen3.8-Flash-Next runs. When the work
@@ -45,7 +45,7 @@ RTX 5090, i9-13900K, 96 GB DDR5-5800, PCIe link measured 27.6-27.7 GB/s; the art
   64 tokens past the root; its first turn was 6 tokens): its first turn is now a 64+-token message,
   with `free-cache-resume` requested as the other prefix tests do.
 - Non-real `ctest`: 241 of 243 pass. `infernix_hybrid_cache_defaults_test` fails on main as well
-  (3d1931c7 accepts `--draft-tokens auto` with DFlash2; the test still expects a refusal).
+  (a0527d1d accepts `--draft-tokens auto` with DFlash2; the test still expects a refusal).
   `infernix_cuda_stack_check`: the 149 new kernel keys (this geometry's attention, RoPE, conv, Q8
   and drafter shapes, the rg16 head, the FP32-scale FP8 route, Flash-Next's renamed wide down
   instance at its old 40 bytes) are recorded after review, 86 of them equal to their 16-head
@@ -157,7 +157,7 @@ the CPU (~53 GB/s); split misses add their down rows to the busy link (stage 428
 bound by miss bytes over both paths (about 96 misses of 5.3 MB per token at ~80 GB/s combined), plus
 ~60 µs of dense work and a ~18 µs routing/plan kernel per layer.
 
-**No regression on main's models** (main 1acbc468 against the branch, infernix_bench ABBA, tok/s):
+**No regression on main's models** (main fc07d378 against the branch, infernix_bench ABBA, tok/s):
 
 | Model | pp4096 main / branch | tg256 main / branch | MTP 3 tg256 main / branch |
 |---|---:|---:|---:|
@@ -240,7 +240,7 @@ model to this geometry and gives it offloaded routed experts. The same code then
 
 A route's processing cost is D(lossless, route) − D(lossless, design reference), measured with
 `compare-prefill`/`compare-decode` on an `infernix-perplexity --reference` or an
-`infernix_decode_quality_forced --reference --observe` run as the base (main ccbc95c2). The
+`infernix_decode_quality_forced --reference --observe` run as the base (main 67dc619b). The
 precise reference this plan first extended was retired on main; `--lossless` is the gates'
 reference.
 
@@ -1106,7 +1106,7 @@ or a slower CPU team moves the share the same way as the divisor rule did. It re
 `ExpertOffload` (the 122B); `INFERNIX_TMP_LINK_SHARE` still overrides it, and Flash-Next's Program keeps its own
 rule. Same bits: placement only.
 
-**A/B** (main 3a1f6bcf's generator against the rule's build, the same workload, two rounds A B / B A; the rule's
+**A/B** (main f7a52de4's generator against the rule's build, the same workload, two rounds A B / B A; the rule's
 measured share 63-68/256; greedy outputs equal in all 10 pairs):
 
 | Workload | Divisor rule | Share rule | Change |

@@ -54,7 +54,7 @@ same source builds in an NInfer checkout for a like-for-like comparison.
 
 ## 3. Recorded results
 
-Measured on 2026-10-05 on an RTX 5090 (CUDA 13.4, Windows), Gold-Star-Infer at `5fbfc3db` against
+Measured on 2026-10-05 on an RTX 5090 (CUDA 13.4, Windows), Gold-Star-Infer at `f40fca5f` against
 NInfer `68c54356` plus the Windows port (with only a `--prefill-chunk` option added to its
 perplexity tool), official Qwen3.8-27B NVFP4 artifact unless stated. The reference in these runs
 lifted only the 4-bit (MLP) sites to 16-bit activations; sites that run 8-bit activations (FP8
@@ -177,7 +177,7 @@ saving (at least 3x), or index-plane pressure the deployed contexts do not have:
 per lane at 256K and 832 MiB at 1M, against an expert pool of roughly 8,300 frames ([the design
 record](qwen3_8-flash-next-design.md) §4.2). The bar's numbers come from a CPU-only prototype over
 captures from the fork's engine revision `51601ea2` (2026-10-13, a descendant of this repository's
-`bbc2771c`), not from the GPU measurement the rest of this section describes; scan time was not
+`7a876856`), not from the GPU measurement the rest of this section describes; scan time was not
 measured and was deliberately non-gating.
 
 ## 4. Qwen3.8-Flash-Next: NVFP4 artifact against the Unsloth UD-Q4_K_XL GGUF
@@ -193,7 +193,7 @@ measurements**: no UD-Q4_K_XL support exists in Infernix.
 
 Teacher-forced on identical token ids
 ([design §16.5](qwen3_8-flash-next-design.md#165-precision-boundaries-and-measured-quality-2026-10-04-rtx-5090)),
-recorded 2026-10-07. Infernix ran recipe B (`e3be72cde`) with INT8 KV; Strata 0.1.40 ran UD-Q4_K_XL
+recorded 2026-10-07. Infernix ran recipe B (`c2e3735ba`) with INT8 KV; Strata 0.1.40 ran UD-Q4_K_XL
 with INT8 KV. The texts were 2,557 positions of code, a document and a chat transcript, all ≤ 1,024
 tokens.
 
@@ -950,7 +950,7 @@ does not fall with a third term. The plain arm never reaches 9 columns, so it al
 `batched-decode` after its [5120, 17408] down tile changed (8 K-warps at 5-16 columns, 35.6-51.8
 against 41.6-60.8 us). That tile is `batched-decode`'s own route (`ops::LinearRoutes::WideDownTile`,
 decode and verification rounds only): until 2026-10-18 it also served exact-route prefill calls of
-5-16 columns, an unqualified exact-route numerics change since `1fe367b4`, and those now run the
+5-16 columns, an unqualified exact-route numerics change since `4fe28055`, and those now run the
 release's 4 K-warp tiles again. Every arm passes, jointly with the paths above:
 
 | 27B, KV | Arm | TV excess (bound) / budget | Top-1 excess, points (bound) / budget | KL excess / cap |
@@ -1273,7 +1273,7 @@ without `preemption`).
   rewrite prompts at two streams 0 of 960 (27 copy rounds); 35B-A3B one request 55 of 960 against 48
   for fixed 7-draft chains (2026-10-21), two streams with plain 3-draft batches 54 of 960 (worst
   1.63).
-- **Speed** (RTX 5090, INT8 KV, main 0e91f862, `infernix_decode_quality_gen` with N workers keeping
+- **Speed** (RTX 5090, INT8 KV, main 560b4e51, `infernix_decode_quality_gen` with N workers keeping
   N requests decoding: 1,280-token slices of Infernix's code continued greedily and of its Markdown
   docs sampled at temperature 1 with top-k 20 and top-p 0.95, 384 tokens each; 24 slices on the
   27B, 48 on the 35B-A3B; wall-clock tok/s):
@@ -1492,7 +1492,7 @@ without `preemption`).
   decode (MTP at concurrency 2, 256 segments) TV excess 4.4e-4 (bound 8.0e-4), top-1 7.9e-4
   (3.1e-3), KL 2.7e-4, p99.9 ratio 0.97. It is registered on BF16 KV for FP4-Local and recipe C; the
   KV format does not enter the expert kernels, so each one's timing holds there.
-- **Speed:** `infernix_bench` INT8 KV, chunk 4,096, ABBA (2026-10-14/15, before main 2ec268c2,
+- **Speed:** `infernix_bench` INT8 KV, chunk 4,096, ABBA (2026-10-14/15, before main 952587ce,
   whose changes leave recipe C's route alone): pp4096 1,631 → 1,637 tok/s (level), pp16384 6,175 →
   6,380 (+3.3 %), pp32768 6,620 → 8,803 (+33 %), pp65536 6,730 → 9,067 (+35 %); short prompts are
   bound by the expert stream over the x8 link.
@@ -1793,12 +1793,12 @@ one prompt came from that text's acceptance (597 rounds against 576, time per ro
 16 prompts of the bench corpus the pooled acceptance length is 2.219 against 2.172 (+2.1 %; per prompt
 +0.030, standard error 0.035; ahead on 9, behind on 6), so it costs nothing.
 
-**35B-A3B Q8 shared-expert prefill (`4f0bb18f`, NInfer `610f79e9d`).** The Q8 gate/up and down
+**35B-A3B Q8 shared-expert prefill (`15602c92`, NInfer `610f79e9d`).** The Q8 gate/up and down
 prefill kernels of `Qwen3.6-35B-A3B` apply each 32-wide group's FP16 scale to the FP32 partial sum
 and pass the SiLU output as a BF16 high/low pair, where the old route rounded each code × scale to
 BF16 before the MMA. Against the FP64 oracle the worst relative L2 error fell 3× (Q4/Q5) and 5× (Q8);
 prefill got 2.3-2.6 % slower, decode is unchanged. It shipped without the model-level gate 6.1 asks
-for; the gate was run on 2026-10-18 (`compare-prefill`, the build before `4f0bb18f` as base and the
+for; the gate was run on 2026-10-18 (`compare-prefill`, the build before `15602c92` as base and the
 current one as candidate, both `--reproducible`; `qwen3_6_35b_a3b.ninfer`, the quick corpus,
 14,336-token windows at stride 7,168, chunks 896-7,168, 36 windows, 1,044,668 positions per route).
 The reference route runs the same shared-expert kernels as the route that writes it, so the gate ran

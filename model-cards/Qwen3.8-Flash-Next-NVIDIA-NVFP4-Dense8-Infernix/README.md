@@ -218,7 +218,7 @@ dense projections in 8 bits cost no measurable quality on these texts.
 
 RTX 5090 in a PCIe Gen5 **x8** link (x16 is likely faster, most of all for this model, whose
 expert-cache misses cross PCIe on every token), Core i9-13900K, 96 GB DDR5, Windows 11; Infernix
-at `3b35ccf9`, INT8 KV, MTP with 4 drafts and the proposal head. Strata 0.1.40 on the same machine
+at `9c8bd5e6`, INT8 KV, MTP with 4 drafts and the proposal head. Strata 0.1.40 on the same machine
 runs the Unsloth UD-Q4_K_XL GGUF with its own MTP drafter.
 
 | Context | TTFT, Infernix | TTFT, Strata | Decode tok/s, Infernix | Decode tok/s, Strata |
