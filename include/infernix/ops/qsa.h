@@ -81,7 +81,9 @@ struct QsaPageSpaces {
 
 /// One attention layer's paged planes.
 struct QsaKVLayer {
-    PagedKVLayerView kv;  // K/V planes in the configured storage (block_table unused here)
+    // K/V planes in the configured storage (block_table unused here). The packed BF16 storage's kv.unpackable is
+    // its flags, one a table row (QsaBatch::table_rows indexes them; see PagedKVBatchLayerView::unpackable).
+    PagedKVLayerView kv;
     Tensor pooled_pages;  // BF16 [Di/R, 64, 1, pages]
     QsaPageSpaces spaces; // pages outside the pool (none by default)
 };
@@ -171,7 +173,9 @@ struct QsaPrepareNorms {
  *     key_h(c)             = RoPE(norm_{key}(k[:, h, c]), r(c)), an FP32 vector
  *     K/V row (p, h)       = kv_cache_append_batch's encoding of key_h(c) and v[:, h, c] in the
  *                            layer's storage at position p through table row table_rows[b]
- *                            (codec input key_h(c) itself; BF16 storage keeps BF16(key_h(c))).
+ *                            (codec input key_h(c) itself; the BF16 storages keep BF16(key_h(c)),
+ *                            the packed one in its packed row; a row with no packed form sets the
+ *                            flag kv.unpackable[table_rows[b]], as kv_cache_append_batch does).
  *   Pooled keys and tails are qsa_pool_keys's for the call's raw keys index_k, except that the
  *   pooled key of every block the call completes is BF16(RoPE(norm_{index_key}(bf16(mean)),
  *   r(first token))) without a BF16 rounding of the normalized key; the tails change only when
@@ -186,7 +190,7 @@ struct QsaPrepareNorms {
  * Supported domain:
  *   head_dim 256, Di 128, rotary_dim 64, kv_heads 2 or 4, heads a multiple of kv_heads,
  *   1 <= index_heads <= 4, R > 1 dividing Di; KV storages for which qsa_prepare_supports() holds:
- *   bf16, int8-g64, fp8-row, nvfp4 and k8v4 (the vector-quantized storages are appended by
+ *   bf16, bf16p, int8-g64, fp8-row, nvfp4 and k8v4 (the vector-quantized storages are appended by
  *   qsa_attention and are rejected).
  *
  * Numeric:
@@ -225,6 +229,10 @@ void qsa_prepare(const QsaPrepareInputs& inputs, const QsaPrepareNorms& norms, T
                                                         std::int32_t max_context,
                                                         KvCacheStorage storage);
 
+/// Device scratch for qsa_attention's `unpack`: one sequence's K and V rows up to `max_context`, as the bf16
+/// storage holds them (BF16 K, FP16 V), and a block table.
+[[nodiscard]] std::size_t qsa_attention_unpack_bytes(const QsaGeometry& geometry, std::int32_t max_context);
+
 /// The call's keys and values for the vector-quantized storages (vq2, k4v2), which qsa_attention
 /// appends itself: BF16 K (normalized, after RoPE) and V [head_dim, kv_heads, width, batch].
 struct QsaAppend {
@@ -243,9 +251,13 @@ struct QsaAppend {
 ///     a window slot for keys before the call, the call's own row for its columns (staged in the
 ///     workspace for calls wider than kKVWindowInlineWidth, which take one sequence, and committed
 ///     to the window afterwards); from its codes otherwise.
+/// `unpack`: null, or qsa_attention_unpack_bytes(geometry, max_context) bytes of device scratch. A packed BF16 call
+/// of one sequence on the Tensor Core prompt route then unpacks that sequence's rows up to its last position once
+/// and attends over them, instead of decoding every tile each column gathers (a token is gathered by every column
+/// that attends to it); other calls ignore it. The output bits are the same either way.
 void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& layer,
                    const QsaBatch& batch, const QsaGeometry& geometry, float scale,
                    std::int32_t max_context, void* workspace, std::size_t workspace_bytes,
-                   Tensor& out, cudaStream_t stream, const QsaAppend* append = nullptr);
+                   Tensor& out, cudaStream_t stream, const QsaAppend* append = nullptr, void* unpack = nullptr);
 
 } // namespace infernix::ops

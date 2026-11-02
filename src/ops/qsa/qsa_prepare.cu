@@ -20,6 +20,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/append/geometry.cuh"
+#include "ops/kv_cache/bf16p_codec.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
@@ -76,6 +77,7 @@ struct PrepareArgs {
     void* k_scales;
     void* v_scales;
     bf16* pooled;
+    std::int32_t* unpackable; // packed BF16: one flag a table row (QsaKVLayer::kv), or null
     QsaPageSpaces spaces;
     std::int32_t table_stride;
     std::int32_t columns;
@@ -263,6 +265,27 @@ __device__ __forceinline__ void prepare_kv(const PrepareArgs& a, int column, int
         store_row(static_cast<bf16*>(a.k_pages) + base, key, lane);
         const int4 value = load_vec<int4>(a.v + row + 8 * lane);
         store_vec(static_cast<__half*>(a.v_pages) + base + 8 * lane, bf16x8_bits_to_f16x8_bits(value));
+    } else if constexpr (Storage == KvCacheStorage::Bf16Packed) {
+        // The bf16 storage's values through the packed codec: K after its one BF16 rounding (gathered to eight
+        // consecutive values a lane through the warp's scratch), V as its BF16 source row (readers convert it to
+        // FP16 as the bf16 storage's append does). A row with no packed form sets its sequence's flag.
+        auto* staged = reinterpret_cast<bf16*>(scratch);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { staged[lane + 32 * j] = __float2bfloat16_rn(key[j]); }
+        __syncwarp();
+        const uint4 key_bits = *reinterpret_cast<const uint4*>(staged + 8 * lane);
+        __syncwarp(); // the codec reuses the scratch
+        const uint4 value_bits = load_vec<uint4>(a.v + row + 8 * lane);
+        const std::int64_t at   = paged_kv_element_offset<kBf16pRowBytes, Geometry::KVHeads>(page, head, slot, 0);
+        const std::int64_t side = paged_kv_element_offset<kBf16pSideBytes, Geometry::KVHeads>(page, head, slot, 0);
+        auto* words = reinterpret_cast<unsigned*>(scratch);
+        const bool packed_key = bf16p_encode_row(key_bits, static_cast<std::uint8_t*>(a.k_pages) + at,
+                                                 static_cast<std::uint8_t*>(a.k_scales) + side, words, lane);
+        const bool packed_value = bf16p_encode_row(value_bits, static_cast<std::uint8_t*>(a.v_pages) + at,
+                                                   static_cast<std::uint8_t*>(a.v_scales) + side, words, lane);
+        if (!(packed_key && packed_value) && lane == 0 && a.unpackable != nullptr) {
+            a.unpackable[a.table_rows[sequence]] = 1;
+        }
     } else {
         // Keys of every quantized storage, and NVFP4 values, take the normalized D256 Hadamard
         // preparation; the codecs read FP32 rows.
@@ -472,6 +495,7 @@ void require_geometry(const QsaGeometry& g) {
 bool qsa_prepare_supports(KvCacheStorage storage) noexcept {
     switch (storage) {
     case KvCacheStorage::BFloat16:
+    case KvCacheStorage::Bf16Packed:
     case KvCacheStorage::Int8Group64:
     case KvCacheStorage::Fp8E4M3Row256:
     case KvCacheStorage::Nvfp4Group16:
@@ -580,6 +604,7 @@ void qsa_prepare(const QsaPrepareInputs& inputs, const QsaPrepareNorms& norms, T
     args.k_scales         = layer.kv.k_scale_pages.data;
     args.v_scales         = layer.kv.v_scale_pages.data;
     args.pooled           = static_cast<bf16*>(layer.pooled_pages.data);
+    args.unpackable       = layer.kv.unpackable;
     args.spaces           = layer.spaces;
     args.table_stride     = batch.block_tables.ne[0];
     args.columns          = columns;
@@ -609,6 +634,7 @@ void qsa_prepare(const QsaPrepareInputs& inputs, const QsaPrepareNorms& norms, T
 
     switch (storage) {
     case KvCacheStorage::BFloat16: launch_heads<KvCacheStorage::BFloat16>(args, kv_heads, grid, stream); break;
+    case KvCacheStorage::Bf16Packed: launch_heads<KvCacheStorage::Bf16Packed>(args, kv_heads, grid, stream); break;
     case KvCacheStorage::Int8Group64: launch_heads<KvCacheStorage::Int8Group64>(args, kv_heads, grid, stream); break;
     case KvCacheStorage::Fp8E4M3Row256:
         launch_heads<KvCacheStorage::Fp8E4M3Row256>(args, kv_heads, grid, stream);

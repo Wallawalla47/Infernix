@@ -1,6 +1,8 @@
 // QSA indexer, pooled keys, block selection and block-sparse attention
-// (docs/maintainer/qwen3_8-flash-next-design.md §8.10). KV storages: bf16 and int8 (INT8-G64 with
-// Hadamard-rotated keys, as written by kv_cache_append).
+// (docs/maintainer/qwen3_8-flash-next-design.md §8.10). KV storages: every scalar storage of
+// paged_kv_storage_layout (bf16; bf16p, decoded in shared memory to bf16's tile; int8, fp8, nvfp4
+// and k8v4, with Hadamard-rotated keys, as written by kv_cache_append) and the vector-quantized vq2
+// and k4v2.
 
 #include "infernix/ops/qsa.h"
 #include "infernix/ops/rope.h"
@@ -10,6 +12,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/append/launch.h"
+#include "ops/kv_cache/bf16p_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/kv_window.cuh"
 #include "ops/kv_cache/q4_lloyd_codec.cuh"
@@ -278,14 +281,20 @@ __device__ __forceinline__ void scatter_head_sums(const float (&part)[Group], in
 // One stage of attended tokens in shared memory, gathered by cp.async from each token's page space:
 // planes [K rows | V rows | K scales | V scales] of kTokenTile tokens each, in the paged planes' own
 // byte layout (paged_kv_storage_layout). A storage's key() and value() decode cell (j, d) to
-// exactly its represented value in FP32: every code times its stored scale is exact in FP32.
-template <int KeyBytes, int ValueBytes, int KeyScaleBytes, int ValueScaleBytes>
+// exactly its represented value in FP32: every code times its stored scale is exact in FP32. A row
+// of the paged planes holds KeyRowBytes / ValueRowBytes: the stage's row bytes, except for the
+// packed BF16 storage, whose 384-byte rows fill the front of the bf16 storage's rows (kPacked).
+template <int KeyBytes, int ValueBytes, int KeyScaleBytes, int ValueScaleBytes, int KeyRowBytes = KeyBytes,
+          int ValueRowBytes = ValueBytes>
 struct StagePlanes {
     static constexpr int kKeyBytes        = KeyBytes;
     static constexpr int kValueBytes      = ValueBytes;
+    static constexpr int kKeyRowBytes     = KeyRowBytes;
+    static constexpr int kValueRowBytes   = ValueRowBytes;
     static constexpr int kKeyScaleBytes   = KeyScaleBytes;
     static constexpr int kValueScaleBytes = ValueScaleBytes;
     static constexpr bool kVq             = false;
+    static constexpr bool kPacked         = KeyRowBytes != KeyBytes;
     static constexpr int kValues          = kTokenTile * KeyBytes;
     static constexpr int kKeyScales       = kValues + kTokenTile * ValueBytes;
     static constexpr int kValueScales     = kKeyScales + kTokenTile * KeyScaleBytes;
@@ -335,6 +344,19 @@ struct KVTile;
 // BF16 keys, FP16 values.
 template <>
 struct KVTile<KvCacheStorage::BFloat16> : StagePlanes<kHeadDim * 2, kHeadDim * 2, 0, 0> {
+    static constexpr bool kRotatedKeys = false, kRotatedValues = false;
+    __device__ static float key(const unsigned char* stage, int j, int d) {
+        return __bfloat162float(reinterpret_cast<const bf16*>(key_row(stage, j))[d]);
+    }
+    __device__ static float value(const unsigned char* stage, int j, int d) { return fp16_at(value_row(stage, j), d); }
+};
+
+// Packed BF16 (ops/kv_cache/bf16p_codec.cuh): each row's 384 bytes gather into the front of a bf16
+// row and its side record into the scale plane, then the kernel rewrites the row in place as the bf16
+// storage holds it (K as BF16, V as FP16), so cells read as BF16's and the bits are the bf16 storage's.
+template <>
+struct KVTile<KvCacheStorage::Bf16Packed>
+    : StagePlanes<kHeadDim * 2, kHeadDim * 2, kBf16pSideBytes, kBf16pSideBytes, kBf16pRowBytes, kBf16pRowBytes> {
     static constexpr bool kRotatedKeys = false, kRotatedValues = false;
     __device__ static float key(const unsigned char* stage, int j, int d) {
         return __bfloat162float(reinterpret_cast<const bf16*>(key_row(stage, j))[d]);
@@ -594,7 +616,7 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
             cp_commit();
             return;
         }
-        constexpr int KC = Tile::kKeyBytes / 16, VC = Tile::kValueBytes / 16;
+        constexpr int KC = Tile::kKeyRowBytes / 16, VC = Tile::kValueRowBytes / 16;
         // Byte offset of token j's row of `bytes` in its page's plane.
         const auto offset = [&](int j, int page, int bytes) {
             return (static_cast<std::size_t>(kv_head + kv_heads * page) * kPagedKVPageSize +
@@ -611,9 +633,9 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
                                       : detail::qsa_space_plane(spaces, kv.v_pages.data, spaces.host_v, spaces.lent_v,
                                                                 ids[buf][j], page);
             unsigned char* dst = is_key ? stage + j * Tile::kKeyBytes : stage + Tile::kValues + j * Tile::kValueBytes;
-            cp_async<16, Cache::cg>(dst + 16 * chunk, static_cast<const unsigned char*>(base) +
-                                                          offset(j, page, is_key ? Tile::kKeyBytes : Tile::kValueBytes) +
-                                                          16 * chunk);
+            cp_async<16, Cache::cg>(dst + 16 * chunk,
+                                    static_cast<const unsigned char*>(base) +
+                                        offset(j, page, is_key ? Tile::kKeyRowBytes : Tile::kValueRowBytes) + 16 * chunk);
         }
         if constexpr (Tile::kKeyScaleBytes > 0) {
             for (int j = threadIdx.x; j < n; j += kAttentionThreads) {
@@ -748,6 +770,24 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
             }
             __syncthreads();
         }
+        if constexpr (Tile::kPacked) {
+            // Each packed row rewritten in place as the bf16 storage holds it, a warp a row: every lane reads its
+            // code bytes, nibbles and the side record, then (__syncwarp) writes its eight decoded values over them.
+            unsigned char* st = smem + s * Shared::kStage;
+            for (int c = warp; c < n * 2; c += kAttentionWarps) {
+                const int j = c >> 1, role = c & 1;
+                unsigned char* row = st + (role ? Tile::kValues + j * Tile::kValueBytes : j * Tile::kKeyBytes);
+                const uint2 side   = *reinterpret_cast<const uint2*>(
+                    st + (role ? Tile::kValueScales : Tile::kKeyScales) + j * kBf16pSideBytes);
+                const uint2 code   = *reinterpret_cast<const uint2*>(row + 8 * lane);
+                const unsigned nib = *reinterpret_cast<const unsigned*>(row + kBf16pNibbles + 4 * lane);
+                const uint4 out =
+                    role ? bf16p_decode_regs_f16(code, nib, side, lane) : bf16p_decode_regs(code, nib, side, lane);
+                __syncwarp();
+                *reinterpret_cast<uint4*>(row + 16 * lane) = out;
+            }
+            __syncthreads();
+        }
         const unsigned char* stage = smem + s * Shared::kStage;
         // Scores: one warp per token, all query heads of the group.
         for (int j = warp; j < n; j += kAttentionWarps) {
@@ -874,6 +914,68 @@ __global__ void merge_kernel(const float* __restrict__ partial, int heads, int s
         acc += w * slot[d];
     }
     out[(static_cast<std::size_t>(t) * heads + head) * kHeadDim + d] = __float2bfloat16_rn(l > 0.0F ? acc / l : 0.0F);
+}
+
+// qsa_attention's `unpack` scratch for `max_context` positions: K rows (BF16) and V rows (FP16) [head_dim, 64,
+// kv_heads, pages], the bf16 storage's planes over logical pages, then the identity block table of those pages.
+struct UnpackScratch {
+    unsigned char* k;
+    unsigned char* v;
+    std::int32_t* table;
+};
+
+std::size_t unpack_pages(std::int32_t max_context) {
+    return (static_cast<std::size_t>(max_context) + kPagedKVPageSize - 1) / kPagedKVPageSize;
+}
+
+std::size_t unpack_plane_bytes(const QsaGeometry& g, std::int32_t max_context) {
+    return unpack_pages(max_context) * kPagedKVPageSize * g.kv_heads * kHeadDim * 2;
+}
+
+UnpackScratch unpack_scratch(void* base, const QsaGeometry& g, std::int32_t max_context) {
+    auto* p = static_cast<unsigned char*>(base);
+    const std::size_t plane = unpack_plane_bytes(g, max_context);
+    return {p, p + plane, reinterpret_cast<std::int32_t*>(p + 2 * plane)};
+}
+
+// The packed BF16 rows of one sequence's pages, up to its call's last position, as the bf16 storage holds them: a
+// CTA a (logical page, KV head), four warps of 32 rows (64 keys, then 64 values), each row decoded by its warp from
+// its 384 bytes and side record (through the page spaces) and written in order (the prompt kernel swizzles as it
+// gathers). The CTAs of page 0 .. needed - 1 and KV head 0 also write the identity table entry.
+constexpr int kUnpackWarps = 4;
+
+__global__ void __launch_bounds__(kUnpackWarps * 32)
+    unpack_packed_kernel(PagedKVLayerView kv, QsaPageSpaces spaces, const std::int32_t* __restrict__ tables,
+                         const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
+                         int columns, int kv_heads, UnpackScratch out) {
+    pdl::enter();
+    const int logical = static_cast<int>(blockIdx.x), head = static_cast<int>(blockIdx.y);
+    if (logical > (positions[columns - 1] >> kPagedKVPageShift)) { return; }
+    const int warp = static_cast<int>(threadIdx.x) >> 5, lane = static_cast<int>(threadIdx.x) & 31;
+    const int id = tables[static_cast<std::size_t>(table_rows[0]) * gridDim.x + logical];
+    if (head == 0 && threadIdx.x == 0) { out.table[logical] = logical; }
+    int page;
+    const auto* k_codes = static_cast<const unsigned char*>(
+        detail::qsa_space_plane(spaces, kv.k_pages.data, spaces.host_k, spaces.lent_k, id, page));
+    const auto* v_codes = static_cast<const unsigned char*>(
+        detail::qsa_space_plane(spaces, kv.v_pages.data, spaces.host_v, spaces.lent_v, id, page));
+    const auto* k_sides = static_cast<const unsigned char*>(
+        detail::qsa_space_plane(spaces, kv.k_scale_pages.data, spaces.host_k_scale, spaces.lent_k_scale, id, page));
+    const auto* v_sides = static_cast<const unsigned char*>(
+        detail::qsa_space_plane(spaces, kv.v_scale_pages.data, spaces.host_v_scale, spaces.lent_v_scale, id, page));
+    const std::size_t stored = static_cast<std::size_t>(head + kv_heads * page) * kPagedKVPageSize;
+    const std::size_t target = static_cast<std::size_t>(head + kv_heads * logical) * kPagedKVPageSize;
+#pragma unroll 4
+    for (int i = 0; i < 32; ++i) {
+        const int r = warp * 32 + i, role = r / kPagedKVPageSize, slot = r % kPagedKVPageSize;
+        const std::size_t row = stored + slot;
+        const unsigned char* codes = (role ? v_codes : k_codes) + row * kBf16pRowBytes;
+        const uint2 side   = *reinterpret_cast<const uint2*>((role ? v_sides : k_sides) + row * kBf16pSideBytes);
+        const uint2 code   = *reinterpret_cast<const uint2*>(codes + 8 * lane);
+        const unsigned nib = *reinterpret_cast<const unsigned*>(codes + kBf16pNibbles + 4 * lane);
+        const uint4 value  = role ? bf16p_decode_regs_f16(code, nib, side, lane) : bf16p_decode_regs(code, nib, side, lane);
+        *reinterpret_cast<uint4*>((role ? out.v : out.k) + (target + slot) * kHeadDim * 2 + 16 * lane) = value;
+    }
 }
 
 // Calls of at most this many columns: decode, one row's verification, up to eight plain lanes.
@@ -1073,10 +1175,16 @@ std::size_t qsa_attention_workspace_bytes(const QsaGeometry& geometry, std::int3
     return std::max(bytes, small);
 }
 
+std::size_t qsa_attention_unpack_bytes(const QsaGeometry& geometry, std::int32_t max_context) {
+    require_geometry(geometry);
+    require(max_context > 0, "max_context must be positive");
+    return 2 * unpack_plane_bytes(geometry, max_context) + sizeof(std::int32_t) * unpack_pages(max_context);
+}
+
 void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& layer,
                    const QsaBatch& batch, const QsaGeometry& geometry, float scale,
                    std::int32_t max_context, void* workspace, std::size_t workspace_bytes,
-                   Tensor& out, cudaStream_t stream, const QsaAppend* append) {
+                   Tensor& out, cudaStream_t stream, const QsaAppend* append, void* unpack) {
     require_geometry(geometry);
     const int columns = q.ne[2];
     require_batch(batch, columns);
@@ -1150,6 +1258,30 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     // width-invariance class, so a column's bits still do not depend on its call's width there.
     const int splits = attention_splits(columns, geometry);
     if (splits == 1 && detail::qsa_prompt_supported(layer, geometry)) {
+        if (layer.kv.storage == KvCacheStorage::Bf16Packed && unpack != nullptr && batch.batch == 1) {
+            // The sequence's rows unpacked once, then the bf16 prompt kernel over them through the identity table:
+            // the bf16 storage's rows, tiles and arithmetic, so its bits.
+            const int pages = stride;
+            require(static_cast<std::size_t>(pages) <= unpack_pages(max_context), "the block table outgrows max_context");
+            const UnpackScratch scratch = unpack_scratch(unpack, geometry, max_context);
+            unpack_packed_kernel<<<dim3(pages, geometry.kv_heads), kUnpackWarps * 32, 0, stream>>>(
+                layer.kv, layer.spaces, tables, rows, pos, columns, geometry.kv_heads, scratch);
+            check_launch("packed unpack");
+            const auto planes = static_cast<std::int32_t>(unpack_pages(max_context));
+            QsaKVLayer unpacked;
+            unpacked.kv.storage      = KvCacheStorage::BFloat16;
+            unpacked.kv.head_dim     = layer.kv.head_dim;
+            unpacked.kv.num_kv_heads = layer.kv.num_kv_heads;
+            unpacked.kv.k_pages = Tensor(scratch.k, DType::BF16, {kHeadDim, kPagedKVPageSize, geometry.kv_heads, planes});
+            unpacked.kv.v_pages = Tensor(scratch.v, DType::FP16, {kHeadDim, kPagedKVPageSize, geometry.kv_heads, planes});
+            unpacked.pooled_pages = layer.pooled_pages;
+            QsaBatch identity     = batch;
+            identity.block_tables = Tensor(scratch.table, DType::I32, {pages, 1});
+            identity.table_rows   = Tensor(scratch.table, DType::I32, {1}); // entry 0 is 0
+            detail::qsa_prompt_attention(q, unpacked, identity, geometry, scale, ws.selected, ws.counts, out, stream,
+                                         vq_args);
+            return;
+        }
         detail::qsa_prompt_attention(q, layer, batch, geometry, scale, ws.selected, ws.counts, out, stream,
                                      vq_args);
         commit();
@@ -1200,6 +1332,9 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     switch (layer.kv.storage) {
     case KvCacheStorage::BFloat16:
         launch_storage.template operator()<KvCacheStorage::BFloat16>();
+        break;
+    case KvCacheStorage::Bf16Packed:
+        launch_storage.template operator()<KvCacheStorage::Bf16Packed>();
         break;
     case KvCacheStorage::Int8Group64:
         launch_storage.template operator()<KvCacheStorage::Int8Group64>();

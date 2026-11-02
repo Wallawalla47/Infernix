@@ -1095,6 +1095,7 @@ public:
         const auto kv_heads = dim(c_.attention.kv_heads);
         execution::ForwardKV kv;
         kv.block_tables  = tables_->matrix();
+        std::fill_n(unpackable_flag(0), kMaximumConcurrency, 0);
         for (std::uint32_t l = 0; l < plan_.kv_layers; ++l) {
             const prefix::PlaneRange planes = prefix::kv_layer_planes(kv_geometry_, l);
             std::size_t plane               = planes.begin;
@@ -1102,6 +1103,7 @@ public:
             layer.kv.storage      = options_.kv_cache;
             layer.kv.head_dim     = dim(c_.attention.head_dim);
             layer.kv.num_kv_heads = kv_heads;
+            layer.kv.unpackable   = unpackable_flag(0); // indexed by table row (ops::QsaKVLayer)
             layer.kv.k_pages      = pool_->plane(plane++);
             if (layout.key.has_scale()) { layer.kv.k_scale_pages = pool_->plane(plane++); }
             layer.kv.v_pages = pool_->plane(plane++);
@@ -1800,6 +1802,7 @@ public:
         lane.sampling.token_counts =
             static_cast<std::int32_t*>(token_counts_.p) + static_cast<std::size_t>(index) * token_domain_;
         *nonfinite_flag(index)  = 0; // the lane's earlier rounds have completed
+        *unpackable_flag(index) = 0;
         lane.sampling.nonfinite = nonfinite_flag(index);
         lane.epoch           = ++next_epoch_;
         lane.phase           = Phase::Prefill;
@@ -2001,6 +2004,7 @@ public:
         lane.sampling.token_counts =
             static_cast<std::int32_t*>(token_counts_.p) + static_cast<std::size_t>(index) * token_domain_;
         *nonfinite_flag(index)  = 0;
+        *unpackable_flag(index) = 0;
         lane.sampling.nonfinite = nonfinite_flag(index);
         rebuild_token_counts(lane);
         lane.readout.clear(); // the prompt's readout was delivered before the pause
@@ -2775,10 +2779,11 @@ public:
                                                2ULL * width_, cudaMemcpyDeviceToDevice, device_.stream));
                     lane.mtp_cells = lane.state_tokens - 1;
                 }
-                // Non-finite logits: what the request published may hold that state, so its release
-                // withdraws it (prefix_withdraw).
+                // Non-finite logits, or KV with no packed form: what the request published may hold that state,
+                // so its release withdraws it (prefix_withdraw).
                 lane.prefix.withdraw =
-                    pending.row_failure(row) == runtime::PendingRowFailure::NonFiniteLogits;
+                    pending.row_failure(row) == runtime::PendingRowFailure::NonFiniteLogits ||
+                    pending.row_failure(row) == runtime::PendingRowFailure::UnpackableKv;
                 lane.constraint_round.clear();
                 out.rows[row].speculative = lane.speculative;
                 out.rows[row].disposition = d.failed ? runtime::CommitDisposition::FailedReleased
@@ -5334,8 +5339,9 @@ private:
             fold_rows[row]   = {static_cast<std::int32_t>(index), static_cast<std::int32_t>(index), 0};
             out.rows[row].speculative_counters = speculative_counters(lane.speculative);
             if (d.cancelled || d.failed) {
-                lane.prefix.withdraw = pending.row_failure(static_cast<std::size_t>(row)) ==
-                                       runtime::PendingRowFailure::NonFiniteLogits;
+                const auto failure   = pending.row_failure(static_cast<std::size_t>(row));
+                lane.prefix.withdraw = failure == runtime::PendingRowFailure::NonFiniteLogits ||
+                                       failure == runtime::PendingRowFailure::UnpackableKv;
                 lane.constraint_round.clear();
                 out.rows[row].speculative = lane.speculative;
                 out.rows[row].disposition = d.failed ? runtime::CommitDisposition::FailedReleased
@@ -6445,8 +6451,11 @@ private:
             const std::uint64_t reached = count >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << count) - 1U;
             std::int32_t* const nonfinite = nonfinite_flag(ContractAccess::lane(rows[row]));
             const bool nonfinite_row      = std::exchange(*nonfinite, 0) != 0;
+            // Likewise the packed BF16 KV's flag: a row with no packed form left the KV unlike the bf16 storage's.
+            const bool unpackable_row = std::exchange(*unpackable_flag(ContractAccess::lane(rows[row])), 0) != 0;
             ContractAccess::set_row_failure(pending, row,
-                                            nonfinite_row || runtime::testing::take_nonfinite_fault()
+                                            unpackable_row ? runtime::PendingRowFailure::UnpackableKv
+                                            : nonfinite_row || runtime::testing::take_nonfinite_fault()
                                                 ? runtime::PendingRowFailure::NonFiniteLogits
                                             : (grammar_dead_[row] & reached) != 0
                                                 ? runtime::PendingRowFailure::ConstraintDeadEnd
@@ -6458,6 +6467,13 @@ private:
     PinnedHostBuffer nonfinite_flags_{sizeof(std::int32_t) * kMaximumConcurrency};
     [[nodiscard]] std::int32_t* nonfinite_flag(std::uint32_t lane) const noexcept {
         return static_cast<std::int32_t*>(nonfinite_flags_.data()) + lane;
+    }
+    // Per KV table row (a lane's row is its index, tables_->acquire(index)): set by the packed BF16 KV's
+    // append when a K or V row has no packed form (ops::kv_cache_append, ops::qsa_prepare), read and cleared by
+    // the round's commit, which fails that request (PendingRowFailure::UnpackableKv).
+    PinnedHostBuffer unpackable_flags_{sizeof(std::int32_t) * kMaximumConcurrency};
+    [[nodiscard]] std::int32_t* unpackable_flag(std::uint32_t lane) const noexcept {
+        return static_cast<std::int32_t*>(unpackable_flags_.data()) + lane;
     }
     // Set for the duration of one decode or prefill call.
     struct GrammarScope {

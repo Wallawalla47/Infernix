@@ -69,7 +69,7 @@ offline CausalScoring. It includes:
 
 - the Text model;
 - the MTP layer;
-- QSA with **every Infernix KV profile** (`bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`;
+- QSA with **every Infernix KV profile** (`bf16`, `bf16p`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`;
   §8.10);
 - Vision, which can be selected at startup.
 
@@ -1314,6 +1314,7 @@ of this machine run, and it is optimized first. The other profiles follow in thi
 | Profile | K+V per token and KV head | Per context token (13 layers + index keys) | 32K / 128K / 256K context |
 |---|---:|---:|---|
 | `bf16` (BF16 K, FP16 V) | 1,024 B | 27.5 KB | 0.90 / 3.60 / 7.20 GB |
+| `bf16p` (`bf16`'s values, packed losslessly; §19.3.48) | 784 B | 21.2 KB | 0.70 / 2.78 / 5.56 GB |
 | **`int8` (INT8-G64), primary** | 528 B | 14.6 KB | 0.48 / 1.91 / 3.82 GB |
 | `fp8` (E4M3FN-row256) | 516 B | 14.2 KB | 0.47 / 1.87 / 3.74 GB |
 | `nvfp4` (NVFP4-G16) | 288 B | 8.3 KB | 0.27 / 1.09 / 2.18 GB |
@@ -1328,7 +1329,8 @@ How each part handles the profiles:
   Stored codes are therefore identical to the dense-attention models'.
 - **Decode attention (K3b).**
   - It walks the selected 4-token blocks through the block table and loads each block with a
-    **per-profile tile loader**: BF16/FP16 direct; INT8-G64 and FP8-row codes times their scales;
+    **per-profile tile loader**: BF16/FP16 direct; packed BF16 rows rewritten in shared memory as the
+    BF16/FP16 tile (so the arithmetic and bits are `bf16`'s); INT8-G64 and FP8-row codes times their scales;
     E2M1 times E4M3; K8V4's mixed pair; or VQ2/K4V2 codes in the Hadamard-rotated domain, with q
     rotated once and the output rotated back.
   - The loaders reuse the dequantization routines of the existing `softmax_attention` consumers.
@@ -3085,7 +3087,7 @@ guide, is `--kv-dtype int8 --max-context 262144` at C=1, with the recipe-B artif
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4\|vq2\|k4v2` | existing (`bf16`) | **Changes output.** Every profile is supported (§8.10); `int8` is the primary configuration. |
+| `--kv-dtype bf16\|bf16p\|int8\|fp8\|nvfp4\|k8v4\|vq2\|k4v2` | existing (`bf16`) | **Changes output** (except `bf16p`, which gives `bf16`'s). Every profile is supported (§8.10); `int8` is the primary configuration. |
 | `--max-context N` | existing | Up to 262,144. Loans keep the unused reservation serving experts (§9.2). |
 | `--expert-frames auto\|N` | `auto` | Frame pool size; `auto` takes all device memory left after the plan of §15.1 |
 | `--mtp-expert-slots auto\|N` | `auto` (128) | MTP expert pool (§9.1); affects acceptance only |
@@ -12393,6 +12395,53 @@ router could read logits still landing: the varying runs' dispatch offsets diffe
 not at all. With the uploads ordered against the call every width gave one hash in 3-6 runs, both routes; every op
 benchmark's fixture transfers now go through ordered helpers (bench/README.md, Benchmark inputs). The expert kernels
 were deterministic throughout; the Program's uploads settle the legacy stream already (`DeviceBuffer::copy_from_host`).
+
+### 19.3.48 Packed BF16 KV (`--kv-dtype bf16p`) in QSA (2026-11-02; same bits as `bf16`; opt-in)
+
+**Why.** `bf16p` ([paged KV §4.3](paged-kv-cache.md)) holds `bf16`'s K and V exactly in 784 bytes a token and KV head
+against 1,024, so the same memory holds 1.31 times the tokens; here the KV a long context takes comes out of the
+expert cache. It was Qwen3.5's only; the owner asked for it on every path.
+
+**What.**
+- *Writers.* The fused prepare (`qsa_prepare`, `qsa-prepare-fused`) rounds each key to BF16 once as for `bf16` and packs
+  K and the BF16 V source row through `bf16p_encode_row`; the composed prepare appends through `kv_cache_append_batch`.
+  A row with no packed form sets its table row's flag (`QsaKVLayer::kv.unpackable`, pinned host words in the Program),
+  and the round's commit fails that request (`PendingRowFailure::UnpackableKv`, its published prefix withdrawn) while
+  the Engine keeps serving, as on Qwen3.5.
+- *Decode and verification* (`qsa.cu`): a stage gathers each attended row's 384 bytes into the front of a `bf16` row
+  slot and its side record into the scale plane; after the wait each warp rewrites rows in place as `bf16` holds them
+  (BF16 K, FP16 V), so the tile, the arithmetic and the bits are `bf16`'s.
+- *Prompt route* (`qsa_prompt.cu`, one column a CTA): the same gather and in-place decode a tile, a token's key and
+  value rows a step. A token is gathered by every column that attends it (about 256 times in a 4,096-column call at
+  32K), so prefill calls instead unpack the sequence once a call: `qsa_attention`'s `unpack` scratch (one sequence's
+  rows up to `--max-context`, BF16 K and FP16 V, 2 KiB a position at 2 KV heads, with an identity block table) is
+  filled by a bandwidth-bound pass up to the call's last position, then `bf16`'s prompt kernel runs over it. The
+  Forward takes the scratch for calls wider than `kQsaUnpackColumns` (512): those run in the wide arena lent from the
+  expert frames while a prompt runs (§19.3.7), which is sized for it (512 MiB at `--max-context 262144`, 64 MiB at
+  32,768), so the static arena and decode keep no extra memory. Narrower calls (MTP chunks, short prompts) decode as
+  they gather.
+- Qualified as `bf16` (`fast_path_configuration` maps it), and read as `bf16` by the design reference; `--lossless`
+  keeps `bf16`.
+
+**Measured** (RTX 5090, Dense8 artifact, `infernix_bench` 32K and 128K prompts + 256 tokens, plain decode, two ABBA
+pairs; `infernix_qsa_attention_bench`, 24/2 heads, cold L2).
+- Bits: `test_qsa --part bf16p` (rows with zeros, subnormals and up to six escapes below and above the window) against
+  FP64 and bit for bit against the `bf16` storage holding the same K and V, every case and route (decode, verification,
+  prompt with and without the unpack scratch, page spaces, the 4,096-column chunks); the fused prepare's rows decode to
+  the `bf16` prepare's K and V and its outputs are that prepare's bits; an unpackable value row flags only its table
+  row. Greedy ids identical to `bf16` (19K-token chat, 256 tokens, plain and DFlash2 auto: same 91 rounds); the
+  prefix-cache (Host tier save and restore) and preemption real tests pass on `bf16p`.
+- KV at `--max-context 262144`: grows to 4.78 GiB against 6.19 (about 540 more expert frames at a full context). The
+  elastic pool maps each plane in whole chunks, so the packed storage's two small side planes a layer make its
+  startup mapping 24-48 MiB larger than `bf16`'s (10-18 fewer frames until a context grows).
+- Ops, `bf16p` against `bf16`: decode and verification W = 1 level, W = 16 +5-7 %; prompt calls with the unpack scratch
+  W = 4,096 +0.4 % (8K), +3.2 % (32K), +3.7 % (128K; the pass reads 392 and writes 1,024 bytes a row, ~0.3 ms), W = 1,024
+  +2-14 %; with the in-place decode only W = 64-4,096 1.31-1.75x (the first build, before the pairing: 1.40-1.95x).
+  Rejected: two tokens a decode step (no faster than one).
+- End to end: prefill level (32K -0.2 %, 128K +0.1 %; the in-place decode alone lost 8.4-9.4 %), decode 32K -0.6 %
+  (both pairs), 128K +1.4 % (both pairs).
+- Ornith-1.5-122B (Qwen3.5 route, unchanged): greedy ids identical; KV 3.23 -> 2.47 GB at 131K; prefill -0.3 / -0.7 %
+  (32K / 128K), decode +5.8 / +6.3 % (CPU-miss-bound and noisy: one 32K pair +13 %, the other -0.8 %).
 
 ---
 

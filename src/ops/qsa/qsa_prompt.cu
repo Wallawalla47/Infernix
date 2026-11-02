@@ -8,6 +8,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/kv_cache/bf16p_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/q4_lloyd_codec.cuh"
 #include "ops/kv_cache/vq2_codec.cuh"
@@ -86,6 +87,15 @@ struct PromptShape<KvCacheStorage::BFloat16> {
     static constexpr int Warps = 2;
     static constexpr Code Key = Code::Bf16, Value = Code::Fp16;
 };
+// Packed BF16 (ops/kv_cache/bf16p_codec.cuh): each tile row's 384 bytes gather into the front of a bf16
+// row with its side record, then the warp rewrites the row in place as the bf16 storage holds it (K as
+// BF16, V as FP16, swizzled), so the tile is the bf16 storage's from there on and so are the bits.
+template <>
+struct PromptShape<KvCacheStorage::Bf16Packed> {
+    static constexpr int Vq    = 0;
+    static constexpr int Warps = 2;
+    static constexpr Code Key = Code::Bf16, Value = Code::Fp16;
+};
 template <>
 struct PromptShape<KvCacheStorage::Fp8E4M3Row256> {
     static constexpr int Vq    = 0;
@@ -129,13 +139,16 @@ struct Stage {
     using K                         = Row<Shape::Key>;
     using V                         = Row<Shape::Value>;
     static constexpr bool Parity    = Shape::Key == Code::Fp8 || Shape::Value == Code::Fp8 || Shape::Vq > 0;
+    static constexpr bool Packed    = Storage == KvCacheStorage::Bf16Packed;
     static constexpr int Values     = kTile * K::Bytes;
     static constexpr int KeyScales  = Values + kTile * V::Bytes;
     static constexpr int ValueScales = KeyScales + kTile * K::ScaleSlot;
     static constexpr int ParityWord = ValueScales + kTile * V::ScaleSlot;
+    // Packed BF16: the rows' side records, [K, V][row].
+    static constexpr int Sides        = ParityWord + (Parity ? 16 : 0);
     // Vector-quantized: the paged code rows, each row's FP16 code scale (K, V) as its aligned word,
     // the window tags (K, V) and each row's token and read mode.
-    static constexpr int VqKeyCodes   = ParityWord + (Parity ? 16 : 0);
+    static constexpr int VqKeyCodes   = Sides + (Packed ? 2 * kTile * kBf16pSideBytes : 0);
     static constexpr int VqValueCodes = VqKeyCodes + kTile * Shape::Vq;
     static constexpr int VqCodeScales = VqValueCodes + (Shape::Vq > 0 ? kTile * kKVCacheVq2CodeBytes : 0);
     static constexpr int VqTags       = VqCodeScales + (Shape::Vq > 0 ? kTile * 8 : 0);
@@ -404,6 +417,34 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
             }
             const unsigned odd = __ballot_sync(FullMask, role == 0 && (token & 1) != 0);
             if (lane == 0) { *reinterpret_cast<unsigned*>(k_s + S::ParityWord) = odd; }
+            cp_commit();
+            return;
+        }
+        if constexpr (S::Packed) {
+            static_assert(P == Part::Both, "packed tiles decode keys and values together");
+            // Each row's 384 bytes in order at the front of its bf16 row (expand decodes them in place), and its
+            // side record: lanes 0-15 the keys', 16-31 the values'. Rows past the list are zero (an all-zero
+            // record decodes to zeros).
+            constexpr int Chunks = kBf16pRowUnits;
+            const auto own_k     = reinterpret_cast<unsigned long long>(k_plane + row_at * kBf16pRowBytes);
+            const auto own_v     = reinterpret_cast<unsigned long long>(v_plane + row_at * kBf16pRowBytes);
+#pragma unroll
+            for (int j = 0; j < kTile * Chunks / 32; ++j) {
+                const int chunk = lane + 32 * j;
+                const int r = chunk / Chunks, c = chunk % Chunks;
+                const bool ok   = __shfl_sync(FullMask, static_cast<int>(valid), r) != 0;
+                const auto* ks  = reinterpret_cast<const unsigned char*>(__shfl_sync(FullMask, own_k, r));
+                const auto* vs  = reinterpret_cast<const unsigned char*>(__shfl_sync(FullMask, own_v, r));
+                cp_async_zfill<16, Cache::cg>(k_s + r * K::Bytes + 16 * c, ks + 16 * c, ok ? 16 : 0);
+                cp_async_zfill<16, Cache::cg>(v_s + r * V::Bytes + 16 * c, vs + 16 * c, ok ? 16 : 0);
+            }
+            const int role = lane >> 4;
+            int side_page;
+            const auto* sides = static_cast<const unsigned char*>(
+                role ? qsa_space_plane(spaces, v_scales, spaces.host_v_scale, spaces.lent_v_scale, id, side_page)
+                     : qsa_space_plane(spaces, k_scales, spaces.host_k_scale, spaces.lent_k_scale, id, side_page));
+            cp_async_zfill<kBf16pSideBytes>(k_s + S::Sides + (role * kTile + row) * kBf16pSideBytes,
+                                            sides + row_at * kBf16pSideBytes, valid ? kBf16pSideBytes : 0);
             cp_commit();
             return;
         }
@@ -788,8 +829,34 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
         }
     };
 
-    // Vector-quantized storages: settle stage st's rows (exact rows kept, codes decoded).
+    // Vector-quantized storages: settle stage st's rows (exact rows kept, codes decoded). Packed BF16: each
+    // row rewritten in place as the bf16 storage holds it, swizzled (every lane reads its code bytes, nibbles
+    // and the side record before any lane writes); a token's key and value rows a step, two independent
+    // decodes in flight (two tokens a step measured no faster). Calls that run in a lent arena unpack the
+    // sequence once instead (qsa_attention's `unpack`).
     const auto expand = [&](int st) {
+        if constexpr (S::Packed) {
+            static_assert(K::Bytes == V::Bytes, "packed key and value rows share the bf16 row size");
+            unsigned char* k_s = stages + st * S::Bytes;
+            unsigned char* v_s = k_s + S::Values;
+#pragma unroll 1
+            for (int row = 0; row < kTile; ++row) {
+                const unsigned char* k_at = k_s + row * K::Bytes;
+                const unsigned char* v_at = v_s + row * V::Bytes;
+                const uint2 k_side   = *reinterpret_cast<const uint2*>(k_s + S::Sides + row * kBf16pSideBytes);
+                const uint2 v_side   = *reinterpret_cast<const uint2*>(k_s + S::Sides + (kTile + row) * kBf16pSideBytes);
+                const uint2 k_code   = *reinterpret_cast<const uint2*>(k_at + 8 * lane);
+                const uint2 v_code   = *reinterpret_cast<const uint2*>(v_at + 8 * lane);
+                const unsigned k_nib = *reinterpret_cast<const unsigned*>(k_at + kBf16pNibbles + 4 * lane);
+                const unsigned v_nib = *reinterpret_cast<const unsigned*>(v_at + kBf16pNibbles + 4 * lane);
+                const uint4 k_out    = bf16p_decode_regs(k_code, k_nib, k_side, lane);
+                const uint4 v_out    = bf16p_decode_regs_f16(v_code, v_nib, v_side, lane);
+                __syncwarp();
+                *reinterpret_cast<uint4*>(k_s + swizzled(row, K::Bytes, lane)) = k_out;
+                *reinterpret_cast<uint4*>(v_s + swizzled(row, V::Bytes, lane)) = v_out;
+            }
+            __syncwarp();
+        }
         if constexpr (Shape::Vq > 0) {
             // Lane l takes row l % 16 of role l / 16 (K, V): its exact row stays when the read is from
             // the call's staged row or the window slot's tag matches the stored codes; otherwise the
@@ -1013,7 +1080,7 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
     // same bits.
     constexpr bool two_ctas = 2 * (prompt_smem_bytes<Storage, 1>() + 1024) <= 100 * 1024;
     if (two_ctas && q.ne[2] * g.kv_heads >= sms) {
-        if constexpr (two_ctas && PromptShape<Storage>::Vq == 0) {
+        if constexpr (two_ctas && PromptShape<Storage>::Vq == 0 && !Stage<Storage>::Packed) {
             if (qsa_prompt_split(Storage)) {
                 run.template operator()<1, true>();
             } else {
@@ -1034,6 +1101,7 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
 bool qsa_prompt_supported(const QsaKVLayer& layer, const QsaGeometry& geometry) {
     switch (layer.kv.storage) {
     case KvCacheStorage::BFloat16:
+    case KvCacheStorage::Bf16Packed:
     case KvCacheStorage::Int8Group64:
     case KvCacheStorage::Fp8E4M3Row256:
     case KvCacheStorage::Nvfp4Group16:
@@ -1051,6 +1119,9 @@ void qsa_prompt_attention(const Tensor& q, const QsaKVLayer& layer, const QsaBat
                           const std::int32_t* counts, Tensor& out, cudaStream_t stream, const QsaVqWindow& vq) {
     require(qsa_prompt_supported(layer, geometry), "the prompt route does not serve this layer");
     switch (layer.kv.storage) {
+    case KvCacheStorage::Bf16Packed:
+        launch<KvCacheStorage::Bf16Packed>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        break;
     case KvCacheStorage::Int8Group64:
         launch<KvCacheStorage::Int8Group64>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
         break;

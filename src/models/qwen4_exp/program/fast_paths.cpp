@@ -604,9 +604,12 @@ std::string describe(const FastPathConfiguration& configuration) {
 
 FastPathConfiguration fast_path_configuration(const execution::Parameters& parameters,
                                               const EngineOptions& options) {
+    // Packed BF16 KV gives attention bf16's K and V bits (and the fused prepare stores them through the packed
+    // codec): it is qualified as bf16.
     FastPathConfiguration out{.dense      = DenseKernels::Bf16,
                               .a4_experts = !parameters.model.config().text.moe.a16_experts,
-                              .kv         = options.kv_cache};
+                              .kv         = options.kv_cache == KvCacheStorage::Bf16Packed ? KvCacheStorage::BFloat16
+                                                                                         : options.kv_cache};
     // The dense layers share one kernel family; the GDN q/k/v/z projection is the one the fast
     // routes serve.
     for (const execution::BlockParameters& block : parameters.layers) {
@@ -694,8 +697,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::UniverTrees: return false; // Qwen3.5's tree rounds only
     case FastPath::GdnTreeClosedForm: return false; // Qwen3.5's tree rounds only
     case FastPath::QsaPrepareFused:
-        // ops::qsa_prepare_supports's KV formats (bf16, int8, fp8, nvfp4, k8v4); VQ2 and K4V2 append
-        // inside qsa_attention and keep the composed prepare.
+        // ops::qsa_prepare_supports's KV formats (bf16 and bf16p, int8, fp8, nvfp4, k8v4); VQ2 and K4V2
+        // append inside qsa_attention and keep the composed prepare.
         return configuration.kv == KvCacheStorage::Int8Group64 || configuration.kv == KvCacheStorage::BFloat16 ||
                configuration.kv == KvCacheStorage::Fp8E4M3Row256 || configuration.kv == KvCacheStorage::Nvfp4Group16 ||
                configuration.kv == KvCacheStorage::Fp8KeyNvfp4Value;

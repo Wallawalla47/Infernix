@@ -298,7 +298,10 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         }
         out.text.lossless         = options.lossless;
         out.text.design_reference = options.lossless && options.reference;
-        out.text.design_kv        = out.text.design_reference ? options.reference_kv : KvCacheStorage::BFloat16;
+        // Packed BF16 KV stores bf16's values exactly: the design reference reads it as bf16 (no codec).
+        out.text.design_kv = out.text.design_reference && options.reference_kv != KvCacheStorage::Bf16Packed
+                                 ? options.reference_kv
+                                 : KvCacheStorage::BFloat16;
         // Banks that are W4A4 by their checkpoint (scales, not optional) run 16-bit activations only when asked
         // (--a16-activations, or --a8-activations, whose 8-bit route runs on the 16-bit banks).
         out.text.moe.a4_native   = scales && !out.text.moe.a4_optional;
