@@ -547,9 +547,13 @@ closes its thinking first and calls after it.
 
 Non-strict parameter names and order remain open. Their schema supplies the existing value
 normalization hints; it is not compiled as a strict constraint. Open objects, root unions, and
-unsupported schema assertions therefore remain usable. A call names each parameter at most once
-(the constraint refuses a repeated name), so the published JSON object, streamed or whole, contains
-each key once. `strict:true` additionally enforces the parameter contract below.
+unsupported schema assertions therefore remain usable. A root `oneOf` / `anyOf` of object variants
+(a zod or Pydantic discriminated union) supplies its variants' properties as hints too: a name takes
+the union of the types its variants give it, so a string-typed field keeps `2026` or `true` as text;
+a variant that leaves it untyped, or a branch that cannot be read, leaves the value text to decide.
+A call names each parameter at most once (the constraint refuses a repeated name), so the published
+JSON object, streamed or whole, contains each key once. `strict:true` additionally enforces the
+parameter contract below.
 
 Top-level `tool_constraints:"auto"` opts into request-driven constraints: ordinary non-strict
 `tool_choice:"auto"` then uses free generation. Strict tools, selection/count restrictions, and

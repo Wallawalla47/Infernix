@@ -174,6 +174,83 @@ TypeDomain type_domain(const Json& schema, const Json& document) {
     return type_domain(schema, document, open);
 }
 
+// A root union's branch as the object schema it names, through local references; nullptr when it
+// cannot be read (not an object, or a remote, missing or cyclic reference).
+const Json* variant_object(const Json& branch, const Json& document) {
+    const Json* node = &branch;
+    std::set<const Json*> seen;
+    while (node->is_object() && node->contains("$ref")) {
+        const Json& ref = (*node)["$ref"];
+        if (!ref.is_string() || !seen.insert(node).second) return nullptr;
+        const auto& pointer = ref.get_ref<const std::string&>();
+        if (pointer != "#" && !pointer.starts_with("#/")) return nullptr;
+        try {
+            node = &document.at(Json::json_pointer(pointer.substr(1)));
+        } catch (const Json::exception&) { return nullptr; }
+    }
+    return node->is_object() ? node : nullptr;
+}
+
+// A non-strict tool's parameters, whose types guide their value text: the root's `properties`, and
+// those of the object variants of a root `anyOf` / `oneOf` (a zod or Pydantic discriminated union,
+// Codex's `automation_update`), each name once. A variant property's types are the union of the
+// types its declaring variants give it, known only when each of them is; a root property of the same
+// name narrows them. A union with a branch that cannot be read declares nothing.
+std::vector<Contract::Parameter> non_strict_parameters(const Json& schema) {
+    struct Declared {
+        std::string name;
+        TypeDomain types;
+    };
+    const auto named = [](std::vector<Declared>& list, const std::string& name) {
+        return std::find_if(list.begin(), list.end(), [&](const Declared& entry) { return entry.name == name; });
+    };
+    std::vector<Declared> declared;
+    if (const auto properties = schema.find("properties"); properties != schema.end() && properties->is_object())
+        for (const auto& [name, property] : properties->items()) declared.push_back({name, type_domain(property, schema)});
+    for (const char* key : {"anyOf", "oneOf"}) {
+        const auto branches = schema.find(key);
+        if (branches == schema.end() || !branches->is_array()) continue;
+        std::vector<Declared> united;
+        bool readable = true;
+        for (const Json& branch : *branches) {
+            const Json* variant = variant_object(branch, schema);
+            if (variant == nullptr) {
+                readable = false;
+                break;
+            }
+            const auto properties = variant->find("properties");
+            if (properties == variant->end() || !properties->is_object()) continue;
+            for (const auto& [name, property] : properties->items()) {
+                const TypeDomain types = type_domain(property, schema);
+                if (const auto entry = named(united, name); entry != united.end()) {
+                    entry->types.bits |= types.bits;
+                    entry->types.known = entry->types.known && types.known;
+                } else {
+                    united.push_back({name, types});
+                }
+            }
+        }
+        if (!readable) continue;
+        for (Declared& entry : united) {
+            if (const auto root = named(declared, entry.name); root != declared.end())
+                root->types.narrow(entry.types);
+            else
+                declared.push_back(std::move(entry));
+        }
+    }
+    std::vector<Contract::Parameter> parameters;
+    for (const Declared& entry : declared) {
+        Contract::Parameter parameter;
+        parameter.name = entry.name;
+        if (entry.types.known) {
+            parameter.policy     = NormalizationPolicy::DeclaredTypes;
+            parameter.types.bits = entry.types.bits;
+        }
+        parameters.push_back(std::move(parameter));
+    }
+    return parameters;
+}
+
 // The raw-text branches of a nullable string, as the grammar takes them: the open string schemas,
 // the members of the finite (enum / const) ones, and whether null is one of the values.
 struct TextBranches {
@@ -375,19 +452,8 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons,
             tool.declaration_index = i;
             // Non-strict output keeps the established best-effort normalization contract: the
             // types its schema names, through local references and enum / const values, guide
-            // the value text.
-            if (schema.is_object() && schema.contains("properties") &&
-                schema["properties"].is_object()) {
-                for (const auto& [name, property] : schema["properties"].items()) {
-                    Contract::Parameter parameter;
-                    parameter.name = name;
-                    if (const TypeDomain types = type_domain(property, schema); types.known) {
-                        parameter.policy     = NormalizationPolicy::DeclaredTypes;
-                        parameter.types.bits = types.bits;
-                    }
-                    tool.parameters.push_back(std::move(parameter));
-                }
-            }
+            // the value text (a constrained strict tool's are replaced at selection by its strict list).
+            if (schema.is_object()) tool.parameters = non_strict_parameters(schema);
             result->tools.push_back(std::move(tool));
         } catch (const Json::exception& error) {
             fail(std::string("invalid tool declaration: ") + error.what(), "/" + std::to_string(i));

@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -2117,6 +2118,60 @@ int test_reference_and_value_type_hints() {
     return failures;
 }
 
+// A non-strict tool whose parameters are a root `oneOf` / `anyOf` of object variants (a zod
+// discriminated union, Codex's `automation_update`; Basalt #208) declares its variants' properties:
+// a string-typed one keeps `2026`, `true` and `null` as text. A name the variants type differently
+// takes the union of their types (with a string among them it stays text); a variant that leaves it
+// untyped, or a branch that cannot be read (a remote reference), leaves the value text to decide, as
+// for an undeclared name. The free and the constrained route agree byte for byte.
+int test_root_union_type_hints() {
+    const Json zod = {
+        {"type", "object"},
+        {"properties", Json::object()},
+        {"$defs",
+         {{"Create", {{"type", "object"},
+                      {"properties", {{"mode", {{"const", "create"}}}, {"name", {{"type", "string"}}},
+                                      {"shared", {{"type", "string"}}}, {"loose", Json::object()}}}}},
+          {"Update", {{"type", "object"},
+                      {"properties", {{"mode", {{"const", "update"}}}, {"paused", {{"type", "boolean"}}},
+                                      {"shared", {{"type", "integer"}}}, {"loose", {{"type", "string"}}}}}}}}},
+        {"oneOf", Json::array({Json{{"$ref", "#/$defs/Create"}}, Json{{"$ref", "#/$defs/Update"}}})}};
+    const Json remote = {
+        {"type", "object"},
+        {"anyOf", Json::array({Json{{"$ref", "https://example.com/schema.json"}},
+                               Json{{"type", "object"}, {"properties", {{"name", {{"type", "string"}}}}}}})}};
+    const auto declarations = contract_from_definitions(
+        {Json{{"type", "function"}, {"function", {{"name", "automate"}, {"parameters", zod}}}}.dump(),
+         Json{{"type", "function"}, {"function", {{"name", "fetch"}, {"parameters", remote}}}}.dump()});
+    const auto constrained = fi::select_tool_call_contract(declarations, infernix::ToolChoice{});
+    int failures           = 0;
+    if (!constrained) { return check(false, "default tool choice did not constrain the calls"); }
+    // Each call's arguments and the JSON they must decode to.
+    const std::vector<std::tuple<std::string, std::vector<std::pair<std::string, std::string>>, std::string>> cases = {
+        {"automate",
+         {{"mode", "update"}, {"name", "2026"}, {"paused", "true"}, {"shared", "null"}, {"loose", "7"}},
+         R"({"mode":"update","name":"2026","paused":true,"shared":"null","loose":7})"},
+        {"automate", {{"name", "true"}, {"shared", "2026"}}, R"({"name":"true","shared":"2026"})"},
+        {"fetch", {{"name", "2026"}}, R"({"name":2026})"}};
+    for (const auto& [tool, arguments, expected] : cases) {
+        std::string text = "<tool_call>\n<function=" + tool + ">\n";
+        for (const auto& [name, value] : arguments) {
+            text += "<parameter=" + name + ">\n" + value + "\n</parameter>\n";
+        }
+        text += "</function>\n</tool_call>";
+        const auto parsed = parse(text, 64, *declarations);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls.front().arguments_json == expected,
+                          "a root union's arguments were typed wrongly: " + expected);
+        fi::ToolCallOutputDecoder decoder(constrained, 64);
+        (void)feed(decoder, text);
+        const auto terminal = decoder.finish(infernix::FinishReason::StopToken);
+        failures += check(terminal.tool_calls.size() == 1 && terminal.tool_calls.front().arguments_json == expected,
+                          "the constrained route typed a root union's arguments differently: " + expected);
+    }
+    return failures;
+}
+
 // A file whose content documents the call format holds the call's own closing lines and then more
 // text (Strata #4701): those lines are value text, so the file keeps every byte, on the free route
 // (strict and tolerant, whole and at every chunking) and the constrained one, whose streamed steps
@@ -2206,6 +2261,7 @@ int main() {
     failures += test_schema_mismatches_remain_structured();
     failures += test_unknown_schema_types_keep_inference();
     failures += test_reference_and_value_type_hints();
+    failures += test_root_union_type_hints();
     failures += test_strict_structure_and_active_tool_set();
     failures += test_name_limits_and_non_strict_omissions();
     failures += test_duplicate_tool_contracts_rejected();
