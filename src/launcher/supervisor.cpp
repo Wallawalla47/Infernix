@@ -40,7 +40,19 @@ std::string exit_status_meaning(int code, bool serving) {
     char hex[16];
     std::snprintf(hex, sizeof(hex), "0x%08X", static_cast<unsigned>(code));
 #ifdef _WIN32
+    // Windows' loader statuses: the server never ran (the launcher's error mode keeps the system's dialog away).
+    // The release zip carries every DLL but the Visual C++ runtime (candidates SV-01).
+    const auto unloadable = [&](const char* problem) {
+        return std::string("could not start: ") + problem + " (" + hex +
+               "). Download the Windows release zip from https://github.com/Wallawalla47/Infernix/releases/latest "
+               "and keep all its DLLs beside infernix-serve.exe; the Microsoft Visual C++ Redistributable (x64) "
+               "supplies the rest";
+    };
     switch (static_cast<unsigned>(code)) {
+    case 0xC0000135u: return unloadable("a DLL it needs is missing");
+    case 0xC0000139u: return unloadable("a DLL beside it is from another version");
+    case 0xC000007Bu: return unloadable("a DLL it loads is damaged or not 64-bit");
+    case 0xC0000142u: return unloadable("a DLL it loads failed to initialize");
     case 3: return "crashed: aborted (exit status 3)";
     case 0xC0000005u: return std::string("crashed: access violation (") + hex + ")";
     case 0xC000001Du: return std::string("crashed: illegal instruction (") + hex + ")";
@@ -66,7 +78,11 @@ std::string exit_status_meaning(int code, bool serving) {
         case SIGBUS: return "crashed: bus error (SIGBUS)";
         case SIGILL: return "crashed: illegal instruction (SIGILL)";
         case SIGFPE: return "crashed: arithmetic error (SIGFPE)";
-        case SIGKILL: return "was killed (SIGKILL; the system's out-of-memory killer, perhaps)";
+        // systemd-oomd (on by default on Ubuntu 22.04+ and Fedora) kills by memory pressure and leaves no kernel
+        // log line (Strata #4967).
+        case SIGKILL:
+            return "was killed (SIGKILL; under memory pressure, perhaps by the kernel's out-of-memory killer, "
+                   "`journalctl -k`, or by systemd-oomd, `journalctl -u systemd-oomd`)";
         case SIGTERM: return "was terminated (SIGTERM)";
         default: return "was ended by signal " + std::to_string(code - 128);
         }

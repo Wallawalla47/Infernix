@@ -579,9 +579,19 @@ void test_exit_meaning() {
 #ifdef _WIN32
     check(exit_status_meaning(static_cast<int>(0xC0000005u), true).find("access violation") != std::string::npos, "0xC0000005");
     check(exit_status_meaning(static_cast<int>(0xC0000409u), true).find("fail-fast") != std::string::npos, "0xC0000409");
+    // The loader's statuses: the server never started, and the note names the release to take the DLLs from.
+    for (const unsigned status : {0xC0000135u, 0xC0000139u, 0xC000007Bu, 0xC0000142u}) {
+        const std::string meaning = exit_status_meaning(static_cast<int>(status), false);
+        check(meaning.starts_with("could not start: a DLL") &&
+                  meaning.find("https://github.com/Wallawalla47/Infernix/releases/latest") != std::string::npos &&
+                  meaning.find("crashed") == std::string::npos,
+              "a DLL load failure names the release instead of a crash");
+    }
 #else
     check(exit_status_meaning(128 + SIGSEGV, true).find("segmentation fault") != std::string::npos, "SIGSEGV");
-    check(exit_status_meaning(128 + SIGKILL, true).find("out-of-memory") != std::string::npos, "SIGKILL");
+    const std::string killed = exit_status_meaning(128 + SIGKILL, true);
+    check(killed.find("out-of-memory") != std::string::npos && killed.find("systemd-oomd") != std::string::npos,
+          "SIGKILL names both memory-pressure killers");
 #endif
     check(exit_status_meaning(1, false) == "failed to start", "infernix-serve's own statuses first");
     // taskkill /F ends a serving server with status 1: not a startup failure.

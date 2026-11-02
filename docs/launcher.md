@@ -395,7 +395,8 @@ While a model serves, the launcher watches its `infernix-serve` (**Settings → 
 
 | It notices | When | Then |
 |---|---|---|
-| a crash | the server exits without being asked (the exit status is named: access violation, out of memory, killed by the system...) | restarts the model |
+| a crash | the server exits without being asked (the exit status is named: access violation, out of memory, killed by the system...; on Linux a SIGKILL names both memory-pressure killers, the kernel's (`journalctl -k`) and systemd-oomd (`journalctl -u systemd-oomd`), which leaves no kernel log line) | restarts the model |
+| a missing DLL | Windows cannot start `infernix-serve`: a DLL it needs is missing, from another version, damaged or failed to initialize (status 0xC0000135, 0xC0000139, 0xC000007B or 0xC0000142) | reports it with the release to take the DLLs from (`https://github.com/Wallawalla47/Infernix/releases/latest`; every DLL in its zip belongs beside `infernix-serve.exe`, and the Visual C++ Redistributable supplies the rest) |
 | a lock-up | requests are in the server or waiting on it, and it answers nothing for the hang timeout (60 s; at least three checks a second apart) | asks it to stop, ends it after 15 s, restarts the model |
 | a stall | requests are in the server, yet no prompt or output token is processed for the stall timeout (300 s; the progress counters move with every prompt chunk and token, so long prompts do not count) | the same |
 | a load that does not fit | the server's own sizing error (the KV cache beside the weights, a GPU allocation, pinning RAM), or the computer's free RAM below the RAM floor (2 GiB) for three seconds while it loads (the computer would otherwise page heavily) | ends or reports the load, names the shortfall, and suggests changes |
