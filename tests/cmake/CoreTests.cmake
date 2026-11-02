@@ -123,7 +123,8 @@ infernix_add_test(infernix_jinja_test
 add_test(NAME infernix_cuda_stack_tool_test
   COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/cuda_stack/test_check_cuda_stack.py)
 # Register spills and local arrays: no kernel of the server may use more per-thread stack or local
-# memory than tools/cuda_stack/cuda_stack_allowlist.json records.
+# memory, or hold more local stores and loads (SASS STL, LDL) in its code, than
+# tools/cuda_stack/cuda_stack_allowlist.json records.
 if(TARGET infernix-serve)
   add_test(NAME infernix_cuda_stack_check
     COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tools/cuda_stack/check_cuda_stack.py check
