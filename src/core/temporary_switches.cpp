@@ -65,10 +65,6 @@ constexpr Registration kSwitches[] = {
     // program_impl.h apply_prompt_routes; the 122B: models/qwen3_5/program/offload.cpp end_pass; candidates
     // CF-01). Same bits (placement only).
     {"INFERNIX_TMP_CONTINUING_PROMPT", Scope::All, Kind::Value},
-    // Diagnostic: =<dir>; after each prompt's prefill on a BF16 KV cache, its K and V pages are written
-    // there with their layout (models/qwen3_5/program/kv_dump.cpp; tools/kv_lossless_count counts the
-    // 12-bit lossless blocks of candidates §23.2 PB-01). Output-neutral.
-    {"INFERNIX_TMP_KV_DUMP", Scope::Qwen3_5, Kind::Value},
     // Diagnostic (2026-10-29): =<MB/s>; the artifact read queues (core/direct_read_queue.cpp) hold each finished read
     // until a device of that rate would have delivered it, to measure the SSD tier on a slower drive. Same bits.
     {"INFERNIX_TMP_SSD_MBPS", Scope::All, Kind::Value},
