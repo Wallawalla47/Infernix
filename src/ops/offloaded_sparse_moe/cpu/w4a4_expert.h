@@ -174,7 +174,7 @@ void rg16_row_sums(CpuIsa isa, const std::uint8_t* matrix, int blocks, int rg_be
 void quantize_a4(CpuIsa isa, const std::uint16_t* v, int n, float input_scale, canon::A4Block* out);
 
 // h[i] = canon::swiglu_bf16(g[i], u[i]) for i < n, eight at a time in AVX2 on the vector ISAs, bit
-// for bit (the SwiGLU of every NVFP4 CPU route).
+// for bit (the SwiGLU of the NVFP4 and GGUF CPU routes).
 void swiglu_bf16_n(CpuIsa isa, const std::uint16_t* g, const std::uint16_t* u, int n, std::uint16_t* h);
 
 // Phase A for 16-intermediate units [unit_begin, unit_end): gate/up rows, SwiGLU, and A4 of h
