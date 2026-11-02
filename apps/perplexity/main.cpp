@@ -81,7 +81,7 @@ std::string usage_text() {
            "       [--prefill-chunk N] (tokens per scoring prefill pass, a multiple of 128;\n"
            "        default the Engine's 1024)\n"
            "       [--rope-yarn-factor F] (startup-fixed, finite [1,4], default 1; ceiling only)\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] (default fp8)\n"
+           "       [--kv-dtype bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2] (default fp8)\n"
            "       [--logits-dtype fp32|bf16] (the head's logits scoring reads; default fp32, bf16\n"
            "        rounds each once, as Transformers returns them, for comparisons)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
@@ -197,8 +197,10 @@ Options parse_options(int argc, char** argv) {
                 out.kv = infernix::KvCacheStorage::Vq2;
             } else if (dtype == "k4v2") {
                 out.kv = infernix::KvCacheStorage::Q4KeyVq2Value;
+            } else if (dtype == "bf16p") {
+                out.kv = infernix::KvCacheStorage::Bf16Packed;
             } else {
-                usage_error("--kv-dtype must be bf16, int8, fp8, nvfp4, k8v4, vq2, or k4v2");
+                usage_error("--kv-dtype must be bf16, bf16p, int8, fp8, nvfp4, k8v4, vq2, or k4v2");
             }
         } else if (option == "--logits-dtype") {
             try {
@@ -246,6 +248,8 @@ std::string kv_name(infernix::KvCacheStorage value) {
         return "vq2";
     case infernix::KvCacheStorage::Q4KeyVq2Value:
         return "k4v2";
+    case infernix::KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     throw std::logic_error("unknown KV dtype");
 }

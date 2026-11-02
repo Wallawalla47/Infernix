@@ -5,14 +5,20 @@
 #include "artifact/reader.h"
 #include "core/ggml_format.h"
 #include "artifact/views.h"
+#include "core/weight_view.h"
+#include "infernix/ops/bf16_p12.h"
+#include "infernix/ops/hyper_connection.h"
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/registry.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 namespace infernix::models::qwen4_exp {
@@ -198,13 +204,13 @@ PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& prefix)
     return out;
 }
 
-TextWeights bind_text(Bindings& b, const TextConfig& c, Residency experts) {
+TextWeights bind_text(Bindings& b, const TextConfig& c, Residency experts, Residency embedding) {
     TextWeights out;
     const std::uint64_t h = c.hidden_size, v = c.vocab_size;
-    // BF16 rows, or a GGUF import's IQ4_XS rows (Parameters checks the format).
+    // BF16 rows, or a GGUF import's IQ4_XS rows (Parameters checks the format); pinned, or on the device for packing
+    // (packable_embedding).
     out.token_embedding = b.parameter("text/token_embedding", {v, h}, {},
-                                      c.ggml_weights ? std::nullopt : std::optional<QType>(QType::BF16),
-                                      Residency::HostPinned);
+                                      c.ggml_weights ? std::nullopt : std::optional<QType>(QType::BF16), embedding);
     out.output_head = b.parameter("text/output_head", {v, h}, "text/final_hidden");
     out.final_mixer = bind_hc(b, c, "text/final_mixer/", false);
     for (std::uint32_t i = 0; i < c.num_hidden_layers; ++i) {
@@ -380,6 +386,195 @@ FrontendResources bind_resources(artifact::Binder& binder, const Config& config)
     return out;
 }
 
+// Whether the token embedding is one BF16 [V, H] object load-time packing takes (LoadOptions::pack_bf16): it then
+// loads to transient device memory, is packed there and lives packed in pinned host memory, gathered zero-copy as the
+// BF16 rows were (ops::embedding reads bf16_p12 rows). A GGUF import's IQ4_XS rows stay as stored.
+bool packable_embedding(const artifact::Reader& reader, const TextConfig& c) {
+    const auto found = reader.directory().bindings.find("text/token_embedding");
+    if (c.ggml_weights || found == reader.directory().bindings.end() || found->second.parts.size() != 1 ||
+        !found->second.whole_object) {
+        return false;
+    }
+    const auto& g = reader.geometry(found->second.parts.front().object);
+    return g.format == QType::BF16 && g.layout == QuantLayout::Contiguous && g.shape.size() == 2 && g.shape[1] % 8 == 0 &&
+           g.shape[0] <= std::numeric_limits<std::int32_t>::max() && g.shape[1] < 65536;
+}
+
+// The BF16 weights the forward reads only through Ops that take bf16_p12: the projections it runs through
+// ops::linear (execution/forward.cpp project(), whose L2 warm reads bf16_p12 planes too) — each layer's attention or
+// GDN input, control and output projections, the PLE key and value projections and the MTP layer's attention — and
+// the text head, which ops::projection_fp32 reads (unless its 2-bit screen is bound: the screened head's exact rescore
+// reads BF16 rows) — and, with LoadOptions::pack_mixers, the hyper-connection mixers' down, inject and up matrices,
+// which ops::hyper_connection_mix reads. An artifact object is packed (LoadOptions::pack_bf16) when every parameter on
+// it is one of them and device-resident, and it is a BF16 [n, k] matrix its Ops take packed: a projection with tuned
+// packed routes (ops::bf16_p12_linear_tuned), a head of a shape ops::bf16_p12_projection_fp32_supported takes, a mixer
+// matrix ops::hyper_connection_bf16_p12_supported takes.
+std::vector<artifact::ObjectHandle> packable_objects(const TextWeights& w, const std::vector<PendingWeight>& pending,
+                                                     const artifact::Reader& reader, bool mixers) {
+    std::vector<bool> linear(pending.size(), false), head(pending.size(), false), mixer(pending.size(), false);
+    const auto mark = [&](std::initializer_list<WeightId> ids) {
+        for (const WeightId id : ids) {
+            if (id.valid()) { linear.at(id.index) = true; }
+        }
+    };
+    const auto mark_mixer = [&](const HyperConnectionWeights& hc) {
+        if (!mixers) { return; }
+        for (const WeightId id : {hc.down, hc.up, hc.inject}) {
+            if (id.valid()) { mixer.at(id.index) = true; }
+        }
+    };
+    if (!w.output_head_screen.valid()) { head.at(w.output_head.index) = true; }
+    mark_mixer(w.final_mixer);
+    for (const BlockWeights& block : w.layers) {
+        mark_mixer(block.attn_hc);
+        mark_mixer(block.mlp_hc);
+    }
+    if (w.mtp) {
+        mark_mixer(w.mtp->attn_hc);
+        mark_mixer(w.mtp->mlp_hc);
+        mark_mixer(w.mtp->final_mixer);
+    }
+    const auto attention = [&](const AttentionWeights& a) {
+        mark({a.query, a.gate, a.key, a.value, a.index_query, a.index_key, a.output});
+    };
+    for (const BlockWeights& block : w.layers) {
+        if (const auto* a = std::get_if<AttentionWeights>(&block.mixer)) { attention(*a); }
+        if (const auto* g = std::get_if<GdnWeights>(&block.mixer)) {
+            mark({g->query, g->key, g->value, g->z, g->a_projection, g->b_projection, g->output});
+        }
+        if (block.ple) { mark({block.ple->key_projection, block.ple->value_projection}); }
+    }
+    if (w.mtp) { attention(w.mtp->attention); }
+    struct Readers {
+        bool qualify = true, linear = false, head = false, mixer = false;
+    };
+    std::map<std::size_t, Readers> objects;
+    for (std::size_t i = 0; i < pending.size(); ++i) {
+        const bool qualifies = (linear[i] || head[i] || mixer[i]) && pending[i].reference.residency == Residency::Device;
+        for (const auto& part : pending[i].reference.binding.parts) {
+            auto& readers   = objects[part.object.index];
+            readers.qualify = readers.qualify && qualifies;
+            readers.linear  = readers.linear || linear[i];
+            readers.head    = readers.head || head[i];
+            readers.mixer   = readers.mixer || mixer[i];
+        }
+    }
+    std::vector<artifact::ObjectHandle> out;
+    for (const auto& [index, readers] : objects) {
+        const artifact::ObjectHandle handle{index};
+        const auto& g = reader.geometry(handle);
+        if (!readers.qualify || g.format != QType::BF16 || g.layout != QuantLayout::Contiguous || g.shape.size() != 2 ||
+            g.shape[0] > std::numeric_limits<std::int32_t>::max() || g.shape[1] > std::numeric_limits<std::int32_t>::max()) {
+            continue;
+        }
+        const auto n = static_cast<std::int32_t>(g.shape[0]), k = static_cast<std::int32_t>(g.shape[1]);
+        if ((!readers.linear || ops::bf16_p12_linear_tuned(n, k)) &&
+            (!readers.head || ops::bf16_p12_projection_fp32_supported(n, k)) &&
+            (!readers.mixer || ops::hyper_connection_bf16_p12_supported(n, k))) {
+            out.push_back(handle);
+        }
+    }
+    return out;
+}
+
+std::uint64_t align_256(std::uint64_t bytes) { return (bytes + 255) / 256 * 256; }
+
+// A packed object's device bytes for planning, its escapes bounded by one weight in 1,024 (recipe A's projections
+// escape about one in 5,000).
+std::uint64_t packed_estimate(const WeightGeometry& g) {
+    return align_256(bf16_p12_geometry(g.shape[0], g.shape[1], g.elements / 1024).bytes);
+}
+
+// Packs the transient BF16 objects (count pass, one block for every plane, pack pass), points the bound views at the
+// packed parents and frees the BF16 copies. `host_objects` are packed through a device staging block into pinned host
+// memory (one block, mapped for the device).
+PackedWeights pack_objects(artifact::MaterializedArtifact& backing, const std::vector<artifact::ObjectHandle>& objects,
+                           const std::vector<artifact::ObjectHandle>& host_objects, std::vector<BoundWeight>& bound,
+                           DeviceContext& device) {
+    PackedWeights out;
+    if (objects.empty() && host_objects.empty()) { return out; }
+    const auto start = std::chrono::steady_clock::now();
+    struct Item {
+        const WeightParent* source;
+        std::int32_t n, k;
+        bool host;
+        std::uint64_t scratch, escapes, offset;
+    };
+    std::vector<Item> items;
+    std::uint64_t scratch_bytes = 0;
+    for (const auto* list : {&objects, &host_objects}) {
+        for (const auto handle : *list) {
+            const WeightParent& parent = backing.device_parent(handle);
+            const auto n = static_cast<std::int32_t>(parent.geometry.shape[0]);
+            const auto k = static_cast<std::int32_t>(parent.geometry.shape[1]);
+            items.push_back({&parent, n, k, list == &host_objects, scratch_bytes, 0, 0});
+            scratch_bytes += align_256(ops::bf16_p12_pack_scratch_bytes(n));
+        }
+    }
+    auto lap = [last = start]() mutable {
+        const auto now = std::chrono::steady_clock::now();
+        const double s = std::chrono::duration<double>(now - last).count();
+        last           = now;
+        return s;
+    };
+    // Every count enqueued, then one read of all of them.
+    DeviceBuffer scratch(scratch_bytes + 4 * items.size());
+    auto* scratch_base = static_cast<std::byte*>(scratch.p);
+    auto* counts       = reinterpret_cast<std::uint32_t*>(scratch_base + scratch_bytes);
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        const auto& item = items[i];
+        ops::bf16_p12_count(item.source->device, item.n, item.k, scratch_base + item.scratch, counts + i, device.stream);
+    }
+    std::vector<std::uint32_t> escapes(items.size());
+    CUDA_CHECK(cudaMemcpyAsync(escapes.data(), counts, 4 * items.size(), cudaMemcpyDeviceToHost, device.stream));
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    std::uint64_t total = 0, host_total = 0;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        auto& item       = items[i];
+        item.escapes     = escapes[i];
+        auto& end        = item.host ? host_total : total;
+        item.offset      = end;
+        end              = align_256(end + bf16_p12_geometry(item.n, item.k, item.escapes).bytes);
+        out.source_bytes += item.source->geometry.bytes;
+        out.escapes += item.escapes;
+    }
+    out.phase_seconds[0] = lap();
+    out.storage          = DeviceBuffer(total);
+    DeviceBuffer staging(host_total);
+    if (host_total != 0) {
+        out.host_storage = std::make_unique<RegisteredHostBuffer>(host_total);
+        out.host_storage->pin();
+        out.host_bytes = host_total;
+    }
+    out.phase_seconds[1] = lap();
+    std::unordered_map<const WeightParent*, const WeightParent*> packed;
+    for (const auto& item : items) {
+        auto* at = static_cast<std::byte*>(item.host ? staging.p : out.storage.p) + item.offset;
+        ops::bf16_p12_pack(item.source->device, item.n, item.k, item.escapes, scratch_base + item.scratch, at,
+                           device.stream);
+        auto parent      = std::make_unique<WeightParent>();
+        parent->geometry = bf16_p12_geometry(item.n, item.k, item.escapes);
+        parent->data     = item.host ? out.host_storage->data() + item.offset : at;
+        parent->device   = item.host ? out.host_storage->device_data() + item.offset : at;
+        packed.emplace(item.source, parent.get());
+        out.parents.push_back(std::move(parent));
+    }
+    if (host_total != 0) {
+        CUDA_CHECK(cudaMemcpyAsync(out.host_storage->data(), staging.p, host_total, cudaMemcpyDeviceToHost, device.stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    out.phase_seconds[2] = lap();
+    for (auto& weight : bound) {
+        for (auto& part : weight.view.parts) {
+            if (const auto found = packed.find(part.parent); found != packed.end()) { part.parent = found->second; }
+        }
+    }
+    backing.release_transient();
+    out.phase_seconds[3] = lap();
+    out.seconds          = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    return out;
+}
+
 // alpha = fl32(weight_scale_2 * input_scale) per matrix, from the stored words (design §6.1).
 std::vector<ops::offloaded_moe::ExpertScales> expert_scales(const ExpertBankPlanes& planes,
                                                            const artifact::HostValues& inputs,
@@ -415,13 +610,18 @@ struct LoadPlan::Impl {
     FrontendResources resources;
     InstanceInfo info;
     std::optional<qwen3_5::VisionOverlayLayout> vision_overlay; // vision offload
-    std::uint64_t embedding_bytes = 0; // the token embedding's stored bytes (pinned)
+    std::uint64_t embedding_bytes = 0; // the token embedding's pinned bytes (stored, or packed: packed_host_bytes)
+    bool embedding_in_block       = true; // in the pinned block (not packed into its own)
     std::uint64_t mtp_expert_pinned = 0; // the drafter's routed banks' stored bytes, pinned behind the drafter pool
     // The DFlash2 companion (--draft-model): its Reader, its plan, and the first of its weights in
     // `pending` (the main artifact's come first).
     std::unique_ptr<artifact::Reader> draft_reader;
     std::optional<artifact::MaterializationPlan> draft_materialization;
     std::size_t draft_first = 0;
+    // LoadOptions::pack_bf16: the transient BF16 objects packed at load, and their packed bytes for planning: into
+    // device memory, and into pinned host memory (the token embedding: packable_embedding), a pin after the block's.
+    std::vector<artifact::ObjectHandle> packed_objects, packed_host_objects;
+    std::uint64_t packed_bytes = 0, packed_host_bytes = 0;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -450,7 +650,7 @@ std::uint64_t LoadPlan::pinned_other_bytes() const {
 bool LoadPlan::has_output_head_screen() const { return impl_->weights.output_head_screen.valid(); }
 
 std::uint64_t LoadPlan::device_bytes() const {
-    return impl_->materialization.device_capacity_bytes +
+    return impl_->materialization.device_capacity_bytes + impl_->packed_bytes +
            (impl_->draft_materialization ? impl_->draft_materialization->device_capacity_bytes : 0);
 }
 
@@ -460,13 +660,14 @@ std::uint32_t LoadPlan::public_token_count() const {
 
 std::uint64_t LoadPlan::pinned_expert_bytes() const {
     const std::uint64_t pinned = impl_->materialization.pinned_capacity_bytes;
-    const std::uint64_t other  = pinned_other_bytes();
+    // A packed embedding is pinned outside the block.
+    const std::uint64_t other = pinned_other_bytes() - (impl_->embedding_in_block ? 0 : impl_->embedding_bytes);
     return pinned > other ? pinned - other : 0;
 }
 
 void LoadPlan::set_host_reserve(std::uint64_t reserve_bytes, std::uint64_t later_pinned_bytes) {
     impl_->materialization.host_reserve_bytes = reserve_bytes;
-    impl_->materialization.later_pinned_bytes = later_pinned_bytes;
+    impl_->materialization.later_pinned_bytes = later_pinned_bytes + impl_->packed_host_bytes;
 }
 
 bool is_qwen4_exp(const artifact::Reader& reader) {
@@ -497,8 +698,10 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     artifact::Binder binder(reader);
     out->resources = bind_resources(binder, out->config);
     Bindings bindings(binder);
+    const bool pack_embedding = options.pack_bf16 && packable_embedding(reader, out->config.text);
     out->weights = bind_text(bindings, out->config.text,
-                             options.stream_experts ? Residency::Streamed : Residency::HostPinned);
+                             options.stream_experts ? Residency::Streamed : Residency::HostPinned,
+                             pack_embedding ? Residency::Device : Residency::HostPinned);
     if (out->config.vision) {
         out->weights.vision = bind_vision(bindings, *out->config.vision, out->config.text,
                                           options.overlay_vision() ? Residency::HostPinned : Residency::Device);
@@ -658,9 +861,27 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         for (const auto& part : bindings.weights.at(out->weights.token_embedding.index).reference.binding.parts) {
             if (std::find(objects.begin(), objects.end(), part.object) == objects.end()) { objects.push_back(part.object); }
         }
-        for (const auto object : objects) { out->embedding_bytes += artifact::object_bytes(reader.directory().object(object)); }
+        if (pack_embedding) {
+            // Packed into pinned host memory once loaded (pack_objects), outside the pinned block.
+            out->packed_host_objects = objects;
+            out->embedding_in_block  = false;
+            for (const auto object : objects) {
+                binder.mark_device_transient(object);
+                out->packed_host_bytes += packed_estimate(reader.geometry(object));
+            }
+            out->embedding_bytes = out->packed_host_bytes;
+        } else {
+            for (const auto object : objects) { out->embedding_bytes += artifact::object_bytes(reader.directory().object(object)); }
+        }
     }
     out->pending = std::move(bindings.weights);
+    if (options.pack_bf16) {
+        out->packed_objects = packable_objects(out->weights, out->pending, reader, options.pack_mixers);
+        for (const auto object : out->packed_objects) {
+            binder.mark_device_transient(object);
+            out->packed_bytes += packed_estimate(reader.geometry(object));
+        }
+    }
     if (out->config.dflash2) {
         // The companion's weights, after every main-artifact weight; it declares its Use of the target
         // head its drafts read (the proposal head with --lm-head-draft, else the text head).
@@ -702,8 +923,10 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
 Model::Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
              std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
              std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
-             std::optional<ExpertStore> expert_store, std::optional<artifact::MaterializedArtifact> draft_backing)
-    : backing_(std::move(backing)), draft_backing_(std::move(draft_backing)), expert_store_(std::move(expert_store)),
+             std::optional<ExpertStore> expert_store, std::optional<artifact::MaterializedArtifact> draft_backing,
+             PackedWeights packed)
+    : backing_(std::move(backing)), draft_backing_(std::move(draft_backing)), packed_(std::move(packed)),
+      expert_store_(std::move(expert_store)),
       config_(std::move(config)), options_(options),
       weights_(std::move(weights)), bound_(std::move(bound)), banks_(std::move(banks)),
       resources_(std::move(resources)), info_(std::move(info)), overlay_vision_(std::move(overlay_vision)) {}
@@ -746,6 +969,7 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         }
         bound.push_back(std::move(weight));
     }
+    PackedWeights packed = pack_objects(backing, data->packed_objects, data->packed_host_objects, bound, device);
     std::vector<ExpertBank> banks;
     const auto& layers = data->weights.layers;
     // Streamed banks (the SSD tier): the records stay in the artifact; each layer's multipliers
@@ -828,7 +1052,7 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                             std::move(data->weights), std::move(bound),
                                             std::move(banks), std::move(data->resources),
                                             std::move(data->info), std::move(overlay), std::move(backing),
-                                            std::move(store), std::move(draft_backing)));
+                                            std::move(store), std::move(draft_backing), std::move(packed)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

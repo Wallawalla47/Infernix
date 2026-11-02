@@ -216,6 +216,10 @@ infernix_add_family_op_test(infernix_kv_cache_append_test FAMILY attention
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_cache_append.cpp"
   LIBRARIES infernix_ops)
 
+infernix_add_family_op_test(infernix_kv_cache_bf16p_test FAMILY attention
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_cache_bf16p.cpp"
+  LIBRARIES infernix_ops)
+
 infernix_add_family_op_test(infernix_kv_cache_vq_test FAMILY attention
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_cache_vq.cu"
   LIBRARIES infernix_ops)

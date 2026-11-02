@@ -1,6 +1,7 @@
 #include "infernix/ops/projection_fp32.h"
 #include "ops/projection_fp32/projection_fp32_route.h"
 #include "ops/projection_fp32/projection_fp32_mma.h"
+#include "ops/projection_fp32/projection_fp32_p12.h"
 #include "ops/common/memory.cuh"
 #include "core/device.h"
 #include "core/pdl.cuh"
@@ -518,6 +519,14 @@ bool tall_route(int rows, int columns, int min_columns, detail::ProjectionRoute 
 } // namespace
 
 void projection_fp32(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    if (weight.qtype == QType::BF16_P12) {
+        require(x.data != nullptr && x.dtype == DType::BF16 && x.is_contiguous() && x.ne[2] == 1 && x.ne[3] == 1 &&
+                    aligned16(x.data),
+                "x must be contiguous, 16-byte aligned BF16 [K, T]");
+        require(out.data != nullptr && out.dtype == DType::FP32 && out.is_contiguous(), "out must be contiguous FP32");
+        detail::projection_fp32_bf16_p12(x, weight, out, stream);
+        return;
+    }
     detail::projection_fp32_route(x, weight, out, detail::ProjectionRoute::Automatic, stream);
 }
 

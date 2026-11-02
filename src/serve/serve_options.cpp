@@ -240,6 +240,7 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     if (value == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
     if (value == "vq2") { return KvCacheStorage::Vq2; }
     if (value == "k4v2") { return KvCacheStorage::Q4KeyVq2Value; }
+    if (value == "bf16p") { return KvCacheStorage::Bf16Packed; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
@@ -449,9 +450,12 @@ std::string serve_usage_text(const char* argv0) {
            "                             10 on Flash-Next, 8 on the 122B). Changes the output; not\n"
            "                             with --reproducible. Default off; Strata's\n"
            "                             default is 7\n"
-           "  --kv-dtype T               KV storage: bf16 (default) | int8 | fp8 | nvfp4 | k8v4 |\n"
-           "                             vq2 | k4v2; bf16 stores K as BF16 and V as FP16 (exact\n"
-           "                             for 2^-17 <= |v| < 2^16), with --lossless V as BF16\n"
+           "  --kv-dtype T               KV storage: bf16 (default) | bf16p | int8 | fp8 | nvfp4 |\n"
+           "                             k8v4 | vq2 | k4v2; bf16 stores K as BF16 and V as FP16\n"
+           "                             (exact for 2^-17 <= |v| < 2^16), with --lossless V as\n"
+           "                             BF16; bf16p (Qwen3.5) stores bf16's values in 23 % fewer\n"
+           "                             bytes (12 bits a value; same output as bf16; a request\n"
+           "                             with a KV row it cannot pack fails)\n"
            "  --logits-dtype T           fp32 (default) | bf16: the head's logits the sampler,\n"
            "                             greedy choice, draft acceptance and constraints read;\n"
            "                             bf16 rounds each once, as Transformers returns them\n"

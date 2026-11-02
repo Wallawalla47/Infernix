@@ -1463,6 +1463,18 @@ private:
                     remove_completed_slot(lane);
                     continue;
                 }
+                if (failures[row] == PendingRowFailure::UnpackableKv) {
+                    // The packed BF16 KV storage cannot hold one of this request's K or V rows exactly.
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                       "a K or V row has no --kv-dtype bf16p packed form: failed 1 "
+                                       "request; the Engine keeps serving");
+                    complete_error(request, std::make_exception_ptr(std::runtime_error(
+                                                "a K or V row of this request has more values outside its "
+                                                "exponent window than --kv-dtype bf16p can store exactly; the "
+                                                "request was not completed (--kv-dtype bf16 stores every row)")));
+                    remove_completed_slot(lane);
+                    continue;
+                }
                 if (refused[row]) {
                     std::string what = "unknown error";
                     try {

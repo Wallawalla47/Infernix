@@ -232,6 +232,19 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         require_non_empty_tensors(ids, out);
         detail::embed_gather_fp8_launch(ids, table, out, stream, fault);
         break;
+    case QType::BF16_P12:
+        if (table.layout != QuantLayout::P12Rows) { throw std::invalid_argument("embedding: bf16_p12 table must be P12Rows"); }
+        require_weight_2d(table);
+        if (table.shape[1] != out.ne[0] || table.shape[1] % 8 != 0) {
+            throw std::invalid_argument("embedding: bf16_p12 table d must match out.ne[0] and be a multiple of 8");
+        }
+        if (table.qdata == nullptr || table.qhigh == nullptr || table.scales == nullptr || table.escapes == nullptr) {
+            throw std::invalid_argument("embedding: bf16_p12 planes must be non-null");
+        }
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::embed_gather_p12_launch(ids, table, out, stream, fault);
+        break;
     default:
         throw std::invalid_argument("embedding: unsupported table qtype");
     }

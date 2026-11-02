@@ -4,6 +4,7 @@
 
 #include "ops/common/math.h"
 #include "ops/kernel/embed_gather.cuh"
+#include "ops/linear/bf16_p12/bf16_p12_kernels.cuh"
 #include "core/device.h" // CUDA_CHECK
 #include "core/pdl.cuh"
 
@@ -12,6 +13,35 @@
 
 namespace infernix::ops::detail {
 namespace {
+
+// bf16_p12 rows (BF16 packed at load, core/weight.h P12Rows): a CTA per token and a thread per 8-weight chunk, so a
+// table in pinned host memory costs one round trip of independent reads (the row's words, codes and nibbles; a chunk
+// with escapes then reads the row's escape list). Each chunk decodes to the stored BF16 words.
+template <bool Vector>
+__global__ void embed_gather_p12_kernel(EmbedIds ids, const uint2* __restrict__ codes,
+                                        const unsigned* __restrict__ nibbles, const unsigned* __restrict__ words,
+                                        const unsigned* __restrict__ escapes, __nv_bfloat16* __restrict__ out,
+                                        std::int32_t d) {
+    const auto t              = static_cast<std::int32_t>(blockIdx.x);
+    const std::int32_t row    = ids.row(t);
+    const std::int32_t chunks = d / 8;
+    __nv_bfloat16* column     = out + static_cast<std::int64_t>(t) * d;
+    const std::int64_t base   = static_cast<std::int64_t>(row < 0 ? 0 : row) * chunks;
+    const P12Row state        = row < 0 ? P12Row{} : p12_row(words, row);
+    for (auto c = static_cast<std::int32_t>(threadIdx.x); c < chunks; c += static_cast<std::int32_t>(blockDim.x)) {
+        const uint4 w = row < 0 ? make_uint4(0, 0, 0, 0) : p12_decode_chunk(codes[base + c], nibbles[base + c], state, c, escapes);
+        if constexpr (Vector) {
+            reinterpret_cast<uint4*>(column)[c] = w;
+        } else {
+            const unsigned parts[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                column[8 * c + 2 * i]     = __ushort_as_bfloat16(static_cast<unsigned short>(parts[i] & 0xFFFFU));
+                column[8 * c + 2 * i + 1] = __ushort_as_bfloat16(static_cast<unsigned short>(parts[i] >> 16));
+            }
+        }
+    }
+}
 
 constexpr int kBlock          = 128;
 constexpr int kQ6GroupedBlock = kEmbedGatherQ6Group * kEmbedGatherQ6GroupsPerBlock;
@@ -159,6 +189,24 @@ void embed_gather_q8_launch(const Tensor& ids, const Weight& table, Tensor& out,
     embed_gather_q8_kernel<<<grid_for(n), kBlock, 0, stream>>>(
         guard, codes, scales,
         static_cast<__nv_bfloat16*>(out.data), d, T, table.padded_shape[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void embed_gather_p12_launch(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream,
+                             DeviceFault fault) {
+    const EmbedIds guard{static_cast<const std::int32_t*>(ids.data), table.n, fault};
+    const std::int32_t d       = out.ne[0];
+    const std::int32_t threads = std::min(1024, static_cast<std::int32_t>(div_up(d / 8, 32)) * 32);
+    const auto* codes          = static_cast<const uint2*>(table.qdata);
+    const auto* nibbles        = static_cast<const unsigned*>(table.qhigh);
+    const auto* words          = static_cast<const unsigned*>(table.scales);
+    const auto* escapes        = static_cast<const unsigned*>(table.escapes);
+    auto* column               = static_cast<__nv_bfloat16*>(out.data);
+    if (reinterpret_cast<std::uintptr_t>(out.data) % 16 == 0) {
+        embed_gather_p12_kernel<true><<<ids.ne[0], threads, 0, stream>>>(guard, codes, nibbles, words, escapes, column, d);
+    } else {
+        embed_gather_p12_kernel<false><<<ids.ne[0], threads, 0, stream>>>(guard, codes, nibbles, words, escapes, column, d);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

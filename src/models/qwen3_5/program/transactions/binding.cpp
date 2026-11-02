@@ -209,6 +209,8 @@ void ProgramImpl::install_binding(ContextTransaction& tx) {
         // A paused request keeps its proposer in the saved control and resumes with it.
         if (ngram_draft_window != 0) { take_ngram_index(request, *tx.base); }
     }
+    // The rows' earlier appends belonged to other requests.
+    clear_unpackable(state);
     refresh_state_views(state);
     request.permit   = tx.first_unit;
     request.recovery = tx.recovery;

@@ -313,7 +313,7 @@ void MaterializedArtifact::begin(const Reader& reader, const MaterializationPlan
     stats_.read_bytes            = plan.prior_read_bytes;
     stats_.owned_value_bytes     = plan.owned_value_bytes;
     stats_.device_capacity_bytes = plan.device_capacity_bytes;
-    stats_.device_object_count   = plan.device_objects.size();
+    stats_.device_object_count   = plan.device_objects.size() + plan.transient_objects.size();
     stats_.host_object_count     = plan.host_objects.size();
     stats_.pinned_object_count   = plan.pinned_objects.size();
     if (plan.device_capacity_bytes > std::numeric_limits<std::size_t>::max()) {
@@ -410,25 +410,35 @@ MaterializedArtifact materialize_geometry(const Reader& reader, MaterializationP
         std::byte* at       = out.geometry_pinned_->data() + placement.offset;
         storage.pinned      = weight_parent(geometry, at, divisor, at);
     }
-    if (plan.device_capacity_bytes) {
-        out.geometry_device_ =
-            std::make_unique<AddressReservation>(static_cast<std::size_t>(plan.device_capacity_bytes));
-    }
-    for (const auto& placement : plan.device_objects) {
-        const auto& geometry = reader.geometry(placement.object);
-        auto& object         = out.objects_.at(placement.object.index);
-        if (object.device || !out.geometry_device_ || geometry.bytes != placement.bytes ||
-            placement.offset + placement.bytes > plan.device_capacity_bytes) {
-            throw ArtifactError("invalid or duplicate device placement");
+    const auto bind_device = [&](const std::vector<DevicePlacement>& placements, std::uint64_t capacity,
+                                 std::unique_ptr<AddressReservation>& reservation) {
+        if (capacity) { reservation = std::make_unique<AddressReservation>(static_cast<std::size_t>(capacity)); }
+        for (const auto& placement : placements) {
+            const auto& geometry = reader.geometry(placement.object);
+            auto& object         = out.objects_.at(placement.object.index);
+            if (object.device || !reservation || geometry.bytes != placement.bytes ||
+                placement.offset + placement.bytes > capacity) {
+                throw ArtifactError("invalid or duplicate device placement");
+            }
+            const auto divisor =
+                object.host ? (geometry.layout == QuantLayout::Rg16 ? object.host->weight_multiplier
+                                                                    : object.host->weight_scale_divisor)
+                            : read_divisor(reader, placement.object, geometry, {}, out.stats_);
+            std::byte* at = reservation->data() + placement.offset;
+            object.device = weight_parent(geometry, at, divisor, at);
         }
-        const auto divisor =
-            object.host ? (geometry.layout == QuantLayout::Rg16 ? object.host->weight_multiplier
-                                                                : object.host->weight_scale_divisor)
-                        : read_divisor(reader, placement.object, geometry, {}, out.stats_);
-        std::byte* at = out.geometry_device_->data() + placement.offset;
-        object.device = weight_parent(geometry, at, divisor, at);
-    }
+    };
+    bind_device(plan.device_objects, plan.device_capacity_bytes, out.geometry_device_);
+    bind_device(plan.transient_objects, plan.transient_capacity_bytes, out.geometry_transient_);
+    for (const auto& placement : plan.transient_objects) { out.transient_objects_.push_back(placement.object); }
     return out;
+}
+
+void MaterializedArtifact::release_transient() {
+    for (const auto handle : transient_objects_) { objects_.at(handle.index).device.reset(); }
+    transient_objects_.clear();
+    transient_.reset();
+    geometry_transient_.reset();
 }
 
 MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& plan,
@@ -440,8 +450,10 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     const StartupObserver no_observer;
     const auto& observer = startup_observer ? *startup_observer : no_observer;
     std::uint64_t total  = 0;
-    for (const auto& placement : plan.device_objects) {
-        total = checked_add(total, placement.bytes, "device payload bytes");
+    for (const auto* placements : {&plan.device_objects, &plan.transient_objects}) {
+        for (const auto& placement : *placements) {
+            total = checked_add(total, placement.bytes, "device payload bytes");
+        }
     }
     // Progress counts the pinned reads (Qwen3.8-Flash-Next's 63 GiB of experts) as well as the
     // device upload, so the phase's rate and ETA describe the whole load.
@@ -470,6 +482,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         out.arena_ =
             std::make_unique<DeviceArena>(static_cast<std::size_t>(plan.device_capacity_bytes));
         device_base = static_cast<std::byte*>(out.arena_->base());
+    }
+    if (plan.transient_capacity_bytes) {
+        out.transient_ = std::make_unique<DeviceArena>(static_cast<std::size_t>(plan.transient_capacity_bytes));
     }
     if (plan.pinned_capacity_bytes) {
         // Checked against memory available now, not the caller's earlier snapshot, so other
@@ -519,18 +534,23 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
     }
     std::vector<CopyRange> ranges;
-    for (const auto& placement : plan.device_objects) {
+    for (const auto& placement : plan.transient_objects) { out.transient_objects_.push_back(placement.object); }
+    for (std::size_t i = 0; i < plan.device_objects.size() + plan.transient_objects.size(); ++i) {
+        const bool transient  = i >= plan.device_objects.size();
+        const auto& placement = transient ? plan.transient_objects[i - plan.device_objects.size()]
+                                          : plan.device_objects[i];
+        DeviceArena* arena    = transient ? out.transient_.get() : out.arena_.get();
         const auto& geometry = reader.geometry(placement.object);
         auto& object         = out.objects_.at(placement.object.index);
-        if (object.device || !device_base || geometry.bytes != placement.bytes) {
+        if (object.device || (!transient && !device_base) || geometry.bytes != placement.bytes) {
             throw ArtifactError("invalid or duplicate device placement");
         }
         std::byte* storage_data;
-        if (out.arena_) {
-            auto storage = out.arena_->alloc_bytes(static_cast<std::size_t>(placement.bytes),
-                                                   static_cast<std::size_t>(placement.alignment));
+        if (arena != nullptr) {
+            auto storage = arena->alloc_bytes(static_cast<std::size_t>(placement.bytes),
+                                              static_cast<std::size_t>(placement.alignment));
             const auto offset = static_cast<std::uint64_t>(
-                static_cast<std::byte*>(storage.data) - static_cast<std::byte*>(out.arena_->base()));
+                static_cast<std::byte*>(storage.data) - static_cast<std::byte*>(arena->base()));
             if (offset != placement.offset) {
                 throw ArtifactError("device offset differs from materialization plan");
             }

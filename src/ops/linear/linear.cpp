@@ -3,6 +3,7 @@
 #include "infernix/ops/rg16_linear.h"
 
 #include "ops/linear/bf16/bf16_dispatch.h"
+#include "ops/linear/bf16_p12/bf16_p12_dispatch.h"
 #include "ops/linear/f16acc/f16acc_plan.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
@@ -104,6 +105,9 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::BF16:
         detail::bf16_dispatch(x, w, out, policy, stream);
         return;
+    case QType::BF16_P12:
+        detail::bf16_p12_dispatch(x, w, out, policy, stream);
+        return;
     case QType::NVFP4:
         detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
         return;
@@ -132,7 +136,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
 // The formats a vocabulary head is stored in.
 bool linear_fp32_output(QType qtype) noexcept {
     return qtype == QType::Q6_G64_FP16 || qtype == QType::Q8_G32_FP16 || qtype == QType::BF16 ||
-           qtype == QType::FP8_E4M3FN_ROW_BF16 || qtype == QType::FP8_E4M3FN_ROW_F32 ||
+           qtype == QType::BF16_P12 || qtype == QType::FP8_E4M3FN_ROW_BF16 || qtype == QType::FP8_E4M3FN_ROW_F32 ||
            qtype == QType::NVFP4_MUL;
 }
 
@@ -144,6 +148,8 @@ bool linear_column_invariant_route(QType qtype, std::int32_t output_rows,
     if (is_fp8_row(qtype)) { return detail::fp8_linear_column_invariant_route(qtype, output_rows, input_rows); }
     // nvfp4_rg16_v1 sums exactly: every route is column-invariant.
     if (qtype == QType::NVFP4_MUL) { return true; }
+    // bf16_p12: the packed skinny GEMV, 16 columns a pass (bf16_p12_dispatch.h).
+    if (qtype == QType::BF16_P12) { return true; }
     return false;
 }
 
@@ -188,6 +194,9 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::BF16:
         (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_bf16_launch(output_rows, input_rows, max_tokens, policy);
+        return 0;
+    case QType::BF16_P12:
+        // No bf16_p12 route takes workspace.
         return 0;
     case QType::NVFP4:
         return detail::nvfp4_linear_workspace_capacity_bytes(output_rows, input_rows, policy,

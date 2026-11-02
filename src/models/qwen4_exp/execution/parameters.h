@@ -143,11 +143,12 @@ public:
     Parameters& operator=(const Parameters&) = delete;
 
     const Model& model;
-    Weight token_embedding; // BF16 (or a GGUF import's IQ4_XS) rows in pinned host memory, read zero-copy
+    Weight token_embedding; // BF16 (packed at load or not; or a GGUF import's IQ4_XS) rows in pinned host memory, read zero-copy
     Tensor output_head; // BF16 [H, V]: one vocabulary row per column (FP32 logits)
-    // Recipe B's 8-bit head (q8_g32_fp16 [V, H], FP32 logits), or a GGUF import's head (ggml blocks,
-    // FP32 logits from ops::ggml_linear); output_head is then empty.
-    std::optional<LinearParameters> output_head_q8;
+    // Recipe B's 8-bit head (q8_g32_fp16 [V, H], FP32 logits), a GGUF import's head (ggml blocks, FP32
+    // logits from ops::ggml_linear) or a BF16 head packed at load (bf16_p12 [V, H], FP32 logits from
+    // ops::projection_fp32); output_head is then empty.
+    std::optional<LinearParameters> output_head_weight;
     // output_head's 2-bit screen (q2_g64_fp16 [V, H]) when bound (the screened-lm-head fast path).
     std::optional<Weight> output_head_screen;
     HyperConnectionParameters final_mixer;

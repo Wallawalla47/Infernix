@@ -89,6 +89,12 @@ infernix_add_family_op_test(infernix_linear_bf16_a16_test FAMILY linear
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_bf16_a16.cpp"
   LIBRARIES infernix_linear_test_support)
 
+# bf16_p12 (lossless 12-bit BF16): the packing's planes against a host decoder and the format's rule, and Linear
+# over packed weights on every registered route against FP64.
+infernix_add_family_op_test(infernix_linear_bf16_p12_test FAMILY linear
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_bf16_p12.cpp"
+  LIBRARIES infernix_linear_test_support)
+
 # FP32 vocabulary-head logits through ops::linear: Q6, Q8, row-FP8 and BF16 heads on every route, against
 # FP64 and the same call's BF16 output.
 infernix_add_family_op_test(infernix_linear_fp32_head_test FAMILY linear
@@ -103,7 +109,8 @@ infernix_add_family_op_test(infernix_tma_staging_test FAMILY linear NO_TEST
 if(WIN32)
   foreach(tma_test infernix_linear_fp8_a8_test infernix_linear_fp8_a16_test infernix_fp8_a8_pair_repeat_test
           infernix_linear_mxfp8_a16_test infernix_linear_f16_accumulate_test infernix_linear_nvfp4_a4_test
-          infernix_nvfp4_tma_staging_race_test infernix_tma_moe_overlap_test infernix_linear_bf16_a16_test)
+          infernix_nvfp4_tma_staging_race_test infernix_tma_moe_overlap_test infernix_linear_bf16_a16_test
+          infernix_linear_bf16_p12_test)
     string(REGEX REPLACE "^infernix_(.*)_test$" "\\1" tma_member "${tma_test}")
     add_test(NAME ${tma_test}_staging COMMAND ${infernix_tma_staging_test_COMMAND} ${tma_member})
     set_tests_properties(${tma_test}_staging PROPERTIES SKIP_RETURN_CODE 77)

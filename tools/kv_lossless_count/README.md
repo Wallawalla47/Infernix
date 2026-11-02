@@ -13,7 +13,11 @@ from the block base, the block's smallest exponent rounded down to even) when al
 within 16 binades of that base; otherwise it stays raw. `count.py` counts the blocks that qualify in
 the page's storage order (a block is two consecutive slots of one KV head at head dim 256), under the
 paper's per-block base and under a per-channel base (one base per head-dim channel per page and KV
-head), with the average bits per value of each, metadata included. Its docstring has the details.
+head), with the average bits per value of each, metadata included. It also counts UZ-40's per-row form,
+chosen at append time without calibration (one exponent window per head row, 4-bit codes, the values
+outside it in E inline escape slots; a row with more stays raw), for E = 2, 4, 6 and 8, and the share of rows the
+shipped `--kv-dtype bf16p` packs (a 14-binade window, zeros and subnormals coded without escapes, E escapes; E = 6
+shipped: a request whose row has more fails). Its docstring has the details.
 
 K is stored as BF16 (after QK-norm and partial RoPE). V is stored as FP16 on the default route; the
 form would store V's BF16 source and convert in registers, so V is counted on that source, recovered

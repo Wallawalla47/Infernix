@@ -1,8 +1,9 @@
 // The fused route of hyper_connection_mix: two kernels instead of norm, the down projection,
 // gates, the up projection and collapse (docs/maintainer/qwen3_8-flash-next-design.md §8.3 K1a/K1b,
-// §19.3.3 Phase 1b), for Q8_G32_FP16 RowSplit weights (Dense8) and BF16 contiguous weights (the
-// bit-exact artifact). The weight codec only changes how a lane's 8 weights are read; the order of
-// every product and sum is the codec-independent schedule below.
+// §19.3.3 Phase 1b), for Q8_G32_FP16 RowSplit weights (Dense8), BF16 contiguous weights (the
+// bit-exact artifact) and bf16_p12 weights (those BF16 weights packed at load, which decode to the same
+// values). The weight codec only changes how a lane's 8 weights are read; the order of every product and
+// sum is the codec-independent schedule below.
 //
 // K1a hc_down_partials: one CTA per (stream s, 8 rows of W_down), a row per warp. The CTA stages its
 // stream's slice of R for up to 8 columns, reduces each column's sum of squares in a fixed order
@@ -29,6 +30,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/ggml/ggml_a8.h"
 #include "ops/ggml/ggml_dp4a.cuh"
+#include "ops/linear/bf16_p12/bf16_p12_kernels.cuh"
 
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -37,6 +39,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace infernix::ops::detail {
 namespace {
@@ -107,6 +110,10 @@ __device__ __forceinline__ float half_bits_to_float(std::uint16_t bits) {
     return __half2float(__ushort_as_half(static_cast<unsigned short>(bits)));
 }
 
+// A codec reads a row's 8-weight chunk (load: the chunk at row `row`, columns k..k+7) with the row's state (row(), loaded
+// once a row) and widens it to 8 floats (widen()). A decoding codec (its Ready differs from its Chunk: kDecodesEarly)
+// turns each chunk into the form widen() takes (ready(), once a chunk).
+
 // q8_g32_fp16 in row_split_k128_v1: int8 codes [rows, padded_k], FP16 scales per 32 codes.
 struct Q8Codec {
     struct Params {
@@ -114,15 +121,18 @@ struct Q8Codec {
         const std::uint8_t* scales;
         int padded_k;
     };
+    struct Row {};
     struct Chunk {
         uint2 code;
         float scale;
     };
+    using Ready = Chunk;
+    __device__ static Row row(const Params&, std::int64_t) { return {}; }
     __device__ static Chunk load(const Params& p, std::int64_t row, int k) {
         return {ld_nc_na<uint2>(p.codes + row * p.padded_k + k),
                 half_bits_to_float(ld_nc_na<std::uint16_t>(p.scales + row * (p.padded_k / 32) * 2 + (k / 32) * 2))};
     }
-    __device__ static void decode(const Chunk& c, float (&w)[8]) {
+    __device__ static void widen(const Ready& c, float (&w)[8]) {
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             w[i] = static_cast<float>(static_cast<std::int8_t>((i < 4 ? c.code.x : c.code.y) >> ((i & 3) * 8))) *
@@ -137,18 +147,60 @@ struct Bf16Codec {
         const bf16* data;
         int stride;
     };
+    struct Row {};
     struct Chunk {
         uint4 bits;
     };
+    using Ready = Chunk;
+    __device__ static Row row(const Params&, std::int64_t) { return {}; }
     __device__ static Chunk load(const Params& p, std::int64_t row, int k) {
         return {ld_nc_na<uint4>(p.data + row * p.stride + k)};
     }
-    __device__ static void decode(const Chunk& c, float (&w)[8]) {
+    __device__ static void widen(const Ready& c, float (&w)[8]) {
         const float2 a = bf16x2_bits_to_float2(c.bits.x), b = bf16x2_bits_to_float2(c.bits.y);
         const float2 d = bf16x2_bits_to_float2(c.bits.z), e = bf16x2_bits_to_float2(c.bits.w);
         w[0] = a.x, w[1] = a.y, w[2] = b.x, w[3] = b.y, w[4] = d.x, w[5] = d.y, w[6] = e.x, w[7] = e.y;
     }
 };
+
+// bf16_p12 (core/weight.h P12Rows, packed at load): a chunk is its 8 code bytes and its nibble word (fewer registers
+// than a BF16 chunk), a row's state its window base; a chunk with escapes reads its row's escape range when it is made
+// ready. Every weight decodes to its BF16 bits, so the mixer's arithmetic is the BF16 codec's. (Staging each row's
+// escapes in shared memory cost registers, which kept the next kernel off the up kernel's SMs, and gained nothing once
+// the decode moved before the dependency wait.)
+struct P12Codec {
+    struct Params {
+        const std::uint8_t* codes;
+        const std::uint8_t* nibbles;
+        const unsigned* words;
+        const unsigned* escapes;
+        int k;
+    };
+    struct Row {
+        unsigned base2;
+    };
+    struct Chunk {
+        uint2 code;
+        unsigned nib;
+    };
+    using Ready = Bf16Codec::Chunk;
+    __device__ static Row row(const Params& p, std::int64_t row) { return {(__ldg(p.words + row) & 0xFFU) * 0x10001U}; }
+    __device__ static Chunk load(const Params& p, std::int64_t row, int k) {
+        return {ld_nc_na<uint2>(p.codes + row * p.k + k), ld_nc_na<unsigned>(p.nibbles + row * (p.k / 2) + k / 2)};
+    }
+    __device__ static Ready ready(const Params& p, const Row& r, const Chunk& c, std::int64_t row, int k) {
+        P12Row state{r.base2, 0, 0};
+        if (p12_has_escape(c.nib)) { state = p12_row(p.words, row); }
+        return {p12_decode_chunk(c.code, c.nib, state, k / 8, p.escapes)};
+    }
+    __device__ static void widen(const Ready& c, float (&w)[8]) { Bf16Codec::widen(c, w); }
+};
+
+// A codec whose chunks need decoding (bf16_p12): the kernels make every chunk ready once, after the weight loads and
+// before the programmatic-dependency wait (weights do not depend on the producer, whose tail hides the decode), and
+// their dot-product loops then widen ready BF16 words exactly as the BF16 codec's do.
+template <class Codec>
+inline constexpr bool kDecodesEarly = !std::is_same_v<typename Codec::Ready, typename Codec::Chunk>;
 
 template <class Codec, class Norm>
 __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_kernel(
@@ -168,6 +220,7 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_kernel(
     // 1. Weights first: this warp's row of the stream's K slice and the thread's norm weights (1 + w),
     // before any activation.
     const std::int64_t source = live ? row : 0;
+    typename Codec::Row row_state = Codec::row(down, source);
     typename Codec::Chunk chunk[kChunks];
 #pragma unroll
     for (int m = 0; m < kChunks; ++m) { chunk[m] = Codec::load(down, source, s * kHidden + m * 256 + lane * 8); }
@@ -179,6 +232,13 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_kernel(
     // collapse may launch beside this grid at once and fetch its own weights meanwhile; it reads the
     // partials only after this grid completes.
     pdl::trigger_dependents();
+    [[maybe_unused]] typename Codec::Ready weights[kChunks];
+    if constexpr (kDecodesEarly<Codec>) {
+#pragma unroll
+        for (int m = 0; m < kChunks; ++m) {
+            weights[m] = Codec::ready(down, row_state, chunk[m], source, s * kHidden + m * 256 + lane * 8);
+        }
+    }
     pdl::wait_for_dependencies();
     // Lanes 4-7 of each quarter warp read a chunk's two float4 halves of Rn in the other order, so a
     // quarter warp's eight 16-byte reads cover all 32 banks.
@@ -256,7 +316,11 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_kernel(
         for (int m = 0; m < kChunks; ++m) {
             const int kk = m * 256 + lane * 8;
             float wv[8];
-            Codec::decode(chunk[m], wv);
+            if constexpr (kDecodesEarly<Codec>) {
+                Codec::widen(weights[m], wv);
+            } else {
+                Codec::widen(chunk[m], wv);
+            }
 #pragma unroll
             for (int c = 0; c < kPassColumns; ++c) {
                 if (c < pass) {
@@ -301,10 +365,12 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
     const int chunks    = rank / 8;
 
     // 1. Weights first: the S rows (s*H + d) of W_up, chunks lane and lane + 32.
+    typename Codec::Row row_state[kStreams];
     typename Codec::Chunk chunk[kStreams][2];
 #pragma unroll
     for (int s = 0; s < kStreams; ++s) {
         const std::int64_t row = static_cast<std::int64_t>(s) * kHidden + (live ? d : 0);
+        row_state[s]           = Codec::row(up, row);
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const int c = lane + 32 * h;
@@ -323,6 +389,17 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
     // Launched as a programmatic dependent: the weights load while the down partials finish. The next
     // projection may launch beside this grid at once and fetch its weights meanwhile.
     pdl::trigger_dependents();
+    [[maybe_unused]] typename Codec::Ready weights[kStreams][2];
+    if constexpr (kDecodesEarly<Codec>) {
+#pragma unroll
+        for (int s = 0; s < kStreams; ++s) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                weights[s][h] = Codec::ready(up, row_state[s], chunk[s][h], static_cast<std::int64_t>(s) * kHidden + dl,
+                                             (lane + 32 * h) * 8);
+            }
+        }
+    }
     pdl::wait_for_dependencies();
     float r_held[2];
 #pragma unroll
@@ -372,7 +449,11 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
 #pragma unroll
                 for (int s = 0; s < kStreams; ++s) {
                     float wv[8];
-                    Codec::decode(chunk[s][h], wv);
+                    if constexpr (kDecodesEarly<Codec>) {
+                        Codec::widen(weights[s][h], wv);
+                    } else {
+                        Codec::widen(chunk[s][h], wv);
+                    }
                     acc[s] = fmaf(wv[0], a.x, acc[s]);
                     acc[s] = fmaf(wv[1], a.y, acc[s]);
                     acc[s] = fmaf(wv[2], a.z, acc[s]);
@@ -491,10 +572,12 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
 
     // 1. Weights first: the warp's rows of the stream's K slice, and the norm weights of the 8-element
     // groups this thread stages (i = 8 tid + 8 kDownThreads h, the same elements K1a's thread sums).
+    typename Codec::Row row_state[RowsPerWarp];
     typename Codec::Chunk chunk[RowsPerWarp][kChunks];
 #pragma unroll
     for (int r = 0; r < RowsPerWarp; ++r) {
         const std::int64_t source = row0 + r < rows ? row0 + r : 0;
+        row_state[r]              = Codec::row(down, source);
 #pragma unroll
         for (int m = 0; m < kChunks; ++m) { chunk[r][m] = Codec::load(down, source, s * kHidden + m * 256 + lane * 8); }
     }
@@ -506,6 +589,17 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
         w_bits[h]   = i < kHidden ? NormGroup<Norm>::load(w + i) : NormGroup<Norm>::zero();
     }
     pdl::trigger_dependents();
+    [[maybe_unused]] typename Codec::Ready weights[RowsPerWarp][kChunks];
+    if constexpr (kDecodesEarly<Codec>) {
+#pragma unroll
+        for (int r = 0; r < RowsPerWarp; ++r) {
+            const std::int64_t source = row0 + r < rows ? row0 + r : 0;
+#pragma unroll
+            for (int m = 0; m < kChunks; ++m) {
+                weights[r][m] = Codec::ready(down, row_state[r], chunk[r][m], source, s * kHidden + m * 256 + lane * 8);
+            }
+        }
+    }
     pdl::wait_for_dependencies();
 
 #pragma unroll 1
@@ -594,7 +688,13 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
             const int g = m * 32 + lane;
             float wv[RowsPerWarp][8];
 #pragma unroll
-            for (int r = 0; r < RowsPerWarp; ++r) { Codec::decode(chunk[r][m], wv[r]); }
+            for (int r = 0; r < RowsPerWarp; ++r) {
+                if constexpr (kDecodesEarly<Codec>) {
+                    Codec::widen(weights[r][m], wv[r]);
+                } else {
+                    Codec::widen(chunk[r][m], wv[r]);
+                }
+            }
 #pragma unroll
             for (int c = 0; c < kPassColumns; ++c) {
                 if (c < pass) {
@@ -668,11 +768,13 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
 
     // 1. Weights first: row q of the warp is stream q / 2 of feature d0 + warp + 8 (q % 2), chunks lane
     // and lane + 32.
+    typename Codec::Row row_state[kUpV4Rows];
     typename Codec::Chunk chunk[kUpV4Rows][2];
 #pragma unroll
     for (int q = 0; q < kUpV4Rows; ++q) {
         const int d            = d0 + warp + kUpV4Warps * (q & 1);
         const std::int64_t row = static_cast<std::int64_t>(q >> 1) * kHidden + (d < kHidden ? d : 0);
+        row_state[q]           = Codec::row(up, row);
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const int c = lane + 32 * h;
@@ -689,6 +791,16 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
         w_bias[s] = 1.0F + norm_value(norm_weight[static_cast<std::int64_t>(s) * kHidden + dl]);
     }
     pdl::trigger_dependents();
+    [[maybe_unused]] typename Codec::Ready weights[kUpV4Rows][2];
+    if constexpr (kDecodesEarly<Codec>) {
+#pragma unroll
+        for (int q = 0; q < kUpV4Rows; ++q) {
+            const int d            = d0 + warp + kUpV4Warps * (q & 1);
+            const std::int64_t row = static_cast<std::int64_t>(q >> 1) * kHidden + (d < kHidden ? d : 0);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) { weights[q][h] = Codec::ready(up, row_state[q], chunk[q][h], row, (lane + 32 * h) * 8); }
+        }
+    }
     pdl::wait_for_dependencies();
     const bool collapses = de < kHidden && te < columns;
     float r[kStreams];
@@ -737,7 +849,11 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
 #pragma unroll
                 for (int q = 0; q < kUpV4Rows; ++q) {
                     float wv[8];
-                    Codec::decode(chunk[q][h], wv);
+                    if constexpr (kDecodesEarly<Codec>) {
+                        Codec::widen(weights[q][h], wv);
+                    } else {
+                        Codec::widen(chunk[q][h], wv);
+                    }
                     acc[q] = fmaf(wv[0], a.x, acc[q]);
                     acc[q] = fmaf(wv[1], a.y, acc[q]);
                     acc[q] = fmaf(wv[2], a.z, acc[q]);
@@ -824,6 +940,16 @@ Q8Codec::Params q8_params(const Weight& w) {
 }
 
 Bf16Codec::Params bf16_params(const Weight& w) { return {static_cast<const bf16*>(w.qdata), bf16_stride(w)}; }
+
+bool bf16_p12(const Weight& w) noexcept {
+    return w.qtype == QType::BF16_P12 && w.layout == QuantLayout::P12Rows && w.qdata != nullptr && w.qhigh != nullptr &&
+           w.scales != nullptr && w.escapes != nullptr && w.k % 8 == 0;
+}
+
+P12Codec::Params p12_params(const Weight& w) {
+    return {static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.qhigh),
+            static_cast<const unsigned*>(w.scales), static_cast<const unsigned*>(w.escapes), w.k};
+}
 
 // Launches hc_down_partials_v4_kernel in K1a's place.
 template <class Codec, class Norm>
@@ -954,7 +1080,8 @@ void launch_norm(const Tensor& residual, const Tensor& norm_weight, typename Cod
 
 bool hc_mix_fused_supported(const Weight& down, const Weight& up, std::int32_t hidden, std::int32_t streams,
                             std::int32_t rank, std::int32_t columns) noexcept {
-    const bool codec = (q8_rowsplit(down) && q8_rowsplit(up)) || (bf16_contiguous(down) && bf16_contiguous(up));
+    const bool codec = (q8_rowsplit(down) && q8_rowsplit(up)) || (bf16_contiguous(down) && bf16_contiguous(up)) ||
+                       (bf16_p12(down) && bf16_p12(up));
     return codec && columns >= 1 && columns <= kHcMixFusedMaxColumns && hidden == kHidden && streams == kStreams &&
            rank > 0 && rank % 8 == 0 && rank <= kMaxRank && down.k == kStreams * kHidden &&
            (down.n == rank || down.n == rank + kStreams) && up.n == kStreams * kHidden && up.k == rank;
@@ -986,6 +1113,9 @@ void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weigh
     if (down.qtype == QType::Q8_G32_FP16) {
         launch_norm<Q8Codec>(residual, norm_weight, q8_params(down), q8_params(up), down.n, rank, streams, eps, x,
                              inject, partials, stream, columns);
+    } else if (down.qtype == QType::BF16_P12) {
+        launch_norm<P12Codec>(residual, norm_weight, p12_params(down), p12_params(up), down.n, rank, streams, eps, x,
+                              inject, partials, stream, columns);
     } else {
         launch_norm<Bf16Codec>(residual, norm_weight, bf16_params(down), bf16_params(up), down.n, rank, streams, eps,
                                x, inject, partials, stream, columns);

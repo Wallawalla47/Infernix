@@ -12189,6 +12189,118 @@ the widths off gave 8.80k and 8.85k. Prompts of 50K-80K, which the rig did not c
 gain. Counting the walk's steps in chunk-wide calls (fewer decode interleavings per prompt) recovered the replay's
 32K+ cold prefill only to 7,848 of 8,039 tok/s and left those two prompts at 8.4k and 7.6k.
 
+### 19.3.46 Lossless 12-bit BF16 weights, packed at load (2026-11-01/02; exact; default)
+
+**What.** Recipe A reads its GDN query/key/value/z projections ([16384, 2560] x36) and QSA projections ([13952,
+2560] x12) as BF16 every decode round (phase 1; phase 2 below adds the output projections, the head, the HC mixers
+and the token embedding). Off `--lossless` the loader packs them losslessly on the GPU
+after the upload (`bf16_p12`, `include/infernix/ops/bf16_p12.h`): a byte of sign and mantissa per weight, a 4-bit
+exponent code from its row's base (the lowest base of the 15-exponent window holding most of the row's nonzero
+weights; code 15 escapes), and each row's escapes (zeros, subnormals, exponents outside the window) as column-sorted
+`col << 16 | bits` words. 12.02 bits a weight on recipe A (205-221 escapes a million). The artifact objects load into
+a transient device arena (`Binder::mark_device_transient`), are counted and packed into one Model-owned block, the
+bound views move to the packed parents and the transient arena is freed before the expert frames are sized:
+3,697 MiB become 2,777 MiB and the 919 MiB freed hold 349 more expert frames (8,608 against 8,259 at 20K context).
+Load cost: the 48 count and pack passes take 29 ms of GPU time; the loader's log line also counts the CUDA module
+load of the process's first kernel launch (~2.4 s), which a load without packing pays later in its startup:
+end-to-end loads differed by 0.0-0.15 s within each of the two load-time modes seen (29 and 33.5 s).
+
+**Routes** (`ops/linear/bf16_p12`, one selector a shape; every route decodes a weight to its BF16 bits):
+- the skinny GEMV (T = 1-8): the BF16 skinny kernel's order, so its bits are the BF16 skinny route's, which is the
+  registered BF16 route of both shapes at T <= 8: decode, MTP drafts and their verification give BF16's outputs;
+- the stream MMA (T = 9-64): each lane decodes its chunks of two rows straight from the planes into m16n8k16 A
+  fragments, the activation tile staged in swizzled shared memory; an output depends only on the schedule's K
+  slices (bits differ from the BF16 routes; deterministic);
+- the packed TMA MMA (T > 64): the BF16 TMA kernel with a producer loading the packed tiles into their own ring,
+  decode warps writing the BF16 tile in the TMA swizzle and the BF16 consumers unchanged: the bits of the BF16 TMA
+  route on the same tile (the registered BF16 route's tile at T > 512 for GDN and T > 1024 for QSA).
+Under `--reproducible` (A16ColumnInvariant) the skinny GEMV runs 16 columns a pass at every width.
+
+**Rejected on the way** (each measured on [16384, 2560], cold L2): a shared-memory-decode MMA on the cp.async BF16
+schedules (two barriers a K tile; 0.73x at T = 17, 0.6x at 4,096); a staged register-decode MMA with the packed tile
+in the cp.async ring (one CTA an SM at 56-84 KB of shared memory: 107 us even at T = 1); the packed TMA kernel with
+one ring (decode inside every stage's round trip: 0.75x at T = 17-64, 0.88x at 4,096; two rings reached 0.93x);
+polling waits instead of suspending ones (no change); decoding the whole matrix before the BF16 route (within 1-10 %
+at T >= 1,024, but 84 MB of workspace a call). The GDN control [96, 2560] and the PLE projections [12800, 2560] stay
+BF16: their packed routes lose to the BF16 routes at most widths (control 0.43-0.97x, PLE from T = 8). Phase 1's
+skinny and stream routes lost on the output projections [2560, 6144] too (0.61-0.91x from T = 5); phase 2's direct
+MMA packs them.
+
+**Op speed** (`infernix_bf16_p12_sweep`, real recipe A tensors, cold-L2 graph medians against the registered BF16
+route): GDN 1.26-1.27x at T = 1-4, 1.13-1.19x at 5-16, 1.08-1.10x at 17-32, 0.87-0.96x at 33-64, 0.67-0.91x at
+65-1,024 (0.67x at T = 192), 0.92-0.99x beyond; QSA 1.18-1.29x at 1-4, 1.09-1.10x at 5-7, about 1.0x at 8-12,
+0.88-0.97x at 16-32, 0.72-0.76x at 33-64, 0.63-0.91x at 65-768, 0.90-0.99x beyond. The packed TMA kernel is
+tensor-bound at large T (90.6 % tensor pipe at T = 4,096 under Nsight Compute) but 7 % behind the BF16 kernel.
+
+**Measured end to end** (`infernix_bench`, recipe A, one request, warm expert state, n-gram table on its volume,
+interleaved, 2 runs an arm; packed against BF16): plain decode 89.3 / 90.1 -> 93.0 / 93.0 tok/s (+3.7 %); MTP conv
+(sampled) +4.5 %; MTP struct 260.3 / 267.4 -> 269.1 / 268.5 (+1.9 %, the same rounds and accepted tokens); a 16K
+prompt's prefill 7,558 / 7,568 -> 7,599 / 7,674 tok/s (+1.0 %). With the packed arm held to the BF16 arm's expert
+frames (`--vram-headroom-mib 1176`), the kernels alone gave plain decode +2.4 % and MTP struct -0.8 % (three runs
+each, within the arms' spread): on speculative decode the gain is the larger expert cache (hit rate 88.1 -> 89.2 %,
+CPU-served misses -9 %). An earlier build ran the stream MMA at T = 8, whose different bits changed the struct
+run's expert routing (+1.6 % CPU-served misses, -2.7 % with frames held); T = 8 moved to the skinny GEMV.
+
+**Phase 2 (2026-11-01/02): every BF16 weight whose packed readers measured faster.** The loader packs an object when
+every reader takes bf16_p12 (`packable_objects`, `load.cpp`):
+- *Output projections* [2560, 6144] (GDN and QSA): the direct MMA (`bf16_p12_direct.cuh`: barrier-free register
+  decode, B fragments through L1, K split into contiguous slices reduced in shared memory; an output's bits depend on
+  the slice count only) with 16 K slices at T <= 32, the stream MMA to 128, the packed TMA MMA beyond. Op: 1.00-1.06x
+  at T <= 8, 0.93x at 16, 0.87-0.94x at 17-32, 0.60-0.66x at 33-128, against the BF16 routes.
+- *Text head* [248320, 2560] (recipe A, FP8, FP4-Local; not while its 2-bit screen is bound, whose rescore reads BF16
+  rows): `ops::projection_fp32` reads it through the direct MMA with 4 K slices, 64 columns a pass (width-invariant).
+  Op: 562-577 against 705 us at T = 1-16 (1.24x), 589-853 against 2,325-3,048 us at T = 24-64.
+- *HC mixers* W_down + inject [324, 10240] and W_up [10240, 320] (recipe A, FP8, FP4-Local, IQ3_S; not under
+  `--a8-activations`, where a GGUF import repacks them to Q8): the fused route (T <= 16) reads them through a
+  bf16_p12 codec that decodes each chunk once, right after the weight loads and before the programmatic-dependency wait
+  (the producer's tail hides it; a chunk with escapes reads its row's escape range there), so the dot products widen
+  BF16 words as the BF16 codec's do and x and inject keep the BF16 matrices' bits. Wider calls decode both matrices into the
+  workspace and run the BF16 steps (the same bits). Op (`infernix_hyper_connection_bench --codec p12`, 48 layers'
+  distinct weights in one graph; final codec below): the composed route 0.69-0.71x at 17-64 (27.4-31.8 against
+  18.9-22.7 us), 0.77x at 128, 0.88x at 512. Output
+  hashes equal BF16's at every width. First drafts lost everywhere: a chunk carrying its row word and coordinates
+  (255 registers; 1.5x slower at T = 1, 3.2x at 16, the up kernels decoding each chunk once a column), then a
+  3-word chunk made ready before the column loop (1.15x and 1.25x slower), then escapes staged in shared memory
+  (1.09x slower at T = 1). Nsight Compute on the down kernel: 41 % more instructions than BF16's, latency-bound at 8
+  warps an SM; moving the decode before the dependency wait made it faster than BF16 (with staged escapes 1.18x at
+  T = 1; the final codec drops the staging, whose registers (247 against BF16's 175 in the v4 up kernel) left no room
+  for the next kernel beside it: 9.59 us at T = 1, 1.11x; 1.09-1.10x at 2-5; 0.99-1.00x at 8-16; every packed kernel
+  now within one register of its BF16 twin).
+- *Token embedding* [248320, 2560] (every recipe but a GGUF import's IQ4_XS rows; pinned host memory, gathered
+  zero-copy): uploaded to the transient arena, packed there and copied into its own pinned block (1,212 -> 911 MiB
+  of Host RAM; `LoadPlan` counts the packed bytes as a later pin, outside the block); `ops::embedding` gathers
+  bf16_p12 rows bit-exactly (a CTA a token, a thread a chunk: one round of independent reads over the link). Under
+  the exclusive RAM layout, recipe A's experts already fit in RAM and VRAM together on this host: the 0.3 GiB is
+  left free (18.3 against 17.7 GiB) rather than buying speed.
+
+Not packed: the shared experts [1280, 2560] and [2560, 640] (recipe A, FP8; 450 MiB): every packed route loses to
+the BF16 route at every width (gate/up 0.65-0.85x, down 0.62-0.98x; down 6.75 against 4.70 us at T = 1), small
+latency-bound matrices where the decode sits on the critical path, about -1 % a decode step against ~43 more expert
+frames. The router with the shared score [513, 2560] (123 MiB): read through projection_fp32's row API and its
+tensor-core router route, it needs packed forms of both (513 rows take no whole-tile route) for at most ~0.3 % (31 MiB;
+0.65 % of the dense bytes a token). The vision tower (855 MiB, pinned with vision offload): would need decoding after
+each copy into the encode window. The DFlash2 companion's codebooks [248320, 256] (rows gathered per candidate) and
+kernel projections. Qwen3.5 artifacts hold 0.41 GiB of BF16 matrices on the 27B (DFlash2 codebooks and kernel
+projections, GDN control) and 0.05 GiB on the 35B-A3B; packing stays a Qwen4Exp load option.
+
+Measured end to end, as phase 1's A/B, three arms (nothing packed / phase 1 / phase 1 with the head and output
+projections): plain decode 89.7 / 95.4 / 99.1 tok/s (+10.4 %; that arm's two runs 102.1 and 96.0), MTP struct 259.3 /
+267.4 / 280.8 (+8.3 %), MTP conv 123.7 / 127.7 / 135.0 (+9.1 %; acceptance varies), 16K prefill 7,572 / 7,672 / 7,711
+tok/s (+1.8 %); expert frames 8,259 / 8,608 / 8,858. Adding the mixers and the embedding (two A/Bs of 2 runs an arm:
+the escape-staging codec, then the final one; device weights 6.50 -> 6.21 GiB, +114 frames): MTP struct 286.8 ->
+290.3 and 288.3 -> 290.7 tok/s (+1.2 %, +0.8 %, the same rounds); 16K prefill 7,698 -> 7,740 and 7,708 -> 7,764
+(+0.5 %, +0.7 %), the 16 tokens after it +1.7 % (second A/B); plain decode -0.6 to -0.9 % in all three run pairs at
+the same speed level (the plain workload alternates between about 96 and 102 tok/s run to run); MTP conv unusable (its
+sampled rounds and accepted tokens differ run to run within an arm). The plain-decode loss is not explained: the
+mixers measure faster in isolation (above), and Nsight Systems kernel times cannot attribute it, since a kernel that
+launches earlier under programmatic dependent launch also measures longer. The owner kept the mixers packed on
+these results (2026-11-02); the plain-decode loss stays open. A greedy CLI run (136-token prompt, 200 tokens) gave
+the same token ids with and without the mixers and embedding packed.
+
+**Not measured.** Several lanes with drafts (calls of 17-64 columns, where the packed routes lose 4-31 %), and the
+`--reproducible` route, where the packed shapes run the skinny GEMV 16 columns a pass at every width (the BF16
+shapes run one column a call there).
+
 ### 19.3.47 FP4-Local's 4-bit route: wide-call split, vector CPU kernels (2026-11-02; same bits; default)
 
 **Why.** `--expert-a4-activations` decoded slower than FP4-Local's default W4A16 route (2026-11-01, DFlash2 auto,

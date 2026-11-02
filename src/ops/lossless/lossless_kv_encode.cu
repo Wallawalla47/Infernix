@@ -119,7 +119,8 @@ LosslessKvPlane plane_of(KvCacheStorage storage, bool key) {
     case KvCacheStorage::Vq2: return {LosslessKvCodec::Vq2, true};
     case KvCacheStorage::Q4KeyVq2Value:
         return key ? LosslessKvPlane{LosslessKvCodec::Q4Lloyd, true} : LosslessKvPlane{LosslessKvCodec::Vq2, true};
-    case KvCacheStorage::BFloat16: break;
+    case KvCacheStorage::BFloat16:
+    case KvCacheStorage::Bf16Packed: break;
     }
     throw std::invalid_argument("lossless_kv_encode: no codec planes for this storage");
 }
