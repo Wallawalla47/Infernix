@@ -537,6 +537,11 @@ std::string Engine::detokenize(std::span<const TokenId> token_ids) const {
     return impl_->frontend().detokenize(token_ids);
 }
 
+std::string Engine::detokenize_bytes(std::span<const TokenId> token_ids) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->frontend().detokenize_bytes(token_ids);
+}
+
 ChatTokens Engine::tokenize_chat(PromptInput input) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->frontend().tokenize_chat(std::move(input));

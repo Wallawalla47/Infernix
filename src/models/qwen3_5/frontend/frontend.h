@@ -92,6 +92,8 @@ public:
                                                 bool allow_prefix_identity = true) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
     [[nodiscard]] std::string detokenize(std::span<const TokenId> token_ids) const;
+    // The same ids decoded without the UTF-8 validation a cut window can fail.
+    [[nodiscard]] std::string detokenize_bytes(std::span<const TokenId> token_ids) const;
     [[nodiscard]] ChatTokens tokenize_chat(PromptInput input) const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession

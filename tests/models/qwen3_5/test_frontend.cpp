@@ -638,6 +638,91 @@ int test_tokenizer_config_merge() {
     return failures;
 }
 
+// A token window can start and end between two bytes of one character, which is the ordinary case
+// for a diagnosis: the byte-preserving route returns those bytes as they are, the strict route keeps
+// refusing them, and for every other input both join exactly the same bytes (serve/prefix_miss.h).
+int test_byte_preserving_decode(const Frontend& frontend) {
+    const fi::Tokenizer& tokenizer = fixture_tokenizer();
+    const auto byte = [](const std::uint8_t value) {
+        return static_cast<int>(fixture_byte_token(value));
+    };
+    const auto thrown = [](const auto& call) -> std::string {
+        try {
+            call();
+            return {};
+        } catch (const std::out_of_range&) { return "out_of_range"; }
+        catch (const std::invalid_argument&) { return "invalid_argument"; }
+        catch (const std::exception&) { return "other"; }
+    };
+    int failures = 0;
+
+    struct Cut {
+        std::vector<int> ids;
+        std::string bytes;
+    };
+    const std::vector<Cut> cuts = {
+        {{byte(0xe2)}, "\xe2"},                              // a lead byte alone
+        {{byte(0x82), byte(0xac)}, "\x82\xac"},               // continuations without their lead
+        {{byte(0xe2), byte(0x82)}, "\xe2\x82"},               // cut short of the last byte
+        {{byte(0xf0), byte(0x9f), byte(0x98)}, "\xf0\x9f\x98"}, // three of four bytes
+        {{byte(0xc0), byte(0x80)}, "\xc0\x80"},               // overlong
+        {{byte(0xed), byte(0xa0), byte(0x80)}, "\xed\xa0\x80"}, // a surrogate
+        {{byte(0xf4), byte(0x90), byte(0x80), byte(0x80)}, "\xf4\x90\x80\x80"}, // out of range
+        {{byte(0xe2), byte('A')}, "\xe2" "A"},           // ordinary text right after a cut
+        {{byte(0xe2), byte(0x82), byte('A'), byte(0xe2), byte(0x82), byte(0xac)},
+         "\xe2\x82" "A\xe2\x82\xac"}, // a later character keeps all of its bytes
+    };
+    for (const Cut& cut : cuts) {
+        failures += check(tokenizer.decode_bytes(cut.ids) == cut.bytes,
+                          "the byte-preserving decode did not return the window's bytes as they are");
+        failures += check(throws_invalid_argument([&] { (void)tokenizer.decode(cut.ids); }),
+                          "the strict decode accepted bytes a window cut");
+    }
+    failures += check(frontend.detokenize_bytes(cuts.front().ids) == cuts.front().bytes &&
+                          throws_invalid_argument(
+                              [&] { (void)frontend.detokenize(cuts.front().ids); }),
+                      "the front end's byte-preserving route did not keep a cut character's bytes");
+
+    for (const std::string& text :
+         {std::string(), std::string("a"), std::string("plain ascii text"), std::string("\xe2\x82\xac"),
+          std::string("caf\xc3\xa9"), std::string("\xe4\xb8\xad"), std::string("\xf0\x9d\x98\x80"),
+          std::string("a\xf0\x9f\x98\x80z"), std::string("\xe2\x82\xac\xef\xbf\xbd")}) {
+        const std::vector<int> ids = tokenizer.encode(text);
+        failures += check(tokenizer.decode_bytes(ids) == text && tokenizer.decode(ids) == text,
+                          "a valid text no longer decodes to its own bytes in both routes");
+    }
+
+    const std::vector<int> with_special = {byte('A'), 248045, byte('B')};
+    failures += check(tokenizer.decode_bytes(with_special) == "A<|im_start|>B" &&
+                          tokenizer.decode(with_special) == "A<|im_start|>B",
+                      "special tokens no longer decode the same way in both routes");
+    const fi::DecodeOptions skipped{.skip_special_tokens = true};
+    failures += check(tokenizer.decode_bytes(with_special, skipped) == "AB" &&
+                          tokenizer.decode(with_special, skipped) == "AB",
+                      "skip_special_tokens no longer applies to both routes");
+    const fi::DecodeOptions stop{.stop_token_ids = {6}};
+    failures += check(tokenizer.decode_bytes(std::vector<int>{byte('A'), 6}, stop) == "A" &&
+                          tokenizer.decode(std::vector<int>{byte('A'), 6}, stop) == "A",
+                      "a terminal stop token is no longer suppressed the same way in both routes");
+    failures += check(tokenizer.decode_bytes(std::vector<int>{6, byte('A')}, stop) == "<eos>A" &&
+                          tokenizer.decode(std::vector<int>{6, byte('A')}, stop) == "<eos>A",
+                      "a stop token inside the ids is no longer kept the same way in both routes");
+
+    for (const std::vector<int>& ids :
+         {std::vector<int>{-1}, std::vector<int>{999999}, std::vector<int>{byte('A'), -1}}) {
+        const std::string strict = thrown([&] { (void)tokenizer.decode(ids); });
+        failures += check(!strict.empty() &&
+                              thrown([&] { (void)tokenizer.decode_bytes(ids); }) == strict,
+                          "an id outside the vocabulary fails the two routes differently");
+    }
+
+    const std::vector<int> with_nul = {byte(0x00), byte('A')};
+    failures += check(tokenizer.decode_bytes(with_nul) == std::string("\0A", 2) &&
+                          tokenizer.decode(with_nul) == std::string("\0A", 2),
+                      "an embedded NUL did not decode the same way in both routes");
+    return failures;
+}
+
 int test_bpe_merge_order() {
     const std::string tokenizer_json = nlohmann::json{
         {"model",
@@ -4233,6 +4318,7 @@ int main() try {
     failures += test_declared_frontend_semantics();
     failures += test_ngram_proposal_only_sources();
     failures += test_tokenizer_config_merge();
+    failures += test_byte_preserving_decode(frontend);
     failures += test_bpe_merge_order();
     failures += test_boundary_aware_tokenization();
     failures += test_rendered_special_tokens();

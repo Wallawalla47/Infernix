@@ -1184,6 +1184,11 @@ std::string Frontend::detokenize(std::span<const TokenId> token_ids) const {
     return impl_->tokenizer->decode(token_ids);
 }
 
+std::string Frontend::detokenize_bytes(std::span<const TokenId> token_ids) const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    return impl_->tokenizer->decode_bytes(token_ids);
+}
+
 ChatTokens Frontend::tokenize_chat(PromptInput input) const {
     if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
     const PromptOptions options           = input.options;

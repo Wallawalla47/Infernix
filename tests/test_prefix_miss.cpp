@@ -3,16 +3,21 @@
 
 #include "serve/prefix_miss.h"
 
+#include <atomic>
 #include <cstdint>
 #include <iostream>
 #include <numeric>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using infernix::TokenId;
 using infernix::serve::PrefixMiss;
+using infernix::serve::PrefixMissSettlement;
 using infernix::serve::PrefixMissTracker;
+using infernix::serve::settle_prefix_miss;
 
 namespace {
 
@@ -40,6 +45,69 @@ std::vector<TokenId> join(std::vector<TokenId> a, const std::vector<TokenId>& b)
 std::string decode(std::span<const TokenId> ids) {
     std::string text;
     for (const TokenId id : ids) text += id == 7 ? std::string("\xe2") : "<" + std::to_string(id) + ">";
+    return text;
+}
+
+// The bytes a window cut leaves behind: token 7 the first three bytes of a four-byte character,
+// token 8 a continuation byte whose lead fell outside the window, token 9 a complete euro sign.
+std::string raw_bytes(std::span<const TokenId> ids) {
+    std::string text;
+    for (const TokenId id : ids) {
+        if (id == 7) {
+            text += "\xf0\x9f\x98";
+        } else if (id == 8) {
+            text += "\x82";
+        } else if (id == 9) {
+            text += "\xe2\x82\xac";
+        } else if (id == 5) {
+            text += '\0';
+        } else {
+            text += "<" + std::to_string(id) + ">";
+        }
+    }
+    return text;
+}
+
+// The check the productive Engine::detokenize applies to its reconstruction, written independently
+// of it: an invalid or incomplete sequence throws rather than reaching the caller as bytes.
+void require_utf8(const std::string& text) {
+    const auto byte = [&text](const std::size_t at) { return static_cast<unsigned char>(text.at(at)); };
+    const auto continuation = [&](const std::size_t at) {
+        return byte(at) >= 0x80U && byte(at) <= 0xbfU;
+    };
+    std::size_t at = 0;
+    while (at < text.size()) {
+        const unsigned char lead = byte(at);
+        std::size_t length       = 0;
+        unsigned char lowest     = 0x80U;
+        if (lead <= 0x7fU) {
+            length = 1;
+        } else if (lead >= 0xc2U && lead <= 0xdfU) {
+            length = 2; // 0xc0 and 0xc1 only encode overlong
+        } else if (lead >= 0xe0U && lead <= 0xefU) {
+            length = 3;
+            lowest = (lead == 0xe0U || lead == 0xedU) ? 0xa0U : 0x80U; // no overlong, no surrogate
+        } else if (lead >= 0xf0U && lead <= 0xf4U) {
+            length = 4;
+            lowest = lead == 0xf0U ? 0x90U : 0x80U; // no overlong, none above U+10FFFF
+        }
+        if (length == 0 || at + length > text.size()) {
+            throw std::invalid_argument("invalid or incomplete UTF-8");
+        }
+        for (std::size_t part = 1; part < length; ++part) {
+            if (!continuation(at + part) || (part == 1 && byte(at + part) < lowest)) {
+                throw std::invalid_argument("invalid UTF-8 continuation byte");
+            }
+        }
+        at += length;
+    }
+}
+
+// The route the serve took: the same bytes, then the strict check that a window cut fails before
+// the recorded text is ever sanitized.
+std::string strict_decode(std::span<const TokenId> ids) {
+    const std::string text = raw_bytes(ids);
+    require_utf8(text);
     return text;
 }
 
@@ -102,6 +170,98 @@ int main() {
     const auto broken = cut.settle(2, std::vector<TokenId>{1, 2, 3, 9, 8}, {}, 0, 5);
     check(broken && broken->earlier && broken->earlier->text == "<2><3>\xef\xbf\xbd<8>",
           "a cut character was not replaced");
+
+    // The productive decoder validates what it returns, so a window that cuts a character threw
+    // before the recorded text was ever sanitized: the finished request must survive that and keep
+    // its window and counters, and say that the diagnosis gave up. The earlier context is
+    // {1,2,7,3} (an incomplete character at its end) in both cases, so that side always collapses
+    // to one U+FFFD; only this side of the divergence differs.
+    struct CutCase {
+        std::vector<TokenId> rewritten;
+        std::string current_text;
+        std::uint64_t failures;
+    };
+    const std::vector<CutCase> cuts = {
+        {{1, 2, 9, 3}, "<1><2>\xe2\x82\xac<3>", 1}, // a complete character on this side
+        {{1, 2, 8, 7}, "\xef\xbf\xbd", 2},          // cut on both sides
+    };
+    for (const CutCase& cut : cuts) {
+        PrefixMissTracker strict(strict_decode, 2, 1, 2);
+        (void)strict.settle(1, std::vector<TokenId>{1, 2, 7, 3}, {}, 0, 5);
+        bool threw = false;
+        std::optional<PrefixMissSettlement> settled;
+        try {
+            settled = settle_prefix_miss(strict, 2, cut.rewritten, {}, 0, 5);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        const PrefixMiss* record = settled && settled->miss ? &*settled->miss : nullptr;
+        check(!threw, "a window cut through a character threw out of the diagnosis");
+        check(settled && settled->diagnostic_failed && record &&
+                  record->kind == PrefixMiss::Kind::Diverged && record->common_prefix_tokens == 2 &&
+                  record->earlier && record->earlier->first == 0 &&
+                  record->earlier->token_ids == std::vector<TokenId>{1, 2, 7, 3} &&
+                  record->earlier->text == "\xef\xbf\xbd" && record->current &&
+                  record->current->text == cut.current_text &&
+                  strict.diagnostic_failures() == cut.failures,
+              "a throwing decoder cost the record its window, its counters or its failure note");
+    }
+
+    // The route the serve takes: the bytes, then the replacement. Every run of bytes that cannot
+    // decode stands for one U+FFFD, and the valid text around it keeps its bytes.
+    {
+        PrefixMissTracker bytes(raw_bytes, 2, 1, 2);
+        (void)bytes.settle(1, std::vector<TokenId>{1, 2, 7, 3}, {}, 0, 5);
+        const auto record = bytes.settle(2, std::vector<TokenId>{1, 2, 8, 7}, {}, 0, 5);
+        check(record && record->earlier && record->earlier->text == "<1><2>\xef\xbf\xbd<3>",
+              "a character truncated at the window's end did not become one U+FFFD");
+        check(record && record->current &&
+                  record->current->text == "<1><2>\xef\xbf\xbd\xef\xbf\xbd",
+              "a leading continuation byte and a truncated character did not become two U+FFFD");
+        check(bytes.diagnostic_failures() == 0, "the byte route reported no diagnostic failure");
+    }
+
+    // A NUL is a byte of the window's text, not its end.
+    {
+        PrefixMissTracker nul(raw_bytes, 2, 1, 2);
+        (void)nul.settle(1, std::vector<TokenId>{1, 2, 5, 9}, {}, 0, 5);
+        const auto record = nul.settle(2, std::vector<TokenId>{1, 2, 3, 9}, {}, 0, 5);
+        std::string expected = "<1><2>";
+        expected += '\0';
+        expected += "\xe2\x82\xac";
+        check(record && record->earlier && record->earlier->text == expected,
+              "a NUL byte did not survive the window's text with the bytes after it");
+    }
+
+    // Concurrent settles share one tracker: nothing throws, and the contexts kept stay whole enough
+    // to explain a later request.
+    {
+        PrefixMissTracker shared(raw_bytes, 16, 100, 4);
+        const std::vector<TokenId> base = run(700000, 300);
+        std::atomic_flag threw;
+        std::vector<std::thread> workers;
+        for (int worker = 0; worker < 4; ++worker) {
+            workers.emplace_back([&] {
+                for (int round = 0; round < 50; ++round) {
+                    const auto prompt =
+                        join(base, run(static_cast<TokenId>(800000 + worker * 1000 + round), 20));
+                    try {
+                        (void)settle_prefix_miss(shared,
+                                                 static_cast<std::uint64_t>(worker * 100 + round),
+                                                 prompt, {}, 0, 320);
+                    } catch (const std::exception&) {
+                        threw.test_and_set();
+                    }
+                }
+            });
+        }
+        for (std::thread& worker : workers) { worker.join(); }
+        check(!threw.test(), "concurrent settles threw");
+        const auto after = shared.settle(999, join(base, run(900000, 20)), {}, 0, 320);
+        check(after && after->kind == PrefixMiss::Kind::Diverged &&
+                  after->common_prefix_tokens == 300 && after->earlier && after->current,
+              "the contexts kept through concurrent settles no longer explain a divergence");
+    }
 
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " prefix_miss (" << failures << " failures)\n";
     return failures == 0 ? 0 : 1;

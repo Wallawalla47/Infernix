@@ -64,6 +64,9 @@ struct GenerationOutcome {
     std::optional<std::uint64_t> output_4grams_in_prompt;
     // With the request JSONL: why a large re-prefill missed the prefix cache (prefix_miss.h).
     std::optional<PrefixMiss> prefix_miss;
+    // That explanation gave up somewhere, so prefix_miss holds less than the request would explain
+    // (prefix_miss.h). The generation itself is unaffected; only a real failure shows as one.
+    bool prefix_miss_diagnostic_failed = false;
 };
 
 // A transport may report an interrupted stream through a callback or is_cancelled().

@@ -2061,6 +2061,12 @@ prefix with its prompt (`common_prefix_tokens`) decides:
 - `kind: "evicted"`: that context is a prefix of the prompt (or the prompt of it), yet at least
   4,096 of its tokens were recomputed (`lost_reuse_tokens`): the cache had lost them.
 
+The window's `text` is always valid UTF-8: the window holds the artifact tokenizer's bytes for its
+token ids, and each run of them that cannot decode stands for one U+FFFD. The diagnosis is optional,
+so a request that could not be explained this way is logged with `prefix_miss: null` and
+`prefix_miss_diagnostic_failed: true` (the field is absent otherwise) rather than failing; the
+request itself succeeded either way.
+
 Both also give the earlier request's `earlier_engine_request_id` and `earlier_context_tokens`, and
 this request's `reused_tokens` and `computed_prefill_tokens`.
 
