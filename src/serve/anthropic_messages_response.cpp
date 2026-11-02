@@ -377,6 +377,11 @@ AnthropicMessagesStream::AnthropicMessagesStream(AnthropicResponseIdentity ident
 
 std::string AnthropicMessagesStream::start() { return start_with_cache(std::nullopt); }
 
+std::string AnthropicMessagesStream::ping() const {
+    if (!started_ || finished_) { return {}; }
+    return event("ping", Json{{"type", "ping"}});
+}
+
 std::string AnthropicMessagesStream::start(const infernix::GenerationStart& generation) {
     if (generation.prompt.prompt_tokens != static_cast<std::uint32_t>(input_tokens_)) {
         throw std::logic_error("Anthropic stream prompt count differs from Engine start");

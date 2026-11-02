@@ -435,6 +435,35 @@ std::optional<std::string> escape_string_controls(std::string_view value) {
     return out;
 }
 
+// The deepest array / object nesting a generated argument value keeps as JSON. The server builds JSON trees from a
+// call's arguments (Anthropic `input`, hosted tools) and serializes them recursively, so a degenerate value nested
+// thousands deep could exhaust a server thread's stack; real arguments stay far below it (candidates LE-14).
+constexpr int kMaxArgumentNesting = 256;
+
+// The deepest array / object nesting of JSON text, outside its strings.
+int json_nesting(std::string_view text) {
+    int depth = 0, deepest = 0;
+    bool quoted = false, escaped = false;
+    for (const char c : text) {
+        if (quoted) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                quoted = false;
+            }
+        } else if (c == '"') {
+            quoted = true;
+        } else if (c == '[' || c == '{') {
+            deepest = std::max(deepest, ++depth);
+        } else if (c == ']' || c == '}') {
+            --depth;
+        }
+    }
+    return deepest;
+}
+
 // Strict JSON first; an array or object refused only for control bytes inside its strings is read
 // with them escaped.
 std::optional<std::string> parse_json_value(std::string_view value, JsonValueKind& kind) {
@@ -461,6 +490,9 @@ NormalizedParameter normalize_declared_parameter(std::string_view encoded_value,
 
     JsonValueKind kind;
     if (auto json = parse_json_value(value, kind)) {
+        if (json_nesting(*json) > kMaxArgumentNesting) {
+            return {.disposition = ParameterNormalization::SchemaMismatch, .json_value = encode_json_string(framed)};
+        }
         return {.disposition = admits_value(types, kind) ? ParameterNormalization::Emitted
                                                          : ParameterNormalization::SchemaMismatch,
                 .json_value  = std::move(*json)};
@@ -481,9 +513,16 @@ NormalizedParameter normalize_parameter(std::string_view encoded_value,
     }
 
     const std::string_view value = trim_format_whitespace(encoded_value);
-    if (Json::accept(value.begin(), value.end())) { return {.json_value = std::string(value)}; }
+    // JSON nested past kMaxArgumentNesting stays text: a JSON string, never a tree too deep to serialize.
+    const auto json_or_text = [&](std::string json) -> NormalizedParameter {
+        if (json_nesting(json) > kMaxArgumentNesting) {
+            return {.disposition = ParameterNormalization::SchemaMismatch, .json_value = encode_json_string(value)};
+        }
+        return {.json_value = std::move(json)};
+    };
+    if (Json::accept(value.begin(), value.end())) { return json_or_text(std::string(value)); }
     JsonValueKind kind;
-    if (auto json = parse_json_value(value, kind)) { return {.json_value = std::move(*json)}; }
+    if (auto json = parse_json_value(value, kind)) { return json_or_text(std::move(*json)); }
     return {.json_value = encode_json_string(value)};
 }
 
@@ -1355,7 +1394,12 @@ private:
             } else if (byte == '"') {
                 quoted_ = true;
             } else if (byte == '{' || byte == '[') {
-                ++depth_;
+                // A strict value streams as the model writes it, so the bound ends the request rather than turning
+                // the value into text: its call would otherwise reach a client as a tree too deep to serialize.
+                if (++depth_ > kMaxArgumentNesting) {
+                    throw std::length_error("a tool call's argument nests arrays or objects deeper than " +
+                                            std::to_string(kMaxArgumentNesting) + " levels");
+                }
             } else if (byte == '}' || byte == ']') {
                 if (--depth_ < 0) {
                     invalid_ = true;

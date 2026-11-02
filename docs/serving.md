@@ -172,6 +172,7 @@ What is exact and what is estimated (`estimated` is always `true`):
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
 | `POST /v1/responses/input_tokens` | Responses prompt-token count without generation |
+| `GET /v1/responses` | a WebSocket upgrade (OpenAI's Responses WebSocket mode, not served) answers `426` with `code: "websocket_not_supported"`, so Codex's built-in provider switches to HTTP at once; any other GET answers `404` |
 | `GET /v1/responses/{id}` | retrieve a locally stored terminal Response |
 | `DELETE /v1/responses/{id}` | delete a locally stored Response |
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
@@ -229,9 +230,12 @@ error responses. Anthropic endpoints use their separate `request-id` contract.
 A generation SSE endpoint commits its response only once the Engine has admitted the request: while
 the request is still queued the client receives no response bytes, and the queue's own answers (a
 queue timeout, an orderly stop) are plain HTTP statuses ([Execution behavior](#execution-behavior)).
-A started stream emits the standard `: keep-alive` comment after five seconds without a protocol
-event. The comment is transport-only: SSE clients ignore it, and it does not change generated text,
-event ordering, usage, stored Responses, or request logs. Accepted connections also use TCP
+A started stream emits a heartbeat after five seconds without a protocol event: Chat Completions a
+chunk whose `delta` is empty, Responses `response.in_progress` again (the same response, the next
+`sequence_number`), and Anthropic Messages its `ping` event (before `message_start`, the standard
+`: keep-alive` comment). A client whose idle timer counts events, not bytes (Codex restarts its timer
+only on an event, and an SSE comment is none), so keeps a stream through a long prefill. The
+heartbeat changes no generated text, usage, stored Responses or request logs. Accepted connections also use TCP
 keepalive and a 15-second retransmission limit (`TCP_USER_TIMEOUT` on Linux, `TCP_MAXRTMS` on
 Windows); together with the heartbeat, a dead or unacknowledging peer is normally cancelled within
 about 20 seconds, including while the request is waiting (TCP alone) or prefilling. A peer whose TCP stack remains connected and acknowledges data
@@ -511,8 +515,10 @@ Markers that are tokens of the model's vocabulary are recognized by the generate
 their spelling. Generated reasoning ends at the model's `</think>` token wherever it appears, with or
 without a following line break, and `<tool_call>` opens a call only as the model's `<tool_call>`
 token, on both the constrained and the unconstrained route and in the recovery from unclosed
-thinking. The same spellings written with ordinary text tokens (for example while the model
-discusses a chat template) stay text in their channel. The model writes the marker tokens when it
+thinking. A `</think>` token after the reasoning has closed (or in a turn without reasoning) is
+stray framing and publishes nothing, so it never enters the history a client sends back; raw output
+(`--raw`, preserved special tokens) keeps its bytes. The same spellings written with ordinary text
+tokens (for example while the model discusses a chat template) stay text in their channel. The model writes the marker tokens when it
 quotes them too: a quoted `</think>` token ends the reasoning, and a quoted `<tool_call>` token stays
 text only by the Markdown code rule above or when its region does not parse. Leading whitespace of
 the answer after `</think>` is dropped; with an output constraint the grammar requires exactly `\n\n`
@@ -551,6 +557,9 @@ unsupported schema assertions therefore remain usable. A root `oneOf` / `anyOf` 
 (a zod or Pydantic discriminated union) supplies its variants' properties as hints too: a name takes
 the union of the types its variants give it, so a string-typed field keeps `2026` or `true` as text;
 a variant that leaves it untyped, or a branch that cannot be read, leaves the value text to decide.
+A generated value nested deeper than 256 arrays or objects is kept as text (a JSON string, counted as
+a schema mismatch), so no call reaches a client as a tree too deep to serialize; a `strict:true` value
+streams as the model writes it, so there the request ends with an error at the 257th level.
 A call names each parameter at most once (the constraint refuses a repeated name), so the published
 JSON object, streamed or whole, contains each key once. `strict:true` additionally enforces the
 parameter contract below.

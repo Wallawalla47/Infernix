@@ -902,7 +902,10 @@ int test_timings() {
         "aggregate Anthropic timings use the exact cache split and N-1 generation intervals");
 
     AnthropicMessagesStream stream(identity, 100);
+    // A quiet stream's heartbeat (UE-05) is the protocol's ping, only after message_start and before the stop.
+    const bool no_early_ping = stream.ping().empty();
     std::vector<std::string> events{stream.start()};
+    const std::string ping = stream.ping();
     // Braced lists evaluate in order: reasoning, then text, then the terminal events.
     for (std::vector<std::string> values :
          {stream.reasoning_delta("thought"), stream.content_delta("answer"), stream.finish(outcome)}) {
@@ -918,6 +921,8 @@ int test_timings() {
                           "Anthropic stream timings belong to the terminal message_delta");
     }
     failures += check(timed == 1, "an Anthropic stream carries exactly one timings object");
+    failures += check(no_early_ping && ping == "event: ping\ndata: {\"type\":\"ping\"}\n\n" && stream.ping().empty(),
+                      "the stream heartbeat is not Anthropic's ping between message_start and the stop");
 
     outcome = {};
     const Json empty = Json::parse(make_anthropic_messages_response(identity, outcome))["timings"];

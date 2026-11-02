@@ -104,6 +104,27 @@ int test_sse_transport() {
     SseTransport released(sink, releaser_cancelled, 5s, start);
     failures += check(released.poll(start),
                       "response resource cancellation was not observed by SSE transport");
+
+    // A protocol heartbeat (UE-05): the stream's own event in place of the comment, rendered on each quiet interval
+    // (so a renderer may number its events), and the comment while the renderer has no event yet.
+    write_ok = true;
+    writes.clear();
+    std::atomic<bool> evented_cancelled{false};
+    SseTransport evented(sink, evented_cancelled, 5s, start);
+    int rendered     = 0;
+    bool event_ready = false;
+    evented.set_heartbeat([&]() -> std::string {
+        if (!event_ready) { return {}; }
+        return "event: ping\ndata: " + std::to_string(++rendered) + "\n\n";
+    });
+    failures += check(!evented.poll(start + 5s) && writes == std::vector<std::string>{std::string(SseTransport::kHeartbeatComment)},
+                      "a heartbeat renderer without an event did not fall back to the comment");
+    event_ready = true;
+    failures += check(!evented.poll(start + 10s) && !evented.poll(start + 15s) && writes.size() == 3 &&
+                          writes[1] == "event: ping\ndata: 1\n\n" && writes[2] == "event: ping\ndata: 2\n\n",
+                      "the protocol heartbeat was not written on each quiet interval");
+    failures += check(!evented.poll(start + 19999ms) && writes.size() == 3,
+                      "a protocol heartbeat did not reset the quiet interval");
     return failures;
 }
 

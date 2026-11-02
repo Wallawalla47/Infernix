@@ -1082,6 +1082,12 @@ int test_stream_response() {
     failures += check(role["choices"][0]["delta"]["role"] == "assistant" &&
                           role["choices"][0]["logprobs"].is_null() && role["usage"].is_null(),
                       "stream starts with role, nullable logprobs, and null usage");
+    // A quiet stream's heartbeat (UE-05): a chunk of the same completion whose delta is empty.
+    Json heartbeat = parse_sse(stream.keep_alive());
+    failures += check(heartbeat["object"] == "chat.completion.chunk" && heartbeat["id"] == role["id"] &&
+                          heartbeat["choices"][0]["delta"] == Json::object() &&
+                          heartbeat["choices"][0]["finish_reason"].is_null() && heartbeat["usage"].is_null(),
+                      "the stream heartbeat is not an empty-delta chunk of the completion");
     Json reasoning = parse_sse(stream.reasoning_delta("thought"));
     Json content   = parse_sse(stream.content_delta("ans"));
     failures += check(reasoning["choices"][0]["delta"]["reasoning_content"] == "thought" &&
@@ -1107,6 +1113,7 @@ int test_stream_response() {
                           usage["timings"]["predicted_n"] == 7,
                       "dedicated stream usage carries token accounting and terminal timings");
     failures += check(events.back() == "data: [DONE]\n\n", "stream ends with DONE sentinel");
+    failures += check(stream.keep_alive().empty(), "a heartbeat followed the stream's finish");
     failures += check(usage["constraint"]["branch"] == "content" &&
                           usage["constraint"]["terminated"] == true &&
                           !parse_sse(events[0]).contains("constraint") &&

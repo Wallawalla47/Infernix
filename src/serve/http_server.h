@@ -43,6 +43,11 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
                                                               const httplib::Request& request,
                                                               httplib::Response& response);
 
+// GET /v1/responses. OpenAI's WebSocket mode for Responses (`response.create` over a GET upgrade) is not served: an
+// upgrade is answered 426 with the OpenAI error envelope, which Codex's built-in provider takes as a switch to HTTP for
+// the session instead of failing the turn (candidates IJ-02; Ollama answers it so too); any other GET answers 404.
+void handle_responses_upgrade(const httplib::Request& request, httplib::Response& response);
+
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
 

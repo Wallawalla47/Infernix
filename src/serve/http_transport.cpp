@@ -207,9 +207,9 @@ bool SseTransport::poll(Clock::time_point now) {
     if (cancelled_.load(std::memory_order_acquire)) { return true; }
     if (sink_.is_writable && !sink_.is_writable()) { return mark_cancelled(); }
     if (now - last_write_ < heartbeat_interval_) { return false; }
-    if (!sink_.write(kHeartbeatComment.data(), kHeartbeatComment.size())) {
-        return mark_cancelled();
-    }
+    const std::string event = heartbeat_event_ ? heartbeat_event_() : std::string();
+    const std::string_view heartbeat = event.empty() ? kHeartbeatComment : std::string_view(event);
+    if (!sink_.write(heartbeat.data(), heartbeat.size())) { return mark_cancelled(); }
     last_write_ = now;
     return false;
 }

@@ -821,6 +821,12 @@ std::vector<std::string> OpenAIResponsesEventStream::start() {
             sse(impl_->event("response.in_progress", Json{{"response", response}}))};
 }
 
+std::string OpenAIResponsesEventStream::keep_alive() {
+    if (!impl_->started || impl_->finish_built) { return {}; }
+    const Json response = in_progress_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime);
+    return sse(impl_->event("response.in_progress", Json{{"response", response}}));
+}
+
 std::vector<std::string> OpenAIResponsesEventStream::reasoning_delta(const std::string& text) {
     if (!impl_->started || impl_->finish_built) {
         throw std::logic_error("invalid reasoning delta event state");

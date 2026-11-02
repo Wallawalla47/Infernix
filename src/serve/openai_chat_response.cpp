@@ -290,6 +290,11 @@ std::string OpenAIChatStream::content_delta(const std::string& text) {
     return chunk(identity_, Json{{"content", text}}, nullptr, include_usage_, live_timings_json());
 }
 
+std::string OpenAIChatStream::keep_alive() const {
+    if (!started_ || finished_) { return {}; }
+    return chunk(identity_, Json::object(), nullptr, include_usage_);
+}
+
 std::string OpenAIChatStream::tool_call_delta(const infernix::ToolCallDelta& delta) {
     const bool opens = delta.index == calls_.size();
     if (!started_ || finished_ || (opens && delta.name.empty()) ||

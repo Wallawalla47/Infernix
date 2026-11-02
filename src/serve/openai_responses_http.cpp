@@ -571,6 +571,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                     return true;
                 }
                 SseTransport transport(sink, stream->cancelled);
+                transport.set_heartbeat([&] { return stream->encoder->keep_alive(); });
                 const auto send_failed = [&](const ApiError& error) {
                     try {
                         render_and_write(transport, [&] { return stream->encoder->failed(error); });

@@ -36,6 +36,14 @@ bool is_anthropic_path(std::string_view path) {
     return canonical_api_path(path).starts_with("/v1/messages");
 }
 
+// A WebSocket upgrade: `websocket` among the Upgrade field's protocols, matched case-insensitively (RFC 9110 7.8).
+bool requests_websocket(const httplib::Request& request) {
+    std::string upgrade = request.get_header_value("Upgrade");
+    std::transform(upgrade.begin(), upgrade.end(), upgrade.begin(),
+                   [](unsigned char c) { return static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c); });
+    return upgrade.find("websocket") != std::string::npos;
+}
+
 bool is_openai_path(std::string_view path) {
     return path.starts_with("/v1/") && !is_anthropic_path(path);
 }
@@ -164,6 +172,19 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
         write_openai_error(response, error);
     }
     return httplib::Server::HandlerResponse::Handled;
+}
+
+void handle_responses_upgrade(const httplib::Request& request, httplib::Response& response) {
+    if (!requests_websocket(request)) {
+        response.status = 404;
+        return;
+    }
+    ApiError error;
+    error.status  = 426;
+    error.type    = "invalid_request_error";
+    error.code    = "websocket_not_supported";
+    error.message = "the Responses WebSocket mode is not supported: send POST /v1/responses over HTTP";
+    write_openai_error(response, error);
 }
 
 bool matches_bearer_credential(std::string_view authorization, std::string_view api_key) noexcept {
@@ -596,6 +617,7 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_responses(req, res);
                  });
+    server_.Get(api_route_pattern("/responses"), handle_responses_upgrade);
     server_.Post(api_route_pattern("/responses/input_tokens"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_input_tokens(req, res);

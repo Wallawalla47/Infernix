@@ -331,6 +331,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     return true;
                 }
                 SseTransport transport(sink, stream->cancelled);
+                transport.set_heartbeat([&] { return encoder->ping(); });
                 const auto send_error = [&](const ApiError& error) {
                     try {
                         if (!encoder->started()) {

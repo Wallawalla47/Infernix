@@ -1842,6 +1842,40 @@ int test_sse_sequence_and_failures() {
 // A streamed Response refused before its generation (a prompt over the context limit) is a whole
 // event stream: created, in_progress, then failed with the error's code and message, numbered from
 // zero, every event the same Response. Codex compacts its conversation on exactly this failure.
+// A quiet stream's heartbeat (UE-05) is `response.in_progress` again: the response in progress, the next sequence
+// number, between the stream's other events; nothing before the start or after the finish.
+int test_stream_keep_alive() {
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(Json{{"model", "m"}, {"input", "hi"}, {"stream", true}}, limits());
+    OpenAIResponsesEventStream stream("resp_keep_alive", 1, request, {});
+    int failures = check(stream.keep_alive().empty(), "a heartbeat preceded the stream's start");
+    std::vector<std::string> wire = stream.start();
+    wire.push_back(stream.keep_alive());
+    const std::vector<std::string> delta = stream.content_delta("Hello.");
+    wire.insert(wire.end(), delta.begin(), delta.end());
+    wire.push_back(stream.keep_alive());
+    GenerationOutcome outcome;
+    outcome.text          = "Hello.";
+    outcome.finish_reason = infernix::FinishReason::StopToken;
+    const OpenAIResponsesStreamFinish finish = stream.finish(outcome);
+    failures += check(stream.keep_alive().empty(), "a heartbeat followed the stream's finish");
+    std::uint64_t sequence = 0;
+    int heartbeats         = 0;
+    for (const std::string& event_wire : wire) {
+        const Json event = parse_event(event_wire);
+        failures += check(event.at("sequence_number") == sequence++, "a heartbeat broke the event sequence");
+        if (event_wire.find("response.in_progress") != std::string::npos && sequence > 2) {
+            ++heartbeats;
+            failures += check(event.at("type") == "response.in_progress" && event.at("response").at("id") == "resp_keep_alive" &&
+                                  event.at("response").at("status") == "in_progress",
+                              "a heartbeat was not the response in progress");
+        }
+    }
+    failures += check(heartbeats == 2 && finish.response.body.at("status") == "completed",
+                      "the heartbeats were not two in_progress events, or changed the response");
+    return failures;
+}
+
 int test_failed_before_generation_stream() {
     const OpenAIResponsesCreateRequest request = parse_openai_responses_create_request(
         Json{{"model", "m"}, {"input", "hello"}, {"stream", true}, {"temperature", 0.5}}, limits());
@@ -2004,6 +2038,7 @@ int main() try {
     failures += test_sse_sequence_and_failures();
     failures += test_failed_before_generation_stream();
     failures += test_streamed_function_calls();
+    failures += test_stream_keep_alive();
     failures += test_input_tokens_uses_shared_state_path();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

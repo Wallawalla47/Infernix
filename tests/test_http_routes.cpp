@@ -74,6 +74,7 @@ int main() {
                    const std::string id = req.matches.size() > 1 ? req.matches[1].str() : "";
                    res.set_content(id, "text/plain");
                });
+    server.Get(api_route_pattern("/responses"), infernix::serve::handle_responses_upgrade);
     const int port = server.bind_to_any_port("127.0.0.1");
     failures += check(port > 0, "test server could not bind a loopback port");
     if (port > 0) {
@@ -94,6 +95,20 @@ int main() {
         const httplib::Result model = client.Get("/v1/v1/models/qwen3.8-27b");
         failures += check(model && model->status == 200 && model->body == "qwen3.8-27b",
                           "a doubled prefix must not shift the route's capture groups");
+        // A Responses WebSocket upgrade (Codex's built-in provider) answers 426 with the OpenAI envelope under either
+        // prefix, so the client switches to HTTP at once; a plain GET still finds nothing (IJ-02).
+        const httplib::Headers upgrade{{"Connection", "Upgrade"},
+                                       {"Upgrade", "WebSocket"},
+                                       {"Sec-WebSocket-Version", "13"},
+                                       {"Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="}};
+        for (const char* path : {"/v1/responses", "/v1/v1/responses"}) {
+            const httplib::Result refused = client.Get(path, upgrade);
+            failures += check(refused && refused->status == 426 &&
+                                  Json::parse(refused->body).at("error").at("code") == "websocket_not_supported",
+                              "a Responses WebSocket upgrade did not answer 426 with the OpenAI error");
+        }
+        const httplib::Result plain = client.Get("/v1/responses");
+        failures += check(plain && plain->status == 404, "a plain GET on /v1/responses did not answer 404");
         server.stop();
         listener.join();
     }

@@ -2837,6 +2837,34 @@ int test_reasoning_close_by_token_identity(const Frontend& frontend) {
     return failures;
 }
 
+// A close token after the reasoning has closed is the model's stray framing (NU-08): the answer publishes nothing for
+// it, whatever the decode rounds, so it never enters the history a client sends back; raw output keeps its bytes, and
+// its spelling in ordinary tokens stays answer text.
+int test_stray_reasoning_close_is_dropped(const Frontend& frontend) {
+    int failures = 0;
+    std::vector<infernix::TokenId> tokens = fixture_tokens("thought");
+    tokens.push_back(kFixtureThinkCloseToken);
+    const auto first = fixture_tokens("'; first");
+    tokens.insert(tokens.end(), first.begin(), first.end());
+    tokens.push_back(kFixtureThinkCloseToken);
+    const auto second = fixture_tokens(" second </think> spelled");
+    tokens.insert(tokens.end(), second.begin(), second.end());
+    const auto make_session = [&] { return frontend.make_output_session(thinking_prompt(frontend), {}); };
+    for (const std::size_t round : {0U, 1U, 3U}) {
+        const Published published = publish_rounds(make_session, tokens, round);
+        failures += check(published.reasoning == "thought" &&
+                              published.content == "'; first second </think> spelled",
+                          "a close token after the reasoning closed was published as answer text");
+    }
+    const auto make_raw = [&] {
+        return frontend.make_output_session(thinking_prompt(frontend), {}, infernix::OutputOptions{.raw = true});
+    };
+    const Published raw = publish_rounds(make_raw, tokens, 0);
+    failures += check(raw.content.find("first</think> second") != std::string::npos,
+                      "raw output dropped a close token's bytes");
+    return failures;
+}
+
 // The request log's model_thinking_tokens counts the model's thinking without a budget too
 // (upstream Neroued/ninfer#373): the thinking and its close, as the presentation decoder counts
 // reasoning tokens, never the whole answer.
@@ -4364,6 +4392,7 @@ int main() try {
     failures += test_stop_strings_skip_tool_calls();
     failures += test_reasoning_split(frontend);
     failures += test_reasoning_close_by_token_identity(frontend);
+    failures += test_stray_reasoning_close_is_dropped(frontend);
     failures += test_reasoning_close_resolves_at_terminal(frontend);
     failures += test_thinking_tokens_without_budget(frontend);
     failures += test_thinking_budget_control(frontend);

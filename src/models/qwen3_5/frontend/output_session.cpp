@@ -721,8 +721,13 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         }
 
         StopMatch match;
+        // The close token after the reasoning has closed (or in a turn without reasoning) is the model's stray
+        // framing, not answer text: it publishes nothing unless special tokens are preserved (raw output), and so it
+        // never enters the history a client sends back (NU-08; NVIDIA flare #162 measured it in 11-14 of 373 GLM-5.3
+        // replies). Its spelling in ordinary tokens stays text, as everywhere.
+        const bool stray_close = reasoning_close && !impl_->preview_state.in_reasoning && !impl_->preserve_special;
         const std::string_view bytes =
-            !impl_->preserve_special && decoded.special ? std::string_view{} : decoded.bytes;
+            stray_close || (!impl_->preserve_special && decoded.special) ? std::string_view{} : decoded.bytes;
         feed_token(impl_->preview_state, reasoning_close, token == impl_->markers.tool_call, bytes, impl_->policy,
                    impl_->preview_output, count, &match);
 

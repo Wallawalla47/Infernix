@@ -166,6 +166,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     return true;
                 }
                 SseTransport transport(sink, stream->cancelled);
+                transport.set_heartbeat([&] { return encoder->keep_alive(); });
                 const auto send_error = [&](const ApiError& error) {
                     try {
                         render_and_write(transport, [&] { return sse_error_event(error); });
