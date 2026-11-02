@@ -97,7 +97,7 @@ struct Bank {
         std::uniform_real_distribution<float> lg(-10.0F, -6.0F);
         for (auto& v : s) { v = __float2half(std::exp2(lg(rng))); }
         scales = DeviceBuffer(ngroups * sizeof(__half));
-        CUDA_CHECK(cudaMemcpy(scales.p, s.data(), scales.bytes, cudaMemcpyHostToDevice));
+        bench::upload(scales.p, s.data(), scales.bytes);
         weight.qtype           = q8 ? QType::Q8_G32_FP16 : QType::Q4_G64_FP16;
         weight.layout          = QuantLayout::RowSplit;
         weight.qdata           = codes.p;
@@ -144,7 +144,7 @@ int main(int argc, char** argv) {
                 std::copy_n(order.begin(), kTopK, ids.begin() + static_cast<std::ptrdiff_t>(t) * kTopK);
             }
             DeviceBuffer d_ids(ids.size() * sizeof(std::int32_t));
-            CUDA_CHECK(cudaMemcpy(d_ids.p, ids.data(), d_ids.bytes, cudaMemcpyHostToDevice));
+            bench::upload(d_ids.p, ids.data(), d_ids.bytes);
             const DeviceBuffer x = bench::make_bf16(static_cast<std::size_t>(kHidden) * columns, options.seed + columns, -2.0F, 2.0F);
             DeviceBuffer out(sizeof(std::uint16_t) * kHidden * entries);
             const std::size_t ws_bytes = ops::resident_moe_workspace_bytes(entries, kInter);
@@ -159,7 +159,7 @@ int main(int argc, char** argv) {
                 },
                 flush, context.stream, options.warmup, options.repeat);
             std::vector<std::uint8_t> bytes(out.bytes);
-            CUDA_CHECK(cudaMemcpy(bytes.data(), out.p, out.bytes, cudaMemcpyDeviceToHost));
+            bench::read_back(bytes.data(), out.p, out.bytes);
             std::printf("T=%d entries=%3d | median %7.1f us (min %7.1f, p95 %7.1f) | %6.0f GB/s | output fnv1a %016llx\n",
                         columns, entries, timing.median_us, timing.min_us, timing.p95_us,
                         expert_bytes * entries / (timing.median_us * 1e-6) / 1e9,

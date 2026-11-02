@@ -221,8 +221,7 @@ public:
         for (std::size_t index = 0; index < segment_lengths_.size(); ++index) {
             cumulative[index + 1] = cumulative[index] + segment_lengths_[index];
         }
-        CUDA_CHECK(cudaMemcpy(cu_seqlens_.p, cumulative.data(), cu_seqlens_.bytes,
-                              cudaMemcpyHostToDevice));
+        bench::upload(cu_seqlens_.p, cumulative.data(), cu_seqlens_.bytes);
     }
 
     void launch(Entry entry, cudaStream_t stream) {

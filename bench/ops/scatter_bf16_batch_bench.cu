@@ -126,8 +126,8 @@ struct Case {
                                      : 0;
             live += hv[i];
         }
-        CUDA_CHECK(cudaMemcpy(lanes.p, hl.data(), b * 4, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(valid.p, hv.data(), b * 4, cudaMemcpyHostToDevice));
+        bench::upload(lanes.p, hl.data(), b * 4);
+        bench::upload(valid.p, hv.data(), b * 4);
         initialize_bits<<<(source.bytes / 4 + 255) / 256, 256>>>(static_cast<unsigned*>(source.p),
                                                                  source.bytes / 4, 12345);
         initialize_bits<<<(destination.bytes / 4 + 255) / 256, 256>>>(

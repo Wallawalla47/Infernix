@@ -35,6 +35,14 @@ workload. These changes establish a new input/timing baseline: older constant or
 fixtures and repeated in-place chains are not directly comparable. Compare implementations using
 the same fixture, seed, cache policy, and timing mode.
 
+Op benchmarks launch on non-blocking streams, which order neither after nor before the legacy
+stream, while a legacy-stream `cudaMemcpy` from pageable memory may return before its data lands
+(and `cudaMemset` or a device-to-device copy before it runs). Fixture transfers therefore go through
+`ops/infernix_bench_common.h`'s `upload`, `read_back`, `fill_bytes` and `copy_device`, which wait for
+the device on both sides; `SavedBuffer` snapshots the same way. (Until 2026-11-02 the benchmarks
+called `cudaMemcpy` directly: `infernix_offloaded_moe_wide_bench`'s routing then read its logits
+before they landed and gave different outputs from run to run at every width after a process's first.)
+
 ## Build
 
 `CMakeLists.txt` includes explicit registrations from `ops/`, `inference/`, `decode_quality/`,
@@ -476,7 +484,11 @@ the exact W4A16 wide route, or `a16x2`, expert-a4-residual), and `--bank ggml --
 exact|bf16|a8` GGUF records at Flash-Next's geometry (`bf16` takes the BF16 stage-decode tiles from 4,096 columns,
 `kGgmlStageDecodeMinColumns`, the exact tiles below it). `--staging-slots 0` (frames only) runs one pass over every
 job with no staging, the shape of a decode call's resident pass; with `--cold` and decode widths it times the narrow
-expert kernels as decode and verification find them.
+expert kernels as decode and verification find them. Each line ends with an FNV-1a hash of the call's outputs (equal
+hashes: bit-identical outputs across builds and runs; a line reports output values no launch wrote). `--dump
+<prefix>` writes each call's dispatch and outputs (`<prefix>_T<tokens>_<placement>.bin`, an int32 header then the
+offsets, jobs, entries and BF16 outputs) for comparing runs entry by entry, and `--fill-workspace <byte>` sets the
+experts workspace to that byte before each width's calls.
 
 ```bash
 ./build/bench/infernix_offloaded_moe_wide_bench --activation a16 --tokens 512,2048,4096 --placement frames

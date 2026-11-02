@@ -175,7 +175,7 @@ struct Case {
         for (int j = 0; j < width; ++j) { position[j] = context - width + j; }
         const auto upload = [](const std::vector<std::int32_t>& h) {
             DeviceBuffer d(h.size() * sizeof(std::int32_t));
-            CUDA_CHECK(cudaMemcpy(d.p, h.data(), d.bytes, cudaMemcpyHostToDevice));
+            bench::upload(d.p, h.data(), d.bytes);
             return d;
         };
         tables    = upload(table);

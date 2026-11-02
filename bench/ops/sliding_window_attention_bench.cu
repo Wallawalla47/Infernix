@@ -262,10 +262,9 @@ public:
                 host_positions[static_cast<std::size_t>(row * tokens + token)] = context + token;
             }
         }
-        CUDA_CHECK(cudaMemcpy(positions_.p, host_positions.data(), positions_.bytes,
-                              cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(valid_.p, host_valid.data(), valid_.bytes, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(lane_.p, host_lanes.data(), lane_.bytes, cudaMemcpyHostToDevice));
+        bench::upload(positions_.p, host_positions.data(), positions_.bytes);
+        bench::upload(valid_.p, host_valid.data(), valid_.bytes);
+        bench::upload(lane_.p, host_lanes.data(), lane_.bytes);
     }
 
     void launch(cudaStream_t stream) {

@@ -31,7 +31,7 @@
 //                                   [--repeat 10] [--seed N]
 //                                   [--columns-per-expert C] [--split-scales] [--geometry flash-next|122b]
 //                                   [--bank nvfp4|ggml] [--formats iq3_s,iq4_nl] [--ggml-wide exact|bf16|a8]
-//                                   [--staging-slots 64]
+//                                   [--staging-slots 64] [--dump <prefix>]
 //
 // --staging-slots 0 (frames only) runs one pass over every job with no staging, the shape of a decode call's
 // resident pass.
@@ -76,10 +76,12 @@ struct Options {
     int warmup            = 3;
     int repeat            = 10;
     std::uint32_t seed    = 20261004U;
+    std::string dump;               // --dump <prefix>: each call's dispatch and outputs to <prefix>_T<tokens>_<placement>.bin
     bool a16              = false;
     moe::WideA16 wide_a16 = moe::WideA16::kExact; // a16x2 / a16x3: W4A16 experts on an A4 residual route; a8: kA8
     moe::NarrowA16 narrow_a16 = moe::NarrowA16::kExact; // --narrow a4r: W4A16 narrow jobs on two-term A4; a8: kA8
     bool cold             = false;
+    int fill_workspace    = -1;     // --fill-workspace <byte>: the workspace set to that byte before each width's calls
     int columns_per_expert = 0;     // > 0: uniform routing, every used expert has exactly this many columns
     bool split_scales      = false; // distinct gate and up input scales: no expert takes the wide route
     bool geometry_122b     = false;
@@ -174,8 +176,12 @@ Options parse_options(int argc, char** argv) {
             options.narrow_a16 = v == "a4r" ? moe::NarrowA16::kA4Residual : moe::NarrowA16::kExact;
         } else if (arg == "--cold") {
             options.cold = true;
+        } else if (arg == "--fill-workspace") {
+            options.fill_workspace = std::stoi(value()) & 0xFF;
         } else if (arg == "--seed") {
             options.seed = static_cast<std::uint32_t>(std::stoul(value()));
+        } else if (arg == "--dump") {
+            options.dump = value();
         } else if (arg == "--columns-per-expert") {
             options.columns_per_expert = std::stoi(value());
             if (options.columns_per_expert < 1) { throw std::invalid_argument("--columns-per-expert must be positive"); }
@@ -327,13 +333,13 @@ struct Fixture {
             const std::uint8_t* source = records.data() + static_cast<std::size_t>(e % kDistinct) * stride;
             std::memcpy(host + static_cast<std::size_t>(e) * stride, source, stride);
         }
-        CUDA_CHECK(cudaMemcpy(frames_memory.p, host, bank, cudaMemcpyHostToDevice));
+        bench::upload(frames_memory.p, host, bank);
         std::vector<std::int32_t> table(g_geometry.experts), none(g_geometry.experts, -1);
         for (int e = 0; e < g_geometry.experts; ++e) { table[static_cast<std::size_t>(e)] = e; }
         frames_table  = DeviceBuffer(sizeof(std::int32_t) * g_geometry.experts);
         resident_none = DeviceBuffer(sizeof(std::int32_t) * g_geometry.experts);
-        CUDA_CHECK(cudaMemcpy(frames_table.p, table.data(), frames_table.bytes, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(resident_none.p, none.data(), resident_none.bytes, cudaMemcpyHostToDevice));
+        bench::upload(frames_table.p, table.data(), frames_table.bytes);
+        bench::upload(resident_none.p, none.data(), resident_none.bytes);
         std::vector<moe::ExpertScales> s(g_geometry.experts);
         std::uniform_real_distribution<float> lg(-11.0F, -7.0F);
         for (auto& e : s) {
@@ -349,7 +355,7 @@ struct Fixture {
             }
         }
         scales = DeviceBuffer(sizeof(moe::ExpertScales) * g_geometry.experts);
-        CUDA_CHECK(cudaMemcpy(scales.p, s.data(), scales.bytes, cudaMemcpyHostToDevice));
+        bench::upload(scales.p, s.data(), scales.bytes);
         staging = DeviceBuffer(static_cast<std::size_t>(kStagingSlots) * stride);
         CUDA_CHECK(cudaStreamCreateWithFlags(&overlap, cudaStreamNonBlocking));
         for (auto& event : events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
@@ -393,7 +399,7 @@ void run_point(Fixture& fixture, int tokens, const Options& options, bench::L2Fl
     const int entries = g_geometry.top_k * tokens;
     const auto logits = routing_logits(rng, tokens, options.columns_per_expert);
     DeviceBuffer d_logits(logits.size() * sizeof(float));
-    CUDA_CHECK(cudaMemcpy(d_logits.p, logits.data(), d_logits.bytes, cudaMemcpyHostToDevice));
+    bench::upload(d_logits.p, logits.data(), d_logits.bytes);
     DeviceBuffer ids(sizeof(std::int32_t) * entries), weights(sizeof(float) * entries), gate(sizeof(float) * tokens);
     ops::MoeRouting routing{Tensor(ids.p, DType::I32, {g_geometry.top_k, tokens}), Tensor(weights.p, DType::FP32, {g_geometry.top_k, tokens}),
                             Tensor(gate.p, DType::FP32, {tokens})};
@@ -423,6 +429,8 @@ void run_point(Fixture& fixture, int tokens, const Options& options, bench::L2Fl
     DeviceBuffer workspace(ops::moe_experts_workspace_bytes(g_geometry.shape,
         max_jobs, entries, tokens, options.a16 ? moe::ExpertActivation::kA16 : moe::ExpertActivation::kA4,
         options.wide_a16));
+    // A fixed pattern in the workspace, so that no call depends on what an earlier width's call left in this memory.
+    if (options.fill_workspace >= 0) { bench::fill_bytes(workspace.p, options.fill_workspace, workspace.bytes); }
     for (const bool staged : {false, true}) {
         if ((staged && options.placement == "frames") || (!staged && options.placement == "staged")) { continue; }
         ops::MoeExpertSource source = fixture.source(staged);
@@ -437,14 +445,38 @@ void run_point(Fixture& fixture, int tokens, const Options& options, bench::L2Fl
         const auto launch = [&](cudaStream_t s) {
             ops::moe_experts(tx, dispatch, source, g_geometry.top_k, max_jobs, workspace.p, out, s);
         };
+        // A sentinel no output can hold (0xFFFF, a BF16 NaN with every payload bit set; the kernels write the
+        // canonical 0x7FC0) shows entries that no launch wrote, which the hash would otherwise read uninitialized.
+        bench::fill_bytes(outputs.p, 0xFF, outputs.bytes);
         const auto timing = options.cold ? bench::measure_cold_launch(launch, *flush, stream, options.warmup, options.repeat)
                                          : bench::measure_launch(launch, stream, options.warmup, options.repeat);
         const double tflops = g_geometry.expert_flops() * wide_entries / (timing.median_us * 1e-6) / 1e12;
         // FNV-1a of the outputs: equal hashes mean bit-identical results across kernel versions.
         std::vector<std::uint8_t> bytes(outputs.bytes);
-        CUDA_CHECK(cudaMemcpy(bytes.data(), outputs.p, outputs.bytes, cudaMemcpyDeviceToHost));
+        bench::read_back(bytes.data(), outputs.p, outputs.bytes);
         std::uint64_t hash = 1469598103934665603ULL;
         for (const std::uint8_t b : bytes) { hash = (hash ^ b) * 1099511628211ULL; }
+        std::size_t unwritten = 0;
+        for (std::size_t i = 0; i + 1 < bytes.size(); i += 2) { unwritten += bytes[i] == 0xFF && bytes[i + 1] == 0xFF; }
+        if (unwritten > 0) { std::printf("T=%5d: %zu output values never written\n", tokens, unwritten); }
+        if (!options.dump.empty()) {
+            // int32 header {tokens, entries, experts, top_k, hidden, pass_jobs}, offsets [experts + 1], jobs
+            // [experts], entries [entries], then the BF16 outputs [entries][hidden] (by routed entry).
+            std::vector<std::int32_t> jobs(g_geometry.experts), order(entries);
+            bench::read_back(jobs.data(), dispatch.jobs, jobs.size() * sizeof(std::int32_t));
+            bench::read_back(order.data(), dispatch.entries, order.size() * sizeof(std::int32_t));
+            const std::int32_t header[6] = {tokens, entries, g_geometry.experts, g_geometry.top_k, g_geometry.shape.hidden,
+                                            options.staging_slots};
+            const std::string path = options.dump + "_T" + std::to_string(tokens) + (staged ? "_staged" : "_frames") + ".bin";
+            std::FILE* file = std::fopen(path.c_str(), "wb");
+            if (file == nullptr) { throw std::runtime_error("cannot write " + path); }
+            std::fwrite(header, sizeof header, 1, file);
+            std::fwrite(offsets.data(), sizeof(std::int32_t), offsets.size(), file);
+            std::fwrite(jobs.data(), sizeof(std::int32_t), jobs.size(), file);
+            std::fwrite(order.data(), sizeof(std::int32_t), order.size(), file);
+            std::fwrite(bytes.data(), 1, bytes.size(), file);
+            std::fclose(file);
+        }
         std::printf("T=%5d placement=%-6s experts used %3d (wide %3d, narrow %3d, largest %4d) wide entries %6d of %6d | "
                     "moe_experts median %9.1f us (min %9.1f, p95 %9.1f) | x48 layers %7.3f s | wide %.1f TFLOP/s | "
                     "output fnv1a %016llx\n",

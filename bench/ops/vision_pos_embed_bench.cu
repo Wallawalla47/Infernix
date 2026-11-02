@@ -106,8 +106,8 @@ void run(std::int32_t patches, bool control, bool profile_once) {
     }
     DeviceBuffer di(indices.size() * sizeof(std::int32_t));
     DeviceBuffer dw(weights.size() * sizeof(float));
-    cudaMemcpy(di.p, indices.data(), di.bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(dw.p, weights.data(), dw.bytes, cudaMemcpyHostToDevice);
+    upload(di.p, indices.data(), di.bytes);
+    upload(dw.p, weights.data(), dw.bytes);
     SavedBuffer initial(x);
     const auto restore = [&](cudaStream_t stream) { initial.restore(stream); };
     Tensor ttable(table.p, DType::BF16, {kD, kRows});

@@ -122,9 +122,9 @@ struct Case {
             he[i]           = hs[i] + count;
             live += count;
         }
-        CUDA_CHECK(cudaMemcpy(lanes.p, hl.data(), b * 4, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(starts.p, hs.data(), b * 4, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(ends.p, he.data(), b * 4, cudaMemcpyHostToDevice));
+        bench::upload(lanes.p, hl.data(), b * 4);
+        bench::upload(starts.p, hs.data(), b * 4);
+        bench::upload(ends.p, he.data(), b * 4);
     }
 
     void launch(cudaStream_t stream) { ops::prepare_ragged_prefix(x, l, s, e, y, p, n, stream); }

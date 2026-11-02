@@ -54,11 +54,42 @@ inline DeviceBuffer make_f32(std::size_t n, std::uint64_t seed, float low, float
     return result;
 }
 
+// Fixture transfers ordered against every stream: each waits for all work issued before it and has landed when it
+// returns. A legacy-stream cudaMemcpy from pageable memory may return before its DMA lands, and cudaMemset or a
+// device-to-device cudaMemcpy before it runs, while the benches launch on non-blocking streams (DeviceContext's,
+// bench_loop_prepared's, ...), which order neither after nor before the legacy stream: an Op could read a partly
+// written operand, or a transfer overwrite one an earlier launch still reads. infernix_offloaded_moe_wide_bench's
+// routing read its logits still landing and changed every output of later widths run to run (2026-11-02). Setup only:
+// never inside a timed region.
+inline void upload(void* destination, const void* source, std::size_t bytes) {
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(destination, source, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+inline void fill_bytes(void* destination, int value, std::size_t bytes) {
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemset(destination, value, bytes));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+inline void copy_device(void* destination, const void* source, std::size_t bytes) {
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(destination, source, bytes, cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+// A readback of what work on any stream wrote: a legacy-stream cudaMemcpy does not wait for non-blocking streams.
+inline void read_back(void* destination, const void* source, std::size_t bytes) {
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(destination, source, bytes, cudaMemcpyDeviceToHost));
+}
+
 // Snapshot only mutable operands. Restore is setup, never part of a timed Op.
 class SavedBuffer {
 public:
     explicit SavedBuffer(DeviceBuffer& buffer) : destination_(buffer.p), initial_(buffer.bytes) {
-        CUDA_CHECK(cudaMemcpy(initial_.p, buffer.p, buffer.bytes, cudaMemcpyDeviceToDevice));
+        copy_device(initial_.p, buffer.p, buffer.bytes);
     }
 
     void restore(cudaStream_t stream) const {

@@ -178,14 +178,13 @@ inline PackedQuantizedWeight make_nvfp4_rg16_weight(std::int32_t n, std::int32_t
     }
     // The codes and scales are the unit plane (low_bytes); the multiplier word is not counted.
     PackedQuantizedWeight result{DeviceBuffer(static_cast<std::size_t>(payload_bytes)), {}, unit_bytes, 0, 0, 0, 0};
-    CUDA_CHECK(cudaMemset(result.storage.p, 0, result.storage.bytes));
+    fill_bytes(result.storage.p, 0, result.storage.bytes);
     detail::fill_rg16_kernel<<<detail::launch_grid(unit_bytes), 256>>>(static_cast<std::uint8_t*>(result.storage.p),
                                                                        unit_bytes, seed);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     constexpr float kMultiplier = 3.0517578e-05F;
-    CUDA_CHECK(cudaMemcpy(static_cast<std::uint8_t*>(result.storage.p) + multiplier_offset, &kMultiplier,
-                          sizeof(kMultiplier), cudaMemcpyHostToDevice));
+    upload(static_cast<std::uint8_t*>(result.storage.p) + multiplier_offset, &kMultiplier, sizeof(kMultiplier));
 
     Weight& weight            = result.weight;
     weight.payload            = result.storage.p;
@@ -243,7 +242,7 @@ inline PackedQuantizedWeight make_row_split_weight(QType qtype, std::int32_t n, 
         scale_offset,
         scale_bytes,
     };
-    CUDA_CHECK(cudaMemset(result.storage.p, 0, result.storage.bytes));
+    fill_bytes(result.storage.p, 0, result.storage.bytes);
     const int bits = qtype == QType::Q4_G64_FP16   ? 4
                      : qtype == QType::Q5_G64_FP16 ? 5
                      : qtype == QType::Q6_G64_FP16 ? 6
@@ -308,7 +307,7 @@ inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
         scale_offset,
         scale_bytes,
     };
-    CUDA_CHECK(cudaMemset(result.storage.p, 0, result.storage.bytes));
+    fill_bytes(result.storage.p, 0, result.storage.bytes);
     constexpr float kWeightDivisor = 128.0F;
     detail::fill_nvfp4_weight_kernel<<<detail::launch_grid(code_bytes), 256>>>(
         static_cast<std::uint8_t*>(result.storage.p),
@@ -316,8 +315,7 @@ inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
         kWeightDivisor);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(static_cast<std::uint8_t*>(result.storage.p) + divisor_offset,
-                          &kWeightDivisor, sizeof(kWeightDivisor), cudaMemcpyHostToDevice));
+    upload(static_cast<std::uint8_t*>(result.storage.p) + divisor_offset, &kWeightDivisor, sizeof(kWeightDivisor));
 
     Weight& weight              = result.weight;
     weight.payload              = result.storage.p;
@@ -368,7 +366,7 @@ inline PackedQuantizedWeight make_fp8_weight(std::int32_t n, std::int32_t k,
         scale_offset,
         scale_bytes,
     };
-    CUDA_CHECK(cudaMemset(result.storage.p, 0, result.storage.bytes));
+    fill_bytes(result.storage.p, 0, result.storage.bytes);
     auto* scale_plane = static_cast<std::uint8_t*>(result.storage.p) + scale_offset;
     if (f32) {
         detail::fill_fp8_weight_kernel<<<detail::launch_grid(code_bytes), 256>>>(
@@ -434,7 +432,7 @@ inline PackedQuantizedWeight make_mxfp8_weight(std::int32_t n, std::int32_t k, s
     PackedQuantizedWeight result{
         DeviceBuffer(static_cast<std::size_t>(payload_bytes)), {}, code_bytes, 0, 0, scale_offset, scale_bytes,
     };
-    CUDA_CHECK(cudaMemset(result.storage.p, 0, result.storage.bytes));
+    fill_bytes(result.storage.p, 0, result.storage.bytes);
     auto* base = static_cast<std::uint8_t*>(result.storage.p);
     detail::fill_mxfp8_weight_kernel<<<detail::launch_grid(code_bytes), 256>>>(base, base + scale_offset, code_bytes,
                                                                                scale_bytes, seed);

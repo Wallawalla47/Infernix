@@ -58,7 +58,7 @@ std::vector<int> parse_csv(const char* value) {
 
 DeviceBuffer copy_positions(const std::vector<std::int32_t>& host) {
     DeviceBuffer device(host.size() * sizeof(std::int32_t));
-    cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice);
+    upload(device.p, host.data(), device.bytes);
     return device;
 }
 
