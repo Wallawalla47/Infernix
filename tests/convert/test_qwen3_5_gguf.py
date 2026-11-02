@@ -260,6 +260,13 @@ def test_inexact_or_inconsistent_ggufs_are_refused(tmp_path):
     with pytest.raises(ValueError, match="cannot be recovered exactly"):
         model.parameters["text/layers/0/gdn/a_log"].source.values()
 
+    # Quantized GDN control projections (some third-party GGUFs; Strata #3925): Qwen3.5's control step reads BF16, which
+    # a Q8_0 row cannot match exactly, so the import is refused with the reason and the alternatives.
+    gates = dict(tensors)
+    gates["blk.0.ssm_alpha.weight"] = (gates["blk.0.ssm_alpha.weight"][0], True)
+    with pytest.raises(ValueError, match="ssm_alpha.weight: stored as Q8_0; .* cannot be imported bit-exactly"):
+        build("gates", gates)
+
 
 def test_value_head_columns_move_whole_blocks_only():
     matrix = array_source(torch.arange(2 * 4 * 32, dtype=torch.float64).reshape(2, 128), "m")
