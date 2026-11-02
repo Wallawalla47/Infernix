@@ -523,6 +523,15 @@ content bytes after the separator publish as generated, with no unbounded trimmi
 whitespace. A line break directly before the close token is framing too (the canonical serialization
 is `\n</think>\n\n`) and is not published as reasoning.
 
+A Qwen tool grammar also withholds the `<tool_call>` token from the reasoning branch
+(`ReasoningFraming::withheld_token`): a call written there would never run, and since EOS is refused
+until the reasoning closes, the model could not end the turn and would write on to its thinking budget
+(ninferpro measured turns of 65 and 145 such calls). With the token refused, the model closes its
+thinking and calls after it. The token's spelling in ordinary tokens stays reasoning text, as
+`</think>`'s does; an assistant continuation holding the token inside its reasoning is not a prefix of
+the grammar, and a `--thinking-budget-message` holding it is refused at startup (the budget's control
+span is reasoning that passes the same grammar).
+
 Free reasoning cannot reach a different phase in decoder and matcher: `</think>` spelled with ordinary
 tokens is reasoning in both, and the close token without the separator is refused by the grammar. The
 separator is matched at the byte level after the token, so a token that holds both the end of the

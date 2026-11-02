@@ -349,8 +349,13 @@ compile_tool_grammar(text::GrammarCompiler& compiler, const Contract& contract,
         companion = std::make_unique<ToolCallRules>(compiler.vocabulary(), compiler.tag_end_tokens(), tool_call_token,
                                                     reasoning, body.has_value() && !contract.required, names, quotes);
     }
+    // The reasoning may not write the `<tool_call>` token: a call there never runs, and the reasoning,
+    // which cannot end the turn, would go on to its budget. Its spelling in ordinary tokens stays
+    // reasoning text, as `</think>`'s does.
+    text::ReasoningFraming framing = reasoning;
+    framing.withheld_token         = tool_call_token;
     return compiler.compile_model(
-        identity.dump(), [&] { return build(contract, body, tool_call_token); }, reasoning,
+        identity.dump(), [&] { return build(contract, body, tool_call_token); }, framing,
         continuation, std::move(companion));
 }
 } // namespace infernix::models::qwen3_5::frontend

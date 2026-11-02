@@ -23,10 +23,13 @@ namespace infernix::text {
 // The model's reasoning ahead of a constrained output: any tokens but the close token, then that
 // token and the fixed separator bytes the output starts after. Only the close token's identity
 // ends the reasoning, never its spelling in ordinary tokens. Without a close token the output
-// starts at once.
+// starts at once. `withheld_token` is a token the reasoning may not write either: a Qwen tool
+// grammar withholds `<tool_call>`, since a call written there never runs and the reasoning, which
+// cannot end the turn, would go on to its budget.
 struct ReasoningFraming {
     std::optional<std::int32_t> close_token;
     std::string_view separator;
+    std::optional<std::int32_t> withheld_token;
 };
 
 // A request's companion to its grammar for rules the context-free grammar cannot express (Qwen
