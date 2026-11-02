@@ -727,6 +727,11 @@ public:
                 throw std::invalid_argument(std::string(control_name) +
                                             " contains a default terminal token");
             }
+            // The control is reasoning, which a tool grammar keeps free of the call token.
+            if (token == markers.tool_call) {
+                throw std::invalid_argument(std::string(control_name) +
+                                            " contains the <tool_call> token");
+            }
         }
         thinking_control_tokens = std::make_shared<const std::vector<TokenId>>(std::move(encoded));
     }
@@ -1177,6 +1182,11 @@ std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
 std::string Frontend::detokenize(std::span<const TokenId> token_ids) const {
     if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
     return impl_->tokenizer->decode(token_ids);
+}
+
+std::string Frontend::detokenize_bytes(std::span<const TokenId> token_ids) const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    return impl_->tokenizer->decode_bytes(token_ids);
 }
 
 ChatTokens Frontend::tokenize_chat(PromptInput input) const {

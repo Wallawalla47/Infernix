@@ -946,17 +946,23 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
     return encoded;
 }
 
-std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) const {
+std::string Tokenizer::decode_bytes(std::span<const int> ids, DecodeOptions options) const {
     std::string text;
     const std::size_t terminal_stop_index =
         (!ids.empty() && is_stop_token_id(options.stop_token_ids, ids.back())) ? ids.size() - 1
                                                                                : ids.size();
 
+    text.reserve(ids.size());
     for (std::size_t i = 0; i < ids.size(); ++i) {
         const int id = ids[i];
         if (i == terminal_stop_index) { continue; }
         text += decode_token_bytes(id, options.skip_special_tokens);
     }
+    return text;
+}
+
+std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) const {
+    std::string text = decode_bytes(ids, std::move(options));
     (void)uni::utf8_codepoints(text, "Tokenizer::decode reconstructed output");
     return text;
 }

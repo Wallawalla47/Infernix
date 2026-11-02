@@ -21,15 +21,17 @@ void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
-// Byte tokens 0-255, EOS 256 and the model's `<tool_call>` token.
+// Byte tokens 0-255, EOS 256, the model's `<tool_call>` token and its `</think>` token.
 constexpr std::int32_t kEos      = 256;
 constexpr std::int32_t kToolCall = 257;
+constexpr std::int32_t kThinkEnd = 258;
 
 infernix::text::GrammarCompiler compiler() {
     std::vector<std::string> tokens;
     for (int i = 0; i < 256; ++i) tokens.emplace_back(1, static_cast<char>(i));
     tokens.emplace_back();
     tokens.emplace_back(frontend::kToolCallOpen);
+    tokens.emplace_back("</think>");
     return {std::move(tokens), {kEos}, 32 * 1024 * 1024};
 }
 
@@ -363,12 +365,60 @@ void quoted_closers(infernix::text::GrammarCompiler& compiled) {
     require(!accepts(compiled, *bounded, call(document)), "a bounded string held quoted closing lines");
 }
 
+// Inside the reasoning a tool grammar refuses the `<tool_call>` token, which could never open a call
+// there and would leave the model unable to end the turn (EOS is refused until the reasoning closes;
+// ninferpro's incident: 65 and 145 calls written inside thinking). Its spelling in ordinary tokens stays
+// reasoning text; after `</think>` and the separator the token opens calls as before. An assistant
+// continuation holding the token inside the reasoning is not a prefix of the grammar.
+void calls_in_thinking(infernix::text::GrammarCompiler& compiled) {
+    const infernix::text::ReasoningFraming thinking{.close_token = kThinkEnd, .separator = "\n\n"};
+    infernix::ToolChoice required;
+    required.mode = infernix::ToolChoiceMode::Required;
+    const auto allowed = [](const std::vector<std::uint32_t>& words, std::int32_t token) {
+        return (words[static_cast<std::size_t>(token) / 32] >> (token % 32) & 1U) != 0;
+    };
+    for (const bool strict : {false, true}) {
+        for (const auto& choice : {infernix::ToolChoice{}, required}) {
+            const auto bound = contract(schema({{"type", "string"}}), strict, choice);
+            auto matcher     = frontend::compile_tool_grammar(compiled, *bound, kToolCall, thinking, {});
+            std::vector<std::uint32_t> words(matcher->mask_words());
+            const auto step = [&](std::int32_t token) {
+                require(matcher->masks({}, words) == 0 && allowed(words, token),
+                        "the grammar refused a token of the reasoning or of the call after it");
+                matcher->accept(token);
+                matcher->confirm();
+            };
+            for (const std::int32_t token : tokens("Let me check the file. ")) { step(token); }
+            require(matcher->masks({}, words) == 0 && !allowed(words, kToolCall) && !allowed(words, kEos) &&
+                        allowed(words, kThinkEnd),
+                    "the reasoning admitted the call token or the end, or refused its close");
+            for (const std::int32_t token : tokens("```\n" + call("a"), true)) { step(token); }
+            require(matcher->masks({}, words) == 0 && !allowed(words, kToolCall) && !allowed(words, kEos),
+                    "a call spelled in ordinary tokens left the reasoning");
+            step(kThinkEnd);
+            for (const std::int32_t token : tokens("\n\n")) { step(token); }
+            for (const std::int32_t token : tokens(call("a"))) { step(token); }
+            require(matcher->masks({}, words) == 0 && allowed(words, kEos),
+                    "a call after the reasoning did not complete the turn");
+        }
+    }
+    const auto automatic = contract(schema({{"type", "string"}}), false);
+    bool refused         = false;
+    try {
+        std::vector<std::int32_t> continuation = tokens("Plan: ");
+        continuation.push_back(kToolCall);
+        (void)frontend::compile_tool_grammar(compiled, *automatic, kToolCall, thinking, continuation);
+    } catch (const infernix::RequestError&) { refused = true; }
+    require(refused, "a continuation with the call token inside the reasoning was accepted");
+}
+
 void run() {
     auto compiled = compiler();
     basic_contracts(compiled);
     selected_contracts(compiled);
     quoted_calls(compiled);
     quoted_closers(compiled);
+    calls_in_thinking(compiled);
     infernix::ToolChoice required;
     required.mode = infernix::ToolChoiceMode::Required;
     auto fixed =

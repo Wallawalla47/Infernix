@@ -541,12 +541,19 @@ while all declarations retain their original order in the prompt. Requests with 
 The model can answer normally or start a tool call; a call must use the model's tool framing and a
 declared function name. A `<tool_call>` token inside Markdown code of the answer (the rules above)
 is a quoted example: the answer goes on as text and the token's spelling publishes as content.
+While the model is thinking, the constraint refuses the `<tool_call>` token: a call written inside
+the thinking would never run, and the turn cannot end before the thinking closes, so the model
+closes its thinking first and calls after it.
 
 Non-strict parameter names and order remain open. Their schema supplies the existing value
 normalization hints; it is not compiled as a strict constraint. Open objects, root unions, and
-unsupported schema assertions therefore remain usable. A call names each parameter at most once
-(the constraint refuses a repeated name), so the published JSON object, streamed or whole, contains
-each key once. `strict:true` additionally enforces the parameter contract below.
+unsupported schema assertions therefore remain usable. A root `oneOf` / `anyOf` of object variants
+(a zod or Pydantic discriminated union) supplies its variants' properties as hints too: a name takes
+the union of the types its variants give it, so a string-typed field keeps `2026` or `true` as text;
+a variant that leaves it untyped, or a branch that cannot be read, leaves the value text to decide.
+A call names each parameter at most once (the constraint refuses a repeated name), so the published
+JSON object, streamed or whole, contains each key once. `strict:true` additionally enforces the
+parameter contract below.
 
 Top-level `tool_constraints:"auto"` opts into request-driven constraints: ordinary non-strict
 `tool_choice:"auto"` then uses free generation. Strict tools, selection/count restrictions, and
@@ -1724,7 +1731,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--default-max-tokens N` | output limit when omitted by a request; startup logs an `output limit` note when `--max-context` is at least four times it | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests, lowered by the answer room where it would leave the answer less | unset |
 | `--no-thinking-answer-room` | thinking may use all of the output limit (by default, from an output limit of 1,024, it closes early enough to leave a quarter for the answer: with no budget, under `--default-thinking-budget`, or with a request budget at or above the limit; the limit is `max_tokens` or the context the prompt leaves, whichever is less) | answer room on |
-| `--thinking-budget-message S` | text committed when a thinking budget ends thinking, replacing Qwen's early-close guidance; the close marker is appended when `S` lacks it, and `S` may contain `</think>` only as that final close | Qwen guidance |
+| `--thinking-budget-message S` | text committed when a thinking budget ends thinking, replacing Qwen's early-close guidance; the close marker is appended when `S` lacks it, and `S` may contain `</think>` only as that final close and no `<tool_call>` token | Qwen guidance |
 | `--reasoning-loop MODE` | `off`, `stop` or `conclude`: reasoning-loop guard for thinking requests without a token constraint (details under [OpenAI Chat Completions](#openai-chat-completions)) | `off` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--vision-offload auto\|on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; `on` requires `--vision`. `auto` is on for artifacts with offloaded experts, Qwen3.8-Flash-Next and Qwen3.5-122B-A10B (the expert cache lends the encode memory), and off for the other Qwen3.5 artifacts | `auto` |
@@ -2053,6 +2060,12 @@ prefix with its prompt (`common_prefix_tokens`) decides:
   window's first index; characters a cut splits become U+FFFD).
 - `kind: "evicted"`: that context is a prefix of the prompt (or the prompt of it), yet at least
   4,096 of its tokens were recomputed (`lost_reuse_tokens`): the cache had lost them.
+
+The window's `text` is always valid UTF-8: the window holds the artifact tokenizer's bytes for its
+token ids, and each run of them that cannot decode stands for one U+FFFD. The diagnosis is optional,
+so a request that could not be explained this way is logged with `prefix_miss: null` and
+`prefix_miss_diagnostic_failed: true` (the field is absent otherwise) rather than failing; the
+request itself succeeded either way.
 
 Both also give the earlier request's `earlier_engine_request_id` and `earlier_context_tokens`, and
 this request's `reused_tokens` and `computed_prefill_tokens`.

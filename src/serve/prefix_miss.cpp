@@ -14,11 +14,15 @@ std::size_t common_prefix(std::span<const infernix::TokenId> a, std::span<const 
                                     a.begin());
 }
 
-// A window cut can split a multi-byte character: such bytes become U+FFFD.
+// A window cut can split a multi-byte character: each run of bytes that cannot decode becomes one
+// U+FFFD, as the JSON writer's replacement policy defines it. Valid UTF-8 passes through unchanged.
 std::string valid_utf8(const std::string& text) {
     return RequestJson::parse(RequestJson(text).dump(-1, ' ', false, RequestJson::error_handler_t::replace))
         .get<std::string>();
 }
+
+// The text of a window whose bytes the decoder rejected outright.
+constexpr std::string_view kUndecodable = "\xef\xbf\xbd";
 
 } // namespace
 
@@ -37,16 +41,22 @@ PrefixMissWindow PrefixMissTracker::window(std::span<const infernix::TokenId> to
     out.first = static_cast<std::uint32_t>(first);
     out.token_ids.assign(tokens.begin() + static_cast<std::ptrdiff_t>(first),
                          tokens.begin() + static_cast<std::ptrdiff_t>(last));
-    out.text = valid_utf8(detokenize_(out.token_ids));
+    // The text is the one part of a window its cut can spoil, and the decoder the caller holds is
+    // allowed to reject the cut's bytes: that costs this text, never the tokens, the position or
+    // the record they explain.
+    try {
+        out.text = valid_utf8(detokenize_(out.token_ids));
+    } catch (const std::exception&) {
+        out.text = kUndecodable;
+        diagnostic_failures_.fetch_add(1, std::memory_order_relaxed);
+    }
     return out;
 }
 
-std::optional<PrefixMiss> PrefixMissTracker::settle(std::uint64_t engine_request_id,
-                                                    std::span<const infernix::TokenId> prompt,
-                                                    std::span<const infernix::TokenId> output,
-                                                    std::uint32_t reused_tokens,
-                                                    std::uint32_t computed_prefill_tokens) {
-    std::lock_guard lock(mutex_);
+// The record explaining `prompt` against the earlier contexts, or none. The caller holds mutex_.
+std::optional<PrefixMiss> PrefixMissTracker::diagnose(std::span<const infernix::TokenId> prompt,
+                                                      std::uint32_t reused_tokens,
+                                                      std::uint32_t computed_prefill_tokens) const {
     std::optional<PrefixMiss> miss;
     if (computed_prefill_tokens >= min_tokens_ && !prompt.empty()) {
         // The earlier context sharing the longest prefix (the latest on ties).
@@ -79,6 +89,24 @@ std::optional<PrefixMiss> PrefixMissTracker::settle(std::uint64_t engine_request
             }
         }
     }
+    return miss;
+}
+
+std::optional<PrefixMiss> PrefixMissTracker::settle(std::uint64_t engine_request_id,
+                                                    std::span<const infernix::TokenId> prompt,
+                                                    std::span<const infernix::TokenId> output,
+                                                    std::uint32_t reused_tokens,
+                                                    std::uint32_t computed_prefill_tokens) {
+    std::lock_guard lock(mutex_);
+    // The diagnosis is optional: whatever it cannot establish, it leaves the settled request's own
+    // context in place for the requests that follow.
+    std::optional<PrefixMiss> miss;
+    try {
+        miss = diagnose(prompt, reused_tokens, computed_prefill_tokens);
+    } catch (const std::exception&) {
+        miss.reset();
+        diagnostic_failures_.fetch_add(1, std::memory_order_relaxed);
+    }
     Context context{.engine_request_id = engine_request_id, .tokens = {}};
     context.tokens.reserve(prompt.size() + output.size());
     context.tokens.insert(context.tokens.end(), prompt.begin(), prompt.end());
@@ -86,6 +114,27 @@ std::optional<PrefixMiss> PrefixMissTracker::settle(std::uint64_t engine_request
     contexts_.push_back(std::move(context));
     while (contexts_.size() > capacity_) { contexts_.pop_front(); }
     return miss;
+}
+
+PrefixMissSettlement settle_prefix_miss(PrefixMissTracker& tracker,
+                                        const std::uint64_t engine_request_id,
+                                        std::span<const infernix::TokenId> prompt,
+                                        std::span<const infernix::TokenId> output,
+                                        const std::uint32_t reused_tokens,
+                                        const std::uint32_t computed_prefill_tokens) {
+    const std::uint64_t before = tracker.diagnostic_failures();
+    std::optional<PrefixMiss> miss;
+    bool abandoned = false;
+    try {
+        miss = tracker.settle(engine_request_id, prompt, output, reused_tokens,
+                              computed_prefill_tokens);
+    } catch (const std::exception&) {
+        // What the tracker itself could not attribute to one window: still only the diagnosis.
+        miss.reset();
+        abandoned = true;
+    }
+    return {.miss = std::move(miss),
+            .diagnostic_failed = abandoned || tracker.diagnostic_failures() != before};
 }
 
 } // namespace infernix::serve

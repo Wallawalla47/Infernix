@@ -101,12 +101,14 @@ std::string quoted(unsigned char c) {
     return result;
 }
 
-// Free reasoning is any token but the close token; the close token then requires the separator.
-// Its spelling in ordinary tokens stays reasoning, as in the output decoder. Concatenation keeps
-// the user's rule names in their own namespace.
+// Free reasoning is any token but the close token (and the withheld token, if any); the close token
+// then requires the separator. Its spelling in ordinary tokens stays reasoning, as in the output
+// decoder. Concatenation keeps the user's rule names in their own namespace.
 xgrammar::Grammar reasoning_prefix(const ReasoningFraming& framing) {
     const std::string close = std::to_string(*framing.close_token);
-    std::string source = "root ::= reasoning\nreasoning ::= ExcludeToken(" + close +
+    std::string excluded    = close;
+    if (framing.withheld_token) { excluded += ", " + std::to_string(*framing.withheld_token); }
+    std::string source = "root ::= reasoning\nreasoning ::= ExcludeToken(" + excluded +
                          ") reasoning | Token(" + close + ")";
     for (unsigned char c : framing.separator) { source += " " + quoted(c); }
     return xgrammar::Grammar::FromEBNF(source + "\n");
@@ -116,7 +118,8 @@ xgrammar::Grammar reasoning_prefix(const ReasoningFraming& framing) {
 std::string framing_key(const ReasoningFraming& framing) {
     if (!framing.close_token) { return "-:"; }
     return std::to_string(*framing.close_token) + ":" + std::to_string(framing.separator.size()) +
-           ":" + std::string(framing.separator);
+           ":" + std::string(framing.separator) + ":" +
+           (framing.withheld_token ? std::to_string(*framing.withheld_token) : "-");
 }
 
 void validate(const xgrammar::Grammar& grammar, const std::vector<std::string>& vocab,

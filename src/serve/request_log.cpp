@@ -745,6 +745,10 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
                                          {"scheduling", scheduling_json(outcome.scheduling)},
                                          {"admission", admission_json(outcome.admission)}};
     record["prefix_miss"] = prefix_miss_json(outcome.prefix_miss);
+    // Only a request whose diagnosis gave up says so, so every other record stays as it was.
+    if (outcome.prefix_miss_diagnostic_failed) {
+        record["prefix_miss_diagnostic_failed"] = true;
+    }
     return record.dump();
 }
 
