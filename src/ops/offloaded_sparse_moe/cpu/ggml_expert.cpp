@@ -882,6 +882,9 @@ inline void a8_decode20(const std::uint8_t* row, Weights (&w)[kGgmlHSlices], __m
                             std::uint16_t* const* h) {                                                                  \
             constexpr int P        = a8::kGateUpPartials;                                                               \
             const std::uint8_t* up = record + static_cast<std::size_t>(kIntermediate) * row_bytes;                      \
+            /* Each column's gate and up outputs of up to 16 rows, then their SwiGLU eight at a time. */                \
+            std::uint16_t gate[kMaxColumns][16], value[kMaxColumns][16];                                                \
+            int first = i_begin;                                                                                        \
             for (int i = i_begin; i < i_end; ++i) {                                                                     \
                 const std::uint8_t* g = record + static_cast<std::size_t>(i) * row_bytes;                               \
                 const std::uint8_t* u = up + static_cast<std::size_t>(i) * row_bytes;                                   \
@@ -907,8 +910,14 @@ inline void a8_decode20(const std::uint8_t* row, Weights (&w)[kGgmlHSlices], __m
                     }                                                                                                   \
                 }                                                                                                       \
                 for (int c = 0; c < ncols; ++c) {                                                                       \
-                    h[c][i] = canon::swiglu_bf16(a8_output<F>(a8_butterfly16(acc[c][0], acc[c][1])),                    \
-                                                 a8_output<F>(a8_butterfly16(acc[c][2], acc[c][3])));                   \
+                    gate[c][i - first]  = a8_output<F>(a8_butterfly16(acc[c][0], acc[c][1]));                           \
+                    value[c][i - first] = a8_output<F>(a8_butterfly16(acc[c][2], acc[c][3]));                           \
+                }                                                                                                       \
+                if (i + 1 - first == 16 || i + 1 == i_end) {                                                            \
+                    for (int c = 0; c < ncols; ++c) {                                                                   \
+                        swiglu_bf16_n(CpuIsa::kAvx2, gate[c], value[c], i + 1 - first, &h[c][first]);                   \
+                    }                                                                                                   \
+                    first = i + 1;                                                                                      \
                 }                                                                                                       \
             }                                                                                                           \
         }                                                                                                               \
@@ -1030,6 +1039,9 @@ void a8_avx512_gate_up(const std::uint8_t* record, int row_bytes, const CpuA8Sli
                        const float (*xd)[kGgmlXSlices], int ncols, int i_begin, int i_end, std::uint16_t* const* h) {
     constexpr int P        = a8::kGateUpPartials;
     const std::uint8_t* up = record + static_cast<std::size_t>(kIntermediate) * row_bytes;
+    // Each column's gate and up outputs of up to 16 rows, then their SwiGLU eight at a time.
+    std::uint16_t gate[kMaxColumns][16], value[kMaxColumns][16];
+    int first = i_begin;
     for (int i = i_begin; i < i_end; ++i) {
         const std::uint8_t* g = record + static_cast<std::size_t>(i) * row_bytes;
         const std::uint8_t* u = up + static_cast<std::size_t>(i) * row_bytes;
@@ -1049,8 +1061,14 @@ void a8_avx512_gate_up(const std::uint8_t* record, int row_bytes, const CpuA8Sli
             }
         }
         for (int c = 0; c < ncols; ++c) {
-            h[c][i] = canon::swiglu_bf16(a8_output<F>(a8_butterfly16(_mm512_castps512_ps256(accg[c]), a8_high256(accg[c]))),
-                                         a8_output<F>(a8_butterfly16(_mm512_castps512_ps256(accu[c]), a8_high256(accu[c]))));
+            gate[c][i - first]  = a8_output<F>(a8_butterfly16(_mm512_castps512_ps256(accg[c]), a8_high256(accg[c])));
+            value[c][i - first] = a8_output<F>(a8_butterfly16(_mm512_castps512_ps256(accu[c]), a8_high256(accu[c])));
+        }
+        if (i + 1 - first == 16 || i + 1 == i_end) {
+            for (int c = 0; c < ncols; ++c) {
+                swiglu_bf16_n(CpuIsa::kAvx2, gate[c], value[c], i + 1 - first, &h[c][first]);
+            }
+            first = i + 1;
         }
     }
 }
@@ -1215,12 +1233,14 @@ void ggml_gate_up(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat
             ggml_row_sums(isa, format.gate_up, record, row_bytes, kGgmlXSlices, i0, i1, x, ncols, g);
             ggml_row_sums(isa, format.gate_up, up, row_bytes, kGgmlXSlices, i0, i1, x, ncols, u);
         }
-        for (int i = i0; i < i1; ++i) {
-            for (int c = 0; c < ncols; ++c) {
+        for (int c = 0; c < ncols; ++c) {
+            std::uint16_t gate[kUnit], value[kUnit];
+            for (int i = i0; i < i1; ++i) {
                 const std::size_t at = static_cast<std::size_t>(i - i0) * ncols + c;
-                h[c][i] = canon::swiglu_bf16(ggml::output_bf16(g[at], x_emax[c], format.gate_up),
-                                             ggml::output_bf16(u[at], x_emax[c], format.gate_up));
+                gate[i - i0]  = ggml::output_bf16(g[at], x_emax[c], format.gate_up);
+                value[i - i0] = ggml::output_bf16(u[at], x_emax[c], format.gate_up);
             }
+            swiglu_bf16_n(isa, gate, value, i1 - i0, &h[c][i0]);
         }
     }
 }
