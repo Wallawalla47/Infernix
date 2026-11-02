@@ -1169,7 +1169,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     return out;
 }
 
-void validate_target_options(const execution::Parameters& parameters, DeviceContext& device,
+void validate_target_options(const execution::Parameters& parameters,
                              const EngineOptions& options) {
     if (!parameters.model.config().text.attention ||
         parameters.model.config().text.full_attention_layers == 0) {
@@ -1281,9 +1281,6 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             throw std::invalid_argument("tree verification requires single FP8, NVFP4 or Q8 "
                                         "GDN input projections");
         }
-    }
-    if (device.compute_capability() != 120) {
-        throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
     }
     if (options.speculative.ngram_draft_tokens != 0 &&
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&
@@ -1665,7 +1662,7 @@ std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options, std::uint32_t idle_prefill_width,
                            const ProgramOffloadOptions* offload) {
-    validate_target_options(parameters, device, options);
+    validate_target_options(parameters, options);
     if (idle_prefill_width != 0) {
         const std::vector<std::uint32_t> widths = idle_prefill_widths_impl(parameters, options);
         if (std::find(widths.begin(), widths.end(), idle_prefill_width) == widths.end()) {

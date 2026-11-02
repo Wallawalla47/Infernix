@@ -46,6 +46,14 @@ constexpr std::size_t kLosslessStackBytes = 1536;
 DeviceContext initialize_device(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
     DeviceContext device(options.device);
+    // Every kernel is built for sm_120a alone: another GPU is refused by name here, before the artifact is read, rather
+    // than at its first kernel launch after a long load (candidates IH-01).
+    if (device.compute_capability() != 120) {
+        throw std::runtime_error("Infernix needs an NVIDIA GPU of compute capability 12.0 (sm_120a: GeForce RTX 50 "
+                                 "series, RTX PRO Blackwell); device " + std::to_string(options.device) + ", " +
+                                 device.props.name + ", is compute capability " + std::to_string(device.props.major) +
+                                 "." + std::to_string(device.props.minor));
+    }
     const std::size_t stack = options.lossless ? kLosslessStackBytes : kStackBytes;
     device.bind_to_current_thread();
     if (const cudaError_t err = cudaDeviceSetLimit(cudaLimitStackSize, stack); err != cudaSuccess) {
