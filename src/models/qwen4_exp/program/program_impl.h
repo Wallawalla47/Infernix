@@ -1505,9 +1505,12 @@ public:
         // not the reference.
         if (cpu_service_) {
             measure_cpu_rate_settled(record_stride);
+            const auto [wide_share, wide_from] = wide_link_share();
             for (auto& channel : experts.cpu) {
-                channel.pcie_divisor = pcie_divisor();
-                channel.pcie_share   = pcie_share();
+                channel.pcie_divisor    = pcie_divisor();
+                channel.pcie_share      = pcie_share();
+                channel.wide_share      = wide_share;
+                channel.wide_share_from = wide_from;
             }
         }
         if (!options_.route_trace.empty()) {
@@ -6148,8 +6151,8 @@ private:
     // decode_link_share_256): FP4-Local's 67/256 against the divisor rule's 1/3, with the tensor-core narrow experts,
     // decoded the community struct fixture +6.3 %, short context +5.4 % and after a 16K prompt +0.1 % (DFlash2 auto,
     // three interleaved pairs each, every struct and short-context pair ahead, 2026-10-30; with the dp4a experts the
-    // rule had been level or ahead). INFERNIX_TMP_LINK_SHARE=divisor keeps them on the divisor rule. GGUF and W4A4
-    // banks keep the rule (unmeasured).
+    // rule had been level or ahead). INFERNIX_TMP_LINK_SHARE=divisor keeps them on the divisor rule. GGUF banks keep
+    // the rule (unmeasured), W4A4 banks the rule below eight columns (wide_link_share).
     [[nodiscard]] int pcie_share() const noexcept {
         if (options_.cpu_pcie_divisor > 0) { return 0; }
         const auto& switches = temporary_switches::offload();
@@ -6161,6 +6164,28 @@ private:
         }
         return runtime::expert_offload::link_share_256(switches, link_bytes_per_second_, cpu_expert_rate(), record);
     }
+
+    // The link's share in 256ths of the host-memory misses of decode calls of at least `from` columns, and `from`
+    // (MoeCpuChannel::wide_share, wide_share_from); {0, 0}: every width takes pcie_share / pcie_divisor. NVFP4 banks
+    // keep 51/256 of a call's misses on the link from eight columns instead of their one-column rule (W4A4 the divisor
+    // rule's 1/3, W4A16 the share form's 67/256 on FP4-Local): a CPU expert's cost past its first column is its
+    // compute, which the one-column rate the rules take hides (team bench, 2026-11-02, one worker: W4A4 a column 128 us
+    // past the first, against 205 us for a one-column expert), so wide verification rounds give the CPU more.
+    // FP4-Local, DFlash2 auto, three interleaved pairs each (2026-11-02). --expert-a4-activations against the divisor
+    // rule: 61/256 struct +3.6 % (every pair), after a 16K prompt +0.7 %, conv +0.3 %; from six columns after 16K
+    // -0.4 %; 41/256 struct +1.3 %; 73/256 at every width struct +4.1 % but after 16K -0.6 % (every pair); with the
+    // vector CPU kernels 51/256 level with 61/256 and 72/256 struct -1.3 %. W4A16 against the share form: 51/256 struct
+    // +2.5 %, conv +0.7 % (every pair), after 16K level; 61/256 struct +1.6 %. Dense8 against the divisor rule: struct
+    // +4.3 % (every pair), after 16K +1.7 %, conv +0.5 %. A fixed cpu_pcie_divisor or an INFERNIX_TMP_LINK_SHARE share
+    // leaves every width alone.
+    [[nodiscard]] std::pair<std::int32_t, std::int32_t> wide_link_share() const {
+        const auto& bank = *parameters_.layers.front().moe.bank;
+        const bool fixed = options_.cpu_pcie_divisor > 0 ||
+                           temporary_switches::offload().link_share != temporary_switches::OffloadSwitches::LinkShare::kDivisor;
+        if (fixed || bank.planes.gate_up_format != QType::NVFP4_MUL) { return {0, 0}; }
+        return {kWideLinkShare256, ops::offloaded_moe::kMaxColumns};
+    }
+    static constexpr std::int32_t kWideLinkShare256 = 51;
 
     [[nodiscard]] int pcie_divisor() const noexcept {
         if (options_.cpu_pcie_divisor > 0) { return options_.cpu_pcie_divisor; }
