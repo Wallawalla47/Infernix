@@ -761,7 +761,11 @@ messages received without reasoning, with or without the option, and
 `infernix_chat_reasoning_restored_total` counts those restored.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
-finish-reason chunk and `[DONE]`. A constrained tool call streams as `delta.tool_calls` chunks: the
+finish-reason chunk and `[DONE]`. The role chunk goes out with the stream's first event (with
+`return_progress`, the first prompt-progress chunk; otherwise the first output delta, or the finish
+of an answer with none), as OpenAI's does, so a client's time to its first chunk includes the
+prefill; until then a long prefill's heartbeat is an SSE comment (`: keep-alive`), which JSON chunk
+readers skip. A constrained tool call streams as `delta.tool_calls` chunks: the
 first carries the call's `index`, `id`, `type` and `function.name` with the first argument
 fragment, later ones its `index` and the next `function.arguments` fragment. Free tool output sends
 each call whole in one chunk before the finish reason. When `stream_options.include_usage` is true, a final empty
@@ -772,9 +776,9 @@ supported.
 
 A failure after the stream has started is sent as OpenAI does: one unnamed `data:` event whose
 payload is the usual error body (`{"error": {...}}`, which OpenAI SDKs raise as an API error), then
-the connection closes without a finish-reason chunk, usage chunk or `[DONE]`. A stream starts at
-Engine admission, so it carries only mid-generation failures: a queue timeout or an orderly stop
-before admission answers as a plain HTTP status on every route.
+the connection closes without a finish-reason chunk, usage chunk or `[DONE]`. A stream's response
+(status 200 and its headers) starts at Engine admission, so it carries only mid-generation failures:
+a queue timeout or an orderly stop before admission answers as a plain HTTP status on every route.
 
 ### llama.cpp-compatible request observations
 

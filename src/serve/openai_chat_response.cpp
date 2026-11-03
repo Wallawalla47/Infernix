@@ -207,7 +207,7 @@ std::string OpenAIChatStream::start() {
 }
 
 void OpenAIChatStream::note_start(const infernix::GenerationStart& start) {
-    if (!started_ || admitted_ || finished_ ||
+    if (admitted_ || finished_ ||
         start.reused_prompt_tokens > start.prompt.prompt_tokens) {
         throw std::logic_error("invalid OpenAI Chat generation-start state");
     }
