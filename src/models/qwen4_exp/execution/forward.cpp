@@ -267,8 +267,11 @@ void Forward::begin_call(const ForwardBatch& batch, const Tensor* logits) {
             throw std::invalid_argument("Qwen4Exp forward: layer waits do not match the layers");
         }
     }
-    // Prefill chunks and forced tokens run eagerly; decode and verification rounds may be captured.
-    eager_chunk_ = batch.verify == nullptr && batch.width > 1;
+    // Prefill chunks and forced tokens run eagerly; decode and verification rounds may be captured. A
+    // streamed call is a prefill chunk at any width: a layer walk's one-token chunk run as a decode call
+    // took its experts beside the span's stream ring and read 2.6-12 nats off its cold prefill
+    // (candidates SA-12; the walk keeps a one-token last call on its own for coalescing).
+    eager_chunk_ = batch.verify == nullptr && (batch.width > 1 || batch.stream);
     work_.reset();
 }
 

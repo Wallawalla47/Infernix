@@ -88,8 +88,10 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
     // span of streamed calls (as its own MoE group, walk_begin), so its experts are read from the span's ring
     // instead of being staged again right after it. It also puts a divergence inside that last call (a /v1/decide
     // fan-out's questions) inside a running span, where a sibling cannot coalesce (prefix_await_sibling). pp16413:
-    // IQ3_S +4.1 %, Dense8 +0.06 % (2026-10-28). A one-token last call stays its own call: as a walk chunk it
-    // gave run-dependent bits on the reproducible route (resume_width_real r 1008 L 1025; 2-116 tokens equal).
+    // IQ3_S +4.1 %, Dense8 +0.06 % (2026-10-28). A one-token last call stays its own call, so the span ends at a
+    // divergence one token before the prompt's end and a sibling coalesces there (test_decide_real's coalesce).
+    // (It once also gave wrong bits as a walk chunk, run as a decode call; streamed calls now run eagerly at any
+    // width, Forward::begin_call, candidates SA-12.)
     if (end + 1 == lane.calls.size() && lane.calls[end] - from >= kWalkJoinMinTokens &&
         total + (lane.calls[end] - from) <= kWalkMaxTokens) {
         total += lane.calls[end] - from;
