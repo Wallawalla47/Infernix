@@ -475,8 +475,12 @@ Gated DeltaNet recurrent state is 144 of an image's 186.8 MiB (§3.2). `--cache-
    list) whose tail tokens equal `prompt[64·(anchor.depth+1) .. F)`, with **`F ≤ n − 1`**. At
    least one prompt token is always prefilled, so logits, continuation hidden and MTP/DFlash
    bridges come from the normal path. No full-hit path exists.
-3. Frontiers inside a Vision token span are not valid resume points. Tap placement never creates
-   them, and match rejects them defensively.
+3. Frontiers inside a Vision token span are not valid resume points, and neither are frontiers
+   past an item's start in the 64-token block it begins in: a snapshot's key is its anchor path
+   (each full block carries the media key of the items beginning before its end) plus its tail
+   tokens, so an item lying wholly in the tail block is in no key, and two prompts differing only
+   by it would share the snapshot (candidates QA-05; `media_exclusion`). Tap placement never
+   creates them, and match rejects them (both models).
 
 Complexity is O(k + snapshots on path). A 240 k prompt is 3,750 hash probes and exact 256 B
 compares: tens of microseconds.
@@ -1025,7 +1029,9 @@ policy lives:
 ### 9.1 Device KV (LRU, tail-first)
 
 - One intrusive list of `Cached` device pages whose owner has no refs and no pins: nodes with
-  `active_refs == 0 && restore_pins == 0`, and snapshot tails with `restore_pins == 0`.
+  `active_refs == 0 && restore_pins == 0`, and snapshot tails with `restore_pins == 0`. A pinned
+  snapshot (an image or tail transfer in flight, or a quote being bound) pins its anchor path, so
+  an unbacked eviction (§9.4) never removes a subtree that holds it.
 - On a hit, touched nodes move to the MRU end.
 - On release, nodes are appended in reverse block order.
 - Allocation pops from the LRU head:
@@ -1939,7 +1945,7 @@ rules, measurements and the build record are in the
 | Taps | `plan_taps` with Vision exclusions, then the call planner (`prefix/call_plan.h`): boundary exact taps (Explicit, Structural) always split; the generation opener and Automatic taps split only when the split adds at most 0.1 s of call cost (a CPU-served opener tail costs ~35 ms), else become flexible. Taps planned as boundaries (Explicit, Structural, coalescing, branch) are published as `SnapshotKind::Boundary`. A branch tap is an exact boundary tap where the prompt leaves its cached path (the end of its matched blocks), planned when that point is at least 1,024 tokens past the resume frontier (`kBranchTapMinTokens`): a client re-sending a long transcript with new content inserted before its end then resumes at the branch instead of the last chunk boundary (measured 2026-10-17, Dense8, 40K-token transcript, chunk 16,384: re-sent queries reuse 40,128 against 32,768 tokens, time to first token 0.6-1.1 s against 2.1-2.2 s, the first diverging query +0.6 s for the split; the agentic replay, seeds 42/43 at scale 0.5, keeps its cache hits: 84.6 against 84.5 % and 84.9 against 85.2 %). Unlike Qwen3.5's removed branch-point taps (§16.8), a Flash-Next prefill call has a large fixed cost (the expert stream), so re-prefilling the shared tokens after a chunk boundary costs nearly a full call. The opener is kept after endpoint resumes; a resume from an opener snapshot whose capturing request had resumed from an endpoint counts `endpoint_mismatch_fallbacks` |
 | Supersession | Unlike §9.3, a request's captures never supersede its own earlier ones: its first capture (tap or endpoint) supersedes the snapshot it resumed from and the endpoints it went past; its ladder taps, system-block boundary and the prompt's last tap stay retained and GDSF values them. In agentic replays the edits and loop-detection side calls diverge at exactly those taps: superseded first, a full Host tier evicted them before they were reused |
 | Prefill calls | The plan's calls from the resume frontier: without exact taps `F, F + chunk, ...` (for F = 0 the cold grid). Calls of at most 8 columns are CPU-served and promote experts at the decode rate. Without `free-cache-resume` (the reproducible route) every tap, coalescing point and resume frontier lies on the prefill-chunk grid (`ProgramImpl::resume_grid`), so a resumed prefill's calls are the cold prefill's: several prefill routes change their arithmetic with the call's width (model-quality.md §6.7) |
-| Vision | A resume frontier strictly inside an item is never chosen; items ending at or before the frontier are not encoded again (the encode window is planned from the frontier); suffix M-RoPE positions come from the prompt |
+| Vision | A resume frontier strictly inside an item, or past its start in the block it begins in (rule 3 of §6.1), is never chosen; items ending at or before the frontier are not encoded again (the encode window is planned from the frontier); suffix M-RoPE positions come from the prompt |
 | Statistics | `RuntimeStats::hybrid_*` and the request log's `cached_prefix_tokens` / `restored_host_bytes` as in Qwen3.5 |
 | Persistence | As §5.5, own format (`prefix/persist.cpp`, `NINFQ4PC` version 1): the block table also stores each block's `mtp_next`; snapshot meta travels inside each image's header slab and is validated by the state-image layout fingerprint, which the file's geometry also records. Saved at the Engine's stop after every lane is released; loaded into the empty cache at startup |
 | Preemption | A pause publishes the lane's blocks and its state at the frontier to the cache, as a consistent abort does, and releases the lane (design §19.3.13); the resume binds from the deepest snapshot, without replay when it sits at the paused frontier |

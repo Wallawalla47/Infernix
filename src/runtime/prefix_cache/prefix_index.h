@@ -286,6 +286,7 @@ public:
     // Pins one node and its ancestors (in-flight transfer of that node).
     void pin_node(NodeRef node);
     void unpin_node(NodeRef node);
+    // Pins one snapshot and its anchor path (in-flight transfer of the snapshot's image or tail).
     void pin_snapshot(SnapshotRef snapshot);
     void unpin_snapshot(SnapshotRef snapshot);
 

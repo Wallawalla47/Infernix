@@ -748,7 +748,9 @@ HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
 std::vector<pc::TapExclusion> ProgramImpl::prefix_exclusions(const qwen3_5::PreparedPromptData& prompt) {
     std::vector<pc::TapExclusion> out;
     if (prompt.vision_items.empty()) { return out; }
-    for (const auto& range : qwen3_5::detail::vision_ranges(prompt)) { out.push_back({range.begin, range.end}); }
+    for (const auto& range : qwen3_5::detail::vision_ranges(prompt)) {
+        out.push_back(pc::media_exclusion(range.begin, range.end));
+    }
     return out;
 }
 

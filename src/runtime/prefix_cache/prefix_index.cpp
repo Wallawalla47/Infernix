@@ -419,7 +419,11 @@ void PrefixCacheIndex::unpin_node(NodeRef node) {
 }
 
 void PrefixCacheIndex::pin_snapshot(SnapshotRef snapshot) {
-    ++require(snapshot).pins;
+    Snapshot& entry = require(snapshot);
+    ++entry.pins;
+    // A pinned snapshot pins its anchor path, as a pinned node pins its ancestors: an unbacked
+    // eviction removes a whole subtree, which must never hold a snapshot a transfer still reads.
+    if (entry.anchor != kNoId) { pin_path_from(entry.anchor); }
     refresh_tail(snapshot.index);
 }
 
@@ -427,6 +431,7 @@ void PrefixCacheIndex::unpin_snapshot(SnapshotRef snapshot) {
     Snapshot& entry = require(snapshot);
     if (entry.pins == 0) { invariant("prefix cache snapshot unpinned without a pin"); }
     --entry.pins;
+    if (entry.anchor != kNoId) { unpin_path_from(entry.anchor, true); }
     refresh_tail(snapshot.index);
 }
 

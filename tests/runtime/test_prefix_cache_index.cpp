@@ -299,6 +299,31 @@ void test_device_lru_order() {
     index.check_invariants();
 }
 
+// A snapshot whose Host write is in flight outlives its released path: the unbacked eviction that
+// would remove its anchor's subtree (the snapshot with it) waits until the write lands.
+void test_pinned_snapshot_keeps_anchor() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64), backend);
+    const auto tokens          = make_tokens(64 * 4, 70);
+    const auto path            = insert_sequence(index, backend, tokens);
+    const SnapshotRef endpoint = publish_tap(index, path[3]);
+    index.pin_snapshot(endpoint);
+    require(index.begin_snapshot_host_fill(endpoint), "no slabs for the snapshot's Host write");
+    index.release_path(path);
+    index.check_invariants();
+    require(index.device_evictable_blocks() == 0,
+            "a pinned snapshot's anchor path must not be evictable");
+    require(index.evict_device_blocks(4) == 0 && index.valid(endpoint),
+            "an unbacked eviction must not remove a pinned snapshot");
+    index.complete_snapshot_host_fill(endpoint);
+    index.unpin_snapshot(endpoint);
+    index.check_invariants();
+    require(index.device_evictable_blocks() == 4, "the path is evictable once the write lands");
+    require(index.evict_device_blocks(4) == 4 && backend.live.empty(),
+            "every page must be released after the write");
+    index.check_invariants();
+}
+
 void test_backed_before_unbacked() {
     RecordingBackend backend;
     PrefixCacheIndex index(small_config(64), backend);
@@ -1661,6 +1686,17 @@ void test_tap_planner() {
     }
     require(find(excluded, 12000).has_value(), "an excluded explicit tap moves to the span start");
 
+    // A media item's exclusion reaches the end of the block it begins in: an item lying wholly in a
+    // snapshot's partial tail block is in no key (only full blocks carry media keys).
+    const auto same = [](TapExclusion a, TapExclusion b) { return a.begin == b.begin && a.end == b.end; };
+    require(same(media_exclusion(10, 30), {10, 64}) && same(media_exclusion(10, 200), {10, 200}) &&
+                same(media_exclusion(64, 70), {64, 128}) && same(media_exclusion(63, 64), {63, 64}),
+            "a media exclusion does not reach the end of the item's first block");
+    const std::vector<TapHint> late{{12010, TapHintKind::Explicit}};
+    const std::vector<TapExclusion> short_item{media_exclusion(12000, 12005)};
+    require(find(plan_taps(30020, 0, late, {}, short_item, config), 12000).has_value(),
+            "a tap after a short media item in its own block did not move to the item's start");
+
     // Budget: the highest-priority tap survives.
     TapPlannerConfig one = config;
     one.max_new_taps     = 1;
@@ -1733,6 +1769,7 @@ int main() {
         test_match_and_choice();
         test_collisions_and_tails();
         test_device_lru_order();
+        test_pinned_snapshot_keeps_anchor();
         test_backed_before_unbacked();
         test_host_dead_and_gdsf();
         test_device_slots();

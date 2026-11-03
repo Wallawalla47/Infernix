@@ -24,11 +24,18 @@ struct TapHint {
     TapHintKind kind       = TapHintKind::MessageBoundary;
 };
 
-// Half-open token span in which no resume point may lie (a Vision item's tokens).
+// Span whose interior (begin, end) no resume point may lie in (a Vision item's tokens).
 struct TapExclusion {
     std::uint32_t begin = 0;
     std::uint32_t end   = 0;
 };
+
+// The exclusion of a media item covering tokens [begin, end). A snapshot's identity is its anchor
+// path (full blocks, each carrying the media key of the items that begin before its end) plus the
+// tokens of its partial tail block, so an item that begins inside the tail block before the
+// frontier is in no key: two prompts that differ only by it would share the snapshot. The span
+// therefore reaches at least to the end of the block the item begins in.
+[[nodiscard]] TapExclusion media_exclusion(std::uint32_t begin, std::uint32_t end) noexcept;
 
 // How the prefill loop realizes a tap.
 enum class TapPlacement : std::uint8_t {

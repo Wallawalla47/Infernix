@@ -1,4 +1,5 @@
 #include "runtime/prefix_cache/tap_planner.h"
+#include "runtime/prefix_cache/block_hash.h"
 
 #include <algorithm>
 #include <optional>
@@ -41,6 +42,11 @@ constexpr std::uint32_t distance(std::uint32_t a, std::uint32_t b) noexcept {
 }
 
 } // namespace
+
+TapExclusion media_exclusion(std::uint32_t begin, std::uint32_t end) noexcept {
+    const std::uint32_t block_end = (begin / kBlockTokens + 1U) * kBlockTokens;
+    return TapExclusion{begin, std::max(end, block_end)};
+}
 
 std::vector<PlannedTap> plan_taps(std::uint32_t prompt_tokens, std::uint32_t base,
                                   std::span<const TapHint> hints,
