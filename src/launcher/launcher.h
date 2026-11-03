@@ -115,7 +115,8 @@ private:
                                      const EnvVars& env) const;
     [[nodiscard]] std::string effective_alias(const std::string& config_id, const ScannedModel& model,
                                               const LibraryScan& scan) const;
-    [[nodiscard]] Json preview_json(const std::string& config_id, const ScannedModel& model, const LibraryScan& scan,
+    // Not under the library lock: it may run --help and looks for the files the arguments name.
+    [[nodiscard]] Json preview_json(const std::string& config_id, const ScannedModel& model, const std::string& alias,
                                     Args args, const EnvVars& env) const;
     [[nodiscard]] std::filesystem::path serve_executable() const;
     [[nodiscard]] ServeOptions serve_options() const;
@@ -204,7 +205,9 @@ private:
     void handle_models_unload(const httplib::Request& request, httplib::Response& response, ApiCall& call);
     void handle_models_sse(const httplib::Request& request, httplib::Response& response, ApiCall& call);
     // A configuration as llama-server's GET /props describes its loaded model, without loading it.
-    [[nodiscard]] Json props_json(const std::string& config_id, const ScannedModel& model, const LibraryScan& scan) const;
+    // Not under the library lock: it may run --help.
+    [[nodiscard]] Json props_json(const std::string& config_id, const ScannedModel& model, const Args& args,
+                                  const std::string& alias) const;
     // A /models/sse event: `model_status` (loading, loaded, unloaded with a failed load's exit
     // code) or, for the model "*", `models_reload` when the list changes.
     void publish_model_event(const std::string& model, const std::string& event, Json data = nullptr);
@@ -225,7 +228,13 @@ private:
 
     // Events.
     void publish(const std::string& name, const Json& data);
+    // Publishes the new log and event records to the web UI and writes the server's log file, every
+    // 150 ms until stop() has ended everything that logs.
     void flush_logs_loop();
+    // A line for the launcher's console, printed in order by console_loop(): a console that does not
+    // take output (a QuickEdit selection holds it) delays only that thread.
+    void print_console(std::string line);
+    void console_loop();
     void toast(const std::string& level, const std::string& message);
     [[nodiscard]] Json state_json() const;
     [[nodiscard]] Json hf_files_json(const std::string& repo) const;
@@ -267,6 +276,12 @@ private:
     std::mutex pending_logs_mutex_;
     std::vector<LogRecord> pending_logs_;
     std::vector<EventRecord> pending_events_;
+    std::atomic<bool> stop_flushing_{false};
+
+    std::mutex console_mutex_;
+    std::condition_variable console_cv_;
+    std::vector<std::string> console_lines_;
+    bool console_stopping_ = false;
 
     // The instance transitions already reported, the latest incident and the recent restarts.
     mutable std::mutex incident_mutex_;
@@ -293,6 +308,7 @@ private:
     bool stopped_ = false;
     std::thread scanner_;
     std::thread log_flusher_;
+    std::thread console_writer_;
     httplib::Server server_;
     std::string bound_host_;
     int bound_port_ = 0;

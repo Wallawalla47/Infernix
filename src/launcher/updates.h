@@ -28,6 +28,14 @@ namespace infernix::launcher {
 [[nodiscard]] std::optional<std::string> release_version(std::string_view build_or_tag);
 // Release versions compared part by part (2026.10.09.2 > 2026.10.09); <0, 0, >0.
 [[nodiscard]] int compare_versions(std::string_view a, std::string_view b);
+// Whether a release asset is Infernix's Windows zip ("infernix-<version>-windows-x64.zip") with a
+// name that is safe as a file name: letters, digits, '.', '_' and '-' only.
+[[nodiscard]] bool is_windows_release_asset(std::string_view name);
+// GitHub's latest-release answer as the update state shows it: {tag, version, published_at, notes,
+// url, asset} with asset {name, bytes, sha256, url} or null when there is no Windows zip. A field
+// that is absent or null (a release without notes, an asset GitHub did not hash) reads as empty;
+// nullopt when `body` is not a JSON object.
+[[nodiscard]] std::optional<Json> parse_release(const std::string& body);
 
 class ModelUpdates {
 public:

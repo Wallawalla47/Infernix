@@ -115,6 +115,38 @@ int compare_versions(std::string_view a, std::string_view b) {
     return 0;
 }
 
+bool is_windows_release_asset(std::string_view name) {
+    // The name becomes the download's file name in the updates folder.
+    static const std::regex pattern(R"(infernix-[A-Za-z0-9._-]+-windows-x64\.zip)");
+    return std::regex_match(name.begin(), name.end(), pattern);
+}
+
+std::optional<Json> parse_release(const std::string& body) {
+    const Json release = Json::parse(body, nullptr, false);
+    if (!release.is_object()) { return std::nullopt; }
+    Json asset        = nullptr;
+    const Json assets = json_or<Json>(release, "assets", Json::array());
+    if (assets.is_array()) {
+        for (const Json& candidate : assets) {
+            const std::string name = json_or<std::string>(candidate, "name", "");
+            if (!is_windows_release_asset(name)) { continue; }
+            const std::string digest = json_or<std::string>(candidate, "digest", "");
+            asset = {{"name", name},
+                     {"bytes", json_or<std::uint64_t>(candidate, "size", 0)},
+                     {"sha256", digest.starts_with("sha256:") ? Json(digest.substr(7)) : Json(nullptr)},
+                     {"url", json_or<std::string>(candidate, "browser_download_url", "")}};
+            break;
+        }
+    }
+    const std::string tag = json_or<std::string>(release, "tag_name", "");
+    return Json{{"tag", tag},
+                {"version", release_version(tag).value_or(tag)},
+                {"published_at", json_or<std::string>(release, "published_at", "")},
+                {"notes", json_or<std::string>(release, "body", "")},
+                {"url", json_or<std::string>(release, "html_url", "")},
+                {"asset", asset}};
+}
+
 // --- Models ----------------------------------------------------------------------------------
 
 ModelUpdates::ModelUpdates(Hooks hooks) : hooks_(std::move(hooks)) {
@@ -338,30 +370,11 @@ void InfernixUpdate::check_now() {
         if (!result.error.empty() || result.status != 200) {
             error_ = result.error.empty() ? "GitHub answered HTTP " + std::to_string(result.status)
                                           : "cannot reach GitHub: " + result.error;
+        } else if (std::optional<Json> release = parse_release(result.body)) {
+            latest_ = std::move(*release);
+            error_.reset();
         } else {
-            try {
-                const Json release = Json::parse(result.body);
-                Json asset         = nullptr;
-                for (const Json& candidate : release.value("assets", Json::array())) {
-                    const std::string name = candidate.value("name", "");
-                    if (name.starts_with("infernix-") && name.ends_with("-windows-x64.zip")) {
-                        std::string digest = candidate.value("digest", "");
-                        asset = {{"name", name},
-                                 {"bytes", candidate.value("size", std::uint64_t{0})},
-                                 {"sha256", digest.starts_with("sha256:") ? Json(digest.substr(7)) : Json(nullptr)},
-                                 {"url", candidate.value("browser_download_url", "")}};
-                        break;
-                    }
-                }
-                const std::string tag = release.value("tag_name", "");
-                latest_ = {{"tag", tag},
-                           {"version", release_version(tag).value_or(tag)},
-                           {"published_at", release.value("published_at", "")},
-                           {"notes", release.value("body", "")},
-                           {"url", release.value("html_url", "")},
-                           {"asset", asset}};
-                error_.reset();
-            } catch (const Json::exception& failure) { error_ = std::string("unreadable release: ") + failure.what(); }
+            error_ = "unreadable release: GitHub's answer is not a JSON object";
         }
     }
     publish();

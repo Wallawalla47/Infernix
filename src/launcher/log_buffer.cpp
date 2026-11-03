@@ -90,28 +90,51 @@ void LogBuffer::set_dir(std::filesystem::path log_dir) {
 }
 
 void LogBuffer::begin_instance(std::uint32_t instance, const std::string& label) {
-    std::lock_guard lock(mutex_);
-    std::error_code created;
-    std::filesystem::create_directories(log_dir_, created);
-    partial_.clear();
-    partial_instance_ = instance;
-    if (file_.is_open()) { file_.close(); }
     std::string safe;
     for (const char c : label) {
         safe.push_back(std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.' ? c : '_');
     }
     if (safe.size() > 80) { safe.resize(80); }
-    file_.open(log_dir_ / ("serve-" + file_stamp() + "-" + safe + ".log"), std::ios::binary | std::ios::trunc);
+    std::lock_guard lock(mutex_);
+    partial_.clear();
+    partial_instance_ = instance;
+    file_writes_.push_back(FileWrite{.open = log_dir_ / ("serve-" + file_stamp() + "-" + safe + ".log")});
+}
+
+void LogBuffer::open_file(const std::filesystem::path& path) {
+    if (file_.is_open()) { file_.close(); }
+    const std::filesystem::path dir = path.parent_path();
+    std::error_code created;
+    std::filesystem::create_directories(dir, created);
+    file_.open(path, std::ios::binary | std::ios::trunc);
     // Keep the newest 20 server logs.
     std::vector<std::filesystem::directory_entry> logs;
     std::error_code error;
-    for (const auto& entry : std::filesystem::directory_iterator(log_dir_, error)) {
+    for (const auto& entry : std::filesystem::directory_iterator(dir, error)) {
         if (entry.path().filename().string().starts_with("serve-")) { logs.push_back(entry); }
     }
     std::sort(logs.begin(), logs.end(), [](const auto& a, const auto& b) {
         return a.path().filename() > b.path().filename();
     });
     for (std::size_t i = 20; i < logs.size(); ++i) { std::filesystem::remove(logs[i].path(), error); }
+}
+
+void LogBuffer::write_files() {
+    std::lock_guard writing(file_mutex_);
+    std::vector<FileWrite> writes;
+    {
+        std::lock_guard lock(mutex_);
+        writes.swap(file_writes_);
+    }
+    if (writes.empty()) { return; }
+    for (const FileWrite& write : writes) {
+        if (!write.open.empty()) { open_file(write.open); }
+        if (!write.data.empty() && file_.is_open()) {
+            file_.write(write.data.data(), static_cast<std::streamsize>(write.data.size()));
+        }
+        if (write.close && file_.is_open()) { file_.close(); }
+    }
+    if (file_.is_open()) { file_.flush(); }
 }
 
 void LogBuffer::end_instance() {
@@ -129,7 +152,8 @@ void LogBuffer::end_instance() {
             partial_.clear();
             push_locked(std::move(record), emitted);
         }
-        if (file_.is_open()) { file_.close(); }
+        if (file_writes_.empty() || file_writes_.back().close) { file_writes_.emplace_back(); }
+        file_writes_.back().close = true;
         listener = listener_;
     }
     if (listener && !emitted.empty()) { listener(emitted); }
@@ -140,10 +164,9 @@ void LogBuffer::append_output(std::uint32_t instance, std::string_view chunk) {
     Listener listener;
     {
         std::lock_guard lock(mutex_);
-        if (file_.is_open()) {
-            file_.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
-            file_.flush();
-        }
+        // Queued for write_files(), after the last step unless that one closes its file.
+        if (file_writes_.empty() || file_writes_.back().close) { file_writes_.emplace_back(); }
+        file_writes_.back().data.append(chunk);
         partial_instance_ = instance;
         partial_.append(chunk);
         std::size_t start = 0;

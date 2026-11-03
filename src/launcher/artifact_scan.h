@@ -97,6 +97,10 @@ struct ScannedDir {
     std::size_t models        = 0;
     std::size_t drafters      = 0;
     std::size_t ngram_volumes = 0;
+    // The room on its drive when it was scanned (nullopt when the drive did not say).
+    std::optional<std::uint64_t> free_bytes;
+    std::optional<std::uint64_t> total_bytes;
+    // Why it was not scanned, or scanned only in part.
     std::optional<std::string> error;
 };
 

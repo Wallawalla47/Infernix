@@ -36,9 +36,11 @@ The console prints the addresses and the browser opens the web UI:
 
 Ctrl+C (or closing the console) stops the loaded model in order, so it saves its prefix cache and
 expert-cache state, pauses running downloads and exits. Only the launcher's own events and server
-errors appear in its console; the web UI shows the server's full log. On Windows the server shares
-the launcher's console, which carries the orderly stop; started without one (by a program or a
-shortcut that gives it none), the launcher makes a hidden console of its own.
+errors appear in its console; the web UI shows the server's full log. A console that holds its
+output (a QuickEdit selection) or a slow log folder never holds up the server: the launcher keeps
+reading its output and writes the console and `serve-logs/` from threads of their own. On Windows
+the server shares the launcher's console, which carries the orderly stop; started without one (by a
+program or a shortcut that gives it none), the launcher makes a hidden console of its own.
 
 ## What it remembers
 
@@ -115,9 +117,12 @@ folder levels deep, reading file headers only:
   a model's own table first, then FP8, NVFP4, IQ4_NL and BF16 (an FP8 table without a recorded scale
   serves only its own artifact).
 
-Folders are rescanned when they change in the launcher, after a download and every minute.
+Folders are rescanned when they change in the launcher, after a download and every minute. A folder
+whose listing fails part way (a network share that goes away, say) is marked as scanned only in
+part, with the reason; the files found before it stay listed.
 
-**Models** shows each folder's size, the free space on its drive, and each model's, drafter's and
+**Models** shows each folder's size, the free space on its drive (read by the last scan, so a
+sleeping network drive never holds up the web UI or the API), and each model's, drafter's and
 volume's size on disk. **Delete files** removes a model's artifact (every part), a drafter or an
 n-gram volume from the disk after you type its file name. A model's deletion takes the files at
 the location shown (every part, its `.conversion.json` and `.expert-state`) and its
@@ -131,7 +136,8 @@ its option in the text, an edit to the text moves the controls, and options with
 kept. The **DFlash2 drafter** and **N-gram volume** pickers (Qwen3.8-Flash-Next) list the compatible
 files found and write `--draft-model` and `--ngram-volume`. The full command line is previewed with
 warnings (an option this `infernix-serve` does not have, a missing file, a Flash-Next model without
-a volume). Every option of the installed `infernix-serve --help` is listed in the reference drawer.
+a volume). Every option of the installed `infernix-serve --help` is listed in the reference drawer
+(read once per build of `infernix-serve`; a `--help` that fails is run again when next needed).
 
 The **model id** is the name tools see in `/v1/models` and send back; it defaults to the artifact's
 file name without its part numbering, and any other name can be set (two configurations cannot

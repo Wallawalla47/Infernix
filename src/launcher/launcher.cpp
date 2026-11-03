@@ -309,12 +309,10 @@ Launcher::Launcher(LauncherOptions options)
     } catch (const Json::exception&) { catalog_ = {{"entries", Json::array()}}; }
 
     // The console shows the event log (but its debug records) and the server's errors; the web
-    // UI shows everything.
+    // UI shows everything. The listeners only queue: the server's output pipe is read on the
+    // thread that calls the log's.
     event_log_.set_listener([this](const EventRecord& record) {
-        if (record.level != "debug") {
-            std::fprintf(stdout, "%s\n", format_event_line(record).c_str() + 11); // without the date
-            std::fflush(stdout);
-        }
+        if (record.level != "debug") { print_console(format_event_line(record).substr(11)); } // without the date
         std::lock_guard lock(pending_logs_mutex_);
         pending_events_.push_back(record);
     });
@@ -324,9 +322,10 @@ Launcher::Launcher(LauncherOptions options)
         }
         for (const LogRecord& record : records) {
             if (record.source == "server" && (record.level == "error" || record.level == "critical")) {
-                std::fprintf(stdout, "%s  %-5s  serve | %s\n", local_clock(record.t).c_str(), record.level.c_str(),
-                             record.text.c_str());
-                std::fflush(stdout);
+                char head[48];
+                std::snprintf(head, sizeof(head), "%s  %-5s  serve | ", local_clock(record.t).c_str(),
+                              record.level.c_str());
+                print_console(head + record.text);
             }
         }
         std::lock_guard lock(pending_logs_mutex_);
@@ -427,8 +426,9 @@ Launcher::Launcher(LauncherOptions options)
         .changed      = [this](const Json& state) { publish("infernix_release", state); },
     });
 
-    scanner_     = std::thread([this] { scan_loop(); });
-    log_flusher_ = std::thread([this] { flush_logs_loop(); });
+    scanner_        = std::thread([this] { scan_loop(); });
+    log_flusher_    = std::thread([this] { flush_logs_loop(); });
+    console_writer_ = std::thread([this] { console_loop(); });
     register_routes();
 }
 
@@ -505,7 +505,15 @@ void Launcher::stop() {
     }
     scan_cv_.notify_all();
     if (scanner_.joinable()) { scanner_.join(); }
+    // The server's log file and the console get what is still queued.
+    stop_flushing_ = true;
     if (log_flusher_.joinable()) { log_flusher_.join(); }
+    {
+        std::lock_guard lock(console_mutex_);
+        console_stopping_ = true;
+    }
+    console_cv_.notify_all();
+    if (console_writer_.joinable()) { console_writer_.join(); }
     usage_.flush();
     // The API keys' last use is kept in memory between other changes.
     store_.update_settings([](Settings&) {});
@@ -525,8 +533,10 @@ void Launcher::toast(const std::string& level, const std::string& message) {
 }
 
 void Launcher::flush_logs_loop() {
-    while (!stopping_) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    // Through the shutdown too (the server's last lines while it stops), then once more after it.
+    for (;;) {
+        const bool last = stop_flushing_;
+        if (!last) { std::this_thread::sleep_for(std::chrono::milliseconds(150)); }
         std::vector<LogRecord> batch;
         std::vector<EventRecord> events;
         {
@@ -540,12 +550,37 @@ void Launcher::flush_logs_loop() {
             for (const EventRecord& record : events) { lines.push_back(to_json(record)); }
             publish("eventlog", {{"lines", lines}});
         }
-        if (batch.empty()) { continue; }
-        // Listeners run outside the log lock, so records from two threads can arrive swapped.
-        std::sort(batch.begin(), batch.end(), [](const LogRecord& a, const LogRecord& b) { return a.seq < b.seq; });
-        Json lines = Json::array();
-        for (const LogRecord& record : batch) { lines.push_back(to_json(record)); }
-        publish("log", {{"lines", lines}});
+        if (!batch.empty()) {
+            // Listeners run outside the log lock, so records from two threads can arrive swapped.
+            std::sort(batch.begin(), batch.end(), [](const LogRecord& a, const LogRecord& b) { return a.seq < b.seq; });
+            Json lines = Json::array();
+            for (const LogRecord& record : batch) { lines.push_back(to_json(record)); }
+            publish("log", {{"lines", lines}});
+        }
+        logs_.write_files();
+        if (last) { return; }
+    }
+}
+
+void Launcher::print_console(std::string line) {
+    {
+        std::lock_guard lock(console_mutex_);
+        console_lines_.push_back(std::move(line));
+    }
+    console_cv_.notify_one();
+}
+
+void Launcher::console_loop() {
+    std::unique_lock lock(console_mutex_);
+    for (;;) {
+        console_cv_.wait(lock, [this] { return console_stopping_ || !console_lines_.empty(); });
+        if (console_lines_.empty()) { return; } // stopping, and everything printed
+        std::vector<std::string> lines;
+        lines.swap(console_lines_);
+        lock.unlock();
+        for (const std::string& line : lines) { std::fprintf(stdout, "%s\n", line.c_str()); }
+        std::fflush(stdout);
+        lock.lock();
     }
 }
 
@@ -576,7 +611,7 @@ void Launcher::request_scan() {
 }
 
 void Launcher::scan_loop() {
-    // Runs `infernix-serve --help` once now, so no API call waits for it under the library lock.
+    // Runs `infernix-serve --help` now, so the first API calls find it cached.
     (void)serve_options();
     std::unique_lock lock(library_mutex_);
     while (!stopping_) {
@@ -708,7 +743,8 @@ Json Launcher::library_json() const {
             model["configs"] = configs;
         }
     }
-    // Each folder's share of the library and its drive's room.
+    // Each folder's share of the library (its drive's room comes with the scan: no drive is touched
+    // under the library lock).
     for (Json& dir : library["dirs"]) {
         const std::filesystem::path path = utf8_path(dir["path"].get<std::string>());
         std::uint64_t bytes              = 0;
@@ -723,10 +759,6 @@ Json Launcher::library_json() const {
             if (inside(volume.path)) { bytes += volume.bytes; }
         }
         dir["library_bytes"] = bytes;
-        std::error_code error;
-        const std::filesystem::space_info space = std::filesystem::space(path, error);
-        dir["free_bytes"]  = error ? Json(nullptr) : Json(space.available);
-        dir["total_bytes"] = error ? Json(nullptr) : Json(space.capacity);
     }
     return library;
 }
@@ -986,7 +1018,7 @@ Json Launcher::fit_plan_json(const std::string& config_id, const ScannedModel& m
     return out;
 }
 
-Json Launcher::preview_json(const std::string& config_id, const ScannedModel& model, const LibraryScan& scan,
+Json Launcher::preview_json(const std::string& config_id, const ScannedModel& model, const std::string& alias,
                             Args args, const EnvVars& env) const {
     const ServeOptions serve = serve_options();
     const TakesValue takes   = [&serve](std::string_view flag) { return serve.takes_value(flag); };
@@ -1034,9 +1066,8 @@ Json Launcher::preview_json(const std::string& config_id, const ScannedModel& mo
     for (const auto& [name, value] : env) {
         if (name.empty() || name.find('=') != std::string::npos) { warnings.push_back("not a variable name: " + name); }
     }
-    const std::vector<std::string> managed = {"--host", "127.0.0.1", "--port", "<auto>", "--model-id",
-                                              effective_alias(config_id, model, scan), "--any-model-name",
-                                              "--log-stats-panel", "off", "--log-colours", "off"};
+    const std::vector<std::string> managed = {"--host", "127.0.0.1", "--port", "<auto>", "--model-id", alias,
+                                              "--any-model-name", "--log-stats-panel", "off", "--log-colours", "off"};
     std::vector<std::string> argv = {path_utf8(serve_executable()), path_utf8(model.path)};
     argv.insert(argv.end(), args.begin(), args.end());
     if (const std::optional<std::filesystem::path> cache = prefix_cache_file(config_id, args)) {
@@ -2042,8 +2073,8 @@ void Launcher::handle_models(const Request& request, Response& response, ApiCall
 // ---------------------------------------------------------------------------------------------
 // HTTP: llama-server's router API (Settings.llamacpp_api)
 
-Json Launcher::props_json(const std::string& config_id, const ScannedModel& model, const LibraryScan& scan) const {
-    const Args args                 = effective_args(config_id, model, scan);
+Json Launcher::props_json(const std::string& config_id, const ScannedModel& model, const Args& args,
+                          const std::string& alias) const {
     const std::uint64_t context     = context_length(args);
     const InstanceSnapshot instance = supervisor_->snapshot();
     const bool loaded               = instance.model_key == config_id && instance.state == InstanceState::Ready;
@@ -2070,7 +2101,7 @@ Json Launcher::props_json(const std::string& config_id, const ScannedModel& mode
               {"params", {{"n_predict", -1}, {"max_tokens", default_output_tokens(args, context)}}}}},
             {"total_slots", slots},
             {"model_path", path_utf8(model.path)},
-            {"model_alias", effective_alias(config_id, model, scan)},
+            {"model_alias", alias},
             {"chat_template_caps",
              {{"supports_tools", true},
               {"supports_tool_calls", true},
@@ -2114,9 +2145,20 @@ void Launcher::handle_props(const Request& request, Response& response, ApiCall&
             key = store_.settings().default_model;
         }
     }
-    std::lock_guard lock(library_mutex_);
-    const std::optional<ConfigRef> ref = key ? find_config_locked(*key) : std::nullopt;
-    if (!ref) {
+    std::optional<std::string> id;
+    ScannedModel model;
+    Args args;
+    std::string alias;
+    {
+        std::lock_guard lock(library_mutex_);
+        if (const std::optional<ConfigRef> ref = key ? find_config_locked(*key) : std::nullopt) {
+            id    = ref->id;
+            model = *ref->model;
+            args  = effective_args(ref->id, *ref->model, library_);
+            alias = effective_alias(ref->id, *ref->model, library_);
+        }
+    }
+    if (!id) {
         // Nothing to describe: llama-server's router answer.
         send_json(response, {{"role", "router"},
                              {"model_alias", "infernix-launcher"},
@@ -2125,7 +2167,7 @@ void Launcher::handle_props(const Request& request, Response& response, ApiCall&
                              {"build_info", "infernix-launcher " + options_.version}});
         return;
     }
-    send_json(response, props_json(ref->id, *ref->model, library_));
+    send_json(response, props_json(*id, model, args, alias));
 }
 
 void Launcher::handle_models_load(const Request& request, Response& response, ApiCall& call) {
@@ -2672,6 +2714,8 @@ void Launcher::register_management_routes() {
                 admin([this, with_config, body_json, parse_args, parse_env, check_alias, config_changed](const Request& q,
                                                                                                        Response& s) {
                     const Json patch = body_json(q);
+                    const std::optional<Args> patch_args =
+                        patch.contains("args") ? std::optional<Args>(parse_args(patch["args"])) : std::nullopt;
                     Json config;
                     with_config(q, [&](const ConfigRef& ref, const LibraryScan& scan) {
                         const ScannedModel& m    = *ref.model;
@@ -2693,14 +2737,13 @@ void Launcher::register_management_routes() {
                             }
                         }
                         if (patch.contains("listed")) { stored.listed = json_or<bool>(patch, "listed", true); }
-                        if (patch.contains("args")) {
-                            Args args = parse_args(patch["args"]);
+                        if (patch_args) {
                             // The default configuration follows the defaults until it differs; a named
                             // one keeps its own.
-                            if (!named && args == model_default_args(m, scan)) {
+                            if (!named && *patch_args == model_default_args(m, scan)) {
                                 stored.args.reset();
                             } else {
-                                stored.args = std::move(args);
+                                stored.args = *patch_args;
                             }
                         }
                         if (patch.contains("env")) { stored.env = parse_env(patch["env"]); }
@@ -2728,6 +2771,8 @@ void Launcher::register_management_routes() {
                      const Json body        = body_json(q);
                      const std::string name = trim(json_or<std::string>(body, "name", ""));
                      if (name.empty()) { throw std::invalid_argument("a configuration needs a name"); }
+                     const std::optional<Args> body_args =
+                         body.contains("args") ? std::optional<Args>(parse_args(body["args"])) : std::nullopt;
                      Json config;
                      with_config(q, [&](const ConfigRef& ref, const LibraryScan& scan) {
                          // A copy of `from` (one of this artifact's configurations), else of the defaults.
@@ -2735,8 +2780,7 @@ void Launcher::register_management_routes() {
                          if (artifact_key_of(from) != ref.model->key || !find_config_locked(from)) { from = ref.id; }
                          StoredModelConfig stored;
                          stored.name = name;
-                         stored.args = body.contains("args") ? parse_args(body["args"])
-                                                             : effective_args(from, *ref.model, scan);
+                         stored.args = body_args ? *body_args : effective_args(from, *ref.model, scan);
                          stored.env  = body.contains("env") ? parse_env(body["env"]) : effective_env(from);
                          if (const std::optional<StoredModelConfig> source = store_.model_config(from)) {
                              stored.idle_unload_min = source->idle_unload_min;
@@ -2807,17 +2851,25 @@ void Launcher::register_management_routes() {
                  }));
     server_.Post(api + config_path + "/preview", admin([this, with_config, body_json, parse_env](const Request& q, Response& s) {
                      const Json body = body_json(q);
+                     std::string id, alias;
+                     ScannedModel model;
+                     Args args;
+                     EnvVars env;
                      with_config(q, [&](const ConfigRef& ref, const LibraryScan& scan) {
-                         Args args = effective_args(ref.id, *ref.model, scan);
+                         id    = ref.id;
+                         model = *ref.model;
+                         alias = effective_alias(ref.id, *ref.model, scan);
+                         args  = effective_args(ref.id, *ref.model, scan);
                          if (body.contains("args") && body["args"].is_array()) {
                              args.clear();
                              for (const Json& arg : body["args"]) {
                                  if (arg.is_string()) { args.push_back(arg.get<std::string>()); }
                              }
                          }
-                         const EnvVars env = body.contains("env") ? parse_env(body["env"]) : effective_env(ref.id);
-                         send_json(s, preview_json(ref.id, *ref.model, scan, std::move(args), env));
+                         env = body.contains("env") ? parse_env(body["env"]) : effective_env(ref.id);
                      });
+                     // Outside the library lock: it runs --help when not cached and looks for the files named.
+                     send_json(s, preview_json(id, model, alias, std::move(args), env));
                  }));
     server_.Get(api + config_path + "/script", admin([this, with_config](const Request& q, Response& s) {
                     const ScriptShell shell = q.get_param_value("shell") == "sh" ? ScriptShell::Sh : ScriptShell::Cmd;
@@ -2839,6 +2891,8 @@ void Launcher::register_management_routes() {
                  }));
     server_.Post(api + config_path + "/plan", admin([this, with_config, body_json, parse_args, parse_env](const Request& q, Response& s) {
                      const Json body = body_json(q);
+                     const std::optional<Args> body_args =
+                         body.contains("args") ? std::optional<Args>(parse_args(body["args"])) : std::nullopt;
                      std::string id;
                      ScannedModel model;
                      Args args;
@@ -2846,7 +2900,7 @@ void Launcher::register_management_routes() {
                      with_config(q, [&](const ConfigRef& ref, const LibraryScan& scan) {
                          id    = ref.id;
                          model = *ref.model;
-                         args  = body.contains("args") ? parse_args(body["args"]) : effective_args(ref.id, *ref.model, scan);
+                         args  = body_args ? *body_args : effective_args(ref.id, *ref.model, scan);
                          env   = body.contains("env") ? parse_env(body["env"]) : effective_env(ref.id);
                      });
                      send_json(s, fit_plan_json(id, model, args, env));

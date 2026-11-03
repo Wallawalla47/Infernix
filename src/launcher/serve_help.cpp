@@ -3,6 +3,7 @@
 #include "launcher/process.h"
 
 #include <cctype>
+#include <exception>
 #include <mutex>
 #include <sstream>
 
@@ -105,29 +106,66 @@ bool ServeOptions::lists_value(std::string_view flag, std::string_view value) co
     return false;
 }
 
-ServeOptions load_serve_options(const std::filesystem::path& executable) {
-    static std::mutex mutex;
-    static std::string cached_key;
-    static ServeOptions cached;
-    const std::string key = path_utf8(executable) + "|" + std::to_string(modified_ms(executable));
-    std::lock_guard lock(mutex);
-    if (key == cached_key) { return cached; }
+ServeHelpCache::ServeHelpCache(Capture capture) : capture_(std::move(capture)) {}
+
+ServeOptions ServeHelpCache::capture_options(const std::filesystem::path& executable) const {
     ServeOptions result;
     result.executable = executable;
     std::error_code error;
     result.found = std::filesystem::is_regular_file(executable, error);
     if (!result.found) {
         result.error = "infernix-serve was not found at " + path_utf8(executable);
-    } else if (const std::optional<CaptureResult> help =
-                   run_capture(executable, {"--help"}, std::chrono::seconds(20))) {
-        result.options = parse_serve_help(help->output);
+    } else if (const std::optional<std::string> help = capture_(executable)) {
+        result.options = parse_serve_help(*help);
         if (result.options.empty()) { result.error = "infernix-serve --help listed no options"; }
     } else {
         result.error = "infernix-serve --help did not run";
     }
-    cached_key = key;
-    cached     = result;
     return result;
+}
+
+ServeOptions ServeHelpCache::get(const std::filesystem::path& executable) {
+    const std::string key = path_utf8(executable) + "|" + std::to_string(modified_ms(executable));
+    std::optional<std::promise<ServeOptions>> promise;
+    std::shared_future<ServeOptions> options;
+    std::uint64_t number = 0;
+    {
+        std::lock_guard lock(mutex_);
+        if (key != key_ || !options_.valid()) {
+            promise.emplace();
+            key_     = key;
+            options_ = promise->get_future().share();
+            number   = ++capture_number_;
+        }
+        options = options_;
+    }
+    if (!promise) { return options.get(); }
+    // This call captures. A failure is forgotten (unless a later capture replaced it) before the
+    // callers waiting on it see it, so the next call tries again.
+    const auto forget = [&] {
+        std::lock_guard lock(mutex_);
+        if (capture_number_ == number) { options_ = std::shared_future<ServeOptions>(); }
+    };
+    ServeOptions result;
+    try {
+        result = capture_options(executable);
+    } catch (...) {
+        forget();
+        promise->set_exception(std::current_exception());
+        throw;
+    }
+    if (result.options.empty()) { forget(); }
+    promise->set_value(result);
+    return result;
+}
+
+ServeOptions load_serve_options(const std::filesystem::path& executable) {
+    static ServeHelpCache cache([](const std::filesystem::path& path) -> std::optional<std::string> {
+        const std::optional<CaptureResult> help = run_capture(path, {"--help"}, std::chrono::seconds(20));
+        if (!help) { return std::nullopt; }
+        return help->output;
+    });
+    return cache.get(executable);
 }
 
 Json to_json(const ServeOptions& options, const std::optional<std::string>& build) {

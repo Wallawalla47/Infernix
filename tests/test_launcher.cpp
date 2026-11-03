@@ -1,6 +1,7 @@
-// infernix-launcher: launch-parameter edits, serve log and --help parsing, artifact and n-gram
-// volume recognition, default launch parameters, the router's drain-then-switch order, the advice
-// for loads that do not fit, the event log and the exit-status wording.
+// infernix-launcher: launch-parameter edits, serve log and --help parsing, the --help cache, the
+// server's log files, artifact and n-gram volume recognition, default launch parameters, the
+// router's drain-then-switch order, the advice for loads that do not fit, the event log, GitHub's
+// release answer and the exit-status wording.
 
 #include "launcher/args.h"
 #include "launcher/artifact_scan.h"
@@ -23,8 +24,10 @@
 #include <csignal>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -117,6 +120,113 @@ void test_help() {
     check(!serve.lists_value("--spec", "dflash2x") && !serve.lists_value("--spec", "of") &&
               !serve.lists_value("--max-context", "N|") && !serve.lists_value("--no-such-flag", "off"),
           "a prefix, an unlisted value and an unknown flag are not");
+}
+
+void test_help_cache() {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix-launcher-test-help";
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    std::filesystem::create_directories(dir, ignored);
+    // Files standing for infernix-serve: the cache keys on the path and the modification time.
+    const std::filesystem::path serve = dir / "infernix-serve.exe";
+    const std::filesystem::path other = dir / "other-serve.exe";
+    write_file_atomic(serve, "x");
+    write_file_atomic(other, "x");
+    const std::string help = "  --max-context N            max context tokens per request\n";
+
+    std::atomic<int> runs{0};
+    std::atomic<bool> works{false};
+    ServeHelpCache cache([&](const std::filesystem::path&) -> std::optional<std::string> {
+        ++runs;
+        if (!works) { return std::nullopt; }
+        return help;
+    });
+    const ServeOptions failed = cache.get(serve);
+    check(failed.found && failed.options.empty() && failed.error, "a --help that did not run is reported");
+    works = true;
+    check(cache.get(serve).options.size() == 1 && runs == 2, "a failed run is not kept: the next call runs it again");
+    works = false;
+    check(cache.get(serve).options.size() == 1 && runs == 2, "a help that lists options is kept");
+
+    // A capture that takes long (infernix-serve's is up to 20 s): a caller asking for the same
+    // executable meanwhile shares it, and the cache's lock is not held, so another executable's help
+    // is read in the meantime.
+    std::atomic<bool> release{false};
+    std::atomic<int> slow_runs{0};
+    std::atomic<int> other_runs{0};
+    const auto slow_capture = [&](const std::filesystem::path& path) -> std::optional<std::string> {
+        if (path == serve) {
+            ++slow_runs;
+            for (int i = 0; i < 500 && !release; ++i) { std::this_thread::sleep_for(10ms); }
+        } else {
+            ++other_runs;
+        }
+        return help;
+    };
+    const auto wait_for_capture = [&](int runs_before) {
+        for (int i = 0; i < 400 && slow_runs == runs_before; ++i) { std::this_thread::sleep_for(5ms); }
+    };
+    {
+        ServeHelpCache shared(slow_capture);
+        ServeOptions first, second;
+        std::thread first_caller([&] { first = shared.get(serve); });
+        wait_for_capture(0);
+        std::thread second_caller([&] { second = shared.get(serve); });
+        std::this_thread::sleep_for(100ms);
+        release = true;
+        first_caller.join();
+        second_caller.join();
+        check(slow_runs == 1 && first.options.size() == 1 && second.options.size() == 1,
+              "callers asking during a capture share it");
+    }
+    {
+        release = false;
+        ServeHelpCache unlocked(slow_capture);
+        ServeOptions blocked;
+        std::thread blocked_caller([&] { blocked = unlocked.get(serve); });
+        wait_for_capture(1);
+        auto unrelated = std::async(std::launch::async, [&] { return unlocked.get(other); });
+        const bool answered = unrelated.wait_for(2s) == std::future_status::ready;
+        check(answered && other_runs == 1, "another executable's help is read while a capture runs");
+        release = true;
+        blocked_caller.join();
+        check(unrelated.get().options.size() == 1 && blocked.options.size() == 1, "both listed");
+    }
+    std::filesystem::remove_all(dir, ignored);
+}
+
+void test_serve_log_files() {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix-launcher-test-serve-logs";
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    LogBuffer logs(dir);
+    logs.begin_instance(1, "first model");
+    logs.append_output(1, "2026-10-30 11:55:04.605  INFO  build windows-2026.10.18\nraw ");
+    logs.append_output(1, "line\n");
+    check(logs.page(0, 10)["lines"].size() == 2, "the server's lines are records at once");
+    logs.end_instance();
+    logs.begin_instance(2, "second");
+    logs.append_output(2, "second output\n");
+    check(!std::filesystem::exists(dir, ignored), "reading the server's output writes nothing (write_files does)");
+
+    logs.write_files();
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ignored)) { files.push_back(entry.path()); }
+    std::sort(files.begin(), files.end());
+    check(files.size() == 2, "one log file per server instance");
+    if (files.size() == 2) {
+        check(files[0].filename().string().ends_with("-first_model.log") && files[1].filename().string().ends_with("-second.log"),
+              "serve-<time>-<model>.log");
+        check(read_file(files[0]).value_or("") == "2026-10-30 11:55:04.605  INFO  build windows-2026.10.18\nraw line\n",
+              "an instance's output as it came, in its own file");
+        check(read_file(files[1]).value_or("") == "second output\n", "the next instance's in the next file");
+        logs.append_output(2, "more\n");
+        logs.write_files();
+        check(read_file(files[1]).value_or("") == "second output\nmore\n", "later output joins the open file");
+    }
+    logs.end_instance();
+    logs.write_files();
+    std::filesystem::remove_all(dir, ignored);
 }
 
 std::string volume_header(std::uint32_t row_bytes, const std::uint8_t id[16], std::uint16_t scale, std::uint16_t tag) {
@@ -575,6 +685,55 @@ void test_release_versions() {
           "versions compare part by part");
 }
 
+void test_release_answer() {
+    // A release published without notes whose zip GitHub did not hash: both fields are null.
+    const std::string unhashed = R"({"tag_name": "windows-2026.11.03", "published_at": "2026-11-03T09:00:00Z",
+        "html_url": "https://github.com/Wallawalla47/Infernix/releases/tag/windows-2026.11.03", "body": null,
+        "assets": [{"name": "ffmpeg-2026.11.03-source.zip", "size": 10, "digest": null, "browser_download_url": "https://a/f.zip"},
+                   {"name": "infernix-2026.11.03-windows-x64.zip", "size": 123, "digest": null,
+                    "browser_download_url": "https://a/i.zip"}]})";
+    std::optional<Json> release = parse_release(unhashed);
+    check(release && (*release)["version"] == "2026.11.03" && (*release)["notes"] == "",
+          "a release without notes is read, not refused");
+    check(release && (*release)["asset"]["name"] == "infernix-2026.11.03-windows-x64.zip" &&
+              (*release)["asset"]["bytes"] == 123 && (*release)["asset"]["sha256"].is_null() &&
+              (*release)["asset"]["url"] == "https://a/i.zip",
+          "the Windows zip without a digest has no SHA-256");
+    release = parse_release(R"({"tag_name": "windows-2026.11.03", "body": "notes", "published_at": null, "html_url": null,
+        "assets": [{"name": "infernix-2026.11.03-windows-x64.zip", "size": null, "browser_download_url": "https://a/i.zip",
+                    "digest": "sha256:00ff"}]})");
+    check(release && (*release)["notes"] == "notes" && (*release)["published_at"] == "" &&
+              (*release)["asset"]["sha256"] == "00ff" && (*release)["asset"]["bytes"] == 0,
+          "GitHub's sha256: digest is kept; other null fields read as empty");
+    release = parse_release(R"({"tag_name": "windows-2026.11.03",
+        "assets": [{"name": "infernix-x\\..\\..\\evil-windows-x64.zip", "browser_download_url": "https://a/e.zip"}]})");
+    check(release && (*release)["asset"].is_null(), "an asset name that is not a plain file name is no update");
+    check(!parse_release("not json") && !parse_release("[1, 2]"), "an answer that is not a JSON object is unreadable");
+
+    check(is_windows_release_asset("infernix-2026.11.03-windows-x64.zip") &&
+              is_windows_release_asset("infernix-2026.11.03.2-windows-x64.zip"),
+          "release zips");
+    check(!is_windows_release_asset("infernix-a/b-windows-x64.zip") && !is_windows_release_asset("infernix-a b-windows-x64.zip") &&
+              !is_windows_release_asset("infernix-windows-x64.zip") && !is_windows_release_asset("ffmpeg-1-windows-x64.zip") &&
+              !is_windows_release_asset("infernix-1-windows-x64.zip.exe") && !is_windows_release_asset("infernix-1:x-windows-x64.zip"),
+          "separators, spaces, other programs and other suffixes are refused");
+}
+
+void test_scan_folder() {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix-launcher-test-scan";
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    std::filesystem::create_directories(dir / "sub", ignored);
+    const LibraryScan scan = scan_library({dir}, 2);
+    check(scan.dirs.size() == 1 && scan.dirs[0].exists && !scan.dirs[0].error, "an empty folder scans whole");
+    // The drive's room comes with the scan, so the library routes never ask the drive.
+    const Json dirs = to_json(scan)["dirs"];
+    check(scan.dirs.size() == 1 && scan.dirs[0].free_bytes && scan.dirs[0].total_bytes &&
+              dirs[0]["free_bytes"].is_number() && dirs[0]["total_bytes"].is_number(),
+          "the scan records its drive's free and total bytes");
+    std::filesystem::remove_all(dir, ignored);
+}
+
 void test_exit_meaning() {
 #ifdef _WIN32
     check(exit_status_meaning(static_cast<int>(0xC0000005u), true).find("access violation") != std::string::npos, "0xC0000005");
@@ -615,7 +774,10 @@ int main() {
     test_args();
     test_records();
     test_help();
+    test_help_cache();
+    test_serve_log_files();
     test_library();
+    test_scan_folder();
     test_router();
     test_load_advice();
     test_event_log();
@@ -623,6 +785,7 @@ int main() {
     test_launch_scripts();
     test_usage_book();
     test_release_versions();
+    test_release_answer();
     test_exit_meaning();
     test_events();
     if (failures != 0) {

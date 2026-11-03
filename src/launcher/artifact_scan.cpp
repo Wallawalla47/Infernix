@@ -460,6 +460,13 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
         dir.path = root;
         std::error_code error;
         dir.exists = std::filesystem::is_directory(root, error);
+        // Read here, on the scan's thread, so no API call waits on the drive (a sleeping network share).
+        std::error_code space_error;
+        const std::filesystem::space_info space = std::filesystem::space(root, space_error);
+        if (!space_error) {
+            dir.free_bytes  = space.available;
+            dir.total_bytes = space.capacity;
+        }
         if (!dir.exists) {
             dir.error = error ? error.message() : "folder not found";
             scan.dirs.push_back(std::move(dir));
@@ -472,11 +479,10 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
             scan.dirs.push_back(std::move(dir));
             continue;
         }
+        // A failed step ends the walk (MSVC's STL and libstdc++ leave the iterator at the end), so the
+        // folder says it was scanned only in part instead of losing its later files silently.
         for (; it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
-            if (error) {
-                error.clear();
-                continue;
-            }
+            if (error) { break; }
             const std::filesystem::directory_entry& entry = *it;
             std::error_code status_error;
             if (entry.is_directory(status_error)) {
@@ -554,6 +560,7 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
                 }
             }
         }
+        if (error) { dir.error = "scanned only in part: " + error.message(); }
         scan.dirs.push_back(std::move(dir));
     }
     // Forget files no longer present.
@@ -592,6 +599,8 @@ Json to_json(const LibraryScan& scan) {
                         {"models", dir.models},
                         {"drafters", dir.drafters},
                         {"ngram_volumes", dir.ngram_volumes},
+                        {"free_bytes", dir.free_bytes ? Json(*dir.free_bytes) : Json(nullptr)},
+                        {"total_bytes", dir.total_bytes ? Json(*dir.total_bytes) : Json(nullptr)},
                         {"error", dir.error ? Json(*dir.error) : Json(nullptr)}});
     }
     const auto optional_path = [](const std::optional<std::filesystem::path>& path) {

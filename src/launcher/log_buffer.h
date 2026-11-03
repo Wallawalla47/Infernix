@@ -3,7 +3,9 @@
 // The console log shown on the dashboard: infernix-serve's output split into records (its
 // `YYYY-MM-DD HH:MM:SS.mmm  LEVEL  message` lines parsed, other lines kept as raw), interleaved with
 // the launcher's own records, in a bounded ring with increasing sequence numbers. Each server
-// instance's output is also written to `serve-<time>-<model>.log` in the server-log folder.
+// instance's output is also written to `serve-<time>-<model>.log` in the server-log folder: the
+// reader only queues it, and write_files() (one writer thread) writes it, so a slow disk never holds
+// up the server's output pipe.
 
 #include "launcher/util.h"
 
@@ -50,12 +52,15 @@ public:
     // The folder of the next instances' log files.
     void set_dir(std::filesystem::path log_dir);
 
-    // A new server instance: opens its log file and keeps the newest 20 files.
+    // A new server instance: its log file is opened (and the newest 20 files kept) by the next
+    // write_files().
     void begin_instance(std::uint32_t instance, const std::string& label);
     void end_instance();
     // Raw output from the server; complete lines become records.
     void append_output(std::uint32_t instance, std::string_view chunk);
     void add(std::uint32_t instance, std::string level, std::string source, std::string text);
+    // Writes the queued log-file output, in order, and flushes the file.
+    void write_files();
 
     [[nodiscard]] Json page(std::uint64_t after, std::size_t limit) const;
     // The newest records of `instance` at `level` or worse, newest last.
@@ -64,7 +69,15 @@ public:
     void set_listener(Listener listener);
 
 private:
+    // One step of the log files, in order: open `open` (closing the previous file), write `data`,
+    // then close the file when `close`.
+    struct FileWrite {
+        std::filesystem::path open;
+        std::string data;
+        bool close = false;
+    };
     void push_locked(LogRecord record, std::vector<LogRecord>& emitted);
+    void open_file(const std::filesystem::path& path);
 
     std::filesystem::path log_dir_;
     mutable std::mutex mutex_;
@@ -72,8 +85,11 @@ private:
     std::uint64_t next_seq_ = 1;
     std::string partial_;
     std::uint32_t partial_instance_ = 0;
-    std::ofstream file_;
+    std::vector<FileWrite> file_writes_;
     Listener listener_;
+    // write_files() only; taken before mutex_, never under it.
+    std::mutex file_mutex_;
+    std::ofstream file_;
 };
 
 } // namespace infernix::launcher
