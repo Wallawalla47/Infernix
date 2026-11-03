@@ -164,7 +164,8 @@ not consume the allowance, and an incomplete scan continues in ticket order. Que
 capacity releases and completed transactions trigger a scan; a request that already failed under the
 same event is not quoted again, and ordinary decode does not reopen a scan. While the FIFO head
 waits, the Engine prefetches its Host-only path into spare Device cache. A paused request's wait
-constrains only itself; idle lanes and capacity can serve fresh requests that are able to enter.
+constrains only itself; idle lanes and capacity can serve fresh requests that are able to enter
+(§5.2 bounds its wait by its older residents).
 
 ### 5.2 Pressure and complete resume
 
@@ -181,6 +182,22 @@ The paused queue tries resumes in original ticket order. While an older resident
 request only tries idle and cache space; it cannot repeatedly pause young borrowers merely to
 probe a resume. After the older resident leaves, the oldest paused request can take back the lane and
 capacity held by younger requests. Fresh admission does not proactively preempt residents.
+
+**Why age order (decided 2026-11-03).** Pressure is resolved by age: only the oldest resident takes
+capacity from others, a paused request is always younger than whoever paused it, and fresh requests are
+younger still. A paused request therefore waits at most until the residents older than itself finish or
+are cancelled; nothing younger can delay it, since the deferred resume is retried on every capacity
+event and, once no older resident remains, takes back the lane and capacity younger requests hold.
+Fresh requests may use idle space meanwhile (the space the paused request cannot use yet), so no
+capacity stands idle. This is chosen because it finishes every request soonest: each pause is a
+Replay (Qwen3.5 recomputes from the deepest cached state; Qwen3.8-Flash-Next restores the snapshot it
+published), and the age order pauses only when the oldest work cannot otherwise advance. Rotating
+service turns (NInfer `a754fcf3`: the turn passes after 1 to 4 s of progress under pressure) bound
+every request's silence to seconds but pause on every turn, so they spend more of the GPU on Replay and
+finish the set later; holding fresh requests while anything is paused leaves capacity idle. The cost
+of the age order is latency, not delivery: a request paused behind long older generations waits for
+them (as in first-come, first-served order), so `--max-concurrency` and the KV capacity should leave
+room for the concurrent contexts a workload needs.
 
 At most one request holds a complete resume permit at a time. It rebuilds its old history and completes
 its first real new unit first, while other runnable units keep executing. Native holds the real
