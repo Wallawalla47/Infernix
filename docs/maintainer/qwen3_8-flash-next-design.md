@@ -12247,7 +12247,8 @@ run's expert routing (+1.6 % CPU-served misses, -2.7 % with frames held); T = 8 
 every reader takes bf16_p12 (`packable_objects`, `load.cpp`):
 - *Output projections* [2560, 6144] (GDN and QSA): the direct MMA (`bf16_p12_direct.cuh`: barrier-free register
   decode, B fragments through L1, K split into contiguous slices reduced in shared memory; an output's bits depend on
-  the slice count only) with 16 K slices at T <= 32, the stream MMA to 128, the packed TMA MMA beyond. Op: 1.00-1.06x
+  the slice count only) with 16 K slices at T <= 16 and 8 at 17-32 (the sweep's widest 16-slice schedule
+  is 16 columns), the stream MMA to 128, the packed TMA MMA beyond. Op: 1.00-1.06x
   at T <= 8, 0.93x at 16, 0.87-0.94x at 17-32, 0.60-0.66x at 33-128, against the BF16 routes.
 - *Text head* [248320, 2560] (recipe A, FP8, FP4-Local; not while its 2-bit screen is bound, whose rescore reads BF16
   rows; the screen is bound only with a KV format where screened-lm-head is qualified in some configuration, so
