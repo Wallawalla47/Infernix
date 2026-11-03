@@ -235,6 +235,17 @@ int main() {
         failures += check(q::fast_path_qualified(FastPath::ExpertA4Residual, offloaded) &&
                               !q::fast_path_qualified(FastPath::ExpertA4Residual3, offloaded),
                           "two-term expert-a4-residual is registered on the 122B, three terms are not");
+        // free-cache-resume and preemption measured faster there (2026-11-03: continuing-turn TTFT, a short pool);
+        // gdn-f16-accumulate level.
+        failures += check(q::fast_path_qualified(FastPath::FreeCacheResume, offloaded) &&
+                              q::fast_path_qualified(FastPath::Preemption, offloaded) &&
+                              !q::fast_path_qualified(FastPath::GdnF16Accumulate, offloaded),
+                          "free-cache-resume and preemption are registered on the 122B, gdn-f16-accumulate is not");
+    }
+    for (const KvCacheStorage kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16,
+                                    KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
+        failures += check(q::fast_path_qualified(FastPath::PromptPv8, {32, ActivationClass::A8, kv, false, true}),
+                          "prompt-pv8 is registered on the 122B on every format its kernel serves (measured faster)");
     }
     failures += check(!q::fast_path_applies(FastPath::ExpertA4Residual, int8_24, options) &&
                           !q::fast_path_applies(FastPath::ExpertA4Residual3, int8_24, options),
