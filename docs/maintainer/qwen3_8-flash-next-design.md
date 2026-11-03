@@ -12061,10 +12061,18 @@ DRAM bandwidth their resident records need. They now run `ops/offloaded_sparse_m
   gate row's thread pairs with its up row's (lane + 4) for SwiGLU. x comes from shared memory for jobs of at most two
   columns, else from L2. The job's last CTA rewrites every entry's h in place as limbs, with h_emax.
 - Down: a warp a row group of 40 units, copied before the PDL wait; the job's h limbs then come to shared memory.
-- Calls of up to 64 columns take them (`kA16NmmaCallColumns`: eight lanes of eight columns), their jobs of more than
-  eight columns the wide route as before; the workspace of the A4 residual wide routes (FP4-Local's default
-  `expert-a4-residual`) then holds the x limbs, exponents and counts too. Wider calls' (prefill's) narrow jobs keep
-  the dp4a kernels.
+- Calls of up to 4,096 columns take them (`kA16NmmaCallColumns`; 64, eight lanes of eight columns, until 2026-11-03,
+  below), their jobs of more than eight columns the wide route as before; the workspace of the A4 residual wide
+  routes (FP4-Local's default `expert-a4-residual`) then holds the x limbs, exponents and counts too. Wider calls'
+  narrow jobs keep the dp4a kernels.
+- **Prefill calls (2026-11-03, candidates TM-02a).** A prompt call's narrow jobs took the dp4a kernels until then. Op
+  bench (`infernix_offloaded_moe_wide_bench --activation a16x2 --placement frames`, the moe_experts call, two runs
+  each, same hashes), dp4a against tensor cores: 128 columns 2,284 -> 1,179 us (0.52x), 256 3,143 -> 1,381 (0.44x),
+  512 3,418 -> 1,457 (0.43x), 1,024 2,778 -> 1,540 (0.55x), 2,048 1,656 -> 1,580, 4,096 2,065 -> 2,035. End to end
+  (FP4-Local, BF16 KV, -p N -n 1, two rotated runs) level from pp256 to pp16384 (+0.2, -0.1, +0.3, 0.0 %): prefill
+  there waits on the expert stream over the link, and the gain shows where a prompt's experts are resident. With
+  every call taking them, pp32768 and pp65536 lost 0.2 and 0.4 % (both runs): the layer walk's MoE groups of up to
+  32,768 columns have no narrow jobs, and encoding all their tokens' limbs is the cost, hence the 4,096 cap.
 
 **Test.** `infernix_offloaded_moe_layer_test`: the W4A16 calls of one, four, five and eight columns, every placement,
 staging pass, CPU share and SSD-tier read against `expert_forward_a16`'s bits, with exact and (new) A4 residual
@@ -12443,6 +12451,73 @@ pairs; `infernix_qsa_attention_bench`, 24/2 heads, cold L2).
   (both pairs), 128K +1.4 % (both pairs).
 - Ornith-1.5-122B (Qwen3.5 route, unchanged): greedy ids identical; KV 3.23 -> 2.47 GB at 131K; prefill -0.3 / -0.7 %
   (32K / 128K), decode +5.8 / +6.3 % (CPU-miss-bound and noisy: one 32K pair +13 %, the other -0.8 %).
+
+### 19.3.49 FP4-Local's 16-bit route: assisted prompt calls, narrow jobs and the split gate/up (2026-11-03; same bits; default)
+
+**Why.** The owner saw FP4-Local's default (A16) prefill far slower than `--expert-a4-activations`. Same build, BF16
+KV, `-p N -n 1` from one warm expert state, two rotated runs (RTX 5090, PCIe 5.0 x8, i9-13900K): A4 against A16
+pp64 1.22x, pp256 1.00x, pp1024 1.01x, pp4096 1.02x, pp16384 1.01x, pp32768 1.06x, pp65536 1.06x. The gap lives in
+the CPU-assisted calls (more columns than a decode round, at most 255: §19.3.1 P7) and in the GEMM-bound long
+prompts (two A4 terms against one, §19.3.23). From 256 columns the gated stream's split (§19.3.12) follows the
+measured rates, and both routes wait on the link alike.
+
+**Assisted calls' link share.** An assisted call kept 51/256 of its host-memory misses on the link, the decode
+verification rounds' share (§19.3.47), and gave the CPU team the rest (up to 256 jobs). A16's exact CPU arithmetic
+(three byte products a weight) serves about 31,000 expert columns/s against W4A4's 59,000, so the CPU was the call's
+critical path. `MoeCpuChannel::assist_share` gives assisted calls their own share, and `assist_share_wide` /
+`assist_ramp_from` let it grow with the call's width: a wider call gives each CPU expert more columns while its link
+cost stays one record. The Program keeps 77/256 up to 64 columns, rising linearly to 104/256 at 255, for NVFP4 W4A16
+banks on the exact narrow arithmetic (`assist_link_share`). First, the link's share at every width
+(`INFERNIX_TMP_LINK_SHARE`; decode untouched at `-n 1`), two runs:
+
+| Prompt | 51/256 | 77/256 | 128/256 | 179/256 | A4 |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 213.6 | 275.8 (1.29x) | 206.2 | 159.0 | 258.5 |
+| 128 | 324.6 | 378.7 (1.17x) | 330.2 | 252.9 | 404.7 |
+| 255 | 463.7 | 469.9 (1.01x) | 464.0 | 355.5 | 572.4 |
+
+Then the assisted share alone (a temporary switch, fixed at every width), rotated, runs in the fast CPU state below:
+
+| Prompt | 64 | 77 | 90 | 104 | 118 |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 203.3 | 207.1 | 188.1 | | |
+| 64 | 247.1 | 276.8 | 266.8 | | |
+| 96 | | 330.6 | 342.9 | 315.9 | 286.1 |
+| 128 | | 377.7 | 393.0 | 382.5 | 342.9 |
+| 192 | | 408.9 | 471.4 | 459.6 | 418.0 |
+| 255 | | 464.7 | 509.2 | 532.2 | 495.0 |
+
+The ramp end to end against the fixed 77/256 (the binary before it, three rotated runs a point, all in the fast
+state): pp96 336.1 -> 346.7 tok/s (+3.1 %), pp128 382.1 -> 408.8 (+7.0 %), pp192 416.7 -> 476.9 (+14.5 %), pp255
+465.8 -> 539.1 (+15.7 %), every run ahead; pp32 and pp64 (the same share) +2.2 % and +0.1 %, the runs' spread. Against
+the morning's 51/256 that is pp64 +29 %, pp128 +26 %, pp255 +16 %; A4 (258.5 / 404.7 / 572.4) now leads only at 255
+columns (-6 %).
+
+**A slow CPU state.** On 2026-11-03 the same runs went through three windows of 6-10 minutes (15:54-16:03,
+16:10-16:16, 16:39-16:49) in which every assisted call ran about 35 % slower with identical work (the same hit rates and
+CPU-served counts), normal startup probes (17.8-20.8K experts/s, link 27.3-27.6 GB/s), the CPU at the same clocks and
+each run's load 4 s longer; there 118/256 led at 96-192 columns (pp192 412.7 against 77's 282.3) and 104 at 255. The
+cause lies outside the process (not attributed; the 2026-11-02 two-speed runs had the same signature). The ramp's
+wider shares serve both states; a split that follows the CPU team's observed time at run time would serve them better
+(not built).
+
+The 4-bit route and the other banks keep the wide share (unmeasured). Still open: A4 leads A16 at 128-255 columns by
+the CPU arithmetic, and a prompt of 255 tokens (assisted) prefills faster than one of 256 (the gated stream): A16 465
+against 371 tok/s, A4 573 against 370, a boundary not re-tuned since the tensor-core narrow kernels and the vector CPU
+kernels landed (not attributed).
+
+**Narrow jobs of prompt calls** on the tensor-core kernels up to 4,096 columns: §19.3.40.
+
+**Split gate/up.** Calls of four columns or more give each row group of `gate_up_nmma16_kernel` two warps, each
+streaming half of K through a three-stage ring (two CTAs an SM, 48 KB static shared memory); the halves' int64 sums
+add exactly, so the bits are the unsplit kernel's (TensorFold #1351 gave a one-row unit two warps, GB10 gate/up 93.2
+-> 86.6 us). Op bench (`--activation a16 --placement frames --cold --staging-slots 0`, three interleaved runs, same
+hashes), split against unsplit: 1 column 43.6 / 43.8 us, 2 66.1 / 66.1, 3 74.1 / 72.4, 4 90.8 / 92.7, 6 115.4 /
+117.5, 8 133.9 / 135.7, 16 232.3 / 236.4. One column (plain decode) is unchanged: its 43.6 us against ~15 us of
+record bytes is the pass's fixed latency, which the split does not touch. End to end (FP4-Local, BF16 KV, three ABBA
+blocks, the same text and rounds), unsplit against split: DFlash2 after a 16K prompt 227.25 -> 227.70 tok/s (3 of 3
+ahead), the struct fixture 430.83 -> 431.27 (2 of 3), plain decode (one column: the same kernels) 128.90 -> 128.80.
+Kept by the op gain at no cost.
 
 ---
 

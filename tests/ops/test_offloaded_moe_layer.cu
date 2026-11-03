@@ -342,6 +342,15 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     // Prefill CPU assist (P7): calls of at least 9 columns take up to 256 CPU-served misses.
     moe::CpuMissService service_assist(layers, {.workers = 6, .max_jobs = 8, .max_columns = 255, .pcie_divisor = 4,
                                                 .wide_from = 9, .wide_jobs = moe::kMaxCpuJobs, .cpus = {}, .activation = activation, .narrow_a16 = narrow});
+    // The same with the assisted calls' own link share (MoeCpuChannel::assist_share: 153/256 on the link), and with
+    // a share ramp (77/256 up to 32 columns, rising to 230/256 at 255: 64 columns keep 98/256, 96 columns 120/256).
+    moe::CpuMissService service_assist_share(layers, {.workers = 6, .max_jobs = 8, .max_columns = 255, .pcie_divisor = 4,
+                                                      .wide_from = 9, .wide_jobs = moe::kMaxCpuJobs, .assist_share = 153,
+                                                      .cpus = {}, .activation = activation, .narrow_a16 = narrow});
+    moe::CpuMissService service_assist_ramp(layers, {.workers = 6, .max_jobs = 8, .max_columns = 255, .pcie_divisor = 4,
+                                                     .wide_from = 9, .wide_jobs = moe::kMaxCpuJobs, .assist_share = 77,
+                                                     .assist_share_wide = 230, .assist_ramp_from = 32, .cpus = {},
+                                                     .activation = activation, .narrow_a16 = narrow});
     // A prefill call's CPU share (design §19.3.12): calls up to a chunk of 4,096 columns, every narrow
     // miss offered (no PCIe share), up to every expert of the layer.
     moe::CpuMissService service_wide(layers, {.workers = 6, .max_jobs = 8, .max_columns = moe::kMaxCpuCallColumns,
@@ -357,10 +366,20 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                               .records = &copied});
     // The CPU's share of the misses (design §19.3.5 S3): want = min(cap, M - kept) of the misses with
     // at most max_job_columns columns, so the number served is min(want, eligible misses). The link
-    // keeps M / one_column_divisor in a one-column call (when set), else (M * pcie_share) >> 8 with a
-    // share, else M / pcie_divisor (none for 0).
+    // keeps M / one_column_divisor in a one-column call (when set), else (M * share) >> 8 in an assisted
+    // call (assist_share, moving linearly from assist_ramp_from columns to assist_share_wide at max_columns),
+    // else (M * pcie_share) >> 8 with a share, else M / pcie_divisor (none for 0).
     const auto kept_of = [&](const auto& channel, int misses) {
         if (columns == 1 && channel.one_column_divisor > 0) { return misses / channel.one_column_divisor; }
+        if (channel.assist_share > 0 && channel.wide_from > 0 && columns >= channel.wide_from) {
+            int share = channel.assist_share;
+            if (channel.assist_ramp_from > 0 && columns > channel.assist_ramp_from) {
+                share += (channel.assist_share_wide - channel.assist_share) *
+                         (std::min(columns, channel.max_columns) - channel.assist_ramp_from) /
+                         (channel.max_columns - channel.assist_ramp_from);
+            }
+            return (misses * share) >> 8;
+        }
         if (channel.pcie_share > 0) { return (misses * channel.pcie_share) >> 8; }
         return channel.pcie_divisor > 0 ? misses / channel.pcie_divisor : 0;
     };
@@ -466,12 +485,15 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         take(false, n + std::min(cap - n, misses - kept_of(channel, misses)));
         return chosen;
     };
-    // Outputs with the CPU engine's bits: every W4A16 output (its wide route is exact too), and the
-    // W4A4 narrow route's (design §8.5): an expert with at most eight columns, or one whose gate and
-    // up projections keep separate input scales (the fixture's every third expert, unless shared_input).
+    // Outputs with the CPU engine's bits: every W4A16 output on the exact wide route (and a wide call's narrow jobs
+    // under the A4 residual wide routes, whose wide jobs take A4 terms), and the W4A4 narrow route's (design §8.5): an
+    // expert with at most eight columns, or one whose gate and up projections keep separate input scales (the
+    // fixture's every third expert, unless shared_input).
+    const bool a16_exact_wide = a16 && wide == moe::WideA16::kExact;
     std::vector<std::uint8_t> exact_outputs(static_cast<std::size_t>(top_k) * columns);
     for (std::size_t i = 0; i < exact_outputs.size(); ++i) {
-        exact_outputs[i] = a16 || expert_columns[ids[i]] <= moe::kMaxCpuColumns || (!shared_input && ids[i] % 3 == 0);
+        exact_outputs[i] = a16_exact_wide || expert_columns[ids[i]] <= moe::kMaxCpuColumns ||
+                           (!a16 && !shared_input && ids[i] % 3 == 0);
     }
     std::vector<std::uint16_t> placed;
     // The fork stream and its events, for the one-pass decode/verification route.
@@ -492,7 +514,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                 Config{64, nullptr, true, true},
                                 Config{64, &service_narrow, true, true}, Config{3, nullptr, false, true},
                                 Config{64, &service_assist}, Config{3, &service_assist}, Config{0, &service_assist},
-                                Config{64, &service_assist, true}, Config{0, nullptr, false, false, true},
+                                Config{64, &service_assist, true}, Config{64, &service_assist_share},
+                                Config{3, &service_assist_share}, Config{64, &service_assist_ramp},
+                                Config{3, &service_assist_ramp}, Config{0, nullptr, false, false, true},
                                 Config{3, nullptr, false, false, true}, Config{64, nullptr, false, false, true},
                                 Config{64, nullptr, true, false, true}, Config{64, &service_wide},
                                 Config{0, &service_wide}, Config{64, &service_wide, false, false, true},
@@ -1721,8 +1745,8 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
             test_tail_skip(96, 16, 10, 8, 409); // two verify rows: past the fork route, wide experts never skipped
         }
         // W4A16 experts (§16.2.1): decode, verification, several columns per expert, many misses, and
-        // a short prompt's call. The narrow jobs of calls of at most 64 columns take the tensor-core narrow
-        // kernels; a wider call's narrow jobs the dp4a multi-column kernels.
+        // a short prompt's call. The narrow jobs of calls of at most 4,096 columns take the tensor-core narrow
+        // kernels (64 before 2026-11-03), a wider call's narrow jobs the dp4a multi-column kernels.
         constexpr auto kA16 = moe::ExpertActivation::kA16;
         test_layer(12, 1, 10, 41, kA16);
         test_layer(24, 8, 10, 43, kA16);
@@ -1740,6 +1764,10 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
         test_layer(12, 1, 10, 141, kA16, kExactNarrow, kResidualWide);
         test_layer(24, 8, 10, 143, kA16, kExactNarrow, kResidualWide);
         test_layer(9, 3, 3, 147, kA16, kExactNarrow, kResidualWide);
+        // A short prompt's call there: its narrow jobs on the tensor-core kernels (the exact bits; its wide jobs take
+        // A4 terms, outside this test), with the x limbs the A4 residual workspace now holds for every width.
+        test_layer(512, 512, 10, 149, kA16, kExactNarrow, kResidualWide);
+        test_layer(512, 96, 10, 155, kA16, kExactNarrow, kResidualWide);
         // The two-term narrow route (expert-a4-residual-decode): GPU kernels and CPU-served misses alike,
         // for every placement, staging pass, CPU share and SSD-tier read of the configurations above.
         constexpr auto kTwoTerm = moe::NarrowA16::kA4Residual;

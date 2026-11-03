@@ -170,7 +170,7 @@ struct Offsets {
     std::size_t lossless;                              // kLossless
     std::size_t x_acts, h_acts, ring_jobs, ring_counters; // the narrow ring (ring_call)
     bool has_ring;
-    bool has_nmma; // the A4 residual routes' x limbs, x_emax and job_ctas for a16_nmma_columns calls
+    bool has_nmma; // the A4 residual routes' x limbs, x_emax and job_ctas for the tensor-core narrow jobs
     std::size_t end;
 };
 
@@ -206,8 +206,8 @@ Offsets offsets(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t en
         // The narrow route still needs its h rows (BF16 h of every entry) and exponents, and a ring
         // call (ring_call) its x exponents.
         o.h_rows = take(e * h_row);
-        // A decode or verification call's narrow jobs take the tensor-core narrow kernels, which read the call's x
-        // limbs and their gate/up CTA counts.
+        // The narrow jobs take the tensor-core narrow kernels, which read the call's x limbs and their gate/up CTA
+        // counts (a16_x_row_bytes per token: 7,680 at Flash-Next's geometry).
         o.has_nmma = shape == kFlashNextShape && a16_nmma_columns(columns) && !ring_call(shape, activation, wide_a16, columns);
         if (ring_call(shape, activation, wide_a16, columns) || o.has_nmma) { o.x_emax = take(t * sizeof(std::int32_t)); }
         if (o.has_nmma) {
@@ -566,7 +566,15 @@ Descriptors make_descriptors_terms(const std::uint8_t* x_terms_plane, const std:
 
 std::size_t experts_workspace_bytes(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t entries,
                                     std::int32_t columns, ExpertActivation activation, WideA16 wide_a16) {
-    return offsets(shape, max_jobs, entries, columns, activation, wide_a16).end;
+    std::size_t bytes = offsets(shape, max_jobs, entries, columns, activation, wide_a16).end;
+    // A call of at most kA16NmmaCallColumns columns may hold x limbs a wider one does not (a16_nmma_columns): callers
+    // size the widest call they make, so its bytes cover the widest call that holds them too.
+    if (columns > kA16NmmaCallColumns) {
+        const auto narrower = static_cast<std::int32_t>(
+            (static_cast<std::int64_t>(entries) * kA16NmmaCallColumns + columns - 1) / columns);
+        bytes = std::max(bytes, offsets(shape, max_jobs, narrower, kA16NmmaCallColumns, activation, wide_a16).end);
+    }
+    return bytes;
 }
 
 ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, std::int32_t max_jobs,
@@ -624,7 +632,7 @@ int persistent_ctas() {
 
 Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source, std::int32_t top_k,
              std::int32_t max_jobs, std::int32_t pass_jobs, const ExpertsWorkspace& workspace, Tensor& outputs,
-             cudaStream_t stream) {
+             cudaStream_t stream, bool x_limbs_encoded) {
     if (pass_jobs <= 0 || max_jobs <= 0) { throw std::invalid_argument("offloaded_sparse_moe wide: empty passes"); }
     const int entries = outputs.ne[1];
     Call call;
@@ -692,6 +700,7 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
         call.x_emax  = workspace.x_emax;
         call.h_emax  = workspace.h_emax;
         call.top_k   = top_k;
+        if (x_limbs_encoded) { return call; }
         with_expert_geometry(source.shape, [&]<class G>() {
             encode_x_kernel<G><<<x.ne[1], G::kHidden / 16, 0, stream>>>(static_cast<const std::uint16_t*>(x.data),
                                                                        workspace.x_limbs, workspace.x_emax);

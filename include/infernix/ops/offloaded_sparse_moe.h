@@ -190,6 +190,14 @@ struct MoeCpuChannel {
     // to wide_jobs <= kMaxCpuJobs CPU-served misses.
     std::int32_t wide_from              = 0;
     std::int32_t wide_jobs              = 0;
+    // When assist_share > 0, an assisted call (at least wide_from columns) keeps (misses * share) >> 8 on the stage
+    // instead of the shares above (in 256ths): share is assist_share up to assist_ramp_from columns (0: at every
+    // width), then moves linearly to assist_share_wide at max_columns. A prompt call's CPU experts carry more columns
+    // than a verification round's, the more the wider the call, so a slow CPU arithmetic wants more of them on the
+    // link (Flash-Next's Program: W4A16 banks on the exact route).
+    std::int32_t assist_share           = 0;
+    std::int32_t assist_share_wide      = 0;
+    std::int32_t assist_ramp_from       = 0;
     // The arithmetic the service computes W4A16 jobs with (CpuMissService::Options::narrow_a16);
     // moe_experts requires it to equal the source's narrow_a16, so a CPU-served miss keeps the GPU's bits.
     offloaded_moe::NarrowA16 narrow_a16 = offloaded_moe::NarrowA16::kExact;

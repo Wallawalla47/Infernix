@@ -45,6 +45,9 @@ public:
         int max_job_columns = kMaxCpuColumns; // misses with more columns stay on the GPU
         int wide_from   = 0;     // calls of at least this many columns (0: none) take wide_jobs as their cap
         int wide_jobs   = 0;     // prefill assist cap, at most kMaxCpuJobs
+        int assist_share = 0;    // > 0: an assisted call keeps (misses * assist_share) >> 8 on the stage (MoeCpuChannel)
+        int assist_share_wide = 0; // MoeCpuChannel: the share reached at max_columns, from assist_ramp_from columns
+        int assist_ramp_from  = 0; // (0: assist_share at every width)
         // Optional: the logical CPUs (a mask, bit i: CPU i) worker i may run on; 0 or a missing entry
         // leaves it unpinned (worker 0 is the service thread).
         std::vector<std::uint64_t> cpus;

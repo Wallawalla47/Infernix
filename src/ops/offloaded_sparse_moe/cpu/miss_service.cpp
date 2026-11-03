@@ -181,6 +181,9 @@ MoeCpuChannel CpuMissService::channel(int layer) const {
     out.max_job_columns = options_.max_job_columns;
     out.wide_from       = options_.wide_from;
     out.wide_jobs       = options_.wide_jobs;
+    out.assist_share    = options_.assist_share;
+    out.assist_share_wide = options_.assist_share_wide;
+    out.assist_ramp_from  = options_.assist_ramp_from;
     out.narrow_a16      = options_.narrow_a16;
     out.ggml_a8         = options_.ggml_a8 ? 1 : 0;
     return out;

@@ -1,7 +1,7 @@
 // The tensor-core narrow route of NVFP4 W4A16 experts (design §16.2.1's arithmetic, §19.3.40), included by
 // moe_layer.cu after the A16 narrow kernels: the jobs of at most moe::kMaxColumns columns of a call of at most
-// moe::wide::kA16NmmaCallColumns columns (decode and verification, up to eight lanes; wider jobs keep the wide route)
-// on the exact narrow arithmetic at Qwen3.8-Flash-Next's geometry (a16_nmma_call). Every row sum
+// moe::wide::kA16NmmaCallColumns columns (decode, verification and prefill up to 4,096 columns; wider jobs keep the wide
+// route) on the exact narrow arithmetic at Qwen3.8-Flash-Next's geometry (a16_nmma_call). Every row sum
 // S = sum_b e4m3_scaled(s_b) P_b is the same int64 as the dp4a kernels' and the CPU engine's, so the outputs are
 // theirs bit for bit wherever an expert runs.
 //
@@ -25,6 +25,7 @@ constexpr int kNmma16Threads    = 32 * kNmma16Warps;
 constexpr int kNmma16StageUnits = 8;  // units per stage of a gate/up warp's ring (1,152 bytes)
 constexpr int kNmma16Depth      = 4;  // stages in a gate/up warp's ring
 constexpr int kNmma16SharedX    = 2;  // columns whose x a gate/up CTA copies to shared memory
+constexpr int kNmma16SplitColumns = 4; // calls from this width split a gate/up row group's K over two warps
 // A limb row's stride in shared memory: 16 bytes past the row, so two columns' words t fall in different banks.
 template <int RowBytes>
 inline constexpr int kNmma16RowStride = RowBytes + 16;
@@ -180,17 +181,33 @@ struct Nmma16Args {
     PassPhase phase;
 };
 
-template <class G>
-struct Nmma16GateUpShared {
-    std::int32_t scaled[256];
-    alignas(16) std::uint8_t x[kNmma16SharedX][kNmma16RowStride<Nmma16Shape<G>::kXRowBytes>];
-    alignas(16) std::uint8_t ring[kNmma16Warps][kNmma16Depth][Nmma16Shape<G>::kStageBytes];
+// A gate/up CTA's warps: KSplit warps a row group, each streaming 1 / KSplit of K through a Depth-stage ring.
+template <int KSplit>
+struct Nmma16GateUpWarps {
+    static constexpr int kSplit   = KSplit;
+    static constexpr int kDepth   = KSplit == 1 ? kNmma16Depth : 3; // 3 keeps two split CTAs an SM (48 KB static)
+    static constexpr int kWarps   = kNmma16Warps * KSplit;
+    static constexpr int kThreads = 32 * kWarps;
 };
 
-template <class G>
-__global__ void __launch_bounds__(kNmma16Threads) gate_up_nmma16_kernel(Nmma16Args a) {
+template <class G, int KSplit>
+struct Nmma16GateUpShared {
+    using W = Nmma16GateUpWarps<KSplit>;
+    std::int32_t scaled[256];
+    alignas(16) std::uint8_t x[kNmma16SharedX][kNmma16RowStride<Nmma16Shape<G>::kXRowBytes>];
+    // The rings; after the K loop the later K parts' sums ([part - 1][row group][lane][4]) reuse them.
+    alignas(16) std::uint8_t ring[W::kWarps][W::kDepth][Nmma16Shape<G>::kStageBytes];
+    static_assert(KSplit == 1 || (KSplit - 1) * kNmma16Warps * 32 * 4 * sizeof(long long) <= sizeof(ring),
+                  "the later K parts' sums fit the rings");
+};
+
+template <class G, int KSplit>
+__global__ void __launch_bounds__(Nmma16GateUpWarps<KSplit>::kThreads) gate_up_nmma16_kernel(Nmma16Args a) {
     using S = Nmma16Shape<G>;
-    __shared__ Nmma16GateUpShared<G> sm;
+    using W = Nmma16GateUpWarps<KSplit>;
+    constexpr int kPartStages = S::kStages / KSplit;
+    static_assert(S::kStages % KSplit == 0 && kPartStages >= W::kDepth, "whole stages in each K part, a full ring");
+    __shared__ Nmma16GateUpShared<G, KSplit> sm;
     __shared__ int last_cta;
     // The down pass (a programmatic dependent in captured graphs) may launch and start its weight copies now: it
     // reads h only after its PDL wait.
@@ -206,13 +223,17 @@ __global__ void __launch_bounds__(kNmma16Threads) gate_up_nmma16_kernel(Nmma16Ar
     if (moe::wide_route(count, scales)) { return; }
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     const int g = lane / 4, t = lane % 4;
-    const int group = static_cast<int>(blockIdx.x) * kNmma16Warps + warp;
-    const std::uint8_t* units = record + static_cast<std::size_t>(group) * G::kGateUpBlocks * moe::kUnitBytes;
+    // This warp's row group in the CTA and its part of K (blocks [part, part + 1) * kPartStages * kNmma16StageUnits).
+    const int rg = warp % kNmma16Warps, part = warp / kNmma16Warps;
+    const int group = static_cast<int>(blockIdx.x) * kNmma16Warps + rg;
+    const int b0    = part * kPartStages * kNmma16StageUnits;
+    const std::uint8_t* units =
+        record + (static_cast<std::size_t>(group) * G::kGateUpBlocks + static_cast<std::size_t>(b0)) * moe::kUnitBytes;
     const auto token = [&](int c) { return moe::wide::entry_column(dispatch.entries[first + c], a.top_k, dispatch.shared_first); };
     const bool shared_x = count <= kNmma16SharedX;
     if (shared_x) {
         constexpr int kChunks = S::kXRowBytes / 16;
-        for (int i = static_cast<int>(threadIdx.x); i < count * kChunks; i += kNmma16Threads) {
+        for (int i = static_cast<int>(threadIdx.x); i < count * kChunks; i += W::kThreads) {
             const int c = i / kChunks, k = i % kChunks;
             ggml::tile::cp_async16(sm.x[c] + 16 * k, a.x_limbs + static_cast<std::size_t>(token(c)) * S::kXRowBytes + 16 * k, 16);
         }
@@ -221,30 +242,30 @@ __global__ void __launch_bounds__(kNmma16Threads) gate_up_nmma16_kernel(Nmma16Ar
     auto& ring = sm.ring[warp];
     const auto issue = [&](int stage) {
         const std::uint8_t* src = units + static_cast<std::size_t>(stage) * S::kStageBytes;
-        for (int i = lane; i < S::kStageBytes / 16; i += 32) { ggml::tile::cp_async16(ring[stage % kNmma16Depth] + 16 * i, src + 16 * i, 16); }
+        for (int i = lane; i < S::kStageBytes / 16; i += 32) { ggml::tile::cp_async16(ring[stage % W::kDepth] + 16 * i, src + 16 * i, 16); }
     };
 #pragma unroll
-    for (int k = 0; k < kNmma16Depth - 1; ++k) {
+    for (int k = 0; k < W::kDepth - 1; ++k) {
         issue(k);
         ggml::tile::cp_async_commit();
     }
-    nmma16_fill_scaled(sm.scaled, kNmma16Threads);
-    ggml::tile::cp_async_wait<kNmma16Depth - 1>(); // the x group
-    __syncthreads();                         // x and the scale table
+    nmma16_fill_scaled(sm.scaled, W::kThreads);
+    ggml::tile::cp_async_wait<W::kDepth - 1>(); // the x group
+    __syncthreads();                            // x and the scale table
     // Column g's limb row (a thread past the job's columns reads its last one; its sums are not used).
     const int column = min(g, count - 1);
     long long s[4] = {0, 0, 0, 0};
     const auto k_loop = [&](auto global_x, const std::uint8_t* limbs) {
         constexpr bool kGlobal = decltype(global_x)::value;
-        for (int st = 0; st < S::kStages; ++st) {
-            ggml::tile::cp_async_wait<kNmma16Depth - 2>();
+        for (int st = 0; st < kPartStages; ++st) {
+            ggml::tile::cp_async_wait<W::kDepth - 2>();
             __syncwarp();
-            if (st + kNmma16Depth - 1 < S::kStages) { issue(st + kNmma16Depth - 1); }
+            if (st + W::kDepth - 1 < kPartStages) { issue(st + W::kDepth - 1); }
             ggml::tile::cp_async_commit();
-            const std::uint8_t* stage = ring[st % kNmma16Depth];
+            const std::uint8_t* stage = ring[st % W::kDepth];
 #pragma unroll
             for (int u = 0; u < kNmma16StageUnits; ++u) {
-                const int b = st * kNmma16StageUnits + u;
+                const int b = b0 + st * kNmma16StageUnits + u;
                 nmma16_unit<kGlobal>(stage + u * moe::kUnitBytes, limbs + nmma16_block_offset(b, t), sm.scaled, g, t, s);
             }
             __syncwarp(); // every lane is done with this stage before a later issue refills it
@@ -255,26 +276,47 @@ __global__ void __launch_bounds__(kNmma16Threads) gate_up_nmma16_kernel(Nmma16Ar
     } else {
         k_loop(std::true_type{}, a.x_limbs + static_cast<std::size_t>(token(column)) * S::kXRowBytes);
     }
-    // Rows g and g + 8 are gate rows for even g (row 2 i is intermediate i's gate, 2 i + 1 its up): the up row's
-    // outputs come from lane + 4.
-    const bool gate = (g & 1) == 0;
-    std::uint16_t y[4];
+    if constexpr (KSplit > 1) {
+        // The later parts' sums join part 0's (exact int64 adds, so the bits are the unsplit kernel's), through the
+        // rings' memory once every warp is done with its ring.
+        auto* parts = reinterpret_cast<long long (*)[kNmma16Warps][32][4]>(&sm.ring[0][0][0]);
+        ggml::tile::cp_async_wait<0>();
+        __syncthreads();
+        if (part > 0) {
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int c = 2 * t + (i & 1);
-        y[i] = canon::a16_row_output(s[i], a.x_emax[token(min(c, count - 1))], gate ? scales.alpha_gate : scales.alpha_up);
+            for (int i = 0; i < 4; ++i) { parts[part - 1][rg][lane][i] = s[i]; }
+        }
+        __syncthreads();
+        if (part == 0) {
+#pragma unroll
+            for (int p = 1; p < KSplit; ++p) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) { s[i] += parts[p - 1][rg][lane][i]; }
+            }
+        }
     }
-    std::uint16_t up[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) { up[i] = static_cast<std::uint16_t>(__shfl_down_sync(0xFFFFFFFFU, y[i], 4)); }
-    if (gate) {
-        auto* h = reinterpret_cast<std::uint16_t*>(a.h_rows);
+    if (part == 0) {
+        // Rows g and g + 8 are gate rows for even g (row 2 i is intermediate i's gate, 2 i + 1 its up): the up row's
+        // outputs come from lane + 4.
+        const bool gate = (g & 1) == 0;
+        std::uint16_t y[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int c = 2 * t + (i & 1);
-            const int k = group * 8 + g / 2 + (i < 2 ? 0 : 4); // rows g, g + 8: intermediates g / 2, g / 2 + 4
-            if (c < count) {
-                h[static_cast<std::size_t>(first + c) * moe::wide::A16Planes<G>::kHRowElements + k] = canon::swiglu_bf16(y[i], up[i]);
+            y[i] = canon::a16_row_output(s[i], a.x_emax[token(min(c, count - 1))], gate ? scales.alpha_gate : scales.alpha_up);
+        }
+        std::uint16_t up[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { up[i] = static_cast<std::uint16_t>(__shfl_down_sync(0xFFFFFFFFU, y[i], 4)); }
+        if (gate) {
+            auto* h = reinterpret_cast<std::uint16_t*>(a.h_rows);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int c = 2 * t + (i & 1);
+                const int k = group * 8 + g / 2 + (i < 2 ? 0 : 4); // rows g, g + 8: intermediates g / 2, g / 2 + 4
+                if (c < count) {
+                    h[static_cast<std::size_t>(first + c) * moe::wide::A16Planes<G>::kHRowElements + k] = canon::swiglu_bf16(y[i], up[i]);
+                }
             }
         }
     }
@@ -288,7 +330,7 @@ __global__ void __launch_bounds__(kNmma16Threads) gate_up_nmma16_kernel(Nmma16Ar
     }
     __syncthreads();
     if (last_cta == 0) { return; } // (a job belongs to one pass; the call's prepare kernel clears the counts)
-    for (int c = warp; c < count; c += kNmma16Warps) { nmma16_encode_h<G>(a.h_rows, a.h_emax, first + c, lane); }
+    for (int c = warp; c < count; c += W::kWarps) { nmma16_encode_h<G>(a.h_rows, a.h_emax, first + c, lane); }
 }
 
 // A down CTA's shared memory: the warps' row groups, then the job's h limb rows (as many as its columns, sized at
@@ -387,8 +429,21 @@ void launch_expert_pass_a16_nmma(int columns, const MoeDispatch& dispatch, const
     const Nmma16Args args{layout.x_limbs, layout.x_emax, dispatch, source, top_k, job_records, flags, base,
                           layout.h_rows, layout.h_emax, layout.job_ctas, outputs, phase};
     if (part != PassPart::Down) {
-        CUDA_CHECK(pdl::launch_with(pdl::Dependency::Serialized, {dim3(S::kGateUpCtas, jobs), dim3(kNmma16Threads), 0, stream},
-                                    gate_up_nmma16_kernel<G>, args));
+        // Calls of kNmma16SplitColumns columns or more split each row group's K over two warps; narrower ones keep one
+        // warp a group (op bench, FP4-Local's geometry, frames, cold L2, three interleaved runs, 2026-11-03: split
+        // against unsplit 1 column 43.6 / 43.8 us, 2 66.1 / 66.1, 3 74.1 / 72.4 (+2.4 %), 4 90.8 / 92.7, 6 115.4 /
+        // 117.5, 8 133.9 / 135.7, 16 232.3 / 236.4; same hashes; FP4-Local decode, BF16 KV, three ABBA blocks: DFlash2
+        // after a 16K prompt 227.25 -> 227.70 tok/s, 3 of 3 ahead, the struct fixture 430.83 -> 431.27, plain decode
+        // (one column, never split) 128.90 -> 128.80, the same text and rounds).
+        if (columns < kNmma16SplitColumns) {
+            CUDA_CHECK(pdl::launch_with(pdl::Dependency::Serialized,
+                                        {dim3(S::kGateUpCtas, jobs), dim3(Nmma16GateUpWarps<1>::kThreads), 0, stream},
+                                        gate_up_nmma16_kernel<G, 1>, args));
+        } else {
+            CUDA_CHECK(pdl::launch_with(pdl::Dependency::Serialized,
+                                        {dim3(S::kGateUpCtas, jobs), dim3(Nmma16GateUpWarps<2>::kThreads), 0, stream},
+                                        gate_up_nmma16_kernel<G, 2>, args));
+        }
         check_launch("A16 tensor-core gate/up");
     }
     if (part == PassPart::GateUp) { return; }

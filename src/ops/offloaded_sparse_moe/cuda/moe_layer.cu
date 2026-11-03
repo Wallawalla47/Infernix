@@ -2066,12 +2066,20 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
         const int n       = min(cap, ssd); // SSD-only, up to the cap
         const int one     = channel.one_column_divisor_device != nullptr && columns == 1 ? *channel.one_column_divisor_device
                                                                                          : channel.one_column_divisor;
-        // The link keeps M / one_column_divisor in a one-column call (when set), else (M * wide_share) >> 8 in a
-        // call of at least wide_share_from columns, else (M * pcie_share) >> 8 with a share, else M / pcie_divisor
-        // (none for 0).
+        // The link keeps M / one_column_divisor in a one-column call (when set), else (M * share) >> 8 in an assisted
+        // call (at least wide_from columns, when set; share: assist_share, rising from assist_ramp_from columns to
+        // assist_share_wide at max_columns), else (M * wide_share) >> 8 in a call of at least wide_share_from columns,
+        // else (M * pcie_share) >> 8 with a share, else M / pcie_divisor (none for 0).
         const bool by_one = columns == 1 && one > 0;
+        const bool assist = channel.assist_share > 0 && channel.wide_from > 0 && columns >= channel.wide_from;
         const bool wide   = channel.wide_share_from > 0 && columns >= channel.wide_share_from;
+        const int ramp    = channel.max_columns - channel.assist_ramp_from;
+        const int share   = channel.assist_ramp_from > 0 && columns > channel.assist_ramp_from && ramp > 0
+                                ? channel.assist_share + (channel.assist_share_wide - channel.assist_share) *
+                                                             (min(columns, channel.max_columns) - channel.assist_ramp_from) / ramp
+                                : channel.assist_share;
         const int kept    = by_one                     ? misses / one
+                            : assist                   ? (misses * share) >> 8
                             : wide                     ? (misses * channel.wide_share) >> 8
                             : channel.pcie_share > 0   ? (misses * channel.pcie_share) >> 8
                             : channel.pcie_divisor > 0 ? misses / channel.pcie_divisor
@@ -3032,7 +3040,10 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         CUDA_CHECK(cudaEventRecord(events[0], stream));
         CUDA_CHECK(cudaStreamWaitEvent(source.overlap_stream, events[0], 0));
         // Planned after the fork, so the first pass's staging overlaps the plan and quantization.
-        if (use_wide) { wide = moe::wide::prepare(x, dispatch, source, top_k, max_jobs, half, layout, outputs, stream); }
+        if (use_wide) {
+            wide = moe::wide::prepare(x, dispatch, source, top_k, max_jobs, half, layout, outputs, stream,
+                                      a16_nmma_call(source, static_cast<int>(x.ne[1]), layout));
+        }
         int pass = 0;
         for (int base = 0; base < max_jobs; base += half, ++pass) {
             const int jobs = std::min(half, max_jobs - base);
@@ -3108,7 +3119,11 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
         return;
     }
-    if (use_wide) { wide = moe::wide::prepare(x, dispatch, source, top_k, max_jobs, pass_jobs, layout, outputs, stream); }
+    if (use_wide) {
+        // The tensor-core narrow kernels' prepare (prepare_x) encoded every token's x limbs already.
+        wide = moe::wide::prepare(x, dispatch, source, top_k, max_jobs, pass_jobs, layout, outputs, stream,
+                                  a16_nmma_call(source, static_cast<int>(x.ne[1]), layout));
+    }
     MoeExpertSource unlanded = source; // landing is for forked calls only
     unlanded.landing         = nullptr;
     unlanded.landing_slots   = 0;

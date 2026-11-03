@@ -1510,11 +1510,15 @@ public:
         if (cpu_service_) {
             measure_cpu_rate_settled(record_stride);
             const auto [wide_share, wide_from] = wide_link_share();
+            const AssistShare assist           = assist_link_share();
             for (auto& channel : experts.cpu) {
-                channel.pcie_divisor    = pcie_divisor();
-                channel.pcie_share      = pcie_share();
-                channel.wide_share      = wide_share;
-                channel.wide_share_from = wide_from;
+                channel.pcie_divisor      = pcie_divisor();
+                channel.pcie_share        = pcie_share();
+                channel.wide_share        = wide_share;
+                channel.wide_share_from   = wide_from;
+                channel.assist_share      = assist.share;
+                channel.assist_share_wide = assist.wide;
+                channel.assist_ramp_from  = assist.ramp_from;
             }
         }
         if (!options_.route_trace.empty()) {
@@ -6299,6 +6303,37 @@ private:
         return {kWideLinkShare256, ops::offloaded_moe::kMaxColumns};
     }
     static constexpr std::int32_t kWideLinkShare256 = 51;
+
+    // The link's share in 256ths of an assisted prompt call's host-memory misses (calls past the decode width up to
+    // kAssistMaxColumns; MoeCpuChannel::assist_share and its ramp), share 0: the wide share above. An NVFP4 W4A16 bank
+    // on the exact CPU arithmetic (three byte products a weight: the team serves ~31K expert columns/s against W4A4's
+    // ~59K) keeps kAssistLinkShare256 up to kAssistRampFrom columns, rising to kAssistLinkShareWide256 at 255: a wider
+    // call gives each CPU expert more columns while its link cost stays one record. FP4-Local's default route, BF16
+    // KV, -p N -n 1 from a warm state (2026-11-03, fixed shares at every width; 2-3 runs a point, rotated): against
+    // the wide share's 51/256, 77/256 pp64 +28 %, pp128 +15 %; the best fixed share by width 77 at 32-64 columns (64
+    // and 90 slower), 90 at 96-192 (pp96 330.6 -> 342.9 tok/s against 77, pp128 377.7 -> 393.0, pp192 408.9 ->
+    // 471.4), 104 at 255 (464.7 -> 532.2; 90 509.2, 118 495.0); the ramp against the fixed 77, three runs, every
+    // run ahead: pp96 +3.1 %, pp128 +7.0 %, pp192 +14.5 %, pp255 +15.7 %. In the slow CPU state seen that day (an
+    // outside cause: identical work, normal startup probes, 35 % slower assisted calls) 118 led at 96-192 and 104 at
+    // 255; the ramp's wider shares serve both. The 4-bit route (W4A4's faster CPU arithmetic) and the other banks keep
+    // the wide share (unmeasured). A fixed cpu_pcie_divisor or an INFERNIX_TMP_LINK_SHARE share leaves every width
+    // alone.
+    struct AssistShare {
+        std::int32_t share = 0, wide = 0, ramp_from = 0;
+    };
+    [[nodiscard]] AssistShare assist_link_share() const {
+        const auto& bank = *parameters_.layers.front().moe.bank;
+        const bool fixed = options_.cpu_pcie_divisor > 0 ||
+                           temporary_switches::offload().link_share != temporary_switches::OffloadSwitches::LinkShare::kDivisor;
+        const bool exact_a16 = bank.activation == ops::offloaded_moe::ExpertActivation::kA16 &&
+                               bank.planes.gate_up_format == QType::NVFP4_MUL &&
+                               cpu_narrow_a16() == ops::offloaded_moe::NarrowA16::kExact;
+        if (fixed || !exact_a16) { return {}; }
+        return {kAssistLinkShare256, kAssistLinkShareWide256, kAssistRampFrom};
+    }
+    static constexpr std::int32_t kAssistLinkShare256     = 77;
+    static constexpr std::int32_t kAssistLinkShareWide256 = 104;
+    static constexpr std::int32_t kAssistRampFrom         = 64;
 
     [[nodiscard]] int pcie_divisor() const noexcept {
         if (options_.cpu_pcie_divisor > 0) { return options_.cpu_pcie_divisor; }

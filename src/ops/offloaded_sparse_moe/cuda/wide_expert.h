@@ -272,12 +272,17 @@ inline constexpr int kLosslessChunkColumns = 2048;
 inline constexpr std::size_t kCpuCallBytes = 2304; // 2 words + 512 indices, rounded to 256
 
 [[nodiscard]] std::int32_t max_tiles(std::int32_t max_jobs, std::int32_t entries);
-// Calls whose narrow W4A16 jobs (at most kMaxColumns columns each) take the tensor-core narrow kernels
-// (moe_layer.cu's a16_nmma_call): decode and verification calls of up to eight lanes, at most
-// kA16NmmaCallColumns columns, whose x limbs, exponents and per-job gate/up CTA counts the workspace then holds
-// under the A4 residual wide routes too (the exact wide route's workspace has them already). Their wider jobs
-// keep the wide route; wider calls' narrow jobs the dp4a kernels.
-inline constexpr int kA16NmmaCallColumns = 64;
+// The narrow W4A16 jobs (at most kMaxColumns columns each) of calls of at most kA16NmmaCallColumns columns at
+// Flash-Next's geometry take the tensor-core narrow kernels (moe_layer.cu's a16_nmma_call), so the workspace holds
+// the call's x limbs, exponents and per-job gate/up CTA counts under the A4 residual wide routes too (the exact wide
+// route's workspace has them already); the wider jobs keep the wide route, a wider call's narrow jobs the dp4a
+// kernels. Decode and verification calls (up to 64 columns) and prefill calls up to 4,096 columns take them since
+// 2026-11-03 (FP4-Local's default route, op bench with every record in frames, the moe_experts call against the dp4a
+// narrow jobs, same hashes: 128 columns 0.52x, 256 0.44x, 512 0.43x, 1,024 0.55x, 2,048 0.95x, 4,096 0.99x; end to
+// end level at pp256-pp16384, where prefill waits on the expert stream). Wider calls (the layer walk's MoE groups of
+// up to 32,768 columns) have almost no narrow jobs, and encoding all their tokens' x limbs cost pp32768 -0.2 % and
+// pp65536 -0.4 %.
+inline constexpr int kA16NmmaCallColumns = 4096;
 INFERNIX_WIDE_HD constexpr bool a16_nmma_columns(int columns) { return columns <= kA16NmmaCallColumns; }
 // `columns` is the call's T (entries = top_k * T); the activation and W4A16 wide route select the planes.
 // `shape` is the bank's geometry (MoeExpertSource::shape; shape_supported).
@@ -327,10 +332,12 @@ struct Call {
 
 // Plans the call's wide work tiles in passes of `pass_jobs` jobs (the passes moe_experts stages),
 // quantizes x for every wide entry and stages the TMA descriptors (W4A4), or encodes every token's
-// x limbs (W4A16). Enqueued on `stream`.
+// x limbs (W4A16; `x_limbs_encoded`: the tensor-core narrow kernels' prepare already did, in the same
+// encoding). Enqueued on `stream`.
 [[nodiscard]] Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                            std::int32_t top_k, std::int32_t max_jobs, std::int32_t pass_jobs,
-                           const ExpertsWorkspace& workspace, Tensor& outputs, cudaStream_t stream);
+                           const ExpertsWorkspace& workspace, Tensor& outputs, cudaStream_t stream,
+                           bool x_limbs_encoded = false);
 
 // Computes the wide experts among the jobs of `pass`, whose records job_records holds by then:
 // the gate/up GEMM with SwiGLU and the encoding of h (A4, or the W4A16 limbs), then the down GEMM
