@@ -696,6 +696,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program =
         std::make_unique<models::qwen4_exp::Program>(instance->parameters, device, std::move(program_options));
+    if (options.ram_resize) { instance->program->start_ram_resize(options.ram_free_bytes); }
     const auto& sizing = instance->program->vram_sizing();
     const std::uint64_t frames_bytes =
         static_cast<std::uint64_t>(sizing.frames) * device_plan.expert_frame_bytes;

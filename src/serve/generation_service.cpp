@@ -397,6 +397,7 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     engine_options.media_cache_bytes        = options.media_cache_bytes;
     engine_options.media_live_bytes         = options.media_live_bytes;
     engine_options.ram_free_bytes           = options.ram_free_bytes;
+    engine_options.ram_resize               = options.ram_resize;
     engine_options.expert_ram_bytes         = options.expert_ram_bytes;
     engine_options.expert_ram_layout        = options.expert_ram_layout;
     engine_options.expert_pin_bytes         = options.expert_pin_bytes;

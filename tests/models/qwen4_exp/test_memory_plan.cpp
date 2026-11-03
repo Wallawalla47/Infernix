@@ -11,6 +11,7 @@
 // every other expert.
 
 #include "runtime/expert_offload/memory_plan.h"
+#include "runtime/expert_offload/ram_monitor.h"
 
 #include <cstdio>
 #include <deque>
@@ -531,9 +532,61 @@ void test_nominal_and_lend() {
     require(!LendCapacity{}.lends(1), "an empty cache lends nothing");
 }
 
+// The RAM tiers' resize law (--ram-resize auto): below 2 GiB available a release in whole steps up to 3 GiB free,
+// capped by what the tiers can give; growth only after more than the growth floor (the reserve, at least 3 GiB, plus a
+// step) has held for 10 s since the last release, by what stays above it, its pieces then due one after another;
+// nothing due when the tiers have no room, which is measured again every 30 s under pressure.
+void test_ram_control() {
+    using infernix::runtime::expert_offload::RamControl;
+    RamControl control(8 * kGiB);
+    control.set_room(10 * kGiB, 0);
+    require(control.observe(kGiB + kGiB / 2, 0.0) && control.decide(kGiB + kGiB / 2, 0.0).release == 2 * kGiB &&
+                control.decide(kGiB + kGiB / 2, 0.0).grow == 0,
+            "1.5 GiB available: release 2 GiB (whole steps to 3 GiB free)");
+    require(control.decide(2 * kGiB - 1, 0.0).release == 2 * kGiB, "just under 2 GiB: 1 GiB and a byte, two steps");
+    require(!control.observe(5 * kGiB, 1.0) && control.decide(5 * kGiB, 1.0).release == 0, "5 GiB: no pressure");
+    control.set_room(kGiB, 0);
+    require(control.decide(kGiB / 2, 2.0).release == kGiB, "the release stops at what the tiers can give");
+    control.set_room(0, 0);
+    control.checked(3.0);
+    require(!control.observe(kGiB / 2, 3.0) && !control.observe(kGiB / 2, 32.0) &&
+                control.decide(kGiB / 2, 33.0).release == 0,
+            "no room: nothing due under pressure");
+    require(control.observe(kGiB / 2, 33.0), "no room under pressure: the tiers are asked again after 30 s");
+    require(!control.observe(5 * kGiB, 100.0), "no pressure, no room: nothing to ask");
+
+    control.resized(100.0, true);
+    control.set_room(0, 6 * kGiB);
+    require(!control.observe(12 * kGiB, 100.0) && !control.observe(12 * kGiB, 105.0),
+            "growth waits while the threshold has not held for 10 s");
+    require(control.observe(12 * kGiB, 110.5) && control.decide(12 * kGiB, 110.5).grow == 3 * kGiB,
+            "12 GiB available after 10 s: grow by what stays above the reserve plus a step (3 GiB)");
+    require(!control.observe(8 * kGiB + kGiB / 2, 111.0), "a dip below the reserve plus a step restarts the hold");
+    require(!control.observe(12 * kGiB, 113.0) && !control.observe(12 * kGiB, 120.0) &&
+                control.observe(12 * kGiB, 123.5),
+            "the hold restarts from the dip");
+    control.resized(124.0, true);
+    require(!control.observe(12 * kGiB, 130.0) && control.observe(12 * kGiB, 134.5), "a release restarts the hold");
+    control.resized(135.0, false);
+    require(control.observe(11 * kGiB, 135.0) && control.decide(11 * kGiB, 135.0).grow == 2 * kGiB,
+            "a growth piece does not: the next is due at once");
+    control.set_room(0, kGiB);
+    require(control.decide(12 * kGiB, 135.0).grow == kGiB, "growth stops at the startup size");
+
+    // A reserve under 3 GiB: growth still leaves 3 GiB plus a step, or it would grow back into pressure.
+    RamControl small(2 * kGiB);
+    small.set_room(0, 8 * kGiB);
+    require(small.growth_floor() == 4 * kGiB, "growth floor: at least 3 GiB plus a step");
+    require(!small.observe(4 * kGiB, 0.0) && !small.observe(4 * kGiB, 20.0), "4 GiB available: nothing to grow into");
+    require(!small.observe(6 * kGiB + kGiB / 2, 21.0) && small.observe(6 * kGiB + kGiB / 2, 31.0) &&
+                small.decide(6 * kGiB + kGiB / 2, 31.0).grow == 2 * kGiB,
+            "6.5 GiB for 10 s: grow 2 GiB, leaving 4.5");
+}
+
 int main() {
     try {
         test_nominal_and_lend();
+        test_ram_control();
         test_full_mode_boundary();
         test_reserve_applied_once();
         test_planned_terms();

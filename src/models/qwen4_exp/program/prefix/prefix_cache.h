@@ -234,6 +234,21 @@ public:
     // Releases every reference the cache holds; the index is rebuilt empty.
     void clear() noexcept;
 
+    // ---- Host tier resize (RAM pressure, runtime::HostMemoryGovernor) --------------------------
+    // With no lane bound (the Engine idle): drains the transfers, then gives back whole chunks worth at least `bytes`
+    // (the lowest-valued entries go, the rest move below the cut), keeping image_slabs + 2 slabs. Returns the bytes
+    // released.
+    std::uint64_t shrink_host_tier(std::uint64_t bytes);
+    // Pins chunks of at most `bytes` back, up to the startup size; returns the bytes added (fewer when the OS
+    // refuses to pin one).
+    std::uint64_t grow_host_tier(std::uint64_t bytes);
+    // The startup size of the Host tier, and what shrink_host_tier could release and grow_host_tier add now.
+    [[nodiscard]] std::uint64_t host_tier_capacity_bytes() const noexcept {
+        return static_cast<std::uint64_t>(host_.slabs) * host_.slab_bytes;
+    }
+    [[nodiscard]] std::uint64_t host_tier_shrinkable_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t host_tier_growable_bytes() const noexcept { return host_tier_capacity_bytes() - pinned_bytes(); }
+
     // ---- persistence (persist.cpp) -------------------------------------------------------------
     // Writes every Host-backed snapshot and its Host block path to `path` (through `path.tmp`,
     // renamed when complete). Requires idle transfers. `abandoned` stops the save, deleting the
@@ -249,6 +264,7 @@ public:
     void release_device_block(std::uint32_t device_id) noexcept override;
     void release_snapshot(runtime::prefix_cache::SnapshotRef snapshot) noexcept override;
     void drop_snapshot_device_image(runtime::prefix_cache::SnapshotRef snapshot) noexcept override;
+    void move_host_slab(std::uint32_t from, std::uint32_t to) noexcept override;
 
 private:
     struct PendingCapture {

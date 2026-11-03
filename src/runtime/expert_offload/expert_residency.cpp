@@ -648,6 +648,11 @@ void ExpertResidency::release_reservations() {
     landing_per_layer_ = 0;
 }
 
+void ExpertResidency::publish_promotions() {
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    publish_landed();
+}
+
 void ExpertResidency::publish_landed() {
     auto* table = static_cast<std::int32_t*>(table_host_.data());
     for (auto it = in_flight_.begin(); it != in_flight_.end();) {

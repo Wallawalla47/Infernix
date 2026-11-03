@@ -865,6 +865,11 @@ struct EngineOptions {
     // that would take it, the n-gram table goes to RAM only beside it, and an automatic Host tier sizes from
     // what is left beyond it.
     std::uint64_t ram_free_bytes = kDefaultRamFreeBytes;
+    // --ram-resize auto|off: between requests the RAM tiers (the prefix cache's Host tier; the expert tier's slots
+    // and records) give memory back while less than 2 GiB of physical memory is available, and take it back in
+    // pieces, up to their startup sizes, once more than ram_free_bytes (at least 3 GiB) plus 1 GiB has stayed
+    // available for 10 s (runtime::expert_offload::RamMonitor). Off: every tier keeps its startup size.
+    bool ram_resize = true;
     // Qwen3.8-Flash-Next (--expert-ram-mib): at most this much Host RAM for the routed experts.
     // Less than every expert needs selects the SSD tier: the experts not in RAM are read from the
     // artifact when used. Empty: what the RAM ledger leaves after the reserve and every other pin.

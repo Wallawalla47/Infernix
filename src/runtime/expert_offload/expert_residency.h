@@ -211,6 +211,13 @@ public:
     [[nodiscard]] const std::int32_t* host_table() const noexcept {
         return static_cast<const std::int32_t*>(table_host_.data());
     }
+    // Promotions queued for issue_loads that it has not issued: a RAM shrink of the SSD tier waits for none (an
+    // unpinned record a pending promotion reads carries no pin).
+    [[nodiscard]] bool loads_pending() const noexcept { return !load_commands_.empty(); }
+    // Between rounds, before a RAM shrink of the SSD tier: waits for the promotions on the copy stream and publishes
+    // them (as the next before_round would, which still uploads the table), so their slots' H2D pins go. A warm
+    // start's promotions otherwise pin slots in most of the tier's chunks until the first round.
+    void publish_promotions();
     [[nodiscard]] std::int32_t* route_log() noexcept { return static_cast<std::int32_t*>(route_device_.p); }
     [[nodiscard]] std::size_t route_stride() const noexcept { return route_stride_; }
     // The last downloaded route log (valid once its round has completed), as after_round reads it.

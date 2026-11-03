@@ -25,6 +25,7 @@
 #include "models/qwen3_5/program/ngram_proposer.h"
 #include "models/qwen3_5/program/offload.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
+#include "runtime/expert_offload/ram_monitor.h"
 #include "runtime/prefix_cache/cost.h"
 #include "runtime/prefix_cache/prefix_index.h"
 #include "runtime/prefix_cache/tap_planner.h"
@@ -36,6 +37,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -863,6 +865,19 @@ public:
     std::filesystem::path hybrid_file_;
     std::string hybrid_fingerprint_;
     std::optional<HybridCachePersistence> hybrid_shutdown_save_;
+
+    // ---- RAM pressure (Program::start_ram_resize): the monitor and the engine's diagnostic sink -------------------
+    std::unique_ptr<runtime::expert_offload::RamMonitor> ram_;
+    std::function<void(const std::string&, DiagnosticLevel)> ram_diagnostic_;
+    // The growth so far of the pieces the monitor asks for one after another (logged once they stop).
+    std::uint64_t ram_grown_prefix_ = 0, ram_grown_experts_ = 0;
+    // Between requests: the resize the monitor finds due, applied to the prefix cache's Host tier, then (a release past
+    // it, a growth before it) to the offloaded experts' SSD tier.
+    void maintain_ram();
+    // The offloaded experts' SSD tier (null without one), and what the RAM tiers could give back and take back now.
+    [[nodiscard]] runtime::expert_offload::HostExpertTier* ram_expert_tier() noexcept;
+    [[nodiscard]] std::uint64_t ram_shrinkable();
+    [[nodiscard]] std::uint64_t ram_growable();
     std::uint64_t hybrid_saved_writes_ = 0; // host_write_bytes at the last save or load
     std::uint64_t hybrid_saves_        = 0; // periodic saves of the attached file that succeeded
     // Entries withdrawn after a non-finite failure that another sequence or a transfer still pinned

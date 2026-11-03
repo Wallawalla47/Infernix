@@ -42,7 +42,11 @@ with `--expert-stripe` in the SSD tier.
   (2026-10-17, one run each), plain tg512 measured 43.8 tok/s at 2048, 38.3 at 5120 and 35.6 at
   8192, today's default; MTP 4 at 4K + 512 measured 36.3-43.5, 40.4-40.9 and 39.6-39.7 (two runs
   each; how much RAM is free at startup moves it as much as the setting does). On a machine that
-  runs little else, `--ram-free-mib 2048` gives that artifact its speed back.
+  runs little else, `--ram-free-mib 2048` gives that artifact its speed back. When other programs
+  later take the RAM (less than 2 GiB available), `--ram-resize auto` (the default) gives some back
+  between requests, the prefix cache's Host tier first and then the SSD tier's expert copies (those
+  experts are read from the artifact meanwhile), and takes it back once the reserve is free again
+  ([serving](serving.md#server-options)); `--ram-resize off` keeps every startup size.
 - **VRAM.** All of it: the expert cache takes what the dense weights, the KV cache, the
   workspaces and a reserve for CUDA graphs leave, less a headroom for the display and other
   programs (see [VRAM](#vram)).

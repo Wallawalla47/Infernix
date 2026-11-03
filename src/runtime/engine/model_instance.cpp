@@ -1189,6 +1189,12 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         }
         break;
     }
+    if (options.ram_resize) {
+        instance->program->start_ram_resize(
+            options.ram_free_bytes, [observer = options.diagnostic_observer](const std::string& text, DiagnosticLevel level) {
+                publish_diagnostic(observer, level, "%s", text.c_str());
+            });
+    }
     LoadSummary::PrefixCacheRestore restore;
     if (options.context_cache.enabled) {
         instance->program->set_hybrid_cost(hybrid_cache_cost(context_cost.model));

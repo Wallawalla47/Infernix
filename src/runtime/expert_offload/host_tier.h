@@ -72,8 +72,8 @@ enum SlotPin : std::uint8_t {
     kPinCopy     = 1U << 6, // an admission's copy reads (the transit slot) or writes (the class slot) it
 };
 
-// The list a non-resident slot belongs to.
-enum class SlotList : std::uint8_t { kNone, kRing, kPrefetch, kDemotion, kLent };
+// The list a non-resident slot belongs to; kRetired: out of service (retire), holding nothing.
+enum class SlotList : std::uint8_t { kNone, kRing, kPrefetch, kDemotion, kLent, kRetired };
 
 // One landing the agent reports at a boundary: the record of `key` was read into `slot` while the
 // slot carried `serial`.
@@ -158,13 +158,15 @@ public:
     [[nodiscard]] std::uint32_t demotion_allowance() const { return allowance_; }
     // Keys that left both tiers (SSD-only afterwards), by cause, since start: VRAM victims dropped (T5) because
     // their frame was not published (a loan's or a shrink's, or one evicted while loading), no demotion slot was
-    // left, or they were not worth one; and RAM residents (their only host copy) evicted for another key.
+    // left, or they were not worth one; RAM residents (their only host copy) evicted for another key; and RAM
+    // residents a retirement (a RAM shrink) evicted.
     struct Losses {
-        std::uint64_t unpublished = 0, no_slot = 0, unworthy = 0, residents_evicted = 0;
+        std::uint64_t unpublished = 0, no_slot = 0, unworthy = 0, residents_evicted = 0, retired = 0;
     };
     [[nodiscard]] const Losses& losses() const { return losses_; }
 
-    // Keys whose host slot changed since the last call (the device pointer table's dirty set).
+    // Keys whose host copy changed since the last call, a slot's or a held record's (the device pointer table's
+    // dirty set; a held key's entry stays null).
     void take_dirty(std::vector<std::uint32_t>& keys);
 
     // ---- startup
@@ -179,6 +181,9 @@ public:
     [[nodiscard]] bool has_free_resident() const;
     // Marks `key` held outside the slots (see held); false when it has a slot copy or is held.
     bool hold(std::uint32_t key);
+    // Ends key's hold (the caller gives its record back): it is SSD-only afterwards unless VRAM holds it (which the
+    // tier does not know, so no loss is counted), and a landing of it may be admitted. False when it is not held.
+    bool unhold(std::uint32_t key);
     // Seeds the decayed LFU at the current time with a saved session's use counts, each capped at
     // `cap`, so the first admissions and demotions rank RAM residents by what that session used
     // instead of comparing all-zero scores (where the lowest slot, the best-ranked pre-fill, goes
@@ -197,6 +202,22 @@ public:
     // Every lent slot becomes a free resident slot again.
     void give_back();
     [[nodiscard]] std::size_t lent() const { return lent_.size(); }
+
+    // ---- RAM resize (engine thread, no round in flight)
+    // Takes `slots` out of service, all or none (false: nothing changed), so the caller can free their memory: none
+    // may be pinned, lent or a landing's target, and each class keeps more slots in service than its demotion list
+    // (the constructor's rule, so the demotion targets stand). A resident or shadow slot's key leaves RAM (a resident
+    // counts in Losses::retired) and a free slot leaves its class's free list. A slot of the ring, the prefetch list
+    // or a demotion list gives its place to a slot outside `slots`, a free one of its size, else the admission victim
+    // (of its class; of a class of the transit size for the ring and the prefetch list), which leaves RAM too, so
+    // every list keeps its size; a retired ring or prefetch slot takes its replacement's class. A class's shadow
+    // floor scales with its slots in service (rounded down), so the floor keeps its share of the class.
+    bool retire(std::span<const std::uint32_t> slots);
+    // Whether retire(slots) would succeed now (it changes nothing).
+    [[nodiscard]] bool retirable(std::span<const std::uint32_t> slots) const;
+    // Brings retired slots back as free resident slots of their class; the shadow floors scale back.
+    void restore(std::span<const std::uint32_t> slots);
+    [[nodiscard]] std::size_t retired() const { return retired_.size(); }
 
     // ---- round boundaries (engine thread, no round in flight)
     // A new round begins: every Use pin is released and each ring slot gets a fresh serial (an
@@ -285,7 +306,10 @@ private:
         std::vector<std::uint32_t> free; // free slots of the resident partition
         std::vector<std::uint32_t> demotion;
         std::vector<HeapEntry> heap[2];
+        std::uint32_t slots           = 0; // its slots, retired ones included
+        std::uint32_t retired         = 0;
         std::uint32_t demotion_target = 0;
+        std::uint32_t floor           = 0; // the configured shadow floor, which shadow_floor scales (retire)
         std::uint32_t shadow_floor    = 0;
         std::uint32_t shadows         = 0;
         bool transit_pitch            = false;
@@ -315,10 +339,16 @@ private:
     // A free slot of class c taken from its free list, else -1.
     std::int32_t take_free(std::uint8_t c);
     void set_resident(std::uint32_t slot, std::uint32_t key, SlotState state);
-    // Removes the slot's key from RAM (T12) and returns it as a free slot.
-    void evict(std::uint32_t slot);
+    // Removes the slot's key from RAM (T12) and returns it as a free slot; a resident's loss counts as a retirement's
+    // when `retiring`.
+    void evict(std::uint32_t slot, bool retiring = false);
     void mark_dirty(std::uint32_t key);
     void replace_in_list(std::vector<std::uint32_t>& list, std::uint32_t old_slot, std::uint32_t new_slot);
+    // retire()'s check: marks `slots` in `in` and gives the ring and prefetch replacements each class of the transit
+    // size gives (`draw`); false when the retirement cannot be made.
+    bool plan_retirement(std::span<const std::uint32_t> slots, std::vector<std::uint8_t>& in,
+                         std::vector<std::uint32_t>& draw) const;
+    void scale_shadow_floors();
 
     Config config_;
     DecayedLfu lfu_;
@@ -333,6 +363,7 @@ private:
     std::size_t held_count_ = 0;
     std::vector<std::uint32_t> ring_, prefetch_;
     std::vector<std::uint32_t> lent_; // lend(): slots out of the classes' resident partitions
+    std::vector<std::uint32_t> retired_; // retire(): slots out of service
     std::vector<std::uint32_t> used_; // slots holding a Use pin
     std::vector<std::uint32_t> streamed_; // slots holding a Stream pin
     std::vector<AdmissionCopy> copies_;  // admissions waiting for their copies

@@ -106,6 +106,13 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
     // Empty when every page is locked in RAM; otherwise the OS's reason.
     [[nodiscard]] const std::string& lock_failure() const noexcept { return lock_failure_; }
+    // Gives the pages of [offset, offset + bytes) (page-aligned, committed) back to the OS: unlocked and decommitted
+    // (Linux: dropped), and the hard minimum working set lowered by their size. Their bytes are lost; recommit them
+    // before touching them again.
+    void decommit(std::size_t offset, std::size_t bytes) noexcept;
+    // Commits a decommitted range again (zeroed) and locks it as the constructor does; false when the OS refuses the
+    // commit (the range stays decommitted). A refused lock leaves the pages pageable (lock_failure()).
+    [[nodiscard]] bool recommit(std::size_t offset, std::size_t bytes);
 
 private:
     std::byte* data_  = nullptr;

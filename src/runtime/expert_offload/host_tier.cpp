@@ -113,8 +113,10 @@ HostTier::HostTier(const Config& config)
     classes_.resize(classes.size());
     for (std::size_t c = 0; c < classes.size(); ++c) {
         ClassState& cs     = classes_[c];
+        cs.slots           = classes[c].slots;
         cs.demotion_target = classes[c].demotion;
         cs.transit_pitch   = classes[c].transit_pitch;
+        cs.floor           = classes[c].shadow_floor;
         cs.shadow_floor    = classes[c].shadow_floor;
         const std::uint32_t end = s + classes[c].slots;
         for (std::uint32_t i = 0; i < classes[c].demotion; ++i, ++s) {
@@ -279,7 +281,7 @@ void HostTier::set_resident(std::uint32_t slot, std::uint32_t key, SlotState sta
     push_victim(slot);
 }
 
-void HostTier::evict(std::uint32_t slot) {
+void HostTier::evict(std::uint32_t slot, bool retiring) {
     Slot& s = slots_[slot];
     if (s.pins != 0 || (s.state != SlotState::kResident && s.state != SlotState::kShadow)) {
         throw std::logic_error("HostTier: evicting a pinned or empty slot");
@@ -288,7 +290,7 @@ void HostTier::evict(std::uint32_t slot) {
     mark_dirty(s.key);
     --resident_count_;
     if (s.state == SlotState::kShadow) { count_shadow(slot, -1); }
-    if (s.state == SlotState::kResident) { ++losses_.residents_evicted; } // its only host copy
+    if (s.state == SlotState::kResident) { ++(retiring ? losses_.retired : losses_.residents_evicted); } // its only host copy
     s.state = SlotState::kFree;
     push_victim(slot); // invalidates its heap entries
 }
@@ -321,6 +323,15 @@ bool HostTier::hold(std::uint32_t key) {
     if (host_copy(key) || held(key)) { return false; }
     held_[key] = 1;
     ++held_count_;
+    mark_dirty(key);
+    return true;
+}
+
+bool HostTier::unhold(std::uint32_t key) {
+    if (!held(key)) { return false; }
+    held_[key] = 0;
+    --held_count_;
+    mark_dirty(key);
     return true;
 }
 
@@ -387,6 +398,142 @@ void HostTier::give_back() {
         classes_[slot_class_[s]].free.push_back(s);
     }
     lent_.clear();
+}
+
+bool HostTier::plan_retirement(std::span<const std::uint32_t> slots, std::vector<std::uint8_t>& in,
+                               std::vector<std::uint32_t>& draw) const {
+    const std::size_t n = classes_.size();
+    in.assign(slots_.size(), 0);
+    draw.assign(n, 0);
+    std::vector<std::uint32_t> leave(n, 0), listed(n, 0);
+    std::uint32_t transit = 0; // ring and prefetch slots to replace
+    for (const std::uint32_t s : slots) {
+        if (s >= slots_.size() || in[s] != 0 || slots_[s].list == SlotList::kRetired) {
+            throw std::invalid_argument("HostTier: a retirement names a slot out of range, twice or retired already");
+        }
+        in[s]            = 1;
+        const Slot& slot = slots_[s];
+        if (slot.pins != 0 || slot.list == SlotList::kLent || slot.state == SlotState::kLanding) { return false; }
+        if (slot.list == SlotList::kRing || slot.list == SlotList::kPrefetch) {
+            ++transit;
+            continue;
+        }
+        ++leave[slot_class_[s]];
+        if (slot.list == SlotList::kDemotion) { ++listed[slot_class_[s]]; }
+    }
+    // A class's replacements: its free slots and its admission victims (every eligible slot) outside `slots`; its
+    // demotion list's come first, the ring's and the prefetch list's from what the classes of the transit size have
+    // left beyond their demotion lists and one resident slot.
+    std::vector<std::uint32_t> spare(n, 0);
+    for (std::size_t c = 0; c < n; ++c) {
+        const ClassState& cs = classes_[c];
+        std::uint32_t outside = 0;
+        for (const std::uint32_t s : cs.free) { outside += in[s] == 0 ? 1U : 0U; }
+        for (const auto& heap : cs.heap) {
+            for (const HeapEntry& e : heap) { outside += in[e.slot] == 0 ? 1U : 0U; }
+        }
+        if (outside < listed[c]) { return false; }
+        spare[c] = outside - listed[c];
+    }
+    for (std::size_t c = 0; c < n && transit > 0; ++c) {
+        const ClassState& cs     = classes_[c];
+        const std::uint32_t kept = cs.slots - cs.retired - leave[c];
+        if (!cs.transit_pitch || kept <= cs.demotion_target + 1) { continue; }
+        draw[c] = std::min({transit, spare[c], kept - cs.demotion_target - 1});
+        leave[c] += draw[c];
+        transit -= draw[c];
+    }
+    if (transit > 0) { return false; }
+    for (std::size_t c = 0; c < n; ++c) {
+        if (classes_[c].slots - classes_[c].retired - leave[c] <= classes_[c].demotion_target) { return false; }
+    }
+    return true;
+}
+
+bool HostTier::retirable(std::span<const std::uint32_t> slots) const {
+    std::vector<std::uint8_t> in;
+    std::vector<std::uint32_t> draw;
+    return plan_retirement(slots, in, draw);
+}
+
+bool HostTier::retire(std::span<const std::uint32_t> slots) {
+    std::vector<std::uint8_t> in;
+    std::vector<std::uint32_t> draw;
+    if (!plan_retirement(slots, in, draw)) { return false; }
+    // Their keys leave RAM and their free slots the free lists first, so every replacement comes from outside `slots`.
+    for (const std::uint32_t s : slots) {
+        if (slots_[s].state == SlotState::kResident || slots_[s].state == SlotState::kShadow) { evict(s, true); }
+    }
+    for (ClassState& cs : classes_) {
+        std::erase_if(cs.free, [&](std::uint32_t s) { return in[s] != 0; });
+    }
+    const auto replacement = [&](std::uint8_t c) {
+        std::int32_t r = take_free(c);
+        if (r < 0) {
+            double ignored = 0;
+            r              = victim_for_admission(c, ignored);
+            if (r < 0) { throw std::logic_error("HostTier: a retirement lost a replacement it planned"); }
+            evict(static_cast<std::uint32_t>(r), true);
+        }
+        return static_cast<std::uint32_t>(r);
+    };
+    for (std::size_t c = 0; c < classes_.size(); ++c) {
+        for (std::uint32_t& s : classes_[c].demotion) {
+            if (in[s] == 0) { continue; }
+            s              = replacement(static_cast<std::uint8_t>(c));
+            slots_[s].list = SlotList::kDemotion;
+        }
+    }
+    // A ring or prefetch slot's replacement (of a class the plan draws from) joins the list with a fresh serial, as an
+    // admission's swap does, and the retired slot takes its class.
+    std::size_t from = 0;
+    for (auto* list : {&ring_, &prefetch_}) {
+        const SlotList tag = list == &ring_ ? SlotList::kRing : SlotList::kPrefetch;
+        for (std::uint32_t& s : *list) {
+            if (in[s] == 0) { continue; }
+            while (draw[from] == 0) { ++from; }
+            --draw[from];
+            const auto c          = static_cast<std::uint8_t>(from);
+            const std::uint32_t r = replacement(c);
+            Slot& rs              = slots_[r];
+            rs.list               = tag;
+            rs.serial             = next_serial_++;
+            slot_class_[r]        = kTransit;
+            slot_class_[s]        = c;
+            s                     = r;
+        }
+    }
+    for (const std::uint32_t s : slots) {
+        slots_[s].state = SlotState::kFree;
+        slots_[s].list  = SlotList::kRetired;
+        ++classes_[slot_class_[s]].retired;
+        retired_.push_back(s);
+    }
+    scale_shadow_floors();
+    return true;
+}
+
+void HostTier::restore(std::span<const std::uint32_t> slots) {
+    std::vector<std::uint8_t> seen(slots_.size(), 0);
+    for (const std::uint32_t s : slots) {
+        if (s >= slots_.size() || slots_[s].list != SlotList::kRetired || seen[s]++ != 0) {
+            throw std::logic_error("HostTier: restoring a slot that is not retired");
+        }
+    }
+    for (const std::uint32_t s : slots) {
+        slots_[s].list = SlotList::kNone;
+        ClassState& cs = classes_[slot_class_[s]];
+        cs.free.push_back(s);
+        --cs.retired;
+    }
+    std::erase_if(retired_, [&](std::uint32_t s) { return slots_[s].list != SlotList::kRetired; });
+    scale_shadow_floors();
+}
+
+void HostTier::scale_shadow_floors() {
+    for (ClassState& cs : classes_) {
+        cs.shadow_floor = static_cast<std::uint32_t>(static_cast<std::uint64_t>(cs.floor) * (cs.slots - cs.retired) / cs.slots);
+    }
 }
 
 void HostTier::mark_used(std::uint32_t slot) {
@@ -694,6 +841,25 @@ void HostTier::check() const {
             fail("lent slot state");
         }
     }
+    // Retired slots hold nothing and stay in their class's count; each class keeps more slots in service than its
+    // demotion list, and its shadow floor is the configured one scaled by them.
+    std::vector<std::uint32_t> class_retired(classes_.size(), 0);
+    for (const auto s : retired_) {
+        place(s, "retired");
+        if (slots_[s].list != SlotList::kRetired || slots_[s].state != SlotState::kFree || slots_[s].pins != 0 ||
+            slot_class_[s] == kTransit) {
+            fail("retired slot state");
+        }
+        ++class_retired[slot_class_[s]];
+    }
+    for (std::size_t c = 0; c < classes_.size(); ++c) {
+        const ClassState& cs = classes_[c];
+        if (cs.slots != class_slots[c] || cs.retired != class_retired[c]) { fail("class " + std::to_string(c) + " retired count"); }
+        if (cs.slots - cs.retired <= cs.demotion_target) { fail("class " + std::to_string(c) + " keeps no resident slot"); }
+        if (cs.shadow_floor != static_cast<std::uint64_t>(cs.floor) * (cs.slots - cs.retired) / cs.slots) {
+            fail("class " + std::to_string(c) + " shadow floor");
+        }
+    }
     std::size_t residents = 0, shadows = 0;
     std::vector<std::uint32_t> class_shadows(classes_.size(), 0);
     for (std::uint32_t s = 0; s < slots_.size(); ++s) {
@@ -711,7 +877,7 @@ void HostTier::check() const {
         } else if (slot.state == SlotState::kLanding) {
             place(s, "landings in flight");
             const bool demotion = (slot.pins & kPinD2H) != 0, copy = (slot.pins & kPinCopy) != 0;
-            if (demotion == copy || slot_of_[slot.key] >= 0) { fail("landing target"); }
+            if (demotion == copy || slot_of_[slot.key] >= 0 || slot.list != SlotList::kNone) { fail("landing target"); }
             if (copy && (!copying_[slot.key] || !copying_slot(s, false))) { fail("a copy target without its copy"); }
             if (slot_class_[s] != key_class_[slot.key]) { fail("a landing in another class's slot"); }
         }

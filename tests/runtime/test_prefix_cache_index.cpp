@@ -39,12 +39,15 @@ public:
         live.erase(id);
     }
 
+    void move_host_slab(std::uint32_t from, std::uint32_t to) noexcept override { moves.emplace_back(from, to); }
+
     std::uint32_t allocate() {
         const std::uint32_t id = next++;
         live.insert(id);
         return id;
     }
 
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> moves;
     std::vector<std::uint32_t> released;
     std::set<std::uint32_t> live;
     std::uint32_t next = 1;
@@ -1107,6 +1110,79 @@ void test_image_only_host_tier() {
 
 // Host-born snapshots (images copied straight to Host slabs) on an index without Device snapshot
 // slots: reservations, publication with and without a tail, duplicates, Device-tail eviction.
+// RAM pressure: shrink_host evicts as an allocation would until the owned slabs fit below the limit, then moves
+// those past it into free slabs below (the backend copies them); a pinned entry keeps its slabs, so the limit stays
+// above them; grow_host brings the slabs back as free ones.
+void test_host_tier_resize() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 0), backend);
+    constexpr double kAny = std::numeric_limits<double>::infinity();
+    std::vector<std::vector<NodeRef>> paths;
+    std::vector<SnapshotRef> snapshots;
+    for (std::uint32_t s = 0; s < 6; ++s) {
+        paths.push_back(insert_sequence(index, backend, make_tokens(64 * 2, 700 + s)));
+        auto image = index.reserve_host_image(false, kAny);
+        require(image.has_value(), "an image reservation");
+        snapshots.push_back(
+            index.publish_host_snapshot(paths.back()[1], 128, {}, std::nullopt, std::move(*image), SnapshotKind::Tap).snapshot);
+    }
+    for (const auto& path : paths) {
+        for (const NodeRef node : path) { backup_node(index, node); }
+        index.release_path(path); // the sequences ended: the Engine is idle
+    }
+    index.check_invariants();
+    require(index.stats().host_free_slabs == 64 - 36 && index.stats().host_slab_limit == 64,
+            "six images and twelve blocks take 36 slabs");
+    const auto owned_below = [&](std::uint32_t limit) {
+        for (const auto& path : paths) {
+            for (const NodeRef node : path) {
+                if (index.valid(node) && index.node(node).host == CopyState::Resident &&
+                    index.node(node).host_slab >= limit) {
+                    return false;
+                }
+            }
+        }
+        for (const SnapshotRef snapshot : snapshots) {
+            if (!index.valid(snapshot)) { continue; }
+            for (const std::uint32_t slab : index.snapshot(snapshot).host_slabs) {
+                if (slab >= limit) { return false; }
+            }
+        }
+        return true;
+    };
+
+    require(index.shrink_host(20) == 20 && index.stats().host_slab_limit == 20, "the limit is reached");
+    index.check_invariants();
+    require(owned_below(20) && !backend.moves.empty() &&
+                std::all_of(backend.moves.begin(), backend.moves.end(),
+                            [](const auto& move) { return move.first >= 20 && move.second < 20; }),
+            "what stayed was moved below the limit");
+    require(index.stats().host_snapshot_evictions > 0 && index.stats().host_free_slabs <= 20,
+            "the shrink evicted to fit");
+    // A pinned snapshot keeps its slabs: the limit stays above them.
+    const auto kept = std::find_if(snapshots.begin(), snapshots.end(), [&](SnapshotRef s) { return index.valid(s); });
+    require(kept != snapshots.end(), "a snapshot survives the shrink");
+    const std::vector<std::uint32_t> pinned_slabs(index.snapshot(*kept).host_slabs.begin(),
+                                                  index.snapshot(*kept).host_slabs.end());
+    const std::uint32_t top = *std::max_element(pinned_slabs.begin(), pinned_slabs.end());
+    index.pin_snapshot(*kept);
+    const std::uint32_t reached = index.shrink_host(0);
+    index.check_invariants();
+    require(reached > top && reached < 20 && owned_below(reached) && index.valid(*kept) &&
+                std::equal(pinned_slabs.begin(), pinned_slabs.end(), index.snapshot(*kept).host_slabs.begin()),
+            "a pinned snapshot's slabs moved or were retired");
+    index.unpin_snapshot(*kept);
+
+    index.grow_host(64);
+    index.check_invariants();
+    const PrefixIndexStats grown = index.stats();
+    require(grown.host_slab_limit == 64 && grown.host_free_slabs >= 64 - reached, "grow_host frees the retired slabs");
+    auto image = index.reserve_host_image(false, kAny);
+    require(image.has_value(), "a grown tier reserves again");
+    index.release_host_image(std::move(*image));
+    index.check_invariants();
+}
+
 void test_host_born_snapshots() {
     RecordingBackend backend;
     PrefixCacheIndex index(small_config(64, 0), backend);
@@ -1788,6 +1864,7 @@ int main() {
         test_persistence_roundtrip();
         test_restore_plan();
         test_image_only_host_tier();
+        test_host_tier_resize();
         test_host_born_snapshots();
         test_host_image_claims();
         test_queue_holds();

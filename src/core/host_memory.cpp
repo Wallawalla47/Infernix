@@ -230,6 +230,40 @@ std::byte* RegisteredHostBuffer::device_at(std::size_t offset) const noexcept {
     return slice.device + (offset - slice.begin);
 }
 
+#ifdef _WIN32
+namespace {
+
+// VirtualLock holds pages in the working set, so the hard minimum must cover them (with the process's own pages above
+// it); the maximum stays soft.
+constexpr SIZE_T kWorkingSetSlack = SIZE_T{64} << 20;
+
+// Raises the hard minimum working set by `bytes` and locks [at, at + bytes); empty, or the OS's reason. `raised` grows
+// by what the minimum grew.
+std::string lock_resident(std::byte* at, std::size_t bytes, std::size_t& raised) {
+    SIZE_T minimum = 0, maximum = 0;
+    DWORD flags    = 0;
+    if (!::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum, &maximum, &flags)) {
+        return "Windows error " + std::to_string(::GetLastError()) + " reading the working set";
+    }
+    const SIZE_T grow   = bytes + (raised == 0 ? kWorkingSetSlack : 0);
+    const SIZE_T wanted = minimum + grow;
+    if (!::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), wanted, std::max(maximum, wanted + kWorkingSetSlack),
+                                      QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
+        return "Windows error " + std::to_string(::GetLastError()) + " raising the working set";
+    }
+    raised += grow;
+    constexpr std::size_t kPiece = std::size_t{1} << 30;
+    for (std::size_t done = 0; done < bytes; done += kPiece) {
+        if (!::VirtualLock(at + done, std::min(kPiece, bytes - done))) {
+            return "Windows error " + std::to_string(::GetLastError()) + " locking pages";
+        }
+    }
+    return {};
+}
+
+} // namespace
+#endif
+
 ResidentHostBuffer::ResidentHostBuffer(std::size_t bytes) : size_(bytes) {
     if (bytes == 0) { throw std::invalid_argument("ResidentHostBuffer size must be nonzero"); }
 #ifdef _WIN32
@@ -238,30 +272,8 @@ ResidentHostBuffer::ResidentHostBuffer(std::size_t bytes) : size_(bytes) {
         throw std::runtime_error("VirtualAlloc of " + std::to_string(bytes) + " bytes failed: Windows error " +
                                  std::to_string(::GetLastError()));
     }
-    data_ = static_cast<std::byte*>(p);
-    // VirtualLock holds pages in the working set, so the hard minimum must cover them (with the
-    // process's own pages above it); the maximum stays soft.
-    constexpr SIZE_T kSlack = SIZE_T{64} << 20;
-    SIZE_T minimum = 0, maximum = 0;
-    DWORD flags    = 0;
-    if (!::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum, &maximum, &flags)) {
-        lock_failure_ = "Windows error " + std::to_string(::GetLastError()) + " reading the working set";
-        return;
-    }
-    const SIZE_T wanted = minimum + bytes + kSlack;
-    if (!::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), wanted, std::max(maximum, wanted + kSlack),
-                                      QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
-        lock_failure_ = "Windows error " + std::to_string(::GetLastError()) + " raising the working set";
-        return;
-    }
-    raised_ = bytes + kSlack;
-    constexpr std::size_t kPiece = std::size_t{1} << 30;
-    for (std::size_t at = 0; at < bytes; at += kPiece) {
-        if (!::VirtualLock(data_ + at, std::min(kPiece, bytes - at))) {
-            lock_failure_ = "Windows error " + std::to_string(::GetLastError()) + " locking pages";
-            return;
-        }
-    }
+    data_         = static_cast<std::byte*>(p);
+    lock_failure_ = lock_resident(data_, bytes, raised_);
 #else
     void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) { throw std::runtime_error("mmap of " + std::to_string(bytes) + " bytes failed"); }
@@ -283,6 +295,41 @@ ResidentHostBuffer::~ResidentHostBuffer() {
 #else
     (void)::munmap(data_, size_);
 #endif
+}
+
+void ResidentHostBuffer::decommit(std::size_t offset, std::size_t bytes) noexcept {
+    if (bytes == 0) { return; }
+    std::byte* at = data_ + offset;
+#ifdef _WIN32
+    (void)::VirtualUnlock(at, bytes); // fails on pages the OS never locked, which decommit alike
+    (void)::VirtualFree(at, bytes, MEM_DECOMMIT);
+    // The minimum shrinks by the pages it covered (never below the slack it was raised with).
+    const std::size_t lowered = std::min(bytes, raised_ > kWorkingSetSlack ? raised_ - kWorkingSetSlack : 0);
+    SIZE_T minimum = 0, maximum = 0;
+    DWORD flags    = 0;
+    if (lowered != 0 && ::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum, &maximum, &flags) &&
+        minimum > lowered && ::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), minimum - lowered, maximum, flags)) {
+        raised_ -= lowered;
+    }
+#else
+    (void)::munlock(at, bytes);
+    (void)::madvise(at, bytes, MADV_DONTNEED);
+#endif
+}
+
+bool ResidentHostBuffer::recommit(std::size_t offset, std::size_t bytes) {
+    if (bytes == 0) { return true; }
+    std::byte* at = data_ + offset;
+#ifdef _WIN32
+    if (::VirtualAlloc(at, bytes, MEM_COMMIT, PAGE_READWRITE) == nullptr) { return false; }
+    // Locked again only when the constructor raised the working set (otherwise the block stays pageable).
+    if (raised_ != 0) {
+        if (std::string failure = lock_resident(at, bytes, raised_); !failure.empty()) { lock_failure_ = std::move(failure); }
+    }
+#else
+    if (::mlock(at, bytes) != 0) { lock_failure_ = "mlock failed (RLIMIT_MEMLOCK)"; }
+#endif
+    return true;
 }
 
 AddressReservation::AddressReservation(std::size_t bytes) : size_(bytes) {

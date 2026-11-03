@@ -386,6 +386,7 @@ int main(int argc, char** argv) {
                                                                    : std::filesystem::path(cli.artifact_path.string() + ".expert-state");
         engine_options.expert_state_off         = cli.expert_state && cli.expert_state->empty(); // --expert-state off
         engine_options.ram_free_bytes           = cli.ram_free_bytes;
+        engine_options.ram_resize               = false; // one generation: the Engine is never idle to resize
         engine_options.expert_ram_bytes         = cli.expert_ram_bytes;
         engine_options.expert_ram_layout        = cli.expert_ram_layout;
         engine_options.expert_pin_bytes         = cli.expert_pin_bytes;

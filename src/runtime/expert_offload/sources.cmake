@@ -1,11 +1,12 @@
 # The shared expert-offload component (docs/maintainer/qwen3_5-122b-offload-design.md §7): the pieces
-# Qwen3.8-Flash-Next's and Qwen3.5's Programs both instantiate. Bank loading, the expert store and the
-# memory plan join infernix_model_loading; the residency, tiers, monitor, route trace and expert stream
-# join infernix_model_runtime.
+# Qwen3.8-Flash-Next's and Qwen3.5's Programs both instantiate. Bank loading, the expert store, the
+# memory plan and the RAM monitor join infernix_model_loading; the residency, tiers, VRAM monitor, route
+# trace and expert stream join infernix_model_runtime.
 target_sources(infernix_model_loading PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/expert_bank.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_store.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/memory_plan.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/ram_monitor.cpp"
 )
 
 target_sources(infernix_model_runtime PRIVATE

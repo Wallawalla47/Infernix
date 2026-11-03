@@ -4,6 +4,7 @@
 #include "core/paged_kv_cache.h"
 
 #include <algorithm>
+#include <cstring>
 #include <exception>
 #include <stdexcept>
 #include <string>
@@ -25,8 +26,8 @@ using runtime::prefix_cache::TapPlannerConfig;
 namespace {
 
 constexpr auto kFullPage = static_cast<std::uint32_t>(kPagedKVPageSize);
-// Largest single pinned allocation of the Host slab pool.
-constexpr std::size_t kHostChunkBytes = std::size_t{4} << 30U;
+// Largest single pinned allocation of the Host slab pool, which is also its resize step under RAM pressure.
+constexpr std::size_t kHostChunkBytes = std::size_t{1} << 30U;
 
 std::span<const std::byte* const> const_records(const std::vector<std::byte*>& records) noexcept {
     return {reinterpret_cast<const std::byte* const*>(records.data()), records.size()};
@@ -775,6 +776,69 @@ void HybridPrefixCache::clear() noexcept {
 }
 
 // ---- PrefixIndexBackend ------------------------------------------------------------------------
+
+// ---- Host tier resize ------------------------------------------------------------------------------
+
+std::uint32_t HybridPrefixCache::host_floor_chunks() const noexcept {
+    return std::max(1U, (2U * host_layout_.image_slabs + slabs_per_chunk_ - 1U) / slabs_per_chunk_);
+}
+
+std::uint64_t HybridPrefixCache::host_tier_shrinkable_bytes() const noexcept {
+    std::uint64_t bytes = 0;
+    for (std::size_t i = host_floor_chunks(); i < host_chunks_.size(); ++i) { bytes += host_chunks_[i].size(); }
+    return host_chunks_.empty() ? 0 : bytes;
+}
+
+std::uint64_t HybridPrefixCache::host_tier_growable_bytes() const noexcept {
+    std::uint64_t pinned = 0;
+    for (const PinnedHostBuffer& chunk : host_chunks_) { pinned += chunk.size(); }
+    return host_tier_capacity_bytes() - pinned;
+}
+
+std::uint64_t HybridPrefixCache::shrink_host_tier(std::uint64_t bytes) {
+    if (host_chunks_.empty()) { return 0; }
+    const std::uint32_t per_chunk = slabs_per_chunk_;
+    const std::uint64_t chunk     = static_cast<std::uint64_t>(per_chunk) * host_layout_.slab_bytes;
+    const auto have               = static_cast<std::uint32_t>(host_chunks_.size());
+    const std::uint32_t floor     = host_floor_chunks();
+    const auto drop               = static_cast<std::uint32_t>(std::min<std::uint64_t>(have, (bytes + chunk - 1U) / chunk));
+    const std::uint32_t keep      = std::max(floor, have - drop);
+    if (bytes == 0 || keep >= have) { return 0; }
+    drain();
+    const std::uint32_t reached = index_->shrink_host(keep * per_chunk);
+    const std::uint32_t kept    = (reached + per_chunk - 1U) / per_chunk;
+    std::uint64_t released      = 0;
+    while (host_chunks_.size() > kept) {
+        released += host_chunks_.back().size();
+        host_chunks_.pop_back();
+    }
+    return released;
+}
+
+std::uint64_t HybridPrefixCache::grow_host_tier(std::uint64_t bytes) {
+    if (config_.host_slabs == 0) { return 0; }
+    const std::uint32_t per_chunk = slabs_per_chunk_;
+    std::uint64_t grown           = 0;
+    while (host_chunks_.size() * per_chunk < config_.host_slabs) {
+        const auto first       = static_cast<std::uint32_t>(host_chunks_.size() * per_chunk);
+        const std::size_t size = static_cast<std::size_t>(std::min(per_chunk, config_.host_slabs - first)) *
+                                 host_layout_.slab_bytes;
+        if (grown + size > bytes) { break; }
+        try {
+            host_chunks_.emplace_back(size);
+        } catch (const std::exception&) {
+            break; // the OS refuses to pin it now
+        }
+        grown += size;
+    }
+    index_->grow_host(
+        static_cast<std::uint32_t>(std::min<std::uint64_t>(config_.host_slabs, host_chunks_.size() * per_chunk)));
+    return grown;
+}
+
+void HybridPrefixCache::move_host_slab(std::uint32_t from, std::uint32_t to) noexcept {
+    std::memcpy(slab(to), slab(from), host_layout_.slab_bytes);
+}
 
 void HybridPrefixCache::release_device_block(std::uint32_t device_id) noexcept {
     if (device_id >= blocks_.size() || !blocks_[device_id]) { std::terminate(); }

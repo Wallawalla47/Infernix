@@ -87,6 +87,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--response-store-max-mib"},
     ServeOptionArity{"--device"},
     ServeOptionArity{"--ram-free-mib"},
+    ServeOptionArity{"--ram-resize"},
     ServeOptionArity{"--expert-ram-mib"},
     ServeOptionArity{"--expert-ram-layout"},
     ServeOptionArity{"--expert-pin-mib"},
@@ -413,6 +414,12 @@ std::string serve_usage_text(const char* argv0) {
            "                             other programs (default " +
            std::to_string(kDefaultRamFreeBytes >> 20) +
            ")\n"
+           "  --ram-resize auto|off      auto (default): between requests the RAM tiers (the\n"
+           "                             prefix cache's Host tier, then offloaded experts'\n"
+           "                             RAM copies) give RAM back while less than 2 GiB is\n"
+           "                             available and take it back once --ram-free-mib\n"
+           "                             (at least 3 GiB) plus 1 GiB stays free; off keeps\n"
+           "                             their startup sizes\n"
            "  --expert-ram-mib N|auto    Offloaded experts: Host RAM in MiB for the routed\n"
            "                             experts (auto: what --ram-free-mib and the other\n"
            "                             pins leave); less than all of them need reads the\n"
@@ -434,7 +441,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             to free VRAM less --vram-headroom-mib;\n"
            "                             offloaded experts:\n"
            "                             auto = --max-context x --max-concurrency)\n"
-           "  --vram-headroom-mib N|auto VRAM in MiB startup sizing leaves free for the\n"
+           "  --vram-headroom-mib N|auto\n"
+           "                             VRAM in MiB startup sizing leaves free for the\n"
            "                             display and other programs: Qwen3.5, after\n"
            "                             --kv-capacity auto; offloaded experts, after the\n"
            "                             expert cache (auto: 1024 with a display on the\n"
@@ -996,6 +1004,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--ram-free-mib is out of range");
             }
             options.ram_free_bytes = mib << 20;
+        } else if (arg == "--ram-resize") {
+            const std::string mode = require_value("--ram-resize");
+            if (mode != "auto" && mode != "off") { throw std::invalid_argument("--ram-resize must be auto or off"); }
+            options.ram_resize = mode == "auto";
         } else if (arg == "--expert-ram-mib") {
             const std::string text = require_value("--expert-ram-mib");
             if (text == "auto") {

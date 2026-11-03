@@ -41,7 +41,10 @@ void Program::maintain() {
     impl_->settle_deferred();
     impl_->apply_vram_target(true);
     impl_->maintain_expert_state();
+    impl_->maintain_ram();
 }
+
+void Program::start_ram_resize(std::uint64_t reserve_bytes) { impl_->start_ram_resize(reserve_bytes); }
 
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->prefix_stats(); }
 

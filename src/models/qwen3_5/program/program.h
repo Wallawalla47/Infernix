@@ -446,6 +446,11 @@ public:
     // through the waker, from its own thread, and the Engine calls maintain() under its execution lock.
     void maintain();
     void set_maintenance_waker(std::function<void()> waker);
+    // RAM pressure (EngineOptions::ram_resize, runtime::expert_offload::RamMonitor): starts the monitor under which
+    // maintain() shrinks the prefix cache's Host tier while the OS runs short and grows it back once more than
+    // `reserve_bytes` plus a step stays free, reporting each resize to `diagnostic`. A no-op without a Host tier.
+    // Before the Engine sets its maintenance waker.
+    void start_ram_resize(std::uint64_t reserve_bytes, std::function<void(const std::string&, DiagnosticLevel)> diagnostic);
     // Offloaded experts: the logical CPUs the Engine's round thread runs on, a core the CPU expert team
     // leaves free (runtime::expert_offload::CpuPlacement::engine); 0 (unpinned) otherwise.
     [[nodiscard]] std::uint64_t engine_thread_cpus() const noexcept;

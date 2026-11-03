@@ -4,8 +4,9 @@
 // service's role) including a straddling record, a resident key served without a read, duplicate
 // demands sharing a ticket, admission of hot landings at the next boundary (the victims lose their
 // host copy, the dirty set names both), ring exhaustion reusing finished slots, a failed read,
-// destruction with reads in flight, and unpinned records (a refused pin chunk becoming unpinned
-// records, their startup fill, CPU demands served in place and never admitted). CPU and disk only,
+// destruction with reads in flight, unpinned records (a refused pin chunk becoming unpinned
+// records, their startup fill, CPU demands served in place and never admitted), and a RAM resize
+// (pinned chunks and unpinned records given back and taken again, refilled from the file). CPU and disk only,
 // except with --fetch: the tier as the responder
 // of a fetch channel (mapped words, so a CUDA context), this thread playing the device's half of the
 // protocol (ops/offloaded_sparse_moe/cpu/fetch_request.h): records landed from RAM and read from disk,
@@ -34,6 +35,10 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#    include <windows.h>
+#endif
 
 namespace {
 
@@ -465,6 +470,48 @@ void test_mixed_strides() {
               "mixed strides: the refill takes the passed-over keys first and skips the frames' keys");
         host.check();
     }
+    {
+        // A RAM resize with record-size classes, in chunks of two slots: the transit region stays, each class keeps
+        // more slots than its demotion list (3 of 7) while the tier keeps min_slots (15 of 24), and growth refills both
+        // classes. With no uses every chunk costs nothing, so the later chunks go first: class 1's slot 23 and class
+        // 0's slot 16, then each class's next two.
+        HostExpertTier::Options small = o;
+        small.slots_per_chunk         = 2;
+        std::vector<void*> freed;
+        small.release = [&freed](void* p) {
+            freed.push_back(p);
+            ::operator delete(p, std::align_val_t{4096});
+        };
+        HostExpertTier resized(store, small);
+        std::vector<std::uint32_t> all(2 * kExpertsHere);
+        for (std::uint32_t k = 0; k < all.size(); ++k) { all[k] = k; }
+        check(resized.prefill(all) == 10, "mixed resize: each class's 5 resident slots fill");
+        std::vector<const std::uint8_t*> transit;
+        for (const std::uint32_t s : resized.controller().ring()) { transit.push_back(resized.slot_bytes(s)); }
+        for (const std::uint32_t s : resized.controller().prefetch_list()) { transit.push_back(resized.slot_bytes(s)); }
+        const std::uint64_t expected = 3 * kRecord + 3 * (kRecord / 2);
+        check(resized.shrinkable_bytes() == expected, "mixed resize: three slots of each class can go");
+        check(resized.shrink(~0ULL) == expected && freed.size() == 4 && resized.shrinkable_bytes() == 0,
+              "mixed resize: four chunks given back");
+        bool transit_kept = true;
+        for (const void* p : freed) { transit_kept = transit_kept && std::find(transit.begin(), transit.end(), p) == transit.end(); }
+        for (const std::uint32_t s : resized.controller().ring()) { transit_kept = transit_kept && resized.slot_bytes(s) != nullptr; }
+        check(transit_kept, "mixed resize: the transit slots stay");
+        bool kept = true;
+        for (const std::uint32_t k : {0U, 1U, kExpertsHere, kExpertsHere + 1}) { kept = kept && holds(resized.record(k), k); }
+        for (const std::uint32_t k : {2U, 3U, 4U, kExpertsHere + 2, kExpertsHere + 3, kExpertsHere + 4}) {
+            kept = kept && resized.record(k) == nullptr;
+        }
+        check(kept, "mixed resize: the given-back slots' keys lost their records, the others keep theirs");
+        resized.controller().check();
+        check(resized.grow(~0ULL) == expected && resized.growable_bytes() == 0, "mixed resize: growth takes it all back");
+        bool refilled = true;
+        for (std::uint32_t k = 0; k < 5; ++k) {
+            refilled = refilled && holds(resized.record(k), k) && holds(resized.record(kExpertsHere + k), kExpertsHere + k);
+        }
+        check(refilled, "mixed resize: growth refills both classes from the artifact");
+        resized.controller().check();
+    }
     std::error_code ec;
     std::filesystem::remove(path, ec);
 }
@@ -661,6 +708,196 @@ void test_fetch_unpinned(const ExpertStore& store) {
     tier.end_round();
 }
 
+// A RAM resize (shrink, grow) of the pinned slots: four chunks of 16 slots; shrink gives back the chunk holding the
+// least valuable residents through the release callback (here the lists' chunk: their replacements evict the lowest
+// keys), passes over a chunk with a pinned slot or a refill's target, and stops at min_slots (15); growth allocates the
+// chunks again and refills them with the best-ranked keys, and stops where the OS refuses.
+void test_resize(const ExpertStore& store) {
+    struct Calls {
+        int allocated = 0, released = 0, refuse_after = -1;
+        std::vector<void*> freed;
+    } calls;
+    {
+        auto o     = options();
+        o.allocate = [&calls](std::size_t bytes) -> void* {
+            if (calls.refuse_after >= 0 && calls.allocated >= calls.refuse_after) { return nullptr; }
+            ++calls.allocated;
+            return ::operator new(bytes, std::align_val_t{4096});
+        };
+        o.release = [&calls](void* p) {
+            ++calls.released;
+            calls.freed.push_back(p);
+            ::operator delete(p, std::align_val_t{4096});
+        };
+        HostExpertTier tier(store, o);
+        auto& host = tier.controller();
+        std::vector<std::uint32_t> ranked(kKeys);
+        for (std::uint32_t k = 0; k < kKeys; ++k) { ranked[k] = k; }
+        check(calls.allocated == 4 && tier.prefill(ranked) == 50, "resize: four chunks; keys 0-49 in slots 14-63");
+        for (std::uint32_t k = 0; k < 50; ++k) {
+            const std::vector<std::uint32_t> one{k};
+            tier.record_uses(0, one, static_cast<double>(k + 1));
+        }
+        std::vector<std::uint32_t> dirty;
+        tier.take_dirty(dirty);
+        check(tier.growable_bytes() == 0 && tier.shrinkable_bytes() == 3 * 16 * kRecord,
+              "resize: three chunks can go above min_slots");
+        tier.begin_round(32);
+        bool threw = false;
+        try {
+            (void)tier.shrink(1);
+        } catch (const std::logic_error&) { threw = true; }
+        check(threw, "resize: no shrink while a round is open");
+        tier.end_round();
+
+        // Chunk 0 (slots 0-15: the lists and keys 0 and 1) is the cheapest; its lists' 14 replacements evict keys 2-15.
+        const std::uint8_t* chunk0 = tier.slot_bytes(0);
+        check(tier.shrink(1) == 16 * kRecord && calls.released == 1 && calls.freed[0] == chunk0,
+              "resize: shrink gives the least valuable chunk back through the release callback");
+        bool retired = true, evicted = true, kept = true;
+        for (std::uint32_t s = 0; s < 16; ++s) {
+            retired = retired && tier.slot_bytes(s) == nullptr && host.list(s) == expert_cache::SlotList::kRetired;
+        }
+        for (std::uint32_t k = 0; k < 16; ++k) { evicted = evicted && tier.record(k) == nullptr; }
+        for (std::uint32_t k = 16; k < 50; ++k) { kept = kept && matches(tier.record(k), k); }
+        check(retired && evicted && kept, "resize: the chunk's keys and its lists' replacements lost their records, the rest keep theirs");
+        dirty.clear();
+        tier.take_dirty(dirty);
+        std::sort(dirty.begin(), dirty.end());
+        bool exact = dirty.size() == 16;
+        for (std::uint32_t k = 0; k < 16 && exact; ++k) { exact = dirty[k] == k; }
+        check(exact, "resize: the evicted keys are dirty");
+        check(tier.pinned_slots() == 48 && tier.pinned_bytes() == 48 * kRecord && tier.growable_bytes() == 16 * kRecord,
+              "resize: the pinned counts follow");
+        host.check();
+        // The ring's new slots serve the next round.
+        tier.begin_round(32);
+        std::vector<std::uint32_t> statuses;
+        std::vector<bool> valid;
+        (void)serve(tier, {3, 60, 70, 20}, statuses, valid);
+        check(valid[0] && valid[1] && valid[2] && valid[3], "resize: demands land in the slots left");
+        tier.end_round();
+
+        // Key 16 (chunk 1, now the cheapest) is queued for VRAM: chunk 2 goes instead; then chunk 1, and chunk 3 holds
+        // the floor.
+        host.queued(16);
+        const std::uint8_t* chunk2 = tier.slot_bytes(32);
+        check(tier.shrink(1) == 16 * kRecord && calls.freed.back() == chunk2 && tier.slot_bytes(16) != nullptr,
+              "resize: a chunk with a pinned slot is passed over");
+        host.unqueued(16);
+        check(tier.shrinkable_bytes() == 16 * kRecord && tier.shrink(~0ULL) == 16 * kRecord && tier.pinned_slots() == 16 &&
+                  tier.shrink(~0ULL) == 0 && tier.shrinkable_bytes() == 0,
+              "resize: shrink stops at min_slots");
+        host.check();
+
+        // Growth: the three chunks come back, and the best-ranked keys without a host copy (0-47) fill them.
+        dirty.clear();
+        tier.take_dirty(dirty);
+        check(tier.grow(1) == 0, "resize: growth takes no chunk larger than asked");
+        check(tier.grow(~0ULL) == 48 * kRecord && calls.allocated == 7 && tier.growable_bytes() == 0 && tier.pinned_slots() == 64,
+              "resize: growth allocates every chunk again");
+        bool refilled = true;
+        for (std::uint32_t k = 0; k < 50; ++k) { refilled = refilled && matches(tier.record(k), k); }
+        dirty.clear();
+        tier.take_dirty(dirty);
+        check(refilled && tier.record(50) == nullptr && dirty.size() == 48, "resize: growth refills the best-ranked keys, dirty");
+        host.check();
+
+        // A refill's target (a demotion slot) keeps its chunk until the demotion completes.
+        {
+            const std::vector<std::uint32_t> hot{60};
+            tier.record_uses(1, hot, 1000.0);
+        }
+        std::uint32_t target = 0;
+        check(host.vram_evicted(60, true, target) == expert_cache::VramEviction::kDemote, "resize: a demotion");
+        const std::uint32_t id = tier.refill(60, target);
+        const std::uint8_t* target_chunk = tier.slot_bytes(target / 16 * 16);
+        check(id != HostExpertTier::kNoRefill && tier.shrink(1) == 16 * kRecord && calls.freed.back() != target_chunk &&
+                  tier.slot_bytes(target) != nullptr,
+              "resize: a refill's target keeps its chunk");
+        while (tier.refill_state(id) == 0) { std::this_thread::yield(); }
+        check(tier.refill_state(id) == 1, "resize: the refill lands");
+        tier.refill_release(id);
+        host.demotion_completed(60, target, false);
+        check(matches(tier.record(60), 60), "resize: the refilled record is in RAM");
+        host.check();
+        // The OS refuses to pin more.
+        calls.refuse_after = calls.allocated;
+        check(tier.grow(~0ULL) == 0 && tier.growable_bytes() == 16 * kRecord, "resize: growth stops when the OS refuses");
+        host.check();
+    }
+    check(calls.released == calls.allocated, "resize: every chunk allocated is released once");
+}
+
+// A RAM resize of the unpinned records: the pinned chunks cannot go (chunk 0 holds min_slots, chunk 1 the bounce
+// slots), so shrink gives back the lowest-ranked held keys' records (their pages decommitted), and growth commits them
+// again and refills them with the best-ranked keys without a host copy.
+void test_resize_unpinned(const ExpertStore& store) {
+    int chunks = 0;
+    HostExpertTier tier(store, refusing_options(chunks));
+    std::vector<std::uint32_t> ranked(kKeys);
+    for (std::uint32_t k = 0; k < kKeys; ++k) { ranked[k] = k; }
+    check(tier.prefill(ranked) == 14 && tier.fill_unpinned(ranked, {}) == 46, "unpinned resize: keys 14-59 are held");
+    check(tier.shrinkable_bytes() == 46 * kRecord, "unpinned resize: only the unpinned records can go");
+    // Key 59 (the last filled) is the best ranked; the lowest are then 58, 57, 56, 55 and 54.
+    {
+        const std::vector<std::uint32_t> hot{59};
+        tier.record_uses(0, hot, 100.0);
+    }
+    std::vector<std::uint32_t> dirty;
+    tier.take_dirty(dirty);
+    dirty.clear();
+    const std::uint8_t* gone = tier.unpinned_record(54);
+#ifdef _WIN32
+    SIZE_T minimum_before = 0, maximum = 0;
+    DWORD flags = 0;
+    (void)::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum_before, &maximum, &flags);
+#endif
+    check(tier.shrink(5 * kRecord) == 5 * kRecord, "unpinned resize: five records given back");
+    bool released = true;
+    for (std::uint32_t k = 54; k < 59; ++k) {
+        released = released && tier.unpinned_record(k) == nullptr && tier.host_record(k) == nullptr && !tier.controller().held(k);
+    }
+    check(released && matches(tier.unpinned_record(59), 59) && matches(tier.unpinned_record(53), 53),
+          "unpinned resize: the lowest-ranked held keys' records go");
+    tier.take_dirty(dirty);
+    std::sort(dirty.begin(), dirty.end());
+    check(dirty == std::vector<std::uint32_t>{54, 55, 56, 57, 58}, "unpinned resize: their keys are dirty");
+    check(tier.growable_bytes() == 5 * kRecord && tier.shrinkable_bytes() == 41 * kRecord, "unpinned resize: the room follows");
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION info{};
+    check(::VirtualQuery(gone, &info, sizeof(info)) != 0 && info.State == MEM_RESERVE, "unpinned resize: the pages are decommitted");
+    if (tier.unpinned_lock_failure().empty()) {
+        SIZE_T minimum_after = 0;
+        (void)::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum_after, &maximum, &flags);
+        check(minimum_before - minimum_after == 5 * kRecord, "unpinned resize: the minimum working set is lowered");
+    }
+#endif
+    tier.controller().check();
+    // An unheld key is read from the artifact.
+    tier.begin_round(32);
+    std::vector<std::uint32_t> statuses;
+    std::vector<bool> valid;
+    (void)serve(tier, {56}, statuses, valid);
+    check(valid[0] && tier.unpinned_record(56) == nullptr, "unpinned resize: an unheld key is read from the artifact");
+    tier.end_round();
+    // Growth: the best-ranked keys without a host copy (100-104) fill the committed records.
+    {
+        const std::vector<std::uint32_t> wanted{100, 101, 102, 103, 104};
+        tier.record_uses(0, wanted, 50.0);
+    }
+    check(tier.grow(5 * kRecord) == 5 * kRecord && tier.growable_bytes() == 0, "unpinned resize: the records are committed again");
+    bool refilled = true;
+    for (std::uint32_t k = 100; k < 105; ++k) {
+        refilled = refilled && matches(tier.unpinned_record(k), k) && tier.controller().held(k) && tier.record(k) == nullptr;
+    }
+    check(refilled, "unpinned resize: growth refills them with the best-ranked keys");
+#ifdef _WIN32
+    check(::VirtualQuery(gone, &info, sizeof(info)) != 0 && info.State == MEM_COMMIT, "unpinned resize: the pages are committed again");
+#endif
+    tier.controller().check();
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -772,6 +1009,8 @@ int main(int argc, char** argv) {
             host.check();
         }
         test_unpinned(store);
+        test_resize(store);
+        test_resize_unpinned(store);
         if (argc > 1 && std::string_view(argv[1]) == "--fetch") {
             test_fetch(store);
             test_read_ahead(store);

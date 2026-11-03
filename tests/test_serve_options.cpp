@@ -662,6 +662,18 @@ int main() {
                       "--ram-free-mib must default to 8 GiB");
     failures += check(parse({"infernix-serve", "model.ninfer", "--ram-free-mib", "4096"}).ram_free_bytes == (4096ULL << 20),
                       "--ram-free-mib must set the RAM left free");
+    // --ram-resize: the RAM tiers follow memory pressure unless it is off.
+    failures += check(parse({"infernix-serve", "model.ninfer"}).ram_resize &&
+                          !parse({"infernix-serve", "model.ninfer", "--ram-resize", "off"}).ram_resize &&
+                          parse({"infernix-serve", "model.ninfer", "--ram-resize", "off", "--ram-resize", "auto"}).ram_resize,
+                      "--ram-resize must default to auto and parse off and auto");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"infernix-serve", "model.ninfer", "--ram-resize", "on"});
+        } catch (const std::exception&) { rejected = true; }
+        failures += check(rejected, "--ram-resize must reject another value");
+    }
     // --log-file: duplicate console records to a plain timestamped file (console-only by default).
     failures += check(parse({"infernix-serve", "model.ninfer"}).log_file.empty(),
                       "--log-file must default to console-only");

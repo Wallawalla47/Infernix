@@ -300,6 +300,17 @@ export const MEMORY_CONTROLS: Control[] = [
     min: 0,
   },
   {
+    kind: "select",
+    flag: "--ram-resize",
+    label: "RAM given back under pressure",
+    help: "auto: while less than 2 GiB of RAM is available, the prefix cache's Host tier and then offloaded experts' RAM copies give memory back between requests, and take it back once RAM left free (at least 3 GiB) plus 1 GiB is available again; off keeps their startup sizes.",
+    options: [
+      { value: "auto", label: "auto" },
+      { value: "off", label: "off" },
+    ],
+    unsetLabel: "auto (default)",
+  },
+  {
     kind: "switch",
     flag: "--embedding-host",
     label: "Token embedding in RAM",

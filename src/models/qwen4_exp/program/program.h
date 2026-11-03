@@ -559,6 +559,10 @@ public:
     // worker, between rounds and under its execution lock. An empty waker detaches the engine.
     void set_maintenance_waker(std::function<void()> waker);
     void maintain();
+    // RAM pressure (EngineOptions::ram_resize, runtime::expert_offload::RamMonitor): starts the monitor under which
+    // maintain() shrinks the prefix cache's Host tier while the OS runs short and grows it back once more than
+    // `reserve_bytes` plus a step stays free.
+    void start_ram_resize(std::uint64_t reserve_bytes);
     Program(const Program&)            = delete;
     Program& operator=(const Program&) = delete;
 

@@ -193,8 +193,9 @@ public:
         if (constraint_warm_.joinable()) { constraint_warm_.join(); }
     }
 
-    // A Program that resizes resources outside rounds (Qwen4Exp's expert cache, design §19.3.7)
-    // asks for maintain() through a waker; the idle worker runs it under the execution lock.
+    // A Program that resizes resources outside rounds (Qwen4Exp's expert cache, design §19.3.7; the RAM
+    // tiers under memory pressure, --ram-resize) asks for maintain() through a waker; the idle worker
+    // runs it under the execution lock.
     static constexpr bool kProgramMaintains = requires(typename Instance::ModelContract::Program& program) {
         program.maintain();
         program.set_maintenance_waker(std::function<void()>{});
@@ -2695,7 +2696,7 @@ private:
                                 instance_.program->maintain();
                             } catch (const std::exception& error) {
                                 publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
-                                                   "VRAM resize outside rounds failed: %s", error.what());
+                                                   "VRAM or RAM resize outside rounds failed: %s", error.what());
                             }
                         }
                         continue;
