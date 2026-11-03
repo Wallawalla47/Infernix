@@ -444,8 +444,9 @@ public:
         state.exact_reasoning_framing = grammar != nullptr;
         prefix_execution.phase        = starts_in_reasoning ? PrefixExecutionTracker::Phase::Reasoning
                                                             : PrefixExecutionTracker::Phase::Off;
-        semantic.budget = thinking.budget;
-        semantic.loop   = thinking.loop;
+        semantic.budget      = thinking.budget;
+        semantic.loop        = thinking.loop;
+        end_turn_in_thinking = thinking.end_turn_in_thinking;
         // The semantic tracker counts the model's own thinking tokens for every response that starts
         // in thinking: the request log reports that count (model_thinking_tokens), so it must run
         // without a budget too (NInfer Neroued/ninfer#373; it used to stay 0 unless a budget was
@@ -524,8 +525,9 @@ public:
     fi::OutputMarkerTokens markers;
     StopPolicy policy;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
-    bool preserve_special = false;
-    bool split_reasoning  = false;
+    bool preserve_special     = false;
+    bool split_reasoning      = false;
+    bool end_turn_in_thinking = false; // ThinkingControlOptions::end_turn_in_thinking
     // Tolerant tool output keeps the open thinking so a turn that ends inside it can still return
     // the calls stranded there; the text is dropped once the thinking closes.
     bool collect_open_reasoning = false;
@@ -614,6 +616,15 @@ OutputSession::OutputSession(
                                    std::move(grammar), continuation, combined)) {}
 
 bool OutputSession::constrained() const noexcept { return impl_ && impl_->grammar != nullptr; }
+
+runtime::ReasoningBan OutputSession::reasoning_ban() const noexcept {
+    if (!impl_ || impl_->end_turn_in_thinking || !impl_->semantic.in_reasoning || impl_->markers.reasoning_close < 0 ||
+        impl_->markers.turn_ends[0] < 0) {
+        return {};
+    }
+    return {.close = impl_->markers.reasoning_close,
+            .ends  = {impl_->markers.turn_ends[0], impl_->markers.turn_ends[1]}};
+}
 
 void OutputSession::observe_constraint(bool timings, double prepare_seconds) noexcept {
     if (constrained()) impl_->grammar->observe(timings, prepare_seconds);

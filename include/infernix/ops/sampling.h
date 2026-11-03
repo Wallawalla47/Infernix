@@ -54,6 +54,12 @@ struct SamplingConfig {
     // produced token's position, v). Speculative verification then compares each draft with that
     // token as greedy verification does, so speculation returns plain sampling's text.
     bool gumbel_max = false;
+    // A row whose reasoning is open at the call's first position (the frontend's thinking not yet closed):
+    // reasoning_close is the close token and reasoning_ends the end-of-turn tokens (-1: none), which take no
+    // probability at a position before which the row has not written reasoning_close (sample(): the call's one
+    // position; speculative verify column c: drafts[0..c-1]). reasoning_close -1: no such row.
+    std::int32_t reasoning_close   = -1;
+    std::int32_t reasoning_ends[2] = {-1, -1};
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive

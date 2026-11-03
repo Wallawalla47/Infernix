@@ -1399,6 +1399,34 @@ int greedy_penalty_case(int token_domain) {
         bits, token_domain, drafts, 100, token_domain, config, counts, expected);
 }
 
+// A row in open reasoning (SamplingConfig::reasoning_close 11, ends 7 and 9): an end-of-turn token is refused at a
+// verify column unless a draft before the column is the close token. Drafts {11, 7}: column 1 follows the close, so
+// its best token 7 verifies the second draft, and column 2 adds 3. Drafts {5, 7}: column 1's 7 is refused, so its
+// next best 2 corrects the second draft. Single-block (64) and multi-block (257) routes.
+int reasoning_ban_accept_case(int token_domain, bool closed) {
+    constexpr int k = 2;
+    const std::vector<std::int32_t> drafts{closed ? 11 : 5, 7};
+    const std::vector<std::int32_t> raw_targets{drafts[0], 7, 3};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0F);
+    logits[static_cast<std::size_t>(drafts[0])] = 5.0F;
+    logits[7]                                   = 4.0F;
+    logits[token_domain + 7]                    = 5.0F;
+    logits[token_domain + 2]                    = 4.5F;
+    logits[2 * token_domain + 3]                = 5.0F;
+    std::vector<std::uint16_t> bits(logits.size());
+    for (std::size_t index = 0; index < logits.size(); ++index) { bits[index] = f32_to_bf16(logits[index]); }
+    ops::SamplingConfig config{};
+    config.temperature       = 0.0F;
+    config.reasoning_close   = 11;
+    config.reasoning_ends[0] = 7;
+    config.reasoning_ends[1] = 9;
+    const std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
+    const auto expected = closed ? accept_state_oracle(drafts, 2, 3, 100) : accept_state_oracle(drafts, 1, 2, 100);
+    return execute_accept_case("speculative open-reasoning end-of-turn token-domain=" + std::to_string(token_domain) +
+                                   (closed ? " after a drafted close" : " without a close"),
+                               raw_targets, bits, token_domain, drafts, 100, token_domain, config, counts, expected);
+}
+
 // A verification column without a finite logit (every value NaN) sets the row's
 // SamplingConfig::nonfinite flag and selects token 0 in its place, on the single-block (64) and
 // multi-block (257) routes; the finite column before it is still verified and accepted.
@@ -2727,6 +2755,10 @@ INFERNIX_OP_TEST(speculative_round) {
     failures += greedy_accept_case(31, 30, 257);
     failures += greedy_penalty_case(64);
     failures += greedy_penalty_case(257);
+    for (const int domain : {64, 257}) {
+        failures += reasoning_ban_accept_case(domain, true);
+        failures += reasoning_ban_accept_case(domain, false);
+    }
     failures += nonfinite_column_case(64);
     failures += nonfinite_column_case(257);
     failures += raw_greedy_nonfinite_case(64);

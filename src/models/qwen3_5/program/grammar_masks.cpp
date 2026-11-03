@@ -13,6 +13,14 @@ ops::SamplingMask ProgramImpl::bind_grammar_mask(runtime::TokenMaskProvider* pro
             words};
 }
 
+void ProgramImpl::bind_reasoning_ban(runtime::TokenMaskProvider* provider, std::size_t row,
+                                     ops::SamplingConfig& config) const noexcept {
+    const runtime::ReasoningBan ban = provider ? provider->reasoning_ban(row) : runtime::ReasoningBan{};
+    config.reasoning_close   = ban.close;
+    config.reasoning_ends[0] = ban.ends[0];
+    config.reasoning_ends[1] = ban.ends[1];
+}
+
 ops::SamplingMask ProgramImpl::fill_grammar_mask(runtime::TokenMaskProvider* provider,
                                                  std::size_t row, std::span<const TokenId> drafts) {
     grammar_dead_positions[row] = 0;

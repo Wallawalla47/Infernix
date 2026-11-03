@@ -2865,6 +2865,32 @@ int test_stray_reasoning_close_is_dropped(const Frontend& frontend) {
     return failures;
 }
 
+// A reply in open thinking reports its end-of-turn exclusion (the close token and the model's default stop tokens)
+// until it commits the close; a reply that starts outside thinking, or allows the end there, reports none.
+int test_reasoning_ban(const Frontend& frontend) {
+    auto prompt                     = thinking_prompt(frontend);
+    const auto& defaults            = frontend.default_stop_policy().token_ids;
+    auto session                    = frontend.make_output_session(prompt, {});
+    const infernix::runtime::ReasoningBan open = session.reasoning_ban();
+    int failures = check(open.active() && open.close == kFixtureThinkCloseToken && !defaults.empty() &&
+                             open.ends[0] == defaults[0] && (defaults.size() < 2 || open.ends[1] == defaults[1]),
+                         "an open thinking did not report the close token and the default stop tokens");
+    std::vector<infernix::TokenId> tokens = fixture_tokens("thought");
+    (void)session.preview_model(tokens, 64, infernix::FinishReason::OutputLimit);
+    (void)session.commit_preview();
+    failures += check(session.reasoning_ban().active(), "thinking without its close ended the exclusion");
+    tokens = {kFixtureThinkCloseToken};
+    const auto answer = fixture_tokens("\n\nanswer");
+    tokens.insert(tokens.end(), answer.begin(), answer.end());
+    (void)session.preview_model(tokens, 64, infernix::FinishReason::OutputLimit);
+    failures += check(session.reasoning_ban().active(), "a previewed close ended the exclusion before its commit");
+    (void)session.commit_preview();
+    failures += check(!session.reasoning_ban().active(), "the committed close did not end the exclusion");
+    auto allowed = frontend.make_output_session(prompt, {}, {}, infernix::ThinkingControlOptions{.end_turn_in_thinking = true});
+    failures += check(!allowed.reasoning_ban().active(), "end_turn_in_thinking did not lift the exclusion");
+    return failures;
+}
+
 // The request log's model_thinking_tokens counts the model's thinking without a budget too
 // (upstream Neroued/ninfer#373): the thinking and its close, as the presentation decoder counts
 // reasoning tokens, never the whole answer.
@@ -4395,6 +4421,7 @@ int main() try {
     failures += test_stray_reasoning_close_is_dropped(frontend);
     failures += test_reasoning_close_resolves_at_terminal(frontend);
     failures += test_thinking_tokens_without_budget(frontend);
+    failures += test_reasoning_ban(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_reasoning_loop_guard(frontend);
     failures += test_constrained_thinking_control(frontend);

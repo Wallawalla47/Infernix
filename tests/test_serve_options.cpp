@@ -674,6 +674,19 @@ int main() {
         } catch (const std::exception&) { rejected = true; }
         failures += check(rejected, "--ram-resize must reject another value");
     }
+    // --end-in-thinking: a reply may not end while its thinking is open unless allowed.
+    failures += check(!parse({"infernix-serve", "model.ninfer"}).end_turn_in_thinking &&
+                          parse({"infernix-serve", "model.ninfer", "--end-in-thinking", "allow"}).end_turn_in_thinking &&
+                          !parse({"infernix-serve", "model.ninfer", "--end-in-thinking", "allow", "--end-in-thinking",
+                                  "refuse"}).end_turn_in_thinking,
+                      "--end-in-thinking must default to refuse and parse allow and refuse");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"infernix-serve", "model.ninfer", "--end-in-thinking", "off"});
+        } catch (const std::exception&) { rejected = true; }
+        failures += check(rejected, "--end-in-thinking must reject another value");
+    }
     // --log-file: duplicate console records to a plain timestamped file (console-only by default).
     failures += check(parse({"infernix-serve", "model.ninfer"}).log_file.empty(),
                       "--log-file must default to console-only");

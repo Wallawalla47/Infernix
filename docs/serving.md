@@ -733,6 +733,15 @@ penalties do not catch because every pass varies a little.
   `reasoning_loop_coverage`) record each firing. It can mistake a long, deliberately repeated
   checklist for a loop; keep it off where the thinking legitimately repeats whole passages.
 
+`--end-in-thinking refuse|allow` (default `refuse`): while a reply's thinking is open, the model's end-of-turn
+tokens (`generation_config.json`'s first two stop tokens) get no probability, greedy and sampled, in decode and in
+speculative verification (a drafted end before the drafted `</think>` is rejected), so a turn cannot end inside its
+thinking with an empty answer; it ends its thinking first (or reaches the thinking budget). A constrained request's
+grammar refuses them there already, so this reaches the unconstrained ones; a token constraint chooses every step
+itself and keeps them. vLLM #55420 measured the same masking on Qwen3.8-27B NVFP4: empty `stop` turns 5 of 8 ->
+0 of 8. `allow` keeps the model's own distribution. The output changes only where a request would have ended
+inside its thinking.
+
 For Chat Completions, `reasoning_effort: "none"` requests disabled thinking. The selected template
 interprets the other standard values (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
 Conflicting explicit `enable_thinking` and effort values return `conflicting_template_option`.
@@ -1764,6 +1773,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking-answer-room` | thinking may use all of the output limit (by default, from an output limit of 1,024, it closes early enough to leave a quarter for the answer: with no budget, under `--default-thinking-budget`, or with a request budget at or above the limit; the limit is `max_tokens` or the context the prompt leaves, whichever is less) | answer room on |
 | `--thinking-budget-message S` | text committed when a thinking budget ends thinking, replacing Qwen's early-close guidance; the close marker is appended when `S` lacks it, and `S` may contain `</think>` only as that final close and no `<tool_call>` token | Qwen guidance |
 | `--reasoning-loop MODE` | `off`, `stop` or `conclude`: reasoning-loop guard for thinking requests without a token constraint (details under [OpenAI Chat Completions](#openai-chat-completions)) | `off` |
+| `--end-in-thinking MODE` | `refuse` or `allow`: whether a reply may end while its thinking is open (`refuse`: the end-of-turn tokens get no probability until the thinking closes; details under [OpenAI Chat Completions](#openai-chat-completions)) | `refuse` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--vision-offload auto\|on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; `on` requires `--vision`. `auto` is on for artifacts with offloaded experts, Qwen3.8-Flash-Next and Qwen3.5-122B-A10B (the expert cache lends the encode memory), and off for the other Qwen3.5 artifacts | `auto` |
 | `--vision-max-merged N` | merged vision tokens per image or video, `64..32768` | `32768` |

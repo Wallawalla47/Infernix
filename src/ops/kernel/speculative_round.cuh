@@ -431,7 +431,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     const std::int32_t* row_drafts  = drafts + row * k;
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
     const Logit* row_logits = logits + static_cast<std::int64_t>(row) * cols * physical_rows;
-    const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
+    const bool penalties = sampling_adjusts(cfg);
 
     if (!(cfg.temperature > 0.0f) && !penalties && cfg.mask.words == nullptr) {
         if (tid == 0) {
@@ -598,7 +598,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     if (col > extent) { return; }
     const SamplingConfig cfg = configs[row];
     const bool greedy        = !(cfg.temperature > 0.0f);
-    const bool penalties     = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
+    const bool penalties     = sampling_adjusts(cfg);
     if ((greedy && !penalties && cfg.mask.words == nullptr) || token_domain <= kSamplerTileItems) {
         return;
     }
@@ -692,7 +692,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
     if (token_domain <= kSamplerTileItems) { return; }
     const bool greedy    = !(cfg.temperature > 0.0f);
-    const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
+    const bool penalties = sampling_adjusts(cfg);
 
     if (greedy && !penalties && cfg.mask.words == nullptr) {
         const Logit* row_logits = logits + static_cast<std::int64_t>(row) * cols * physical_rows;
@@ -1385,7 +1385,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_parti
     if (col >= speculative_tree_live_columns(tree, current_extents[row], k)) { return; }
     const SamplingConfig cfg = configs[row];
     const bool greedy        = !(cfg.temperature > 0.0f);
-    const bool penalties     = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
+    const bool penalties     = sampling_adjusts(cfg);
     if ((greedy && !penalties) || token_domain <= kSamplerTileItems) { return; }
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
     if (partial == 0 && threadIdx.x == 0) {
@@ -1478,7 +1478,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__
     const SamplingConfig cfg = configs[row];
     if (token_domain <= kSamplerTileItems) { return; }
     const bool greedy    = !(cfg.temperature > 0.0f);
-    const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
+    const bool penalties = sampling_adjusts(cfg);
 
     if (greedy && !penalties) {
         if (tid < 32 && col == 0 && group == 0) {

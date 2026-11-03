@@ -596,6 +596,8 @@ public:
     std::optional<DFlashDraftHandoff> dflash_draft_handoff;
     std::array<std::uint64_t, kMaximumConcurrency> grammar_dead_positions{};
     ops::SamplingMask bind_grammar_mask(runtime::TokenMaskProvider*, std::size_t row);
+    // The row's end-of-turn exclusion while its thinking is open (runtime::ReasoningBan; none without a provider).
+    void bind_reasoning_ban(runtime::TokenMaskProvider*, std::size_t row, ops::SamplingConfig& config) const noexcept;
     ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider*, std::size_t row,
                                         std::span<const TokenId> drafts);
     Tensor token_counts;

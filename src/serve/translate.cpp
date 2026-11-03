@@ -361,6 +361,9 @@ infernix::RequestOptions to_request_options(const GenerationRequest& request,
         // (settle_thinking_budget) once the prompt length, and so the room the context leaves, is known.
         // A token constraint owns every output step, so the guard's injected close has no room.
         if (request.token_constraint.empty()) { options.execution.thinking.loop = server.reasoning_loop; }
+        // A token constraint chooses every output step itself, the end of the turn included.
+        options.execution.thinking.end_turn_in_thinking =
+            server.end_turn_in_thinking || !request.token_constraint.empty();
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;

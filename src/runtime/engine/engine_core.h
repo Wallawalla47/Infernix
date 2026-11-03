@@ -83,6 +83,15 @@ public:
             return outputs[row] && outputs[row]->constrained();
         }
 
+        ReasoningBan reasoning_ban(std::size_t row) const noexcept override {
+            return outputs[row] ? outputs[row]->reasoning_ban() : ReasoningBan{};
+        }
+
+        // Whether the round needs this provider: a row with a grammar, or one whose thinking is open.
+        bool needed(std::size_t row) const noexcept {
+            return outputs[row] && (outputs[row]->constrained() || outputs[row]->reasoning_ban().active());
+        }
+
         std::uint64_t fill(std::size_t row, std::span<const TokenId> drafts,
                            std::span<std::uint32_t> words) override {
             return outputs[row]->grammar_masks(drafts, words);
@@ -1622,7 +1631,7 @@ private:
         setup.finish();
         RoundMasks masks;
         masks.outputs[0] = &request->output;
-        auto* provider   = request->output.constrained() ? &masks : nullptr;
+        auto* provider   = masks.needed(0) ? &masks : nullptr;
         ProgramCallScope program_call(*this);
         auto progress = instance_.program->advance_prefill(*request->sequence,
                                                            &program_call.failed_timing(), provider);
@@ -2244,14 +2253,14 @@ private:
         const auto started = Clock::now();
         ProgramCallScope program_call(*this);
         RoundMasks masks;
-        bool constrained = false;
+        bool masked = false;
         for (std::size_t row = 0; row < membership.size; ++row) {
             masks.outputs[row] = &slots_[membership.lane_span()[row]]->output;
-            constrained |= masks.outputs[row]->constrained();
+            masked |= masks.needed(row);
         }
         auto pending = instance_.program->decode(
             membership.sequence_span(), membership.budget_span(), &program_call.failed_timing(),
-            constrained ? &masks : nullptr);
+            masked ? &masks : nullptr);
         program_call.finish(pending.execution_timing());
         commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
         const std::uint64_t round_ns = elapsed_ns(started, Clock::now());

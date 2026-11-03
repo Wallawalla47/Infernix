@@ -236,6 +236,12 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
     return col * kSamplerCandidateCap + j;
 }
 
+// Whether a row's logits take sampling_adjusted_logit's penalties or its open-reasoning exclusion (the
+// grammar mask is tested separately by each caller).
+__device__ __forceinline__ bool sampling_adjusts(const SamplingConfig& c) {
+    return c.presence_penalty != 0.0f || c.frequency_penalty != 0.0f || c.reasoning_close >= 0;
+}
+
 // Applies presence/frequency penalties to a raw logit. `overlay`/`overlay_len`
 // carry a round-local count overlay: tokens already committed earlier in the
 // current speculative round but not yet flushed to the global `token_counts`. For speculative
@@ -244,11 +250,18 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 // the penalty at each column sees the same prefix a per-token sampler would.
 // Non-speculative callers pass no overlay. The scan is bounded by k and
 // only runs when penalties are active, so it is free on the no-penalty path.
+// An end-of-turn token of a row in open reasoning is excluded until the overlay holds the close token
+// (SamplingConfig::reasoning_close).
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
                                                          int overlay_len             = 0) {
     if (c.mask.words && !(c.mask.words[overlay_len * c.mask.stride + v / 32] & (1u << (v % 32)))) {
         return -CUDART_INF_F;
+    }
+    if (c.reasoning_close >= 0 && (v == c.reasoning_ends[0] || v == c.reasoning_ends[1])) {
+        bool closed = false;
+        for (int j = 0; j < overlay_len; ++j) { closed = closed || overlay[j] == c.reasoning_close; }
+        if (!closed) { return -CUDART_INF_F; }
     }
     float x = raw;
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }

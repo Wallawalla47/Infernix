@@ -239,10 +239,11 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
     }
     grammar_dead_positions[0] = 0;
     if (requests[lane].prefill && permit.main_frontier >= requests[lane].prefill->prompt_tokens &&
-        masks && masks->constrained(0)) {
+        masks && (masks->constrained(0) || masks->reasoning_ban(0).active())) {
         auto& config       = static_cast<qwen3_5::PrefillRoundHost*>(round_host->data())->sampling;
         config             = requests[lane].sampling_host;
         config.mask        = fill_grammar_mask(masks, 0, {});
+        bind_reasoning_ban(masks, 0, config);
         Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
         CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &config, sizeof(config),
                                    cudaMemcpyHostToDevice, device.stream));

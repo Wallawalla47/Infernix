@@ -5223,6 +5223,7 @@ private:
         for (std::int32_t b = 0; b < batch; ++b) {
             configs[b]      = lanes_[lanes[b]].sampling;
             configs[b].mask = grammar_mask(static_cast<std::size_t>(b), drafts_[b]);
+            reasoning_ban(static_cast<std::size_t>(b), configs[b]);
         }
         upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
         Tensor drafts(spec_device(spec_layout_.drafts), DType::I32, {K, batch});
@@ -6035,6 +6036,7 @@ private:
         for (std::int32_t b = 0; b < batch; ++b) {
             configs[b]          = lanes_[lanes[b]].sampling;
             configs[b].mask     = grammar_mask(static_cast<std::size_t>(b), {});
+            reasoning_ban(static_cast<std::size_t>(b), configs[b]);
             sample_positions[b] = positions[b];
         }
         upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
@@ -6545,6 +6547,15 @@ private:
         upload_pinned(device_words, host.data(), host.size_bytes(), device_.stream);
         grammar_->uploaded(row, host.size_bytes());
         return {device_words, static_cast<std::int32_t>(words)};
+    }
+    // Row `row`'s end-of-turn exclusion while its thinking is open (runtime::ReasoningBan; none without the round's
+    // provider), for its sampler and verification; the drafters propose without it, and a drafted end-of-turn is
+    // rejected.
+    void reasoning_ban(std::size_t row, ops::SamplingConfig& config) const noexcept {
+        const runtime::ReasoningBan ban = grammar_ != nullptr ? grammar_->reasoning_ban(row) : runtime::ReasoningBan{};
+        config.reasoning_close   = ban.close;
+        config.reasoning_ends[0] = ban.ends[0];
+        config.reasoning_ends[1] = ban.ends[1];
     }
     // After the round's synchronize. A row fails when its sampler found no finite logit (the lane's
     // flag, cleared here for its next round; its tokens are placeholders), or when the tokens it

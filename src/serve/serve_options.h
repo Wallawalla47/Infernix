@@ -155,6 +155,9 @@ struct ServeOptions {
     // --reasoning-loop off|stop|conclude: the reasoning-loop guard for thinking requests without a
     // token constraint (off by default).
     infernix::ReasoningLoopAction reasoning_loop = infernix::ReasoningLoopAction::Off;
+    // --end-in-thinking refuse|allow: whether a turn may end while its thinking is open (refuse by default:
+    // ThinkingControlOptions::end_turn_in_thinking off).
+    bool end_turn_in_thinking = false;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     bool log_colours       = false; // --log-colours on|off: colour the console stats lines

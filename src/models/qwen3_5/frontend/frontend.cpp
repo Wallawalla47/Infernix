@@ -692,6 +692,9 @@ public:
             }
             defaults.token_ids.push_back(token);
         }
+        for (std::size_t i = 0; i < markers.turn_ends.size() && i < defaults.token_ids.size(); ++i) {
+            markers.turn_ends[i] = defaults.token_ids[i];
+        }
         std::string control_suffix(kThinkingControl);
         const char* control_name = "canonical thinking control suffix";
         if (!options.thinking_budget_message.empty()) {

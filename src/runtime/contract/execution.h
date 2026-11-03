@@ -67,6 +67,7 @@ class TokenMaskProvider {
 public:
     virtual ~TokenMaskProvider()                                           = default;
     [[nodiscard]] virtual bool constrained(std::size_t row) const noexcept = 0;
+    [[nodiscard]] virtual ReasoningBan reasoning_ban(std::size_t /*row*/) const noexcept { return {}; }
     // Returns dead-end position bits. Even dead/unreachable positions receive a safe nonempty
     // device mask. A dead end fails a row only if verification reaches that position.
     [[nodiscard]] virtual std::uint64_t fill(std::size_t row, std::span<const TokenId> drafts,

@@ -981,6 +981,10 @@ struct ThinkingControlOptions {
     // not this model-origin budget.
     std::optional<std::uint32_t> budget;
     ReasoningLoopAction loop = ReasoningLoopAction::Off;
+    // false (default): the model's end-of-turn tokens take no probability while the thinking phase is open, so a turn
+    // cannot end inside its thinking with an empty reply (a constrained request's grammar refuses them there already);
+    // true: they keep their probability.
+    bool end_turn_in_thinking = false;
 };
 
 // Most tokens one prompt readout may name.

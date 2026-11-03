@@ -650,6 +650,10 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             throw std::invalid_argument("constraint token is outside the tokenizer domain");
         }
     }
+    // A token constraint chooses every output step itself, the end of the turn included.
+    if (!resolved_options.execution.constraint.empty()) {
+        resolved_options.execution.thinking.end_turn_in_thinking = true;
+    }
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
     if (prompt_summary.prompt_tokens > impl_->options.max_context) {

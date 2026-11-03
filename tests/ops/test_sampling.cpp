@@ -48,7 +48,8 @@ bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
            a.min_p == b.min_p && a.presence_penalty == b.presence_penalty &&
            a.frequency_penalty == b.frequency_penalty && a.seed == b.seed &&
            a.token_counts == b.token_counts && a.mask.words == b.mask.words &&
-           a.mask.stride == b.mask.stride && a.nonfinite == b.nonfinite;
+           a.mask.stride == b.mask.stride && a.nonfinite == b.nonfinite && a.reasoning_close == b.reasoning_close &&
+           a.reasoning_ends[0] == b.reasoning_ends[0] && a.reasoning_ends[1] == b.reasoning_ends[1];
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -429,6 +430,43 @@ int deterministic_stochastic_contract() {
         failures += verify_exact(test_case.label, result.tokens, {oracle.tokens.front()});
         failures += verify_exact("sample increments only selected token", result.counts.front(),
                                  expected_counts);
+    }
+    return failures;
+}
+
+// A row in open reasoning (SamplingConfig::reasoning_close): its end-of-turn tokens take no probability, greedy and
+// sampled alike, on the one-tile route (domain <= 256) and the multi-block one, FP32 and BF16 logits; a row without it,
+// or whose ends name other tokens, keeps them.
+int reasoning_end_ban_contract() {
+    int failures = 0;
+    for (const int token_domain : {200, 248320}) {
+        for (const DType dtype : {DType::BF16, DType::FP32}) {
+            const int physical_rows = token_domain + 3;
+            constexpr int batch     = 5;
+            std::vector<float> logits(static_cast<std::size_t>(physical_rows) * batch, -8.0f);
+            for (int row = 0; row < batch; ++row) {
+                logits[static_cast<std::size_t>(row) * physical_rows + 7]   = 6.0f; // an end of turn, the best
+                logits[static_cast<std::size_t>(row) * physical_rows + 150] = 5.0f; // the second end, next
+                logits[static_cast<std::size_t>(row) * physical_rows + 3]   = 4.0f; // the best other token
+            }
+            round_to_bf16(logits);
+            std::vector<ops::SamplingConfig> configs(batch);
+            for (auto& config : configs) {
+                config.reasoning_close   = 11;
+                config.reasoning_ends[0] = 7;
+                config.reasoning_ends[1] = 150;
+            }
+            configs[1].temperature = 0.7f; // sampled, top-1: the best allowed token
+            configs[1].top_k       = 1;
+            configs[1].seed        = 9;
+            configs[2].reasoning_close = -1; // no open reasoning
+            configs[3].reasoning_ends[0] = 9; // only 150 is an end here
+            configs[4].presence_penalty = 0.5f; // with a penalty too
+            const RunResult result = run_batch(logits, physical_rows, token_domain, std::move(configs),
+                                               {1, 2, 3, 4, 5}, ops::kSamplePurposeDecode, {}, dtype);
+            failures += result.integrity_failures;
+            failures += verify_exact("sample open-reasoning end-of-turn exclusion", result.tokens, {3, 3, 7, 7, 3});
+        }
     }
     return failures;
 }
@@ -999,6 +1037,7 @@ INFERNIX_OP_TEST(sampling) {
     failures += greedy_contract();
     failures += deterministic_stochastic_contract();
     failures += heterogeneous_batch_contract();
+    failures += reasoning_end_ban_contract();
     failures += filtered_distribution_contract();
     failures += capped_distribution_contract();
     failures += tied_boundary_distribution_contract();
