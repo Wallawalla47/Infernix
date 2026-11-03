@@ -286,7 +286,8 @@ __global__ void __launch_bounds__(S::kThreads, S::kMinBlocks)
 // Whether `S` takes a [rows, k] packed weight: whole row groups and whole steps.
 template <class S>
 [[nodiscard]] constexpr bool p12_stream_fits(std::int32_t rows, std::int32_t k) noexcept {
-    return rows % 16 == 0 && k % S::kStepK == 0;
+    // A warp stores all kWarpRows rows of its row groups, unchecked (only its loads are clamped).
+    return rows % S::kWarpRows == 0 && k % S::kStepK == 0;
 }
 
 template <class S>

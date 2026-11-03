@@ -2852,6 +2852,7 @@ public:
         out.row_count = rows.size();
         ContractAccess::consume(pending);
         pending_transaction_ = 0;
+        round_width_         = 1;
         deferred_.pending    = false;
         return out;
     }
@@ -2927,6 +2928,7 @@ public:
             }
             transaction_lane_.reset();
             pending_transaction_ = 0;
+            round_width_         = 1;
             deferred_.pending    = false; // the failed round's cache update
             device_.synchronize();
             if (prefix_) {
@@ -2950,6 +2952,7 @@ public:
         }
         transaction_lane_.reset();
         pending_transaction_ = 0;
+        round_width_         = 1; // an abandoned verification round leaves no width behind (candidates QA-16)
         deferred_.pending    = false; // after a failure the last round's cache update is dropped (shutdown settles it first)
         try { device_.synchronize(); } catch (...) {}
         if (clear_prefix_on_release_) { // a failed round may have published state it never computed

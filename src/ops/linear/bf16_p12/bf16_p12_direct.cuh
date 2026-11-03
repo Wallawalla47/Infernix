@@ -220,7 +220,8 @@ __global__ void __launch_bounds__(S::kThreads, S::kMinBlocks)
 // Whether `S` takes a [rows, k] packed weight at `tokens` columns: whole row groups and 128-weight steps.
 template <class S>
 [[nodiscard]] constexpr bool p12_direct_fits(std::int32_t rows, std::int32_t k, std::int32_t tokens) noexcept {
-    return rows % 16 == 0 && k % 128 == 0 && k / 128 >= S::kKSlices && tokens >= 1 && tokens <= S::kMaxTokens;
+    // A warp stores all kWarpRows rows of its row groups, unchecked (only its loads are clamped).
+    return rows % S::kWarpRows == 0 && k % 128 == 0 && k / 128 >= S::kKSlices && tokens >= 1 && tokens <= S::kMaxTokens;
 }
 
 template <class S, class Output>
