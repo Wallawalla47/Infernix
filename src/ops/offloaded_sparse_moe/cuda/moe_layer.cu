@@ -2535,27 +2535,32 @@ __global__ void __launch_bounds__(kThreads)
 
 // --------------------------------------------------------------------------------------- combine
 
+// A grid has at most 65,535 rows: a wider call (a 122B prefill pass of 94K columns) gives each row of
+// blocks several columns, each computed as alone.
+constexpr int kCombineGridRows = 65535;
+
 template <bool kMasked>
 __global__ void combine_kernel(const bf16* __restrict__ outputs, const float* __restrict__ weights,
                                const float* __restrict__ shared_gate, const bf16* __restrict__ shared,
                                int hidden, int top_k, int columns, bf16* __restrict__ y, MoeColumnMask mask) {
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
-    if (d >= hidden || t >= columns) { return; }
-    if constexpr (kMasked) {
-        // A masked column has no outputs (no dispatch entry): its y is 0.
-        if (!column_live(mask, t)) {
-            y[static_cast<std::size_t>(t) * hidden + d] = __float2bfloat16_rn(0.0F);
-            return;
+    if (d >= hidden) { return; }
+    for (int t = blockIdx.y; t < columns; t += gridDim.y) {
+        if constexpr (kMasked) {
+            // A masked column has no outputs (no dispatch entry): its y is 0.
+            if (!column_live(mask, t)) {
+                y[static_cast<std::size_t>(t) * hidden + d] = __float2bfloat16_rn(0.0F);
+                continue;
+            }
         }
+        float sum = 0.0F;
+        for (int k = 0; k < top_k; ++k) { // fixed rank order: placement-invariant
+            sum += weights[static_cast<std::size_t>(t) * top_k + k] *
+                   __bfloat162float(outputs[(static_cast<std::size_t>(t) * top_k + k) * hidden + d]);
+        }
+        sum += shared_gate[t] * __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]);
+        y[static_cast<std::size_t>(t) * hidden + d] = __float2bfloat16_rn(sum);
     }
-    float sum = 0.0F;
-    for (int k = 0; k < top_k; ++k) { // fixed rank order: placement-invariant
-        sum += weights[static_cast<std::size_t>(t) * top_k + k] *
-               __bfloat162float(outputs[(static_cast<std::size_t>(t) * top_k + k) * hidden + d]);
-    }
-    sum += shared_gate[t] * __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]);
-    y[static_cast<std::size_t>(t) * hidden + d] = __float2bfloat16_rn(sum);
 }
 
 // combine_kernel's y, kept in a register, injected into the residual streams as
@@ -2567,19 +2572,20 @@ __global__ void combine_inject_kernel(const bf16* __restrict__ outputs, const fl
     // A programmatic dependent; its small grid lets the next mixer launch and fetch its weights at once.
     pdl::enter();
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
-    if (d >= hidden || t >= columns) { return; }
-    float sum = 0.0F;
-    for (int k = 0; k < top_k; ++k) { // fixed rank order: placement-invariant
-        sum += weights[static_cast<std::size_t>(t) * top_k + k] *
-               __bfloat162float(outputs[(static_cast<std::size_t>(t) * top_k + k) * hidden + d]);
-    }
-    sum += shared_gate[t] * __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]);
-    const float v           = __bfloat162float(__float2bfloat16_rn(sum));
-    const std::size_t width = static_cast<std::size_t>(streams) * hidden;
-    for (int s = 0; s < streams; ++s) {
-        bf16& r = residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d];
-        r       = __float2bfloat16_rn(__bfloat162float(r) + inject[static_cast<std::size_t>(t) * streams + s] * v);
+    if (d >= hidden) { return; }
+    for (int t = blockIdx.y; t < columns; t += gridDim.y) { // kCombineGridRows, as combine_kernel
+        float sum = 0.0F;
+        for (int k = 0; k < top_k; ++k) { // fixed rank order: placement-invariant
+            sum += weights[static_cast<std::size_t>(t) * top_k + k] *
+                   __bfloat162float(outputs[(static_cast<std::size_t>(t) * top_k + k) * hidden + d]);
+        }
+        sum += shared_gate[t] * __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]);
+        const float v           = __bfloat162float(__float2bfloat16_rn(sum));
+        const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+        for (int s = 0; s < streams; ++s) {
+            bf16& r = residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d];
+            r       = __float2bfloat16_rn(__bfloat162float(r) + inject[static_cast<std::size_t>(t) * streams + s] * v);
+        }
     }
 }
 
@@ -3139,7 +3145,7 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
     const bool masked = routing.mask.valid != nullptr;
     require(!masked || (routing.mask.width > 0 && columns % routing.mask.width == 0),
             "a column mask needs whole rows of the call's columns");
-    const dim3 grid((hidden + kThreads - 1) / kThreads, columns);
+    const dim3 grid((hidden + kThreads - 1) / kThreads, std::min(columns, kCombineGridRows));
     const auto* routed_out = static_cast<const bf16*>(outputs.data);
     const auto* weights    = static_cast<const float*>(routing.weights.data);
     const auto* gate       = static_cast<const float*>(routing.shared_gate.data);
@@ -3166,7 +3172,8 @@ void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const 
                 inject.ne[1] == columns && streams > 0 && residual.ne[0] == streams * hidden &&
                 residual.ne[1] == columns,
             "combine inject shapes disagree");
-    CUDA_CHECK(pdl::launch_consumer({dim3((hidden + kThreads - 1) / kThreads, columns), dim3(kThreads), 0, stream},
+    CUDA_CHECK(pdl::launch_consumer({dim3((hidden + kThreads - 1) / kThreads, std::min(columns, kCombineGridRows)),
+                                     dim3(kThreads), 0, stream},
                                     combine_inject_kernel, static_cast<const bf16*>(outputs.data),
                                     static_cast<const float*>(routing.weights.data),
                                     static_cast<const float*>(routing.shared_gate.data),

@@ -1169,6 +1169,72 @@ void test_combine_inject(int columns, int top_k, int streams, std::uint32_t seed
     }
 }
 
+// A call wider than a grid's 65,535 rows (a 122B prefill pass of 94K columns): moe_combine and
+// moe_combine_inject bit-equal to the same ops run on its first 65,535 columns and on the rest (each
+// column is computed alone, so a split call is the qualified narrower route).
+void test_combine_wide(int columns, int top_k, int streams, int hidden, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> n(0.0F, 1.0F);
+    const auto bf16s = [&](std::size_t count) {
+        std::vector<std::uint16_t> v(count);
+        for (auto& x : v) { x = infernix::test::f32_to_bf16(n(rng)); }
+        return v;
+    };
+    const auto floats = [&](std::size_t count) {
+        std::vector<float> v(count);
+        for (auto& x : v) { x = n(rng); }
+        return v;
+    };
+    const auto H = static_cast<std::size_t>(hidden), K = static_cast<std::size_t>(top_k), S = static_cast<std::size_t>(streams);
+    const auto outputs  = bf16s(H * columns * K);
+    const auto shared   = bf16s(H * columns);
+    const auto weights  = floats(K * columns);
+    const auto gate     = floats(columns);
+    const auto inject   = floats(S * columns);
+    const auto residual = bf16s(S * H * columns);
+    auto* d_outputs = device_copy(outputs);
+    auto* d_shared  = device_copy(shared);
+    auto* d_weights = device_copy(weights);
+    auto* d_gate    = device_copy(gate);
+    auto* d_inject  = device_copy(inject);
+    auto* d_whole   = device_copy(residual);
+    auto* d_parts   = device_copy(residual);
+    std::uint16_t *d_y_whole = nullptr, *d_y_parts = nullptr;
+    cuda_check(cudaMalloc(&d_y_whole, shared.size() * sizeof(std::uint16_t)), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_y_parts, shared.size() * sizeof(std::uint16_t)), "cudaMalloc");
+    // Columns [begin, begin + count) of every input, as their own call.
+    const auto run = [&](int begin, int count, std::uint16_t* y, std::uint16_t* res) {
+        const auto b = static_cast<std::size_t>(begin);
+        const infernix::ops::MoeRouting routing{Tensor{}, Tensor(d_weights + b * K, DType::FP32, {top_k, count}),
+                                                Tensor(d_gate + b, DType::FP32, {count})};
+        const Tensor t_outputs(d_outputs + b * K * H, DType::BF16, {hidden, count * top_k});
+        const Tensor t_shared(d_shared + b * H, DType::BF16, {hidden, count});
+        const Tensor t_inject(d_inject + b * S, DType::FP32, {streams, count});
+        Tensor t_y(y + b * H, DType::BF16, {hidden, count});
+        Tensor t_res(res + b * S * H, DType::BF16, {streams * hidden, count});
+        infernix::ops::moe_combine(t_outputs, routing, t_shared, t_y, nullptr);
+        infernix::ops::moe_combine_inject(t_outputs, routing, t_shared, t_inject, t_res, nullptr);
+    };
+    run(0, columns, d_y_whole, d_whole);
+    run(0, 65535, d_y_parts, d_parts);
+    run(65535, columns - 65535, d_y_parts, d_parts);
+    cuda_check(cudaDeviceSynchronize(), "combine wide");
+    std::vector<std::uint16_t> y_whole(shared.size()), y_parts(shared.size()), whole(residual.size()), parts(residual.size());
+    cuda_check(cudaMemcpy(y_whole.data(), d_y_whole, y_whole.size() * 2, cudaMemcpyDeviceToHost), "copy");
+    cuda_check(cudaMemcpy(y_parts.data(), d_y_parts, y_parts.size() * 2, cudaMemcpyDeviceToHost), "copy");
+    cuda_check(cudaMemcpy(whole.data(), d_whole, whole.size() * 2, cudaMemcpyDeviceToHost), "copy");
+    cuda_check(cudaMemcpy(parts.data(), d_parts, parts.size() * 2, cudaMemcpyDeviceToHost), "copy");
+    const bool same = y_whole == y_parts && whole == parts && whole != residual;
+    std::printf("combine T=%d k=%d S=%d H=%d: %s\n", columns, top_k, streams, hidden,
+                same ? "bit-equal to its 65,535-column parts" : "DIFFERENT");
+    check(same, "a call wider than 65,535 columns combines as its parts do");
+    for (void* p : {static_cast<void*>(d_outputs), static_cast<void*>(d_shared), static_cast<void*>(d_weights),
+                    static_cast<void*>(d_gate), static_cast<void*>(d_inject), static_cast<void*>(d_whole),
+                    static_cast<void*>(d_parts), static_cast<void*>(d_y_whole), static_cast<void*>(d_y_parts)}) {
+        cudaFree(p);
+    }
+}
+
 // moe_route_dispatch, captured (so its kernel runs as a programmatic dependent) and replayed on new
 // logits, against the oracles: ids exactly the top-k with lower-id ties (the logits repeat values
 // so ties occur), weights and shared gate against the FP64 formula, the dispatch exact as in
@@ -1620,6 +1686,7 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
             test_route_pooled(256, 3, 8, 256, 271, true);
             test_route_pooled(256, 4, 8, 64, 277, true);
             for (const int columns : {1, 5}) { test_combine_inject(columns, 10, 4, 300U + columns); }
+            test_combine_wide(94080, 8, 4, 96, 311); // the 122B's fitted 94,592-token chunk at INT8 KV's waves
             test_service_column_bound();
             test_service_failure_reported();
         }
