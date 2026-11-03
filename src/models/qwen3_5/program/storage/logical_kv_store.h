@@ -163,11 +163,13 @@ public:
 
     void abort_transfer_destination(LogicalKVPageHandle handle,
                                     DeviceKVPageReservation& reservation) noexcept {
-        if (!valid(handle)) { return; }
+        if (!valid(handle)) { return; } // published (commit reset the handle) or never opened
         Page& page = pages_[handle.index_];
+        // A live destination in any other state would strand its page (occupied, owned by nobody), as
+        // publish_transfer_destination's refusal would.
         if (!page.device_replica || !page.destination_pinned || page.references != 0 ||
             page.writer_references != 0 || page.source_pins != 0) {
-            return;
+            std::terminate();
         }
         physical_->dematerialize_one(reservation, std::move(*page.device_replica));
         page.device_replica.reset();

@@ -1166,6 +1166,11 @@ std::int32_t* KVExecutionTablePool::writable_shadow(KVExecutionRowHandle row_han
     RowFence& fence = row_fences_[static_cast<std::size_t>(row_handle.row_)];
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    // A capture can neither query nor wait for an earlier publication's upload, which may still read
+    // the slice this rewrites (paged-kv-cache.md §12.17): refused rather than published past its fence.
+    if (count != 0 && fence.end > fence.begin && capture != cudaStreamCaptureStatusNone) {
+        throw std::logic_error("KV execution table row published during a capture behind an unsettled upload");
+    }
     if (count != 0 && fence.end > fence.begin && capture == cudaStreamCaptureStatusNone) {
         const std::uint64_t end = static_cast<std::uint64_t>(logical_begin) + count;
         const bool overlaps     = logical_begin < fence.end && fence.begin < end;

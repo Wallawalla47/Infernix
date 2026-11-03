@@ -568,6 +568,9 @@ public:
     void shrink_kv(bool evict);
     [[nodiscard]] bool kv_idle_due() const noexcept;
     std::unique_ptr<qwen3_5::DecoderState> decoder;
+    // Before the KV stores: DFlash Full's page pool must outlive the backend stores' leases into it,
+    // also when the constructor unwinds (members are destroyed in reverse order).
+    std::optional<DFlashPersistentState> dflash;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
     std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
@@ -579,7 +582,6 @@ public:
     // One view per round-family width below draft_window: rounds of a narrower family verify at
     // their own width for every batch size and record/fold through the dense view of that width.
     std::vector<NarrowReplayView> narrow_replay_views;
-    std::optional<DFlashPersistentState> dflash;
     // An artifact with offloaded experts: the Program's experts and their engine (offload.h); null
     // otherwise.
     std::unique_ptr<ProgramOffload> offload;
