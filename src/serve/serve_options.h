@@ -24,6 +24,7 @@ inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 inline constexpr std::uint32_t kDefaultRequestLogKeep     = 4;
 inline constexpr std::uint32_t kMaximumRequestLogKeep     = 1000;
+inline constexpr std::uint32_t kMaximumPendingRequests    = 1024;
 // Seconds an idle connection stays open past the Keep-Alive timeout the server advertises, so a
 // client that retires its pooled connection at the advertised deadline always closes first.
 inline constexpr std::uint32_t kKeepAliveBufferSec = 10;
@@ -66,6 +67,7 @@ struct ServeOptions {
     bool a8_activations            = false; // EngineOptions::a8_activations
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t max_concurrency      = 1;
+    // At most kMaximumPendingRequests: the HTTP pool starts a worker for each admitted or pending request.
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     // HTTP keep-alive: how long a finished response's connection stays open for the next

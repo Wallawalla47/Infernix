@@ -151,9 +151,11 @@ const product::ConfigProgram& serve_config_program() {
 }
 
 int parse_nonnegative_int(const char* text, const char* label) {
+    // ERANGE: where long is int's size (Windows), an overflow saturates at the bound checked below.
+    errno            = 0;
     char* end        = nullptr;
     const long value = std::strtol(text, &end, 10);
-    if (end == text || *end != '\0' || value < 0 ||
+    if (errno == ERANGE || end == text || *end != '\0' || value < 0 ||
         value > static_cast<long>(std::numeric_limits<int>::max())) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
     }
@@ -1206,8 +1208,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");
     }
-    if (options.max_pending_requests == 0) {
-        throw std::invalid_argument("--max-pending-requests must be positive");
+    // The HTTP pool starts one worker per admitted or pending request (and the Engine sizes its queue for them).
+    if (options.max_pending_requests == 0 || options.max_pending_requests > kMaximumPendingRequests) {
+        throw std::invalid_argument("--max-pending-requests must be in [1," + std::to_string(kMaximumPendingRequests) +
+                                    "]");
     }
     if (options.pending_timeout_ms == 0) {
         throw std::invalid_argument("--pending-timeout-ms must be positive");

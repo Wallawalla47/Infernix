@@ -83,6 +83,16 @@ int main() {
     failures += check(missing_yarn_rejected, "missing serving YaRN factor accepted");
     failures += check(serve_usage_text("infernix-serve").find("--rope-yarn-factor") != std::string::npos,
                       "serving help omits YaRN");
+    // Integer options past int's range are refused, not saturated (Windows' long is int's size), and the pending
+    // queue (one HTTP worker each) is bounded (candidates QA-13).
+    for (const auto* option : {"--max-http-clients", "--pending-timeout-ms", "--max-pending-requests"}) {
+        failures += check(!parse_error({"infernix-serve", "model.ninfer", option, "99999999999"}).empty(),
+                          "an integer option past int's range was accepted");
+    }
+    failures += check(parse({"infernix-serve", "model.ninfer", "--max-pending-requests", "1024"}).max_pending_requests == 1024,
+                      "--max-pending-requests 1024 refused");
+    failures += check(!parse_error({"infernix-serve", "model.ninfer", "--max-pending-requests", "1025"}).empty(),
+                      "--max-pending-requests past 1024 accepted");
     // --plan FILE: the start's options as given, plus where the plan goes; the Engine's options are the
     // start's (make_engine_options), so the plan sizes that start.
     {

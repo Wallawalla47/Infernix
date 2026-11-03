@@ -121,6 +121,17 @@ int test_regex_refusals() {
                                   .find("Invalid regular expression pattern") == 0,
                           "a malformed pattern was accepted: " + pattern);
     }
+    // An escape past the last code point is refused before it can overflow (it used to wrap into a class
+    // range that matched nearly everything); a comment is no item; an empty group repeats as Python's does.
+    for (const std::string pattern : {R"([\UFFFFFFFF-A])", R"(\U80000000)", R"(\U00110000)", "(?#x)*a", "(?#open"}) {
+        failures += check(input_error([&] { (void)regex(index, pattern); })
+                                  .find("Invalid regular expression pattern") == 0,
+                          "a pattern Python refuses was accepted: " + pattern);
+    }
+    failures += check(regex(index, "(?:){5}weather") == std::vector<std::size_t>{0} &&
+                          regex(index, "()*weather") == std::vector<std::size_t>{0} &&
+                          regex(index, "weathe(?#x)*r") == std::vector<std::size_t>{0},
+                      "an empty group's repeat or a comment before a quantifier is not read as Python reads it");
     failures += check(input_error([&] { (void)regex(index, "missing) at"); }) ==
                           "Invalid regular expression pattern: unbalanced parenthesis at position 7",
                       "the error position is not Python's");
