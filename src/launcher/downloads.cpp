@@ -112,6 +112,15 @@ public:
         return true;
     }
 
+    // What is written so far, on the disk.
+    bool flush() {
+#ifdef _WIN32
+        return FlushFileBuffers(handle_) != 0;
+#else
+        return ::fsync(fd_) == 0;
+#endif
+    }
+
     // Once every range is written the file needs no sparse flag.
     void finish() {
 #ifdef _WIN32
@@ -321,8 +330,9 @@ Json Downloads::create(const Json& request) {
         if (it == listing.files.end()) { throw std::invalid_argument(path + " is not in " + repo); }
         auto file    = std::make_unique<DownloadFile>();
         file->path   = path;
-        file->bytes  = it->size;
-        file->sha256 = it->sha256;
+        file->bytes    = it->size;
+        file->sha256   = it->sha256;
+        file->git_blob = it->git_blob;
         // What still has to arrive: not a file already there whole (unless replacing it), less what
         // an interrupted download left.
         const std::filesystem::path final_path = job->target_dir / utf8_path(path);
@@ -536,14 +546,16 @@ void Downloads::run_job(DownloadJob& job) {
         }
         std::filesystem::path part = final_path;
         part += ".part";
-        if (file.sha256 && (!hooks_.verify || hooks_.verify())) {
+        if ((file.sha256 || file.git_blob) && (!hooks_.verify || hooks_.verify())) {
             {
                 std::lock_guard lock(mutex_);
                 file.state = "verifying";
                 job.state  = "verifying";
             }
             notify();
-            const std::optional<std::string> digest = sha256_file(part, nullptr, interrupt_);
+            const std::optional<std::string> digest =
+                file.sha256 ? sha256_file(part, nullptr, interrupt_) : git_blob_id_file(part, interrupt_);
+            const std::string& expected = file.sha256 ? *file.sha256 : *file.git_blob;
             if (interrupt_) {
                 std::lock_guard lock(mutex_);
                 file.state = "paused";
@@ -553,7 +565,7 @@ void Downloads::run_job(DownloadJob& job) {
                 std::lock_guard lock(mutex_);
                 job.state = "running";
             }
-            if (!digest || *digest != *file.sha256) {
+            if (!digest || *digest != expected) {
                 std::filesystem::remove(part, error);
                 std::filesystem::path meta = part;
                 meta += ".json";
@@ -627,16 +639,23 @@ bool Downloads::download_file(DownloadJob& job, DownloadFile& file, const std::f
     file.done = already;
 
     std::mutex meta_mutex;
+    std::mutex save_mutex; // one record write at a time
     auto last_meta_save = std::chrono::steady_clock::now();
     const auto save_meta = [&](bool force) {
-        std::lock_guard lock(meta_mutex);
-        const auto now = std::chrono::steady_clock::now();
-        if (!force && now - last_meta_save < std::chrono::seconds(3)) { return; }
-        last_meta_save = now;
-        Json indices   = Json::array();
-        for (std::uint64_t i = 0; i < chunks; ++i) {
-            if (done[i]) { indices.push_back(i); }
+        Json indices = Json::array();
+        {
+            std::lock_guard lock(meta_mutex);
+            const auto now = std::chrono::steady_clock::now();
+            if (!force && now - last_meta_save < std::chrono::seconds(3)) { return; }
+            last_meta_save = now;
+            for (std::uint64_t i = 0; i < chunks; ++i) {
+                if (done[i]) { indices.push_back(i); }
+            }
         }
+        // The record names only chunks already on the disk: after a power cut it must not call
+        // the zeros of a preallocated file done. (An older record written last names fewer.)
+        std::lock_guard save(save_mutex);
+        if (!out.flush()) { return; }
         try {
             write_file_atomic(meta_path, Json{{"size", size}, {"chunk", kChunkBytes}, {"revision", job.revision},
                                               {"done", indices}}
@@ -761,6 +780,7 @@ void Downloads::save_locked() const {
             files.push_back({{"path", file->path},
                              {"bytes", file->bytes},
                              {"sha256", file->sha256 ? Json(*file->sha256) : Json(nullptr)},
+                             {"git_blob", file->git_blob ? Json(*file->git_blob) : Json(nullptr)},
                              {"done", file->done.load()},
                              {"state", file->state},
                              {"error", file->error ? Json(*file->error) : Json(nullptr)}});
@@ -804,6 +824,7 @@ void Downloads::load() {
             file->path  = json_or<std::string>(f, "path", "");
             file->bytes = json_or<std::uint64_t>(f, "bytes", 0);
             if (f.contains("sha256") && f["sha256"].is_string()) { file->sha256 = f["sha256"].get<std::string>(); }
+            if (f.contains("git_blob") && f["git_blob"].is_string()) { file->git_blob = f["git_blob"].get<std::string>(); }
             file->done  = json_or<std::uint64_t>(f, "done", 0);
             file->state = json_or<std::string>(f, "state", "queued");
             if (file->state == "downloading" || file->state == "verifying") { file->state = "queued"; }

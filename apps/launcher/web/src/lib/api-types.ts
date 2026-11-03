@@ -849,6 +849,8 @@ export interface ServeOptions {
 
 export interface LauncherState {
   version: string;
+  /** This launcher process; a restarted one numbers its console and event-log lines afresh. */
+  run: string;
   /** The launcher's own folder (AppData only when that folder is read-only). */
   data_dir: string;
   /** Full path of infernix-launcher.json: settings, model configs, last model, download queue. */

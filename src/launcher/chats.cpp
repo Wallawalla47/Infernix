@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <iterator>
 #include <stdexcept>
 #include <vector>
 
@@ -27,18 +28,54 @@ Json ChatStore::summary(const Json& chat) {
             {"updated_at", json_or<std::int64_t>(chat, "updated_at", 0)}};
 }
 
-Json ChatStore::list() const {
-    std::lock_guard lock(mutex_);
-    std::vector<Json> chats;
+std::optional<ChatStore::Stamp> ChatStore::stamp_of(const std::filesystem::path& path) {
     std::error_code error;
-    for (const auto& entry : std::filesystem::directory_iterator(dir_, error)) {
-        if (entry.path().extension() != ".json") { continue; }
-        const std::optional<std::string> text = read_file(entry.path());
-        if (!text) { continue; }
+    Stamp stamp;
+    stamp.size = std::filesystem::file_size(path, error);
+    if (error) { return std::nullopt; }
+    stamp.written = std::filesystem::last_write_time(path, error);
+    if (error) { return std::nullopt; }
+    return stamp;
+}
+
+Json ChatStore::list() const {
+    // Chats are written whole (renamed into place), so they are read without the lock, and only
+    // the files changed since the last list are parsed: a slow list holds up no save.
+    std::map<std::filesystem::path, Cached> current;
+    std::vector<std::filesystem::path> changed;
+    {
+        std::lock_guard lock(mutex_);
+        std::error_code error;
+        for (const auto& entry : std::filesystem::directory_iterator(dir_, error)) {
+            if (entry.path().extension() != ".json") { continue; }
+            const std::optional<Stamp> stamp = stamp_of(entry.path());
+            if (!stamp) { continue; }
+            if (const auto it = summaries_.find(entry.path()); it != summaries_.end() && it->second.stamp == *stamp) {
+                current.emplace(entry.path(), it->second);
+            } else {
+                changed.push_back(entry.path());
+            }
+        }
+    }
+    for (const std::filesystem::path& path : changed) {
+        const std::optional<Stamp> stamp       = stamp_of(path);
+        const std::optional<std::string> text = read_file(path);
+        if (!stamp || !text) { continue; }
         try {
             const Json chat = Json::parse(*text);
-            if (chat.is_object()) { chats.push_back(summary(chat)); }
+            if (chat.is_object()) { current.emplace(path, Cached{*stamp, summary(chat)}); }
         } catch (const Json::exception&) {}
+    }
+    std::vector<Json> chats;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& [path, cached] : current) {
+            summaries_.insert_or_assign(path, cached);
+            chats.push_back(cached.summary);
+        }
+        for (auto it = summaries_.begin(); it != summaries_.end();) {
+            it = current.contains(it->first) ? std::next(it) : summaries_.erase(it);
+        }
     }
     std::sort(chats.begin(), chats.end(), [](const Json& a, const Json& b) {
         return a.value("updated_at", std::int64_t{0}) > b.value("updated_at", std::int64_t{0});
@@ -48,8 +85,8 @@ Json ChatStore::list() const {
 
 std::optional<Json> ChatStore::get(const std::string& id) const {
     if (!valid_id(id)) { return std::nullopt; }
-    std::lock_guard lock(mutex_);
-    const std::optional<std::string> text = read_file(path_of(id));
+    const std::optional<std::string> text = read_file(path_of(id)); // written whole: no lock
+
     if (!text) { return std::nullopt; }
     try {
         return Json::parse(*text);
@@ -68,14 +105,18 @@ Json ChatStore::put(const std::string& id, Json chat) {
     std::lock_guard lock(mutex_);
     std::error_code error;
     std::filesystem::create_directories(dir_, error);
-    write_file_atomic(path_of(id), text);
-    return summary(chat);
+    const std::filesystem::path path = path_of(id);
+    write_file_atomic(path, text);
+    Json brief = summary(chat);
+    if (const std::optional<Stamp> stamp = stamp_of(path)) { summaries_.insert_or_assign(path, Cached{*stamp, brief}); }
+    return brief;
 }
 
 bool ChatStore::remove(const std::string& id) {
     if (!valid_id(id)) { return false; }
     std::lock_guard lock(mutex_);
     std::error_code error;
+    summaries_.erase(path_of(id));
     return std::filesystem::remove(path_of(id), error);
 }
 

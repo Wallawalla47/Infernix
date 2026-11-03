@@ -201,6 +201,8 @@ void Supervisor::stop(std::chrono::seconds timeout) {
         port      = state_.port;
         if (!child_ || state_.state == InstanceState::Idle || state_.state == InstanceState::Failed) {
             // Nothing running; still reap a finished monitor below.
+        } else if (child_->exit_code()) {
+            // It ended by itself (a crash the monitor has yet to see): the monitor reports it as one.
         } else {
             stop_requested_ = true;
             state_.state    = InstanceState::Stopping;

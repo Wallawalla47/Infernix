@@ -5,6 +5,7 @@
 
 #include "launcher/args.h"
 #include "launcher/artifact_scan.h"
+#include "launcher/chats.h"
 #include "launcher/event_log.h"
 #include "launcher/events.h"
 #include "launcher/launch_script.h"
@@ -14,6 +15,7 @@
 #include "launcher/router.h"
 #include "launcher/routing.h"
 #include "launcher/serve_help.h"
+#include "launcher/sha256.h"
 #include "launcher/supervisor.h"
 #include "launcher/updates.h"
 #include "launcher/usage.h"
@@ -24,6 +26,7 @@
 #include <csignal>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <mutex>
@@ -31,6 +34,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -75,6 +82,11 @@ void test_args() {
     check(windows_quote("a\"b") == "\"a\\\"b\"", "quotes are escaped");
     check(windows_quote("C:\\my dir\\") == "\"C:\\my dir\\\\\"", "a trailing backslash is doubled before the quote");
     check(windows_quote("") == "\"\"", "an empty argument is kept");
+    check(batch_command_line({"plain", "a b"}) == "plain \"a b\"", "a batch line quotes as a program's");
+    check(batch_command_line({"R&D\\"}) == "\"R&D\\\\\"", "cmd's metacharacters are quoted, even with no space");
+    // The first argument's inner quote leaves cmd in its quotes at each later opening one.
+    check(batch_command_line({"a\"b&c", "R&D", "x|y"}) == "\"a\\\"b^&c\" \"R^&D\" \"x^|y\"",
+          "metacharacters the line's quotes leave outside cmd's are escaped");
 }
 
 void test_records() {
@@ -485,6 +497,25 @@ void test_router() {
     auto e2 = router.acquire("e", nullptr, refusal);
     check(e2 != nullptr, "Load in the UI loads it again");
     e2.reset();
+
+    // The watchdog's restart of a crashed instance yields to an Unload of it, whether the Unload
+    // lands before the crash is seen or after.
+    const auto instance_of = [&](const std::string& key) {
+        auto lease = router.acquire(key, nullptr, refusal);
+        return lease ? lease->instance() : 0U;
+    };
+    const std::uint32_t f = instance_of("f");
+    router.request_unload();
+    router.instance_ended(f);
+    check(f != 0 && router.unloaded(f) && !router.restart("f", f), "a crashed instance unloaded first is not restarted");
+    const std::uint32_t g = instance_of("g");
+    router.instance_ended(g);
+    router.request_unload();
+    check(g > f && !router.restart("g", g), "nor one unloaded after its crash was seen");
+    const std::uint32_t h = instance_of("h");
+    router.instance_ended(h);
+    check(h > g && !router.unloaded(h) && router.restart("h", h), "a crash with no Unload restarts its model");
+    check(instance_of("h") > h, "...as a new instance");
     router.shutdown();
 }
 
@@ -579,6 +610,34 @@ void test_event_log() {
     log.add("info", "settings", "third");
     check(read_file(moved / EventLog::kEventsFile).value_or("").find("third") != std::string::npos, "later records go there");
     check(log.page(0, 10)["lines"].size() == 3, "the memory keeps the earlier records");
+#ifdef _WIN32
+    {
+        // A full file another program holds open without sharing delete (a tail tool) cannot be
+        // rotated: it keeps its records and grows until a later try moves it.
+        const std::filesystem::path held_dir = dir / "held";
+        std::filesystem::create_directories(held_dir, ignored);
+        const std::filesystem::path held = held_dir / EventLog::kEventsFile;
+        {
+            std::ofstream fill(held, std::ios::binary);
+            fill << "oldest record\n" << std::string(EventLog::kEventsLimit - 20, 'x') << '\n';
+        }
+        HANDLE tail = CreateFileW(held.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        check(tail != INVALID_HANDLE_VALUE, "a tail tool holds the file");
+        check(log.set_dir(held_dir, error), "the log folder can change to the held file's");
+        log.add("info", "launcher", "past the limit");
+        const std::string head = read_file(held).value_or("").substr(0, 14);
+        check(head == "oldest record\n" && std::filesystem::file_size(held, ignored) > EventLog::kEventsLimit &&
+                  !std::filesystem::exists(held_dir / (std::string(EventLog::kEventsFile) + ".1")),
+              "a file that cannot be moved keeps its records");
+        if (tail != INVALID_HANDLE_VALUE) { CloseHandle(tail); }
+        const std::string block(64 << 10, 'y');
+        for (int i = 0; i < 20; ++i) { log.add("info", "launcher", block); }
+        check(read_file(held_dir / (std::string(EventLog::kEventsFile) + ".1")).value_or("").starts_with("oldest record\n") &&
+                  std::filesystem::file_size(held, ignored) < EventLog::kEventsLimit,
+              "a later try rotates it once it is free");
+    }
+#endif
     std::filesystem::remove_all(dir, ignored);
 }
 
@@ -634,6 +693,14 @@ void test_launch_scripts() {
     check(out.find("set \"A=1\"") != std::string::npos && out.find("100%% done") != std::string::npos &&
               out.find("--model-id model-a") != std::string::npos,
           "a batch script: variables, %% doubled, a model id");
+    check(out.find("chcp 65001") != std::string::npos, "a batch script reads in UTF-8");
+    const std::vector<ScriptCommand> batch_round = parse_launch_script(
+        write_launch_script(ScriptShell::Cmd, "C:\\R&D\\infernix-serve.exe", "D:\\R&D\\m.infernix",
+                            {"--thinking-budget-message", "say \"go\" & act|now"}, {}, "m"),
+        ScriptShell::Cmd, takes);
+    check(batch_round.size() == 1 && batch_round[0].artifact == "D:\\R&D\\m.infernix" &&
+              contains(batch_round[0].args, {"--thinking-budget-message", "say \"go\" & act|now"}),
+          "a batch script with cmd's metacharacters written and read back");
     const std::vector<ScriptCommand> round = parse_launch_script(
         write_launch_script(ScriptShell::Sh, "/opt/infernix-serve", "/m/x y.infernix", {"--max-context", "4096"}, {{"A", "it's"}}, "x"),
         ScriptShell::Sh, takes);
@@ -770,8 +837,53 @@ void test_events() {
 
 } // namespace
 
+// Download checks: git blob ids (`git hash-object`, Python's hashlib for the longer ones).
+void test_blob_ids() {
+    check(git_blob_id("") == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391" &&
+              git_blob_id("hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a",
+          "git's own blob ids");
+    check(git_blob_id(std::string(55, 'b')) == "13836c2549eab2ac757d0279ebbb2641a6a6e1ac",
+          "a header and contents one byte short of a block pad into another");
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "infernix-launcher-test-blob";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << std::string(1000, 'a');
+    }
+    const std::atomic<bool> cancel{false};
+    check(git_blob_id_file(path, cancel) == std::optional<std::string>("a50be72b20f0e3f078d252e8e56b11b4bec67509"),
+          "a file's blob id, over several blocks");
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+}
+
+// The chat list reads each file once until it changes, a save through the store or a file
+// replaced beside it.
+void test_chats() {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix-launcher-test-chats";
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    ChatStore store(dir);
+    store.put("a", Json{{"title", "first"}, {"messages", Json::array()}, {"updated_at", 1}});
+    store.put("b", Json{{"title", "second"}, {"messages", Json::array({1})}, {"updated_at", 2}});
+    Json list = store.list();
+    check(list.size() == 2 && list[0]["id"] == "b" && list[0]["messages"] == 1 && list[1]["title"] == "first",
+          "chat summaries, newest first");
+    store.put("a", Json{{"title", "renamed"}, {"messages", Json::array()}, {"updated_at", 3}});
+    list = store.list();
+    check(list.size() == 2 && list[0]["title"] == "renamed", "a save shows in the next list");
+    write_file_atomic(dir / "b.json", Json{{"id", "b"}, {"title", "edited beside it"}, {"messages", Json::array()},
+                                           {"updated_at", 4}}
+                                          .dump());
+    list = store.list();
+    check(list.size() == 2 && list[0]["title"] == "edited beside it", "a file replaced outside the store is read again");
+    check(store.remove("a") && store.list().size() == 1 && store.get("b").has_value(), "a removed chat leaves the list");
+    std::filesystem::remove_all(dir, ignored);
+}
+
 int main() {
     test_args();
+    test_blob_ids();
+    test_chats();
     test_records();
     test_help();
     test_help_cache();

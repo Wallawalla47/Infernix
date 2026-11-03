@@ -116,6 +116,8 @@ HfListing hf_list_files(const std::string& repo, const std::string& token) {
                     file.sha256 = lower(lfs["sha256"].get<std::string>());
                 }
                 file.size = json_or<std::uint64_t>(lfs, "size", file.size);
+            } else if (sibling.contains("blobId") && sibling["blobId"].is_string()) {
+                file.git_blob = lower(sibling["blobId"].get<std::string>());
             }
             listing.files.push_back(std::move(file));
         }

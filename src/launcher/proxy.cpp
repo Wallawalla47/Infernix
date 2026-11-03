@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -36,7 +37,10 @@ struct Bridge {
     bool failed       = false;
     int status        = 0;
     httplib::Headers headers;
+    // An event stream's chunks, relayed as they come; a whole answer collects in `body`.
+    bool whole = false;
     std::deque<std::string> chunks;
+    std::string body;
     std::string error;
     std::atomic<bool> downstream_gone{false};
     std::unique_ptr<httplib::Client> client;
@@ -116,6 +120,15 @@ std::shared_ptr<Bridge> start_bridge(httplib::Request upstream, int port, std::s
             raw->status       = answer.status;
             raw->headers      = answer.headers;
             raw->have_headers = true;
+            // A whole answer is sized up front when its length is known, so the relay holds one
+            // copy of it (forward_request tells a stream from its content type the same way).
+            raw->whole = !lower(answer.get_header_value("Content-Type")).starts_with("text/event-stream");
+            const std::string length = answer.get_header_value("Content-Length");
+            std::size_t bytes        = 0;
+            const auto [end, error]  = std::from_chars(length.data(), length.data() + length.size(), bytes);
+            if (raw->whole && error == std::errc{} && end == length.data() + length.size()) {
+                raw->body.reserve(std::min<std::size_t>(bytes, std::size_t{1} << 30));
+            }
         }
         raw->cv.notify_all();
         return !raw->downstream_gone.load();
@@ -123,7 +136,11 @@ std::shared_ptr<Bridge> start_bridge(httplib::Request upstream, int port, std::s
     upstream.content_receiver = [raw](const char* data, size_t size, size_t, size_t) {
         {
             std::lock_guard lock(raw->mutex);
-            raw->chunks.emplace_back(data, size);
+            if (raw->whole) {
+                raw->body.append(data, size);
+            } else {
+                raw->chunks.emplace_back(data, size);
+            }
         }
         raw->cv.notify_all();
         return !raw->downstream_gone.load();
@@ -257,9 +274,7 @@ void forward_request(const httplib::Request& request, httplib::Response& respons
                 return;
             }
         }
-        std::string body;
-        for (const std::string& chunk : bridge->chunks) { body += chunk; }
-        bridge->chunks.clear();
+        std::string body = std::move(bridge->body);
         lock.unlock();
         bridge->delivered(body);
         response.set_content(std::move(body), content_type);

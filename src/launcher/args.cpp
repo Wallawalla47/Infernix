@@ -123,6 +123,29 @@ std::string windows_quote(std::string_view arg) {
     if (!arg.empty() && arg.find_first_of(" \t\n\v\"") == std::string_view::npos) {
         return std::string(arg);
     }
+    return windows_quoted(arg);
+}
+
+std::string batch_command_line(const std::vector<std::string>& argv) {
+    constexpr std::string_view kMetacharacters = "&|<>^()";
+    std::string out;
+    bool quoted = false; // cmd's own quote state, which every " on the line toggles (an escaped one too)
+    for (std::size_t i = 0; i < argv.size(); ++i) {
+        if (i != 0) { out.push_back(' '); }
+        const bool special = argv[i].find_first_of(kMetacharacters) != std::string::npos;
+        for (const char c : special ? windows_quoted(argv[i]) : windows_quote(argv[i])) {
+            if (c == '"') {
+                quoted = !quoted;
+            } else if (!quoted && kMetacharacters.find(c) != std::string_view::npos) {
+                out.push_back('^');
+            }
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+std::string windows_quoted(std::string_view arg) {
     std::string out = "\"";
     std::size_t backslashes = 0;
     for (const char c : arg) {

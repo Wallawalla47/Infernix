@@ -27,7 +27,8 @@ namespace infernix::launcher {
 struct DownloadFile {
     std::string path;
     std::uint64_t bytes = 0;
-    std::optional<std::string> sha256;
+    std::optional<std::string> sha256;   // an LFS file's
+    std::optional<std::string> git_blob; // a file kept in git itself: its blob id
     std::atomic<std::uint64_t> done{0};
     std::string state = "queued"; // queued downloading verifying done failed paused skipped
     std::optional<std::string> error;

@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -175,6 +176,19 @@ std::string session_cookie(const httplib::Request& request) {
         at = end + 1;
     }
     return {};
+}
+
+// A query parameter's unsigned value, `fallback` without it; std::invalid_argument (a 400) when it
+// is not one in range.
+std::uint64_t query_u64(const Request& request, const char* name, std::uint64_t fallback) {
+    if (!request.has_param(name)) { return fallback; }
+    const std::string text = request.get_param_value(name);
+    std::uint64_t value    = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size()) {
+        throw std::invalid_argument(std::string(name) + " is not an unsigned integer in range");
+    }
+    return value;
 }
 
 // Random letters and digits from the system's random source.
@@ -587,7 +601,9 @@ void Launcher::console_loop() {
 Json Launcher::state_json() const {
     const Settings settings = store_.settings();
     const std::string base  = ui_url();
+    static const std::string run = random_token(16); // this process: its sequence numbers start afresh
     return {{"version", options_.version},
+            {"run", run},
             {"data_dir", path_utf8(options_.data_dir)},
             {"memory_file", path_utf8(store_.memory_file())},
             {"logs", log_paths_json()},
@@ -1460,6 +1476,8 @@ void Launcher::handle_incident(const InstanceSnapshot& snapshot) {
         action = "not restarted (automatic restarts are off); the next request loads it again";
     } else if (next && *next != snapshot.model_key) {
         action = "not restarted: another model is loading next";
+    } else if (router_ && router_->unloaded(snapshot.instance)) {
+        action = "not restarted: it was unloaded";
     } else {
         std::lock_guard lock(incident_mutex_);
         const auto now = std::chrono::steady_clock::now();
@@ -1473,6 +1491,11 @@ void Launcher::handle_incident(const InstanceSnapshot& snapshot) {
                      " in " + std::to_string(kRestartWindow.count()) + " minutes)";
             restart = true;
         }
+    }
+    // An Unload landing since the check above still wins.
+    if (restart && !(router_ && router_->restart(snapshot.model_key, snapshot.instance))) {
+        restart = false;
+        action  = "not restarted: it was unloaded";
     }
     {
         std::lock_guard lock(incident_mutex_);
@@ -1493,7 +1516,6 @@ void Launcher::handle_incident(const InstanceSnapshot& snapshot) {
     const char* title = kind == "crash" ? "infernix-serve crashed" : kind == "hang" ? "infernix-serve stopped responding"
                                                                                       : "Requests stopped progressing";
     toast("error", std::string(title) + " (" + snapshot.alias + "); " + action);
-    if (restart && router_) { router_->request_load(snapshot.model_key, false); }
 }
 
 void Launcher::log_api_request(const ApiCall& call, int status, std::optional<std::int64_t> first_byte_ms,
@@ -1583,7 +1605,10 @@ std::uint64_t Launcher::activity_begin(const Request& request, const ApiCall& ca
         record.client    = request.remote_addr;
         record.key_name  = call.key_name;
         record.routed_by = call.routed_by;
-        id               = record.id;
+        if (request.has_header("X-Infernix-Request-Label")) {
+            record.label = request.get_header_value("X-Infernix-Request-Label");
+        }
+        id = record.id;
         activity_.push_back(std::move(record));
         while (activity_.size() > kActivityLimit) { activity_.pop_front(); }
     }
@@ -1611,11 +1636,20 @@ void Launcher::activity_update(std::uint64_t id, const std::string& state, int s
 
 void Launcher::absorb_metrics(const Json& metrics) {
     if (!metrics.is_object()) { return; }
-    const auto activity_of = [](const Json& label) -> std::optional<std::uint64_t> {
-        if (!label.is_string() || !label.get<std::string>().starts_with("launcher-")) { return std::nullopt; }
-        try {
-            return std::stoull(label.get<std::string>().substr(9));
-        } catch (const std::exception&) { return std::nullopt; }
+    // The launcher's record of a server row by its label: launcher-<n>, or a client's own label
+    // (the newest record that sent it). The activity lock held.
+    const auto activity_of = [this](const Json& label) -> std::optional<std::uint64_t> {
+        if (!label.is_string()) { return std::nullopt; }
+        const std::string& text = label.get_ref<const std::string&>();
+        if (text.starts_with("launcher-")) {
+            try {
+                return std::stoull(text.substr(9));
+            } catch (const std::exception&) { return std::nullopt; }
+        }
+        for (auto it = activity_.rbegin(); it != activity_.rend(); ++it) {
+            if (it->label == text) { return it->id; }
+        }
+        return std::nullopt;
     };
     bool changed = false;
     // Running requests' progress.
@@ -1682,8 +1716,6 @@ void Launcher::absorb_metrics(const Json& metrics) {
                     if (record.model_key) { sample.config_id = *record.model_key; }
                     sample.client = record.key_name ? *record.key_name : record.client;
                 }
-            } else if (label.is_string()) {
-                sample.client = "label " + label.get<std::string>();
             }
             samples.push_back(std::move(sample));
         }
@@ -2933,17 +2965,13 @@ void Launcher::register_management_routes() {
     // Live state.
     server_.Get(api + "/instance", admin([this](const Request&, Response& s) { send_json(s, instance_json()); }));
     server_.Get(api + "/logs", admin([this](const Request& q, Response& s) {
-                    std::uint64_t after = 0;
-                    std::size_t limit   = 2000;
-                    if (q.has_param("after")) { after = std::stoull(q.get_param_value("after")); }
-                    if (q.has_param("limit")) { limit = std::clamp<std::size_t>(std::stoull(q.get_param_value("limit")), 1, 20000); }
+                    const std::uint64_t after = query_u64(q, "after", 0);
+                    const auto limit = static_cast<std::size_t>(std::clamp<std::uint64_t>(query_u64(q, "limit", 2000), 1, 20000));
                     send_json(s, logs_.page(after, limit));
                 }));
     server_.Get(api + "/eventlog", admin([this](const Request& q, Response& s) {
-                    std::uint64_t after = 0;
-                    std::size_t limit   = 2000;
-                    if (q.has_param("after")) { after = std::stoull(q.get_param_value("after")); }
-                    if (q.has_param("limit")) { limit = std::clamp<std::size_t>(std::stoull(q.get_param_value("limit")), 1, 5000); }
+                    const std::uint64_t after = query_u64(q, "after", 0);
+                    const auto limit = static_cast<std::size_t>(std::clamp<std::uint64_t>(query_u64(q, "limit", 2000), 1, 5000));
                     send_json(s, event_log_.page(after, limit));
                 }));
     server_.Post(api + "/logs/open", admin([this](const Request&, Response& s) {

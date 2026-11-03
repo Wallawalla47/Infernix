@@ -217,12 +217,17 @@ std::unique_ptr<ChildProcess> ChildProcess::start(const std::filesystem::path& e
     auto impl     = std::make_unique<Impl>();
     impl->process = info.hProcess;
     impl->pid     = info.dwProcessId;
-    impl->job     = CreateJobObjectW(nullptr, nullptr);
-    if (impl->job != nullptr) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(impl->job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
-        AssignProcessToJobObject(impl->job, info.hProcess);
+    // The job ends the child with the launcher, however the launcher ends. A child it cannot hold
+    // is not started: it would outlive a crashed launcher, keeping the GPU and its port.
+    impl->job = CreateJobObjectW(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (impl->job == nullptr ||
+        !SetInformationJobObject(impl->job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
+        !AssignProcessToJobObject(impl->job, info.hProcess)) {
+        const std::string reason = last_error_text();
+        CloseHandle(info.hThread); // impl ends the suspended process
+        throw std::runtime_error("cannot tie " + path_utf8(executable) + " to the launcher (a job object): " + reason);
     }
     ResumeThread(info.hThread);
     CloseHandle(info.hThread);

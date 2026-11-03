@@ -6,7 +6,9 @@
 
 #include "launcher/util.h"
 
+#include <cstdint>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -30,11 +32,24 @@ public:
     bool remove(const std::string& id);
 
 private:
+    // A file's size and write time: a summary is parsed again only when they change.
+    struct Stamp {
+        std::uintmax_t size = 0;
+        std::filesystem::file_time_type written;
+        bool operator==(const Stamp&) const = default;
+    };
+    struct Cached {
+        Stamp stamp;
+        Json summary;
+    };
+
     [[nodiscard]] std::filesystem::path path_of(const std::string& id) const;
     [[nodiscard]] static Json summary(const Json& chat);
+    [[nodiscard]] static std::optional<Stamp> stamp_of(const std::filesystem::path& path);
 
     std::filesystem::path dir_;
     mutable std::mutex mutex_;
+    mutable std::map<std::filesystem::path, Cached> summaries_; // the last list's, and saves since
 };
 
 } // namespace infernix::launcher

@@ -75,8 +75,21 @@ std::string expand_cmd(std::string_view line, const std::map<std::string, std::s
     return out;
 }
 
-// CommandLineToArgvW's rules, with batch's ^ escapes outside quotes.
-std::vector<std::string> tokenize_cmd(std::string_view line) {
+// cmd's pass first: a ^ outside cmd's quotes, which every " toggles, escapes the next character;
+// then CommandLineToArgvW's rules on what the program receives.
+std::vector<std::string> tokenize_cmd(std::string_view batch_line) {
+    std::string line;
+    bool cmd_quoted = false;
+    for (std::size_t i = 0; i < batch_line.size(); ++i) {
+        const char c = batch_line[i];
+        if (c == '"') {
+            cmd_quoted = !cmd_quoted;
+        } else if (!cmd_quoted && c == '^' && i + 1 < batch_line.size()) {
+            line.push_back(batch_line[++i]);
+            continue;
+        }
+        line.push_back(c);
+    }
     std::vector<std::string> tokens;
     std::string token;
     bool in_token = false, quoted = false;
@@ -109,11 +122,6 @@ std::vector<std::string> tokenize_cmd(std::string_view line) {
             } else {
                 quoted = !quoted;
             }
-            in_token = true;
-            continue;
-        }
-        if (!quoted && c == '^' && i + 1 < line.size()) {
-            token.push_back(line[++i]);
             in_token = true;
             continue;
         }
@@ -387,11 +395,11 @@ std::string write_launch_script(ScriptShell shell, const std::string& executable
             }
             return escaped;
         };
-        out = "@echo off\r\nrem " + model_id + ": written by infernix-launcher\r\n";
+        // The file is UTF-8, which cmd reads only in code page 65001.
+        out = "@echo off\r\nchcp 65001>nul\r\nrem " + model_id + ": written by infernix-launcher\r\n";
         for (const auto& [name, value] : env) { out += batch("set \"" + name + "=" + value + "\"") + "\r\n"; }
-        std::string line = windows_quote(executable);
-        for (const std::string& arg : argv) { line += " " + windows_quote(arg); }
-        out += batch(line) + "\r\npause\r\n";
+        argv.insert(argv.begin(), executable);
+        out += batch(batch_command_line(argv)) + "\r\npause\r\n";
         return out;
     }
     out = "#!/usr/bin/env bash\n# " + model_id + ": written by infernix-launcher\n";

@@ -64,6 +64,18 @@ const COMPONENTS: Components = {
       {children}
     </a>
   ),
+  // A model's words make the browser fetch nothing (an image's address can carry the chat to its
+  // host): an image is a link to open.
+  img: ({ src, alt, title }) => {
+    const label = alt || (typeof src === "string" ? src : "") || "image";
+    return typeof src === "string" && src !== "" ? (
+      <a href={src} title={title} target="_blank" rel="noreferrer noopener">
+        {label}
+      </a>
+    ) : (
+      <span>{label}</span>
+    );
+  },
   table: ({ children }) => (
     <div className="chat-table">
       <table>{children}</table>

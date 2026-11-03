@@ -84,6 +84,12 @@ public:
     // The UI's Load (and the watchdog's restart): queues `key` like a request; `force` cancels running
     // requests at once. It ends the hold of a failed load of `key`.
     void request_load(const std::string& key, bool force);
+    // The watchdog's restart of `key` after its instance `instance` crashed: request_load, unless
+    // that instance was unloaded (from the launcher, idle or replaced), before its end was seen or
+    // after; false then.
+    bool restart(const std::string& key, std::uint32_t instance);
+    // Whether instance `instance` was unloaded so (restart refuses it).
+    [[nodiscard]] bool unloaded(std::uint32_t instance) const;
     // Ends the hold of a failed load of `key` (its configuration changed).
     void clear_hold(const std::string& key);
     // Ends every hold (the launcher's settings, the server port among them, changed).
@@ -121,6 +127,8 @@ private:
 
     void release();
     void run();
+    // request_load; with `ended`, refused (false) when that instance was unloaded.
+    bool queue_load(const std::string& key, bool force, std::optional<std::uint32_t> ended);
     void touch_locked();
     std::shared_ptr<Epoch> push_epoch_locked(const std::string& key);
     // Whole seconds left in `key`'s hold (rounded up); 0 when none is active.
@@ -137,6 +145,7 @@ private:
     int ready_port_              = 0;
     std::uint32_t ready_instance_ = 0;
     std::uint32_t last_ended_     = 0; // the newest instance reported ended
+    std::uint32_t unloaded_through_ = 0; // every instance up to this one was unloaded
     std::string loading_key_;
     int in_flight_               = 0;
     bool unload_requested_       = false;

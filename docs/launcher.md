@@ -160,7 +160,8 @@ artifact become the launch parameters (the ones the launcher sets itself are dro
 this `infernix-serve` lacks are named), and its `--model-id` the model id. When the artifact is in a
 model folder (by path, else by file name), the import replaces one of that model's configurations
 or becomes a new named one; otherwise the launcher says which artifact it needs. **Export** writes the
-configuration as a `.bat` (Windows) or `.sh` that runs `infernix-serve` directly, with its model id.
+configuration as a `.bat` (Windows; UTF-8, with every argument quoted for cmd) or `.sh` that runs
+`infernix-serve` directly, with its model id.
 
 **Will it fit?** asks the installed `infernix-serve` to size the configuration without loading it
 (`infernix-serve --plan`): the VRAM it would take (weights, KV cache and the context it holds,
@@ -212,9 +213,9 @@ entered by its `owner/name`.
 
 Downloads run one repository at a time, each file in 64 MiB pieces over several connections
 (**Settings → Downloads**), into `<file>.part`. Pausing, a dropped connection or a launcher restart
-resumes where it stopped. A finished file is checked against its SHA-256 from Hugging Face and
-renamed into place; the destination becomes a model folder and is scanned. A Hugging Face token
-(settings, `HF_TOKEN`, or the `huggingface-cli login` token file) is sent for gated repositories.
+resumes where it stopped (a piece counts as done once it is on the disk). A finished file is checked
+against Hugging Face's hash (an LFS file's SHA-256, else its git blob id) and renamed into place;
+the destination becomes a model folder and is scanned. A Hugging Face token (settings, `HF_TOKEN`, or the `huggingface-cli login` token file) is sent for gated repositories.
 
 ## Connect coding tools
 
@@ -414,7 +415,8 @@ running; if a request then waits on it and it still does not answer, it is treat
 once. Unloading an idle model after a while is a separate choice, **Idle unload** (off).
 
 A restart loads the same model with the same parameters, at most 3 times in 15 minutes; after that,
-and when automatic restarts are off, the next request loads it again. Requests running when the
+and when automatic restarts are off, the next request loads it again. A model unloaded around the
+failure (from the launcher, idle, or for another model) is not restarted. Requests running when the
 server failed end with an error (their streams stop); requests waiting for the model are served by
 the restarted one. Each incident shows as a banner on the dashboard and a notification, and goes into
 the [event log](#event-log). With the watchdog off, a crash is still reported, nothing is restarted
@@ -454,7 +456,8 @@ Launcher events** shows this session's records with filters and the full details
 response (a stream's events as they were sent) to `infernix-launcher-requests.jsonl`, one JSON
 object per request, each body cut at 16 MiB. It holds prompts and answers in full and grows quickly.
 
-Both files rotate by size (16 MiB and 100 MiB) into `FILE.1` .. `FILE.5`. The server's own console,
+Both files rotate by size (16 MiB and 100 MiB) into `FILE.1` .. `FILE.5`; a file another program holds
+open (a tail tool) keeps growing until a later rotation can move it. The server's own console,
 one file per load, is kept in `serve-logs/` in the same folder (the newest 20). Moving the log folder
 applies at once to later records; a folder that cannot be written leaves the records in memory and
 says so.
@@ -479,7 +482,7 @@ says so.
 | Unknown model names | use the loaded model | or reject them |
 | Default model, load on start | none, off | the model for unknown names when none is loaded; load it (else the last one) at startup |
 | Keep each model's prefix cache | off | adds `--prefix-cache-file` in the data folder for every model |
-| Download connections, verify | 8, on | parallel connections per file; SHA-256 check |
+| Download connections, verify | 8, on | parallel connections per file; hash check |
 | Log folder | the launcher's folder | the event log, the request-content log and `serve-logs/` (applies at once) |
 | Record request and response contents | off | `infernix-launcher-requests.jsonl` ([Event log](#event-log)) |
 | Watchdog, restart automatically | on, on | [Watchdog](#watchdog) |

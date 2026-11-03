@@ -65,8 +65,9 @@ public:
 private:
     struct File {
         std::ofstream stream;
-        std::uint64_t bytes = 0;
-        bool failed         = false;
+        std::uint64_t bytes     = 0;
+        std::uint64_t rotate_at = 0; // after a failed rotation, the size of the next try
+        bool failed             = false;
     };
     void write_locked(File& file, const std::filesystem::path& path, std::uint64_t limit, const std::string& line);
 

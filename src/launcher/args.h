@@ -43,7 +43,13 @@ std::vector<std::string> strip_managed_flags(Args& args, const TakesValue& takes
 // display.
 [[nodiscard]] std::string shell_quote(std::string_view arg);
 [[nodiscard]] std::string command_line_for_display(const std::vector<std::string>& argv);
-// One argument quoted by the rules CommandLineToArgvW and the MSVC runtime undo.
+// One argument quoted by the rules CommandLineToArgvW and the MSVC runtime undo: bare when it can
+// be, windows_quoted always quoted.
 [[nodiscard]] std::string windows_quote(std::string_view arg);
+[[nodiscard]] std::string windows_quoted(std::string_view arg);
+// A command line cmd.exe reads before the program does (a batch file): each argument
+// windows_quote'd, and quoted whenever it holds one of cmd's metacharacters; those the line's
+// inner quotes leave outside cmd's own quote state are caret-escaped. A batch file doubles % itself.
+[[nodiscard]] std::string batch_command_line(const std::vector<std::string>& argv);
 
 } // namespace infernix::launcher

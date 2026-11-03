@@ -507,10 +507,12 @@ void InfernixUpdate::install() {
     };
     const std::string source = path_utf8(*root);
     const std::string target = path_utf8(options_.install_dir);
-    std::string arguments;
-    for (const std::string& arg : options_.restart_args) { arguments += " " + windows_quote(arg); }
+    // The line before the arguments leaves cmd outside its quotes.
+    const std::string arguments =
+        options_.restart_args.empty() ? std::string() : " " + batch_command_line(options_.restart_args);
     const std::string script =
         "@echo off\r\n"
+        "chcp 65001>nul\r\n" // the file is UTF-8, which cmd reads only in code page 65001
         "rem Infernix update: written by infernix-launcher\r\n"
         "set \"PID=" + std::to_string(GetCurrentProcessId()) + "\"\r\n"
         ":wait\r\n"

@@ -145,7 +145,120 @@ private:
 
 #endif
 
+// SHA-1 (FIPS 180-4), for git blob ids only: the files it reads are small.
+class Sha1 {
+public:
+    void update(const std::uint8_t* data, std::size_t size) {
+        total_ += size;
+        while (size > 0) {
+            const std::size_t take = std::min(size, std::size_t{64} - fill_);
+            std::memcpy(block_.data() + fill_, data, take);
+            fill_ += take;
+            data += take;
+            size -= take;
+            if (fill_ == 64) {
+                compress();
+                fill_ = 0;
+            }
+        }
+    }
+
+    std::array<std::uint8_t, 20> finish() {
+        const std::uint64_t bits = total_ * 8;
+        const std::uint8_t one   = 0x80;
+        const std::uint8_t zero  = 0;
+        update(&one, 1);
+        while (fill_ != 56) { update(&zero, 1); }
+        std::array<std::uint8_t, 8> length{};
+        for (int i = 0; i < 8; ++i) { length[i] = static_cast<std::uint8_t>(bits >> (56 - 8 * i)); }
+        update(length.data(), length.size());
+        std::array<std::uint8_t, 20> digest{};
+        for (int i = 0; i < 20; ++i) { digest[i] = static_cast<std::uint8_t>(state_[i / 4] >> (24 - 8 * (i % 4))); }
+        return digest;
+    }
+
+private:
+    static std::uint32_t rotl(std::uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+
+    void compress() {
+        std::array<std::uint32_t, 80> w{};
+        for (int i = 0; i < 16; ++i) {
+            w[i] = static_cast<std::uint32_t>(block_[4 * i]) << 24 | static_cast<std::uint32_t>(block_[4 * i + 1]) << 16 |
+                   static_cast<std::uint32_t>(block_[4 * i + 2]) << 8 | static_cast<std::uint32_t>(block_[4 * i + 3]);
+        }
+        for (int i = 16; i < 80; ++i) { w[i] = rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1); }
+        std::uint32_t a = state_[0], b = state_[1], c = state_[2], d = state_[3], e = state_[4];
+        for (int i = 0; i < 80; ++i) {
+            std::uint32_t f = 0, k = 0;
+            if (i < 20) {
+                f = (b & c) | (~b & d);
+                k = 0x5a827999;
+            } else if (i < 40) {
+                f = b ^ c ^ d;
+                k = 0x6ed9eba1;
+            } else if (i < 60) {
+                f = (b & c) | (b & d) | (c & d);
+                k = 0x8f1bbcdc;
+            } else {
+                f = b ^ c ^ d;
+                k = 0xca62c1d6;
+            }
+            const std::uint32_t next = rotl(a, 5) + f + e + k + w[i];
+            e                        = d;
+            d                        = c;
+            c                        = rotl(b, 30);
+            b                        = a;
+            a                        = next;
+        }
+        state_[0] += a;
+        state_[1] += b;
+        state_[2] += c;
+        state_[3] += d;
+        state_[4] += e;
+    }
+
+    std::array<std::uint32_t, 5> state_ = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0};
+    std::array<std::uint8_t, 64> block_{};
+    std::size_t fill_    = 0;
+    std::uint64_t total_ = 0;
+};
+
+void update_blob_header(Sha1& hasher, std::uint64_t size) {
+    const std::string header = "blob " + std::to_string(size);
+    hasher.update(reinterpret_cast<const std::uint8_t*>(header.data()), header.size() + 1); // with its NUL
+}
+
 } // namespace
+
+std::optional<std::string> git_blob_id_file(const std::filesystem::path& path, const std::atomic<bool>& cancel) {
+    std::error_code error;
+    const std::uint64_t size = std::filesystem::file_size(path, error);
+    std::ifstream in(path, std::ios::binary);
+    if (error || !in) { return std::nullopt; }
+    Sha1 hasher;
+    update_blob_header(hasher, size);
+    std::vector<char> buffer(kReadBytes);
+    std::uint64_t hashed = 0;
+    while (in) {
+        if (cancel.load()) { return std::nullopt; }
+        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto got = static_cast<std::size_t>(in.gcount());
+        if (got == 0) { break; }
+        hasher.update(reinterpret_cast<const std::uint8_t*>(buffer.data()), got);
+        hashed += got;
+    }
+    if (in.bad() || hashed != size) { return std::nullopt; }
+    const auto digest = hasher.finish();
+    return hex_string(digest.data(), digest.size());
+}
+
+std::string git_blob_id(std::string_view data) {
+    Sha1 hasher;
+    update_blob_header(hasher, data.size());
+    hasher.update(reinterpret_cast<const std::uint8_t*>(data.data()), data.size());
+    const auto digest = hasher.finish();
+    return hex_string(digest.data(), digest.size());
+}
 
 std::optional<std::string> sha256_file(const std::filesystem::path& path,
                                        const std::function<void(std::uint64_t)>& progress,

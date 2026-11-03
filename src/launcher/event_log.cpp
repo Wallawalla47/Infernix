@@ -14,21 +14,27 @@ std::string upper(std::string text) {
     return text;
 }
 
-// FILE -> FILE.1 -> ... -> FILE.keep; the oldest is deleted.
-void rotate(const std::filesystem::path& path, int keep) {
-    std::error_code ignored;
+// FILE -> FILE.1 -> ... -> FILE.keep; the oldest is deleted. False, with nothing moved, when FILE
+// cannot be moved (a program holding it open without sharing delete, a tail tool say).
+bool rotate(const std::filesystem::path& path, int keep) {
+    std::error_code code;
     const auto numbered = [&](int index) {
         std::filesystem::path name = path;
         name += "." + std::to_string(index);
         return name;
     };
-    std::filesystem::remove(numbered(keep), ignored);
+    std::filesystem::path moving = path;
+    moving += ".rotating";
+    std::filesystem::rename(path, moving, code);
+    if (code) { return false; }
+    std::filesystem::remove(numbered(keep), code);
     for (int index = keep - 1; index >= 1; --index) {
-        if (std::filesystem::exists(numbered(index), ignored)) {
-            std::filesystem::rename(numbered(index), numbered(index + 1), ignored);
+        if (std::filesystem::exists(numbered(index), code)) {
+            std::filesystem::rename(numbered(index), numbered(index + 1), code);
         }
     }
-    std::filesystem::rename(path, numbered(1), ignored);
+    std::filesystem::rename(moving, numbered(1), code);
+    return true;
 }
 
 } // namespace
@@ -67,8 +73,9 @@ bool EventLog::set_dir(const std::filesystem::path& dir, std::string& error) {
     std::lock_guard lock(mutex_);
     for (File* file : {&events_, &requests_}) {
         if (file->stream.is_open()) { file->stream.close(); }
-        file->bytes  = 0;
-        file->failed = false;
+        file->bytes     = 0;
+        file->rotate_at = 0;
+        file->failed    = false;
     }
     dir_ = dir;
     std::error_code code;
@@ -116,11 +123,16 @@ void EventLog::write_locked(File& file, const std::filesystem::path& path, std::
             return;
         }
     }
-    if (file.bytes > 0 && file.bytes + line.size() + 1 > limit) {
+    if (file.bytes > 0 && file.bytes + line.size() + 1 > limit && file.bytes >= file.rotate_at) {
         file.stream.close();
-        rotate(path, kKeep);
-        file.stream.open(path, std::ios::binary | std::ios::trunc);
-        file.bytes = 0;
+        // A file that cannot be moved keeps its records and grows; a later line tries again.
+        if (rotate(path, kKeep)) {
+            file.bytes     = 0;
+            file.rotate_at = 0;
+        } else {
+            file.rotate_at = file.bytes + limit / 16;
+        }
+        file.stream.open(path, std::ios::binary | std::ios::app);
         if (!file.stream) {
             file.failed = true;
             return;

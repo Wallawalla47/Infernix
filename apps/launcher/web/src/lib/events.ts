@@ -262,12 +262,16 @@ export function startEvents(qc: QueryClient): () => void {
 
     listen(es, "hello", (launcher: LauncherState) => {
       attempt = 0;
+      // A restarted launcher (an installed update, say) numbers its console lines afresh: the
+      // last run's would hide every new one from appendLogs, so they go.
+      const restarted = state.launcher !== null && state.launcher.run !== launcher.run;
       update({
         connected: true,
         everConnected: true,
         disconnectedAt: null,
         launcher,
         instance: launcher.instance,
+        ...(restarted ? { logs: [] } : {}),
       });
       qc.setQueryData(["state"], launcher);
       qc.setQueryData(["settings"], launcher.settings);

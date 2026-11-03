@@ -156,11 +156,24 @@ void Router::release() {
 }
 
 void Router::request_load(const std::string& key, bool force) {
+    queue_load(key, force, std::nullopt);
+}
+
+bool Router::restart(const std::string& key, std::uint32_t instance) {
+    return queue_load(key, false, instance);
+}
+
+bool Router::unloaded(std::uint32_t instance) const {
+    std::lock_guard lock(mutex_);
+    return instance <= unloaded_through_;
+}
+
+bool Router::queue_load(const std::string& key, bool force, std::optional<std::uint32_t> ended) {
     {
         std::lock_guard lock(mutex_);
-        if (stopping_) { return; }
+        if (stopping_ || (ended && *ended <= unloaded_through_)) { return false; }
         holds_.erase(key);
-        if (epochs_.empty() && !unload_requested_ && ready_key_ == key) { return; }
+        if (epochs_.empty() && !unload_requested_ && ready_key_ == key) { return true; }
         std::shared_ptr<Epoch> epoch =
             !epochs_.empty() && epochs_.back()->key == key ? epochs_.back() : push_epoch_locked(key);
         epoch->forced = epoch->forced || force;
@@ -178,6 +191,7 @@ void Router::request_load(const std::string& key, bool force) {
     }
     cv_.notify_all();
     if (hooks_.changed) { hooks_.changed(); }
+    return true;
 }
 
 void Router::request_unload() {
@@ -189,6 +203,8 @@ void Router::request_unload() {
         }
         epochs_.clear();
         unload_requested_ = true;
+        // The loaded instance, or one whose end (a crash) was seen first: neither is restarted.
+        unloaded_through_ = std::max({unloaded_through_, ready_instance_, last_ended_});
     }
     cv_.notify_all();
     if (hooks_.changed) { hooks_.changed(); }
@@ -261,7 +277,8 @@ void Router::run() {
             if (idle_min > 0 && ready_key_ == key && epochs_.empty() && in_flight_ == 0 &&
                 Clock::now() - last_activity_ > std::chrono::minutes(idle_min)) {
                 ready_key_.clear();
-                ready_instance_ = 0;
+                unloaded_through_ = std::max(unloaded_through_, ready_instance_);
+                ready_instance_   = 0;
                 lock.unlock();
                 hooks_.stop();
                 lock.lock();
@@ -297,7 +314,8 @@ void Router::run() {
         const std::string key = front->key;
         loading_key_          = key;
         ready_key_.clear();
-        ready_instance_ = 0;
+        unloaded_through_ = std::max(unloaded_through_, ready_instance_); // the instance it replaces
+        ready_instance_   = 0;
         lock.unlock();
         if (hooks_.changed) { hooks_.changed(); }
         Loaded loaded = hooks_.load(key);

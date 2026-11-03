@@ -13,7 +13,8 @@ namespace infernix::launcher {
 struct HfFile {
     std::string path;
     std::uint64_t size = 0;
-    std::optional<std::string> sha256;
+    std::optional<std::string> sha256;   // an LFS file's
+    std::optional<std::string> git_blob; // a file kept in git itself: its blob id
 };
 
 struct HfListing {

@@ -82,6 +82,7 @@ private:
         std::string client;
         std::optional<std::string> key_name;
         std::optional<std::string> routed_by;
+        std::optional<std::string> label; // the client's own X-Infernix-Request-Label, forwarded as it is
         Json progress = nullptr; // the server's live progress while it runs (RequestProgress)
         bool usage_counted = false;
     };
