@@ -893,7 +893,9 @@ queue (subject to the queue timeout), and one it cannot lend with the request's 
 reserved and nothing else running also returns HTTP 400 `media_budget_exceeded` (fewer or smaller
 images, or a shorter conversation, fit); the server keeps serving either way. HTTP 413 `request_too_large` is reserved for a raw request
 body that exceeds `--max-request-mib` before JSON parsing; it is not used for model-context or media
-resource errors.
+resource errors. A body whose JSON nests arrays or objects more than 256 levels deep is refused at
+parsing with HTTP 400 (`invalid_request_error`, "request body JSON nests arrays or objects deeper
+than 256 levels").
 
 ## OpenAI prompt caching
 

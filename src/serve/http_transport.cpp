@@ -58,6 +58,8 @@ RequestJson parse_json_body(const httplib::Request& request) {
     text::ParsedJsonNumbers parsed;
     try {
         parsed = text::parse_json_numbers(request.body);
+    } catch (const text::JsonNestingError& error) {
+        bad_request(std::string("request body ") + error.what());
     } catch (const std::exception&) { bad_request("request body is not valid JSON"); }
     validate_schema_number_input(parsed);
     return std::move(parsed.value);

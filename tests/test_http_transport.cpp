@@ -1,5 +1,6 @@
 #include "serve/http_transport.h"
 #include "serve/request.h"
+#include "text/json_input.h"
 
 #include <atomic>
 #include <cerrno>
@@ -257,6 +258,33 @@ int test_prompt_json_member_order() {
         "HTTP request JSON changed prompt-bearing object member order");
 }
 
+// A body nested past the bound is a 400 at parse time: serializing or copying such a tree recurses
+// once per level and would overflow a worker's stack (candidates QA-04).
+int test_json_nesting() {
+    int failures = 0;
+    const std::size_t bound = infernix::text::kMaxJsonNesting;
+    // The root object is one level, so `arrays` arrays inside it nest arrays + 1 deep.
+    for (const std::size_t arrays : {bound - 1, bound, std::size_t{100000}}) {
+        httplib::Request request;
+        request.body = R"({"tools":)" + std::string(arrays, '[') + std::string(arrays, ']') + "}";
+        bool refused = false;
+        std::string message;
+        try {
+            (void)infernix::serve::parse_json_body(request);
+        } catch (const infernix::serve::ApiException& error) {
+            refused = error.error().status == 400;
+            message = error.error().message;
+        }
+        failures += check(refused == (arrays + 1 > bound),
+                          "a request body was refused within the nesting bound or accepted past it");
+        if (refused) {
+            failures += check(message.find("deeper than 256 levels") != std::string::npos,
+                              "a too-deep request body was not refused for its nesting");
+        }
+    }
+    return failures;
+}
+
 int test_schema_number_precision() {
     int failures = 0;
     const std::vector<std::pair<std::string, std::string>> cases{
@@ -502,7 +530,7 @@ int test_inherited_socket_liveness() {
 int main() {
     int failures = test_ngram_identity() + test_request_label() + test_ngram_generation() + test_sse_transport() +
                    test_sse_response_headers() + test_prompt_json_member_order() +
-                   test_schema_number_precision();
+                   test_schema_number_precision() + test_json_nesting();
 #if defined(__linux__) || defined(_WIN32)
     failures += test_inherited_socket_liveness();
     failures += test_exclusive_port();

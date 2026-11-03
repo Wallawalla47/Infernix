@@ -57,7 +57,7 @@ public:
     }
 
     bool start_object(std::size_t size) {
-        clear_value();
+        enter();
         stack_.push_back({});
         return dom_.start_object(size);
     }
@@ -74,7 +74,7 @@ public:
     }
 
     bool start_array(std::size_t size) {
-        clear_value();
+        enter();
         stack_.push_back({.array = true});
         return dom_.start_array(size);
     }
@@ -118,6 +118,12 @@ private:
     void scalar() {
         clear_value();
         advance();
+    }
+
+    // Thrown, not refused through the SAX result: the parse ignores it and would keep a partial DOM.
+    void enter() {
+        if (stack_.size() == kMaxJsonNesting) { throw JsonNestingError(); }
+        clear_value();
     }
 
     ParsedJsonNumbers& result_;
