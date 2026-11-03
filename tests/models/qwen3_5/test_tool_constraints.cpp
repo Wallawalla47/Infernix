@@ -412,6 +412,38 @@ void calls_in_thinking(infernix::text::GrammarCompiler& compiled) {
     require(refused, "a continuation with the call token inside the reasoning was accepted");
 }
 
+// The grammar's raw string reads the `<tool_call>` token right after a call's closing lines (or after
+// them and their `\n` when calls are not parallel) as value text, which the decoder refuses as a
+// malformed call: the token is masked there for every choice, and a newline still opens the next call.
+void calls_after_closers(infernix::text::GrammarCompiler& compiled) {
+    infernix::ToolChoice required;
+    required.mode = infernix::ToolChoiceMode::Required;
+    infernix::ToolChoice single;
+    single.parallel = false;
+    for (const bool strict : {false, true}) {
+        for (const auto& choice : {infernix::ToolChoice{}, required}) {
+            const auto bound = contract(schema({{"type", "string"}}), strict, choice);
+            require(!accepts(compiled, *bound, call("a") + call("b")),
+                    "the call token right after a call's closing lines was admitted");
+            require(accepts(compiled, *bound, call("a") + "\n" + call("b")),
+                    "a call after a call's closing lines and a newline was refused");
+        }
+        const auto one = contract(schema({{"type", "string"}}), strict, single);
+        require(accepts(compiled, *one, call("a")), "a single call was refused");
+        require(!accepts(compiled, *one, call("a") + "\n" + call("b")),
+                "a second call token was admitted where calls are not parallel");
+    }
+    // Its decoder still refuses that sequence, so the mask is what keeps the request alive.
+    const auto bound = contract(schema({{"type", "string"}}), false);
+    frontend::ToolCallOutputDecoder decoder(bound, 64);
+    (void)feed(decoder, call("a") + call("b"));
+    bool refused = false;
+    try {
+        (void)decoder.finish();
+    } catch (const std::logic_error&) { refused = true; }
+    require(refused, "the decoder accepted a call token right after a call's closing lines");
+}
+
 void run() {
     auto compiled = compiler();
     basic_contracts(compiled);
@@ -419,6 +451,7 @@ void run() {
     quoted_calls(compiled);
     quoted_closers(compiled);
     calls_in_thinking(compiled);
+    calls_after_closers(compiled);
     infernix::ToolChoice required;
     required.mode = infernix::ToolChoiceMode::Required;
     auto fixed =

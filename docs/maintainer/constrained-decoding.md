@@ -467,9 +467,11 @@ call's closing lines, `\n</parameter>\n</function>\n</tool_call>`, that more val
 document quoting them; candidates SY-04, Strata #4701). The free string rule is a segment without the
 delimiter, then any number of those closing lines and another segment (`xml_string` in the vendored
 converter), so the matcher keeps both readings after the closers until the next token decides: the
-end of the output or the next call's `<tool_call>` token (which no value holds) closes the call, other
-text continues the value. The companion and `ConstrainedToolStream` follow the same rule; the stream
-holds the call's last fragment until then. Strings with a length bound or a pattern keep the plain
+end of the output or `\n` and the next call's `<tool_call>` token closes the call, other text
+continues the value. The `<tool_call>` token is the next call's opener only after that `\n` (and only
+when calls are parallel), while the raw string would read it as value text right after the closers:
+the companion, which every tool grammar has, masks it there (candidates QA-02). The companion and
+`ConstrainedToolStream` follow the same rule; the stream holds the call's last fragment until then. Strings with a length bound or a pattern keep the plain
 exclusion. Grammar and parser use the same delimiter rule and strict output generates only
 losslessly representable values; a
 required const/enum value that cannot be represented returns an explicit error instead of being

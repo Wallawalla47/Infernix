@@ -590,8 +590,9 @@ because the Qwen parameter format cannot distinguish those branches. Such unions
 or arrays are supported.
 A raw value holds the delimiter `\n</parameter>` only inside the whole call's closing lines
 (`\n</parameter>\n</function>\n</tool_call>`) that more value text follows, as in a file that documents
-the call format: the call ends where the output then ends or the next call's token begins, so a
-streamed call's last fragment arrives with that next token or with the end of the turn. A value
+the call format: the call ends where the output then ends or a newline and the next call's token
+begin (the token is not admitted straight after the closing lines), so a streamed call's last
+fragment arrives with that next token or with the end of the turn. A value
 cannot hold `\n</parameter>` followed by a parameter opener; a string with a length bound or a pattern
 cannot hold the closing lines either. Unsatisfiable required values are rejected.
 Integer arguments use signed 64-bit values; number arguments use finite binary64-compatible

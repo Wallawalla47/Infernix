@@ -31,20 +31,28 @@ constexpr std::string_view kCallClose     = "</function>\n</tool_call>";
 // `<parameter=NAME>\nVALUE\n</parameter>\n` per parameter, then `</function>\n</tool_call>`, and `\n`
 // before the next call's token. A value ends at its first `\n</parameter>` (a JSON value cannot
 // spell it), except that a raw value goes on when text other than the next call's token follows the
-// whole call's closing lines (the grammar's raw string rule).
+// whole call's closing lines (the grammar's raw string rule). `calls`: the grammar's raw string reads
+// the `<tool_call>` token right after those closing lines (or after their `\n` when calls are not
+// parallel) as value text, while the decoder takes the token there only as the next call's opener,
+// so it is masked there; every tool grammar has this rule.
 class ToolCallRules final : public text::GrammarStateConstraint {
 public:
     ToolCallRules(std::shared_ptr<const std::vector<std::string>> vocabulary,
                   std::shared_ptr<const std::vector<std::int32_t>> tag_ends, std::int32_t tool_call,
-                  const text::ReasoningFraming& reasoning, bool combined, bool names, bool quotes)
+                  const text::ReasoningFraming& reasoning, bool combined, bool parallel, bool names,
+                  bool quotes)
         : vocabulary_(std::move(vocabulary)), tag_ends_(std::move(tag_ends)), tool_call_(tool_call),
           reasoning_close_(reasoning.close_token), separator_(reasoning.separator.size()),
-          body_phase_(combined ? Phase::Branch : Phase::Text), names_rule_(names), quotes_rule_(quotes) {
+          body_phase_(combined ? Phase::Branch : Phase::Text), parallel_(parallel), names_rule_(names),
+          quotes_rule_(quotes) {
         cursor_.phase = reasoning_close_ ? Phase::Reasoning : body_phase_;
         committed_    = {cursor_, names_};
     }
 
     void filter(std::span<std::uint32_t> mask) override {
+        if (cursor_.phase == Phase::AfterCall && !opens_call(cursor_)) {
+            mask[static_cast<std::size_t>(tool_call_) / 32] &= ~(1u << (static_cast<std::uint32_t>(tool_call_) % 32));
+        }
         if (!names_rule_ || !in_call(cursor_.phase)) { return; }
         // Only a token holding '>' completes a name; outside a name or a started opener it must also
         // hold the whole opener. Value tokens need no simulation.
@@ -132,6 +140,9 @@ private:
 
     static bool in_call(Phase phase) noexcept { return phase >= Phase::Header; }
 
+    // Whether the `<tool_call>` token opens the next call after a call's closing lines.
+    bool opens_call(const Cursor& cursor) const noexcept { return parallel_ && cursor.matched != 0; }
+
     bool quoted(const Cursor& cursor, std::int32_t token) const noexcept {
         return quotes_rule_ && token == tool_call_ && cursor.phase == Phase::Text && cursor.code.in_code();
     }
@@ -142,12 +153,15 @@ private:
             return true;
         }
         if (token == tool_call_) {
-            // The token opens a call from free text, a combined grammar's first token, or after a call.
+            // The token opens a call from free text, a combined grammar's first token, or after a
+            // call's closing lines and their `\n`; a value holds it as its spelling.
+            if (cursor.phase == Phase::AfterCall && !opens_call(cursor)) { return false; }
             if (cursor.phase == Phase::Text || cursor.phase == Phase::Branch || cursor.phase == Phase::AfterCall) {
                 cursor = {.phase = Phase::Header};
                 names.clear();
+                return true;
             }
-            return true;
+            return cursor.phase != Phase::Value || feed(cursor, names, kToolCallOpen);
         }
         if (cursor.phase == Phase::Reasoning) {
             if (token == *reasoning_close_) { cursor = {.phase = separator_ != 0 ? Phase::Separator : body_phase_}; }
@@ -238,6 +252,7 @@ private:
     std::optional<std::int32_t> reasoning_close_;
     std::size_t separator_;
     Phase body_phase_;
+    bool parallel_;
     bool names_rule_;
     bool quotes_rule_;
     Cursor cursor_;
@@ -342,12 +357,14 @@ compile_tool_grammar(text::GrammarCompiler& compiler, const Contract& contract,
     }
     // The grammar orders a strict tool's parameters, so only non-strict calls need the name rule; only
     // a grammar with free text before its calls (an auto choice without a JSON answer) needs quotes.
+    // Every grammar with calls needs the rule for the token after a call's closing lines.
     std::unique_ptr<text::GrammarStateConstraint> companion;
     const bool names  = std::any_of(contract.tools.begin(), contract.tools.end(), [](const auto& tool) { return !tool.strict; });
     const bool quotes = !contract.tools.empty() && !contract.required && !body;
-    if (names || quotes) {
+    if (!contract.tools.empty()) {
         companion = std::make_unique<ToolCallRules>(compiler.vocabulary(), compiler.tag_end_tokens(), tool_call_token,
-                                                    reasoning, body.has_value() && !contract.required, names, quotes);
+                                                    reasoning, body.has_value() && !contract.required,
+                                                    contract.parallel, names, quotes);
     }
     // The reasoning may not write the `<tool_call>` token: a call there never runs, and the reasoning,
     // which cannot end the turn, would go on to its budget. Its spelling in ordinary tokens stays
