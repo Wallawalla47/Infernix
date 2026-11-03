@@ -173,8 +173,8 @@ private:
     void register_routes();
     void register_management_routes();
     void register_public_routes();
-    // The management API: this computer, or (remote management on) an admin key or its sign-in;
-    // always after page_checks. Otherwise the error is written (401 "sign_in" when signing in helps).
+    // The management API: this computer, or (remote management on) anyone while no key exists and
+    // an admin key or its sign-in once one does; always after page_checks. Otherwise the error is written (401 "sign_in" when signing in helps).
     bool admin_allowed(const httplib::Request& request, httplib::Response& response);
     // The checks against other web pages (Origin) and DNS rebinding (Host); writes a 403 when given
     // a response.

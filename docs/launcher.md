@@ -310,9 +310,12 @@ name the key each request came with. Listening on another address than loopback 
 a warning.
 
 The web UI and its management API (`/launcher/api`) answer this computer without a key. From
-another computer they need **Allow remote management** on and an Admin key: the UI asks for it once
-and keeps a sign-in cookie (HttpOnly, SameSite=Strict, 30 days; signing out or restarting the
-launcher ends it). The UI's own chat uses the endpoint without a key.
+another computer they need **Manage from other computers** on, and then follow the keys as `/v1`
+does: with no key they are open to every computer that reaches the launcher (listening beyond
+loopback with remote management on and no key is that choice); once any key exists they need an
+Admin key, which the UI asks for once and keeps as a sign-in cookie (HttpOnly, SameSite=Strict, 30
+days; signing out or restarting the launcher ends it). The UI's own chat uses the endpoint without a
+key.
 
 Other web pages cannot use the management API, whatever the CORS setting: it refuses requests whose
 `Origin` is neither the launcher's own page nor a loopback one and, unless they carry an Admin key,
@@ -468,7 +471,7 @@ says so.
 |---|---|---|
 | Host, port | `127.0.0.1`, `1234` | listen address (applies after a restart) |
 | API keys | none | named keys; with any, `/v1` needs one ([API keys](#api-keys-and-remote-access)) |
-| Allow remote management | off | the web UI from other computers, with an Admin key |
+| Manage from other computers | off | the web UI from other computers; an Admin key once any key exists |
 | CORS | on | browser access headers on every answer (applies after a restart) |
 | llama.cpp endpoints | off | `llama-server`'s router API for llama.cpp providers ([llama.cpp endpoints](#llamacpp-endpoints)) |
 | `infernix-serve` | beside the launcher | the server executable; its `--help` drives the option reference |
