@@ -1447,7 +1447,12 @@ private:
             if (normalized.disposition == ParameterNormalization::Omitted) {
                 ++omitted_;
             } else {
-                if (normalized.disposition == ParameterNormalization::SchemaMismatch) { ++mismatched_; }
+                // A name the declared tool does not declare is a schema mismatch, as normalize_raw_tool_call
+                // counts it on the whole-text route.
+                if (normalized.disposition == ParameterNormalization::SchemaMismatch ||
+                    (tool_ != nullptr && parameter_ == nullptr)) {
+                    ++mismatched_;
+                }
                 emit(pair_prefix() + normalized.json_value);
             }
         }

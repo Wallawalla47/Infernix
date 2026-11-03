@@ -444,8 +444,21 @@ void calls_after_closers(infernix::text::GrammarCompiler& compiled) {
     require(refused, "the decoder accepted a call token right after a call's closing lines");
 }
 
+// A parameter a declared non-strict tool does not declare counts as a schema mismatch on the constrained
+// (streamed) route, as the whole-text route counts it (candidates QA-14).
+void undeclared_parameters() {
+    const auto open        = contract(schema({{"type", "string"}}), false);
+    const std::string text = "<tool_call>\n<function=call>\n<parameter=extra>\n1\n</parameter>\n</function>\n</tool_call>";
+    frontend::ToolCallOutputDecoder decoder(open, 64);
+    (void)feed(decoder, text);
+    const auto terminal = decoder.finish();
+    require(terminal.tool_calls.size() == 1 && terminal.diagnostics.schema_mismatch_arguments == 1,
+            "a streamed call's undeclared parameter was not counted as a schema mismatch");
+}
+
 void run() {
     auto compiled = compiler();
+    undeclared_parameters();
     basic_contracts(compiled);
     selected_contracts(compiled);
     quoted_calls(compiled);

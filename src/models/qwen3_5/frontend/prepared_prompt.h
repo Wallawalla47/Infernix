@@ -170,13 +170,6 @@ struct PreparedPromptData {
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
 
     [[nodiscard]] bool has_media() const noexcept { return !vision_items.empty(); }
-
-    // Payload slots remain indexed one-to-one with vision_items for the lifetime of the prompt.
-    // Releasing host storage must not destroy that structural identity while a Vision prefill
-    // session can still revisit the same item in a later Text chunk.
-    void release_all_media_payloads() noexcept {
-        for (auto& payload : media_payloads) { payload.reset(); }
-    }
 };
 
 class PreparedPromptAccess {

@@ -119,11 +119,12 @@ PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
         pos = next;
     }
 
-    // Each media input contributes one complete Qwen placeholder in input order.
-    for (std::size_t pos = 0; pos < source.size();) {
-        const auto image = find_marker(output, "<|image_pad|>", pos);
-        const auto video = find_marker(output, "<|video_pad|>", pos);
-        const auto pad   = std::min(image, video);
+    // Each media input contributes one complete Qwen placeholder in input order. The next pad of
+    // each kind is searched again only once it is consumed, so the scan stays linear in the prompt.
+    std::size_t image = find_marker(output, "<|image_pad|>", 0);
+    std::size_t video = find_marker(output, "<|video_pad|>", 0);
+    for (;;) {
+        const auto pad = std::min(image, video);
         if (pad == std::string::npos) break;
         const auto modality = pad == image ? Modality::Image : Modality::Video;
         const std::string_view token =
@@ -142,7 +143,11 @@ PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
                 "chat template media placeholders must match input count, type and order");
         }
         result.media_placeholders.push_back({{pad, pad + token.size()}, modality, index});
-        pos = pad + token.size();
+        if (modality == Modality::Image) {
+            image = find_marker(output, "<|image_pad|>", pad + token.size());
+        } else {
+            video = find_marker(output, "<|video_pad|>", pad + token.size());
+        }
     }
     if (result.media_placeholders.size() != media.size()) {
         throw std::invalid_argument("chat template omitted an input media placeholder");

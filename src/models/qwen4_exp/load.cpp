@@ -374,6 +374,8 @@ FrontendResources bind_resources(artifact::Binder& binder, const Config& config)
     out.tokenizer_config_json  = resource("text", "tokenizer_config.json");
     out.chat_template_jinja    = resource("text", "chat_template.jinja");
     out.generation_config_json = resource("text", "generation_config.json");
+    // An artifact's sampling presets, as Qwen3.5 binds them (a converter's --resource sampling.json=PATH).
+    if (binder.has_resource("text", "sampling.json")) { out.sampling_json = resource("text", "sampling.json"); }
     if (config.vision) {
         out.preprocessor_config_json       = resource("vision", "preprocessor_config.json");
         out.video_preprocessor_config_json = resource("vision", "video_preprocessor_config.json");
