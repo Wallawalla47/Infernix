@@ -1398,8 +1398,11 @@ without `preemption`).
 - **What changes:** `q8-sliced-k` runs NInfer's GEMV, sliced-K and grouped sliced-K tables for the
   Q8 [16384, 2560] GDN projection and the [2560, 6144] GDN and QSA output projections, where they
   are faster than the exact routes (above T = 128, and at T = 321-384 and 449-511 on [16384,
-  2560], they keep the exact routes). Their reduction order depends on the call's width, so it
-  couples a request's decode to the other requests of its round (`request_invariant` is false).
+  2560], they keep the exact routes), and since 2026-11-03 sliced-K tiles for the hyper-connection
+  [324, 10240] and [320, 10240] projections at 65-1,344 and 65-2,048 columns (candidates NQ-01: the
+  q8 oracle test at every route seam; no model-level arm was run for them). Their reduction order
+  depends on the call's width, so it couples a request's decode to the other requests of its round
+  (`request_invariant` is false).
   `gdn-conv-fused` feeds plain decode's GDN convolution the projection's FP32 q/k/v; and
   `qsa-prepare-fused` keeps FP32 between the QSA layer's norm, rotation and append steps. With them
   MTP output no longer equals plain decode.

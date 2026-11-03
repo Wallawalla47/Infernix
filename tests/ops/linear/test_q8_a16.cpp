@@ -94,9 +94,13 @@ int q8_a16_conformance() {
         // The q8-sliced-k fast routes (LinearRoutes::Q8SlicedK) meet the same criterion on every route and
         // at each seam of the two fast tables; other shapes run their exact route under Fast.
         const bool fast_shape = (shape.n == 16384 && shape.k == 2560) || (shape.n == 2560 && shape.k == 6144);
+        // The hyper-connection projections' sliced-K routes past 64 columns, at each seam of their tables.
+        const bool hc_shape = shape.k == 10240 && (shape.n == 324 || shape.n == 320);
         for (int t : fast_shape ? std::vector<int>{1,  2,  3,  5,  7,  8,  9,  15, 16, 17, 23,  24,  25,  31,
                                                    32, 33, 39, 40, 41, 47, 48, 49, 50, 51, 62,  63,  64,  65,
                                                    95, 96, 97, 127, 128, 129, 256, 511, 512, 513, 4096}
+                     : hc_shape ? std::vector<int>{1,   8,   64,  65,   100,  256,  257,  300,  512,  513, 960,
+                                                   961, 1152, 1153, 1344, 1345, 2048, 2049, 4096}
                                 : std::vector<int>{1, 8, 64}) {
             calls.push_back({t, CallForm::Policy, infernix::ops::LinearPolicy::A16Only, false,
                              infernix::ops::LinearRoutes::Q8SlicedK});
