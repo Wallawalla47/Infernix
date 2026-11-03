@@ -186,6 +186,25 @@ struct VramSizing {
 // (ExpertResidency::frame_bytes, the average frame). Engine::plan takes the same off its frames.
 [[nodiscard]] std::uint32_t pool_slack_frames(std::size_t pools, std::uint64_t chunk_bytes,
                                               std::uint64_t frame_bytes) noexcept;
+// What an expert cache lends one run (a prefill pass's workspace): the most frames one pool lends with no
+// lease out (above the quarter each keeps), and that pool's pitch (ExpertResidency::lend_capacity).
+struct LendCapacity {
+    std::uint64_t frames = 0, pitch = 0;
+    // Whether one run lends `bytes` with a frame to spare.
+    [[nodiscard]] bool lends(std::uint64_t bytes) const noexcept { return pitch != 0 && (bytes + pitch - 1) / pitch < frames; }
+};
+// The same for a cache not built yet of `frames` frames, over the pools these per-layer record strides form
+// with `experts` experts a layer, split among them as ExpertResidency::resize splits them (a pool's arena
+// taken to hold its limit): the Engine's prefill-chunk fit for the offloaded Qwen3.5, at start and in
+// Engine::plan.
+[[nodiscard]] LendCapacity lend_capacity(std::span<const std::uint64_t> strides, std::uint32_t experts,
+                                         std::uint32_t frames);
+// The reproducible route fits its prefill chunk to the frames a launch would size with kNominalInUseBytes
+// in use before loading, an attached display's headroom and no OS budget below free memory: a function of
+// the GPU, the options and the artifact, not of what other programs held at launch (Flash-Next and the
+// offloaded Qwen3.5 alike). Without the launch's figure the snapshot stands.
+inline constexpr std::uint64_t kNominalInUseBytes = 3ULL << 30;
+[[nodiscard]] VramSnapshot nominal_snapshot(VramSnapshot snapshot, std::optional<std::uint64_t> in_use_before_load) noexcept;
 
 // The runtime law of an elastic frame pool (design §19.3.7): from the latest snapshot, the pool's
 // size and the time, the frame count it should have. Pure and single-threaded; the Program guards

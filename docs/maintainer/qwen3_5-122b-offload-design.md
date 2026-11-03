@@ -967,6 +967,18 @@ must still win (its "restored" line).
   The exact route's bits follow the chunk grid on Qwen3.5, as today (Flash-Next design §19.3,
   "The prefill chunk"). The A8 projections, the canonical experts and the head add no seam of
   their own (§8.2, §8.6).
+- **Chunk fit (2026-11-03, candidates RF-04 (c)).** A pass wider than the static arena runs on a
+  workspace the expert cache lends (`ProgramOffload::wide_workspace`); one it cannot lend is
+  allocated per prompt, which fails on a full card after admission. The Engine plans the widest
+  chunk at most `--prefill-chunk`, on its 128-token grid, whose widest pass (text or MTP, idle-wide
+  included) the cache lends with a frame to spare once every lane's context is full: its frames
+  estimated as Engine::plan estimates them, beside the elastic KV region whole, and on the
+  reproducible route also at a nominal launch (3 GiB in use before loading, Flash-Next's
+  `nominal_snapshot`). The Program is then planned at that chunk (its buffers shrink with it, as
+  Engine::plan reports them), with a warning naming both chunks. Unlike Flash-Next's per-call
+  re-fit, the chunk here is the prefill grid (taps, resumes, Replay steps), so it is fitted once,
+  for full contexts; a launch whose live frames come out below the estimate still allocates per
+  prompt when it must.
 - **CPU assist.** For calls of at most 4,096 × 27.5 GB/s / link columns (Flash-Next P7; a link within
   5 % of 27.5 GB/s counts as it), with the next layer's guessed heavy experts copied ahead (Flash-Next
   design §19.3.12; the cap was 1,536 before copy-ahead, 2026-10-26).

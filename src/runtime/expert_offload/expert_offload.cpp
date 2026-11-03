@@ -219,7 +219,7 @@ void ExpertOffload::diagnostic(const std::string& text, DiagnosticLevel level) c
     } catch (...) {}
 }
 
-void ExpertOffload::start(cudaStream_t compute, const std::function<void(std::uint64_t, std::uint64_t)>& lendable_frames) {
+void ExpertOffload::start(cudaStream_t compute) {
     // What the offload switches resolved to (their values are in the startup log's temporary switches line).
     {
         std::string line =
@@ -231,19 +231,13 @@ void ExpertOffload::start(cudaStream_t compute, const std::function<void(std::ui
         }
         diagnostic(line, DiagnosticLevel::Debug);
     }
-    // The prefill chunk the cache can lend a wide workspace for, from the frames it will start with,
-    // before the SSD tier (whose tickets are sized by the chunk).
-    if (options_.expert_cache && lendable_frames) {
-        const std::uint64_t frames = size_expert_frames(vram_->query(), frame_demand(record_stride_)).frames;
-        lendable_frames(frames - frames / 4, record_stride_);
-    }
     if (setup_.store != nullptr) { create_tier(); }
     // After the tier (whose pinned slots probe the link when the banks stay in the artifact), before
     // the CPU service and the split take the measured rate.
     measure_link();
     if (options_.prefill_stream && options_.expert_cache) { create_stream(); }
     create_cpu_service();
-    size_frames(compute, lendable_frames);
+    size_frames(compute);
     warm_start(compute);
     // The SSD tier has no records in RAM before its fill: the CPU team's rates are measured on its RAM
     // copies now, so the decode split follows this record size and CPU (source() reads it).
@@ -856,7 +850,7 @@ VramDemand ExpertOffload::frame_demand(std::uint64_t frame_bytes) const {
 
 // The frames take what the fixed allocations, the graph executables' reserve and the display headroom
 // leave (§19.3.7); a chunk the driver places in system memory is given back and the cache stops there.
-void ExpertOffload::size_frames(cudaStream_t compute, const std::function<void(std::uint64_t, std::uint64_t)>& lendable_frames) {
+void ExpertOffload::size_frames(cudaStream_t compute) {
     if (!options_.expert_cache) { return; }
     const VramDemand demand = frame_demand(residency_->frame_bytes());
     sizing_                 = size_expert_frames(vram_->query(), demand);
@@ -914,9 +908,6 @@ void ExpertOffload::size_frames(cudaStream_t compute, const std::function<void(s
         startup_frames_ = frames_now_;
         vram_epoch_     = Clock::now();
         monitor_ = std::make_unique<VramMonitor>(setup_.device, *vram_, [this](const VramSnapshot& s) { on_vram_snapshot(s); });
-    }
-    if (grown.frames > 0 && lendable_frames) {
-        lendable_frames(residency_->lend_capacity_bytes() / residency_->lend_pitch(), residency_->lend_pitch());
     }
 }
 

@@ -43,6 +43,7 @@
 #include "core/vmm_arena.h"
 #include "core/vram_budget.h"
 #include "runtime/expert_offload/expert_cache.h"
+#include "runtime/expert_offload/memory_plan.h"
 #include "runtime/expert_offload/route_predictor.h"
 
 #include <cuda_runtime.h>
@@ -165,9 +166,8 @@ public:
     [[nodiscard]] std::uint64_t lend_capacity_bytes() const noexcept;
     // The same were the cache `frames` frames, split among the pools as resize splits them (a cache
     // the KV pool's growth has shrunk): the most frames one pool lends with no lease out, and its pitch.
-    struct LendCapacity {
-        std::uint64_t frames = 0, pitch = 0;
-    };
+    // (expert_offload::lend_capacity counts a cache not built yet the same way.)
+    using LendCapacity = expert_offload::LendCapacity;
     [[nodiscard]] LendCapacity lend_capacity(std::uint32_t frames) const;
     // The layers whose experts a lease's frames held (its pool's).
     [[nodiscard]] std::uint32_t lease_layers(const FrameLease& lease) const noexcept {

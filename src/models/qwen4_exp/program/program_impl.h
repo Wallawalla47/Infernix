@@ -1477,7 +1477,7 @@ public:
             if (options_.reproducible && options_.vram_in_use_before_load && chunk_ < nominal_chunk_) {
                 diagnostic("the expert cache is smaller than the one the reproducible route fits its prefill chunk to (" +
                                std::to_string(*options_.vram_in_use_before_load >> 20) + " MiB of VRAM were in use before "
-                               "loading, against a nominal " + std::to_string(kNominalInUseBytes >> 20) +
+                               "loading, against a nominal " + std::to_string(runtime::expert_offload::kNominalInUseBytes >> 20) +
                                "): this launch prefills at " + std::to_string(chunk_) + " tokens instead of " +
                                std::to_string(nominal_chunk_) + ", so its output can differ from a launch that fits " +
                                std::to_string(nominal_chunk_) + " (free VRAM, or set --prefill-chunk " +
@@ -4518,19 +4518,10 @@ private:
         return lent.frames * lent.pitch;
     }
 
-    // The reproducible route fits its chunk to the frames a launch would size with kNominalInUseBytes in
-    // use before loading, an attached display's headroom and no OS budget below free memory: a function
-    // of the GPU, the options and the artifact, not of what other programs held at launch. Without the
-    // launch's figure (a Program built outside an Engine) the snapshot stands.
-    static constexpr std::uint64_t kNominalInUseBytes = 3ULL << 30;
-    [[nodiscard]] VramSnapshot nominal_snapshot(VramSnapshot s) const noexcept {
-        if (!options_.vram_in_use_before_load) { return s; }
-        const std::uint64_t used = *options_.vram_in_use_before_load;
-        s.device_free = used >= kNominalInUseBytes ? s.device_free + (used - kNominalInUseBytes)
-                                                   : s.device_free - std::min(s.device_free, kNominalInUseBytes - used);
-        s.has_budget  = false;
-        s.display     = DisplayState::Attached;
-        return s;
+    // The reproducible route's nominal launch (expert_offload::nominal_snapshot); without the launch's
+    // figure (a Program built outside an Engine) the snapshot stands.
+    [[nodiscard]] VramSnapshot nominal_snapshot(const VramSnapshot& s) const noexcept {
+        return runtime::expert_offload::nominal_snapshot(s, options_.vram_in_use_before_load);
     }
 
     // A prompt's calls planned at a chunk the cache no longer lends: the KV pool grew since its binding

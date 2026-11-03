@@ -195,20 +195,72 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
 
 namespace {
 
-std::size_t current_free_device_bytes() {
-    std::size_t free_bytes  = 0;
-    std::size_t total_bytes = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-    return free_bytes;
+// The free device memory a start sizes its KV against: cudaMemGetInfo's, bounded under WDDM by the OS
+// budget less this process's usage, as the expert frames are (size_expert_frames). The two differ (an RTX
+// 5090: 24.10 GiB free against 21.88 the budget left, Basalt #28), and a KV sized past the budget is
+// demoted to system memory, which the Program's spill guard refuses at startup (candidates VR-04).
+std::size_t free_device_bytes(const VramSnapshot& s) {
+    if (!s.has_budget) { return s.device_free; }
+    const std::uint64_t left = s.local_budget > s.local_usage ? s.local_budget - s.local_usage : 0U;
+    return static_cast<std::size_t>(std::min<std::uint64_t>(s.device_free, left));
+}
+
+std::size_t current_free_device_bytes(int device, bool past_budget) {
+    return free_device_bytes(open_vram_budget_source(device, past_budget)->query());
+}
+
+// Offloaded experts: an estimate of the expert frames beside `sequence`. A start sizes them from a live
+// reading once the Program's allocations exist (ExpertOffload::size_frames); here they take what the
+// Program's reservation less its CUDA Graph allowance (with the elastic text KV region whole, as when
+// every lane's context is full, and the engine's staging and tables), the MTP drafter's expert pool and
+// `not_uploaded` bytes the snapshot still counts as free (Engine::plan's weights) leave of `snapshot`,
+// less the pools' chunk slack the start keeps off them.
+struct OffloadedFrames {
+    std::uint32_t frames     = 0;
+    std::uint64_t frame_bytes = 0, headroom = 0;
+    std::uint64_t beside     = 0; // the drafter's expert pool
+    std::vector<std::uint64_t> strides;
+    std::uint32_t experts = 0;
+};
+
+OffloadedFrames estimate_offloaded_frames(const models::qwen3_5::Model& model, const models::qwen3_5::SequencePlan& sequence,
+                                          std::uint64_t reservation, std::uint64_t not_uploaded, const VramSnapshot& snapshot,
+                                          const expert_offload::OffloadOptions& offload, DeviceContext& device) {
+    OffloadedFrames out;
+    const auto& moe = std::get<models::qwen3_5::MoeConfig>(model.config().text.ffn);
+    for (const auto& bank : model.expert_banks()) { out.strides.push_back(bank.planes.record_stride); }
+    out.experts = moe.num_experts;
+    const expert_offload::ExpertLayout layout{static_cast<std::uint32_t>(out.strides.size()), moe.num_experts,
+                                              moe.num_experts_per_tok};
+    // Beside the reservation (which holds the engine's staging and tables, SequencePlan's offload_fixed_bytes):
+    // the MTP drafter's expert pool, allocated before the engine sizes its frames (ProgramOffload::start).
+    if (const std::uint32_t slots = model.config().mtp_expert_slots; slots != 0) {
+        out.beside = expert_offload::DrafterExpertPool::device_bytes(model.config().mtp_expert_bytes,
+                                                                     static_cast<std::int32_t>(slots),
+                                                                     static_cast<std::int32_t>(moe.num_experts));
+    }
+    expert_offload::VramDemand demand;
+    demand.headroom = offload.vram_headroom;
+    demand.elastic  = offload.vram_monitor && VmmArena::supported(device.device);
+    // The engine's graph bound (ProgramImpl's constructor).
+    demand.graphs = static_cast<std::uint32_t>(
+        (sequence.graph_allowance_bytes() + expert_offload::kGraphExecutableBytes - 1) /
+        expert_offload::kGraphExecutableBytes);
+    demand.frame_bytes = expert_offload::ExpertResidency::average_frame_bytes(out.strides);
+    demand.max_frames  = expert_offload::ExpertResidency::max_frames(layout);
+    demand.fixed       = not_uploaded + (reservation - sequence.graph_allowance_bytes()) + out.beside;
+    const expert_offload::VramSizing sizing = expert_offload::size_expert_frames(snapshot, demand);
+    const std::uint32_t slack = expert_offload::pool_slack_frames(
+        expert_offload::frame_pools(out.strides), expert_offload::ExpertResidency::kChunkBytes, demand.frame_bytes);
+    out.frames      = sizing.frames > slack ? sizing.frames - slack : 0U;
+    out.frame_bytes = demand.frame_bytes;
+    out.headroom    = sizing.headroom;
+    return out;
 }
 
 // Engine::plan, Qwen3.5 family: the finalized sequence plan's device memory beside the weights (whose
 // bytes plan.vram already holds), the Host tier it settled, and with offloaded experts an estimate of the
-// expert frames: a start sizes them from a live reading once the Program's allocations exist
-// (ExpertOffload::size_frames); here they take what the weights, the Program's reservation less its
-// CUDA Graph allowance (with the elastic text KV region whole, as when every lane's context is full, and
-// the engine's staging and tables) and the MTP drafter's expert pool leave from the free memory now, less
-// the pools' chunk slack the start keeps off them.
+// expert frames (estimate_offloaded_frames).
 void plan_qwen3_5_program(EnginePlan& plan, const EngineOptions& options, const ModelInstance& instance,
                           const models::qwen3_5::SequencePlan& sequence, const KvCapacityResolution& resolution,
                           std::size_t free_after_weights, const expert_offload::OffloadOptions* offload,
@@ -228,41 +280,44 @@ void plan_qwen3_5_program(EnginePlan& plan, const EngineOptions& options, const 
         }
     }
     if (offload != nullptr) {
-        const models::qwen3_5::Model& model = *instance.model;
-        const auto& moe                     = std::get<models::qwen3_5::MoeConfig>(model.config().text.ffn);
-        std::vector<std::uint64_t> strides;
-        for (const auto& bank : model.expert_banks()) { strides.push_back(bank.planes.record_stride); }
-        const expert_offload::ExpertLayout layout{static_cast<std::uint32_t>(strides.size()), moe.num_experts,
-                                                  moe.num_experts_per_tok};
-        // Beside the reservation (which holds the engine's staging and tables, SequencePlan's offload_fixed_bytes):
-        // the MTP drafter's expert pool, allocated before the engine sizes its frames (ProgramOffload::start).
-        std::uint64_t beside = 0;
-        if (const std::uint32_t slots = model.config().mtp_expert_slots; slots != 0) {
-            beside = expert_offload::DrafterExpertPool::device_bytes(model.config().mtp_expert_bytes,
-                                                                     static_cast<std::int32_t>(slots),
-                                                                     static_cast<std::int32_t>(moe.num_experts));
-        }
-        expert_offload::VramDemand demand;
-        demand.headroom = offload->vram_headroom;
-        demand.elastic  = offload->vram_monitor && VmmArena::supported(device.device);
-        // The engine's graph bound (ProgramImpl's constructor).
-        demand.graphs = static_cast<std::uint32_t>(
-            (sequence.graph_allowance_bytes() + expert_offload::kGraphExecutableBytes - 1) /
-            expert_offload::kGraphExecutableBytes);
-        demand.frame_bytes = expert_offload::ExpertResidency::average_frame_bytes(strides);
-        demand.max_frames  = expert_offload::ExpertResidency::max_frames(layout);
-        demand.fixed       = vram.weights_bytes + (reservation - sequence.graph_allowance_bytes()) + beside;
-        const expert_offload::VramSizing sizing = expert_offload::size_expert_frames(
-            open_vram_budget_source(device.device, options.vram_past_budget)->query(), demand);
-        const std::uint32_t slack = expert_offload::pool_slack_frames(
-            expert_offload::frame_pools(strides), expert_offload::ExpertResidency::kChunkBytes, demand.frame_bytes);
-        vram.expert_frames      = sizing.frames > slack ? sizing.frames - slack : 0U;
-        vram.expert_cache_bytes = static_cast<std::uint64_t>(*vram.expert_frames) * demand.frame_bytes;
-        vram.headroom_bytes     = sizing.headroom;
-        vram.planned_bytes += beside + *vram.expert_cache_bytes;
-        used = reservation + beside + *vram.expert_cache_bytes + sizing.headroom;
+        const OffloadedFrames estimate =
+            estimate_offloaded_frames(*instance.model, sequence, reservation, vram.weights_bytes,
+                                      open_vram_budget_source(device.device, options.vram_past_budget)->query(),
+                                      *offload, device);
+        vram.expert_frames      = estimate.frames;
+        vram.expert_cache_bytes = static_cast<std::uint64_t>(estimate.frames) * estimate.frame_bytes;
+        vram.headroom_bytes     = estimate.headroom;
+        vram.planned_bytes += estimate.beside + *vram.expert_cache_bytes;
+        used = reservation + estimate.beside + *vram.expert_cache_bytes + estimate.headroom;
     }
     vram.left_bytes = free_after_weights > used ? free_after_weights - used : 0;
+}
+
+// Offloaded experts (candidates RF-04 (c)): whether the expert cache, every lane's context full, lends
+// `sequence`'s widest prefill pass its workspace (ProgramOffload::wide_workspace) with a frame to spare,
+// with the frames estimated as Engine::plan estimates them (`now`); on the reproducible route also at a
+// nominal launch (expert_offload::nominal_snapshot), so its chunk depends only on the GPU, the options and
+// the artifact unless this launch's own cache is the smaller. A pass the cache cannot lend allocates its
+// workspace per prompt, which fails on a full card after admission.
+struct PrefillLend {
+    bool now = true, nominal = true;
+    [[nodiscard]] bool lent() const noexcept { return now && nominal; }
+};
+
+PrefillLend offloaded_prefill_lent(const models::qwen3_5::Model& model, const models::qwen3_5::SequencePlan& sequence,
+                                   std::uint64_t reservation, std::uint64_t not_uploaded, const VramSnapshot& snapshot,
+                                   std::optional<std::uint64_t> in_use_before_load, bool reproducible,
+                                   const expert_offload::OffloadOptions& offload, DeviceContext& device) {
+    PrefillLend out;
+    const std::uint64_t pass = sequence.offload_wide_pass_bytes();
+    if (pass == 0 || !offload.expert_cache) { return out; }
+    const auto lends = [&](const VramSnapshot& at) {
+        const OffloadedFrames estimate = estimate_offloaded_frames(model, sequence, reservation, not_uploaded, at, offload, device);
+        return expert_offload::lend_capacity(estimate.strides, estimate.experts, estimate.frames).lends(pass);
+    };
+    out.now = lends(snapshot);
+    if (reproducible) { out.nominal = lends(expert_offload::nominal_snapshot(snapshot, in_use_before_load)); }
+    return out;
 }
 
 // Engine::plan, Qwen3.5 family: the largest --max-context whose smallest reservation resolves beside the
@@ -688,6 +743,13 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan = models::qwen3_5::plan_load(reader, models::load_options(options, models::Architecture::Qwen3_5));
+    // Offloaded experts: the VRAM in use before anything is uploaded, for the reproducible route's nominal
+    // prefill-chunk fit (offloaded_prefill_lent), as Qwen3.8-Flash-Next takes it.
+    std::optional<std::uint64_t> in_use_before_load;
+    if (plan.offloaded_experts()) {
+        const VramSnapshot before = open_vram_budget_source(device.device, options.vram_past_budget)->query();
+        in_use_before_load        = before.device_total - std::min(before.device_total, before.device_free);
+    }
     // Engine::plan: the readings a start plans against, before anything is planned, and the weights' arena
     // (which a refusal below still reports).
     if (plan_only) {
@@ -958,59 +1020,134 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     for (int attempt = 0;; ++attempt) {
         if (!planning) { planning.emplace(options.startup_observer, StartupPhase::TargetFinalize); }
         const models::qwen3_5::detail::ProgramOffloadOptions* offload = offload_options ? &*offload_options : nullptr;
-        auto planner = models::qwen3_5::make_sequence_planner(instance->parameters, device, options, offload);
-        if (expert_ram && options.kv_capacity.mode == KvCapacityMode::Automatic) {
-            // Every lane's full context in whole pages (a lane's last page holds its context's tail).
-            const std::uint64_t page   = planner.capacity_curve().main_page_tokens;
-            const std::uint64_t tokens = static_cast<std::uint64_t>(options.max_concurrency) *
-                                         ((static_cast<std::uint64_t>(options.max_context) + page - 1U) / page) * page;
-            if (tokens > std::numeric_limits<std::uint32_t>::max()) {
-                throw std::invalid_argument("--max-context x --max-concurrency exceeds the KV capacity range");
-            }
-            kv_policy = KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(tokens));
-        }
         // Engine::plan reads the free memory where a start does, less the weights it did not upload.
+        const VramSnapshot vram_now  = open_vram_budget_source(device.device, options.vram_past_budget)->query();
+        const std::size_t free_now   = free_device_bytes(vram_now);
         const std::size_t free_bytes =
-            plan_only ? planned_free_after_weights(current_free_device_bytes(), planned_weights, planned_beside_weights)
-                      : current_free_device_bytes();
-        const std::size_t headroom   = base_headroom + retry_headroom;
-        KvCapacityResolution resolution;
-        if (plan_only) {
-            const auto fitted = plan_capacity(*planned, kv_policy, planner.capacity_curve(), free_bytes, headroom);
-            if (!fitted) {
-                plan_qwen3_5_context(*planned, options, instance->parameters, device, offload, free_bytes, headroom);
-                return {};
-            }
-            resolution = *fitted;
-        } else {
-            resolution = resolve_kv_capacity(kv_policy, planner.capacity_curve(), free_bytes, headroom);
+            plan_only ? planned_free_after_weights(free_now, planned_weights, planned_beside_weights) : free_now;
+        if (vram_now.has_budget) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
+                               "KV sizing: %zu MiB free (cudaMemGetInfo %zu MiB; OS budget %llu MiB, %llu used)",
+                               free_now >> 20, vram_now.device_free >> 20,
+                               static_cast<unsigned long long>(vram_now.local_budget >> 20),
+                               static_cast<unsigned long long>(vram_now.local_usage >> 20));
         }
-        // idle-wide-prefill: plan the widest idle width (4096, 2048, then 1024 tokens, as the chunk is
-        // rounded) whose larger prefill buffers and workspace keep the KV capacity: an explicit one
-        // whole, an automatic one down to every lane's full context. None fitting keeps chunk-wide steps.
-        {
-            const std::uint64_t page_tokens = planner.capacity_curve().main_page_tokens;
-            const std::uint64_t lane_page_groups =
-                static_cast<std::uint64_t>(options.max_concurrency) *
-                ((static_cast<std::uint64_t>(options.max_context) + page_tokens - 1U) / page_tokens);
-            for (const std::uint32_t width :
-                 models::qwen3_5::idle_prefill_widths(instance->parameters, options)) {
-                auto wide = models::qwen3_5::make_sequence_planner(instance->parameters, device,
-                                                                   options, width, offload);
-                if (const auto fitted =
-                        resolve_kv_capacity_beside(kv_policy, wide.capacity_curve(),
-                                                   free_bytes, headroom, resolution, lane_page_groups)) {
-                    planner    = std::move(wide);
-                    resolution = *fitted;
-                    break;
+        const std::size_t headroom = base_headroom + retry_headroom;
+        // The sequence plan of `trial` (these options at another prefill chunk, for the fit below) with its
+        // KV capacity resolved; none when Engine::plan finds no capacity that fits.
+        const auto plan_sequence = [&](const EngineOptions& trial)
+            -> std::optional<std::pair<models::qwen3_5::SequencePlan, KvCapacityResolution>> {
+            auto planner = models::qwen3_5::make_sequence_planner(instance->parameters, device, trial, offload);
+            if (expert_ram && trial.kv_capacity.mode == KvCapacityMode::Automatic) {
+                // Every lane's full context in whole pages (a lane's last page holds its context's tail).
+                const std::uint64_t page   = planner.capacity_curve().main_page_tokens;
+                const std::uint64_t tokens = static_cast<std::uint64_t>(trial.max_concurrency) *
+                                             ((static_cast<std::uint64_t>(trial.max_context) + page - 1U) / page) * page;
+                if (tokens > std::numeric_limits<std::uint32_t>::max()) {
+                    throw std::invalid_argument("--max-context x --max-concurrency exceeds the KV capacity range");
+                }
+                kv_policy = KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(tokens));
+            }
+            KvCapacityResolution resolution;
+            if (plan_only) {
+                const auto fitted = plan_capacity(*planned, kv_policy, planner.capacity_curve(), free_bytes, headroom);
+                if (!fitted) { return std::nullopt; }
+                resolution = *fitted;
+            } else {
+                resolution = resolve_kv_capacity(kv_policy, planner.capacity_curve(), free_bytes, headroom);
+            }
+            // idle-wide-prefill: plan the widest idle width (4096, 2048, then 1024 tokens, as the chunk is
+            // rounded) whose larger prefill buffers and workspace keep the KV capacity: an explicit one
+            // whole, an automatic one down to every lane's full context. None fitting keeps chunk-wide steps.
+            {
+                const std::uint64_t page_tokens = planner.capacity_curve().main_page_tokens;
+                const std::uint64_t lane_page_groups =
+                    static_cast<std::uint64_t>(trial.max_concurrency) *
+                    ((static_cast<std::uint64_t>(trial.max_context) + page_tokens - 1U) / page_tokens);
+                for (const std::uint32_t width : models::qwen3_5::idle_prefill_widths(instance->parameters, trial)) {
+                    auto wide = models::qwen3_5::make_sequence_planner(instance->parameters, device, trial, width, offload);
+                    if (const auto fitted = resolve_kv_capacity_beside(kv_policy, wide.capacity_curve(), free_bytes,
+                                                                       headroom, resolution, lane_page_groups)) {
+                        planner    = std::move(wide);
+                        resolution = *fitted;
+                        break;
+                    }
+                }
+            }
+            auto sequence = std::move(planner).finalize(resolution.main_page_groups);
+            if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
+                sequence.kv_capacity() != resolution.resolved_tokens) {
+                throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
+            }
+            return std::pair{std::move(sequence), resolution};
+        };
+        auto planned_sequence = plan_sequence(options);
+        if (!planned_sequence) {
+            plan_qwen3_5_context(*planned, options, instance->parameters, device, offload, free_bytes, headroom);
+            return {};
+        }
+        if (offload != nullptr) {
+            // The widest prefill chunk at most --prefill-chunk (on its 128-token grid) whose widest pass the
+            // expert cache lends with every lane's context full (offloaded_prefill_lent): the workspace grows
+            // with the chunk and the frames shrink, so the widest that lends is the fastest. Its buffers are
+            // planned at that chunk, as Engine::plan reports them; a start sizes its frames from a live reading,
+            // so a launch smaller than the estimate still lends the workspace per prompt when it must
+            // (ProgramOffload::wide_workspace). As Qwen3.8-Flash-Next's start fits its chunk (design §19.3.7),
+            // though the 122B's chunk is its prefill grid (taps, resumes, replay steps), so it is fitted once,
+            // for full contexts, not re-fitted per call.
+            const VramSnapshot snapshot = open_vram_budget_source(device.device, options.vram_past_budget)->query();
+            const std::uint64_t not_uploaded = plan_only ? planned->vram.weights_bytes : 0U;
+            const bool reproducible          = !options.fast_paths;
+            const auto lent = [&](const std::pair<models::qwen3_5::SequencePlan, KvCapacityResolution>& p) {
+                return offloaded_prefill_lent(*instance->model, p.first, p.second.runtime_reservation_bytes, not_uploaded,
+                                              snapshot, in_use_before_load, reproducible, offload->engine, device);
+            };
+            if (const PrefillLend requested = lent(*planned_sequence); !requested.lent()) {
+                const std::uint32_t asked = options.prefill_chunk;
+                const std::uint64_t pass  = planned_sequence->first.offload_wide_pass_bytes();
+                const auto lent_at = [&](std::uint32_t chunk) {
+                    EngineOptions trial  = options;
+                    trial.prefill_chunk  = chunk;
+                    const auto candidate = plan_sequence(trial);
+                    return candidate ? lent(*candidate) : PrefillLend{false, false};
+                };
+                constexpr std::uint32_t kGrid = models::qwen3_5::kPrefillChunkAlignment;
+                std::uint32_t low = 1, high = asked / kGrid - 1U, fitted = 0;
+                while (low <= high) {
+                    const std::uint32_t mid = low + (high - low) / 2U;
+                    if (lent_at(mid * kGrid).lent()) {
+                        fitted = mid * kGrid;
+                        low    = mid + 1U;
+                    } else {
+                        high = mid - 1U;
+                    }
+                }
+                if (fitted != 0) {
+                    // What bound it: this launch's cache, or the nominal one, one grid step above.
+                    const PrefillLend above = fitted + kGrid == asked ? requested : lent_at(fitted + kGrid);
+                    options.prefill_chunk = fitted;
+                    planned_sequence      = plan_sequence(options);
+                    if (!planned_sequence) { throw std::logic_error("the fitted prefill chunk lost its KV capacity"); }
+                    publish_diagnostic(
+                        options.diagnostic_observer, DiagnosticLevel::Warning,
+                        "--prefill-chunk %u needs %llu MiB of workspace for its widest pass, more than the expert cache "
+                        "can lend once every lane's context is full; prefilling at %u tokens (--prefill-chunk %u "
+                        "plans that from the start)",
+                        asked, static_cast<unsigned long long>(pass >> 20), fitted, fitted);
+                    if (reproducible && !above.now && above.nominal) {
+                        publish_diagnostic(
+                            options.diagnostic_observer, DiagnosticLevel::Warning,
+                            "the expert cache is smaller than the one the reproducible route fits its prefill chunk to "
+                            "(%llu MiB of VRAM were in use before loading, against a nominal %llu): this launch prefills "
+                            "at %u tokens, so its output can differ from a launch that fits a wider chunk (free VRAM, or "
+                            "set --prefill-chunk %u on every launch)",
+                            static_cast<unsigned long long>(in_use_before_load.value_or(0) >> 20),
+                            static_cast<unsigned long long>(expert_offload::kNominalInUseBytes >> 20), fitted, fitted);
+                    }
                 }
             }
         }
-        auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
-        if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
-            sequence.kv_capacity() != resolution.resolved_tokens) {
-            throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
-        }
+        auto& [sequence, resolution] = *planned_sequence;
         if (plan_only) {
             plan_qwen3_5_program(*planned, options, *instance, sequence, resolution, free_bytes,
                                  offload_options ? &offload_options->engine : nullptr, device);
@@ -1075,7 +1212,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     }
     device.synchronize();
     program->complete();
-    instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
+    instance->kv_capacity_resolution.available_after_startup_bytes =
+        current_free_device_bytes(device.device, options.vram_past_budget);
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;
     summary.architecture = models::architecture_name(instance->model->config().text.architecture);

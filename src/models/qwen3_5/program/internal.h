@@ -12,7 +12,6 @@
 
 namespace infernix::models::qwen3_5 {
 
-inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
 // batched-a8-subset-decode's narrowest call: the two-term tiles step up from 64 columns, one term

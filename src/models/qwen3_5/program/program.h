@@ -26,6 +26,9 @@ namespace execution {
 class Parameters;
 }
 
+// --prefill-chunk's grid: a chunk is a nonzero multiple of it.
+inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
+
 namespace detail {
 struct ProgramOffloadOptions;
 struct SequencePlanImpl;
@@ -74,6 +77,9 @@ public:
     // to decode (idle-wide-prefill; the chunk when that fast path is off).
     [[nodiscard]] std::uint32_t prefill_chunk() const noexcept;
     [[nodiscard]] std::uint32_t idle_prefill_width() const noexcept;
+    // With offloaded experts: the workspace the expert cache lends the widest prefill pass (text or MTP,
+    // ProgramOffload's wide pass); 0 when no pass borrows.
+    [[nodiscard]] std::size_t offload_wide_pass_bytes() const noexcept;
 
 private:
     explicit SequencePlan(std::unique_ptr<detail::SequencePlanImpl> impl) noexcept;

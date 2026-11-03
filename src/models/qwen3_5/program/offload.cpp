@@ -117,10 +117,9 @@ ProgramOffload::~ProgramOffload() {
     if (experts_.split_stream != nullptr) { cudaStreamDestroy(experts_.split_stream); }
 }
 
-void ProgramOffload::start(cudaStream_t compute,
-                           const std::function<void(std::uint64_t, std::uint64_t)>& lendable_frames) {
+void ProgramOffload::start(cudaStream_t compute) {
     create_drafter_pool(compute); // before the engine sizes its frames from the free memory
-    engine_.start(compute, lendable_frames);
+    engine_.start(compute);
     build_experts();
 }
 

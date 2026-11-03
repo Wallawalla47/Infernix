@@ -65,6 +65,11 @@ std::uint32_t SequencePlan::idle_prefill_width() const noexcept {
     return impl_ != nullptr ? impl_->idle_prefill_width : 0;
 }
 
+std::size_t SequencePlan::offload_wide_pass_bytes() const noexcept {
+    return impl_ != nullptr ? std::max(impl_->workspace.text_prefill_wide, impl_->workspace.mtp_prefill_wide) : 0;
+}
+
+
 SequencePlanner::SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 

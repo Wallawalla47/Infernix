@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <vector>
 
@@ -188,6 +189,30 @@ std::size_t frame_pools(std::span<const std::uint64_t> strides) {
 std::uint32_t pool_slack_frames(std::size_t pools, std::uint64_t chunk_bytes, std::uint64_t frame_bytes) noexcept {
     if (pools < 2 || frame_bytes == 0) { return 0; }
     return static_cast<std::uint32_t>((pools - 1) * chunk_bytes / frame_bytes);
+}
+
+LendCapacity lend_capacity(std::span<const std::uint64_t> strides, std::uint32_t experts, std::uint32_t frames) {
+    std::map<std::uint64_t, std::uint32_t> layers_of; // pitch -> its layers, as ExpertResidency groups them
+    for (const std::uint64_t stride : strides) { ++layers_of[stride]; }
+    const auto layers = static_cast<std::uint32_t>(strides.size());
+    LendCapacity best;
+    for (const auto& [pitch, count] : layers_of) {
+        const std::uint32_t limit    = count * experts - 1;
+        const std::uint32_t split    = layers_of.size() == 1 ? std::min(frames, limit) : std::min(frames / layers * count, limit);
+        const std::uint64_t lendable = split - split / 4;
+        if (lendable * pitch > best.frames * best.pitch) { best = {lendable, pitch}; }
+    }
+    return best;
+}
+
+VramSnapshot nominal_snapshot(VramSnapshot s, std::optional<std::uint64_t> in_use_before_load) noexcept {
+    if (!in_use_before_load) { return s; }
+    const std::uint64_t used = *in_use_before_load;
+    s.device_free = used >= kNominalInUseBytes ? s.device_free + (used - kNominalInUseBytes)
+                                               : s.device_free - std::min<std::uint64_t>(s.device_free, kNominalInUseBytes - used);
+    s.has_budget  = false;
+    s.display     = DisplayState::Attached;
+    return s;
 }
 
 VramControl::VramControl(const VramDemand& demand, std::uint64_t chunk_bytes, std::uint64_t usage,

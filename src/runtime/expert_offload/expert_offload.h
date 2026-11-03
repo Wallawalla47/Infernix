@@ -206,9 +206,9 @@ public:
 
     // After the Program's fixed allocations: the SSD tier, the link, the stream, the CPU service and
     // its rates, the frames (sized from free memory for `demand`'s graphs and headroom), the VRAM
-    // monitor, the warm start and the route trace. `lendable_frames` (optional) tells the Program how
-    // many frames it may borrow for a wide workspace (fit_wide_work_to_cache), before and after sizing.
-    void start(cudaStream_t compute, const std::function<void(std::uint64_t frames, std::uint64_t pitch)>& lendable_frames = {});
+    // monitor, the warm start and the route trace. The prefill chunk is fitted to the cache before
+    // (the Engine's offloaded_prefill_lent, from the frames Engine::plan estimates).
+    void start(cudaStream_t compute);
 
     // A layer's MoE source: its frames, host records (or tier tables), scales, geometry, staging, CPU
     // channel, fetch channel and error word. The per-call fields stay unset: landing (landing_slots(),
@@ -390,7 +390,7 @@ private:
     void plan_exclusive(const ExpertStore& store, HostExpertTier::Options& tier);
     void create_stream();
     void create_cpu_service();
-    void size_frames(cudaStream_t compute, const std::function<void(std::uint64_t, std::uint64_t)>& lendable_frames);
+    void size_frames(cudaStream_t compute);
     void warm_start(cudaStream_t compute);
     [[nodiscard]] VramDemand frame_demand(std::uint64_t frame_bytes) const;
     void on_vram_snapshot(const VramSnapshot& snapshot);

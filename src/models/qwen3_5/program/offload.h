@@ -96,9 +96,8 @@ public:
     ProgramOffload& operator=(const ProgramOffload&) = delete;
 
     // After the Program's fixed allocations: the engine's start (link, CPU service, frames, warm
-    // start), then the forward's view. `lendable_frames` as ExpertOffload::start.
-    void start(cudaStream_t compute,
-               const std::function<void(std::uint64_t frames, std::uint64_t pitch)>& lendable_frames = {});
+    // start), then the forward's view.
+    void start(cudaStream_t compute);
 
     [[nodiscard]] runtime::expert_offload::ExpertOffload& engine() noexcept { return engine_; }
     [[nodiscard]] const runtime::expert_offload::ExpertOffload& engine() const noexcept { return engine_; }

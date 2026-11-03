@@ -16,6 +16,7 @@
 #include <deque>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using namespace infernix;
 using namespace infernix::runtime::expert_offload;
@@ -495,8 +496,44 @@ void test_exclusive_tier() {
 
 } // namespace
 
+// What the prefill-chunk fits read (Flash-Next's start; the offloaded Qwen3.5's Engine plan, candidates RF-04 (c)):
+// the reproducible route's nominal launch, and the lend capacity of a cache not built yet, split among the
+// pools of its strides as resize splits it.
+void test_nominal_and_lend() {
+    VramSnapshot s;
+    s.device_free  = 20 * kGiB;
+    s.device_total = 32 * kGiB;
+    s.has_budget   = true;
+    s.display      = DisplayState::Headless;
+    require(nominal_snapshot(s, std::nullopt).device_free == s.device_free && nominal_snapshot(s, std::nullopt).has_budget,
+            "without a reading the snapshot stands");
+    const VramSnapshot busier = nominal_snapshot(s, 5 * kGiB);
+    require(busier.device_free == 22 * kGiB && !busier.has_budget && busier.display == DisplayState::Attached,
+            "5 GiB in use before loading: sized as if 3 GiB, an attached display and no OS budget");
+    require(nominal_snapshot(s, 1 * kGiB).device_free == 18 * kGiB, "1 GiB in use: 2 GiB less free than measured");
+    VramSnapshot tight = s;
+    tight.device_free  = 1 * kGiB;
+    require(nominal_snapshot(tight, 0).device_free == 0, "the nominal free memory stops at zero");
+
+    const std::vector<std::uint64_t> one(48, 10 * kMiB);
+    const auto lend = lend_capacity(one, 256, 1000);
+    require(lend.frames == 750 && lend.pitch == 10 * kMiB, "one pool lends what it keeps above a quarter");
+    require(lend_capacity(one, 256, 1000000).frames == (48 * 256 - 1) - (48 * 256 - 1) / 4,
+            "a pool lends at most what its limit keeps above a quarter");
+    require(lend.lends(749 * 10 * kMiB) && !lend.lends(749 * 10 * kMiB + 1) && !lend.lends(750 * 10 * kMiB),
+            "a run lends with a frame to spare");
+    std::vector<std::uint64_t> two(40, 4 * kMiB);
+    two.insert(two.end(), 8, 9 * kMiB);
+    // 4,800 frames over 48 layers: 4,000 for the 40 layers of 4 MiB (lending 12,000 MiB), 800 for the 8 of 9 MiB
+    // (5,400 MiB).
+    const auto split = lend_capacity(two, 256, 4800);
+    require(split.frames == 3000 && split.pitch == 4 * kMiB, "two pools: the one that lends the most bytes");
+    require(!LendCapacity{}.lends(1), "an empty cache lends nothing");
+}
+
 int main() {
     try {
+        test_nominal_and_lend();
         test_full_mode_boundary();
         test_reserve_applied_once();
         test_planned_terms();
