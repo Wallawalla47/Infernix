@@ -1383,6 +1383,12 @@ void lower_tools(const Json& body, GenerationRequest& request,
         }
         request.tools.push_back(std::move(tool.definition));
     }
+    // A deferred tool without a server tool search is a client deferring behind its own search
+    // (Claude Code's DeferredToolPlaceholder for its MCP tools, which its system reminder names): a
+    // direct call to one of those names is the client's to answer, not text. A server search's
+    // deferred tools are all declared, so its name set stays closed.
+    request.open_tool_names = searches.empty() && std::any_of(request.tools.begin(), request.tools.end(),
+                                                              [](const ToolDefinition& tool) { return tool.deferred; });
 }
 
 void parse_thinking(const Json& body, GenerationRequest& request) {

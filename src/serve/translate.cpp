@@ -320,6 +320,7 @@ infernix::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.preserve_thinking         = semantics.preserve_thinking;
     input.options.chat_template_kwargs_json = semantics.chat_template_kwargs_json;
     input.options.add_vision_id             = false;
+    input.options.open_tool_names           = request.open_tool_names;
     // Listed tools render in the prompt's tool section in request order; deferred ones only join
     // the output contract, so declaring one never changes the prompt.
     for (const ToolDefinition& tool : request.tools) {

@@ -59,13 +59,17 @@ struct ToolCallOutputContract {
     bool constrained = false;
     bool required    = false;
     bool parallel    = true;
+    // The client knows tools the request does not declare (PromptOptions::open_tool_names): a
+    // well-formed call to an undeclared name is the client's to judge, so the parser keeps it a call.
+    bool open_names  = false;
 };
 
 // Listed declarations come first, then deferred ones (declared but absent from the prompt's tool
 // section); declaration_index counts across both.
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons,
-                                std::span<const std::string> deferred_tool_jsons = {});
+                                std::span<const std::string> deferred_tool_jsons = {},
+                                bool open_names = false);
 
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
 select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& declarations,

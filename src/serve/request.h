@@ -198,6 +198,9 @@ struct GenerationRequest {
     NgramSessionHints ngram_session;
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
+    // The client knows tools it does not declare (Anthropic Messages with a deferred tool and no
+    // server tool search: Claude Code's MCP tools, listed by name only): infernix::PromptOptions::open_tool_names.
+    bool open_tool_names = false;
     std::size_t tool_name_max_length = kMaximumToolNameLength;
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;

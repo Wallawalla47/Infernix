@@ -1434,6 +1434,20 @@ int test_tolerant_undeclared_and_value_cut() {
     failures += check(!strict.is_tool_call_response &&
                           strict.diagnostics.fallback_reason == Reason::UndeclaredTool,
                       "strict mode did not reject the undeclared-name call");
+    // A client that knows tools it does not declare (PromptOptions::open_tool_names: Claude Code's
+    // deferred MCP tools, SY-05) gets the call even from the strict parser, not as a repair; a drifted
+    // opener still needs a declared name.
+    auto open        = std::make_shared<fi::ToolCallOutputContract>(*contract);
+    open->open_names = true;
+    const auto opened = parse(undeclared, 64, *open);
+    failures += check(opened.is_tool_call_response && opened.tool_calls.size() == 1 &&
+                          opened.tool_calls.front().name == "not_a_declared_tool" &&
+                          opened.diagnostics.fallback_reason == Reason::None &&
+                          !opened.diagnostics.tolerant_recovered &&
+                          Json::parse(opened.tool_calls.front().arguments_json).at("filePath") == "/tmp/out.js",
+                      "open names did not keep the undeclared-name call");
+    const auto drifted = parse("<tool_call>\n<=not_a_declared_tool>\n</function>\n</tool_call>", 64, *open, true);
+    failures += check(!drifted.is_tool_call_response, "open names read an undeclared drifted opener as a call");
 
     const std::string value_cut = "Now\n"
                                   "<tool_call>\n"

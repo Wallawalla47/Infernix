@@ -1309,6 +1309,10 @@ struct PromptOptions {
     // constraints cover them after tool_jsons, in this order, while the template's tool section
     // omits them; a message that loads one carries its definition in its own content.
     std::vector<std::string> deferred_tool_jsons;
+    // The client knows tools the request does not declare (it defers tools behind its own search, as
+    // Claude Code does with its MCP tools): a well-formed call to an undeclared name stays a call for
+    // the client to judge instead of turning into text. The prompt does not change.
+    bool open_tool_names = false;
 };
 
 enum class PromptCacheMarkerKind : std::uint8_t {

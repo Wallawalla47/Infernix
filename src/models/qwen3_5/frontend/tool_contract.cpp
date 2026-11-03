@@ -418,10 +418,11 @@ void prepare_strict_parameters(Contract::Tool& tool) {
 
 std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons,
-                                std::span<const std::string> deferred_tool_jsons) {
+                                std::span<const std::string> deferred_tool_jsons, bool open_names) {
     const std::size_t count = tool_jsons.size() + deferred_tool_jsons.size();
     if (count == 0) return {};
-    auto result = std::make_shared<Contract>();
+    auto result        = std::make_shared<Contract>();
+    result->open_names = open_names;
     std::set<std::string> names;
     for (std::size_t i = 0; i < count; ++i) {
         const std::string& source = i < tool_jsons.size() ? tool_jsons[i]
@@ -478,9 +479,10 @@ select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& d
         std::none_of(declarations->tools.begin(), declarations->tools.end(),
                      [](const auto& tool) { return tool.strict; }))
         return declarations;
-    auto selected      = std::make_shared<Contract>();
-    selected->required = choice.mode == ToolChoiceMode::Required;
-    selected->parallel = choice.parallel;
+    auto selected        = std::make_shared<Contract>();
+    selected->required   = choice.mode == ToolChoiceMode::Required;
+    selected->parallel   = choice.parallel;
+    selected->open_names = declarations && declarations->open_names;
     if (declarations && choice.mode != ToolChoiceMode::None) {
         for (const auto& tool : declarations->tools) {
             if (!choice.allowed_names ||

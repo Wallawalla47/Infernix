@@ -1526,6 +1526,13 @@ blocks inside an ordinary `tool_result`:
 The referenced definitions load after the result's text and images. A `tool_reference` outside a
 `tool_result` is rejected. Count Tokens lowers the same history.
 
+Such a client may know tools it does not declare at all: Claude Code declares one deferred
+`DeferredToolPlaceholder` and lists its MCP tools by name in a system reminder until its search
+loads them. A request with a deferred tool and no tool search tool therefore takes a model's direct
+call to an undeclared name as a `tool_use` for the client to judge (Claude Code runs a deferred MCP
+tool called this way) instead of turning it into text; with a tool search tool every deferred tool
+is declared, and a call outside the declared names stays text under the default parser.
+
 ### OpenAI Responses
 
 Declare one `tool_search` tool. Without `execution`, or with `"execution":"server"`, the search is

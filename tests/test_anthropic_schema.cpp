@@ -1366,6 +1366,14 @@ int test_deferred_tool_declarations() {
                           std::vector<std::string>{"tools/0/input_schema", "tools/1/input_schema",
                                                    "tools/2/input_schema"},
                       "Engine tool-schema errors no longer map to their request tools");
+    // A server search declares every deferred tool, so its name set stays closed; a deferred tool
+    // without one (Claude Code's DeferredToolPlaceholder for its MCP tools, which its system
+    // reminder lists by name only, SY-05) opens it for calls to undeclared names.
+    Json claude_code     = base_request();
+    claude_code["tools"] = Json::array({ordinary_tool(), deferred_tool("DeferredToolPlaceholder", "Placeholder")});
+    failures += check(with_prompt.options.open_tool_names == false && !without_prompt.options.open_tool_names &&
+                          prompt(parse(claude_code).generation).options.open_tool_names,
+                      "open tool names do not follow a client-side deferral");
 
     Json none           = deferred;
     none["tool_choice"] = Json{{"type", "none"}};
