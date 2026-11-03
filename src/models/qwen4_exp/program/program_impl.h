@@ -1143,6 +1143,7 @@ public:
             banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.device_records));
             host_strides.push_back(layer.moe.bank->planes.record_stride);
             record_stride = std::max(record_stride, layer.moe.bank->planes.record_stride);
+            bank_host_bytes_ += layer.moe.bank->planes.record_stride * c_.moe.experts;
         }
         if (record_stride != plan_.record_stride ||
             (!c_.exact_experts && std::any_of(host_strides.begin(), host_strides.end(),
@@ -2978,6 +2979,24 @@ public:
         out.kv_cache                = options_.kv_cache;
         out.kv_payload_bytes        = kv_vmm_ ? kv_vmm_->mapped_bytes() : kv_backing_.bytes;
         out.workspace_logical_peak_bytes = work_capacity_;
+        if (residency_) {
+            // As the 122B's ExpertOffload::memory_summary reports its cache; the cache only resizes
+            // under the VRAM monitor, so without it the startup frames are today's.
+            ExpertCacheMemorySummary cache;
+            cache.frames         = residency_->frames();
+            cache.startup_frames = monitor_ ? startup_frames_ : cache.frames;
+            cache.routed_experts = static_cast<std::uint64_t>(c_.num_hidden_layers) * c_.moe.experts;
+            cache.frame_bytes    = residency_->frame_bytes();
+            cache.staging_bytes  = plan_.staging;
+            cache.ssd_tier       = tier_ != nullptr;
+            cache.host_ram_bytes = tier_ ? options_.expert_ram_bytes + options_.expert_unpinned_bytes : bank_host_bytes_;
+            if (kv_vmm_ && residency_->elastic()) {
+                cache.kv_backed_pages   = pool_->backed_pages();
+                cache.kv_capacity_pages = pool_->capacity_pages();
+                cache.kv_backed_bytes   = kv_vmm_->mapped_bytes();
+            }
+            out.expert_cache = cache;
+        }
         return out;
     }
 
@@ -5970,6 +5989,7 @@ private:
     std::optional<VramControl> control_;
     std::function<void()> waker_;
     std::uint32_t frames_now_ = 0, startup_frames_ = 0;
+    std::uint64_t bank_host_bytes_ = 0; // every routed expert's record in host memory (memory())
     std::uint64_t pool_now_   = 0;
     bool low_frames_warned_   = false;
     bool pressure_warned_     = false;

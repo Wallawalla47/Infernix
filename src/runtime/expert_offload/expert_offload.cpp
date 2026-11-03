@@ -922,6 +922,16 @@ void ExpertOffload::size_frames(cudaStream_t compute, const std::function<void(s
 
 double ExpertOffload::vram_seconds() const { return std::chrono::duration<double>(Clock::now() - vram_epoch_).count(); }
 
+ExpertCacheTotals ExpertOffload::totals() const noexcept {
+    const ExpertResidency::Stats& s = residency_->stats();
+    return ExpertCacheTotals{.frames     = residency_->frames(),
+                             .routed     = s.routed,
+                             .hits       = s.hits,
+                             .promotions = s.promotions,
+                             .landed     = s.landed,
+                             .cpu_served = cpu_service_ ? cpu_service_->served_experts() : 0};
+}
+
 ExpertCacheMemorySummary ExpertOffload::memory_summary() const noexcept {
     ExpertCacheMemorySummary out;
     out.frames         = residency_->frames();

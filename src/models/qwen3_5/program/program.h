@@ -493,6 +493,9 @@ public:
     // HybridPrefixCacheOptions::persistent_save_interval). Absent without a file or a change.
     [[nodiscard]] std::optional<HybridCachePersistence> save_prefix_cache_now(const CancellationView& abandoned);
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    // With offloaded experts: the VRAM expert cache's counters since startup and its size now
+    // (RuntimeStats::expert_cache); nothing otherwise.
+    [[nodiscard]] std::optional<ExpertCacheTotals> expert_cache_totals() const noexcept;
     void reset_memory_peaks() noexcept;
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept;

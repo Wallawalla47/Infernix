@@ -3,7 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
+#include <vector>
 
 namespace infernix {
 
@@ -52,15 +54,40 @@ public:
     // Writes one byte of every page of [begin, end) that nothing has written yet, so its first
     // touch (the zeroing) happens here; it must not overlap bytes already filled.
     void prefault(std::size_t begin, std::size_t end) const noexcept;
-    // Page-locks and maps the block for the device; once.
-    void pin();
-    [[nodiscard]] std::byte* device_data() const noexcept { return device_; } // null before pin()
+    // Page-locks and maps the block for the device; once. One registration of the whole block; when
+    // the driver refuses it and `boundaries` (ascending offsets inside the block where an object
+    // begins) are given, slices of at most kSliceBytes that end only at those offsets, each mapped
+    // on its own (Basalt #73/#82: a Windows host refused 39.5 GiB whole and pinned it in slices).
+    // Throws when a slice is refused too. `slice_bytes` is for tests.
+    static constexpr std::size_t kSliceBytes = std::size_t{4} << 30;
+    void pin(std::span<const std::size_t> boundaries = {}, std::size_t slice_bytes = kSliceBytes);
+    // Where the device reaches byte `offset` (null before pin()). Contiguous within a slice, so an
+    // object that begins at one of pin()'s boundaries reads from here to its end.
+    [[nodiscard]] std::byte* device_at(std::size_t offset) const noexcept;
+    [[nodiscard]] std::byte* device_data() const noexcept { return device_at(0); }
+    // Registrations the block took: 1 whole, more in slices, 0 before pin().
+    [[nodiscard]] std::size_t registrations() const noexcept { return slices_.size(); }
 
 private:
-    std::byte* data_   = nullptr;
-    std::size_t size_  = 0;
-    std::byte* device_ = nullptr;
+    struct Slice {
+        std::size_t begin  = 0;
+        std::size_t bytes  = 0;
+        std::byte* device = nullptr;
+    };
+    // Registers [begin, begin + bytes) and appends it to slices_; false when the driver refuses it.
+    bool register_slice(std::size_t begin, std::size_t bytes, std::string& failure);
+    void unregister() noexcept;
+
+    std::byte* data_  = nullptr;
+    std::size_t size_ = 0;
+    std::vector<Slice> slices_;
 };
+
+namespace testing {
+// Makes RegisteredHostBuffer::pin refuse every registration larger than `bytes` (0: none), as a
+// driver that will not page-lock one large block would (sliced-pinning tests).
+void refuse_host_registrations_above(std::size_t bytes);
+} // namespace testing
 
 // Host memory kept in RAM for the CPU without page-locking it for the device: on Windows the
 // process's hard minimum working set grows by its size and its pages are VirtualLock'ed; on Linux

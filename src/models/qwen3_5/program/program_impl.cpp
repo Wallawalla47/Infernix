@@ -59,9 +59,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
-      spill_source(offload_options != nullptr
-                       ? open_vram_budget_source(device_in.device, offload_options->engine.vram_past_budget)
-                       : nullptr),
+      // Every Program checks its fixed allocations against the driver's sysmem fallback (VR-04): a
+      // resident model's KV and arenas are as exposed to it as an offloaded one's.
+      spill_source(open_vram_budget_source(
+          device_in.device, offload_options != nullptr && offload_options->engine.vram_past_budget)),
       spill_guard(begun_spill_guard(spill_source.get())), persistent(plan.persistent.bytes),
       workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),

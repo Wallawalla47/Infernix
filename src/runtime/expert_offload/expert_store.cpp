@@ -1,11 +1,13 @@
 #include "runtime/expert_offload/expert_store.h"
 
+#include "artifact/file_io.h"
 #include "artifact/framing.h"
 
 #include <algorithm>
 #include <cstring>
-#include <fstream>
 #include <iterator>
+#include <optional>
+#include <span>
 #include <string>
 
 namespace infernix::runtime::expert_offload {
@@ -120,12 +122,18 @@ ExpertStripe read_expert_stripe(const std::filesystem::path& path) {
     const auto fail = [&](const std::string& why) {
         throw artifact::ArtifactError("expert stripe " + path.string() + ": " + why);
     };
-    std::ifstream file(path, std::ios::binary);
-    if (!file) { fail("cannot open"); }
+    // Read through the unbuffered handle the records are read with: a cached read of a file Windows
+    // then reads unbuffered can throttle those reads (Basalt #57).
+    std::optional<artifact::InputFile> file;
+    try {
+        file.emplace(path);
+    } catch (const std::exception&) { fail("cannot open"); }
+    const auto read = [&](std::uint64_t offset, std::span<std::uint8_t> into) {
+        if (offset > file->bytes() || into.size() > file->bytes() - offset) { fail("shorter than its header"); }
+        file->read_exact(offset, std::as_writable_bytes(into));
+    };
     std::vector<std::uint8_t> header(ExpertStore::kAlignment);
-    if (!file.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()))) {
-        fail("shorter than its header");
-    }
+    read(0, header);
     if (!std::equal(std::begin(kStripeMagic), std::end(kStripeMagic), header.begin())) {
         fail("not an expert stripe (or not completely written)");
     }
@@ -141,14 +149,10 @@ ExpertStripe read_expert_stripe(const std::filesystem::path& path) {
         fail("inconsistent header");
     }
     header.resize(bytes);
-    if (bytes > ExpertStore::kAlignment &&
-        !file.read(reinterpret_cast<char*>(header.data() + ExpertStore::kAlignment),
-                   static_cast<std::streamsize>(bytes - ExpertStore::kAlignment))) {
-        fail("shorter than its header");
+    if (bytes > ExpertStore::kAlignment) {
+        read(ExpertStore::kAlignment, std::span<std::uint8_t>(header).subspan(ExpertStore::kAlignment));
     }
-    std::error_code error;
-    const std::uint64_t size = std::filesystem::file_size(path, error);
-    if (error) { fail("cannot read its size"); }
+    const std::uint64_t size = file->bytes();
     std::uint64_t end = bytes;
     for (std::uint32_t l = 0; l < layers; ++l) {
         const std::uint8_t* p = &header[kStripeFixed + static_cast<std::size_t>(l) * kStripeLayer];

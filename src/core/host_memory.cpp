@@ -3,8 +3,10 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -22,6 +24,13 @@
 
 namespace infernix {
 namespace {
+
+std::atomic<std::size_t>& refused_registrations() {
+    static std::atomic<std::size_t> above{0};
+    return above;
+}
+
+std::size_t refused_registration_above() noexcept { return refused_registrations().load(std::memory_order_relaxed); }
 
 #ifndef _WIN32
 // A "Key:   N kB" field of a /proc file, in bytes.
@@ -135,7 +144,7 @@ RegisteredHostBuffer::RegisteredHostBuffer(std::size_t bytes) : size_(bytes) {
 }
 
 RegisteredHostBuffer::~RegisteredHostBuffer() {
-    if (device_ != nullptr) { (void)cudaHostUnregister(data_); }
+    unregister();
 #ifdef _WIN32
     (void)::VirtualFree(data_, 0, MEM_RELEASE);
 #else
@@ -150,19 +159,75 @@ void RegisteredHostBuffer::prefault(std::size_t begin, std::size_t end) const no
     }
 }
 
-void RegisteredHostBuffer::pin() {
-    if (device_ != nullptr) { throw std::logic_error("RegisteredHostBuffer is already pinned"); }
-    if (const auto status = cudaHostRegister(data_, size_, cudaHostRegisterPortable | cudaHostRegisterMapped);
+bool RegisteredHostBuffer::register_slice(std::size_t begin, std::size_t bytes, std::string& failure) {
+    std::byte* at = data_ + begin;
+    if (const std::size_t limit = refused_registration_above(); limit != 0 && bytes > limit) {
+        failure = "cudaHostRegister of " + std::to_string(bytes) + " bytes refused (test)";
+        return false;
+    }
+    if (const auto status = cudaHostRegister(at, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped);
         status != cudaSuccess) {
-        throw std::runtime_error("cudaHostRegister of " + std::to_string(size_) +
-                                 " bytes failed: " + cudaGetErrorString(status));
+        (void)cudaGetLastError();
+        failure = "cudaHostRegister of " + std::to_string(bytes) + " bytes failed: " + cudaGetErrorString(status);
+        return false;
     }
     void* device = nullptr;
-    if (const auto status = cudaHostGetDevicePointer(&device, data_, 0); status != cudaSuccess) {
-        (void)cudaHostUnregister(data_);
+    if (const auto status = cudaHostGetDevicePointer(&device, at, 0); status != cudaSuccess) {
+        (void)cudaHostUnregister(at);
         throw std::runtime_error(std::string("cudaHostGetDevicePointer failed: ") + cudaGetErrorString(status));
     }
-    device_ = static_cast<std::byte*>(device);
+    slices_.push_back(Slice{.begin = begin, .bytes = bytes, .device = static_cast<std::byte*>(device)});
+    return true;
+}
+
+void RegisteredHostBuffer::unregister() noexcept {
+    for (const Slice& slice : slices_) { (void)cudaHostUnregister(data_ + slice.begin); }
+    slices_.clear();
+}
+
+void RegisteredHostBuffer::pin(std::span<const std::size_t> boundaries, std::size_t slice_bytes) {
+    if (!slices_.empty()) { throw std::logic_error("RegisteredHostBuffer is already pinned"); }
+    std::string whole;
+    if (register_slice(0, size_, whole)) { return; }
+    // Slices that end at object boundaries, each as long as slice_bytes allows (an object larger
+    // than that is one slice of its own); a slice never splits a page, which two registrations
+    // cannot share.
+    constexpr std::size_t kPage = 4096;
+    std::vector<std::size_t> cuts;
+    for (const std::size_t at : boundaries) {
+        if (at % kPage == 0 && at > 0 && at < size_ && (cuts.empty() || at > cuts.back())) { cuts.push_back(at); }
+    }
+    if (cuts.empty()) { throw std::runtime_error(whole); }
+    std::size_t begin = 0;
+    std::size_t next  = 0;
+    while (begin < size_) {
+        std::size_t end = size_;
+        while (next < cuts.size() && cuts[next] <= begin) { ++next; }
+        if (end - begin > slice_bytes) {
+            std::size_t cut = next;
+            while (cut < cuts.size() && cuts[cut] - begin <= slice_bytes) { ++cut; }
+            if (cut > next) {
+                end = cuts[cut - 1];
+            } else if (next < cuts.size()) {
+                end = cuts[next];
+            }
+        }
+        std::string failure;
+        if (!register_slice(begin, end - begin, failure)) {
+            unregister();
+            throw std::runtime_error(whole + "; registered in slices of at most " + std::to_string(slice_bytes >> 20) +
+                                     " MiB instead, a slice failed too: " + failure);
+        }
+        begin = end;
+    }
+}
+
+std::byte* RegisteredHostBuffer::device_at(std::size_t offset) const noexcept {
+    if (slices_.empty()) { return nullptr; }
+    const auto after = std::upper_bound(slices_.begin(), slices_.end(), offset,
+                                        [](std::size_t at, const Slice& slice) { return at < slice.begin; });
+    const Slice& slice = *(after - 1);
+    return slice.device + (offset - slice.begin);
 }
 
 ResidentHostBuffer::ResidentHostBuffer(std::size_t bytes) : size_(bytes) {
@@ -245,5 +310,11 @@ AddressReservation::~AddressReservation() {
     (void)::munmap(data_, size_);
 #endif
 }
+
+namespace testing {
+void refuse_host_registrations_above(std::size_t bytes) {
+    refused_registrations().store(bytes, std::memory_order_relaxed);
+}
+} // namespace testing
 
 } // namespace infernix

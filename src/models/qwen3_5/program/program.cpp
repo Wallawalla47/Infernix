@@ -273,6 +273,10 @@ std::optional<HybridCachePersistence> Program::hybrid_shutdown_save() const {
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->physical_usage(); }
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
+std::optional<ExpertCacheTotals> Program::expert_cache_totals() const noexcept {
+    if (!impl_->offload) { return std::nullopt; }
+    return impl_->offload->engine().totals();
+}
 
 void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
 

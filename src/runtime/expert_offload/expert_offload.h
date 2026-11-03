@@ -239,6 +239,8 @@ public:
     [[nodiscard]] HostExpertTier* tier() noexcept { return tier_.get(); }
     [[nodiscard]] ExpertStream* stream() noexcept { return stream_.get(); }
     [[nodiscard]] ops::offloaded_moe::CpuMissService* cpu_service() noexcept { return cpu_service_.get(); }
+    // The cache's counters since startup and its size now (RuntimeStats::expert_cache).
+    [[nodiscard]] ExpertCacheTotals totals() const noexcept;
     [[nodiscard]] const CpuSplitPolicy* split_policy() const noexcept { return split_.get(); }
     [[nodiscard]] double link_bytes_per_second() const noexcept { return link_bytes_per_second_; }
     [[nodiscard]] std::uint32_t frames() const noexcept { return residency_->frames(); }

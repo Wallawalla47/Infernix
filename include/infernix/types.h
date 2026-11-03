@@ -1880,8 +1880,9 @@ struct ExpertCacheStats {
     std::uint64_t decode_hits   = 0;
 };
 
-// Qwen3.8-Flash-Next: the VRAM expert cache's cumulative counters since startup and its current
-// size (RuntimeStats::expert_cache, exported by /metrics). Absent for models without one.
+// An offloaded-expert model (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): the VRAM expert cache's
+// cumulative counters since startup and its current size (RuntimeStats::expert_cache, exported by
+// /metrics). Absent for models without one.
 struct ExpertCacheTotals {
     std::uint32_t frames     = 0; // frames backed now, one routed expert each
     std::uint64_t routed     = 0; // routed (layer, expert) uses
@@ -2221,7 +2222,8 @@ struct RuntimeStats {
     std::uint32_t device_main_kv_occupied_pages    = 0;
     std::uint32_t device_backend_kv_occupied_pages = 0;
 
-    // The VRAM expert cache of an offloaded-expert model (Qwen3.8-Flash-Next); absent otherwise.
+    // The VRAM expert cache of an offloaded-expert model (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B);
+    // absent otherwise.
     std::optional<ExpertCacheTotals> expert_cache;
 
     // The prefix cache; zero when it is disabled. Block and snapshot gauges are absolute; the

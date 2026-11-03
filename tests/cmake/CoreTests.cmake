@@ -18,6 +18,11 @@ infernix_add_test(infernix_direct_read_queue_test SOURCES "${CMAKE_CURRENT_LIST_
 infernix_add_test(infernix_read_only_file_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_read_only_file.cpp"
   LIBRARIES infernix_core)
 
+# Pinned host blocks registered whole or in slices at object boundaries (candidates SS-02; a CUDA device).
+infernix_add_test(infernix_host_memory_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_memory.cpp"
+  LIBRARIES infernix_core)
+set_tests_properties(infernix_host_memory_test PROPERTIES SKIP_RETURN_CODE 77)
+
 set_tests_properties(infernix_device_test PROPERTIES
   ENVIRONMENT_MODIFICATION "INFERNIX_CUDA_SYNC=unset:")
 set(sync_modes spin blocking yield auto)

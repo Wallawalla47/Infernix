@@ -528,9 +528,22 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     }
     if (out.pinned_) {
         prefault.reset(); // every worker done before the block is locked
-        out.pinned_->pin();
+        // In slices at object boundaries when the driver refuses the whole block (candidates SS-02).
+        std::vector<std::size_t> boundaries;
+        boundaries.reserve(plan.pinned_objects.size());
         for (const auto& placement : plan.pinned_objects) {
-            out.objects_.at(placement.object.index).pinned->device = out.pinned_->device_data() + placement.offset;
+            boundaries.push_back(static_cast<std::size_t>(placement.offset));
+        }
+        std::sort(boundaries.begin(), boundaries.end());
+        try {
+            out.pinned_->pin(boundaries);
+        } catch (const std::runtime_error& error) {
+            throw ArtifactError(std::string("the pinned weights could not be page-locked (") + error.what() +
+                                "); with offloaded experts a smaller --expert-ram-mib pins fewer of them");
+        }
+        for (const auto& placement : plan.pinned_objects) {
+            out.objects_.at(placement.object.index).pinned->device =
+                out.pinned_->device_at(static_cast<std::size_t>(placement.offset));
         }
     }
     std::vector<CopyRange> ranges;
