@@ -12,6 +12,7 @@
 #include "infernix/ops/offloaded_sparse_moe.h"
 
 #include "core/device.h"
+#include "core/grid_rows.h"
 #include "core/pdl.cuh"
 #include "core/temporary_switches.h"
 
@@ -2535,10 +2536,8 @@ __global__ void __launch_bounds__(kThreads)
 
 // --------------------------------------------------------------------------------------- combine
 
-// A grid has at most 65,535 rows: a wider call (a 122B prefill pass of 94K columns) gives each row of
-// blocks several columns, each computed as alone.
-constexpr int kCombineGridRows = 65535;
-
+// A wider call than a grid's rows (a 122B prefill pass of 94K columns) gives each row of blocks
+// several columns, each computed as alone (core/grid_rows.h).
 template <bool kMasked>
 __global__ void combine_kernel(const bf16* __restrict__ outputs, const float* __restrict__ weights,
                                const float* __restrict__ shared_gate, const bf16* __restrict__ shared,
@@ -2573,7 +2572,7 @@ __global__ void combine_inject_kernel(const bf16* __restrict__ outputs, const fl
     pdl::enter();
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= hidden) { return; }
-    for (int t = blockIdx.y; t < columns; t += gridDim.y) { // kCombineGridRows, as combine_kernel
+    for (int t = blockIdx.y; t < columns; t += gridDim.y) { // grid_rows, as combine_kernel
         float sum = 0.0F;
         for (int k = 0; k < top_k; ++k) { // fixed rank order: placement-invariant
             sum += weights[static_cast<std::size_t>(t) * top_k + k] *
@@ -3145,7 +3144,7 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
     const bool masked = routing.mask.valid != nullptr;
     require(!masked || (routing.mask.width > 0 && columns % routing.mask.width == 0),
             "a column mask needs whole rows of the call's columns");
-    const dim3 grid((hidden + kThreads - 1) / kThreads, std::min(columns, kCombineGridRows));
+    const dim3 grid((hidden + kThreads - 1) / kThreads, grid_rows(columns));
     const auto* routed_out = static_cast<const bf16*>(outputs.data);
     const auto* weights    = static_cast<const float*>(routing.weights.data);
     const auto* gate       = static_cast<const float*>(routing.shared_gate.data);
@@ -3172,7 +3171,7 @@ void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const 
                 inject.ne[1] == columns && streams > 0 && residual.ne[0] == streams * hidden &&
                 residual.ne[1] == columns,
             "combine inject shapes disagree");
-    CUDA_CHECK(pdl::launch_consumer({dim3((hidden + kThreads - 1) / kThreads, std::min(columns, kCombineGridRows)),
+    CUDA_CHECK(pdl::launch_consumer({dim3((hidden + kThreads - 1) / kThreads, grid_rows(columns)),
                                      dim3(kThreads), 0, stream},
                                     combine_inject_kernel, static_cast<const bf16*>(outputs.data),
                                     static_cast<const float*>(routing.weights.data),

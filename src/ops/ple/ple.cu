@@ -1,5 +1,7 @@
 #include "infernix/ops/ple.h"
 
+#include "core/grid_rows.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -42,15 +44,17 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
     return total;
 }
 
+// Every kernel that gives a column a row of blocks loops over the call's columns (core/grid_rows.h).
 __global__ void embed_kernel(const std::uint8_t* __restrict__ rows, const bf16* __restrict__ scale,
-                             int elements, bf16* __restrict__ out) {
+                             int elements, int columns, bf16* __restrict__ out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
     if (i >= elements) { return; }
-    __nv_fp8_e4m3 code;
-    code.__x      = rows[static_cast<std::size_t>(t) * elements + i];
-    const float v = static_cast<float>(code) * __bfloat162float(scale[0]);
-    out[static_cast<std::size_t>(t) * elements + i] = __float2bfloat16_rn(v);
+    for (int t = blockIdx.y; t < columns; t += gridDim.y) {
+        __nv_fp8_e4m3 code;
+        code.__x      = rows[static_cast<std::size_t>(t) * elements + i];
+        const float v = static_cast<float>(code) * __bfloat162float(scale[0]);
+        out[static_cast<std::size_t>(t) * elements + i] = __float2bfloat16_rn(v);
+    }
 }
 
 // bf16_rn(p * m) of the exact product: hi = fl32(p * m) and its error lo (an FMA residual, exact)
@@ -103,40 +107,42 @@ __global__ void __launch_bounds__(kThreads)
     gate_kernel(const bf16* __restrict__ key, const bf16* __restrict__ value,
                 const bf16* __restrict__ residual, const Norm* __restrict__ key_norm,
                 const Norm* __restrict__ query_norm, const Norm* __restrict__ conv_norm, int hidden,
-                int width, float eps, bf16* __restrict__ gated, bf16* __restrict__ normalized) {
+                int width, int columns, float eps, bf16* __restrict__ gated, bf16* __restrict__ normalized) {
     __shared__ float scratch[kThreads / 32];
-    const int s = blockIdx.x, t = blockIdx.y;
-    const std::size_t base = static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
-    float key_sq = 0.0F, query_sq = 0.0F;
-    for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
-        const float k = __bfloat162float(key[base + d]);
-        const float q = __bfloat162float(residual[base + d]);
-        key_sq += k * k;
-        query_sq += q * q;
-    }
-    const float key_inv   = rsqrtf(block_sum(key_sq, scratch) / static_cast<float>(hidden) + eps);
-    const float query_inv = rsqrtf(block_sum(query_sq, scratch) / static_cast<float>(hidden) + eps);
-    float dot = 0.0F;
-    for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
-        const std::size_t c = static_cast<std::size_t>(s) * hidden + d;
-        const float k = __bfloat162float(key[base + d]) * key_inv * (1.0F + norm_value(key_norm[c]));
-        const float q = __bfloat162float(residual[base + d]) * query_inv * (1.0F + norm_value(query_norm[c]));
-        dot += k * q;
-    }
-    float g = block_sum(dot, scratch) / sqrtf(static_cast<float>(hidden));
-    g       = copysignf(sqrtf(fmaxf(fabsf(g), 1.0e-6F)), g);
-    const float gate = sigmoidf(g);
-    float gated_sq   = 0.0F;
-    for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
-        const float v = gate * __bfloat162float(value[static_cast<std::size_t>(t) * hidden + d]);
-        gated[base + d] = __float2bfloat16_rn(v);
-        gated_sq += v * v;
-    }
-    const float gated_inv = rsqrtf(block_sum(gated_sq, scratch) / static_cast<float>(hidden) + eps);
-    for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
-        const std::size_t c = static_cast<std::size_t>(s) * hidden + d;
-        const float v = gate * __bfloat162float(value[static_cast<std::size_t>(t) * hidden + d]);
-        normalized[base + d] = __float2bfloat16_rn(v * gated_inv * (1.0F + norm_value(conv_norm[c])));
+    const int s = blockIdx.x;
+    for (int t = blockIdx.y; t < columns; t += gridDim.y) {
+        const std::size_t base = static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
+        float key_sq = 0.0F, query_sq = 0.0F;
+        for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
+            const float k = __bfloat162float(key[base + d]);
+            const float q = __bfloat162float(residual[base + d]);
+            key_sq += k * k;
+            query_sq += q * q;
+        }
+        const float key_inv   = rsqrtf(block_sum(key_sq, scratch) / static_cast<float>(hidden) + eps);
+        const float query_inv = rsqrtf(block_sum(query_sq, scratch) / static_cast<float>(hidden) + eps);
+        float dot = 0.0F;
+        for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
+            const std::size_t c = static_cast<std::size_t>(s) * hidden + d;
+            const float k = __bfloat162float(key[base + d]) * key_inv * (1.0F + norm_value(key_norm[c]));
+            const float q = __bfloat162float(residual[base + d]) * query_inv * (1.0F + norm_value(query_norm[c]));
+            dot += k * q;
+        }
+        float g = block_sum(dot, scratch) / sqrtf(static_cast<float>(hidden));
+        g       = copysignf(sqrtf(fmaxf(fabsf(g), 1.0e-6F)), g);
+        const float gate = sigmoidf(g);
+        float gated_sq   = 0.0F;
+        for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
+            const float v = gate * __bfloat162float(value[static_cast<std::size_t>(t) * hidden + d]);
+            gated[base + d] = __float2bfloat16_rn(v);
+            gated_sq += v * v;
+        }
+        const float gated_inv = rsqrtf(block_sum(gated_sq, scratch) / static_cast<float>(hidden) + eps);
+        for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
+            const std::size_t c = static_cast<std::size_t>(s) * hidden + d;
+            const float v = gate * __bfloat162float(value[static_cast<std::size_t>(t) * hidden + d]);
+            normalized[base + d] = __float2bfloat16_rn(v * gated_inv * (1.0F + norm_value(conv_norm[c])));
+        }
     }
 }
 
@@ -147,24 +153,25 @@ __global__ void conv_kernel(const bf16* __restrict__ gated, const bf16* __restri
                             const std::int32_t* __restrict__ source_slots, int columns,
                             bf16* __restrict__ residual) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
-    if (c >= channels || t >= columns) { return; }
-    const int sequence = t / width, local = t % width;
-    const int slot     = source_slots[sequence];
-    float acc          = 0.0F;
-    for (int j = 0; j < taps; ++j) {
-        const int source = local - (taps - 1 - j) * dilation;
-        float x;
-        if (source >= 0) {
-            x = __bfloat162float(normalized[static_cast<std::size_t>(sequence * width + source) * channels + c]);
-        } else {
-            x = __bfloat162float(states[(static_cast<std::size_t>(slot) * span + (span + source)) * channels + c]);
+    if (c >= channels) { return; }
+    for (int t = blockIdx.y; t < columns; t += gridDim.y) {
+        const int sequence = t / width, local = t % width;
+        const int slot     = source_slots[sequence];
+        float acc          = 0.0F;
+        for (int j = 0; j < taps; ++j) {
+            const int source = local - (taps - 1 - j) * dilation;
+            float x;
+            if (source >= 0) {
+                x = __bfloat162float(normalized[(static_cast<std::size_t>(sequence) * width + source) * channels + c]);
+            } else {
+                x = __bfloat162float(states[(static_cast<std::size_t>(slot) * span + (span + source)) * channels + c]);
+            }
+            acc += __bfloat162float(weight[static_cast<std::size_t>(j) * channels + c]) * x;
         }
-        acc += __bfloat162float(weight[static_cast<std::size_t>(j) * channels + c]) * x;
+        const std::size_t i = static_cast<std::size_t>(t) * channels + c;
+        const float out     = __bfloat162float(gated[i]) + acc * sigmoidf(acc);
+        residual[i]         = __float2bfloat16_rn(__bfloat162float(residual[i]) + out);
     }
-    const std::size_t i = static_cast<std::size_t>(t) * channels + c;
-    const float out     = __bfloat162float(gated[i]) + acc * sigmoidf(acc);
-    residual[i]         = __float2bfloat16_rn(__bfloat162float(residual[i]) + out);
 }
 
 // One thread per (channel, sequence) shifts the history in increasing order, so an in-place
@@ -221,8 +228,8 @@ void ple_embed(const Tensor& rows, const Tensor& scale, Tensor& out, cudaStream_
     const int columns  = rows.ne[2];
     require(scale.numel() == 1 && out.ne[0] == elements && out.ne[1] == columns && columns > 0,
             "embed shapes disagree");
-    embed_kernel<<<dim3((elements + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
-        static_cast<const std::uint8_t*>(rows.data), static_cast<const bf16*>(scale.data), elements,
+    embed_kernel<<<dim3((elements + kThreads - 1) / kThreads, grid_rows(columns)), kThreads, 0, stream>>>(
+        static_cast<const std::uint8_t*>(rows.data), static_cast<const bf16*>(scale.data), elements, columns,
         static_cast<bf16*>(out.data));
     check_launch("embed");
 }
@@ -262,11 +269,11 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
                 normalized.ne[0] == width && normalized.ne[1] == columns && columns > 0 && eps > 0,
             "gate shapes disagree");
     const auto launch = [&]<class Norm>() {
-        gate_kernel<Norm><<<dim3(streams, columns), kThreads, 0, stream>>>(
+        gate_kernel<Norm><<<dim3(streams, grid_rows(columns)), kThreads, 0, stream>>>(
             static_cast<const bf16*>(key.data), static_cast<const bf16*>(value.data),
             static_cast<const bf16*>(residual.data), static_cast<const Norm*>(key_norm.data),
-            static_cast<const Norm*>(query_norm.data), static_cast<const Norm*>(conv_norm.data), hidden, width, eps,
-            static_cast<bf16*>(gated.data), static_cast<bf16*>(normalized.data));
+            static_cast<const Norm*>(query_norm.data), static_cast<const Norm*>(conv_norm.data), hidden, width,
+            columns, eps, static_cast<bf16*>(gated.data), static_cast<bf16*>(normalized.data));
     };
     if (norm == DType::FP32) {
         launch.template operator()<float>();
@@ -294,7 +301,7 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
     const int span = (taps - 1) * dilation;
     require(states.ne[0] == channels && states.ne[1] == span, "conv state must be [C, span, slots]");
     const int width = columns / sequences;
-    conv_kernel<<<dim3((channels + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
+    conv_kernel<<<dim3((channels + kThreads - 1) / kThreads, grid_rows(columns)), kThreads, 0, stream>>>(
         static_cast<const bf16*>(gated.data), static_cast<const bf16*>(normalized.data),
         static_cast<const bf16*>(weight.data), taps, dilation, span, channels, width,
         static_cast<const bf16*>(states.data), static_cast<const std::int32_t*>(source_slots.data),

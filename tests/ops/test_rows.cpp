@@ -90,6 +90,9 @@ INFERNIX_OP_TEST(rows) {
     failures += split_case({7, 9}, 17, 0);
     failures += split_case({64, 64}, 9, 1);
     failures += split_case({5}, 3, 0);
+    // Calls wider than a grid's 65,535 rows (core/grid_rows.h), on both routes.
+    failures += split_case({8, 16}, 70000, 0);
+    failures += split_case({7, 9}, 70000, 0);
     std::cout << (failures ? "FAIL" : "OK") << " split_rows\n";
     return failures ? 1 : 0;
 }

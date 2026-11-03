@@ -7,6 +7,7 @@
 #include "infernix/ops/qsa.h"
 #include "infernix/ops/rope.h"
 
+#include "core/grid_rows.h"
 #include "core/paged_kv_storage.h"
 #include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
@@ -101,27 +102,30 @@ __device__ __forceinline__ void rope_angle(const std::int32_t* rope, std::int64_
 
 // ------------------------------------------------------------------------------- index query
 
-// One CTA (128 threads) per (index head, column).
+// One CTA (128 threads) per (index head, column), each row of CTAs every gridDim.y-th column
+// (core/grid_rows.h).
 __global__ void index_query_kernel(bf16* __restrict__ q, const bf16* __restrict__ weight,
-                                   const std::int32_t* __restrict__ rope, int heads, int rotary,
+                                   const std::int32_t* __restrict__ rope, int heads, int columns, int rotary,
                                    float theta, PreparedRope yarn, float eps) {
     __shared__ float scratch[4];
     __shared__ float normed[kIndexDim];
     pdl::enter(); // launched as a programmatic dependent
-    const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
-    bf16* row     = q + (static_cast<std::size_t>(t) * heads + h) * kIndexDim;
-    const float x = __bfloat162float(row[d]);
-    const float inv = rsqrtf(block_sum(x * x, scratch) / kIndexDim + eps);
-    normed[d]       = __bfloat162float(__float2bfloat16_rn(x * inv * (1.0F + __bfloat162float(weight[d]))));
-    __syncthreads();
-    float out = normed[d];
-    if (d < rotary) {
-        const int half = rotary / 2, i = d % half;
-        float c, s;
-        rope_angle(rope + t, gridDim.y, i, rotary, theta, yarn, c, s);
-        out = d < half ? normed[d] * c - normed[d + half] * s : normed[d] * c + normed[d - half] * s;
+    const int h = blockIdx.x, d = threadIdx.x;
+    for (int t = blockIdx.y; t < columns; t += gridDim.y) {
+        bf16* row     = q + (static_cast<std::size_t>(t) * heads + h) * kIndexDim;
+        const float x = __bfloat162float(row[d]);
+        const float inv = rsqrtf(block_sum(x * x, scratch) / kIndexDim + eps);
+        normed[d]       = __bfloat162float(__float2bfloat16_rn(x * inv * (1.0F + __bfloat162float(weight[d]))));
+        __syncthreads();
+        float out = normed[d];
+        if (d < rotary) {
+            const int half = rotary / 2, i = d % half;
+            float c, s;
+            rope_angle(rope + t, columns, i, rotary, theta, yarn, c, s);
+            out = d < half ? normed[d] * c - normed[d + half] * s : normed[d] * c + normed[d - half] * s;
+        }
+        row[d] = __float2bfloat16_rn(out); // the next column's block_sum barriers precede its normed writes
     }
-    row[d] = __float2bfloat16_rn(out);
 }
 
 // --------------------------------------------------------------------------------- pooled keys
@@ -1100,10 +1104,10 @@ void qsa_index_query(Tensor& q, const Tensor& norm_weight, const Tensor& rope_po
                 rope_positions.numel() == 3 * static_cast<std::int64_t>(columns) &&
                 norm_weight.numel() == kIndexDim && columns > 0,
             "index query shapes disagree (RoPE positions are [T, 3])");
-    require(pdl::launch_consumer({dim3(geometry.index_heads, columns), dim3(kIndexDim), 0, stream}, index_query_kernel,
-        static_cast<bf16*>(q.data), static_cast<const bf16*>(norm_weight.data),
-        static_cast<const std::int32_t*>(rope_positions.data), geometry.index_heads, geometry.rotary_dim,
-        geometry.theta, index_rope(geometry), geometry.eps) == cudaSuccess,
+    require(pdl::launch_consumer({dim3(geometry.index_heads, grid_rows(columns)), dim3(kIndexDim), 0, stream},
+                                 index_query_kernel, static_cast<bf16*>(q.data), static_cast<const bf16*>(norm_weight.data),
+                                 static_cast<const std::int32_t*>(rope_positions.data), geometry.index_heads, columns,
+                                 geometry.rotary_dim, geometry.theta, index_rope(geometry), geometry.eps) == cudaSuccess,
             "index query launch failed");
     check_launch("index query");
 }

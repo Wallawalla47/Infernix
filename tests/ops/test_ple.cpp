@@ -308,6 +308,11 @@ INFERNIX_OP_TEST(ple) {
         test_conv(4 * 2048, 4, 3, 3, 4, false, false, 230U);
         test_conv(300, 2, 2, 2, 3, true, false, 240U);
         test_conv(300, 5, 1, 1, 9, true, true, 241U);
+        // Calls wider than a grid's 65,535 rows (core/grid_rows.h), on small rows.
+        test_embed(8, 1, 70000, 16);
+        test_gate(2, 8, 70000, 152);
+        test_conv(8, 4, 3, 1, 70000, true, false, 250U);
+        test_conv(8, 2, 2, 2, 40000, true, true, 251U);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

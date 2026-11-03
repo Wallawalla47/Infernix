@@ -2390,7 +2390,8 @@ void test_prepare(KvCacheStorage storage, std::uint32_t seed) {
 // The index queries and pooled keys (plain RoPE, YaRN over a short span and Flash-Next's YaRN x4),
 // and the fused prepare under YaRN.
 void run_index_part() {
-    for (const int columns : {1, 5, 64, 1024}) { test_index_query(columns, 100U + columns); }
+    // 70,000 columns: a call wider than a grid's 65,535 rows (core/grid_rows.h).
+    for (const int columns : {1, 5, 64, 1024, 70000}) { test_index_query(columns, 100U + columns); }
     test_pool(7);
     // Under YaRN (factor 4 over an original span of 4096, so the ramp falls inside the rotary
     // pairs and positions reach past the span).
