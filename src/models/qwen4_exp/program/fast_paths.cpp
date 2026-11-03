@@ -1,9 +1,9 @@
 // Qwen3.8-Flash-Next fast-path selection (EngineOptions::fast_paths): which numerics-changing routes
-// run for a loaded artifact, from the registry of configurations each passed the acceptance gate in
-// (docs/maintainer/model-quality.md section 6.7).
+// run for an artifact (its stored formats), from the registry of configurations each passed the
+// acceptance gate in (docs/maintainer/model-quality.md section 6.7).
 #include "models/qwen4_exp/program/fast_paths.h"
 
-#include "models/qwen4_exp/execution/parameters.h"
+#include "models/qwen4_exp/config.h"
 
 #include <algorithm>
 #include <array>
@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
-#include <variant>
 
 namespace infernix::models::qwen4_exp {
 namespace {
@@ -602,23 +601,13 @@ std::string describe(const FastPathConfiguration& configuration) {
            kv_name(configuration.kv) + " KV";
 }
 
-FastPathConfiguration fast_path_configuration(const execution::Parameters& parameters,
-                                              const EngineOptions& options) {
+FastPathConfiguration fast_path_configuration(const Config& config, const EngineOptions& options) {
+    // The dense layers share one kernel family; the GDN q/k/v/z projection is the one the fast routes serve.
     // Packed BF16 KV gives attention bf16's K and V bits (and the fused prepare stores them through the packed
     // codec): it is qualified as bf16.
-    FastPathConfiguration out{.dense      = DenseKernels::Bf16,
-                              .a4_experts = !parameters.model.config().text.moe.a16_experts,
-                              .kv         = options.kv_cache == KvCacheStorage::Bf16Packed ? KvCacheStorage::BFloat16
-                                                                                         : options.kv_cache};
-    // The dense layers share one kernel family; the GDN q/k/v/z projection is the one the fast
-    // routes serve.
-    for (const execution::BlockParameters& block : parameters.layers) {
-        if (const auto* gdn = std::get_if<execution::GdnParameters>(&block.mixer)) {
-            out.dense = dense_kernels(gdn->projection.weight.qtype);
-            break;
-        }
-    }
-    return out;
+    return {.dense      = dense_kernels(config.text.dense_format),
+            .a4_experts = !config.text.moe.a16_experts,
+            .kv         = options.kv_cache == KvCacheStorage::Bf16Packed ? KvCacheStorage::BFloat16 : options.kv_cache};
 }
 
 bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration,
@@ -766,8 +755,8 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
             .router_mma        = selected(FastPath::RouterMma)};
 }
 
-FastPathSelection select_fast_paths(const execution::Parameters& parameters, const EngineOptions& options) {
-    FastPathSelection out{.configuration = fast_path_configuration(parameters, options), .paths = {}};
+FastPathSelection select_fast_paths(const Config& config, bool output_head_screen, const EngineOptions& options) {
+    FastPathSelection out{.configuration = fast_path_configuration(config, options), .paths = {}};
     for (const FastPath path : options.fast_path_candidates) {
         if (!fast_path_applies(path, out.configuration, options)) {
             throw std::invalid_argument(std::string("fast path ") + fast_path_name(path) +
@@ -782,7 +771,7 @@ FastPathSelection select_fast_paths(const execution::Parameters& parameters, con
         // --screen-heads); without it the configuration keeps the exact head.
         const bool qualified = options.fast_paths && fast_path_applies(path, out.configuration, options) &&
                                fast_path_qualified(path, out.configuration) &&
-                               (path != FastPath::ScreenedLmHead || parameters.output_head_screen.has_value());
+                               (path != FastPath::ScreenedLmHead || output_head_screen);
         if (candidate || qualified) { out.paths.push_back(path); }
     }
     return out;
@@ -809,19 +798,9 @@ A8Routes a8_activation_routes(const FastPathConfiguration& configuration, QType 
     return out;
 }
 
-A8Routes a8_activation_routes(const execution::Parameters& parameters, const FastPathSelection& fast) {
-    std::size_t ggml_projections = 0;
-    for (const execution::BlockParameters& block : parameters.layers) {
-        if (const auto* gdn = std::get_if<execution::GdnParameters>(&block.mixer)) {
-            ggml_projections += std::size_t{gdn->projection.is_ggml()} + gdn->output.is_ggml();
-        } else {
-            const auto& attention = std::get<execution::AttentionParameters>(block.mixer);
-            ggml_projections += std::size_t{attention.projection.is_ggml()} + attention.output.is_ggml();
-        }
-        ggml_projections += std::size_t{block.moe.shared_gate_up.is_ggml()} + block.moe.shared_down.is_ggml();
-    }
-    return a8_activation_routes(fast.configuration, parameters.layers.front().moe.bank->planes.gate_up_format,
-                                ggml_projections, fast.selected(FastPath::ExpertA4ResidualDecode));
+A8Routes a8_activation_routes(const Config& config, const FastPathSelection& fast) {
+    return a8_activation_routes(fast.configuration, config.text.expert_format, config.text.ggml_projections,
+                                fast.selected(FastPath::ExpertA4ResidualDecode));
 }
 
 void A8Routes::apply(execution::ForwardFastPaths& fast) const noexcept {

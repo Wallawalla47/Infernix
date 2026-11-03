@@ -21,6 +21,8 @@ public:
     LoadPlan& operator=(const LoadPlan&) = delete;
 
     [[nodiscard]] const Config& config() const;
+    // The tokenizer and chat template the Model will hold (Engine::plan compiles its frontend from them).
+    [[nodiscard]] const FrontendResources& resources() const;
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
     // Pinned bytes of the expert banks and of the model's other pinned weights (token embedding).
     [[nodiscard]] std::uint64_t pinned_expert_bytes() const;

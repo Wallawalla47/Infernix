@@ -12,8 +12,10 @@
 #include "core/vram_budget.h"
 #include "infernix/types.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 
 namespace infernix::runtime::expert_offload {
@@ -176,6 +178,14 @@ struct VramSizing {
 // memory and B the OS budget less this process's usage (no budget: F's bound alone); frames =
 // clamp(frame_bytes / frame size, 0, max_frames).
 [[nodiscard]] VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& demand);
+// The expert cache's pools for these per-layer record strides: one per distinct stride (the layers of
+// one stride share a pool, ExpertResidency), so an NVFP4 or block-FP8 artifact has one.
+[[nodiscard]] std::size_t frame_pools(std::span<const std::uint64_t> strides);
+// The frames a start keeps off size_expert_frames' count before it backs them: every pool maps whole
+// chunks of `chunk_bytes`, so one chunk per pool beyond the first, in frames of `frame_bytes`
+// (ExpertResidency::frame_bytes, the average frame). Engine::plan takes the same off its frames.
+[[nodiscard]] std::uint32_t pool_slack_frames(std::size_t pools, std::uint64_t chunk_bytes,
+                                              std::uint64_t frame_bytes) noexcept;
 
 // The runtime law of an elastic frame pool (design §19.3.7): from the latest snapshot, the pool's
 // size and the time, the frame count it should have. Pure and single-threaded; the Program guards

@@ -1,11 +1,14 @@
 // Qwen3.8-Flash-Next fast-path selection (models/qwen4_exp/program/fast_paths.h): where each fast
 // path's kernels run, which configurations the registry qualifies it for, how a configuration is
-// described, and the routes --a8-activations gives it. The selection itself (select_fast_paths) needs loaded parameters; the startup log and
-// the quality gate's runs cover it.
+// described, the routes --a8-activations gives it, and the selection and refusals a model's
+// configuration (the stored formats its loader records) gives.
 
+#include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/program/fast_paths.h"
 
+#include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -512,6 +515,60 @@ int main() {
         failures += check(fp4_local_a4.describe().find("decode and verification: none") != std::string::npos &&
                               recipe_c_a8.describe().find("prefill: the routed experts") != std::string::npos,
                           "the startup line names what takes 8-bit activations in decode and in prefill");
+    }
+
+    // The selection from a model's configuration: the stored formats the loader records (TextConfig), so a start
+    // and Engine::plan refuse a candidate or --a8-activations before any weight is read.
+    {
+        const auto model = [](QType dense, bool a16_experts, QType experts, std::uint32_t ggml_projections) {
+            q::Config out;
+            out.text.dense_format     = dense;
+            out.text.moe.a16_experts  = a16_experts;
+            out.text.expert_format    = experts;
+            out.text.ggml_projections = ggml_projections;
+            return out;
+        };
+        const auto refusal = [](const q::Config& config, const infernix::EngineOptions& asked) {
+            try {
+                (void)q::select_fast_paths(config, false, asked);
+            } catch (const std::invalid_argument& error) { return std::string(error.what()); }
+            return std::string();
+        };
+        infernix::EngineOptions int8 = options;
+        int8.kv_cache                = KvCacheStorage::Int8Group64;
+        const q::Config gguf_import  = model(QType::GGML_IQ3_S, true, QType::GGML_IQ3_S, 160);
+        const q::Config fp8_import   = model(QType::BF16, true, QType::FP8_E4M3FN_B128, 0);
+        const q::Config fp4_local    = model(QType::FP8_E4M3FN_G32_E8M0, true, QType::NVFP4_MUL, 0);
+        const q::Config nvfp4_dense8 = model(QType::Q8_G32_FP16, false, QType::NVFP4_MUL, 0);
+        failures += check(q::fast_path_configuration(gguf_import, int8) ==
+                                  FastPathConfiguration{kGgml, false, KvCacheStorage::Int8Group64} &&
+                              q::fast_path_configuration(nvfp4_dense8, int8) ==
+                                  FastPathConfiguration{DenseKernels::Q8, true, KvCacheStorage::Int8Group64},
+                          "the configuration is the stored dense format's family and the experts' activations");
+        infernix::EngineOptions packed = options;
+        packed.kv_cache                = KvCacheStorage::Bf16Packed;
+        failures += check(q::fast_path_configuration(fp4_local, packed).kv == KvCacheStorage::BFloat16,
+                          "packed BF16 KV is qualified as bf16");
+        infernix::EngineOptions q8_sliced = int8;
+        q8_sliced.fast_path_candidates    = {FastPath::Q8SlicedK};
+        failures += check(refusal(nvfp4_dense8, q8_sliced).empty() &&
+                              q::select_fast_paths(nvfp4_dense8, false, q8_sliced).selected(FastPath::Q8SlicedK),
+                          "a candidate that applies is selected");
+        failures += check(refusal(gguf_import, q8_sliced).find("does not apply to GGUF dense") != std::string::npos,
+                          "a candidate that does not apply is refused, naming the configuration");
+        // A qualified screened-lm-head runs only where the loader bound the LM head's screen.
+        failures += check(!q::select_fast_paths(fp4_local, false, int8).selected(FastPath::ScreenedLmHead) &&
+                              q::select_fast_paths(fp4_local, true, int8).selected(FastPath::ScreenedLmHead),
+                          "screened-lm-head needs its bound screen");
+        // --a8-activations reads the experts' format and the GGUF projections from the configuration.
+        const q::A8Routes gguf = q::a8_activation_routes(gguf_import, q::select_fast_paths(gguf_import, false, int8));
+        failures += check(gguf.ggml_projections == 160 && gguf.ggml_dense && gguf.ggml_experts && !gguf.nvfp4_experts,
+                          "a GGUF import's 8-bit routes from its configuration");
+        failures += check(!q::a8_activation_routes(fp8_import, q::select_fast_paths(fp8_import, false, int8)).any(),
+                          "the official FP8 import (BF16 dense, block-FP8 experts) has no 8-bit route: refused");
+        const q::A8Routes local = q::a8_activation_routes(fp4_local, q::select_fast_paths(fp4_local, false, int8));
+        failures += check(local.nvfp4_experts && local.mxfp8_dense && local.ggml_projections == 0,
+                          "FP4-Local's W4A16 experts and MXFP8 dense take their 8-bit routes");
     }
 
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " Qwen3.8-Flash-Next fast-path selection\n";

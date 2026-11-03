@@ -861,8 +861,8 @@ void ExpertOffload::size_frames(cudaStream_t compute, const std::function<void(s
     const VramDemand demand = frame_demand(residency_->frame_bytes());
     sizing_                 = size_expert_frames(vram_->query(), demand);
     // Each pool maps whole chunks: one chunk of slack per pool beyond the first.
-    const auto slack = static_cast<std::uint32_t>((residency_->pools() - 1) * ExpertResidency::kChunkBytes / residency_->frame_bytes());
-    sizing_.frames   = sizing_.frames > slack ? sizing_.frames - slack : 0U;
+    const std::uint32_t slack = pool_slack_frames(residency_->pools(), ExpertResidency::kChunkBytes, residency_->frame_bytes());
+    sizing_.frames            = sizing_.frames > slack ? sizing_.frames - slack : 0U;
     const auto grown = residency_->resize(sizing_.frames, compute, *vram_);
     if (grown.spilled != 0) {
         diagnostic(std::to_string(grown.spilled >> 20) + " MiB of the expert frames were placed in system memory and given "

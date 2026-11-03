@@ -10,6 +10,7 @@
 #include "infernix/ops/hyper_connection.h"
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/registry.h"
+#include "runtime/expert_offload/memory_plan.h"
 
 #include <chrono>
 #include <cmath>
@@ -631,6 +632,8 @@ LoadPlan& LoadPlan::operator=(LoadPlan&&) noexcept = default;
 
 const Config& LoadPlan::config() const { return impl_->config; }
 
+const FrontendResources& LoadPlan::resources() const { return impl_->resources; }
+
 const artifact::MaterializationPlan& LoadPlan::materialization() const {
     return impl_->materialization;
 }
@@ -823,6 +826,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         // Exact banks' frames take the largest stored record stride (a GGUF import's vary by layer).
         std::optional<QuantLayout> kind;
         std::uint64_t stride_sum = 0;
+        std::vector<std::uint64_t> strides;
         for (const auto& layer : out->weights.layers) {
             for (const auto& part : bindings.weights.at(layer.moe.experts.index).reference.binding.parts) {
                 const auto& tensor = reader.directory().tensor(part.object);
@@ -833,6 +837,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
                     throw ArtifactError("Qwen4Exp: routed experts must be NVFP4, block-FP8 or ggml expert banks");
                 }
                 if (kind && *kind != k) { throw ArtifactError("Qwen4Exp: every layer's expert bank must be of one kind"); }
+                if (!kind) { out->config.text.expert_format = expert_bank_layout(g, nullptr).gate_up_format; }
                 kind = k;
                 if ((k == QuantLayout::GgmlExpertIq4Nl) != out->config.text.ggml_weights) {
                     throw ArtifactError("Qwen4Exp: ggml expert banks belong to a GGUF import (and only there)");
@@ -845,14 +850,36 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
                     out->config.text.expert_frame_stride = std::max(out->config.text.expert_frame_stride, g.record_stride);
                     stride_sum += g.record_stride;
                 }
+                strides.push_back(g.record_stride);
             }
         }
         if (out->config.text.exact_experts) {
             const std::uint64_t layers = out->weights.layers.size();
             out->config.text.expert_frame_bytes = (stride_sum + layers - 1) / layers;
         }
+        out->config.text.expert_frame_pools = static_cast<std::uint32_t>(runtime::expert_offload::frame_pools(strides));
         if (out->config.text.exact_experts && !out->config.text.moe.a16_experts) {
             throw ArtifactError("Qwen4Exp: exact expert banks are A16 only (no activation scales)");
+        }
+    }
+    {
+        // The dense formats the fast paths and the 8-bit routes read (TextConfig::dense_format, ggml_projections), as
+        // execution::Parameters binds them: a projection is its first parameter's parent, GGUF blocks or native.
+        const auto stored = [&](WeightId id) -> const WeightGeometry& {
+            return reader.geometry(bindings.weights.at(id.index).reference.binding.parts.front().object);
+        };
+        const auto blocks = [&](WeightId id) { return is_ggml_matrix_layout(stored(id).layout) ? 1U : 0U; };
+        bool gdn_seen = false;
+        for (const auto& layer : out->weights.layers) {
+            if (const auto* gdn = std::get_if<GdnWeights>(&layer.mixer)) {
+                if (!gdn_seen) { out->config.text.dense_format = stored(gdn->query).format; }
+                gdn_seen = true;
+                out->config.text.ggml_projections += blocks(gdn->query) + blocks(gdn->output);
+            } else {
+                const auto& attention = std::get<AttentionWeights>(layer.mixer);
+                out->config.text.ggml_projections += blocks(attention.query) + blocks(attention.output);
+            }
+            out->config.text.ggml_projections += blocks(layer.moe.shared_gate) + blocks(layer.moe.shared_down);
         }
     }
     {

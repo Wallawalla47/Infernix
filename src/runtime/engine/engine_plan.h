@@ -28,8 +28,9 @@ void plan_readings(EnginePlan& plan, std::string gpu_name, const VramSnapshot& v
 void plan_refuse(EnginePlan& plan, std::string refusal);
 
 // The free device memory a Qwen3.5-family start sizes its Program against, read where the start reads
-// it after the weights: the plan's reading there less the weights' arena it did not allocate (and an
-// overlay vision window's staging, which the weights' pool allocates beside them).
+// it after the weights: the plan's reading there less the weights' arena it did not allocate (and with
+// --vision-offload on what the weights' pool maps beyond it, the arena's last partial chunk: the overlay
+// window borrows evicted chunks).
 [[nodiscard]] std::size_t planned_free_after_weights(std::size_t free_now, std::uint64_t weights_bytes,
                                                      std::uint64_t beside_weights_bytes = 0) noexcept;
 

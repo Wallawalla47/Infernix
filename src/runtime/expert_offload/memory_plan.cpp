@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 namespace infernix::runtime::expert_offload {
 namespace {
@@ -176,6 +177,17 @@ VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& de
         out.frames = static_cast<std::uint32_t>(std::min<std::uint64_t>(frames, demand.max_frames));
     }
     return out;
+}
+
+std::size_t frame_pools(std::span<const std::uint64_t> strides) {
+    std::vector<std::uint64_t> distinct(strides.begin(), strides.end());
+    std::sort(distinct.begin(), distinct.end());
+    return static_cast<std::size_t>(std::unique(distinct.begin(), distinct.end()) - distinct.begin());
+}
+
+std::uint32_t pool_slack_frames(std::size_t pools, std::uint64_t chunk_bytes, std::uint64_t frame_bytes) noexcept {
+    if (pools < 2 || frame_bytes == 0) { return 0; }
+    return static_cast<std::uint32_t>((pools - 1) * chunk_bytes / frame_bytes);
 }
 
 VramControl::VramControl(const VramDemand& demand, std::uint64_t chunk_bytes, std::uint64_t usage,

@@ -2084,7 +2084,7 @@ struct EnginePlanRam {
     // Offloaded experts: the RAM the routed experts take.
     std::optional<std::uint64_t> experts_bytes;
     // The weights the load pins in RAM (offloaded experts, the token embedding, an offloaded vision
-    // tower); empty when it pins none.
+    // tower and the pinned mirror of the device weights its window evicts); empty when it pins none.
     std::optional<std::uint64_t> pinned_bytes;
     // The prefix cache's Host tier; empty without the prefix cache.
     std::optional<std::uint64_t> host_context_bytes;

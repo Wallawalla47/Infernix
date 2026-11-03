@@ -1,10 +1,12 @@
 // Engine::plan's shared steps (runtime/engine/engine_plan.h): a plan resolves a capacity curve against the
 // free memory less the weights exactly as a start does (resolve_kv_capacity), refuses in the start's own
-// words, keeps its first refusal, totals its RAM, and finds the largest --max-context a start accepts.
-// Pure: no GPU.
+// words, keeps its first refusal, takes the start's expert-pool slack off its frames and its weights' pool
+// beside the arena, totals its RAM, and finds the largest --max-context a start accepts. Pure: no GPU.
 
+#include "core/evictable_weight_pool.h"
 #include "runtime/engine/engine_plan.h"
 #include "runtime/engine/kv_capacity.h"
+#include "runtime/expert_offload/memory_plan.h"
 
 #include <cstdint>
 #include <iostream>
@@ -97,6 +99,41 @@ int main() {
         plan_refuse(plan, "first");
         plan_refuse(plan, "second");
         failures += check(!plan.fits && plan.error == "first", "the first refusal is the plan's error");
+    }
+
+    // ---- what a start keeps off its expert frames, which the plan's frames leave off too ----
+    {
+        constexpr std::uint64_t kChunk = 64ULL << 20;
+        // A GGUF import's layers of three record sizes: three pools, two chunks of slack in average frames.
+        const std::uint64_t strides[] = {6'291'456, 5'242'880, 6'291'456, 4'194'304, 5'242'880};
+        failures += check(expert_offload::frame_pools(strides) == 3, "one pool per distinct record stride");
+        // 128 MiB in frames of their mean stride (5,452,596 bytes): 24 whole frames.
+        failures += check(expert_offload::pool_slack_frames(3, kChunk, 5'452'596) == 24,
+                          "one chunk of slack per pool beyond the first, in average frames");
+        const std::uint64_t nvfp4[] = {7'340'032, 7'340'032, 7'340'032};
+        failures += check(expert_offload::frame_pools(nvfp4) == 1 &&
+                              expert_offload::pool_slack_frames(1, kChunk, 7'340'032) == 0,
+                          "one record size: one pool and no slack");
+        failures += check(expert_offload::pool_slack_frames(3, kChunk, 0) == 0, "no frame size: no slack");
+    }
+
+    // ---- --vision-offload on: the weights' pool beside the arena, and its pinned tail mirror ----
+    {
+        constexpr std::size_t kChunk = EvictableWeightPool::kChunkBytes;
+        // The pool maps the arena in whole chunks; an overlay window borrows evicted chunks, nothing more.
+        failures += check(EvictableWeightPool::mapped_bytes(10 * kChunk + 5) == 11 * kChunk &&
+                              EvictableWeightPool::mapped_bytes(10 * kChunk) == 10 * kChunk,
+                          "the weights' pool maps the arena in whole chunks");
+        failures += check(planned_free_after_weights(100 * kChunk, 10 * kChunk + 5,
+                                                     EvictableWeightPool::mapped_bytes(10 * kChunk + 5) -
+                                                         (10 * kChunk + 5)) == 89 * kChunk,
+                          "a plan sizes beside the pool's chunks, not beside a window's staging");
+        // The loader starts the evictable tail on a chunk (Binder::finish), so the mirror is the whole tail.
+        failures += check(EvictableWeightPool::mirror_bytes(10 * kChunk + 5, 3 * kChunk + 5) == 3 * kChunk + 5,
+                          "the mirror holds the evictable tail's weights");
+        failures += check(EvictableWeightPool::mirror_bytes(10 * kChunk + 5, 3 * kChunk + 9) == 3 * kChunk + 5,
+                          "the mirror starts at the tail's first whole chunk");
+        failures += check(EvictableWeightPool::mirror_bytes(10 * kChunk, 0) == 0, "no ladder: no mirror");
     }
 
     // ---- the RAM totals ----

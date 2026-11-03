@@ -3,6 +3,7 @@
 #include "artifact/formats.h"
 #include "artifact/materializer.h"
 #include "core/decode_graph.h"
+#include "core/evictable_weight_pool.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
 #include "core/vmm_arena.h"
@@ -17,6 +18,7 @@
 #include "runtime/engine/expert_memory.h"
 #include "runtime/expert_offload/drafter_pool.h"
 #include "runtime/expert_offload/expert_residency.h"
+#include "runtime/expert_offload/memory_plan.h"
 #include "runtime/expert_offload/route_trace.h"
 #include "runtime/expert_offload/vram_monitor.h"
 
@@ -204,8 +206,9 @@ std::size_t current_free_device_bytes() {
 // bytes plan.vram already holds), the Host tier it settled, and with offloaded experts an estimate of the
 // expert frames: a start sizes them from a live reading once the Program's allocations exist
 // (ExpertOffload::size_frames); here they take what the weights, the Program's reservation less its
-// CUDA Graph allowance (the elastic text KV region whole, as when every lane's context is full), the
-// engine's staging and tables and the MTP drafter's expert pool leave from the free memory now.
+// CUDA Graph allowance (with the elastic text KV region whole, as when every lane's context is full, and
+// the engine's staging and tables) and the MTP drafter's expert pool leave from the free memory now, less
+// the pools' chunk slack the start keeps off them.
 void plan_qwen3_5_program(EnginePlan& plan, const EngineOptions& options, const ModelInstance& instance,
                           const models::qwen3_5::SequencePlan& sequence, const KvCapacityResolution& resolution,
                           std::size_t free_after_weights, const expert_offload::OffloadOptions* offload,
@@ -231,37 +234,30 @@ void plan_qwen3_5_program(EnginePlan& plan, const EngineOptions& options, const 
         for (const auto& bank : model.expert_banks()) { strides.push_back(bank.planes.record_stride); }
         const expert_offload::ExpertLayout layout{static_cast<std::uint32_t>(strides.size()), moe.num_experts,
                                                   moe.num_experts_per_tok};
-        // The Program's offload geometry (ProgramImpl's constructor).
-        const std::uint32_t draft_window = sequence.draft_window();
-        models::qwen3_5::detail::OffloadGeometry geometry;
-        geometry.lanes     = static_cast<std::int32_t>(options.max_concurrency);
-        geometry.max_width = static_cast<std::int32_t>(draft_window + 1U);
-        geometry.columns   = static_cast<std::int32_t>(std::max<std::uint32_t>(
-            std::max(sequence.idle_prefill_width(), sequence.prefill_chunk()), options.max_concurrency * (draft_window + 1U)));
-        geometry.chunk       = static_cast<std::int32_t>(sequence.prefill_chunk());
-        geometry.speculative = options.speculative.backend != SpeculativeBackend::None ||
-                               options.speculative.ngram_draft_tokens != 0;
-        geometry.graph_bound = static_cast<std::uint32_t>(
-            (sequence.graph_allowance_bytes() + expert_offload::kGraphExecutableBytes - 1) /
-            expert_offload::kGraphExecutableBytes);
-        geometry.device = device.device;
-        std::uint64_t beside = models::qwen3_5::detail::ProgramOffload::fixed_bytes(instance.parameters, geometry, *offload);
+        // Beside the reservation (which holds the engine's staging and tables, SequencePlan's offload_fixed_bytes):
+        // the MTP drafter's expert pool, allocated before the engine sizes its frames (ProgramOffload::start).
+        std::uint64_t beside = 0;
         if (const std::uint32_t slots = model.config().mtp_expert_slots; slots != 0) {
-            beside += expert_offload::DrafterExpertPool::device_bytes(model.config().mtp_expert_bytes,
-                                                                      static_cast<std::int32_t>(slots),
-                                                                      static_cast<std::int32_t>(moe.num_experts));
+            beside = expert_offload::DrafterExpertPool::device_bytes(model.config().mtp_expert_bytes,
+                                                                     static_cast<std::int32_t>(slots),
+                                                                     static_cast<std::int32_t>(moe.num_experts));
         }
         expert_offload::VramDemand demand;
-        demand.headroom    = offload->vram_headroom;
-        demand.elastic     = offload->vram_monitor && VmmArena::supported(device.device);
-        demand.graphs      = geometry.graph_bound;
+        demand.headroom = offload->vram_headroom;
+        demand.elastic  = offload->vram_monitor && VmmArena::supported(device.device);
+        // The engine's graph bound (ProgramImpl's constructor).
+        demand.graphs = static_cast<std::uint32_t>(
+            (sequence.graph_allowance_bytes() + expert_offload::kGraphExecutableBytes - 1) /
+            expert_offload::kGraphExecutableBytes);
         demand.frame_bytes = expert_offload::ExpertResidency::average_frame_bytes(strides);
         demand.max_frames  = expert_offload::ExpertResidency::max_frames(layout);
         demand.fixed       = vram.weights_bytes + (reservation - sequence.graph_allowance_bytes()) + beside;
         const expert_offload::VramSizing sizing = expert_offload::size_expert_frames(
             open_vram_budget_source(device.device, options.vram_past_budget)->query(), demand);
-        vram.expert_frames      = sizing.frames;
-        vram.expert_cache_bytes = static_cast<std::uint64_t>(sizing.frames) * demand.frame_bytes;
+        const std::uint32_t slack = expert_offload::pool_slack_frames(
+            expert_offload::frame_pools(strides), expert_offload::ExpertResidency::kChunkBytes, demand.frame_bytes);
+        vram.expert_frames      = sizing.frames > slack ? sizing.frames - slack : 0U;
+        vram.expert_cache_bytes = static_cast<std::uint64_t>(*vram.expert_frames) * demand.frame_bytes;
         vram.headroom_bytes     = sizing.headroom;
         vram.planned_bytes += beside + *vram.expert_cache_bytes;
         used = reservation + beside + *vram.expert_cache_bytes + sizing.headroom;
@@ -270,12 +266,14 @@ void plan_qwen3_5_program(EnginePlan& plan, const EngineOptions& options, const 
 }
 
 // Engine::plan, Qwen3.5 family: the largest --max-context whose smallest reservation resolves beside the
-// weights as the start resolves it (the base sequence plan, without idle-wide-prefill), the other options
-// as given. An explicit KV capacity equal to --max-context (infernix-serve's default without the prefix
-// cache) follows the context; any other stays fixed. Bounded by the model's positions (with YaRN).
+// weights as the start resolves it (the base sequence plan, without idle-wide-prefill, with the offloaded
+// experts' engine options when `offload` is set), the other options as given. An explicit KV capacity
+// equal to --max-context (infernix-serve's default without the prefix cache) follows the context; any
+// other stays fixed. Bounded by the model's positions (with YaRN).
 void plan_qwen3_5_context(EnginePlan& plan, const EngineOptions& options,
                           const models::qwen3_5::execution::Parameters& parameters, DeviceContext& device,
-                          bool offloaded, std::size_t free_after_weights, std::size_t headroom) {
+                          const models::qwen3_5::detail::ProgramOffloadOptions* offload,
+                          std::size_t free_after_weights, std::size_t headroom) {
     const double positions = static_cast<double>(parameters.model.config().text.max_position_embeddings) *
                              std::max(1.0, static_cast<double>(options.rope_yarn_factor));
     const auto upper       = static_cast<std::uint32_t>(
@@ -286,9 +284,9 @@ void plan_qwen3_5_context(EnginePlan& plan, const EngineOptions& options,
         EngineOptions trial = options;
         trial.max_context   = context;
         if (kv_follows) { trial.kv_capacity = KvCapacityPolicy::explicit_capacity(context); }
-        auto planner            = models::qwen3_5::make_sequence_planner(parameters, device, trial);
+        auto planner            = models::qwen3_5::make_sequence_planner(parameters, device, trial, offload);
         KvCapacityPolicy policy = trial.kv_capacity;
-        if (offloaded && policy.mode == KvCapacityMode::Automatic) {
+        if (offload != nullptr && policy.mode == KvCapacityMode::Automatic) {
             const std::uint64_t page   = planner.capacity_curve().main_page_tokens;
             const std::uint64_t tokens = static_cast<std::uint64_t>(trial.max_concurrency) *
                                          ((static_cast<std::uint64_t>(context) + page - 1U) / page) * page;
@@ -690,16 +688,21 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan = models::qwen3_5::plan_load(reader, models::load_options(options, models::Architecture::Qwen3_5));
-    // Engine::plan: the readings a start plans against, before anything is planned.
+    // Engine::plan: the readings a start plans against, before anything is planned, and the weights' arena
+    // (which a refusal below still reports).
     if (plan_only) {
         planned->architecture = models::architecture_name(plan.config().text.architecture);
         plan_readings(*planned, device.props.name, open_vram_budget_source(device.device, options.vram_past_budget)->query(),
                       host_memory_snapshot(), options);
+        planned->vram.weights_bytes = plan.materialization().device_capacity_bytes;
+        planned->vram.planned_bytes = planned->vram.weights_bytes;
     }
     // Offloaded experts (Qwen3.5-122B-A10B design §11.2): the RAM ledger places the routed banks in
     // pinned RAM or in the SSD tier before anything is pinned or read.
     std::optional<ExpertRamPlan> expert_ram;
     bool exclusive_experts = false;
+    bool ladder            = false; // the overlay vision window's evictable weight ladder
+    std::uint64_t tail_mirror = 0;  // its pinned mirror
     if (options.expert_tail_skip != 0) {
         // normalize_engine_options admitted it for an artifact with offloaded experts.
         const auto& moe = std::get<models::qwen3_5::MoeConfig>(plan.config().text.ffn);
@@ -748,7 +751,15 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         }
         plan.set_host_reserve(options.ram_free_bytes, expert_ram->demand.later_pinned);
     } else {
-        plan.set_host_reserve(options.ram_free_bytes);
+        // --vision-offload on: the weights' pool (the evictable ladder, load.cpp) maps the arena in whole chunks and,
+        // once loaded, mirrors its evictable tail (the embedding, the heads, MTP) in pinned RAM, a pin after the
+        // block's (EvictableWeightPool::capture_tail_mirror).
+        const artifact::MaterializationPlan& placement = plan.materialization();
+        ladder = placement.evictable_tail_bytes != 0;
+        if (ladder) {
+            tail_mirror = EvictableWeightPool::mirror_bytes(placement.device_capacity_bytes, placement.evictable_tail_bytes);
+        }
+        plan.set_host_reserve(options.ram_free_bytes, tail_mirror);
     }
     // Engine::plan: the pinned block's check (materialize's), the RAM report, and the weights; then the
     // plan-only load reads the offloaded experts' scales from the artifact (streamed), as the SSD tier does.
@@ -757,13 +768,13 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     if (plan_only) {
         const artifact::MaterializationPlan& placement = plan.materialization();
         planned_weights = placement.device_capacity_bytes;
-        // An overlay vision window's staging, which the weights' pool maps beside the arena.
-        if (!plan.offloaded_experts() && plan.vision_overlay_layout()) {
-            planned_beside_weights = plan.vision_overlay_layout()->staging_bytes;
-        }
+        // The ladder's chunk alignment beyond the arena (an overlay window borrows evicted chunks: no staging).
+        if (ladder) { planned_beside_weights = EvictableWeightPool::mapped_bytes(planned_weights) - planned_weights; }
         planned->vram.weights_bytes = planned_weights;
         EnginePlanRam& ram          = planned->ram;
-        if (placement.pinned_capacity_bytes != 0) { ram.pinned_bytes = placement.pinned_capacity_bytes; }
+        if (const std::uint64_t pinned = placement.pinned_capacity_bytes + tail_mirror; pinned != 0) {
+            ram.pinned_bytes = pinned;
+        }
         const std::uint64_t host_tier =
             options.context_cache.enabled ? options.context_cache.host_capacity_bytes.value_or(0U) : 0U;
         if (options.context_cache.enabled) { ram.host_context_bytes = host_tier; }
@@ -776,7 +787,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             ram.expert_ram_layout = exclusive_experts ? ExpertRamLayout::Exclusive : ExpertRamLayout::Full;
             plan_ram_totals(*planned, expert_ram->ledger.planned + expert_ram->ledger.expert_ram);
         } else {
-            plan_ram_totals(*planned, placement.pinned_capacity_bytes + host_tier);
+            plan_ram_totals(*planned, placement.pinned_capacity_bytes + tail_mirror + host_tier);
         }
         pinned_refusal = artifact::pinned_shortfall(placement, available_host_memory_bytes());
         if (plan.offloaded_experts() && !(expert_ram && expert_ram->tier)) {
@@ -967,8 +978,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         if (plan_only) {
             const auto fitted = plan_capacity(*planned, kv_policy, planner.capacity_curve(), free_bytes, headroom);
             if (!fitted) {
-                plan_qwen3_5_context(*planned, options, instance->parameters, device, expert_ram.has_value(),
-                                     free_bytes, headroom);
+                plan_qwen3_5_context(*planned, options, instance->parameters, device, offload, free_bytes, headroom);
                 return {};
             }
             resolution = *fitted;
@@ -1004,8 +1014,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         if (plan_only) {
             plan_qwen3_5_program(*planned, options, *instance, sequence, resolution, free_bytes,
                                  offload_options ? &offload_options->engine : nullptr, device);
-            plan_qwen3_5_context(*planned, options, instance->parameters, device, expert_ram.has_value(),
-                                 free_bytes, headroom);
+            plan_qwen3_5_context(*planned, options, instance->parameters, device, offload, free_bytes, headroom);
             return {};
         }
         options.context_cache.host_capacity_bytes = sequence.host_capacity_bytes();

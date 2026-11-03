@@ -11,6 +11,7 @@
 #include "models/load_options.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/load.h"
+#include "runtime/expert_offload/expert_residency.h"
 #include "runtime/expert_offload/memory_plan.h"
 #include "models/qwen4_exp/program/fast_paths.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
@@ -27,6 +28,7 @@
 #include <chrono>
 #include <cstdio>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -58,10 +60,52 @@ void report(const EngineOptions& options, DiagnosticLevel level, const std::stri
     report_engine(options, level, text);
 }
 
+// The fast paths and --a8-activations' routes are chosen from the stored formats the load plan records
+// (TextConfig::dense_format, expert_format, ggml_projections) before any weight is read; the bound
+// Parameters must agree, or a route chosen for one format would run on another.
+void check_selection_formats(const models::qwen4_exp::execution::Parameters& parameters,
+                             const models::qwen4_exp::Config& config) {
+    std::optional<QType> dense;
+    std::uint32_t ggml = 0;
+    for (const auto& block : parameters.layers) {
+        if (const auto* gdn = std::get_if<models::qwen4_exp::execution::GdnParameters>(&block.mixer)) {
+            if (!dense) { dense = gdn->projection.weight.qtype; }
+            ggml += std::uint32_t{gdn->projection.is_ggml()} + gdn->output.is_ggml();
+        } else {
+            const auto& attention = std::get<models::qwen4_exp::execution::AttentionParameters>(block.mixer);
+            ggml += std::uint32_t{attention.projection.is_ggml()} + attention.output.is_ggml();
+        }
+        ggml += std::uint32_t{block.moe.shared_gate_up.is_ggml()} + block.moe.shared_down.is_ggml();
+    }
+    const bool same = (!dense || models::qwen4_exp::dense_kernels(*dense) ==
+                                     models::qwen4_exp::dense_kernels(config.text.dense_format)) &&
+                      ggml == config.text.ggml_projections &&
+                      (parameters.layers.empty() || parameters.layers.front().moe.bank == nullptr ||
+                       parameters.layers.front().moe.bank->planes.gate_up_format == config.text.expert_format);
+    if (!same) {
+        throw std::logic_error("Qwen4Exp: the stored formats the fast paths were chosen from differ from the bound "
+                               "parameters'");
+    }
+}
+
+// The frontend a start makes (Qwen4ExpInstance), whose chat template Engine::plan compiles too.
+models::qwen3_5::FrontendOptions frontend_options(const EngineOptions& options) {
+    return {.chat_template_path       = options.chat_template_path,
+            .architecture             = models::Architecture::Qwen4Exp,
+            .vision_enabled           = options.enable_vision,
+            .max_context              = options.max_context,
+            .media_cache_bytes        = options.media_cache_bytes,
+            .media_live_bytes         = options.media_live_bytes,
+            .media_preprocess_threads = options.media_preprocess_threads,
+            .vision_max_merged_tokens = options.vision_max_merged_tokens,
+            .thinking_budget_message  = options.thinking_budget_message};
+}
+
 // Engine::plan: the device plan and the VRAM check a start makes before it reads the weights
-// (check_expert_vram), into plan.vram, and the largest --max-context whose device plan still leaves
-// the expert cache room (the check passes) with the other options as given. An explicit KV capacity
-// equal to --max-context (infernix-serve's default without the prefix cache) follows the context.
+// (check_expert_vram), into plan.vram, with the frames the Program sizes from that check less its
+// pools' chunk slack, and the largest --max-context whose device plan still leaves the expert cache
+// room (the check passes) with the other options as given. An explicit KV capacity equal to
+// --max-context (infernix-serve's default without the prefix cache) follows the context.
 void plan_device_memory(EnginePlan& plan, const EngineOptions& options,
                         const models::qwen4_exp::ProgramOptions& program_options, const models::qwen4_exp::Config& config,
                         std::uint32_t public_tokens, std::uint64_t dense, const VramSnapshot& before) {
@@ -69,6 +113,8 @@ void plan_device_memory(EnginePlan& plan, const EngineOptions& options,
     const ExpertVramCheck check =
         size_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + device_plan.fixed_bytes(), device_plan.graph_bound,
                          device_plan.expert_frame_bytes, device_plan.max_frames, device_contributors(dense, device_plan));
+    const std::uint32_t slack = expert_offload::pool_slack_frames(
+        config.text.expert_frame_pools, expert_offload::ExpertResidency::kChunkBytes, device_plan.expert_frame_bytes);
     EnginePlanVram& vram           = plan.vram;
     vram.weights_bytes             = dense;
     // The KV at --max-context (an elastic pool starts at device_plan.kv and grows from the expert cache).
@@ -79,8 +125,8 @@ void plan_device_memory(EnginePlan& plan, const EngineOptions& options,
     vram.workspace_bytes           = device_plan.workspace;
     vram.graph_allowance_bytes     = check.sizing.reserve; // the reserve for graph executables
     vram.headroom_bytes            = check.sizing.headroom;
-    vram.expert_frames             = check.sizing.frames;
-    vram.expert_cache_bytes        = static_cast<std::uint64_t>(check.sizing.frames) * device_plan.expert_frame_bytes;
+    vram.expert_frames             = check.sizing.frames > slack ? check.sizing.frames - slack : 0U;
+    vram.expert_cache_bytes        = static_cast<std::uint64_t>(*vram.expert_frames) * device_plan.expert_frame_bytes;
     vram.planned_bytes             = dense + device_plan.fixed_bytes() + *vram.expert_cache_bytes;
     const std::uint64_t used       = vram.planned_bytes + check.sizing.headroom + check.sizing.reserve;
     vram.left_bytes                = before.device_free > used ? before.device_free - used : 0;
@@ -184,16 +230,7 @@ Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> sou
     // hc_q8; the loader left them unpacked for it).
     : model(std::move(source)),
       parameters(*model, models::load_options(options, models::Architecture::Qwen4Exp).hc_q8_repack),
-      frontend(models::qwen3_5::make_frontend(model->resources(),
-                                              {.chat_template_path      = options.chat_template_path,
-                                               .architecture            = models::Architecture::Qwen4Exp,
-                                               .vision_enabled          = options.enable_vision,
-                                               .max_context             = options.max_context,
-                                               .media_cache_bytes       = options.media_cache_bytes,
-                                               .media_live_bytes        = options.media_live_bytes,
-                                               .media_preprocess_threads = options.media_preprocess_threads,
-                                               .vision_max_merged_tokens = options.vision_max_merged_tokens,
-                                               .thinking_budget_message = options.thinking_budget_message})),
+      frontend(models::qwen3_5::make_frontend(model->resources(), frontend_options(options))),
       capacity(options.max_context) {}
 
 Qwen4ExpInstance::~Qwen4ExpInstance() = default;
@@ -218,13 +255,31 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         return load;
     };
     auto plan = models::qwen4_exp::plan_load(reader, qwen4_load(false));
+    // The fast paths qualified for this configuration (docs/maintainer/model-quality.md section 6.7) and
+    // --a8-activations' routes (LOSSY, opt-in; design §19.3.31; models::qwen4_exp::A8Routes), from the stored
+    // formats: a --fast-path candidate or an --a8-activations that does not apply is refused before any weight
+    // is read, by a start and by Engine::plan alike.
+    const models::qwen4_exp::FastPathSelection fast =
+        models::qwen4_exp::select_fast_paths(plan.config(), plan.has_output_head_screen(), options);
+    const models::qwen4_exp::A8Routes a8 = options.a8_activations
+                                               ? models::qwen4_exp::a8_activation_routes(plan.config(), fast)
+                                               : models::qwen4_exp::A8Routes{};
+    if (options.a8_activations && !a8.any()) {
+        throw std::invalid_argument(
+            "--a8-activations: no 8-bit activation route applies to this artifact (it covers a GGUF import's dense "
+            "projections and GGUF or NVFP4 W4A16 experts in decode and prefill, and MXFP8 dense projections in "
+            "prefill)");
+    }
     // The RAM ledger (design §19.3.7): the experts take what the reserve and every other planned
     // allocation leave, before anything is pinned or read. It is planned below with the Program's options.
     auto vram = open_vram_budget_source(device.device, options.vram_past_budget);
-    // Engine::plan: the readings a start plans against, before anything is planned.
+    // Engine::plan: the readings a start plans against, before anything is planned, and the dense weights
+    // (which a refusal below still reports).
     if (plan_only) {
         planned->architecture = models::architecture_name(models::Architecture::Qwen4Exp);
         plan_readings(*planned, device.props.name, vram->query(), host_memory_snapshot(), options);
+        planned->vram.weights_bytes = plan.device_bytes();
+        planned->vram.planned_bytes = planned->vram.weights_bytes;
     }
     // --host-context-mib auto: the prefix cache's Host tier is sized after the experts and the n-gram table.
     const bool prefix_auto     = options.context_cache.enabled && options.context_cache.host_capacity_auto;
@@ -339,8 +394,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
 
     // The VRAM check (design §19.3.7), before the weights are read: the dense weights, the
     // Program's fixed allocations, the reserve for graph executables and the display headroom
-    // must leave room for the expert cache. Fast paths are selected once the weights are bound, so
-    // the check counts sampled-mtp-drafts' draft graphs whenever it could be selected.
+    // must leave room for the expert cache. The check counts sampled-mtp-drafts' draft graphs whenever
+    // it could be selected; the Program plans with the selection (`fast`).
     program_options.sampled_mtp_drafts =
         options.speculative.backend == SpeculativeBackend::Mtp &&
         (options.fast_paths || std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
@@ -544,6 +599,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
             !shortfall.empty()) {
             plan_refuse(*planned, std::move(shortfall));
         }
+        // Then its frontend compiles the chat template (Qwen4ExpInstance), which may refuse --chat-template.
+        (void)models::qwen3_5::make_frontend(plan.resources(), frontend_options(options));
         return {};
     }
     (void)check_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + device_plan.fixed_bytes(),
@@ -580,9 +637,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<Qwen4ExpInstance>(std::move(model), options);
     frontend.complete();
+    check_selection_formats(instance->parameters, instance->model->config());
 
-    // The fast paths qualified for this configuration (docs/maintainer/model-quality.md section 6.7).
-    const models::qwen4_exp::FastPathSelection fast = models::qwen4_exp::select_fast_paths(instance->parameters, options);
+    // The fast paths selected before the load.
     program_options.fast_paths        = fast.forward();
     // Two-row speculative rounds: MTP's (adaptive-speculation) or DFlash2's (dflash2-pairs); each
     // applies only to its drafter.
@@ -610,17 +667,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                    "4-bit route follows NVIDIA's specification, is faster on prompts and is the recommended "
                    "configuration");
     }
-    // --a8-activations (LOSSY, opt-in; design §19.3.31): the 8-bit activation routes of this artifact
-    // (models::qwen4_exp::A8Routes), in decode and verification calls and in prefill calls, or a refusal where it
-    // has none. Every other call keeps its route.
+    // --a8-activations: the 8-bit activation routes resolved before the load, in decode and verification calls and
+    // in prefill calls. Every other call keeps its route.
     if (options.a8_activations) {
-        const models::qwen4_exp::A8Routes a8 = models::qwen4_exp::a8_activation_routes(instance->parameters, fast);
-        if (!a8.any()) {
-            throw std::invalid_argument(
-                "--a8-activations: no 8-bit activation route applies to this artifact (it covers a GGUF import's dense "
-                "projections and GGUF or NVFP4 W4A16 experts in decode and prefill, and MXFP8 dense projections in "
-                "prefill)");
-        }
         a8.apply(program_options.fast_paths);
         // The 8-bit route's CPU-served GGUF misses take a larger team: 24 workers against 16 on the i9-13900K
         // (IQ3_S, DFlash2 auto, the hyper-connection repack on): -3.6 % conv and -3.3 % struct per decode step,

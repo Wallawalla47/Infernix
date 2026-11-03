@@ -43,6 +43,7 @@ using runtime::expert_offload::kPinRoomMarginBytes;
 using runtime::expert_offload::kVramBudgetMarginBytes;
 using runtime::expert_offload::pin_room;
 using runtime::expert_offload::plan_host_memory;
+using runtime::expert_offload::pool_slack_frames;
 using runtime::expert_offload::read_expert_stripe;
 using runtime::expert_offload::RouteTrace;
 using runtime::expert_offload::route_trace_index;

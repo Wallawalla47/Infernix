@@ -132,7 +132,7 @@ plan's `error`.
 | `vram.planned_bytes`, `left_bytes` | everything planned on the device, and what free VRAM leaves beside it, the headroom and the expert cache's reserve |
 | `ram.total_bytes`, `available_bytes`, `ram_free_bytes` | physical RAM, what is available now, and the reserve (`--ram-free-mib`) |
 | `ram.experts_bytes`, `tier`, `expert_ram_layout` | offloaded experts: the RAM the ledger gives the routed experts; `full` when none is read from the SSD (all in RAM, or with the exclusive layout in RAM or VRAM), `ssd` when part are; and `full` or `exclusive` |
-| `ram.pinned_bytes` | the weights the load pins in RAM (offloaded experts, the token embedding with them or with `--embedding-host`, an offloaded vision tower) |
+| `ram.pinned_bytes` | the weights the load pins in RAM (offloaded experts, the token embedding with them or with `--embedding-host`, an offloaded vision tower and, on the Qwen3.5 family without offloaded experts, the pinned mirror of the device weights its window evicts: the embedding, the heads, MTP) |
 | `ram.host_context_bytes` | the prefix cache's pinned Host tier (`--host-context-mib`, or its automatic size) |
 | `ram.ngram_bytes`, `ngram_residency` | Qwen3.8-Flash-Next's n-gram table: in RAM (`ram`, the whole table) or read from its volume (`volume`, the row cache's bytes) |
 | `ram.planned_bytes`, `left_bytes` | everything planned in RAM, and what available RAM leaves beside it and the reserve |
@@ -143,21 +143,24 @@ What is exact and what is estimated (`estimated` is always `true`):
 - The start's own code computes everything from the artifact and the options: the weights' bytes,
   the capacity curve, workspace and graph allowance, the RAM ledger (experts, tier, pins, Host tier,
   n-gram table) and Qwen3.8-Flash-Next's device plan and expert-frame sizing. Qwen3.8-Flash-Next's
-  start makes these checks before it reads any weight, so `fits` is the start's own decision; its
-  Program then re-plans with the fast paths the loaded weights select, so its actual frames can
-  differ slightly from `expert_frames`.
+  start makes these checks before it reads any weight, as it refuses a `--fast-path` candidate or
+  `--a8-activations` that does not apply, so `fits` is the start's own decision (the plan compiles
+  the chat template as the start's frontend does); its Program then re-plans with the fast paths
+  selected, so its actual frames can differ slightly from `expert_frames`. Both families'
+  `expert_frames` leave off the 64 MiB chunk per further record-size pool a start keeps free (a GGUF
+  import's layers have up to seven).
 - The Qwen3.5 family's capacity is resolved against the free VRAM read where a start reads it, less
-  the weights' arena the plan did not upload (and an overlay vision window's staging). A start reads
-  it after the upload, which may differ by the driver's allocation granularity; an automatic
-  `kv_tokens` and `kv_bytes` follow from it.
+  the weights' arena the plan did not upload (with `--vision-offload on`, in whole 16 MiB chunks: the
+  vision window borrows the evicted ones). A start reads it after the upload, which may differ by the
+  driver's allocation granularity; an automatic `kv_tokens` and `kv_bytes` follow from it.
 - The CUDA Graph allowance is the planned one. When a start's graphs need more, an automatic KV
   capacity retries once with 1 GiB more headroom (fewer KV pages); the plan cannot see that.
 - A Qwen3.5 model with offloaded experts (Qwen3.5-122B-A10B) sizes its expert frames from a live
   reading once the Program's allocations exist. The plan takes the weights, the Program's
-  reservation less its graph allowance (the elastic KV region whole, as with every lane's context
-  full), the expert engine's staging and tables and the MTP drafter's expert pool from the free VRAM
-  now; the cache starts larger while contexts are short. Few frames slow decode but do not refuse
-  the start.
+  reservation less its graph allowance (with the elastic KV region whole, as with every lane's
+  context full, and the expert engine's staging and tables) and the MTP drafter's expert pool from
+  the free VRAM now; the cache starts larger while contexts are short. Few frames slow decode but do
+  not refuse the start.
 - Anything that changes between the plan and the start (another program's memory) changes the start.
 
 ## Endpoints

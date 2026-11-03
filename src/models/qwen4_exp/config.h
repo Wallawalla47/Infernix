@@ -5,6 +5,7 @@
 // supplies dimensions and the n-gram hash and table geometry
 // (docs/maintainer/qwen3_8-flash-next-design.md §2, §12).
 
+#include "core/weight.h"
 #include "models/load_options.h"
 #include "models/qwen3_5/config.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
@@ -180,8 +181,19 @@ struct TextConfig {
     // stream-ring and RAM slots take it), set by the loader from the stored banks; 0 means the NVFP4
     // record's. expert_frame_bytes: the mean stride, rounded up (the expert cache's sizing unit: its
     // pools give every layer the same frame count; ExpertResidency::average_frame_bytes).
+    // expert_frame_pools: the cache's pools, one per distinct stride (runtime::expert_offload::frame_pools).
     std::uint64_t expert_frame_stride = 0;
     std::uint64_t expert_frame_bytes  = 0;
+    std::uint32_t expert_frame_pools  = 1;
+    // What the fast-path selection and --a8-activations' routes read of the weights (program/fast_paths.h),
+    // set by the loader from their stored formats, so a start decides before it reads them and Engine::plan
+    // as it does: the GDN q/k/v/z projection's format (one dense kernel family serves every layer; a BF16
+    // one packed at load runs the BF16 kernels' arithmetic), the routed experts' gate/up plane format
+    // (ExpertBankPlanes::gate_up_format), and how many dense projections are GGUF blocks (each layer's mixer
+    // input and output and its shared expert's gate/up and down).
+    QType dense_format             = QType::BF16;
+    QType expert_format            = QType::NVFP4_MUL;
+    std::uint32_t ggml_projections = 0;
 
     // The positions a context may use: the native ones times the YaRN factor, at most 1,048,576.
     [[nodiscard]] std::uint32_t context_ceiling() const noexcept {

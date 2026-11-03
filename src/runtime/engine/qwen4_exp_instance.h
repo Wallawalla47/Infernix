@@ -54,8 +54,10 @@ struct ConstructedQwen4Exp {
                                                                            const artifact::Directory& target);
 
 // With `plan` (Engine::plan) the construction stops at its VRAM check, before any weight is read:
-// the RAM plan and the device plan land in *plan and the result is empty. A start's memory refusals
-// become EnginePlan::fits false; anything else throws as a start would.
+// the RAM plan and the device plan land in *plan, the chat template is compiled as the start's frontend
+// compiles it, and the result is empty. A start's memory refusals become EnginePlan::fits false; anything
+// else throws as a start would (the fast paths' and --a8-activations' refusals among them, which both make
+// from the stored formats before any weight is read).
 [[nodiscard]] ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device,
                                                       EnginePlan* plan = nullptr);
 

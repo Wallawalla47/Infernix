@@ -10,9 +10,7 @@
 
 namespace infernix::models::qwen4_exp {
 
-namespace execution {
-class Parameters;
-}
+struct Config;
 
 // The dense kernels an artifact's GDN q/k/v/z projection runs: one family per kernel set, so every
 // GGUF block format (one exact A16 kernel family, design 19.3.25) is one configuration.
@@ -34,8 +32,9 @@ struct FastPathConfiguration {
 // For example "Q8 dense, 4-bit expert activations, int8 KV".
 [[nodiscard]] std::string describe(const FastPathConfiguration& configuration);
 
-[[nodiscard]] FastPathConfiguration fast_path_configuration(const execution::Parameters& parameters,
-                                                            const EngineOptions& options);
+// From the model's configuration (the stored formats TextConfig records: a load plan's, before any weight is
+// read, and the loaded Model's alike).
+[[nodiscard]] FastPathConfiguration fast_path_configuration(const Config& config, const EngineOptions& options);
 
 // Whether the path acts in this configuration under these options at all.
 [[nodiscard]] bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration,
@@ -64,8 +63,9 @@ struct FastPathSelection {
 };
 
 // The qualified paths that apply when options.fast_paths is set, plus every
-// options.fast_path_candidates entry (qualification runs), which must apply.
-[[nodiscard]] FastPathSelection select_fast_paths(const execution::Parameters& parameters,
+// options.fast_path_candidates entry (qualification runs), which must apply (std::invalid_argument otherwise).
+// `output_head_screen`: the loader bound the LM head's 2-bit screen (LoadPlan::has_output_head_screen).
+[[nodiscard]] FastPathSelection select_fast_paths(const Config& config, bool output_head_screen,
                                                   const EngineOptions& options);
 
 // --a8-activations (EngineOptions::a8_activations; LOSSY, opt-in, never a fast path; design §19.3.31): the
@@ -107,7 +107,7 @@ struct A8Routes {
 // W4A16 experts' narrow calls).
 [[nodiscard]] A8Routes a8_activation_routes(const FastPathConfiguration& configuration, QType expert_format,
                                             std::size_t ggml_projections, bool expert_a4_narrow) noexcept;
-// The same for loaded parameters beside their selected fast paths.
-[[nodiscard]] A8Routes a8_activation_routes(const execution::Parameters& parameters, const FastPathSelection& fast);
+// The same for a model's configuration (its stored formats) beside its selected fast paths.
+[[nodiscard]] A8Routes a8_activation_routes(const Config& config, const FastPathSelection& fast);
 
 } // namespace infernix::models::qwen4_exp
