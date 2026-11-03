@@ -193,11 +193,11 @@ Defaults per family (README "Recommended settings per model"):
 
 A 27B keeps all of its KV cache on the GPU, so its context is what the GPU holds beside the
 weights: the launcher reckons 2.03 GB plus 33,792 bytes per token of context (measured with INT8 KV,
-two requests and both draft kinds), the Engine's 1 GiB of headroom and 1 GB for the CUDA context and
-the display, rounded down to 4,096 tokens and at most 240,000. On a 32 GB RTX 5090 that is 188,416
-for the 23.7 GB official NVFP4 artifact (it starts at up to about 196,000 there; 240,000 needs
-1.5 GB more) and 240,000 for artifacts of 21.6 GB or less. Raise it with `--vram-headroom-mib 0`
-when nothing else uses the GPU.
+two requests and both draft kinds), the Engine's automatic headroom (256 MiB when NVML reports no
+display on the GPU, else 1 GiB) and 1 GB for the CUDA context and the display, rounded down to
+4,096 tokens and at most 240,000. On a 32 GB RTX 5090 that is 208,896 headless and 188,416 with a
+display for the 23.7 GB official NVFP4 artifact, and 240,000 for artifacts of up to 22.7 GB headless
+(21.9 GB with a display). Raise it with `--vram-headroom-mib 0` when nothing else uses the GPU.
 
 The launcher sets `--host`, `--port`, `--model-id` (the model id), `--any-model-name`,
 `--log-stats-panel off` and `--log-colours off` itself; they are removed from saved parameters.

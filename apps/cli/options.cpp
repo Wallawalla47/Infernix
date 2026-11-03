@@ -264,13 +264,11 @@ std::string usage_text(const char* argv0) {
            "                           with --reproducible. Default off; Strata's\n"
            "                           default is 7\n"
            "  --vram-headroom-mib N|auto\n"
-           "                           VRAM in MiB startup sizing leaves free: Qwen3.5,\n"
-           "                           after --kv-capacity auto (auto " +
-           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           "); Qwen3.8-\n"
-           "                           Flash-Next, after the expert cache, for the display\n"
-           "                           and other programs (auto: 1024 with a display on\n"
-           "                           the GPU, else 256)\n"
+           "                           VRAM in MiB startup sizing leaves free for the\n"
+           "                           display and other programs: Qwen3.5, after\n"
+           "                           --kv-capacity auto; offloaded experts, after the\n"
+           "                           expert cache (auto: 1024 with a display on the\n"
+           "                           GPU, else 256)\n"
            "  --kv-dtype T             bf16 (default) | bf16p | int8 | fp8 | nvfp4 | k8v4 | vq2 |\n"
            "                           k4v2; bf16 stores K as BF16 and V as FP16 (exact for\n"
            "                           2^-17 <= |v| < 2^16), with --lossless V as BF16; bf16p\n"

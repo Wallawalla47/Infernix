@@ -383,6 +383,11 @@ void test_library() {
     check(fitting_27b_context(small, rtx5090) == 240000, "a smaller artifact gets the full 240,000");
     check(fitting_27b_context(dense, HostFacts{96ull << 30, 0}) == 188416, "an unknown GPU gets the 32 GB value");
     check(fitting_27b_context(dense, HostFacts{96ull << 30, 24ull << 30}) == 32768, "a too-small GPU gets the floor");
+    // The Engine's automatic headroom follows the display (VM-07 b): 256 MiB headless, 1 GiB with a
+    // display or when NVML cannot tell (the case above).
+    check(fitting_27b_context(dense, HostFacts{96ull << 30, 32607ull << 20, false}) == 208896 &&
+              fitting_27b_context(dense, HostFacts{96ull << 30, 32607ull << 20, true}) == 188416,
+          "the 27B context does not follow the GPU's display");
 }
 
 void test_router() {

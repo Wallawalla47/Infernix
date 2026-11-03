@@ -434,12 +434,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             to free VRAM less --vram-headroom-mib;\n"
            "                             offloaded experts:\n"
            "                             auto = --max-context x --max-concurrency)\n"
-           "  --vram-headroom-mib N|auto VRAM in MiB startup sizing leaves free: Qwen3.5,\n"
-           "                             after --kv-capacity auto (auto " +
-           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           "); Qwen3.8-Flash-\n"
-           "                             Next, after the expert cache, for the display and\n"
-           "                             other programs (auto: 1024 with a display on the\n"
+           "  --vram-headroom-mib N|auto VRAM in MiB startup sizing leaves free for the\n"
+           "                             display and other programs: Qwen3.5, after\n"
+           "                             --kv-capacity auto; offloaded experts, after the\n"
+           "                             expert cache (auto: 1024 with a display on the\n"
            "                             GPU, else 256)\n"
            "  --vram-past-budget         Qwen3.8-Flash-Next on Windows: also use the VRAM\n"
            "                             the OS budget withholds (~0.6 GiB more expert\n"

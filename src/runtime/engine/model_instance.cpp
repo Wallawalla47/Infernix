@@ -1009,8 +1009,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
-    const std::size_t base_headroom = options.vram_headroom_bytes.value_or(kDefaultKvCapacityHeadroomBytes);
-    std::size_t retry_headroom      = 0;
+    std::size_t retry_headroom = 0;
     // Offloaded experts take the VRAM the Program leaves (their frames are sized after its fixed
     // allocations), so an automatic KV capacity is every lane's full context, as on
     // Qwen3.8-Flash-Next, rather than the free VRAM.
@@ -1032,7 +1031,14 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
                                static_cast<unsigned long long>(vram_now.local_budget >> 20),
                                static_cast<unsigned long long>(vram_now.local_usage >> 20));
         }
-        const std::size_t headroom = base_headroom + retry_headroom;
+        // An automatic KV capacity leaves the offloaded models' display headroom (256 MiB with no display on
+        // the GPU, 1 GiB with one or when unknown). Measured headless on the 27B and 35B at 4 x 65,536 (RTX
+        // 5090, 2026-11-03): the earlier fixed 1 GiB stayed free, and long prefills, decode at four lanes
+        // and a constrained tool call took 2 MiB more after startup.
+        const std::size_t headroom =
+            static_cast<std::size_t>(runtime::expert_offload::display_headroom(vram_now.display, false,
+                                                                              options.vram_headroom_bytes)) +
+            retry_headroom;
         // The sequence plan of `trial` (these options at another prefill chunk, for the fit below) with its
         // KV capacity resolved; none when Engine::plan finds no capacity that fits.
         const auto plan_sequence = [&](const EngineOptions& trial)

@@ -61,6 +61,7 @@ struct Nvml {
     int (*pcie_throughput)(NvmlDevice, int, unsigned int*) = nullptr;
     int (*link_generation)(NvmlDevice, unsigned int*)     = nullptr;
     int (*link_width)(NvmlDevice, unsigned int*)          = nullptr;
+    int (*display_active)(NvmlDevice, int*)               = nullptr; // nvmlEnableState_t: 1 a display
     int (*driver_version)(char*, unsigned int)            = nullptr;
     std::vector<NvmlDevice> devices;
     bool ready = false;
@@ -103,6 +104,7 @@ struct Nvml {
         bind(pcie_throughput, "nvmlDeviceGetPcieThroughput");
         bind(link_generation, "nvmlDeviceGetCurrPcieLinkGeneration");
         bind(link_width, "nvmlDeviceGetCurrPcieLinkWidth");
+        bind(display_active, "nvmlDeviceGetDisplayActive");
         bind(driver_version, "nvmlSystemGetDriverVersion");
         if (init == nullptr || count == nullptr || handle == nullptr || init() != kNvmlSuccess) { return; }
         unsigned int n = 0;
@@ -630,6 +632,11 @@ Telemetry::Telemetry(ServerProbe server, Listener listener)
     for (std::size_t i = 0; i < sources_->nvml.devices.size(); ++i) {
         const GpuReading gpu = sources_->nvml.read(static_cast<std::uint32_t>(i), sources_->nvml.devices[i]);
         facts_.gpus.push_back({gpu.index, {gpu.name, gpu.vram_total}});
+    }
+    int active = -1;
+    if (!sources_->nvml.devices.empty() && sources_->nvml.display_active != nullptr &&
+        sources_->nvml.display_active(sources_->nvml.devices.front(), &active) == kNvmlSuccess && active >= 0) {
+        facts_.first_gpu_display = active != 0;
     }
     if (sources_->nvml.driver_version != nullptr) {
         char version[96] = {};

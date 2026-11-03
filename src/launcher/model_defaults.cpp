@@ -18,18 +18,19 @@ std::string stem_of(const ScannedModel& model) {
 std::uint64_t fitting_27b_context(const ScannedModel& model, const HostFacts& host) {
     // Measured on the official NVFP4 artifact (RTX 5090 32 GB, INT8 KV, two lanes, DFlash2 and
     // n-gram drafts; 2026-10-31): the Engine's minimum reservation is 2.03 GB plus 33,792 bytes per
-    // context token, it keeps 1 GiB of headroom, and about 0.74 GB beside the file's bytes went to the
-    // CUDA context, workspaces and the display (1 GB is assumed, leaving room for other programs).
+    // context token, and about 0.74 GB beside the file's bytes went to the CUDA context, workspaces
+    // and the display (1 GB is assumed, leaving room for other programs). The Engine's automatic
+    // headroom is 256 MiB on a GPU without a display and 1 GiB with one (or when NVML cannot tell).
     // A file's unloaded parts (vision without --vision) make this lower than what fits, never higher.
     constexpr std::uint64_t kUnknownGpu = 188416;
     constexpr double kPerToken          = 33792.0;
     constexpr double kFixed             = 2.03e9;
     constexpr double kBeside            = 1.0e9;
-    constexpr double kHeadroom          = 1073741824.0;
     constexpr std::uint64_t kStep       = 4096;
     if (host.vram_total_bytes == 0) { return kUnknownGpu; }
+    const double headroom = host.display == false ? 268435456.0 : 1073741824.0;
     const double budget =
-        static_cast<double>(host.vram_total_bytes) - static_cast<double>(model.bytes) - kBeside - kHeadroom - kFixed;
+        static_cast<double>(host.vram_total_bytes) - static_cast<double>(model.bytes) - kBeside - headroom - kFixed;
     const auto tokens = budget <= 0.0 ? 0 : static_cast<std::uint64_t>(budget / kPerToken) / kStep * kStep;
     return std::clamp<std::uint64_t>(tokens, 32768, 240000);
 }

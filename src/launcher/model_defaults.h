@@ -16,6 +16,8 @@ namespace infernix::launcher {
 struct HostFacts {
     std::uint64_t ram_total_bytes  = 0;
     std::uint64_t vram_total_bytes = 0; // the first GPU's; 0 when unknown
+    // Whether that GPU drives a display; empty when unknown (taken as one, as the Engine does).
+    std::optional<bool> display;
 };
 
 // Qwen3.x-27B keeps all of its KV on the GPU: the --max-context that fits beside the artifact.

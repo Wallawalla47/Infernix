@@ -709,6 +709,7 @@ Args Launcher::model_default_args(const ScannedModel& model, const LibraryScan& 
     HostFacts host;
     host.ram_total_bytes = facts.ram_total;
     if (!facts.gpus.empty()) { host.vram_total_bytes = facts.gpus.front().second.second; }
+    host.display = facts.first_gpu_display;
     return default_args(scan, model, host);
 }
 

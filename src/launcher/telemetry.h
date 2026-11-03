@@ -68,6 +68,8 @@ struct SystemFacts {
     std::uint32_t threads = 0;
     std::uint64_t ram_total = 0;
     std::vector<std::pair<std::uint32_t, std::pair<std::string, std::uint64_t>>> gpus;
+    // Whether the first GPU drives a display (NVML); empty when NVML cannot tell.
+    std::optional<bool> first_gpu_display;
     std::optional<std::string> driver_version;
     std::optional<std::string> cpu_temp_source;
 };

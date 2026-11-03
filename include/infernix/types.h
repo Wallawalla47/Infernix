@@ -392,10 +392,6 @@ enum class KvCapacityMode : std::uint8_t {
     Automatic,
 };
 
-// Qwen3.5's automatic KV capacity leaves this much device memory free unless
-// EngineOptions::vram_headroom_bytes says otherwise.
-inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
-
 struct KvCapacityPolicy {
     KvCapacityMode mode           = KvCapacityMode::Explicit;
     std::uint32_t explicit_tokens = 2048;
@@ -750,10 +746,10 @@ struct EngineOptions {
     // Extends only the allowed ceiling, never max_context itself or artifact metadata.
     float rope_yarn_factor             = 1.0F;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
-    // Device memory startup sizing leaves free; empty selects the model's automatic value.
-    // Qwen3.5: what --kv-capacity auto leaves after the KV cache (requires it; automatic 1 GiB).
-    // Qwen3.8-Flash-Next: what the expert cache leaves for the display and other programs once
-    // every fixed allocation is made (automatic: 1 GiB with a display attached, 256 MiB headless).
+    // Device memory startup sizing leaves free for the display and other programs; empty selects the
+    // automatic value, 1 GiB with a display attached (or unknown) and 256 MiB headless
+    // (expert_offload::display_headroom). Qwen3.5: what --kv-capacity auto leaves after the KV cache
+    // (requires it). Offloaded experts: what the expert cache leaves once every fixed allocation is made.
     std::optional<std::size_t> vram_headroom_bytes;
     // Qwen3.8-Flash-Next on Windows: also size the expert cache into the physical VRAM the OS
     // budget withholds (~0.6 GiB on an RTX 5090), measured at startup (--vram-past-budget). That
