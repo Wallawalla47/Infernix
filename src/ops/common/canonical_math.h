@@ -181,8 +181,12 @@ INFERNIX_CANON_HD std::uint8_t e4m3_rn_satfinite(float x) {
 }
 
 // E2M1 encode with round-to-nearest-even onto {0, 0.5, 1, 1.5, 2, 3, 4, 6} and saturation to 6
-// (the semantics of cvt.rn.satfinite.e2m1x2.f32). The sign of x, including -0, sets bit 3.
-// Callers never pass NaN: the quantizer divides finite BF16 activations by a positive scale.
+// (the semantics of cvt.rn.satfinite.e2m1x2.f32). The sign of x, including -0, sets bit 3. An Inf
+// saturates and a NaN (which compares false) takes code 7, so the A4 rule encodes non-finite inputs
+// as finite codes. They do not arise from finite ones (gate/up sums stay below 2^56 * 2^-20 * alpha):
+// an Inf or NaN reaching an A4 encoder comes from a residual stream that is already non-finite, which
+// carries it to the logits, where the request fails (no finite logit). The A16 and A4-residual
+// routes give NaN outputs for such a column instead (kA16NonFinite, a4r_row_scale).
 INFERNIX_CANON_HD std::uint8_t e2m1_rn_satfinite(float x) {
     const std::uint32_t bits = f32_bits(x);
     const unsigned sign      = (bits >> 31) != 0 ? 8U : 0U;
