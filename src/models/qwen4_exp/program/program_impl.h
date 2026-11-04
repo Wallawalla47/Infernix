@@ -1393,9 +1393,9 @@ public:
             // The team's rate sets the decode miss split (design §19.3.12): the service starts on the
             // reference rates, and its channels take the measured split after the warm start (below).
             // Decode and verification calls are CPU-served up to decode_columns; prefill calls up to
-            // kAssistMaxColumns take the assist cap (wider chunks stream or stage on the GPU).
+            // assist_max_columns take the assist cap (wider chunks stream or stage on the GPU).
             const int decode_columns = std::max(ops::offloaded_moe::kMaxCpuColumns, lanes * max_width_);
-            const bool assist        = assist_jobs > 0 && decode_columns < kAssistMaxColumns;
+            const bool assist        = assist_jobs > 0 && decode_columns < assist_max_columns();
             std::vector<ops::offloaded_moe::CpuMissService::Layer> service_layers;
             for (const auto& layer : parameters_.layers) {
                 service_layers.push_back({.records       = reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records),
@@ -1408,7 +1408,7 @@ public:
                 ops::offloaded_moe::CpuMissService::Options{
                     .workers     = static_cast<int>(cpu_workers),
                     .max_jobs    = static_cast<int>(std::min<std::uint32_t>(cpu_jobs, ops::offloaded_moe::kMaxCpuJobs)),
-                    .max_columns = assist ? kAssistMaxColumns : decode_columns,
+                    .max_columns = assist ? assist_max_columns() : decode_columns,
                     .pcie_divisor = pcie_divisor(),
                     .one_column_divisor = one_column_divisor(),
                     .pcie_share  = pcie_share(),
@@ -1435,8 +1435,10 @@ public:
                 }
             }
             if (assist && expert_stream_ && options_.prefill_cpu_split) {
-                split_policy_ = std::make_unique<SplitPolicy>(*this);
-                experts.split = split_policy_.get();
+                split_policy_                 = std::make_unique<SplitPolicy>(*this);
+                experts.split                 = split_policy_.get();
+                experts.split_keep_columns    = split_keep_columns();
+                experts.split_wide_keep_below = split_wide_keep_below();
             }
         }
         create_prefix_cache();
@@ -2294,7 +2296,7 @@ public:
         // the others, and a call the stream turns down, read them first.
         // FP4-Local from a volume (2026-10-30, three interleaved runs): pp16413 6,829 -> 6,999 tok/s, pp4096
         // 2,727 -> 2,802 (every pair ahead).
-        const bool rows_behind = expert_stream_ && width >= kStreamMinColumns && !walk_.active;
+        const bool rows_behind = expert_stream_ && width >= stream_min_columns() && !walk_.active;
         {
             const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
                                                static_cast<std::uint64_t>(rows_behind ? 0 : width));
@@ -3633,6 +3635,51 @@ public:
     // every expert, and their misses stream or stage on the GPU.
     static constexpr int kAssistMaxColumns = 255;
 
+    // FP4-Local (an NVFP4 bank, W4A16 on the exact CPU arithmetic or W4A4: wide_assist) CPU-assists prompt calls up to
+    // kWideAssistMaxColumns. Its gated calls narrower than split_keep_columns plan the CPU split at
+    // kSplitKeepRateShare of the team's rates (about "every narrow miss to the CPU") and keep the assisted calls'
+    // link share of those experts, staged inside the call (ForwardExperts::split_keep_columns); wider ones plan at
+    // split_rate_share and keep the wide share below split_wide_keep_below, else give the split's experts all to the
+    // CPU. Design §19.3.50; -p N -n 1 from a warm state, two rotated runs a point, pairs within 0.5 % (2026-11-04):
+    //   16-bit, assisted to 575 against gated from 257 (pure split at 10x): pp320 +21.7 %, pp384 +18.2 %, pp448
+    //   +14.7 %, pp512 +9.0 %, pp575 +4.1 %. Gated, the kept share against the best pure split: pp768 651.5 against
+    //   632.0 tok/s (1x; 0.3 / 0.5 / 0.7: 588.7 / 608.4 / 621.1; with 3,990 CPU experts at 0.7 against the kept form's
+    //   4,091 the count is not the cause), pp1023 759.8 / 747.0 (1x), pp1536 994.1 / 981.4 (0.7), pp2048 1,237.0 /
+    //   1,240.5 (0.5), pp3072 1,730.7 / 1,769.1 (0.3), pp4096 2,219.8 / 2,302.9 (0.3), pp8192 level (the walk).
+    //   4-bit (--expert-a4-activations), assisted against gated from 257: pp384 +26 %, pp512 +21 %, pp575 +17 %; the
+    //   kept share (77/256) against the best pure split: pp1023 789.6 / 781.4 (3x), pp1536 1,038.0 / 1,018.1 (1.5x),
+    //   pp2048 1,295.8 / 1,277.0 (1x), pp3072 1,816.0 / 1,811.0 (1x), pp4096 2,340.9 / 2,349.5 (0.3).
+    //   The wide share (51/256) kept in the pure split against none, the same binary: 16-bit pp2048 (0.5) +1.9 %,
+    //   pp3072 (0.3) -0.5 %, pp4096 (0.3) +0.1 % (level); 4-bit pp4096 (0.3) +0.4 % (three pairs, every one ahead).
+    // The other banks keep kAssistMaxColumns and kSplitRateShare with the wide share kept (unmeasured).
+    static constexpr int kWideAssistMaxColumns    = 575;
+    static constexpr double kSplitKeepRateShare   = 10.0;
+    static constexpr std::int32_t kSplitKeepA16Columns = 2048;
+    static constexpr std::int32_t kSplitKeepA4Columns  = 4096;
+    [[nodiscard]] bool wide_assist() const {
+        const auto& bank       = *parameters_.layers.front().moe.bank;
+        const bool nvfp4       = bank.planes.gate_up_format == QType::NVFP4_MUL;
+        const bool exact_a16   = nvfp4 && bank.activation == ops::offloaded_moe::ExpertActivation::kA16 &&
+                                 cpu_narrow_a16() == ops::offloaded_moe::NarrowA16::kExact;
+        return exact_a16 || (nvfp4 && bank.activation == ops::offloaded_moe::ExpertActivation::kA4);
+    }
+    [[nodiscard]] bool a4_bank() const {
+        return parameters_.layers.front().moe.bank->activation == ops::offloaded_moe::ExpertActivation::kA4;
+    }
+    [[nodiscard]] int assist_max_columns() const { return wide_assist() ? kWideAssistMaxColumns : kAssistMaxColumns; }
+    [[nodiscard]] std::int32_t stream_min_columns() const { return assist_max_columns() + 1; }
+    [[nodiscard]] std::int32_t split_keep_columns() const {
+        if (!wide_assist() || assist_link_share().share == 0) { return 0; }
+        return a4_bank() ? kSplitKeepA4Columns : kSplitKeepA16Columns;
+    }
+    // Gated calls from split_keep_columns up to this width keep the bank's wide link share of the split's experts
+    // (wide_link_share: 51/256 on the NVFP4 banks): FP4-Local's 16-bit route in its 0.5 range, every other bank at
+    // every width (the split call's form from 2026-11-02 to 11-04, there by accident).
+    [[nodiscard]] std::int32_t split_wide_keep_below() const {
+        if (wide_assist() && !a4_bank()) { return kSplitRateShareA16MidTo; }
+        return std::numeric_limits<std::int32_t>::max();
+    }
+
     // At a boundary (no round's kernels in flight; `idle`: no request active): resizes the expert
     // cache to the control law's decision.
     void apply_vram_target(bool idle) {
@@ -3719,12 +3766,13 @@ private:
             char text[640];
             std::snprintf(text, sizeof(text),
                           "expert cache: %u frames; request %.1f%% of %llu routed experts hit, %llu promotions, "
-                          "%llu landed, %llu misses CPU-served; since start %.1f%%; VRAM free %zu MiB; RAM: process "
-                          "%.1f GiB private, %.1f GiB resident, %.1f of %.1f GiB free",
+                          "%llu landed, %llu misses CPU-served (the CPU team at %.2fx its measured rates' time); since "
+                          "start %.1f%%; VRAM free %zu MiB; RAM: process %.1f GiB private, %.1f GiB resident, %.1f of "
+                          "%.1f GiB free",
                           residency_->frames(), routed ? 100.0 * static_cast<double>(hits) / static_cast<double>(routed) : 0.0,
                           static_cast<unsigned long long>(routed), static_cast<unsigned long long>(promoted),
                           static_cast<unsigned long long>(landed),
-                          static_cast<unsigned long long>(cpu),
+                          static_cast<unsigned long long>(cpu), cpu_service_ ? cpu_service_->speed_ratio() : 1.0,
                           s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0,
                           free_vram >> 20, static_cast<double>(ram.process_private) / kGiB,
                           static_cast<double>(ram.process_resident) / kGiB, static_cast<double>(ram.available_physical) / kGiB,
@@ -4427,9 +4475,12 @@ private:
     // Whether this chunk streams; lends the ring first when none is held. With `walk_bytes`, the
     // lease also holds a layer walk's area after the ring (stream_walk_bytes_; zero when the
     // lendable frames do not cover it): the experts its frames evict widen each half by their
-    // per-layer share.
+    // per-layer share. A walk's first call (walk_span_end, which checks the span's width) may be
+    // narrower than stream_min_columns.
     bool stream_chunk(std::int32_t width, std::size_t walk_bytes = 0) {
-        if (!expert_stream_ || width < kStreamMinColumns || residency_->frames() == 0) { return false; }
+        if (!expert_stream_ || (walk_bytes == 0 && width < stream_min_columns()) || residency_->frames() == 0) {
+            return false;
+        }
         if (!stream_lease_.valid()) {
             const std::int32_t* table = residency_->host_table();
             const std::uint32_t E     = c_.moe.experts;
@@ -6315,25 +6366,34 @@ private:
     // 471.4), 104 at 255 (464.7 -> 532.2; 90 509.2, 118 495.0); the ramp against the fixed 77, three runs, every
     // run ahead: pp96 +3.1 %, pp128 +7.0 %, pp192 +14.5 %, pp255 +15.7 %. In the slow CPU state seen that day (an
     // outside cause: identical work, normal startup probes, 35 % slower assisted calls) 118 led at 96-192 and 104 at
-    // 255; the ramp's wider shares serve both. The 4-bit route (W4A4's faster CPU arithmetic) and the other banks keep
-    // the wide share (unmeasured). A fixed cpu_pcie_divisor or an INFERNIX_TMP_LINK_SHARE share leaves every width
-    // alone.
+    // 255; the ramp's wider shares serve both. The bank's assisted calls past 255 columns (wide_assist) continue the
+    // ramp's slope to their widest (149/256 at 575). An NVFP4 W4A4 bank (the 4-bit route, wide_assist) keeps
+    // kA4AssistLinkShare256 at every width: FP4-Local --expert-a4-activations, fixed shares against its wide share's
+    // 51/256 at 9-255 columns and against the gated stream past them (2026-11-04, two rotated runs): 38 / 51 / 64 / 77 /
+    // 104 pp128 401.3 / 407.6 / 412.2* / 448.1* / 377.7 tok/s (51/256 404.5*; * the one undisturbed run; the 16-bit
+    // ramp's 86/256 433.4), pp255 576.3 / 569.7 / 576.3 / 577.8 / 536.8 (574.2), pp384 691.2 / 692.9 / 690.6 / 692.4 /
+    // 653.2 (streamed 438.5), pp575 797.7 / 798.3 / 796.9 / 796.8 / 795.5 (573.9); the 16-bit ramp's 122-149/256 at
+    // 384-575 lost 17 % and 19 %. The other banks keep the wide share (unmeasured). A fixed cpu_pcie_divisor or an
+    // INFERNIX_TMP_LINK_SHARE share leaves every width alone.
     struct AssistShare {
         std::int32_t share = 0, wide = 0, ramp_from = 0;
     };
     [[nodiscard]] AssistShare assist_link_share() const {
-        const auto& bank = *parameters_.layers.front().moe.bank;
         const bool fixed = options_.cpu_pcie_divisor > 0 ||
                            temporary_switches::offload().link_share != temporary_switches::OffloadSwitches::LinkShare::kDivisor;
-        const bool exact_a16 = bank.activation == ops::offloaded_moe::ExpertActivation::kA16 &&
-                               bank.planes.gate_up_format == QType::NVFP4_MUL &&
-                               cpu_narrow_a16() == ops::offloaded_moe::NarrowA16::kExact;
-        if (fixed || !exact_a16) { return {}; }
-        return {kAssistLinkShare256, kAssistLinkShareWide256, kAssistRampFrom};
+        if (fixed || !wide_assist()) { return {}; }
+        if (parameters_.layers.front().moe.bank->activation == ops::offloaded_moe::ExpertActivation::kA4) {
+            return {kA4AssistLinkShare256, kA4AssistLinkShare256, 0};
+        }
+        const int top  = assist_max_columns();
+        const int wide = std::min(256, kAssistLinkShare256 + (kAssistLinkShareWide256 - kAssistLinkShare256) *
+                                                                 (top - kAssistRampFrom) / (kAssistMaxColumns - kAssistRampFrom));
+        return {kAssistLinkShare256, wide, kAssistRampFrom};
     }
     static constexpr std::int32_t kAssistLinkShare256     = 77;
     static constexpr std::int32_t kAssistLinkShareWide256 = 104;
     static constexpr std::int32_t kAssistRampFrom         = 64;
+    static constexpr std::int32_t kA4AssistLinkShare256   = 77;
 
     [[nodiscard]] int pcie_divisor() const noexcept {
         if (options_.cpu_pcie_divisor > 0) { return options_.cpu_pcie_divisor; }
@@ -6782,20 +6842,31 @@ private:
     // the measured rates was fastest on a 13900K at 6 and at 3 workers (Dense8, pp256-1024; 6 workers
     // -4 to -6 % against the fitted rates, 3 workers -11 to -19 % against the measured ones). A line
     // fitted to measured layer times starved the CPU instead (the kept experts' cost is not linear).
-    static constexpr double kSplitRateShare = 0.3;
+    // FP4-Local's (wide_assist) gated calls below split_keep_columns plan at kSplitKeepRateShare; its 16-bit route's
+    // calls of 2,048-3,071 columns at kSplitRateShareA16Mid (pp2048 1,240.5 against 1,233.3 tok/s at 0.3; pp3072
+    // 1,752.5 against 1,769.1), every wider call at kSplitRateShare (§19.3.50).
+    static constexpr double kSplitRateShare              = 0.3;
+    static constexpr double kSplitRateShareA16Mid        = 0.5;
+    static constexpr std::int32_t kSplitRateShareA16MidTo = 3072;
+    [[nodiscard]] double split_rate_share(std::int32_t tokens) const {
+        if (!wide_assist()) { return kSplitRateShare; }
+        if (tokens < split_keep_columns()) { return kSplitKeepRateShare; }
+        return !a4_bank() && tokens < kSplitRateShareA16MidTo ? kSplitRateShareA16Mid : kSplitRateShare;
+    }
     class SplitPolicy final : public CpuSplitPolicy {
     public:
         explicit SplitPolicy(const ProgramImpl& program) : program_(program) {}
-        std::uint32_t choose(std::uint32_t layer, std::span<const std::int32_t> columns,
+        std::uint32_t choose(std::uint32_t layer, std::int32_t tokens, std::span<const std::int32_t> columns,
                              std::span<std::uint8_t> cpu) const override {
             const auto& p              = program_;
             const std::uint32_t E      = p.c_.moe.experts;
             const std::int32_t* frames = p.residency_->host_table() + static_cast<std::size_t>(layer) * E;
             const double link          = static_cast<double>(p.residency_->frame_pitch(layer)) / p.link_bytes_per_second_;
             // The team's measured rates (cpu_rates.cpp: one-column jobs fix the per-expert cost, 8-column
-            // jobs the per-column cost) at kSplitRateShare, the share of them a gated layer realises.
-            const double per_expert    = 1.0 / (p.cpu_expert_rate() * kSplitRateShare);
-            const double per_column    = 1.0 / (p.cpu_column_rate() * kSplitRateShare);
+            // jobs the per-column cost) at split_rate_share, the share of them a gated layer realises.
+            const double share         = p.split_rate_share(tokens);
+            const double per_expert    = 1.0 / (p.cpu_expert_rate() * share);
+            const double per_column    = 1.0 / (p.cpu_column_rate() * share);
             constexpr int kNarrow      = ops::offloaded_moe::kMaxCpuColumns;
             std::array<std::uint32_t, kNarrow + 1> width_count{};
             std::uint32_t absent = 0;

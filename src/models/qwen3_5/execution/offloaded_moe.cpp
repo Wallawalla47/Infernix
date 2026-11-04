@@ -235,7 +235,7 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
             std::copy(experts.split_columns.begin(), experts.split_columns.end(), experts.split_priced.begin());
             streaming->mask_ahead(p.layer, experts.split_priced);
             const std::uint32_t cpu = call.split && experts.split != nullptr && source.cpu.max_jobs > 0
-                                          ? experts.split->choose(p.layer, experts.split_priced, experts.split_cpu)
+                                          ? experts.split->choose(p.layer, T, experts.split_priced, experts.split_cpu)
                                           : 0U;
             experts.split_streamed_experts += streaming->plan_layer(p.layer, experts.split_columns, experts.split_cpu);
             experts.split_cpu_experts += cpu;

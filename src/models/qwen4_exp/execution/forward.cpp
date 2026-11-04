@@ -1227,18 +1227,44 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         std::copy(split_columns_.begin(), split_columns_.end(), split_priced_.begin());
         streaming->mask_ahead(layer, split_priced_);
         const std::uint32_t cpu = batch->split && experts_.split != nullptr && source.cpu.max_jobs > 0
-                                      ? experts_.split->choose(layer, split_priced_, split_cpu_)
+                                      ? experts_.split->choose(layer, T, split_priced_, split_cpu_)
                                       : 0U;
         split_streamed_experts_ += streaming->plan_layer(layer, split_columns_, split_cpu_);
         split_cpu_experts_ += cpu;
         if (cpu > 0) {
-            source.cpu.max_columns        = ops::offloaded_moe::kMaxCpuCallColumns;
-            source.cpu.pcie_divisor       = 0;
-            source.cpu.pcie_share         = 0;
-            source.cpu.one_column_divisor = 0;
-            source.cpu.one_column_divisor_device = nullptr;
-            source.cpu.wide_from          = 1;
-            source.cpu.wide_jobs          = static_cast<std::int32_t>(cpu);
+            // The call takes the channel's connection and arithmetic and only the link share the policy names (a
+            // share field added later stays at its "none"): below split_keep_columns the assisted calls' share of
+            // the split's experts, below split_wide_keep_below the wide calls' share, else none, so they all go to
+            // the CPU. Until 2026-11-04 the call reset the shares one by one and missed the wide calls' and the
+            // assisted calls': from 11-02 every split call kept 51/256 or more of its CPU experts on the link
+            // (Flash-Next design §19.3.50).
+            const ops::MoeCpuChannel& channel = source.cpu;
+            ops::MoeCpuChannel split;
+            split.request         = channel.request;
+            split.x               = channel.x;
+            split.y               = channel.y;
+            split.done            = channel.done;
+            split.status          = channel.status;
+            split.heartbeat       = channel.heartbeat;
+            split.sequence        = channel.sequence;
+            split.layer           = channel.layer;
+            split.max_jobs        = channel.max_jobs;
+            split.max_job_columns = channel.max_job_columns;
+            split.narrow_a16      = channel.narrow_a16;
+            split.ggml_a8         = channel.ggml_a8;
+            split.max_columns     = ops::offloaded_moe::kMaxCpuCallColumns;
+            split.pcie_divisor    = 0;
+            split.wide_from       = 1;
+            split.wide_jobs       = static_cast<std::int32_t>(cpu);
+            if (T < experts_.split_keep_columns) {
+                split.assist_share      = channel.assist_share;
+                split.assist_share_wide = channel.assist_share_wide;
+                split.assist_ramp_from  = channel.assist_ramp_from;
+            } else if (T < experts_.split_wide_keep_below) {
+                split.wide_share      = channel.wide_share;
+                split.wide_share_from = channel.wide_share_from;
+            }
+            source.cpu            = split;
         } else {
             source.cpu = ops::MoeCpuChannel{};
         }

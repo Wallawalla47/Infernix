@@ -3,10 +3,12 @@
 // team survives many rounds with workers spinning and parking. Host-only: needs no GPU.
 
 #include "ops/op_family.h"
+#include "ops/offloaded_sparse_moe/cpu/cpu_speed.h"
 #include "ops/offloaded_sparse_moe/cpu/expert_team.h"
 #include "ops/offloaded_moe_fixtures.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -286,6 +288,33 @@ void bench_team() {
     }
 }
 
+// The team's run-time speed (CpuSpeed): requests timed at the reference rates read 1, a team twice as slow reads 2 once
+// enough work is pooled, little work reads 1, the estimate follows a change within its horizon, and a new reference
+// restarts it.
+void test_speed_estimate() {
+    moe::CpuSpeed speed;
+    speed.set_reference(10'000.0, 40'000.0); // 100 us an expert, 25 us a column
+    const std::vector<int> narrow(8, 1), wide(4, 8);
+    check(std::abs(speed.predicted(narrow) - 8 * 100e-6) < 1e-12, "a one-column job costs the per-expert time");
+    check(std::abs(speed.predicted(wide) - 4 * 200e-6) < 1e-12, "an eight-column job costs its columns' time");
+    speed.add(narrow, 8 * 100e-6);
+    check(speed.ratio() == 1.0, "under kMinimumSeconds of work the estimate stays 1");
+    // 2,000 requests of ~0.8 ms predicted: 1.6 s, about three horizons, so the first request's weight is ~4 %.
+    for (int i = 0; i < 2'000; ++i) { speed.add(i % 2 ? narrow : wide, 2.0 * speed.predicted(i % 2 ? narrow : wide)); }
+    check(std::abs(speed.ratio() - 2.0) < 0.01, "a team taking twice the predicted time reads 2");
+    // Back at the reference speed: after eight horizons of work the old ratio has decayed away.
+    for (int i = 0; i < 5'000; ++i) { speed.add(wide, speed.predicted(wide)); }
+    check(std::abs(speed.ratio() - 1.0) < 0.01, "the estimate follows the team back within a few horizons");
+    speed.add({}, 1.0);
+    check(std::abs(speed.ratio() - 1.0) < 0.01, "a request without jobs changes nothing");
+    speed.set_reference(5'000.0, 20'000.0);
+    speed.add(wide, 1e-3);
+    check(speed.ratio() == 1.0, "a new reference restarts the estimate");
+    moe::CpuSpeed unset;
+    unset.add(wide, 1.0);
+    check(unset.ratio() == 1.0, "without a reference the estimate stays 1");
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(offloaded_moe_team) {
@@ -294,6 +323,7 @@ INFERNIX_OP_TEST(offloaded_moe_team) {
         return 0;
     }
     g_quick = argc > 1 && std::string(argv[1]) == "--quick";
+    test_speed_estimate();
     test_worker_counts();
     test_worker_counts_a16(moe::kFlashNextShape);
     test_worker_counts_a16(moe::kQwen3_5_122BShape);

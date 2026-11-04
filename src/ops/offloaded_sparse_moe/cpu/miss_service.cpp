@@ -224,7 +224,8 @@ void CpuMissService::serve() {
         std::vector<CpuExpertJob> jobs(static_cast<std::size_t>(jobs_));
         std::vector<CpuExpertJob> ready, read;
         std::vector<std::uint32_t> tickets;
-        std::vector<int> read_jobs;
+        std::vector<int> read_jobs, ready_columns;
+        ready_columns.reserve(static_cast<std::size_t>(jobs_));
         auto* volatile_status = reinterpret_cast<volatile std::uint32_t*>(status_);
         auto* volatile_beat   = reinterpret_cast<volatile std::uint32_t*>(heartbeat_);
         std::uint32_t beat    = 0;
@@ -299,7 +300,13 @@ void CpuMissService::serve() {
                     status = ENOENT;
                 }
             }
+            const auto started = std::chrono::steady_clock::now();
             team.run(std::span<const CpuExpertJob>(ready.data(), ready.size()), {volatile_beat, &beat});
+            if (!ready.empty()) {
+                ready_columns.clear();
+                for (const CpuExpertJob& job : ready) { ready_columns.push_back(job.ncols); }
+                speed_.add(ready_columns, std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+            }
             if (!read_jobs.empty()) {
                 read.clear();
                 for (std::size_t i = 0; i < read_jobs.size(); ++i) {

@@ -13,6 +13,7 @@
 // every call that uses its channels, and its destructor must run only when no call is pending.
 
 #include "infernix/ops/offloaded_sparse_moe.h"
+#include "ops/offloaded_sparse_moe/cpu/cpu_speed.h"
 #include "ops/offloaded_sparse_moe/cpu/expert_team.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_request.h"
 #include "ops/offloaded_sparse_moe/cpu/record_provider.h"
@@ -95,6 +96,10 @@ public:
     // without a request the thread idles in waits of about 0.5 ms (Windows: a high-resolution
     // waitable timer; a plain sleep_for(50 us) there lasts one 15.6 ms timer tick).
     void wake() const noexcept;
+    // The team's speed against the caller's reference rates (CpuSpeed): each request's experts with their records in
+    // memory are timed as the team computes them (tier reads excluded). Before set_reference_rates, 1.
+    void set_reference_rates(double expert_rate, double column_rate) noexcept { speed_.set_reference(expert_rate, column_rate); }
+    [[nodiscard]] double speed_ratio() const noexcept { return speed_.ratio(); }
 
 private:
     void serve();
@@ -116,6 +121,7 @@ private:
     void* wake_event_ = nullptr;             // Windows: auto-reset event wake() signals
     void* idle_timer_ = nullptr;             // Windows: the idle wait's high-resolution timer
     std::atomic<std::uint64_t> served_{0}, experts_{0};
+    CpuSpeed speed_;
     mutable std::mutex failure_mutex_;
     std::string failure_;
     std::thread thread_;

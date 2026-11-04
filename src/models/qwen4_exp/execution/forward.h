@@ -121,6 +121,14 @@ struct ForwardExperts {
     ExpertStream* stream = nullptr;
     // A gated stream's split of each layer's experts between the link and the CPU (§19.3.12).
     const CpuSplitPolicy* split = nullptr;
+    // A gated call of fewer columns keeps the CPU channel's assisted link share of the experts the split marked
+    // (ops::MoeCpuChannel::assist_share and its ramp, continued to the split's widest call): the widest of them
+    // are staged inside the call, the rest computed on the CPU (design §19.3.50). 0: no call keeps that share.
+    std::int32_t split_keep_columns = 0;
+    // A gated call of at least split_keep_columns and fewer than split_wide_keep_below columns keeps the channel's
+    // wide link share of the experts the split marked (ops::MoeCpuChannel::wide_share from wide_share_from: 51/256
+    // on the NVFP4 banks); a wider one gives them all to the CPU (design §19.3.50).
+    std::int32_t split_wide_keep_below = 0;
     // --expert-tail-skip (approximate, 0: off): the generation rounds' ops::MoeExpertSource::
     // tail_skip_rank.
     std::int32_t tail_skip_rank = 0;

@@ -82,6 +82,10 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
     // last call after it, the two walk: as its own call the last one stages its misses again right after the
     // streamed call (FP4-Local pp16413, a 29-token last call after 16,384 tokens: 299 ms, mostly CPU-served
     // misses; walked 6,999 -> 7,684 tok/s, 2026-10-30; pp4125 on IQ3_S and Dense8 1.000x, 2026-10-27).
+    // A span's calls stream their experts once, as one call of their summed width would: it walks only from that
+    // width's stream boundary (stream_min_columns; FP4-Local's 16-bit route assists calls to 575 columns, §19.3.50),
+    // so a call of 256-575 columns before the prompt's narrow last one stays CPU-assisted.
+    if (total < static_cast<std::uint32_t>(stream_min_columns())) { return first; }
     const bool one_then_last = end - first == 1U && end + 1 == lane.calls.size() && lane.calls[end] - from >= kWalkJoinMinTokens;
     if (end - first < 2U && !one_then_last) { return first; }
     // The prompt's last call, too narrow to stream, joins a

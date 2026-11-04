@@ -12501,10 +12501,9 @@ cause lies outside the process (not attributed; the 2026-11-02 two-speed runs ha
 wider shares serve both states; a split that follows the CPU team's observed time at run time would serve them better
 (not built).
 
-The 4-bit route and the other banks keep the wide share (unmeasured). Still open: A4 leads A16 at 128-255 columns by
-the CPU arithmetic, and a prompt of 255 tokens (assisted) prefills faster than one of 256 (the gated stream): A16 465
-against 371 tok/s, A4 573 against 370, a boundary not re-tuned since the tensor-core narrow kernels and the vector CPU
-kernels landed (not attributed).
+The other banks keep the wide share (unmeasured). A4 leads A16 at 128-255 columns by the CPU arithmetic. A prompt of
+255 tokens (assisted) prefilled faster than one of 256 (the gated stream): A16 465 against 371 tok/s, A4 573 against
+370; §19.3.50 moves the boundary and gives the 4-bit route its own shares.
 
 **Narrow jobs of prompt calls** on the tensor-core kernels up to 4,096 columns: §19.3.40.
 
@@ -12518,6 +12517,131 @@ record bytes is the pass's fixed latency, which the split does not touch. End to
 blocks, the same text and rounds), unsplit against split: DFlash2 after a 16K prompt 227.25 -> 227.70 tok/s (3 of 3
 ahead), the struct fixture 430.83 -> 431.27 (2 of 3), plain decode (one column: the same kernels) 128.90 -> 128.80.
 Kept by the op gain at no cost.
+
+### 19.3.50 FP4-Local's prompt calls: assisted to 575 columns, the split's kept link share, the CPU team's speed (2026-11-04; same bits; default)
+
+**Why.** A 255-token prompt (CPU-assisted) prefilled faster than a 256-token one (the gated stream): A16 465 against
+371 tok/s, A4 573 against 370 (§19.3.49). The boundary (`kAssistMaxColumns` 255, `kStreamMinColumns` 256) predates
+the tensor-core narrow kernels and the vector CPU kernels, and the gated split (§19.3.12) planned its CPU share at 0.3
+of the measured rates (`kSplitRateShare`, Dense8's 2026-10-10 fit).
+
+**The split call kept CPU experts on the link.** A gated call's CPU split (`SplitPolicy`) marks experts for the CPU,
+and `Forward` rewrote the call's channel for it field by field. It missed the wide calls' share (`wide_share_from`,
+2026-11-02) and the assisted calls' (`assist_share`, 11-03), so the planning kernel kept (marked x share) >> 8 of the
+marked experts on the link (the widest of them: it takes them narrowest first) and staged them inside the call: 51/256
+on every NVFP4 bank since 11-02, on FP4-Local's 16-bit route since 11-03 its assisted ramp continued to the split
+call's 4,096 columns (82/256 at 768, 104/256 at 4,096; 89 and 149 with the 575-column boundary below). The logs show
+it (main's policy at pp4096: 2,006 experts marked, 1,217 CPU-served; the 575 boundary at 10 times the rates, pp4096:
+2,745 and 1,172, pp768: 6,237 and 4,091). The first boundary round ran with it, and so moving the boundary slowed calls it
+never reaches (pp2048 -1.3 %, pp4096 -2.3 %, three runs). The split call now takes the channel's connection and
+arithmetic fields alone (a share field added later stays at its "none"), and keeps a share only where the policy says
+so (below). Measured apart on the fixed code, the planning share and the kept share help in different width ranges.
+
+**Measured.** FP4-Local, BF16 KV, `-p N -n 1` from a copy of one warm expert state, `--max-ctx 8704`, two rotated runs
+a point, every pair within 0.5 % (RTX 5090, PCIe 5.0 x8, i9-13900K). Prompt calls up to 575 columns CPU-assisted
+against the gated stream from 257 (its split at 10 times the rates, nothing kept), tok/s:
+
+| Prompt | 16-bit assisted | 16-bit gated | 4-bit assisted | 4-bit gated |
+|---:|---:|---:|---:|---:|
+| 320 | 557.7 | 458.1 | | |
+| 384 | 578.9 | 489.6 | 689.8 | 547.6 |
+| 448 | 612.5 | 533.9 | | |
+| 512 | 637.4 | 585.0 | 780.9 | 645.1 |
+| 575 | 649.9 | 624.2 | 798.3 | 684.8 |
+
+The 16-bit route's gated calls, the split planned at 0.3-10 times the rates with nothing kept, and planned at 10 times
+with the assisted share kept (the leak's form):
+
+| Prompt | 0.3 | 0.5 | 0.7 | 1 | 3 | 10 | kept |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 768 | 588.7 | 608.4 | 621.1 | 632.0 | 619.2 | 604.9 | **651.5** |
+| 1,023 | 709.3 | 727.0 | 737.2 | 747.0 | 732.9 | 723.7 | **759.8** |
+| 1,536 | 963.3 | 976.9 | 981.4 | 973.9 | | 943.8 | **994.1** |
+| 2,048 | 1,233.3 | **1,240.5** | 1,231.9 | 1,213.6 | 1,188.5 | 1,192.5 | 1,237.0 |
+| 3,072 | **1,769.1** | 1,752.5 | 1,732.3 | 1,716.9 | | 1,718.9 | 1,730.7 |
+| 4,096 | **2,302.9** | | | 2,243.9 | 2,242.1 | 2,240.6 | 2,219.8 |
+| 8,192 | 4,041.7 | | | 4,042.5 | 4,042.8 | 4,039.1 | 4,040.2 |
+
+The 4-bit route's (`--expert-a4-activations`; kept: 77/256):
+
+| Prompt | 0.3 | 1 | 1.5 | 3 | 10 | kept |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1,023 | 717.7 | 766.1 | 777.6 | 781.3 | 780.7 | **789.6** |
+| 1,536 | | 1,014.6 | 1,018.1 | 1,015.7 | 1,018.8 | **1,038.0** |
+| 2,048 | 1,250.8 | 1,272.7 | 1,273.2 | 1,275.2 | 1,270.9 | **1,295.8** |
+| 3,072 | | 1,811.0 | 1,807.6 | 1,805.4 | 1,803.3 | **1,816.0** |
+| 4,096 | **2,349.5** | 2,344.7 | | 2,346.0 | 2,346.3 | 2,340.9 |
+
+The kept form's lead is not its CPU count: at pp768 the pure split at 0.7 put 3,990 experts on the CPU and the kept
+form 4,091, 621.1 against 651.5 tok/s. What differs is the rest's route: the kept experts are staged inside the call
+(2,146 of them, 1,596 gated copies) where the pure split hands them to the stream (3,843 gated copies). Not attributed
+further. Long gated prompts are link-bound (pp4096 at 0.3 streams 43.4 GiB, 1.69 s of a 1.78 s prefill at 27.6
+GB/s), and more CPU experts slow them (10 times the rates: 41.5 GiB, yet 2.7 % slower), likely the CPU's record reads
+contending with the DMA's in DRAM (unproven).
+
+**Built.** For an NVFP4 bank on FP4-Local's arithmetic (`wide_assist`: W4A16 on the exact CPU arithmetic, or W4A4):
+- Prompt calls up to `kWideAssistMaxColumns` = 575 columns are CPU-assisted (the miss service sized to them; the
+  16-bit route's share ramp continues its slope to 149/256 at 575, the 4-bit route keeps 77/256 at every width:
+  `assist_link_share`); calls of 576 and more take the gated stream (`stream_min_columns`). The 4-bit route's fixed
+  shares 38 / 51 / 64 / 77 / 104 of 256 (two rotated runs; * the one undisturbed run of two): pp128 401.3 / 407.6 /
+  412.2* / 448.1* / 377.7 tok/s, pp255 576.3 / 569.7 / 576.3 / 577.8 / 536.8, pp384 691.2 / 692.9 / 690.6 / 692.4 /
+  653.2, pp575 797.7 / 798.3 / 796.9 / 796.8 / 795.5; the 16-bit ramp's 122-149/256 at 384-575 lost 17 % and 19 %.
+- Gated calls narrower than `split_keep_columns` (2,048 columns on the 16-bit route, 4,096 on the 4-bit one) plan the
+  split at 10 times the rates (`kSplitKeepRateShare`) and keep the assisted share of its experts on the link, staged
+  inside the call (`ForwardExperts::split_keep_columns`; on the 16-bit route the ramp continued to the split call's
+  4,096 columns: 89/256 at 768, 112/256 at 2,047).
+- Wider gated calls plan the split at 0.5 of the rates on the 16-bit route at 2,048-3,071 columns and at 0.3
+  elsewhere (`split_rate_share`; `CpuSplitPolicy::choose` takes the call's width), and keep the bank's wide link
+  share (51/256) of the split's experts below `split_wide_keep_below` (3,072 on the 16-bit route, every width on the
+  4-bit one); wider ones give them all to the CPU. The same binary, the wide share kept against none: 16-bit pp2048
+  1,253.7 / 1,230.2 tok/s (+1.9 %, both pairs), pp3072 1,766.2 / 1,775.0 (-0.5 %), pp4096 2,307.1 / 2,304.4 (+0.1 %:
+  level, not kept); 4-bit pp4096 2,335.4 / 2,325.6 (+0.4 %, three pairs, every one ahead).
+- A layer walk's span (`walk_span_end`) forms only when its calls together reach the stream boundary, so a
+  256-575-column call before the prompt's narrow last call (the generation opener's cut) stays assisted; a span's
+  first call may be narrower than the boundary (`stream_chunk` with the walk's area), as before.
+
+The other banks keep 255 / 256 columns and 0.3 with the wide share kept at every width, their split calls' form from
+2026-11-02: GGUF and block-FP8 banks have no wide share (the leak never reached them), and an NVFP4 W4A16 bank on the
+approximate CPU arithmetic keeps its 51/256 (unmeasured).
+
+**Against main's policy** (two binaries, the rig above; main = the binary before this work, on the 4-bit banks the one
+before their change; the final build before the wide share's return), new against old:
+
+| Prompt | FP4-Local 16-bit | FP4-Local 4-bit | Dense8 | Recipe A | Recipe C |
+|---:|---:|---:|---:|---:|---:|
+| 128 | +0.9 % | +9.0 % | +9.2 % | +10.2 % | -0.5 % |
+| 255 / 256 | +51.9 % (256) | +1.2 % | +2.2 % | +0.3 % | +0.8 % |
+| 384 | +37.3 % | +57.2 % | +55.3 % | +52.0 % | +36.1 % |
+| 575 | +17.2 % | +38.8 % | +36.8 % | +31.1 % | +15.9 % |
+| 768 | +15.8 % | | | | |
+| 1,023 | +10.8 % | +11.4 % | +11.9 % | +10.7 % | +11.1 % |
+| 1,536 | +6.4 % | | | | |
+| 2,048 | +3.7 % | +3.5 % | +3.5 % | +3.4 % | +3.4 % |
+| 3,072 | +2.7 % | | | | |
+| 4,096 | +2.6 % | -0.7 % | -0.6 % | -0.8 % | +2.0 % |
+| 8,192 | -0.1 % | | | | |
+
+FP4-Local 16-bit pp4096 is 2,244.2 -> 2,302.4 tok/s, pp2048 1,195.8 -> 1,239.7. Recipe C's pp128 runs 400.3 / 410.3
+against 406.0 / 408.5 (inside their spread); pp8192 splits nothing in either binary (0 experts marked). The 4-bit banks'
+pp4096 loss was main's wide share, which the build that table ran without (main: 2,422 marked, 1,963 CPU-served;
+then 2,410 and 2,410); the wide share's return above gives those calls main's form back. Recipe C (W4A16 experts, FP8
+dense) and the 4-bit Dense8 and recipe A take the policy by code (`wide_assist`). The kept form reproduces the leak's
+work where it was best: the leaky binary against the final one at pp768 650.5 / 651.8 and pp1536 993.8 / 994.2 tok/s,
+the same counts (6,237 marked / 4,091 served; 4,919 / 2,962).
+
+**The CPU team's speed.** `CpuSpeed` (`ops/offloaded_sparse_moe/cpu/cpu_speed.h`): the miss service times each
+served batch against the startup probe's prediction (per expert max(1 / expert rate, columns / column rate)) and keeps
+a ratio pooled over 0.5 s; the expert-cache report line prints it ("the CPU team at N.NNx its measured rates' time").
+It reads 0.86-1.00 in normal windows and 1.46-1.94 in the slow state of §19.3.49, whose startup probes read normal
+(19.1-21.0K experts/s); the state correlates with the System process's CPU during the pinned load (+0.76 over 62 runs;
+on-demand zeroing), not with clocks, DPC time, Defender or core packing (not attributed). A transform that scaled the
+decode and gated splits by the ratio (clamped to 8x) was built and measured: quiet decode level (it never engaged),
+under 8 busy processes conv -0.4 % and pp512 -2.0 %, under 32 conv +6.2 % inside its noise: not adopted, removed.
+
+**Row-fast MXFP8 prefill GEMMs from 16,384 tokens.** The exact MXFP8 GEMM's calls of at least `kMxfp8RowFastTokens`
+= 16,384 tokens walk the rows of one token tile before the next (`Mxfp8RowFast`, `mxfp8_launch.cuh`; candidates
+RV-44): FP4-Local BF16 KV, two rotated runs, from 4,096 / 8,192 tokens against never: pp8192 1.000x / 0.999x,
+pp16384 1.000x / 1.000x, pp32768 1.020x / 1.021x (the layer walk's wide calls). Same bits.
 
 ---
 

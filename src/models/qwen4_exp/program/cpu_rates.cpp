@@ -185,6 +185,8 @@ void ProgramImpl::measure_cpu_rate_settled(std::uint64_t record_stride) {
         cpu_expert_rate_ = rates.experts;
         cpu_column_rate_ = rates.columns;
     }
+    // The team's run-time speed is read against the rates the splits take (CpuMissService::speed_ratio).
+    if (cpu_service_) { cpu_service_->set_reference_rates(cpu_expert_rate(), cpu_column_rate()); }
     const std::string how = measured ? rates.note + rates.readings_text() : "reference: no expert records in RAM yet";
     char kept[160];
     const bool switched = temporary_switches::offload().link_share != temporary_switches::OffloadSwitches::LinkShare::kDivisor;

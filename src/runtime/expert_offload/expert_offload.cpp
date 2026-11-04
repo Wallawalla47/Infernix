@@ -68,7 +68,7 @@ public:
 
     // The thinnest non-resident experts of the layer (n <= 8 columns, in order of n then id), as many
     // as minimise the later of the CPU's predicted time and the link's for the rest.
-    std::uint32_t choose(std::uint32_t layer, std::span<const std::int32_t> columns,
+    std::uint32_t choose(std::uint32_t layer, std::int32_t /*tokens*/, std::span<const std::int32_t> columns,
                          std::span<std::uint8_t> cpu) const override {
         const ExpertResidency& residency = offload_.residency();
         const std::uint32_t E      = static_cast<std::uint32_t>(columns.size());

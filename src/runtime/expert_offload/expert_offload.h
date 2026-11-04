@@ -56,12 +56,12 @@
 namespace infernix::runtime::expert_offload {
 
 // The prefill CPU split's choice (Flash-Next design §19.3.12): for one layer of a gated streamed
-// chunk, marks cpu[e] = 1 for the non-resident experts the CPU computes (columns[e]: the chunk's
-// columns routed to expert e) and returns how many it marked.
+// chunk of `tokens` columns, marks cpu[e] = 1 for the non-resident experts the CPU computes
+// (columns[e]: the chunk's columns routed to expert e) and returns how many it marked.
 class CpuSplitPolicy {
 public:
     virtual ~CpuSplitPolicy() = default;
-    virtual std::uint32_t choose(std::uint32_t layer, std::span<const std::int32_t> columns,
+    virtual std::uint32_t choose(std::uint32_t layer, std::int32_t tokens, std::span<const std::int32_t> columns,
                                  std::span<std::uint8_t> cpu) const = 0;
 };
 

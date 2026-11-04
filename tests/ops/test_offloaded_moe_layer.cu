@@ -351,6 +351,12 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                                      .wide_from = 9, .wide_jobs = moe::kMaxCpuJobs, .assist_share = 77,
                                                      .assist_share_wide = 230, .assist_ramp_from = 32, .cpus = {},
                                                      .activation = activation, .narrow_a16 = narrow});
+    // FP4-Local's 16-bit route (Flash-Next design §19.3.50): calls assisted to 575 columns with the Program's ramp, 77/256
+    // up to 64 columns rising to 149/256 at 575 (a 512-column call keeps 140/256 on the link).
+    moe::CpuMissService service_assist_wide(layers, {.workers = 6, .max_jobs = 8, .max_columns = 575, .pcie_divisor = 4,
+                                                     .wide_from = 9, .wide_jobs = moe::kMaxCpuJobs, .assist_share = 77,
+                                                     .assist_share_wide = 149, .assist_ramp_from = 64, .cpus = {},
+                                                     .activation = activation, .narrow_a16 = narrow});
     // A prefill call's CPU share (design §19.3.12): calls up to a chunk of 4,096 columns, every narrow
     // miss offered (no PCIe share), up to every expert of the layer.
     moe::CpuMissService service_wide(layers, {.workers = 6, .max_jobs = 8, .max_columns = moe::kMaxCpuCallColumns,
@@ -516,7 +522,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                 Config{64, &service_assist}, Config{3, &service_assist}, Config{0, &service_assist},
                                 Config{64, &service_assist, true}, Config{64, &service_assist_share},
                                 Config{3, &service_assist_share}, Config{64, &service_assist_ramp},
-                                Config{3, &service_assist_ramp}, Config{0, nullptr, false, false, true},
+                                Config{3, &service_assist_ramp}, Config{64, &service_assist_wide},
+                                Config{3, &service_assist_wide}, Config{0, nullptr, false, false, true},
                                 Config{3, nullptr, false, false, true}, Config{64, nullptr, false, false, true},
                                 Config{64, nullptr, true, false, true}, Config{64, &service_wide},
                                 Config{0, &service_wide}, Config{64, &service_wide, false, false, true},
