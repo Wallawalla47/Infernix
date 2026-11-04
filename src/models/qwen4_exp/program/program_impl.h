@@ -3681,7 +3681,8 @@ public:
     //   pp2048 1,295.8 / 1,277.0 (1x), pp3072 1,816.0 / 1,811.0 (1x), pp4096 2,340.9 / 2,349.5 (0.3).
     //   The wide share (51/256) kept in the pure split against none, the same binary: 16-bit pp2048 (0.5) +1.9 %,
     //   pp3072 (0.3) -0.5 %, pp4096 (0.3) +0.1 % (level); 4-bit pp4096 (0.3) +0.4 % (three pairs, every one ahead).
-    // The other banks keep kAssistMaxColumns and kSplitRateShare with the wide share kept (unmeasured).
+    // The other banks keep kSplitRateShare with the wide share kept (unmeasured); the GGUF and block-FP8 ones assist
+    // to kWideAssistMaxColumns too (assist_max_columns), the other NVFP4 ones to kAssistMaxColumns.
     static constexpr int kWideAssistMaxColumns    = 575;
     static constexpr double kSplitKeepRateShare   = 10.0;
     static constexpr std::int32_t kSplitKeepA16Columns = 2048;
@@ -3696,7 +3697,17 @@ public:
     [[nodiscard]] bool a4_bank() const {
         return parameters_.layers.front().moe.bank->activation == ops::offloaded_moe::ExpertActivation::kA4;
     }
-    [[nodiscard]] int assist_max_columns() const { return wide_assist() ? kWideAssistMaxColumns : kAssistMaxColumns; }
+    // The GGUF (IQ3_S) and block-FP8 banks also assist prompt calls to kWideAssistMaxColumns, their link shares as
+    // they were (candidates XB-02; -p N -n 1 from the artifact's warm state, two or three rotated pairs a point,
+    // 2026-11-04; assisted to 575 against streamed from 256): IQ3_S pp256 +18.8 %, pp320 +23.2 %, pp384 +11.2 % and
+    // pp512 +8.2 % (five pairs each, one slower: the CPU team's bimodal state), pp448 +16.8 %, pp575 +7.8 %, pp768
+    // -0.3 %; the FP8 import pp256 +27.7 %, pp320 +27.1 %, pp384 +21.8 %, pp448 +20.1 %, pp512 +23.6 %, pp575 +11.4 %,
+    // pp640 / 768 / 1024 -0.9 / 0.0 / -0.6 % (five pairs at 768; its SSD tier swings runs by about 5 %). The NVFP4
+    // banks off FP4-Local's routes keep kAssistMaxColumns (unmeasured).
+    [[nodiscard]] int assist_max_columns() const {
+        const bool gguf_or_block_fp8 = parameters_.layers.front().moe.bank->planes.gate_up_format != QType::NVFP4_MUL;
+        return wide_assist() || gguf_or_block_fp8 ? kWideAssistMaxColumns : kAssistMaxColumns;
+    }
     [[nodiscard]] std::int32_t stream_min_columns() const { return assist_max_columns() + 1; }
     [[nodiscard]] std::int32_t split_keep_columns() const {
         if (!wide_assist() || assist_link_share().share == 0) { return 0; }
