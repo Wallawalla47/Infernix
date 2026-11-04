@@ -300,6 +300,20 @@ still streaming, which measured about 10 % slower on the RTX 5090 DFlash2 round.
 may stage its first weight tiles into shared memory before the wait. Attention over the KV cache
 stays an ordinary launch; it has no weights to stage and measured no faster as a dependent.
 
+Placing a read after the wait in the source does not keep it there: ptxas moved a non-coherent load
+(`const __restrict__`, `LDG.E.CONSTANT`) of the Flash-Next conv snapshot kernel's slot index above
+`griddepcontrol.wait` (SASS `ACQBULK`). That index is host-written ingress, which is safe, but producer output
+read through such a pointer could be read early in the same way. The PDL skew test build checks a model's
+captured rounds for such reads: configure a tree with `-DINFERNIX_PDL_SKEW=ON` (candidates LE-12). There,
+every `wait_for_dependencies()` first lets its dependents launch, then waits, then spins about 20 µs, so each
+producer writes its outputs late while its consumers already run their code before their own wait. A
+request's ids on the reproducible route must then equal a normal build's. `INFERNIX_PDL_SKEW_SELECT=k/n`
+launches as programmatic dependents only the kernels whose name hashes to k modulo n (`1/1`: none, a
+control), and `INFERNIX_PDL_SKEW_LOG=1` prints each kernel's choice, hash and name, so a difference can be
+narrowed to one consumer. The spin follows the wait so that the code before the wait compiles as in a
+normal build: an earlier version spun before the wait, and the compiler moved the QSA attention kernel's
+loads above it, a failure the normal binary does not have.
+
 #### Asynchronous-copy pipelines
 
 A producer that refills shared-memory stages with TMA or bulk copies (`cp.async.bulk.tensor`,

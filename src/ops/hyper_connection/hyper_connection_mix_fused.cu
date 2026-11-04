@@ -1034,7 +1034,7 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
         attributes[0].val.clusterDim.y = 1;
         attributes[0].val.clusterDim.z = 1;
         unsigned count                 = 1;
-        if (pdl::graph_dependent(stream)) {
+        if (pdl::graph_dependent(stream, hc_up_collapse_v4_kernel<Codec, Norm, true>)) {
             attributes[1].id                                         = cudaLaunchAttributeProgrammaticStreamSerialization;
             attributes[1].val.programmaticStreamSerializationAllowed = 1;
             count                                                    = 2;

@@ -14,6 +14,13 @@ struct LaunchConfig {
     cudaStream_t stream            = nullptr;
 };
 
+#ifdef INFERNIX_PDL_SKEW
+// The skew build's selection of the kernels that launch as programmatic dependents (pdl_skew.cpp).
+[[nodiscard]] bool skew_selected(const void* kernel);
+#else
+[[nodiscard]] constexpr bool skew_selected(const void*) noexcept { return true; }
+#endif
+
 // Launches a consumer kernel as a programmatic dependent of the immediately preceding producer
 // kernel in the same stream. Every consumer control path that reads producer output must first call
 // wait_for_dependencies().
@@ -30,7 +37,7 @@ launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), Call
     config.dynamicSmemBytes = launch.dynamic_smem_bytes;
     config.stream           = launch.stream;
     config.attrs            = &attribute;
-    config.numAttrs         = 1;
+    config.numAttrs         = skew_selected(reinterpret_cast<const void*>(kernel)) ? 1 : 0;
 
     return cudaLaunchKernelEx(&config, kernel, std::forward<CallArgs>(args)...);
 }
@@ -44,6 +51,13 @@ launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), Call
         return false;
     }
     return status == cudaStreamCaptureStatusActive;
+}
+
+// graph_dependent() for a launcher that sets the programmatic attribute itself (beside a cluster
+// dimension): also false for a kernel the skew build leaves serialized.
+template <class... KernelArgs>
+[[nodiscard]] inline bool graph_dependent(cudaStream_t stream, void (*kernel)(KernelArgs...)) noexcept {
+    return graph_dependent(stream) && skew_selected(reinterpret_cast<const void*>(kernel));
 }
 
 // Launches a kernel that implements the consumer protocol below (enter() before touching anything
@@ -88,7 +102,21 @@ template <class... KernelArgs, class... CallArgs>
 __device__ __forceinline__ void trigger_dependents() { cudaTriggerProgrammaticLaunchCompletion(); }
 
 // Call on every consumer control path before its first access to producer-dependent data.
-__device__ __forceinline__ void wait_for_dependencies() { cudaGridDependencySynchronize(); }
+//
+// A skew build (CMake INFERNIX_PDL_SKEW, tests only; candidates LE-12) lets every kernel's dependents launch at its
+// wait and spins ~20 us after it, so each producer writes its outputs late while its consumers already run their code
+// before their own wait: a consumer that reads producer output there reads stale data, and its outputs differ from a
+// normal build's. The spin follows the wait so the code before it compiles as in a normal build (spinning before it,
+// the compiler moved a consumer's non-coherent loads above the wait: a failure the normal binary does not have).
+__device__ __forceinline__ void wait_for_dependencies() {
+#ifdef INFERNIX_PDL_SKEW
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
+    for (int i = 0; i < 20; ++i) { __nanosleep(1000); }
+#else
+    cudaGridDependencySynchronize();
+#endif
+}
 
 // Consumer protocol for launch_consumer(). Call one of these in every thread, before any access
 // other than reading immutable weights; a CTA that returns early must still have called it, so

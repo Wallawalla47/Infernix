@@ -203,7 +203,7 @@ void launch_columns(std::int32_t k, std::int32_t columns, cudaStream_t stream, v
     attributes[0].val.clusterDim.y = 1;
     attributes[0].val.clusterDim.z = 1;
     unsigned count                 = 1;
-    if (pdl::graph_dependent(stream)) {
+    if (pdl::graph_dependent(stream, kernel)) {
         attributes[1].id                                         = cudaLaunchAttributeProgrammaticStreamSerialization;
         attributes[1].val.programmaticStreamSerializationAllowed = 1;
         count                                                    = 2;

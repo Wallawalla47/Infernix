@@ -30,6 +30,13 @@ endif()
 option(INFERNIX_BUILD_APPS "Build the Infernix CLI, server and perplexity evaluator" ON)
 option(BUILD_TESTING "Build Infernix tests" OFF)
 option(INFERNIX_BUILD_BENCHMARKS "Build Infernix benchmarks" OFF)
+# Test builds only: every PDL wait lets its dependents launch, waits, then spins (core/pdl.cuh), so producers
+# write late and a kernel that reads its producer's output before its wait reads stale data and the output
+# changes (docs/maintainer/op-development.md, programmatic dependent launch).
+option(INFERNIX_PDL_SKEW "Skew programmatic dependent launches (a test build that exposes early reads)" OFF)
+if(INFERNIX_PDL_SKEW)
+  add_compile_definitions(INFERNIX_PDL_SKEW=1)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
