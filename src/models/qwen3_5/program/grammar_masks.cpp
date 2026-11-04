@@ -19,6 +19,7 @@ void ProgramImpl::bind_reasoning_ban(runtime::TokenMaskProvider* provider, std::
     config.reasoning_close   = ban.close;
     config.reasoning_ends[0] = ban.ends[0];
     config.reasoning_ends[1] = ban.ends[1];
+    config.reasoning_withheld = ban.withheld;
 }
 
 ops::SamplingMask ProgramImpl::fill_grammar_mask(runtime::TokenMaskProvider* provider,

@@ -434,6 +434,7 @@ public:
           collect_open_reasoning(split_reasoning && output.tolerant_tool_calls &&
                                  tool_call_output_ != nullptr &&
                                  !tool_call_output_->constrained && grammar_ == nullptr),
+          withhold_tool_call(!output.raw && tool_call_output_ != nullptr && markers_.tool_call >= 0),
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
                            output.tool_name_max_length, output.tolerant_tool_calls),
           grammar(std::move(grammar_)), combined(combined_) {
@@ -531,6 +532,10 @@ public:
     // Tolerant tool output keeps the open thinking so a turn that ends inside it can still return
     // the calls stranded there; the text is dropped once the thinking closes.
     bool collect_open_reasoning = false;
+    // A row that declares tools may not open a call while its thinking is open (ReasoningBan::withheld), on every
+    // route: the constrained tool grammars already withhold `<tool_call>` there (NS-01), and on the unconstrained
+    // route a call inside thinking left the turn unable to end (candidates WD-40; vLLM #55420).
+    bool withhold_tool_call = false;
     std::string open_reasoning;
     std::vector<std::size_t> open_reasoning_tool_calls;
     // Per channel: the stream offsets of `<tool_call>` tokens committed but not yet published,
@@ -622,8 +627,9 @@ runtime::ReasoningBan OutputSession::reasoning_ban() const noexcept {
         impl_->markers.turn_ends[0] < 0) {
         return {};
     }
-    return {.close = impl_->markers.reasoning_close,
-            .ends  = {impl_->markers.turn_ends[0], impl_->markers.turn_ends[1]}};
+    return {.close    = impl_->markers.reasoning_close,
+            .ends     = {impl_->markers.turn_ends[0], impl_->markers.turn_ends[1]},
+            .withheld = impl_->withhold_tool_call ? impl_->markers.tool_call : TokenId{-1}};
 }
 
 void OutputSession::observe_constraint(bool timings, double prepare_seconds) noexcept {

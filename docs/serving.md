@@ -510,7 +510,9 @@ the call's tool declares `NAME`; otherwise it stays text of the value it follows
 parser keeps it as value text too. A repaired opener reports `tolerant_recovered`.
 
 Tolerant mode also recovers calls the model wrote inside its thinking when it ends the turn with
-its stop token without closing the thinking, so no call reached the answer. If, from some marker to
+its stop token without closing the thinking, so no call reached the answer. Under the default
+`--end-in-thinking refuse` neither the call token nor the stop token can be produced inside thinking (see
+below), so this applies with `allow`. If, from some marker to
 the end of that thinking, there is nothing but complete calls to declared tools (parsed strictly),
 those calls become the structured turn (logged at Info severity). The thinking before them stays
 reasoning and is never published as content. Nothing is recovered when the thinking was closed,
@@ -739,8 +741,11 @@ speculative verification (a drafted end before the drafted `</think>` is rejecte
 thinking with an empty answer; it ends its thinking first (or reaches the thinking budget). A constrained request's
 grammar refuses them there already, so this reaches the unconstrained ones; a token constraint chooses every step
 itself and keeps them. vLLM #55420 measured the same masking on Qwen3.8-27B NVFP4: empty `stop` turns 5 of 8 ->
-0 of 8. `allow` keeps the model's own distribution. The output changes only where a request would have ended
-inside its thinking.
+0 of 8. A request that declares tools also gets no `<tool_call>` token while its thinking is open (the constrained
+tool grammars already withhold it there): a call written inside unclosed thinking could never end the turn, and
+vLLM #55420 saw such turns run to the output limit with thousands of calls (about 1 in 150 agentic requests), so
+the model closes its thinking before it calls. `allow` keeps the model's own distribution for both. The output
+changes only where a request would have ended, or opened a call, inside its thinking.
 
 For Chat Completions, `reasoning_effort: "none"` requests disabled thinking. The selected template
 interprets the other standard values (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
@@ -1776,7 +1781,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking-answer-room` | thinking may use all of the output limit (by default, from an output limit of 1,024, it closes early enough to leave a quarter for the answer: with no budget, under `--default-thinking-budget`, or with a request budget at or above the limit; the limit is `max_tokens` or the context the prompt leaves, whichever is less) | answer room on |
 | `--thinking-budget-message S` | text committed when a thinking budget ends thinking, replacing Qwen's early-close guidance; the close marker is appended when `S` lacks it, and `S` may contain `</think>` only as that final close and no `<tool_call>` token | Qwen guidance |
 | `--reasoning-loop MODE` | `off`, `stop` or `conclude`: reasoning-loop guard for thinking requests without a token constraint (details under [OpenAI Chat Completions](#openai-chat-completions)) | `off` |
-| `--end-in-thinking MODE` | `refuse` or `allow`: whether a reply may end while its thinking is open (`refuse`: the end-of-turn tokens get no probability until the thinking closes; details under [OpenAI Chat Completions](#openai-chat-completions)) | `refuse` |
+| `--end-in-thinking MODE` | `refuse` or `allow`: whether a reply may end, or with tools open a call, while its thinking is open (`refuse`: the end-of-turn tokens, and `<tool_call>` when tools are declared, get no probability until the thinking closes; details under [OpenAI Chat Completions](#openai-chat-completions)) | `refuse` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--vision-offload auto\|on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; `on` requires `--vision`. `auto` is on for artifacts with offloaded experts, Qwen3.8-Flash-Next and Qwen3.5-122B-A10B (the expert cache lends the encode memory), and off for the other Qwen3.5 artifacts | `auto` |
 | `--vision-max-merged N` | merged vision tokens per image or video, `64..32768` | `32768` |
@@ -1795,7 +1800,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--prefix-cache-save-mins N` | with `--prefix-cache-file`: also save the Host tier there every `N` minutes while serving, counted from the end of the previous save, and only when it changed since the last save or load. The save runs at the first point between execution units once due, also while requests run: they wait while it is written (the log reports the size, the save time and how long requests waited). It writes `PATH.tmp` and replaces `PATH` only once complete, so a crash or power loss leaves the previous file; stopping the server during a periodic save abandons it before the shutdown save. Each save rewrites the whole file (up to `--host-context-mib`, several GB), so a short interval writes a lot to the drive and wears an SSD faster: at 7.5 GB every 5 minutes that is up to ~2 TB a day, every 30 minutes ~360 GB. | off: saved only when the server stops |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
-| `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text, and complete calls stranded in thinking the model never closed | off |
+| `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text, and (with `--end-in-thinking allow`) complete calls stranded in thinking the model never closed | off |
 | `--restore-tool-reasoning` | give a Chat Completions tool-call message sent back without reasoning the reasoning this server generated for it (see Chat Completions) | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |

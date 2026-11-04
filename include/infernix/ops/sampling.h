@@ -57,9 +57,12 @@ struct SamplingConfig {
     // A row whose reasoning is open at the call's first position (the frontend's thinking not yet closed):
     // reasoning_close is the close token and reasoning_ends the end-of-turn tokens (-1: none), which take no
     // probability at a position before which the row has not written reasoning_close (sample(): the call's one
-    // position; speculative verify column c: drafts[0..c-1]). reasoning_close -1: no such row.
-    std::int32_t reasoning_close   = -1;
-    std::int32_t reasoning_ends[2] = {-1, -1};
+    // position; speculative verify column c: drafts[0..c-1]). reasoning_close -1: no such row. reasoning_withheld (-1:
+    // none) is excluded the same way: the tool-call opener of a row that declares tools, so a call starts only after
+    // the row closes its thinking.
+    std::int32_t reasoning_close    = -1;
+    std::int32_t reasoning_ends[2]  = {-1, -1};
+    std::int32_t reasoning_withheld = -1;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive

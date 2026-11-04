@@ -6708,6 +6708,7 @@ private:
         config.reasoning_close   = ban.close;
         config.reasoning_ends[0] = ban.ends[0];
         config.reasoning_ends[1] = ban.ends[1];
+        config.reasoning_withheld = ban.withheld;
     }
     // After the round's synchronize. A row fails when its sampler found no finite logit (the lane's
     // flag, cleared here for its next round; its tokens are placeholders), or when the tokens it

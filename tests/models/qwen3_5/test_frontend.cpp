@@ -2888,6 +2888,29 @@ int test_reasoning_ban(const Frontend& frontend) {
     failures += check(!session.reasoning_ban().active(), "the committed close did not end the exclusion");
     auto allowed = frontend.make_output_session(prompt, {}, {}, infernix::ThinkingControlOptions{.end_turn_in_thinking = true});
     failures += check(!allowed.reasoning_ban().active(), "end_turn_in_thinking did not lift the exclusion");
+
+    // A reply that declares tools also withholds the call opener while its thinking is open (candidates WD-40: on the
+    // unconstrained route a call written inside thinking could never end the turn); without tools nothing is withheld.
+    failures += check(open.withheld == -1, "a reply without tools withheld a token in its thinking");
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
+    message.parts.push_back(infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = "x", .media = {}});
+    infernix::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.continuation    = infernix::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}})");
+    const auto tool_prompt = frontend.prepare(std::move(input));
+    auto with_tools        = frontend.make_output_session(tool_prompt, {});
+    const infernix::runtime::ReasoningBan tool_ban = with_tools.reasoning_ban();
+    failures += check(tool_ban.active() && tool_ban.withheld == kFixtureToolCallToken &&
+                          tool_ban.close == kFixtureThinkCloseToken,
+                      "a reply with tools did not withhold the call opener in its open thinking");
+    auto tools_allowed = frontend.make_output_session(tool_prompt, {}, {},
+                                                      infernix::ThinkingControlOptions{.end_turn_in_thinking = true});
+    failures += check(!tools_allowed.reasoning_ban().active(),
+                      "end_turn_in_thinking did not lift the call opener's exclusion");
     return failures;
 }
 
