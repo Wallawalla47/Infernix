@@ -1,14 +1,17 @@
 #include "media/decode/decode.h"
 #include "fixtures/media/jpeg.h"
+#include "fixtures/media/webp_gif.h"
 
 #ifdef INFERNIX_MEDIA_NATIVE_PNG
 #include "media/decode/png_decode.h"
 #include "png_fixtures_generated.h"
 #endif
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <functional>
 #include <iostream>
@@ -171,6 +174,31 @@ void test_jpeg_references() {
         const auto expected = decode_base64(fixture.rgb);
         expect_image(encoded, fixture.width, fixture.height, expected, fixture.name);
     }
+}
+
+// WebP (lossless, lossy at both parities of width and height, animated, with alpha) and GIF (static, animated)
+// against Pillow's RGB8 of the first frame, as transformers' load_image returns it (candidates MJ-01: the Launcher
+// accepts both and no test decoded either). Every case equals Pillow's pixels: lossy WebP through libwebp's
+// upsampling and conversion, the rest through FFmpeg.
+void test_webp_gif_references() {
+    std::string failures;
+    for (const auto& fixture : webp_gif_fixtures::cases) {
+        const auto encoded  = decode_base64(fixture.encoded);
+        const auto expected = decode_base64(fixture.rgb);
+        const auto info     = infernix::media::decode::inspect_image(encoded, {});
+        const auto image    = infernix::media::decode::decode_image(encoded, {});
+        const std::string name(fixture.name);
+        if (info.width != fixture.width || info.height != fixture.height || image.width != fixture.width ||
+            image.height != fixture.height || image.rgb.size() != expected.size()) {
+            throw std::runtime_error(name + ": geometry mismatch");
+        }
+        int worst = 0;
+        for (std::size_t i = 0; i < expected.size(); ++i) {
+            worst = std::max(worst, std::abs(static_cast<int>(image.rgb[i]) - static_cast<int>(expected[i])));
+        }
+        if (worst != 0) { failures += " " + name + " (largest channel difference " + std::to_string(worst) + ")"; }
+    }
+    if (!failures.empty()) { throw std::runtime_error("RGB differs from Pillow's:" + failures); }
 }
 
 // EXIF orientations 1..8 against ImageOps.exif_transpose().
@@ -516,6 +544,7 @@ int main() {
     try {
         test_issue_20_unaligned_jpeg();
         test_jpeg_references();
+        test_webp_gif_references();
         test_jpeg_orientation();
         test_ffmpeg_odd_width();
         test_jpeg_errors();
