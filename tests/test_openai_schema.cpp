@@ -604,6 +604,23 @@ int test_tools() {
                      Json{{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "sunny"}}});
     failures += check(parse(history).generation.has_tool_history(),
                       "tool-call history follows wire types without inventing JSON validation");
+    // Arguments nested past the body's bound are a 400 at their path (the prompt render would recurse once a level;
+    // candidates WF-01); the bound itself is accepted, and the legacy function_call is bounded too.
+    const auto nested = [](std::size_t levels) { return std::string(levels, '[') + std::string(levels, ']'); };
+    history["messages"][1]["tool_calls"][0]["function"]["arguments"] = nested(257);
+    const ApiError deep = api_error([&] { (void)parse(history); });
+    failures += check(deep.status == 400 && deep.param == "messages[1].tool_calls[0].function.arguments",
+                      "history tool-call arguments nested past the bound were not refused at their path");
+    history["messages"][1]["tool_calls"][0]["function"]["arguments"] = nested(256);
+    failures += check(parse(history).generation.has_tool_history(), "arguments at the nesting bound were refused");
+    Json legacy_deep = base_request();
+    legacy_deep["messages"] =
+        Json::array({Json{{"role", "user"}, {"content", "go"}},
+                     Json{{"role", "assistant"},
+                          {"content", nullptr},
+                          {"function_call", Json{{"name", "legacy"}, {"arguments", nested(300)}}}}});
+    failures += check(api_error([&] { (void)parse(legacy_deep); }).param == "messages[1].function_call.arguments",
+                      "legacy function_call arguments nested past the bound were not refused");
 
     // Results returned out of call order (as parallel runners finish) are put back in call order
     // when their ids name exactly the turn's calls; any other run keeps the order received.

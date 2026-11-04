@@ -926,7 +926,9 @@ images, or a shorter conversation, fit); the server keeps serving either way. HT
 body that exceeds `--max-request-mib` before JSON parsing; it is not used for model-context or media
 resource errors. A body whose JSON nests arrays or objects more than 256 levels deep is refused at
 parsing with HTTP 400 (`invalid_request_error`, "request body JSON nests arrays or objects deeper
-than 256 levels").
+than 256 levels"). The same bound holds inside a history tool call's `arguments` string (Chat
+`tool_calls` and `function_call`, Responses `function_call` and `tool_search_call` Items), which the
+body's parse cannot see: HTTP 400 at that argument's path.
 
 ## OpenAI prompt caching
 

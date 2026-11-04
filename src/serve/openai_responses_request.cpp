@@ -439,6 +439,7 @@ ToolCall parse_function_call_item(
         bad_request("function_call arguments must be a JSON string", "input");
     }
     call.arguments_json  = item.at("arguments").get<std::string>();
+    require_bounded_arguments(call.arguments_json, "input");
     const Json arguments = Json::parse(call.arguments_json, nullptr, false);
     if (arguments.is_discarded() || !arguments.is_object()) {
         bad_request("function_call arguments must encode a JSON object", "input");
@@ -767,6 +768,7 @@ ToolCall parse_tool_search_call_item(
     }
     Json arguments = item.at("arguments");
     if (arguments.is_string()) {
+        require_bounded_arguments(item.at("arguments").get_ref<const std::string&>(), "input");
         arguments = Json::parse(item.at("arguments").get<std::string>(), nullptr, false);
     }
     if (arguments.is_discarded() || !arguments.is_object()) {

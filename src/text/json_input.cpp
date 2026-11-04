@@ -178,6 +178,29 @@ ParsedJsonNumbers parse_json_numbers(std::string_view source) {
     return parsed;
 }
 
+std::size_t json_text_nesting(std::string_view text) noexcept {
+    std::size_t depth = 0, deepest = 0;
+    bool quoted = false, escaped = false;
+    for (const char c : text) {
+        if (quoted) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                quoted = false;
+            }
+        } else if (c == '"') {
+            quoted = true;
+        } else if (c == '[' || c == '{') {
+            deepest = std::max(deepest, ++depth);
+        } else if ((c == ']' || c == '}') && depth > 0) {
+            --depth;
+        }
+    }
+    return deepest;
+}
+
 std::optional<std::string> inexact_schema_number(const ParsedJsonNumbers& parsed,
                                                  const std::string& schema_pointer) {
     if (parsed.inexact_numbers.empty()) return {};

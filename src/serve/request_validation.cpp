@@ -176,6 +176,14 @@ void parse_structured_outputs(const RequestJson& body, GenerationRequest& reques
         bad_request("constrained tools require model EOS and cannot use custom stops", "stop");
 }
 
+void require_bounded_arguments(std::string_view arguments, const std::string& param) {
+    if (text::json_text_nesting(arguments) > text::kMaxJsonNesting) {
+        bad_request("tool call arguments nest arrays or objects deeper than " +
+                        std::to_string(text::kMaxJsonNesting) + " levels",
+                    param);
+    }
+}
+
 [[noreturn]] void bad_request(std::string message, std::string param, std::string code) {
     ApiError error;
     error.status  = 400;

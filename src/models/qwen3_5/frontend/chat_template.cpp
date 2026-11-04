@@ -2,6 +2,7 @@
 
 #include "models/qwen3_5/frontend/media_cache.h"
 #include "models/qwen3_5/frontend/prompt_layout.h"
+#include "text/json_input.h"
 #include "text/unicode.h"
 
 #include <algorithm>
@@ -362,6 +363,12 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         if (!message.tool_calls.empty()) {
             value["tool_calls"] = Json::array();
             for (const auto& call : message.tool_calls) {
+                // The render converts the parsed arguments recursively: a value nested past the body's bound fails
+                // the request rather than the stack (the serve parsers refuse it first; candidates WF-01).
+                if (text::json_text_nesting(call.arguments_json) > text::kMaxJsonNesting) {
+                    throw std::invalid_argument("tool call arguments nest arrays or objects deeper than " +
+                                                std::to_string(text::kMaxJsonNesting) + " levels");
+                }
                 value["tool_calls"].push_back(
                     {{"id", call.id},
                      {"type", "function"},

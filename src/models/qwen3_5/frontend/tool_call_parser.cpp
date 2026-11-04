@@ -1,4 +1,5 @@
 #include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "text/json_input.h"
 
 #include <nlohmann/json.hpp>
 
@@ -438,31 +439,9 @@ std::optional<std::string> escape_string_controls(std::string_view value) {
 // The deepest array / object nesting a generated argument value keeps as JSON. The server builds JSON trees from a
 // call's arguments (Anthropic `input`, hosted tools) and serializes them recursively, so a degenerate value nested
 // thousands deep could exhaust a server thread's stack; real arguments stay far below it (candidates LE-14).
-constexpr int kMaxArgumentNesting = 256;
+constexpr std::size_t kMaxArgumentNesting = text::kMaxJsonNesting;
 
-// The deepest array / object nesting of JSON text, outside its strings.
-int json_nesting(std::string_view text) {
-    int depth = 0, deepest = 0;
-    bool quoted = false, escaped = false;
-    for (const char c : text) {
-        if (quoted) {
-            if (escaped) {
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == '"') {
-                quoted = false;
-            }
-        } else if (c == '"') {
-            quoted = true;
-        } else if (c == '[' || c == '{') {
-            deepest = std::max(deepest, ++depth);
-        } else if (c == ']' || c == '}') {
-            --depth;
-        }
-    }
-    return deepest;
-}
+std::size_t json_nesting(std::string_view value) noexcept { return text::json_text_nesting(value); }
 
 // Strict JSON first; an array or object refused only for control bytes inside its strings is read
 // with them escaped.

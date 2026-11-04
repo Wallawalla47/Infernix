@@ -30,6 +30,10 @@ public:
 // would change value. Consumers apply the precision contract only to active schemas. Throws
 // JsonNestingError past kMaxJsonNesting levels.
 ParsedJsonNumbers parse_json_numbers(std::string_view source);
+
+// The deepest array / object nesting of JSON text, outside its strings, without parsing it: the bound for a JSON
+// document carried inside a string (a tool call's `arguments`), which the body's parse never sees nested.
+std::size_t json_text_nesting(std::string_view text) noexcept;
 std::optional<std::string> inexact_schema_number(const ParsedJsonNumbers& parsed,
                                                  const std::string& schema_pointer = {});
 } // namespace infernix::text

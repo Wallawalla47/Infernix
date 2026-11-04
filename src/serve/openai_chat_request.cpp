@@ -369,6 +369,8 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_
             bad_request("function tool_calls must contain string arguments",
                         prefix + ".function.arguments");
         }
+        require_bounded_arguments(function.at("arguments").get_ref<const std::string&>(),
+                                  prefix + ".function.arguments");
         calls.push_back(ToolCall{
             .id             = value.at("id").get<std::string>(),
             .name           = require_function_name(function, prefix + ".function.name"),
@@ -391,6 +393,8 @@ std::optional<ToolCall> parse_legacy_assistant_function_call(const Json& message
     if (!call.contains("arguments") || !call.at("arguments").is_string()) {
         bad_request("assistant function_call must contain string arguments", "messages");
     }
+    require_bounded_arguments(call.at("arguments").get_ref<const std::string&>(),
+                              "messages[" + std::to_string(index) + "].function_call.arguments");
     return ToolCall{.id   = {},
                     .name = require_function_name(
                         call, "messages[" + std::to_string(index) + "].function_call.name"),
