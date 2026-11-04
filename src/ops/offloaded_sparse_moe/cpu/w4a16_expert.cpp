@@ -166,7 +166,11 @@ inline __m256i dot4_avxvnni(__m256i acc, __m256i u, __m256i s) {
 }
 
 // One body, two target attributes: AVX-VNNI must not leak into the plain AVX2 variant. Half h holds
-// rows 8h..8h+7 (low nibbles for h = 0, high nibbles for h = 1).
+// rows 8h..8h+7 (low nibbles for h = 0, high nibbles for h = 1). The halves run as two passes over a
+// row group's blocks (its ~23 KB of units stay in L1/L2 for the second, which issues no prefetch): one
+// half's 3N block accumulators and 2N row sums are live instead of both halves' 10N, which spilled to
+// the stack in every instance (candidates WB-01; Basalt #182 removed the same spill). The sums are exact
+// integers, so the pass order leaves the bits unchanged.
 #define INFERNIX_AVX2_ROW_SUMS_A16(NAME, DOT) \
 void NAME(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end, \
           const A16Block* const* acts, std::int64_t* out, int prefetch_bytes) { \
@@ -174,48 +178,41 @@ void NAME(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end, \
     const __m256i lut_b = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kBiasedCodes.data()))); \
     const __m256i low4  = _mm256_set1_epi8(0x0F); \
     for (int rg = rg_begin; rg < rg_end; ++rg) { \
-        __m256i even[2][N], odd[2][N]; \
+        const std::uint8_t* const units = matrix + static_cast<std::size_t>(rg) * blocks * kUnitBytes; \
         for (int h = 0; h < 2; ++h) { \
-            for (int c = 0; c < N; ++c) { even[h][c] = odd[h][c] = _mm256_setzero_si256(); } \
-        } \
-        for (int b = 0; b < blocks; ++b) { \
-            const std::uint8_t* unit = matrix + (static_cast<std::size_t>(rg) * blocks + b) * kUnitBytes; \
-            prefetch_unit(unit, prefetch_bytes); \
-            __m256i plo[2][N], pmid[2][N], phi[2][N]; \
-            for (int h = 0; h < 2; ++h) { \
-                for (int c = 0; c < N; ++c) { plo[h][c] = pmid[h][c] = phi[h][c] = _mm256_setzero_si256(); } \
-            } \
-            for (int q = 0; q < 4; ++q) { \
-                const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(unit + 32 * q)); \
-                const __m256i idx[2] = {_mm256_and_si256(v, low4), _mm256_and_si256(_mm256_srli_epi16(v, 4), low4)}; \
-                for (int h = 0; h < 2; ++h) { \
-                    const __m256i ws = _mm256_shuffle_epi8(lut_s, idx[h]); \
-                    const __m256i wb = _mm256_shuffle_epi8(lut_b, idx[h]); \
+            __m256i even[N], odd[N]; \
+            for (int c = 0; c < N; ++c) { even[c] = odd[c] = _mm256_setzero_si256(); } \
+            for (int b = 0; b < blocks; ++b) { \
+                const std::uint8_t* unit = units + static_cast<std::size_t>(b) * kUnitBytes; \
+                if (h == 0) { prefetch_unit(unit, prefetch_bytes); } \
+                __m256i plo[N], pmid[N], phi[N]; \
+                for (int c = 0; c < N; ++c) { plo[c] = pmid[c] = phi[c] = _mm256_setzero_si256(); } \
+                for (int q = 0; q < 4; ++q) { \
+                    const __m256i v   = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(unit + 32 * q)); \
+                    const __m256i idx = _mm256_and_si256(h == 0 ? v : _mm256_srli_epi16(v, 4), low4); \
+                    const __m256i ws  = _mm256_shuffle_epi8(lut_s, idx); \
+                    const __m256i wb  = _mm256_shuffle_epi8(lut_b, idx); \
                     for (int c = 0; c < N; ++c) { \
                         const A16Block& a = acts[c][b]; \
-                        plo[h][c]  = DOT(plo[h][c], _mm256_set1_epi32(quad_word(a.lo, q)), ws); \
-                        pmid[h][c] = DOT(pmid[h][c], _mm256_set1_epi32(quad_word(a.mid, q)), ws); \
-                        phi[h][c]  = DOT(phi[h][c], wb, _mm256_set1_epi32(quad_word(a.hi, q))); \
+                        plo[c]  = DOT(plo[c], _mm256_set1_epi32(quad_word(a.lo, q)), ws); \
+                        pmid[c] = DOT(pmid[c], _mm256_set1_epi32(quad_word(a.mid, q)), ws); \
+                        phi[c]  = DOT(phi[c], wb, _mm256_set1_epi32(quad_word(a.hi, q))); \
                     } \
                 } \
-            } \
-            for (int h = 0; h < 2; ++h) { \
                 const __m256i sw     = scales8_avx2(unit + 128 + 8 * h); \
                 const __m256i sw_odd = _mm256_srli_epi64(sw, 32); \
                 for (int c = 0; c < N; ++c) { \
-                    const __m256i hi = _mm256_sub_epi32(phi[h][c], _mm256_set1_epi32(kBias * acts[c][b].hi_sum)); \
-                    const __m256i p  = _mm256_add_epi32(_mm256_add_epi32(plo[h][c], _mm256_slli_epi32(pmid[h][c], 8)), \
+                    const __m256i hi = _mm256_sub_epi32(phi[c], _mm256_set1_epi32(kBias * acts[c][b].hi_sum)); \
+                    const __m256i p  = _mm256_add_epi32(_mm256_add_epi32(plo[c], _mm256_slli_epi32(pmid[c], 8)), \
                                                         _mm256_slli_epi32(hi, 16)); \
-                    even[h][c] = _mm256_add_epi64(even[h][c], _mm256_mul_epi32(p, sw)); \
-                    odd[h][c]  = _mm256_add_epi64(odd[h][c], _mm256_mul_epi32(_mm256_srli_epi64(p, 32), sw_odd)); \
+                    even[c] = _mm256_add_epi64(even[c], _mm256_mul_epi32(p, sw)); \
+                    odd[c]  = _mm256_add_epi64(odd[c], _mm256_mul_epi32(_mm256_srli_epi64(p, 32), sw_odd)); \
                 } \
             } \
-        } \
-        for (int h = 0; h < 2; ++h) { \
             for (int c = 0; c < N; ++c) { \
                 alignas(32) std::int64_t e[4], o[4]; \
-                _mm256_store_si256(reinterpret_cast<__m256i*>(e), even[h][c]); \
-                _mm256_store_si256(reinterpret_cast<__m256i*>(o), odd[h][c]); \
+                _mm256_store_si256(reinterpret_cast<__m256i*>(e), even[c]); \
+                _mm256_store_si256(reinterpret_cast<__m256i*>(o), odd[c]); \
                 for (int i = 0; i < 4; ++i) { \
                     const std::size_t base = static_cast<std::size_t>(rg - rg_begin) * 16 + 8 * h; \
                     out[(base + 2 * i) * N + c]     = e[i]; \
