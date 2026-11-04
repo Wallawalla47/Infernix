@@ -100,7 +100,8 @@ int q8_a16_conformance() {
                                                    32, 33, 39, 40, 41, 47, 48, 49, 50, 51, 62,  63,  64,  65,
                                                    95, 96, 97, 127, 128, 129, 256, 511, 512, 513, 4096}
                      : hc_shape ? std::vector<int>{1,   8,   64,  65,   100,  256,  257,  300,  512,  513, 960,
-                                                   961, 1152, 1153, 1344, 1345, 2048, 2049, 4096}
+                                                   961, 1152, 1153, 1344, 1345, 1920, 2048, 2049, 3200, 3800,
+                                                   4096, 5000}
                                 : std::vector<int>{1, 8, 64}) {
             calls.push_back({t, CallForm::Policy, infernix::ops::LinearPolicy::A16Only, false,
                              infernix::ops::LinearRoutes::Q8SlicedK});
@@ -185,6 +186,55 @@ int q8_a16_column_invariance() {
     }
     return failures;
 }
+
+// Prefill widths of the hyper-connection down [324, 10240]: its MMA tiles past 96 columns accumulate every output over
+// K in one order, so a call's columns equal the same columns of a call of another width whichever tile each width
+// takes (candidates NQ-08 chose tiles by width). Each width's columns against a 16,384-column call, bit for bit.
+int q8_a16_hc_wide_widths() {
+    constexpr int kWidest = 16384;
+    const Geometry shape{324, 10240, 463U};
+    const auto host = make_q8_g32_fp16_weight(shape.n, shape.k, shape.seed);
+    std::vector<std::uint16_t> activation(static_cast<std::size_t>(shape.k) * kWidest);
+    std::uint32_t state = shape.seed;
+    for (auto& bits : activation) {
+        state = state * 1664525U + 1013904223U;
+        bits  = infernix::test::f32_to_bf16(static_cast<float>(static_cast<std::int32_t>(state >> 8) - (1 << 23)) /
+                                            static_cast<float>(1 << 23));
+    }
+    void *weight = nullptr, *x = nullptr, *y = nullptr;
+    infernix::test::cuda_check(cudaMalloc(&weight, host.payload.size()), "weight");
+    infernix::test::cuda_check(cudaMalloc(&x, activation.size() * 2), "activation");
+    infernix::test::cuda_check(cudaMalloc(&y, static_cast<std::size_t>(shape.n) * kWidest * 2), "output");
+    infernix::test::cuda_check(cudaMemcpy(weight, host.payload.data(), host.payload.size(), cudaMemcpyHostToDevice),
+                               "upload weight");
+    infernix::test::cuda_check(cudaMemcpy(x, activation.data(), activation.size() * 2, cudaMemcpyHostToDevice),
+                               "upload activation");
+    const infernix::Weight w = host.device_weight(weight);
+    const auto run = [&](int t) {
+        infernix::Tensor input(x, infernix::DType::BF16, {shape.k, t});
+        infernix::Tensor output(y, infernix::DType::BF16, {shape.n, t});
+        infernix::ops::linear(input, w, output, nullptr);
+        std::vector<std::uint16_t> out(static_cast<std::size_t>(shape.n) * t);
+        infernix::test::cuda_check(cudaMemcpy(out.data(), y, out.size() * 2, cudaMemcpyDeviceToHost), "read columns");
+        return out;
+    };
+    const std::vector<std::uint16_t> widest = run(kWidest);
+    int failures = 0;
+    for (int t : {97, 1024, 1025, 1500, 2048, 2049, 3072, 3800, 4096, 4097, 5000, 6000, 7500, 8192, 11000, 12288}) {
+        const std::vector<std::uint16_t> out = run(t);
+        std::size_t differing = 0;
+        for (std::size_t i = 0; i < out.size(); ++i) differing += out[i] != widest[i];
+        if (differing != 0) {
+            std::cerr << "Q8_A16 [324,10240] T=" << t << ": " << differing << " outputs differ from a " << kWidest
+                      << "-column call's\n";
+            ++failures;
+        }
+    }
+    cudaFree(weight);
+    cudaFree(x);
+    cudaFree(y);
+    return failures;
+}
 } // namespace
 
 INFERNIX_OP_TEST(linear_q8_a16) {
@@ -193,7 +243,7 @@ INFERNIX_OP_TEST(linear_q8_a16) {
         return 77;
     }
     try {
-        const int failures = q8_a16_conformance() + q8_a16_column_invariance();
+        const int failures = q8_a16_conformance() + q8_a16_column_invariance() + q8_a16_hc_wide_widths();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Q8_A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

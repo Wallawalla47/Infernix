@@ -20,8 +20,27 @@ Q8Launch select_q8_n324_k10240(std::int32_t tokens) {
     // Beyond 96 columns (prefill chunks): the MMA tile sweep of 2026-10-05 (fn/rigs/layer/q8tiles2.bat,
     // RTX 5090). Every MMA tile accumulates each output over K in the same order, so their bits are
     // identical (checked at every swept point); only speed differs.
-    if (tokens <= 1024) return launch_q8_a16_mma_r32_t64;
-    return launch_q8_a16_mma_r48_t64;
+    // Past 1,024 columns the tile follows the SM waves: the r48_t64 tile everywhere lost up to 20 % where its last
+    // wave was nearly empty (candidates NQ-08). infernix_linear_bench --qtype q8 --n 324 --k 10240, cold L2, two
+    // interleaved rounds every 64 columns from 1,088 to 16,384 over r32_t64 / r48_t64 / r64_t96 / r64_t128 /
+    // r96_t96 (a first pass at 512-column steps also had r32_t96, r32_t128 and r128_t64, never best): a tile takes
+    // an interval where it beat r48_t64 by 2 % or more, the seams at the last measured column; the sweep's summed
+    // time x0.922, the intervals' gains 3-20 % (2026-11-04).
+    if (tokens <= 1920) return launch_q8_a16_mma_r32_t64;   // -5.3..-9.0 % past 1,024
+    if (tokens <= 3072) return launch_q8_a16_mma_r48_t64;
+    if (tokens <= 3584) return launch_q8_a16_mma_r64_t128;  // -15.8..-16.7 %
+    if (tokens <= 4032) return launch_q8_a16_mma_r96_t96;   // -2.7..-3.8 %
+    if (tokens <= 4608) return launch_q8_a16_mma_r48_t64;
+    if (tokens <= 5376) return launch_q8_a16_mma_r64_t96;   // -16.7..-19.7 %
+    if (tokens <= 7168) return launch_q8_a16_mma_r64_t128;  // -6.5..-14.4 %
+    if (tokens <= 8128) return launch_q8_a16_mma_r96_t96;   // -3.4..-15.2 %
+    if (tokens <= 9280) return launch_q8_a16_mma_r48_t64;
+    if (tokens <= 10880) return launch_q8_a16_mma_r64_t128; // -8.8..-11.9 %
+    if (tokens <= 12160) return launch_q8_a16_mma_r96_t96;  // -3.8..-6.3 %
+    if (tokens <= 12416) return launch_q8_a16_mma_r48_t64;
+    if (tokens <= 14464) return launch_q8_a16_mma_r64_t128; // -6.8..-15.6 %
+    if (tokens <= 16320) return launch_q8_a16_mma_r96_t96;  // -4.8..-10.1 %
+    return launch_q8_a16_mma_r64_t128;                      // 16,384: -4.6 %
 }
 
 namespace {
