@@ -12643,7 +12643,7 @@ under 8 busy processes conv -0.4 % and pp512 -2.0 %, under 32 conv +6.2 % inside
 RV-44): FP4-Local BF16 KV, two rotated runs, from 4,096 / 8,192 tokens against never: pp8192 1.000x / 0.999x,
 pp16384 1.000x / 1.000x, pp32768 1.020x / 1.021x (the layer walk's wide calls). Same bits.
 
-### 19.3.51 FP4-Local's decode side streams; MTP rounds' commit (2026-11-04; same bits)
+### 19.3.51 FP4-Local's decode side streams; MTP rounds' commit; the FP8 import's wide decode share (2026-11-04; same bits)
 
 **Side streams and the shared expert (default on FP4-Local's default route).** The 8-bit GGUF expert route took
 the side streams' least priority and the shared expert's fork at the layer's input (§19.3.31). FP4-Local's NVFP4
@@ -12660,6 +12660,15 @@ configurations keep the greatest priority and the late fork (unmeasured).
 verification's results) stays with DFlash2 rounds without MTP: on MTP rounds it measured level (FP4-Local `--spec
 mtp`, the struct fixture, 351.78 -> 351.90 tok/s, three rotated reps inside their spread; the same text and ids on
 the reproducible route, and the MTP real tests passed).
+
+**The block-FP8 banks' wide decode calls (default).** The official FP8 import kept every width on its divisor rule
+(1/3 of a call's host-memory misses on the link), while its CPU team is memory-bound at one column (§19.3.47): a
+CPU expert's further columns cost it little. Its decode calls of eight columns or more now keep the NVFP4 banks'
+51/256 (`wide_link_share`). The struct fixture, DFlash2 auto, the same rounds and tokens in every arm (SSD tier,
+the BF16 n-gram volume): a sweep of two reps, 41 / 51 / 61 / 73 against none +5.8 / +5.9 / +5.3 / +4.3 % (none ran
+first in both reps), then 51 against none in ABBA order, four reps, 60.42 -> 62.86 tok/s (+4.0 %), every rep ahead.
+The FP8 banks' prompt split keeps no share (`split_wide_keep_below`: never measured there). GGUF banks keep their
+rule (share forms at every width measured slower on IQ3_S, 2026-10-31).
 
 ---
 

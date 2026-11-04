@@ -3673,9 +3673,11 @@ public:
         return a4_bank() ? kSplitKeepA4Columns : kSplitKeepA16Columns;
     }
     // Gated calls from split_keep_columns up to this width keep the bank's wide link share of the split's experts
-    // (wide_link_share: 51/256 on the NVFP4 banks): FP4-Local's 16-bit route in its 0.5 range, every other bank at
-    // every width (the split call's form from 2026-11-02 to 11-04, there by accident).
+    // (wide_link_share: 51/256): on the NVFP4 banks FP4-Local's 16-bit route in its 0.5 range and every other at every
+    // width (the split call's form from 2026-11-02 to 11-04, there by accident); the block-FP8 banks' decode share
+    // stays out of their prompt split (never measured there).
     [[nodiscard]] std::int32_t split_wide_keep_below() const {
+        if (parameters_.layers.front().moe.bank->planes.gate_up_format != QType::NVFP4_MUL) { return 0; }
         if (wide_assist() && !a4_bank()) { return kSplitRateShareA16MidTo; }
         return std::numeric_limits<std::int32_t>::max();
     }
@@ -6347,14 +6349,21 @@ private:
     // -0.4 %; 41/256 struct +1.3 %; 73/256 at every width struct +4.1 % but after 16K -0.6 % (every pair); with the
     // vector CPU kernels 51/256 level with 61/256 and 72/256 struct -1.3 %. W4A16 against the share form: 51/256 struct
     // +2.5 %, conv +0.7 % (every pair), after 16K level; 61/256 struct +1.6 %. Dense8 against the divisor rule: struct
-    // +4.3 % (every pair), after 16K +1.7 %, conv +0.5 %. A fixed cpu_pcie_divisor or an INFERNIX_TMP_LINK_SHARE share
-    // leaves every width alone.
+    // +4.3 % (every pair), after 16K +1.7 %, conv +0.5 %. Block-FP8 banks (the official FP8 import; their CPU team is
+    // memory-bound at one column, §19.3.47) take the same 51/256 against their divisor rule's 1/3 (candidates IP-10,
+    // 2026-11-04; struct, DFlash2 auto, the same rounds and tokens): 60.42 -> 62.86 tok/s, four ABBA reps, every one
+    // ahead; a sweep before it (two reps, the no-share arm first in both) 41 / 51 / 61 / 73 at +5.8 / +5.9 / +5.3 /
+    // +4.3 %; their prompt split keeps nothing (split_wide_keep_below). GGUF banks keep their rule (share forms at
+    // every width measured slower on IQ3_S, 2026-10-31). A fixed cpu_pcie_divisor or an INFERNIX_TMP_LINK_SHARE share leaves every width alone.
     [[nodiscard]] std::pair<std::int32_t, std::int32_t> wide_link_share() const {
         const auto& bank = *parameters_.layers.front().moe.bank;
         const bool fixed = options_.cpu_pcie_divisor > 0 ||
                            temporary_switches::offload().link_share != temporary_switches::OffloadSwitches::LinkShare::kDivisor;
-        if (fixed || bank.planes.gate_up_format != QType::NVFP4_MUL) { return {0, 0}; }
-        return {kWideLinkShare256, ops::offloaded_moe::kMaxColumns};
+        if (fixed) { return {0, 0}; }
+        if (bank.planes.gate_up_format == QType::NVFP4_MUL || bank.planes.gate_up_format == QType::FP8_E4M3FN_B128) {
+            return {kWideLinkShare256, ops::offloaded_moe::kMaxColumns};
+        }
+        return {0, 0};
     }
     static constexpr std::int32_t kWideLinkShare256 = 51;
 
