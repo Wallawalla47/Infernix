@@ -548,8 +548,7 @@ public:
                 return calls.empty() ? FallbackReason::MalformedStructure : FallbackReason::None;
             }
             if (tool_call_at(pos)) {
-                RawToolCall call;
-                const FallbackReason terminal = finish_call(calls, call, parse_tool_call(pos, call));
+                const FallbackReason terminal = parse_tool_call(pos, calls);
                 if (terminal != FallbackReason::None) { return terminal; }
             } else if (starts_with_at(text_, pos, "<function_calls>")) {
                 pos += 16;
@@ -622,18 +621,35 @@ private:
         return failure;
     }
 
-    FallbackReason parse_tool_call(std::size_t& pos, RawToolCall& call) {
-        if (!tool_call_at(pos)) { return FallbackReason::MalformedStructure; }
+    // One `<tool_call>` wrapper: one function, or several in a row before its closer, each a call. Qwen models
+    // sometimes write several functions inside one wrapper (candidates WD-43; vLLM #43713: 6-7 % of Qwen3.6-27B agent
+    // trials); before, the region became text (strict) or kept only the first call (tolerant). Returns parse()'s
+    // terminal (None: the wrapper closed and its calls are in `calls`).
+    FallbackReason parse_tool_call(std::size_t& pos, std::vector<RawToolCall>& calls) {
+        if (!tool_call_at(pos)) { return finish_failed(calls, FallbackReason::MalformedStructure); }
         pos += kToolCallOpen.size();
-        skip_format_whitespace(text_, pos);
-        const FallbackReason failure = parse_function(pos, call);
-        if (failure != FallbackReason::None) { return failure; }
-        skip_format_whitespace(text_, pos);
-        if (consume(pos, "</tool_call>")) { return FallbackReason::None; }
-        // Tolerant: a complete call may be followed by explanatory text, or the model may have
-        // stopped at the end of its budget before the closing tag. parse() resolves the terminal
-        // flag; the strict parser keeps the hard structural failure.
-        return tolerant_ ? FallbackReason::TruncatedTail : FallbackReason::MalformedStructure;
+        for (;;) {
+            skip_format_whitespace(text_, pos);
+            RawToolCall call;
+            const FallbackReason failure = parse_function(pos, call);
+            if (failure != FallbackReason::None) { return finish_call(calls, call, failure); }
+            skip_format_whitespace(text_, pos);
+            if (consume(pos, "</tool_call>")) { return finish_call(calls, call, FallbackReason::None); }
+            if (starts_with_at(text_, pos, "<function") || starts_with_at(text_, pos, "<invoke")) {
+                (void)finish_call(calls, call, FallbackReason::None);
+                continue;
+            }
+            // Tolerant: a complete call may be followed by explanatory text, or the model may have
+            // stopped at the end of its budget before the closing tag; the strict parser keeps the
+            // hard structural failure.
+            return finish_call(calls, call,
+                               tolerant_ ? FallbackReason::TruncatedTail : FallbackReason::MalformedStructure);
+        }
+    }
+
+    FallbackReason finish_failed(std::vector<RawToolCall>& calls, FallbackReason failure) {
+        RawToolCall none;
+        return finish_call(calls, none, failure);
     }
 
     FallbackReason parse_function(std::size_t& pos, RawToolCall& call) {

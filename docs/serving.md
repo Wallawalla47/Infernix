@@ -483,7 +483,9 @@ command such as `echo '</parameter></function>'`. An unmatched nested parameter 
 closer followed by another parameter's opener, cannot be represented unambiguously and makes that
 tool-call region ordinary content. Later content is still examined:
 the first tool-call region (any accepted marker form) that parses becomes the structured turn, and any
-quoted markup before it stays ordinary content. A marker inside Markdown code of the answer is a
+quoted markup before it stays ordinary content. One `<tool_call>` may hold several `<function=...>`
+blocks in a row before its `</tool_call>` (Qwen models sometimes write them so); each is a call, and a
+malformed one among them fails the region like any other. A marker inside Markdown code of the answer is a
 quoted example and stays content even when it is a complete call, on this route and on the
 constrained route below. Code follows CommonMark's rules without lists or block quotes: a
 ```` ``` ```` or `~~~` fence, from its opening line until a line of the same character at least as

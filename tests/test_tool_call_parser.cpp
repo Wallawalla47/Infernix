@@ -170,6 +170,41 @@ int test_multiple_calls() {
     return failures;
 }
 
+// Several functions inside one `<tool_call>` wrapper are each a call, strict and tolerant (candidates WD-43; vLLM
+// #43713); a malformed later function still fails a strict region as a whole.
+int test_functions_in_one_wrapper() {
+    const auto contract = contract_from_definitions({tool_definition("first", Json::object()),
+                                                     tool_definition("second", Json::object()),
+                                                     tool_definition("third", Json::object())});
+    const std::string text = "Working.\n<tool_call>\n<function=first>\n<parameter=a>\n1\n</parameter>\n</function>\n"
+                             "<function=second>\n</function>\n"
+                             "<function=third>\n<parameter=c>\nthree\n</parameter>\n</function>\n</tool_call>";
+    int failures = 0;
+    for (const bool tolerant : {false, true}) {
+        const auto parsed = parse(text, 64, *contract, tolerant);
+        failures += check(parsed.is_tool_call_response && parsed.content == "Working." &&
+                              parsed.tool_calls.size() == 3 && parsed.tool_calls[0].name == "first" &&
+                              parsed.tool_calls[1].name == "second" && parsed.tool_calls[2].name == "third" &&
+                              parsed.diagnostics.fallback_reason == infernix::ToolCallParseFallbackReason::None,
+                          tolerant ? "tolerant: functions in one wrapper were not each a call"
+                                   : "strict: functions in one wrapper were not each a call");
+        if (parsed.tool_calls.size() == 3) {
+            failures += check(Json::parse(parsed.tool_calls[0].arguments_json).at("a") == 1 &&
+                                  Json::parse(parsed.tool_calls[1].arguments_json).empty() &&
+                                  Json::parse(parsed.tool_calls[2].arguments_json).at("c") == "three",
+                              "a call in a shared wrapper lost its arguments");
+        }
+    }
+    const std::string broken = "<tool_call>\n<function=first>\n</function>\n<function=second>\n<parameter=x>\n1\n"
+                               "</function>\n</tool_call>";
+    failures += check_rejected(broken, *contract, infernix::ToolCallParseFallbackReason::MalformedStructure,
+                               "strict: a malformed second function in one wrapper did not fail the region");
+    const auto tolerant_broken = parse(broken, 64, *contract, true);
+    failures += check(tolerant_broken.tool_calls.size() == 1 && tolerant_broken.tool_calls[0].name == "first",
+                      "tolerant: the complete first function before a malformed one was not kept");
+    return failures;
+}
+
 int test_declared_strings_preserve_text() {
     const auto contract =
         contract_for("TaskUpdate",
@@ -2310,6 +2345,7 @@ int main() {
     failures += test_invalid_utf8_parameter_value();
     failures += test_duplicate_parameter_keeps_last_value();
     failures += test_multiple_calls();
+    failures += test_functions_in_one_wrapper();
     failures += test_declared_strings_preserve_text();
     failures += test_string_values_preserve_embedded_tool_markup();
     failures += test_parameter_delimiters_in_values();
