@@ -11,6 +11,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace infernix::serve {
@@ -33,6 +34,15 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
 infernix::PromptInput to_prompt_input(const GenerationRequest& req,
                                     const ResolvedPromptSemantics& semantics,
                                     const MediaAcquirer& acquire_media);
+
+// For a server without vision: the request with every image or video inside a tool result (an Anthropic
+// `tool_result`, a Chat `tool` message, a Responses `function_call_output`) replaced by a fixed text note, or nothing
+// when no tool result holds media. An agent client keeps a tool result in its history and sends it again on every
+// turn, so failing it would fail the rest of the session (candidates WD-41; TensorRT-LLM #21449); media a user sends
+// still answers vision_disabled. The note is fixed, so the prompt, and its prefix-cache identity, repeat each turn.
+inline constexpr std::string_view kToolImageOmittedNote = "[image omitted: this server has no vision input]";
+inline constexpr std::string_view kToolVideoOmittedNote = "[video omitted: this server has no vision input]";
+std::optional<GenerationRequest> omit_tool_result_media(const GenerationRequest& req);
 
 // The text a turn that loads tools ends with: the definitions in the function form of the listed
 // tools, framed like the prompt's tool section. It depends on the definitions alone, so a history

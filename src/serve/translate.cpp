@@ -425,4 +425,22 @@ std::optional<std::uint32_t> settle_thinking_budget(const ServeOptions& server,
     return room;
 }
 
+std::optional<GenerationRequest> omit_tool_result_media(const GenerationRequest& req) {
+    std::optional<GenerationRequest> out;
+    for (std::size_t m = 0; m < req.messages.size(); ++m) {
+        if (req.messages[m].role != ChatRole::Tool) { continue; }
+        for (std::size_t p = 0; p < req.messages[m].content.size(); ++p) {
+            const ContentKind kind = req.messages[m].content[p].kind;
+            if (kind == ContentKind::Text) { continue; }
+            if (!out) { out = req; }
+            ContentPart& part = out->messages[m].content[p];
+            part.kind         = ContentKind::Text;
+            part.text = std::string(kind == ContentKind::Image ? kToolImageOmittedNote : kToolVideoOmittedNote);
+            part.type_raw = "text";
+            part.source   = {};
+        }
+    }
+    return out;
+}
+
 } // namespace infernix::serve

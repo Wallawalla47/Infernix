@@ -421,6 +421,37 @@ Json tool_result(std::string id, std::string content, bool is_error = false) {
                 {"is_error", is_error}};
 }
 
+// Without vision, an image inside a tool result (Claude Code's Read of an image file) becomes a fixed note instead of
+// failing every later turn of the session; an image the user sends stays media (vision_disabled), and a request with
+// no tool-result media is left alone (candidates WD-41).
+int test_tool_result_media_note() {
+    const Json image = Json{{"type", "image"}, {"source", Json{{"type", "url"}, {"url", "https://example/shot.png"}}}};
+    Json body        = base_request();
+    body["messages"] = Json::array(
+        {Json{{"role", "assistant"}, {"content", Json::array({tool_use("toolu_a")})}},
+         Json{{"role", "user"},
+              {"content", Json::array({Json{{"type", "tool_result"},
+                                            {"tool_use_id", "toolu_a"},
+                                            {"content", Json::array({Json{{"type", "text"}, {"text", "the file"}},
+                                                                     image})}},
+                                       Json{{"type", "text"}, {"text", "continue"}}})}}});
+    const GenerationRequest request = parse(body).generation;
+    const std::optional<GenerationRequest> noted = omit_tool_result_media(request);
+    const auto tool = std::ranges::find_if(noted ? noted->messages : request.messages,
+                                           [](const ChatTurn& turn) { return turn.role == infernix::ChatRole::Tool; });
+    int failures = check(request.media_item_count() == 1 && noted && noted->media_item_count() == 0 &&
+                             tool != noted->messages.end() && tool->content.size() == 2 &&
+                             tool->content[0].text == "the file" && tool->content[1].kind == ContentKind::Text &&
+                             tool->content[1].text == kToolImageOmittedNote,
+                         "a tool result's image did not become the omitted-image note");
+    body["messages"][1]["content"].push_back(image);
+    const std::optional<GenerationRequest> mixed = omit_tool_result_media(parse(body).generation);
+    failures += check(mixed && mixed->media_item_count() == 1, "the user's own image was dropped with the tool's");
+    failures += check(!omit_tool_result_media(parse(base_request()).generation),
+                      "a request without tool-result media was rewritten");
+    return failures;
+}
+
 int test_tool_history() {
     Json body        = base_request();
     body["messages"] = Json::array(
@@ -1877,6 +1908,7 @@ int main() {
     failures += test_attribution_system_block();
     failures += test_claude_code_prompt();
     failures += test_tool_history();
+    failures += test_tool_result_media_note();
     failures += test_tools();
     failures += test_prompt_object_order();
     failures += test_thinking_and_count_tokens();

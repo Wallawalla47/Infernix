@@ -45,7 +45,11 @@ falling back to its architecture name when no name is stored. An explicit `--mod
 HTTP alias override and does not select or alter model execution.
 
 Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
-allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
+allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. An image or
+video inside a tool result (an Anthropic `tool_result`, a Chat `tool` message, a Responses
+`function_call_output`) is the exception: it reaches the model as the fixed text
+`[image omitted: this server has no vision input]` (or `[video omitted: ...]`), because an agent client
+keeps the result in its history and a 400 would fail every later turn of the session. Add
 `--vision` when the server must accept image or video input. Speculative residency is likewise
 frozen by `--spec mtp|dflash|dflash2|auto` and `--draft-tokens`; omitting `--spec` loads no speculative backend.
 `--lm-head-draft` additionally loads the optimized proposal head. DFlash on 35B-A3B and DFlash2 on Qwen3.8-27B can be combined

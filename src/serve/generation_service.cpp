@@ -487,6 +487,13 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                                 CacheParticipation cache_participation,
                                                 DeadlinePolicy deadline_policy,
                                                 bool admitted) const {
+    // Without vision, a tool result's media becomes a text note (omit_tool_result_media); the user's still fails below.
+    if (!options_.enable_vision && request.media_item_count() != 0) {
+        if (std::optional<GenerationRequest> noted = omit_tool_result_media(request)) {
+            return prepare_impl(*noted, consumer_mode, std::move(observation), std::move(is_cancelled),
+                                cache_participation, deadline_policy, admitted);
+        }
+    }
     PreparedRequest prepared;
     prepared.constraint_param               = request.constraint_param;
     prepared.tool_schema_params             = tool_declaration_params(request);
@@ -594,6 +601,11 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
 
 int GenerationService::count_prompt_tokens(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
+    if (!options_.enable_vision && request.media_item_count() != 0) {
+        if (std::optional<GenerationRequest> noted = omit_tool_result_media(request)) {
+            return count_prompt_tokens(*noted, std::move(is_cancelled));
+        }
+    }
     const bool request_has_media = request.media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
