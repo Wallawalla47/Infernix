@@ -348,8 +348,11 @@ test (skipped without it, and for a tokenizer.json of another size).
 
 The agent entry checks multi-turn continuation and branching. The preemption entry exercises
 Replay recovery and cancellation while paused or replaying; `INFERNIX_PREEMPTION_REAL_SCENARIO`
-selects `all`, `replay`, `cancel-paused`, `cancel-replay` or `cache-replay` (the prefix cache on,
-each resume binding from a snapshot of its own prompt; skipped by `all` under a test constraint). Native transaction tests cover pause and
+selects `all`, `replay`, `cancel-paused`, `cancel-replay`, `cache-replay` (the prefix cache on,
+each resume binding from a snapshot of its own prompt; skipped by `all` under a test constraint),
+`fairness` or `cache-fairness` (two long generations in one context of KV: bounded service turns
+must give each at least two recoveries with new output before either ends, and a short request
+submitted under pressure keeps its queue deadline). Native transaction tests cover pause and
 Replay with the exact ledger splits, grammar-row failure and replayed sampling counts; their
 positional backend is `none`, `mtp`, `dflash` or `dflash2`. Each backend requires an artifact containing that component.
 Public-HTTP latency and output gaps are measured separately by the

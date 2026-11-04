@@ -9315,10 +9315,10 @@ unwritten.
 - `reserve_units` grows a decode or control unit's lane to its frontier plus one round before the
   round: it evicts unpinned cached blocks, grows the elastic pool (§19.3.11), reserves and maps the
   missing pages at the end of the lane's block table. A shortage goes back to the Engine, which
-  reclaims and then pauses the youngest resident.
+  reclaims and then pauses a resident for the service turn's owner (resource-scheduling §5.2).
 - An extent fits the pool on its own when the capacity is at least `--max-context` (the default,
-  `--max-context` per lane; serve refuses a smaller `--kv-capacity`), so the oldest resident can
-  always grow to its extent once the younger ones are paused. No admission check enforces it: the
+  `--max-context` per lane; serve refuses a smaller `--kv-capacity`), so a turn's owner can
+  always grow to its extent once the others are paused. No admission check enforces it: the
   `feasible` hook planned for that was never connected and was removed (2026-10-27).
 - The MTP drafter clamps its cells to the lane's mapped positions: the shared prefix pages plus the
   private ones (`prefix.page_base + pages`). Before this change the clamp counted only the private

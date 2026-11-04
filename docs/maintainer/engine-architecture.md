@@ -255,9 +255,10 @@ and the Program. Ingress, consumers and transport interact through queues, atomi
 response events.
 
 A worker cycle first advances context transactions and terminal states and processes
-cancellation, and on a capacity event tries a complete resume of the oldest paused request. It then
-acquires unit permits row by row for resident requests (resumes first, then original ticket order),
-uses the remaining headroom to try fresh admission, and then executes the runnable control and decode
+cancellation, ends a service turn that has served its slice, and while a turn is held under KV
+pressure tries a complete resume of its owner if it is paused. It then acquires unit permits row by
+row for resident requests (the turn's owner first, then original ticket order), uses the remaining
+headroom to try fresh admission when no turn is held, and then executes the runnable control and decode
 work and one prefill/Replay chunk. A protected resume gets the chunk first; other prefills rotate among
 resident requests, and decode batches use the actual `B`.
 
@@ -265,8 +266,9 @@ The Program's `reserve_units` atomically acquires the typed incremental demand o
 Engine calls it row by row to form the runnable subset. One row lacking resources does not stop other
 permitted rows from executing. Ordinary unit settlement releases unused reservations and provisional
 suffixes; a resume permit keeps the reservation still needed for the future rebuild and the first new
-unit. Pressure can evict cached blocks or pause young resident requests; admission and fairness
-details are in the [resource scheduling](resource-scheduling-and-context-cache.md) document.
+unit. Pressure can evict cached blocks or, in bounded service turns, pause resident requests for the
+turn's owner; admission and fairness details are in the
+[resource scheduling](resource-scheduling-and-context-cache.md#scheduling) document.
 
 A resource transaction can interleave with execution of unaffected resident requests, but the
 Program freezes dependencies on the same sequence, source/destination lease, block table and transfer
@@ -282,10 +284,9 @@ at most one prefill unit. Its rendering, tokenization and output session are pre
 their own, never on the worker. It is idle-only internal work, not a priority class.
 
 Admission checks start a bounded scan on events such as the wait queue, capacity release and resource
-transaction completion. Ordinary decode progress by itself does not restart a failed admission scan. A
-failed resume does not close fresh admission; while older resident requests remain, a paused request
-does not blindly pause young borrowers to probe a resume. Ordinary active requests do not reserve the
-whole remaining generation length.
+transaction completion. Ordinary decode progress by itself does not restart a failed admission scan.
+While admitted requests contend for capacity, fresh admission waits and only the turn's owner pauses
+residents. Ordinary active requests do not reserve the whole remaining generation length.
 
 ## 5. Commit and publication
 

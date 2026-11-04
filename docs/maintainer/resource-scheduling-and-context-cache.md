@@ -91,9 +91,10 @@ copy of a cached partial tail page are acquired at bind time.
 The requests to multiple typed pools for one unit succeed together; on failure the partial
 reservation of this attempt is returned and the specific shortfall is reported.
 
-The Engine acquires resident unit permits with resumes first and original ticket order first, forming
-the runnable subset; one row temporarily lacking resources does not stop other permitted rows from
-executing. Fresh admission uses the remaining headroom and cannot spend existing permits. Ordinary unit
+The Engine acquires resident unit permits with the service turn's owner first (§5.2), then in original
+ticket order, forming the runnable subset; one row temporarily lacking resources does not stop other
+permitted rows from executing. Fresh admission uses the remaining headroom and cannot spend existing
+permits. Ordinary unit
 settlement releases unused reservations, and later growth keeps requesting on demand. Operators do not
 select cache victims internally.
 
@@ -134,10 +135,11 @@ those copies layer by layer. After a successful binding no other source is tried
 
 ### 5.1 Ordinary cycle
 
-Each cycle first processes context transactions, terminal states and cancellation, and on a real
-capacity event tries a complete resume of the oldest paused request. It then requests resident unit
-permits row by row, resumes first and original ticket order first, keeps the runnable subset, and
-uses the remaining headroom to try fresh admission.
+Each cycle first processes context transactions, terminal states and cancellation, ends a service
+turn that has served its slice (§5.2), and while a turn is held tries a complete resume of its owner
+if it is paused. It then requests resident unit permits row by row, the turn's owner first and then
+original ticket order, keeps the runnable subset, and, while no turn is held and nothing is paused or
+recovering, uses the remaining headroom to try fresh admission.
 It executes the permitted compact Control/Decode set and one Prefill/Replay chunk; rows committed by
 Control reacquire Decode permits in the next cycle. Graphs use the actual member count and execution
 profile. With the `idle-wide-prefill` fast path a Prefill permit reserved while no other lane is
@@ -163,47 +165,50 @@ younger requests. Each scan checks the queue head and at most C following candid
 not consume the allowance, and an incomplete scan continues in ticket order. Queue changes, actual
 capacity releases and completed transactions trigger a scan; a request that already failed under the
 same event is not quoted again, and ordinary decode does not reopen a scan. While the FIFO head
-waits, the Engine prefetches its Host-only path into spare Device cache. A paused request's wait
-constrains only itself; idle lanes and capacity can serve fresh requests that are able to enter
-(§5.2 bounds its wait by its older residents).
+waits, the Engine prefetches its Host-only path into spare Device cache. Under pressure fresh requests
+stay queued (their queue deadline still applies) until the admitted requests no longer contend (§5.2).
 
 ### 5.2 Pressure and complete resume
 
 ```text
 unit shortfall → reclaim optional reservations and evict cached Device blocks
-              → take back younger residents for the oldest necessary work, or pause a young row that cannot advance itself
+              → the blocked request takes a service turn (or, during one, waits for its own)
+              → the turn's owner pauses the youngest other resident
 ```
 
-Requests that are Materializing, already terminated or holding a complete resume permit are not
-preemption victims. A pause happens at a stable Native commit boundary and does not interrupt a
-kernel. Other permitted requests keep executing; the whole batch does not need to fit before running.
+**Service turns (adopted 2026-11-04, after NInfer `a754fcf3`, which fixed #434: long requests
+silent for hours while short ones completed).** Every admitted request, resident or paused, has a
+place in a service order kept in admission order. When a resident cannot obtain its unit after the
+cache gave what it could, pressure begins and that request owns the first turn. The owner keeps the
+next capacity hand-over across reclamation, pause, binding and Replay: it pauses residents for its own
+unit (the youngest other one that is not binding, finished or protecting a recovery), it is resumed
+first when it is the one paused, and while it is paused or binding no other resident reserves a unit,
+so no one borrows capacity released for it. Once it holds its permit, the others use what is left.
+During a turn only the owner may take capacity from a resident; another blocked request only records
+that it contends.
 
-The paused queue tries resumes in original ticket order. While an older resident exists, a paused
-request only tries idle and cache space; it cannot repeatedly pause young borrowers merely to
-probe a resume. After the older resident leaves, the oldest paused request can take back the lane and
-capacity held by younger requests. Fresh admission does not proactively preempt residents.
+A turn ends at a cycle boundary once its owner has served one second of execution that committed new
+progress for it (prompt or output tokens), or as long as its restore took (Replay time) up to four
+seconds; waiting for a grant and Replay never count as service, and a turn never ends while a
+recovery is pending. The turn then passes to the next admitted request in the order (a paused one is
+resumed, pausing whoever its unit needs), and an unused permit of the previous turn is released.
+Pressure ends when a turn ends with nothing paused and no other request contending; a terminal owner
+passes its turn at once. Every admitted request therefore advances within a bounded number of turns
+of about a second each; the cost is Replay on the turns that pause (Qwen3.5 recomputes from the
+deepest cached state; Qwen3.8-Flash-Next restores the snapshot it published), so `--max-concurrency`
+and the KV capacity should still leave room for the contexts a workload runs together. While
+pressure holds, fresh requests wait in the queue under their queue deadline instead of entering idle
+space that a turn's owner would need next. (This replaced an age order, 2026-11-03 to 11-04, under
+which a request paused behind long older generations waited for all of them.)
 
-**Why age order (decided 2026-11-03).** Pressure is resolved by age: only the oldest resident takes
-capacity from others, a paused request is always younger than whoever paused it, and fresh requests are
-younger still. A paused request therefore waits at most until the residents older than itself finish or
-are cancelled; nothing younger can delay it, since the deferred resume is retried on every capacity
-event and, once no older resident remains, takes back the lane and capacity younger requests hold.
-Fresh requests may use idle space meanwhile (the space the paused request cannot use yet), so no
-capacity stands idle. This is chosen because it finishes every request soonest: each pause is a
-Replay (Qwen3.5 recomputes from the deepest cached state; Qwen3.8-Flash-Next restores the snapshot it
-published), and the age order pauses only when the oldest work cannot otherwise advance. Rotating
-service turns (NInfer `a754fcf3`: the turn passes after 1 to 4 s of progress under pressure) bound
-every request's silence to seconds but pause on every turn, so they spend more of the GPU on Replay and
-finish the set later; holding fresh requests while anything is paused leaves capacity idle. The cost
-of the age order is latency, not delivery: a request paused behind long older generations waits for
-them (as in first-come, first-served order), so `--max-concurrency` and the KV capacity should leave
-room for the concurrent contexts a workload needs.
+A pause happens at a stable Native commit boundary and does not interrupt a kernel. Other permitted
+requests keep executing; the whole batch does not need to fit before running.
 
-At most one request holds a complete resume permit at a time. It rebuilds its old history and completes
-its first real new unit first, while other runnable units keep executing. Native holds the real
-capacity across chunks, and the runtime uses `recovery_pending` to decide when protection ends.
-Reaching the old frontier or completing the MTP bridge does not count as new progress; a new
-prefill, a generation/control commit or a terminal state ends the protection.
+At most one request holds a complete resume permit at a time, the turn's owner. It rebuilds its old
+history and completes its first real new unit first, while other runnable units keep executing. Native
+holds the real capacity across chunks, and the runtime uses `recovery_pending` to decide when
+protection ends. Reaching the old frontier or completing the MTP bridge does not count as new
+progress; a new prefill, a generation/control commit or a terminal state ends the protection.
 
 Prefill chunk boundaries give resident requests a chance to rotate. When all lanes are occupied, a new
 request still has to wait for some resident to finish, be cancelled or pause under resource pressure;
@@ -217,11 +222,10 @@ permit flow; after Control/Decode executes, only Prefill/Replay permits that hav
 refreshed, and each round is still one compact decode batch and one prefill turn. Incomplete
 asynchronous events are not spin-waited on.
 
-Events such as completion, cancellation, permanent shrink and a younger request pausing to release
-resources provide resume opportunities. A failed resume waits locally for the next event; a request that
-just paused does not resume immediately because of its own release. When no real execution or transfer
-can release resources, the oldest request must advance through reclaim and a legal permit, and an error
-is reported if the capacity contract is not met.
+A deferred resume of the turn's owner is retried every cycle; while it waits, residents that it does
+not need keep their lanes but reserve no new unit. When no real execution or transfer can release
+resources, the turn's owner must advance through reclaim and a legal permit, and an error is reported
+if the capacity contract is not met (§3.2).
 
 ### 5.3 Replay
 

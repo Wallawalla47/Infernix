@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -325,6 +327,20 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
     auto first_prepared   = engine.prepare_tokens(std::move(first_prompt));
     auto second_prepared  = engine.prepare_tokens(std::move(second_prompt));
 
+    // The second request's own lifecycle from its scheduling observations (delivered on its consumer
+    // thread, which also checks its cancellation): a service turn may pause either request.
+    enum class Lifecycle { Running, Paused, Restored };
+    std::atomic<Lifecycle> second_state{Lifecycle::Running};
+    observations[1].scheduling = [&](const infernix::GenerationSchedulingObservation& event) {
+        using infernix::GenerationSchedulingTransition;
+        if (event.transition == GenerationSchedulingTransition::Paused) { second_state = Lifecycle::Paused; }
+        if (event.transition == GenerationSchedulingTransition::Restored) { second_state = Lifecycle::Restored; }
+        if (event.transition == GenerationSchedulingTransition::ReplayComplete ||
+            event.transition == GenerationSchedulingTransition::RecoveryComplete) {
+            second_state = Lifecycle::Running;
+        }
+    };
+
     Timeline timeline;
     std::mutex handoff_mutex;
     std::condition_variable handoff;
@@ -377,13 +393,14 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
         if (cancel_stage == CancelStage::None) { return false; }
         const auto stats    = engine.runtime_stats();
         const bool observed = cancel_stage == CancelStage::Paused
-                                  ? stats.paused_requests == 1
-                                  : stats.replaying_requests != 0 && stats.replayed_tokens != 0;
+                                  ? second_state == Lifecycle::Paused && stats.paused_requests == 1
+                                  : second_state == Lifecycle::Restored && stats.replaying_requests != 0 &&
+                                        stats.replayed_tokens != 0;
         if (!observed) { return false; }
-        // The second request's ticket is strictly newer: its submit follows first.start().
-        // With only these two requests, protecting the oldest resident makes it the only victim.
-        // CancellationView is checked by the consumer, including while its stream is idle; it
-        // observes actual Engine state without delaying a model callback or guessing a sleep.
+        // Only the second request is observed (a turn can pause either; one restores at a time, so a
+        // replaying request while the second is restored is the second). CancellationView is checked
+        // by the consumer, including while its stream is idle; it observes actual Engine state
+        // without delaying a model callback or guessing a sleep.
         cancellation_observed     = stats;
         committed_at_cancellation = second_sink.committed_tokens();
         cancellation_requested    = true;
@@ -467,10 +484,8 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
                 after.replayed_tokens - before.replayed_tokens == totals.replayed_tokens,
             "request and Engine scheduling counters disagree");
     if (cancel_stage != CancelStage::None) {
-        require(first_result->scheduling.preemptions == 0 &&
-                    second_result.scheduling.preemptions != 0 &&
-                    second_result.scheduling.paused_ns != 0,
-                "cancellation pressure did not preserve the oldest resident");
+        require(second_result.scheduling.preemptions != 0 && second_result.scheduling.paused_ns != 0,
+                "cancellation did not reach the requested pressure state");
         // The consumer may still have committed events queued when it observes paused state.
         // validate() checks the complete drained stream against the terminal result as well.
         require(second_result.generated_token_ids.size() >= committed_at_cancellation,
@@ -482,7 +497,9 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
                         second_result.scheduling.replayed_tokens == 0,
                     "paused cancellation unexpectedly resumed execution");
         } else {
-            require(second_result.scheduling.replayed_tokens >=
+            // The Engine's count at cancellation may include the first request's Replay (a turn can
+            // pause it too).
+            require(second_result.scheduling.replayed_tokens + first_result->scheduling.replayed_tokens >=
                             cancellation_observed.replayed_tokens &&
                         second_result.scheduling.replayed_tokens != 0,
                     "replay cancellation lost work performed before cancellation");
@@ -518,6 +535,101 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
             "an orderly stop was reported as an Engine failure");
 }
 
+// NW-01, the shape of NInfer #434's fairness test (a754fcf3): two long generations that cannot stay
+// resident together. Bounded service turns (resource-scheduling §5.2) must give both repeated
+// service — at least two recoveries each, every one with new committed output — before either ends;
+// a short request submitted while one is paused keeps its queue deadline (fresh admission waits under
+// pressure); the cancelled cohort settles with no membership or physical state left.
+constexpr std::uint32_t kFairnessCapacity = 2048;
+
+void fairness(const std::filesystem::path& artifact, infernix::SpeculativeBackend selected,
+              std::string_view backend_name, bool prefix_cache) {
+    using Clock  = std::chrono::steady_clock;
+    auto options = engine_options(artifact, selected, prefix_cache);
+    // One context of KV for two: each request fits alone, together they pass it at about half.
+    options.max_context = kFairnessCapacity;
+    options.kv_capacity = infernix::KvCapacityPolicy::explicit_capacity(kFairnessCapacity);
+    infernix::Engine engine(options);
+    const std::uint32_t outputs = kFairnessCapacity - kPromptTokens - 1;
+    std::array<infernix::GenerationHandle, 2> handles;
+    std::array<std::optional<infernix::GenerationResult>, 2> results;
+    std::array<std::exception_ptr, 2> errors;
+    std::array<unsigned, 2> recoveries{};
+    std::array<std::uint64_t, 2> last_progress{};
+    std::atomic<bool> stop{false};
+    std::atomic<bool> ended_early{false};
+    std::atomic<bool> stale_recovery{false};
+    std::mutex mutex;
+    // The deadline bounds a regression too: the behaviour under test is starvation.
+    const auto deadline = Clock::now() + std::chrono::seconds(180);
+    for (std::size_t row = 0; row < 2; ++row) {
+        std::vector<infernix::TokenId> tokens(kPromptTokens, 198);
+        tokens.front() = static_cast<infernix::TokenId>(1000 + row);
+        infernix::GenerationObservationOptions observation;
+        observation.scheduling = [&, row](const infernix::GenerationSchedulingObservation& event) {
+            if (event.transition != infernix::GenerationSchedulingTransition::RecoveryComplete) { return; }
+            std::lock_guard lock(mutex);
+            if (event.request_decode_tokens <= last_progress[row]) { stale_recovery = true; }
+            last_progress[row] = event.request_decode_tokens;
+            ++recoveries[row];
+            if (recoveries[0] >= 2 && recoveries[1] >= 2) { stop = true; }
+        };
+        handles[row] = engine.submit(engine.prepare_tokens(std::move(tokens)), request(outputs, prefix_cache),
+                                     infernix::OutputConsumerMode::Aggregate, observation);
+    }
+    std::array<std::jthread, 2> consumers;
+    for (std::size_t row = 0; row < 2; ++row) {
+        consumers[row] = std::jthread([&, row] {
+            try {
+                results[row] = handles[row].wait(
+                    nullptr, infernix::CancellationView([&] { return stop.load() || Clock::now() >= deadline; }));
+                if (!stop.load()) { ended_early = true; }
+            } catch (...) { errors[row] = std::current_exception(); }
+        });
+    }
+    bool saw_pause     = false;
+    bool queue_timeout = false;
+    while (Clock::now() < deadline && !stop.load()) {
+        if (engine.runtime_stats().paused_requests != 0) {
+            saw_pause  = true;
+            auto probe = engine.submit(engine.prepare_tokens({198, 1002, 198}), request(1, prefix_cache),
+                                       infernix::OutputConsumerMode::Aggregate, {},
+                                       Clock::now() + std::chrono::milliseconds(100));
+            try {
+                (void)probe.wait();
+            } catch (const infernix::RequestError& error) {
+                queue_timeout = error.kind() == infernix::RequestErrorKind::QueueTimeout;
+            }
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    for (auto& consumer : consumers) { consumer.join(); }
+    for (const auto& error : errors) {
+        if (error) { std::rethrow_exception(error); }
+    }
+    std::cout << (prefix_cache ? "cache-fairness" : "fairness") << " backend=" << backend_name
+              << " recoveries=" << recoveries[0] << ',' << recoveries[1];
+    (void)engine.memory_summary(); // the completed worker boundary (it takes the execution lock)
+    const auto after = engine.runtime_stats();
+    std::cout << " preemptions=" << after.preemptions << " replayed_tokens=" << after.replayed_tokens
+              << " generated=" << (results[0] ? results[0]->generated_token_ids.size() : 0) << ','
+              << (results[1] ? results[1]->generated_token_ids.size() : 0) << '\n';
+    require(saw_pause && queue_timeout, "a fresh request bypassed paused work or lost its queue deadline");
+    require(!stale_recovery, "a recovery completed without new committed output");
+    require(!ended_early.load() && recoveries[0] >= 2 && recoveries[1] >= 2,
+            "an admitted request waited for its peer to finish instead of receiving service");
+    for (const auto& result : results) {
+        require(result && result->finish_reason == infernix::FinishReason::Cancelled &&
+                    !result->generated_token_ids.empty() && result->generated_token_ids.size() < outputs,
+                "fair service did not preserve cancellation and the output budget");
+    }
+    settled(after, prefix_cache);
+    const auto probe = engine.generate(engine.prepare_tokens({198, 1003, 198}), request(2, prefix_cache));
+    require(probe.generated_token_ids.size() == 2 && engine.is_available() && !engine.has_failed(),
+            "pressure recovery did not reopen admission");
+}
+
 } // namespace
 
 int main() {
@@ -534,9 +646,10 @@ int main() {
         const auto selected     = backend(backend_name);
         const auto scenario     = setting("INFERNIX_PREEMPTION_REAL_SCENARIO", "all");
         require(scenario == "all" || scenario == "replay" || scenario == "cancel-paused" ||
-                    scenario == "cancel-replay" || scenario == "cache-replay",
+                    scenario == "cancel-replay" || scenario == "cache-replay" || scenario == "fairness" ||
+                    scenario == "cache-fairness",
                 "INFERNIX_PREEMPTION_REAL_SCENARIO must be all, replay, cancel-paused, "
-                "cancel-replay or cache-replay");
+                "cancel-replay, cache-replay, fairness or cache-fairness");
         if (scenario == "all" || scenario == "replay") { exercise(artifact, selected, backend_name); }
         if (scenario == "all" || scenario == "cancel-paused") {
             exercise(artifact, selected, backend_name, CancelStage::Paused);
@@ -548,6 +661,11 @@ int main() {
         if ((scenario == "all" && setting("INFERNIX_TEST_CONSTRAINT", "none") == "none") ||
             scenario == "cache-replay") {
             exercise(artifact, selected, backend_name, CancelStage::None, true);
+        }
+        if (scenario == "all" || scenario == "fairness") { fairness(artifact, selected, backend_name, false); }
+        if ((scenario == "all" && setting("INFERNIX_TEST_CONSTRAINT", "none") == "none") ||
+            scenario == "cache-fairness") {
+            fairness(artifact, selected, backend_name, true);
         }
     } catch (const std::exception& error) {
         std::cerr << "real Engine preemption test failed: " << error.what() << '\n';
