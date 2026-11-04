@@ -1423,11 +1423,11 @@ void parse_thinking(const Json& body, GenerationRequest& request) {
 
     if (thinking.contains("display") && !thinking.at("display").is_null()) {
         if (!thinking.at("display").is_string()) {
-            bad_request("thinking.display must be 'summarized' or 'omitted'", "thinking");
+            bad_request("thinking.display must be 'summarized', 'omitted' or 'updates'", "thinking");
         }
         const std::string display = thinking.at("display").get<std::string>();
-        if (display != "summarized" && display != "omitted") {
-            bad_request("thinking.display must be 'summarized' or 'omitted'", "thinking");
+        if (display != "summarized" && display != "omitted" && display != "updates") {
+            bad_request("thinking.display must be 'summarized', 'omitted' or 'updates'", "thinking");
         }
         if (type == "disabled") {
             bad_request("thinking.display is valid only when thinking is adaptive or enabled",
@@ -1436,10 +1436,14 @@ void parse_thinking(const Json& body, GenerationRequest& request) {
     }
 }
 
-bool thinking_display_omitted(const Json& body) {
+// display:"omitted", and the beta display:"updates" (Anthropic: reasoning blocks empty as under "omitted", plus the
+// progress-update blocks some models write between tool calls, which Qwen models do not): the reasoning travels in the
+// signature only.
+bool thinking_display_hidden(const Json& body) {
     if (!body.contains("thinking") || !body.at("thinking").is_object()) { return false; }
     const Json& thinking = body.at("thinking");
-    return thinking.contains("display") && thinking.at("display") == "omitted";
+    return thinking.contains("display") &&
+           (thinking.at("display") == "omitted" || thinking.at("display") == "updates");
 }
 
 void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose purpose) {
@@ -1621,7 +1625,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
 
     result.tool_searches = parse_common_prompt(body, result.generation, ParsePurpose::Messages,
                                                limits.claude_code_prompt);
-    result.hide_thinking = thinking_display_omitted(body);
+    result.hide_thinking = thinking_display_hidden(body);
     parse_generation_fields(body, result.generation);
     parse_structured_outputs(body, result.generation);
     return result;

@@ -1362,8 +1362,10 @@ restores the reasoning from it, so the prompt (and its prefix-cache identity) is
 `summarized` display would give; non-empty `thinking` text takes precedence, any other signature
 stays non-semantic metadata, and a malformed Infernix signature fails with
 `invalid_thinking_signature`. The signature is not encrypted or authenticated: this is a local
-trusted server, and the value is the same reasoning text `summarized` display shows. Count Tokens
-ignores `display`. `preserve_thinking` remains a Infernix extension for closed-turn reasoning
+trusted server, and the value is the same reasoning text `summarized` display shows. The beta
+`thinking.display:"updates"` is served exactly as `"omitted"`: Anthropic returns its reasoning blocks
+empty the same way and adds readable progress-update blocks between tool calls, which the served models
+do not write. Count Tokens ignores `display`. `preserve_thinking` remains a Infernix extension for closed-turn reasoning
 history. `output_config.effort` passes its protocol-validated value to the
 selected template, substituting the nearest value the template accepts as described above.
 `output_config.format` accepts JSON Schema output as described above.
