@@ -30,15 +30,20 @@ constexpr int kIndexDim       = 128;
 constexpr unsigned kFullMask  = 0xFFFFFFFFU;
 constexpr int kLanePartials   = kIndexDim / 32; // products each lane accumulates per dot
 
-// Scoring: a warp step reads kScoreStepBlocks pooled keys and, per column, reduce-scatters the
-// kScoreStepBlocks x kScoreHeadSlots = 32 lane partials of its dots.
-constexpr int kScoreThreads     = 256;
-constexpr int kScoreWarps       = kScoreThreads / 32;
-constexpr int kScoreCtasPerSm   = 2;
-constexpr int kScoreStepBlocks  = 8;
-constexpr int kScoreHeadSlots   = 4;  // index heads (1..4; unused slots hold zero queries)
-constexpr int kScoreTileColumns = 16; // columns of one row scored from one key read
-static_assert(kScoreStepBlocks * kScoreHeadSlots == 32);
+// Scoring: a warp step reads a step's pooled keys and, per column, reduce-scatters the step's blocks x
+// kScoreHeadSlots lane partials of its dots. Rows of at most kScoreNarrowMaxBlocks blocks take steps of
+// kScoreNarrowStepBlocks (candidates KG-03: the QSA attention op bench, BF16 KV, three rounds, selection time
+// against 8-block steps at 1 / 2 / 4 / 8 columns: 8K -13.5 / -16.4 / -13.0 / -11.3 %, 16K -16.5 / -13.0 / -9.0 /
+// -10.8 %, 32K -8.8 / -8.8 / -3.0 / -9.7 %, 64K level, 128K level / +8.0 / +1.8 / +5.8 %; 2-block steps no
+// better at 8-16K and slower from 32K; 2026-11-04), longer rows kScoreStepBlocks. The same scores either way.
+constexpr int kScoreThreads          = 256;
+constexpr int kScoreWarps            = kScoreThreads / 32;
+constexpr int kScoreCtasPerSm        = 2;
+constexpr int kScoreStepBlocks       = 8;
+constexpr int kScoreNarrowStepBlocks = 4;
+constexpr int kScoreNarrowMaxBlocks  = 8192; // 32K tokens at the ratio 4
+constexpr int kScoreHeadSlots        = 4;  // index heads (1..4; unused slots hold zero queries)
+constexpr int kScoreTileColumns      = 16; // columns of one row scored from one key read
 
 // Selection.
 constexpr int kSelectThreads     = 512;
@@ -72,81 +77,57 @@ __device__ __forceinline__ const bf16* pooled_element(const bf16* pool, const Qs
            static_cast<std::int64_t>(slot_width) * (token & kPagedKVPageMask) + slot;
 }
 
-// One stage of the reduce-scatter: lanes whose `Half` bit is clear keep values [0, Half), the
-// others [Half, 2 Half); each kept value adds its partner lane's copy (own + partner, as
-// warp_sum's `v += __shfl_xor_sync(v, Half)`).
-template <int Half>
-__device__ __forceinline__ void reduce_scatter_stage(float (&v)[32], int lane) {
-    const bool upper = (lane & Half) != 0;
+// One butterfly stage at shuffle offset `Offset` over `Values` values: with more than one, lanes whose
+// `Offset` bit is clear keep the lower half and the others the upper half, each kept value adding its
+// partner lane's copy; with one, every lane adds its partner's copy. Either way own + partner, as
+// warp_sum's `v += __shfl_xor_sync(v, Offset)`.
+template <int Offset, int Values>
+__device__ __forceinline__ void reduce_scatter_step(float* v, int lane) {
+    if constexpr (Values > 1) {
+        constexpr int Half = Values / 2;
+        const bool upper   = (lane & Offset) != 0;
 #pragma unroll
-    for (int i = 0; i < Half; ++i) {
-        const float keep = upper ? v[i + Half] : v[i];
-        const float send = upper ? v[i] : v[i + Half];
-        v[i]             = keep + __shfl_xor_sync(kFullMask, send, Half);
+        for (int i = 0; i < Half; ++i) {
+            const float keep = upper ? v[i + Half] : v[i];
+            const float send = upper ? v[i] : v[i + Half];
+            v[i]             = keep + __shfl_xor_sync(kFullMask, send, Offset);
+        }
+    } else {
+        v[0] = v[0] + __shfl_xor_sync(kFullMask, v[0], Offset);
     }
 }
 
-// Lane l returns the 32-lane sum of its value l, bitwise equal to warp_sum's result for that value
-// (31 shuffles for 32 sums instead of 160). After the stages at offsets 16..o, each value lane l
-// keeps is the sum over the lanes l ^ m, m a combination of those offsets, formed by exactly the
-// additions the xor butterfly performs at lane l; the butterfly ends with that sum in every lane.
-__device__ __forceinline__ float reduce_scatter_32(float (&v)[32], int lane) {
-    reduce_scatter_stage<16>(v, lane);
-    reduce_scatter_stage<8>(v, lane);
-    reduce_scatter_stage<4>(v, lane);
-    reduce_scatter_stage<2>(v, lane);
-    reduce_scatter_stage<1>(v, lane);
+// Lane l returns the 32-lane sum of its value l / (32 / N) (N of 32, 16 or 8 values), bitwise equal to
+// warp_sum's result for that value (N - 1 + log2(32 / N) shuffles for N sums instead of 5 N). After the
+// stages at offsets 16..o, each value lane l keeps is the sum over the lanes l ^ m, m a combination of
+// those offsets, formed by exactly the additions the xor butterfly performs at lane l; the butterfly
+// ends with that sum in every lane.
+template <int N>
+__device__ __forceinline__ float reduce_scatter(float (&v)[N], int lane) {
+    static_assert(N == 32 || N == 16 || N == 8, "32, 16 or 8 values a lane");
+    reduce_scatter_step<16, N>(v, lane);
+    reduce_scatter_step<8, (N / 2 > 1 ? N / 2 : 1)>(v, lane);
+    reduce_scatter_step<4, (N / 4 > 1 ? N / 4 : 1)>(v, lane);
+    reduce_scatter_step<2, (N / 8 > 1 ? N / 8 : 1)>(v, lane);
+    reduce_scatter_step<1, (N / 16 > 1 ? N / 16 : 1)>(v, lane);
     return v[0];
 }
 
-// Grid (CTAs per tile, tiles). A tile is up to 16 consecutive columns of one row; its CTAs split
-// the row's blocks in steps of 8, one step per warp at a time. Each pooled key is read once per
-// tile and scored for every column of the tile that sees it. With `clear`, the CTAs first zero
-// `clear_words` words of selection state (histograms and arrival counters).
-__global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
-    qsa_score_kernel(const bf16* __restrict__ index_q, int index_heads, const bf16* __restrict__ pooled,
-                     const std::int32_t* __restrict__ tables, int table_stride,
-                     const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
-                     int width, int ratio, int top_blocks, int group_begin, const ScoreTiles tiles,
-                     float* __restrict__ scores, int score_stride, std::uint32_t* __restrict__ clear,
-                     int clear_words, QsaPageSpaces spaces) {
-    pdl::enter_streaming();
-    if (clear != nullptr) {
-        const std::int64_t ctas = static_cast<std::int64_t>(gridDim.x) * gridDim.y;
-        const std::int64_t cta  = static_cast<std::int64_t>(blockIdx.y) * gridDim.x + blockIdx.x;
-        const int begin         = static_cast<int>(clear_words * cta / ctas);
-        const int end           = static_cast<int>(clear_words * (cta + 1) / ctas);
-        for (int i = begin + static_cast<int>(threadIdx.x); i < end; i += kScoreThreads) { clear[i] = 0; }
-    }
-    __shared__ float4 qs[kScoreTileColumns][kScoreHeadSlots][32]; // lane l: q[h][l + 32 j], j = 0..3
-    __shared__ int column_blocks[kScoreTileColumns];
-    const int tile = static_cast<int>(blockIdx.y);
-    const int c0 = tiles.first[tile], nc = tiles.columns[tile];
-    const int t0 = group_begin + c0;
-    int tile_blocks = 0;
-    for (int c = 0; c < nc; ++c) { tile_blocks = max(tile_blocks, (positions[t0 + c] + 1) / ratio); }
-    const int steps      = (tile_blocks + kScoreStepBlocks - 1) / kScoreStepBlocks;
-    const int first_step = static_cast<int>(blockIdx.x) * kScoreWarps;
-    if (tile_blocks <= top_blocks || first_step >= steps) {
-        pdl::trigger_dependents();
-        return; // every column of the tile is dense, or this CTA has no step
-    }
-    if (static_cast<int>(threadIdx.x) < nc) {
-        column_blocks[threadIdx.x] = (positions[t0 + static_cast<int>(threadIdx.x)] + 1) / ratio;
-    }
-    for (int i = static_cast<int>(threadIdx.x); i < nc * kScoreHeadSlots * kIndexDim; i += kScoreThreads) {
-        const int c = i / (kScoreHeadSlots * kIndexDim), h = (i / kIndexDim) % kScoreHeadSlots, d = i % kIndexDim;
-        const float value =
-            h < index_heads
-                ? __bfloat162float(index_q[(static_cast<std::size_t>(t0 + c) * index_heads + h) * kIndexDim + d])
-                : 0.0F;
-        reinterpret_cast<float*>(&qs[c][h][d % 32])[d / 32] = value;
-    }
-    __syncthreads();
-
+// Score steps of StepBlocks blocks a warp step (8, 4 or 2) over the tile's blocks, from step first_step: every
+// StepBlocks gives the same scores, each block's dot being its lanes' partials summed in the butterfly's order.
+template <int StepBlocks>
+__device__ __forceinline__ void score_tile_steps(const float4 (&qs)[kScoreTileColumns][kScoreHeadSlots][32],
+                                                 const int (&column_blocks)[kScoreTileColumns], int nc, int c0,
+                                                 int tile_blocks, int first_step, int index_heads,
+                                                 const bf16* __restrict__ pooled, const std::int32_t* table, int ratio,
+                                                 float* __restrict__ scores, int score_stride,
+                                                 const QsaPageSpaces& spaces) {
+    static_assert(StepBlocks == 8 || StepBlocks == 4 || StepBlocks == 2, "8, 4 or 2 blocks a step");
+    constexpr int kValues = StepBlocks * kScoreHeadSlots; // a lane's partials of one step's dots
+    constexpr int kSpread = 32 / kValues;                 // lanes holding each value after the reduce-scatter
+    const int steps       = (tile_blocks + StepBlocks - 1) / StepBlocks;
     const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32;
-    const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[t0 / width]) * table_stride;
-    const int slot_width      = kIndexDim / ratio;
+    const int slot_width = kIndexDim / ratio;
     int token_offset[kLanePartials], slot[kLanePartials];
 #pragma unroll
     for (int j = 0; j < kLanePartials; ++j) {
@@ -156,10 +137,10 @@ __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
     const bool block_in_page = ratio <= kPagedKVPageSize; // a block's tokens share one page
     const float scale        = rsqrtf(static_cast<float>(kIndexDim));
     for (int step = first_step + warp; step < steps; step += static_cast<int>(gridDim.x) * kScoreWarps) {
-        const int b0 = step * kScoreStepBlocks;
-        float key[kScoreStepBlocks][kLanePartials];
+        const int b0 = step * StepBlocks;
+        float key[StepBlocks][kLanePartials];
 #pragma unroll
-        for (int bb = 0; bb < kScoreStepBlocks; ++bb) {
+        for (int bb = 0; bb < StepBlocks; ++bb) {
             const int b = b0 + bb;
             if (b >= tile_blocks) {
 #pragma unroll
@@ -190,9 +171,9 @@ __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
             for (int h = 0; h < kScoreHeadSlots; ++h) { q[h] = qs[c][h][lane]; }
             // Value bb * 4 + h: this lane's partial of block b0 + bb, head h, accumulated in j order
             // from 0 like the one-warp-per-block kernel's `dot += q[h][lane + 32 j] * key[j]`.
-            float v[32];
+            float v[kValues];
 #pragma unroll
-            for (int bb = 0; bb < kScoreStepBlocks; ++bb) {
+            for (int bb = 0; bb < StepBlocks; ++bb) {
 #pragma unroll
                 for (int h = 0; h < kScoreHeadSlots; ++h) {
                     float dot = 0.0F;
@@ -203,13 +184,14 @@ __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
                     v[bb * kScoreHeadSlots + h] = dot;
                 }
             }
-            // Lane 4 bb + h now holds head h's dot of block b0 + bb; heads join in head order.
-            const float relu  = fmaxf(reduce_scatter_32(v, lane), 0.0F);
-            const float relu1 = __shfl_down_sync(kFullMask, relu, 1);
-            const float relu2 = __shfl_down_sync(kFullMask, relu, 2);
-            const float relu3 = __shfl_down_sync(kFullMask, relu, 3);
-            const int b       = b0 + lane / kScoreHeadSlots;
-            if (lane % kScoreHeadSlots == 0 && b < blocks) {
+            // Lanes kSpread (4 bb + h) .. + kSpread - 1 now hold head h's dot of block b0 + bb; heads join
+            // in head order.
+            const float relu  = fmaxf(reduce_scatter(v, lane), 0.0F);
+            const float relu1 = __shfl_down_sync(kFullMask, relu, kSpread);
+            const float relu2 = __shfl_down_sync(kFullMask, relu, 2 * kSpread);
+            const float relu3 = __shfl_down_sync(kFullMask, relu, 3 * kSpread);
+            const int b       = b0 + lane / (kScoreHeadSlots * kSpread);
+            if (lane % (kScoreHeadSlots * kSpread) == 0 && b < blocks) {
                 float score = 0.0F;
                 score += relu;
                 if (index_heads > 1) { score += relu1; }
@@ -218,6 +200,64 @@ __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
                 scores[static_cast<std::size_t>(c0 + c) * score_stride + b] = score * scale;
             }
         }
+    }
+}
+
+// Grid (CTAs per tile, tiles). A tile is up to 16 consecutive columns of one row; its CTAs split the row's
+// blocks in steps of kScoreNarrowStepBlocks blocks while the row has at most kScoreNarrowMaxBlocks blocks,
+// else of kScoreStepBlocks, one step per warp at a time: the narrow steps put twice the warps on the short
+// rows that leave most SMs idle (one step a warp), the wide ones shuffle less per block where every SM is
+// busy. Each pooled key is read once per tile and scored for every column of the tile that sees it. With
+// `clear`, the CTAs first zero `clear_words` words of selection state (histograms and arrival counters).
+__global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
+    qsa_score_kernel(const bf16* __restrict__ index_q, int index_heads, const bf16* __restrict__ pooled,
+                     const std::int32_t* __restrict__ tables, int table_stride,
+                     const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
+                     int width, int ratio, int top_blocks, int group_begin, const ScoreTiles tiles,
+                     float* __restrict__ scores, int score_stride, std::uint32_t* __restrict__ clear,
+                     int clear_words, QsaPageSpaces spaces) {
+    pdl::enter_streaming();
+    if (clear != nullptr) {
+        const std::int64_t ctas = static_cast<std::int64_t>(gridDim.x) * gridDim.y;
+        const std::int64_t cta  = static_cast<std::int64_t>(blockIdx.y) * gridDim.x + blockIdx.x;
+        const int begin         = static_cast<int>(clear_words * cta / ctas);
+        const int end           = static_cast<int>(clear_words * (cta + 1) / ctas);
+        for (int i = begin + static_cast<int>(threadIdx.x); i < end; i += kScoreThreads) { clear[i] = 0; }
+    }
+    __shared__ float4 qs[kScoreTileColumns][kScoreHeadSlots][32]; // lane l: q[h][l + 32 j], j = 0..3
+    __shared__ int column_blocks[kScoreTileColumns];
+    const int tile = static_cast<int>(blockIdx.y);
+    const int c0 = tiles.first[tile], nc = tiles.columns[tile];
+    const int t0 = group_begin + c0;
+    int tile_blocks = 0;
+    for (int c = 0; c < nc; ++c) { tile_blocks = max(tile_blocks, (positions[t0 + c] + 1) / ratio); }
+    const bool narrow    = tile_blocks <= kScoreNarrowMaxBlocks;
+    const int step       = narrow ? kScoreNarrowStepBlocks : kScoreStepBlocks;
+    const int steps      = (tile_blocks + step - 1) / step;
+    const int first_step = static_cast<int>(blockIdx.x) * kScoreWarps;
+    if (tile_blocks <= top_blocks || first_step >= steps) {
+        pdl::trigger_dependents();
+        return; // every column of the tile is dense, or this CTA has no step
+    }
+    if (static_cast<int>(threadIdx.x) < nc) {
+        column_blocks[threadIdx.x] = (positions[t0 + static_cast<int>(threadIdx.x)] + 1) / ratio;
+    }
+    for (int i = static_cast<int>(threadIdx.x); i < nc * kScoreHeadSlots * kIndexDim; i += kScoreThreads) {
+        const int c = i / (kScoreHeadSlots * kIndexDim), h = (i / kIndexDim) % kScoreHeadSlots, d = i % kIndexDim;
+        const float value =
+            h < index_heads
+                ? __bfloat162float(index_q[(static_cast<std::size_t>(t0 + c) * index_heads + h) * kIndexDim + d])
+                : 0.0F;
+        reinterpret_cast<float*>(&qs[c][h][d % 32])[d / 32] = value;
+    }
+    __syncthreads();
+    const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[t0 / width]) * table_stride;
+    if (narrow) {
+        score_tile_steps<kScoreNarrowStepBlocks>(qs, column_blocks, nc, c0, tile_blocks, first_step, index_heads,
+                                                 pooled, table, ratio, scores, score_stride, spaces);
+    } else {
+        score_tile_steps<kScoreStepBlocks>(qs, column_blocks, nc, c0, tile_blocks, first_step, index_heads, pooled,
+                                           table, ratio, scores, score_stride, spaces);
     }
     pdl::trigger_dependents();
 }
@@ -887,7 +927,9 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
     const auto* rows       = static_cast<const std::int32_t*>(batch.table_rows.data);
     const auto* positions  = static_cast<const std::int32_t*>(batch.positions.data);
     const int sms          = multiprocessors();
-    const int max_steps    = ceil_div(max_blocks + 1, kScoreStepBlocks);
+    // The most steps a row takes: narrow steps up to kScoreNarrowMaxBlocks blocks, wide ones past them.
+    const int max_steps = std::max(ceil_div(std::min(max_blocks + 1, kScoreNarrowMaxBlocks), kScoreNarrowStepBlocks),
+                                   ceil_div(max_blocks + 1, kScoreStepBlocks));
     // Wide rows take the register-tiled kernel when a block's key is 16-byte aligned in one page.
     const bool wide = batch.width >= kWideMinWidth && geometry.ratio <= kPagedKVPageSize &&
                       (kIndexDim / geometry.ratio) % 8 == 0;

@@ -7171,6 +7171,16 @@ baselines: tg512 88.7-90.0 plain and 133.5-138.7 MTP; serve warm 147.2 / 97.5; c
        at 64K (decode, IQ3_S DFlash2 0.9964, Dense8 MTP-3 1.0000), removed 2026-10-28.
      - Launches: the score kernel is a programmatic dependent (streaming: it triggers after its
        loop), the select kernel enters with `pdl::enter()`; 2 launches per layer call and group.
+     - Score steps (2026-11-04, candidates KG-03): a warp step scored 8 blocks, so a 16K decode row
+       (4,096 blocks at the ratio 4, 512 steps) kept 64 CTAs busy and left most SMs idle. Rows of at
+       most 8,192 blocks (32K tokens) now take 4-block steps, longer rows 8: the reduce-scatter over
+       16 values keeps the butterfly's additions (offsets 16 .. 2, then a full add at 1), so the scores
+       are the same bits (`infernix_qsa_select_test` bit-exact against the reference at every size;
+       2-block steps pass too). QSA attention op bench, BF16 KV, three rounds, selection time at 1 /
+       2 / 4 / 8 columns: 8K 14.94 / 15.46 / 15.49 / 17.47 -> 12.93 / 12.90 / 13.44 / 15.49 µs, 16K
+       -16.5 / -13.0 / -8.8 / -10.6 %, 32K -8.8 / -8.8 / -3.0 / -9.7 %, 64K and 128K level (4-block
+       steps measured +1.8-8.0 % at 128K: more shuffles per block where every SM is busy; 2-block
+       steps no better at 8-16K and slower from 32K).
      - Expected (estimates, before measurement), per layer call at W = 1: pooled keys
        N × 256 B (0.5 / 2.1 / 8.4 / 16.8 MB at 8K / 32K / 128K / 262K, floor 0.3 / 1.3 / 4.9 /
        9.9 µs at 1.7 TB/s); score kernel ~2.5 / 3 / 6.5 / 11 µs, select ~5 / 5 / 6 / 8 µs (latency
