@@ -355,11 +355,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
     out.state_images = qwen3_5::plan_state_image_device_pool(builder, state_image_spec);
     if (plan.speculative_backend != SpeculativeBackend::None) {
+        // A layer's records hold the widest round's columns (verify_column_capacity), as the verify
+        // logits do: rows of draft_window + 1 columns, enough of them for every family's width times the
+        // rows it serves (ProgramImpl views a narrower round's records with the rows its columns hold).
         out.replay_records = plan_gdn_replay_records(
             builder,
             GdnReplayRecordSpec{
                 .layers          = dimension(config.linear_attention_layers),
-                .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
+                .record_capacity = static_cast<std::int32_t>(replay_record_rows(
+                    plan.round_shapes, plan.tree_widths, plan.max_concurrency, plan.draft_window)),
                 .width           = static_cast<std::int32_t>(plan.draft_window + 1U),
                 .conv_channels   = (config.gdn ? dimension(config.gdn->conv_channels()) : 0),
                 .qk_heads        = (config.gdn ? dimension(config.gdn->linear_num_key_heads) : 0),

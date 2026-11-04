@@ -147,6 +147,23 @@ struct TreeWidthPlan {
     return columns;
 }
 
+// The GDN replay records' rows a layer at their storage width draft_window + 1: enough for the widest
+// round's columns (verify_column_capacity; every lane without speculative round shapes), at most C.
+[[nodiscard]] inline std::uint32_t replay_record_rows(const std::vector<SpeculativeRoundShape>& shapes,
+                                                      const TreeWidthPlan& tree_widths, std::uint32_t max_concurrency,
+                                                      std::uint32_t draft_window) noexcept {
+    const std::uint32_t columns = verify_column_capacity(shapes, tree_widths, max_concurrency);
+    const std::uint32_t width   = draft_window + 1U;
+    return columns == 0 ? max_concurrency : std::min(max_concurrency, (columns + width - 1U) / width);
+}
+
+// The rows a round of `width` columns may record in storage of `rows` rows of draft_window + 1 columns
+// (as the verify logits' view: the rows the columns hold, at most C).
+[[nodiscard]] inline std::uint32_t replay_view_rows(std::uint32_t rows, std::uint32_t draft_window, std::uint32_t width,
+                                                    std::uint32_t max_concurrency) noexcept {
+    return std::min(max_concurrency, rows * (draft_window + 1U) / width);
+}
+
 // The columns one causal-scoring tile holds; its logits are [vocabulary, tile].
 inline constexpr std::uint32_t kCausalScoreTile = 512;
 

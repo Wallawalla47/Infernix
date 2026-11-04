@@ -22,8 +22,11 @@ causal-conv history, and the space and compute characteristics of the current Qw
 The Record/Fold implementation and contract are in
 [`gdn_replay.h`](../../include/infernix/ops/gdn_replay.h) and
 [`replay.cpp`](../../src/ops/linear_attention/gated_delta_net/replay.cpp). The model config determines the
-layer/head counts, and the Program reserves record capacity for the enabled MTP, DFlash or DFlash2
-window.
+layer/head counts, and the Program reserves record capacity for the widest round the enabled MTP, DFlash
+or DFlash2 policy verifies: a layer's records hold rows of the widest window, as many as the widest
+round's columns need (`verify_column_capacity`, the same bound as the verify logits: each round family's
+width times the most rows it serves), and a narrower family's rounds view them as more rows of fewer
+columns (`GdnReplayRecords::narrowed(width, rows)`).
 
 ---
 

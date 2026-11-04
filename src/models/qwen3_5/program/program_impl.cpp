@@ -203,7 +203,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                             })) {
                 continue;
             }
-            GdnReplayRecords narrowed = replay_records->narrowed(width);
+            // The rows this width's columns hold in the storage (the records hold the widest round's
+            // columns a layer, persistent_layout), as the verify logits' view.
+            const auto rows = static_cast<std::int32_t>(
+                replay_view_rows(static_cast<std::uint32_t>(replay_records->spec.record_capacity), draft_window,
+                                 static_cast<std::uint32_t>(width), plan.max_concurrency));
+            GdnReplayRecords narrowed = replay_records->narrowed(width, rows);
             ops::GdnReplayFoldPlan fold(narrowed, state_images->linear().all_layers_view());
             narrow_replay_views.push_back(NarrowReplayView{narrowed, std::move(fold)});
         }

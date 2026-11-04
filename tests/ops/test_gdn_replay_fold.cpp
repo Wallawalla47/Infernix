@@ -127,7 +127,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     cuda_check(cudaMemset(record_base, 0xff, record_bytes), "initialize replay records");
     const GdnReplayRecords storage_records({record_base, record_bytes}, record_layout);
     const GdnReplayRecords records =
-        storage_width > width ? storage_records.narrowed(width) : storage_records;
+        storage_width > width ? storage_records.narrowed(width, record_spec.record_capacity) : storage_records;
 
     std::vector<std::uint16_t> conv_records(records.conv.numel(), 0xffffU);
     std::vector<std::uint16_t> key_records(records.key.numel(), 0xffffU);

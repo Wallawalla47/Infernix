@@ -5241,7 +5241,7 @@ private:
                                    std::to_string(width) + " columns exceeds the plan's records");
         }
         execution::ForwardVerify v;
-        v.gdn        = records_.narrowed(width);
+        v.gdn        = records_.narrowed(width, records_.spec.record_capacity);
         v.ple_inputs = Tensor(ple_records_.p, DType::BF16, {width_, width, batch});
         v.qsa_keys   = Tensor(qsa_records_.p, DType::BF16, {di_, width, batch, dim(c_.attention_layers)});
         return v;
@@ -5249,7 +5249,7 @@ private:
 
     const ops::GdnReplayFoldPlan& fold(std::int32_t width) {
         auto& plan = folds_.at(static_cast<std::size_t>(width));
-        if (!plan) { plan.emplace(records_.narrowed(width), gdn_->all_layers_view()); }
+        if (!plan) { plan.emplace(records_.narrowed(width, records_.spec.record_capacity), gdn_->all_layers_view()); }
         return *plan;
     }
 
