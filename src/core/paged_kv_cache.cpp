@@ -704,7 +704,8 @@ TransferWork DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPage
 std::uint32_t DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin,
                                               std::size_t plane_end, std::int32_t first, std::size_t count,
                                               std::byte* host_base, std::size_t host_pitch,
-                                              const HostKVPageLayout& host, cudaStream_t stream) const {
+                                              std::size_t max_pitch, const HostKVPageLayout& host,
+                                              cudaStream_t stream) const {
     const bool to_host = kind == cudaMemcpyDeviceToHost;
     std::uint32_t copies = 0;
     for (std::size_t plane_index = plane_begin; plane_index < plane_end; ++plane_index) {
@@ -712,27 +713,35 @@ std::uint32_t DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t p
         const HostKVPlaneLayout& host_plane = host.planes[plane_index];
         std::byte* host_plane_base          = host_base + host_plane.offset;
         auto* device_base                   = static_cast<unsigned char*>(plane.data);
-        const auto copy                     = [&](std::byte* host_ptr, unsigned char* device_ptr,
-                                                  std::size_t device_pitch, std::size_t width) {
+        const auto copy = [&](std::byte* host_ptr, std::size_t pitch_on_host, unsigned char* device_ptr,
+                              std::size_t device_pitch, std::size_t width, std::size_t height) {
             ++copies;
             if (to_host) {
-                CUDA_CHECK(cudaMemcpy2DAsync(host_ptr, host_pitch, device_ptr, device_pitch, width,
-                                             count, cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpy2DAsync(host_ptr, pitch_on_host, device_ptr, device_pitch, width,
+                                             height, cudaMemcpyDeviceToHost, stream));
             } else {
-                CUDA_CHECK(cudaMemcpy2DAsync(device_ptr, device_pitch, host_ptr, host_pitch, width,
-                                             count, cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpy2DAsync(device_ptr, device_pitch, host_ptr, pitch_on_host, width,
+                                             height, cudaMemcpyHostToDevice, stream));
             }
         };
         if (geometry().device_plane_order == PagedKVPlaneOrder::PageMajor) {
-            copy(host_plane_base, device_base + static_cast<std::int64_t>(first) * plane.nb[3],
-                 plane.nb[3], host_plane.page_payload_bytes);
+            copy(host_plane_base, host_pitch, device_base + static_cast<std::int64_t>(first) * plane.nb[3],
+                 plane.nb[3], host_plane.page_payload_bytes, count);
+        } else if (count < static_cast<std::size_t>(plane.ne[3]) && static_cast<std::size_t>(plane.nb[3]) <= max_pitch) {
+            // A record packs a page's heads one after another, the device a head's pages: a run
+            // shorter than the head count copies each page's heads as one strided transfer (a
+            // DFlash Full pool's one-page evictions and restores: one copy a plane, not one a head).
+            for (std::size_t page = 0; page < count; ++page) {
+                copy(host_plane_base + page * host_pitch, host_plane.head_payload_bytes,
+                     device_base + (static_cast<std::int64_t>(first) + static_cast<std::int64_t>(page)) * plane.nb[2],
+                     plane.nb[3], host_plane.head_payload_bytes, static_cast<std::size_t>(plane.ne[3]));
+            }
         } else {
             for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
-                copy(host_plane_base +
-                         static_cast<std::size_t>(head) * host_plane.head_payload_bytes,
+                copy(host_plane_base + static_cast<std::size_t>(head) * host_plane.head_payload_bytes, host_pitch,
                      device_base + static_cast<std::int64_t>(head) * plane.nb[3] +
                          static_cast<std::int64_t>(first) * plane.nb[2],
-                     plane.nb[2], host_plane.head_payload_bytes);
+                     plane.nb[2], host_plane.head_payload_bytes, count);
             }
         }
     }
@@ -936,7 +945,7 @@ std::uint32_t DeviceKVPagePool::copy_to_host_records(std::span<const DeviceKVPag
         const std::size_t end = host_record_run_end(source, addresses, record_groups, begin,
                                                     layout.page_stride, max_pitch, pitch);
         copies += copy_host_run(cudaMemcpyDeviceToHost, plane_begin, plane_end, source[begin].index_,
-                                end - begin, records[begin], pitch, layout, stream);
+                                end - begin, records[begin], pitch, max_pitch, layout, stream);
         begin = end;
     }
     return copies;
@@ -976,7 +985,8 @@ std::uint32_t DeviceKVPagePool::copy_from_host_records(std::span<const std::byte
                                                     layout.page_stride, max_pitch, pitch);
         // The H2D direction only reads the host run.
         copies += copy_host_run(cudaMemcpyHostToDevice, plane_begin, plane_end, destination[begin].index_,
-                                end - begin, const_cast<std::byte*>(records[begin]), pitch, layout, stream);
+                                end - begin, const_cast<std::byte*>(records[begin]), pitch, max_pitch, layout,
+                                stream);
         begin = end;
     }
     return copies;

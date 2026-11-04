@@ -319,10 +319,14 @@ private:
 
     [[nodiscard]] bool valid_handle(DeviceKVPageHandle handle) const noexcept;
     [[nodiscard]] std::int32_t physical_index(DeviceKVPageHandle handle) const;
+    // One run of `count` consecutive physical pages from `first` whose host records advance by
+    // host_pitch: a HeadMajor plane copies head by head (one strided transfer of the run per head)
+    // or, when the run has fewer pages than the plane has heads and the head stride is within
+    // max_pitch, page by page (one strided transfer of the page's heads). Returns the copies issued.
     std::uint32_t copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin, std::size_t plane_end,
                                 std::int32_t first, std::size_t count, std::byte* host_base,
-                                std::size_t host_pitch, const HostKVPageLayout& host,
-                                cudaStream_t stream) const;
+                                std::size_t host_pitch, std::size_t max_pitch,
+                                const HostKVPageLayout& host, cudaStream_t stream) const;
     [[nodiscard]] static std::size_t host_record_run_end(std::span<const DeviceKVPageHandle> pages,
                                                          std::span<const std::byte* const> records,
                                                          std::span<const std::uint32_t> groups,
