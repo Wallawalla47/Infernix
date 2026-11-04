@@ -63,7 +63,8 @@ struct FastPathSelection {
 };
 
 // The qualified paths that apply when options.fast_paths is set, plus every
-// options.fast_path_candidates entry (qualification runs), which must apply (std::invalid_argument otherwise).
+// options.fast_path_candidates entry (qualification runs), which must apply (std::invalid_argument otherwise),
+// less every options.fast_path_exclusions entry, which must be one of those qualified paths.
 // `output_head_screen`: the loader bound the LM head's 2-bit screen (LoadPlan::has_output_head_screen).
 [[nodiscard]] FastPathSelection select_fast_paths(const Config& config, bool output_head_screen,
                                                   const EngineOptions& options);

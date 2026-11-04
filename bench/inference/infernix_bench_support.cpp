@@ -539,6 +539,8 @@ std::string usage_text(std::string_view program) {
         << "                              for the configuration, the artifact's kernels and KV)\n"
         << "  --fast-path <name>          qualification: also run this fast path, qualified\n"
         << "                              or not (a registry name; repeatable)\n"
+        << "  --no-fast-path <name>       leave-one-out: leave this selected fast path out of the\n"
+        << "                              default route (repeatable)\n"
         << "  --prefill-split-workspace-mib <n>  prompt-attention split workspace (default: "
         << kDefaultPrefillSplitWorkspaceMiB << ";\n"
         << "                              128-384 recommended, 0 = no splitting)\n"
@@ -764,6 +766,11 @@ BenchOptions parse_args(int argc, char** argv) {
             const std::optional<FastPath> path = parse_fast_path(name);
             if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
             options.fast_path_candidates.push_back(*path);
+        } else if (arg == "--no-fast-path") {
+            const std::string name(value("--no-fast-path"));
+            const std::optional<FastPath> path = parse_fast_path(name);
+            if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
+            options.fast_path_exclusions.push_back(*path);
         } else if (arg == "--spec") {
             product::apply_speculative_backend(options.speculative, value("--spec"));
         } else if (arg == "--draft-tokens") {

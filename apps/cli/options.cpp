@@ -133,6 +133,7 @@ constexpr std::array kCliOptions{
     CliOption{"--reproducible", false},
     CliOption{"--lossless", false},
     CliOption{"--fast-path", true, true},
+    CliOption{"--no-fast-path", true, true},
     CliOption{"--expert-a4-activations", false},
     CliOption{"--a16-activations", false},
     CliOption{"--a8-activations", false},
@@ -306,6 +307,8 @@ std::string usage_text(const char* argv0) {
            "                           (docs/maintainer/lossless-route.md)\n"
            "  --fast-path NAME         also run this fast path, qualified or not\n"
            "                           (qualification runs; repeatable)\n"
+           "  --no-fast-path NAME      leave this selected fast path out of the default\n"
+           "                           route (leave-one-out measurements; repeatable)\n"
            "  --a16-activations        Qwen3.8-Flash-Next artifacts whose routed experts are\n"
            "                           NVIDIA's W4A4 NVFP4 (Dense8, recipe A): run them with\n"
            "                           16-bit activations instead of the checkpoint's 4-bit\n"
@@ -615,6 +618,11 @@ Options parse_options(int argc, char** argv) {
             const std::optional<FastPath> path = parse_fast_path(name);
             if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
             options.fast_path_candidates.push_back(*path);
+        } else if (arg == "--no-fast-path") {
+            const std::string name(value(arg));
+            const std::optional<FastPath> path = parse_fast_path(name);
+            if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
+            options.fast_path_exclusions.push_back(*path);
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
         } else if (arg == "--a16-activations") {

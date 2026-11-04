@@ -411,6 +411,7 @@ int main(int argc, char** argv) {
         engine_options.fast_paths                    = cli.fast_paths && !cli.lossless;
         engine_options.lossless                      = cli.lossless;
         engine_options.fast_path_candidates          = cli.fast_path_candidates;
+        engine_options.fast_path_exclusions          = cli.fast_path_exclusions;
         engine_options.speculative              = cli.speculative;
         engine_options.enable_vision            = cli.enable_vision;
         engine_options.vision_offload           = cli.vision_offload;

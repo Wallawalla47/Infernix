@@ -853,6 +853,10 @@ struct EngineOptions {
     // whether or not they are qualified for this configuration, so their cost can be measured.
     // Each must apply to the configuration (its kernel must run in it).
     std::vector<FastPath> fast_path_candidates;
+    // Measurement only (leave-one-out arms on the default route): leave these out of the fast paths `fast_paths`
+    // selects. Each must be one the configuration selects (not a candidate as well); the reproducible route refuses
+    // them.
+    std::vector<FastPath> fast_path_exclusions;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     // The head's logits on every route (--logits-dtype): FP32, or BF16 for comparisons with engines and
     // references that round them; a startup choice (the round buffers and CUDA Graphs are planned for it).

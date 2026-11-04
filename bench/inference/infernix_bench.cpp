@@ -262,6 +262,7 @@ int main(int argc, char** argv) {
         engine_options.original_nvfp4_prefill_kernel     = options.original_nvfp4_prefill_kernel;
         engine_options.fast_paths                        = options.fast_paths;
         engine_options.fast_path_candidates              = options.fast_path_candidates;
+        engine_options.fast_path_exclusions              = options.fast_path_exclusions;
         engine_options.prefill_split_workspace_mib       = options.prefill_split_workspace_mib;
         engine_options.ngram_volume_path = options.ngram_volume_path;
         engine_options.ngram_residency   = options.ngram_residency;

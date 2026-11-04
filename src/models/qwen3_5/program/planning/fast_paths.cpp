@@ -693,7 +693,14 @@ FastPathSelection select_fast_paths(const Model& model, const EngineOptions& opt
         const bool qualified = options.fast_paths &&
                                fast_path_applies(path, out.configuration, options) &&
                                fast_path_qualified(path, out.configuration);
-        if (candidate || qualified) { out.paths.push_back(path); }
+        const bool excluded = std::find(options.fast_path_exclusions.begin(), options.fast_path_exclusions.end(),
+                                        path) != options.fast_path_exclusions.end();
+        if (excluded && (candidate || !qualified)) {
+            throw std::invalid_argument(std::string("--no-fast-path ") + fast_path_name(path) +
+                                        (candidate ? ": also asked for as a candidate (--fast-path)"
+                                                   : ": not selected for " + describe(out.configuration)));
+        }
+        if ((candidate || qualified) && !excluded) { out.paths.push_back(path); }
     }
     return out;
 }

@@ -462,6 +462,18 @@ int run_tests() {
                           (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--fast-path", "no-such-path"});
                       }),
                       "CLI accepted an unknown fast path");
+    // --no-fast-path NAME: a leave-one-out exclusion, repeatable; unknown names are refused.
+    const auto excluded = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--no-fast-path", "prompt-pv8",
+                                 "--no-fast-path", "preemption"});
+    failures += check(excluded.fast_path_exclusions ==
+                              std::vector<infernix::FastPath>{infernix::FastPath::PromptPv8,
+                                                              infernix::FastPath::Preemption} &&
+                          excluded.fast_path_candidates.empty(),
+                      "CLI --no-fast-path must collect each named exclusion");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--no-fast-path", "no-such-path"});
+                      }),
+                      "CLI accepted an unknown excluded fast path");
 
     // --config FILE: the model and options from a TOML file; [cli] overrides the top level, [serve]
     // is infernix-serve's and is not read here, repeatable options take arrays, and the command

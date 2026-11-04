@@ -560,6 +560,30 @@ int main() {
         failures += check(!q::select_fast_paths(fp4_local, false, int8).selected(FastPath::ScreenedLmHead) &&
                               q::select_fast_paths(fp4_local, true, int8).selected(FastPath::ScreenedLmHead),
                           "screened-lm-head needs its bound screen");
+        // --no-fast-path (leave-one-out arms): the named path leaves the selection and every other stays; a path the
+        // configuration does not select, or one also asked for as a candidate, is refused.
+        {
+            const q::FastPathSelection full = q::select_fast_paths(fp4_local, true, int8);
+            infernix::EngineOptions without = int8;
+            without.fast_path_exclusions    = {FastPath::ScreenedLmHead};
+            const q::FastPathSelection left = q::select_fast_paths(fp4_local, true, without);
+            bool others = left.paths.size() + 1 == full.paths.size();
+            for (const FastPath path : left.paths) { others = others && full.selected(path); }
+            failures += check(!left.selected(FastPath::ScreenedLmHead) && others,
+                              "an excluded path leaves the selection, the others stay");
+            const auto refused = [](const q::Config& config, bool screen, const infernix::EngineOptions& asked) {
+                try {
+                    (void)q::select_fast_paths(config, screen, asked);
+                } catch (const std::invalid_argument& error) { return std::string(error.what()); }
+                return std::string();
+            };
+            failures += check(refused(fp4_local, false, without).find("not selected") != std::string::npos,
+                              "an excluded path the configuration does not select (no bound screen) is refused");
+            infernix::EngineOptions both = without;
+            both.fast_path_candidates    = {FastPath::ScreenedLmHead};
+            failures += check(refused(fp4_local, true, both).find("candidate") != std::string::npos,
+                              "a path both asked for and excluded is refused");
+        }
         // --a8-activations reads the experts' format and the GGUF projections from the configuration.
         const q::A8Routes gguf = q::a8_activation_routes(gguf_import, q::select_fast_paths(gguf_import, false, int8));
         failures += check(gguf.ggml_projections == 160 && gguf.ggml_dense && gguf.ggml_experts && !gguf.nvfp4_experts,

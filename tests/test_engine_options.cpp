@@ -154,6 +154,13 @@ int main() {
     failures += check(exact_text.find("fast paths") == std::string::npos,
                       "the reproducible route was rejected with the lossless route");
     options.lossless = false;
+    // --no-fast-path leaves a path out of the default route's selection: the reproducible route refuses it.
+    options.fast_path_exclusions = {infernix::FastPath::PromptPv8};
+    bool excluded_invalid        = false;
+    const std::string excluded_text = construction_error(options, excluded_invalid);
+    failures += check(excluded_invalid && excluded_text.find("--no-fast-path") != std::string::npos,
+                      "a fast-path exclusion was accepted on the reproducible route");
+    options.fast_path_exclusions.clear();
     // Every fast path round-trips through its name.
     for (const infernix::FastPath path : infernix::kFastPaths) {
         failures += check(infernix::parse_fast_path(infernix::fast_path_name(path)) == path,

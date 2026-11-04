@@ -161,7 +161,8 @@ struct FastPathSelection {
 };
 
 // The qualified paths that apply when options.fast_paths is set, plus every
-// options.fast_path_candidates entry (qualification runs), which must apply.
+// options.fast_path_candidates entry (qualification runs), which must apply, less every
+// options.fast_path_exclusions entry, which must be one of those qualified paths.
 [[nodiscard]] FastPathSelection select_fast_paths(const Model& model, const EngineOptions& options);
 
 // --a8-activations (EngineOptions::a8_activations; LOSSY, opt-in, never a fast path;

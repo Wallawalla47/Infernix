@@ -119,6 +119,10 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
                              (options.expert_a4_activations && !options.reference) || options.a8_activations)) {
         throw std::invalid_argument("the lossless route runs no fast path: disable fast paths");
     }
+    if (!options.fast_path_exclusions.empty() && (!options.fast_paths || options.lossless)) {
+        throw std::invalid_argument("--no-fast-path leaves a path out of the default route's selection: the "
+                                    "reproducible and lossless routes select none");
+    }
     if (options.reference && (!options.lossless || options.purpose != EnginePurpose::CausalScoring)) {
         throw std::invalid_argument("the design reference (--reference) is the lossless route's causal scoring");
     }
@@ -189,6 +193,7 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     // The 8-bit activation routes change the KV and state their calls write (decode, short and prefill calls).
     if (options.a8_activations) { out += ";a8"; }
     for (const FastPath path : options.fast_path_candidates) { out += std::string(",") + fast_path_name(path); }
+    for (const FastPath path : options.fast_path_exclusions) { out += std::string(",-") + fast_path_name(path); }
     out += ";build=" + options.context_cache.hybrid.persistent_identity;
     return out;
 }

@@ -70,6 +70,7 @@ struct Options {
     bool expert_a16_activations         = false;
     bool fast_paths                     = true;
     std::vector<infernix::FastPath> fast_path_candidates;
+    std::vector<infernix::FastPath> fast_path_exclusions;
     std::optional<std::filesystem::path> ngram_volume;
     infernix::product::LogLevel log_level = infernix::product::LogLevel::Info;
 };
@@ -101,6 +102,8 @@ std::string usage_text() {
            "        paths run, as in infernix-serve)\n"
            "       [--fast-path NAME]... (qualification: also run this fast path, qualified or\n"
            "        not: prompt-pv8, decode-split64)\n"
+           "       [--no-fast-path NAME]... (leave-one-out: score the default route without this\n"
+           "        selected fast path)\n"
            "       [--ngram-volume <file>] (Qwen3.8-Flash-Next n-gram volume; default\n"
            "        <artifact>.ngram)\n"
            "       [--output <directory>]\n"
@@ -181,6 +184,11 @@ Options parse_options(int argc, char** argv) {
             const std::optional<infernix::FastPath> path = infernix::parse_fast_path(name);
             if (!path) { usage_error("unknown fast path: " + std::string(name)); }
             out.fast_path_candidates.push_back(*path);
+        } else if (option == "--no-fast-path") {
+            const std::string_view name = value("--no-fast-path");
+            const std::optional<infernix::FastPath> path = infernix::parse_fast_path(name);
+            if (!path) { usage_error("unknown fast path: " + std::string(name)); }
+            out.fast_path_exclusions.push_back(*path);
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
@@ -335,6 +343,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     // The lossless route runs no fast path.
     engine_options.fast_paths           = options.fast_paths && !options.lossless;
     engine_options.fast_path_candidates = options.fast_path_candidates;
+    engine_options.fast_path_exclusions = options.fast_path_exclusions;
     if (options.ngram_volume) { engine_options.ngram_volume_path = *options.ngram_volume; }
     engine_options.expert_stripe_path   = options.expert_stripe;
     engine_options.startup_observer = startup_log.observer();

@@ -96,7 +96,7 @@ infernix_bench --weights <artifact.ninfer>
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2>] [--use-original-int8-prefill-kernel]
           [--use-original-nvfp4-prefill-kernel] [--prefill-split-workspace-mib <n>]
-          [--reproducible] [--fast-path <name>]...
+          [--reproducible] [--fast-path <name>]... [--no-fast-path <name>]...
           [--spec <mtp|dflash|dflash2|auto> --draft-tokens <n|auto>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -797,7 +797,8 @@ so broad Graph-envelope measurements can be distinguished from exact-length meas
 `--prefill-split-workspace-mib`). `--decode-split64` selects the decode-split64 fast path's
 schedule (INT8 KV: 64-key splits for 24-head single-column rows). In `infernix_bench`, the fast
 paths qualified for the configuration (the artifact's kernels and KV format) run unless `--reproducible`, and `--fast-path NAME`
-also runs a candidate path; the report records the paths that ran as `fast_paths`.
+also runs a candidate path; `--no-fast-path NAME` leaves one selected path out (a leave-one-out arm of the default
+route; a path not selected fails startup); the report records the paths that ran as `fast_paths`.
 
 ```bash
 cmake --build build --parallel --target infernix_causal_softmax_attention_bench

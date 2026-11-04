@@ -385,6 +385,7 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     engine_options.fast_paths                    = options.fast_paths && !options.lossless;
     engine_options.lossless                      = options.lossless;
     engine_options.fast_path_candidates          = options.fast_path_candidates;
+    engine_options.fast_path_exclusions          = options.fast_path_exclusions;
     engine_options.kv_cache                  = options.kv_cache;
     engine_options.logits_dtype              = options.logits_dtype;
     engine_options.enable_vision             = options.enable_vision;

@@ -396,16 +396,19 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // Program's fixed allocations, the reserve for graph executables and the display headroom
     // must leave room for the expert cache. The check counts sampled-mtp-drafts' draft graphs whenever
     // it could be selected; the Program plans with the selection (`fast`).
+    const auto listed = [](const std::vector<FastPath>& paths, FastPath path) {
+        return std::find(paths.begin(), paths.end(), path) != paths.end();
+    };
     program_options.sampled_mtp_drafts =
         options.speculative.backend == SpeculativeBackend::Mtp &&
-        (options.fast_paths || std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
-                                         FastPath::SampledMtpDrafts) != options.fast_path_candidates.end());
+        ((options.fast_paths && !listed(options.fast_path_exclusions, FastPath::SampledMtpDrafts)) ||
+         listed(options.fast_path_candidates, FastPath::SampledMtpDrafts));
     // screened-lm-head's graphs likewise: asked for as a candidate, or with fast paths where the loader bound the
-    // LM head's screen (the path is qualified per configuration).
+    // LM head's screen (the path is qualified per configuration) and --no-fast-path leaves it in.
     program_options.screened_lm_head =
-        std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
-                  FastPath::ScreenedLmHead) != options.fast_path_candidates.end() ||
-        (options.fast_paths && plan.has_output_head_screen());
+        listed(options.fast_path_candidates, FastPath::ScreenedLmHead) ||
+        (options.fast_paths && plan.has_output_head_screen() &&
+         !listed(options.fast_path_exclusions, FastPath::ScreenedLmHead));
     // fp16-gdn-state's smaller pool likewise (it is qualified nowhere, so only a candidate selects it).
     program_options.fp16_gdn_state = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
                                                FastPath::Fp16GdnState) != options.fast_path_candidates.end();

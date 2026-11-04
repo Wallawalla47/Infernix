@@ -55,6 +55,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--reproducible", false},
     ServeOptionArity{"--lossless", false},
     ServeOptionArity{"--fast-path", true, true},
+    ServeOptionArity{"--no-fast-path", true, true},
     ServeOptionArity{"--expert-a4-activations", false},
     ServeOptionArity{"--a16-activations", false},
     ServeOptionArity{"--a8-activations", false},
@@ -320,6 +321,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             (docs/maintainer/lossless-route.md)\n"
            "  --fast-path NAME           also run this fast path, qualified or not\n"
            "                             (qualification and timing runs; repeatable)\n"
+           "  --no-fast-path NAME        leave this selected fast path out of the default\n"
+           "                             route (leave-one-out timing runs; repeatable)\n"
            "  --expert-a4-activations    nvidia/Qwen3.8-Flash-Next-FP4-Local only: run its\n"
            "                             routed experts with 4-bit (NVFP4) activations, using\n"
            "                             the activation scales NVIDIA calibrated for them.\n"
@@ -823,6 +826,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             const std::optional<FastPath> path = parse_fast_path(name);
             if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
             options.fast_path_candidates.push_back(*path);
+        } else if (arg == "--no-fast-path") {
+            const std::string name(require_value("--no-fast-path"));
+            const std::optional<FastPath> path = parse_fast_path(name);
+            if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
+            options.fast_path_exclusions.push_back(*path);
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
         } else if (arg == "--a16-activations") {
