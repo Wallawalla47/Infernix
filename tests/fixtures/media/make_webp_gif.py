@@ -1,6 +1,6 @@
-"""Writes tests/fixtures/media/webp_gif.h: small WebP (lossless, lossy, animated, with alpha) and GIF (static and
-animated) images made with Pillow and their first frames decoded by Pillow as RGB8, as transformers' load_image
-returns them (candidates MJ-01).
+"""Writes tests/fixtures/media/webp_gif.h: small WebP (lossless, lossy, animated, with alpha), GIF (static and
+animated) and transparent PNG images made with Pillow and their first frames decoded by Pillow as RGB8, as
+transformers' load_image returns them (candidates MJ-01).
 
 python -I tests/fixtures/media/make_webp_gif.py tests/fixtures/media/webp_gif.h    (Pillow with WebP; 12.3 used)
 """
@@ -46,6 +46,10 @@ def first_frame_rgb(data):
 
 alpha = pattern(0).convert("RGBA")
 alpha.putalpha(Image.linear_gradient("L").resize((W, H)))
+gray_alpha = pattern(0).convert("L").convert("LA")
+gray_alpha.putalpha(Image.linear_gradient("L").resize((W, H)))
+palette = pattern(0).quantize(64)
+palette.info["transparency"] = bytes(range(0, 256, 4))  # every entry partly transparent
 cases = [
     ("webp lossless", save([pattern(0)], format="WEBP", lossless=True)),
     ("webp lossy q80", save([pattern(0)], format="WEBP", quality=80)),
@@ -58,9 +62,13 @@ cases = [
     ("webp lossless alpha", save([alpha], format="WEBP", lossless=True)),
     ("gif static", save([pattern(0).quantize(256)], format="GIF")),
     ("gif animated", save([pattern(0).quantize(256), pattern(91).quantize(256)], format="GIF", duration=100, loop=0)),
+    # Transparent PNGs (native decode on Windows, FFmpeg elsewhere): alpha dropped as Pillow's convert("RGB").
+    ("png rgba", save([alpha], format="PNG")),
+    ("png gray alpha", save([gray_alpha], format="PNG")),
+    ("png palette trns", save([palette], format="PNG", transparency=palette.info["transparency"])),
 ]
 lines = ["#pragma once", "", "#include <array>", "#include <string_view>", "", "namespace webp_gif_fixtures {", "",
-         f"// WebP and GIF inputs made with Pillow {PIL.__version__} (small patterns and gradients; the animated ones have",
+         f"// WebP, GIF and PNG inputs made with Pillow {PIL.__version__} (small patterns and gradients; the animated ones have",
          "// two frames) and Pillow's RGB8 decode of each first frame (Image.open, seek(0), convert(\"RGB\"), as",
          "// transformers' load_image: an alpha channel is dropped): candidates MJ-01, written by make_webp_gif.py.",
          "struct Case {", "    std::string_view name;", "    int width;", "    int height;",

@@ -176,10 +176,12 @@ void test_jpeg_references() {
     }
 }
 
-// WebP (lossless, lossy at both parities of width and height, animated, with alpha) and GIF (static, animated)
-// against Pillow's RGB8 of the first frame, as transformers' load_image returns it (candidates MJ-01: the Launcher
-// accepts both and no test decoded either). Every case equals Pillow's pixels: lossy WebP through libwebp's
-// upsampling and conversion, the rest through FFmpeg.
+// WebP (lossless, lossy at both parities of width and height, animated, with alpha), GIF (static, animated) and
+// transparent PNG (RGBA, gray + alpha, palette + tRNS) against Pillow's RGB8 of the first frame, as transformers'
+// load_image returns it (candidates MJ-01: the Launcher accepts them and no test decoded WebP or GIF). Every case
+// equals Pillow's pixels, alpha dropped as most engines drop it (llama.cpp, Ollama, LMDeploy, mlx-vlm, TGI; vLLM,
+// SGLang and TensorRT-LLM composite instead): lossy WebP through libwebp's upsampling and conversion, PNG through
+// the native decoder where the build has it, the rest through FFmpeg.
 void test_webp_gif_references() {
     std::string failures;
     for (const auto& fixture : webp_gif_fixtures::cases) {
@@ -432,20 +434,20 @@ void test_png_decoders() {
         }
     }
 
-    // 8-bit RGBA, 2x1. Pixel 0 alpha 128 composited over white; pixel 1 opaque.
+    // 8-bit RGBA, 2x1. Pixel 0 has alpha 128: alpha is dropped, so its stored color; pixel 1 opaque.
     {
         auto s = sp(png_rgba8, std::size(png_rgba8));
         const Image image = decode_image(s, {});
-        expect_exact(image, 0, 0, {255, 127, 127});
+        expect_exact(image, 0, 0, {255, 0, 0});
         expect_exact(image, 1, 0, {0, 255, 0});
     }
 
-    // palette + tRNS, 3x1. Middle entry alpha 128 composited over white.
+    // palette + tRNS, 3x1. The middle entry's alpha 128 is dropped: its palette color.
     {
         auto s = sp(png_palette_trns, std::size(png_palette_trns));
         const Image image = decode_image(s, {});
         expect_exact(image, 0, 0, {10, 20, 30});
-        expect_exact(image, 1, 0, {147, 152, 157});
+        expect_exact(image, 1, 0, {40, 50, 60});
         expect_exact(image, 2, 0, {70, 80, 90});
     }
 
