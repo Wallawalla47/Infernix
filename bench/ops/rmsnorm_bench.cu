@@ -56,7 +56,7 @@ Options parse(int argc, char** argv) {
         if (arg == "--help") {
             std::puts("usage: infernix_rmsnorm_bench [--kind dflash2_hidden|hidden27|target_q27|"
                       "target_k27|dflash_hidden|dflash_q|dflash_k|target_hidden35|target_q35|"
-                      "target_k35|gated35|gated27] [--tokens T,...] [--execution eager|graph] "
+                      "target_k35|gated35|gated27|mtp_hidden_norm] [--tokens T,...] [--execution eager|graph] "
                       "[--cache cold|warm] [--graph-calls 1..64] [--warmup N] [--repeat N] "
                       "[--csv-out PATH] [--profile]");
             std::exit(0);
@@ -103,7 +103,8 @@ constexpr Shape shapes[]{
     {"dflash_hidden", 2048, 1, false, false},  {"dflash_q", 128, 32, false, false},
     {"dflash_k", 128, 8, false, false},        {"target_hidden35", 2048, 1, true, false},
     {"target_q35", 256, 16, true, false},      {"target_k35", 256, 2, true, false},
-    {"gated35", 128, 32, false, true},         {"gated27", 128, 48, false, true}};
+    {"gated35", 128, 32, false, true},         {"gated27", 128, 48, false, true},
+    {"mtp_hidden_norm", 10240, 1, true, false}};
 
 const Shape& find_shape(const std::string& name) {
     for (const auto& shape : shapes)
