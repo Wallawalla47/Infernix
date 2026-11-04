@@ -502,7 +502,9 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
 //     (floats 0-3 of every 8 in plane 0, floats 4-7 in plane 1). The 16-byte stores of a quarter
 //     warp and the dot product's reads are then conflict-free, and the raw store plus in-place
 //     rescale pass of K1a (a two-way conflicted store, then a read and a write) is gone. The CTA
-//     keeps 8 warps of one row each, so the norm's per-thread sums and warp order are unchanged.
+//     keeps 8 warps of one row each, so the norm's per-thread sums and warp order are unchanged. A
+//     pass's 8 column sums (the squares, and each row's dot products) reduce by one transposed
+//     butterfly each, 9 shuffles for 8 x 5, with warp_sum's bits (candidates SZ-03, 2026-11-04).
 //   K1b v4: 8 warps of 8 rows (2 features x 4 streams, v4's row map) instead of 16 warps of 4; a
 //     warp's 8 row sums of a token reduce by one transposed butterfly of 9 shuffles, so a CTA issues
 //     8 x 9 = 72 shuffles per token instead of 16 x (4 warp_sums' 20 + 8 for lane 0's residual
@@ -632,12 +634,12 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
                 }
             }
         }
-#pragma unroll
-        for (int c = 0; c < kPassColumns; ++c) {
-            if (c < pass) {
-                const float total = warp_sum(sums[c]);
-                if (lane == 0) { scratch[warp][c] = total; }
-            }
+        // The pass's 8 column sums by one transposed butterfly (9 shuffles for 8 x 5): lane 4c holds column c's
+        // warp_sum, bit for bit (see warp_sum8_transposed); a column past the pass sums zeros and is not stored.
+        static_assert(kPassColumns == 8, "the transposed butterfly reduces eight values");
+        {
+            const float total = warp_sum8_transposed(sums, lane);
+            if ((lane & 3) == 0 && (lane >> 2) < pass) { scratch[warp][lane >> 2] = total; }
         }
         __syncthreads();
         if (static_cast<int>(threadIdx.x) < pass) {
@@ -714,16 +716,13 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
                 }
             }
         }
+        // Each row's 8 column sums by one transposed butterfly: lane 4c stores column c.
 #pragma unroll
         for (int r = 0; r < RowsPerWarp; ++r) {
-#pragma unroll
-            for (int c = 0; c < kPassColumns; ++c) {
-                if (c < pass) {
-                    const float total = warp_sum(acc[r][c]);
-                    if (lane == 0 && row0 + r < rows) {
-                        partial[(static_cast<std::int64_t>(s) * rows + row0 + r) * columns + c0 + c] = total;
-                    }
-                }
+            const float total = warp_sum8_transposed(acc[r], lane);
+            const int c       = lane >> 2;
+            if ((lane & 3) == 0 && c < pass && row0 + r < rows) {
+                partial[(static_cast<std::int64_t>(s) * rows + row0 + r) * columns + c0 + c] = total;
             }
         }
         __syncthreads(); // the next pass overwrites rn
