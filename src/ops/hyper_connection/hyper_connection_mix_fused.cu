@@ -833,18 +833,26 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
     __syncthreads();
 
     // 3. Per token, the warp's 8 rows in the lane-chunk order, one transposed butterfly, and lane
-    // 4q stores row q's sum.
-#pragma unroll 1
-    for (int t = 0; t < columns; ++t) {
-        const float4* mt = reinterpret_cast<const float4*>(m + t * rank);
-        float acc[kUpV4Rows];
+    // 4q stores row q's sum. Tokens go in groups of G (2, the last one alone for an odd count): each weight chunk
+    // is widened once a group, and every (row, token) sum keeps its fmaf order (candidates NQ-02).
+    const auto group = [&]<int G>(int t0) {
+        float acc[G][kUpV4Rows];
 #pragma unroll
-        for (int q = 0; q < kUpV4Rows; ++q) { acc[q] = 0.0F; }
+        for (int g = 0; g < G; ++g) {
+#pragma unroll
+            for (int q = 0; q < kUpV4Rows; ++q) { acc[g][q] = 0.0F; }
+        }
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const int c = lane + 32 * h;
             if (c < chunks) {
-                const float4 a = mt[c], b = mt[chunks + c];
+                float4 a[G], b[G];
+#pragma unroll
+                for (int g = 0; g < G; ++g) {
+                    const float4* mt = reinterpret_cast<const float4*>(m + (t0 + g) * rank);
+                    a[g] = mt[c];
+                    b[g] = mt[chunks + c];
+                }
 #pragma unroll
                 for (int q = 0; q < kUpV4Rows; ++q) {
                     float wv[8];
@@ -853,23 +861,33 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
                     } else {
                         Codec::widen(chunk[q][h], wv);
                     }
-                    acc[q] = fmaf(wv[0], a.x, acc[q]);
-                    acc[q] = fmaf(wv[1], a.y, acc[q]);
-                    acc[q] = fmaf(wv[2], a.z, acc[q]);
-                    acc[q] = fmaf(wv[3], a.w, acc[q]);
-                    acc[q] = fmaf(wv[4], b.x, acc[q]);
-                    acc[q] = fmaf(wv[5], b.y, acc[q]);
-                    acc[q] = fmaf(wv[6], b.z, acc[q]);
-                    acc[q] = fmaf(wv[7], b.w, acc[q]);
+#pragma unroll
+                    for (int g = 0; g < G; ++g) {
+                        acc[g][q] = fmaf(wv[0], a[g].x, acc[g][q]);
+                        acc[g][q] = fmaf(wv[1], a[g].y, acc[g][q]);
+                        acc[g][q] = fmaf(wv[2], a[g].z, acc[g][q]);
+                        acc[g][q] = fmaf(wv[3], a[g].w, acc[g][q]);
+                        acc[g][q] = fmaf(wv[4], b[g].x, acc[g][q]);
+                        acc[g][q] = fmaf(wv[5], b[g].y, acc[g][q]);
+                        acc[g][q] = fmaf(wv[6], b[g].z, acc[g][q]);
+                        acc[g][q] = fmaf(wv[7], b[g].w, acc[g][q]);
+                    }
                 }
             }
         }
-        const float total = warp_sum8_transposed(acc, lane);
-        if ((lane & 3) == 0) {
-            const int q = lane >> 2;
-            u[(t * kStreams + (q >> 1)) * kUpFeatures + warp + kUpV4Warps * (q & 1)] = total;
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            const float total = warp_sum8_transposed(acc[g], lane);
+            if ((lane & 3) == 0) {
+                const int q = lane >> 2;
+                u[((t0 + g) * kStreams + (q >> 1)) * kUpFeatures + warp + kUpV4Warps * (q & 1)] = total;
+            }
         }
-    }
+    };
+    constexpr int kUpTokenGroup = 2;
+#pragma unroll 1
+    for (int t = 0; t + kUpTokenGroup <= columns; t += kUpTokenGroup) { group.template operator()<kUpTokenGroup>(t); }
+    if (columns % kUpTokenGroup != 0) { group.template operator()<1>(columns - 1); }
     __syncthreads();
 
     // 4. The collapse, K1b's expressions in its order.
