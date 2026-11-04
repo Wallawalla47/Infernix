@@ -12,6 +12,7 @@
 #include "ops/linear/fp8/fp8_instances.cuh"
 #include "ops/linear/fp8/fp8_shared.cuh"
 #include "ops/linear/mxfp8/mxfp8_a16_tma_mma.cuh"
+#include "ops/linear/mxfp8/mxfp8_dispatch.h"
 
 namespace infernix::ops::detail {
 
@@ -38,9 +39,25 @@ using Mxfp8P4 = Mxfp8ProducerWarps<Schedule, 4>;
 template <class Schedule>
 using Mxfp8Tma = Mxfp8TmaProducer<Schedule>;
 
+// A schedule with the rows of one token tile walked before the next (the f16-accumulate route's F16AccRowFast): the
+// weights stay in L2 and each BF16 token tile is read once, where the token-fast raster streams the whole activation
+// (168 MB at 32,768 tokens and K = 2,560, past L2) again for every row tile. The same bits: each output's K sum does
+// not depend on the order of the tiles. Calls of at least kMxfp8RowFastTokens (mxfp8_dispatch.h) take it.
+template <class Schedule>
+struct Mxfp8RowFast : Schedule {
+    static constexpr Fp8MmaRaster kRaster = Fp8MmaRaster::RowFast;
+};
+
 // One schedule into any linear output (a plain [N,T] tensor, or segments of the rows).
 template <class Geometry, class Schedule, class Output>
 void mxfp8_tma(const Mxfp8Operands& p, Output output, cudaStream_t stream) {
+    if constexpr (Schedule::kRaster != Fp8MmaRaster::RowFast) {
+        if (p.tokens >= kMxfp8RowFastTokens) {
+            launch_mxfp8_a16_tma_mma<Fp8ScheduleInstance<Mxfp8RowFast<Schedule>, Geometry::kInputRows>>(
+                p, output, LinearIdentityEpilogue{}, stream);
+            return;
+        }
+    }
     launch_mxfp8_a16_tma_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(p, output, LinearIdentityEpilogue{},
                                                                                  stream);
 }
