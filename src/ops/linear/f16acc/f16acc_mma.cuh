@@ -95,6 +95,13 @@ struct F16AccLayout {
 // writes each 16-value activation block permuted (f16acc_encode.cu) so that the A fragment's slots
 // (2t, 2t + 1) and (2t + 8, 2t + 9) hold those values. Each k16 step sums the same 16 products.
 // scale_stage is the stage's MXFP8 scale bytes.
+//
+// Every ldmatrix address is one per-thread base XOR a compile-time constant plus an immediate. A row's swizzled
+// 16-byte slice is logical ^ ((row & 7) << 4) (fp8_mma_shared_byte's two forms at a 128-byte row), each lane's
+// row is lane & 7 modulo 8 in every tile, and every stage and row starts on 128 bytes of the 1024-aligned
+// storage, so the slice's shared address is (thread base) ^ (logical byte): the same addresses with no k-step
+// offset kept live. Computed per k step, those offsets filled the 17-warp FP8-row schedules' 96 registers,
+// which reloaded 11-12 of them from local memory every stage (IP-09).
 template <class Schedule, F16AccScales Scales>
 __device__ __forceinline__ void
 f16acc_compute_stage(const unsigned char* activation_stage, const std::uint8_t* weight_stage,
@@ -103,6 +110,10 @@ f16acc_compute_stage(const unsigned char* activation_stage, const std::uint8_t* 
     constexpr bool GroupScales = Scales != F16AccScales::Row;
     constexpr int kRowBytes = Schedule::kActivationRowBytes;
     static_assert(kRowBytes == 128, "the activation swizzle assumes one 128-byte span per row");
+    static_assert(Schedule::kBlockK == 128, "the weight swizzle assumes one 128-byte span per row");
+    static_assert(Schedule::kActivationHalfBytes % 128 == 0 && Schedule::kActivationStageBytes % 128 == 0 &&
+                      Schedule::kWeightStageBytes % 128 == 0,
+                  "every stage starts on 128 bytes");
     constexpr int kStepsPerHalf   = 64 / 16;
     constexpr int kChunkSteps     = kF16AccumulateChunk / 16;
     constexpr int kGroupsPerStage = Schedule::kBlockK / 32;
@@ -112,39 +123,42 @@ f16acc_compute_stage(const unsigned char* activation_stage, const std::uint8_t* 
     const int a_matrix     = lane >> 3;
     const int a_row_offset = (lane & 7) + ((a_matrix & 1) << 3);
     const int a_byte       = (a_matrix >> 1) * 16;
+    const unsigned swizzle = static_cast<unsigned>(lane & 7) << 4;
+    // Row a_row_offset of the warp's first 16-token tile, its 16-byte slice a_byte swizzled.
+    const unsigned a_base = smem_addr(activation_stage) +
+                            static_cast<unsigned>((warp_token * Schedule::kWarpTokens + a_row_offset) * kRowBytes) +
+                            (static_cast<unsigned>(a_byte) ^ swizzle);
+    // Weight row warp_row * kWarpRows + (lane >> 3) * 8 + (lane & 7) for ldmatrix x4 (lane l addresses row
+    // l & 7 of matrix l >> 3); with one or two tiles, x2 (with one tile, both matrices are its rows).
+    const int b_row = warp_row * Schedule::kWarpRows + (lane & 7) +
+                      (Schedule::kMmaRows % 4 == 0 ? (lane >> 3) * 8 : Schedule::kMmaRows == 2 ? ((lane >> 3) & 1) * 8 : 0);
+    const unsigned b_base = smem_addr(weight_stage) + static_cast<unsigned>(b_row * Schedule::kBlockK) + swizzle;
     // The accumulator's weight rows (C columns 2t and 2t + 1 of each n8 tile).
     const int c_row = 2 * (lane & 3);
     unsigned partial[Schedule::kMmaTokens][Schedule::kMmaRows][2];
 #pragma unroll
     for (int k_step = 0; k_step < Schedule::kMmaK; ++k_step) {
         unsigned a[Schedule::kMmaTokens][4];
+        const unsigned a_step = (a_base ^ static_cast<unsigned>((k_step % kStepsPerHalf) * 32)) +
+                                static_cast<unsigned>((k_step / kStepsPerHalf) * Schedule::kActivationHalfBytes);
 #pragma unroll
         for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
-            const int row     = warp_token * Schedule::kWarpTokens + mma_token * 16 + a_row_offset;
-            const int logical = (k_step % kStepsPerHalf) * 32 + a_byte;
             ldmatrix_x4(a[mma_token][0], a[mma_token][1], a[mma_token][2], a[mma_token][3],
-                        smem_addr(activation_stage + (k_step / kStepsPerHalf) * Schedule::kActivationHalfBytes +
-                                  row * kRowBytes + (logical ^ ((row & 7) << 4))));
+                        a_step + static_cast<unsigned>(mma_token * 16 * kRowBytes));
         }
         unsigned b[Schedule::kMmaRows][2];
         {
             static_assert(Schedule::kMmaRows <= 2 || Schedule::kMmaRows % 4 == 0, "ldmatrix B takes 1, 2 or 4k tiles");
-            // The 16-byte k slice of weight row `row` (lane l addresses row l & 7 of matrix l >> 3).
-            const auto slice = [&](int row) {
-                return smem_addr(weight_stage + row * Schedule::kBlockK + fp8_mma_shared_byte<Schedule>(row, k_step * 16));
-            };
+            const unsigned b_step = b_base ^ static_cast<unsigned>(k_step * 16);
             unsigned codes[Schedule::kMmaRows < 2 ? 2 : Schedule::kMmaRows];
             if constexpr (Schedule::kMmaRows % 4 == 0) {
 #pragma unroll
                 for (int group = 0; group < Schedule::kMmaRows / 4; ++group) {
-                    const int row = warp_row * Schedule::kWarpRows + (group * 4 + (lane >> 3)) * 8 + (lane & 7);
                     ldmatrix_x4(codes[4 * group], codes[4 * group + 1], codes[4 * group + 2], codes[4 * group + 3],
-                                slice(row));
+                                b_step + static_cast<unsigned>(group * 32 * Schedule::kBlockK));
                 }
             } else {
-                // One or two tiles: x2 (with one tile, both matrices are its rows).
-                const int tile = Schedule::kMmaRows == 2 ? ((lane >> 3) & 1) : 0;
-                ldmatrix_x2(codes[0], codes[1], slice(warp_row * Schedule::kWarpRows + tile * 8 + (lane & 7)));
+                ldmatrix_x2(codes[0], codes[1], b_step);
             }
 #pragma unroll
             for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
