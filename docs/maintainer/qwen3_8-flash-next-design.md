@@ -10446,6 +10446,11 @@ order) with an FP32 row scale amax / (6 · 448), and runs both terms through the
 kernel into one accumulator (two stages of 39 KB holding both terms' A tiles, two CTAs per SM; the
 epilogues multiply by the row scale). Two terms failed the gate first, three passed, and two passed
 once the acceptance policy gained an absolute floor, kept under its single budgets (model-quality.md 6.3); the record follows.
+Since 2026-11-04 (candidates NQ-09) one CTA a token forms its row scale and its x terms once and stores them in each
+of its entries' rows (an inverse of the dispatch's entries), where the terms were formed once per wide entry (11
+times a token): the same bits (the wide bench's output hashes equal at 256-16,384 columns), the routed experts'
+call at FP4-Local's geometry 1,378.9 / 1,525.8 / 2,020.8 / 6,272.9 -> 1,316.1 / 1,457.8 / 1,911.3 / 5,772.5 us at
+256 / 1,024 / 4,096 / 16,384 columns (-4.6 / -4.5 / -5.4 / -8.0 %, three rounds, frames).
 
 *Two terms first (2026-10-14/15).* `test_offloaded_moe_wide` against the exact arithmetic: mean
 relative L2 0.31-0.41 % per case, worst entry 2.0 %. End to end on the recipe C artifact

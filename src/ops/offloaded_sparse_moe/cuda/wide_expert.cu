@@ -166,7 +166,7 @@ struct Offsets {
     std::size_t job_records, cpu_flags, cpu_call, tiles, pass_tiles;
     std::size_t h_blocks, x_plane;                      // W4A4
     std::size_t x_limbs, h_rows, x_emax, h_emax, job_ctas; // W4A16
-    std::size_t x_terms_plane, x_row_scale, h_terms_plane, h_row_scale; // W4A16 two-term A4
+    std::size_t x_terms_plane, x_row_scale, x_slot_entries, h_terms_plane, h_row_scale; // W4A16 two-term A4
     std::size_t lossless;                              // kLossless
     std::size_t x_acts, h_acts, ring_jobs, ring_counters; // the narrow ring (ring_call)
     bool has_ring;
@@ -215,8 +215,9 @@ Offsets offsets(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t en
             o.job_ctas = take(j * sizeof(std::uint32_t));
         }
         o.h_emax        = take(e * sizeof(std::int32_t));
-        o.x_terms_plane = take(e * static_cast<std::size_t>(x_terms_row_bytes(shape, terms.x)));
-        o.x_row_scale   = take(t * sizeof(float));
+        o.x_terms_plane  = take(e * static_cast<std::size_t>(x_terms_row_bytes(shape, terms.x)));
+        o.x_row_scale    = take(t * sizeof(float));
+        o.x_slot_entries = take(e * sizeof(std::int32_t));
         o.h_terms_plane = take(e * static_cast<std::size_t>(h_terms_row_bytes(shape, terms.h)));
         o.h_row_scale   = take(e * sizeof(float));
     } else if (activation == ExpertActivation::kA16) {
@@ -415,15 +416,33 @@ __device__ __forceinline__ void store_terms(std::uint8_t* row, int b, int code_b
     }
 }
 
-// Every token's x row scale: one CTA per token, one 16-element block per thread (160 or 192).
-template <class G>
+// The entry of each dispatch value (column * top_k + slot, then shared_first + column with a shared job): every
+// entry p holds one value, so the map covers every slot of every column.
+__global__ void x_slot_entries_kernel(MoeDispatch dispatch, int entries, std::int32_t* __restrict__ slot_entries) {
+    for (int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); p < entries;
+         p += static_cast<int>(gridDim.x * blockDim.x)) {
+        slot_entries[dispatch.entries[p]] = p;
+    }
+}
+
+// Every token's x row scale and the terms of x for every entry of its column: one CTA per token, one 16-element
+// block per thread (160 or 192). A block's terms are formed once and stored in each entry's row (the column's
+// top_k routed entries and its shared one; a narrow entry's row is written too and never read), where the
+// terms were formed once per wide entry (11 times a token at top_k 10; candidates NQ-09). The same scale and
+// terms: the row's amax is exact in any order and each block's terms take the same inputs.
+template <class G, int Terms>
 __global__ void __launch_bounds__(G::kHidden / 16)
-    x_row_scale_kernel(const std::uint16_t* __restrict__ x, float* __restrict__ row_scale) {
+    x_terms_kernel(const std::uint16_t* __restrict__ x, int top_k, MoeDispatch dispatch,
+                   const std::int32_t* __restrict__ slot_entries, float* __restrict__ row_scale,
+                   std::uint8_t* __restrict__ plane) {
+    using P                = A4Planes<G>;
     constexpr int kThreads = G::kHidden / 16;
-    static_assert(kThreads % 32 == 0);
+    static_assert(kThreads % 32 == 0 && kThreads == G::kGateUpBlocks);
     __shared__ float maxima[kThreads / 32];
+    __shared__ float scale;
     const int t = static_cast<int>(blockIdx.x), b = static_cast<int>(threadIdx.x);
-    const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * G::kHidden + 16 * b);
+    const std::uint16_t* block = x + static_cast<std::size_t>(t) * G::kHidden + 16 * b;
+    const auto* source         = reinterpret_cast<const uint4*>(block);
     std::uint16_t v[16];
     unpack16(source[0], source[1], v);
     float amax = 0.0F;
@@ -443,35 +462,17 @@ __global__ void __launch_bounds__(G::kHidden / 16)
         float all = 0.0F;
 #pragma unroll
         for (int w = 0; w < kThreads / 32; ++w) { all = maxima[w] > all || maxima[w] != maxima[w] ? maxima[w] : all; }
-        row_scale[t] = residual_row_scale(all);
+        scale        = residual_row_scale(all);
+        row_scale[t] = scale;
     }
-}
-
-// The terms of every wide entry's x (its token's row, entry_column: a shared-expert job's entries
-// follow the routed ones), as quantize_kernel does for A4.
-template <class G, int Terms>
-__global__ void __launch_bounds__(kQuantizeThreads)
-    quantize_x_terms_kernel(const std::uint16_t* __restrict__ x, int top_k, MoeDispatch dispatch,
-                       const std::int32_t* __restrict__ tiles, const std::int32_t* __restrict__ pass_tiles, int passes,
-                       const float* __restrict__ row_scale, std::uint8_t* __restrict__ plane) {
-    using P            = A4Planes<G>;
-    constexpr int kBlocks = G::kGateUpBlocks; // 160 or 192
-    const int total = pass_tiles[passes];
-    for (int tile = static_cast<int>(blockIdx.x); tile < total; tile += static_cast<int>(gridDim.x)) {
-        const int job = tiles[2 * tile], column = tiles[2 * tile + 1];
-        const int expert = dispatch.jobs[job];
-        const int first  = dispatch.offsets[expert] + column;
-        const int count  = min(kTileColumns, dispatch.offsets[expert + 1] - first);
-        for (int task = static_cast<int>(threadIdx.x); task < count * kBlocks; task += kQuantizeThreads) {
-            const int i = task / kBlocks, b = task % kBlocks;
-            const int p = first + i;
-            const int t = entry_column(dispatch.entries[p], top_k, dispatch.shared_first);
-            TermBlock<Terms> q;
-            term_block(x + static_cast<std::size_t>(t) * G::kHidden + 16 * b, row_scale[t], q);
-            store_terms(plane + static_cast<std::size_t>(p) * P::x_terms_row_bytes(Terms), b, P::kXCodeBytes,
-                        P::kXRowBytes, q);
-        }
-    }
+    __syncthreads();
+    TermBlock<Terms> q;
+    term_block(block, scale, q);
+    const auto store = [&](int p) {
+        store_terms(plane + static_cast<std::size_t>(p) * P::x_terms_row_bytes(Terms), b, P::kXCodeBytes, P::kXRowBytes, q);
+    };
+    for (int slot = 0; slot < top_k; ++slot) { store(slot_entries[t * top_k + slot]); }
+    if (dispatch.shared_first != 0x7FFFFFFF) { store(slot_entries[dispatch.shared_first + t]); }
 }
 
 // The pass's wide entries' h (BF16 rows) as terms with their row scales: one warp per entry.
@@ -598,6 +599,7 @@ ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, s
         w.h_emax      = reinterpret_cast<std::int32_t*>(p + o.h_emax);
         w.x_terms_plane = reinterpret_cast<std::uint8_t*>(p + o.x_terms_plane);
         w.x_row_scale = reinterpret_cast<float*>(p + o.x_row_scale);
+        w.x_slot_entries = reinterpret_cast<std::int32_t*>(p + o.x_slot_entries);
         w.h_terms_plane = reinterpret_cast<std::uint8_t*>(p + o.h_terms_plane);
         w.h_row_scale = reinterpret_cast<float*>(p + o.h_row_scale);
     } else if (activation == ExpertActivation::kA16) {
@@ -661,8 +663,8 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     const ResidualTerms terms =
         source.activation == ExpertActivation::kA16 ? residual_terms(source.wide_a16) : ResidualTerms{};
     if (terms.x != 0) {
-        // W4A16 A4 residual: every token's row scale, then each wide entry's x terms; h's terms are
-        // formed per pass from the BF16 h the gate/up epilogue writes.
+        // W4A16 A4 residual: every token's row scale and its x terms, stored in each of its entries' rows; h's
+        // terms are formed per pass from the BF16 h the gate/up epilogue writes.
         call.a4_residual   = true;
         call.terms         = terms;
         call.h_rows        = workspace.h_rows;
@@ -672,13 +674,13 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
         call.h_row_scale   = workspace.h_row_scale;
         Descriptors descriptors{};
         with_expert_geometry(source.shape, [&]<class G>() {
-            x_row_scale_kernel<G><<<x.ne[1], G::kHidden / 16, 0, stream>>>(static_cast<const std::uint16_t*>(x.data),
-                                                                          workspace.x_row_scale);
-            check_launch("x row scale");
+            x_slot_entries_kernel<<<persistent_ctas(), kQuantizeThreads, 0, stream>>>(dispatch, entries,
+                                                                                   workspace.x_slot_entries);
+            check_launch("x slot entries");
             const auto quantize_x = [&]<int Terms>() {
-                quantize_x_terms_kernel<G, Terms><<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
-                    static_cast<const std::uint16_t*>(x.data), top_k, dispatch, workspace.tiles, workspace.pass_tiles,
-                    call.passes, workspace.x_row_scale, workspace.x_terms_plane);
+                x_terms_kernel<G, Terms><<<x.ne[1], G::kHidden / 16, 0, stream>>>(
+                    static_cast<const std::uint16_t*>(x.data), top_k, dispatch, workspace.x_slot_entries,
+                    workspace.x_row_scale, workspace.x_terms_plane);
             };
             terms.x == 3 ? quantize_x.template operator()<3>() : quantize_x.template operator()<2>();
             check_launch("quantize A4 residual x");

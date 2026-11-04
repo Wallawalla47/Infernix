@@ -230,6 +230,8 @@ struct ExpertsWorkspace {
     // W4A16, A4 residual (h_rows holds the BF16 h; x_emax and h_emax serve a ring call's narrow experts)
     std::uint8_t* x_terms_plane;  // [entries][x_terms_row_bytes(shape, x terms)]; the 8-bit route's A8 codes (a8_x_rows)
     float* x_row_scale;           // [columns]
+    std::int32_t* x_slot_entries; // [entries]: the entry of each dispatch value (column * top_k + slot, then
+                                  // shared_first + column): the x terms' rows a column writes
     std::uint8_t* h_terms_plane;  // [entries][h_terms_row_bytes(shape, h terms)]
     float* h_row_scale;           // [entries]
     // kLossless: lossless_experts_bytes(shape, max_jobs, entries) (moe_layer.cu's lossless_expert.cuh)
