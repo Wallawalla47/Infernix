@@ -692,6 +692,18 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                         : std::string()) +
                    "; every other call keeps its route");
     }
+    // FP4-Local's default route (MXFP8 dense, NVFP4 experts with 16-bit activations) takes both too: the side streams
+    // at the least priority and the shared expert forked at the layer's input, where its call encodes no activations
+    // (candidates IN-06; BF16 KV, three rotated reps, the same rounds and tokens): conv 129.04 -> 129.99 tok/s
+    // (+0.7 %), the struct fixture 431.21 -> 437.04 (+1.4 %), after a 16K prompt 227.65 -> 230.18 (+1.1 %), every rep
+    // ahead; the least priority alone -0.2 / +0.6 / +0.4 %, the early fork alone +0.8 / +0.6 / +0.4 % (2026-11-04).
+    // Same bits. The other configurations keep the greatest priority and the late fork (unmeasured).
+    if (const auto& text = instance->model->config().text;
+        options.fast_paths && !options.a8_activations && text.moe.a16_experts &&
+        text.expert_format == QType::NVFP4_MUL && text.dense_format == QType::FP8_E4M3FN_G32_E8M0) {
+        program_options.side_streams_least_priority = true;
+        program_options.shared_expert_early         = true;
+    }
 
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program =

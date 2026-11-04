@@ -12643,6 +12643,24 @@ under 8 busy processes conv -0.4 % and pp512 -2.0 %, under 32 conv +6.2 % inside
 RV-44): FP4-Local BF16 KV, two rotated runs, from 4,096 / 8,192 tokens against never: pp8192 1.000x / 0.999x,
 pp16384 1.000x / 1.000x, pp32768 1.020x / 1.021x (the layer walk's wide calls). Same bits.
 
+### 19.3.51 FP4-Local's decode side streams; MTP rounds' commit (2026-11-04; same bits)
+
+**Side streams and the shared expert (default on FP4-Local's default route).** The 8-bit GGUF expert route took
+the side streams' least priority and the shared expert's fork at the layer's input (§19.3.31). FP4-Local's NVFP4
+W4A16 calls encode no activations on the side stream, so the early fork never ran there; the shared expert now forks
+at the layer's input whether or not the call encodes (`ForwardExperts::shared_early`), and FP4-Local's default route
+(MXFP8 dense, NVFP4 experts with 16-bit activations, no `--a8-activations`) takes both. BF16 KV, three rotated reps,
+the same rounds and tokens in every arm, against the greatest priority and the late fork: both conv 129.04 -> 129.99
+tok/s (+0.7 %), the struct fixture 431.21 -> 437.04 (+1.4 %), after a 16K prompt 227.65 -> 230.18 (+1.1 %), every rep
+ahead; the least priority alone -0.2 / +0.6 / +0.4 %, the early fork alone +0.8 / +0.6 / +0.4 %. The CLI's text and
+ids were equal across the arms on the reproducible route (DFlash2 greedy and sampled, plain). The other
+configurations keep the greatest priority and the late fork (unmeasured).
+
+**MTP rounds' commit (measured, not changed).** §19.3.34's early commit (launched behind its gate right after the
+verification's results) stays with DFlash2 rounds without MTP: on MTP rounds it measured level (FP4-Local `--spec
+mtp`, the struct fixture, 351.78 -> 351.90 tok/s, three rotated reps inside their spread; the same text and ids on
+the reproducible route, and the MTP real tests passed).
+
 ---
 
 ## 20. Documentation and authority changes

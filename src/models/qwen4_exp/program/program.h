@@ -475,10 +475,12 @@ struct ProgramOptions {
     // with 6 workers, 103.7 with 16 and 103.6 with 20 (2026-10-11; 16 workers with divisor 3: 101.1).
     std::uint32_t cpu_ggml_expert_workers = 16;
     // The staging, shared-expert and split streams at the device's least stream priority instead of its greatest
-    // (program_impl.h), so the routed experts' resident pass keeps its SMs (the 8-bit GGUF expert route).
+    // (program_impl.h), so the routed experts' resident pass keeps its SMs (the 8-bit GGUF expert route and
+    // FP4-Local's default route).
     bool side_streams_least_priority = false;
-    // Decode and verification layers queue the shared expert on its stream right after the routed experts' early
-    // encoding, beside the router and the plan, instead of after the plan (execution::ForwardExperts::shared_early).
+    // Decode and verification layers queue the shared expert on its stream at the layer's input (after the routed
+    // experts' early encoding, where the call has one), beside the router and the plan, instead of after the plan
+    // (execution::ForwardExperts::shared_early; the same routes).
     bool shared_expert_early = false;
     std::uint32_t cpu_expert_jobs    = 16;
     std::int32_t cpu_pcie_divisor    = 0;

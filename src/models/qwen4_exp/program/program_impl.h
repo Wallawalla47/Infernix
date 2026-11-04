@@ -1179,8 +1179,8 @@ public:
         // CTAs retire: the tensor-core gate/up holds ~90 % of an SM's registers and shared memory, and the shared
         // expert's SwiGLU waited ~30 us a layer for an SM. IQ3_S full layout, 2 runs each (2026-10-29): 16K
         // 263.6 -> 265.3 tok/s, struct 456.5 -> 463.3; the shared stream alone 265.8 / 455.4. (With the dp4a
-        // kernels' smaller CTAs this measured 0.999x and was removed on 2026-10-28.) The 8-bit GGUF expert route
-        // takes the least priority instead (ProgramOptions::side_streams_least_priority).
+        // kernels' smaller CTAs this measured 0.999x and was removed on 2026-10-28.) The 8-bit GGUF expert route and
+        // FP4-Local's default route take the least priority instead (ProgramOptions::side_streams_least_priority).
         int least_priority = 0, greatest_priority = 0;
         CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority));
         const int side_priority = options_.side_streams_least_priority ? least_priority : greatest_priority;
@@ -4326,6 +4326,9 @@ private:
     // graph launch waits for the stream's earlier work, which a held kernel would never finish.)
     std::uint32_t* commit_gate_ready() const { return static_cast<std::uint32_t*>(commit_gate_host_.data()); }
 
+    // MTP rounds keep the commit's launch after the results: launched ahead (the same bits, the same text) they
+    // measured level, FP4-Local --spec mtp on the struct fixture 351.78 -> 351.90 tok/s, three rotated reps inside
+    // their spread (candidates IN-04, 2026-11-04).
     bool commit_ahead(std::int32_t batch, std::int32_t W) {
         return !c_.lossless && dflash2_ && !mtp_ && !graph_set_.capturing && commit_graph(batch, W).executable.ready();
     }

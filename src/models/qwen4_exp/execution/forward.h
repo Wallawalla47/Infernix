@@ -102,8 +102,8 @@ struct ForwardExperts {
     // input, joined before the combine) while the routed experts compute. Null: in order.
     cudaStream_t shared_stream = nullptr;
     std::array<cudaEvent_t, 4> shared_events{};
-    // With the routed experts' early encoding fork (an 8-bit GGUF bank), the shared expert follows the encoding on
-    // shared_stream at once, beside the router and the route's plan, instead of after the plan beside the routed
+    // The shared expert forks onto shared_stream at the layer's input (after the routed experts' early encoding,
+    // where the call has one), beside the router and the route's plan, instead of after the plan beside the routed
     // experts (ProgramOptions::shared_expert_early).
     bool shared_early = false;
     // Decode and verification calls compute their staged misses on this stream while the overlap stream
