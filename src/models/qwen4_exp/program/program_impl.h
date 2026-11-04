@@ -307,6 +307,9 @@ inline constexpr std::int32_t kSampledDraftRanks = 4;
 struct DeviceLayout {
     std::int32_t lanes = 0, token_domain = 0, head_rows = 0, chunk = 0, mtp_k = 0, max_width = 1, columns = 0,
                  pages_per_row = 0, mtp_columns = 0;
+    // The widest rounds decode() forms (ProgramImpl::verify_rows / verify_columns / round_columns): the rows and
+    // columns of its widest verification (0 without speculation), and every round's columns.
+    std::int32_t verify_rows = 0, verify_columns = 0, round_columns = 0;
     bool mtp = false;
     std::uint32_t kv_pages = 0, kv_layers = 0;
     std::uint64_t record_stride = 0; // the largest expert record
@@ -576,6 +579,9 @@ public:
         const auto kv_tokens = o.kv_capacity_tokens != 0 ? o.kv_capacity_tokens : o.max_context * o.max_concurrency;
         d.kv_pages      = (kv_tokens + kPagedKVPageSize - 1) / kPagedKVPageSize;
         const std::int32_t lanes = d.lanes, W = d.max_width;
+        d.verify_rows    = verify_rows(o, d, lanes);
+        d.verify_columns = verify_columns(o, d, lanes);
+        d.round_columns  = round_columns(o, d, lanes);
         // One copy-on-write page per lane, so a whole-extent resume always fits (design §19.3.1).
         if (o.prefix_cache) { d.kv_pages += static_cast<std::uint32_t>(lanes); }
         const std::size_t width = c.residual_width(), di = c.qsa.index_head_dim, r = c.qsa.compress_ratio;
@@ -640,8 +646,9 @@ public:
         // The head's FP32 logits, which the sampler, verification, constraints and the prompt readout read; with
         // BF16 logits their BF16 rounding beside them (the lossless head writes only that).
         const bool bf16_head = o.bf16_logits && c.lossless;
-        d.logits32     = bf16_head ? 0 : sizeof(float) * c.vocab_size * lanes * W;
-        d.logits16     = o.bf16_logits ? 2ULL * c.vocab_size * lanes * W : 0;
+        const auto round_columns = static_cast<std::size_t>(d.round_columns);
+        d.logits32     = bf16_head ? 0 : sizeof(float) * c.vocab_size * round_columns;
+        d.logits16     = o.bf16_logits ? 2ULL * c.vocab_size * round_columns : 0;
         d.token_counts = 4ULL * static_cast<std::size_t>(d.token_domain) * lanes;
         if (o.causal_scoring) {
             d.score_residuals = align(2ULL * width * o.max_context);
@@ -653,15 +660,16 @@ public:
         // The workspace arena (the forward pass, sampling, draft acceptance and the drafter) covers
         // decode, verification and calls of up to kStaticWorkColumns columns; a wider prefill call
         // swaps in an arena of the chunk's size lent from expert frames (design §19.3.7, VRAM item 1).
-        d.static_columns = std::max(lanes * W, std::min(d.chunk, kStaticWorkColumns));
+        d.static_columns = std::max(d.round_columns, std::min(d.chunk, kStaticWorkColumns));
         d.work           = workspace_bytes(c, o, d, lanes, d.static_columns);
         d.wide_work      = d.chunk > d.static_columns ? workspace_bytes(c, o, d, lanes, d.chunk) : 0;
 
-        // Verification (W > 1): GDN replay records, PLE and QSA records, the round's I32 arrays.
+        // Verification (W > 1): GDN replay records (verify_rows rows of up to W columns a layer), PLE and QSA records
+        // (verify_columns columns), the round's I32 arrays.
         if (W > 1) {
             LayoutBuilder records_builder;
             d.records       = plan_gdn_replay_records(records_builder, {.layers          = dim(c.gdn_layers),
-                                                                        .record_capacity = lanes,
+                                                                        .record_capacity = d.verify_rows,
                                                                         .width           = W,
                                                                         .conv_channels   = dim(c.gdn.conv_channels()),
                                                                         .qk_heads        = dim(c.gdn.key_heads),
@@ -669,8 +677,8 @@ public:
                                                                         .key_dim         = dim(c.gdn.key_head_dim),
                                                                         .value_dim       = dim(c.gdn.value_head_dim)});
             d.records_bytes = records_builder.finish(256);
-            d.ple_records   = 2ULL * width * W * lanes;
-            d.qsa_records   = 2ULL * di * W * lanes * c.attention_layers;
+            d.ple_records   = 2ULL * width * static_cast<std::size_t>(d.verify_columns);
+            d.qsa_records   = 2ULL * di * static_cast<std::size_t>(d.verify_columns) * c.attention_layers;
             const std::size_t cells = static_cast<std::size_t>(lanes) * W;
             std::size_t at          = 0;
             const auto take         = [&](std::size_t words) {
@@ -694,7 +702,7 @@ public:
         // The MTP drafter (design 11.2): residual columns, the saved and chain columns, its QSA
         // records, the HC ones and its io.
         if (d.mtp) {
-            d.mtp_columns      = std::max(lanes * W, std::min(d.chunk, 512));
+            d.mtp_columns      = std::max(d.round_columns, std::min(d.chunk, 512));
             d.mtp_column_bytes = 2ULL * width;
             d.mtp_ones         = sizeof(float) * c.hc.streams * static_cast<std::size_t>(d.mtp_columns);
             const auto k       = static_cast<std::size_t>(d.mtp_k);
@@ -887,15 +895,35 @@ public:
                bank.planes.gate_up_format != QType::FP8_E4M3FN_B128;
     }
 
+    // The widest rounds decode() forms with `lanes` lanes and the plan's drafter (design 19.3.5): one verifying
+    // row of up to max_width columns and, with pair speculation and a neural drafter, two rows at one width of at
+    // most 1 + min(kPairMaxDrafts, its drafts); rounds of three or more rows, and every round without
+    // speculation, decode plain (one column a row). Verification buffers hold verify_rows rows and verify_columns
+    // columns, the logits and the arena round_columns columns, not lanes x max_width (candidates VM-02).
+    static bool pair_rounds(const ProgramOptions& o, const DeviceLayout& d, std::int32_t lanes) noexcept {
+        return d.max_width > 1 && o.pair_speculation && lanes >= 2 && (d.mtp || d.dflash2);
+    }
+    static std::int32_t verify_rows(const ProgramOptions& o, const DeviceLayout& d, std::int32_t lanes) noexcept {
+        return d.max_width <= 1 ? 0 : pair_rounds(o, d, lanes) ? 2 : 1;
+    }
+    static std::int32_t verify_columns(const ProgramOptions& o, const DeviceLayout& d, std::int32_t lanes) noexcept {
+        if (d.max_width <= 1) { return 0; }
+        const std::int32_t drafts = d.mtp ? d.mtp_k : d.dflash_k;
+        return std::max(d.max_width, pair_rounds(o, d, lanes) ? 2 * (1 + std::min(kPairMaxDrafts, drafts)) : 0);
+    }
+    static std::int32_t round_columns(const ProgramOptions& o, const DeviceLayout& d, std::int32_t lanes) noexcept {
+        return std::max(lanes, verify_columns(o, d, lanes));
+    }
+
     // The workspace arena of a Program with `lanes` lanes and the plan's widths: the forward at its
-    // widest call (a prefill chunk or every lane's widest round), sampling, acceptance and the
-    // drafter. The plan sizes the arena with the Program's lane count; the per-lane report compares
-    // lane counts.
+    // widest call (a prefill chunk or the widest round), sampling, acceptance and the drafter. The
+    // plan sizes the arena with the Program's lane count; the per-lane report compares lane counts.
     static std::size_t workspace_bytes(const TextConfig& c, const ProgramOptions& o, const DeviceLayout& d,
                                        std::int32_t lanes, std::int32_t columns) {
-        const std::int32_t W = d.max_width;
+        const std::int32_t W      = d.max_width;
+        const std::int32_t rounds = round_columns(o, d, lanes);
         std::size_t bytes =
-            execution::Forward::workspace_bytes(c, std::max(columns, lanes * W), dim(o.max_context), o.kv_cache,
+            execution::Forward::workspace_bytes(c, std::max(columns, rounds), dim(o.max_context), o.kv_cache,
                                                 wide_a16(o)) +
             ops::sampling_workspace_capacity_bytes(d.token_domain, 1, lanes);
         // A prefill projection's input encoded for its prefill route, K up to the GDN/QSA value width (the output
@@ -905,30 +933,32 @@ public:
             const std::size_t k = std::max<std::size_t>({std::size_t(c.hidden_size), std::size_t(c.gdn.value_width()),
                                                          std::size_t(c.attention.query_width())});
             if (ops::has_route(o.fast_paths.prefill_routes, ops::LinearRoutes::F16Accumulate)) {
-                bytes += ops::linear_f16_accumulate_workspace_bytes(dim(k), std::max(columns, lanes * W));
+                bytes += ops::linear_f16_accumulate_workspace_bytes(dim(k), std::max(columns, rounds));
             }
             if (ops::has_route(o.fast_paths.prefill_routes, ops::LinearRoutes::Fp8A8PairBlock32)) {
-                bytes += ops::linear_fp8_a8_pair_block32_workspace_bytes(dim(k), std::max(columns, lanes * W));
+                bytes += ops::linear_fp8_a8_pair_block32_workspace_bytes(dim(k), std::max(columns, rounds));
             }
         }
         if (W > 1) {
+            // Acceptance runs on a verification's rows only.
+            const std::int32_t rows = verify_rows(o, d, lanes);
             std::size_t accept =
-                ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, W - 1, 1, lanes);
+                ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, W - 1, 1, rows);
             if (((o.sampled_mtp_drafts && d.mtp) || d.dflash2) && sparse_acceptance(d.token_domain, W, lanes)) {
                 accept = std::max(accept, ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
                                               d.token_domain, ops::SpeculativeAcceptExecutionEnvelope{}, 1, W - 1, 1,
-                                              lanes));
+                                              rows));
             }
             bytes += accept;
         }
         if (d.mtp) {
-            bytes += execution::Forward::mtp_workspace_bytes(c, std::max(lanes * W, std::min(d.chunk, 512)), lanes,
+            bytes += execution::Forward::mtp_workspace_bytes(c, std::max(rounds, std::min(d.chunk, 512)), lanes,
                                                              d.head_rows, dim(o.max_context), o.kv_cache);
         }
         // The lossless route's calls: a scored window, or (generation) the cache form over the lanes.
         if (c.lossless) {
             bytes = std::max(bytes, execution::Forward::lossless_workspace_bytes(
-                                        c, std::max(columns, lanes * W), o.causal_scoring ? 0 : dim(o.max_context), lanes) +
+                                        c, std::max(columns, rounds), o.causal_scoring ? 0 : dim(o.max_context), lanes) +
                                         ops::sampling_workspace_capacity_bytes(d.token_domain, 1, lanes));
         }
         // The DFlash2 drafter runs between Forward calls, in the same arena.
@@ -5129,14 +5159,23 @@ private:
     // The head's logits of `columns` columns as the Forward writes them: FP32 (logits32_), or with BF16 logits on
     // the lossless route BF16 (logits16_, each exact sum correctly rounded).
     Tensor head_logits(std::int32_t columns) {
+        require_logit_columns(columns);
         if (options_.bf16_logits && c_.lossless) { return Tensor(logits16_.p, DType::BF16, {vocab_, columns}); }
         return Tensor(logits32_.p, DType::FP32, {vocab_, columns});
     }
     // The logits the sampler, verification, constraints and the prompt readout read, `columns` columns: FP32, or
     // BF16 (ProgramOptions::bf16_logits).
     Tensor read_logits(std::int32_t columns) {
+        require_logit_columns(columns);
         if (options_.bf16_logits) { return Tensor(logits16_.p, DType::BF16, {vocab_, columns}); }
         return Tensor(logits32_.p, DType::FP32, {vocab_, columns});
+    }
+    // The logits hold the widest round's columns (plan_device): a round past it is a policy error.
+    void require_logit_columns(std::int32_t columns) const {
+        if (columns < 1 || columns > plan_.round_columns) {
+            throw std::logic_error("Qwen4Exp: " + std::to_string(columns) + " logit columns exceed the plan's " +
+                                   std::to_string(plan_.round_columns));
+        }
     }
     // BF16 logits off the lossless route: the head's FP32 sums of `columns` columns rounded once to BF16.
     void round_logits(std::int32_t columns, cudaStream_t s) {
@@ -5194,7 +5233,13 @@ private:
     std::int32_t* spec_host(std::size_t offset) const { return static_cast<std::int32_t*>(spec_host_.data()) + offset; }
     std::int32_t* spec_device(std::size_t offset) const { return static_cast<std::int32_t*>(spec_device_.p) + offset; }
 
+    // The records hold the widest verification's rows and columns (plan_device).
     execution::ForwardVerify verify_view(std::int32_t batch, std::int32_t width) const {
+        if (batch < 1 || batch > plan_.verify_rows || width > max_width_ ||
+            static_cast<std::int64_t>(batch) * width > plan_.verify_columns) {
+            throw std::logic_error("Qwen4Exp: a verification of " + std::to_string(batch) + " x " +
+                                   std::to_string(width) + " columns exceeds the plan's records");
+        }
         execution::ForwardVerify v;
         v.gdn        = records_.narrowed(width);
         v.ple_inputs = Tensor(ple_records_.p, DType::BF16, {width_, width, batch});

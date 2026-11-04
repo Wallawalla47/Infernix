@@ -7972,7 +7972,12 @@ change at merge time.
   configuration alone (the expert record stride from the format's geometry). The constructor
   allocates exactly from it and throws `logic_error` if the bytes it allocated differ, so the
   startup estimate cannot drift. Option validation moved into it, so a bad option fails before the
-  weights are read.
+  weights are read. Verification buffers hold the widest verification the round policy forms (§19.3.5),
+  not lanes x W (candidates VM-02, 2026-11-04): one row of up to W columns, and with pair speculation two
+  rows of at most 1 + min(2, drafts) columns, since rounds of three or more rows decode plain. The GDN replay
+  records keep that many rows (2, else 1) of W columns a layer, the PLE and QSA records and the acceptance
+  workspace that many columns and rows, and the logits max(lanes, those columns); `verify_view` and the logit
+  views refuse a wider round.
 - **Startup order.** `construct_qwen4_exp`: RAM ledger, then the VRAM pre-check (dense bytes from
   the load plan plus the device plan) before `materialize_model`; a negative frame budget fails
   with the contributors, fewer than 2,048 frames warn. A spill guard wraps the dense upload (fatal),
@@ -8781,7 +8786,8 @@ end-to-end effect is not measured yet.
 #### VRAM item 1: the prefill workspace lent from frames
 
 **Design.**
-- The static workspace covers only `max(lanes × W, min(chunk, 512))` columns.
+- The static workspace covers only `max(round columns, min(chunk, 512))` columns, the round columns being
+  the widest round's: max(lanes, the widest verification's columns) (VM-02; lanes × W before 2026-11-04).
 - A wider call swaps in a wide arena, taken from the first of these that is available:
   - the stream lease (after the ring);
   - a frame lease of its own;

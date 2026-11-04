@@ -2,16 +2,19 @@
 // capture at first use, through the public Engine on the real artifact.
 // Per drafter (arguments plain, mtp, dflash2), two Engines run the same two prompts, one capturing each graph at
 // its first use and one capturing the set at startup (models::qwen4_exp::testing::set_startup_capture):
-// - the reproducible route (fast paths off), the prompts one at a time and then both together: the generated ids
-//   must be equal, since a startup-captured graph holds the same kernels over the same addresses;
+// - the reproducible route (fast paths off), the prompts one at a time and then one request a lane together (the
+//   prompts in turn): the generated ids must be equal, since a startup-captured graph holds the same kernels over
+//   the same addresses, and each request's must equal its prompt's alone (the route is request-invariant);
 // - the default route, the same runs (two rows together take pair rounds there): every graph the rounds launched
 //   must come from the startup set (no "captured at its first use" warning). Its ids are reported, not required
 //   equal: the drafter pool's swaps and pair rounds make its drafts, and so its verified widths, depend on timing.
+// INFERNIX_QWEN4_LANES (2 to 8, default 2) sets the lanes: from three, rounds of three or more rows decode plain
+// beside verification records sized for two rows (candidates VM-02).
 // Each Engine's construction time, the startup line and free VRAM after construction are printed (the set's cost).
 // Skips (77) without INFERNIX_QWEN4_ARTIFACT; dflash2 skips without INFERNIX_QWEN4_DFLASH2.
 //
 //   INFERNIX_QWEN4_ARTIFACT=out.infernix [INFERNIX_QWEN4_NGRAM=out.ngram] [INFERNIX_QWEN4_DFLASH2=drafter.infernix]
-//   [INFERNIX_QWEN4_KV=int8] infernix_qwen4_exp_startup_capture_real_test plain mtp dflash2
+//   [INFERNIX_QWEN4_KV=int8] [INFERNIX_QWEN4_LANES=4] infernix_qwen4_exp_startup_capture_real_test plain mtp dflash2
 
 #include "kv_cache_storage.h"
 #include "models/qwen4_exp/program/graph_set.h"
@@ -39,6 +42,7 @@ struct Setup {
     const char* artifact = nullptr;
     const char* ngram    = nullptr;
     const char* drafter  = nullptr;
+    std::uint32_t lanes  = 2;
 };
 
 // A code prompt whose answer repeats its own structure (n-gram copies reach the widest verifications) and a prose
@@ -61,8 +65,8 @@ infernix::EngineOptions engine_options(const Setup& setup, std::string_view draf
     const char* kv                = std::getenv("INFERNIX_QWEN4_KV");
     options.kv_cache              = kv != nullptr ? infernix::test::parse_kv_cache_storage(kv)
                                                   : infernix::KvCacheStorage::Int8Group64;
-    options.max_concurrency       = 2;
-    options.max_pending_requests  = 2;
+    options.max_concurrency       = setup.lanes;
+    options.max_pending_requests  = setup.lanes;
     options.prefill_chunk         = 512;
     options.context_cache.enabled = false; // every run prefills its whole prompt
     options.fast_paths            = fast_paths;
@@ -104,7 +108,7 @@ std::size_t free_vram() {
 }
 
 struct Arm {
-    // The prompts one at a time, then both submitted together.
+    // The prompts one at a time, then one request a lane submitted together (request i: prompt i mod 2).
     std::vector<std::vector<infernix::TokenId>> alone, together;
     std::uint32_t late_captures = 0;
     std::string startup_line;
@@ -138,7 +142,9 @@ Arm run_arm(const Setup& setup, std::string_view drafter, bool fast_paths, bool 
                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         }
         std::vector<infernix::GenerationHandle> handles;
-        for (const char* text : kPrompts) { handles.push_back(engine.submit(engine.prepare(prompt_input(text)), request_options())); }
+        for (std::uint32_t i = 0; i < setup.lanes; ++i) {
+            handles.push_back(engine.submit(engine.prepare(prompt_input(kPrompts[i % 2])), request_options()));
+        }
         for (auto& handle : handles) { arm.together.push_back(handle.wait().generated_token_ids); }
     }
     infernix::models::qwen4_exp::testing::set_startup_capture(std::nullopt);
@@ -183,6 +189,17 @@ int run(const Setup& setup, std::string_view drafter, bool fast_paths) {
             }
         }
     }
+    // The reproducible route is request-invariant: every request together gives its prompt's ids alone.
+    for (const Arm* arm : {&first, &startup}) {
+        for (std::size_t i = 0; !fast_paths && i < arm->together.size() && arm->alone.size() == 2; ++i) {
+            const auto& alone = arm->alone[i % 2];
+            check(arm->together[i] == alone,
+                  std::string(arm == &first ? "first-use" : "startup") + " request " + std::to_string(i) +
+                      " together differs from its prompt alone: " + std::to_string(arm->together[i].size()) + " / " +
+                      std::to_string(alone.size()) + " tokens, first difference at " +
+                      std::to_string(first_difference(arm->together[i], alone)));
+        }
+    }
     return failures;
 }
 
@@ -194,6 +211,13 @@ int main(int argc, char** argv) {
     setup.artifact = std::getenv("INFERNIX_QWEN4_ARTIFACT");
     setup.ngram    = std::getenv("INFERNIX_QWEN4_NGRAM");
     setup.drafter  = std::getenv("INFERNIX_QWEN4_DFLASH2");
+    if (const char* lanes = std::getenv("INFERNIX_QWEN4_LANES"); lanes != nullptr && *lanes != '\0') {
+        setup.lanes = static_cast<std::uint32_t>(std::strtoul(lanes, nullptr, 10));
+        if (setup.lanes < 2 || setup.lanes > 8) {
+            std::fprintf(stderr, "FAIL: INFERNIX_QWEN4_LANES must be 2 to 8\n");
+            return 1;
+        }
+    }
     if (setup.artifact == nullptr || *setup.artifact == '\0') {
         std::printf("SKIP: set INFERNIX_QWEN4_ARTIFACT\n");
         return 77;
