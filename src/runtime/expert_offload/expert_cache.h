@@ -96,6 +96,10 @@ public:
 
     // Seeds residency and counts, for example from a saved state or a shipped profile.
     void seed(std::span<const std::uint32_t> resident_keys, std::span<const std::uint32_t> counts);
+    // Breaks the ties of seeded whole counts by the seeds' order (`ranked`, best first): the i-th of n gains
+    // 0.5 (n - i) / (n + 1), under half a use, so equal counts order by rank and unequal ones keep their order.
+    // Before the first round only.
+    void rank_seeds(std::span<const std::uint32_t> ranked);
 
     // Changes the capacity (the frame pool grew or shrank). Shrinking evicts the lowest-score
     // residents, wherever their frames are, into `victims`; uses keep their counts. With

@@ -342,6 +342,16 @@ void LfruPolicy::seed(std::span<const std::uint32_t> resident_keys, std::span<co
     }
 }
 
+void LfruPolicy::rank_seeds(std::span<const std::uint32_t> ranked) {
+    const auto n = static_cast<double>(ranked.size());
+    for (std::size_t i = 0; i < ranked.size(); ++i) {
+        const std::uint32_t k = ranked[i];
+        count_[k] += 0.5 * (n - static_cast<double>(i)) / (n + 1.0);
+        if (resident(k)) { resident_count_[slot_[k]] = count_[k]; }
+    }
+    low_valid_ = false;
+}
+
 void LfruPolicy::evict(std::uint32_t key) {
     if (resident(key)) { erase(key); }
 }
@@ -523,7 +533,7 @@ void CacheController::load(std::uint32_t key, std::uint32_t frame, std::vector<C
 std::uint32_t CacheController::seed(std::span<const std::uint32_t> keys, std::span<const std::uint32_t> counts,
                                     std::vector<Command>& out) {
     policy_.seed({}, counts);
-    std::uint32_t loaded = 0;
+    std::vector<std::uint32_t> loaded_keys;
     for (const std::uint32_t key : keys) {
         if (key >= table_.size() || policy_.resident(key) || policy_.resident_count() >= policy_.capacity()) { continue; }
         const auto frame = frames_.acquire();
@@ -531,9 +541,13 @@ std::uint32_t CacheController::seed(std::span<const std::uint32_t> keys, std::sp
         const std::uint32_t one[] = {key};
         policy_.seed(one, {});
         load(key, *frame, out);
-        ++loaded;
+        loaded_keys.push_back(key);
     }
-    return loaded;
+    // The callers cap the seeded counts (kSeedCountCap: 16), which ties most of a calibrated order at the cap
+    // (497 of 512 Flash-Next experts a layer, 241 of 256 on the 122B); the ties fell to the key, so the first
+    // layer's untouched seeds left first. They now leave lowest rank first (candidates QA-19).
+    if (!counts.empty()) { policy_.rank_seeds(loaded_keys); }
+    return static_cast<std::uint32_t>(loaded_keys.size());
 }
 
 std::uint32_t CacheController::reserve_free(std::uint32_t count, std::vector<std::uint32_t>& out) {

@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <cstdio>
 #include <fstream>
@@ -641,10 +642,38 @@ void test_seed() {
     check(frames.size() == loaded && keys.size() == loaded, "each seeded key copies into its own frame");
     check(keys.count(40) == 1 && keys.count(3) == 1 && keys.count(99) == 0, "duplicates and out-of-range keys are skipped");
     check(keys.count(11) == 0 && keys.count(13) == 0, "keys past the capacity are not loaded");
-    check(cache.policy().resident(40) && cache.policy().count(40) == 40 % 7, "seeded keys are resident with their counts");
+    check(cache.policy().resident(40) && std::floor(cache.policy().count(40)) == 40 % 7,
+          "seeded keys are resident with their counts (and a rank fraction under half a use)");
     check(cache.policy().count(50) == 50 % 7, "counts are seeded for every key");
     cmds.clear();
     check(cache.seed(ranked, {}, cmds) == 0 && cmds.empty(), "a full cache seeds nothing more");
+
+    // Ties at the callers' cap break by rank (candidates QA-19): keys 9, 2, 5 seeded in that order with one count
+    // leave lowest rank first (5, then 2), not lowest key first; a higher count still outranks a better rank.
+    CacheController tied(kKeys, 4, 0, 1);
+    std::vector<std::uint32_t> capped(kKeys, 16);
+    capped[1] = 3;
+    capped[7] = 4;
+    const std::vector<std::uint32_t> order{9, 2, 5, 1};
+    cmds.clear();
+    check(tied.seed(order, capped, cmds) == 4, "four seeds fill four frames");
+    const LfruPolicy& p = tied.policy();
+    check(p.score(9) > p.score(2) && p.score(2) > p.score(5), "equal counts order by rank");
+    check(p.score(5) > p.score(1), "unequal counts keep their order");
+    check(p.count(7) == 4.0, "a key not seeded keeps its whole count");
+    for (const auto& c : cmds) {
+        if (c.kind == CacheController::Command::Kind::kCopy) { check(tied.complete_load(c.key, c.frame, c.serial), "a seed publishes"); }
+    }
+    cmds.clear();
+    const std::uint32_t miss[] = {7};
+    tied.on_route(miss, 1, cmds);
+    tied.on_quiescent(cmds);
+    check(!p.resident(1) && p.resident(5) && p.resident(7), "the lowest count leaves first");
+    const std::uint32_t both[] = {7, 8}; // 7 hits and 8 misses: the victim is one of the tied seeds
+    tied.on_route(both, 2, cmds);
+    tied.on_quiescent(cmds);
+    check(p.resident(8) && !p.resident(5) && p.resident(9) && p.resident(2),
+          "then the lowest-ranked of the tied seeds, not the lowest key");
 }
 
 // Prompt seeding (design §19.3.27): credit adds weighted uses, marked used now, with no clock tick
