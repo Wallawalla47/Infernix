@@ -393,8 +393,12 @@ private:
     // FLOOR is 1 (Basalt's is 2): any key routed in the round is a candidate. A replay of a 16K route trace at 12,528
     // frames gave 96.4 % hits at floor 1 against 91.6 % at 2 (0.5 no better, 1.5 93.9 %), for 6.5 against 3.8
     // promotions a token; IQ3_S decode 16K +1.5 %, struct +5.4 %, community conv / prose +2.7-4.2 % (2026-10-29).
+    // MARGIN is 1 (Basalt's 1.5; candidates WB-02, 2026-11-05): IQ3_S, decode_arms from its warm state, three rotated
+    // reps, against 1.5: 1.0 struct 403.60 -> 412.57 tok/s (+2.2 %; 96.2 -> 97.6 % hits, 10.2K -> 15.5K promotions)
+    // and after a 16K prompt +1.2 % (the 1.5 arm's comparable reps), 0.7 struct +1.6 %, 1.25 +1.1 %; a larger margin
+    // lost (2 struct -6.0 %, 3 -17.5 %), as Basalt's -1.35 % at 3 came from a 5080 adapting every window.
     struct Adaptive {
-        float decay = 0.85F, floor = 1.0F, margin = 1.5F;
+        float decay = 0.85F, floor = 1.0F, margin = 1.0F;
         std::uint32_t swaps = 96, cap = 96;
         std::vector<float> count;     // per key
         std::vector<std::uint8_t> done; // per key: swapped in this round

@@ -1359,8 +1359,9 @@ def format_prompt_seed(seed):
 
 
 # The engine's adaptive tier (ExpertResidency::Adaptive): Basalt's rules (b80e026, bde2328) of decay 0.85 per round,
-# margin 1.5 and 96 swaps a round, with the candidate floor 1.0 where Basalt's is 2.0 (2026-10-29).
-ADAPTIVE_DEFAULTS = (0.85, 1.0, 1.5, 96)
+# 96 swaps a round, with the candidate floor 1.0 where Basalt's is 2.0 (2026-10-29) and the margin 1.0 where Basalt's is
+# 1.5 (2026-11-05, candidates WB-02).
+ADAPTIVE_DEFAULTS = (0.85, 1.0, 1.0, 96)
 
 
 def parse_vram_policy(text):
