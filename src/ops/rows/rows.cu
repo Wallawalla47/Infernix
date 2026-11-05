@@ -30,15 +30,29 @@ bool contiguous_bf16(const Tensor& t) {
     return t.data != nullptr && t.dtype == DType::BF16 && t.is_contiguous() && t.ne[2] == 1 && t.ne[3] == 1;
 }
 
+// The output holding row `row`: the last one beginning at or before it (an empty output begins where the next one
+// does, which then wins). The scan is unrolled over constant indices, so `targets` stays in the parameter bank; the
+// former `while` over a runtime index copied all 104 bytes of it to local memory in every thread.
+struct SplitTarget {
+    __nv_bfloat16* data;
+    int begin, width;
+};
+__device__ __forceinline__ SplitTarget split_target(const SplitTargets& targets, int row) {
+    SplitTarget out{targets.data[0], 0, targets.begin[1]};
+#pragma unroll
+    for (int i = 1; i < kMaxOutputs; ++i) {
+        if (row >= targets.begin[i]) { out = {targets.data[i], targets.begin[i], targets.begin[i + 1] - targets.begin[i]}; }
+    }
+    return out;
+}
+
 // The split kernels give each row of blocks every gridDim.y-th column (core/grid_rows.h).
 __global__ void split_kernel(const __nv_bfloat16* __restrict__ in, int rows, int columns, SplitTargets targets) {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= rows) { return; }
-    int i = 0;
-    while (r >= targets.begin[i + 1]) { ++i; }
-    const int width = targets.begin[i + 1] - targets.begin[i];
+    const SplitTarget target = split_target(targets, r);
     for (int t = blockIdx.y; t < columns; t += gridDim.y) {
-        targets.data[i][static_cast<std::size_t>(t) * width + (r - targets.begin[i])] =
+        target.data[static_cast<std::size_t>(t) * target.width + (r - target.begin)] =
             in[static_cast<std::size_t>(t) * rows + r];
     }
 }
@@ -49,13 +63,12 @@ __global__ void split_vector_kernel(const uint4* __restrict__ in, int rows8, int
     pdl::enter(); // launched as a programmatic dependent
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= rows8) { return; }
-    const int row = r * 8;
-    int i         = 0;
-    while (row >= targets.begin[i + 1]) { ++i; }
-    const int width = targets.begin[i + 1] - targets.begin[i];
-    auto* out       = reinterpret_cast<uint4*>(targets.data[i]);
+    const int row            = r * 8;
+    const SplitTarget target = split_target(targets, row);
+    auto* out                = reinterpret_cast<uint4*>(target.data);
     for (int t = blockIdx.y; t < columns; t += gridDim.y) {
-        out[(static_cast<std::size_t>(t) * width + (row - targets.begin[i])) / 8] = in[static_cast<std::size_t>(t) * rows8 + r];
+        out[(static_cast<std::size_t>(t) * target.width + (row - target.begin)) / 8] =
+            in[static_cast<std::size_t>(t) * rows8 + r];
     }
 }
 

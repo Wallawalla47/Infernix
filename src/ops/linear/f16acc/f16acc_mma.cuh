@@ -135,6 +135,11 @@ f16acc_compute_stage(const unsigned char* activation_stage, const std::uint8_t* 
     const unsigned b_base = smem_addr(weight_stage) + static_cast<unsigned>(b_row * Schedule::kBlockK) + swizzle;
     // The accumulator's weight rows (C columns 2t and 2t + 1 of each n8 tile).
     const int c_row = 2 * (lane & 3);
+    // The MXFP8 TMA instance of the 64-token x 256-row schedule (FP4-Local's [1280, 2560] prefill projection) keeps
+    // the per-step offsets: with the one-base form it reloads one value from local memory every stage (SASS: 1 STL,
+    // 1 LDL inside its K loop; N 1280 K 2560 T 1024 33.8 -> 35.9 us, T 4096 / 16384 +1.7 / +0.9 %), while the
+    // per-step form has no local access there (candidates IP-09b). Every other instance takes the one base.
+    constexpr bool kStepOffsets = GroupScales && Schedule::kBlockTokens == 64 && Schedule::kBlockRows == 256;
     unsigned partial[Schedule::kMmaTokens][Schedule::kMmaRows][2];
 #pragma unroll
     for (int k_step = 0; k_step < Schedule::kMmaK; ++k_step) {
@@ -143,22 +148,40 @@ f16acc_compute_stage(const unsigned char* activation_stage, const std::uint8_t* 
                                 static_cast<unsigned>((k_step / kStepsPerHalf) * Schedule::kActivationHalfBytes);
 #pragma unroll
         for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
-            ldmatrix_x4(a[mma_token][0], a[mma_token][1], a[mma_token][2], a[mma_token][3],
-                        a_step + static_cast<unsigned>(mma_token * 16 * kRowBytes));
+            if constexpr (kStepOffsets) {
+                const int row     = warp_token * Schedule::kWarpTokens + mma_token * 16 + a_row_offset;
+                const int logical = (k_step % kStepsPerHalf) * 32 + a_byte;
+                ldmatrix_x4(a[mma_token][0], a[mma_token][1], a[mma_token][2], a[mma_token][3],
+                            smem_addr(activation_stage + (k_step / kStepsPerHalf) * Schedule::kActivationHalfBytes +
+                                      row * kRowBytes + (logical ^ ((row & 7) << 4))));
+            } else {
+                ldmatrix_x4(a[mma_token][0], a[mma_token][1], a[mma_token][2], a[mma_token][3],
+                            a_step + static_cast<unsigned>(mma_token * 16 * kRowBytes));
+            }
         }
         unsigned b[Schedule::kMmaRows][2];
         {
             static_assert(Schedule::kMmaRows <= 2 || Schedule::kMmaRows % 4 == 0, "ldmatrix B takes 1, 2 or 4k tiles");
             const unsigned b_step = b_base ^ static_cast<unsigned>(k_step * 16);
+            // The 16-byte k slice of weight row `row` (lane l addresses row l & 7 of matrix l >> 3), per step.
+            const auto slice = [&](int row) {
+                return smem_addr(weight_stage + row * Schedule::kBlockK + fp8_mma_shared_byte<Schedule>(row, k_step * 16));
+            };
             unsigned codes[Schedule::kMmaRows < 2 ? 2 : Schedule::kMmaRows];
             if constexpr (Schedule::kMmaRows % 4 == 0) {
 #pragma unroll
                 for (int group = 0; group < Schedule::kMmaRows / 4; ++group) {
+                    const unsigned address =
+                        kStepOffsets
+                            ? slice(warp_row * Schedule::kWarpRows + (group * 4 + (lane >> 3)) * 8 + (lane & 7))
+                            : b_step + static_cast<unsigned>(group * 32 * Schedule::kBlockK);
                     ldmatrix_x4(codes[4 * group], codes[4 * group + 1], codes[4 * group + 2], codes[4 * group + 3],
-                                b_step + static_cast<unsigned>(group * 32 * Schedule::kBlockK));
+                                address);
                 }
             } else {
-                ldmatrix_x2(codes[0], codes[1], b_step);
+                const int tile = Schedule::kMmaRows == 2 ? ((lane >> 3) & 1) : 0;
+                ldmatrix_x2(codes[0], codes[1],
+                            kStepOffsets ? slice(warp_row * Schedule::kWarpRows + tile * 8 + (lane & 7)) : b_step);
             }
 #pragma unroll
             for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
