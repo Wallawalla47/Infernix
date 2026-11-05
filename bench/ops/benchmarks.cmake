@@ -67,7 +67,7 @@ infernix_add_op_bench(infernix_offloaded_moe_wide_bench SOURCES "${CMAKE_CURRENT
 infernix_add_op_bench(infernix_ggml_linear_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/ggml_linear_bench.cu")
 infernix_add_op_bench(infernix_resident_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/resident_moe_bench.cu")
 infernix_add_op_bench(infernix_hyper_connection_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/hyper_connection_bench.cu")
-infernix_add_op_bench(infernix_a16_cpu_rows_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/a16_cpu_rows_bench.cpp")
+infernix_add_op_bench(infernix_cpu_rows_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/cpu_rows_bench.cpp")
 infernix_add_op_bench(infernix_linear_pair_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_pair_bench.cu")
 infernix_add_op_bench(infernix_context_kv_materialize_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bench.cu")

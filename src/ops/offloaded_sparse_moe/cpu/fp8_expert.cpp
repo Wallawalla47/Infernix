@@ -122,14 +122,17 @@ inline SliceWeights slice_weights(const std::uint8_t* codes) {
 // (A * lo, A * hi, B * lo, B * hi over the even elements, then the odd ones; each lane sums 8
 // products of at most 1920 * 2047 per tile, below 2^25) give the tile's exact
 // P = 2^19 S_Bhi + 2^11 S_Ahi + 2^8 S_Blo + S_Alo (int64), which enters R as fp8_exact.h's. From
-// three columns on, the even and odd halves share their four streams (16 products per lane per
-// tile, below 2^26): the accumulators fit the 16 registers instead of spilling 32.
+// two columns on, the even and odd halves share their four streams (16 products per lane per
+// tile, below 2^26): two columns' eight streams, the slice's four decoded weight vectors and the
+// loads fit the 16 registers (separate halves spilled; candidates §58: -9 % a two-column call on
+// AVX-VNNI). Three and four columns still spill some, and measured faster than pairs that decode each
+// slice twice as often (+10-17 %).
 #define INFERNIX_FP8_ROW_SUMS(Name, Target, Mad)                                                                       \
     template <int NC>                                                                                                  \
     INFERNIX_TARGET(Target)                                                                                            \
     void Name##_n(const std::uint8_t* codes, const std::uint16_t* scales, int k, int row_begin, int row_end,           \
                   const SplitLimbSlice* const* columns, int c0, int ncols, exact::I128* r, int* e_min) {               \
-        constexpr int kStreams = NC >= 3 ? 4 : 8;                                                                      \
+        constexpr int kStreams = NC >= 2 ? 4 : 8;                                                                      \
         const int tiles = k / kTile;                                                                                   \
         for (int row = row_begin; row < row_end; ++row) {                                                              \
             const std::uint8_t* w     = codes + static_cast<std::size_t>(row) * k;                                     \
