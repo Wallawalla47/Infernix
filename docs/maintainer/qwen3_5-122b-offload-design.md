@@ -982,6 +982,13 @@ must still win (its "restored" line).
 - **CPU assist.** For calls of at most 4,096 × 27.5 GB/s / link columns (Flash-Next P7; a link within
   5 % of 27.5 GB/s counts as it), with the next layer's guessed heavy experts copied ahead (Flash-Next
   design §19.3.12; the cap was 1,536 before copy-ahead, 2026-10-26).
+- **Assisted prompt calls.** Calls of at most 575 columns stage their misses with the CPU team serving
+  some (`ExpertOffload::assist_max_columns`, on an NVFP4 W4A16 bank on the exact CPU arithmetic; 255
+  otherwise), keeping FP4-Local's link share of their host-memory misses: 77/256 to 64 columns, 104/256
+  at 255, on to 149/256 at 575 (Flash-Next §19.3.50); wider passes stream. Streaming from 256 had left
+  the cliff Flash-Next removed in XB-02 (pp255 279.5 tok/s, pp256 228.1); assisted to 575 (2026-11-05,
+  candidates §58): pp256 +40 %, pp320 +34 %, pp384 +26 %, pp512 +10 %, pp575 +4 %, and pp128-255
+  +6-16 % from the ramp.
 - **Prefill never promotes.** The prompt's routes credit the cache instead.
 - **Kernels.** The A8 TMA projections (§8.2), the exact wide experts with the int32-group epilogue
   (§8.6), the group-16 prompt attention with FP16 P×V, and the GDN chunk kernel at 64 heads.

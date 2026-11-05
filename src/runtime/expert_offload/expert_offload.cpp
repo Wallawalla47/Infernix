@@ -427,6 +427,33 @@ int ExpertOffload::pcie_share() const noexcept {
     return decode_link_share_256(link_bytes_per_second_, cpu_expert_rate(), record);
 }
 
+// An NVFP4 W4A16 bank on the exact CPU arithmetic assists prompt calls to kWideAssistMaxColumns, streaming from one
+// more, as Flash-Next's FP4-Local does with the same CPU kernel (candidates §51: pp256 +51.9 %, pp384 +37.3 %, pp575
+// +17.2 % there). The 122B before (2026-11-05, -p N -n 1 in one process, INT8 KV): pp255 279.5 tok/s against pp256
+// 228.1, pp320 253.7, pp384 283.5 (candidates §58). Other banks keep kAssistMaxColumns.
+bool ExpertOffload::wide_assist() const noexcept {
+    const ExpertBank& bank = *setup_.banks.front();
+    return bank.planes.gate_up_format == QType::NVFP4_MUL && bank.activation == moe::ExpertActivation::kA16 &&
+           options_.narrow_a16 == moe::NarrowA16::kExact;
+}
+
+std::int32_t ExpertOffload::assist_max_columns() const noexcept {
+    return wide_assist() ? kWideAssistMaxColumns : kAssistMaxColumns;
+}
+
+// An assisted call's link share of its host-memory misses (MoeCpuChannel::assist_share and its ramp): on a wide-assist
+// bank Flash-Next's FP4-Local ramp, 77/256 to 64 columns rising to 104/256 at 255 and on with the same slope to
+// kWideAssistMaxColumns (149/256), measured there with the same CPU kernel (Flash-Next design §19.3.50); the others
+// keep the decode share. A fixed cpu_pcie_divisor or INFERNIX_TMP_LINK_SHARE leaves every width alone.
+ExpertOffload::AssistShare ExpertOffload::assist_link_share() const noexcept {
+    const bool fixed = options_.cpu_pcie_divisor > 0 ||
+                       temporary_switches::offload().link_share != temporary_switches::OffloadSwitches::LinkShare::kDivisor;
+    if (fixed || !wide_assist()) { return {}; }
+    constexpr int kShare = 77, kShareAt255 = 104, kRampFrom = 64;
+    constexpr int kWide  = kShare + (kShareAt255 - kShare) * (kWideAssistMaxColumns - kRampFrom) / (kAssistMaxColumns - kRampFrom);
+    return {kShare, std::min(256, kWide), kRampFrom};
+}
+
 int ExpertOffload::one_column_divisor() const noexcept {
     return plain_by_context(setup_, options_) ? plain_divisor(0) : 0;
 }
@@ -754,7 +781,7 @@ void ExpertOffload::create_stream() {
 // CPU-served misses for decode and verification calls and every call of at most kMaxCpuColumns
 // columns (short prompts, chunk remainders, forced tokens), whose experts are all thin and so give the
 // same bits on either device (design §16.2); wider prefill chunks stay on the GPU, except the
-// assisted calls up to kAssistMaxColumns and the streamed chunks' split.
+// assisted calls up to assist_max_columns() and the streamed chunks' split.
 void ExpertOffload::create_cpu_service() {
     const std::uint32_t workers = placement_.workers, jobs = options_.cpu_expert_jobs;
     if (workers == 0 || jobs == 0) { return; }
@@ -764,7 +791,8 @@ void ExpertOffload::create_cpu_service() {
     }
     if (!tier_) { measure_cpu_rate_settled(); } // the tier's rates follow its fill (start)
     const int decode_columns = std::max(moe::kMaxCpuColumns, setup_.lanes * setup_.max_width);
-    const bool assist        = options_.cpu_assist_jobs > 0 && decode_columns < kAssistMaxColumns;
+    const bool assist        = options_.cpu_assist_jobs > 0 && decode_columns < assist_max_columns();
+    const AssistShare share  = assist ? assist_link_share() : AssistShare{};
     std::vector<moe::CpuMissService::Layer> layers;
     for (const ExpertBank* bank : setup_.banks) {
         layers.push_back({.records       = reinterpret_cast<const std::uint8_t*>(bank->planes.records),
@@ -778,12 +806,15 @@ void ExpertOffload::create_cpu_service() {
         moe::CpuMissService::Options{
             .workers            = static_cast<int>(workers),
             .max_jobs           = static_cast<int>(std::min<std::uint32_t>(jobs, moe::kMaxCpuJobs)),
-            .max_columns        = assist ? kAssistMaxColumns : decode_columns,
+            .max_columns        = assist ? assist_max_columns() : decode_columns,
             .pcie_divisor       = pcie_divisor(),
             .one_column_divisor = one_column_divisor(),
             .pcie_share         = pcie_share(),
             .wide_from          = assist ? decode_columns + 1 : 0,
             .wide_jobs          = assist ? static_cast<int>(std::min<std::uint32_t>(options_.cpu_assist_jobs, moe::kMaxCpuJobs)) : 0,
+            .assist_share       = share.share,
+            .assist_share_wide  = share.wide,
+            .assist_ramp_from   = share.ramp_from,
             .cpus               = placement_.cpus,
             .activation         = front.activation,
             .narrow_a16         = options_.narrow_a16,
@@ -1431,7 +1462,7 @@ void ExpertOffload::clear_prompt_uses(std::uint32_t lane) {
 
 bool ExpertOffload::lend_stream(std::int32_t width, std::uint64_t wide_bytes, std::uint64_t walk_bytes,
                                 cudaStream_t compute) {
-    if (!stream_ || width < kStreamMinColumns || residency_->frames() == 0) { return false; }
+    if (!stream_ || width < stream_min_columns() || residency_->frames() == 0) { return false; }
     if (leases_.ring.valid()) { return true; }
     // The ring holds two halves of as many records as the layer with the most non-resident experts has
     // (+ one slot for the slot tables), so no streamed layer leaves misses to staging (F2: halves of 384

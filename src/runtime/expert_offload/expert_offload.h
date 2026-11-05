@@ -168,12 +168,13 @@ public:
     // Fewer frames than this make decode slow (runtime/engine's kFewExpertFrames for Flash-Next).
     static constexpr std::uint32_t kFewFrames = 2048;
     // Calls of at most this many columns are CPU-served (design §16.2); prefill calls up to
-    // kAssistMaxColumns are CPU-assisted (P7).
-    static constexpr std::int32_t kServedCallColumns = 8;
-    static constexpr std::int32_t kAssistMaxColumns  = 255;
-    // Chunks narrower than this keep the MoE's staging; wider ones stream (F2), the ring halves at
-    // least kStreamHalfMin records.
-    static constexpr std::int32_t kStreamMinColumns = 256;
+    // assist_max_columns() are CPU-assisted (P7): kWideAssistMaxColumns on an NVFP4 W4A16 bank on the exact CPU
+    // arithmetic, as Flash-Next's FP4-Local (candidates §51, carried in §58), else kAssistMaxColumns.
+    static constexpr std::int32_t kServedCallColumns    = 8;
+    static constexpr std::int32_t kAssistMaxColumns     = 255;
+    static constexpr std::int32_t kWideAssistMaxColumns = 575;
+    // Chunks of at least stream_min_columns() stream (F2); narrower ones keep the MoE's staging. The ring halves
+    // hold at least kStreamHalfMin records.
     static constexpr std::uint32_t kStreamHalfMin   = 16;
     // RAM slots a layer walk's span lends for its stream's reads of SSD-only experts.
     static constexpr std::uint32_t kStreamReadSlots = 1280;
@@ -354,6 +355,14 @@ public:
     [[nodiscard]] int pcie_divisor() const noexcept;
     // The link's share of a decode call's misses in 256ths (0 with a fixed divisor).
     [[nodiscard]] int pcie_share() const noexcept;
+    // The widest CPU-assisted prefill call, and the narrowest streamed one (one more).
+    [[nodiscard]] std::int32_t assist_max_columns() const noexcept;
+    [[nodiscard]] std::int32_t stream_min_columns() const noexcept { return assist_max_columns() + 1; }
+    struct AssistShare {
+        int share = 0, wide = 0, ramp_from = 0;
+    };
+    [[nodiscard]] bool wide_assist() const noexcept;
+    [[nodiscard]] AssistShare assist_link_share() const noexcept;
     // Plain decode's one-column divisor by context (placement.h plain_divisor; Flash-Next: d = 1
     // below 1,536 tokens, 2 from there): its startup value, 0 when the rule does not apply.
     [[nodiscard]] int one_column_divisor() const noexcept;

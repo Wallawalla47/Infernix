@@ -240,9 +240,14 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
             experts.split_streamed_experts += streaming->plan_layer(p.layer, experts.split_columns, experts.split_cpu);
             experts.split_cpu_experts += cpu;
             if (cpu > 0) {
+                // The split's experts all go to the CPU: no share of the assisted calls' (candidates §58: the
+                // assisted share leaking in here cost streamed prompts 1.2-3.3 % on the 122B).
                 source.cpu.max_columns               = moe::kMaxCpuCallColumns;
                 source.cpu.pcie_divisor              = 0;
                 source.cpu.pcie_share                = 0;
+                source.cpu.assist_share              = 0;
+                source.cpu.assist_share_wide         = 0;
+                source.cpu.assist_ramp_from          = 0;
                 source.cpu.one_column_divisor        = 0;
                 source.cpu.one_column_divisor_device = nullptr;
                 source.cpu.wide_from                 = 1;

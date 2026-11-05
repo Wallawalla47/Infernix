@@ -108,7 +108,7 @@ public:
     // §19.3.12; Qwen3.5-122B design §10): a prompt's (prefill, replay) or forced tokens' ----
     enum class PassKind { Prompt, Forced };
     // Before a pass of at most `columns` tokens: wakes the CPU service and opens the round, then picks
-    // the pass's route. A pass of at least kStreamMinColumns streams when the ring can be lent; a
+    // the pass's route. A pass of at least stream_min_columns() streams when the ring can be lent; a
     // streamed pass narrow enough for the measured link and CPU gates its layers on their routing and
     // gives the CPU their thinnest misses. Each layer's ring half is released once its experts are
     // enqueued (only a layer walk, which Qwen3.5 does not run yet, keeps them). A pass wider than
