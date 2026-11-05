@@ -1,4 +1,5 @@
 #pragma once
+#include "core/pdl.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/common/math.cuh"
 #include "ops/linear/common/epilogue.cuh"
@@ -9,6 +10,10 @@ namespace infernix::ops::detail {
 template <class Schedule, bool FullRows, class Output, class Epilogue>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_a16_gemv_kernel(
     Q8LinearOperands operands, Output output, Epilogue epilogue) {
+    // A programmatic dependent (launch_q8_a16_gemv): it waits before any load, and x (the producer's output) is read
+    // with a coherent load, which cannot be issued above the wait as the non-coherent __ldg form can (candidates
+    // XB-05's NVFP4 GEMV). Both no-ops in an ordinary launch.
+    pdl::enter_streaming();
     constexpr int R = Schedule::kBlockRows, W = Schedule::kWarpsPerRow;
     const int k        = Schedule::kStaticK > 0 ? Schedule::kStaticK : operands.k;
     const int padded_k = Schedule::kStaticK > 0 ? Schedule::kStaticK : operands.padded_k;
@@ -30,7 +35,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             const int kk      = phase * 256 + lane * 8;
             if (Schedule::kStaticK > 0 || kk < k) {
                 const uint2 codes  = load_ldg<uint2>(code_row + kk);
-                const uint4 values = load_ldg<uint4>(operands.x + kk);
+                const uint4 values = *reinterpret_cast<const uint4*>(operands.x + kk);
                 const float2 xv[]{bf16x2_bits_to_float2(values.x), bf16x2_bits_to_float2(values.y),
                                   bf16x2_bits_to_float2(values.z), bf16x2_bits_to_float2(values.w)};
 #pragma unroll
@@ -43,6 +48,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             }
         }
     }
+    pdl::trigger_dependents();
     acc = warp_reduce_sum(acc);
     if constexpr (W > 1) {
         __shared__ float partial[R][W];
