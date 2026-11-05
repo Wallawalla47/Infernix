@@ -695,17 +695,21 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                         : std::string()) +
                    "; every other call keeps its route");
     }
-    // FP4-Local's default route (MXFP8 dense, NVFP4 experts with 16-bit activations) takes both too: the side streams
-    // at the least priority and the shared expert forked at the layer's input, where its call encodes no activations
-    // (candidates IN-06; BF16 KV, three rotated reps, the same rounds and tokens): conv 129.04 -> 129.99 tok/s
-    // (+0.7 %), the struct fixture 431.21 -> 437.04 (+1.4 %), after a 16K prompt 227.65 -> 230.18 (+1.1 %), every rep
-    // ahead; the least priority alone -0.2 / +0.6 / +0.4 %, the early fork alone +0.8 / +0.6 / +0.4 % (2026-11-04).
-    // Same bits. The other configurations keep the greatest priority and the late fork (unmeasured).
-    if (const auto& text = instance->model->config().text;
-        options.fast_paths && !options.a8_activations && text.moe.a16_experts &&
-        text.expert_format == QType::NVFP4_MUL && text.dense_format == QType::FP8_E4M3FN_G32_E8M0) {
-        program_options.side_streams_least_priority = true;
+    // Every default route forks the shared expert at the layer's input (after the routed experts' early encoding,
+    // where the call has one), and the routes with NVFP4 W4A16 experts (FP4-Local, Huihui, recipe C) also put the side
+    // streams at the least priority. Same bits; BF16 KV, the same rounds and tokens in every arm, every rep or pair
+    // ahead. FP4-Local (candidates IN-06, three rotated reps, 2026-11-04): both, conv 129.04 -> 129.99 tok/s (+0.7 %),
+    // the struct fixture 431.21 -> 437.04 (+1.4 %), after a 16K prompt 227.65 -> 230.18 (+1.1 %); the least priority
+    // alone -0.2 / +0.6 / +0.4 %, the early fork alone +0.8 / +0.6 / +0.4 %. The others (candidates XB-03, 2026-11-05):
+    // recipe C both conv 137.03 -> 138.46 (+1.0 %), struct 420.30 -> 423.37 (+0.7 %), the fork alone +0.4 / -0.1 %;
+    // Dense8 the fork conv 127.40 -> 131.96 (+3.6 %), struct 412.51 -> 416.05 (+0.9 %), the least priority adding
+    // nothing (131.87, 416.33); IQ3_S the fork conv 120.61 -> 121.27, struct 397.85 -> 399.66 (+0.5 % each, four
+    // pairs); recipe A struct 299.62 -> 300.11 (+0.2 %, four pairs); the FP8 import struct 62.76 -> 63.29 (+0.8 %,
+    // four pairs). The greatest priority stays where the least was not measured faster (IQ3_S's default measured the
+    // greatest faster on 2026-10-29).
+    if (const auto& text = instance->model->config().text; options.fast_paths && !options.a8_activations) {
         program_options.shared_expert_early         = true;
+        program_options.side_streams_least_priority = text.moe.a16_experts && text.expert_format == QType::NVFP4_MUL;
     }
 
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);

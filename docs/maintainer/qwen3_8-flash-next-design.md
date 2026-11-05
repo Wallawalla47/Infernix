@@ -12683,8 +12683,18 @@ at the layer's input whether or not the call encodes (`ForwardExperts::shared_ea
 the same rounds and tokens in every arm, against the greatest priority and the late fork: both conv 129.04 -> 129.99
 tok/s (+0.7 %), the struct fixture 431.21 -> 437.04 (+1.4 %), after a 16K prompt 227.65 -> 230.18 (+1.1 %), every rep
 ahead; the least priority alone -0.2 / +0.6 / +0.4 %, the early fork alone +0.8 / +0.6 / +0.4 %. The CLI's text and
-ids were equal across the arms on the reproducible route (DFlash2 greedy and sampled, plain). The other
-configurations keep the greatest priority and the late fork (unmeasured).
+ids were equal across the arms on the reproducible route (DFlash2 greedy and sampled, plain).
+
+The other default routes (2026-11-05, candidates XB-03; decode_arms from each artifact's warm state, the same rounds
+and tokens in every arm, every rep or pair ahead): every default route (no `--a8-activations`) now forks the shared
+expert at the layer's input, and the routes with NVFP4 W4A16 experts (FP4-Local, Huihui, recipe C) also take the
+least priority. Recipe C (three rotated reps): both conv 137.03 -> 138.46 tok/s (+1.0 %), struct 420.30 -> 423.37
+(+0.7 %), the fork alone +0.4 / -0.1 %. Dense8: the fork conv 127.40 -> 131.96 (+3.6 %), struct 412.51 -> 416.05
+(+0.9 %), with the least priority 131.87 / 416.33 (nothing more). ABBA x4, the fork against the late fork: IQ3_S conv
+120.61 -> 121.27, struct 397.85 -> 399.66 (+0.5 % each); recipe A struct 299.62 -> 300.11 (+0.2 %); the FP8 import
+struct 62.76 -> 63.29 (+0.8 %). The greatest priority stays on those routes (IQ3_S's default measured it faster on
+2026-10-29, §19.3.31). Not measured: the reproducible route (the gate leaves it out; neither half changes bits) and
+`--a8-activations` outside the GGUF expert route.
 
 **MTP rounds' commit (measured, not changed).** §19.3.34's early commit (launched behind its gate right after the
 verification's results) stays with DFlash2 rounds without MTP: on MTP rounds it measured level (FP4-Local `--spec
