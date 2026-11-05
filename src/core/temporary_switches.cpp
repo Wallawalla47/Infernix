@@ -28,6 +28,9 @@ constexpr Registration kSwitches[] = {
     // extents and a per-round draft log path. Draft-only.
     {"INFERNIX_TMP_QWEN35_MTP_CALIBRATED", Scope::Qwen3_5, Kind::Flag},
     {"INFERNIX_TMP_QWEN35_MTP_DRAFT_LOG", Scope::Qwen3_5, Kind::Value},
+    // TEMPORARY: =<file> appends every instantiated CUDA graph's top-level edges and their dependency types
+    // (core/decode_graph.cpp, dump_graph_edges; the PDL edge census, candidates §57). Diagnostic only.
+    {"INFERNIX_TMP_GRAPH_EDGES", Scope::All, Kind::Value},
     // The scheduler's decode share (runtime/engine/engine_core.h, decode_share_from_environment): a
     // prefill unit's share of decode batches and the remaining tokens below which it stops. Same bits.
     {"INFERNIX_TMP_DECODE_SHARE", Scope::All, Kind::Value},
