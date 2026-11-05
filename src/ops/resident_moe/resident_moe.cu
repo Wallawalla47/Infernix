@@ -6,6 +6,7 @@
 #include "infernix/ops/resident_moe.h"
 
 #include "core/device.h"
+#include "ops/common/bytes.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -82,14 +83,13 @@ struct Q2 {
 struct Q8 {
     static constexpr int kCodes = 16, kGroup = 32, kQuads = kCodes / 4, kChunksPerRow = 2;
     __device__ static float chunk_dot(uint4 w, const float4* x, int c) {
-        const auto* codes = reinterpret_cast<const std::int8_t*>(&w);
-        float dot         = 0.0F;
+        float dot = 0.0F;
 #pragma unroll
         for (int q = 0; q < kQuads; ++q) {
             const float4 v    = x[(q + c / kChunksPerRow) % kQuads];
             const float xs[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
-            for (int j = 0; j < 4; ++j) { dot = fmaf(static_cast<float>(codes[4 * q + j]), xs[j], dot); }
+            for (int j = 0; j < 4; ++j) { dot = fmaf(static_cast<float>(signed_byte_of(w, 4 * q + j)), xs[j], dot); }
         }
         return dot;
     }

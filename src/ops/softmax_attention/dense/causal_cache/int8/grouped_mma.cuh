@@ -493,17 +493,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     float vs      = 0.0f;
                     if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }
                     vs                = __shfl_sync(FullMask, vs, grp * 8);
-                    const int2 raw    = load_vec<int2>(&v_i8[key_l * D + d]);
-                    const auto* codes = reinterpret_cast<const std::int8_t*>(&raw);
+                    const int2 raw = load_vec<int2>(&v_i8[key_l * D + d]);
                     int4 values;
-                    values.x = pack_f16x2(static_cast<float>(codes[0]) * vs,
-                                          static_cast<float>(codes[1]) * vs);
-                    values.y = pack_f16x2(static_cast<float>(codes[2]) * vs,
-                                          static_cast<float>(codes[3]) * vs);
-                    values.z = pack_f16x2(static_cast<float>(codes[4]) * vs,
-                                          static_cast<float>(codes[5]) * vs);
-                    values.w = pack_f16x2(static_cast<float>(codes[6]) * vs,
-                                          static_cast<float>(codes[7]) * vs);
+                    values.x = pack_f16x2(static_cast<float>(signed_byte_of(raw, 0)) * vs,
+                                          static_cast<float>(signed_byte_of(raw, 1)) * vs);
+                    values.y = pack_f16x2(static_cast<float>(signed_byte_of(raw, 2)) * vs,
+                                          static_cast<float>(signed_byte_of(raw, 3)) * vs);
+                    values.z = pack_f16x2(static_cast<float>(signed_byte_of(raw, 4)) * vs,
+                                          static_cast<float>(signed_byte_of(raw, 5)) * vs);
+                    values.w = pack_f16x2(static_cast<float>(signed_byte_of(raw, 6)) * vs,
+                                          static_cast<float>(signed_byte_of(raw, 7)) * vs);
                     store_vec(dst, values);
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));

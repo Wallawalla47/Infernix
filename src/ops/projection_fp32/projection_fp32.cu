@@ -2,6 +2,7 @@
 #include "ops/projection_fp32/projection_fp32_route.h"
 #include "ops/projection_fp32/projection_fp32_mma.h"
 #include "ops/projection_fp32/projection_fp32_p12.h"
+#include "ops/common/bytes.cuh"
 #include "ops/common/memory.cuh"
 #include "core/device.h"
 #include "core/pdl.cuh"
@@ -290,9 +291,8 @@ __global__ void projection_q8_kernel(const bf16* __restrict__ x, int k, int padd
             // Read once per call (a full-vocabulary head is 636 MB): it leaves L2 first.
             const uint2 packed = ld_nc_na_evict_first(w + chunk);
             const float scale  = __half2float(srow[chunk / 4]);
-            const auto* wv     = reinterpret_cast<const std::int8_t*>(&packed);
             float wf[8];
-            for (int i = 0; i < 8; ++i) { wf[i] = static_cast<float>(wv[i]) * scale; }
+            for (int i = 0; i < 8; ++i) { wf[i] = static_cast<float>(signed_byte_of(packed, i)) * scale; }
             for (int column = 0; column < kColumns; ++column) {
                 if (column < count) {
                     const uint4 xp = staged[column * chunks + chunk];
@@ -416,9 +416,8 @@ struct TallQ8 {
         return {ld_nc_na_evict_first(p), __half2float(scales[static_cast<std::size_t>(row) * (padded_k / 32) + chunk / 4])};
     }
     __device__ static void decode(const Chunk& c, float (&w)[8]) {
-        const auto* v = reinterpret_cast<const std::int8_t*>(&c.code);
 #pragma unroll
-        for (int i = 0; i < 8; ++i) { w[i] = static_cast<float>(v[i]) * c.scale; }
+        for (int i = 0; i < 8; ++i) { w[i] = static_cast<float>(signed_byte_of(c.code, i)) * c.scale; }
     }
 };
 
