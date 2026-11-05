@@ -511,6 +511,9 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
 //     gather) = 448, and each m read feeds 8 rows instead of 4; m is staged in two planes; partials,
 //     inv and R are read through __ldg. The collapse runs after the token loop, one thread per
 //     (token, feature), from the row sums in shared memory, with K1b's own expressions in its order.
+//     The partials are read as float4s, each thread's eight issued before any is summed (candidates NQ-02's
+//     other half, ninferpro 6eaf01c618): RTX 5090, per call against the scalar loads, q8 -4.4 .. -6.8 %, bf16
+//     -1.2 .. -7.7 %, p12 -2.2 .. -8.2 % at 2-16 columns, the same hashes (2026-11-05).
 // Not adopted: v4's deferred RMS scale (Strata multiplies unscaled partials by inv in up, another
 // rounding) and its collapse (it rounds each sigmoid(u) Rn product before the stream sum, where
 // K1b's chain may fuse each product into the sum).
@@ -811,22 +814,46 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
     }
 
     // 2. z = sum_s partial[s] in order s = 0..S-1; m = SiLU(z / S) into plane (k / 4) % 2 at
-    // 4 (k / 8) + k % 4; CTA 0 writes the injects.
+    // 4 (k / 8) + k % 4; CTA 0 writes the injects. A stream's partials are down_rows * columns contiguous floats (a
+    // multiple of 4, which launch() checks), read as float4s, every load of a batch issued before any is used
+    // (candidates NQ-02, ninferpro 6eaf01c618).
     const float inv_streams = 1.0F / static_cast<float>(kStreams);
     const int half          = rank / 2;
-#pragma unroll 4
-    for (int i = tid; i < down_rows * columns; i += kUpV4Threads) {
-        const int k = i / columns, t = i - k * columns;
-        float z     = 0.0F;
+    const int quads         = down_rows * columns / 4;
+    const auto* partial4    = reinterpret_cast<const float4*>(partial);
+    constexpr int kZBatch   = 2;
+#pragma unroll 1
+    for (int j0 = tid; j0 < quads; j0 += kZBatch * kUpV4Threads) {
+        float4 p[kZBatch][kStreams];
 #pragma unroll
-        for (int s = 0; s < kStreams; ++s) {
-            z += __ldg(partial + (static_cast<std::int64_t>(s) * down_rows + k) * columns + t);
+        for (int b = 0; b < kZBatch; ++b) {
+            const int j = j0 + b * kUpV4Threads;
+#pragma unroll
+            for (int s = 0; s < kStreams; ++s) {
+                p[b][s] = j < quads ? __ldg(partial4 + static_cast<std::int64_t>(s) * quads + j)
+                                    : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+            }
         }
-        const float v = z * inv_streams;
-        if (k < rank) {
-            m[t * rank + ((k >> 2) & 1) * half + (k >> 3) * 4 + (k & 3)] = v * sigmoidf(v);
-        } else if (inject != nullptr && blockIdx.x == 0) {
-            inject[static_cast<std::int64_t>(t) * kStreams + (k - rank)] = 2.0F * sigmoidf(v);
+#pragma unroll
+        for (int b = 0; b < kZBatch; ++b) {
+            const int j = j0 + b * kUpV4Threads;
+            if (j < quads) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int i = 4 * j + e, k = i / columns, t = i - k * columns;
+                    float z     = 0.0F;
+#pragma unroll
+                    for (int s = 0; s < kStreams; ++s) {
+                        z += e == 0 ? p[b][s].x : e == 1 ? p[b][s].y : e == 2 ? p[b][s].z : p[b][s].w;
+                    }
+                    const float v = z * inv_streams;
+                    if (k < rank) {
+                        m[t * rank + ((k >> 2) & 1) * half + (k >> 3) * 4 + (k & 3)] = v * sigmoidf(v);
+                    } else if (inject != nullptr && blockIdx.x == 0) {
+                        inject[static_cast<std::int64_t>(t) * kStreams + (k - rank)] = 2.0F * sigmoidf(v);
+                    }
+                }
+            }
         }
     }
     for (int i = tid; i < kStreams * columns; i += kUpV4Threads) { inv[i] = __ldg(inv_in + i); }
@@ -1017,8 +1044,10 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
     const std::size_t rn_bytes =
         static_cast<std::size_t>(std::min(columns, kPassColumns)) * kHidden * sizeof(float);
     // Two or more columns take v4's read scheduling (above); the v4 K1a reads the norm weights as
-    // 16-byte vectors.
-    const bool v4 = columns >= 2 && v4_norm(norm_weight);
+    // 16-byte vectors, the v4 up collapse its partials as float4s (each stream's down_rows * columns floats from a
+    // 16-byte boundary).
+    const bool v4 = columns >= 2 && v4_norm(norm_weight) && down_rows * columns % 4 == 0 &&
+                    reinterpret_cast<std::uintptr_t>(partials) % 16 == 0;
     if (v4) {
         launch_down_v4<Codec, Norm>(residual, norm_weight, down, down_rows, streams, eps, partial, inv, rn_bytes,
                                     stream);
