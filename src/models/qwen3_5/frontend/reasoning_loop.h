@@ -8,7 +8,11 @@
 // That is Strata's measure (its #728 recovery), which also fixes the thresholds below; the
 // literature's looping criterion (a 30-gram repeated 20 times) only fires far later.
 // A loop can also be written as a single long word, which no word measure can see: Strata's #1753
-// reads a periodic tail as full coverage, and periodic_tail below does the same.
+// reads a periodic tail as full coverage, and periodic_tail below does the same. A third failure
+// repeats nothing at all: thinking that degenerates into one run-on of hyphen-joined words, every
+// word new and no sentence ending (Strata #5218, Qwen3.8-Flash-Next on long agent requests: the
+// longest chain 0-56 characters in normal thinking against 203-1,569 in degenerate runs);
+// longest_hyphen_chain below measures it.
 
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +31,7 @@ inline constexpr std::size_t kLoopHistoryWords    = 30000; // how far back passa
 inline constexpr double kLoopCoverage             = 0.25;  // coverage at which the guard fires
 inline constexpr std::size_t kLoopTailChars       = 2048;  // reasoning characters read at the end
 inline constexpr std::size_t kLoopTailPeriod      = 64;    // a period at most this long repeats
+inline constexpr std::size_t kLoopRunOnChars      = 200;   // a hyphen chain this long is a run-on
 
 // Appends the words of UTF-8 `bytes` to `words` as 64-bit hashes. A word is a run of letters, digits
 // and '_' (ASCII letters lower-cased); every other non-space character is a word of its own, so an
@@ -48,5 +53,12 @@ void append_tail(std::string_view bytes, std::string& tail);
 // characters repeated (Strata's #1753). The comparison is byte-exact where Strata folds case, which no loop
 // this catches depends on. False while fewer than kLoopTailChars characters have been emitted.
 [[nodiscard]] bool periodic_tail(std::string_view text);
+
+// The length in bytes of the longest chain of ASCII letter runs joined by single hyphens in `text`
+// (Strata's `[A-Za-z]+(?:-[A-Za-z]+)+`: at least one hyphen; a digit, '_', a space, any other byte or a
+// second hyphen in a row ends the chain), 0 when there is none. Letters only, so identifiers, UUIDs and
+// base64 strings, whose digits break chains, are not run-ons. The guard reads it over the reasoning's
+// tail (append_tail: at least 4 x kLoopTailChars bytes, every byte since the previous check).
+[[nodiscard]] std::size_t longest_hyphen_chain(std::string_view text);
 
 } // namespace infernix::models::qwen3_5

@@ -199,6 +199,7 @@ struct SemanticThinkingState {
     bool loop_detected                 = false;
     std::uint32_t loop_thinking_tokens = 0;
     float loop_coverage                = 0.0F;
+    std::uint32_t loop_run_on_chars    = 0;
 };
 
 struct StopMatch {
@@ -794,13 +795,16 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     if (semantic.loop != ReasoningLoopAction::Off && semantic.in_reasoning && !semantic.applied &&
         !semantic.loop_detected && semantic.model_thinking_tokens >= semantic.loop_next_check) {
         semantic.loop_next_check = (semantic.model_thinking_tokens / kLoopCheckTokens + 1) * kLoopCheckTokens;
-        // Strata reads a periodic tail as full coverage before its word measure.
+        // Strata reads a periodic tail as full coverage before its word measure; thinking that repeats
+        // nothing can still be a hyphen-joined run-on (Strata #5218).
         const double coverage =
             periodic_tail(semantic.loop_tail) ? 1.0 : impl_->loop_coverage(semantic.loop_round);
-        if (coverage >= kLoopCoverage) {
+        const std::size_t run_on = coverage >= kLoopCoverage ? 0 : longest_hyphen_chain(semantic.loop_tail);
+        if (coverage >= kLoopCoverage || run_on >= kLoopRunOnChars) {
             semantic.loop_detected        = true;
             semantic.loop_thinking_tokens = semantic.model_thinking_tokens;
             semantic.loop_coverage        = static_cast<float>(coverage);
+            semantic.loop_run_on_chars    = run_on >= kLoopRunOnChars ? static_cast<std::uint32_t>(run_on) : 0U;
             const std::uint64_t control =
                 impl_->thinking_control_tokens ? impl_->thinking_control_tokens->size() : 0U;
             const std::uint64_t remaining = total_budget_remaining - count;
@@ -1035,6 +1039,7 @@ ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
         .loop_detected         = impl_->semantic.loop_detected,
         .loop_thinking_tokens  = impl_->semantic.loop_thinking_tokens,
         .loop_coverage         = impl_->semantic.loop_coverage,
+        .loop_run_on_chars     = impl_->semantic.loop_run_on_chars,
     };
 }
 

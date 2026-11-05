@@ -1815,10 +1815,13 @@ struct ThinkingBudgetStats {
     std::uint32_t injected_tokens = 0;
     bool applied                  = false;
     // The reasoning-loop guard fired: after this many model-origin thinking tokens, at this
-    // repeated-passage coverage (ThinkingControlOptions::loop decided the action).
+    // repeated-passage coverage (ThinkingControlOptions::loop decided the action). loop_run_on_chars is
+    // the hyphen-joined run-on that fired it, in characters, or 0 when repeated passages or a periodic
+    // tail did.
     bool loop_detected               = false;
     std::uint32_t loop_thinking_tokens = 0;
     float loop_coverage              = 0.0F;
+    std::uint32_t loop_run_on_chars  = 0;
 };
 
 enum class ConstraintCacheAccess : std::uint8_t { Hit, Built, Waited };

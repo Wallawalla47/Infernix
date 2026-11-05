@@ -207,4 +207,27 @@ bool periodic_tail(std::string_view text) {
     return false;
 }
 
+std::size_t longest_hyphen_chain(std::string_view text) {
+    const auto letter = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+    std::size_t best = 0;
+    std::size_t at   = 0;
+    while (at < text.size()) {
+        if (!letter(text[at])) {
+            ++at;
+            continue;
+        }
+        // A chain from here: letters, then any number of "-letters" groups.
+        const std::size_t begin = at;
+        while (at < text.size() && letter(text[at])) { ++at; }
+        bool joined = false;
+        while (at + 1 < text.size() && text[at] == '-' && letter(text[at + 1])) {
+            ++at;
+            while (at < text.size() && letter(text[at])) { ++at; }
+            joined = true;
+        }
+        if (joined) { best = std::max(best, at - begin); }
+    }
+    return best;
+}
+
 } // namespace infernix::models::qwen3_5

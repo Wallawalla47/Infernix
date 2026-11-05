@@ -731,15 +731,21 @@ penalties do not catch because every pass varies a little.
   split into words (letters, digits and non-ASCII bytes; ASCII case folded) and punctuation marks.
   The guard fires when at least 25 % of the last 2,000 words lie inside a 12-word passage that
   occurs at least three times in the last 30,000 words. A passage repeated twice (a recap) does not
-  count. The thresholds are those of Strata's measured `reasoning_loop_recovery`.
+  count. The thresholds are those of Strata's measured `reasoning_loop_recovery`. It also fires when
+  the last 2,048 characters repeat one period of at most 64 characters, and when the thinking's tail
+  holds a run-on of hyphen-joined words (ASCII letters joined by single hyphens) of 200 characters or
+  more: thinking that degenerates into one `a-b-c-...` chain repeats nothing (Strata's measurement on
+  Qwen3.8-Flash-Next: the longest chain 0-56 characters in normal thinking, 203-1,569 in degenerate
+  runs).
 - **`stop`** ends the reply there with `finish_reason` `length` (Anthropic `max_tokens`).
 - **`conclude`** commits the same control span a reached thinking budget does (Qwen's early-close
   guidance, or `--thinking-budget-message`, plus `</think>`), so the model answers from the thinking
   it has; no prompt is read again. When the remaining output budget cannot hold the span and one
   more token, it stops instead.
 - The console line and the request log (`reasoning_loop_detected`, `reasoning_loop_thinking_tokens`,
-  `reasoning_loop_coverage`) record each firing. It can mistake a long, deliberately repeated
-  checklist for a loop; keep it off where the thinking legitimately repeats whole passages.
+  `reasoning_loop_coverage`, and `reasoning_loop_run_on_chars`, the chain's length when a run-on fired
+  it, else 0) record each firing. It can mistake a long, deliberately repeated checklist for a loop;
+  keep it off where the thinking legitimately repeats whole passages.
 
 `--end-in-thinking refuse|allow` (default `refuse`): while a reply's thinking is open, the model's end-of-turn
 tokens (`generation_config.json`'s first two stop tokens) get no probability, greedy and sampled, in decode and in

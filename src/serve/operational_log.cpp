@@ -317,9 +317,14 @@ OperationalRecord render_request_done(const RequestLogContext& context,
     }
     if (outcome.thinking.loop_detected) {
         out << " | reasoning loop after "
-            << product::format_pretty_count(outcome.thinking.loop_thinking_tokens) << " thinking tokens ("
-            << static_cast<int>(outcome.thinking.loop_coverage * 100.0F + 0.5F) << "% repeated), "
-            << (outcome.thinking.applied ? "concluded" : "stopped");
+            << product::format_pretty_count(outcome.thinking.loop_thinking_tokens) << " thinking tokens (";
+        if (outcome.thinking.loop_run_on_chars != 0) {
+            out << "a " << product::format_pretty_count(outcome.thinking.loop_run_on_chars)
+                << "-character hyphen run-on";
+        } else {
+            out << static_cast<int>(outcome.thinking.loop_coverage * 100.0F + 0.5F) << "% repeated";
+        }
+        out << "), " << (outcome.thinking.applied ? "concluded" : "stopped");
     }
     if (outcome.timings.vision_offload_window_seconds > 0.0) {
         out << " vision_offload_ms=" << outcome.timings.vision_offload_window_seconds * 1000.0

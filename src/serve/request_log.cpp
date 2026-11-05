@@ -729,6 +729,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"reasoning_loop_detected", outcome.thinking.loop_detected},
              {"reasoning_loop_thinking_tokens", outcome.thinking.loop_thinking_tokens},
              {"reasoning_loop_coverage", outcome.thinking.loop_coverage},
+             {"reasoning_loop_run_on_chars", outcome.thinking.loop_run_on_chars},
              {"tool_call_count", outcome.tool_calls.size()},
              {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)}};
     record["timings_seconds"] = Json{

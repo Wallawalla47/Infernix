@@ -3085,8 +3085,27 @@ int test_reasoning_loop_guard(const Frontend& frontend) {
         const auto stats    = session.thinking_stats();
         failures += check(decision.finish_reason == infernix::FinishReason::OutputLimit && stats.loop_detected &&
                               stats.loop_coverage >= 0.25F && stats.loop_thinking_tokens >= 512 &&
-                              !stats.applied,
+                              !stats.applied && stats.loop_run_on_chars == 0,
                           "Stop did not end a looping reasoning at a check");
+    }
+    {
+        // Thinking that repeats nothing but degenerates into one hyphen-joined run-on (Strata #5218).
+        static const char* parts[] = {"so",   "then", "we",    "need", "to",    "check", "maybe", "again",
+                                      "the",  "list", "value", "is",   "fine",  "but",   "wait",  "hmm",
+                                      "okay", "and",  "next",  "edge", "case",  "right", "now",   "sure"};
+        std::string run_on = varied + " ";
+        unsigned rs        = 3;
+        for (int i = 0; i < 900; ++i) {
+            rs = rs * 1103515245U + 12345U;
+            run_on += (i == 0 ? "" : "-") + std::string(parts[(rs >> 8) % 24]);
+        }
+        auto session = frontend.make_output_session(thinking_prompt(frontend), {}, {},
+                                                    infernix::ThinkingControlOptions{.loop = infernix::ReasoningLoopAction::Stop});
+        const auto decision = run(session, fixture_tokenizer().encode(run_on), 1'000'000);
+        const auto stats    = session.thinking_stats();
+        failures += check(decision.finish_reason == infernix::FinishReason::OutputLimit && stats.loop_detected &&
+                              stats.loop_run_on_chars >= 200 && stats.loop_coverage < 0.25F && !stats.applied,
+                          "Stop did not end a hyphen run-on");
     }
     {
         auto session = frontend.make_output_session(
