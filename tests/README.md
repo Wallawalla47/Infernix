@@ -332,6 +332,23 @@ reproducible route the ids must be equal; on both routes no graph may be capture
 prints each Engine's construction time and free VRAM. It reads `INFERNIX_QWEN4_ARTIFACT`, `INFERNIX_QWEN4_NGRAM`,
 `INFERNIX_QWEN4_DFLASH2` (dflash2 skips without it) and `INFERNIX_QWEN4_KV`.
 
+The entries above compare requests inside one Engine. `tools/reproducible_digest.py` compares two processes: it
+starts `infernix-serve --reproducible` twice with launch arguments of your choice (`--a`, `--b`: fewer expert frames
+through `--vram-headroom-mib`, another `--ram-free-mib`, `--max-concurrency`), sends process B other requests first
+(`--b-warmup`) and, with `--b-concurrent`, the compared requests at once, and compares the SHA-256 digests of each
+compared request's committed token ids from the request log. Each process starts from its own copy of
+`--expert-state` (or `off`; `--b-cold`: B without it), and the ports default to 18431-18432. It exits 1 when a
+digest differs. The route resumes from the prefix cache only on the prefill chunk grid, so a request meant to resume
+in B needs a shared prefix longer than the chunk, and both processes the same `--prefill-chunk` (a narrower
+launch-fitted chunk is the route's documented launch-dependent case). `tests/test_reproducible_digest.py` covers its
+log reading.
+
+```bash
+python3.11 -I tools/reproducible_digest.py --serve build/apps/infernix-serve --model out/model.infernix \
+  --requests requests.json --b-warmup warmup.json --b "--vram-headroom-mib 3072 --max-concurrency 2" \
+  --b-concurrent --out /tmp/digest
+```
+
 `infernix_qwen3_5_calibrated_order_test` (host only) checks the Qwen3.5-122B-A10B's calibrated expert order: the
 shape guard (a table serves only its exact geometry), the conversion to the warm start's state, the built-in table
 (empty until generated, else 48 x 256 permutations), and that a usable saved state wins over the order while a
