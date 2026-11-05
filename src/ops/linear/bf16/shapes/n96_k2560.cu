@@ -37,9 +37,14 @@ Bf16Launch ninfer_route(std::int32_t tokens) {
 // fastest measured route per interval (bench/ops/bf16_flash_next_sweep.cu, RTX 5090, 2 % tolerance,
 // seams at the last measured T).
 Bf16Launch select_bf16_n96_k2560(std::int32_t tokens) {
+    // Decode and verification calls run NInfer's routes as programmatic dependents of the GDN input projection
+    // before them (its CTAs launch during that projection's tail, and the kernel after it launches once its rows
+    // are summed): the serialized launch broke the round's PDL chain twice a GDN layer. FP4-Local, with the one-trip
+    // combine-inject, ABBA x4: conv 128.74 -> 129.12 tok/s, struct 435.43 -> 437.13 (candidates TM-08, 2026-11-05).
     // NInfer's T = 1 route accumulates a column like its T = 8 route (checked bit for bit): 3.20 us vs 4.74.
-    if (tokens == 1) return ninfer_route(1);
-    if (tokens <= 8) return ninfer_route(8); // decode 33.0 us vs skinny 50.9 us over T = 1..8
+    if (tokens == 1) return launch_bf16_gemv<S0, pdl::Dependency::Programmatic>;
+    // Decode 33.0 us vs skinny 50.9 us over T = 1..8 (ninfer_route(8) and ninfer_route(16) are both S2).
+    if (tokens <= 16) return launch_bf16_simt<S2, pdl::Dependency::Programmatic>;
     if (tokens <= 384) return ninfer_route(tokens);
     if (tokens <= 512) return launch_bf16_sliced_k_mma<Bf16A16SlicedR32T16W4>; // sliced_r32t16w4
     if (tokens <= 768) return launch_bf16_mma<Bf16A16MmaR32T32K256S3>; // mma_r32t32k256s3

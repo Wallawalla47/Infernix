@@ -13,7 +13,7 @@ namespace infernix::ops::detail {
 
 template <class Schedule, class Output, class Epilogue>
 void launch_bf16_a16_gemv(const Bf16A16Operands& p, Output output, Epilogue epilogue,
-                          cudaStream_t stream) {
+                          cudaStream_t stream, pdl::Dependency dependency = pdl::Dependency::Serialized) {
     validate_bf16_operands<Schedule>(p);
     if (p.tokens != 1 || p.rows % Schedule::kBlockRows ||
         p.k % (bf16_predicated_k<Schedule>
@@ -37,14 +37,15 @@ void launch_bf16_a16_gemv(const Bf16A16Operands& p, Output output, Epilogue epil
             CUDA_CHECK(status);
         }
     }
-    kernel<<<p.rows / Schedule::kBlockRows, Schedule::kThreads, bytes, stream>>>(
-        p.x, p.weight, output, epilogue, p.k);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_with(dependency,
+                                {dim3(p.rows / Schedule::kBlockRows), dim3(Schedule::kThreads),
+                                 static_cast<std::size_t>(bytes), stream},
+                                kernel, p.x, p.weight, output, epilogue, p.k));
 }
 
 template <class Schedule, class Output, class Epilogue>
 void launch_bf16_a16_simt(const Bf16A16Operands& p, Output output, Epilogue epilogue,
-                          cudaStream_t stream) {
+                          cudaStream_t stream, pdl::Dependency dependency = pdl::Dependency::Serialized) {
     validate_bf16_operands<Schedule>(p);
     if (p.rows % Schedule::kBlockRows ||
         p.k % (bf16_predicated_k<Schedule>
@@ -59,9 +60,9 @@ void launch_bf16_a16_simt(const Bf16A16Operands& p, Output output, Epilogue epil
     }
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
-        bf16_a16_simt_kernel<Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
-            p.x, p.weight, output, epilogue, p.k, p.tokens, offset);
-        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(pdl::launch_with(dependency, {grid, dim3(Schedule::kThreads), 0, stream},
+                                    bf16_a16_simt_kernel<Schedule, Output, Epilogue>, p.x, p.weight, output,
+                                    epilogue, p.k, p.tokens, offset));
     });
 }
 

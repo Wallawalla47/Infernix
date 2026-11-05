@@ -423,7 +423,8 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
                  cudaStream_t stream);
 /// moe_combine followed by hyper_connection_inject(y, inject, residual) without materializing y:
 /// residual[s*H+d, t] = bf16(residual[s*H+d, t] + inject[s, t] * y[d, t]), y the BF16 combine of
-/// column t, with the same bits as the two calls. inject: FP32 [S, T]; residual: BF16 [S*H, T].
+/// column t, with the same bits as the two calls. inject: FP32 [S, T]; residual: BF16 [S*H, T]; at most
+/// 4 streams and top-16 routing (the kernel holds a column's loads in registers).
 void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared,
                         const Tensor& inject, Tensor& residual, cudaStream_t stream);
 

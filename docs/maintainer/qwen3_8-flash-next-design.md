@@ -12696,6 +12696,17 @@ struct 62.76 -> 63.29 (+0.8 %). The greatest priority stays on those routes (IQ3
 2026-10-29, §19.3.31). Not measured: the reproducible route (the gate leaves it out; neither half changes bits) and
 `--a8-activations` outside the GGUF expert route.
 
+**Two decode launches (2026-11-05, candidates TM-08; same bits).** The combine-inject kernel issues a column's loads
+(the experts' outputs and weights, the shared expert, the injects and the residual streams) before any sum uses them
+(ninferpro `4dd57a0d9a`; at most 4 streams and top-16), and the GDN control projection's decode and verification
+routes (`[96, 2560]`, T <= 16) are programmatic dependents of the input projection before them: their serialized
+launch broke the round's PDL chain twice a GDN layer. FP4-Local, BF16 KV, three rotated reps against both off: the
+combine alone conv / struct / after 16K +0.1 / +0.3 / +0.1 % (struct every rep ahead), the PDL alone +0.2 / +0.1 /
++0.1 % (8 of 9 rep pairs ahead, inside the spread); both, ABBA x4, conv 128.74 -> 129.12 tok/s (+0.3 %), struct
+435.43 -> 437.13 (+0.4 %), every pair ahead. ninferpro's composed input GEMVs (one launch for the projection and its
+BF16 neighbour) were not built: FP4-Local's attention input is already one MXFP8 launch, and the PDL form takes the
+GDN pair's launch gap.
+
 **MTP rounds' commit (measured, not changed).** §19.3.34's early commit (launched behind its gate right after the
 verification's results) stays with DFlash2 rounds without MTP: on MTP rounds it measured level (FP4-Local `--spec
 mtp`, the struct fixture, 351.78 -> 351.90 tok/s, three rotated reps inside their spread; the same text and ids on
