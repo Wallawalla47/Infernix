@@ -3666,7 +3666,8 @@ public:
     static constexpr int kAssistMaxColumns = 255;
 
     // FP4-Local (an NVFP4 bank, W4A16 on the exact CPU arithmetic or W4A4: wide_assist) CPU-assists prompt calls up to
-    // kWideAssistMaxColumns. Its gated calls narrower than split_keep_columns plan the CPU split at
+    // kWideAssistMaxColumns (past it, assisted to 767 against gated on the 16-bit route, three rotated pairs each, every
+    // one behind, 2026-11-05: pp640 -6.7 %, pp704 -8.8 %, pp767 -10.9 %). Its gated calls narrower than split_keep_columns plan the CPU split at
     // kSplitKeepRateShare of the team's rates (about "every narrow miss to the CPU") and keep the assisted calls'
     // link share of those experts, staged inside the call (ForwardExperts::split_keep_columns); wider ones plan at
     // split_rate_share and keep the wide share below split_wide_keep_below, else give the split's experts all to the

@@ -12570,6 +12570,12 @@ against the gated stream from 257 (its split at 10 times the rates, nothing kept
 | 512 | 637.4 | 585.0 | 780.9 | 645.1 |
 | 575 | 649.9 | 624.2 | 798.3 | 684.8 |
 
+Past 575 the gated stream wins on the 16-bit route (2026-11-05, the same rig, `--max-ctx 8704`, assisted to 767
+against the built boundary, three rotated pairs a point, every one behind): pp640 606.9 / 650.3 (-6.7 %), pp704 586.9
+/ 643.4 (-8.8 %), pp767 582.5 / 653.7 (-10.9 %). The FP8 import's block-FP8 bank (8-bit records, about 1.8 times
+NVFP4's bytes a weight, partly on the SSD tier) keeps winning assisted to 4,096 (below); what makes the two differ was
+not measured.
+
 The 16-bit route's gated calls, the split planned at 0.3-10 times the rates with nothing kept, and planned at 10 times
 with the assisted share kept (the leak's form):
 
