@@ -16,7 +16,10 @@
 #include <psapi.h>
 #else
 #include <sys/mman.h>
+#include <sys/resource.h>
 
+#include <cerrno>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -262,6 +265,43 @@ std::string lock_resident(std::byte* at, std::size_t bytes, std::size_t& raised)
 }
 
 } // namespace
+#else
+namespace {
+
+// A service started without LimitMEMLOCK, or a login shell's default, may lock as little as 8 MiB while its hard limit
+// allows more: the soft limit is raised to the hard one once (no privilege needed) before the first lock (candidates
+// WA-02, Strata 5a13c34f).
+void raise_memlock_soft_limit() noexcept {
+    static const bool raised = [] {
+        rlimit limit{};
+        if (::getrlimit(RLIMIT_MEMLOCK, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY &&
+            (limit.rlim_max == RLIM_INFINITY || limit.rlim_cur < limit.rlim_max)) {
+            limit.rlim_cur = limit.rlim_max;
+            (void)::setrlimit(RLIMIT_MEMLOCK, &limit);
+        }
+        return true;
+    }();
+    (void)raised;
+}
+
+// Locks [at, at + bytes); empty, or the reason with the limit and what raises it.
+std::string lock_resident(std::byte* at, std::size_t bytes) {
+    raise_memlock_soft_limit();
+    if (::mlock(at, bytes) == 0) { return {}; }
+    const int error = errno;
+    std::string limit_text = "unknown";
+    if (rlimit limit{}; ::getrlimit(RLIMIT_MEMLOCK, &limit) == 0) {
+        const auto mib = [](rlim_t value) {
+            return value == RLIM_INFINITY ? std::string("unlimited") : std::to_string(value >> 20) + " MiB";
+        };
+        limit_text = mib(limit.rlim_cur) + " (hard " + mib(limit.rlim_max) + ")";
+    }
+    return "mlock of " + std::to_string(bytes >> 20) + " MiB failed: " + std::strerror(error) + ", RLIMIT_MEMLOCK " +
+           limit_text + "; raise the memlock limit (LimitMEMLOCK=infinity in a systemd unit, `ulimit -l unlimited` in "
+                        "the launching shell, or a memlock line in /etc/security/limits.conf)";
+}
+
+} // namespace
 #endif
 
 ResidentHostBuffer::ResidentHostBuffer(std::size_t bytes) : size_(bytes) {
@@ -277,8 +317,8 @@ ResidentHostBuffer::ResidentHostBuffer(std::size_t bytes) : size_(bytes) {
 #else
     void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) { throw std::runtime_error("mmap of " + std::to_string(bytes) + " bytes failed"); }
-    data_ = static_cast<std::byte*>(p);
-    if (::mlock(data_, bytes) != 0) { lock_failure_ = "mlock failed (RLIMIT_MEMLOCK)"; }
+    data_         = static_cast<std::byte*>(p);
+    lock_failure_ = lock_resident(data_, bytes);
 #endif
 }
 
@@ -327,7 +367,7 @@ bool ResidentHostBuffer::recommit(std::size_t offset, std::size_t bytes) {
         if (std::string failure = lock_resident(at, bytes, raised_); !failure.empty()) { lock_failure_ = std::move(failure); }
     }
 #else
-    if (::mlock(at, bytes) != 0) { lock_failure_ = "mlock failed (RLIMIT_MEMLOCK)"; }
+    if (std::string failure = lock_resident(at, bytes); !failure.empty()) { lock_failure_ = std::move(failure); }
 #endif
     return true;
 }

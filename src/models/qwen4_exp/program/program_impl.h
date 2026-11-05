@@ -4011,8 +4011,8 @@ private:
         if (options_.ngram_in_ram) {
             try {
                 if (const std::string why = volume_.resident_lock_failure(); !why.empty()) {
-                    diagnostic("the n-gram table is in RAM but Windows would not lock it there (" + why +
-                                   "); it still serves rows, but under memory pressure Windows may page part of it out "
+                    diagnostic("the n-gram table is in RAM but the OS would not lock it there (" + why +
+                                   "); it still serves rows, but under memory pressure the OS may page part of it out "
                                    "and long prompts slow down",
                                DiagnosticLevel::Warning);
                 }
