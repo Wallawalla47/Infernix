@@ -3697,16 +3697,20 @@ public:
     [[nodiscard]] bool a4_bank() const {
         return parameters_.layers.front().moe.bank->activation == ops::offloaded_moe::ExpertActivation::kA4;
     }
-    // The GGUF (IQ3_S) and block-FP8 banks also assist prompt calls to kWideAssistMaxColumns, their link shares as
-    // they were (candidates XB-02; -p N -n 1 from the artifact's warm state, two or three rotated pairs a point,
-    // 2026-11-04; assisted to 575 against streamed from 256): IQ3_S pp256 +18.8 %, pp320 +23.2 %, pp384 +11.2 % and
-    // pp512 +8.2 % (five pairs each, one slower: the CPU team's bimodal state), pp448 +16.8 %, pp575 +7.8 %, pp768
-    // -0.3 %; the FP8 import pp256 +27.7 %, pp320 +27.1 %, pp384 +21.8 %, pp448 +20.1 %, pp512 +23.6 %, pp575 +11.4 %,
-    // pp640 / 768 / 1024 -0.9 / 0.0 / -0.6 % (five pairs at 768; its SSD tier swings runs by about 5 %). The NVFP4
-    // banks off FP4-Local's routes keep kAssistMaxColumns (unmeasured).
+    // The GGUF (IQ3_S) banks assist prompt calls to kWideAssistMaxColumns and the block-FP8 ones every call the CPU
+    // path takes (kMaxCpuCallColumns, 4,096), their link shares as they were (candidates XB-02; -p N -n 1 from the
+    // artifact's warm state, rotated pairs). Assisted against streamed from 256 (2026-11-04): IQ3_S pp256 +18.8 %,
+    // pp320 +23.2 %, pp384 +11.2 % and pp512 +8.2 % (five pairs each, one slower: the CPU team's bimodal state), pp448
+    // +16.8 %, pp575 +7.8 %; the FP8 import pp256 +27.7 %, pp320 +27.1 %, pp384 +21.8 %, pp448 +20.1 %, pp512 +23.6 %,
+    // pp575 +11.4 %. Past 575, assisted against streamed (2026-11-05): IQ3_S pp640 -7.2 % (one assisted run +7.5 %, two
+    // -14 %, the bimodal state), pp704 +1.1 %, pp767 -0.3 %, pp896 +2.6 %, pp1023 +3.7 % (three pairs, mixed: it keeps
+    // 575); the FP8 import pp640 +26.2 %, pp704 +23.2 %, pp767 +22.9 %, pp896 +20.1 %, pp1023 +17.5 %, pp1280 +14.7 %,
+    // pp1536 +12.4 %, pp2048 +11.1 %, pp3072 +11.4 %, pp4096 +12.6 % (two pairs each, every one ahead). The NVFP4 banks
+    // off FP4-Local's routes keep kAssistMaxColumns (unmeasured).
     [[nodiscard]] int assist_max_columns() const {
-        const bool gguf_or_block_fp8 = parameters_.layers.front().moe.bank->planes.gate_up_format != QType::NVFP4_MUL;
-        return wide_assist() || gguf_or_block_fp8 ? kWideAssistMaxColumns : kAssistMaxColumns;
+        const QType format = parameters_.layers.front().moe.bank->planes.gate_up_format;
+        if (format == QType::FP8_E4M3FN_B128) { return ops::offloaded_moe::kMaxCpuCallColumns; }
+        return wide_assist() || format != QType::NVFP4_MUL ? kWideAssistMaxColumns : kAssistMaxColumns;
     }
     [[nodiscard]] std::int32_t stream_min_columns() const { return assist_max_columns() + 1; }
     [[nodiscard]] std::int32_t split_keep_columns() const {

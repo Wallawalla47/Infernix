@@ -12621,18 +12621,25 @@ contending with the DMA's in DRAM (unproven).
   256-575-column call before the prompt's narrow last call (the generation opener's cut) stays assisted; a span's
   first call may be narrower than the boundary (`stream_chunk` with the walk's area), as before.
 
-The GGUF (IQ3_S) and block-FP8 banks assist prompt calls to 575 columns too (2026-11-04, candidates XB-02), their
-link shares as they were (none kept: they have no wide share, so the leak never reached them) and their split at 0.3.
-They had the same cliff: IQ3_S pp255 574.9 against pp256 502.1 tok/s, the FP8 import 99.6 against 83.3. Assisted to
-575 against streamed from 256 (`-p N -n 1` from each artifact's warm state, `--max-ctx 4096`, ABBA): IQ3_S pp256 598.4
-/ 503.6 (+18.8 %), pp320 648.0 / 525.9 (+23.2 %), pp384 680.7 / 611.9 (+11.2 %, five pairs, one assisted run below
-every streamed one), pp448 797.8 / 682.9 (+16.8 %), pp512 861.5 / 796.4 (+8.2 %, five pairs, one below), pp575 939.8
-/ 872.0 (+7.8 %), pp768 894.1 / 896.9 (-0.3 %); the FP8 import (its experts partly on the SSD tier) pp256 104.9 / 82.1
-(+27.7 %), pp320 +27.1 %, pp384 +21.8 %, pp448 +20.1 %, pp512 +23.6 %, pp575 172.3 / 154.7 (+11.4 %), pp640 / 768 /
-1024 -0.9 / 0.0 / -0.6 % (five pairs at 768, which swung -5.2 % and +3.4 % between blocks). The assisted runs on
-IQ3_S are bimodal (the CPU team's slow state, candidates IP-06); the streamed ones were within 1 %. The CPU-served
-and streamed experts give the same bits (reproducible-route ids equal at a 450-token prompt). An NVFP4 W4A16 bank
-on the approximate CPU arithmetic keeps 255 / 256 columns and its 51/256 (unmeasured).
+The GGUF (IQ3_S) banks assist prompt calls to 575 columns too, and the block-FP8 ones every call the CPU path takes
+(`kMaxCpuCallColumns`, 4,096) (2026-11-04 and -05, candidates XB-02), their link shares as they were (none kept: they
+have no wide share, so the leak never reached them) and their split at 0.3. They had the same cliff: IQ3_S pp255
+574.9 against pp256 502.1 tok/s, the FP8 import 99.6 against 83.3. Assisted to 575 against streamed from 256 (`-p N
+-n 1` from each artifact's warm state, `--max-ctx 4096`, ABBA): IQ3_S pp256 598.4 / 503.6 (+18.8 %), pp320 648.0 /
+525.9 (+23.2 %), pp384 680.7 / 611.9 (+11.2 %, five pairs, one assisted run below every streamed one), pp448 797.8 /
+682.9 (+16.8 %), pp512 861.5 / 796.4 (+8.2 %, five pairs, one below), pp575 939.8 / 872.0 (+7.8 %); the FP8 import
+(its experts partly on the SSD tier) pp256 104.9 / 82.1 (+27.7 %), pp320 +27.1 %, pp384 +21.8 %, pp448 +20.1 %, pp512
++23.6 %, pp575 172.3 / 154.7 (+11.4 %). That block's rows past 575 streamed in both arms (controls: IQ3_S pp768
+-0.3 %, the FP8 import pp640 / 768 / 1024 -0.9 / 0.0 / -0.6 %). Past 575, assisted to 1,023 or 4,096 against
+streamed (2026-11-05): IQ3_S pp640 787.1 / 847.8 (-7.2 %: one assisted run 911.3, two 730 and 720, the bimodal state;
+the startup probes alike), pp704 +1.1 %, pp767 -0.3 %, pp896 +2.6 %, pp1023 +3.7 % (three pairs each, mixed: it
+keeps 575); the FP8 import pp640 186.6 / 147.9 (+26.2 %), pp704 +23.2 %, pp767 +22.9 %, pp896 +20.1 %, pp1023 +17.5 %,
+pp1280 276.9 / 241.4 (+14.7 %), pp1536 +12.4 %, pp2048 +11.1 %, pp3072 +11.4 %, pp4096 716.5 / 636.6 (+12.6 %) (two
+pairs each, every one ahead). The assisted runs on IQ3_S are bimodal (the CPU team's slow state, candidates IP-06);
+the streamed ones were within 1 %. The CPU-served and streamed experts give the same bits (reproducible-route ids
+equal at a 450-token prompt on both artifacts, and on the FP8 import at 2,547 tokens with 4,096 against 575, where
+prefill went 451.1 -> 523.7 tok/s). An NVFP4 W4A16 bank on the approximate CPU arithmetic keeps 255 / 256 columns and
+its 51/256 (unmeasured).
 
 **Against main's policy** (two binaries, the rig above; main = the binary before this work, on the 4-bit banks the one
 before their change; the final build before the wide share's return), new against old:
