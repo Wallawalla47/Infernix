@@ -2257,7 +2257,12 @@ struct BatchAttentionCase {
     // Speculative verification-tree ancestor masks, [B][W] row-major (one per column of every
     // row); empty is the causal Op.
     std::vector<std::uint32_t> tree_masks;
+    // One-row causal cases only: > 0 checks the first and last kOracleEdgeColumns valid columns and every
+    // oracle_stride-th one between against the FP64 oracle (with a stride below the 64-query tile, every tile at
+    // several of its row positions), instead of every column; 0 checks every column.
+    std::int32_t oracle_stride = 0;
 };
+constexpr std::int32_t kOracleEdgeColumns = 64;
 
 std::vector<float> extract_request_columns(const std::vector<float>& source,
                                            std::size_t column_elements, std::int32_t width,
@@ -2407,7 +2412,26 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
             return std::vector<int>(positions.begin() + b * width,
                                     positions.begin() + b * width + valid[b]);
         };
+        // test_case.oracle_stride: the columns the oracle and the comparison see (empty: every column).
+        std::vector<int> oracle_columns;
+        if (test_case.oracle_stride > 0) {
+            if (batch != 1 || tree) throw std::invalid_argument("oracle_stride takes one-row causal cases");
+            for (int j = 0; j < valid[0]; ++j)
+                if (j < kOracleEdgeColumns || j >= valid[0] - kOracleEdgeColumns || j % test_case.oracle_stride == 0)
+                    oracle_columns.push_back(j);
+        }
         const auto oracle = [&](int b) {
+            if (!oracle_columns.empty()) {
+                const std::vector<int> all = row_positions(b);
+                const std::vector<double> subset = ideal_attention(
+                    select_query_columns(extract_request_columns(q, q_column_elements, width, b, valid[b]),
+                                         q_column_elements, oracle_columns),
+                    expected[lanes[b]], select_query_columns(all, 1, oracle_columns));
+                for (std::size_t i = 0; i < oracle_columns.size(); ++i)
+                    std::copy_n(subset.begin() + static_cast<std::ptrdiff_t>(i * q_column_elements), q_column_elements,
+                                reference.begin() + static_cast<std::ptrdiff_t>(oracle_columns[i] * q_column_elements));
+                return;
+            }
             insert_request_columns(
                 ideal_attention(extract_request_columns(q, q_column_elements, width, b, valid[b]),
                                 expected[lanes[b]], row_positions(b),
@@ -2470,8 +2494,16 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
                                   (test_case.column_invariant ? " column-invariant" : "") +
                                   (test_case.bf16_prompt_split ? " bf16-prompt-split" : "");
         const auto output = copy_from_guarded<std::uint16_t>(dout, q.size());
-        failures += verify_attention(label, bf16_bits_to_double(output), reference,
-                                     attention_criterion(storage, test_case.fast_prompt_pv8));
+        if (oracle_columns.empty()) {
+            failures += verify_attention(label, bf16_bits_to_double(output), reference,
+                                         attention_criterion(storage, test_case.fast_prompt_pv8));
+        } else {
+            failures += verify_attention(label + " (" + std::to_string(oracle_columns.size()) + " oracle columns)",
+                                         bf16_bits_to_double(select_query_columns(output, q_column_elements,
+                                                                                  oracle_columns)),
+                                         select_query_columns(reference, q_column_elements, oracle_columns),
+                                         attention_criterion(storage, test_case.fast_prompt_pv8));
+        }
         failures += verify_invalid_columns_zero(label, output, geometry, width, valid);
         BatchDeviceCache::Bytes after = cache.snapshot_bytes();
         failures += cache.verify(label, expected, after);
@@ -2846,7 +2878,9 @@ int run_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
                                {16, {0}, {1}, {0}, MappingPattern::Fragmented, 1502u});
     if (storage == KvCacheStorage::BFloat16) {
         // bf16-prompt-split: prompt-route widths over short and long prefixes, a ragged last query
-        // tile and a masked tail, against the oracle on every geometry.
+        // tile and a masked tail, against the oracle on every geometry. The oracle sees the first and last 64
+        // columns and every 29th between (each 64-query tile at two or three row positions): every column of these
+        // 12 cases took ~90 s of the entry's ~200 s (candidates XB-08).
         for (const Geometry& geometry : kGeometries) {
             std::uint32_t split_seed = 4200u;
             for (const auto& [width, context, valid] :
@@ -2854,6 +2888,7 @@ int run_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
                   std::tuple{2048, 17000, 1500}}) {
                 BatchAttentionCase split{width, {context}, {valid}, {0}, MappingPattern::Fragmented, split_seed++};
                 split.bf16_prompt_split = true;
+                split.oracle_stride     = 29;
                 failures += run_batch_case(execution, geometry, storage, split);
             }
         }
