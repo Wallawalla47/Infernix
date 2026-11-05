@@ -6,8 +6,8 @@
 //                one generated, no named token outscores it, and a resumed prompt reads what its cold
 //                run reads (within rounding: their prefill calls differ; with expert-a4-residual or its
 //                narrow form alone, whose expert arithmetic depends on an expert's column count, or
-//                ggml-bf16-prefill, whose arithmetic depends on how the calls are cut and walked, its top
-//                token). With
+//                ggml-bf16-prefill, whose arithmetic depends on how the calls are cut and walked, within
+//                those paths' measured drift, which can reorder near-tied top candidates). With
 //                INFERNIX_DECIDE_DUMP=DIR the prompt ids and readout are written there for the FP64
 //                oracle of the gate, which log-softmaxes the forward test's FP32 logits of the same
 //                prompt rounded to BF16.
@@ -159,7 +159,9 @@ int readout(infernix::Engine& engine, bool dump, std::size_t suffix) {
     // and one of at most eight (GPU narrow kernels and CPU-served misses alike) exactly, so a resumed run,
     // whose prefill calls give its experts other column counts than its cold run's, reads within the
     // path's own error rather than rounding (NVIDIA FP4-Local, 2026-10-21: up to 0.33 nats on this
-    // prompt's flat distribution, bit-identical without the path): there the claim is its top token.
+    // prompt's flat distribution, bit-identical without the path; three terms 0.53 on the uncensored NVFP4 in
+    // ninferpro ce18e3e23a, where that drift reordered the cold run's top two, 0.2 nats apart): there the claim is
+    // the named tokens' and the top's log-probabilities within kWidthDrift, not the same top token (candidates WF-04).
     // expert-a4-residual-decode alone splits the arithmetic the other way. With both, every expert takes
     // the same two terms and the widths differ only in how the products are summed (tensor-core FP32
     // order against exact): the claim is rounding again.
@@ -176,15 +178,23 @@ int readout(infernix::Engine& engine, bool dump, std::size_t suffix) {
     // run's [512,850) is a 338-column call (exact experts, below 512). On the GSQ-RCO IQ3_S import (2026-10-31) that read
     // up to 0.20 nats with the path alone and 0.47 with gdn-f16-accumulate beside it, 0 without it (the exact route,
     // each other registered path alone or all together), the top token the same in every arm. With it the claim is the
-    // top token too.
+    // same bound.
     const bool narrow_terms = has("expert-a4-residual-decode");
     const bool wide_terms   = has("expert-a4-residual") || has("expert-a4-residual-3");
     const bool width_arithmetic = narrow_terms != wide_terms || has("expert-a4-residual-3") || has("ggml-bf16-prefill");
     const bool same_top = a.readout && b.readout && a.readout->top_token == b.readout->top_token;
     if (width_arithmetic) {
-        failures += check(same_top, "readout: resumed reads cold's top token (a width-dependent path: expert-a4-residual "
-                                    "or its narrow form alone, or ggml-bf16-prefill; worst " + std::to_string(worst) +
-                                    " nats)");
+        constexpr double kWidthDrift = 0.75; // the largest drift measured (0.53 nats), with room
+        const double top_gap =
+            a.readout && b.readout
+                ? std::fabs(static_cast<double>(a.readout->top_logprob) - static_cast<double>(b.readout->top_logprob))
+                : kWidthDrift + 1.0;
+        failures += check(worst <= kWidthDrift && top_gap <= kWidthDrift,
+                          "readout: resumed reads cold's named and top log-probabilities within " +
+                              std::to_string(kWidthDrift) + " nats (a width-dependent path: expert-a4-residual or "
+                              "its narrow form alone, or ggml-bf16-prefill; worst " + std::to_string(worst) +
+                              ", top gap " + std::to_string(top_gap) + (same_top ? "" : ", the top token flipped") +
+                              ")");
     } else {
         failures += check(same_top && worst <= 0.05,
                           "readout: resumed equals cold within 0.05 nats (worst " + std::to_string(worst) + ")");

@@ -3,9 +3,15 @@
 // keeps serving, and a later request gives the same greedy ids as before the fault (the prefix cache
 // the failed round may have published into is emptied). Three requests run against two lanes, so
 // one may wait in the queue across the recovery.
+//
+// With INFERNIX_QWEN4_DFLASH2 naming the DFlash2 companion the same recovery runs again under the drafter (7 drafts):
+// the fault lands in a verification round, and the request after the recovery prefills and commits its first token
+// through the plain commit path, which a round width left behind by the abandoned verification round would misroute
+// (candidates QA-16 (b), WF-03; ninferpro f94d72ad6e).
 // Skips (77) unless INFERNIX_QWEN4_ARTIFACT names a Qwen4Exp artifact.
 //
-//   INFERNIX_QWEN4_ARTIFACT=out.ninfer [INFERNIX_QWEN4_NGRAM=out.ninfer.ngram] infernix_qwen4_exp_expert_fault_real_test
+//   INFERNIX_QWEN4_ARTIFACT=out.ninfer [INFERNIX_QWEN4_NGRAM=out.ninfer.ngram]
+//   [INFERNIX_QWEN4_DFLASH2=out.dflash2.ninfer] infernix_qwen4_exp_expert_fault_real_test
 
 #include "runtime/expert_offload/expert_offload.h"
 #include "infernix/engine.h"
@@ -48,22 +54,20 @@ void check(bool ok, const std::string& what) {
     if (!ok) { ++failures; }
 }
 
-} // namespace
-
-int main() {
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
-    const char* artifact = std::getenv("INFERNIX_QWEN4_ARTIFACT");
-    if (artifact == nullptr) {
-        std::printf("SKIP: set INFERNIX_QWEN4_ARTIFACT\n");
-        return 77;
-    }
-    const char* ngram = std::getenv("INFERNIX_QWEN4_NGRAM");
+// One recovery pass: `drafter` names the DFlash2 companion (plain decoding when null).
+int run(const char* artifact, const char* ngram, const char* drafter) {
+    failures = 0;
     try {
         std::mutex diagnostics_mutex;
         std::vector<std::string> diagnostics;
         infernix::EngineOptions options;
         options.artifact_path = artifact;
         if (ngram != nullptr) { options.ngram_volume_path = ngram; }
+        if (drafter != nullptr) {
+            options.speculative.backend      = infernix::SpeculativeBackend::DFlash2;
+            options.speculative.draft_tokens = 7;
+            options.speculative.draft_model  = drafter;
+        }
         options.max_context     = 4096;
         options.max_concurrency = 2;
         options.kv_cache        = infernix::KvCacheStorage::Int8Group64;
@@ -80,7 +84,7 @@ int main() {
         const auto baseline = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;
         check(baseline.size() == kTokens, "the baseline generates its tokens");
 
-        // The fault lands in the first rounds the three requests run.
+        // The fault lands in the first rounds the three requests run (a verification round under the drafter).
         infernix::runtime::expert_offload::testing::set_expert_fault(4);
         std::vector<std::optional<std::vector<infernix::TokenId>>> ids(3);
         std::vector<std::string> errors(3);
@@ -124,6 +128,27 @@ int main() {
         std::printf("%d checks failed\n", failures);
         return 1;
     }
+    return 0;
+}
+
+} // namespace
+
+int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    const char* artifact = std::getenv("INFERNIX_QWEN4_ARTIFACT");
+    if (artifact == nullptr) {
+        std::printf("SKIP: set INFERNIX_QWEN4_ARTIFACT\n");
+        return 77;
+    }
+    const char* ngram   = std::getenv("INFERNIX_QWEN4_NGRAM");
+    const char* drafter = std::getenv("INFERNIX_QWEN4_DFLASH2");
+    std::printf("plain decoding:\n");
+    int status = run(artifact, ngram, nullptr);
+    if (drafter != nullptr) {
+        std::printf("DFlash2 drafting:\n");
+        status += run(artifact, ngram, drafter);
+    }
+    if (status != 0) { return 1; }
     std::printf("expert fault recovery checks passed\n");
     return 0;
 }
