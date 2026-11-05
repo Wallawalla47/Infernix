@@ -58,8 +58,7 @@ void launch_q5_a16_sliced_k_pipelined(const Q5LinearOperands& operands, Output o
         throw std::invalid_argument("Q5 pipelined sliced-K requires full weights");
     }
     launch_sliced_k_pipelined<Q5SlicedKPipelinedFamily<Schedule>>(
-        q5_sliced_k_operands(operands), output, epilogue, stream, row_policy,
-        pdl::Dependency::Serialized, SlicedKRoute::OneWave);
+        q5_sliced_k_operands(operands), output, epilogue, stream, row_policy, SlicedKRoute::OneWave);
 }
 
 template <class Schedule, class Output, class Epilogue,
@@ -78,8 +77,7 @@ void launch_q5_a16_sliced_k_mma(const Q5LinearOperands& operands, Output output,
         const SlicedKRoute route = groupwise_sliced_k_route();
         if (route != SlicedKRoute::Release && full) {
             launch_sliced_k_pipelined<Q5SlicedKPipelinedFamily<Schedule>>(
-                q5_sliced_k_operands(operands), output, epilogue, stream, row_policy,
-                pdl::Dependency::Serialized, route);
+                q5_sliced_k_operands(operands), output, epilogue, stream, row_policy, route);
             return;
         }
     }

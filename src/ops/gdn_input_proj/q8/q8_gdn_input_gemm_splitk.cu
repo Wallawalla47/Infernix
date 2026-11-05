@@ -5,6 +5,7 @@
 #include "ops/gdn_input_proj/q8/q8_gdn_input_kernels.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/gdn_input_proj/gdn_conv.cuh"
@@ -30,6 +31,12 @@ constexpr int kFirstExactCols          = 2;
 constexpr int kLastProjectionExactCols = 32;
 constexpr int kLastSnapshotExactCols   = 16;
 using Output                           = LinearBf16SegmentedOutput<8192, 4096>;
+
+// The exact-column and sliced calls (decode and verification widths) launch as programmatic dependents of the
+// kernel before them: the sliced-K kernel waits before any load and triggers after its K loop. The Qwen3.6-35B-A3B
+// (INT8 KV, 3 rotated reps, RTX 5090): its Q8 projections are 1.4 % of plain decode's +2.7 % and 0.5 % of MTP's
+// +1.1 % from the decode graphs' programmatic launches (candidates §58). Same bits.
+constexpr pdl::Dependency kDependency = pdl::Dependency::Programmatic;
 
 template <class Publish>
 struct Q8GdnSplitKConvEpilogue {
@@ -62,7 +69,7 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tens
     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
     launch_q8_a16_sliced_k_mma<
         typename Schedule::template with_problem<Geometry::kInputRows, ActiveCols, true>>(
-        q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
+        q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream, {}, kDependency);
 }
 
 template <int ActiveCols, class Publish>
@@ -99,7 +106,7 @@ void launch_active_cols_conv(const Tensor& x, const Weight& weight, const Tensor
     };
     launch_q8_a16_sliced_k_mma<
         typename Schedule::template with_problem<Geometry::kInputRows, ActiveCols, true>>(
-        q8_linear_operands(x, weight), ignored_output, epilogue, stream);
+        q8_linear_operands(x, weight), ignored_output, epilogue, stream, {}, kDependency);
 }
 
 template <int ActiveCols>
@@ -137,7 +144,7 @@ void launch_sliced32(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor&
     launch_q8_a16_sliced_k_mma<typename Schedule::template with_problem<
         Geometry::kInputRows, kLastProjectionExactCols, false>>(q8_linear_operands(x, weight),
                                                                output, LinearIdentityEpilogue{},
-                                                               stream);
+                                                               stream, {}, kDependency);
 }
 
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>

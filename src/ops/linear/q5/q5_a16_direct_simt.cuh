@@ -21,6 +21,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_dir
     constexpr int T  = Schedule::kBlockTokens;
     constexpr int P  = Schedule::kPhasesPerWarp;
     constexpr int BK = Schedule::kBlockK;
+    // A programmatic consumer waits before it reads x or writes (a no-op in a serialized launch); a fork's
+    // joining sibling (JoinPdl) computes first and waits at its end (candidates §58).
+    if constexpr (!JoinPdl) pdl::enter_streaming();
     if constexpr (TriggerPdl) {
         if (threadIdx.x == 0) pdl::trigger_dependents();
     }

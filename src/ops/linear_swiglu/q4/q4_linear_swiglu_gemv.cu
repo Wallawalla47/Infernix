@@ -5,6 +5,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "core/pdl.cuh"
 #include "ops/linear/q4/q4_sliced_k_launch.cuh"
 
 #include <cuda_bf16.h>
@@ -127,6 +128,8 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
     __shared__ __align__(16) __nv_bfloat16 x_sh[kK];
     __shared__ uint4 code_tile[kWarpsPerBlock][kStages][2][kVecsPerWarpTile];
     __shared__ uint4 scale_tile[kWarpsPerBlock][kStages][2][2];
+    // x is the norm's output: wait for it (a no-op in a serialized launch; candidates §58).
+    pdl::enter_streaming();
 
     auto* x_sh_v    = reinterpret_cast<uint4*>(x_sh);
     const auto* x_g = reinterpret_cast<const uint4*>(x);
@@ -215,10 +218,12 @@ void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor&
         throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816,5120]");
     }
     const int grid = kIntermediate / kPairsPerBlock;
-    q4_linear_swiglu_gemv_pair_kernel<<<grid, kBlockThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
-    CUDA_CHECK(cudaGetLastError());
+    // A programmatic dependent of the norm: the groupwise 27B's Q4 / Q5 decode and verification projections, INT8 KV,
+    // 3 rotated reps: plain decode +0.46 %, DFlash2 +0.91 % (candidates §58). Same bits.
+    CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(kBlockThreads), 0, stream},
+                                q4_linear_swiglu_gemv_pair_kernel, static_cast<const __nv_bfloat16*>(x.data),
+                                static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
+                                static_cast<__nv_bfloat16*>(out.data)));
 }
 
 void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Tensor& out,

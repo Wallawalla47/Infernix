@@ -39,6 +39,9 @@ __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
                                      const char* __restrict__ shared_down_codes,
                                      unsigned long long shared_down_bytes) {
     __shared__ float partial[kD1Warps];
+    // x is the norm's output (a no-op unless this launch is a programmatic dependent, candidates §58). D2 stays
+    // serialized behind D1: D3 stages x before its own wait.
+    pdl::enter_streaming();
     const int row   = static_cast<int>(blockIdx.x);
     const int warp  = static_cast<int>(threadIdx.x) >> 5;
     const int lane  = static_cast<int>(threadIdx.x) & 31;
@@ -508,13 +511,15 @@ __global__ void sparse_moe_d4_token_kernel(
 
 void launch_d1(const Tensor& x, const SparseMoeWeights& weights,
                const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
-    sparse_moe_d1_kernel<<<kRouterRows, kD1Warps * 32, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data),
+    // A programmatic dependent of the norm (the Qwen3.6-35B-A3B plain decode, INT8 KV: +0.43 % of the decode graphs'
+    // +2.7 %, leave-one-out, candidates §58). D2 stays serialized: D3 stages x before its own wait.
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(kRouterRows), dim3(kD1Warps * 32), 0, stream},
+        sparse_moe_d1_kernel, static_cast<const __nv_bfloat16*>(x.data),
         static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata),
         static_cast<float*>(workspace.scratch.data),
         static_cast<const char*>(weights.shared_down.qdata),
-        static_cast<unsigned long long>(kHidden) * kIntermediate);
-    CUDA_CHECK(cudaGetLastError());
+        static_cast<unsigned long long>(kHidden) * kIntermediate));
 }
 
 template <class Codec>

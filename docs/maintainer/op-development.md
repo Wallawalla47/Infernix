@@ -297,8 +297,19 @@ concurrent requests. Kernels that stream most of their bytes in a main loop use
 `enter_streaming()` and call `pdl::trigger_dependents()` after that loop (or rely on the trigger at
 exit): an entry-time trigger lets later nodes occupy SMs and prefetch weights while the loop is
 still streaming, which measured about 10 % slower on the RTX 5090 DFlash2 round. A streaming kernel
-may stage its first weight tiles into shared memory before the wait. Attention over the KV cache
-stays an ordinary launch; it has no weights to stage and measured no faster as a dependent.
+may stage its first weight tiles into shared memory before the wait. Attention over the KV cache has
+no weights to stage and once measured no faster as a dependent; the grouped decode and verification
+kernels of every KV format are dependents now (they wait at entry): in the Qwen3.5 decode graphs they
+measured +0.24 % on the 35B-A3B's MTP rounds, +0.09 % on the groupwise 27B's DFlash2 rounds and level
+on the NVFP4 27B (candidates §58).
+
+A kernel's position in the chain also guards its successors. A consumer whose code before its own wait
+reads an input written two or more kernels back (the 35B-A3B MoE's D3 stages the router input, its
+small-T S3 too, a fork's joining sibling computes before it waits) is safe only while a serialized launch,
+or a kernel that triggers after its own wait, stands between that input's writer and it. So D2 and the
+small-T router S1 stay serialized launches, and so does the head of the groupwise 27B's GDN-input fork.
+When a launch becomes a programmatic dependent, list its successors' pre-wait loads (the SASS audit and
+the transitive chain check of candidates XB-05) against the new upstream set.
 
 Placing a read after the wait in the source does not keep it there: ptxas moved a non-coherent load
 (`const __restrict__`, `LDG.E.CONSTANT`) of the Flash-Next conv snapshot kernel's slot index above

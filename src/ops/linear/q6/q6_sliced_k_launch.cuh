@@ -35,8 +35,7 @@ void launch_q6_a16_sliced_k_mma(const Q6LinearOperands& operands, Output output,
             launch_sliced_k_pipelined<Q6SlicedKPipelinedFamily<Schedule>>(
                 SlicedKOperands{operands.x, operands.codes, operands.high, operands.scales,
                                 operands.rows, operands.k, operands.tokens, operands.padded_k},
-                output, epilogue, stream, SlicedKIdentityRows<Schedule::kBlockRows>{},
-                pdl::Dependency::Serialized, route);
+                output, epilogue, stream, SlicedKIdentityRows<Schedule::kBlockRows>{}, route);
             return;
         }
     }

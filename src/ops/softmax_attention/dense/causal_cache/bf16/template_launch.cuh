@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/grouped_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/tiled_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/merge.cuh"
@@ -69,11 +70,14 @@ void launch_bf16_kv_grouped_mma(const CausalAttentionOperands& p, Bf16KvCacheVie
         if constexpr (bytes > 48 * 1024) dynamic = bf16_kv_dynamic_shared<bytes, kernel>();
         const dim3 grid(G::KVHeads * div_up(p.width * G::GroupSize, T::kQueryRows),
                         partition.capacity, p.batch);
-        kernel<<<grid, threads, dynamic, stream>>>(
+        // A programmatic dependent of the RoPE / append kernel before it (the kernel waits at entry): the Qwen3.5 decode
+        // graphs, INT8 KV, leave-one-out: the 35B-A3B MTP +0.24 %, the groupwise 27B DFlash2 +0.09 %, the NVFP4 27B
+        // level (candidates §58). Same bits.
+        CUDA_CHECK(pdl::launch_consumer(
+                                    {grid, dim3(threads), static_cast<std::size_t>(dynamic), stream}, kernel,
             p.q, input, p.positions, cache.keys, cache.values, cache.tables, cache.valid_columns,
             cache.table_rows, cache.table_stride, p.width, p.visible_capacity, p.scale, partition,
-            partials, cache.tree_masks, cache.key_side, cache.value_side);
-        CUDA_CHECK(cudaGetLastError());
+            partials, cache.tree_masks, cache.key_side, cache.value_side));
     };
     if constexpr (!Input::writes_cache) {
         if (packed) {

@@ -237,9 +237,10 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     sliced_k_pipelined_kernel(SlicedKOperands operands, int stages, Output output,
                               Epilogue epilogue, int token_begin, RowPolicy row_policy) {
     constexpr SlicedKFormat F = Schedule::kFormat;
-    // Like the release Q4 kernel, wait for the producer first and let dependents launch once the
-    // K loop is done; the release Q5/Q6 kernels have no programmatic dependency.
-    if constexpr (F == SlicedKFormat::Q4) { pdl::enter_streaming(); }
+    // Every launch is a programmatic dependent: wait for the producer first (Q4 lets its dependents launch once the
+    // K loop is done; Q5 / Q6 as their CTAs exit). The groupwise 27B's decode and verification projections, INT8 KV,
+    // 3 rotated reps: plain decode +0.46 %, DFlash2 +0.91 % (candidates §58).
+    pdl::enter_streaming();
     constexpr int R  = Schedule::kBlockRows;
     constexpr int T  = Schedule::kBlockTokens;
     constexpr int C  = Schedule::kTokenCapacity;
@@ -541,8 +542,7 @@ int sliced_k_resident(Kernel kernel, int threads, std::size_t shared) {
 // One launch at a chosen shape (block rows from the schedule, `stages` ring slots).
 template <class Schedule, class Output, class Epilogue, class RowPolicy>
 void launch_sliced_k_pipelined_shape(const SlicedKOperands& operands, int stages, Output output,
-                                     Epilogue epilogue, cudaStream_t stream, RowPolicy row_policy,
-                                     pdl::Dependency dependency) {
+                                     Epilogue epilogue, cudaStream_t stream, RowPolicy row_policy) {
     constexpr auto kernel = &sliced_k_pipelined_kernel<Schedule, Output, Epilogue, RowPolicy>;
     sliced_k_allow_shared<kernel, Schedule::kOptInBytes>();
     const std::size_t shared = Schedule::shared_bytes(stages);
@@ -555,8 +555,7 @@ void launch_sliced_k_pipelined_shape(const SlicedKOperands& operands, int stages
         SlicedKOperands slice = operands;
         slice.x += static_cast<std::int64_t>(offset) * operands.k;
         slice.tokens = count;
-        CUDA_CHECK(pdl::launch_with(dependency,
-                                    {grid, dim3(Schedule::kThreads), shared, stream}, kernel,
+        CUDA_CHECK(pdl::launch_consumer({grid, dim3(Schedule::kThreads), shared, stream}, kernel,
                                     slice, stages, output, epilogue, offset, row_policy));
     });
 }
@@ -571,8 +570,7 @@ concept SlicedKRebindable = requires { typename RowPolicy::template Rebind<Rows>
 // admissible), and the launch. Callers check that the weights are full first.
 template <class Family, class Output, class Epilogue, class RowPolicy>
 void launch_sliced_k_pipelined(const SlicedKOperands& operands, Output output, Epilogue epilogue,
-                               cudaStream_t stream, RowPolicy row_policy,
-                               pdl::Dependency dependency, SlicedKRoute route) {
+                               cudaStream_t stream, RowPolicy row_policy, SlicedKRoute route) {
     constexpr int kBase = Family::kBaseRows;
     constexpr int kWide = 2 * kBase;
     static_assert(Family::template fits<kBase>(), "the base schedule must fit the pipelined kernel");
@@ -623,12 +621,12 @@ void launch_sliced_k_pipelined(const SlicedKOperands& operands, Output output, E
         if (shape.block_rows == kWide) {
             launch_sliced_k_pipelined_shape<typename Family::template Schedule<kWide>>(
                 operands, shape.stages, output, epilogue, stream,
-                typename RowPolicy::template Rebind<kWide>{}, dependency);
+                typename RowPolicy::template Rebind<kWide>{});
             return;
         }
     }
     launch_sliced_k_pipelined_shape<typename Family::template Schedule<kBase>>(
-        operands, shape.stages, output, epilogue, stream, row_policy, dependency);
+        operands, shape.stages, output, epilogue, stream, row_policy);
 }
 
 } // namespace infernix::ops::detail

@@ -3,6 +3,7 @@
 #include "ops/linear_add/q8/q8_linear_add_kernels.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear/q8/q8_sliced_k_launch.cuh"
 #include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
 
@@ -19,6 +20,12 @@ constexpr int kRowsPerCta     = 16;
 constexpr int kFirstExactCols = 2;
 constexpr int kLastExactCols  = 48;
 using ProjectionLauncher      = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+
+// The exact-column and sliced calls (decode and verification widths) launch as programmatic dependents of the
+// kernel before them: the sliced-K kernel waits before any load and triggers after its K loop. The Qwen3.6-35B-A3B
+// (INT8 KV, 3 rotated reps, RTX 5090): its Q8 projections are 1.4 % of plain decode's +2.7 % and 0.5 % of MTP's
+// +1.1 % from the decode graphs' programmatic launches (candidates §58). Same bits.
+constexpr pdl::Dependency kDependency = pdl::Dependency::Programmatic;
 
 // Exact = false runs the ActiveCols schedule over every ActiveCols-column slice of a wider call
 // (runtime token count, one grid row per slice).
@@ -47,7 +54,7 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_
     launch_q8_a16_sliced_k_mma<
         typename Schedule::template with_problem<Geometry::kInputRows, ActiveCols, Exact>>(
         q8_linear_operands(x, weight), output,
-        LinearResidualAddEpilogue{{output.data, output.rows, 0}}, stream);
+        LinearResidualAddEpilogue{{output.data, output.rows, 0}}, stream, {}, kDependency);
 }
 
 template <int Hidden, std::size_t... Offsets>

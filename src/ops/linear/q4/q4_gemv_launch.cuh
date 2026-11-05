@@ -1,5 +1,6 @@
 #pragma once
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/math.h"
 #include "ops/linear/q4/q4_a16_gemv.cuh"
 #include "ops/linear/q4/q4_operands.h"
@@ -8,7 +9,7 @@ namespace infernix::ops::detail {
 template <class Schedule, bool TriggerPdl = false, bool JoinPdl = false, bool Dependent = false,
           class Output, class Epilogue>
 void launch_q4_a16_gemv(const Q4LinearOperands& operands, Output output, Epilogue epilogue,
-                        cudaStream_t stream) {
+                        cudaStream_t stream, pdl::Dependency dependency = pdl::Dependency::Serialized) {
     validate_q4_operands(operands);
     if (operands.tokens != 1) throw std::invalid_argument("Q4 GEMV requires T=1");
     if constexpr (Schedule::kStaticGroupsPerRow > 0) {
@@ -30,11 +31,10 @@ void launch_q4_a16_gemv(const Q4LinearOperands& operands, Output output, Epilogu
             operands.codes, operands.scales, output, epilogue, operands.rows, operands.k,
             operands.padded_k));
     } else {
-        q4_a16_gemv_kernel<Schedule, Output, Epilogue, TriggerPdl, JoinPdl>
-            <<<grid, block, shared_bytes, stream>>>(operands.x, operands.codes, operands.scales,
-                                                    output, epilogue, operands.rows, operands.k,
-                                                    operands.padded_k);
-        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(pdl::launch_with(dependency, {grid, block, shared_bytes, stream},
+                                    q4_a16_gemv_kernel<Schedule, Output, Epilogue, TriggerPdl, JoinPdl>,
+                                    operands.x, operands.codes, operands.scales, output, epilogue,
+                                    operands.rows, operands.k, operands.padded_k));
     }
 }
 } // namespace infernix::ops::detail

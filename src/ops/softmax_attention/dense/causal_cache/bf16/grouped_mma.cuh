@@ -62,6 +62,9 @@ __launch_bounds__(Packed ? S::kThreads + 32 * kBf16pProducerWarps<S> : S::kLaunc
                                     float scale, Bf16KvPartition partition,
                                     CausalPartialView partial, const std::uint32_t* tree_masks,
                                     const std::uint8_t* key_side, const std::uint8_t* value_side) {
+    // Every input but the scale and the geometry is a kernel's output (q, the appended K/V, the cache and its
+    // tables): wait before any of them (a no-op unless the launch is a programmatic dependent, candidates §58).
+    pdl::enter_streaming();
     static_assert(!(Packed && Input::writes_cache), "the packed storage appends before its attention");
     const int width = S::kFixedWidth ? S::kFixedWidth : runtime_width;
     constexpr int D = G::kHeadDim, M = S::kQueryRows, N = S::kKeyRows;

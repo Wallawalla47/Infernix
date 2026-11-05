@@ -22,6 +22,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t logical_capacity, CausalKvPartition partition, float attention_scale,
         float* partial_acc, float* partial_m, float* partial_l, const std::uint32_t* tree_masks) {
+    // Every input but the scale and the geometry is a kernel's output (q, the appended K/V, the cache and its
+    // tables): wait before any of them (a no-op unless the launch is a programmatic dependent, candidates §58).
+    pdl::enter_streaming();
     constexpr int TokenTile = Schedule::kTokenTile, WarpsPerCta = Schedule::kWarps;
     constexpr int KeyBlock             = Schedule::kKeyRows;
     constexpr bool DynamicArena        = Schedule::kDynamicArena;
