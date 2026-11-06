@@ -93,8 +93,8 @@ constexpr int kNormPairsPerLane = 2;
 
 template <RmsEpilogue Epilogue>
 __launch_bounds__(kThreads) __global__
-    void gated_rmsnorm_encode_kernel(const __nv_bfloat162* __restrict__ x, const __nv_bfloat162* __restrict__ weight,
-                                     const __nv_bfloat162* __restrict__ z, std::int32_t d, std::int32_t heads, float eps,
+    void gated_rmsnorm_encode_kernel(const __nv_bfloat162* x, const __nv_bfloat162* __restrict__ weight,
+                                     const __nv_bfloat162* z, std::int32_t d, std::int32_t heads, float eps,
                                      const std::int32_t* __restrict__ perm, int perm_block, std::int32_t* __restrict__ words,
                                      std::int32_t* __restrict__ emax) {
     __shared__ __align__(16) __nv_bfloat162 part[kPartElements / 2];
@@ -141,7 +141,7 @@ __launch_bounds__(kThreads) __global__
 
 // sigmoid_gate_mul_pair over the CTA's 256 packs of the column.
 __launch_bounds__(kThreads) __global__
-    void sigmoid_mul_encode_kernel(const Bf16x8Pack* __restrict__ gate, const Bf16x8Pack* __restrict__ x, std::int32_t k,
+    void sigmoid_mul_encode_kernel(const Bf16x8Pack* gate, const Bf16x8Pack* x, std::int32_t k,
                                    const std::int32_t* __restrict__ perm, int perm_block, std::int32_t* __restrict__ words,
                                    std::int32_t* __restrict__ emax) {
     constexpr int kPacks = kPartElements / 8;
@@ -229,8 +229,8 @@ constexpr int kA8NormMaxBlocks = 64; // input blocks of 128 a column the permuta
 
 template <RmsEpilogue Epilogue>
 __launch_bounds__(kA8NormThreads) __global__
-    void gated_rmsnorm_a8_encode_kernel(const __nv_bfloat162* __restrict__ x, const __nv_bfloat162* __restrict__ weight,
-                                        const __nv_bfloat162* __restrict__ z, std::int32_t heads, std::int64_t rows,
+    void gated_rmsnorm_a8_encode_kernel(const __nv_bfloat162* x, const __nv_bfloat162* __restrict__ weight,
+                                        const __nv_bfloat162* z, std::int32_t heads, std::int64_t rows,
                                         float eps, const std::int32_t* __restrict__ perm, std::int32_t* __restrict__ words,
                                         std::int32_t stride, std::int32_t k, int sums) {
     namespace a8 = ggml::a8;

@@ -271,7 +271,7 @@ __global__ void causal_conv1d_decode_kernel(const __nv_bfloat16* x, const __nv_b
 }
 
 __global__ void causal_conv1d_decode_distinct_kernel(
-    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* x, const __nv_bfloat16* __restrict__ weight,
     const __nv_bfloat16* __restrict__ conv_state_in, __nv_bfloat16* __restrict__ conv_state_out,
     __nv_bfloat16* __restrict__ out, std::int32_t C) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
@@ -303,7 +303,7 @@ __global__ void causal_conv1d_decode_distinct_kernel(
 // straight to its three destinations.
 template <class Output>
 __global__ void causal_conv1d_snapshot_decode_kernel(
-    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* x, const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,
     const std::int32_t* __restrict__ snapshot_base_slot, Output out,
     std::int32_t C, std::int64_t slot_stride) {
@@ -438,7 +438,7 @@ __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
 // Read-only batched form: one block row per request, one thread per channel, serial columns. No
 // state is written; the per-column arithmetic is the snapshot kernels'.
 template <class Output>
-__global__ void causal_conv1d_from_states_kernel(const __nv_bfloat16* __restrict__ x,
+__global__ void causal_conv1d_from_states_kernel(const __nv_bfloat16* x,
                                                  const __nv_bfloat16* __restrict__ weight,
                                                  const __nv_bfloat16* __restrict__ conv_states,
                                                  const std::int32_t* __restrict__ initial_state_slots,

@@ -204,7 +204,7 @@ inline constexpr bool kDecodesEarly = !std::is_same_v<typename Codec::Ready, typ
 
 template <class Codec, class Norm>
 __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_kernel(
-    const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
+    const bf16* residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
     int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out) {
     extern __shared__ __align__(16) float rn[]; // [kPassColumns][kHidden]
     __shared__ float scratch[kDownThreads / 32][kPassColumns];
@@ -353,7 +353,7 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_kernel(
 
 template <class Codec, class Norm>
 __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
-    const float* __restrict__ partial, const float* __restrict__ inv_in, const bf16* __restrict__ residual,
+    const float* partial, const float* inv_in, const bf16* residual,
     const Norm* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
     float* __restrict__ inject, bf16* __restrict__ x) {
     __shared__ __align__(16) float m[kHcMixFusedMaxColumns * kMaxRank]; // [T][rank]
@@ -561,7 +561,7 @@ __device__ __forceinline__ float warp_sum8_transposed(const float (&v)[8], int l
 // [pass column][plane][kHidden / 2].
 template <class Codec, class Norm>
 __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
-    const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
+    const bf16* residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
     int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out) {
     constexpr int RowsPerWarp = 1;
     extern __shared__ __align__(16) float rn[]; // [kPassColumns][2][kHidden / 2]
@@ -754,7 +754,7 @@ bool v4_norm(const Tensor& norm_weight) noexcept { return reinterpret_cast<std::
 
 template <class Codec, class Norm, bool kA8>
 __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
-    const float* __restrict__ partial, const float* __restrict__ inv_in, const bf16* __restrict__ residual,
+    const float* partial, const float* inv_in, const bf16* residual,
     const Norm* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
     float* __restrict__ inject, bf16* __restrict__ x, UpA8Columns a8_columns) {
     static_assert(kUpFeatures == 2 * kUpV4Warps && kUpV4Rows == 2 * kStreams);

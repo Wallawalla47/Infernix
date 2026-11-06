@@ -140,8 +140,8 @@ __device__ __forceinline__ void shfl_add(ggml::I128& r, int offset) {
 // pointer of slice s is offset by s / 8 * 15 block_bytes.
 template <QType F, bool OutF32, int Lanes, int C, bool Tiled = false>
 __global__ void __launch_bounds__(kThreads)
-    rows_kernel(RowsGroup g, int row_bytes, int slices, const std::int32_t* __restrict__ encoded,
-                const std::int32_t* __restrict__ emax, int columns) {
+    rows_kernel(RowsGroup g, int row_bytes, int slices, const std::int32_t* encoded,
+                const std::int32_t* emax, int columns) {
     constexpr int kRowsPerWarp = 32 / Lanes;
     constexpr std::size_t kBlockBytes = ggml_block_bytes(F);
     const GroupSlot seg             = group_slot(g);
@@ -226,7 +226,7 @@ enum : int { kPlain = 0, kStaged = 1 };
 // One CTA of the mma rows: segment `seg` (rows row_bytes apart) of its launch.
 template <QType F, bool OutF32, int Stage>
 __device__ __forceinline__ void mma_rows_body(const GroupSlot& seg, int row_bytes, int slices,
-                                              const std::int32_t* __restrict__ encoded, const std::int32_t* __restrict__ emax,
+                                              const std::int32_t* encoded, const std::int32_t* emax,
                                               int columns, MmaPartial& partial) {
     constexpr int Warps        = kMmaWarps;
     constexpr int kBlockSlices = ggml::tile::kBlockSlices<F>;
@@ -276,8 +276,8 @@ __device__ __forceinline__ void mma_rows_body(const GroupSlot& seg, int row_byte
 
 template <QType F, bool OutF32, int Stage = kStaged>
 __global__ void __launch_bounds__(kMmaWarps * 32, 4)
-    mma_rows_kernel(RowsGroup grp, int row_bytes, int slices, const std::int32_t* __restrict__ encoded,
-                    const std::int32_t* __restrict__ emax, int columns) {
+    mma_rows_kernel(RowsGroup grp, int row_bytes, int slices, const std::int32_t* encoded,
+                    const std::int32_t* emax, int columns) {
     __shared__ MmaPartial partial;
     mma_rows_body<F, OutF32, Stage>(group_slot(grp), row_bytes, slices, encoded, emax, columns, partial);
 }
@@ -287,8 +287,8 @@ __global__ void __launch_bounds__(kMmaWarps * 32, 4)
 // 2026-10-16).
 template <QType F0, QType F1, bool OutF32>
 __global__ void __launch_bounds__(kMmaWarps * 32, 4)
-    mma_rows_mixed_kernel(RowsGroup grp, int slices, const std::int32_t* __restrict__ encoded,
-                          const std::int32_t* __restrict__ emax, int columns) {
+    mma_rows_mixed_kernel(RowsGroup grp, int slices, const std::int32_t* encoded,
+                          const std::int32_t* emax, int columns) {
     __shared__ MmaPartial partial;
     const GroupSlot seg = group_slot(grp);
     if (seg.format == 0) {
@@ -353,8 +353,8 @@ std::size_t tiled_shared_bytes(int warps, int split, int stages, int slot_bytes)
 // One CTA of the tiled kernel: segment `seg` (seg.row_bytes per row) of its launch, ring slots of
 // slot_bytes (the launch's largest run).
 template <QType F, bool OutF32>
-__device__ __forceinline__ void tiled_mma_body(const GroupSlot& seg, int slices, const std::int32_t* __restrict__ encoded,
-                                               const std::int32_t* __restrict__ emax, int columns, int split, int stages,
+__device__ __forceinline__ void tiled_mma_body(const GroupSlot& seg, int slices, const std::int32_t* encoded,
+                                               const std::int32_t* emax, int columns, int split, int stages,
                                                int slot_bytes, unsigned char* shared) {
     static_assert(kTiledFormat<F>, "tiled rows: formats of 256-element blocks");
     constexpr int kBlockBytes = static_cast<int>(ggml_block_bytes(F));
@@ -440,8 +440,8 @@ __device__ __forceinline__ void tiled_mma_body(const GroupSlot& seg, int slices,
 
 template <QType F, bool OutF32>
 __global__ void __launch_bounds__(kTiledMaxThreads, 2)
-    tiled_mma_kernel(RowsGroup grp, int slices, const std::int32_t* __restrict__ encoded,
-                     const std::int32_t* __restrict__ emax, int columns, int split, int stages, int slot_bytes) {
+    tiled_mma_kernel(RowsGroup grp, int slices, const std::int32_t* encoded,
+                     const std::int32_t* emax, int columns, int split, int stages, int slot_bytes) {
     extern __shared__ __align__(16) unsigned char tiled_shared[];
     tiled_mma_body<F, OutF32>(group_slot(grp), slices, encoded, emax, columns, split, stages, slot_bytes, tiled_shared);
 }
@@ -450,8 +450,8 @@ __global__ void __launch_bounds__(kTiledMaxThreads, 2)
 // (RowsGroup::format 0: F0, 1: F1).
 template <QType F0, QType F1, bool OutF32>
 __global__ void __launch_bounds__(kTiledMaxThreads, 2)
-    tiled_mma_mixed_kernel(RowsGroup grp, int slices, const std::int32_t* __restrict__ encoded,
-                           const std::int32_t* __restrict__ emax, int columns, int split, int stages, int slot_bytes) {
+    tiled_mma_mixed_kernel(RowsGroup grp, int slices, const std::int32_t* encoded,
+                           const std::int32_t* emax, int columns, int split, int stages, int slot_bytes) {
     extern __shared__ __align__(16) unsigned char tiled_shared[];
     const GroupSlot seg = group_slot(grp);
     if (seg.format == 0) {
@@ -510,8 +510,8 @@ std::size_t tiled_wide_shared_bytes(int warps, int split, int stages, int slot_b
 // One CTA of the wide tiled kernel: segment `seg`'s tiles at column group `group` (columns 16 group ..
 // 16 group + 15 of the call).
 template <QType F, bool OutF32>
-__device__ __forceinline__ void tiled_wide_body(const GroupSlot& seg, int group, int slices, const std::int32_t* __restrict__ encoded,
-                                                const std::int32_t* __restrict__ emax, int columns, int split, int stages,
+__device__ __forceinline__ void tiled_wide_body(const GroupSlot& seg, int group, int slices, const std::int32_t* encoded,
+                                                const std::int32_t* emax, int columns, int split, int stages,
                                                 int slot_bytes, unsigned char* shared) {
     static_assert(kTiledFormat<F>, "tiled rows: formats of 256-element blocks");
     constexpr int kBlockBytes = static_cast<int>(ggml_block_bytes(F));
@@ -614,7 +614,7 @@ __device__ __forceinline__ void tiled_wide_body(const GroupSlot& seg, int group,
 // CTA b of the launch: column group b % groups of the group's CTA b / groups.
 template <QType F, bool OutF32, int MinBlocks = kWideMinBlocks<F>>
 __global__ void __launch_bounds__(kTiledMaxThreads, MinBlocks)
-    tiled_wide_kernel(RowsGroup grp, int slices, const std::int32_t* __restrict__ encoded, const std::int32_t* __restrict__ emax,
+    tiled_wide_kernel(RowsGroup grp, int slices, const std::int32_t* encoded, const std::int32_t* emax,
                       int columns, int split, int stages, int slot_bytes, int groups) {
     extern __shared__ __align__(16) unsigned char tiled_shared[];
     const int b = static_cast<int>(blockIdx.x);
@@ -626,8 +626,8 @@ __global__ void __launch_bounds__(kTiledMaxThreads, MinBlocks)
 // so the register bound is the min-term one when either has a min term (else MinBlocks: wide_mixed_one_cta).
 template <QType F0, QType F1, bool OutF32, int MinBlocks = kWideMixedMinBlocks<F0, F1>>
 __global__ void __launch_bounds__(kTiledMaxThreads, MinBlocks)
-    tiled_wide_mixed_kernel(RowsGroup grp, int slices, const std::int32_t* __restrict__ encoded,
-                            const std::int32_t* __restrict__ emax, int columns, int split, int stages, int slot_bytes,
+    tiled_wide_mixed_kernel(RowsGroup grp, int slices, const std::int32_t* encoded,
+                            const std::int32_t* emax, int columns, int split, int stages, int slot_bytes,
                             int groups) {
     extern __shared__ __align__(16) unsigned char tiled_shared[];
     const int b         = static_cast<int>(blockIdx.x);
@@ -686,7 +686,7 @@ inline constexpr int kPlaneTileBlocks = kPlaneTileThreads<F> == 512 ? 1 : F == Q
 template <QType F, bool OutF32, bool Tiled>
 __global__ void __launch_bounds__(kPlaneTileThreads<F>, kPlaneTileBlocks<F>)
     tile_kernel(const std::uint8_t* __restrict__ weights, int rows, int row_bytes, int slices,
-                const std::int32_t* __restrict__ encoded, const std::int32_t* __restrict__ emax, int columns,
+                const std::int32_t* encoded, const std::int32_t* emax, int columns,
                 void* __restrict__ out, int n, int out_offset, const std::uint8_t* __restrict__ plane) {
     extern __shared__ __align__(16) unsigned char tile_shared[];
     auto& sm       = *reinterpret_cast<ggml::tile::PlaneShared*>(tile_shared);

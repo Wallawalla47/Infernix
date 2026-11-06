@@ -52,7 +52,7 @@ constexpr std::size_t shared_bytes() {
 // Columns: the MMA column width (8 or 16) holding the call's tokens, which are W x B <= Columns.
 template <int Hidden, int Columns>
 __global__ __launch_bounds__(kThreads, 1) void dynamic_grouped_conv_prepare_fused_kernel(
-    const __nv_bfloat16* __restrict__ residual, const __nv_bfloat16* __restrict__ norm,
+    const __nv_bfloat16* residual, const __nv_bfloat16* __restrict__ norm,
     const __nv_bfloat16* __restrict__ base, const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ prepared, __nv_bfloat16* __restrict__ finish, float eps, int tokens, int width) {
     constexpr int kGroups = Hidden / 16, kTiles = Hidden / kBlockK, kBlocks = Columns / 8;

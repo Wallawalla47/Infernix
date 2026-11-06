@@ -101,7 +101,7 @@ int lanes_for(int slices) {
 // row pointer is offset by s / 8 * 15 blocks (ggml_linear.cu's tiled rows_kernel).
 template <QType F, bool OutF32, int Lanes, bool Tiled, int MaxC>
 __global__ void __launch_bounds__(kRowsThreads)
-    rows_kernel(A8Group g, int slices, const std::int32_t* __restrict__ encoded, int stride, int columns) {
+    rows_kernel(A8Group g, int slices, const std::int32_t* encoded, int stride, int columns) {
     constexpr int kRowsPerWarp        = 32 / Lanes;
     constexpr std::size_t kBlockBytes = ggml_block_bytes(F);
     const Slot seg = slot_at(g, static_cast<int>(blockIdx.x));
