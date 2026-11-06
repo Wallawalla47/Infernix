@@ -37,7 +37,14 @@ bf16_kv_merge_statistics(const float* partial_m, const float* partial_l, int q_h
     return total;
 }
 
-template <typename Geometry, class Schedule, bool MultiBatch, bool Masked>
+// Gather: the splits with weight are collected first and their loads issued four at a time, the
+// same additions in the same order as one pass that skips the empty splits (the shared causal
+// merge's gather, 143d118c). It pays where the merge is a latency chain, one or two columns in the
+// call (16/2 heads: -2..-6.5 % for append, attention and merge at one or two rows of 1.3K-61K
+// keys); a wider call's grid hides the dependent loads and the gather's ballot and barriers cost
+// up to 8 % (four or eight rows of eight columns at 1.3K keys), so it keeps the plain pass
+// (RTX 5090, 2026-11-06). Both give the same bits.
+template <typename Geometry, class Schedule, bool MultiBatch, bool Masked, bool Gather>
 __launch_bounds__(Schedule::kThreads) __global__
     void bf16_kv_merge_kernel(const float* partial_acc, const float* partial_m,
                               const float* partial_l, const std::int32_t* positions,
@@ -97,14 +104,42 @@ __launch_bounds__(Schedule::kThreads) __global__
     const float head_l = bf16_kv_merge_statistics<Geometry, Schedule>(
         partial_m, partial_l, q_head, token, tokens, active_split_count, weights, warp_sums,
         scalars);
-    const int d = d_start + tid;
-    if (tid >= DChunk || d >= Geometry::kHeadDim) return;
+    const int d     = d_start + tid;
     float numerator = 0.0f;
-    for (int split = 0; split < active_split_count; ++split) {
-        if (weights[split] != 0.0f)
-            numerator +=
-                partial_acc[causal_partial_index<Geometry>(q_head, d, token, split, tokens)] *
-                weights[split];
+    if constexpr (Gather) {
+        __shared__ int live[Schedule::kThreads];
+        __shared__ int live_count;
+        const bool has   = tid < active_split_count && weights[tid] != 0.0f;
+        const unsigned b = __ballot_sync(0xffffffffu, has);
+        if ((tid & 31) == 0) warp_sums[tid >> 5] = __int_as_float(__popc(b));
+        __syncthreads();
+        int before = 0;
+        for (int w = 0; w < (tid >> 5); ++w) before += __float_as_int(warp_sums[w]);
+        if (has) live[before + __popc(b & ((1u << (tid & 31)) - 1u))] = tid;
+        if (tid == Schedule::kThreads - 1) live_count = before + __popc(b);
+        __syncthreads();
+        if (tid >= DChunk || d >= Geometry::kHeadDim) return;
+        const int count = live_count;
+        int i           = 0;
+        for (; i + 4 <= count; i += 4) {
+            float a[4];
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+                a[k] = partial_acc[causal_partial_index<Geometry>(q_head, d, token, live[i + k], tokens)];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) numerator += a[k] * weights[live[i + k]];
+        }
+        for (; i < count; ++i)
+            numerator += partial_acc[causal_partial_index<Geometry>(q_head, d, token, live[i], tokens)] *
+                         weights[live[i]];
+    } else {
+        if (tid >= DChunk || d >= Geometry::kHeadDim) return;
+        for (int split = 0; split < active_split_count; ++split) {
+            if (weights[split] != 0.0f)
+                numerator +=
+                    partial_acc[causal_partial_index<Geometry>(q_head, d, token, split, tokens)] *
+                    weights[split];
+        }
     }
 
     const float value = (head_l > 0.0f) ? numerator / head_l : 0.0f;
