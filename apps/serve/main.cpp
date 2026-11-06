@@ -341,6 +341,12 @@ int main(int argc, char** argv) {
         infernix::serve::GenerationService service(
             options, startup_log.observer(), infernix::product::engine_diagnostic_observer(logger));
         startup_log.engine_ready(service.load_summary());
+        if (options.context_cache.ssd_capacity_bytes != 0) {
+            // The SSD tier (hybrid-prefix-cache-spec §5.7): a scratch file, removed at exit.
+            logger->info("prefix cache SSD tier | {} GiB in {} | written when the Host tier fills, "
+                         "removed at exit",
+                         options.context_cache.ssd_capacity_bytes >> 30U, options.context_cache.ssd_directory.string());
+        }
         operational_log.engine_capacity(service);
         startup_log.chat_template_roles(service.chat_template_role_support(),
                                         options.chat_template_path.string());

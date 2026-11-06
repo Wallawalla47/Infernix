@@ -5,6 +5,7 @@ add_library(infernix_runtime_support STATIC
   engine/public_types.cpp
   prefix_cache/block_hash.cpp
   prefix_cache/prefix_index.cpp
+  prefix_cache/ssd_tier.cpp
   prefix_cache/tap_planner.cpp
 )
 infernix_internal_includes(infernix_runtime_support)

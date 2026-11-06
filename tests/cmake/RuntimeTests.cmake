@@ -10,6 +10,11 @@ infernix_add_test(infernix_prefix_cache_index_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_prefix_cache_index.cpp"
   LIBRARIES infernix_runtime_support)
 
+# The prefix cache's SSD tier driver over a real index and scratch file (CPU and disk only).
+infernix_add_test(infernix_ssd_tier_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_ssd_tier.cpp"
+  LIBRARIES infernix_runtime_support)
+
 # The block drafters' draft-length policy (--draft-tokens auto with DFlash or DFlash2): the calibrated
 # length, the expected tokens of a prefix and the calibration's updates.
 infernix_add_test(infernix_draft_length_test

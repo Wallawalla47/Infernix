@@ -7,6 +7,7 @@
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/state/state_image.h"
 #include "runtime/prefix_cache/prefix_index.h"
+#include "runtime/prefix_cache/ssd_tier.h"
 #include "runtime/prefix_cache/tap_planner.h"
 
 #include <cuda_runtime_api.h>
@@ -15,6 +16,7 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -99,12 +101,14 @@ struct HybridPersistResult {
 
 class HybridPrefixCache final : public runtime::prefix_cache::PrefixIndexBackend {
 public:
+    // With config.ssd_slabs, the SSD tier's scratch file is created in `ssd_directory` (§5.7).
     HybridPrefixCache(const runtime::prefix_cache::PrefixIndexConfig& config,
                       runtime::prefix_cache::TapPlannerConfig taps, LogicalKVPageStore& text_pages,
                       LogicalKVPageStore* backend_pages, StateImageStore& states,
                       qwen3_5::StateImageDevicePool& state_pool, const HybridHostLayout& host,
                       std::vector<HybridRestoreLayer> layers,
-                      StartupPhaseScope* pin_progress = nullptr);
+                      StartupPhaseScope* pin_progress = nullptr,
+                      const std::filesystem::path& ssd_directory = {});
     ~HybridPrefixCache() override;
 
     HybridPrefixCache(const HybridPrefixCache&)            = delete;
@@ -176,6 +180,20 @@ public:
 
     // Waits for every Host write and landing restore and publishes them.
     void drain();
+
+    // ---- SSD tier (§5.7) -------------------------------------------------------------------------
+    [[nodiscard]] runtime::prefix_cache::SsdTier* ssd() noexcept { return ssd_.get(); }
+    [[nodiscard]] const runtime::prefix_cache::SsdTier* ssd() const noexcept { return ssd_.get(); }
+    // Applies landed SSD transfers and starts write-backs; returns whether a promotion landed since
+    // the last call (a request waiting for it can be quoted again). False without an SSD tier.
+    bool poll_ssd();
+    // The same, keeping a landing for the next poll_ssd (the idle worker's maintenance).
+    void service_ssd();
+    // Whether service_ssd would start a write-back now.
+    [[nodiscard]] bool ssd_due() const noexcept { return ssd_ && ssd_->write_back_due(); }
+    // Starts reading the parts of `snapshot` only on the SSD into the Host tier (Ready without an
+    // SSD tier or when nothing is only there).
+    [[nodiscard]] runtime::prefix_cache::SsdTier::Promotion promote(runtime::prefix_cache::SnapshotRef snapshot);
 
     // ---- Host restores (one admission staged at a time) --------------------------------------
     // Opens a restore batch ordered after the producer's queued work (Device destinations may have
@@ -336,6 +354,9 @@ private:
     // crosses chunks, and every copy record carries its chunk as its group, so a strided copy
     // run never spans two chunks (two records of different chunks would otherwise form a run).
     std::vector<PinnedHostBuffer> host_chunks_;
+    // Declared after the chunks it reads and writes: destroyed first, waiting for its transfers.
+    std::unique_ptr<runtime::prefix_cache::SsdTier> ssd_;
+    bool ssd_landed_ = false;
     std::uint32_t slabs_per_chunk_ = 0;
     cudaStream_t restore_stream_   = nullptr;
     std::vector<std::optional<HybridBlockPages>> blocks_;

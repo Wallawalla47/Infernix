@@ -691,7 +691,25 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             throw std::invalid_argument(
                 "hybrid tap ladder and minimum gap must be at least 64 tokens");
         }
+        // The SSD tier sits below the Host tier and moves Host slabs (hybrid-prefix-cache-spec §5.7).
+        if (cache.ssd_capacity_bytes != 0 || !cache.ssd_directory.empty()) {
+            if (cache.ssd_capacity_bytes == 0 || cache.ssd_directory.empty()) {
+                throw std::invalid_argument("--ssd-context-gib and --ssd-context-dir go together");
+            }
+            if (!host_tier) {
+                throw std::invalid_argument("the SSD tier needs a Host tier: --host-context-mib must be positive");
+            }
+            std::error_code ec;
+            if (!std::filesystem::is_directory(cache.ssd_directory, ec)) {
+                throw std::invalid_argument("--ssd-context-dir " + cache.ssd_directory.string() +
+                                            " is not an existing directory");
+            }
+            cache.ssd_directory = std::filesystem::absolute(cache.ssd_directory, ec);
+        }
     } else {
+        if (cache.ssd_capacity_bytes != 0 || !cache.ssd_directory.empty()) {
+            throw std::invalid_argument("the SSD tier requires the prefix cache (--no-prefix-reuse refuses it)");
+        }
         // Without a prefix cache every request starts from the root and nothing is retained:
         // the lanes' StateImages are the only Device state and there is no Host tier.
         if (cache.host_capacity_bytes.value_or(0U) != 0 ||

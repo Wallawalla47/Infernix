@@ -511,7 +511,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         prefix_bytes        = auto_host_context_bytes(ledger_left_bytes(expert_offload::plan_host_memory(snapshot, demand)));
         demand.prefix_cache = prefix_bytes;
     }
-    if (cache.enabled) { program_options.prefix_host_bytes = prefix_bytes; }
+    if (cache.enabled) {
+        program_options.prefix_host_bytes    = prefix_bytes;
+        program_options.prefix_ssd_bytes     = cache.ssd_capacity_bytes;
+        program_options.prefix_ssd_directory = cache.ssd_directory;
+    }
     // The SSD tier (design §19.3.7): the banks stay in the artifact; the Program pins RAM slots for
     // the experts the ledger leaves room for (less their lock overhead) and reads the rest on use.
     if (plan_only) {

@@ -14,6 +14,7 @@ add_library(infernix_core STATIC
   vmm_arena.cu
   device.cu
   direct_read_queue.cpp
+  direct_scratch_file.cpp
   dtype.cpp
   gpu_telemetry.cpp
   host_load.cpp

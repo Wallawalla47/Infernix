@@ -16,6 +16,10 @@ struct CacheCostModel {
     double attention_pair_seconds = 0.0;
     double h2d_bytes_per_second   = 50.0e9;
     double transfer_batch_seconds = 20.0e-6;
+    // Reads from the SSD tier into Host slabs (hybrid-prefix-cache-spec §5.7): the rate starts at a
+    // regular NVMe drive's and follows each measured promotion.
+    double ssd_bytes_per_second = 2.0e9;
+    double ssd_batch_seconds    = 1.0e-3;
     // Saturation of the per-call cost with the call's width, for models whose fixed call cost is
     // weight traffic that grows with the distinct routes a call touches (offloaded experts): each
     // token adds a fraction rho of the remaining route cost. 0 charges every call chunk_seconds.
@@ -49,6 +53,12 @@ struct CacheCostModel {
     [[nodiscard]] double restore_seconds(std::uint64_t bytes) const noexcept {
         if (bytes == 0) { return 0.0; }
         return transfer_batch_seconds + static_cast<double>(bytes) / h2d_bytes_per_second;
+    }
+
+    // Reading `bytes` from the SSD tier into the Host tier, before their restore to the Device.
+    [[nodiscard]] double ssd_seconds(std::uint64_t bytes) const noexcept {
+        if (bytes == 0) { return 0.0; }
+        return ssd_batch_seconds + static_cast<double>(bytes) / ssd_bytes_per_second;
     }
 };
 

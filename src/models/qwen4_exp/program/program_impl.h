@@ -1681,6 +1681,9 @@ public:
         std::vector<SourceCandidate> out;
         if (prefix_) {
             std::optional<PrefixSelection> chosen = prefix_select(data, b, kNoLane);
+            // The source it chose is being read from the SSD tier (hybrid-prefix-cache-spec §5.7): no
+            // source yet; the Engine quotes it again when the read lands.
+            if (prefix_ssd_wait_) { return {}; }
             const std::uint32_t reuse = chosen && chosen->snapshot ? chosen->frontier : 0U;
             // Coalescing only defers a fresh request (an empty list: the Engine asks again).
             if (b.reuse && maximum_frontier == UINT32_MAX && prefix_await_sibling(data, reuse)) { return {}; }
@@ -3230,7 +3233,12 @@ public:
     void set_maintenance_waker(std::function<void()> waker) {
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         if (ram_) { ram_->set_waker(waker); }
+        if (prefix_ && prefix_->ssd() != nullptr) { prefix_->ssd()->set_waker(waker); }
         waker_ = std::move(waker);
+    }
+    // The SSD tier's transfers land while the Engine is idle: applied, and its write-back continued.
+    void maintain_storage() {
+        if (prefix_) { prefix_->service_ssd(); }
     }
 
     // ---- RAM pressure (Program::start_ram_resize, runtime::expert_offload::RamMonitor) ----
@@ -6245,6 +6253,10 @@ public:
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
     // Without free cache resume a request resumes only from prefill state on the prefill-chunk grid.
     [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept { return resume_grid(); }
+    // The SSD tier (hybrid-prefix-cache-spec §5.7).
+    bool hybrid_poll_storage() { return prefix_ && prefix_->poll_ssd(); }
+    [[nodiscard]] bool hybrid_source_pending() const noexcept { return prefix_ssd_wait_; }
+    [[nodiscard]] bool hybrid_storage_due() const noexcept { return prefix_ && prefix_->ssd_due(); }
 
 private:
     void prefix_pin(const PrefixSelection& selection);
@@ -7331,6 +7343,8 @@ private:
     prefix::StateImageLayout image_layout_;
     std::unique_ptr<prefix::LaneStateImage> lane_image_;
     std::unique_ptr<prefix::PrefixCache> prefix_;
+    // The last quote (prefix_select without a lane) chose a source being read from the SSD tier.
+    bool prefix_ssd_wait_ = false;
     // After the prefix cache, so its thread stops first (start_ram_resize).
     std::unique_ptr<runtime::expert_offload::RamMonitor> ram_;
     // The growth so far of the pieces the monitor asks for one after another (maintain_ram logs it once they stop).

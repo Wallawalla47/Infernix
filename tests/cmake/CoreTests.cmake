@@ -14,6 +14,10 @@ infernix_add_test(infernix_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/
 infernix_add_test(infernix_direct_read_queue_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_direct_read_queue.cpp"
   LIBRARIES infernix_core)
 
+# Unbuffered scratch storage for the prefix cache's SSD tier (CPU and disk only).
+infernix_add_test(infernix_direct_scratch_file_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_direct_scratch_file.cpp"
+  LIBRARIES infernix_core)
+
 # Unbuffered block reads through a ring (CPU and disk only).
 infernix_add_test(infernix_read_only_file_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_read_only_file.cpp"
   LIBRARIES infernix_core)

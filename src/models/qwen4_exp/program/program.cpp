@@ -42,6 +42,7 @@ void Program::maintain() {
     impl_->apply_vram_target(true);
     impl_->maintain_expert_state();
     impl_->maintain_ram();
+    impl_->maintain_storage();
 }
 
 void Program::start_ram_resize(std::uint64_t reserve_bytes) { impl_->start_ram_resize(reserve_bytes); }
@@ -83,6 +84,12 @@ std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& bas
 std::uint32_t Program::hybrid_prefetch_room() const noexcept { return impl_->hybrid_prefetch_room(); }
 void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) { impl_->hybrid_hold_queue(queue); }
 std::uint64_t Program::hybrid_cache_epoch() const noexcept { return impl_->hybrid_cache_epoch(); }
+
+bool Program::hybrid_poll_storage() { return impl_->hybrid_poll_storage(); }
+
+bool Program::hybrid_source_pending() const noexcept { return impl_->hybrid_source_pending(); }
+
+bool Program::hybrid_storage_due() const noexcept { return impl_->hybrid_storage_due(); }
 std::uint32_t Program::hybrid_resume_grid() const noexcept { return impl_->hybrid_resume_grid(); }
 
 runtime::ResourceReservation Program::reserve_units(std::span<const ExecutionUnit> units) {

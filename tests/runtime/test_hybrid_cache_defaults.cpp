@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 
@@ -90,6 +91,36 @@ int main() {
             (void)normalize_engine_options(options);
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "a disabled prefix cache accepted a capacity");
+    }
+
+    // The SSD tier (hybrid-prefix-cache-spec §5.7) is off by default; it needs its directory, an
+    // enabled cache and a Host tier, on every architecture.
+    {
+        EngineOptions options;
+        failures += check(normalize_engine_options(options).context_cache.ssd_capacity_bytes == 0U,
+                          "the SSD tier is on by default");
+        for (const auto architecture : {infernix::models::Architecture::Qwen3_5, infernix::models::Architecture::Qwen4Exp}) {
+            EngineOptions on;
+            on.context_cache.ssd_capacity_bytes = 16ULL << 30U;
+            on.context_cache.ssd_directory      = std::filesystem::temp_directory_path();
+            const infernix::ContextCacheOptions out = normalize_engine_options(on, architecture).context_cache;
+            failures += check(out.ssd_capacity_bytes == (16ULL << 30U) && out.ssd_directory.is_absolute(),
+                              "the SSD tier was not kept");
+        }
+        for (int variant = 0; variant < 4; ++variant) {
+            EngineOptions bad;
+            bad.context_cache.ssd_capacity_bytes = 16ULL << 30U;
+            bad.context_cache.ssd_directory      = std::filesystem::temp_directory_path();
+            if (variant == 0) { bad.context_cache.ssd_directory.clear(); }
+            if (variant == 1) { bad.context_cache.host_capacity_bytes = 0; }
+            if (variant == 2) { bad.context_cache.enabled = false; }
+            if (variant == 3) { bad.context_cache.ssd_directory /= "infernix-missing-directory-for-test"; }
+            bool rejected = false;
+            try {
+                (void)normalize_engine_options(bad);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "an unusable SSD tier was accepted");
+        }
     }
 
     // Out-of-range tuning is rejected.

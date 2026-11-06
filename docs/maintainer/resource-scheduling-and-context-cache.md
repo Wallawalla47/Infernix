@@ -69,6 +69,7 @@ determined by its layer count, geometry and storage format.
 | `max_concurrency` | The limit C on simultaneously held execution bindings, range 1–8 |
 | `context_cache.hybrid.device_snapshot_slots` | Device StateImages beyond the C lane images, holding cached snapshots and tap staging |
 | `context_cache.host_capacity_bytes` | The pinned Host slab pool shared by cached KV blocks and snapshot images |
+| `context_cache.ssd_capacity_bytes` | The opt-in SSD tier below it (0: none), a scratch file of Host-slab-sized records |
 
 The page lower bound of the Main KV capacity is `max(ceil(max_context / 64), C)`, which satisfies one
 request exclusively using the maximum context and the geometric requirement of C minimum pages.
@@ -121,7 +122,10 @@ them by "restore transfer cost + remaining prefill cost" with the Engine's conte
 coefficients ([spec §6](hybrid-prefix-cache-spec.md)). Queries produce no use heat or cache hits.
 
 A waiting request retains no source: queue holds only order eviction, and a request quotes the tree
-again when it is next considered. A quote that went stale binds as an invalid source, so the Engine
+again when it is next considered. A source with parts only on the opt-in SSD tier is read into the Host
+tier before it binds: the quote returns no source and reports the read (`hybrid_source_pending`), the
+request keeps its place as a waiting request (not an unadmittable one), and the Engine scans the queue
+again when the read lands (`hybrid_poll_storage`, every cycle; [spec §5.7](hybrid-prefix-cache-spec.md#57-ssd-tier-opt-in)). A quote that went stale binds as an invalid source, so the Engine
 moves to its next candidate. When a request shares a new prefix with a lane still prefilling, it can
 wait for that lane's snapshot at the divergence instead of prefilling the prefix again.
 

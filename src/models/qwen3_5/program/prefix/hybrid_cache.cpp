@@ -28,6 +28,8 @@ namespace {
 constexpr auto kFullPage = static_cast<std::uint32_t>(kPagedKVPageSize);
 // Largest single pinned allocation of the Host slab pool, which is also its resize step under RAM pressure.
 constexpr std::size_t kHostChunkBytes = std::size_t{1} << 30U;
+// Host chunks start on a 4 KiB boundary: the SSD tier moves their slabs with unbuffered file I/O.
+constexpr std::size_t kHostChunkAlignment = 4096;
 
 std::span<const std::byte* const> const_records(const std::vector<std::byte*>& records) noexcept {
     return {reinterpret_cast<const std::byte* const*>(records.data()), records.size()};
@@ -41,7 +43,8 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
                                      qwen3_5::StateImageDevicePool& state_pool,
                                      const HybridHostLayout& host,
                                      std::vector<HybridRestoreLayer> layers,
-                                     StartupPhaseScope* pin_progress)
+                                     StartupPhaseScope* pin_progress,
+                                     const std::filesystem::path& ssd_directory)
     : config_(config), taps_(taps), text_pages_(&text_pages), backend_pages_(backend_pages),
       states_(&states), state_pool_(&state_pool), host_layout_(host), images_(config.max_snapshots),
       layers_(std::move(layers)) {
@@ -74,7 +77,7 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
             const std::uint32_t slabs = std::min(slabs_per_chunk_, config.host_slabs - first);
             const std::size_t bytes   = static_cast<std::size_t>(slabs) * host.slab_bytes;
             try {
-                host_chunks_.emplace_back(bytes);
+                host_chunks_.emplace_back(bytes, kHostChunkAlignment);
             } catch (const std::exception& error) {
                 throw std::runtime_error("pinning the hybrid prefix cache Host tier failed after " +
                                          std::to_string(pinned >> 20U) + " of " +
@@ -86,8 +89,31 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
         }
         CUDA_CHECK(cudaStreamCreateWithFlags(&restore_stream_, cudaStreamNonBlocking));
     }
+    if (config.ssd_slabs != 0) {
+        // Its slabs are Host slabs byte for byte, so a transfer is a plain copy (§5.7).
+        ssd_ = std::make_unique<runtime::prefix_cache::SsdTier>(
+            ssd_directory, config.ssd_slabs, host.slab_bytes, [this](std::uint32_t id) { return slab(id); });
+    }
     blocks_.reserve(config.max_nodes);
     index_.emplace(config_, *this);
+}
+
+bool HybridPrefixCache::poll_ssd() {
+    service_ssd();
+    return std::exchange(ssd_landed_, false);
+}
+
+void HybridPrefixCache::service_ssd() {
+    if (!ssd_) { return; }
+    // Landed Host writes first: a just-finished request's snapshots are written back before the next
+    // request's prefill can displace them.
+    poll();
+    ssd_landed_ |= ssd_->poll(*index_);
+}
+
+runtime::prefix_cache::SsdTier::Promotion HybridPrefixCache::promote(SnapshotRef snapshot) {
+    if (!ssd_) { return runtime::prefix_cache::SsdTier::Promotion::Ready; }
+    return ssd_->promote(*index_, snapshot);
 }
 
 HybridPrefixCache::~HybridPrefixCache() {
@@ -110,6 +136,10 @@ HybridPrefixCache::~HybridPrefixCache() {
 void HybridPrefixCache::set_cost(const CacheCostModel& cost) {
     config_.cost = cost;
     index_->set_cost(cost);
+    // The SSD read rate is this drive's measurement, not the Engine's calibration.
+    if (ssd_ && ssd_->counters().read_bytes_per_second > 0.0) {
+        index_->set_ssd_rate(ssd_->counters().read_bytes_per_second);
+    }
 }
 
 // ---- ids and references ------------------------------------------------------------------------
@@ -480,6 +510,9 @@ void HybridPrefixCache::poll() {
         finish_landing(landing_.front());
         landing_.pop_front();
     }
+    // SSD transfers land on their own threads; the index learns of them here (§5.7). New write-backs
+    // start only from poll_ssd, between rounds.
+    if (ssd_) { ssd_->settle(*index_); }
 }
 
 void HybridPrefixCache::drain() {
@@ -751,10 +784,12 @@ void HybridPrefixCache::clear() noexcept {
         }
     }
     pending_.clear();
-    // The index is rebuilt below, so landing batches only return their events.
+    // The index is rebuilt below, so landing batches only return their events, and SSD transfers
+    // are waited for and forgotten (the new index holds no SSD slab).
     for (RestoreBatch& batch : landing_) { recycle_events(batch); }
     landing_.clear();
     reset_restore();
+    if (ssd_) { ssd_->abandon(); }
     for (std::optional<HybridBlockPages>& pages : blocks_) {
         if (!pages) { continue; }
         (void)text_pages_->release_reference(pages->text, false);
@@ -805,6 +840,8 @@ std::uint64_t HybridPrefixCache::shrink_host_tier(std::uint64_t bytes) {
     const std::uint32_t keep      = std::max(floor, have - drop);
     if (bytes == 0 || keep >= have) { return 0; }
     drain();
+    // An SSD transfer pins the slabs it reads or writes: settled first, so a shrink moves them freely.
+    if (ssd_) { ssd_->drain(*index_); }
     const std::uint32_t reached = index_->shrink_host(keep * per_chunk);
     const std::uint32_t kept    = (reached + per_chunk - 1U) / per_chunk;
     std::uint64_t released      = 0;
@@ -825,7 +862,7 @@ std::uint64_t HybridPrefixCache::grow_host_tier(std::uint64_t bytes) {
                                  host_layout_.slab_bytes;
         if (grown + size > bytes) { break; }
         try {
-            host_chunks_.emplace_back(size);
+            host_chunks_.emplace_back(size, kHostChunkAlignment);
         } catch (const std::exception&) {
             break; // the OS refuses to pin it now
         }

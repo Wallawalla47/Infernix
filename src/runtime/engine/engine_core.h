@@ -1881,6 +1881,23 @@ private:
         resources_.hold_queue(*instance_.program, ids, bases);
     }
 
+    // The prefix cache's SSD tier (hybrid-prefix-cache-spec §5.7): landed transfers are applied and
+    // its write-back continued every cycle; a landed promotion lets the request waiting for it be
+    // quoted again.
+    void poll_storage() {
+        if constexpr (requires { instance_.program->hybrid_poll_storage(); }) {
+            if (instance_.program->hybrid_poll_storage()) { request_admission_check(); }
+        }
+    }
+
+    [[nodiscard]] bool source_pending() const noexcept {
+        if constexpr (requires { instance_.program->hybrid_source_pending(); }) {
+            return instance_.program->hybrid_source_pending();
+        } else {
+            return false;
+        }
+    }
+
     // Fails a waiting (fresh or paused) request that admission can never serve, alone: as a worker
     // error it would fail the whole Engine.
     void fail_unadmittable(const std::shared_ptr<Request>& request, bool restoring,
@@ -1938,6 +1955,12 @@ private:
                 std::vector<SourceCandidate> sources = resources_.candidates(
                     *instance_.program, *request->base_plan,
                     restoring ? request->suspended->frontier() : UINT32_MAX);
+                if (sources.empty() && source_pending()) {
+                    // Its source is being read from the SSD tier (hybrid-prefix-cache-spec §5.7): it
+                    // waits for that read, whose landing starts a new scan (poll_storage).
+                    if (restoring) { return false; }
+                    continue;
+                }
                 // An idle-time pass whose history the cache already holds ends before any binding
                 // (an agent turn that echoed the reply resumes from its endpoint anyway, §7.9).
                 if (request->background && !restoring && next_turn_covered(*request, sources)) {
@@ -2703,6 +2726,11 @@ private:
                     !instance_.program->has_context_transaction()) {
                     // The idle-time pass of a finished turn starts once its quiet period has passed.
                     if (start_next_turn_locked()) { continue; }
+                    // The SSD tier writes back what the last requests left in the Host tier while the
+                    // Engine is idle (hybrid-prefix-cache-spec §5.7); its transfers wake the worker.
+                    if constexpr (kProgramMaintains && requires { instance_.program->hybrid_storage_due(); }) {
+                        if (instance_.program->hybrid_storage_due()) { maintenance_requested_ = true; }
+                    }
                     const std::uint64_t seen = next_turn_serial_;
                     const auto woken         = [&] {
                         return stopping_ || !pending_.empty() || maintenance_requested_ ||
@@ -2777,6 +2805,7 @@ private:
                 yield_next_turn();
                 (void)expire_pending_requests();
                 executed = progress_context_transaction(boundary);
+                poll_storage();
                 (void)settle_terminal_requests(boundary);
                 cancel_active_requests(snapshot_cancellations(), boundary);
                 for (auto it = paused_.begin();

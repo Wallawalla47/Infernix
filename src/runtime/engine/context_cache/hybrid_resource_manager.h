@@ -102,6 +102,20 @@ public:
         out.hybrid_held_snapshot_losses    = hybrid.held_snapshot_losses;
         out.hybrid_held_host_refusals      = hybrid.held_host_refusals;
         out.hybrid_tool_call_holds         = hybrid.tool_call_holds;
+        const auto& ssd                     = hybrid.ssd;
+        out.hybrid_ssd_capacity_bytes       = ssd.capacity_bytes;
+        out.hybrid_ssd_used_bytes           = ssd.used_bytes;
+        out.hybrid_ssd_only_snapshots       = ssd.ssd_only_snapshots;
+        out.hybrid_ssd_write_bytes          = ssd.write_bytes;
+        out.hybrid_ssd_read_bytes           = ssd.read_bytes;
+        out.hybrid_ssd_image_writes         = ssd.image_writes;
+        out.hybrid_ssd_block_writes         = ssd.block_writes;
+        out.hybrid_ssd_host_image_demotions = ssd.host_image_demotions;
+        out.hybrid_ssd_host_block_demotions = ssd.host_block_demotions;
+        out.hybrid_ssd_promotions           = ssd.promotions;
+        out.hybrid_ssd_snapshot_evictions   = ssd.snapshot_evictions;
+        out.hybrid_ssd_failures             = ssd.write_failures + ssd.read_failures;
+        out.hybrid_ssd_read_bytes_per_second = ssd.read_bytes_per_second;
     }
 
     // Holds the sources of the requests waiting for admission, in admission order

@@ -695,6 +695,12 @@ tokens; KV blocks are shared across requests. `infernix` (one request) runs with
   exceed the cache lose whole conversations at the back of the queue instead of every waiting
   request losing part of its own ([spec §9.6](maintainer/hybrid-prefix-cache-spec.md#96-queue-holds)).
   `--no-queue-holds` turns this off.
+- **SSD tier (opt-in).** `--ssd-context-gib N --ssd-context-dir DIR` keeps what the Host pool gives up
+  (snapshots and their blocks) in an N GiB scratch file on a local SSD and reads it back when a
+  conversation returns, instead of recomputing it: with the default 4 GiB-class Host pool a long
+  agent conversation (~2.4 GB at 160K tokens) is otherwise pushed out by the next one. It takes no
+  RAM beyond the cache's index, writes only when the Host pool fills, and is removed at exit
+  ([serving options](serving.md), [spec §5.7](maintainer/hybrid-prefix-cache-spec.md#57-ssd-tier-opt-in)).
 - **Exactness.** A resumed request computes what the request that left the snapshot computed; it
   may differ from an uncached run where two tokens are near ties. `--no-prefix-reuse` gives
   uncached runs.

@@ -248,6 +248,15 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
             "Bytes copied into the Host tier.");
     COUNTER(hybrid_host_restore_bytes, "host_context_restore_bytes_total",
             "Bytes restored from the Host tier.");
+    // The SSD tier below it (zero without --ssd-context-gib).
+    GAUGE(hybrid_ssd_capacity_bytes, "ssd_context_capacity_bytes", "SSD context-cache capacity.");
+    GAUGE(hybrid_ssd_used_bytes, "ssd_context_used_bytes", "SSD context-cache bytes in occupied slabs.");
+    COUNTER(hybrid_ssd_write_bytes, "ssd_context_write_bytes_total", "Bytes written to the SSD tier.");
+    COUNTER(hybrid_ssd_read_bytes, "ssd_context_read_bytes_total", "Bytes read back from the SSD tier.");
+    COUNTER(hybrid_ssd_promotions, "ssd_context_promotions_total",
+            "Sources read from the SSD tier into the Host tier.");
+    COUNTER(hybrid_ssd_snapshot_evictions, "ssd_context_snapshot_evictions_total",
+            "Snapshots lost from the SSD tier.");
     // The VRAM expert cache (Qwen3.8-Flash-Next): a gauge for its size, counters for its traffic.
     if (stats.expert_cache) {
         const ExpertCacheTotals& e = *stats.expert_cache;

@@ -90,6 +90,8 @@ void ProgramImpl::create_prefix_cache() {
     config.index.cost = options_.prefix_cost;
     config.taps       = options_.prefix_taps;
     config.kv_pages   = kv_pages_;
+    config.ssd_bytes     = options_.prefix_ssd_bytes;
+    config.ssd_directory = options_.prefix_ssd_directory;
     prefix_           = std::make_unique<prefix::PrefixCache>(config, *pool_, kv_geometry_, *lane_image_,
                                                             options_.prefix_host_bytes, device_.stream);
     if (mtp_) {
@@ -239,6 +241,7 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
     };
     PrefixSelection root;
     root.need = E;
+    if (lane == kNoLane) { prefix_ssd_wait_ = false; }
     if (base.reuse && n > 1) {
         prefix_->poll();
         pc::MatchResult match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
@@ -299,16 +302,31 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
             }
             s.image_restore = !(resident && *resident == c.snapshot);
             s.existing      = frontiers;
-            if (fits(s)) { return planned(std::move(s)); }
+            if (!fits(s)) { continue; }
+            if (c.ssd_bytes != 0) {
+                // Part of it is only on the SSD tier (hybrid-prefix-cache-spec §5.7). A binding takes
+                // only what is above it (its quote promoted the source); a quote starts the read and
+                // the request waits for it. The cost model already weighed the read.
+                if (lane != kNoLane) { continue; }
+                const pc::SsdTier::Promotion promotion = prefix_->promote(c.snapshot);
+                if (promotion == pc::SsdTier::Promotion::Pending) {
+                    prefix_ssd_wait_ = true;
+                    return std::nullopt;
+                }
+                if (promotion == pc::SsdTier::Promotion::Unavailable) { continue; }
+            }
+            return planned(std::move(s));
         }
         return std::nullopt;
         };
         if (std::optional<PrefixSelection> s = select()) { return s; }
+        if (prefix_ssd_wait_) { return std::nullopt; }
         if (!match.candidates.empty() && prefix_->transfers_pending()) {
             // Blocks pinned only by in-flight Host writes become evictable once those land: a cached
             // source is not given up for the root while a finished lane's writes land.
             prefix_->drain();
             if (std::optional<PrefixSelection> s = select()) { return s; }
+            if (prefix_ssd_wait_) { return std::nullopt; }
         }
     }
     if (fits(root)) { return planned(std::move(root)); }
@@ -343,7 +361,15 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
         return c.filling_blocks != 0 || prefix::inside_exclusion(c.frontier, spans);
     });
     const pc::AdmissionChoice choice = index.choose(match, n);
-    if (!choice.candidate || match.candidates[*choice.candidate].host_only_blocks == 0) { return 0U; }
+    if (!choice.candidate) { return 0U; }
+    if (match.candidates[*choice.candidate].ssd_bytes != 0) {
+        // The head's source is read from the SSD tier into the Host tier while it waits
+        // (hybrid-prefix-cache-spec §5.7); its Device prefetch follows once that lands.
+        const pc::SsdTier::Promotion promotion = prefix_->promote(match.candidates[*choice.candidate].snapshot);
+        if (promotion == pc::SsdTier::Promotion::Pending) { return std::nullopt; }
+        if (promotion == pc::SsdTier::Promotion::Unavailable) { return 0U; }
+    }
+    if (match.candidates[*choice.candidate].host_only_blocks == 0) { return 0U; }
     const std::span<const pc::NodeRef> path(match.path.data(), match.candidates[*choice.candidate].path_blocks);
     index.acquire_path(path);
     std::uint32_t started = 0;
@@ -742,6 +768,8 @@ HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
     out.held_device_evictions   = index.held_device_evictions;
     out.held_snapshot_losses    = index.held_snapshot_losses;
     out.held_host_refusals      = index.held_host_refusals;
+    out.ssd = pc::ssd_tier_stats(prefix_->ssd(), index, prefix_->host_layout().slab_bytes,
+                                 prefix_->index().config().ssd_slabs);
     return out;
 }
 

@@ -24,6 +24,7 @@
 #include "models/qwen4_exp/program/prefix/state_image.h"
 #include "infernix/types.h"
 #include "runtime/prefix_cache/prefix_index.h"
+#include "runtime/prefix_cache/ssd_tier.h"
 #include "runtime/prefix_cache/tap_planner.h"
 
 #include <cuda_runtime_api.h>
@@ -31,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <optional>
 #include <filesystem>
 #include <span>
@@ -98,6 +100,10 @@ struct PrefixCacheConfig {
     runtime::prefix_cache::TapPlannerConfig taps;
     std::uint32_t kv_pages             = 0; // Device page groups of the pool
     std::uint32_t device_snapshot_slots = 0;
+    // The SSD tier (hybrid-prefix-cache-spec §5.7): its size, rounded down to whole Host slabs, and
+    // the directory of its scratch file. 0: none.
+    std::uint64_t ssd_bytes = 0;
+    std::filesystem::path ssd_directory;
 };
 
 // One admission's restore: Host pages into new pages, an image into a lane, then the events a
@@ -196,6 +202,18 @@ public:
     void poll();
     // Waits for every capture, write and restore in flight and publishes them.
     void drain();
+
+    // ---- SSD tier (hybrid-prefix-cache-spec §5.7) ----------------------------------------------
+    [[nodiscard]] runtime::prefix_cache::SsdTier* ssd() noexcept { return ssd_.get(); }
+    [[nodiscard]] const runtime::prefix_cache::SsdTier* ssd() const noexcept { return ssd_.get(); }
+    // Applies landed SSD transfers and starts write-backs; returns whether a promotion landed since
+    // the last call. service_ssd keeps the landing for the next poll_ssd (idle maintenance).
+    bool poll_ssd();
+    void service_ssd();
+    // Whether service_ssd would start a write-back now.
+    [[nodiscard]] bool ssd_due() const noexcept { return ssd_ && ssd_->write_back_due(); }
+    // Starts reading the parts of `snapshot` only on the SSD into the Host tier.
+    [[nodiscard]] runtime::prefix_cache::SsdTier::Promotion promote(runtime::prefix_cache::SnapshotRef snapshot);
     [[nodiscard]] bool transfers_pending() const noexcept {
         return !captures_.empty() || !writes_.empty() || !landing_.empty();
     }
@@ -319,6 +337,9 @@ private:
     const LaneStateImage* lanes_ = nullptr;
     PrefixHostLayout host_;
     std::vector<PinnedHostBuffer> chunks_;
+    // Declared after the chunks it reads and writes: destroyed first, waiting for its transfers.
+    std::unique_ptr<runtime::prefix_cache::SsdTier> ssd_;
+    bool ssd_landed_ = false;
     cudaStream_t compute_  = nullptr; // not owned
     cudaStream_t transfer_ = nullptr;
     cudaStream_t restore_stream_ = nullptr;

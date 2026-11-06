@@ -2,7 +2,7 @@
 
 The hybrid prefix cache (HPC) is Infernix's prefix cache for every supported artifact. It reuses
 prompt prefixes through content-addressed 64-token KV blocks and sparse recurrent-state snapshots,
-kept on the Device and in one pinned Host tier. It replaced the original continuation/checkpoint
+kept on the Device, in one pinned Host tier and, opt-in, in an SSD tier below it (§5.7). It replaced the original continuation/checkpoint
 cache, which was removed on 2026-10-09; throughout this document "Legacy" names that removed
 design, kept only where it explains a decision or a measurement. Scheduling, permits, preemption
 and Replay recovery are in [Resource scheduling](resource-scheduling-and-context-cache.md).
@@ -55,6 +55,7 @@ other value is derived from the rest of the configuration (§14.2).
 | §7.9 next-turn prefill | implemented 2026-10-27 (`--cache-next-turn-ms`; default on for Qwen3.5, off for Qwen3.8-Flash-Next and refused on its reproducible route): host tests pass; real scenarios `next-turn` / `next-turn-reproducible` (27B) pass; Flash-Next's reproducible resume from the pass was not exact, and its reproducible route keeps no tap where a lane ends (§7.9); the agentic replay A/B is outstanding |
 | §6.2 cost model | implemented: the Engine's context-cost coefficients (prefill and Host-to-Device transfer) rank sources and value snapshots |
 | §5.5 persistence across restarts | implemented (opt-in `--prefix-cache-file`) |
+| §5.7 SSD tier | implemented 2026-11-06 (opt-in `--ssd-context-gib` with `--ssd-context-dir`), both bindings: host-only unit tests (index write-back, demotion, promotion, SSD eviction order, a randomized stress with invariant checks), `infernix_ssd_tier_test` (bytes through a real scratch file), `infernix_direct_scratch_file_test`, real scenarios `ssd-restore`/`ssd-restore-mtp` (27B) and `--ssd` (Flash-Next), timing `--ssd-scale` (§16.9) |
 | §12.2 in-flight prefix coalescing | implemented: requests sharing a new prefix with a lane still prefilling wait for its snapshot at the divergence instead of prefilling the prefix again |
 | §7.2–§7.3 zero-split GDN state tap and phase alignment | not implemented: an exact tap costs one prefill split (about 15 ms per turn on 27B); flexible taps avoid it, and requests resuming from an endpoint skip the opener tap (§7.1) |
 | §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
@@ -466,6 +467,136 @@ Gated DeltaNet recurrent state is 144 of an image's 186.8 MiB (§3.2). `--cache-
   agreement no worse than a different prefill chunking); NLL was not measured. The agentic A/B
   showed no consistent gain at a 16 GB Host tier (§16.8), so `fp32` stays the default and the packed
   forms are an option for Host tiers too small for the working set.
+
+### 5.7 SSD tier (opt-in)
+
+`--ssd-context-gib N` with `--ssd-context-dir DIR` (`ContextCacheOptions::ssd_capacity_bytes`,
+`ssd_directory`; default off) adds a tier below the Host tier, for both bindings (Qwen3.5 and
+Qwen3.8-Flash-Next, §17). A Host tier sized to leave RAM for the experts holds only one or two long
+agent conversations: on the FP4-Local agent log of 2026-11-02/03 (Host tier 3.75 GiB, INT8 KV at
+14.6 KB a token) a 160K-token conversation's path is about 2.3 GB, and 1,122 of 1,321 s of prefill
+recomputed context the cache had held. The SSD tier keeps what the Host tier gives up and reads it
+back instead of recomputing it.
+
+Storage and transfers:
+
+- One scratch file per process in DIR (`infernix-context-<pid>-<n>.bin`), created at startup with its
+  whole size reserved (`FileAllocationInfo` / `posix_fallocate`, nothing written, so startup is
+  instant and a drive without the space fails at once). It is opened unbuffered (no page cache, so it
+  holds no RAM) and is removed when the process ends, a crash included (Windows deletes it on close,
+  POSIX unlinks it when created). Its content does not outlive the process; `--prefix-cache-file`
+  (§5.5) saves the Host tier only.
+- The file is an array of SSD slabs of the Host slab size: an SSD slab holds exactly the bytes of one
+  Host slab (a block bundle, an image part, a tail), so every transfer is a byte copy between pinned
+  Host memory and the file, and a restore through the SSD is bit-exact for every KV storage and state
+  form, the reproducible and lossless routes included. Each SSD slab id maps to one fixed offset; the
+  free list hands out the lowest id first, so the file fills from its start (on Windows a write past
+  the valid data length completes synchronously after zeroing any gap below it, so filling in order
+  keeps those writes sequential and gap-free).
+- `core::DirectScratchFile` runs the transfers on its own threads: up to 8 reads in flight, then up
+  to 2 writes, and no write is issued while a read waits, so a restore never queues behind
+  write-back. Consecutive SSD slabs over consecutive Host addresses go as one I/O of up to 8 MiB
+  (QD 8 of such I/Os reaches a PCIe 4.0 or 5.0 drive's sequential rate). A failed I/O is retried
+  twice.
+- `runtime::prefix_cache::SsdTier` drives it for the index; completions are applied on the Engine
+  worker (the index has one mutator): at every cache poll, every Engine cycle (`hybrid_poll_storage`)
+  and, while the Engine is idle, through the maintenance waker. New write-backs start only between
+  rounds, never inside an admission.
+
+Index state. A node has at most one SSD slab, a snapshot image its image slabs plus one for a tail,
+like its Host copy (`CopyState` Absent/Filling/Resident per tier). A node has a copy if any tier
+holds
+one; a snapshot is valid when its image is in a Device slot or on the Host or the SSD, and its tail
+on the Device, the Host or the SSD. A Device copy with a Host or SSD copy is backed (§9.1), and a
+Device slot owner with a Host or SSD image is not Device-only (§9.2). The index also counts, per
+node, the snapshots below it whose image is on the Device or the Host (`warm_below`): a block whose
+snapshots are all only on the SSD is "cold".
+
+Write-back (Host to SSD). Only what the Host tier would otherwise lose is written, and each block at
+most once while the SSD keeps it (blocks are immutable):
+
+- The Host tier's lossless room is its free slabs, dead blocks' slabs, and every Host copy the SSD
+  also holds ("clean": blocks and images). While it is below the target, `begin_ssd_write` takes the
+  retained (not superseded), unpinned, unheld, Host-resident snapshot of lowest GDSF priority whose
+  image has no SSD copy (the Host tier's next victim) and writes its image (and tail) and every block
+  of its path that is Host-resident without an SSD copy; a snapshot with a Device-only block on its
+  path, or one another write-back is writing, is passed over for the next. At most two write-backs
+  run at once.
+- Target: three quarters of the Host tier, so at most a quarter of it holds content the SSD does not.
+  One prefill unit can take most of the tier at once (its captures, its released blocks, a promotion)
+  before a write-back started after it could land; with half the tier as the target, a FP4-Local
+  test lost the endpoint the previous request had just published that way. A Host tier with room
+  writes nothing; superseded snapshots, dead blocks and Device-only content are never written. Each
+  Engine cycle first publishes landed captures and Host writes, then decides, so a request's
+  snapshots are written before the next request's prefill displaces them; while the Engine is idle
+  the maintenance waker runs it (`hybrid_storage_due`).
+- SSD transfers hold I/O pins (path-wide, like pins) on their snapshot and its path: the Host and SSD
+  copies they read or write stay and the entries stay indexed, but their Device copies stay
+  evictable (a path pin takes a block out of the Device LRU, and one did make an idle Engine refuse a
+  prompt that needed those pages). A Device copy that is an entry's only copy stays out of the LRU
+  while I/O-pinned, and a Device slot owner under a promotion is never removed for its slot.
+- Unbuffered I/O needs sector-aligned memory: Host chunks are allocated 4 KiB-aligned
+  (`PinnedHostBuffer(bytes, 4096)`), since `cudaMallocHost` returned a 1 GiB chunk only 512-byte
+  aligned. A transfer the file refuses or the drive fails counts as a failure, never an Engine error.
+- SSD room for a write-back worth `H` (its snapshot's priority) comes from, in order: the SSD copies
+  of dead blocks; superseded SSD-only snapshots, oldest first; SSD copies of images still on the
+  Host or the Device whose priority exceeds `H` (the Host keeps those longer; most valuable first);
+  then SSD-only snapshots worth at most `H`, lowest first (a loss: `L` rises to its priority). The
+  room is checked before anything is evicted: a write-back that cannot fit displaces nothing, and up
+  to 8 candidates are tried. The bound keeps write-backs from displacing one another's backups in
+  turn (a test of the first unbounded version looped forever doing exactly that). Held snapshots
+  (§9.6) are never SSD victims.
+- A failed write leaves the entries as they were; after three failures the tier stops writing and
+  keeps reading.
+
+Host eviction with an SSD tier (replacing §9.3's order):
+
+1. dead blocks (with their SSD copies);
+2. clean blocks under no Device- or Host-resident snapshot image ("cold"): the Host copy goes;
+3. superseded snapshots: one with an SSD image gives up its Host image and stays on the SSD, another
+   is removed as before;
+4. retained snapshots with an SSD image, lowest priority first: they give up their Host image and
+   stay restorable; their exclusive path becomes cold and goes in step 2;
+5. other clean blocks (under a snapshot whose image is still on the Device or the Host);
+6. retained snapshots without an SSD copy, as before (GDSF, the claim, `L`).
+
+Steps 2 to 5 lose nothing. Held snapshots and their paths keep their Host copies (§9.6). Without an
+SSD tier steps 2, 4 and 5 find nothing, so the order is §9.3's.
+
+Restore (SSD to Host to Device). `match` reports the blocks of a candidate's path with neither a
+Device nor a Host copy (`ssd_only_blocks`), whether its image or tail is only on the SSD, and the
+bytes to read (`ssd_bytes`); `choose` adds `ssd_seconds(ssd_bytes)` (1 ms plus the bytes at the
+measured read rate, which starts at 2 GB/s and follows every promotion of 16 MB or more) to its
+cost, so a shallower Device or Host source wins when it is cheaper. A source with SSD-only parts is
+promoted before it binds:
+
+- The quote that chooses it (`hybrid_sources`) or the blocked-head prefetch (§6.6) calls
+  `begin_ssd_promotion`: the snapshot is I/O-pinned, Host slabs are taken for its SSD-only blocks and its
+  image (and tail) by the eviction order above, marked Filling, and read. The quote returns no
+  source and `hybrid_source_pending()`: the Engine keeps the request queued (a waiting request, not
+  an unadmittable one; others may be admitted under the bypass rules) and scans the queue again when
+  `hybrid_poll_storage` reports the landing. The request's source is held meanwhile (§9.6), so its
+  promoted copies stay; it then binds from the Host tier as in §6.4-§6.5. A binding (`start_binding`)
+  never waits: a source found only on the SSD there is stale and the Engine moves to the next.
+- When the Host tier cannot free the slabs (`NoRoom`), the quote takes the best source above the SSD.
+- The SSD copies stay after a promotion (an inclusive tier): when those blocks leave the Host tier
+  again nothing is written.
+- A failed read frees the Host slabs and drops the SSD copies it read (an entry left with no copy
+  goes with its subtree, §9.4); the request is quoted again.
+
+RAM and writes:
+
+- Every SSD-resident block keeps its tree node in RAM (about 400 bytes with its 64 tokens) and every
+  SSD-only snapshot its record: a 64 GiB tier of Flash-Next INT8 slabs (0.93 MB) adds about 70K
+  nodes, about 30 MB.
+- A conversation turn writes at most its new blocks and the snapshots retained when the Host tier
+  needs their room, once each. The `throughput` record's `context_cache.hybrid.ssd` object and
+  `/metrics` (`ssd_context_*`) report the bytes written and read, promotions, demotions and losses.
+
+Configuration: `--ssd-context-gib` and `--ssd-context-dir` go together; the tier is refused with
+`--no-prefix-reuse`, without a Host tier (`--host-context-mib 0`), with a directory that does not
+exist, and with a size below one snapshot image and its block (the size rounds down to whole Host
+slabs). The startup log names the directory and size.
 
 ---
 
@@ -1080,6 +1211,8 @@ new claim (a long prompt's hot snapshots after Host write-back stripped their Ho
 
 ### 9.3 Host (superseded snapshots first, then GDSF; dead-KV first)
 
+(With an SSD tier, Host copies the SSD also holds go before anything is lost: §5.7 gives the order.)
+
 **Supersession.** In a conversation the next request resumes from the newest snapshot of its
 lineage, not from the one the current request resumed from. When a sequence is about to publish a
 deeper snapshot on its path, the snapshot it resumed from becomes *superseded*, and so does the
@@ -1492,6 +1625,8 @@ struct ContextCacheOptions {
     bool enabled;                                           // --no-prefix-reuse disables
     HybridPrefixCacheOptions hybrid;
     std::optional<std::size_t> host_capacity_bytes;         // --host-context-mib: Host slab pool
+    std::uint64_t ssd_capacity_bytes;                       // --ssd-context-gib: SSD tier (§5.7), 0 = off
+    std::filesystem::path ssd_directory;                    // --ssd-context-dir: its scratch file's place
 };
 ```
 
@@ -1507,6 +1642,7 @@ prefill_chunk` and a Host tier present when the budget is nonzero:
 | `tap_ladder_tokens` | `max(4096, 2·chunk)` | ladder taps land on chunk boundaries; a finer ladder only duplicates them |
 | `tap_min_gap_tokens` | `max(1024, chunk)` | the same |
 | `next_turn_prefill_quiet` | 150 ms (`kDefaultNextTurnPrefillQuiet`), `0..3600000` ms | TensorFold's measured quiet period (§7.9) |
+| `ssd_capacity_bytes` | 0 (off) | it writes to the drive whenever the Host tier fills (§5.7): an opt-in |
 | KV capacity (`infernix-serve`) | `--kv-capacity auto` unless given | free VRAM becomes Device block cache |
 
 With the cache disabled, `host_capacity_bytes`, `device_snapshot_slots` and
@@ -1933,6 +2069,75 @@ Functional checks of the trial builds (Qwen3.8-27B official NVFP4, RTX 5090, gre
   `fp24` rounding changes greedy trajectories immediately; whether it degrades answers is what the
   resume-equivalence measurement has to establish.
 
+### 16.9 SSD tier (2026-11-06)
+
+Built for the FP4-Local agent log of 2026-11-02/03 (§5.7). Measured on the RTX 5090 machine (PCIe 5.0
+x8 GPU link, 96 GB RAM) with two drives: a Samsung 990 PRO 2 TB (PCIe 4.0 TLC, the regular SSD) and
+an Intel Optane P5800X 400 GB.
+
+- **A 100K-token conversation** (`infernix_qwen4_exp_prefix_cache_real_test --ssd-scale`; FP4-Local,
+  INT8 KV, default route, 16,384-token chunks, Host tier 4 GiB, SSD tier 16 GiB): conversation A, then
+  B pushing A's blocks off the Device; A plus 64 tokens resumes from the Host tier; C and D push A
+  out of the Host tier; the same prompt again resumes from the SSD tier.
+
+| drive | cold prefill (100K) | Host resume (98,304 reused) | SSD resume (99,968 reused) | read |
+|---|---:|---:|---:|---|
+| 990 PRO (E:) | 10.81 s | 2.24 s | **0.42 s** | 0.98 GB at 6.80 GB/s |
+| P5800X (G:) | 10.77 s | 2.23 s | **0.41 s** | 0.98 GB at 6.96 GB/s |
+
+  Times are to the first token. The Host resume prefills 1,760 tokens from A's snapshot, the SSD
+  resume 96 from the first resume's own, so the two resumes are not the same work; the SSD read
+  itself is 0.98 GB in about 0.14 s. The regular drive reads within 3 % of the Optane one: with eight
+  8 MiB reads in flight both run near their sequential rates. Both resumes generated the same 16
+  tokens. The run wrote 6.56 GB (10 images, 6,275 blocks): with a Host tier smaller than the
+  conversations, nearly everything the conversations leave is written once.
+- **Exactness** (exact route, byte copies at every tier): FP4-Local `--ssd` (a 300 MiB Host tier, a
+  4 GiB SSD tier): a tap resume read back from the SSD tier equals the cold run, and a turn 2 resumed
+  at turn 1's endpoint read back from it equals the lane-resident resume; Qwen3.8-27B NVFP4
+  `ssd-restore` and `ssd-restore-mtp` (a 480 MiB Host tier): the prompt-tail snapshot read back from
+  the SSD tier generates what the Device-resident engine does.
+- **Fixed while building** (each found by a test above): SSD jobs first held path pins, which took
+  their blocks' Device copies out of the LRU, and an idle Engine refused a prompt that needed those
+  pages (I/O pins replaced them); a write-back making SSD room by dropping other snapshots' backups
+  let two write-backs displace each other forever (the claim bound); with half the Host tier as the
+  write-back target, and with retries 100 ms apart, a request's endpoint was still unwritten when the
+  next request's prefill displaced it (three quarters, and a retry at every poll, after landed
+  captures are published); `cudaMallocHost` returned a 1 GiB Host chunk only 512-byte aligned, which
+  unbuffered I/O refuses (chunks are allocated 4 KiB-aligned).
+- **The agentic replay** (`bench/agentic_ab`, FP4-Local on the owner's launch flags with
+  `--host-context-mib 3840` in both arms, the SSD arm adding a 64 GiB tier on the 990 PRO; seed 42,
+  scale 1.0, corpus `a0c806c5`, 130 requests per arm, one run each):
+
+| metric | no SSD tier | SSD tier | change |
+|---|---:|---:|---:|
+| average time to first token | 4.3 s (3.2-5.6) | 3.4 s (2.8-4.0) | −21.6 % |
+| median / 90th percentile | 2.93 / 9.7 s | 2.33 / 5.5 s | −20.6 / −43.2 % |
+| continuing-session turns (112), average | 4.29 s | 3.25 s | −24.3 % |
+| new long prompts (6), average | 8.0 s | 7.6 s | −4.8 % |
+| prompt tokens served from cache | 78.8 % | 90.8 % | +12.0 points |
+| prompt tokens prefilled | 1,142,284 | 497,279 | −56.5 % |
+| whole-prompt re-prefills, main sessions (of 75) / subagents (of 37) | 9 / 1 | 0 / 0 | |
+| output tok/s, one request decoding | 161 (156-166) | 157 (148-163) | −2.1 % |
+| decode rounds/s, one request decoding | 63.0 (59.2-65.9) | 61.2 (55.6-65.1) | −2.8 % |
+| prefill tok/s, the two requests with no cache hit | 7,721 | 7,671 | −0.6 % |
+| workload wall time | 12.3 min | 12.8 min | +3.4 % |
+
+  Brackets are 95 % bootstrap intervals. The session resumed after idling took 0.98 s against
+  9.91 s. The decode rows are within their intervals but both lower, and write-back runs during
+  decode; they are not resolved by one run each. Subagent tool-loop turns averaged 5.17 s against
+  4.97 s although more of their prompts came from cache (91.3 against 85.0 %): their averages are
+  decided by a few queue waits (survey-1#3 29.4 s against 4.0 s, the same 1,988 tokens prefilled).
+  Each arm samples its own text (completion tokens 77,036 against 90,706), so wall time and
+  batching are not comparable between the arms. The SSD arm wrote
+  33.3 GB (159 snapshot images, 9,348 blocks) and read 11.7 GB back (36 promotions), with no
+  failures and no SSD evictions; 33.3 GB of the 64 GiB were in use at the end. From this run's and
+  the scale run's counters an image is about 164 MB and a block about 0.8 MB, so images were about
+  three quarters of the writes (an estimate).
+- **Not measured here**: a Linux Engine (the POSIX path, `pread`/`pwrite` on an `O_DIRECT` file unlinked
+  at creation, passes `infernix_direct_scratch_file_test`, `infernix_ssd_tier_test` and the index test
+  under WSL2 Ubuntu 24.04 with g++ 13.3, `-Wall -Wextra` clean, but no Linux model run); a QLC drive
+  after its SLC cache is exhausted (writes would slow, reads are issued first).
+
 ## 17. Qwen4Exp binding (Qwen3.8-Flash-Next)
 
 `Qwen4ExpForCausalLM` keeps every routed expert in pinned Host RAM and streams them into a Device
@@ -1955,6 +2160,7 @@ rules, measurements and the build record are in the
 | Vision | A resume frontier strictly inside an item, or past its start in the block it begins in (rule 3 of §6.1), is never chosen; items ending at or before the frontier are not encoded again (the encode window is planned from the frontier); suffix M-RoPE positions come from the prompt |
 | Statistics | `RuntimeStats::hybrid_*` and the request log's `cached_prefix_tokens` / `restored_host_bytes` as in Qwen3.5 |
 | Persistence | As §5.5, own format (`prefix/persist.cpp`, `NINFQ4PC` version 1): the block table also stores each block's `mtp_next`; snapshot meta travels inside each image's header slab and is validated by the state-image layout fingerprint, which the file's geometry also records. Saved at the Engine's stop after every lane is released; loaded into the empty cache at startup |
+| SSD tier | As §5.7 (`prefix_select` promotes the source a quote chooses; a binding skips sources only on the SSD). Snapshot meta and `mtp_next` stay with their index entries, so an SSD copy is the Host slabs' bytes alone |
 | Preemption | A pause publishes the lane's blocks and its state at the frontier to the cache, as a consistent abort does, and releases the lane (design §19.3.13); the resume binds from the deepest snapshot, without replay when it sits at the paused frontier |
 | Failure | A row with non-finite logits withdraws the request's entries (§7.8): its captures are Host-born, so the release first drains the transfer stream and reads each capture's publication (the lane keeps its capture ids until its release). A `RecoverableExecutionError` (an expert record that could not be read) still empties the whole cache, since the failed round's state is unknown for every lane |
 | Not built | Device snapshot slots, prefill CPU assist and C > 1 extras (design P7, P8) |

@@ -4,6 +4,7 @@
 #include "runtime/contract/resources.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "runtime/prefix_cache/cost.h"
+#include "runtime/prefix_cache/ssd_stats.h"
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -223,6 +224,7 @@ struct HybridPrefixCacheStats {
     std::uint64_t held_snapshot_losses       = 0;
     std::uint64_t held_host_refusals         = 0;
     std::uint64_t tool_call_holds            = 0;
+    runtime::prefix_cache::SsdTierStats ssd; // the SSD tier (hybrid-prefix-cache-spec §5.7)
 };
 
 class ResumeState {
@@ -483,6 +485,14 @@ public:
     [[nodiscard]] bool hybrid_holds_stale() const noexcept;
     // Changes when a queued request's choice of snapshot may have changed.
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
+    // The SSD tier (hybrid-prefix-cache-spec §5.7): applies landed transfers and starts write-backs;
+    // returns whether a promotion landed since the last call, so the queue is scanned again.
+    bool hybrid_poll_storage();
+    // Whether the last hybrid_sources call returned no source because the source it chose is being
+    // read from the SSD tier (the request waits for that read, not for capacity).
+    [[nodiscard]] bool hybrid_source_pending() const noexcept;
+    // Whether the SSD tier would start a write-back now: the idle Engine runs maintain() for it.
+    [[nodiscard]] bool hybrid_storage_due() const noexcept;
     // The positions a request can resume from: every position with free-cache-resume, else the
     // prefill chunk grid (the reproducible route).
     [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept;

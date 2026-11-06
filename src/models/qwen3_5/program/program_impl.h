@@ -867,6 +867,8 @@ public:
     std::array<HybridLaneState, kMaximumConcurrency> hybrid_lanes_;
     runtime::prefix_cache::CacheCostModel hybrid_cost_;
     double hybrid_coalesce_wait_seconds_ = 0.0;
+    // The last hybrid_sources call deferred its request to an SSD promotion (spec §5.7).
+    bool hybrid_source_pending_ = false;
     std::filesystem::path hybrid_file_;
     std::string hybrid_fingerprint_;
     std::optional<HybridCachePersistence> hybrid_shutdown_save_;

@@ -665,6 +665,12 @@ struct ContextCacheOptions {
     // steps and at least 1 GiB (after Strata v0.2.6's rule); other models take kDefaultHybridHostCacheBytes.
     // Engine::options() reports the resolved size in host_capacity_bytes.
     bool host_capacity_auto = false;
+    // The SSD tier below the Host tier (docs/maintainer/hybrid-prefix-cache-spec.md §5.7): a scratch
+    // file of ssd_capacity_bytes (rounded down to whole Host slabs) created in ssd_directory at startup,
+    // read and written unbuffered, and removed when the process ends. 0 (the default) disables it; it
+    // needs the cache and a Host tier. Every model's prefix cache supports it.
+    std::uint64_t ssd_capacity_bytes = 0;
+    std::filesystem::path ssd_directory;
 };
 
 struct ContextCostOptions {
@@ -2302,6 +2308,23 @@ struct RuntimeStats {
     std::uint64_t hybrid_held_host_refusals      = 0;
     // Holds placed after a reply ending in a tool call (HybridPrefixCacheOptions::tool_call_hold).
     std::uint64_t hybrid_tool_call_holds         = 0;
+    // The SSD tier (ContextCacheOptions::ssd_capacity_bytes; zero without one): its size and bytes
+    // in use, the snapshots only it holds, bytes written and read, images and blocks written, Host
+    // copies given up because it holds them, promotions (reads into the Host tier), SSD-only
+    // snapshots lost, and failed transfers. Gauges are absolute, the rest cumulative.
+    std::uint64_t hybrid_ssd_capacity_bytes       = 0;
+    std::uint64_t hybrid_ssd_used_bytes           = 0;
+    std::uint32_t hybrid_ssd_only_snapshots       = 0;
+    std::uint64_t hybrid_ssd_write_bytes          = 0;
+    std::uint64_t hybrid_ssd_read_bytes           = 0;
+    std::uint64_t hybrid_ssd_image_writes         = 0;
+    std::uint64_t hybrid_ssd_block_writes         = 0;
+    std::uint64_t hybrid_ssd_host_image_demotions = 0;
+    std::uint64_t hybrid_ssd_host_block_demotions = 0;
+    std::uint64_t hybrid_ssd_promotions           = 0;
+    std::uint64_t hybrid_ssd_snapshot_evictions   = 0;
+    std::uint64_t hybrid_ssd_failures             = 0;
+    double hybrid_ssd_read_bytes_per_second       = 0.0; // the last promotion of 16 MB or more
     // Idle-time prefill of finished turns (HybridPrefixCacheOptions::next_turn_prefill_quiet): passes
     // started, run to their end, yielded to a request at a unit boundary, skipped because the cache
     // already held all but a few of their tokens, and turns dropped before a pass started (a

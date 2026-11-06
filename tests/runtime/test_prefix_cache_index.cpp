@@ -1661,6 +1661,433 @@ void test_random_stress() {
     }
 }
 
+// ---- SSD tier (spec §5.7) ------------------------------------------------------------------------
+
+PrefixIndexConfig ssd_config(std::uint32_t host_slabs, std::uint32_t ssd_slabs, std::uint32_t slots = 0) {
+    PrefixIndexConfig config = small_config(host_slabs, slots);
+    config.ssd_slabs         = ssd_slabs;
+    config.max_nodes         = 256;
+    config.max_snapshots     = 48;
+    return config;
+}
+
+// A Host-born endpoint at the end of `tokens` (whole blocks), its blocks backed on the Host first.
+SnapshotRef host_endpoint(PrefixCacheIndex& index, RecordingBackend& backend, const std::vector<TokenId>& tokens) {
+    const auto path = insert_sequence(index, backend, tokens);
+    for (const NodeRef node : path) { backup_node(index, node); }
+    auto image = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+    require(image.has_value(), "an endpoint image fits the Host tier");
+    const PublishResult result = index.publish_host_snapshot(
+        path.back(), static_cast<std::uint32_t>(path.size()) * kBlockTokens, {}, std::nullopt, std::move(*image),
+        SnapshotKind::Endpoint);
+    require(result.created, "endpoint published");
+    index.release_path(path);
+    index.check_invariants();
+    return result.snapshot;
+}
+
+void write_back(PrefixCacheIndex& index) {
+    std::optional<SsdJob> job = index.begin_ssd_write();
+    require(job.has_value(), "a write-back starts");
+    index.check_invariants();
+    index.complete_ssd_write(*job);
+    index.check_invariants();
+}
+
+MatchCandidate match_one(PrefixCacheIndex& index, std::vector<TokenId> prompt) {
+    prompt.push_back(5);
+    const auto hashes = block_lookup_hashes(prompt, {});
+    const MatchResult match = index.match(prompt, hashes, {}, static_cast<std::uint32_t>(prompt.size()));
+    require(!match.candidates.empty(), "the prompt matches a snapshot");
+    return match.candidates.front();
+}
+
+void test_ssd_write_back_and_demotion() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(ssd_config(16, 64), backend);
+    require_throws([&] { PrefixCacheIndex bad(ssd_config(0, 64), backend); }, "an SSD tier needs a Host tier");
+    require_throws([&] { PrefixCacheIndex bad(ssd_config(16, 5), backend); }, "an SSD tier holds a snapshot");
+    const auto a          = make_tokens(128, 300);
+    const SnapshotRef end = host_endpoint(index, backend, a); // 2 blocks + 4 image slabs
+    require(index.stats().host_free_slabs == 10 && index.host_lossless_slabs() == 10,
+            "nothing is clean before a write-back");
+
+    // The write-back takes the image and both path blocks, pinned while it runs.
+    std::optional<SsdJob> job = index.begin_ssd_write();
+    require(job.has_value() && job->snapshot == end && job->image && job->nodes.size() == 2 &&
+                job->transfers.size() == 6,
+            "the write-back covers the image and the path");
+    require(index.snapshot(end).ssd == CopyState::Filling && index.node(job->nodes[0]).ssd == CopyState::Filling,
+            "the write-back's copies are Filling");
+    // It holds its Host source, not the Device: the path's Device copies stay evictable (a pinned path
+    // once kept an idle Engine from admitting a prompt that needed those pages).
+    require(index.device_backed_evictable_blocks() == 2, "the written path's Device copies stay evictable");
+    require(job->transfers[0].host_slab == index.node(job->nodes[0]).host_slab &&
+                job->transfers[0].ssd_slab == 0 && job->transfers[5].ssd_slab == 5,
+            "transfers name the Host slabs and the lowest SSD slabs, path first");
+    require(!index.begin_ssd_write().has_value(), "nothing else to write");
+    index.check_invariants();
+    require(index.evict_backed_device_blocks(2) == 2 && index.valid(end), "Device copies go during the write");
+    index.check_invariants();
+    index.complete_ssd_write(*job);
+    index.check_invariants();
+    require(index.snapshot(end).ssd == CopyState::Resident && index.snapshot(end).pins == 0 &&
+                index.stats().ssd_free_slabs == 58,
+            "the write-back landed");
+    require(index.host_lossless_slabs() == 16, "every used Host slab is now clean");
+
+    // Host pressure: the clean endpoint gives up its Host image first (no loss), then its blocks.
+    (void)host_endpoint(index, backend, make_tokens(192, 301)); // 3 blocks + 4 image slabs
+    require(index.stats().host_free_slabs == 3, "a second conversation");
+    auto image = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+    auto more  = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+    require(image && more, "two images fit after demotions");
+    index.check_invariants();
+    // Only the SSD and Host copies remain (the Device copies are backed and go).
+    (void)index.evict_backed_device_blocks(1000);
+    index.check_invariants();
+    const SnapshotView demoted = index.snapshot(end);
+    require(index.valid(end) && demoted.host == CopyState::Absent && demoted.ssd == CopyState::Resident,
+            "the endpoint lives on in the SSD tier");
+    const PrefixIndexStats stats = index.stats();
+    require(stats.host_image_demotions == 1 && stats.host_block_demotions == 1 && stats.host_snapshot_evictions == 0,
+            "an image and a cold block were demoted, nothing was lost");
+    require(stats.ssd_only_snapshots == 1, "one snapshot is SSD-only");
+
+    // Its match names the SSD read, and the cost model adds it.
+    const MatchCandidate candidate = match_one(index, a);
+    require(candidate.snapshot == end && candidate.image_on_ssd_only && candidate.ssd_only_blocks == 1 &&
+                candidate.ssd_bytes == (1U << 20U) + (4U << 20U),
+            "the candidate reads one block and the image from the SSD");
+    index.release_host_image(std::move(*image));
+    index.release_host_image(std::move(*more));
+    index.check_invariants();
+
+    // Promotion reads them back into Host slabs; the SSD keeps its copies.
+    SsdPromotionStart start = index.begin_ssd_promotion(end);
+    require(start.status == SsdPromotionStatus::Started && start.job && start.job->image &&
+                start.job->nodes.size() == 1 && start.job->transfers.size() == 5,
+            "the promotion reads the block and the image");
+    require(index.begin_ssd_promotion(end).status == SsdPromotionStatus::Waiting,
+            "a second request waits for the promotion in flight");
+    index.check_invariants();
+    index.complete_ssd_promotion(*start.job);
+    index.check_invariants();
+    const MatchCandidate back = match_one(index, a);
+    require(back.ssd_bytes == 0 && !back.image_on_ssd_only && index.snapshot(end).ssd == CopyState::Resident,
+            "the source is Host-resident again and still SSD-backed");
+    require(index.begin_ssd_promotion(end).status == SsdPromotionStatus::Resident, "nothing left to promote");
+}
+
+void test_ssd_eviction_order() {
+    constexpr double kAny = std::numeric_limits<double>::infinity();
+    RecordingBackend backend;
+    // Host: 12 slabs; SSD: 15 (two conversations of 2 blocks + 4 image slabs, and three spare).
+    PrefixCacheIndex index(ssd_config(12, 15), backend);
+    const SnapshotRef end_a = host_endpoint(index, backend, make_tokens(128, 310));
+    write_back(index);
+    const SnapshotRef end_b = host_endpoint(index, backend, make_tokens(128, 311));
+    write_back(index);
+    require(index.stats().ssd_free_slabs == 3, "two conversations on the SSD tier");
+    // A third conversation moves a (the older of two equal values) out of the Host tier, then a
+    // capture's demand moves b: both stay restorable, nothing is lost.
+    const SnapshotRef end_c = host_endpoint(index, backend, make_tokens(128, 312));
+    require(index.snapshot(end_a).host == CopyState::Absent && index.snapshot(end_b).host == CopyState::Resident,
+            "the older clean endpoint moved to the SSD first");
+    {
+        auto pressure = index.reserve_host_image(false, kAny);
+        require(pressure.has_value(), "room by demotion");
+        index.release_host_image(std::move(*pressure));
+    }
+    index.check_invariants();
+    require(index.snapshot(end_b).host == CopyState::Absent && index.stats().host_snapshot_evictions == 0,
+            "b moved too, and nothing was lost");
+    for (int hit = 0; hit < 3; ++hit) { index.note_hit(end_b); } // b is now worth more than a or c
+    // Writing c needs 6 SSD slabs: the SSD-only snapshot worth no more than c goes, b stays.
+    write_back(index);
+    require(!index.valid(end_a) && index.valid(end_b) && index.snapshot(end_c).ssd == CopyState::Resident,
+            "the lowest-priority SSD-only snapshot made room");
+    require(index.stats().ssd_snapshot_evictions == 1, "one SSD-only snapshot lost");
+    // d would have to displace b (worth more) or c's backup (worth less): it is not written, and the
+    // refused write evicts nothing.
+    const SnapshotRef end_d = host_endpoint(index, backend, make_tokens(128, 313));
+    const PrefixIndexStats before = index.stats();
+    require(!index.begin_ssd_write().has_value(), "a write worth less than what it displaces is refused");
+    index.check_invariants();
+    require(index.stats().ssd_dead_reclaims == before.ssd_dead_reclaims &&
+                index.stats().ssd_free_slabs == before.ssd_free_slabs,
+            "a refused write-back evicts nothing");
+    // Once c is worth more than d, c's backup yields (after the dead blocks a left): the Host keeps c
+    // longer than d.
+    for (int hit = 0; hit < 6; ++hit) { index.note_hit(end_c); }
+    write_back(index);
+    const PrefixIndexStats stats = index.stats();
+    require(stats.ssd_dead_reclaims == 2 && stats.ssd_backup_drops == 1, "dead copies, then a backup");
+    require(index.valid(end_b) && index.snapshot(end_b).ssd == CopyState::Resident, "b survives on the SSD");
+    require(index.valid(end_c) && index.snapshot(end_c).ssd == CopyState::Absent &&
+                index.snapshot(end_c).host == CopyState::Resident,
+            "c lost only its backup");
+    require(index.snapshot(end_d).ssd == CopyState::Resident, "d was written");
+    // A held snapshot is never an SSD victim, even superseded (otherwise the first to go). Write-backs
+    // never displace one another's backups in turn: the loop ends.
+    (void)index.supersede(end_b);
+    const std::array<SnapshotRef, 1> holds{end_b};
+    index.set_queue_holds(holds);
+    index.check_invariants();
+    (void)host_endpoint(index, backend, make_tokens(128, 314));
+    int writes = 0;
+    while (std::optional<SsdJob> job = index.begin_ssd_write()) {
+        index.complete_ssd_write(*job);
+        index.check_invariants();
+        require(++writes < 8, "write-backs settle");
+    }
+    require(index.valid(end_b) && index.snapshot(end_b).ssd == CopyState::Resident, "the held snapshot stays");
+}
+
+void test_ssd_promotion_abort() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(ssd_config(12, 32), backend);
+    const auto a          = make_tokens(128, 320);
+    const SnapshotRef end = host_endpoint(index, backend, a);
+    write_back(index);
+    // Push it and its blocks out of the Host tier.
+    std::vector<HostImageReservation> reservations;
+    while (auto image = index.reserve_host_image(false, std::numeric_limits<double>::infinity())) {
+        reservations.push_back(std::move(*image));
+    }
+    require(index.snapshot(end).host == CopyState::Absent, "the endpoint is SSD-only");
+    for (HostImageReservation& reservation : reservations) { index.release_host_image(std::move(reservation)); }
+    (void)index.evict_backed_device_blocks(1000); // its blocks are only on the SSD now
+    index.check_invariants();
+    SsdPromotionStart start = index.begin_ssd_promotion(end);
+    require(start.status == SsdPromotionStatus::Started && start.job->nodes.size() == 2 && start.job->image,
+            "promotion started");
+    index.abort_ssd_promotion(*start.job);
+    index.check_invariants();
+    // The SSD copies were the only ones: the snapshot is gone, and its blocks with it.
+    const PrefixIndexStats stats = index.stats();
+    require(!index.valid(end) && stats.snapshots == 0 && stats.nodes == 0, "a failed read loses what it read");
+    require(stats.ssd_free_slabs == 32 && stats.host_free_slabs == 12, "every slab is free again");
+}
+
+void test_ssd_device_slots() {
+    // Qwen3.5's layout: Device snapshot slots above the Host and SSD tiers. A slot owner whose image
+    // only the SSD backs is not Device-only (§9.2): taking its slot keeps the snapshot on the SSD.
+    RecordingBackend backend;
+    PrefixCacheIndex index(ssd_config(12, 32, 1), backend);
+    const auto a       = make_tokens(128, 330);
+    const auto path    = insert_sequence(index, backend, a);
+    for (const NodeRef node : path) { backup_node(index, node); }
+    const SnapshotRef tap = publish_tap(index, path[1]);
+    backup_snapshot(index, tap);
+    index.release_path(path);
+    write_back(index);
+    // Demote the Host image under pressure: the snapshot stays warm on the Device.
+    std::vector<HostImageReservation> reservations;
+    while (auto image = index.reserve_host_image(false, std::numeric_limits<double>::infinity())) {
+        reservations.push_back(std::move(*image));
+    }
+    index.check_invariants();
+    require(index.valid(tap) && index.snapshot(tap).device_slot != kNoId, "the Device copy stays");
+    // A new tap takes the slot: the old owner keeps its SSD copy.
+    const auto slot = index.acquire_device_slot(0.0);
+    require(slot.has_value(), "an SSD-backed owner yields its slot");
+    index.check_invariants();
+    require(index.valid(tap) && index.snapshot(tap).device_slot == kNoId &&
+                index.snapshot(tap).ssd == CopyState::Resident,
+            "the former owner is SSD-only");
+    index.release_device_slot(*slot);
+    for (HostImageReservation& reservation : reservations) { index.release_host_image(std::move(reservation)); }
+    index.check_invariants();
+}
+
+void test_ssd_random_stress() {
+    std::mt19937 rng(4321);
+    std::uint64_t completed_writes = 0, completed_promotions = 0, demotions = 0, ssd_evictions = 0;
+    for (int round = 0; round < 24; ++round) {
+        RecordingBackend backend;
+        const std::uint32_t slots = round % 2 == 0 ? 0U : 2U;
+        // Mostly an SSD tier smaller than the Host's, so SSD eviction runs often.
+        PrefixIndexConfig config  = ssd_config(28, round % 3 == 0 ? 40U : 14U, slots);
+        config.max_nodes          = 160;
+        config.max_snapshots      = 24;
+        PrefixCacheIndex index(config, backend);
+        std::vector<std::vector<TokenId>> prompts;
+        for (int p = 0; p < 6; ++p) {
+            auto tokens = make_tokens(64 * (1 + p % 3), 400 + round);
+            auto suffix = make_tokens(64 * 3, 500 + p + round * 10);
+            tokens.insert(tokens.end(), suffix.begin(), suffix.end());
+            tokens.push_back(1);
+            prompts.push_back(std::move(tokens));
+        }
+        std::vector<std::vector<NodeRef>> held;
+        std::vector<SnapshotRef> published;
+        std::vector<SsdJob> writes, promotions;
+        const auto check = [&] { index.check_invariants(); };
+        for (int step = 0; step < 400; ++step) {
+            const int op = static_cast<int>(rng() % 11U);
+            if (op <= 1 && held.size() < 3) {
+                const auto& prompt = prompts[rng() % prompts.size()];
+                const auto hashes  = block_lookup_hashes(prompt, {});
+                const auto n       = static_cast<std::uint32_t>(prompt.size());
+                MatchResult match  = index.match(prompt, hashes, {}, n);
+                const AdmissionChoice choice = index.choose(match, n);
+                if (choice.candidate && match.candidates[*choice.candidate].ssd_bytes != 0) {
+                    // A source on the SSD is promoted first; the request binds later.
+                    SsdPromotionStart start = index.begin_ssd_promotion(match.candidates[*choice.candidate].snapshot);
+                    if (start.job) { promotions.push_back(std::move(*start.job)); }
+                    check();
+                    continue;
+                }
+                std::uint32_t reuse = 0;
+                if (choice.candidate) {
+                    reuse = match.candidates[*choice.candidate].path_blocks;
+                    index.note_hit(match.candidates[*choice.candidate].snapshot);
+                }
+                std::vector<NodeRef> path(match.path.begin(), match.path.begin() + reuse);
+                index.acquire_path(path);
+                for (const NodeRef node : path) {
+                    const NodeView view = index.node(node);
+                    if (view.device == CopyState::Absent) {
+                        require(view.host == CopyState::Resident, "a chosen source's blocks are above the SSD");
+                        index.begin_device_fill(node, backend.allocate());
+                        index.complete_device_fill(node);
+                    }
+                }
+                NodeRef parent = path.empty() ? NodeRef{} : path.back();
+                for (std::uint32_t b = reuse; b < hashes.size(); ++b) {
+                    if (index.stats().nodes + 2 >= config.max_nodes) { (void)index.evict_device_blocks(4); }
+                    if (index.stats().nodes + 2 >= config.max_nodes) { break; }
+                    const std::span<const TokenId> block(prompt.data() + b * kBlockTokens, kBlockTokens);
+                    const std::uint32_t id    = backend.allocate();
+                    const InsertResult result = index.insert_block(parent, hashes[b], block, 0, id, true);
+                    if (!result.device_attached) { backend.release_device_block(id); }
+                    if (result.replaced_device_id != kNoId) { backend.release_device_block(result.replaced_device_id); }
+                    path.push_back(result.node);
+                    parent = result.node;
+                    const NodeView view = index.node(result.node);
+                    if (view.host == CopyState::Absent && view.device == CopyState::Resident && rng() % 3U != 0) {
+                        index.pin_node(result.node);
+                        if (index.begin_host_fill(result.node)) { index.complete_host_fill(result.node); }
+                        index.unpin_node(result.node);
+                    }
+                    if (rng() % 3U == 0) {
+                        const std::uint32_t frontier = (index.node(result.node).depth + 1U) * kBlockTokens;
+                        if (slots != 0 && rng() % 2U) {
+                            if (const auto slot = index.acquire_device_slot(
+                                    rng() % 2U ? std::numeric_limits<double>::infinity() : 0.0)) {
+                                const PublishResult created = index.publish_snapshot(
+                                    result.node, frontier, {}, std::nullopt, *slot, SnapshotKind::Tap);
+                                if (created.created) {
+                                    published.push_back(created.snapshot);
+                                    if (rng() % 2U) {
+                                        index.pin_snapshot(created.snapshot);
+                                        if (index.begin_snapshot_host_fill(created.snapshot)) {
+                                            index.complete_snapshot_host_fill(created.snapshot);
+                                        }
+                                        index.unpin_snapshot(created.snapshot);
+                                    }
+                                }
+                            }
+                        } else if (rng() % 3U == 0 && b + 1U < hashes.size()) {
+                            // An endpoint inside the next block: its tail goes with the image on the Host
+                            // and the SSD, and sometimes also has a Device copy.
+                            const std::uint32_t tail = 1U + rng() % 63U;
+                            if (auto image = index.reserve_host_image(true, 1.0e9)) {
+                                std::optional<std::uint32_t> tail_id;
+                                if (rng() % 2U) { tail_id = backend.allocate(); }
+                                const PublishResult created = index.publish_host_snapshot(
+                                    result.node, frontier + tail,
+                                    std::span<const TokenId>(prompt.data() + frontier, tail), tail_id,
+                                    std::move(*image), SnapshotKind::Endpoint);
+                                if (created.created) { published.push_back(created.snapshot); }
+                            }
+                        } else if (auto image = index.reserve_host_image(false, rng() % 2U ? 0.0 : 1.0e9)) {
+                            const PublishResult created = index.publish_host_snapshot(
+                                result.node, frontier, {}, std::nullopt, std::move(*image),
+                                rng() % 4U == 0 ? SnapshotKind::Boundary : SnapshotKind::Endpoint);
+                            if (created.created) { published.push_back(created.snapshot); }
+                        }
+                    }
+                    check();
+                }
+                held.push_back(std::move(path));
+            } else if (op == 2 && !held.empty()) {
+                const std::size_t which = rng() % held.size();
+                index.release_path(held[which]);
+                held.erase(held.begin() + static_cast<std::ptrdiff_t>(which));
+            } else if (op == 3 && writes.size() < 3) {
+                if (auto job = index.begin_ssd_write()) { writes.push_back(std::move(*job)); }
+            } else if (op == 4 && !writes.empty()) {
+                const std::size_t which = rng() % writes.size();
+                if (rng() % 8U == 0) {
+                    index.abort_ssd_write(writes[which]);
+                } else {
+                    index.complete_ssd_write(writes[which]);
+                    ++completed_writes;
+                }
+                writes.erase(writes.begin() + static_cast<std::ptrdiff_t>(which));
+            } else if (op == 5 && !promotions.empty()) {
+                const std::size_t which = rng() % promotions.size();
+                if (rng() % 8U == 0) {
+                    index.abort_ssd_promotion(promotions[which]);
+                } else {
+                    index.complete_ssd_promotion(promotions[which]);
+                    ++completed_promotions;
+                }
+                promotions.erase(promotions.begin() + static_cast<std::ptrdiff_t>(which));
+            } else if (op == 6 && !published.empty()) {
+                const SnapshotRef snapshot = published[rng() % published.size()];
+                if (index.valid(snapshot)) {
+                    if (rng() % 2U) {
+                        (void)index.supersede(snapshot);
+                    } else {
+                        index.note_hit(snapshot);
+                    }
+                }
+            } else if (op == 7 && !published.empty()) {
+                std::vector<SnapshotRef> queue;
+                for (std::uint32_t i = rng() % 4U; i > 0; --i) { queue.push_back(published[rng() % published.size()]); }
+                index.set_queue_holds(queue);
+            } else if (op == 8) {
+                (void)index.evict_device_blocks(1 + rng() % 8U);
+            } else if (op == 9) {
+                // Host pressure from a capture that is then dropped.
+                if (auto image = index.reserve_host_image(false, std::numeric_limits<double>::infinity())) {
+                    check();
+                    index.release_host_image(std::move(*image));
+                }
+            } else if (op == 10 && writes.empty() && promotions.empty() && held.empty()) {
+                // A Host tier shrink and regrowth (RAM pressure) moves and demotes with the SSD tier present.
+                (void)index.shrink_host(12);
+                check();
+                index.grow_host(28);
+            }
+            check();
+        }
+        for (SsdJob& job : writes) { index.complete_ssd_write(job); }
+        for (SsdJob& job : promotions) { index.complete_ssd_promotion(job); }
+        for (const auto& path : held) { index.release_path(path); }
+        check();
+        (void)index.evict_device_blocks(1000);
+        check();
+        // Every surviving snapshot is restorable: its image and blocks have a copy somewhere.
+        for (const SnapshotRef snapshot : published) {
+            if (!index.valid(snapshot)) { continue; }
+            const SnapshotView view = index.snapshot(snapshot);
+            require(view.device_slot != kNoId || view.host == CopyState::Resident || view.ssd == CopyState::Resident,
+                    "a surviving snapshot has an image copy");
+        }
+        const PrefixIndexStats stats = index.stats();
+        demotions += stats.host_image_demotions + stats.host_block_demotions;
+        ssd_evictions += stats.ssd_snapshot_evictions + stats.ssd_backup_drops + stats.ssd_dead_reclaims;
+    }
+    std::cout << "ssd stress: " << completed_writes << " write-backs, " << completed_promotions << " promotions, "
+              << demotions << " demotions, " << ssd_evictions << " SSD evictions\n";
+    require(completed_writes > 50 && completed_promotions > 10 && demotions > 50 && ssd_evictions > 10,
+            "the stress exercises every SSD path");
+}
+
 void test_tap_planner() {
     TapPlannerConfig config;
     config.max_new_taps   = 8;
@@ -1871,6 +2298,11 @@ int main() {
         test_insert_without_attach();
         test_cost_model();
         test_random_stress();
+        test_ssd_write_back_and_demotion();
+        test_ssd_eviction_order();
+        test_ssd_promotion_abort();
+        test_ssd_device_slots();
+        test_ssd_random_stress();
         test_tap_planner();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

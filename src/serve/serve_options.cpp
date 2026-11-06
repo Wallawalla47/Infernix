@@ -80,6 +80,8 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--cache-host-state"},
     ServeOptionArity{"--cache-tap-min-gap"},
     ServeOptionArity{"--host-context-mib"},
+    ServeOptionArity{"--ssd-context-gib"},
+    ServeOptionArity{"--ssd-context-dir"},
     ServeOptionArity{"--request-log-jsonl"},
     ServeOptionArity{"--request-log-max-mib"},
     ServeOptionArity{"--request-log-keep"},
@@ -504,6 +506,17 @@ std::string serve_usage_text(const char* argv0) {
            "                             several GB), so a short interval writes a lot to\n"
            "                             the drive and wears an SSD faster; prefer 15-60\n"
            "                             minutes\n"
+           "  --ssd-context-gib N        an SSD tier of N GiB below the Host pool (default\n"
+           "                             0: off). What the Host pool would otherwise lose\n"
+           "                             (snapshots and their blocks) is kept in a scratch\n"
+           "                             file in --ssd-context-dir and read back when a\n"
+           "                             request resumes from it, instead of recomputing\n"
+           "                             it. The file is removed at exit. WARNING: it\n"
+           "                             writes whenever the Host pool fills (each block\n"
+           "                             and each kept snapshot once), which wears an SSD;\n"
+           "                             the log and /metrics report the bytes written\n"
+           "  --ssd-context-dir DIR      existing directory on a local SSD for that file\n"
+           "                             (required with --ssd-context-gib)\n"
            "  --device-snapshot-slots N  device state snapshot slots (default concurrency\n"
            "                             + 1; + 2 without a host tier). Qwen3.8-Flash-\n"
            "                             Next has none\n"
@@ -970,6 +983,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             host_context_explicit = true;
             cache_option_flag     = "--host-context-mib";
+        } else if (arg == "--ssd-context-gib") {
+            const std::uint64_t gib = parse_u64(require_value("--ssd-context-gib"), "ssd-context-gib");
+            if (gib > (std::uint64_t{1} << 20U)) { throw std::invalid_argument("--ssd-context-gib is out of range"); }
+            options.context_cache.ssd_capacity_bytes = gib << 30U;
+            cache_option_flag                        = "--ssd-context-gib";
+        } else if (arg == "--ssd-context-dir") {
+            options.context_cache.ssd_directory = require_value("--ssd-context-dir");
+            if (options.context_cache.ssd_directory.empty()) {
+                throw std::invalid_argument("--ssd-context-dir must not be empty");
+            }
+            cache_option_flag = "--ssd-context-dir";
         } else if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {
@@ -1225,6 +1249,24 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--prefix-cache-file " + file.string() +
                                             ": the directory " + file.parent_path().string() +
                                             " does not exist");
+            }
+        }
+        // The SSD tier (hybrid-prefix-cache-spec §5.7): off unless both are given.
+        std::filesystem::path& ssd = options.context_cache.ssd_directory;
+        const bool ssd_size        = options.context_cache.ssd_capacity_bytes != 0;
+        if (ssd_size != !ssd.empty()) {
+            throw std::invalid_argument(ssd_size ? "--ssd-context-gib needs --ssd-context-dir"
+                                                 : "--ssd-context-dir needs --ssd-context-gib");
+        }
+        if (ssd_size) {
+            if (host_context_explicit && options.context_cache.host_capacity_bytes == 0) {
+                throw std::invalid_argument(
+                    "the SSD tier sits below the Host tier, which --host-context-mib 0 removes");
+            }
+            ssd = std::filesystem::absolute(ssd).lexically_normal();
+            std::error_code error;
+            if (!std::filesystem::is_directory(ssd, error)) {
+                throw std::invalid_argument("--ssd-context-dir " + ssd.string() + " is not an existing directory");
             }
         }
     }

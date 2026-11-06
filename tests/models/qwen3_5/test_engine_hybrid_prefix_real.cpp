@@ -241,6 +241,65 @@ int exercise_restore_exact(const char* artifact, infernix::SpeculativeBackend ba
     return failures;
 }
 
+// The SSD tier (spec §5.7): restore-exact's prompts on a Host tier of about two snapshot images with
+// an SSD tier, and three pressure prompts in between, push the first prompt's prompt-tail snapshot
+// (1024) and its blocks out of the Host tier. The second prompt reads them back from the SSD tier and
+// generates exactly what the Device-resident engine does (byte copies at every tier).
+int exercise_ssd_restore(const char* artifact, infernix::SpeculativeBackend backend) {
+    const std::vector<infernix::TokenId> first = synthetic_tokens(1500, 1);
+    std::vector<infernix::TokenId> second(first.begin(), first.begin() + 1400);
+    const std::vector<infernix::TokenId> suffix = synthetic_tokens(300, 2);
+    second.insert(second.end(), suffix.begin(), suffix.end());
+    std::vector<infernix::TokenId> device_tokens;
+    {
+        infernix::Engine engine(hybrid_options(artifact, backend, 16384, 1ULL << 30, 8));
+        (void)engine.generate(engine.prepare_tokens(first), greedy(8));
+        device_tokens = engine.generate(engine.prepare_tokens(second), greedy(24)).generated_token_ids;
+    }
+    std::filesystem::path directory;
+    if (const char* dir = std::getenv("INFERNIX_TEST_SSD_DIR"); dir != nullptr && *dir != '\0') {
+        directory = dir;
+    } else {
+        directory = infernix::test::unique_temp_path("hybrid_ssd_tier");
+        std::filesystem::create_directories(directory);
+    }
+    infernix::EngineOptions options = hybrid_options(artifact, backend, 4096, 480ULL << 20, 1);
+    options.context_cache.ssd_capacity_bytes = 8ULL << 30;
+    options.context_cache.ssd_directory      = directory;
+    infernix::Engine engine(std::move(options));
+    (void)engine.generate(engine.prepare_tokens(first), greedy(8));
+    for (std::uint32_t seed = 3; seed < 6; ++seed) {
+        (void)engine.generate(engine.prepare_tokens(synthetic_tokens(3900, seed)), greedy(4));
+    }
+    const infernix::RuntimeStats before   = engine.runtime_stats();
+    const infernix::GenerationResult warm = engine.generate(engine.prepare_tokens(second), greedy(24));
+    const infernix::RuntimeStats after    = engine.runtime_stats();
+    std::cout << "ssd-restore: " << after.hybrid_ssd_write_bytes / 1000000 << " MB written ("
+              << after.hybrid_ssd_image_writes << " images, " << after.hybrid_ssd_block_writes << " blocks), "
+              << after.hybrid_ssd_read_bytes / 1000000 << " MB read in " << after.hybrid_ssd_promotions
+              << " promotions, " << after.hybrid_ssd_host_image_demotions << " image demotions, Host snapshot evictions "
+              << after.hybrid_host_snapshot_evictions << ", reused " << warm.reused_prompt_tokens << '\n';
+    int failures = 0;
+    if (after.hybrid_ssd_promotions <= before.hybrid_ssd_promotions) {
+        std::cerr << "ssd-restore: the second prompt did not read its source from the SSD tier\n";
+        ++failures;
+    }
+    if (warm.reused_prompt_tokens != 2 * kPrefillChunk) {
+        std::cerr << "ssd-restore: reused " << warm.reused_prompt_tokens << ", expected the prompt-tail snapshot at "
+                  << 2 * kPrefillChunk << '\n';
+        ++failures;
+    }
+    if (warm.generated_token_ids.size() != 24 || warm.generated_token_ids != device_tokens) {
+        std::cerr << "ssd-restore: the SSD restore generated other tokens than the Device-resident engine\n";
+        ++failures;
+    }
+    if (after.hybrid_ssd_failures != 0) {
+        std::cerr << "ssd-restore: " << after.hybrid_ssd_failures << " SSD transfers failed\n";
+        ++failures;
+    }
+    return failures;
+}
+
 // A restarted Engine resumes from the Host tier its predecessor saved when stopped mid-generation:
 // the restored snapshot is the same bytes, so greedy generation matches an Engine that never
 // restarted. A file written for a different build identity is ignored, a Host tier one slab
@@ -1273,7 +1332,9 @@ int main() {
     }
     const char* selected            = std::getenv("INFERNIX_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 20> kScenarios{"all",
+    constexpr std::array<std::string_view, 22> kScenarios{"all",
+                                                          "ssd-restore",
+                                                          "ssd-restore-mtp",
                                                           "next-turn",
                                                           "next-turn-reproducible",
                                                           "issue29",
@@ -1308,6 +1369,12 @@ int main() {
         }
         if (all || scenario == "restore-exact-dflash2") {
             failures += exercise_restore_exact(artifact, infernix::SpeculativeBackend::DFlash2);
+        }
+        if (all || scenario == "ssd-restore") {
+            failures += exercise_ssd_restore(artifact, infernix::SpeculativeBackend::None);
+        }
+        if (all || scenario == "ssd-restore-mtp") {
+            failures += exercise_ssd_restore(artifact, infernix::SpeculativeBackend::Mtp);
         }
         if (all || scenario == "turns") { failures += exercise_turns(artifact, 1ULL << 30); }
         if (all || scenario == "turns-device-only") { failures += exercise_turns(artifact, 0); }

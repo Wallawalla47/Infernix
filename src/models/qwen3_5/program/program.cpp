@@ -211,9 +211,12 @@ void Program::maintain() {
         impl_->offload->engine().maintain(impl_->device.stream);
     }
     impl_->maintain_ram();
+    // The SSD tier's transfers land while the Engine is idle: apply them and continue its write-back.
+    if (impl_->hybrid_) { impl_->hybrid_->service_ssd(); }
 }
 
 void Program::set_maintenance_waker(std::function<void()> waker) {
+    if (impl_->hybrid_ && impl_->hybrid_->ssd() != nullptr) { impl_->hybrid_->ssd()->set_waker(waker); }
     if (impl_->ram_) { impl_->ram_->set_waker(waker); }
     if (impl_->offload) { impl_->offload->engine().set_maintenance_waker(std::move(waker)); }
 }
@@ -339,6 +342,12 @@ void Program::hybrid_hold_continuation(std::chrono::steady_clock::time_point dea
 bool Program::hybrid_holds_stale() const noexcept { return impl_->hybrid_holds_stale(); }
 
 std::uint64_t Program::hybrid_cache_epoch() const noexcept { return impl_->hybrid_cache_epoch(); }
+
+bool Program::hybrid_poll_storage() { return impl_->hybrid_ && impl_->hybrid_->poll_ssd(); }
+
+bool Program::hybrid_source_pending() const noexcept { return impl_->hybrid_source_pending_; }
+
+bool Program::hybrid_storage_due() const noexcept { return impl_->hybrid_ && impl_->hybrid_->ssd_due(); }
 
 std::uint32_t Program::hybrid_resume_grid() const noexcept {
     return impl_->execution_schedule.grid_cache ? impl_->prefill_chunk : 1U;

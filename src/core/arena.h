@@ -96,7 +96,11 @@ private:
 
 class PinnedHostBuffer {
 public:
-    explicit PinnedHostBuffer(std::size_t size_bytes);
+    explicit PinnedHostBuffer(std::size_t size_bytes) : PinnedHostBuffer(size_bytes, 0) {}
+    // `alignment` (a power of two, 0 for cudaMallocHost's own): data() is a multiple of it. cudaMallocHost
+    // guarantees only 256 bytes (a 1 GiB buffer came back 512-byte aligned), less than unbuffered file I/O
+    // needs (the prefix cache's SSD tier, 4 KiB); a larger alignment over-allocates by it.
+    PinnedHostBuffer(std::size_t size_bytes, std::size_t alignment);
     ~PinnedHostBuffer();
 
     PinnedHostBuffer(const PinnedHostBuffer&)            = delete;
@@ -108,6 +112,7 @@ public:
     std::size_t size() const noexcept;
 
 private:
+    void* raw_        = nullptr; // what cudaMallocHost returned
     void* data_       = nullptr;
     std::size_t size_ = 0;
 };

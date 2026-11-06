@@ -23,6 +23,7 @@
 #include "runtime/contract/resources.h"
 #include "runtime/contract/timing.h"
 #include "runtime/prefix_cache/cost.h"
+#include "runtime/prefix_cache/ssd_stats.h"
 #include "runtime/prefix_cache/tap_planner.h"
 
 #include <array>
@@ -102,6 +103,7 @@ struct HybridPrefixCacheStats {
     std::uint64_t held_snapshot_losses    = 0;
     std::uint64_t held_host_refusals      = 0;
     std::uint64_t tool_call_holds         = 0;
+    runtime::prefix_cache::SsdTierStats ssd; // the SSD tier (hybrid-prefix-cache-spec §5.7)
 };
 
 class SequenceHandle {
@@ -515,6 +517,9 @@ struct ProgramOptions {
     // Host-born state snapshots in a pinned slab pool of prefix_host_bytes.
     bool prefix_cache                = false;
     std::uint64_t prefix_host_bytes  = 0;
+    // The SSD tier below the Host tier (hybrid-prefix-cache-spec §5.7): its size and directory; 0: none.
+    std::uint64_t prefix_ssd_bytes   = 0;
+    std::filesystem::path prefix_ssd_directory;
     runtime::prefix_cache::TapPlannerConfig prefix_taps;
     runtime::prefix_cache::CacheCostModel prefix_cost;
     // What a cut that ends a layer walk's span costs (the next span streams the experts again), at
@@ -607,6 +612,14 @@ public:
     [[nodiscard]] bool hybrid_holds_stale() const noexcept { return false; }
     // Changes when a queued request's choice of snapshot may have changed.
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
+    // The SSD tier (hybrid-prefix-cache-spec §5.7): applies landed transfers and starts write-backs;
+    // returns whether a promotion landed since the last call, so the queue is scanned again.
+    bool hybrid_poll_storage();
+    // Whether the last hybrid_sources call returned no source because the source it chose is being
+    // read from the SSD tier.
+    [[nodiscard]] bool hybrid_source_pending() const noexcept;
+    // Whether the SSD tier would start a write-back now: the idle Engine runs maintain() for it.
+    [[nodiscard]] bool hybrid_storage_due() const noexcept;
     // The positions a request can resume from: every position with free-cache-resume, else the
     // 16-token grid (the reproducible route).
     [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept;

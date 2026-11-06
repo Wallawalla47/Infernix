@@ -55,10 +55,20 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
         throw std::invalid_argument("--host-context-mib is too small for the Qwen4Exp prefix cache: one snapshot needs " +
                                     std::to_string(mib) + " MiB");
     }
+    // The SSD tier holds whole Host slabs (hybrid-prefix-cache-spec §5.7).
+    const std::uint64_t ssd_slabs = config.ssd_bytes / host_.slab_bytes;
+    if (config.ssd_bytes != 0 && ssd_slabs < host_.image_slabs + 2U) {
+        throw std::invalid_argument("--ssd-context-gib is too small for the Qwen4Exp prefix cache: one snapshot needs " +
+                                    std::to_string(((host_.image_slabs + 2ULL) * host_.slab_bytes + (1ULL << 30U) - 1U) >> 30U) +
+                                    " GiB");
+    }
+    if (ssd_slabs > pc::kNoId / 4U) { throw std::invalid_argument("Qwen4Exp prefix cache: the SSD tier is too large"); }
     pc::PrefixIndexConfig index = config.index;
-    index.max_nodes             = config.kv_pages + host_.slabs + 1U;
-    index.max_snapshots         = config.device_snapshot_slots + host_.slabs / host_.image_slabs + 1U;
+    index.max_nodes             = config.kv_pages + host_.slabs + static_cast<std::uint32_t>(ssd_slabs) + 1U;
+    index.max_snapshots         = config.device_snapshot_slots +
+                          (host_.slabs + static_cast<std::uint32_t>(ssd_slabs)) / host_.image_slabs + 1U;
     index.host_slabs            = host_.slabs;
+    index.ssd_slabs             = static_cast<std::uint32_t>(ssd_slabs);
     index.image_slabs           = host_.image_slabs;
     index.device_snapshot_slots = config.device_snapshot_slots;
     index.block_bytes           = host_.page.page_stride;
@@ -73,7 +83,7 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
         const std::uint32_t slabs = std::min(host_.slabs_per_chunk, host_.slabs - first);
         const std::size_t bytes   = static_cast<std::size_t>(slabs) * host_.slab_bytes;
         try {
-            chunks_.emplace_back(bytes);
+            chunks_.emplace_back(bytes, kSlabAlignment);
         } catch (const std::exception& error) {
             throw std::runtime_error("pinning the Qwen4Exp prefix cache Host tier failed after " +
                                      std::to_string(pinned >> 20U) + " of " + std::to_string(total >> 20U) + " MiB (" +
@@ -83,6 +93,12 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
     }
     CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&restore_stream_, cudaStreamNonBlocking));
+    if (index.ssd_slabs != 0) {
+        // Its slabs are Host slabs byte for byte (page records and image segments), so a transfer is a
+        // plain copy, and a snapshot's meta stays with its index entry.
+        ssd_ = std::make_unique<pc::SsdTier>(config.ssd_directory, index.ssd_slabs, host_.slab_bytes,
+                                             [this](std::uint32_t id) { return slab(id); });
+    }
     node_mtp_next_.assign(index.max_nodes, -1);
     snapshot_meta_.assign(index.max_snapshots, StateImageHeader{});
     blocks_.reserve(index.max_nodes);
@@ -433,12 +449,33 @@ void PrefixCache::poll() {
         finish_restore(batch);
         landing_.pop_front();
     }
+    // SSD transfers land on their own threads; the index learns of them here. New write-backs start
+    // only from poll_ssd, between rounds.
+    if (ssd_) { ssd_->settle(*index_); }
 }
 
 void PrefixCache::drain() {
     CUDA_CHECK(cudaStreamSynchronize(transfer_));
     CUDA_CHECK(cudaStreamSynchronize(restore_stream_));
     poll();
+}
+
+bool PrefixCache::poll_ssd() {
+    service_ssd();
+    return std::exchange(ssd_landed_, false);
+}
+
+void PrefixCache::service_ssd() {
+    if (!ssd_) { return; }
+    // Landed captures and writes first: a just-finished request's snapshots are written back before
+    // the next request's prefill can displace them.
+    poll();
+    ssd_landed_ |= ssd_->poll(*index_);
+}
+
+pc::SsdTier::Promotion PrefixCache::promote(pc::SnapshotRef snapshot) {
+    if (!ssd_) { return pc::SsdTier::Promotion::Ready; }
+    return ssd_->promote(*index_, snapshot);
 }
 
 bool PrefixCache::await_extended_endpoint(std::span<const pc::NodeRef> path, std::span<const TokenId> tokens) {
@@ -625,6 +662,8 @@ void PrefixCache::clear() noexcept {
     captures_.clear();
     writes_.clear();
     published_.clear();
+    // The new index holds no SSD slab: transfers are waited for and forgotten.
+    if (ssd_) { ssd_->abandon(); }
     pc::PrefixIndexConfig config = index_->config();
     index_.reset();
     blocks_.clear();
@@ -652,6 +691,8 @@ std::uint64_t PrefixCache::shrink_host_tier(std::uint64_t bytes) {
     const std::uint32_t keep      = std::max(floor, have - drop);
     if (bytes == 0 || keep >= have) { return 0; }
     drain();
+    // An SSD transfer pins the slabs it reads or writes: settled first, so a shrink moves them freely.
+    if (ssd_) { ssd_->drain(*index_); }
     const std::uint32_t reached = index_->shrink_host(keep * per_chunk);
     const std::uint32_t kept    = (reached + per_chunk - 1U) / per_chunk;
     std::uint64_t released      = 0;
@@ -670,7 +711,7 @@ std::uint64_t PrefixCache::grow_host_tier(std::uint64_t bytes) {
         const std::size_t size    = static_cast<std::size_t>(std::min(per_chunk, host_.slabs - first)) * host_.slab_bytes;
         if (grown + size > bytes) { break; }
         try {
-            chunks_.emplace_back(size);
+            chunks_.emplace_back(size, kSlabAlignment);
         } catch (const std::exception&) {
             break; // the OS refuses to pin it now
         }

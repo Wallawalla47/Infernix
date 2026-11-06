@@ -94,11 +94,21 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
         !options.tap_min_gap_tokens) {
         throw std::logic_error("hybrid prefix cache options are not normalized");
     }
+    // The SSD tier holds whole Host slabs (§5.7): its size rounds down to them.
+    const std::uint64_t ssd_slabs64 =
+        slabs == 0 ? 0U : context_cache.ssd_capacity_bytes / std::max<std::size_t>(host.slab_bytes, 1U);
+    if (context_cache.ssd_capacity_bytes != 0 && ssd_slabs64 < host.image_slabs + 2U) {
+        throw std::invalid_argument("--ssd-context-gib is too small: one snapshot and its block need " +
+                                    std::to_string(((host.image_slabs + 2ULL) * host.slab_bytes + (1ULL << 30U) - 1U) >> 30U) +
+                                    " GiB");
+    }
+    const auto ssd_slabs = static_cast<std::uint32_t>(std::min<std::uint64_t>(ssd_slabs64, pc::kNoId / 4U));
     pc::PrefixIndexConfig config;
-    // Every node holds a Device page bundle or a Host slab.
-    config.max_nodes             = text_pool.capacity_pages() + slabs + 1U;
-    config.max_snapshots         = device_slots + slabs / host.image_slabs + 1U;
+    // Every node holds a Device page bundle, a Host slab or an SSD slab.
+    config.max_nodes             = text_pool.capacity_pages() + slabs + ssd_slabs + 1U;
+    config.max_snapshots         = device_slots + (slabs + ssd_slabs) / host.image_slabs + 1U;
     config.host_slabs            = slabs;
+    config.ssd_slabs             = ssd_slabs;
     config.image_slabs           = host.image_slabs;
     config.device_snapshot_slots = device_slots;
     config.block_bytes           = host.block_payload_bytes;
@@ -128,7 +138,7 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
     }
     hybrid_ = std::make_unique<HybridPrefixCache>(
         config, taps, *text_kv_pages, backend_kv_pages.get(), *state_store, *state_images, host,
-        std::move(layers), phase ? &*phase : nullptr);
+        std::move(layers), phase ? &*phase : nullptr, context_cache.ssd_directory);
     if (phase) { phase->complete(host_bytes, host_bytes); }
 }
 
@@ -237,6 +247,7 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
         throw std::logic_error("admission requires a prepared prompt");
     }
     if (hybrid_) { hybrid_->poll(); }
+    hybrid_source_pending_           = false;
     const RequestBasePlanImpl& plan  = *base.impl_;
     const PreparedPromptData& prompt = *plan.prompt;
     const auto n                     = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -339,6 +350,28 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
         hybrid_->drain();
         selected = select();
     }
+    if (selected && selected->ssd_bytes != 0) {
+        // Part of the source is only on the SSD tier (§5.7): it is read into the Host tier first and
+        // the request waits for it (no source; the Engine quotes it again when the read lands). The
+        // cost model already weighed the read against a shallower source and the prefill.
+        const pc::SsdTier::Promotion promotion = hybrid_->promote(selected->snapshot);
+        if (promotion == pc::SsdTier::Promotion::Pending) {
+            hybrid_source_pending_ = true;
+            return {};
+        }
+        if (promotion == pc::SsdTier::Promotion::Unavailable) {
+            // The Host tier cannot take it now: the best source above the SSD serves instead.
+            std::erase_if(match.candidates, [](const pc::MatchCandidate& c) { return c.ssd_bytes != 0; });
+            const pc::AdmissionChoice fallback = index.choose(match, n);
+            order.clear();
+            if (fallback.candidate) { order.push_back(*fallback.candidate); }
+            for (std::size_t i = 0; i < match.candidates.size(); ++i) {
+                if (!fallback.candidate || i != *fallback.candidate) { order.push_back(i); }
+            }
+            selected = select();
+        }
+        // Ready: it landed meanwhile; the binding validates the source as it stands.
+    }
     // Coalescing only defers a fresh request; a resumed one replays from what exists.
     if (maximum_frontier == UINT32_MAX &&
         hybrid_await_sibling(prompt, selected ? selected->frontier : 0U)) {
@@ -380,9 +413,15 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
                inside_vision(candidate.frontier, ranges);
     });
     const pc::AdmissionChoice choice = index.choose(match, n);
-    if (!choice.candidate || match.candidates[*choice.candidate].host_only_blocks == 0) {
-        return 0U;
+    if (!choice.candidate) { return 0U; }
+    if (match.candidates[*choice.candidate].ssd_bytes != 0) {
+        // The head's source is read from the SSD tier into the Host tier while it waits (§5.7); its
+        // Device prefetch follows once that lands.
+        const pc::SsdTier::Promotion promotion = hybrid_->promote(match.candidates[*choice.candidate].snapshot);
+        if (promotion == pc::SsdTier::Promotion::Pending) { return std::nullopt; }
+        if (promotion == pc::SsdTier::Promotion::Unavailable) { return 0U; }
     }
+    if (match.candidates[*choice.candidate].host_only_blocks == 0) { return 0U; }
     const std::span<const pc::NodeRef> path(match.path.data(),
                                             match.candidates[*choice.candidate].path_blocks);
 
@@ -413,7 +452,8 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
             hybrid_->open_restore(device.stream);
             for (const pc::NodeRef node : path) {
                 if (started == wanted) { break; }
-                if (index.node(node).device != pc::CopyState::Absent) { continue; }
+                const pc::NodeView view = index.node(node);
+                if (view.device != pc::CopyState::Absent || view.host != pc::CopyState::Resident) { continue; }
                 HybridBlockPages pages{
                     .text = text_kv_pages->materialize_transfer_destination(*text_pages, kBlock)};
                 if (backend_pool != nullptr) {
@@ -691,11 +731,19 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
         }
         path.assign(match.path.begin(), match.path.begin() + full);
         for (const pc::NodeRef node : path) {
-            const pc::CopyState device = cache->node(node).device;
-            if (device != pc::CopyState::Absent && device != pc::CopyState::Resident) {
+            const pc::NodeView view = cache->node(node);
+            if (view.device != pc::CopyState::Absent && view.device != pc::CopyState::Resident) {
+                return {.source_valid = false};
+            }
+            // Only on the SSD tier: the quote promotes it first (§5.7); evicted again since, it is stale.
+            if (view.device == pc::CopyState::Absent && view.host != pc::CopyState::Resident) {
                 return {.source_valid = false};
             }
         }
+        const bool image_above = snapshot.device_slot != pc::kNoId || snapshot.host == pc::CopyState::Resident;
+        const bool tail_above  = tail == 0 || snapshot.tail_device_copy == pc::CopyState::Resident ||
+                                snapshot.host == pc::CopyState::Resident;
+        if (!image_above || !tail_above) { return {.source_valid = false}; }
     }
 
     ContextTransaction transaction;
@@ -1637,6 +1685,7 @@ HybridPrefixCacheStats ProgramImpl::hybrid_stats() const noexcept {
     out.held_snapshot_losses            = index.held_snapshot_losses;
     out.held_host_refusals              = index.held_host_refusals;
     out.tool_call_holds                 = counters.tool_call_holds;
+    out.ssd = pc::ssd_tier_stats(hybrid_->ssd(), index, hybrid_->host_layout().slab_bytes, config.ssd_slabs);
     return out;
 }
 

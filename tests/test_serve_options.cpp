@@ -945,6 +945,41 @@ int main() {
     }
     failures += check(rejected_cache_file({"--prefix-cache-save-mins", "15"}),
                       "--prefix-cache-save-mins was accepted without --prefix-cache-file");
+    // The SSD tier (hybrid-prefix-cache-spec §5.7): off by default, GiB with an existing directory
+    // (resolved absolute at launch), refused alone, without a Host tier or in a missing directory.
+    {
+        const ServeOptions off = parse({"infernix-serve", "model.ninfer"});
+        failures += check(off.context_cache.ssd_capacity_bytes == 0 && off.context_cache.ssd_directory.empty(),
+                          "the SSD tier is on by default");
+        const std::filesystem::path temp = std::filesystem::temp_directory_path();
+        const ServeOptions on =
+            parse({"infernix-serve", "model.ninfer", "--ssd-context-gib", "64", "--ssd-context-dir", temp.string()});
+        failures += check(on.context_cache.ssd_capacity_bytes == (64ULL << 30U) &&
+                              on.context_cache.ssd_directory == std::filesystem::absolute(temp).lexically_normal(),
+                          "--ssd-context-gib and --ssd-context-dir did not set the SSD tier");
+        const auto rejected_ssd = [&](std::vector<std::string> extra) {
+            std::vector<std::string> arguments{"infernix-serve", "model.ninfer"};
+            arguments.insert(arguments.end(), extra.begin(), extra.end());
+            try {
+                (void)parse(std::move(arguments));
+            } catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
+        failures += check(rejected_ssd({"--ssd-context-gib", "64"}), "--ssd-context-gib was accepted without a directory");
+        failures += check(rejected_ssd({"--ssd-context-dir", temp.string()}),
+                          "--ssd-context-dir was accepted without a size");
+        failures += check(rejected_ssd({"--ssd-context-gib", "64", "--ssd-context-dir",
+                                        (temp / "infernix-missing-directory-for-test").string()}),
+                          "--ssd-context-dir accepted a directory that does not exist");
+        failures += check(rejected_ssd({"--ssd-context-gib", "64", "--ssd-context-dir", temp.string(),
+                                        "--host-context-mib", "0"}),
+                          "the SSD tier was accepted without a Host tier");
+        failures += check(rejected_ssd({"--ssd-context-gib", "x", "--ssd-context-dir", temp.string()}),
+                          "--ssd-context-gib accepted a malformed size");
+        failures += check(rejected_ssd({"--ssd-context-gib", "64", "--ssd-context-dir", temp.string(),
+                                        "--no-prefix-reuse"}),
+                          "the SSD tier was accepted with --no-prefix-reuse");
+    }
     failures += check(rejected_cache_file({"--prefix-cache-file", "file.cache", "--prefix-cache-save-mins", "0"}),
                       "--prefix-cache-save-mins accepted zero");
     for (const std::vector<std::string>& cache_flag :
