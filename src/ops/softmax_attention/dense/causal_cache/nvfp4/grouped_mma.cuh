@@ -3,6 +3,7 @@
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/tile_io.cuh"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/schedule.cuh"
 #include "ops/softmax_attention/common/causal_partition.h"
+#include "ops/softmax_attention/common/grouped_block.cuh"
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
 #include "ops/softmax_attention/common/causal_softmax.cuh"
 #include "ops/softmax_attention/common/causal_tree.cuh"
@@ -74,14 +75,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     static_assert(Br * D * 2 + Schedule::kArenaBytes + Br * PStride * 2 + Br * 4 +
                       2 * Bc * kKVCacheNvfp4Groups <=
                   99 * 1024);
-    const int kv_head      = ParallelQueries ? blockIdx.x % Geometry::KVHeads : blockIdx.x;
-    const int column_begin = ParallelQueries ? (blockIdx.x / Geometry::KVHeads) * TokenTile : 0;
+    const GroupedAttentionBlock block = grouped_attention_block<MultiBatch>();
+    const int kv_head      = ParallelQueries ? block.tile % Geometry::KVHeads : block.tile;
+    const int column_begin = ParallelQueries ? (block.tile / Geometry::KVHeads) * TokenTile : 0;
     const int tile_tokens = ParallelQueries ? min(TokenTile, full_width - column_begin) : TokenTile;
     const int live_row_tiles = (tile_tokens * Geometry::GroupSize + 15) / 16;
     const int partial_width = full_width, partial_begin = column_begin;
-    const int split       = static_cast<int>(blockIdx.y);
-    const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
-    const int split_count = static_cast<int>(gridDim.y);
+    const int split       = block.split;
+    const int batch       = MultiBatch ? block.batch : 0;
+    const int split_count = block.split_count;
     const int tid         = static_cast<int>(threadIdx.x);
     const int warp        = tid >> 5;
     const int lane        = tid & 31;

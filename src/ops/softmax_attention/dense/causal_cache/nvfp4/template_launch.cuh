@@ -39,8 +39,9 @@ void launch_nvfp4_kv_grouped_mma(const CausalAttentionOperands& p, Nvfp4KvCacheV
                 cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
             CUDA_CHECK(status);
         }
-        const dim3 grid(G::KVHeads * (ParallelQueries ? div_up(p.width, S::kTokenTile) : 1),
-                        partition.capacity, p.batch);
+        const dim3 grid = grouped_attention_grid<MultiBatch>(
+            G::KVHeads * (ParallelQueries ? div_up(p.width, S::kTokenTile) : 1),
+            partition.capacity, p.batch);
         // A programmatic dependent of the RoPE / append kernel before it (the kernel waits at entry): the Qwen3.5 decode
         // graphs, INT8 KV, leave-one-out: the 35B-A3B MTP +0.24 %, the groupwise 27B DFlash2 +0.09 %, the NVFP4 27B
         // level (candidates §58). Same bits.
