@@ -1,0 +1,274 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --font-sans:
+    "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", Inter, system-ui, -apple-system,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono:
+    "Cascadia Code", "Cascadia Mono", "JetBrains Mono", Consolas, ui-monospace, SFMono-Regular, Menlo,
+    monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  /* Text in the accent colour (links); fills and icons use primary. */
+  --color-primary-text: var(--primary-text);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+
+  /* Status (reserved for state: never a data series). */
+  --color-success: var(--status-good);
+  --color-warning: var(--status-warning);
+  --color-serious: var(--status-serious);
+  --color-critical: var(--status-critical);
+
+  /* Categorical series slots, fixed order. */
+  --color-series-1: var(--series-1);
+  --color-series-2: var(--series-2);
+  --color-series-3: var(--series-3);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --radius: 0.625rem;
+  --background: oklch(0.982 0.002 80);
+  --foreground: oklch(0.2 0.006 60);
+  --card: oklch(0.997 0.001 80);
+  --card-foreground: oklch(0.2 0.006 60);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.2 0.006 60);
+  /* Burgundy: 7.7:1 on the background, 8.2:1 under white button text. */
+  --primary: oklch(0.45 0.165 356);
+  --primary-foreground: oklch(0.99 0.003 80);
+  --primary-text: oklch(0.45 0.165 356);
+  /* The burgundy at its most contrast (gauge critical zones): darker on light. */
+  --primary-strong: oklch(0.34 0.13 356);
+  --secondary: oklch(0.953 0.003 80);
+  --secondary-foreground: oklch(0.25 0.006 60);
+  --muted: oklch(0.953 0.003 80);
+  --muted-foreground: oklch(0.5 0.01 65);
+  --accent: oklch(0.948 0.016 356);
+  --accent-foreground: oklch(0.27 0.04 356);
+  --destructive: oklch(0.577 0.215 27);
+  --border: oklch(0.905 0.004 80);
+  --input: oklch(0.875 0.005 80);
+  --ring: oklch(0.45 0.165 356);
+  --sidebar: oklch(0.968 0.003 80);
+  --sidebar-foreground: oklch(0.25 0.006 60);
+  --sidebar-accent: oklch(0.93 0.016 356);
+  --sidebar-accent-foreground: oklch(0.22 0.04 356);
+  --sidebar-border: oklch(0.9 0.004 80);
+
+  /* Data visualisation: the validated reference palette, light steps. */
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --chart-grid: #e1e0d9;
+  --chart-axis: #c3c2b7;
+  --chart-muted: #898781;
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+
+  --glow: oklch(0.45 0.165 356 / 0.08);
+}
+
+.dark {
+  --background: oklch(0.135 0.004 50);
+  --foreground: oklch(0.94 0.004 80);
+  --card: oklch(0.175 0.004 50);
+  --card-foreground: oklch(0.94 0.004 80);
+  --popover: oklch(0.198 0.005 50);
+  --popover-foreground: oklch(0.94 0.004 80);
+  /* The burgundy lifted for the dark surface: fills and icons at 3.9:1 on the background (3.7:1 on
+     cards) under white text at 5.1:1; text in the accent takes the lighter primary-text (6.6:1). */
+  --primary: oklch(0.56 0.18 356);
+  --primary-foreground: oklch(0.99 0.003 80);
+  --primary-text: oklch(0.7 0.14 356);
+  /* Lighter on dark: 8:1 on the background. */
+  --primary-strong: oklch(0.74 0.15 356);
+  --secondary: oklch(0.235 0.005 50);
+  --secondary-foreground: oklch(0.94 0.004 80);
+  --muted: oklch(0.225 0.005 50);
+  --muted-foreground: oklch(0.69 0.012 70);
+  --accent: oklch(0.255 0.018 356);
+  --accent-foreground: oklch(0.95 0.012 356);
+  --destructive: oklch(0.65 0.2 25);
+  --border: oklch(1 0 0 / 0.085);
+  --input: oklch(1 0 0 / 0.13);
+  --ring: oklch(0.56 0.18 356);
+  --sidebar: oklch(0.152 0.004 50);
+  --sidebar-foreground: oklch(0.9 0.004 80);
+  --sidebar-accent: oklch(0.235 0.016 356);
+  --sidebar-accent-foreground: oklch(0.96 0.012 356);
+  --sidebar-border: oklch(1 0 0 / 0.07);
+
+  /* Data visualisation: the same hues stepped for the dark surface. */
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --chart-grid: #2c2c2a;
+  --chart-axis: #383835;
+  --chart-muted: #898781;
+
+  --glow: oklch(0.56 0.18 356 / 0.14);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in oklab, var(--muted-foreground) 35%, transparent) transparent;
+  }
+  html {
+    color-scheme: light;
+  }
+  html.dark {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    min-height: 100dvh;
+  }
+  code,
+  kbd,
+  pre {
+    @apply font-mono;
+  }
+}
+
+/* Motion for Radix overlays (keyed by the components' data-slot and state attributes). */
+@keyframes infernix-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes infernix-pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes infernix-slide-right {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+@keyframes infernix-slide-left {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+@keyframes infernix-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(260%);
+  }
+}
+
+[data-slot="dialog-overlay"][data-state="open"],
+[data-slot="sheet-overlay"][data-state="open"] {
+  animation: infernix-fade-in 150ms ease-out;
+}
+[data-slot="dialog-content"][data-state="open"] {
+  animation: infernix-pop-in 160ms ease-out;
+}
+[data-slot="sheet-content"][data-side="right"][data-state="open"] {
+  animation: infernix-slide-right 200ms ease-out;
+}
+[data-slot="sheet-content"][data-side="left"][data-state="open"] {
+  animation: infernix-slide-left 200ms ease-out;
+}
+[data-slot="dropdown-menu-content"][data-state="open"],
+[data-slot="select-content"][data-state="open"],
+[data-slot="tooltip-content"] {
+  animation: infernix-fade-in 110ms ease-out;
+}
+
+.progress-indeterminate {
+  animation: infernix-indeterminate 1.5s ease-in-out infinite;
+}
+
+/* Gauges: the needle and value arc ease to each new reading; the arc glows softly in dark mode. */
+.gauge-anim {
+  transition:
+    transform 600ms cubic-bezier(0.22, 0.8, 0.3, 1),
+    stroke-dashoffset 600ms cubic-bezier(0.22, 0.8, 0.3, 1),
+    opacity 300ms ease-out;
+}
+.dark .gauge-value-arc {
+  filter: drop-shadow(0 0 3px color-mix(in oklab, var(--gauge-glow, var(--primary)) 55%, transparent));
+}
+
+/* The console's resize handle. */
+.console-resize {
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+/* A soft burgundy glow behind the status hero. */
+.hero-glow {
+  background-image: radial-gradient(120% 140% at 0% 0%, var(--glow), transparent 60%);
+}
+
+/* Recharts: keep focus rings off the SVG surface; the cards carry focus. */
+.recharts-wrapper:focus,
+.recharts-surface:focus {
+  outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .progress-indeterminate {
+    animation: none;
+    transform: none;
+    width: 100% !important;
+    opacity: 0.6;
+  }
+}

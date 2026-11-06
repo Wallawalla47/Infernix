@@ -80,7 +80,9 @@ struct ContextAttentionExecutionEnvelope {
  * Every entry computes stable scaled dot-product Softmax Attention. Query head h reads KV head
  * floor(h / (Hq/Hkv)). Public BF16 inputs and persistent cache rows are interpreted after their
  * storage boundary. In the BFloat16 cache profile, K is stored as BF16 and V as
- * FP16_RNE(BF16 input). For a declared visible key set J, the independent mathematical oracle is
+ * FP16_RNE(BF16 input); the packed BF16 profile represents the same values (kv_cache_append), and
+ * its routes give the BFloat16 profile's outputs bit for bit. For a declared visible key set J, the
+ * independent mathematical oracle is
  *
  *   score[j]       = scale * dot(FP64(q[:,h,i]), FP64(k[:,kvh,j]))
  *   probability[j] = exp(score[j] - max(score)) / sum_x exp(score[x] - max(score))
@@ -169,7 +171,8 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * The registered profiles are [D,Hq,Hkv]=[256,24,4] (group 6) and [256,16,2] (group 8), with
  * scale=1/sqrt(256). q/out are contiguous BF16 [D,Hq,W,B], k/v are contiguous BF16
  * [D,Hkv,W,B], positions are contiguous device I32 [W,B], kv_table_rows is contiguous device I32
- * [B], and the cache is BF16, INT8-G64, row-scaled FP8-E4M3FN, NVFP4-G16, or K8V4. valid_columns is
+ * [B], and the cache is BF16, packed BF16, INT8-G64, row-scaled FP8-E4M3FN, NVFP4-G16, or K8V4.
+ * valid_columns is
  * either contiguous device I32 [B] or an empty Tensor meaning every row has W live columns. This
  * dense/masked topology is chosen by the caller and never inferred by copying device metadata to
  * the host. B=1 accepts every positive W in the current prompt/decode domain; B=2..8 accepts

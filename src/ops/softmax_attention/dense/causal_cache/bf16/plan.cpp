@@ -110,4 +110,19 @@ std::size_t bf16_kv_workspace_bytes(int heads, int batch, int min_width, int max
     return maximum;
 }
 
+std::size_t bf16p_kv_prompt_workspace_bytes(int heads, int kv_heads, int min_width, int max_width,
+                                            CausalAttentionExecutionEnvelope envelope, int multiprocessor_count) {
+    std::size_t maximum = 0;
+    for (int width = std::max(min_width, kGroupedPrefillMaxWidth + 1); width <= max_width; ++width) {
+        const auto plan = make_bf16_kv_causal_plan(heads, width, 1, envelope, multiprocessor_count);
+        WorkspaceLayoutBuilder layout;
+        (void)allocate_bf16p_prompt_scratch(layout, heads, kv_heads, width,
+                                            static_cast<int>(envelope.max_visible_keys), plan.prompt_splits,
+                                            bf16_kv_instance_description(plan.instance).query_rows);
+        if (plan.prompt_splits > 1) { (void)allocate_causal_partials(layout, heads, width, plan.prompt_splits, 1); }
+        maximum = std::max(maximum, layout.peak_bytes(1));
+    }
+    return maximum;
+}
+
 } // namespace infernix::ops::detail

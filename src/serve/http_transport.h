@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -53,9 +54,16 @@ public:
     void write(const std::vector<std::string>& items, Clock::time_point now = Clock::now());
 
     // Called by the Engine wait loop. Besides observing an already-closed socket, a quiet stream
-    // periodically writes an SSE comment so TCP_USER_TIMEOUT has traffic with which to detect an
-    // unacknowledged peer. A failed probe marks the request for cancellation.
+    // periodically writes a heartbeat so TCP_USER_TIMEOUT has traffic with which to detect an
+    // unacknowledged peer, and so a client whose idle timer counts events (Codex's restarts only on an
+    // event; a comment is no event) keeps the stream through a long prefill. A failed probe marks the
+    // request for cancellation.
     [[nodiscard]] bool poll(Clock::time_point now = Clock::now());
+
+    // The protocol's own event for a quiet stream (candidates UE-05): a Chat chunk with an empty delta, a
+    // repeated `response.in_progress`, Anthropic's `ping`. It runs on the thread that writes the stream's
+    // events, so it may number them; an empty result (an event not yet allowed) writes the SSE comment.
+    void set_heartbeat(std::function<std::string()> event) { heartbeat_event_ = std::move(event); }
 
 private:
     bool mark_cancelled() noexcept;
@@ -64,6 +72,7 @@ private:
     std::atomic<bool>& cancelled_;
     Clock::duration heartbeat_interval_;
     Clock::time_point last_write_;
+    std::function<std::string()> heartbeat_event_;
 };
 
 template <class Render>
@@ -80,7 +89,13 @@ RequestJson parse_json_body(const httplib::Request& request);
 [[nodiscard]] bool client_disconnected(const httplib::Request& request);
 
 void prepare_sse_response(httplib::Response& response);
+// The listener's options: its port is exclusively its own (no second server binds beside it), and the
+// connections it accepts inherit TCP keepalive and a bound on unacknowledged writes.
 void configure_http_server_socket(socket_t socket) noexcept;
+// Why the listener cannot bind `host`:`port`: the error a socket with the listener's options gets
+// binding it now (cpp-httplib's bind keeps no error; 0 when none does), and what it means for the user.
+[[nodiscard]] int probe_bind_error(const std::string& host, int port);
+[[nodiscard]] std::string bind_failure_reason(int error);
 void set_owned_json_content(httplib::Response& response, std::string body,
                             std::shared_ptr<RequestLifetime> lifetime);
 

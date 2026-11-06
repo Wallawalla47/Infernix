@@ -439,6 +439,7 @@ ToolCall parse_function_call_item(
         bad_request("function_call arguments must be a JSON string", "input");
     }
     call.arguments_json  = item.at("arguments").get<std::string>();
+    require_bounded_arguments(call.arguments_json, "input");
     const Json arguments = Json::parse(call.arguments_json, nullptr, false);
     if (arguments.is_discarded() || !arguments.is_object()) {
         bad_request("function_call arguments must encode a JSON object", "input");
@@ -767,6 +768,7 @@ ToolCall parse_tool_search_call_item(
     }
     Json arguments = item.at("arguments");
     if (arguments.is_string()) {
+        require_bounded_arguments(item.at("arguments").get_ref<const std::string&>(), "input");
         arguments = Json::parse(item.at("arguments").get<std::string>(), nullptr, false);
     }
     if (arguments.is_discarded() || !arguments.is_object()) {
@@ -1232,6 +1234,14 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
             }
             out.wire_tools.push_back(parse_tool_search_tool(item, out, out.wire_tools.size()));
             search_definition = out.prompt.generation.tools.size() - 1U;
+            continue;
+        }
+        if (type == "web_search") {
+            // Codex declares OpenAI's hosted web search on every turn unless its configuration
+            // disables it (`web_search = "disabled"`). Infernix runs no search: the declaration is
+            // accepted and echoed, and the model is not offered the tool (a tool_choice naming it
+            // is still refused).
+            out.wire_tools.push_back(item);
             continue;
         }
         if (type != "namespace") {

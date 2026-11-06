@@ -4,6 +4,7 @@
 // This header owns index math, vectorized decode, and scalar encode; there is deliberately no
 // standalone transcode kernel in the production path.
 
+#include "ops/common/bytes.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
@@ -68,13 +69,12 @@ __device__ __forceinline__ std::int8_t kv_cache_int8_quant_code(float x, float i
 
 __device__ __forceinline__ int4 kv_cache_int8_dequant_i8x8_from(const std::int8_t* codes8,
                                                                 float s) {
-    const int2 raw       = load_vec<int2>(codes8);
-    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
+    const int2 raw = load_vec<int2>(codes8);
     unsigned packed[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const float x0 = static_cast<float>(c[2 * i]) * s;
-        const float x1 = static_cast<float>(c[2 * i + 1]) * s;
+        const float x0 = static_cast<float>(signed_byte_of(raw, 2 * i)) * s;
+        const float x1 = static_cast<float>(signed_byte_of(raw, 2 * i + 1)) * s;
         packed[i]      = pack_bf16x2(x0, x1);
     }
     return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),

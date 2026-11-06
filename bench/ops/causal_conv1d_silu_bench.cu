@@ -96,7 +96,7 @@ DeviceBuffer make_varied_bf16(std::size_t n, std::uint32_t seed) {
         h[i]          = f32_to_bf16(2.0f * u - 1.0f);
     }
     DeviceBuffer d(n * 2u);
-    cudaMemcpy(d.p, h.data(), n * 2u, cudaMemcpyHostToDevice);
+    upload(d.p, h.data(), n * 2u);
     return d;
 }
 
@@ -308,14 +308,11 @@ void run_snapshot(const Options& options) {
             initial_host[static_cast<std::size_t>(row)] = options.batch * options.tokens + row;
         }
     }
-    CUDA_CHECK(cudaMemcpy(initial_slot.p, initial_host.data(), initial_slot.bytes,
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(snapshot_base_slot.p, base_host.data(), snapshot_base_slot.bytes,
-                          cudaMemcpyHostToDevice));
+    upload(initial_slot.p, initial_host.data(), initial_slot.bytes);
+    upload(snapshot_base_slot.p, base_host.data(), snapshot_base_slot.bytes);
     if (!options.valid_columns.empty()) {
         valid_columns = make_zeros(options.valid_columns.size() * sizeof(std::int32_t));
-        CUDA_CHECK(cudaMemcpy(valid_columns.p, options.valid_columns.data(), valid_columns.bytes,
-                              cudaMemcpyHostToDevice));
+        upload(valid_columns.p, options.valid_columns.data(), valid_columns.bytes);
     }
 
     SavedBuffer initial(states);

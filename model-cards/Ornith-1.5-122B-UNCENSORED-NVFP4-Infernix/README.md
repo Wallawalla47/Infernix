@@ -27,9 +27,6 @@ tags:
 
 # Ornith-1.5-122B UNCENSORED NVFP4 for Infernix
 
-> **Preliminary support:** this model runs and is verified, but I am still working on optimisations,
-> so its speeds will change.
-
 > **AI disclaimer:** this artifact, its conversion recipe, the engine that runs it and most of this
 > card were made with AI (mostly Claude Opus 5.5). It is hobby work and is likely to be neither
 > complete nor entirely accurate.
@@ -72,7 +69,7 @@ n-gram volume is needed.
 - About 70 GiB of free host RAM for the all-in-RAM mode. With less, the RAM ledger keeps as many
   experts as fit and reads the rest from the artifact (the SSD expert tier); `--expert-ram-mib` sets
   the split. Windows caps page-locked memory at 80 % of RAM.
-- About 76 GB of disk. An Infernix build from `main` at or after commit `c17e24a8`.
+- About 76 GB of disk. An Infernix build from `main` at or after commit `20e3229a`.
 
 ## What is bit-exact and what is quantized
 
@@ -96,8 +93,13 @@ the checkpoint word for word: 12,288 expert records and 1,322 tensors, no mismat
 ```text
 infernix Ornith-1.5-122B-UNCENSORED-NVFP4-Infernix-00001-of-00003.infernix \
   --prompt "Explain why the sky is blue." --max-context 8192 --max-new 256
-infernix-serve Ornith-1.5-122B-UNCENSORED-NVFP4-Infernix-00001-of-00003.infernix --max-context 262144 --kv-dtype int8 --spec mtp --draft-tokens auto
+infernix-serve Ornith-1.5-122B-UNCENSORED-NVFP4-Infernix-00001-of-00003.infernix --max-context 262144 \
+  --max-concurrency 2 --kv-dtype int8 --spec mtp --draft-tokens auto --host-context-mib 4096
 ```
+
+The server command is the recommended configuration; `--host-context-mib 4096` keeps the prefix cache's
+RAM small beside the experts' ~70 GiB. Infernix builds from 2026-10-31 speculate the same way even
+without `--spec` (`--spec auto` takes MTP on this model).
 
 - **Context memory:** only the first 32,768 tokens of KV are held at startup; longer contexts take
   their KV from the expert cache as they grow and give it back when they end.

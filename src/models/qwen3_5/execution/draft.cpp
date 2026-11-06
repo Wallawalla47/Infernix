@@ -486,14 +486,6 @@ void propose_dflash2_rows(DFlashBatchContext& state, qwen3_5::DFlashDecodeState&
             work.reset();
             return;
         }
-        // INFERNIX_TMP_TREE_ROUND_WIDTH: a proposal graph keeps the block's lattice, from which the
-        // round's verification builds its tree once its width is chosen (build_dflash2_tree).
-        if (confidence != nullptr && frame.block_scores.data) {
-            CUDA_CHECK(cudaMemcpyAsync(frame.block_scores.slice(2, row, batch).data, scores.data, scores.bytes(),
-                                       cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(frame.block_projected.slice(2, row, batch).data, projected.data,
-                                       projected.bytes(), cudaMemcpyDeviceToDevice, stream));
-        }
         const SelectorOperand path_anchors(work, anchors, stream);
         const SelectorOperand path_frontiers(work, frontiers, stream);
         const SelectorOperand frame_drafts(work, staged ? Tensor{} : frame.draft_tokens.slice(1, row, batch),
@@ -846,14 +838,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         const bool forward       = phase == SpeculativePhase::Forward;
         const bool propose       = phase == SpeculativePhase::Propose;
         const bool verify        = phase == SpeculativePhase::Verify;
-        // INFERNIX_TMP_TREE_ROUND_WIDTH: a split tree family's Verify builds the tree from the block's
-        // lattice, at its own width.
-        const bool tree_verify = verify && state.tree;
-        if ((propose || verify) &&
-            (state.ngram || (state.tree && !tree_verify) || !frame.block_drafts.data ||
-             (tree_verify ? !frame.block_scores.data ||
-                                state.neural_proposal_drafts != static_cast<std::uint32_t>(frame.block_drafts.ne[0])
-                          : k > static_cast<std::uint32_t>(frame.block_drafts.ne[0])))) {
+        if ((propose || verify) && (state.ngram || state.tree || !frame.block_drafts.data ||
+                                    k > static_cast<std::uint32_t>(frame.block_drafts.ne[0]))) {
             throw std::logic_error("an adaptive-dflash phase needs a neural round and its block");
         }
         // Verify uploads the controls again: the host wrote the round's extents, valid columns and
@@ -943,18 +929,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             }
             return;
         }
-        if (tree_verify) {
-            // The block's lattice builds each row's tree at the round's width; its main chain is the
-            // proposal's (the same counter keys).
-            const auto block = static_cast<std::int32_t>(state.neural_proposal_drafts);
-            build_dflash2_tree(state, frame, &frame, 0, batch_size, block,
-                               frame.block_candidates.slice(2, 0, batch_size),
-                               frame.block_scores.slice(2, 0, batch_size),
-                               frame.block_projected.slice(2, 0, batch_size));
-            ops::speculative_prepare_tree_verify_inputs(anchors, drafts, frontiers,
-                                                        frame.tree_rows.slice(1, 0, batch_size), verify_ids,
-                                                        target_positions, target_rope, state.execution.device.stream);
-        } else if (verify) {
+        if (verify) {
             // The round's leading k drafts of the block (and their laws), at its own width.
             copy_leading_columns(frame.block_drafts.slice(1, 0, batch_size)
                                      .view({1, frame.block_drafts.ne[0], batch_size}),

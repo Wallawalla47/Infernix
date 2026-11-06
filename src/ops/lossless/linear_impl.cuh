@@ -4,6 +4,7 @@
 
 #include "core/device.h"
 #include "infernix/ops/ggml_linear.h"
+#include "ops/common/bytes.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/ggml/ggml_exact.h"
@@ -447,10 +448,9 @@ struct Nvfp4Format {
 // Sixteen E4M3 codes as the three balanced base-128 digit planes of W = value 2^9.
 __device__ __forceinline__ void fp8_digits16(const std::uint8_t* src, std::int8_t* dst, int plane) {
     const uint4 packed = *reinterpret_cast<const uint4*>(src);
-    const auto* bytes  = reinterpret_cast<const std::uint8_t*>(&packed);
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
-        int W        = e4m3_integer(bytes[j]);
+        int W        = e4m3_integer(byte_of(packed, j));
         const int d0 = ((W + 64) & 127) - 64;
         W            = (W - d0) >> 7;
         const int d1 = ((W + 64) & 127) - 64;

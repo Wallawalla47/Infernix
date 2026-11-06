@@ -82,6 +82,7 @@ public:
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
+    friend std::unique_ptr<Model> plan_model(LoadPlan&&);
     Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
           FrontendResources resources, InstanceInfo info,
           std::optional<VisionOverlayAssets> overlay_vision,

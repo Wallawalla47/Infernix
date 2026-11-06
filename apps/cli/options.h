@@ -22,8 +22,9 @@ struct Options {
     std::optional<std::filesystem::path> expert_state;
     // --expert-stripe FILE: the experts' record tails on a second drive (EngineOptions::expert_stripe_path).
     std::filesystem::path expert_stripe_path;
-    std::uint64_t ram_headroom_bytes = kDefaultRamHeadroomBytes;
+    std::uint64_t ram_free_bytes = kDefaultRamFreeBytes;
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
+    std::optional<ExpertRamLayout> expert_ram_layout; // --expert-ram-layout (empty: the model's default)
     std::optional<std::uint64_t> expert_pin_bytes; // --expert-pin-mib; empty: what the OS lets it pin
     std::filesystem::path grammar_path;
     std::filesystem::path json_schema_path;
@@ -41,6 +42,8 @@ struct Options {
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
+    bool expert_a16_activations    = false; // EngineOptions::expert_a16_activations (--a16-activations)
+    bool a8_activations            = false; // EngineOptions::a8_activations
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t prefill_chunk  = 0; // 0: the model's default (EngineOptions)
     int device                   = 0;
@@ -58,6 +61,8 @@ struct Options {
     // --fast-path NAME (repeatable): also run these, qualified or not (qualification runs;
     // EngineOptions::fast_path_candidates).
     std::vector<FastPath> fast_path_candidates;
+    // --no-fast-path NAME (repeatable): leave these selected paths out (EngineOptions::fast_path_exclusions).
+    std::vector<FastPath> fast_path_exclusions;
     SpeculativeOptions speculative;
     bool enable_vision                     = false;
     VisionOffload vision_offload                    = VisionOffload::Auto;

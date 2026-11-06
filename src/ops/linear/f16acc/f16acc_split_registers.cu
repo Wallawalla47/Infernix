@@ -1,5 +1,5 @@
-// The split-register f16-accumulate launches (f16acc_mma.cuh F16AccSplitRegisters, chosen per call by
-// f16acc_split_registers), each defined once here. This translation unit is in the non-RDC
+// The split-register f16-accumulate launches (f16acc_mma.cuh F16AccSplitRegisters, chosen by
+// kF16AccSplitRaster), each defined once here. This translation unit is in the non-RDC
 // archive, where ptxas keeps the producers' setmaxnreg hand-over to the consumers; the routes' own
 // translation units see only the declarations at the end of f16acc_mma.cuh.
 #include "ops/linear/f16acc/f16acc_mma.cuh"

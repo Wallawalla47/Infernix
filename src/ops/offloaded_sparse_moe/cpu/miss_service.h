@@ -5,12 +5,15 @@
 // the requested experts with the worker team (the service thread is worker 0) from the pinned
 // expert banks, writes the BF16 outputs to mapped memory and answers with the request's sequence.
 // The arithmetic is expert_forward's (A16: expert_forward_a16's, or expert_forward_a4r's under
-// NarrowA16::kA4Residual), so a CPU-served output equals the GPU's bit for bit.
+// NarrowA16::kA4Residual; a request on the 8-bit activation route, MissRequest::a8: a GGUF bank's
+// ggml_a8_expert_forward's, an NVFP4 W4A16 bank's expert_forward_a8's), so a CPU-served output equals
+// the GPU's bit for bit.
 //
 // The service owns the mapped channel buffers and the device sequence counter. It must outlive
 // every call that uses its channels, and its destructor must run only when no call is pending.
 
 #include "infernix/ops/offloaded_sparse_moe.h"
+#include "ops/offloaded_sparse_moe/cpu/cpu_speed.h"
 #include "ops/offloaded_sparse_moe/cpu/expert_team.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_request.h"
 #include "ops/offloaded_sparse_moe/cpu/record_provider.h"
@@ -43,6 +46,9 @@ public:
         int max_job_columns = kMaxCpuColumns; // misses with more columns stay on the GPU
         int wide_from   = 0;     // calls of at least this many columns (0: none) take wide_jobs as their cap
         int wide_jobs   = 0;     // prefill assist cap, at most kMaxCpuJobs
+        int assist_share = 0;    // > 0: an assisted call keeps (misses * assist_share) >> 8 on the stage (MoeCpuChannel)
+        int assist_share_wide = 0; // MoeCpuChannel: the share reached at max_columns, from assist_ramp_from columns
+        int assist_ramp_from  = 0; // (0: assist_share at every width)
         // Optional: the logical CPUs (a mask, bit i: CPU i) worker i may run on; 0 or a missing entry
         // leaves it unpinned (worker 0 is the service thread).
         std::vector<std::uint64_t> cpus;
@@ -51,6 +57,13 @@ public:
         // The arithmetic of A16 jobs (exact, or expert-a4-residual-decode's two terms); it must equal
         // the calls' MoeExpertSource::narrow_a16, which moe_experts checks through the channel.
         NarrowA16 narrow_a16 = NarrowA16::kExact;
+        // --a8-activations: GGUF banks' calls may publish 8-bit activation requests (MissRequest::a8); it must
+        // equal the calls' MoeGgmlBank::a8, which moe_experts checks through the channel (MoeCpuChannel::a8).
+        bool ggml_a8 = false;
+        // --a8-activations: NVFP4 W4A16 banks' calls (activation kA16) may publish 8-bit activation requests
+        // (MissRequest::a8), whose jobs take w4a8_expert.h's route; it must equal those calls' choice. Without it
+        // such a request is answered with EINVAL in the status word.
+        bool nvfp4_a8 = false;
         // Every layer's expert geometry; it must equal the calls' MoeExpertSource::shape (another
         // registered one than Flash-Next's for NVFP4 A16 banks only).
         ExpertShape shape = kFlashNextShape;
@@ -83,6 +96,10 @@ public:
     // without a request the thread idles in waits of about 0.5 ms (Windows: a high-resolution
     // waitable timer; a plain sleep_for(50 us) there lasts one 15.6 ms timer tick).
     void wake() const noexcept;
+    // The team's speed against the caller's reference rates (CpuSpeed): each request's experts with their records in
+    // memory are timed as the team computes them (tier reads excluded). Before set_reference_rates, 1.
+    void set_reference_rates(double expert_rate, double column_rate) noexcept { speed_.set_reference(expert_rate, column_rate); }
+    [[nodiscard]] double speed_ratio() const noexcept { return speed_.ratio(); }
 
 private:
     void serve();
@@ -104,6 +121,7 @@ private:
     void* wake_event_ = nullptr;             // Windows: auto-reset event wake() signals
     void* idle_timer_ = nullptr;             // Windows: the idle wait's high-resolution timer
     std::atomic<std::uint64_t> served_{0}, experts_{0};
+    CpuSpeed speed_;
     mutable std::mutex failure_mutex_;
     std::string failure_;
     std::thread thread_;

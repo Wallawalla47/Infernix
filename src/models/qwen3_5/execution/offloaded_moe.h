@@ -43,9 +43,13 @@ struct OffloadedExperts {
     std::int32_t landing_slots  = 0;
     // --expert-tail-skip's rank for graphed rounds (0: off; MoeExpertSource::tail_skip_rank).
     std::int32_t tail_skip_rank = 0;
-    // The wide route of every call (MoeExpertSource::wide_a16): exact, or the expert-a4-residual fast
-    // paths' two or three A4 terms (ExecutionSchedule::expert_wide, which sized the workspace).
+    // The wide route of every call (MoeExpertSource::wide_a16): exact, --a8-activations' 8-bit route
+    // (WideA16::kA8, with narrow_a16's), or the expert-a4-residual fast paths' two or three A4 terms
+    // (ExecutionSchedule::expert_wide, which sized the workspace).
     ops::offloaded_moe::WideA16 wide_a16 = ops::offloaded_moe::WideA16::kExact;
+    // The narrow route of every call (MoeExpertSource::narrow_a16): exact, or --a8-activations' 8-bit
+    // activations (NarrowA16::kA8: calls of at most nvfp4_a8::kMaxCallColumns columns; LOSSY, opt-in).
+    ops::offloaded_moe::NarrowA16 narrow_a16 = ops::offloaded_moe::NarrowA16::kExact;
     // router-mma: calls of at least kRouterMmaMinColumns columns (prefill chunks and walk calls, never a
     // decode or verification round) compute the router and shared-gate logits on tensor cores
     // (ops::projection_fp32_router_mma: BF16 operands, FP32 accumulation, a column's bits the same at
@@ -59,16 +63,31 @@ struct OffloadedExperts {
     // shared expert runs there while the routed experts stage and compute (Qwen4Exp's pattern).
     cudaStream_t shared_stream = nullptr;
     std::array<cudaEvent_t, 2> shared_events{};
+    // A graphed round's staged misses compute on this stream while the side stream stages their down rows
+    // (ops::MoeExpertSource::split_stream). Null: not split.
+    cudaStream_t split_stream = nullptr;
+    std::array<cudaEvent_t, 2> split_events{};
     // The prefill expert stream (null without one) and the prefill CPU split.
     runtime::expert_offload::ExpertStream* stream      = nullptr;
     const runtime::expert_offload::CpuSplitPolicy* split = nullptr;
-    // A gated split's host scratch: the layer's dispatch offsets (pinned), their event, the experts'
-    // columns and the CPU's choice.
+    // A gated split's host scratch: the layer's dispatch offsets (pinned [E + 2], then the
+    // copy-ahead's guess of the next layer's [E + 1]), their event, the experts' columns, the
+    // columns the CPU split prices (those copied ahead masked), the CPU's choice and the guessed columns.
     PinnedHostBuffer split_offsets{4};
     cudaEvent_t split_ready = nullptr;
     std::vector<std::int32_t> split_columns;
+    std::vector<std::int32_t> split_priced;
     std::vector<std::uint8_t> split_cpu;
+    std::vector<std::int32_t> guess_columns;
     std::uint64_t split_cpu_experts = 0, split_streamed_experts = 0;
+    // The drafter pool (candidates §22 VM-01): the MTP drafter's routed experts in a pool of
+    // drafter_slots device slots (runtime/expert_offload/drafter_pool.h): its banks ([slots * 2I, H], [slots * H, I]),
+    // slot table (device I32 [E]: slot or -1) and demand counts (device I32 [E + 1]); the drafter's resident MoE then
+    // routes among the pooled experts (ops::moe_route_pooled). drafter_slots = 0: the bank is device-resident.
+    std::int32_t drafter_slots = 0;
+    Weight drafter_gate_up, drafter_down;
+    Tensor drafter_slot_of;
+    std::int32_t* drafter_demand = nullptr;
 };
 
 // One call's route through the offloaded experts.

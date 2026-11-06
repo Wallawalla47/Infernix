@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/math.cuh"
+#include "ops/softmax_attention/common/causal_softmax.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 
@@ -269,8 +270,8 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void packed_attention_flash_kerne
         const float next_m1 = fmaxf(m1, block_max1);
         const float m0_l2   = next_m0 * ScaleLog2E;
         const float m1_l2   = next_m1 * ScaleLog2E;
-        const float alpha0  = exp2_approx(__fmaf_rn(m0, ScaleLog2E, -m0_l2));
-        const float alpha1  = exp2_approx(__fmaf_rn(m1, ScaleLog2E, -m1_l2));
+        const float alpha0  = detail::causal_rescale(m0, m0_l2, ScaleLog2E);
+        const float alpha1  = detail::causal_rescale(m1, m1_l2, ScaleLog2E);
 
         float block_sum0 = 0.0f;
         float block_sum1 = 0.0f;

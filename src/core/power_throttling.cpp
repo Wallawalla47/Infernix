@@ -11,21 +11,28 @@
 #endif
 
 #include <mutex>
+#include <optional>
 
 namespace infernix {
 
-void exempt_process_from_power_throttling() noexcept {
+std::optional<unsigned long> exempt_process_from_power_throttling() noexcept {
 #if defined(_WIN32)
     static std::once_flag once;
+    static std::optional<unsigned long> refused;
     try {
         std::call_once(once, [] {
             PROCESS_POWER_THROTTLING_STATE state{};
             state.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
             state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
             state.StateMask   = 0; // controlled and off: never throttled
-            (void)SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
+            if (SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state)) == FALSE) {
+                refused = GetLastError();
+            }
         });
     } catch (...) {}
+    return refused;
+#else
+    return std::nullopt;
 #endif
 }
 

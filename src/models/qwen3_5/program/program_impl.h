@@ -25,6 +25,7 @@
 #include "models/qwen3_5/program/ngram_proposer.h"
 #include "models/qwen3_5/program/offload.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
+#include "runtime/expert_offload/ram_monitor.h"
 #include "runtime/prefix_cache/cost.h"
 #include "runtime/prefix_cache/prefix_index.h"
 #include "runtime/prefix_cache/tap_planner.h"
@@ -36,6 +37,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -370,6 +372,16 @@ struct HybridLaneState {
     // position prefill reached (state computed on the grid equals any other request's cold
     // computation of the same prefix). Unbounded otherwise.
     std::uint32_t publish_frontier = std::numeric_limits<std::uint32_t>::max();
+    // What this sequence published that a non-finite failure withdraws (spec §7.8): the blocks
+    // whose Device copy is its page and the snapshots it created. `withdraw` marks that failure
+    // (set by the commit that discards its row); `saves` counts the cache file's saves at admission.
+    std::vector<runtime::prefix_cache::NodeRef> owned;
+    std::vector<runtime::prefix_cache::SnapshotRef> created;
+    // The snapshots its captures superseded: the withdrawal restores those still cached, so a resend resumes
+    // from what was cached before it (superseded snapshots are evicted first).
+    std::vector<HybridSuperseded> superseded;
+    bool withdraw      = false;
+    std::uint64_t saves = 0;
 };
 
 class ProgramImpl {
@@ -499,19 +511,7 @@ public:
         std::chrono::steady_clock::time_point start{};
         std::uint32_t batch   = 0; // 0: none yet
         std::uint32_t columns = 0;
-        bool drafted          = true; // a draft-free round's cycle (MtpDraftRegime) teaches no cost
     } mtp_confidence_round;
-    // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_SKIP_ROUNDS; ExecutionSchedule::mtp_draft_regime): whether
-    // each MTP round drafts, and the last round's start, batch size, regimes and committed tokens,
-    // which close its cycle for the regime's measurement.
-    std::optional<MtpDraftRegime> mtp_regime;
-    struct MtpRegimeRound {
-        std::chrono::steady_clock::time_point start{};
-        std::uint32_t batch = 0; // 0: none yet
-        bool previous       = true;
-        bool drafted        = true;
-        std::uint32_t tokens = 0;
-    } mtp_regime_round;
     // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_DRAFT_LOG): one line per MTP row that held drafts, and the
     // start-to-start cycle of the round before (0 for the first).
     std::unique_ptr<std::ofstream> mtp_draft_log;
@@ -534,6 +534,11 @@ public:
     std::size_t graph_measured_bytes = 0;
     const WorkspacePlan workspace_plan;
 
+    // Offloaded experts (the 122B, candidates RF-04): free device memory before the fixed allocations below,
+    // which the constructor checks once they are made: memory the driver placed in shared system memory (the
+    // Windows sysmem fallback) fails the startup, as Qwen3.8-Flash-Next's Program does. Declared before them.
+    std::unique_ptr<VramBudgetSource> spill_source;
+    std::optional<SpillGuard> spill_guard;
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
@@ -566,6 +571,9 @@ public:
     void shrink_kv(bool evict);
     [[nodiscard]] bool kv_idle_due() const noexcept;
     std::unique_ptr<qwen3_5::DecoderState> decoder;
+    // Before the KV stores: DFlash Full's page pool must outlive the backend stores' leases into it,
+    // also when the constructor unwinds (members are destroyed in reverse order).
+    std::optional<DFlashPersistentState> dflash;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
     std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
@@ -577,7 +585,6 @@ public:
     // One view per round-family width below draft_window: rounds of a narrower family verify at
     // their own width for every batch size and record/fold through the dense view of that width.
     std::vector<NarrowReplayView> narrow_replay_views;
-    std::optional<DFlashPersistentState> dflash;
     // An artifact with offloaded experts: the Program's experts and their engine (offload.h); null
     // otherwise.
     std::unique_ptr<ProgramOffload> offload;
@@ -590,6 +597,8 @@ public:
     std::optional<DFlashDraftHandoff> dflash_draft_handoff;
     std::array<std::uint64_t, kMaximumConcurrency> grammar_dead_positions{};
     ops::SamplingMask bind_grammar_mask(runtime::TokenMaskProvider*, std::size_t row);
+    // The row's end-of-turn exclusion while its thinking is open (runtime::ReasoningBan; none without a provider).
+    void bind_reasoning_ban(runtime::TokenMaskProvider*, std::size_t row, ops::SamplingConfig& config) const noexcept;
     ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider*, std::size_t row,
                                         std::span<const TokenId> drafts);
     Tensor token_counts;
@@ -599,6 +608,12 @@ public:
     [[nodiscard]] std::int32_t* nonfinite_flag(std::uint32_t lane) const noexcept {
         return static_cast<std::int32_t*>(nonfinite_flags.data()) + lane;
     }
+    // Packed BF16 KV (--kv-dtype bf16p): one flag per execution table row of the text cache, then of the backend
+    // cache, which an append sets when a row has no packed form (PagedKVLayerView::unpackable). Cleared when a request
+    // is bound to its rows; a set flag fails the request at its next commit (runtime::PendingRowFailure::UnpackableKv).
+    std::optional<PinnedHostBuffer> unpackable_flags;
+    void clear_unpackable(const SequenceState& sequence) const noexcept;
+    [[nodiscard]] bool take_unpackable(const SequenceState& sequence) const noexcept;
 
     VisionHandoffState vision_handoff;
     std::array<SequenceState, kMaximumConcurrency> sequences;
@@ -855,7 +870,24 @@ public:
     std::filesystem::path hybrid_file_;
     std::string hybrid_fingerprint_;
     std::optional<HybridCachePersistence> hybrid_shutdown_save_;
+
+    // ---- RAM pressure (Program::start_ram_resize): the monitor and the engine's diagnostic sink -------------------
+    std::unique_ptr<runtime::expert_offload::RamMonitor> ram_;
+    std::function<void(const std::string&, DiagnosticLevel)> ram_diagnostic_;
+    // The growth so far of the pieces the monitor asks for one after another (logged once they stop).
+    std::uint64_t ram_grown_prefix_ = 0, ram_grown_experts_ = 0;
+    // Between requests: the resize the monitor finds due, applied to the prefix cache's Host tier, then (a release past
+    // it, a growth before it) to the offloaded experts' SSD tier.
+    void maintain_ram();
+    // The offloaded experts' SSD tier (null without one), and what the RAM tiers could give back and take back now.
+    [[nodiscard]] runtime::expert_offload::HostExpertTier* ram_expert_tier() noexcept;
+    [[nodiscard]] std::uint64_t ram_shrinkable();
+    [[nodiscard]] std::uint64_t ram_growable();
     std::uint64_t hybrid_saved_writes_ = 0; // host_write_bytes at the last save or load
+    std::uint64_t hybrid_saves_        = 0; // periodic saves of the attached file that succeeded
+    // Entries withdrawn after a non-finite failure that another sequence or a transfer still pinned
+    // (spec §7.8): every later lane release retries them.
+    runtime::prefix_cache::Withdrawal hybrid_withdrawal_;
     // What the last finished lane's next turn resumes from, for a tool-call hold: its endpoint
     // (an echoing client) and its prompt's last tap (a client re-rendering the reply). Invalid
     // where none was published.
@@ -930,8 +962,13 @@ public:
     // published, for a tool-call hold.
     [[nodiscard]] runtime::prefix_cache::SnapshotRef
     hybrid_publish_endpoint(SequenceState& sequence, bool endpoint) noexcept;
-    // Drops the lane's index pins and pending taps. Safe on any lane state.
+    // Drops the lane's index pins and pending taps. Safe on any lane state. A lane marked
+    // `withdraw` writes nothing through and withdraws what it published (hybrid_withdraw).
     void hybrid_release_lane(std::uint32_t lane) noexcept;
+    // After a non-finite failure, once the lane's pins are released: its snapshots' Host writes land,
+    // then its blocks and snapshots leave the cache, and the attached cache file is rewritten at its
+    // next save (deleted now when a save since the lane's admission may hold them).
+    void hybrid_withdraw(HybridLaneState& lane);
     // Supersedes the snapshot the sequence resumed from once it snapshots past it at
     // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3). Each returns
     // what it superseded, for hybrid_undo_supersession.

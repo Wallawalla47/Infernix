@@ -14,6 +14,8 @@
 #include "ops/softmax_attention/dense/causal_cache/vq2/operands.h"
 #include "ops/softmax_attention/dense/causal_cache/vq2/tile_io.cuh"
 
+#include <algorithm>
+
 namespace infernix::ops::detail {
 
 // Grouped attention over a vector-quantized cache for rows of up to eight columns (eight warps),
@@ -25,14 +27,15 @@ namespace infernix::ops::detail {
 // merge applies the inverse rotation. The append runs as a separate launch before this kernel.
 //
 // A row's keys split by how its columns read them (vq_exact_key), and each split CTA has one role:
-//   * Window CTAs (the first `window_splits` splits) take the sink and recent tiles. Each tile's
+//   * Window CTAs (the lowest splits, as many as the row's code tiles leave, at least the plan's
+//     window_splits and at most one per window tile) take the sink and recent tiles. Each tile's
 //     INT8 window slots, tags and paged codes land in one buffer; a slot whose tag does not match
 //     the codes is replaced by its expanded codes. They keep the pairs a column reads exactly.
-//   * Code CTAs (the remaining splits) partition the tiles some column reads from codes. The
+//   * Code CTAs (the next splits) partition the tiles some column reads from codes. The
 //     compact code rows stream double-buffered and each tile is expanded once into the INT8 tile
 //     (the row scale repeated as each group scale). They keep the pairs a column reads from codes.
 // Every (key, column) pair is kept by exactly one CTA, and every CTA publishes a partial (an empty
-// one the neutral state) so the merge reads all window_splits + capacity splits. QK spreads the
+// one the neutral state) so the merge reads every split of the grid. QK spreads the
 // tile's 8-key column blocks, times the row tiles, over up to all the warps, which exchange row
 // maxima through shared memory; PV splits the dimensions over all the warps.
 template <KVCacheVqKeyCodec KeyCodec, int KeyRows>
@@ -58,6 +61,10 @@ struct VqKvGroupedShape {
     static constexpr int kArenaBytes = kSignOffset + (kSignTable ? 128 * 8 : 0);
     static_assert(kStageBytes % 16 == 0 && kTileBytes % 16 == 0);
     static_assert(kKeptOffset + 2 * kKeyRows <= kCodebookOffset);
+    // Q's scales pass through the second stage after the tags and kept flags, which a window CTA's
+    // first tile fills while Q is encoded; a code CTA's second stage is first written after the
+    // scales have moved to registers.
+    static constexpr int kQScaleOffset = (kKeptOffset + 2 * kKeyRows + 15) / 16 * 16;
 };
 
 // The per-block shared-memory limit of this target (sm_120).
@@ -84,6 +91,19 @@ inline constexpr std::uint32_t vq_kv_grouped_smem_bytes() {
 template <class G>
 inline constexpr int kVqParallelTile    = 2 * kCausalGroupedTokens<G>;
 inline constexpr int kVqMaxWindowSplits = 8;
+// The most window tiles one CTA reads, and so the most window CTAs a row takes: its sink tiles and the
+// tiles from its first column's recent window to its last key, at the smallest key tile (32) and the
+// widest CTA (16 columns).
+inline constexpr int kVqMaxWindowTiles =
+    kKVWindowSinkTokens / 32 + (kKVWindowRecentTokens + 16 + 31) / 32 + 1;
+
+// The grid's splits for rows of at most `visible` keys: room for every row's window CTAs (at most its
+// window tiles) and code CTAs (at most `capacity`) within its budget `row_splits`, and never fewer
+// than the plan's window_splits + capacity.
+inline int vq_grid_splits(int window_splits, int row_splits, int capacity, int visible) {
+    const int window_tiles = std::min(kVqMaxWindowTiles, (visible + 31) / 32);
+    return std::max(window_splits + capacity, std::min(row_splits, window_tiles + capacity));
+}
 
 // Warps of a grouped CTA of TokenTile columns: sixteen above 64 query rows.
 template <class G, int TokenTile>
@@ -104,8 +124,9 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
     __global__
     void vq_kv_grouped_kernel(const __nv_bfloat16* q, const std::int32_t* pos, VqKvCacheView cache,
                               std::int32_t full_width, std::int32_t logical_capacity,
-                              CausalKvPartition partition, std::int32_t window_splits, float scale,
-                              float* partial_acc, float* partial_m, float* partial_l) {
+                              CausalKvPartition partition, std::int32_t window_splits,
+                              std::int32_t row_splits, float scale, float* partial_acc,
+                              float* partial_m, float* partial_l) {
     using Shape                 = VqKvGroupedShape<KeyCodec, KeyRows>;
     constexpr int Wc            = kVqGroupedWarps<Geometry, TokenTile>;
     constexpr int RowCount      = TokenTile * Geometry::GroupSize;
@@ -159,9 +180,9 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
     std::uint8_t* kept    = reinterpret_cast<std::uint8_t*>(arena + Shape::kKeptOffset);
     std::int8_t* codebook = arena + Shape::kCodebookOffset;
     uint2* sign_masks     = reinterpret_cast<uint2*>(arena + Shape::kSignOffset);
-    // The query scales pass through the second stage, which nothing touches before the key loop.
-    float* q_scale_tmp = reinterpret_cast<float*>(stage(1));
-    static_assert(RowCount * kKVCacheInt8Groups * 4 <= Shape::kStageBytes);
+    float* q_scale_tmp    = reinterpret_cast<float*>(arena + Shape::kQScaleOffset);
+    static_assert(Shape::kQScaleOffset + RowCount * kKVCacheInt8Groups * 4 <=
+                  Shape::kCodebookOffset);
 
     const int kv_head      = ParallelQueries ? blockIdx.x % Geometry::KVHeads : blockIdx.x;
     const int column_begin = ParallelQueries ? (blockIdx.x / Geometry::KVHeads) * TokenTile : 0;
@@ -170,11 +191,23 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
     const int partial_begin = column_begin;
     const int split         = static_cast<int>(blockIdx.y);
     const int batch         = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
-    // Launched as the append's programmatic dependent: window CTAs read the keys it writes and
-    // wait for it first (every one of them, so this grid's completion implies the append's); code
-    // CTAs read only keys older than any column's window and overlap it.
-    const bool window_role = split < window_splits;
-    if (window_role) pdl::wait_for_dependencies();
+    // Launched as the append's programmatic dependent; the append is an ordinary launch, so
+    // everything before it is complete and only what it writes needs a wait: the codes, scales
+    // and window slots of this call's keys. A window CTA waits just before the first tile that
+    // holds one of them (keys at or after the row's first column, which a later column tile of a
+    // wide row reads too); older window keys never share a slot with them, since a call is at
+    // most kKVWindowInlineWidth columns wide. Code CTAs read only keys older than any column's
+    // window. The plan's first window_splits CTAs also wait before they exit, whatever their
+    // role in this row, so this grid's completion still implies the append's.
+    const bool waits_for_append = split < window_splits;
+    bool append_waited          = false;
+    const auto wait_append      = [&]() {
+        if (!append_waited) pdl::wait_for_dependencies();
+        append_waited = true;
+    };
+    const auto finish_append = [&]() {
+        if (waits_for_append) wait_append();
+    };
     const int tid           = static_cast<int>(threadIdx.x);
     const int warp          = tid >> 5;
     const int lane          = tid & 31;
@@ -206,8 +239,14 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
             static_cast<std::int64_t>(batch) * Geometry::QHeads * partial_width * split_count;
     }
 
-    if (valid_tokens == 0) return; // Merge writes exact zero for masked columns.
-    if (pos[0] < 0 || last_pos < 0 || last_pos >= logical_capacity) return;
+    if (valid_tokens == 0) { // Merge writes exact zero for masked columns.
+        finish_append();
+        return;
+    }
+    if (pos[0] < 0 || last_pos < 0 || last_pos >= logical_capacity) {
+        finish_append();
+        return;
+    }
     // A masked row's keys end at its last valid column: columns past it were never appended.
     int live_end = last_pos + 1;
     if constexpr (Masked) live_end = row_first + max(0, cache.valid_columns[batch]);
@@ -221,30 +260,60 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
     const int live_tiles   = div_up(live_end, Bc);
     int sink_tiles = 0, recent_first = 0, tile_begin = 0, tile_end = 0;
     int code_lo = 0, code_hi = 0;
+    int window_tiles = 0, code_first_tile = 0, code_tiles = 0;
+    if (has_window) {
+        sink_tiles   = min(kKVWindowSinkTokens / Bc, live_tiles);
+        recent_first = max(sink_tiles, max(0, query_first - kKVWindowRecentTokens) / Bc);
+        window_tiles = sink_tiles + max(0, live_tiles - recent_first);
+    }
+    code_lo = has_window ? kKVWindowSinkTokens : 0;
+    code_hi = has_window ? min(live_end, query_last - kKVWindowRecentTokens) : live_end;
+    if (code_hi > code_lo) {
+        code_first_tile = code_lo / Bc;
+        code_tiles      = div_up(code_hi, Bc) - code_first_tile;
+    }
+    // Roles follow this row's tiles. The code tiles take the partition's split count; the window
+    // tiles, read serially from the exact window, take every split the codes leave of the row's
+    // budget, one tile each at most, and never fewer than the plan's window_splits. A long row
+    // therefore keeps the plan's roles, while a short one, whose code splits would sit empty,
+    // spreads its 25 window tiles over as many CTAs (k4v2, 24/4 heads: 8 window CTAs take 36 us at
+    // 1.3K keys, one 120 us). The budget is the plan's row_splits, never the grid: the grid follows
+    // the envelope (the batch's longest row, the graph profile's bucket), and a row's tile grouping,
+    // so its FP32 sums, must not (the reproducible route's row invariance).
+    const int code_want    = code_tiles > 0 ? partition.active(code_hi) : 0;
+    const int window_cnt   = min(window_tiles, max(window_splits, row_splits - code_want));
+    const int code_cnt     = min(code_want, row_splits - window_cnt);
+    const bool window_role = split < window_cnt;
     if (window_role) {
-        if (has_window) {
-            sink_tiles         = min(kKVWindowSinkTokens / Bc, live_tiles);
-            recent_first       = max(sink_tiles, max(0, query_first - kKVWindowRecentTokens) / Bc);
-            // The lowest splits take the tiles: a row shorter than window_splits keys
-            // merges only its first `window` splits (vq_merge_partition).
-            const int count    = sink_tiles + max(0, live_tiles - recent_first);
-            const int per      = div_up(count, window_splits);
-            tile_begin         = min(count, split * per);
-            tile_end           = min(count, tile_begin + per);
+        // The lowest splits take the tiles: a row shorter than the split count merges only its
+        // first `window` splits (vq_merge_partition), and window_cnt never exceeds its tiles.
+        const int per = div_up(window_tiles, window_cnt);
+        tile_begin    = min(window_tiles, split * per);
+        tile_end      = min(window_tiles, tile_begin + per);
+    } else if (code_tiles > 0) {
+        const int c = split - window_cnt;
+        if (c < code_cnt) {
+            tile_begin = code_first_tile + c * code_tiles / code_cnt;
+            tile_end   = code_first_tile + (c + 1) * code_tiles / code_cnt;
         }
-    } else {
-        code_lo = has_window ? kKVWindowSinkTokens : 0;
-        code_hi = has_window ? min(live_end, query_last - kKVWindowRecentTokens) : live_end;
-        if (code_hi > code_lo) {
-            const int first_tile = code_lo / Bc;
-            const int count      = div_up(code_hi, Bc) - first_tile;
-            const int active     = partition.active(code_hi);
-            const int c          = split - window_splits;
-            if (c < active) {
-                tile_begin = first_tile + c * count / active;
-                tile_end   = first_tile + (c + 1) * count / active;
-            }
+    }
+    // A split with no tiles holds the neutral partial (maximum -inf, sum 0). The merge gives it
+    // zero weight and never reads its accumulator, so only the two statistics are written: below
+    // the envelope's split count most splits of a short row are empty, and staging Q and writing a
+    // zero accumulator in each of them cost more than the row's attention (k4v2, 24/4 heads,
+    // eight columns at 1.3K keys: about two thirds of 42 splits per row).
+    if (tile_begin >= tile_end) {
+        for (int row = tid; row < tile_tokens * Geometry::GroupSize; row += Threads) {
+            int q_head = 0, token = 0;
+            causal_row_to_qt<Geometry>(row, kv_head, q_head, token);
+            const std::int64_t index =
+                causal_stat_index<Geometry>(q_head, partial_begin + token, split, partial_width);
+            partial_m[index] = -CUDART_INF_F;
+            partial_l[index] = 0.0f;
         }
+        finish_append();
+        pdl::trigger_dependents();
+        return;
     }
     const auto tile_of = [&](int i) {
         if (!window_role) return i;
@@ -329,9 +398,8 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
 
     // Window CTAs: load key tile `k0` into the INT8 tile (window slots, or expanded codes where a
     // slot's tag does not match the codes). Ends with a barrier.
-    const auto load_window_tile = [&](int k0) {
-        std::uint8_t* codes = stage(0);
-        issue_codes(codes, k0);
+    const auto issue_window_tile = [&](int k0) {
+        issue_codes(stage(0), k0);
         for (int item = tid; item < Bc * 17; item += Threads) {
             // Items 0..15 of a key copy its 16-byte K and V slot chunks, item 16 its scales and tags.
             const int key_l = item / 17;
@@ -356,6 +424,9 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
             }
         }
         cp_commit();
+    };
+    const auto finish_window_tile = [&](int k0) {
+        const std::uint8_t* codes = stage(0);
         cp_wait<0>();
         __syncthreads();
         const __half* row_scales = reinterpret_cast<const __half*>(codes + Shape::kStageScaleOffset);
@@ -379,42 +450,100 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
         __syncthreads();
     };
 
-    vq_stage_codebook(codebook, tid, Threads);
+    // The codebook arrives with the first tile's group: every tile waits for its group and
+    // synchronizes before decoding codes, so nothing reads it earlier, and Q is encoded while it
+    // is in flight instead of after a blocking copy.
+    for (int i = tid; i < kKVCacheVq2Patterns * 8 / 16; i += Threads)
+        cp_async<16>(codebook + 16 * i, g_kv_cache_vq2_codebook + 16 * i);
     if constexpr (Shape::kSignTable) kv_cache_vq2_stage_sign_masks(sign_masks, tid, Threads);
+    // The first tile's loads are in flight while Q is encoded: a code CTA's first stage, and a
+    // window CTA's first tile unless the append still writes some of its keys.
+    bool window_prefetched = false;
     if (!window_role && tile_begin < tile_end) issue_codes(stage(0), tile_of(tile_begin) * Bc);
+    if (window_role && tile_begin < tile_end && (tile_of(tile_begin) + 1) * Bc <= row_first) {
+        issue_window_tile(tile_of(tile_begin) * Bc);
+        window_prefetched = true;
+    }
     cp_commit();
 
     for (int i = tid; i < Br * D; i += Threads) { q_i8[i] = 0; }
     for (int i = tid; i < RowCount * Groups; i += Threads) { q_scale_tmp[i] = 0.0f; }
     __syncthreads();
 
+    // Q encoding with each lane holding eight contiguous dimensions 8*lane..8*lane+7: one 16-byte
+    // load per row, issued a row ahead, and each G64 group within eight neighbouring lanes. The
+    // Sylvester butterflies run over dimension bits 0..7 in the same order as
+    // normalized_hadamard_d256_inplace (bits 0-2 are registers here, 3-7 lanes), with the same
+    // rounded operations, so codes and scales are bit-identical to the lane+32r form. With one
+    // 2-byte load per value and one row in flight this setup took 8-10 us of a 15 us CTA (k4v2,
+    // 24/4 heads, two rows of eight columns at 1.3K keys).
+    const auto load_q_row = [&](int row) {
+        uint4 raw = make_uint4(0u, 0u, 0u, 0u);
+        if (row < RowCount) {
+            int q_head = 0, token = 0;
+            causal_row_to_qt<Geometry>(row, kv_head, q_head, token);
+            if (token < valid_tokens)
+                raw = *reinterpret_cast<const uint4*>(
+                    q + causal_q_index<Geometry>(q_head, 8 * lane, token));
+        }
+        return raw;
+    };
+    uint4 q_next = load_q_row(warp);
     for (int row = warp; row < RowCount; row += Wc) {
-        int q_head = 0;
-        int token  = 0;
-        causal_row_to_qt<Geometry>(row, kv_head, q_head, token);
-        float q_values[8];
+        const uint4 raw = q_next;
+        q_next          = load_q_row(row + Wc);
+        float v[8];
+        const std::uint32_t words[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            v[2 * i]     = __uint_as_float(words[i] << 16);
+            v[2 * i + 1] = __uint_as_float(words[i] & 0xffff0000u);
+        }
+#pragma unroll
+        for (int span = 1; span < 8; span <<= 1) {
+#pragma unroll
+            for (int base = 0; base < 8; base += 2 * span) {
+#pragma unroll
+                for (int offset = 0; offset < span; ++offset) {
+                    const float low         = v[base + offset];
+                    const float high        = v[base + offset + span];
+                    v[base + offset]        = __fadd_rn(low, high);
+                    v[base + offset + span] = __fsub_rn(low, high);
+                }
+            }
+        }
+#pragma unroll
+        for (int stride = 1; stride <= 16; stride <<= 1) {
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const float value = v[r];
+                const float peer  = __shfl_xor_sync(FullMask, value, stride);
+                v[r] = (lane & stride) == 0 ? __fadd_rn(value, peer) : __fsub_rn(peer, value);
+            }
+        }
+        float amax = 0.0f;
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
-            const int d = lane + 32 * r;
-            q_values[r] = token < valid_tokens
-                              ? __bfloat162float(q[causal_q_index<Geometry>(q_head, d, token)])
-                              : 0.0f;
+            v[r] = __fmul_rn(v[r], 0x1p-4f);
+            amax = fmaxf(amax, fabsf(v[r]));
         }
-        normalized_hadamard_d256_inplace(q_values, lane);
+        amax                    = fmaxf(amax, __shfl_xor_sync(FullMask, amax, 1));
+        amax                    = fmaxf(amax, __shfl_xor_sync(FullMask, amax, 2));
+        amax                    = fmaxf(amax, __shfl_xor_sync(FullMask, amax, 4));
+        const float qs          = amax > 0.0f ? amax / 127.0f : 0.0f;
+        const float inv         = qs > 0.0f ? 1.0f / qs : 0.0f;
+        std::uint32_t packed[2] = {0u, 0u};
 #pragma unroll
-        for (int grp = 0; grp < Groups; ++grp) {
-            const int d0    = grp * kKVCacheInt8Group + lane;
-            const int d1    = d0 + 32;
-            const float x0  = q_values[2 * grp];
-            const float x1  = q_values[2 * grp + 1];
-            float amax      = fmaxf(fabsf(x0), fabsf(x1));
-            amax            = warp_max(amax, FullMask);
-            const float qs  = amax > 0.0f ? amax / 127.0f : 0.0f;
-            const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
-            causal_store_query_code(q_i8, row, d0, kv_cache_int8_quant_code(x0, inv));
-            causal_store_query_code(q_i8, row, d1, kv_cache_int8_quant_code(x1, inv));
-            if (lane == 0) { q_scale_tmp[row * Groups + grp] = qs; }
+        for (int r = 0; r < 8; ++r) {
+            const std::uint32_t code =
+                static_cast<std::uint8_t>(kv_cache_int8_quant_code(v[r], inv));
+            packed[r >> 2] |= code << (8 * (r & 3));
         }
+        // Dimensions 8*lane..+7 are b16 columns 4*lane..+3, inside one swizzled 8-column block.
+        const int col_b16 = 4 * lane;
+        const int off     = (row * (kCausalHeadDim / 2) + causal_swizzle(row, col_b16)) * 2;
+        *reinterpret_cast<uint2*>(&q_i8[off]) = make_uint2(packed[0], packed[1]);
+        if ((lane & 7) == 0) q_scale_tmp[row * Groups + (lane >> 3)] = qs;
     }
     __syncthreads();
 
@@ -475,8 +604,10 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
     for (int i = tile_begin; i < tile_end; ++i) {
         const int k0 = tile_of(i) * Bc;
         if (window_role) {
+            if (k0 + Bc > row_first) wait_append(); // this tile holds keys the call appended
             __syncthreads(); // The previous tile's PV is done with the INT8 tile.
-            load_window_tile(k0);
+            if (!(window_prefetched && i == tile_begin)) issue_window_tile(k0);
+            finish_window_tile(k0);
         } else {
             const int s = (i - tile_begin) & 1;
             cp_wait<0>();
@@ -655,6 +786,7 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
             }
         }
     }
+    finish_append();
     // The KV stream is done: a programmatic merge may begin launching as CTAs finish.
     pdl::trigger_dependents();
 
@@ -709,8 +841,9 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
                 causal_row_to_qt<Geometry>(row0, kv_head, q_head, token);
                 const std::int64_t dst = causal_partial_index<Geometry>(
                     q_head, d0, partial_begin + token, split, partial_width);
-                causal_store_partial_pair(&partial_acc[dst], acc[t][b][0][0], acc[t][b][1][0]);
-                causal_store_partial_pair(&partial_acc[dst + 2], acc[t][b][0][1], acc[t][b][1][1]);
+                // The lane's four contiguous dimensions in one 16-byte store.
+                *reinterpret_cast<float4*>(&partial_acc[dst]) =
+                    make_float4(acc[t][b][0][0], acc[t][b][1][0], acc[t][b][0][1], acc[t][b][1][1]);
             }
             if (row1 < tile_tokens * Geometry::GroupSize) {
                 int q_head = 0;
@@ -718,8 +851,8 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
                 causal_row_to_qt<Geometry>(row1, kv_head, q_head, token);
                 const std::int64_t dst = causal_partial_index<Geometry>(
                     q_head, d0, partial_begin + token, split, partial_width);
-                causal_store_partial_pair(&partial_acc[dst], acc[t][b][0][2], acc[t][b][1][2]);
-                causal_store_partial_pair(&partial_acc[dst + 2], acc[t][b][0][3], acc[t][b][1][3]);
+                *reinterpret_cast<float4*>(&partial_acc[dst]) =
+                    make_float4(acc[t][b][0][2], acc[t][b][1][2], acc[t][b][0][3], acc[t][b][1][3]);
             }
         }
     }

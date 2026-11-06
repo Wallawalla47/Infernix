@@ -5,8 +5,9 @@
 //   readout      A prompt's readout names its greedy first token and 15 others: the top token is the
 //                one generated, no named token outscores it, and a resumed prompt reads what its cold
 //                run reads (within rounding: their prefill calls differ; with expert-a4-residual or its
-//                narrow form alone, whose expert arithmetic depends on an expert's column count, its
-//                top token). With
+//                narrow form alone, whose expert arithmetic depends on an expert's column count, or
+//                ggml-bf16-prefill, whose arithmetic depends on how the calls are cut and walked, within
+//                those paths' measured drift, which can reorder near-tied top candidates). With
 //                INFERNIX_DECIDE_DUMP=DIR the prompt ids and readout are written there for the FP64
 //                oracle of the gate, which log-softmaxes the forward test's FP32 logits of the same
 //                prompt rounded to BF16.
@@ -17,7 +18,8 @@
 //                equal what a readout of the same two tokens implies.
 //   coalesce     (plain) Two requests submitted together share a 1,024-token prefix nothing has
 //                cached: the second waits for the first's snapshot at the divergence, resumes from
-//                it, and generates what an uncached run generates (same call boundaries).
+//                it, and generates what an uncached run generates (same call boundaries). The first
+//                ends one token past the divergence, a call no layer walk joins.
 //   prefetch     (plain) While both lanes decode, the waiting head's Host-only blocks are copied to
 //                the Device; it then resumes at its tap and generates what an uncached run does.
 //
@@ -106,7 +108,7 @@ infernix::GenerationResult run(infernix::Engine& engine, const std::vector<infer
     return engine.generate(engine.prepare_tokens(prompt), options);
 }
 
-int readout(infernix::Engine& engine, bool dump) {
+int readout(infernix::Engine& engine, bool dump, std::size_t suffix) {
     int failures = 0;
     const std::vector<infernix::TokenId> prompt = synthetic_tokens(700, 11);
     const auto cold = run(engine, prompt, greedy(1, false));
@@ -138,7 +140,7 @@ int readout(infernix::Engine& engine, bool dump) {
 
     // A prompt resumed from the cache reads (within rounding) what its cold run reads.
     (void)run(engine, prompt, greedy(2, true)); // publishes the prompt's blocks, taps and endpoint
-    const std::vector<infernix::TokenId> longer = concat(prompt, synthetic_tokens(150, 13));
+    const std::vector<infernix::TokenId> longer = concat(prompt, synthetic_tokens(suffix, 13));
     infernix::RequestOptions cold_longer        = greedy(1, false);
     cold_longer.execution.readout_tokens      = named;
     infernix::RequestOptions warm_longer        = cold_longer;
@@ -157,19 +159,42 @@ int readout(infernix::Engine& engine, bool dump) {
     // and one of at most eight (GPU narrow kernels and CPU-served misses alike) exactly, so a resumed run,
     // whose prefill calls give its experts other column counts than its cold run's, reads within the
     // path's own error rather than rounding (NVIDIA FP4-Local, 2026-10-21: up to 0.33 nats on this
-    // prompt's flat distribution, bit-identical without the path): there the claim is its top token.
+    // prompt's flat distribution, bit-identical without the path; three terms 0.53 on the uncensored NVFP4 in
+    // ninferpro ce18e3e23a, where that drift reordered the cold run's top two, 0.2 nats apart): there the claim is
+    // the named tokens' and the top's log-probabilities within kWidthDrift, not the same top token (candidates WF-04).
     // expert-a4-residual-decode alone splits the arithmetic the other way. With both, every expert takes
     // the same two terms and the widths differ only in how the products are summed (tensor-core FP32
     // order against exact): the claim is rounding again.
     const std::vector<std::string>& paths = engine.load_summary().fast_paths;
     const auto has = [&](const char* name) { return std::find(paths.begin(), paths.end(), name) != paths.end(); };
+    std::string selected;
+    for (const std::string& path : paths) { selected += (selected.empty() ? "" : ",") + path; }
+    std::printf("        fast paths: %s; top token cold %d, resumed %d; worst %.6f nats\n",
+                selected.empty() ? "none" : selected.c_str(), a.readout ? a.readout->top_token : -1,
+                b.readout ? b.readout->top_token : -1, worst);
+    // ggml-bf16-prefill (a GGUF import's prefill projections and experts on BF16 tensor cores) makes a prompt's
+    // arithmetic depend on how its calls are cut and walked (infernix/types.h), which a resume changes: the cold
+    // 850-token prompt's chunks [0,512) and [512,850) form one 850-column MoE group (BF16 experts), while the resumed
+    // run's [512,850) is a 338-column call (exact experts, below 512). On the GSQ-RCO IQ3_S import (2026-10-31) that read
+    // up to 0.20 nats with the path alone and 0.47 with gdn-f16-accumulate beside it, 0 without it (the exact route,
+    // each other registered path alone or all together), the top token the same in every arm. With it the claim is the
+    // same bound.
     const bool narrow_terms = has("expert-a4-residual-decode");
     const bool wide_terms   = has("expert-a4-residual") || has("expert-a4-residual-3");
-    const bool width_arithmetic = narrow_terms != wide_terms || has("expert-a4-residual-3");
+    const bool width_arithmetic = narrow_terms != wide_terms || has("expert-a4-residual-3") || has("ggml-bf16-prefill");
     const bool same_top = a.readout && b.readout && a.readout->top_token == b.readout->top_token;
     if (width_arithmetic) {
-        failures += check(same_top, "readout: resumed reads cold's top token (expert-a4-residual or its narrow form "
-                                    "alone; worst " + std::to_string(worst) + " nats)");
+        constexpr double kWidthDrift = 0.75; // the largest drift measured (0.53 nats), with room
+        const double top_gap =
+            a.readout && b.readout
+                ? std::fabs(static_cast<double>(a.readout->top_logprob) - static_cast<double>(b.readout->top_logprob))
+                : kWidthDrift + 1.0;
+        failures += check(worst <= kWidthDrift && top_gap <= kWidthDrift,
+                          "readout: resumed reads cold's named and top log-probabilities within " +
+                              std::to_string(kWidthDrift) + " nats (a width-dependent path: expert-a4-residual or "
+                              "its narrow form alone, or ggml-bf16-prefill; worst " + std::to_string(worst) +
+                              ", top gap " + std::to_string(top_gap) + (same_top ? "" : ", the top token flipped") +
+                              ")");
     } else {
         failures += check(same_top && worst <= 0.05,
                           "readout: resumed equals cold within 0.05 nats (worst " + std::to_string(worst) + ")");
@@ -249,8 +274,13 @@ int cross(infernix::Engine& engine) {
 }
 
 int coalesce(infernix::Engine& engine) {
+    // The leader's prompt ends one token past the divergence. A narrower last call of two or more tokens joins
+    // the streamed calls' layer walk on artifacts whose prefill walks it (IQ3_S, FP4-Local; design §30's walk
+    // join), and a sibling cannot coalesce inside a running span (prefix_await_sibling): it then prefills the
+    // shared part itself, the trade that join made. A one-token last call stays its own call, so the span ends
+    // at the divergence on every artifact.
     const std::vector<infernix::TokenId> shared = synthetic_tokens(1024, 51);
-    const auto first                          = concat(shared, synthetic_tokens(40, 52));
+    const auto first                          = concat(shared, synthetic_tokens(1, 52));
     const auto second                         = concat(shared, synthetic_tokens(40, 53));
     const auto reference                      = run(engine, second, greedy(16, false)).generated_token_ids;
     infernix::GenerationHandle leader   = engine.submit(engine.prepare_tokens(first), greedy(1, true));
@@ -290,13 +320,16 @@ int prefetch(infernix::Engine& engine) {
     return failures + check(waited.generated_token_ids == reference, "prefetch: the head equals an uncached run");
 }
 
-int run_mode(const char* artifact, const char* ngram, bool mtp, const std::vector<infernix::FastPath>& candidates) {
-    std::printf("== %s\n", mtp ? "MTP drafter (--spec mtp, 3 drafts)" : "plain decode");
+int run_mode(const char* artifact, const char* ngram, bool mtp, const std::vector<infernix::FastPath>& candidates,
+             bool fast_paths, bool readout_only, std::size_t suffix) {
+    std::printf("== %s%s\n", mtp ? "MTP drafter (--spec mtp, 3 drafts)" : "plain decode", fast_paths ? "" : ", fast paths off");
     infernix::EngineOptions options = base_options(artifact, ngram, mtp);
+    options.fast_paths = fast_paths;
     options.fast_path_candidates.insert(options.fast_path_candidates.end(), candidates.begin(), candidates.end());
     infernix::Engine engine(options);
     int failures = 0;
-    failures += readout(engine, !mtp && std::getenv("INFERNIX_DECIDE_DUMP") != nullptr);
+    failures += readout(engine, !mtp && std::getenv("INFERNIX_DECIDE_DUMP") != nullptr, suffix);
+    if (readout_only) { return failures; }
     failures += forced(engine);
     failures += chain(engine, mtp ? 12U : 6U, mtp ? "chain (MTP verify)" : "chain");
     failures += cross(engine);
@@ -317,14 +350,20 @@ int main(int argc, char** argv) {
         return 77;
     }
     const char* ngram = std::getenv("INFERNIX_QWEN4_NGRAM");
-    bool plain = true, mtp = true;
+    bool plain = true, mtp = true, fast_paths = true, readout_only = false;
+    std::size_t suffix = 150;
     // --fast-path NAME (repeatable): also run that fast path, qualified or not (the readout's resume
-    // claim follows the selected expert paths).
+    // claim follows the selected expert paths). --no-fast-paths: the exact route alone (with --fast-path,
+    // only the named paths). --readout-only: the readout scenario alone. --readout-suffix N: the tokens the
+    // readout's longer prompt adds past its 700 (default 150).
     std::vector<infernix::FastPath> candidates;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--mtp") { plain = false; }
         if (arg == "--plain") { mtp = false; }
+        if (arg == "--no-fast-paths") { fast_paths = false; }
+        if (arg == "--readout-only") { readout_only = true; }
+        if (arg == "--readout-suffix" && i + 1 < argc) { suffix = static_cast<std::size_t>(std::stoul(argv[++i])); }
         if (arg == "--fast-path" && i + 1 < argc) {
             const auto path = infernix::parse_fast_path(argv[++i]);
             if (!path) {
@@ -336,8 +375,8 @@ int main(int argc, char** argv) {
     }
     try {
         int failures = 0;
-        if (plain) { failures += run_mode(artifact, ngram, false, candidates); }
-        if (mtp) { failures += run_mode(artifact, ngram, true, candidates); }
+        if (plain) { failures += run_mode(artifact, ngram, false, candidates, fast_paths, readout_only, suffix); }
+        if (mtp) { failures += run_mode(artifact, ngram, true, candidates, fast_paths, readout_only, suffix); }
         std::printf(failures == 0 ? "qwen4_exp decide checks passed\n" : "FAIL: %d checks failed\n", failures);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

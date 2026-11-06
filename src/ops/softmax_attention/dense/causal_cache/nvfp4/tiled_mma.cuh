@@ -265,9 +265,9 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_kv_tiled_mma_kern
         const float nm0_scaled = nm0 * scale_l2;
         const float nm1_scaled = nm1 * scale_l2;
         const float alpha0 =
-            m0 == -CUDART_INF_F ? 0.0F : causal_exp_scaled(m0, nm0_scaled, scale_l2);
+            m0 == -CUDART_INF_F ? 0.0F : causal_rescale(m0, nm0_scaled, scale_l2);
         const float alpha1 =
-            m1 == -CUDART_INF_F ? 0.0F : causal_exp_scaled(m1, nm1_scaled, scale_l2);
+            m1 == -CUDART_INF_F ? 0.0F : causal_rescale(m1, nm1_scaled, scale_l2);
         float bl0 = 0.0F;
         float bl1 = 0.0F;
         unsigned p_frag[PVKs][4];

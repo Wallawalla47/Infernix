@@ -156,6 +156,64 @@ Image apply_orientation(Image image, int orientation) {
     return rotated;
 }
 
+// libwebp's RGB output, which Pillow's WebP decoder returns, from a lossy WebP frame's 4:2:0 planes. VP8 decoding
+// is bit-exact, so FFmpeg's planes are libwebp's; libwebp then interpolates chroma with its fancy upsampler (chroma
+// centred between luma pairs, 9/3/3/1 weights in its own integer rounding, edges repeated) and converts with 14-bit
+// BT.601 limited-range arithmetic. Repeating both gives Pillow's pixels, as the JPEG path does through libjpeg; swscale
+// differed by up to 82 per channel on a textured image (candidates MJ-01).
+int webp_clip8(int value) {
+    constexpr int kMask = (256 << 6) - 1;
+    return (value & ~kMask) == 0 ? value >> 6 : (value < 0 ? 0 : 255);
+}
+
+int webp_mult_hi(int value, int coefficient) { return (value * coefficient) >> 8; }
+
+void webp_yuv_to_rgb(int y, int u, int v, std::uint8_t* rgb) {
+    const int luma = webp_mult_hi(y, 19077);
+    rgb[0] = static_cast<std::uint8_t>(webp_clip8(luma + webp_mult_hi(v, 26149) - 14234));
+    rgb[1] = static_cast<std::uint8_t>(
+        webp_clip8(luma - webp_mult_hi(u, 6419) - webp_mult_hi(v, 13320) + 8708));
+    rgb[2] = static_cast<std::uint8_t>(webp_clip8(luma + webp_mult_hi(u, 33050) - 17685));
+}
+
+// One output row. near_* is the chroma row nearer this luma row (weight 3/4 vertically), far_* the other one (the
+// same row at the top and bottom edges).
+void webp_upsample_row(const std::uint8_t* y, const std::uint8_t* near_u, const std::uint8_t* near_v,
+                       const std::uint8_t* far_u, const std::uint8_t* far_v, int width, std::uint8_t* rgb) {
+    webp_yuv_to_rgb(y[0], (3 * near_u[0] + far_u[0] + 2) >> 2, (3 * near_v[0] + far_v[0] + 2) >> 2, rgb);
+    const int pairs = (width - 1) >> 1;
+    for (int x = 1; x <= pairs; ++x) {
+        const int au = near_u[x - 1], bu = near_u[x], cu = far_u[x - 1], du = far_u[x];
+        const int av = near_v[x - 1], bv = near_v[x], cv = far_v[x - 1], dv = far_v[x];
+        const int sum_u = au + bu + cu + du + 8;
+        const int sum_v = av + bv + cv + dv + 8;
+        webp_yuv_to_rgb(y[2 * x - 1], (((sum_u + 2 * (bu + cu)) >> 3) + au) >> 1,
+                        (((sum_v + 2 * (bv + cv)) >> 3) + av) >> 1, rgb + 3 * (2 * x - 1));
+        webp_yuv_to_rgb(y[2 * x], (((sum_u + 2 * (au + du)) >> 3) + bu) >> 1,
+                        (((sum_v + 2 * (av + dv)) >> 3) + bv) >> 1, rgb + 3 * (2 * x));
+    }
+    if ((width & 1) == 0) {
+        const int last = pairs;
+        webp_yuv_to_rgb(y[width - 1], (3 * near_u[last] + far_u[last] + 2) >> 2,
+                        (3 * near_v[last] + far_v[last] + 2) >> 2, rgb + 3 * (width - 1));
+    }
+}
+
+void webp_rgb(const AVFrame* frame, std::uint8_t* rgb) {
+    const int width         = frame->width;
+    const int height        = frame->height;
+    const int chroma_rows   = (height + 1) / 2;
+    const auto plane_row    = [&](int plane, int row) {
+        return frame->data[plane] + static_cast<std::ptrdiff_t>(row) * frame->linesize[plane];
+    };
+    for (int row = 0; row < height; ++row) {
+        const int near = row / 2;
+        const int far  = (row & 1) != 0 ? std::min(near + 1, chroma_rows - 1) : std::max(near - 1, 0);
+        webp_upsample_row(plane_row(0, row), plane_row(1, near), plane_row(2, near), plane_row(1, far),
+                          plane_row(2, far), width, rgb + static_cast<std::size_t>(row) * width * 3);
+    }
+}
+
 struct BufferCursor {
     const std::uint8_t* data = nullptr;
     std::size_t size         = 0;
@@ -341,6 +399,29 @@ public:
             av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
         const bool alpha = composite_alpha && descriptor != nullptr &&
                            (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
+        const std::size_t pixels = static_cast<std::size_t>(width) * height;
+        const bool lossy_webp =
+            (codec_->codec_id == AV_CODEC_ID_WEBP || codec_->codec_id == AV_CODEC_ID_WEBP_ANIM) &&
+            (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVA420P);
+        if (lossy_webp) {
+            out.rgb.resize(pixels * 3);
+            webp_rgb(frame, out.rgb.data());
+            if (alpha) {
+                for (int y = 0; y < height; ++y) {
+                    const std::uint8_t* a_row =
+                        frame->data[3] + static_cast<std::ptrdiff_t>(y) * frame->linesize[3];
+                    std::uint8_t* row = out.rgb.data() + static_cast<std::size_t>(y) * width * 3;
+                    for (int x = 0; x < width; ++x) {
+                        const int a = a_row[x];
+                        for (int c = 0; c < 3; ++c) {
+                            row[3 * x + c] =
+                                static_cast<std::uint8_t>(((255 - a) * 255 + a * row[3 * x + c] + 127) / 255);
+                        }
+                    }
+                }
+            }
+            return apply_orientation(std::move(out), orientation);
+        }
         const AVPixelFormat destination_format = alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
         AvImageBuffer converted(width, height, destination_format);
         // Subsampled chroma is interpolated to every pixel and rounded accurately, as libjpeg's
@@ -353,7 +434,6 @@ public:
         const int rows = sws_scale(sws_, frame->data, frame->linesize, 0, height, converted.data(),
                                    converted.linesize());
         if (rows != height) { throw std::runtime_error("failed to convert media frame to RGB"); }
-        const std::size_t pixels = static_cast<std::size_t>(width) * height;
         out.rgb.resize(pixels * 3);
         if (!alpha) {
             const std::size_t row_bytes = static_cast<std::size_t>(width) * 3;

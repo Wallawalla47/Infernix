@@ -2,7 +2,6 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
-#include "core/temporary_switches.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
@@ -25,8 +24,8 @@ constexpr int kRouterWarps      = 4;
 // The shared expert's intermediate width (its down codes: kHidden x this, one byte per code).
 constexpr int kSharedIntermediate = 512;
 
-// INFERNIX_TMP_SMALL_T_L2_HINTS: both S1 forms warm L2 with the shared-expert down codes, as T = 1's
-// D1 does (shared_down null: no warm). Pure cache hint.
+// Both S1 forms warm L2 with the shared-expert down codes, as T = 1's D1 does (shared_down null: no
+// warm). Pure cache hint.
 __device__ __forceinline__ void small_t_warm_shared_down(const char* shared_down, unsigned long long bytes) {
     if (shared_down == nullptr) { return; }
     const unsigned long long offset =
@@ -355,8 +354,7 @@ void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoeSmallTPlan& plan,
                                const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
     // The shared expert's down codes: [hidden, intermediate] bytes, as T = 1's D1 warms them.
-    const bool hints = temporary_switches::flag("INFERNIX_TMP_SMALL_T_L2_HINTS");
-    const auto* shared_down = hints ? static_cast<const char*>(weights.shared_down.qdata) : nullptr;
+    const auto* shared_down = static_cast<const char*>(weights.shared_down.qdata);
     const auto shared_down_bytes = static_cast<unsigned long long>(kHidden) * kSharedIntermediate;
     dispatch_tokens(plan.tokens, [&]<int Tokens>() {
         launch_s1<Tokens>(static_cast<const __nv_bfloat16*>(x.data),

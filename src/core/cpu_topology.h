@@ -20,6 +20,11 @@ struct PhysicalCore {
 // tell or the machine has more than 64 logical CPUs.
 [[nodiscard]] std::vector<PhysicalCore> physical_cores();
 
+// The logical CPUs this process may run on: its affinity (Windows: the process mask, else every
+// active CPU; Linux: sched_getaffinity, so a taskset or a container's cpuset counts), not the
+// machine's. 0 when unknown.
+[[nodiscard]] std::uint32_t process_logical_cpus() noexcept;
+
 // The lowest logical CPU of a non-empty mask.
 [[nodiscard]] int first_cpu(std::uint64_t cpus) noexcept;
 

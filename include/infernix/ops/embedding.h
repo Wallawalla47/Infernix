@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/device.h" // DeviceFault
 #include "core/weight.h"
 #include "core/tensor.h"
 
@@ -12,17 +13,21 @@ namespace infernix::ops {
  *
  *   ideal[d,t] = dequantize(table)[ids[t],d].
  *
- * `ids` is contiguous I32 [T], `out` is contiguous BF16 [D,T], and every id is in
- * [0,vocab). `table` has logical shape [vocab,D] and is contiguous BF16, Q6_G64_FP16
- * RowSplit, Q8_G32_FP16 RowSplit, or FP8_E4M3FN_ROW_BF16 RowScale. Dense BF16 values are copied
- * bit-exactly. For quantized tables, the oracle independently decodes each code and multiplies it
+ * `ids` is contiguous I32 [T] and `out` is contiguous BF16 [D,T]. An id outside [0,vocab) embeds
+ * zeros in its column and reports `fault` (core DeviceFault) instead of reading outside the table;
+ * every other column is unchanged. `table` has logical shape [vocab,D] and is contiguous BF16, BF16_P12 P12Rows
+ * (BF16 packed at load, include/infernix/ops/bf16_p12.h; D a multiple of 8), Q6_G64_FP16 RowSplit, Q8_G32_FP16
+ * RowSplit, or FP8_E4M3FN_ROW_BF16 RowScale. Dense BF16 values, and the BF16 values of a packed table, are copied
+ * bit-exactly. For quantized tables,
+ * the oracle independently decodes each code and multiplies it
  * by the exact stored scale in FP64; the BF16 output is promoted and compared directly with that
  * ideal. Final output storage rounding belongs to the quantized embedding criterion, not the
  * oracle. The registered domains are Q6 `[248320,5120]`, Q8 `[248320,2048]` or
  * `[248320,5120]`, and FP8 `[248320,5120]`. Q6/Q8 scales are FP16; FP8 has one BF16 multiplier per
- * row and requires 4-byte-aligned output storage. `out` must not overlap `ids` or any table plane.
+ * row and requires 4-byte-aligned output storage. Q6/Q8 planes and outputs need only their element
+ * alignment. `out` must not overlap `ids` or any table plane.
  * There is no workspace or persistent state side effect.
  */
-void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream);
+void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream, DeviceFault fault = {});
 
 } // namespace infernix::ops

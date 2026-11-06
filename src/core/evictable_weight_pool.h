@@ -31,6 +31,11 @@ public:
     static constexpr std::size_t kChunkBytes = 16ULL * 1024ULL * 1024ULL;
 
     [[nodiscard]] static bool supported(int device);
+    // What a pool of this Config takes, before it exists (Engine::plan): the device memory it maps, the
+    // arena in whole chunks (a window borrows evicted chunks, so nothing beyond them), and the pinned
+    // mirror capture_tail_mirror takes of the evictable tail's weights.
+    [[nodiscard]] static std::size_t mapped_bytes(std::size_t arena_bytes) noexcept;
+    [[nodiscard]] static std::size_t mirror_bytes(std::size_t arena_bytes, std::size_t evictable_tail_bytes) noexcept;
 
     explicit EvictableWeightPool(const Config& config);
     ~EvictableWeightPool();

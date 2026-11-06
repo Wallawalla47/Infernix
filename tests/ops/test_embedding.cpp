@@ -1,7 +1,10 @@
 #include "ops/op_family.h"
 #include "core/weight.h"
+#include "core/weight_view.h"
+#include "infernix/ops/bf16_p12.h"
 #include "infernix/ops/embedding.h"
 #include "ops/op_tester.h"
+#include "core/arena.h" // PinnedHostBuffer
 #include "core/device.h"
 #include "core/decode_graph.h"
 
@@ -335,9 +338,11 @@ struct Q8Row {
 
 class Q8Table {
 public:
-    explicit Q8Table(std::int32_t d)
-        : d_(d), groups_(d / kQ8Group), code_plane_bytes_(static_cast<std::size_t>(kVocab) * d),
-          scale_offset_(align_up(code_plane_bytes_, 256)),
+    // `code_offset`: the code plane starts that many bytes into the payload (a byte-addressed view).
+    explicit Q8Table(std::int32_t d, std::size_t code_offset = 0)
+        : d_(d), groups_(d / kQ8Group), code_offset_(code_offset),
+          code_plane_bytes_(static_cast<std::size_t>(kVocab) * d),
+          scale_offset_(align_up(code_offset + code_plane_bytes_, 256)),
           payload_(scale_offset_ + static_cast<std::size_t>(kVocab) * groups_ * 2) {
         for (const std::int32_t row : d == 5120 ? dflash2_fixture_ids() : repeated_ids(8)) {
             if (find(row) == nullptr) add_row(row);
@@ -352,7 +357,7 @@ public:
         result.scale_dtype      = DType::FP16;
         result.payload          = base;
         result.payload_bytes    = payload_.bytes();
-        result.qdata            = base;
+        result.qdata            = base + code_offset_;
         result.qhigh            = nullptr;
         result.scales           = base + scale_offset_;
         result.high_plane_bytes = 0;
@@ -388,7 +393,8 @@ public:
         int failures = payload_.verify_guards(label);
         for (const Q8Row& row : rows_) {
             std::vector<std::uint8_t> got(row.codes.size());
-            payload_.copy_to_host(got.data(), got.size(), static_cast<std::size_t>(row.id) * d_);
+            payload_.copy_to_host(got.data(), got.size(),
+                                  code_offset_ + static_cast<std::size_t>(row.id) * d_);
             failures += verify_exact(label, got, row.codes);
             got.resize(row.scales.size());
             payload_.copy_to_host(got.data(), got.size(),
@@ -427,7 +433,7 @@ private:
             }
         }
         payload_.copy_from_host(row.codes.data(), row.codes.size(),
-                                static_cast<std::size_t>(id) * d_);
+                                code_offset_ + static_cast<std::size_t>(id) * d_);
         payload_.copy_from_host(row.scales.data(), row.scales.size(),
                                 scale_offset_ + static_cast<std::size_t>(id) * groups_ * 2);
         rows_.push_back(std::move(row));
@@ -435,6 +441,7 @@ private:
 
     std::int32_t d_;
     std::int32_t groups_;
+    std::size_t code_offset_;
     std::size_t code_plane_bytes_;
     std::size_t scale_offset_;
     GuardedDeviceBuffer payload_;
@@ -555,9 +562,11 @@ private:
     std::vector<Fp8Row> rows_;
 };
 
+// `output_bits`: receives the first (unreplayed) call's output bits.
 template <typename Table>
 int run_quantized_case(const char* label, Table& table, const std::vector<std::int32_t>& ids,
-                       std::int32_t d, bool replay = false, std::size_t output_offset = 0) {
+                       std::int32_t d, bool replay = false, std::size_t output_offset = 0,
+                       std::vector<std::uint16_t>* output_bits = nullptr) {
     GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer output(static_cast<std::size_t>(d) * ids.size() * 2 + output_offset);
     Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
@@ -583,6 +592,10 @@ int run_quantized_case(const char* label, Table& table, const std::vector<std::i
         else
             launch();
         cuda_synchronize(device.stream);
+        if (output_bits != nullptr && phase == 0) {
+            output_bits->resize(static_cast<std::size_t>(d) * ids.size());
+            output.copy_to_host(output_bits->data(), output_bits->size() * 2, output_offset);
+        }
         failures += verify_quantized(label, output, table.oracle(selected), output_offset);
         failures += output.verify_guards(label) + verify_input(label, device_ids, selected);
         failures += table.verify_unchanged(label);
@@ -591,6 +604,46 @@ int run_quantized_case(const char* label, Table& table, const std::vector<std::i
             output.copy_to_host(prefix.data(), prefix.size());
             failures += verify_exact(label, prefix, std::vector<std::uint8_t>(output_offset, 0x7d));
         }
+    }
+    return failures;
+}
+
+// Ids outside [0, vocab) (vocab, -1 and INT32_MAX, inside the call) embed zeros in their columns and
+// report the fault word instead of reading outside the table; every other column keeps the bits it
+// gets in an all-valid call, which reports nothing.
+int check_out_of_range_ids(const std::string& label, const Weight& weight, std::int32_t d,
+                           const std::vector<std::int32_t>& valid) {
+    constexpr std::uint32_t kFault = 0xFF11;
+    const std::size_t columns      = valid.size(); // at least five: valid ids at both ends
+    std::vector<std::int32_t> ids  = valid;
+    const std::int32_t outside[]   = {weight.shape[0], -1, std::numeric_limits<std::int32_t>::max()};
+    for (std::size_t i = 0; i < std::size(outside); ++i) ids[1 + i * (columns - 3) / 2] = outside[i];
+    PinnedHostBuffer fault(64);
+    auto* word     = static_cast<std::uint32_t*>(fault.data());
+    const auto run = [&](const std::vector<std::int32_t>& selected) {
+        *reinterpret_cast<volatile std::uint32_t*>(word) = 0;
+        GuardedDeviceBuffer device_ids(selected.size() * sizeof(std::int32_t));
+        device_ids.copy_from_host(selected.data(), selected.size() * sizeof(std::int32_t));
+        GuardedDeviceBuffer output(static_cast<std::size_t>(d) * selected.size() * 2);
+        output.fill(0x7d);
+        Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(selected.size())});
+        Tensor result(output.data(), DType::BF16, {d, static_cast<std::int32_t>(selected.size())});
+        ops::embedding(input, weight, result, nullptr, DeviceFault{.word = word, .value = kFault});
+        cuda_synchronize();
+        return std::pair(guarded_to_host<std::uint16_t>(output, static_cast<std::size_t>(d) * selected.size()),
+                         *reinterpret_cast<volatile std::uint32_t*>(word));
+    };
+    const auto [reference, quiet] = run(valid);
+    const auto [got, reported]    = run(ids);
+    std::vector<std::uint16_t> expected = reference;
+    for (std::size_t t = 0; t < columns; ++t) {
+        if (ids[t] != valid[t]) std::fill_n(expected.begin() + static_cast<std::ptrdiff_t>(t * d), d, std::uint16_t{0});
+    }
+    int failures = verify_exact((label + " out-of-range ids").c_str(), got, expected);
+    if (quiet != 0 || reported != kFault) {
+        std::cerr << label << ": fault word " << quiet << " for valid ids and " << reported
+                  << " with ids outside the table (expected 0 and " << kFault << ")\n";
+        ++failures;
     }
     return failures;
 }
@@ -621,6 +674,7 @@ int test_q6() {
     failures += run_quantized_case("embedding Q6 [248320,5120] T=7", table, repeated_ids(7), kQ6D);
     failures +=
         run_quantized_case("embedding Q6 [248320,5120] T=128", table, repeated_ids(128), kQ6D);
+    failures += check_out_of_range_ids("embedding Q6 [248320,5120] T=5", table.weight(), kQ6D, repeated_ids(5));
     return failures;
 }
 
@@ -628,6 +682,11 @@ int test_q8() {
     int failures = 0;
     for (const std::int32_t d : {kQ8VisionD, kQ8TextD}) {
         Q8Table table(d);
+        // Each kernel route: D 2048 grouped (T <= 6) and row (T > 6), D 5120 packed by 10 and by 5.
+        for (const std::size_t t : {5u, d == 5120 ? 129u : 7u}) {
+            failures += check_out_of_range_ids("embedding Q8 [248320," + std::to_string(d) + "] T=" + std::to_string(t),
+                                               table.weight(), d, repeated_ids(t));
+        }
         if (d == 5120) {
             failures += qualify_dflash2("Q8 [248320,5120]", table, 2);
             continue;
@@ -638,6 +697,51 @@ int test_q8() {
             failures += run_quantized_case(label.c_str(), table, repeated_ids(t), d);
         }
     }
+    {
+        // A code plane off a 4-byte boundary takes the scalar kernel.
+        Q8Table table(kQ8TextD, 2);
+        failures += check_out_of_range_ids("embedding Q8 [248320,5120] codes+2 T=5", table.weight(), kQ8TextD,
+                                           repeated_ids(5));
+    }
+    return failures;
+}
+
+// The D=2048 row kernel (T > 6) loads eight codes as one 8-byte word and stores BF16 pairs. A code
+// plane 4 bytes off an 8-byte boundary, an output 2 bytes off a 4-byte one, and both, at a row-route
+// extent (T=7) and an interior one (T=64): each matches the oracle and the aligned call's bits.
+int test_q8_2048_alignment() {
+    constexpr std::int32_t kExtents[] = {7, 64};
+    constexpr std::size_t kCodeOffset = 4, kOutputOffset = 2;
+    const auto label = [](const char* view, std::int32_t t) {
+        return std::string("embedding Q8 [248320,2048] ") + view + " T=" + std::to_string(t);
+    };
+    int failures = 0;
+    std::vector<std::vector<std::uint16_t>> aligned(std::size(kExtents));
+    {
+        Q8Table table(kQ8VisionD);
+        for (std::size_t i = 0; i < std::size(kExtents); ++i) {
+            const auto ids = repeated_ids(static_cast<std::size_t>(kExtents[i]));
+            failures += run_quantized_case(label("aligned", kExtents[i]).c_str(), table, ids,
+                                           kQ8VisionD, false, 0, &aligned[i]);
+            std::vector<std::uint16_t> bits;
+            const std::string name = label("output+2", kExtents[i]);
+            failures += run_quantized_case(name.c_str(), table, ids, kQ8VisionD, false,
+                                           kOutputOffset, &bits);
+            failures += verify_exact((name + " bits").c_str(), bits, aligned[i]);
+        }
+    }
+    Q8Table shifted(kQ8VisionD, kCodeOffset);
+    for (std::size_t i = 0; i < std::size(kExtents); ++i) {
+        const auto ids = repeated_ids(static_cast<std::size_t>(kExtents[i]));
+        for (const std::size_t output_offset : {std::size_t{0}, kOutputOffset}) {
+            std::vector<std::uint16_t> bits;
+            const std::string name =
+                label(output_offset == 0 ? "codes+4" : "codes+4 output+2", kExtents[i]);
+            failures += run_quantized_case(name.c_str(), shifted, ids, kQ8VisionD, false,
+                                           output_offset, &bits);
+            failures += verify_exact((name + " bits").c_str(), bits, aligned[i]);
+        }
+    }
     return failures;
 }
 
@@ -645,6 +749,10 @@ int test_fp8() {
     Fp8Table table;
     int failures = 0;
     failures += qualify_dflash2("FP8 [248320,5120]", table, 4);
+    for (const std::size_t t : {5u, 177u}) { // ten and five blocks a token
+        failures += check_out_of_range_ids("embedding FP8 [248320,5120] T=" + std::to_string(t), table.weight(), kFp8D,
+                                           dflash2_ids(t));
+    }
     const std::vector<std::int32_t> ids = {0};
     GuardedDeviceBuffer device_ids(sizeof(std::int32_t));
     device_ids.copy_from_host(ids.data(), sizeof(std::int32_t));
@@ -710,6 +818,74 @@ int test_dense() {
     failures += device_table.verify_guards("embedding BF16 table");
     failures += verify_exact("embedding BF16 table",
                              guarded_to_host<std::uint16_t>(device_table, table.size()), table);
+    failures += check_out_of_range_ids("embedding BF16 [2304,1152]", weight, kDenseD, ids);
+    return failures;
+}
+
+// bf16_p12 (BF16 packed at load) at Flash-Next's D: a table holding escapes (zeros, tiny and large weights outside a
+// row's exponent window) gives the BF16 rows bit for bit, read from device memory and from mapped pinned host memory
+// (where the Qwen4Exp embedding lives), into aligned and two-byte-aligned outputs; out-of-range ids embed zeros.
+int test_p12() {
+    constexpr std::int32_t kRows = 4096, kD = 2560;
+    std::vector<std::uint16_t> table(static_cast<std::size_t>(kRows) * kD);
+    for (std::size_t i = 0; i < table.size(); ++i) {
+        float value = std::sin(static_cast<float>(i % 7919) * 0.37f) * 0.02f;
+        if (i % 1009 == 0) value = 0.0f;
+        if (i % 1013 == 0) value *= 0x1p-30f;
+        if (i % 1019 == 0) value *= 4096.0f;
+        table[i] = f32_to_bf16(value);
+    }
+    const std::vector<std::int32_t> ids = {0, kRows - 1, 17, 17, 1009, 1, 2048, 4000};
+
+    DeviceBuffer source(table.size() * 2), scratch(ops::bf16_p12_pack_scratch_bytes(kRows)), count(4);
+    source.copy_from_host(table.data(), table.size() * 2);
+    ops::bf16_p12_count(source.p, kRows, kD, scratch.p, static_cast<std::uint32_t*>(count.p), nullptr);
+    std::uint32_t escapes = 0;
+    count.copy_to_host(&escapes, 4);
+    const WeightGeometry g = bf16_p12_geometry(kRows, kD, escapes);
+    DeviceBuffer packed(g.bytes);
+    ops::bf16_p12_pack(source.p, kRows, kD, escapes, scratch.p, packed.p, nullptr);
+    cuda_synchronize();
+    int failures = 0;
+    if (escapes == 0) {
+        std::cerr << "embedding bf16_p12: the table holds no escapes\n";
+        ++failures;
+    }
+
+    // The same planes in mapped pinned host memory.
+    PinnedHostBuffer host(g.bytes);
+    packed.copy_to_host(host.data(), g.bytes);
+    void* mapped = nullptr;
+    cuda_check(cudaHostGetDevicePointer(&mapped, host.data(), 0), "mapped table");
+
+    for (const bool pinned : {false, true}) {
+        WeightParent parent;
+        parent.geometry = g;
+        parent.data = parent.device = static_cast<const std::byte*>(pinned ? mapped : packed.p);
+        const Weight weight = native_weight(
+            WeightView{{kRows, kD}, {{&parent, 0, static_cast<std::uint64_t>(kRows) * kD}}});
+        const std::string label = std::string("embedding bf16_p12 [4096,2560] ") + (pinned ? "pinned" : "device");
+        for (const std::size_t shift : {std::size_t{0}, std::size_t{2}}) {
+            std::vector<std::uint16_t> expected(static_cast<std::size_t>(kD) * ids.size());
+            for (std::size_t t = 0; t < ids.size(); ++t) {
+                std::copy_n(table.data() + static_cast<std::size_t>(ids[t]) * kD, kD, expected.data() + t * kD);
+            }
+            GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+            device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+            GuardedDeviceBuffer output(expected.size() * 2 + shift);
+            output.fill(0x7d);
+            Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+            Tensor result(static_cast<std::byte*>(output.data()) + shift, DType::BF16,
+                          {kD, static_cast<std::int32_t>(ids.size())});
+            ops::embedding(input, weight, result, nullptr);
+            cuda_synchronize();
+            std::vector<std::uint16_t> got(expected.size());
+            cuda_check(cudaMemcpy(got.data(), result.data, got.size() * 2, cudaMemcpyDeviceToHost), "read");
+            failures += verify_exact((label + (shift ? " shifted output" : "")).c_str(), got, expected);
+            failures += output.verify_guards((label + " output").c_str());
+        }
+        failures += check_out_of_range_ids(label, weight, kD, ids);
+    }
     return failures;
 }
 
@@ -726,7 +902,9 @@ INFERNIX_OP_TEST(embedding) {
         failures += test_dense();
         failures += test_q6();
         failures += test_q8();
+        failures += test_q8_2048_alignment();
         failures += test_fp8();
+        failures += test_p12();
     } catch (const std::exception& error) {
         std::cerr << "embedding test exception: " << error.what() << '\n';
         return 1;

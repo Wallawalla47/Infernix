@@ -14,10 +14,29 @@ endif()
 
 project(infernix LANGUAGES C CXX CUDA)
 
+# CUDA 13.4 is the oldest toolkit Infernix accepts: it is the one Infernix is built and tested with.
+# CUDA 13.2 miscompiles sm_120a code: one of Infernix's kernels into an illegal instruction (#48),
+# and another engine's into silently wrong output (Strata #4879); the toolkits before 13.4 are
+# untested, and a wrong build would not announce itself.
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.4)
+  message(FATAL_ERROR
+    "CUDA ${CMAKE_CUDA_COMPILER_VERSION} is older than 13.4, the toolkit Infernix is built and "
+    "tested with. CUDA 13.2 miscompiles sm_120a code (an illegal instruction in one Infernix "
+    "kernel, silently wrong output in another engine's), and older toolkits are untested. Install "
+    "CUDA 13.4 or later and point CMAKE_CUDA_COMPILER at its nvcc.")
+endif()
+
 # --- Global settings ---------------------------------------------------------
 option(INFERNIX_BUILD_APPS "Build the Infernix CLI, server and perplexity evaluator" ON)
 option(BUILD_TESTING "Build Infernix tests" OFF)
 option(INFERNIX_BUILD_BENCHMARKS "Build Infernix benchmarks" OFF)
+# Test builds only: every PDL wait lets its dependents launch, waits, then spins (core/pdl.cuh), so producers
+# write late and a kernel that reads its producer's output before its wait reads stale data and the output
+# changes (docs/maintainer/op-development.md, programmatic dependent launch).
+option(INFERNIX_PDL_SKEW "Skew programmatic dependent launches (a test build that exposes early reads)" OFF)
+if(INFERNIX_PDL_SKEW)
+  add_compile_definitions(INFERNIX_PDL_SKEW=1)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

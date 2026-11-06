@@ -199,7 +199,7 @@ column_by_column_projections(const TextParameters& invariant_text,
 [[nodiscard]] MtpParameters column_invariant_mtp(const MtpParameters& mtp);
 // The activation precision each projection class may take in batched decode and verification.
 // The one-term permission takes precedence over its residual profile; `a8_subset` grants the
-// one-term 8-bit permission to temporary_switches::A8Subset's projections only.
+// one-term 8-bit permission to the attention and GDN input projections and the dense MLP gate/up only.
 struct DecodePrecision {
     bool a8          = true;
     bool a4          = true;
@@ -209,7 +209,7 @@ struct DecodePrecision {
 };
 
 // `text` with each FP8 projection's policy LinearPolicy::A16Only unless `a8` (or `a8_subset` and
-// the projection is in temporary_switches::a8_subset()), and each NVFP4 projection's unless `a4`;
+// the projection is an input projection or an MLP gate/up), and each NVFP4 projection's unless `a4`;
 // with `a8_residual` an FP8 projection permitted 8-bit activations and not given one term takes
 // LinearPolicy::AllowA8Residual, and with `a4_residual` (and not `a4`) an NVFP4 MLP projection
 // permitted 4-bit activations takes LinearPolicy::AllowA4Residual (others and the GDN control keep

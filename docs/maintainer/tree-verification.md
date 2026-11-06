@@ -96,10 +96,9 @@ and +6.1 % on sampled docs against the 7-draft chain that day):
   keeps every estimate current at a cost of about one wide round in 32.
 
 The choice depends only on earlier rounds, never on the draws of the round it sizes, so sampling
-stays exact. (The temporary A/B switch `INFERNIX_TMP_TREE_ROUND_WIDTH`, DFlash2 only, instead
-proposes first and sizes each round from its own draft probabilities, calibrated by the same measured
-gains: the width then depends on the main chain's draws, which precede every side column's, as the
-builder's priorities already do.) It does depend on measured time: two runs of a seeded request may verify different
+stays exact. (Proposing first and sizing each DFlash2 round from its own draft probabilities,
+calibrated by the same measured gains, measured flat on the 27B, 1.0002x, and was removed
+2026-10-28.) It does depend on measured time: two runs of a seeded request may verify different
 trees and so sample different, equally distributed text. A fixed table keeps seeded runs at one
 request reproducible. On a target whose GDN input projections cannot verify trees (see
 [Scope](#scope)) automatic mode resolves to chain verification: the Engine's resolved options

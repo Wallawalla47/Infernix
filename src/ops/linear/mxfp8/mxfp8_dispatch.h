@@ -35,4 +35,10 @@ void mxfp8_gdn_input_n16384_k2560(const Tensor& x, const Weight& weight, Tensor&
 // The route scratch the [16384,2560] parent's GDN form needs over the interval (0 below the admissions).
 [[nodiscard]] std::size_t mxfp8_gdn_input_workspace_capacity_bytes(std::int32_t max_tokens);
 
+// The exact route's calls of at least this many tokens walk the rows of one token tile before the next
+// (mxfp8_launch.cuh Mxfp8RowFast; candidates RV-44): FP4-Local, BF16 KV (the exact route's prefill), -p N -n 1, two
+// rotated runs a point (2026-11-04): from 4,096 or 8,192 tokens against never, pp8192 1.000x / 0.999x, pp16384 1.000x /
+// 1.000x, pp32768 1.020x / 1.021x (the layer walk's wide calls). Same bits.
+inline constexpr std::int64_t kMxfp8RowFastTokens = 16384;
+
 } // namespace infernix::ops::detail

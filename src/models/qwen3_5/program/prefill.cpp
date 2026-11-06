@@ -239,10 +239,11 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
     }
     grammar_dead_positions[0] = 0;
     if (requests[lane].prefill && permit.main_frontier >= requests[lane].prefill->prompt_tokens &&
-        masks && masks->constrained(0)) {
+        masks && (masks->constrained(0) || masks->reasoning_ban(0).active())) {
         auto& config       = static_cast<qwen3_5::PrefillRoundHost*>(round_host->data())->sampling;
         config             = requests[lane].sampling_host;
         config.mask        = fill_grammar_mask(masks, 0, {});
+        bind_reasoning_ban(masks, 0, config);
         Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
         CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &config, sizeof(config),
                                    cudaMemcpyHostToDevice, device.stream));
@@ -529,18 +530,6 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     const std::int32_t next  = std::min(mtp_host_egress->next_extents[row],
                                                         mtp_host_ingress->proposal_limits[row]);
                     sequence.mtp_draft_count = static_cast<std::uint32_t>(std::max(next, 0));
-                    if (execution_schedule.mtp_step_chain) {
-                        // The step chain: the row's drafts end at its first below the round's step
-                        // threshold (a later step ran only for another row, or not at all), the
-                        // gate's comparison of a float widened to binary64.
-                        for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
-                            const float q = mtp_host_egress->next_probabilities[step * max_concurrency + row];
-                            if (static_cast<double>(q) < mtp_host_ingress->step_threshold) {
-                                sequence.mtp_draft_count = step + 1U;
-                                break;
-                            }
-                        }
-                    }
                     sequence.mtp_draft_proposals = execution_schedule.sampled_mtp_drafts;
                     for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
                         const std::size_t at = step * max_concurrency + row;

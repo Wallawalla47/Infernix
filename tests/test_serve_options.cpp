@@ -1,4 +1,5 @@
 #include "test_temp_path.h"
+#include "serve/generation_service.h"
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
@@ -82,6 +83,35 @@ int main() {
     failures += check(missing_yarn_rejected, "missing serving YaRN factor accepted");
     failures += check(serve_usage_text("infernix-serve").find("--rope-yarn-factor") != std::string::npos,
                       "serving help omits YaRN");
+    // Integer options past int's range are refused, not saturated (Windows' long is int's size), and the pending
+    // queue (one HTTP worker each) is bounded (candidates QA-13).
+    for (const auto* option : {"--max-http-clients", "--pending-timeout-ms", "--max-pending-requests"}) {
+        failures += check(!parse_error({"infernix-serve", "model.ninfer", option, "99999999999"}).empty(),
+                          "an integer option past int's range was accepted");
+    }
+    failures += check(parse({"infernix-serve", "model.ninfer", "--max-pending-requests", "1024"}).max_pending_requests == 1024,
+                      "--max-pending-requests 1024 refused");
+    failures += check(!parse_error({"infernix-serve", "model.ninfer", "--max-pending-requests", "1025"}).empty(),
+                      "--max-pending-requests past 1024 accepted");
+    // --plan FILE: the start's options as given, plus where the plan goes; the Engine's options are the
+    // start's (make_engine_options), so the plan sizes that start.
+    {
+        const ServeOptions planned = parse({"infernix-serve", "model.ninfer", "--plan", "plan.json", "--max-context",
+                                            "65536", "--max-concurrency", "2", "--kv-dtype", "int8", "--lossless"});
+        const infernix::EngineOptions engine = make_engine_options(planned);
+        failures += check(planned.plan_path == std::filesystem::path("plan.json") && planned.max_context == 65536 &&
+                              planned.max_concurrency == 2,
+                          "--plan keeps the other launch options");
+        failures += check(engine.artifact_path == std::filesystem::path("model.ninfer") && engine.max_context == 65536 &&
+                              engine.max_concurrency == 2 && engine.kv_cache == infernix::KvCacheStorage::Int8Group64 &&
+                              engine.lossless && !engine.fast_paths,
+                          "the planned Engine options are the start's");
+        failures += check(parse({"infernix-serve", "model.ninfer"}).plan_path.empty(), "no --plan: a start");
+        failures += check(!parse_error({"infernix-serve", "model.ninfer", "--plan"}).empty(),
+                          "--plan without a file accepted");
+        failures += check(serve_usage_text("infernix-serve").find("--plan FILE") != std::string::npos,
+                          "serving help omits --plan");
+    }
     const auto archive = parse({"infernix-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                 "5", "--ngram-draft-tokens", "63", "--ngram-archive-mib", "512",
                                 "--ngram-session-mib", "128", "--ngram-native-sessions"});
@@ -158,6 +188,12 @@ int main() {
     failures += check(parse({"infernix-serve", "model.ninfer", "--expert-a4-activations"}).expert_a4_activations &&
                           !parse({"infernix-serve", "model.ninfer"}).expert_a4_activations,
                       "--expert-a4-activations did not parse (default off)");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--a16-activations"}).expert_a16_activations &&
+                          !parse({"infernix-serve", "model.ninfer"}).expert_a16_activations,
+                      "--a16-activations did not parse (default off)");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--a8-activations"}).a8_activations &&
+                          !parse({"infernix-serve", "model.ninfer"}).a8_activations,
+                      "--a8-activations did not parse (default off)");
     failures += check(parse({"infernix-serve", "model.ninfer", "--embedding-host"}).embedding_host &&
                           !parse({"infernix-serve", "model.ninfer"}).embedding_host,
                       "--embedding-host did not parse (default off)");
@@ -308,8 +344,9 @@ int main() {
                       "default KV capacity is not sized to free VRAM for the hybrid cache");
     failures += check(!defaults.context_cache.host_capacity_bytes.has_value(),
                       "default Host context capacity was resolved before Engine startup");
-    failures += check(defaults.speculative.backend == infernix::SpeculativeBackend::None,
-                      "speculative decoding is not disabled by default");
+    failures += check(defaults.speculative.backend == infernix::SpeculativeBackend::None &&
+                          defaults.speculative.backend_auto && defaults.speculative.draft_tokens_auto,
+                      "speculative decoding is not --spec auto --draft-tokens auto by default");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
                           defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
                       "Responses store defaults mismatch");
@@ -345,11 +382,15 @@ int main() {
     failures += check(parse({"infernix-serve", "model.ninfer", "--kv-dtype", "k4v2"}).kv_cache ==
                           infernix::KvCacheStorage::Q4KeyVq2Value,
                       "--kv-dtype k4v2 did not select 4-bit K / 2-bit V KV");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--kv-dtype", "bf16p"}).kv_cache ==
+                          infernix::KvCacheStorage::Bf16Packed,
+                      "--kv-dtype bf16p did not select packed BF16 KV");
     const std::string kv_help = serve_usage_text("infernix-serve");
     failures += check(kv_help.find("nvfp4") != std::string::npos &&
                           kv_help.find("k8v4") != std::string::npos &&
                           kv_help.find("vq2") != std::string::npos &&
-                          kv_help.find("k4v2") != std::string::npos,
+                          kv_help.find("k4v2") != std::string::npos &&
+                          kv_help.find("bf16p") != std::string::npos,
                       "serve help omits a production KV storage mode");
 
     const ServeOptions model_alias =
@@ -415,6 +456,48 @@ int main() {
                           "serve options did not preserve DFlash2 configuration");
     }
 
+    // --spec auto leaves the drafter to the Engine (backend none until it reads the artifact), with an
+    // automatic draft length and no drafter-specific cut; --draft-model and the drafter flags ride along.
+    {
+        const ServeOptions automatic =
+            parse({"infernix-serve", "model.ninfer", "--spec", "auto", "--draft-tokens", "auto", "--lm-head-draft",
+                   "--draft-model", "drafter.infernix", "--ngram-draft-tokens", "auto", "--draft-tree-nodes", "auto"});
+        failures += check(automatic.speculative.backend_auto &&
+                              automatic.speculative.backend == infernix::SpeculativeBackend::None &&
+                              automatic.speculative.draft_tokens_auto &&
+                              automatic.speculative.proposal_head == infernix::ProposalHead::Optimized &&
+                              automatic.speculative.draft_model == "drafter.infernix",
+                          "--spec auto did not leave the drafter to the Engine with its settings");
+        failures += check(!parse({"infernix-serve", "model.ninfer", "--spec", "auto", "--draft-tokens", "auto", "--spec",
+                                  "mtp", "--draft-tokens", "3"})
+                               .speculative.backend_auto,
+                          "a later --spec mtp kept --spec auto");
+        // The default: a --draft-model alone makes auto take it; --spec off decodes plain; one drafter's fixed
+        // length still needs its --spec.
+        const ServeOptions companion = parse({"infernix-serve", "model.ninfer", "--draft-model", "drafter.infernix"});
+        failures += check(companion.speculative.backend_auto && companion.speculative.draft_model == "drafter.infernix",
+                          "--draft-model without --spec did not ride with the default --spec auto");
+        const ServeOptions off = parse({"infernix-serve", "model.ninfer", "--spec", "off"});
+        failures += check(!off.speculative.backend_auto && off.speculative.backend == infernix::SpeculativeBackend::None,
+                          "--spec off did not decode plain");
+        failures += check(parse_error({"infernix-serve", "model.ninfer", "--draft-tokens", "3"}).find("--spec") !=
+                              std::string::npos,
+                          "a fixed --draft-tokens without --spec was accepted");
+        failures += check(parse_error({"infernix-serve", "model.ninfer", "--spec", "auto", "--draft-tokens", "3"})
+                                  .find("--draft-tokens auto") != std::string::npos &&
+                              parse_error({"infernix-serve", "model.ninfer", "--spec", "auto"})
+                                  .find("--draft-tokens auto") != std::string::npos,
+                          "--spec auto was accepted without --draft-tokens auto");
+        failures += check(parse_error({"infernix-serve", "model.ninfer", "--spec", "auto", "--draft-tokens", "auto",
+                                       "--spec-min-p", "0.5"})
+                                  .find("--spec-min-p") != std::string::npos,
+                          "--spec auto was accepted with one drafter's --spec-min-p");
+        failures += check(!parse_error({"infernix-serve", "model.ninfer", "--spec", "automatic", "--draft-tokens",
+                                        "auto"})
+                               .empty(),
+                          "an unknown --spec value was accepted");
+    }
+
     const ServeOptions dflash_vision = parse(
         {"infernix-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15", "--vision"});
     failures += check(dflash_vision.enable_vision &&
@@ -475,6 +558,10 @@ int main() {
                                            "12",
                                            "--pending-timeout-ms",
                                            "2500",
+                                           "--keep-alive-timeout-sec",
+                                           "90",
+                                           "--max-http-clients",
+                                           "32",
                                            "--max-context",
                                            "4096",
                                            "--kv-capacity",
@@ -513,6 +600,28 @@ int main() {
                       "--max-pending-requests did not reach serving options");
     failures += check(configured.pending_timeout_ms == 2500,
                       "--pending-timeout-ms did not reach serving options");
+    failures += check(configured.keep_alive_timeout_sec == 90,
+                      "--keep-alive-timeout-sec did not reach serving options");
+    failures += check(configured.max_http_clients == 32,
+                      "--max-http-clients did not reach serving options");
+    failures += check(parse_error({"infernix-serve", "model.ninfer"}).empty() &&
+                          parse({"infernix-serve", "model.ninfer"}).keep_alive_timeout_sec == 360,
+                      "--keep-alive-timeout-sec does not outlast a 5-minute client pool by default");
+    failures += check(parse_error({"infernix-serve", "model.ninfer"}).empty() &&
+                          parse({"infernix-serve", "model.ninfer"}).max_http_clients == 64,
+                      "--max-http-clients is not 64 by default");
+    for (const char* bad : {"0", "3601", "-1", "abc"}) {
+        const std::string error =
+            parse_error({"infernix-serve", "model.ninfer", "--keep-alive-timeout-sec", bad});
+        failures += check(error.find("keep-alive-timeout-sec") != std::string::npos,
+                          "--keep-alive-timeout-sec accepted an invalid value");
+    }
+    for (const char* bad : {"0", "-1", "abc"}) {
+        const std::string error =
+            parse_error({"infernix-serve", "model.ninfer", "--max-http-clients", bad});
+        failures += check(error.find("max-http-clients") != std::string::npos,
+                          "--max-http-clients accepted an invalid value");
+    }
     failures += check(configured.log_stats_interval_ms == 0,
                       "--log-stats-interval-ms did not disable periodic reporting");
     failures += check(!configured.log_stats_panel &&
@@ -538,6 +647,57 @@ int main() {
     failures += check(zero_host_context.context_cache.enabled &&
                           zero_host_context.context_cache.host_capacity_bytes == 0,
                       "zero Host context capacity was not retained as an explicit budget");
+    // --host-context-mib auto: no size, the automatic flag; a later number replaces it.
+    const ServeOptions auto_host_context = parse({"infernix-serve", "model.ninfer", "--host-context-mib", "auto"});
+    failures += check(auto_host_context.context_cache.host_capacity_auto &&
+                          !auto_host_context.context_cache.host_capacity_bytes,
+                      "--host-context-mib auto must leave the size to the RAM plan");
+    const ServeOptions auto_then_number =
+        parse({"infernix-serve", "model.ninfer", "--host-context-mib", "auto", "--host-context-mib", "2048"});
+    failures += check(!auto_then_number.context_cache.host_capacity_auto &&
+                          auto_then_number.context_cache.host_capacity_bytes == (2048ULL << 20),
+                      "a later --host-context-mib N must replace auto");
+    // --ram-free-mib: the RAM everything Infernix plans leaves free (8 GiB by default).
+    failures += check(parse({"infernix-serve", "model.ninfer"}).ram_free_bytes == (8192ULL << 20),
+                      "--ram-free-mib must default to 8 GiB");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--ram-free-mib", "4096"}).ram_free_bytes == (4096ULL << 20),
+                      "--ram-free-mib must set the RAM left free");
+    // --ram-resize: the RAM tiers follow memory pressure unless it is off.
+    failures += check(parse({"infernix-serve", "model.ninfer"}).ram_resize &&
+                          !parse({"infernix-serve", "model.ninfer", "--ram-resize", "off"}).ram_resize &&
+                          parse({"infernix-serve", "model.ninfer", "--ram-resize", "off", "--ram-resize", "auto"}).ram_resize,
+                      "--ram-resize must default to auto and parse off and auto");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"infernix-serve", "model.ninfer", "--ram-resize", "on"});
+        } catch (const std::exception&) { rejected = true; }
+        failures += check(rejected, "--ram-resize must reject another value");
+    }
+    // --end-in-thinking: a reply may not end while its thinking is open unless allowed.
+    failures += check(!parse({"infernix-serve", "model.ninfer"}).end_turn_in_thinking &&
+                          parse({"infernix-serve", "model.ninfer", "--end-in-thinking", "allow"}).end_turn_in_thinking &&
+                          !parse({"infernix-serve", "model.ninfer", "--end-in-thinking", "allow", "--end-in-thinking",
+                                  "refuse"}).end_turn_in_thinking,
+                      "--end-in-thinking must default to refuse and parse allow and refuse");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"infernix-serve", "model.ninfer", "--end-in-thinking", "off"});
+        } catch (const std::exception&) { rejected = true; }
+        failures += check(rejected, "--end-in-thinking must reject another value");
+    }
+    // --log-file: duplicate console records to a plain timestamped file (console-only by default).
+    failures += check(parse({"infernix-serve", "model.ninfer"}).log_file.empty(),
+                      "--log-file must default to console-only");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--log-file", "logs/console.log"}).log_file == "logs/console.log",
+                      "--log-file must set the duplicate path");
+    failures += check(!parse_error({"infernix-serve", "model.ninfer", "--log-file", ""}).empty(),
+                      "an empty --log-file path must be refused");
+    failures += check(!parse_error({"infernix-serve", "model.ninfer", "--log-file"}).empty(),
+                      "a missing --log-file value must be refused");
+    failures += check(serve_usage_text("infernix-serve").find("--log-file") != std::string::npos,
+                      "serving help must list --log-file");
 
     for (const auto& [mib, bytes] : std::vector<std::pair<std::string, std::size_t>>{
              {"146.822265625", 153954304},
@@ -653,10 +813,23 @@ int main() {
                                   .context_cache.hybrid.host_state_precision ==
                               infernix::HybridHostStatePrecision::Bf16,
                           "--cache-host-state bf16 was not parsed");
+        // Next-turn prefill (hybrid-prefix-cache-spec §7.9): the Engine's default unless given, 0 off.
+        failures += check(!hybrid_minimal.context_cache.hybrid.next_turn_prefill_quiet.has_value(),
+                          "serving must leave the next-turn prefill's quiet period to the Engine");
+        failures += check(parse({"infernix-serve", "model.ninfer", "--cache-next-turn-ms", "400"})
+                                      .context_cache.hybrid.next_turn_prefill_quiet ==
+                                  std::chrono::milliseconds{400} &&
+                              parse({"infernix-serve", "model.ninfer", "--cache-next-turn-ms", "0"})
+                                      .context_cache.hybrid.next_turn_prefill_quiet ==
+                                  std::chrono::milliseconds{0},
+                          "--cache-next-turn-ms did not reach serving options");
         for (const std::vector<std::string>& bad :
              std::vector<std::vector<std::string>>{{"--cache-host-state", "fp16"},
                                                    {"--cache-tool-hold-secs", "3601"},
-                                                   {"--cache-tool-hold-secs", "-1"}}) {
+                                                   {"--cache-tool-hold-secs", "-1"},
+                                                   {"--cache-next-turn-ms", "3600001"},
+                                                   {"--cache-next-turn-ms", "-1"},
+                                                   {"--no-prefix-reuse", "--cache-next-turn-ms", "150"}}) {
             std::vector<std::string> arguments{"infernix-serve", "model.ninfer"};
             arguments.insert(arguments.end(), bad.begin(), bad.end());
             bool rejected = false;
@@ -693,6 +866,19 @@ int main() {
             (void)parse({"infernix-serve", "model.ninfer", "--expert-ram-mib", bad});
         } catch (const std::exception&) { rejected = true; }
         failures += check(rejected, "--expert-ram-mib must reject a zero or malformed size");
+    }
+    failures += check(parse({"infernix-serve", "model.ninfer", "--expert-ram-layout", "full"}).expert_ram_layout ==
+                              infernix::ExpertRamLayout::Full &&
+                          parse({"infernix-serve", "model.ninfer", "--expert-ram-layout", "exclusive"}).expert_ram_layout ==
+                              infernix::ExpertRamLayout::Exclusive &&
+                          !parse({"infernix-serve", "model.ninfer"}).expert_ram_layout.has_value(),
+                      "--expert-ram-layout must parse exclusive and full, unset leaving the model's default");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"infernix-serve", "model.ninfer", "--expert-ram-layout", "all"});
+        } catch (const std::exception&) { rejected = true; }
+        failures += check(rejected, "--expert-ram-layout must reject another value");
     }
     failures += check(parse({"infernix-serve", "model.ninfer", "--expert-pin-mib", "24576"}).expert_pin_bytes == (24576ULL << 20) &&
                           !parse({"infernix-serve", "model.ninfer", "--expert-pin-mib", "24576", "--expert-pin-mib", "auto"})
@@ -875,6 +1061,35 @@ int main() {
         const auto no_room = parse({"infernix-serve", "model.ninfer", "--no-thinking-answer-room"});
         failures += check(!no_room.thinking_answer_room && !thinking_answer_room_budget(no_room, 8192),
                           "--no-thinking-answer-room did not let thinking use all of max_tokens");
+        // The settled budget: the answer room for a request with none, a cap on
+        // --default-thinking-budget, and in place of a request's own budget at or above its limit.
+        failures += check(settle_thinking_budget(defaults, std::nullopt, 8192) == 6144U &&
+                              !settle_thinking_budget(defaults, std::nullopt, 1023),
+                          "a request without any budget did not get the answer room");
+        const auto large_default =
+            parse({"infernix-serve", "model.ninfer", "--default-thinking-budget", "16384"});
+        failures += check(settle_thinking_budget(large_default, std::nullopt, 8192) == 6144U,
+                          "--default-thinking-budget 16384 left no answer at the default max_tokens");
+        failures += check(settle_thinking_budget(large_default, std::nullopt, 32768) == 16384U,
+                          "--default-thinking-budget was lowered where it leaves the answer its room");
+        failures += check(settle_thinking_budget(large_default, std::nullopt, 1023) == 16384U,
+                          "--default-thinking-budget changed below the answer room's threshold");
+        failures += check(settle_thinking_budget(large_default, std::nullopt, long_prompt) == 9109U,
+                          "--default-thinking-budget ignored the room the context leaves");
+        failures += check(settle_thinking_budget(defaults, 8192U, 8192) == 6144U &&
+                              settle_thinking_budget(large_default, 20000U, 8192) == 6144U,
+                          "a request budget at or above its output limit left no answer");
+        failures += check(settle_thinking_budget(large_default, 7000U, 8192) == 7000U &&
+                              settle_thinking_budget(defaults, 8191U, 8192) == 8191U,
+                          "a request budget below its output limit did not stand as sent");
+        failures += check(settle_thinking_budget(defaults, 20000U, 1023) == 20000U,
+                          "a request budget changed below the answer room's threshold");
+        const auto no_room_default = parse(
+            {"infernix-serve", "model.ninfer", "--default-thinking-budget", "16384", "--no-thinking-answer-room"});
+        failures += check(settle_thinking_budget(no_room_default, std::nullopt, 8192) == 16384U &&
+                              settle_thinking_budget(no_room_default, 20000U, 8192) == 20000U &&
+                              !settle_thinking_budget(no_room, std::nullopt, 8192),
+                          "--no-thinking-answer-room changed a budget");
     }
     request.enable_thinking = false;
     const auto non_thinking = resolve_prompt_semantics(request, thinking_budget);
@@ -1062,6 +1277,20 @@ int main() {
             (void)parse({"infernix-serve", "model.ninfer", "--fast-path", "no-such-path"});
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "an unknown --fast-path name was accepted");
+        const auto left = parse({"infernix-serve", "model.ninfer", "--no-fast-path", "free-cache-resume",
+                                 "--no-fast-path", "prompt-pv8"});
+        failures += check(left.fast_paths && left.fast_path_candidates.empty() &&
+                              left.fast_path_exclusions == std::vector<infernix::FastPath>{
+                                                               infernix::FastPath::FreeCacheResume,
+                                                               infernix::FastPath::PromptPv8},
+                          "--no-fast-path exclusions were not kept in order");
+        rejected = false;
+        try {
+            (void)parse({"infernix-serve", "model.ninfer", "--no-fast-path", "no-such-path"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an unknown --no-fast-path name was accepted");
+        failures += check(serve_usage_text("infernix-serve").find("--no-fast-path") != std::string::npos,
+                          "serve help omits --no-fast-path");
     }
     failures += check(serve_usage_text("infernix-serve").find("prefill-8bit-pv") == std::string::npos,
                       "serve help still lists the removed 8-bit prefill P*V flags");

@@ -1,4 +1,5 @@
 target_sources(infernix_ops PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_dynamic_grouped_conv_prepare_fused.cu"
   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_dynamic_grouped_conv_prepare_partial.cu"
   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_dynamic_grouped_conv_prepare_reduce.cu"
   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_dynamic_grouped_conv_prepare_plan.cpp"

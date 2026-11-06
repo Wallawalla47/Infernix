@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/gdn_replay_records.h"
+#include "infernix/ops/gated_delta_net.h"
 #include "infernix/ops/speculative_tree.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
@@ -54,6 +55,25 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
                              Tensor& out, cudaStream_t stream);
 
+// gated_delta_net_replay_record_conv (validated by the caller): the record kernel computing its q, k, v from qkv
+// by the causal convolution and its gates from a, b, A_log and dt_bias.
+inline constexpr std::int32_t kRecordConvMaxWidth = kGdnReplayConvMaxWidth;
+
+struct RecordConvInputs {
+    const Tensor& qkv;
+    const Tensor& conv_weight;
+    const Tensor& conv_states;
+    const Tensor& a;
+    const Tensor& b;
+    const Tensor& a_log;
+    const Tensor& dt_bias;
+    bool a_direct;
+};
+
+void launch_recurrent_record_conv(const RecordConvInputs& inputs, std::int32_t qk_heads, float scale,
+                                  const Tensor& ssm_states, const Tensor& initial_state_slots, Tensor& key_record,
+                                  Tensor& value_record, Tensor& gate_record, Tensor& out, cudaStream_t stream);
+
 // Verification-tree replay (see recurrent_tree_walk_kernel; with closed_form,
 // recurrent_tree_closed_form_kernel); valid_columns is required.
 void launch_recurrent_tree_record(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -66,5 +86,14 @@ void launch_recurrent_tree_record(const Tensor& q, const Tensor& k, const Tensor
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream);
+
+// The fold with in-place rows read from the device when the kernel runs (GdnReplayFoldPlan::execute_device).
+struct GdnReplayFoldDeviceRows {
+    const std::int32_t* slots         = nullptr; // [active_rows]
+    const std::int32_t* commit_columns = nullptr; // [active_rows]
+};
+
+void launch_replay_fold_device(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
+                               const GdnReplayFoldDeviceRows& rows, std::int32_t active_rows, cudaStream_t stream);
 
 } // namespace infernix::ops::detail::gated_delta_net

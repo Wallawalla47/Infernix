@@ -36,6 +36,11 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
  * w_hat[n, k] = fl32(code[n, k] * scale[n, k / G]) for the group size G (32 or 64), which is
  * exact. The summation order again depends only on K. K is a multiple of 8 and at most 3072; the
  * weight's padded K is a multiple of G.
+ *
+ * Or one `bf16_p12` weight [N, K] (a BF16 head packed at load, include/infernix/ops/bf16_p12.h; N a multiple of 16,
+ * K of 128 and at least 512): each weight decodes to its BF16 bits, the products are exact in FP32 and the
+ * tensor-core MMAs accumulate in FP32 over four K slices added in order, an order that depends on K alone, so a
+ * column's bits do not depend on the call's width at any width.
  */
 void projection_fp32(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 

@@ -1,7 +1,6 @@
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 
 #include "core/nvtx.h"
-#include "core/temporary_switches.h"
 
 #include <cuda_runtime.h>
 
@@ -82,6 +81,9 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
         (options_.activation != ExpertActivation::kA16 || shape != kFlashNextShape ||
          std::any_of(layers_.begin(), layers_.end(), [](const Layer& l) { return l.ggml.valid(); }))) {
         throw std::invalid_argument("CPU miss service: two-term A4 jobs need NVFP4 W4A16 banks of Flash-Next's geometry");
+    }
+    if (options_.nvfp4_a8 && options_.activation != ExpertActivation::kA16) {
+        throw std::invalid_argument("CPU miss service: 8-bit NVFP4 jobs need banks without activation scales (kA16)");
     }
     for (const auto& layer : layers_) {
         // Without a bank (the SSD tier) every request is tiered: it carries its records' addresses.
@@ -179,7 +181,11 @@ MoeCpuChannel CpuMissService::channel(int layer) const {
     out.max_job_columns = options_.max_job_columns;
     out.wide_from       = options_.wide_from;
     out.wide_jobs       = options_.wide_jobs;
+    out.assist_share    = options_.assist_share;
+    out.assist_share_wide = options_.assist_share_wide;
+    out.assist_ramp_from  = options_.assist_ramp_from;
     out.narrow_a16      = options_.narrow_a16;
+    out.ggml_a8         = options_.ggml_a8 ? 1 : 0;
     return out;
 }
 
@@ -210,14 +216,16 @@ void CpuMissService::serve() {
                             .activation = options_.activation,
                             .narrow_a16 = options_.narrow_a16,
                             .ggml       = ggml,
+                            .ggml_a8    = ggml && options_.ggml_a8,
+                            .nvfp4_a8   = options_.nvfp4_a8,
                             .shape      = options_.shape,
-                            .cpus       = options_.cpus,
-                            .shared_x   = temporary_switches::flag("INFERNIX_TMP_CPU_SHARED_X")});
+                            .cpus       = options_.cpus});
         const std::size_t hidden = static_cast<std::size_t>(options_.shape.hidden);
         std::vector<CpuExpertJob> jobs(static_cast<std::size_t>(jobs_));
         std::vector<CpuExpertJob> ready, read;
         std::vector<std::uint32_t> tickets;
-        std::vector<int> read_jobs;
+        std::vector<int> read_jobs, ready_columns;
+        ready_columns.reserve(static_cast<std::size_t>(jobs_));
         auto* volatile_status = reinterpret_cast<volatile std::uint32_t*>(status_);
         auto* volatile_beat   = reinterpret_cast<volatile std::uint32_t*>(heartbeat_);
         std::uint32_t beat    = 0;
@@ -266,11 +274,15 @@ void CpuMissService::serve() {
                 job.record        = r.tiered != 0 ? reinterpret_cast<const std::uint8_t*>(r.record[j])
                                                       : layer.records + expert * layer.record_stride;
                 job.ggml          = layer.ggml;
+                // The 8-bit activation route: a GGUF bank's jobs take ggml_expert.h's a8 functions (a block-FP8
+                // bank keeps its exact route), an NVFP4 bank's w4a8_expert.h's.
+                job.a8            = r.a8 != 0 && (!layer.ggml.valid() || layer.ggml.gate_up != QType::FP8_E4M3FN_B128);
                 job.scales        = layer.ggml.valid() ? ExpertScales{} : layer.scales[expert];
                 job.ncols         = r.ncols[j];
                 // The device publishes 1..kMaxCpuColumns columns (cpu_plan_body); any other count
-                // would index past the job's x/y and the kernels' accumulators.
-                if (job.ncols < 1 || job.ncols > kMaxCpuColumns) {
+                // would index past the job's x/y and the kernels' accumulators. An 8-bit request for an
+                // NVFP4 bank this service was not set up for (Options::nvfp4_a8) has no route here.
+                if (job.ncols < 1 || job.ncols > kMaxCpuColumns || (job.a8 && !layer.ggml.valid() && !options_.nvfp4_a8)) {
                     job.ncols = 0;
                     status    = EINVAL;
                     continue;
@@ -288,7 +300,13 @@ void CpuMissService::serve() {
                     status = ENOENT;
                 }
             }
+            const auto started = std::chrono::steady_clock::now();
             team.run(std::span<const CpuExpertJob>(ready.data(), ready.size()), {volatile_beat, &beat});
+            if (!ready.empty()) {
+                ready_columns.clear();
+                for (const CpuExpertJob& job : ready) { ready_columns.push_back(job.ncols); }
+                speed_.add(ready_columns, std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+            }
             if (!read_jobs.empty()) {
                 read.clear();
                 for (std::size_t i = 0; i < read_jobs.size(); ++i) {

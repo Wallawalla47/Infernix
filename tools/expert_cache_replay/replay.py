@@ -27,27 +27,53 @@ consecutive tokens, approximating a fully accepted W-token speculative verify wi
 Policies admit every miss ("promotion") unless marked CPU-served, in which case misses are computed
 by the CPU and the policy promotes lazily. Output: hit rate, misses and promotions per token.
 
-Headroom report (--headroom, route traces only): the engine's own policy (the LFRU with budgeted
-admission, replayed by host_tier.TierSim in full mode: every miss is served from host memory)
-against Belady MIN with bypass (the optimum when misses are served from host memory, as the engine
-serves them) and Belady MIN without bypass (the demand-fetch optimum), per layer group, at each
---capacities frame count. Hit rates count the distinct experts each scored decode or verification
-round computes per layer. The decision (--decision-frames, default the trace's frames) follows the
-candidate's rule: build cache-policy work only on a gap of >= 3 points between Belady with bypass and
-the engine's policy; a gap under 1 point closes the topic.
+The engine arms (route traces) replay the engine's residency, host_tier.TierSim in full mode (every
+miss served from host memory), with its rules: an LFRU per pool, count halving every 8,192 layer calls
+scaled by the pool's share of the layers, fill-phase landing (while frames are free, a decode or
+verification call's first staged misses land in up to 16 reserved frames per layer and use up that
+layer's promotion budget), the frame count each round ran with (a shrink evicts the lowest scores),
+prompt seeding (credit 256), and the warm start (--seed: none, the calibrated order, or a saved
+--expert-state file; counts capped at 16, at most half the frames). At the trace's own frame count
+they take the budgets the engine recorded; at other counts, the rule read from them (engine_rule).
+What the trace does not record comes from options or the engine log: the pools of a GGUF import
+(--pools; one pool when absent, which is right for NVFP4 and block-FP8 artifacts only), and the CPU's
+share of a call's misses, which decides what lands (--link-divisor, else the log's "decode misses kept
+on the link", else 1/1: every miss staged).
+
+Headroom report (--headroom, route traces only): the engine arm against Belady MIN with bypass under
+the engine arm's own budgets (the same rounds, landings, warm start and frame counts: the gap is the
+choice of victims and admissions alone; greedy under the budgets, so near-optimal rather than a proven
+bound), Belady MIN with bypass (the optimum when misses are served from host memory, as the
+engine serves them) and Belady MIN without bypass (the demand-fetch optimum); the last two run over the
+decode accesses only, at a constant frame count in one pool, from the warm start's experts. Per layer
+group, at each --capacities frame count. Hit rates count the distinct experts each scored decode or
+verification round computes per layer. The decision (--decision-frames, default the trace's frames)
+follows the candidate's rule: build cache-policy work only on a gap of >= 3 points between Belady with
+bypass and the engine's policy; a gap under 1 point closes the topic. The budgeted Belady arm's gap
+says how much of it better victims and admissions take without more promotions.
 
 Protection arms (--headroom --protection; candidates §13 PUB-22, SeqMoE): the engine's LFRU whose
 evictions spare the experts a routing-sequence predictor expects next (route_predictor.py): the next
-rounds' actual keys (the oracle ceiling, per --protect-horizons) and the engine's causal transition
-predictor (INFERNIX_TMP_ROUTE_PROTECT, on the host, so at the same frames). A/B the switch only when
-the predictor gains >= 3 points over the engine's LFRU; an oracle ceiling under 3 points closes the
-topic.
+rounds' actual keys, guarded at every layer's step (round-wide, the oracle ceiling, per
+--protect-horizons), and the engine's causal transition predictor as INFERNIX_TMP_ROUTE_PROTECT runs it
+(each layer's step guards that layer's predictions; on the host, so at the same frames). A/B the switch
+only when the predictor gains >= 3 points over the engine's LFRU; an oracle ceiling under 3 points
+closes the topic.
+
+Validation (--validate, route traces): the engine arm at the trace's frames with the recorded budgets,
+its hit rate over every round's live routed experts (as the engine's "since start"), promotions and
+landings; with --engine-log (a log of the same run with Debug diagnostics) against the engine's own
+"expert cache:" lines, per request for a single-lane run. --headroom with --engine-log adds the same
+comparison at the trace's frames.
 
     py -3.11 -m tools.expert_cache_replay.replay DIR [--capacities 4008,10200] [--window 1]
     py -3.11 -m tools.expert_cache_replay.replay TRACE [TRACE ...] [--warmup-tokens N]
     py -3.11 -m tools.expert_cache_replay.replay TRACE [TRACE ...] --headroom [--capacities 3600,4815]
         [--decision-frames 4815] [--layer-groups 0-19,20-47] [--warmup-tokens N] [--json OUT]
         [--protection [--protect-horizons 1,8] [--protect-per-layer 20]]
+        [--seed none|calibrated|STATE] [--pools POOLS.json] [--engine-log LOG] [--link-divisor D]
+    py -3.11 -m tools.expert_cache_replay.replay TRACE [TRACE ...] --validate [--engine-log LOG]
+        [--seed ...] [--pools ...] [--link-divisor D] [--json OUT]
 """
 import argparse
 import heapq
@@ -57,6 +83,8 @@ from collections import OrderedDict, defaultdict, namedtuple
 
 import numpy as np
 
+from . import calibrated_order as co
+from . import engine_inputs as ei
 from . import host_tier as ht
 from . import route_predictor as rpred
 
@@ -473,15 +501,20 @@ class StaticHindsight(Sim):
 
 class Belady(Sim):
     """Farthest-next-use with group protection. bypass=True: a miss is not admitted when its next use
-    is farther than every evictable resident's (optimal for the CPU-serve model's hit count)."""
+    is farther than every evictable resident's (optimal for the CPU-serve model's hit count). `initial`:
+    keys resident before the first group (the engine's warm start), `first` their first uses
+    (first_uses)."""
 
-    def __init__(self, cap, nxt, bypass=False):
+    def __init__(self, cap, nxt, bypass=False, initial=(), first=None):
         super().__init__(cap)
         self.nxt = nxt; self.bypass = bypass; self.i = 0
         self.res = {}  # key -> next use index
         self.h = []; self.hq = heapq
         self.name = 'Belady MIN' + (' with bypass (CPU-serve optimum)' if bypass else ' (demand-fetch optimum)')
         self.demand = not bypass
+        for k in list(initial)[:cap]:
+            nu = (first or {}).get(int(k), NEVER_USED)
+            self.res[int(k)] = nu; heapq.heappush(self.h, (-nu, int(k)))
 
     def step_group(self, g, score):
         hq = self.hq; gs = set(g); miss = []
@@ -542,10 +575,6 @@ class LazyLRFU(Sim):
             self.touched = set()
 
 
-COUNT_FLOOR = 1.0 / 1024.0   # halved counts below this become 0 (LfruPolicy::kCountFloor)
-ENGINE_HALVING = 8192        # the engine's period (ExpertResidency::kLfruHalvingPeriod)
-
-
 class LFRU(Sim):
     """Zhang (arXiv 2608.07911): score = f / (clock - last + 1), f a global count never reset on eviction;
     evict the lowest score among non-current residents; admit every miss. Clock in layer-call ticks. With
@@ -564,7 +593,7 @@ class LFRU(Sim):
         self.t += 1; gs = set(g); miss = []
         if self.halving and self.t % self.halving == 0:
             for k, c in self.f.items():
-                self.f[k] = 0.0 if c * 0.5 < COUNT_FLOOR else c * 0.5
+                self.f[k] = 0.0 if c * 0.5 < ht.COUNT_FLOOR else c * 0.5
         for k in g:
             self.f[k] += 1.0; self.last[k] = self.t
             if k in self.res: self.hits += score
@@ -585,14 +614,26 @@ class LFRU(Sim):
             self.res.add(k); self.promo += score
 
 
+NEVER_USED = 10 ** 12  # the next use of a key no later group reads
+
+
 def next_uses(groups):
     last = {}
     out = [None] * len(groups)
     for i in range(len(groups) - 1, -1, -1):
-        out[i] = [last.get(int(k), 10 ** 12) for k in groups[i]]
+        out[i] = [last.get(int(k), NEVER_USED) for k in groups[i]]
         for k in groups[i]:
             last[int(k)] = i
     return out
+
+
+def first_uses(groups):
+    """Each key's first group index (a warm-started Belady's residents' next uses)."""
+    first = {}
+    for i in range(len(groups) - 1, -1, -1):
+        for k in groups[i]:
+            first[int(k)] = i
+    return first
 
 
 def to_groups(seq, window):
@@ -655,13 +696,15 @@ def decode_groups(traces, geo, warmup_tokens):
 
 def engine_rule(rounds):
     """The engine's admission budgets, read from the recorded ones: (promotions per layer of a
-    prefill chunk wider than ExpertOffload::kServedCallColumns, decode tokens per promotion once the
-    frames are full). Qwen3.8-Flash-Next records 16 per chunk; Qwen3.5-122B-A10B records 0 (its
-    prompt passes stream every missing expert). The decode interval scales with the measured link
-    (ExpertOffload::promotion_interval), so it comes from the last half of the decode rounds, past
-    the fill phase."""
-    chunks = [r.budget for r in rounds if r.kind == ht.PREFILL and r.rows * r.width > 8]
-    prefill = max(chunks) if chunks else ht.PREFILL_PROMOTIONS
+    prefill chunk wider than the Program's kServedCallColumns (8 columns; narrower calls are
+    CPU-served and promote at the decode rate), decode tokens per promotion once the frames are full).
+    Both models record 0 for wide chunks: Qwen3.8-Flash-Next's Program::prefill promotes nothing there
+    (the answer's staged misses land in free frames and pick its experts, which the prompt's would
+    displace), and Qwen3.5-122B-A10B's prompt passes stream every missing expert. The decode interval
+    scales with the measured link (ExpertOffload::promotion_interval), so it comes from the last half
+    of the decode rounds, past the fill phase."""
+    chunks = [r.budget for r in rounds if r.kind == ht.PREFILL and r.rows * r.width > ht.SERVED_CALL_COLUMNS]
+    prefill = max(chunks) if chunks else 0
     decode = [r for r in rounds if r.kind in (ht.DECODE, ht.VERIFY)]
     tail = decode[len(decode) // 2:]
     budget, tokens = sum(r.budget for r in tail), sum(r.tokens for r in tail)
@@ -691,12 +734,15 @@ def parse_layer_groups(text, layers):
 
 
 class ArmResult:
-    """Scored hits and misses per layer of one arm."""
+    """Scored hits and misses per layer of one arm, its admissions (promotions and landings) at scored
+    rounds, and for an engine arm the replayed TierSim (`sim`)."""
 
     def __init__(self, name, layers):
         self.name = name
         self.hits = np.zeros(layers, np.int64)
         self.keys = np.zeros(layers, np.int64)
+        self.promotions = 0
+        self.sim = None
 
     def rate(self, first=0, last=None):
         last = len(self.keys) - 1 if last is None else last
@@ -717,36 +763,186 @@ def run_decode_arm(sim, groups, scored, geo, name=None):
             layer = int(g[0]) // geo.experts
             out.hits[layer] += sim.hits - before
             out.keys[layer] += len(g)
+    out.promotions = sim.promo
     return out
 
 
-def run_engine_arm(traces, geo, frames, warmup_tokens, *, vram_budget='rule', prefill_promotions=None,
-                   promotion_interval=None, name=None, guard=None):
-    """The engine's policy over every round of the traces (host_tier.TierSim, full mode: no SSD tier,
-    the engine's prompt seeding, an empty cache at the start), scored like the decode arms: a scored
-    decode or verification round's computed key is a hit when it is resident in a published frame.
-    `guard`: eviction protection (TierSim.guard; route_predictor)."""
-    header = {'layers': geo.layers, 'experts': geo.experts, 'top_k': geo.top_k}
-    rule = {}
+def trace_frames(traces):
+    """The frames the engine started with: the header's, else the first round's recorded count (0: none)."""
+    if traces[0].header['frames']:
+        return traces[0].header['frames']
+    return next((r.frames for t in traces for r in t.rounds if r.frames), 0)
+
+
+def run_engine_arm(traces, geo, frames, warmup_tokens, *, setup=None, vram_budget='rule', budgets=None,
+                   prefill_promotions=None, promotion_interval=None, name=None, guard=None, vram_policy='lfru',
+                   next_use=None, record_rounds=False):
+    """The engine's residency over every round of the traces (host_tier.TierSim, full mode: no SSD tier,
+    the engine's prompt seeding, its frame changes), scored like the decode arms: a scored decode or
+    verification round's computed key is a hit when it is resident in a published frame. `setup`: the
+    engine's warm start, pools and CPU split (engine_setup; none: an empty cache, one pool, every miss
+    staged). Budgets: the 'rule' or the 'recorded' ones, or `budgets`, one per round (another arm's
+    sim.applied_budgets). `guard`: eviction protection (TierSim.guard; route_predictor). vram_policy
+    'belady' with `next_use` (host_tier.NextUse over the same rounds): Belady MIN under those budgets.
+    `record_rounds`: keep the sim's round_log (engine_comparison)."""
+    header = {'layers': geo.layers, 'experts': geo.experts, 'top_k': geo.top_k, 'frames': trace_frames(traces)}
+    options = {'follow_frames': True, **(setup or {})}
     if prefill_promotions is not None:
-        rule['prefill_promotions'] = prefill_promotions
+        options['prefill_promotions'] = prefill_promotions
     if promotion_interval is not None:
-        rule['promotion_interval'] = promotion_interval
-    sim = ht.TierSim(header, vram=frames, ram_slots=None, prior='none', vram_budget=vram_budget,
-                     prompt_seed=(ht.PROMPT_SEED_CREDIT, 0, 0), **rule)
+        options['promotion_interval'] = promotion_interval
+    sim = ht.TierSim(header, vram=frames, ram_slots=None, prior='none', vram_budget=vram_budget, budgets=budgets,
+                     prompt_seed=(ht.PROMPT_SEED_CREDIT, 0, 0), vram_policy=vram_policy, next_use=next_use, **options)
     sim.guard = guard
+    if record_rounds:
+        sim.round_log = []
     out = ArmResult(name or f'engine LFRU ({vram_budget} budgets)', geo.layers)
     seen = 0
     for t in traces:
         for r in t.rounds:
+            scored = r.kind in (ht.DECODE, ht.VERIFY) and seen >= warmup_tokens
+            if scored:
+                for layer in range(geo.layers):
+                    keys = round_keys(r, geo, layer)
+                    out.hits[layer] += int(np.count_nonzero(sim.vram_visible(keys)))
+                    out.keys[layer] += keys.size
             if r.kind in (ht.DECODE, ht.VERIFY):
-                if seen >= warmup_tokens:
-                    for layer in range(geo.layers):
-                        keys = round_keys(r, geo, layer)
-                        out.hits[layer] += int(np.count_nonzero(sim.vram_visible(keys)))
-                        out.keys[layer] += keys.size
                 seen += r.tokens
+            before = sim.promotions + sim.landed
             sim.step(r)
+            if scored:
+                out.promotions += sim.promotions + sim.landed - before
+    out.sim = sim
+    return out
+
+
+def engine_setup(args, geo, log=None):
+    """The engine state and mechanisms the route trace does not record, for the engine arms: TierSim
+    keyword arguments (warm start, pools, the CPU's share of a call's misses) and their descriptions."""
+    setup = {'cpu_jobs': args.cpu_jobs}
+    notes = {}
+    if args.seed == 'none':
+        notes['seed'], notes['seed_source'] = 'none (an empty cache)', 'none'
+    elif args.seed == 'calibrated':
+        # Qwen3.8-Flash-Next's order, or the Qwen3.5-122B-A10B's generated table (calibrated_order.py).
+        table = None if (geo.layers, geo.experts, geo.top_k) == ei.CALIBRATED_SHAPE else co.read_table()
+        if table is not None and table[0] == (geo.layers, geo.experts, geo.top_k):
+            setup['warm_start'] = co.order_state(table[1])
+        elif (geo.layers, geo.experts, geo.top_k) == ei.CALIBRATED_SHAPE:
+            setup['warm_start'] = ei.calibrated_expert_order()
+        else:
+            raise SystemExit(f'--seed calibrated: no calibrated order ranks {geo.layers} x {geo.experts} experts, '
+                             f'top-{geo.top_k} (Qwen3.8-Flash-Next\'s ranks {ei.CALIBRATED_SHAPE[0]} x '
+                             f'{ei.CALIBRATED_SHAPE[1]}, top-{ei.CALIBRATED_SHAPE[2]}; the 122B\'s table is '
+                             f'{"empty" if co.read_table() is None else "of another shape"})')
+        notes['seed'], notes['seed_source'] = 'the calibrated order', 'calibrated'
+    else:
+        state = ei.read_expert_state(args.seed)
+        if state.counts.size != geo.layers * geo.experts:
+            raise SystemExit(f'{args.seed}: a state of {state.counts.size} experts, the trace has '
+                             f'{geo.layers * geo.experts}')
+        setup['warm_start'] = (state.counts, state.ranked)
+        notes['seed'] = f'{args.seed} (saved for {state.identity or "an unnamed artifact"}, {state.ranked.size} ranked)'
+        notes['seed_source'] = 'saved'
+    if args.pools:
+        setup['pools'] = ei.read_pools(args.pools, geo.layers)
+        notes['pools'] = f'{len(setup["pools"])} from {args.pools}'
+    else:
+        notes['pools'] = 'one (no --pools: a GGUF import has one per record stride)'
+    if args.link_divisor:
+        setup['link_divisor'] = args.link_divisor
+        notes['link'] = f'1/{args.link_divisor} of a call\'s misses kept on the link (set)'
+    elif log is not None and log.link_share:
+        setup['link_share'] = log.link_share
+        notes['link'] = f'{log.link_share}/256 of a call\'s misses kept on the link (engine log)'
+    elif log is not None and log.link_divisor:
+        setup['link_divisor'] = log.link_divisor
+        notes['link'] = f'1/{log.link_divisor} of a call\'s misses kept on the link (engine log)'
+    else:
+        setup['link_divisor'] = 1
+        notes['link'] = 'every miss staged (no --link-divisor and no CPU split in an engine log)'
+    notes['cpu_jobs'] = f'{args.cpu_jobs} CPU-served misses per call at most'
+    return setup, notes
+
+
+def describe(notes):
+    return '; '.join(f'{k} {v}' for k, v in notes.items() if k != 'seed_source')
+
+
+def split_requests(round_log):
+    """A single-lane run's (live keys, live hits, promotions, landings) per request: a request starts at
+    a prefill round that follows a round of another kind, and the engine reports it at its finish, after
+    its last round settled."""
+    requests = []
+    previous = None
+    for kind, _, keys, hits, promotions, landed in round_log:
+        if kind == ht.PREFILL and previous != ht.PREFILL:
+            requests.append([0, 0, 0, 0])
+        if requests:
+            q = requests[-1]
+            q[0] += keys
+            q[1] += hits
+            q[2] += promotions
+            q[3] += landed
+        previous = kind
+    return requests
+
+
+def engine_comparison(sim, log, notes):
+    """The engine arm at the trace's frames with the recorded budgets (sim, with its round_log): its hit
+    rate over every round's live routed experts (ExpertResidency::Stats routed and hits, which the engine
+    reports "since start"), promotions and landings, and with `log` (engine_inputs.read_engine_log) the
+    engine's own figures, per request when the run had one lane and the log reports each of its requests.
+    Prints them; returns them for the JSON report."""
+    rounds = sim.round_log
+    routed, hits = sum(x[2] for x in rounds), sum(x[3] for x in rounds)
+    decode = [x for x in rounds if x[0] in (ht.DECODE, ht.VERIFY)]
+    decode_routed, decode_hits = sum(x[2] for x in decode), sum(x[3] for x in decode)
+    replay = {'frames': sim.V, 'routed': routed, 'since_start': hits / routed if routed else 0.0,
+              'decode_hit': decode_hits / decode_routed if decode_routed else 0.0, 'promotions': sim.promotions,
+              'landed': sim.landed, 'seeded': len(sim.seeded_keys)}
+    print(f'replay, {sim.V} frames at the end, recorded budgets: {100 * replay["since_start"]:.2f} % of {routed} live '
+          f'routed experts hit since start (decode and verification {100 * replay["decode_hit"]:.2f} %); '
+          f'{sim.promotions} promotions, {sim.landed} landed, {replay["seeded"]} seeded')
+    out = {'replay': replay}
+    if log is None:
+        return out
+    if not log.requests:
+        print('engine log: no "expert cache:" request lines (they are Debug diagnostics)')
+        return out
+    last = log.requests[-1]
+    engine = {'requests': len(log.requests), 'frames': last.frames, 'since_start': last.since_start_percent,
+              'routed': sum(q.routed for q in log.requests), 'promotions': sum(q.promotions for q in log.requests),
+              'landed': sum(q.landed for q in log.requests), 'cpu_served': sum(q.cpu_served for q in log.requests),
+              'seed': log.seed, 'seeded': log.seeded}
+    out['engine'] = engine
+    out['since_start_points'] = 100 * replay['since_start'] - last.since_start_percent
+    print(f'engine log: {len(log.requests)} requests, {last.frames} frames at the last; {last.since_start_percent:.1f} % '
+          f'hit since start; over its requests {engine["routed"]} routed experts, {engine["promotions"]} promotions, '
+          f'{engine["landed"]} landed, {engine["cpu_served"]} misses CPU-served; warm start '
+          f'{log.seed or "not logged"}' + (f' ({log.seeded} experts)' if log.seeded else ''))
+    print(f'since start: replay - engine = {out["since_start_points"]:+.2f} points')
+    if log.seed is not None and log.seed != notes['seed_source']:
+        print(f'warning: the engine\'s warm start was {log.seed}, the replay\'s {notes["seed_source"]} (--seed)')
+    if log.seed is not None and log.seeded != replay['seeded']:
+        print(f'note: the engine seeded {log.seeded} experts, the replay {replay["seeded"]}')
+    if len({x[1] for x in rounds}) != 1:
+        print('per request: not compared (several lanes: a request\'s counters include the other lanes\' rounds)')
+        return out
+    requests = split_requests(rounds)
+    if len(requests) != len(log.requests):
+        print(f'per request: not compared ({len(requests)} requests in the trace, {len(log.requests)} in the log)')
+        return out
+    points = [100 * h / k - q.hit_percent for (k, h, _, _), q in zip(requests, log.requests) if k]
+    differing = sum(1 for (k, _, _, _), q in zip(requests, log.requests) if k != q.routed)
+    worst = max(points, key=abs) if points else 0.0
+    out['per_request'] = {'points': points, 'routed_differing': differing}
+    print(f'per request ({len(requests)}): replay - engine mean {np.mean(points) if points else 0.0:+.2f} points, '
+          f'worst {worst:+.2f}; routed experts differ in {differing}'
+          + (' (the log and the trace are not of the same run, or a request was replayed after preemption)'
+             if differing else ''))
+    if engine['routed'] != routed:
+        print(f'routed experts: engine {engine["routed"]}, replay {routed}')
     return out
 
 
@@ -770,17 +966,19 @@ def protection_verdict(gain_points, ceiling_points):
             f'the oracle ceiling)')
 
 
-def protection_arms(traces, rounds, geo, cap, args, prefill, interval):
-    """PUB-22's arms at `cap` frames: the engine's LFRU protected by the next rounds' actual keys (one
-    arm per --protect-horizons entry), and by the engine's transition predictor."""
+def protection_arms(traces, rounds, geo, cap, args, engine):
+    """PUB-22's arms at `cap` frames, with the engine arm's setup and budget mode (`engine`: run_engine_arm
+    keyword arguments): the engine's LFRU protected by the next rounds' actual keys at every layer's step
+    (one arm per --protect-horizons entry), and by the engine's transition predictor, each layer's step
+    guarding that layer's predictions."""
     arms = []
     for horizon in (int(x) for x in args.protect_horizons.split(',')):
         oracle = rpred.NextRoundsOracle(rounds, geo.layers, geo.experts, horizon)
-        arms.append(run_engine_arm(traces, geo, cap, args.warmup_tokens, prefill_promotions=prefill,
-                                   promotion_interval=interval, guard=oracle, name=f'engine LFRU + {oracle.name}'))
+        arms.append(run_engine_arm(traces, geo, cap, args.warmup_tokens, guard=oracle,
+                                   name=f'engine LFRU + {oracle.name}', **engine))
     predictor = rpred.TransitionPredictor(geo.layers, geo.experts, args.protect_per_layer or 2 * geo.top_k)
-    arms.append(run_engine_arm(traces, geo, cap, args.warmup_tokens, prefill_promotions=prefill,
-                               promotion_interval=interval, guard=predictor, name=f'engine LFRU + {predictor.name}'))
+    arms.append(run_engine_arm(traces, geo, cap, args.warmup_tokens, guard=predictor,
+                               name=f'engine LFRU + {predictor.name}', **engine))
     return arms
 
 
@@ -789,9 +987,11 @@ def headroom(paths, args):
     h = traces[0].header
     rounds = [r for t in traces for r in t.rounds]
     n = geo.layers * geo.experts
+    log = ei.read_engine_log(args.engine_log) if args.engine_log else None
+    setup, notes = engine_setup(args, geo, log)
     recorded = [r.frames for r in rounds if r.frames]
-    trace_frames = h['frames'] or (recorded[0] if recorded else 0)
-    decision = args.decision_frames or trace_frames
+    started = trace_frames(traces)
+    decision = args.decision_frames or started
     if not decision:
         raise SystemExit('the trace records no frame count: pass --decision-frames')
     if args.capacities:
@@ -809,55 +1009,79 @@ def headroom(paths, args):
     if tokens == 0:
         raise SystemExit('no scored decode tokens (a decode trace, or fewer --warmup-tokens)')
     nxt = next_uses(groups)
+    first = first_uses(groups)
+    oracle = ht.NextUse(rounds, geo.layers, geo.experts)
     kinds = defaultdict(int)
     for r in rounds:
         kinds[ht.KIND_NAMES[r.kind]] += 1
     print(f'route traces: {len(traces)}, {len(rounds)} rounds ({", ".join(f"{v} {k}" for k, v in kinds.items())}); '
-          f'{geo.layers} layers x {geo.experts} experts, top-{geo.top_k}; captured with {trace_frames} frames'
+          f'{geo.layers} layers x {geo.experts} experts, top-{geo.top_k}; captured with {started} frames'
           + (f' (per round {min(recorded)}..{max(recorded)})' if recorded else '')
           + f', {h["lanes"]} lanes, max width {h["max_width"]}, MTP {h["mtp_draft_tokens"]}, '
           f'n-gram {h["ngram_draft_tokens"]}')
-    print(f'engine rule: {prefill} promotions per layer per prefill chunk; once full, decode promotes one '
-          f'expert per layer every {interval} tokens' + (' (set)' if args.promotion_interval else ' (from the trace)'))
+    print(f'engine rule: {prefill} promotions per layer per prefill chunk wider than {ht.SERVED_CALL_COLUMNS} columns; '
+          f'once full, decode promotes one expert per layer every {interval} tokens'
+          + (' (set)' if args.promotion_interval else f' (from the trace); the recorded budgets at {started} frames'))
+    print(f'engine setup: {describe(notes)}')
     print(f'scored: {tokens} decode tokens after {warm} warm-up tokens; mean distinct experts per layer per '
           f'round {np.mean([len(g) for g, s in zip(groups, scored) if s]):.2f}')
     names = ['all'] + [g[0] for g in layer_groups]
     results = []
     for cap in caps:
-        engine = run_engine_arm(traces, geo, cap, args.warmup_tokens, prefill_promotions=prefill,
-                                promotion_interval=interval)
-        bypass = run_decode_arm(Belady(cap, nxt, True), groups, scored, geo)
+        # At the engine's own frame count its recorded budgets (unless --promotion-interval asks what the
+        # rule at another interval would do); elsewhere the rule read from them.
+        own = cap == started and not args.promotion_interval
+        mode = {'setup': setup, 'vram_budget': 'recorded' if own else 'rule', 'prefill_promotions': prefill,
+                'promotion_interval': interval}
+        engine = run_engine_arm(traces, geo, cap, args.warmup_tokens, record_rounds=own and log is not None, **mode)
         arms = [engine]
-        if cap == trace_frames:
-            # The budgets the engine applied at its own frame count: ties the replay to the run.
-            arms.append(run_engine_arm(traces, geo, cap, args.warmup_tokens, vram_budget='recorded'))
-        arms += [bypass, run_decode_arm(Belady(cap, nxt, False), groups, scored, geo)]
-        protected = protection_arms(traces, rounds, geo, cap, args, prefill, interval) if args.protection else []
+        if own:
+            # The rule at the engine's frames: whether the replay's fill phase ends where the engine's did.
+            arms.append(run_engine_arm(traces, geo, cap, args.warmup_tokens, **dict(mode, vram_budget='rule')))
+        budgeted = run_engine_arm(traces, geo, cap, args.warmup_tokens, setup=setup, budgets=engine.sim.applied_budgets,
+                                  vram_policy='belady', next_use=oracle, name='Belady MIN with bypass, engine budgets')
+        seeded = engine.sim.seeded_keys
+        bypass = run_decode_arm(Belady(cap, nxt, True, seeded, first), groups, scored, geo)
+        arms += [budgeted, bypass, run_decode_arm(Belady(cap, nxt, False, seeded, first), groups, scored, geo)]
+        protected = protection_arms(traces, rounds, geo, cap, args, mode) if args.protection else []
         arms += protected
         print(f'\n=== {cap} frames ({cap / n:.1%} of {n} experts)' + (' (decision)' if cap == decision else ''))
-        print(f'{"arm":44s} ' + ' '.join(f'{x:>7s}' for x in names) + f' {"miss/tok":>9s}')
+        print(f'{"arm":44s} ' + ' '.join(f'{x:>7s}' for x in names) + f' {"miss/tok":>9s} {"promo/tok":>9s}')
         rows = []
         for arm in arms:
             rates = [arm.rate()] + [arm.rate(a, b) for _, a, b in layer_groups]
-            print(f'{arm.name:44s} ' + ' '.join(f'{100 * x:7.2f}' for x in rates) + f' {arm.misses() / tokens:9.2f}')
+            print(f'{arm.name:44s} ' + ' '.join(f'{100 * x:7.2f}' for x in rates)
+                  + f' {arm.misses() / tokens:9.2f} {arm.promotions / tokens:9.3f}')
             rows.append({'arm': arm.name, 'hit': dict(zip(names, rates)), 'misses_per_token': arm.misses() / tokens,
+                         'promotions_per_token': arm.promotions / tokens,
                          'per_layer_hit': [float(x) for x in arm.hits / np.maximum(arm.keys, 1)]})
         gaps = [100 * (bypass.rate() - engine.rate())] + [100 * (bypass.rate(a, b) - engine.rate(a, b))
                                                           for _, a, b in layer_groups]
+        choice = [100 * (budgeted.rate() - engine.rate())] + [100 * (budgeted.rate(a, b) - engine.rate(a, b))
+                                                              for _, a, b in layer_groups]
         print(f'{"gap, Belady with bypass - engine (points)":44s} ' + ' '.join(f'{x:7.2f}' for x in gaps))
-        result = {'frames': cap, 'arms': rows, 'gap_points': dict(zip(names, gaps))}
+        print(f'{"gap, Belady at the engine budgets - engine":44s} ' + ' '.join(f'{x:7.2f}' for x in choice))
+        result = {'frames': cap, 'arms': rows, 'gap_points': dict(zip(names, gaps)),
+                  'budgeted_gap_points': dict(zip(names, choice))}
         if protected:
             gains = {arm.name: 100 * (arm.rate() - engine.rate()) for arm in protected}
             for name, gain in gains.items():
                 print(f'{"gain, " + name:44s} {gain:7.2f}')
             result['protection_gain_points'] = gains
+        if own and log is not None:
+            print(f'\n--- the engine arm at {cap} frames against the engine log')
+            result['engine_log'] = engine_comparison(engine.sim, log, notes)
         results.append(result)
     final = next(r for r in results if r['frames'] == decision)
     gap = final['gap_points']['all']
+    choice = final['budgeted_gap_points']['all']
     print(f'\ndecision at {decision} frames: {gap:.2f} points -> {verdict(gap)}')
+    print(f'at the engine\'s own budgets, landings, warm start and frame counts Belady gains {choice:.2f} points '
+          f'(victim and admission choice alone)')
     report = {'header': h, 'geometry': geo._asdict(), 'engine_rule': {'prefill_promotions': prefill,
-              'promotion_interval': interval}, 'scored_tokens': tokens, 'warmup_tokens': warm,
-              'decision_frames': decision, 'decision_gap_points': gap, 'verdict': verdict(gap), 'results': results}
+              'promotion_interval': interval}, 'engine_setup': notes, 'scored_tokens': tokens, 'warmup_tokens': warm,
+              'decision_frames': decision, 'decision_gap_points': gap, 'decision_budgeted_gap_points': choice,
+              'verdict': verdict(gap), 'results': results}
     if args.protection:
         gains = final['protection_gain_points']
         predictor = next(v for k, v in gains.items() if 'transition' in k)
@@ -866,6 +1090,27 @@ def headroom(paths, args):
               f'-> {protection_verdict(predictor, ceiling)}')
         report.update({'protection_gain_points': predictor, 'protection_ceiling_points': ceiling,
                        'protection_verdict': protection_verdict(predictor, ceiling)})
+    if args.json:
+        with open(args.json, 'w') as f:
+            json.dump(report, f, indent=1)
+    return 0
+
+
+def validate(paths, args):
+    """--validate: the engine arm at the trace's own frames with the recorded budgets, against the engine
+    log when one is given (engine_comparison)."""
+    geo, traces = read_route_traces(paths)
+    log = ei.read_engine_log(args.engine_log) if args.engine_log else None
+    setup, notes = engine_setup(args, geo, log)
+    frames = trace_frames(traces)
+    if not frames:
+        raise SystemExit('the trace records no frame count')
+    print(f'route traces: {len(traces)}, {sum(len(t.rounds) for t in traces)} rounds; {geo.layers} layers x '
+          f'{geo.experts} experts, top-{geo.top_k}; captured with {frames} frames')
+    print(f'engine setup: {describe(notes)}')
+    arm = run_engine_arm(traces, geo, frames, 0, setup=setup, vram_budget='recorded', record_rounds=True)
+    report = {'header': traces[0].header, 'geometry': geo._asdict(), 'engine_setup': notes,
+              **engine_comparison(arm.sim, log, notes)}
     if args.json:
         with open(args.json, 'w') as f:
             json.dump(report, f, indent=1)
@@ -887,7 +1132,7 @@ def policy_table(geo, warm, scored, tokens, capacities):
     for cap in capacities:
         print(f'\n=== capacity {cap} slots ({cap / (L * E):.1%} of {L * E} experts)')
         print(f'{"policy":66s} {"hit":>6s} {"miss/tok":>9s} {"promo/tok":>9s}')
-        policies = [LRU(cap), LFRU(cap), LFRU(cap, ENGINE_HALVING), LRUPerLayer(cap, geo), SLRU(cap), ARC(cap), LRU2(cap),
+        policies = [LRU(cap), LFRU(cap), LFRU(cap, ht.LFRU_HALVING_PERIOD), LRUPerLayer(cap, geo), SLRU(cap), ARC(cap), LRU2(cap),
                     S3FIFO(cap), SIEVE(cap), DecayedLFU(cap, geo), WTinyLFU(cap, geo), StrataExchange(cap, geo, warm_counts),
                     LazyLRFU(cap, geo, warm_counts, 128, 0.5, 32), StaticHindsight(cap, scored_counts),
                     Belady(cap, nxt, False), Belady(cap, nxt, True)]
@@ -913,18 +1158,38 @@ def main(argv=None):
     ap.add_argument('--layer-groups', default='', help='headroom: layer ranges, e.g. 0-19,20-47 (default: quarters)')
     ap.add_argument('--promotion-interval', type=int, default=0,
                     help='headroom: decode tokens per promotion once full (default: from the recorded budgets)')
-    ap.add_argument('--json', default=None, help='headroom: write the results here')
+    ap.add_argument('--json', default=None, help='headroom, validate: write the results here')
     ap.add_argument('--protection', action='store_true',
                     help='headroom: add the eviction-protection arms (candidates §13 PUB-22)')
     ap.add_argument('--protect-horizons', default='1,8', help='protection: the oracle arms\' horizons in rounds')
     ap.add_argument('--protect-per-layer', type=int, default=0,
                     help='protection: experts the predictor protects per layer and lane (default: 2 x top-k; '
                          'INFERNIX_TMP_ROUTE_PROTECT\'s value)')
+    ap.add_argument('--validate', action='store_true',
+                    help='route traces: the engine arm at the trace\'s frames with its recorded budgets, against '
+                         '--engine-log when given')
+    ap.add_argument('--seed', default='none',
+                    help='engine arms: the warm start, "none" (an empty cache), "calibrated" (the model\'s calibrated '
+                         'order, the engine\'s default without a saved state: Qwen3.8-Flash-Next\'s, or the '
+                         'Qwen3.5-122B-A10B\'s generated calibrated_order.inc) or a saved --expert-state file')
+    ap.add_argument('--pools', default=None,
+                    help='engine arms: a JSON file of the expert pools (a GGUF import has one per record stride; '
+                         'default one pool), see engine_inputs.py')
+    ap.add_argument('--engine-log', default=None,
+                    help='engine arms: a log of the same run with Debug diagnostics: its expert-cache lines to '
+                         'compare with, and its CPU split of decode misses')
+    ap.add_argument('--link-divisor', type=int, default=0,
+                    help='engine arms: a call keeps M / D of its M misses on the link, the CPU serves the rest '
+                         '(default: the engine log\'s, else 1: every miss staged); decides what lands')
+    ap.add_argument('--cpu-jobs', type=int, default=ht.CPU_JOBS,
+                    help='engine arms: CPU-served misses per call at most (ProgramOptions::cpu_expert_jobs)')
     args = ap.parse_args(argv)
 
     if all(is_route_trace(p) for p in args.traces):
         if args.window != 1:
             raise SystemExit('--window applies to FreeToken traces; route traces record their verify rounds')
+        if args.validate:
+            return validate(args.traces, args)
         if args.headroom:
             return headroom(args.traces, args)
         geo, traces = read_route_traces(args.traces)
@@ -943,8 +1208,9 @@ def main(argv=None):
         return 0
     if len(args.traces) != 1 or not os.path.isdir(args.traces[0]):
         raise SystemExit('pass one FreeToken trace directory or engine route-trace files')
-    if args.headroom:
-        raise SystemExit('--headroom needs engine route traces (the engine policy replays their prefill rounds)')
+    if args.headroom or args.validate:
+        raise SystemExit('--headroom and --validate need engine route traces (the engine policy replays their '
+                         'prefill rounds)')
     geo, seqs = load(args.traces[0], args.experts, args.top_k)
     warm = to_groups(seqs[0], args.window)
     scored = to_groups(seqs[1], args.window) + to_groups(seqs[2], args.window)

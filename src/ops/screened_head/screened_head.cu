@@ -28,6 +28,7 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "core/pdl.cuh"
+#include "ops/common/bytes.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/score_id_order.cuh"
@@ -521,10 +522,9 @@ __device__ __forceinline__ float q8_row(const std::int8_t* codes, const __half* 
         const float scale  = __half2float(srow[chunk / 4]);
         const uint4 xp     = __ldcg(reinterpret_cast<const uint4*>(x + chunk * 8));
         const bf16* xv     = reinterpret_cast<const bf16*>(&xp);
-        const auto* wv     = reinterpret_cast<const std::int8_t*>(&packed);
         float wf[8];
 #pragma unroll
-        for (int j = 0; j < 8; ++j) { wf[j] = static_cast<float>(wv[j]) * scale; }
+        for (int j = 0; j < 8; ++j) { wf[j] = static_cast<float>(signed_byte_of(packed, j)) * scale; }
 #pragma unroll
         for (int j = 0; j < 8; ++j) { sum = fmaf(wf[j], __bfloat162float(xv[j]), sum); }
     }

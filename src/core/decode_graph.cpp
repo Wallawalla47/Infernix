@@ -4,10 +4,15 @@
 #include "core/nvtx.h"
 #include "core/temporary_switches.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
+#include <fstream>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace infernix {
 namespace {
@@ -37,6 +42,54 @@ void discard_capture(cudaStream_t stream) noexcept {
     cudaGraph_t discard = nullptr;
     log_cuda_error("cudaStreamEndCapture(discard)", cudaStreamEndCapture(stream, &discard));
     destroy_graph(discard);
+}
+
+// TEMPORARY (the PDL edge census, candidates §57): with INFERNIX_TMP_GRAPH_EDGES=<file>, every instantiated graph's
+// top-level edges are appended to that file: "graph <n> <kernel nodes> <edges>", then one "edge <type> <from> <to>"
+// line an edge (type: its cudaGraphDependencyType, 0 serializing, 1 programmatic; names: the kernels' symbols, "-"
+// for other nodes). Conditional nodes' bodies are not walked.
+void dump_graph_edges(cudaGraph_t graph) {
+    static const std::optional<std::string> path = temporary_switches::value("INFERNIX_TMP_GRAPH_EDGES");
+    if (!path) { return; }
+    static std::mutex mutex;
+    static int graphs = 0;
+    std::size_t node_count = 0;
+    CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &node_count));
+    std::vector<cudaGraphNode_t> nodes(node_count);
+    CUDA_CHECK(cudaGraphGetNodes(graph, nodes.data(), &node_count));
+    std::size_t edge_count = 0;
+    CUDA_CHECK(cudaGraphGetEdges(graph, nullptr, nullptr, nullptr, &edge_count));
+    std::vector<cudaGraphNode_t> from(edge_count), to(edge_count);
+    std::vector<cudaGraphEdgeData> data(edge_count);
+    CUDA_CHECK(cudaGraphGetEdges(graph, from.data(), to.data(), data.data(), &edge_count));
+    const auto kernel = [](cudaGraphNode_t node) {
+        cudaGraphNodeType type{};
+        CUDA_CHECK(cudaGraphNodeGetType(node, &type));
+        return type == cudaGraphNodeTypeKernel;
+    };
+    const auto name = [&](cudaGraphNode_t node) -> std::string {
+        if (!kernel(node)) { return "-"; }
+        cudaKernelNodeParams params{};
+        CUDA_CHECK(cudaGraphKernelNodeGetParams(node, &params));
+        const char* symbol = nullptr;
+        if (cudaFuncGetName(&symbol, params.func) != cudaSuccess || symbol == nullptr) {
+            (void)cudaGetLastError();
+            return "?";
+        }
+        return symbol;
+    };
+    std::size_t kernels = 0;
+    for (cudaGraphNode_t node : nodes) { kernels += kernel(node) ? 1 : 0; }
+    const auto index = [&](cudaGraphNode_t node) {
+        return static_cast<long long>(std::find(nodes.begin(), nodes.end(), node) - nodes.begin());
+    };
+    const std::lock_guard<std::mutex> lock(mutex);
+    std::ofstream out(*path, std::ios::app);
+    out << "graph " << graphs++ << ' ' << kernels << ' ' << edge_count << '\n';
+    for (std::size_t i = 0; i < edge_count; ++i) {
+        out << "edge " << static_cast<int>(data[i].type) << ' ' << name(from[i]) << ' ' << name(to[i]) << ' '
+            << index(from[i]) << ' ' << index(to[i]) << '\n';
+    }
 }
 
 } // namespace
@@ -189,13 +242,13 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
         throw std::logic_error("cannot instantiate an empty CUDA Graph definition");
     }
     reset();
+    dump_graph_edges(definition.graph_);
 
     cudaGraphExec_t exec = nullptr;
-    // TEMPORARY (INFERNIX_TMP_STREAM_PRIORITY, candidates §11 D5): kernels captured from a stream of
-    // greater priority (Flash-Next's staging and shared-expert streams) keep it inside the graph.
-    static const bool node_priority = temporary_switches::flag("INFERNIX_TMP_STREAM_PRIORITY");
+    // Node priorities: the stream priorities captured into the graph keep their order inside it (Flash-Next's
+    // staging, shared-expert and split streams, models/qwen4_exp/program/program_impl.h).
     const cudaError_t err =
-        cudaGraphInstantiate(&exec, definition.graph_, node_priority ? cudaGraphInstantiateFlagUseNodePriority : 0);
+        cudaGraphInstantiate(&exec, definition.graph_, cudaGraphInstantiateFlagUseNodePriority);
     if (err != cudaSuccess) {
         destroy_graph_exec(exec);
         if (err == cudaErrorMemoryAllocation) {

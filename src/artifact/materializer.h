@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace infernix::artifact {
@@ -44,6 +45,10 @@ struct MaterializationPlan {
     std::uint64_t prior_read_bytes      = 0;
     std::uint64_t owned_value_bytes     = 0;
     std::vector<DevicePlacement> device_objects;
+    // Device objects of the second arena, which MaterializedArtifact::release_transient frees
+    // (Binder::mark_device_transient).
+    std::uint64_t transient_capacity_bytes = 0;
+    std::vector<DevicePlacement> transient_objects;
     std::vector<HostPlacement> host_objects;
     std::uint64_t pinned_capacity_bytes = 0;
     std::vector<PinnedPlacement> pinned_objects;
@@ -51,7 +56,7 @@ struct MaterializationPlan {
     std::vector<ObjectHandle> streamed_objects;
     // Physical Host memory the pinned block must leave free, after the caller's later pins
     // (`later_pinned_bytes`, allocated once the model is loaded) are counted against it too.
-    std::uint64_t host_reserve_bytes = kDefaultRamHeadroomBytes;
+    std::uint64_t host_reserve_bytes = kDefaultRamFreeBytes;
     std::uint64_t later_pinned_bytes = 0;
     // Arena suffix holding the ranked (low-traffic) device weights that an
     // EvictableWeightPool may temporarily evict; chunk-aligned by finish().
@@ -96,8 +101,7 @@ public:
                                                     std::uint64_t bytes) const;
 
 private:
-    friend MaterializedArtifact materialize(const Reader&, MaterializationPlan&&, DeviceContext&,
-                                            const StartupObserver*, std::unique_ptr<EvictableWeightPool>);
+    friend class MaterializedArtifact; // locate_streamed fills it
     struct Object {
         std::uint64_t bytes = 0;
         std::vector<FileSegment> segments; // the whole object, `at` from its start
@@ -139,9 +143,15 @@ public:
 
     [[nodiscard]] const MaterializationStats& stats() const noexcept { return stats_; }
 
+    // Frees the transient arena (MaterializationPlan::transient_objects): those objects lose their
+    // device parents, so no view may still point at them. The caller orders every device access to
+    // them before this call.
+    void release_transient();
+
 private:
     friend MaterializedArtifact materialize(const Reader&, MaterializationPlan&&, DeviceContext&,
                                             const StartupObserver*, std::unique_ptr<EvictableWeightPool>);
+    friend MaterializedArtifact materialize_geometry(const Reader&, MaterializationPlan&&);
 
     struct ObjectStorage {
         std::optional<WeightParent> device;
@@ -151,9 +161,23 @@ private:
         std::vector<std::byte> host_data;
     };
 
+    // The steps materialize() and materialize_geometry() share: the plan's counts in the stats, the
+    // streamed objects' files and segments (nothing read), and the Host objects' bytes (read here
+    // only when the binder did not).
+    void begin(const Reader& reader, const MaterializationPlan& plan);
+    void locate_streamed(const Reader& reader, const MaterializationPlan& plan);
+    void bind_host_objects(const Reader& reader, std::vector<HostPlacement>& placements);
+
     std::unique_ptr<DeviceArena> arena_;
+    std::unique_ptr<DeviceArena> transient_;
+    std::vector<ObjectHandle> transient_objects_;
     std::unique_ptr<RegisteredHostBuffer> pinned_;
     std::unique_ptr<EvictableWeightPool> eviction_pool_;
+    // materialize_geometry: the address ranges the device and pinned objects are bound in (no
+    // memory behind them).
+    std::unique_ptr<AddressReservation> geometry_device_;
+    std::unique_ptr<AddressReservation> geometry_transient_;
+    std::unique_ptr<AddressReservation> geometry_pinned_;
     std::vector<ObjectStorage> objects_;
     StreamSource stream_source_;
     MaterializationStats stats_;
@@ -164,5 +188,18 @@ private:
                                                const StartupObserver* startup_observer = nullptr,
                                                std::unique_ptr<EvictableWeightPool> eviction_pool =
                                                    nullptr);
+
+// materialize()'s plan-only twin (Engine::plan): every object gets the parent a load gives it, with
+// device and pinned objects bound at their planned offsets inside address reservations
+// (AddressReservation) instead of device and pinned memory. Host objects keep the bytes the binder
+// already read, NVFP4 divisors and multipliers are read from the artifact as materialize() reads
+// them, and streamed objects are located; nothing else is read, uploaded, pinned or allocated on the
+// device, and no CUDA call is made. A device or pinned view's bytes must never be accessed (they
+// fault): its shape, format and offsets are what planning reads. The stats report no upload.
+[[nodiscard]] MaterializedArtifact materialize_geometry(const Reader& reader, MaterializationPlan&& plan);
+
+// The refusal materialize() gives a plan whose pinned block, later pins and reserve exceed
+// `available_bytes` of physical Host memory; empty when they fit (or nothing is pinned).
+[[nodiscard]] std::string pinned_shortfall(const MaterializationPlan& plan, std::uint64_t available_bytes);
 
 } // namespace infernix::artifact

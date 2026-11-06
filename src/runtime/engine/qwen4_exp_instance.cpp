@@ -1,28 +1,38 @@
 #include "runtime/engine/qwen4_exp_instance.h"
 
+#include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
 #include "core/host_memory.h"
+#include "core/paged_kv_cache.h"
 #include "core/startup.h"
+
 #include "core/vram_budget.h"
 #include "models/load_options.h"
+#include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/load.h"
+#include "runtime/expert_offload/expert_residency.h"
 #include "runtime/expert_offload/memory_plan.h"
 #include "models/qwen4_exp/program/fast_paths.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "runtime/expert_offload/route_trace.h"
 #include "runtime/expert_offload/vram_monitor.h"
 #include "models/registry.h"
+#include "runtime/engine/engine_plan.h"
 #include "runtime/engine/expert_memory.h"
 #include "runtime/engine/model_instance.h"
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 
 namespace infernix::runtime {
 namespace {
@@ -50,6 +60,91 @@ void report(const EngineOptions& options, DiagnosticLevel level, const std::stri
     report_engine(options, level, text);
 }
 
+// The fast paths and --a8-activations' routes are chosen from the stored formats the load plan records
+// (TextConfig::dense_format, expert_format, ggml_projections) before any weight is read; the bound
+// Parameters must agree, or a route chosen for one format would run on another.
+void check_selection_formats(const models::qwen4_exp::execution::Parameters& parameters,
+                             const models::qwen4_exp::Config& config) {
+    std::optional<QType> dense;
+    std::uint32_t ggml = 0;
+    for (const auto& block : parameters.layers) {
+        if (const auto* gdn = std::get_if<models::qwen4_exp::execution::GdnParameters>(&block.mixer)) {
+            if (!dense) { dense = gdn->projection.weight.qtype; }
+            ggml += std::uint32_t{gdn->projection.is_ggml()} + gdn->output.is_ggml();
+        } else {
+            const auto& attention = std::get<models::qwen4_exp::execution::AttentionParameters>(block.mixer);
+            ggml += std::uint32_t{attention.projection.is_ggml()} + attention.output.is_ggml();
+        }
+        ggml += std::uint32_t{block.moe.shared_gate_up.is_ggml()} + block.moe.shared_down.is_ggml();
+    }
+    const bool same = (!dense || models::qwen4_exp::dense_kernels(*dense) ==
+                                     models::qwen4_exp::dense_kernels(config.text.dense_format)) &&
+                      ggml == config.text.ggml_projections &&
+                      (parameters.layers.empty() || parameters.layers.front().moe.bank == nullptr ||
+                       parameters.layers.front().moe.bank->planes.gate_up_format == config.text.expert_format);
+    if (!same) {
+        throw std::logic_error("Qwen4Exp: the stored formats the fast paths were chosen from differ from the bound "
+                               "parameters'");
+    }
+}
+
+// The frontend a start makes (Qwen4ExpInstance), whose chat template Engine::plan compiles too.
+models::qwen3_5::FrontendOptions frontend_options(const EngineOptions& options) {
+    return {.chat_template_path       = options.chat_template_path,
+            .architecture             = models::Architecture::Qwen4Exp,
+            .vision_enabled           = options.enable_vision,
+            .max_context              = options.max_context,
+            .media_cache_bytes        = options.media_cache_bytes,
+            .media_live_bytes         = options.media_live_bytes,
+            .media_preprocess_threads = options.media_preprocess_threads,
+            .vision_max_merged_tokens = options.vision_max_merged_tokens,
+            .thinking_budget_message  = options.thinking_budget_message};
+}
+
+// Engine::plan: the device plan and the VRAM check a start makes before it reads the weights
+// (check_expert_vram), into plan.vram, with the frames the Program sizes from that check less its
+// pools' chunk slack, and the largest --max-context whose device plan still leaves the expert cache
+// room (the check passes) with the other options as given. An explicit KV capacity equal to
+// --max-context (infernix-serve's default without the prefix cache) follows the context.
+void plan_device_memory(EnginePlan& plan, const EngineOptions& options,
+                        const models::qwen4_exp::ProgramOptions& program_options, const models::qwen4_exp::Config& config,
+                        std::uint32_t public_tokens, std::uint64_t dense, const VramSnapshot& before) {
+    const auto device_plan = models::qwen4_exp::Program::plan_device(program_options, config, public_tokens);
+    const ExpertVramCheck check =
+        size_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + device_plan.fixed_bytes(), device_plan.graph_bound,
+                         device_plan.expert_frame_bytes, device_plan.max_frames, device_contributors(dense, device_plan));
+    const std::uint32_t slack = expert_offload::pool_slack_frames(
+        config.text.expert_frame_pools, expert_offload::ExpertResidency::kChunkBytes, device_plan.expert_frame_bytes);
+    EnginePlanVram& vram           = plan.vram;
+    vram.weights_bytes             = dense;
+    // The KV at --max-context (an elastic pool starts at device_plan.kv and grows from the expert cache).
+    vram.kv_bytes                  = std::max(device_plan.kv, device_plan.kv_max);
+    vram.kv_tokens                 = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        static_cast<std::uint64_t>(device_plan.kv_pages) * kPagedKVPageSize, std::numeric_limits<std::uint32_t>::max()));
+    vram.minimum_reservation_bytes = device_plan.fixed_bytes();
+    vram.workspace_bytes           = device_plan.workspace;
+    vram.graph_allowance_bytes     = check.sizing.reserve; // the reserve for graph executables
+    vram.headroom_bytes            = check.sizing.headroom;
+    vram.expert_frames             = check.sizing.frames > slack ? check.sizing.frames - slack : 0U;
+    vram.expert_cache_bytes        = static_cast<std::uint64_t>(*vram.expert_frames) * device_plan.expert_frame_bytes;
+    vram.planned_bytes             = dense + device_plan.fixed_bytes() + *vram.expert_cache_bytes;
+    const std::uint64_t used       = vram.planned_bytes + check.sizing.headroom + check.sizing.reserve;
+    vram.left_bytes                = before.device_free > used ? before.device_free - used : 0;
+    if (!check.refusal.empty()) { plan_refuse(plan, check.refusal); }
+    const bool kv_follows = program_options.kv_capacity_tokens != 0 &&
+                            program_options.kv_capacity_tokens == program_options.max_context;
+    plan.max_context = largest_fitting_context(config.text.context_ceiling(), program_options.max_context,
+                                               [&](std::uint32_t context) {
+        models::qwen4_exp::ProgramOptions trial = program_options;
+        trial.max_context                       = context;
+        if (kv_follows) { trial.kv_capacity_tokens = context; }
+        const auto trial_plan = models::qwen4_exp::Program::plan_device(trial, config, public_tokens);
+        return size_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + trial_plan.fixed_bytes(),
+                                trial_plan.graph_bound, trial_plan.expert_frame_bytes, trial_plan.max_frames, {})
+            .refusal.empty();
+    });
+}
+
 void validate(const EngineOptions& options) {
     if (options.purpose != EnginePurpose::Generation && options.purpose != EnginePurpose::CausalScoring) {
         throw std::invalid_argument("Qwen3.8-Flash-Next serves generation and causal scoring");
@@ -74,7 +169,7 @@ void validate(const EngineOptions& options) {
     // generation runs text through bf16 KV (V stored as BF16) without speculation.
     if (options.lossless) {
         if (options.fast_paths || !options.fast_path_candidates.empty() ||
-            (options.expert_a4_activations && !options.reference)) {
+            (options.expert_a4_activations && !options.reference) || options.a8_activations) {
             throw std::invalid_argument("the lossless route runs no fast path: disable fast paths");
         }
         if (options.purpose == EnginePurpose::CausalScoring && options.prefill_chunk < options.max_context) {
@@ -105,23 +200,43 @@ void validate(const EngineOptions& options) {
 
 bool artifact_is_qwen4_exp(const artifact::Reader& reader) { return models::qwen4_exp::is_qwen4_exp(reader); }
 
+std::vector<std::filesystem::path> dflash2_companions_beside(const std::filesystem::path& artifact_path,
+                                                             const artifact::Directory& target) {
+    std::vector<std::filesystem::path> out;
+    const std::filesystem::path folder =
+        artifact_path.has_parent_path() ? artifact_path.parent_path() : std::filesystem::path(".");
+    std::error_code error;
+    for (std::filesystem::directory_iterator it(folder, error), end; !error && it != end; it.increment(error)) {
+        const std::filesystem::path& path = it->path();
+        std::string extension             = path.extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::error_code ignored;
+        if ((extension != ".infernix" && extension != ".ninfer") || !it->is_regular_file(ignored) ||
+            std::filesystem::equivalent(path, artifact_path, ignored)) {
+            continue;
+        }
+        try {
+            const artifact::Reader reader(path); // a continuation part or an unreadable file throws
+            if (models::qwen4_exp::dflash2_companion_fits(reader.directory(), target)) { out.push_back(path); }
+        } catch (const std::exception&) {}
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> source, const EngineOptions& options)
-    : model(std::move(source)), parameters(*model),
-      frontend(models::qwen3_5::make_frontend(model->resources(),
-                                              {.chat_template_path      = options.chat_template_path,
-                                               .architecture            = models::Architecture::Qwen4Exp,
-                                               .vision_enabled          = options.enable_vision,
-                                               .max_context             = options.max_context,
-                                               .media_cache_bytes       = options.media_cache_bytes,
-                                               .media_live_bytes        = options.media_live_bytes,
-                                               .media_preprocess_threads = options.media_preprocess_threads,
-                                               .vision_max_merged_tokens = options.vision_max_merged_tokens,
-                                               .thinking_budget_message = options.thinking_budget_message})),
+    // --a8-activations: a GGUF import's hyper-connection matrices repacked to Q8 at load (execution::Parameters'
+    // hc_q8; the loader left them unpacked for it).
+    : model(std::move(source)),
+      parameters(*model, models::load_options(options, models::Architecture::Qwen4Exp).hc_q8_repack),
+      frontend(models::qwen3_5::make_frontend(model->resources(), frontend_options(options))),
       capacity(options.max_context) {}
 
 Qwen4ExpInstance::~Qwen4ExpInstance() = default;
 
-ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device) {
+ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device, EnginePlan* planned) {
+    const bool plan_only = planned != nullptr;
     validate(options);
     const auto start = std::chrono::steady_clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
@@ -133,15 +248,45 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const auto qwen4_load = [&](bool stream_experts) {
         auto load           = models::load_options(options, models::Architecture::Qwen4Exp);
         load.stream_experts = stream_experts;
+        // The LM head's screen is bound only with a KV format where screened-lm-head can be selected: a bound screen
+        // keeps the head from being packed (its exact rescore reads BF16 rows), so at BF16 KV, where the path is never
+        // selected, FP4-Local's head packs instead (candidates IP-01).
+        load.lm_head_screen = load.lm_head_screen && models::qwen4_exp::screened_lm_head_qualified_with(options.kv_cache);
         return load;
     };
     auto plan = models::qwen4_exp::plan_load(reader, qwen4_load(false));
+    // The fast paths qualified for this configuration (docs/maintainer/model-quality.md section 6.7) and
+    // --a8-activations' routes (LOSSY, opt-in; design §19.3.31; models::qwen4_exp::A8Routes), from the stored
+    // formats: a --fast-path candidate or an --a8-activations that does not apply is refused before any weight
+    // is read, by a start and by Engine::plan alike.
+    const models::qwen4_exp::FastPathSelection fast =
+        models::qwen4_exp::select_fast_paths(plan.config(), plan.has_output_head_screen(), options);
+    const models::qwen4_exp::A8Routes a8 = options.a8_activations
+                                               ? models::qwen4_exp::a8_activation_routes(plan.config(), fast)
+                                               : models::qwen4_exp::A8Routes{};
+    if (options.a8_activations && !a8.any()) {
+        throw std::invalid_argument(
+            "--a8-activations: no 8-bit activation route applies to this artifact (it covers a GGUF import's dense "
+            "projections and GGUF or NVFP4 W4A16 experts in decode and prefill, and MXFP8 dense projections in "
+            "prefill)");
+    }
     // The RAM ledger (design §19.3.7): the experts take what the reserve and every other planned
-    // allocation leave, before anything is pinned or read.
-    auto vram   = open_vram_budget_source(device.device, options.vram_past_budget);
+    // allocation leave, before anything is pinned or read. It is planned below with the Program's options.
+    auto vram = open_vram_budget_source(device.device, options.vram_past_budget);
+    // Engine::plan: the readings a start plans against, before anything is planned, and the dense weights
+    // (which a refusal below still reports).
+    if (plan_only) {
+        planned->architecture = models::architecture_name(models::Architecture::Qwen4Exp);
+        plan_readings(*planned, device.props.name, vram->query(), host_memory_snapshot(), options);
+        planned->vram.weights_bytes = plan.device_bytes();
+        planned->vram.planned_bytes = planned->vram.weights_bytes;
+    }
+    // --host-context-mib auto: the prefix cache's Host tier is sized after the experts and the n-gram table.
+    const bool prefix_auto     = options.context_cache.enabled && options.context_cache.host_capacity_auto;
+    std::uint64_t prefix_bytes = options.context_cache.enabled && !prefix_auto ? options.context_cache.host_capacity_bytes.value() : 0;
     auto demand = expert_ram_demand(
-        options, {.expert_banks = plan.pinned_expert_bytes(), .other_pinned = plan.pinned_other_bytes()},
-        options.context_cache.enabled ? options.context_cache.host_capacity_bytes.value() : 0, vram->query());
+        options, {.expert_banks = plan.pinned_expert_bytes(), .other_pinned = plan.pinned_other_bytes()}, prefix_bytes,
+        vram->query());
     // The n-gram table its volume holds: the artifact's, or another volume's (any format) in its place.
     const std::filesystem::path volume = options.ngram_volume_path.empty()
                                              ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
@@ -162,34 +307,6 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                    name(own.format) + " table");
     }
     demand.pageable = models::qwen4_exp::NgramVolume::cache_bytes(table);
-    // The n-gram table in RAM (design §12.5): pinned at Program start, so it is a later pin. Auto keeps it
-    // only while every expert stays pinned in RAM with it; Ram keeps it whatever the experts' placement.
-    const auto snapshot = host_memory_snapshot();
-    bool ngram_in_ram   = false;
-    if (options.ngram_residency != NgramResidency::Volume) {
-        auto with_table         = demand;
-        with_table.later_pinned += models::qwen4_exp::NgramVolume::resident_bytes(table);
-        with_table.pageable     = 0;
-        const auto trial        = runtime::expert_offload::plan_host_memory(snapshot, with_table);
-        if (options.ngram_residency == NgramResidency::Ram ||
-            (trial.placement == runtime::expert_offload::ExpertPlacement::Full && !trial.cap_too_large)) {
-            demand       = with_table;
-            ngram_in_ram = true;
-        }
-    }
-    report(options, DiagnosticLevel::Info,
-           std::string("n-gram table: ") +
-               (ngram_in_ram ? "in RAM (" + std::to_string(models::qwen4_exp::NgramVolume::resident_bytes(table) >> 20) +
-                                   " MiB pinned)"
-                             : options.ngram_residency == NgramResidency::Volume
-                                   ? "read from its volume"
-                                   : "read from its volume (the RAM ledger keeps the experts resident first)"));
-    // The SSD tier (design §19.3.7): the banks stay in the artifact; the Program pins RAM slots for
-    // the experts the ledger leaves room for (less their lock overhead) and reads the rest on use.
-    const ExpertRamPlan ram = plan_expert_ram(options, demand, snapshot);
-    const bool tier         = ram.tier;
-    if (tier) { plan = models::qwen4_exp::plan_load(reader, qwen4_load(true)); }
-    plan.set_host_reserve(options.ram_headroom_bytes, demand.later_pinned);
 
     models::qwen4_exp::ProgramOptions program_options;
     program_options.max_context     = options.max_context;
@@ -216,9 +333,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                                : 0U;
     // A fixed draft length verifies every draft unless --spec-min-p asks for the cut.
     program_options.auto_draft_length = options.speculative.draft_tokens_auto;
-    // MTP's automatic length cuts at 0.5 by default; DFlash2's calibrated length needs no cut.
-    program_options.draft_min_p = options.speculative.draft_min_p.value_or(
-        options.speculative.draft_tokens_auto && options.speculative.backend == SpeculativeBackend::Mtp ? 0.5F : 0.0F);
+    // MTP's automatic length cuts by its drafts' cumulative acceptance (MtpCumulative) and DFlash2's
+    // calibrated length needs no cut.
+    program_options.draft_min_p = options.speculative.draft_min_p.value_or(0.0F);
     if (!options.expert_state_path.empty()) {
         // The state belongs to the artifact: its experts and their records, not the build or KV format.
         std::error_code error;
@@ -229,25 +346,17 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                                 ";size=" + std::to_string(error ? 0U : size) +
                                                 ";mtime=" + std::to_string(error ? 0 : time.time_since_epoch().count());
     }
+    program_options.expert_seed = !options.expert_state_off;
     program_options.ngram_volume = volume;
     program_options.ngram_table  = table;
-    program_options.ngram_in_ram = ngram_in_ram;
-    if (!options.expert_stripe_path.empty()) {
-        if (tier) {
-            program_options.expert_stripe = options.expert_stripe_path;
-        } else {
-            report(options, DiagnosticLevel::Info,
-                   "--expert-stripe is not used: every expert fits in RAM, so none is read from disk");
-        }
-    }
     // The hybrid prefix cache (design §19.3.1). Host-born snapshots live in the pinned slab pool;
     // the cost model ranks resume sources by the measured prefill coefficients.
     const ContextCacheOptions& cache = options.context_cache;
     if (cache.enabled) {
         const std::uint32_t chunk         = options.prefill_chunk;
         program_options.prefix_cache      = true;
-        // normalize_engine_options resolved every value for this architecture.
-        program_options.prefix_host_bytes          = cache.host_capacity_bytes.value();
+        // normalize_engine_options resolved every value for this architecture but an automatic Host tier's size,
+        // which the RAM plan below sets (prefix_host_bytes).
         program_options.prefix_taps.max_new_taps   = cache.hybrid.max_new_taps.value();
         program_options.prefix_taps.ladder_tokens  = cache.hybrid.tap_ladder_tokens.value();
         program_options.prefix_taps.min_gap_tokens = cache.hybrid.tap_min_gap_tokens.value();
@@ -275,6 +384,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.vram_headroom = options.vram_headroom_bytes;
     program_options.vram_past_budget = options.vram_past_budget;
     program_options.expert_tail_skip = options.expert_tail_skip;
+
     if (options.expert_tail_skip != 0) {
         report(options, DiagnosticLevel::Warning,
                "--expert-tail-skip " + std::to_string(options.expert_tail_skip) +
@@ -282,33 +392,221 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                    "routes at top-10 rank " + std::to_string(options.expert_tail_skip) +
                    " or lower; output changes (lower quality) for faster decode");
     }
+
+    // The VRAM check (design §19.3.7), before the weights are read: the dense weights, the
+    // Program's fixed allocations, the reserve for graph executables and the display headroom
+    // must leave room for the expert cache. The check counts sampled-mtp-drafts' draft graphs whenever
+    // it could be selected; the Program plans with the selection (`fast`).
+    const auto listed = [](const std::vector<FastPath>& paths, FastPath path) {
+        return std::find(paths.begin(), paths.end(), path) != paths.end();
+    };
+    program_options.sampled_mtp_drafts =
+        options.speculative.backend == SpeculativeBackend::Mtp &&
+        ((options.fast_paths && !listed(options.fast_path_exclusions, FastPath::SampledMtpDrafts)) ||
+         listed(options.fast_path_candidates, FastPath::SampledMtpDrafts));
+    // screened-lm-head's graphs likewise: asked for as a candidate, or with fast paths where the loader bound the
+    // LM head's screen (the path is qualified per configuration) and --no-fast-path leaves it in.
+    program_options.screened_lm_head =
+        listed(options.fast_path_candidates, FastPath::ScreenedLmHead) ||
+        (options.fast_paths && plan.has_output_head_screen() &&
+         !listed(options.fast_path_exclusions, FastPath::ScreenedLmHead));
+    // fp16-gdn-state's smaller pool likewise (it is qualified nowhere, so only a candidate selects it).
+    program_options.fp16_gdn_state = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
+                                               FastPath::Fp16GdnState) != options.fast_path_candidates.end();
+
+    // ---- The RAM plan: the experts, then the n-gram table, then the prefix cache's Host tier ----
+    // --expert-ram-layout full: every expert keeps a RAM copy (full mode) whenever the ledger allows; an explicit
+    // --expert-ram-mib caps it. exclusive (design §19.3.7): RAM holds the experts VRAM does not plus shadows for what
+    // VRAM gives back without a promotion: a prefill's loan (its wide arena and ring, measured at a quarter of the
+    // frames: 2,901-3,098 of 12,576 on IQ3_S at 8K) and the KV growth that takes frames. The warm start then seeds the
+    // rest of the frames, and the fill phase's landings keep their RAM copies as those shadows; the loan and the
+    // shrink evict shadowed experts first (ExpertResidency::lend), so nothing leaves both tiers. What it frees stays
+    // for the n-gram table (its auto rule) and the Host tier.
+    const auto snapshot = host_memory_snapshot();
+    bool exclusive      = false;
+    if (options.expert_ram_layout.value_or(ExpertRamLayout::Exclusive) == ExpertRamLayout::Exclusive &&
+        !options.expert_ram_bytes) {
+        const auto estimate = models::qwen4_exp::Program::plan_device(program_options, plan.config(), plan.public_token_count());
+        expert_offload::VramDemand frames_demand;
+        frames_demand.headroom    = options.vram_headroom_bytes;
+        frames_demand.elastic     = true;
+        frames_demand.graphs      = estimate.graph_bound;
+        frames_demand.fixed       = plan.device_bytes() + estimate.fixed_bytes();
+        frames_demand.frame_bytes = estimate.expert_frame_bytes;
+        frames_demand.max_frames  = estimate.max_frames;
+        const auto sizing           = expert_offload::size_expert_frames(vram->query(), frames_demand);
+        const std::uint64_t frames  = sizing.frames;
+        const std::uint64_t keys    = static_cast<std::uint64_t>(plan.config().text.num_hidden_layers) * plan.config().text.moe.experts;
+        // A quarter of the frames is the loan; the shadows also cover the copies decode's swaps hold at that moment
+        // (a quarter alone left IQ3_S ~570 loan victims a request without a copy: 2026-10-27, x2_iq3_dec8k), so 5/16.
+        const std::uint64_t kv_frames =
+            estimate.kv_max > estimate.kv && estimate.expert_frame_bytes != 0
+                ? (estimate.kv_max - estimate.kv + estimate.expert_frame_bytes - 1) / estimate.expert_frame_bytes
+                : 0;
+        const std::uint64_t reserve = frames * 5 / 16 + kv_frames;
+        // The tier pools its slots by record size, each layer the same share (HostExpertTier), so the experts' slots
+        // cost the layers' mean record (the average frame) and only the lists (ring, prefetch, demotion), which hold
+        // no expert, cost the largest record each. A layer walk's span lends the prefill stream its slots (free ones
+        // first): without room for them a span evicted that many RAM-only experts, which came back from the SSD
+        // (2026-10-28, IQ3_S at 16K: 2,563 stream reads and 833 decode reads a request; 0.89x of the full layout).
+        // The reserve is counted twice: until decode fills the frames the warm start left unseeded, their experts take
+        // RAM slots as RAM-only residents, while the shadows a prefill's loan needs take the reserve again. With it
+        // once, a cold 16K request lost ~1,000 experts to the SSD and decoded 237 tok/s; twice, 0 and 247 (0.5x: 4 and
+        // 246; the full layout 254; 2026-10-28, IQ3_S).
+        const std::uint64_t experts_slots =
+            (keys > frames - std::min(frames, reserve) ? keys - (frames - std::min(frames, reserve)) : 0) + reserve +
+            estimate.expert_tier_stream_slots;
+        const std::uint64_t bytes = experts_slots * estimate.expert_frame_bytes +
+                                    estimate.expert_tier_list_slots * estimate.expert_record_stride;
+        // Plus 2 % for the lock overhead the tier takes off its pinned bytes (IQ3_S: 15,255 of 15,468 planned slots
+        // pinned, leaving 217 experts SSD-only at the warm start).
+        const std::uint64_t cap = bytes + bytes / 50;
+        if (frames > reserve && cap + expert_offload::kLedgerGiB < demand.expert_banks) {
+            demand.expert_cap = cap;
+            exclusive         = !expert_offload::plan_host_memory(snapshot, demand).cap_too_large;
+            if (exclusive) {
+                // The warm start seeds the full layout's share of the frames (never the loan reserve): the free
+                // frames take the fill phase's landings. Seeding every frame measured slower (IQ3_S 16K decode 223
+                // against 235 tok/s); seeding all but the reserve (68 % of the frames) left fewer landings (2,878
+                // against 4,281 a 16K request) and more CPU-served misses: 16K decode 258.2 / 258.8 against
+                // 264.2 / 264.6 tok/s at half (full layout 266.5 / 266.4), struct 455.0 / 455.5 against 457.7 /
+                // 457.4 (full 463.1 / 462.9), the same 47.4 GiB resident (2026-10-29).
+                const double reserve_share          = static_cast<double>(reserve) / static_cast<double>(frames);
+                program_options.expert_seed_share   = std::min(program_options.expert_seed_share, 1.0 - reserve_share);
+                program_options.expert_shadow_share = reserve_share;
+                program_options.expert_ram_exclusive = true;
+            } else {
+                demand.expert_cap.reset(); // a machine too small for it: the ledger's own share (the SSD tier)
+            }
+        }
+    }
+    // The n-gram table in RAM (design §12.5): read at Program start into memory locked in the working set for the
+    // CPU, which alone reads it, so it takes physical RAM but no share of the page-locking limit (pin room) the
+    // experts need. Auto takes it only while the experts keep their planned RAM beside it (every expert in full mode)
+    // and --ram-free-mib stays free beyond the Host tier's floor; Ram takes it whatever the experts' placement.
+    bool ngram_in_ram = false;
+    if (options.ngram_residency != NgramResidency::Volume) {
+        auto with_table           = demand;
+        with_table.pageable       = models::qwen4_exp::NgramVolume::resident_bytes(table); // in place of the row cache
+        const auto without        = expert_offload::plan_host_memory(snapshot, demand);
+        const auto trial          = expert_offload::plan_host_memory(snapshot, with_table);
+        const bool experts_kept   = demand.expert_cap ? trial.expert_ram >= without.expert_ram
+                                                      : trial.placement == expert_offload::ExpertPlacement::Full;
+        const std::uint64_t tier_floor = prefix_auto ? kMinAutoHostContextBytes : 0;
+        if (options.ngram_residency == NgramResidency::Ram ||
+            (experts_kept && !trial.cap_too_large && ledger_left_bytes(trial) >= tier_floor)) {
+            demand       = with_table;
+            ngram_in_ram = true;
+        }
+    }
+    report(options, DiagnosticLevel::Debug,
+           std::string("n-gram table: ") +
+               (ngram_in_ram ? "in RAM (" + std::to_string(models::qwen4_exp::NgramVolume::resident_bytes(table) >> 20) +
+                                   " MiB, locked for the CPU)"
+                             : options.ngram_residency == NgramResidency::Volume
+                                   ? "read from its volume"
+                                   : "read from its volume (the RAM ledger keeps the experts resident first)"));
+    // --host-context-mib auto: the Host tier from what the experts and the table leave beyond --ram-free-mib.
+    if (prefix_auto) {
+        prefix_bytes        = auto_host_context_bytes(ledger_left_bytes(expert_offload::plan_host_memory(snapshot, demand)));
+        demand.prefix_cache = prefix_bytes;
+    }
+    if (cache.enabled) { program_options.prefix_host_bytes = prefix_bytes; }
+    // The SSD tier (design §19.3.7): the banks stay in the artifact; the Program pins RAM slots for
+    // the experts the ledger leaves room for (less their lock overhead) and reads the rest on use.
+    if (plan_only) {
+        // A start refuses an --expert-ram-mib the ledger cannot give (plan_expert_ram).
+        const auto ledger = expert_offload::plan_host_memory(snapshot, demand);
+        if (std::string refusal = expert_ram_refusal(options, ledger); !refusal.empty()) {
+            plan_refuse(*planned, std::move(refusal));
+            planned->ram.experts_bytes = ledger.expert_ram;
+            plan_ram_totals(*planned, ledger.planned + ledger.expert_ram);
+            return {};
+        }
+    }
+    const ExpertRamPlan ram = plan_expert_ram(options, demand, snapshot);
+    if (!plan_only) { reserve_expert_working_set(options, ram.demand); }
+    const bool tier         = ram.tier;
+    if (tier) { plan = models::qwen4_exp::plan_load(reader, qwen4_load(true)); }
+    plan.set_host_reserve(options.ram_free_bytes, demand.later_pinned);
+    program_options.ngram_in_ram = ngram_in_ram;
+    if (!options.expert_stripe_path.empty()) {
+        if (tier) {
+            program_options.expert_stripe = options.expert_stripe_path;
+        } else {
+            report(options, DiagnosticLevel::Info,
+                   "--expert-stripe is not used: every expert fits in RAM, so none is read from disk");
+        }
+    }
     if (tier) {
         program_options.expert_ram_bytes      = ram.expert_ram_bytes;
         program_options.expert_unpinned_bytes = ram.expert_unpinned_bytes;
         program_options.later_pinned_bytes    = ram.later_pinned_bytes;
     }
+    {
+        // The plan in one line, and with each choice's reason at Debug (candidates §22: compare with
+        // Basalt's and Strata's totals).
+        constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+        const double other_gib =
+            static_cast<double>(ram.ledger.planned - demand.pageable * (ngram_in_ram ? 1 : 0) - demand.prefix_cache) / kGiB;
+        const double free_gib = static_cast<double>(ledger_left_bytes(ram.ledger) + demand.reserve) / kGiB;
+        char table_text[64] = "read from its volume";
+        if (ngram_in_ram) {
+            std::snprintf(table_text, sizeof(table_text), "%.1f GiB",
+                          static_cast<double>(models::qwen4_exp::NgramVolume::resident_bytes(table)) / kGiB);
+        }
+        char prefix_text[64] = "off";
+        if (cache.enabled) {
+            std::snprintf(prefix_text, sizeof(prefix_text), "%.1f GiB", static_cast<double>(prefix_bytes) / kGiB);
+        }
+        char line[512];
+        std::snprintf(line, sizeof(line),
+                      "RAM plan: experts %.1f GiB, n-gram table %s, prefix cache %s, other %.1f GiB; %.1f GiB left free "
+                      "for other programs",
+                      static_cast<double>(ram.ledger.expert_ram) / kGiB, table_text, prefix_text, other_gib, free_gib);
+        report(options, DiagnosticLevel::Info, line);
+        std::snprintf(line, sizeof(line),
+                      "RAM plan: experts %.1f GiB (%s), n-gram table %.1f GiB (%s), prefix cache %.1f GiB (%s), other %.1f "
+                      "GiB; %.1f GiB left free for other programs (--ram-free-mib %.1f)",
+                      static_cast<double>(ram.ledger.expert_ram) / kGiB,
+                      !tier ? "every expert" : exclusive ? "those not in VRAM, and shadows for a prefill's loan" : "the SSD tier",
+                      ngram_in_ram ? static_cast<double>(models::qwen4_exp::NgramVolume::resident_bytes(table)) / kGiB : 0.0,
+                      ngram_in_ram ? "RAM" : "volume", static_cast<double>(prefix_bytes) / kGiB,
+                      !cache.enabled ? "off" : prefix_auto ? "auto" : "set", other_gib, free_gib,
+                      static_cast<double>(demand.reserve) / kGiB);
+        report(options, DiagnosticLevel::Debug, line);
+    }
 
-    // The VRAM check (design §19.3.7), before the weights are read: the dense weights, the
-    // Program's fixed allocations, the reserve for graph executables and the display headroom
-    // must leave room for the expert cache. Fast paths are selected once the weights are bound, so
-    // the check counts sampled-mtp-drafts' draft graphs whenever it could be selected.
-    program_options.sampled_mtp_drafts =
-        options.speculative.backend == SpeculativeBackend::Mtp &&
-        (options.fast_paths || std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
-                                         FastPath::SampledMtpDrafts) != options.fast_path_candidates.end());
-    // screened-lm-head's graphs likewise: asked for as a candidate, or with fast paths where the loader bound the
-    // LM head's screen (the path is qualified per configuration).
-    program_options.screened_lm_head =
-        std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
-                  FastPath::ScreenedLmHead) != options.fast_path_candidates.end() ||
-        (options.fast_paths && plan.has_output_head_screen());
-    // fp16-gdn-state's smaller pool likewise (it is qualified nowhere, so only a candidate selects it).
-    program_options.fp16_gdn_state = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
-                                               FastPath::Fp16GdnState) != options.fast_path_candidates.end();
     const auto device_plan =
         models::qwen4_exp::Program::plan_device(program_options, plan.config(), plan.public_token_count());
     const std::uint64_t dense = plan.device_bytes();
     const VramSnapshot before = vram->query();
+    if (plan_only) {
+        EnginePlanRam& planned_ram = planned->ram;
+        planned_ram.experts_bytes  = ram.ledger.expert_ram;
+        planned_ram.tier = ram.ledger.placement == expert_offload::ExpertPlacement::Full || program_options.expert_ram_exclusive
+                               ? EnginePlanExpertTier::Full
+                               : EnginePlanExpertTier::Ssd;
+        planned_ram.expert_ram_layout = exclusive ? ExpertRamLayout::Exclusive : ExpertRamLayout::Full;
+        if (const std::uint64_t pinned = plan.materialization().pinned_capacity_bytes; pinned != 0) {
+            planned_ram.pinned_bytes = pinned;
+        }
+        if (cache.enabled) { planned_ram.host_context_bytes = prefix_bytes; }
+        planned_ram.ngram_bytes     = ngram_in_ram ? models::qwen4_exp::NgramVolume::resident_bytes(table)
+                                                   : models::qwen4_exp::NgramVolume::cache_bytes(table);
+        planned_ram.ngram_residency = ngram_in_ram ? NgramResidency::Ram : NgramResidency::Volume;
+        plan_ram_totals(*planned, ram.ledger.planned + ram.ledger.expert_ram);
+        plan_device_memory(*planned, options, program_options, plan.config(), plan.public_token_count(), dense,
+                           before);
+        // A start meets the pinned block's check in the load, after the VRAM check.
+        if (std::string shortfall = artifact::pinned_shortfall(plan.materialization(), available_host_memory_bytes());
+            !shortfall.empty()) {
+            plan_refuse(*planned, std::move(shortfall));
+        }
+        // Then its frontend compiles the chat template (Qwen4ExpInstance), which may refuse --chat-template.
+        (void)models::qwen3_5::make_frontend(plan.resources(), frontend_options(options));
+        return {};
+    }
     (void)check_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + device_plan.fixed_bytes(),
                             device_plan.graph_bound, device_plan.expert_frame_bytes, device_plan.max_frames,
                             device_contributors(dense, device_plan));
@@ -318,19 +616,34 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     guard.begin();
     auto model = models::qwen4_exp::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
-    if (const std::uint64_t spilled = guard.end(dense); spilled != 0) {
+    // What the weights hold once loaded: packed projections replace the estimate with their size.
+    const std::uint64_t loaded = model->device_weight_bytes();
+    if (const std::uint64_t spilled = guard.end(loaded); spilled != 0) {
         throw std::runtime_error(std::to_string(mib(spilled)) +
                                  " MiB of the dense weights were placed in shared system memory by the driver's "
-                                 "sysmem fallback: free VRAM and start again");
+                                 "sysmem fallback: free VRAM and start again (" + guard.readings(loaded) + ")");
+    }
+    if (const auto& packed = model->packed(); packed.source_bytes != 0) {
+        char line[384];
+        std::snprintf(line, sizeof(line),
+                      "packed BF16 weights: %llu MiB -> %llu MiB device + %llu MiB pinned host (bf16_p12, %llu escapes) "
+                      "in %.0f ms (counts %.0f, allocation %.0f, packing %.0f, freeing the BF16 copies %.0f); %llu MiB "
+                      "freed",
+                      mib(packed.source_bytes), mib(packed.storage.bytes), mib(packed.host_bytes),
+                      static_cast<unsigned long long>(packed.escapes), packed.seconds * 1000.0,
+                      packed.phase_seconds[0] * 1000.0, packed.phase_seconds[1] * 1000.0,
+                      packed.phase_seconds[2] * 1000.0, packed.phase_seconds[3] * 1000.0,
+                      mib(packed.source_bytes - packed.storage.bytes - packed.host_bytes));
+        report(options, DiagnosticLevel::Debug, line);
     }
     const std::uint64_t after_weights = vram->query().device_free;
 
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<Qwen4ExpInstance>(std::move(model), options);
     frontend.complete();
+    check_selection_formats(instance->parameters, instance->model->config());
 
-    // The fast paths qualified for this configuration (docs/maintainer/model-quality.md section 6.7).
-    const models::qwen4_exp::FastPathSelection fast = models::qwen4_exp::select_fast_paths(instance->parameters, options);
+    // The fast paths selected before the load.
     program_options.fast_paths        = fast.forward();
     // Two-row speculative rounds: MTP's (adaptive-speculation) or DFlash2's (dflash2-pairs); each
     // applies only to its drafter.
@@ -343,11 +656,67 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.fp16_gdn_state     = fast.selected(FastPath::Fp16GdnState);
     program_options.block_verification = fast.selected(FastPath::BlockVerification);
     program_options.gumbel_sampling    = !options.fast_paths;
+    program_options.reproducible       = !options.fast_paths;
+    program_options.vram_in_use_before_load = before.device_total - std::min(before.device_total, before.device_free);
     program_options.bf16_logits        = options.logits_dtype == LogitsDtype::BF16;
+    // Routed experts that are W4A4 by their checkpoint, run here with 16-bit activations (--a16-activations) or on
+    // the 8-bit route (--a8-activations): the default follows NVIDIA's specification, so the launch says so.
+    if (const auto& moe = instance->model->config().text.moe; moe.a4_native && moe.a16_experts) {
+        report(options, DiagnosticLevel::Warning,
+               std::string(options.a8_activations ? "--a8-activations" : "--a16-activations") +
+                   ": this artifact's routed experts are NVIDIA's W4A4 NVFP4, which the checkpoint specifies with "
+                   "4-bit activations at NVIDIA's calibrated scales; they now run with " +
+                   (options.a8_activations ? "8-bit" : "16-bit") +
+                   " activations instead, which changes the output and reads long prompts more slowly. The default "
+                   "4-bit route follows NVIDIA's specification, is faster on prompts and is the recommended "
+                   "configuration");
+    }
+    // --a8-activations: the 8-bit activation routes resolved before the load, in decode and verification calls and
+    // in prefill calls. Every other call keeps its route.
+    if (options.a8_activations) {
+        a8.apply(program_options.fast_paths);
+        // The 8-bit route's CPU-served GGUF misses take a larger team: 24 workers against 16 on the i9-13900K
+        // (IQ3_S, DFlash2 auto, the hyper-connection repack on): -3.6 % conv and -3.3 % struct per decode step,
+        // 28 no faster (2026-11-01). default_workers still caps it at the process's logical CPUs less four.
+        if (a8.ggml_experts) { program_options.cpu_ggml_expert_workers = 24; }
+        // Its resident pass is the critical leg of most layers, so the side streams (staging, shared expert, split)
+        // yield to it: their least priority against the default's greatest, -1.2 % conv and -1.9 % struct per decode
+        // step (IQ3_S, DFlash2 auto, 2026-11-01; the default route measured the greatest faster on 2026-10-29), and
+        // the shared expert runs beside the router and the plan, a nearly idle device, rather than beside the
+        // resident pass: a further -0.7 % conv and -0.5 % struct.
+        if (a8.ggml_experts) {
+            program_options.side_streams_least_priority = true;
+            program_options.shared_expert_early         = true;
+        }
+        report(options, DiagnosticLevel::Info,
+               "--a8-activations (approximate): " + a8.describe() +
+                   (instance->parameters.hc_q8_repacked > 0
+                        ? "; the " + std::to_string(instance->parameters.hc_q8_repacked) +
+                              " hyper-connection matrices repacked to 8-bit weights at load"
+                        : std::string()) +
+                   "; every other call keeps its route");
+    }
+    // Every default route forks the shared expert at the layer's input (after the routed experts' early encoding,
+    // where the call has one), and the routes with NVFP4 W4A16 experts (FP4-Local, Huihui, recipe C) also put the side
+    // streams at the least priority. Same bits; BF16 KV, the same rounds and tokens in every arm, every rep or pair
+    // ahead. FP4-Local (candidates IN-06, three rotated reps, 2026-11-04): both, conv 129.04 -> 129.99 tok/s (+0.7 %),
+    // the struct fixture 431.21 -> 437.04 (+1.4 %), after a 16K prompt 227.65 -> 230.18 (+1.1 %); the least priority
+    // alone -0.2 / +0.6 / +0.4 %, the early fork alone +0.8 / +0.6 / +0.4 %. The others (candidates XB-03, 2026-11-05):
+    // recipe C both conv 137.03 -> 138.46 (+1.0 %), struct 420.30 -> 423.37 (+0.7 %), the fork alone +0.4 / -0.1 %;
+    // Dense8 the fork conv 127.40 -> 131.96 (+3.6 %), struct 412.51 -> 416.05 (+0.9 %), the least priority adding
+    // nothing (131.87, 416.33); IQ3_S the fork conv 120.61 -> 121.27, struct 397.85 -> 399.66 (+0.5 % each, four
+    // pairs); recipe A struct 299.62 -> 300.11 (+0.2 %, four pairs); the FP8 import struct 62.76 -> 63.29 (+0.8 %,
+    // four pairs). The greatest priority stays where the least was not measured faster (IQ3_S's default measured the
+    // greatest faster on 2026-10-29).
+    if (const auto& text = instance->model->config().text; options.fast_paths && !options.a8_activations) {
+        program_options.shared_expert_early         = true;
+        program_options.side_streams_least_priority = text.moe.a16_experts && text.expert_format == QType::NVFP4_MUL;
+    }
 
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program =
         std::make_unique<models::qwen4_exp::Program>(instance->parameters, device, std::move(program_options));
+    if (options.ram_resize) { instance->program->start_ram_resize(options.ram_free_bytes); }
     const auto& sizing = instance->program->vram_sizing();
     const std::uint64_t frames_bytes =
         static_cast<std::uint64_t>(sizing.frames) * device_plan.expert_frame_bytes;
@@ -460,8 +829,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
             summary.fast_paths_applicable.emplace_back(fast_path_name(path));
         }
     }
-    // Tail skip makes the output depend on which experts the cache holds.
-    summary.request_invariant = fast.request_invariant() && options.expert_tail_skip == 0;
+    // Tail skip makes the output depend on which experts the cache holds; the 8-bit routes' arithmetic
+    // depends on the call's width.
+    summary.request_invariant =
+        fast.request_invariant() && options.expert_tail_skip == 0 && !options.a8_activations;
 
     ModelMetadata metadata;
     metadata.model_id       = instance->model->info().name;
@@ -472,6 +843,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     metadata.weight_bytes   = stats.device_capacity_bytes + stats.pinned_bytes;
 
     EngineOptions resolved = options;
+    if (prefix_auto) { resolved.context_cache.host_capacity_bytes = prefix_bytes; }
     return {std::move(instance), std::move(summary), std::move(metadata), std::move(resolved)};
 }
 

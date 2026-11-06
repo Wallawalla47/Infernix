@@ -194,7 +194,7 @@ void require_non_empty_tensors(const Tensor& ids, const Tensor& out) {
 
 } // namespace
 
-void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream, DeviceFault fault) {
     if (ids.dtype != DType::I32) { throw std::invalid_argument("embedding: ids must be I32"); }
     if (out.dtype != DType::BF16) { throw std::invalid_argument("embedding: out must be BF16"); }
 
@@ -212,25 +212,38 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
             throw std::invalid_argument("embedding: dense table data must be non-null");
         }
         const Tensor dense = as_dense(table);
-        detail::embed_gather_dense_launch(ids, dense, out, stream);
+        detail::embed_gather_dense_launch(ids, dense, table.shape[0], out, stream, fault);
     } break;
     case QType::Q6_G64_FP16:
         require_q6_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
-        detail::embed_gather_q6_launch(ids, table, out, stream);
+        detail::embed_gather_q6_launch(ids, table, out, stream, fault);
         break;
     case QType::Q8_G32_FP16:
         require_q8_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
-        detail::embed_gather_q8_launch(ids, table, out, stream);
+        detail::embed_gather_q8_launch(ids, table, out, stream, fault);
         break;
     case QType::FP8_E4M3FN_ROW_BF16:
         require_fp8_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
-        detail::embed_gather_fp8_launch(ids, table, out, stream);
+        detail::embed_gather_fp8_launch(ids, table, out, stream, fault);
+        break;
+    case QType::BF16_P12:
+        if (table.layout != QuantLayout::P12Rows) { throw std::invalid_argument("embedding: bf16_p12 table must be P12Rows"); }
+        require_weight_2d(table);
+        if (table.shape[1] != out.ne[0] || table.shape[1] % 8 != 0) {
+            throw std::invalid_argument("embedding: bf16_p12 table d must match out.ne[0] and be a multiple of 8");
+        }
+        if (table.qdata == nullptr || table.qhigh == nullptr || table.scales == nullptr || table.escapes == nullptr) {
+            throw std::invalid_argument("embedding: bf16_p12 planes must be non-null");
+        }
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::embed_gather_p12_launch(ids, table, out, stream, fault);
         break;
     default:
         throw std::invalid_argument("embedding: unsupported table qtype");

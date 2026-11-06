@@ -18,6 +18,11 @@ infernix_add_test(infernix_direct_read_queue_test SOURCES "${CMAKE_CURRENT_LIST_
 infernix_add_test(infernix_read_only_file_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_read_only_file.cpp"
   LIBRARIES infernix_core)
 
+# Pinned host blocks registered whole or in slices at object boundaries (candidates SS-02; a CUDA device).
+infernix_add_test(infernix_host_memory_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_memory.cpp"
+  LIBRARIES infernix_core)
+set_tests_properties(infernix_host_memory_test PROPERTIES SKIP_RETURN_CODE 77)
+
 set_tests_properties(infernix_device_test PROPERTIES
   ENVIRONMENT_MODIFICATION "INFERNIX_CUDA_SYNC=unset:")
 set(sync_modes spin blocking yield auto)
@@ -34,6 +39,12 @@ set_tests_properties(infernix_device_sync_invalid_test PROPERTIES
   ENVIRONMENT "INFERNIX_CUDA_SYNC=invalid")
 set_tests_properties(infernix_device_sync_empty_test PROPERTIES
   ENVIRONMENT "INFERNIX_CUDA_SYNC=")
+
+# The prefill expert stream's gated plans with copy-ahead (candidates BX-09): slots, tables and record bytes.
+infernix_add_test(infernix_expert_stream_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_stream.cpp"
+  "${PROJECT_SOURCE_DIR}/src/runtime/expert_offload/expert_stream.cpp"
+  LIBRARIES infernix_core)
+set_tests_properties(infernix_expert_stream_test PROPERTIES SKIP_RETURN_CODE 77)
 
 infernix_add_test(infernix_decode_graph_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decode_graph.cpp"
   LIBRARIES infernix_core)
@@ -94,13 +105,21 @@ infernix_add_test(infernix_host_load_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_load.cpp"
   LIBRARIES infernix_core)
 
-infernix_add_test(infernix_machine_calibration_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_machine_calibration.cpp"
-  LIBRARIES infernix_core)
-
 infernix_add_test(infernix_cpu_topology_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cpu_topology.cpp"
   LIBRARIES infernix_core)
+
+infernix_add_test(infernix_io_priority_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_io_priority.cpp"
+  LIBRARIES infernix_core)
+
+if(NOT WIN32)
+  # The WSL2 adapter facts through DXCore (skips outside WSL2 or without a CUDA device).
+  infernix_add_test(infernix_dxcore_adapter_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_dxcore_adapter.cpp"
+    LIBRARIES infernix_core)
+  set_tests_properties(infernix_dxcore_adapter_test PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 
 infernix_add_test(infernix_jinja_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_jinja.cpp"
@@ -109,7 +128,8 @@ infernix_add_test(infernix_jinja_test
 add_test(NAME infernix_cuda_stack_tool_test
   COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/cuda_stack/test_check_cuda_stack.py)
 # Register spills and local arrays: no kernel of the server may use more per-thread stack or local
-# memory than tools/cuda_stack/cuda_stack_allowlist.json records.
+# memory, or hold more local stores and loads (SASS STL, LDL) in its code, than
+# tools/cuda_stack/cuda_stack_allowlist.json records.
 if(TARGET infernix-serve)
   add_test(NAME infernix_cuda_stack_check
     COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tools/cuda_stack/check_cuda_stack.py check

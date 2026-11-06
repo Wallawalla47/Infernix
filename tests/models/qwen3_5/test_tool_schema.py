@@ -135,6 +135,22 @@ class ToolSchema(unittest.TestCase):
                 schema({"type": ["string", "null"]}),
                 [{"x": x} for x in [None, "a", "two words"]],
             ),
+            # A nullable string's enum keeps its members; its bounds do not refuse the text null.
+            (
+                schema({"type": ["string", "null"], "enum": ["pending", "completed", None]}),
+                [{"x": x} for x in [None, "pending", "completed", "other"]],
+            ),
+            (
+                {
+                    **schema({"anyOf": [{"$ref": "#/$defs/Status"}, {"type": "null"}]}),
+                    "$defs": {"Status": {"type": "string", "enum": ["pending", "completed"]}},
+                },
+                [{"x": x} for x in [None, "pending", "other"]],
+            ),
+            (
+                schema({"type": ["string", "null"], "maxLength": 2}),
+                [{"x": x} for x in [None, "ab", "abc"]],
+            ),
             (
                 schema(
                     {
@@ -236,6 +252,8 @@ class ToolSchema(unittest.TestCase):
                 }
             ),
             schema({"type": "string", "const": "x\n</parameter>y"}),
+            # The string "null" beside null has no raw text of its own.
+            schema({"type": ["string", "null"], "enum": ["null", None]}),
             schema({"type": "number", "multipleOf": 1}),
             {"type": "object", "additionalProperties": True},
         ]

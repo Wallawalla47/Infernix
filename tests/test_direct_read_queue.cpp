@@ -118,25 +118,30 @@ void test_reads(const std::filesystem::path& path) {
               << ", " << queue.stats().issued << " device reads\n";
 }
 
-// With one read in flight overall, a demand read submitted after prefetch reads is issued first,
-// and a prefetch read of 1 MiB is issued as four 256 KiB sub-reads.
+// With one read in flight overall, a demand read submitted after restore and prefetch reads is issued
+// first and the restore read second; a prefetch read of 1 MiB is issued as four 256 KiB sub-reads and a
+// restore read of 2 MiB as two 1 MiB sub-reads.
 void test_priority_and_split(const std::filesystem::path& path) {
     DirectReadQueue::Options o;
-    o.demand_depth = 1;
+    o.demand_depth   = 1;
+    o.restore_depth  = 1;
     o.prefetch_depth = 1;
-    o.total_depth = 1;
+    o.total_depth    = 1;
     DirectReadQueue queue(o);
     const auto file = queue.open(path);
-    Aligned buffer(5 * (1 << 20));
+    Aligned buffer(7 * (1 << 20));
     for (std::uint64_t i = 0; i < 4; ++i) {
         queue.submit({file, i << 20, 1 << 20, buffer.p + (i << 20), DirectReadQueue::Priority::Prefetch, 10 + i});
     }
+    queue.submit({file, 12 << 20, 2 << 20, buffer.p + (5 << 20), DirectReadQueue::Priority::Restore, 2});
     queue.submit({file, 8 << 20, 1 << 20, buffer.p + (4 << 20), DirectReadQueue::Priority::Demand, 1});
-    const auto done = drain(queue, 5);
-    check(done.size() == 5 && done[0].tag == 1, "the demand read completes first");
-    check(queue.stats().issued == 1 + 4 * 4, "prefetch reads are issued as 256 KiB sub-reads");
+    const auto done = drain(queue, 6);
+    check(done.size() == 6 && done[0].tag == 1, "the demand read completes first");
+    check(done[1].tag == 2, "the restore read completes before the prefetch reads");
+    check(queue.stats().issued == 1 + 2 + 4 * 4, "restore reads are issued as 1 MiB sub-reads, prefetch reads as 256 KiB");
     for (std::uint64_t i = 0; i < 4; ++i) { check(matches(buffer.p + (i << 20), i << 20, 1 << 20), "prefetch bytes"); }
     check(matches(buffer.p + (4 << 20), 8 << 20, 1 << 20), "demand bytes");
+    check(matches(buffer.p + (5 << 20), 12 << 20, 2 << 20), "restore bytes");
 }
 
 // Faults: transient backoff, a hard error retried once and failing twice, a timeout retried once

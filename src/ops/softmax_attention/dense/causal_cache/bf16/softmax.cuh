@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/math.cuh"
+#include "ops/softmax_attention/common/causal_softmax.cuh"
 #include "ops/common/warp.cuh"
 #include <math_constants.h>
 #include <limits>
@@ -26,8 +27,8 @@ struct Bf16KvSoftmaxRow {
         scaled_maximum       = maximum * scale_log2;
         if constexpr (MayBeEmpty)
             if (maximum == kBf16KvNegativeInfinity) scaled_maximum = 0.0f;
-        const float alpha = exp2_approx(__fmaf_rn(previous, scale_log2, -scaled_maximum));
-        return alpha;
+        // previous's scaled value rounds as it did when it was the maximum (an empty history's -inf gives 0).
+        return causal_rescale(previous, scaled_maximum, scale_log2);
     }
 
     __device__ __forceinline__ void accumulate(float alpha, float tile_sum) {

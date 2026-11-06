@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/arena.h"
 #include "core/weight.h"
 #include "infernix/ops/linear.h"
 #include "ops/linear/q8/q8_launch.h"
@@ -15,9 +14,9 @@ Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t, Li
 Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy,
                           LinearRoutes routes);
 
-// LinearRoutes::F16Accumulate on a registered problem at prefill widths takes the f16-accumulate route
-// (q8_f16acc.h), whose encoded activation needs `workspace`.
+// The exact Q8 routes, or LinearRoutes::Q8SlicedK's where a problem registers it; Q8 has no
+// f16-accumulate route (it measured 1.6-1.9 % slower on Dense8 pp32K/64K prefill, removed 2026-10-28).
 void q8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                 LinearRoutes routes, WorkspaceArena* workspace, cudaStream_t stream);
+                 LinearRoutes routes, cudaStream_t stream);
 
 } // namespace infernix::ops::detail

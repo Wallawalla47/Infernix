@@ -3,18 +3,18 @@
 #include "ops/linear/bf16/bf16_template_launch.cuh"
 
 namespace infernix::ops::detail {
-template <class Schedule>
+template <class Schedule, pdl::Dependency Dependency = pdl::Dependency::Serialized>
 void launch_bf16_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_bf16_a16_gemv<Schedule>(bf16_a16_operands(x, w),
                                    LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
-                                   LinearIdentityEpilogue{}, stream);
+                                   LinearIdentityEpilogue{}, stream, Dependency);
 }
 
-template <class Schedule>
+template <class Schedule, pdl::Dependency Dependency = pdl::Dependency::Serialized>
 void launch_bf16_simt(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_bf16_a16_simt<Schedule>(bf16_a16_operands(x, w),
                                    LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
-                                   LinearIdentityEpilogue{}, stream);
+                                   LinearIdentityEpilogue{}, stream, Dependency);
 }
 
 template <class Schedule>

@@ -304,6 +304,143 @@ bool MaterializedArtifact::has_device(ObjectHandle handle) const noexcept {
     return handle.index < objects_.size() && objects_[handle.index].device.has_value();
 }
 
+void MaterializedArtifact::begin(const Reader& reader, const MaterializationPlan& plan) {
+    if (plan.source != &reader || plan.object_count != reader.directory().objects.size()) {
+        throw ArtifactError("materialization plan belongs to another load session");
+    }
+    objects_.resize(plan.object_count);
+    stats_.file_bytes            = reader.file_bytes();
+    stats_.read_bytes            = plan.prior_read_bytes;
+    stats_.owned_value_bytes     = plan.owned_value_bytes;
+    stats_.device_capacity_bytes = plan.device_capacity_bytes;
+    stats_.device_object_count   = plan.device_objects.size() + plan.transient_objects.size();
+    stats_.host_object_count     = plan.host_objects.size();
+    stats_.pinned_object_count   = plan.pinned_objects.size();
+    if (plan.device_capacity_bytes > std::numeric_limits<std::size_t>::max()) {
+        throw ArtifactError("device backing exceeds size_t");
+    }
+}
+
+// Streamed objects: their files and segments only; nothing is read.
+void MaterializedArtifact::locate_streamed(const Reader& reader, const MaterializationPlan& plan) {
+    if (plan.streamed_objects.empty()) { return; }
+    auto& source = stream_source_;
+    source.objects_.resize(plan.object_count);
+    std::vector<std::int32_t> file_of(reader.directory().files.size(), -1);
+    for (const auto handle : plan.streamed_objects) {
+        const auto& object   = reader.directory().object(handle);
+        const auto& geometry = reader.geometry(handle);
+        if (geometry.bytes != object_bytes(object)) { throw ArtifactError("streamed object size differs"); }
+        StreamSource::Object streamed;
+        streamed.bytes = geometry.bytes;
+        for (const auto& segment : reader.segments(object_offset(object), geometry.bytes)) {
+            auto& index = file_of.at(segment.file_index);
+            if (index < 0) {
+                index = static_cast<std::int32_t>(source.files_.size());
+                source.files_.push_back(reader.file_path(segment.file_index));
+            }
+            streamed.segments.push_back({static_cast<std::uint32_t>(index), segment.file_offset,
+                                         segment.destination_offset, segment.bytes});
+        }
+        source.objects_[handle.index] = std::move(streamed);
+        objects_.at(handle.index).streamed = WeightParent{geometry, nullptr};
+    }
+}
+
+void MaterializedArtifact::bind_host_objects(const Reader& reader, std::vector<HostPlacement>& placements) {
+    for (auto& placement : placements) {
+        reader.validate_object(placement.object);
+        auto& storage = objects_.at(placement.object.index);
+        if (!storage.host_data.empty()) { throw ArtifactError("duplicate Host placement"); }
+        const auto& object = reader.directory().object(placement.object);
+        if (placement.data.empty()) {
+            placement.data = reader.read_object(placement.object);
+            stats_.read_bytes = checked_add(stats_.read_bytes, placement.data.size(), "Host read bytes");
+        }
+        if (placement.data.size() != object_bytes(object)) {
+            throw ArtifactError("Host placement size differs from object");
+        }
+        storage.host_data = std::move(placement.data);
+        stats_.retained_host_bytes =
+            checked_add(stats_.retained_host_bytes, storage.host_data.size(), "retained bytes");
+        if (std::holds_alternative<TensorObject>(object)) {
+            const auto& geometry = reader.geometry(placement.object);
+            const auto divisor   = read_divisor(reader, placement.object, geometry, storage.host_data, stats_);
+            storage.host         = weight_parent(geometry, storage.host_data.data(), divisor);
+        }
+    }
+}
+
+std::string pinned_shortfall(const MaterializationPlan& plan, std::uint64_t available_bytes) {
+    if (plan.pinned_capacity_bytes == 0) { return {}; }
+    // Pinned pages cannot be paged out: refuse a lock that would push the rest of the system
+    // into the page file.
+    const auto need = plan.pinned_capacity_bytes + plan.later_pinned_bytes + plan.host_reserve_bytes;
+    if (need <= available_bytes) { return {}; }
+    constexpr double gib = 1024.0 * 1024.0 * 1024.0;
+    char message[320];
+    std::snprintf(message, sizeof(message),
+                  "pinned weights need %.2f GiB, later pins %.2f GiB and a %.2f GiB reserve "
+                  "(--ram-free-mib), but only %.2f GiB of physical Host memory is available",
+                  static_cast<double>(plan.pinned_capacity_bytes) / gib,
+                  static_cast<double>(plan.later_pinned_bytes) / gib,
+                  static_cast<double>(plan.host_reserve_bytes) / gib,
+                  static_cast<double>(available_bytes) / gib);
+    return message;
+}
+
+MaterializedArtifact materialize_geometry(const Reader& reader, MaterializationPlan&& plan) {
+    MaterializedArtifact out;
+    out.begin(reader, plan);
+    out.locate_streamed(reader, plan);
+    out.bind_host_objects(reader, plan.host_objects);
+    if (plan.pinned_capacity_bytes) {
+        out.geometry_pinned_ =
+            std::make_unique<AddressReservation>(static_cast<std::size_t>(plan.pinned_capacity_bytes));
+    }
+    for (const auto& placement : plan.pinned_objects) {
+        reader.validate_object(placement.object);
+        auto& storage = out.objects_.at(placement.object.index);
+        if (storage.pinned || !out.geometry_pinned_ ||
+            placement.bytes != object_bytes(reader.directory().object(placement.object))) {
+            throw ArtifactError("invalid or duplicate pinned placement");
+        }
+        const auto geometry = reader.geometry(placement.object);
+        const auto divisor  = read_divisor(reader, placement.object, geometry, {}, out.stats_);
+        std::byte* at       = out.geometry_pinned_->data() + placement.offset;
+        storage.pinned      = weight_parent(geometry, at, divisor, at);
+    }
+    const auto bind_device = [&](const std::vector<DevicePlacement>& placements, std::uint64_t capacity,
+                                 std::unique_ptr<AddressReservation>& reservation) {
+        if (capacity) { reservation = std::make_unique<AddressReservation>(static_cast<std::size_t>(capacity)); }
+        for (const auto& placement : placements) {
+            const auto& geometry = reader.geometry(placement.object);
+            auto& object         = out.objects_.at(placement.object.index);
+            if (object.device || !reservation || geometry.bytes != placement.bytes ||
+                placement.offset + placement.bytes > capacity) {
+                throw ArtifactError("invalid or duplicate device placement");
+            }
+            const auto divisor =
+                object.host ? (geometry.layout == QuantLayout::Rg16 ? object.host->weight_multiplier
+                                                                    : object.host->weight_scale_divisor)
+                            : read_divisor(reader, placement.object, geometry, {}, out.stats_);
+            std::byte* at = reservation->data() + placement.offset;
+            object.device = weight_parent(geometry, at, divisor, at);
+        }
+    };
+    bind_device(plan.device_objects, plan.device_capacity_bytes, out.geometry_device_);
+    bind_device(plan.transient_objects, plan.transient_capacity_bytes, out.geometry_transient_);
+    for (const auto& placement : plan.transient_objects) { out.transient_objects_.push_back(placement.object); }
+    return out;
+}
+
+void MaterializedArtifact::release_transient() {
+    for (const auto handle : transient_objects_) { objects_.at(handle.index).device.reset(); }
+    transient_objects_.clear();
+    transient_.reset();
+    geometry_transient_.reset();
+}
+
 MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& plan,
                                  DeviceContext& device, const StartupObserver* startup_observer,
                                  std::unique_ptr<EvictableWeightPool> eviction_pool) {
@@ -313,8 +450,10 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     const StartupObserver no_observer;
     const auto& observer = startup_observer ? *startup_observer : no_observer;
     std::uint64_t total  = 0;
-    for (const auto& placement : plan.device_objects) {
-        total = checked_add(total, placement.bytes, "device payload bytes");
+    for (const auto* placements : {&plan.device_objects, &plan.transient_objects}) {
+        for (const auto& placement : *placements) {
+            total = checked_add(total, placement.bytes, "device payload bytes");
+        }
     }
     // Progress counts the pinned reads (Qwen3.8-Flash-Next's 63 GiB of experts) as well as the
     // device upload, so the phase's rate and ETA describe the whole load.
@@ -327,41 +466,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     StartupPhaseScope phase(observer, StartupPhase::WeightsMaterialize, StartupProgressUnit::Bytes,
                             load_total);
     MaterializedArtifact out;
-    out.objects_.resize(plan.object_count);
-    out.stats_.file_bytes            = reader.file_bytes();
-    out.stats_.read_bytes            = plan.prior_read_bytes;
-    out.stats_.owned_value_bytes     = plan.owned_value_bytes;
-    out.stats_.device_capacity_bytes = plan.device_capacity_bytes;
-    out.stats_.device_object_count   = plan.device_objects.size();
-    out.stats_.host_object_count     = plan.host_objects.size();
-    out.stats_.pinned_object_count   = plan.pinned_objects.size();
-    // Streamed objects: their files and segments only; nothing is read.
-    if (!plan.streamed_objects.empty()) {
-        auto& source = out.stream_source_;
-        source.objects_.resize(plan.object_count);
-        std::vector<std::int32_t> file_of(reader.directory().files.size(), -1);
-        for (const auto handle : plan.streamed_objects) {
-            const auto& object   = reader.directory().object(handle);
-            const auto& geometry = reader.geometry(handle);
-            if (geometry.bytes != object_bytes(object)) { throw ArtifactError("streamed object size differs"); }
-            StreamSource::Object streamed;
-            streamed.bytes = geometry.bytes;
-            for (const auto& segment : reader.segments(object_offset(object), geometry.bytes)) {
-                auto& index = file_of.at(segment.file_index);
-                if (index < 0) {
-                    index = static_cast<std::int32_t>(source.files_.size());
-                    source.files_.push_back(reader.file_path(segment.file_index));
-                }
-                streamed.segments.push_back({static_cast<std::uint32_t>(index), segment.file_offset,
-                                             segment.destination_offset, segment.bytes});
-            }
-            source.objects_[handle.index] = std::move(streamed);
-            out.objects_.at(handle.index).streamed = WeightParent{geometry, nullptr};
-        }
-    }
-    if (plan.device_capacity_bytes > std::numeric_limits<std::size_t>::max()) {
-        throw ArtifactError("device backing exceeds size_t");
-    }
+    out.begin(reader, plan);
+    out.locate_streamed(reader, plan);
     std::byte* device_base = nullptr;
     if (eviction_pool) {
         // Overlay mode: the weights arena is the pool's VMM home mapping, so the
@@ -377,22 +483,14 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             std::make_unique<DeviceArena>(static_cast<std::size_t>(plan.device_capacity_bytes));
         device_base = static_cast<std::byte*>(out.arena_->base());
     }
+    if (plan.transient_capacity_bytes) {
+        out.transient_ = std::make_unique<DeviceArena>(static_cast<std::size_t>(plan.transient_capacity_bytes));
+    }
     if (plan.pinned_capacity_bytes) {
-        // Pinned pages cannot be paged out: refuse a lock that would push the rest of the system
-        // into the page file. Checked against memory available now, not the caller's earlier
-        // snapshot, so other programs' growth since then is seen.
-        const auto available = available_host_memory_bytes();
-        const auto need      = plan.pinned_capacity_bytes + plan.later_pinned_bytes + plan.host_reserve_bytes;
-        if (need > available) {
-            constexpr double gib = 1024.0 * 1024.0 * 1024.0;
-            char message[320];
-            std::snprintf(message, sizeof(message),
-                          "pinned weights need %.2f GiB, later pins %.2f GiB and a %.2f GiB reserve "
-                          "(--ram-headroom-mib), but only %.2f GiB of physical Host memory is available",
-                          static_cast<double>(plan.pinned_capacity_bytes) / gib,
-                          static_cast<double>(plan.later_pinned_bytes) / gib,
-                          static_cast<double>(plan.host_reserve_bytes) / gib, static_cast<double>(available) / gib);
-            throw ArtifactError(message);
+        // Checked against memory available now, not the caller's earlier snapshot, so other
+        // programs' growth since then is seen.
+        if (std::string shortfall = pinned_shortfall(plan, available_host_memory_bytes()); !shortfall.empty()) {
+            throw ArtifactError(shortfall);
         }
         out.pinned_ =
             std::make_unique<RegisteredHostBuffer>(static_cast<std::size_t>(plan.pinned_capacity_bytes));
@@ -402,29 +500,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     if (out.pinned_) { prefault.emplace(*out.pinned_, std::clamp(std::thread::hardware_concurrency() / 4, 1U, 8U)); }
     const auto bounce =
         plan.pinned_objects.empty() ? nullptr : std::make_unique<DirectBounce>();
-    for (auto& placement : plan.host_objects) {
-        reader.validate_object(placement.object);
-        auto& storage = out.objects_.at(placement.object.index);
-        if (!storage.host_data.empty()) { throw ArtifactError("duplicate Host placement"); }
-        const auto& object = reader.directory().object(placement.object);
-        if (placement.data.empty()) {
-            placement.data = reader.read_object(placement.object);
-            out.stats_.read_bytes =
-                checked_add(out.stats_.read_bytes, placement.data.size(), "Host read bytes");
-        }
-        if (placement.data.size() != object_bytes(object)) {
-            throw ArtifactError("Host placement size differs from object");
-        }
-        storage.host_data = std::move(placement.data);
-        out.stats_.retained_host_bytes =
-            checked_add(out.stats_.retained_host_bytes, storage.host_data.size(), "retained bytes");
-        if (std::holds_alternative<TensorObject>(object)) {
-            const auto& geometry = reader.geometry(placement.object);
-            const auto divisor =
-                read_divisor(reader, placement.object, geometry, storage.host_data, out.stats_);
-            storage.host = weight_parent(geometry, storage.host_data.data(), divisor);
-        }
-    }
+    out.bind_host_objects(reader, plan.host_objects);
     for (const auto& placement : plan.pinned_objects) {
         reader.validate_object(placement.object);
         auto& storage = out.objects_.at(placement.object.index);
@@ -452,24 +528,42 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     }
     if (out.pinned_) {
         prefault.reset(); // every worker done before the block is locked
-        out.pinned_->pin();
+        // In slices at object boundaries when the driver refuses the whole block (candidates SS-02).
+        std::vector<std::size_t> boundaries;
+        boundaries.reserve(plan.pinned_objects.size());
         for (const auto& placement : plan.pinned_objects) {
-            out.objects_.at(placement.object.index).pinned->device = out.pinned_->device_data() + placement.offset;
+            boundaries.push_back(static_cast<std::size_t>(placement.offset));
+        }
+        std::sort(boundaries.begin(), boundaries.end());
+        try {
+            out.pinned_->pin(boundaries);
+        } catch (const std::runtime_error& error) {
+            throw ArtifactError(std::string("the pinned weights could not be page-locked (") + error.what() +
+                                "); with offloaded experts a smaller --expert-ram-mib pins fewer of them");
+        }
+        for (const auto& placement : plan.pinned_objects) {
+            out.objects_.at(placement.object.index).pinned->device =
+                out.pinned_->device_at(static_cast<std::size_t>(placement.offset));
         }
     }
     std::vector<CopyRange> ranges;
-    for (const auto& placement : plan.device_objects) {
+    for (const auto& placement : plan.transient_objects) { out.transient_objects_.push_back(placement.object); }
+    for (std::size_t i = 0; i < plan.device_objects.size() + plan.transient_objects.size(); ++i) {
+        const bool transient  = i >= plan.device_objects.size();
+        const auto& placement = transient ? plan.transient_objects[i - plan.device_objects.size()]
+                                          : plan.device_objects[i];
+        DeviceArena* arena    = transient ? out.transient_.get() : out.arena_.get();
         const auto& geometry = reader.geometry(placement.object);
         auto& object         = out.objects_.at(placement.object.index);
-        if (object.device || !device_base || geometry.bytes != placement.bytes) {
+        if (object.device || (!transient && !device_base) || geometry.bytes != placement.bytes) {
             throw ArtifactError("invalid or duplicate device placement");
         }
         std::byte* storage_data;
-        if (out.arena_) {
-            auto storage = out.arena_->alloc_bytes(static_cast<std::size_t>(placement.bytes),
-                                                   static_cast<std::size_t>(placement.alignment));
+        if (arena != nullptr) {
+            auto storage = arena->alloc_bytes(static_cast<std::size_t>(placement.bytes),
+                                              static_cast<std::size_t>(placement.alignment));
             const auto offset = static_cast<std::uint64_t>(
-                static_cast<std::byte*>(storage.data) - static_cast<std::byte*>(out.arena_->base()));
+                static_cast<std::byte*>(storage.data) - static_cast<std::byte*>(arena->base()));
             if (offset != placement.offset) {
                 throw ArtifactError("device offset differs from materialization plan");
             }

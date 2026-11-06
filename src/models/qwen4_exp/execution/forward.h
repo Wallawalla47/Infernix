@@ -32,6 +32,18 @@ namespace infernix::models::qwen4_exp::execution {
 // the Program stages the chunk's RoPE positions per sub-chunk of this many cells.
 inline constexpr std::int32_t kMtpChunkColumns = 512;
 
+// Packed BF16 KV: attention calls of more columns than this (one sequence's prefill chunks, which run in the arena
+// lent from the expert frames, the Program's wide arena) unpack the sequence's K/V once a call
+// (ops::qsa_attention's `unpack`); the narrower ones decode as they gather. Same bits.
+inline constexpr std::int32_t kQsaUnpackColumns = 512;
+
+// Faults the Forward's own kernels report in the experts' error word (ForwardExperts::error) instead
+// of trapping (core DeviceFault), as layer << 16 | code like the MoE's: codes above the MoE's
+// (ops/offloaded_sparse_moe/cpu/fetch_request.h) and every errno.
+inline constexpr std::uint32_t kErrorRowGateTimeout    = 0xFF10; // the n-gram rows were not published within kPinnedGateTimeoutNs
+inline constexpr std::uint32_t kErrorTokenId           = 0xFF11; // an id outside the vocabulary reached the token embedding
+inline constexpr std::uint32_t kErrorCommitGateTimeout = 0xFF12; // a gated commit was not released within kPinnedGateTimeoutNs
+
 // Program-owned recurrent state of every slot.
 struct ForwardState {
     LinearAttentionStatePool* gdn = nullptr; // one layer per GDN block
@@ -76,7 +88,8 @@ struct ForwardExperts {
     // experts without a CPU job are read through.
     std::vector<const std::uint8_t* const*> host_tables;
     std::vector<ops::MoeFetchChannel> fetch;
-    // Mapped word a call that could not serve an expert writes (ops::MoeExpertSource::error); the
+    // Mapped word a call that could not serve an expert writes (ops::MoeExpertSource::error), and the
+    // token embedding and the n-gram gate their faults (kErrorTokenId, kErrorRowGateTimeout); the
     // Program checks it after each synchronization. Null: none.
     std::uint32_t* error = nullptr;
     // TEMPORARY (INFERNIX_TMP_REPLAY_BENCH): device word the CPU waits add their nanoseconds to
@@ -88,7 +101,15 @@ struct ForwardExperts {
     // Decode and verification calls run the shared expert on this stream (forked at the layer's
     // input, joined before the combine) while the routed experts compute. Null: in order.
     cudaStream_t shared_stream = nullptr;
-    std::array<cudaEvent_t, 2> shared_events{};
+    std::array<cudaEvent_t, 4> shared_events{};
+    // The shared expert forks onto shared_stream at the layer's input (after the routed experts' early encoding,
+    // where the call has one), beside the router and the route's plan, instead of after the plan beside the routed
+    // experts (ProgramOptions::shared_expert_early).
+    bool shared_early = false;
+    // Decode and verification calls compute their staged misses on this stream while the overlap stream
+    // stages their down rows (ops::MoeExpertSource::split_stream). Null: not split.
+    cudaStream_t split_stream = nullptr;
+    std::array<cudaEvent_t, 2> split_events{};
     // Landing frames of decode and verification calls (design §19.3.5 S4; see
     // ops::MoeExpertSource::landing): layer l uses landing + l * landing_slots and landed + l *
     // landing_slots. Null disables.
@@ -100,9 +121,25 @@ struct ForwardExperts {
     ExpertStream* stream = nullptr;
     // A gated stream's split of each layer's experts between the link and the CPU (§19.3.12).
     const CpuSplitPolicy* split = nullptr;
+    // A gated call of fewer columns keeps the CPU channel's assisted link share of the experts the split marked
+    // (ops::MoeCpuChannel::assist_share and its ramp, continued to the split's widest call): the widest of them
+    // are staged inside the call, the rest computed on the CPU (design §19.3.50). 0: no call keeps that share.
+    std::int32_t split_keep_columns = 0;
+    // A gated call of at least split_keep_columns and fewer than split_wide_keep_below columns keeps the channel's
+    // wide link share of the experts the split marked (ops::MoeCpuChannel::wide_share from wide_share_from: 51/256
+    // on the NVFP4 banks); a wider one gives them all to the CPU (design §19.3.50).
+    std::int32_t split_wide_keep_below = 0;
     // --expert-tail-skip (approximate, 0: off): the generation rounds' ops::MoeExpertSource::
     // tail_skip_rank.
     std::int32_t tail_skip_rank = 0;
+    // The drafter pool (candidates §22 VM-01): the MTP drafter's routed experts in a pool of
+    // drafter_slots device slots (runtime/expert_offload/drafter_pool.h): its banks ([slots * 2I, H], [slots * H, I]), its slot table
+    // (device I32 [E]: slot or -1) and its demand counts (device I32 [E + 1]); the draft steps route among the pooled
+    // experts (ops::moe_route_pooled). drafter_slots = 0: the bank is device-resident (MtpParameters).
+    std::int32_t drafter_slots = 0;
+    Weight drafter_gate_up, drafter_down;
+    Tensor drafter_slot_of;
+    std::int32_t* drafter_demand = nullptr;
 };
 
 // A speculative verification call (design §11): `batch` sequences of `width` >= 2 positions. It
@@ -197,6 +234,9 @@ struct ForwardBatch {
     // release_stream on the span's last chunk only (every chunk reads the same layer copies).
     bool stream         = false;
     bool release_stream = true;
+    // The SSD tier lost no expert (left both tiers) since the stream's span began: a complete layer's experts are
+    // all in VRAM, the ring, a held frame or RAM, so its call runs as one pass, as without the tier.
+    bool stream_whole   = false;
     // With a gated stream (ExpertStream::gated): each layer's routing decides, through
     // ForwardExperts::split, which experts the stream copies and which the CPU serves.
     bool split          = false;
@@ -239,10 +279,6 @@ struct MtpCall {
     const ops::SamplingConfig* sample_configs = nullptr;
     std::uint32_t draft_step                  = 0;
     Tensor sample_rows, sample_logprobs, draft_candidates, draft_q;
-    // TEMPORARY (INFERNIX_TMP_MTP_RUNNER_UP, candidates GX-09): an argmax draft's second-ranked head
-    // row (I32 [T]; the proposal head's row, not its token), for the runner-up rate draft trees need.
-    // Unscreened, unsampled drafts only.
-    Tensor runner_up;
     // Cells whose next token is an image token take its visual embedding (prompt cells only).
     const VisionInput* vision = nullptr;
 };
@@ -365,15 +401,15 @@ private:
     void lossless_head(const Tensor& residuals, Tensor& logits);
     // The block's mixed input (into `into` when given, else the workspace).
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into = nullptr);
-    // The attention half's inject (y with its coefficients `pending`) into the residual, then the MLP
-    // half's mix: one Op that folds the inject into the fused mixer's reads under the temporary
-    // INFERNIX_TMP_HC_INJECT_FOLD (candidates §7.3 D6), else the two Ops in turn. Same bits either way.
-    // `inject` receives the MLP half's coefficients and must not be `pending`.
-    Tensor inject_mix(const HyperConnectionParameters& p, const Tensor& y, const Tensor& pending, Tensor& residual,
-                      Tensor* inject, Tensor* into = nullptr);
-    // The layer's token mixer (GDN or QSA attention) over its mixed input.
-    Tensor mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa);
-    Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
+    // The attention half's mix, and (--a8-activations, where it applies) its mixer input projection's 8-bit columns
+    // into x_a8 (empty otherwise).
+    Tensor mix_mixer_input(const BlockParameters& block, Tensor& residual, Tensor& inject, Tensor& x_a8);
+    [[nodiscard]] std::vector<ops::GgmlSegment> mixer_input_segments(const BlockParameters& block) const;
+    // The layer's token mixer (GDN or QSA attention) over its mixed input (and, when given, the 8-bit columns of
+    // its GGUF input projection, mix_mixer_input's).
+    Tensor mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa, const Tensor* xa_a8 = nullptr);
+    Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch,
+               const Tensor* x_a8 = nullptr);
     // INFERNIX_TMP_ACTIVATION_SCAN: scans a prefill call's projection input (no-op when off).
     void scan_input(const Tensor& x, std::uint32_t layer, ActivationScan::Site site);
     // One QSA block's attention through `layer` and `tails`. Index keys go to `key_records` when
@@ -392,7 +428,7 @@ private:
         const Tensor& table_rows;
         std::int32_t batch = 0, width = 0;
     };
-    Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call);
+    Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call, const Tensor* x_a8 = nullptr);
     // `route_columns` >= 0: a layer walk's grouped call, whose route log keeps its last that many
     // columns. With inject and residual, the output is injected into the residual streams (and not
     // returned).
@@ -401,9 +437,10 @@ private:
                Tensor* residual = nullptr);
     void wait_layer(const ForwardBatch& batch, std::size_t entry);
     void mtp_block(const MtpCall& call, Tensor& residual);
-    // The dense projections' route flags for the current call: ggml-bf16-prefill's and
-    // f16-accumulate-prefill's only in eager calls (prefill chunks, forced tokens), so decode and
-    // verification rounds keep the exact GGUF, FP8 and MXFP8 routes whatever their column count.
+    // The dense projections' route flags for the current call: ForwardFastPaths::prefill_routes
+    // (ggml-bf16-prefill, f16-accumulate-prefill, --a8-activations' prefill routes) only in eager calls
+    // (prefill chunks, forced tokens), so decode and verification rounds keep their routes whatever their
+    // column count.
     [[nodiscard]] ops::LinearRoutes dense_routes() const noexcept;
 
     const Parameters& parameters_;
@@ -422,12 +459,16 @@ private:
     std::unique_ptr<ActivationScan> scan_;
     std::uint32_t scan_layer_ = 0;
     bool eager_chunk_ = false;
-    // A gated call's layer routing on the host: the dispatch offsets (pinned I32 [E + 1]), the
-    // event that lands them, and the per-expert columns and CPU marks derived from them.
+    // A gated call's layer routing on the host: the dispatch offsets (pinned I32 [2 (E + 1)]: the
+    // layer's, then the copy-ahead's guess of the next layer's), the event that lands them, the
+    // per-expert columns and CPU marks derived from them, the columns the CPU split prices (those
+    // copied ahead masked) and the guessed columns.
     PinnedHostBuffer split_offsets_{1};
     cudaEvent_t split_ready_ = nullptr;
     std::vector<std::int32_t> split_columns_;
     std::vector<std::uint8_t> split_cpu_;
+    std::vector<std::int32_t> split_priced_;
+    std::vector<std::int32_t> guess_columns_;
     // The CPU-served and streamed experts of gated calls (diagnostics).
     std::uint64_t split_cpu_experts_ = 0, split_streamed_experts_ = 0;
 

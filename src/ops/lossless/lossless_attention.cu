@@ -871,175 +871,175 @@ __global__ __launch_bounds__(kThreads, M == kMaxima ? 2 : 1) void attention_kern
                 PartialMax{best.value.lo, best.value.hi, best.unit,
                            (have ? kHave : 0) | (nan ? kNan : 0) | (fail ? kFail : 0)};
         }
-        return;
-    }
-    if constexpr (M == kSums || M == kFinal) {
-        // The overall maximum from every range's (each of the row's 16 threads alike).
-        if (active) {
-            for (int s = 0; s < args.splits; ++s) {
-                const PartialMax pm = args.pmax[(static_cast<std::size_t>(s) * args.columns + c) * args.heads + h];
-                nan  = nan || (pm.flags & kNan) != 0;
-                fail = fail || (pm.flags & kFail) != 0;
-                const Score sc{{pm.lo, pm.hi}, pm.unit};
-                if ((pm.flags & kHave) != 0 && (!have || score_greater(sc, best))) {
-                    best = sc;
-                    have = true;
+    } else {
+        if constexpr (M == kSums || M == kFinal) {
+            // The overall maximum from every range's (each of the row's 16 threads alike).
+            if (active) {
+                for (int s = 0; s < args.splits; ++s) {
+                    const PartialMax pm = args.pmax[(static_cast<std::size_t>(s) * args.columns + c) * args.heads + h];
+                    nan  = nan || (pm.flags & kNan) != 0;
+                    fail = fail || (pm.flags & kFail) != 0;
+                    const Score sc{{pm.lo, pm.hi}, pm.unit};
+                    if ((pm.flags & kHave) != 0 && (!have || score_greater(sc, best))) {
+                        best = sc;
+                        have = true;
+                    }
                 }
             }
         }
-    }
 
-    // Pass B: p, sum p (int128 at 2^-87; p <= 1) and the thread's 16 channels' sum p v (int128 at
-    // 2^(vmax_c - 203): p on its 2^-48 grid, v on its channel's grid).
-    // This thread's channels: sub + 16 cc (the row's 16 threads read 16 banks of a value row).
-    I128 num[16];
+        // Pass B: p, sum p (int128 at 2^-87; p <= 1) and the thread's 16 channels' sum p v (int128 at
+        // 2^(vmax_c - 203): p on its 2^-48 grid, v on its channel's grid).
+        // This thread's channels: sub + 16 cc (the row's 16 threads read 16 banks of a value row).
+        I128 num[16];
 #pragma unroll
-    for (int cc = 0; cc < 16; ++cc) { num[cc] = I128{0ULL, 0LL}; }
-    I128 den{0ULL, 0LL};
-    float den_err = 0.0F;
-    double p_err  = 0.0; // the p grid's dropped bits (each below 2^-49), summed over this thread's keys
-    // A row pass A flagged takes the exact fallback: its sums are not formed.
-    const bool work = active && !nan && !fail;
-    for (int j0 = key_begin; j0 < key_end; j0 += kKeys) {
-        for (int rep = 0; rep < reps; ++rep) {
-            bool want[2] = {work && pair_wanted(j0, 0, rep), work && pair_wanted(j0, 1, rep)};
-            if (reps > 1 && __syncthreads_or(want[0] || want[1] ? 1 : 0) == 0) { continue; }
-            load_keys(j0, true, rep);
-            Score sc[2];
-            if (work) { tile_scores(sh, args, b, c, h, kvh, j0, i, sub, want, sc, fail); }
-            if (tile_lo) {
-                load_low_limbs(j0, rep);
-                if (work) { add_low_limbs(sh, i, sub, want, sc, fail); }
-            }
-            if (work) {
-    #pragma unroll
-                for (int half = 0; half < 2; ++half) {
-                    const int jj = sub + 16 * half;
-                    float p = 0.0F;
-                    if (want[half]) {
-                        bool ok       = true;
-                        const Score s = sc[half];
-                        const float d = score_difference(s, best, ok);
-                        if (!ok) { fail = true; }
-                        p = lossless::cr_exp(d);
-                        const std::uint32_t bits = __float_as_uint(p);
-                        const int field = static_cast<int>(bits >> 23), mant = static_cast<int>(bits & 0x7FFFFF);
+        for (int cc = 0; cc < 16; ++cc) { num[cc] = I128{0ULL, 0LL}; }
+        I128 den{0ULL, 0LL};
+        float den_err = 0.0F;
+        double p_err  = 0.0; // the p grid's dropped bits (each below 2^-49), summed over this thread's keys
+        // A row pass A flagged takes the exact fallback: its sums are not formed.
+        const bool work = active && !nan && !fail;
+        for (int j0 = key_begin; j0 < key_end; j0 += kKeys) {
+            for (int rep = 0; rep < reps; ++rep) {
+                bool want[2] = {work && pair_wanted(j0, 0, rep), work && pair_wanted(j0, 1, rep)};
+                if (reps > 1 && __syncthreads_or(want[0] || want[1] ? 1 : 0) == 0) { continue; }
+                load_keys(j0, true, rep);
+                Score sc[2];
+                if (work) { tile_scores(sh, args, b, c, h, kvh, j0, i, sub, want, sc, fail); }
+                if (tile_lo) {
+                    load_low_limbs(j0, rep);
+                    if (work) { add_low_limbs(sh, i, sub, want, sc, fail); }
+                }
+                if (work) {
+        #pragma unroll
+                    for (int half = 0; half < 2; ++half) {
+                        const int jj = sub + 16 * half;
+                        float p = 0.0F;
+                        if (want[half]) {
+                            bool ok       = true;
+                            const Score s = sc[half];
+                            const float d = score_difference(s, best, ok);
+                            if (!ok) { fail = true; }
+                            p = lossless::cr_exp(d);
+                            const std::uint32_t bits = __float_as_uint(p);
+                            const int field = static_cast<int>(bits >> 23), mant = static_cast<int>(bits & 0x7FFFFF);
+                            if (p != 0.0F) {
+                                // p = M 2^(e - 150) at position e - 63 above 2^-87.
+                                bool lost = false;
+                                add_shifted(den, field == 0 ? mant : (0x800000 | mant), (field == 0 ? 1 : field) - 63, lost);
+                                if (lost) { den_err += p; }
+                            }
+                        }
+                        // p 2^48 = M 2^(e - 102), rounded to nearest below the grid (p < 2^-25).
+                        long long P = 0;
                         if (p != 0.0F) {
-                            // p = M 2^(e - 150) at position e - 63 above 2^-87.
-                            bool lost = false;
-                            add_shifted(den, field == 0 ? mant : (0x800000 | mant), (field == 0 ? 1 : field) - 63, lost);
-                            if (lost) { den_err += p; }
+                            const std::uint32_t bits = __float_as_uint(p);
+                            const int field = static_cast<int>(bits >> 23), mant = static_cast<int>(bits & 0x7FFFFF);
+                            const long long Mp = field == 0 ? mant : (0x800000 | mant);
+                            const int shift = (field == 0 ? 1 : field) - 150 + kPBits;
+                            if (shift >= 0) {
+                                P = Mp << shift;
+                            } else {
+                                P = shift > -64 ? ((Mp + (1LL << (-shift - 1))) >> -shift) : 0;
+                                p_err += 0x1p-49;
+                            }
                         }
+                        sh.p[i][jj]  = p;
+                        sh.ph[i][jj] = static_cast<int>(P >> 24);
+                        sh.pl[i][jj] = static_cast<int>(P & 0xFFFFFF);
                     }
-                    // p 2^48 = M 2^(e - 102), rounded to nearest below the grid (p < 2^-25).
-                    long long P = 0;
-                    if (p != 0.0F) {
-                        const std::uint32_t bits = __float_as_uint(p);
-                        const int field = static_cast<int>(bits >> 23), mant = static_cast<int>(bits & 0x7FFFFF);
-                        const long long Mp = field == 0 ? mant : (0x800000 | mant);
-                        const int shift = (field == 0 ? 1 : field) - 150 + kPBits;
-                        if (shift >= 0) {
-                            P = Mp << shift;
-                        } else {
-                            P = shift > -64 ? ((Mp + (1LL << (-shift - 1))) >> -shift) : 0;
-                            p_err += 0x1p-49;
-                        }
-                    }
-                    sh.p[i][jj]  = p;
-                    sh.ph[i][jj] = static_cast<int>(P >> 24);
-                    sh.pl[i][jj] = static_cast<int>(P & 0xFFFFFF);
                 }
-            }
-            __syncthreads();
-            if (work) {
-    #pragma unroll
-                for (int cg = 0; cg < 16; cg += 4) {
-                    long long hi[4] = {0, 0, 0, 0}, lo[4] = {0, 0, 0, 0};
-                    for (int jj = 0; jj < kKeys; ++jj) {
-                        const long long ph = sh.ph[i][jj], pl = sh.pl[i][jj];
-                        if ((ph | pl) == 0) { continue; }
-    #pragma unroll
+                __syncthreads();
+                if (work) {
+        #pragma unroll
+                    for (int cg = 0; cg < 16; cg += 4) {
+                        long long hi[4] = {0, 0, 0, 0}, lo[4] = {0, 0, 0, 0};
+                        for (int jj = 0; jj < kKeys; ++jj) {
+                            const long long ph = sh.ph[i][jj], pl = sh.pl[i][jj];
+                            if ((ph | pl) == 0) { continue; }
+        #pragma unroll
+                            for (int cc = 0; cc < 4; ++cc) {
+                                const long long v = sh.vg[jj][sub + 16 * (cg + cc)];
+                                hi[cc] += ph * v; // |.| < 2^24 2^29 per key: 32 keys below 2^59
+                                lo[cc] += pl * v;
+                            }
+                        }
+        #pragma unroll
                         for (int cc = 0; cc < 4; ++cc) {
-                            const long long v = sh.vg[jj][sub + 16 * (cg + cc)];
-                            hi[cc] += ph * v; // |.| < 2^24 2^29 per key: 32 keys below 2^59
-                            lo[cc] += pl * v;
+                            bool unused = false;
+                            add_shifted(num[cg + cc], hi[cc], 24, unused);
+                            add_shifted(num[cg + cc], lo[cc], 0, unused);
                         }
                     }
-    #pragma unroll
-                    for (int cc = 0; cc < 4; ++cc) {
-                        bool unused = false;
-                        add_shifted(num[cg + cc], hi[cc], 24, unused);
-                        add_shifted(num[cg + cc], lo[cc], 0, unused);
-                    }
                 }
+                __syncthreads();
             }
-            __syncthreads();
         }
-    }
 
 #pragma unroll
-    for (int o = 8; o > 0; o >>= 1) {
-        I128 other;
-        other.lo = __shfl_xor_sync(0xFFFFFFFFU, den.lo, o);
-        other.hi = __shfl_xor_sync(0xFFFFFFFFU, den.hi, o);
-        den      = add_i128(den, other);
-        den_err += __shfl_xor_sync(0xFFFFFFFFU, den_err, o);
-        p_err += __shfl_xor_sync(0xFFFFFFFFU, p_err, o);
-        fail = __shfl_xor_sync(0xFFFFFFFFU, fail ? 1 : 0, o) != 0 || fail;
-    }
-    if constexpr (M == kSums) {
-        if (active) {
-            PartialSum& ps = args.psum[(static_cast<std::size_t>(split) * args.columns + c) * args.heads + h];
-#pragma unroll
-            for (int cc = 0; cc < 16; ++cc) { ps.num[sub + 16 * cc] = num[cc]; }
-            if (sub == 0) {
-                ps.den     = den;
-                ps.p_err   = p_err;
-                ps.den_err = den_err;
-                ps.flags   = fail ? kFail : 0;
-            }
+        for (int o = 8; o > 0; o >>= 1) {
+            I128 other;
+            other.lo = __shfl_xor_sync(0xFFFFFFFFU, den.lo, o);
+            other.hi = __shfl_xor_sync(0xFFFFFFFFU, den.hi, o);
+            den      = add_i128(den, other);
+            den_err += __shfl_xor_sync(0xFFFFFFFFU, den_err, o);
+            p_err += __shfl_xor_sync(0xFFFFFFFFU, p_err, o);
+            fail = __shfl_xor_sync(0xFFFFFFFFU, fail ? 1 : 0, o) != 0 || fail;
         }
-        // Value elements rounded to their grid widen the combine's error bound.
-        for (int d = tid; d < kDim; d += kThreads) {
-            if (sh.vinexact[d] != 0) { atomicOr(args.vinexact + (static_cast<std::size_t>(b) * args.kv_heads + kvh) * kDim + d, 1); }
-        }
-        return;
-    }
-    bool flag = false;
-    if (active) {
-        std::uint16_t* out = args.out + (static_cast<std::size_t>(c) * args.heads + h) * kDim + sub;
-        if (nan) {
+        if constexpr (M == kSums) {
+            if (active) {
+                PartialSum& ps = args.psum[(static_cast<std::size_t>(split) * args.columns + c) * args.heads + h];
 #pragma unroll
-            for (int cc = 0; cc < 16; ++cc) { out[16 * cc] = kNaN; }
-        } else if (fail) {
-            flag = true;
-        } else {
-            const double dsum = lossless::double_i128(den, -87);
-#pragma unroll
-            for (int cc = 0; cc < 16; ++cc) {
-                const int vm = sh.vmax[sub + 16 * cc];
-                const double n = lossless::double_i128(num[cc], vm - 203);
-                const double o = n / dsum;
-                // The num error: p's dropped grid bits times the channel's largest |v| (below 2^(vm - 126)),
-                // and half a v grid unit per rounded value element times sum p.
-                const double num_err = p_err * ldexp(1.0, vm - 126) +
-                                       (sh.vinexact[sub + 16 * cc] != 0 ? (dsum + den_err) * ldexp(1.0, vm - 156) : 0.0);
-                // The conversions (2^-51 each), the division (2^-53), and the dropped terms.
-                const double err = fabs(o) * 0x1p-48 + (num_err + fabs(o) * den_err) / dsum * 1.01;
-                std::uint16_t r;
-                if (lossless::certain_bf16(o, err, r)) {
-                    out[16 * cc] = r;
-                } else {
-                    flag = true;
+                for (int cc = 0; cc < 16; ++cc) { ps.num[sub + 16 * cc] = num[cc]; }
+                if (sub == 0) {
+                    ps.den     = den;
+                    ps.p_err   = p_err;
+                    ps.den_err = den_err;
+                    ps.flags   = fail ? kFail : 0;
                 }
             }
-        }
-    }
+            // Value elements rounded to their grid widen the combine's error bound.
+            for (int d = tid; d < kDim; d += kThreads) {
+                if (sh.vinexact[d] != 0) { atomicOr(args.vinexact + (static_cast<std::size_t>(b) * args.kv_heads + kvh) * kDim + d, 1); }
+            }
+        } else {
+            bool flag = false;
+            if (active) {
+                std::uint16_t* out = args.out + (static_cast<std::size_t>(c) * args.heads + h) * kDim + sub;
+                if (nan) {
 #pragma unroll
-    for (int o = 8; o > 0; o >>= 1) { flag = __shfl_xor_sync(0xFFFFFFFFU, flag ? 1 : 0, o) != 0 || flag; }
-    if (active && sub == 0 && flag) {
-        const std::size_t bit = static_cast<std::size_t>(c) * args.heads + h;
-        atomicOr(args.flagged + bit / 32, 1U << (bit % 32));
+                    for (int cc = 0; cc < 16; ++cc) { out[16 * cc] = kNaN; }
+                } else if (fail) {
+                    flag = true;
+                } else {
+                    const double dsum = lossless::double_i128(den, -87);
+#pragma unroll
+                    for (int cc = 0; cc < 16; ++cc) {
+                        const int vm = sh.vmax[sub + 16 * cc];
+                        const double n = lossless::double_i128(num[cc], vm - 203);
+                        const double o = n / dsum;
+                        // The num error: p's dropped grid bits times the channel's largest |v| (below 2^(vm - 126)),
+                        // and half a v grid unit per rounded value element times sum p.
+                        const double num_err = p_err * ldexp(1.0, vm - 126) +
+                                               (sh.vinexact[sub + 16 * cc] != 0 ? (dsum + den_err) * ldexp(1.0, vm - 156) : 0.0);
+                        // The conversions (2^-51 each), the division (2^-53), and the dropped terms.
+                        const double err = fabs(o) * 0x1p-48 + (num_err + fabs(o) * den_err) / dsum * 1.01;
+                        std::uint16_t r;
+                        if (lossless::certain_bf16(o, err, r)) {
+                            out[16 * cc] = r;
+                        } else {
+                            flag = true;
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) { flag = __shfl_xor_sync(0xFFFFFFFFU, flag ? 1 : 0, o) != 0 || flag; }
+            if (active && sub == 0 && flag) {
+                const std::size_t bit = static_cast<std::size_t>(c) * args.heads + h;
+                atomicOr(args.flagged + bit / 32, 1U << (bit % 32));
+            }
+        }
     }
 }
 

@@ -26,16 +26,22 @@ inline constexpr std::int32_t kHcMixFusedMaxColumns = 16;
 [[nodiscard]] std::size_t hc_mix_fused_workspace_bytes(std::int32_t down_rows, std::int32_t streams,
                                                        std::int32_t columns) noexcept;
 
-// K1a then K1b. `partials` holds hc_mix_fused_workspace_bytes; inject (FP32 [S, T]) may be null.
+// --a8-activations: x's 8-bit copy for a GGUF projection of x (ggml_linear_a8's column words, column t at words + t *
+// stride; slice code sums with `sums`). Null words: none.
+struct HcMixA8Columns {
+    std::int32_t* words = nullptr;
+    std::int32_t stride = 0;
+    bool sums           = false;
+};
+
+// Whether the fused route writes x's 8-bit copy for this call: its two-or-more-column kernels (v4), whose norm
+// weights are 16-byte aligned.
+[[nodiscard]] bool hc_mix_fused_a8_supported(const Tensor& norm_weight, std::int32_t columns) noexcept;
+
+// K1a then K1b. `partials` holds hc_mix_fused_workspace_bytes; inject (FP32 [S, T]) may be null; `a8` (words set)
+// only where hc_mix_fused_a8_supported.
 void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weight& down, const Weight& up,
                   std::int32_t streams, std::int32_t rank, float eps, Tensor& x, Tensor* inject, void* partials,
-                  cudaStream_t stream);
-
-// hyper_connection_inject(y, pending_inject, residual) folded into hc_mix_fused: K1a reads and K1b
-// reads and writes back each residual value with the inject applied (hc_injected), so x, inject and
-// the residual are those of the inject then the mix, bit for bit. `inject` must not be pending_inject.
-void hc_inject_mix_fused(const Tensor& y, const Tensor& pending_inject, Tensor& residual, const Tensor& norm_weight,
-                         const Weight& down, const Weight& up, std::int32_t streams, std::int32_t rank, float eps,
-                         Tensor& x, Tensor* inject, void* partials, cudaStream_t stream);
+                  cudaStream_t stream, HcMixA8Columns a8 = {});
 
 } // namespace infernix::ops::detail

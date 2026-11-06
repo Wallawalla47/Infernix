@@ -2,13 +2,17 @@
 #include "serve/request_log.h"
 
 #include <nlohmann/json.hpp>
+#include <spdlog/logger.h>
+#include <spdlog/sinks/ostream_sink.h>
 
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -216,7 +220,8 @@ int main() {
         check(k8v4_server.at("engine").at("kv_cache") == "k8v4", "K8V4 KV report name missing");
     for (const auto& [storage, name] :
          {std::pair{infernix::KvCacheStorage::Vq2, "vq2"},
-          std::pair{infernix::KvCacheStorage::Q4KeyVq2Value, "k4v2"}}) {
+          std::pair{infernix::KvCacheStorage::Q4KeyVq2Value, "k4v2"},
+          std::pair{infernix::KvCacheStorage::Bf16Packed, "bf16p"}}) {
         options.kv_cache        = storage;
         engine_options.kv_cache = storage;
         memory.kv_cache         = storage;
@@ -339,6 +344,32 @@ int main() {
             "req#7 started | openai-chat non-stream | 2 messages | max output 4,096 | thinking "
             "xhigh, budget 256 | media 1, prepared 120 ms | preserve thinking",
         "pretty request-start record mismatch");
+    {
+        // A request whose instruction roles the template lowered says so once per process, at info;
+        // a request without one adds nothing.
+        std::ostringstream stream;
+        auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(stream);
+        sink->set_pattern("%l %v");
+        auto logger = std::make_shared<spdlog::logger>("operational-test", sink);
+        logger->set_level(spdlog::level::info);
+        const OperationalLog log(logger);
+        RequestLogContext plain = context;
+        plain.preparation.instruction_role_lowerings = 0;
+        log.request_start(plain);
+        log.request_start(context);
+        log.request_start(context);
+        logger->flush();
+        const std::string text = stream.str();
+        const std::string note =
+            "info chat template | req#7: 2 system or developer messages were sent under another role, since "
+            "the artifact's template cannot place them there (a later one as user, a leading developer one "
+            "as system; text and position unchanged; later requests count theirs in --request-log-jsonl) | "
+            "to keep every role, pass --chat-template tools/chat_templates/qwen3_8.jinja";
+        const std::size_t first = text.find("chat template |");
+        failures += check(text.find(note) != std::string::npos &&
+                              text.find("chat template |", first + 1) == std::string::npos,
+                          "the chat template role note is missing, unclear or repeated");
+    }
     RequestLogContext default_thinking = context;
     default_thinking.requested_reasoning_effort.reset();
     default_thinking.thinking_budget.reset();
@@ -471,7 +502,6 @@ int main() {
     outcome.speculative.tree_side_accepted_tokens = 11;
     outcome.speculative.ngram_archive_drafted_tokens  = 441;
     outcome.speculative.ngram_archive_accepted_tokens = 400;
-    outcome.speculative.ngram_gate_rejections         = 5;
     outcome.ngram_archive                             = {.enabled       = true,
                                                          .bound         = true,
                                                          .published     = true,
@@ -567,8 +597,6 @@ int main() {
     failures += check(done.at("speculative").at("tree_side_accepted_tokens") == 11 &&
                           done.at("speculative").at("tree_rounds") == 0,
                       "speculative tree counters missing");
-    failures += check(done.at("speculative").at("ngram_gate_rejections") == 5,
-                      "n-gram agreement gate counter missing");
     failures += check(done.at("speculative").at("ngram_archive_accepted_tokens") == 400 &&
                           done.at("speculative").at("ngram_archive").at("generation") == 3 &&
                           done.at("speculative").at("ngram_archive").at("bound") == true &&
@@ -993,8 +1021,10 @@ int main() {
     }
 
     const auto limit_note = render_output_limit_note(262144, 8192);
-    failures += check(limit_note && limit_note->message.find(
-                                        "8,192 tokens of its 262,144 context") != std::string::npos,
+    failures += check(limit_note && limit_note->message ==
+                                        "output limit | a request that sets no output limit stops "
+                                        "after 8,192 tokens (--default-max-tokens), though its "
+                                        "context allows 262,144",
                       "no output-limit note at 32 times the default limit");
     failures +=
         check(render_output_limit_note(32768, 8192) && !render_output_limit_note(32767, 8192),

@@ -74,31 +74,6 @@ bool compile_direct_types(const Json& type_definition, TypeSet& types) {
     return types.bits != 0;
 }
 
-bool compile_schema_types(const Json& schema, TypeSet& types) {
-    if (!schema.is_object()) { return false; }
-    const auto direct = schema.find("type");
-    if (direct != schema.end()) { return compile_direct_types(*direct, types); }
-
-    const auto any_of     = schema.find("anyOf");
-    const auto one_of     = schema.find("oneOf");
-    const bool has_any_of = any_of != schema.end();
-    const bool has_one_of = one_of != schema.end();
-    if (has_any_of == has_one_of) { return false; }
-
-    const Json& alternatives = has_any_of ? *any_of : *one_of;
-    if (!alternatives.is_array() || alternatives.empty()) { return false; }
-
-    TypeSet combined;
-    for (const Json& alternative : alternatives) {
-        TypeSet branch;
-        if (!compile_schema_types(alternative, branch)) { return false; }
-        combined.bits |= branch.bits;
-    }
-    if (combined.bits == 0) { return false; }
-    types = combined;
-    return true;
-}
-
 const Json& resolve(const Json& node, const Json& document, std::set<std::string>& seen) {
     if (!node.is_object()) return node;
     if (node.contains("$ref") && node["$ref"].is_string()) {
@@ -125,106 +100,260 @@ std::uint8_t value_type(const Json& value) {
     return type_bit(integer ? SchemaType::Integer : SchemaType::Number);
 }
 
-std::uint8_t domain(const Json& source, const Json& document, std::set<std::string> seen = {}) {
-    if (source.is_boolean()) return source.get<bool>() ? 0x7f : 0;
-    const Json& node = resolve(source, document, seen);
-    if (!node.is_object()) return node.is_boolean() && !node.get<bool>() ? 0 : 0x7f;
-    std::uint8_t types = 0x7f;
-    if (node.contains("type")) {
-        TypeSet direct;
-        if (!compile_direct_types(node["type"], direct)) fail("invalid tool parameter type");
-        types = direct.bits;
-        if (types & type_bit(SchemaType::Number)) types |= type_bit(SchemaType::Integer);
+constexpr std::uint8_t kAnyType = 0x7f;
+
+// The JSON types a schema admits, read from its type-bearing keywords alone: `type`, `const`,
+// `enum`, a local `$ref`, `allOf` (each branch narrows them) and `anyOf` / `oneOf` (the union of
+// their branches). It validates nothing: a keyword it cannot read (an invalid type, a remote or
+// missing reference, a reference cycle) narrows nothing, and `known` stays false when nothing
+// narrowed the types.
+struct TypeDomain {
+    std::uint8_t bits = kAnyType;
+    bool known        = false;
+
+    void narrow(TypeDomain other) {
+        bits &= other.bits;
+        known = known || other.known;
     }
-    if (node.contains("const")) return types & value_type(node["const"]);
-    if (node.contains("enum") && node["enum"].is_array()) {
-        std::uint8_t values = 0;
-        for (const auto& item : node["enum"]) values |= value_type(item);
-        return types & values;
+};
+
+// `open` holds the schemas being read, so a reference cycle reads as unknown.
+TypeDomain type_domain(const Json& schema, const Json& document, std::set<const Json*>& open) {
+    if (schema.is_boolean()) return schema.get<bool>() ? TypeDomain{} : TypeDomain{0, true};
+    if (!schema.is_object() || !open.insert(&schema).second) return {};
+    TypeDomain result;
+    if (const auto ref = schema.find("$ref"); ref != schema.end() && ref->is_string()) {
+        const auto& pointer = ref->get_ref<const std::string&>();
+        const Json* target  = nullptr;
+        if (pointer == "#" || pointer.starts_with("#/")) {
+            try {
+                target = &document.at(Json::json_pointer(pointer.substr(1)));
+            } catch (const Json::exception&) {
+                // A missing target narrows nothing.
+            }
+        }
+        if (target != nullptr) result.narrow(type_domain(*target, document, open));
+    }
+    if (const auto type = schema.find("type"); type != schema.end()) {
+        TypeSet direct;
+        if (compile_direct_types(*type, direct)) {
+            // A number type admits the integers too.
+            if (direct.bits & type_bit(SchemaType::Number))
+                direct.bits |= type_bit(SchemaType::Integer);
+            result.narrow({direct.bits, true});
+        }
+    }
+    if (const auto value = schema.find("const"); value != schema.end())
+        result.narrow({value_type(*value), true});
+    if (const auto values = schema.find("enum"); values != schema.end() && values->is_array()) {
+        std::uint8_t bits = 0;
+        for (const Json& value : *values) bits |= value_type(value);
+        result.narrow({bits, true});
     }
     for (const char* key : {"anyOf", "oneOf"}) {
-        if (!node.contains(key) || !node[key].is_array()) continue;
-        std::uint8_t combined = 0;
-        for (const auto& branch : node[key]) combined |= domain(branch, document, seen);
-        types &= combined;
+        const auto branches = schema.find(key);
+        if (branches == schema.end() || !branches->is_array() || branches->empty()) continue;
+        // An unknown branch admits every type: the union is known only when every branch is.
+        TypeDomain combined{0, true};
+        for (const Json& branch : *branches) {
+            const TypeDomain domain = type_domain(branch, document, open);
+            combined.bits |= domain.bits;
+            combined.known = combined.known && domain.known;
+        }
+        result.narrow(combined);
     }
-    if (node.contains("allOf"))
-        for (const auto& branch : node["allOf"]) types &= domain(branch, document, seen);
-    return types;
+    if (const auto branches = schema.find("allOf");
+        branches != schema.end() && branches->is_array())
+        for (const Json& branch : *branches) result.narrow(type_domain(branch, document, open));
+    open.erase(&schema);
+    return result;
 }
 
-// A plain text schema: type "string", or "string" with "null" in a type list, without enum, const or
-// structure; `nullable` is set when null is one of its types.
-bool plain_text_schema(const Json& node, bool& nullable) {
+TypeDomain type_domain(const Json& schema, const Json& document) {
+    std::set<const Json*> open;
+    return type_domain(schema, document, open);
+}
+
+// A root union's branch as the object schema it names, through local references; nullptr when it
+// cannot be read (not an object, or a remote, missing or cyclic reference).
+const Json* variant_object(const Json& branch, const Json& document) {
+    const Json* node = &branch;
+    std::set<const Json*> seen;
+    while (node->is_object() && node->contains("$ref")) {
+        const Json& ref = (*node)["$ref"];
+        if (!ref.is_string() || !seen.insert(node).second) return nullptr;
+        const auto& pointer = ref.get_ref<const std::string&>();
+        if (pointer != "#" && !pointer.starts_with("#/")) return nullptr;
+        try {
+            node = &document.at(Json::json_pointer(pointer.substr(1)));
+        } catch (const Json::exception&) { return nullptr; }
+    }
+    return node->is_object() ? node : nullptr;
+}
+
+// A non-strict tool's parameters, whose types guide their value text: the root's `properties`, and
+// those of the object variants of a root `anyOf` / `oneOf` (a zod or Pydantic discriminated union,
+// Codex's `automation_update`), each name once. A variant property's types are the union of the
+// types its declaring variants give it, known only when each of them is; a root property of the same
+// name narrows them. A union with a branch that cannot be read declares nothing.
+std::vector<Contract::Parameter> non_strict_parameters(const Json& schema) {
+    struct Declared {
+        std::string name;
+        TypeDomain types;
+    };
+    const auto named = [](std::vector<Declared>& list, const std::string& name) {
+        return std::find_if(list.begin(), list.end(), [&](const Declared& entry) { return entry.name == name; });
+    };
+    std::vector<Declared> declared;
+    if (const auto properties = schema.find("properties"); properties != schema.end() && properties->is_object())
+        for (const auto& [name, property] : properties->items()) declared.push_back({name, type_domain(property, schema)});
+    for (const char* key : {"anyOf", "oneOf"}) {
+        const auto branches = schema.find(key);
+        if (branches == schema.end() || !branches->is_array()) continue;
+        std::vector<Declared> united;
+        bool readable = true;
+        for (const Json& branch : *branches) {
+            const Json* variant = variant_object(branch, schema);
+            if (variant == nullptr) {
+                readable = false;
+                break;
+            }
+            const auto properties = variant->find("properties");
+            if (properties == variant->end() || !properties->is_object()) continue;
+            for (const auto& [name, property] : properties->items()) {
+                const TypeDomain types = type_domain(property, schema);
+                if (const auto entry = named(united, name); entry != united.end()) {
+                    entry->types.bits |= types.bits;
+                    entry->types.known = entry->types.known && types.known;
+                } else {
+                    united.push_back({name, types});
+                }
+            }
+        }
+        if (!readable) continue;
+        for (Declared& entry : united) {
+            if (const auto root = named(declared, entry.name); root != declared.end())
+                root->types.narrow(entry.types);
+            else
+                declared.push_back(std::move(entry));
+        }
+    }
+    std::vector<Contract::Parameter> parameters;
+    for (const Declared& entry : declared) {
+        Contract::Parameter parameter;
+        parameter.name = entry.name;
+        if (entry.types.known) {
+            parameter.policy     = NormalizationPolicy::DeclaredTypes;
+            parameter.types.bits = entry.types.bits;
+        }
+        parameters.push_back(std::move(parameter));
+    }
+    return parameters;
+}
+
+// The raw-text branches of a nullable string, as the grammar takes them: the open string schemas,
+// the members of the finite (enum / const) ones, and whether null is one of the values.
+struct TextBranches {
+    Json open     = Json::array();
+    Json members  = Json::array();
+    bool nullable = false;
+};
+
+// Adds a branch without structure: type "string" ("null" in a type list makes it nullable), type
+// "null", or an enum / const of strings and null (prepare_json_schema has dropped the members its
+// type refuses). False when the schema is none of these.
+bool add_text_branch(const Json& node, TextBranches& text) {
     if (!node.is_object()) return false;
-    for (const char* key : {"enum", "const", "anyOf", "oneOf", "allOf", "properties", "items", "$ref"})
+    for (const char* key : {"anyOf", "oneOf", "allOf", "properties", "items", "$ref"})
         if (node.contains(key)) return false;
-    const auto type = node.find("type");
-    if (type == node.end()) return false;
-    if (type->is_string()) return type->get_ref<const std::string&>() == "string";
-    if (!type->is_array()) return false;
-    bool text = false;
-    for (const Json& member : *type) {
-        if (!member.is_string()) return false;
-        const auto& name = member.get_ref<const std::string&>();
-        if (name == "string") {
-            text = true;
-        } else if (name == "null") {
-            nullable = true;
-        } else {
+    bool string = false;
+    bool null   = false;
+    if (const auto type = node.find("type"); type != node.end()) {
+        const Json names = type->is_array() ? *type : Json::array({*type});
+        if (names.empty()) return false;
+        for (const Json& name : names) {
+            if (name == "string") {
+                string = true;
+            } else if (name == "null") {
+                null = true;
+            } else {
+                return false;
+            }
+        }
+    }
+    const auto constant = node.find("const");
+    const auto values   = node.find("enum");
+    if (constant == node.end() && values == node.end()) {
+        if (string) {
+            Json branch    = node;
+            branch["type"] = "string";
+            text.open.push_back(std::move(branch));
+        } else if (!null) {
             return false;
         }
+        text.nullable = text.nullable || null;
+        return true;
     }
-    return text;
+    // A finite branch's values are its members, whatever its type list names.
+    const Json members = constant != node.end() ? Json::array({*constant}) : *values;
+    if (!members.is_array()) return false;
+    for (const Json& member : members) {
+        if (member.is_null()) {
+            text.nullable = true;
+        } else if (!member.is_string()) {
+            return false;
+        } else if (std::find(text.members.begin(), text.members.end(), member) ==
+                   text.members.end()) {
+            text.members.push_back(member);
+        }
+    }
+    return true;
 }
 
-// A schema of type "null" alone, without enum, const or structure.
-bool null_schema(const Json& node) {
-    if (!node.is_object()) return false;
-    for (const char* key : {"enum", "const", "anyOf", "oneOf", "allOf", "properties", "items", "$ref"})
-        if (node.contains(key)) return false;
-    const auto type = node.find("type");
-    return type != node.end() && type->is_string() && type->get_ref<const std::string&>() == "null";
-}
-
-// A nullable string parameter (BX-06: OpenAI strict mode writes every optional field as one): a type list of
-// "string" and "null", or an anyOf / oneOf whose branches are plain strings or null (at least one string).
-// Its model text is raw, as a string's, and the grammar takes it as its string branches (`null` is text it may
-// write, read back as JSON null). Empty when the schema is not one.
-std::optional<Json> nullable_text_branches(const Json& source, const Json& document) {
+// A nullable string parameter (BX-06: OpenAI strict mode writes every optional field as one): a
+// type list of "string" and "null", an enum or const of strings and null (NU-01), or an anyOf /
+// oneOf whose branches are such strings or null (at least one string). Its model text is raw, as a
+// string's: the grammar takes the string branches, their members, and the text `null`, which reads
+// back as JSON null. Empty when the schema is not one; `null_member` is set when a finite branch
+// lists the string "null", which that text cannot tell apart from null.
+std::optional<Json> nullable_text_branches(const Json& source, const Json& document,
+                                           bool& null_member) {
     std::set<std::string> seen;
     const Json& node = resolve(source, document, seen);
-    bool nullable    = false;
-    if (plain_text_schema(node, nullable)) {
-        if (!nullable) return std::nullopt;
-        Json text    = node;
-        text["type"] = "string";
-        return text;
-    }
     if (!node.is_object()) return std::nullopt;
-    for (const char* key : {"type", "enum", "const", "properties", "items", "allOf"})
-        if (node.contains(key)) return std::nullopt;
+    TextBranches text;
     const bool any_of = node.contains("anyOf");
-    if (any_of == node.contains("oneOf")) return std::nullopt;
-    const Json& alternatives = node[any_of ? "anyOf" : "oneOf"];
-    if (!alternatives.is_array() || alternatives.empty()) return std::nullopt;
-    Json strings = Json::array();
-    for (const Json& alternative : alternatives) {
-        std::set<std::string> branch_seen;
-        const Json& branch = resolve(alternative, document, branch_seen);
-        bool null_branch   = false;
-        if (null_schema(branch)) {
-            nullable = true;
-            continue;
+    if (any_of || node.contains("oneOf")) {
+        for (const char* key : {"type", "enum", "const", "properties", "items", "allOf"})
+            if (node.contains(key)) return std::nullopt;
+        if (any_of == node.contains("oneOf")) return std::nullopt;
+        const Json& alternatives = node[any_of ? "anyOf" : "oneOf"];
+        if (!alternatives.is_array() || alternatives.empty()) return std::nullopt;
+        for (const Json& alternative : alternatives) {
+            std::set<std::string> branch_seen;
+            if (!add_text_branch(resolve(alternative, document, branch_seen), text))
+                return std::nullopt;
         }
-        if (!plain_text_schema(branch, null_branch)) return std::nullopt;
-        nullable = nullable || null_branch;
-        Json text    = branch;
-        text["type"] = "string";
-        strings.push_back(std::move(text));
+    } else if (!add_text_branch(node, text)) {
+        return std::nullopt;
     }
-    if (!nullable || strings.empty()) return std::nullopt;
-    return strings.size() == 1 ? strings[0] : Json{{"anyOf", std::move(strings)}};
+    if (!text.nullable || (text.open.empty() && text.members.empty())) return std::nullopt;
+    if (std::find(text.members.begin(), text.members.end(), Json("null")) != text.members.end()) {
+        null_member = true;
+        return std::nullopt;
+    }
+    // An open branch without a pattern whose length bounds admit four characters takes the text
+    // `null` already; otherwise it is one more member.
+    const bool admits_null =
+        std::any_of(text.open.begin(), text.open.end(), [](const Json& branch) {
+            return !branch.contains("pattern") && branch.value("minLength", 0) <= 4 &&
+                   branch.value("maxLength", 4) >= 4;
+        });
+    if (!admits_null) text.members.push_back(Json("null"));
+    Json branches = std::move(text.open);
+    if (!text.members.empty())
+        branches.push_back(Json{{"type", "string"}, {"enum", std::move(text.members)}});
+    return branches.size() == 1 ? branches[0] : Json{{"anyOf", std::move(branches)}};
 }
 
 void prepare_strict_parameters(Contract::Tool& tool) {
@@ -254,13 +383,20 @@ void prepare_strict_parameters(Contract::Tool& tool) {
                  parameter_path(tool));
         Contract::Parameter parameter;
         parameter.name = name;
-        if (compile_schema_types(schema, parameter.types))
-            parameter.policy = NormalizationPolicy::DeclaredTypes;
-        const auto types  = domain(schema, document);
-        const bool string = (types & type_bit(SchemaType::String)) != 0;
+        // The grammar admits values of these types alone, so the decoder reads them as such.
+        const auto types     = type_domain(schema, document).bits;
+        parameter.policy     = NormalizationPolicy::DeclaredTypes;
+        parameter.types.bits = types;
+        const bool string    = (types & type_bit(SchemaType::String)) != 0;
         if (string && types == (type_bit(SchemaType::String) | type_bit(SchemaType::Null))) {
             // Raw text with null as one of its values: the grammar takes the string branches.
-            const std::optional<Json> text = nullable_text_branches(schema, document);
+            bool null_member               = false;
+            const std::optional<Json> text = nullable_text_branches(schema, document, null_member);
+            if (null_member)
+                fail("strict tool '" + tool.name + "' parameter '" + name +
+                         "' lists the string \"null\" beside null, which its raw text cannot "
+                         "tell apart",
+                     parameter_path(tool));
             if (!text || &root != &document)
                 fail("strict tool '" + tool.name + "' parameter '" + name +
                          "' mixes raw string and JSON value types beyond a nullable string",
@@ -282,10 +418,11 @@ void prepare_strict_parameters(Contract::Tool& tool) {
 
 std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons,
-                                std::span<const std::string> deferred_tool_jsons) {
+                                std::span<const std::string> deferred_tool_jsons, bool open_names) {
     const std::size_t count = tool_jsons.size() + deferred_tool_jsons.size();
     if (count == 0) return {};
-    auto result = std::make_shared<Contract>();
+    auto result        = std::make_shared<Contract>();
+    result->open_names = open_names;
     std::set<std::string> names;
     for (std::size_t i = 0; i < count; ++i) {
         const std::string& source = i < tool_jsons.size() ? tool_jsons[i]
@@ -314,17 +451,10 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons,
                 "parameters", Json{{"type", "object"}, {"properties", Json::object()}});
             tool.schema_json       = schema.dump();
             tool.declaration_index = i;
-            // Non-strict output keeps the established best-effort normalization contract.
-            if (schema.is_object() && schema.contains("properties") &&
-                schema["properties"].is_object()) {
-                for (const auto& [name, property] : schema["properties"].items()) {
-                    Contract::Parameter parameter;
-                    parameter.name = name;
-                    if (compile_schema_types(property, parameter.types))
-                        parameter.policy = NormalizationPolicy::DeclaredTypes;
-                    tool.parameters.push_back(std::move(parameter));
-                }
-            }
+            // Non-strict output keeps the established best-effort normalization contract: the
+            // types its schema names, through local references and enum / const values, guide
+            // the value text (a constrained strict tool's are replaced at selection by its strict list).
+            if (schema.is_object()) tool.parameters = non_strict_parameters(schema);
             result->tools.push_back(std::move(tool));
         } catch (const Json::exception& error) {
             fail(std::string("invalid tool declaration: ") + error.what(), "/" + std::to_string(i));
@@ -349,9 +479,10 @@ select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& d
         std::none_of(declarations->tools.begin(), declarations->tools.end(),
                      [](const auto& tool) { return tool.strict; }))
         return declarations;
-    auto selected      = std::make_shared<Contract>();
-    selected->required = choice.mode == ToolChoiceMode::Required;
-    selected->parallel = choice.parallel;
+    auto selected        = std::make_shared<Contract>();
+    selected->required   = choice.mode == ToolChoiceMode::Required;
+    selected->parallel   = choice.parallel;
+    selected->open_names = declarations && declarations->open_names;
     if (declarations && choice.mode != ToolChoiceMode::None) {
         for (const auto& tool : declarations->tools) {
             if (!choice.allowed_names ||

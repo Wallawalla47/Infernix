@@ -20,11 +20,10 @@ bool word_byte(unsigned char c) {
     return c >= 0x80 || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
 }
 
-// Python's `\s`, which Strata's split drops. unicode::is_whitespace covers the Unicode space
-// categories; U+001C-U+001F and U+0085 are whitespace to Python and not to it.
+// Python's `\s`, which Strata's split drops. unicode::is_whitespace is the Unicode White_Space
+// property; U+001C-U+001F are whitespace to Python and not to it.
 bool space_codepoint(std::int32_t value) {
-    return (value >= 0x1c && value <= 0x1f) || value == 0x85 ||
-           text::unicode_internal::is_whitespace(value);
+    return (value >= 0x1c && value <= 0x1f) || text::unicode_internal::is_whitespace(value);
 }
 
 // A non-ASCII byte only shows what it is once its whole character has arrived: one token can hold one
@@ -206,6 +205,29 @@ bool periodic_tail(std::string_view text) {
         if (tail.substr(period) == tail.substr(0, tail.size() - period)) { return true; }
     }
     return false;
+}
+
+std::size_t longest_hyphen_chain(std::string_view text) {
+    const auto letter = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+    std::size_t best = 0;
+    std::size_t at   = 0;
+    while (at < text.size()) {
+        if (!letter(text[at])) {
+            ++at;
+            continue;
+        }
+        // A chain from here: letters, then any number of "-letters" groups.
+        const std::size_t begin = at;
+        while (at < text.size() && letter(text[at])) { ++at; }
+        bool joined = false;
+        while (at + 1 < text.size() && text[at] == '-' && letter(text[at + 1])) {
+            ++at;
+            while (at < text.size() && letter(text[at])) { ++at; }
+            joined = true;
+        }
+        if (joined) { best = std::max(best, at - begin); }
+    }
+    return best;
 }
 
 } // namespace infernix::models::qwen3_5

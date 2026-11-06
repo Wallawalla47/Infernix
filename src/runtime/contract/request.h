@@ -18,6 +18,16 @@ struct ResolvedExecutionOptions {
     TokenConstraint constraint;
 };
 
+// A row whose thinking is open at a call's first position: its end-of-turn tokens, and the tool-call opener when it
+// declares tools (withheld), take no probability until it has written the close token (ops::SamplingConfig::
+// reasoning_close; the output session's reasoning_ban). close -1: none; withheld -1: none.
+struct ReasoningBan {
+    TokenId close    = -1;
+    TokenId ends[2]  = {-1, -1};
+    TokenId withheld = -1;
+    [[nodiscard]] bool active() const noexcept { return close >= 0; }
+};
+
 struct ResolvedRequestOptions {
     std::optional<OutputConstraint> constraint;
     ToolChoice tool_choice;

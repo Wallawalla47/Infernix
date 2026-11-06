@@ -12,8 +12,10 @@
 #include "core/vram_budget.h"
 #include "infernix/types.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 
 namespace infernix::runtime::expert_offload {
@@ -21,8 +23,8 @@ namespace infernix::runtime::expert_offload {
 inline constexpr std::uint64_t kLedgerGiB = 1ULL << 30;
 
 struct HostMemoryDemand {
-    // Physical memory left free for the OS and other programs (--ram-headroom-mib).
-    std::uint64_t reserve = kDefaultRamHeadroomBytes;
+    // Physical memory left free for the OS and other programs (--ram-free-mib).
+    std::uint64_t reserve = kDefaultRamFreeBytes;
     // Pinned expert banks (all layers).
     std::uint64_t expert_banks = 0;
     // The model's other pinned weights (the token embedding).
@@ -100,6 +102,23 @@ struct HostMemoryLedger {
 
 [[nodiscard]] HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const HostMemoryDemand& demand);
 
+// The exclusive RAM layout's tier for an engine whose experts share one record size (ExpertOffload;
+// Qwen3.5-122B-A10B design §11.3; Qwen3.8-Flash-Next's Program sizes its own, with its layer walk's stream
+// slots and record-size pools): the warm start seeds `seeded` frames and RAM holds every other expert plus
+// `shadows`, RAM copies of VRAM experts for what VRAM gives back without a promotion: a prefill's loan of
+// `loan_frames`, the copies decode's swaps hold at that moment (a sixteenth of the frames, as Flash-Next
+// measured) and the elastic KV's growth of `kv_frames`. The seeds never take the frames the shadows cover, so
+// a first loan finds them free.
+struct ExclusiveTier {
+    std::uint64_t seeded  = 0; // frames the warm start fills at most
+    std::uint64_t shadows = 0; // the shadow floor (HostExpertTier::Options::shadow_floor)
+    std::uint64_t slots   = 0; // expert slots: every key but the seeds, and the shadows (0: no exclusive tier)
+};
+// `seed_share`: the share of the frames the warm start would fill without the shadows' bound. Empty when the
+// shadows take every frame (the layout would keep nothing out of RAM).
+[[nodiscard]] ExclusiveTier plan_exclusive_tier(std::uint64_t keys, std::uint64_t frames, std::uint64_t loan_frames,
+                                                std::uint64_t kv_frames, double seed_share);
+
 // ---------------------------------------------------------------- device memory
 
 inline constexpr std::uint64_t kLedgerMiB = 1ULL << 20;
@@ -116,13 +135,10 @@ struct VramDemand {
     // The frame pool shrinks at runtime when the display or another program needs memory. Without
     // that nothing absorbs their growth, so the automatic headroom and the graph reserve are larger.
     bool elastic = false;
-    // CUDA graph executables the Program may instantiate after sizing, and what each may take. An
-    // elastic pool reserves for at most 32 (a lazily capturing Program instantiates a few at a time,
-    // and the pool shrinks for more) unless the Program captures every executable right after the
-    // sizing (eager_graphs: Qwen3.5's Programs).
+    // CUDA graph executables the Program may instantiate after sizing, and what each may take: a fixed
+    // pool reserves for all of them (internal_reserve); an elastic one shrinks for them instead.
     std::uint32_t graphs      = 0;
     std::uint64_t graph_bytes = kGraphExecutableBytes;
-    bool eager_graphs         = false;
     // Device allocations still to be made besides the frames (taken from free memory and budget).
     std::uint64_t fixed = 0;
     // One expert frame, and the most frames the residency uses.
@@ -154,13 +170,41 @@ struct VramSizing {
 // The headroom left for the display and other programs: the requested one, else 256 MiB without a
 // display and, with one (or when unknown), 512 MiB for an elastic pool or 1 GiB for a fixed one.
 [[nodiscard]] std::uint64_t display_headroom(DisplayState display, bool elastic, std::optional<std::uint64_t> requested);
-// The reserve for graph executables instantiated after sizing: max(256 MiB, 128 MiB + one
-// allowance per graph), the graph count capped at 32 for an elastic pool, which absorbs the rest.
+// The reserve for Infernix's own allocations after sizing (graph executables, the driver's): 128 MiB
+// for an elastic pool, whose shrinks absorb the rest; max(256 MiB, 128 MiB + one allowance per graph)
+// for a fixed one.
 [[nodiscard]] std::uint64_t internal_reserve(std::uint32_t graphs, std::uint64_t graph_bytes, bool elastic);
 // frame_bytes = min(F - fixed - headroom, B - fixed - 64 MiB) - reserve, with F the device free
 // memory and B the OS budget less this process's usage (no budget: F's bound alone); frames =
 // clamp(frame_bytes / frame size, 0, max_frames).
 [[nodiscard]] VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& demand);
+// The expert cache's pools for these per-layer record strides: one per distinct stride (the layers of
+// one stride share a pool, ExpertResidency), so an NVFP4 or block-FP8 artifact has one.
+[[nodiscard]] std::size_t frame_pools(std::span<const std::uint64_t> strides);
+// The frames a start keeps off size_expert_frames' count before it backs them: every pool maps whole
+// chunks of `chunk_bytes`, so one chunk per pool beyond the first, in frames of `frame_bytes`
+// (ExpertResidency::frame_bytes, the average frame). Engine::plan takes the same off its frames.
+[[nodiscard]] std::uint32_t pool_slack_frames(std::size_t pools, std::uint64_t chunk_bytes,
+                                              std::uint64_t frame_bytes) noexcept;
+// What an expert cache lends one run (a prefill pass's workspace): the most frames one pool lends with no
+// lease out (above the quarter each keeps), and that pool's pitch (ExpertResidency::lend_capacity).
+struct LendCapacity {
+    std::uint64_t frames = 0, pitch = 0;
+    // Whether one run lends `bytes` with a frame to spare.
+    [[nodiscard]] bool lends(std::uint64_t bytes) const noexcept { return pitch != 0 && (bytes + pitch - 1) / pitch < frames; }
+};
+// The same for a cache not built yet of `frames` frames, over the pools these per-layer record strides form
+// with `experts` experts a layer, split among them as ExpertResidency::resize splits them (a pool's arena
+// taken to hold its limit): the Engine's prefill-chunk fit for the offloaded Qwen3.5, at start and in
+// Engine::plan.
+[[nodiscard]] LendCapacity lend_capacity(std::span<const std::uint64_t> strides, std::uint32_t experts,
+                                         std::uint32_t frames);
+// The reproducible route fits its prefill chunk to the frames a launch would size with kNominalInUseBytes
+// in use before loading, an attached display's headroom and no OS budget below free memory: a function of
+// the GPU, the options and the artifact, not of what other programs held at launch (Flash-Next and the
+// offloaded Qwen3.5 alike). Without the launch's figure the snapshot stands.
+inline constexpr std::uint64_t kNominalInUseBytes = 3ULL << 30;
+[[nodiscard]] VramSnapshot nominal_snapshot(VramSnapshot snapshot, std::optional<std::uint64_t> in_use_before_load) noexcept;
 
 // The runtime law of an elastic frame pool (design §19.3.7): from the latest snapshot, the pool's
 // size and the time, the frame count it should have. Pure and single-threaded; the Program guards

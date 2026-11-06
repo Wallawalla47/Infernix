@@ -40,7 +40,7 @@ constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 
 enum class Entry : std::uint8_t { Append, Cached, Both };
 enum class GeometryChoice : std::uint8_t { H24Kv4, H16Kv2, All };
-enum class KvChoice : std::uint8_t { Bf16, Int8, Fp8, Nvfp4, K8V4, Vq2, K4V2, All };
+enum class KvChoice : std::uint8_t { Bf16, Bf16p, Int8, Fp8, Nvfp4, K8V4, Vq2, K4V2, All };
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
@@ -114,6 +114,7 @@ struct Result {
     std::size_t graph_nodes = 0, workspace_peak = 0;
     int graph_calls = 1;
     ops::CausalAttentionExecutionEnvelope envelope{};
+    std::uint64_t output_hash = 0; // FNV-1a of the output after the timed calls (bits across builds and storages)
 };
 
 [[noreturn]] void usage(const char* message) {
@@ -122,7 +123,7 @@ struct Result {
                  "usage: infernix_causal_softmax_attention_bench "
                  "[--entry append|cached|both] "
                  "[--geometry d256-h24-kv4|d256-h16-kv2|all] "
-                 "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2|all] [--batch B,...] [--tokens W,...] "
+                 "[--kv-dtype bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2|all] [--batch B,...] [--tokens W,...] "
                  "[--context L,...] [--row-contexts L0,...] [--valid-columns V0,...] "
                  "[--table-rows R0,...] "
                  "[--envelope-max N] "
@@ -208,10 +209,12 @@ Options parse_options(int argc, char** argv) {
                 options.kv = KvChoice::Vq2;
             else if (value == "k4v2")
                 options.kv = KvChoice::K4V2;
+            else if (value == "bf16p")
+                options.kv = KvChoice::Bf16p;
             else if (value == "all")
                 options.kv = KvChoice::All;
             else
-                usage("--kv-dtype expects bf16, int8, fp8, nvfp4, k8v4, vq2, k4v2, or all");
+                usage("--kv-dtype expects bf16, bf16p, int8, fp8, nvfp4, k8v4, vq2, k4v2, or all");
         } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), 1, 262144, "--tokens");
         } else if (argument == "--batch") {
@@ -563,20 +566,16 @@ public:
                     mapping_ == PageMapping::Identity ? linear : 2 * linear + 1;
             }
         }
-        CUDA_CHECK(cudaMemcpy(positions_.p, host_positions.data(), positions_.bytes,
-                              cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(block_table_.p, host_table.data(), block_table_.bytes,
-                              cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(valid_columns_.p, valid_columns.data(), valid_columns_.bytes,
-                              cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(table_rows_.p, table_rows.data(), table_rows_.bytes,
-                              cudaMemcpyHostToDevice));
+        bench::upload(positions_.p, host_positions.data(), positions_.bytes);
+        bench::upload(block_table_.p, host_table.data(), block_table_.bytes);
+        bench::upload(valid_columns_.p, valid_columns.data(), valid_columns_.bytes);
+        bench::upload(table_rows_.p, table_rows.data(), table_rows_.bytes);
         // Populate every represented cache row through the public codec, outside measurement.
         // A row view selects its own table while all physical planes remain shared.
         std::vector<std::int32_t> initial_positions(padded_);
         for (int pos = 0; pos < padded_; ++pos) initial_positions[pos] = pos;
         DeviceBuffer dp(std::size_t(padded_) * 4);
-        CUDA_CHECK(cudaMemcpy(dp.p, initial_positions.data(), dp.bytes, cudaMemcpyHostToDevice));
+        bench::upload(dp.p, initial_positions.data(), dp.bytes);
         Tensor positions(dp.p, DType::I32, {padded_});
         for (int row = 0; row < batch_; ++row) {
             auto initial_k =
@@ -608,6 +607,16 @@ public:
                 kScale, cache_view_, envelope_, workspace_, output_tensor_,
                 execution_.on_stream(stream));
         }
+    }
+
+    // FNV-1a over the output's bytes (every call of a case writes the same output).
+    [[nodiscard]] std::uint64_t output_hash() const {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<unsigned char> bytes(output_.bytes);
+        CUDA_CHECK(cudaMemcpy(bytes.data(), output_.p, output_.bytes, cudaMemcpyDeviceToHost));
+        std::uint64_t hash = 0xCBF29CE484222325ULL;
+        for (const unsigned char byte : bytes) { hash = (hash ^ byte) * 0x100000001B3ULL; }
+        return hash;
     }
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
@@ -675,6 +684,8 @@ const char* storage_name(KvCacheStorage storage) {
         return "vq2";
     case KvCacheStorage::Q4KeyVq2Value:
         return "k4v2";
+    case KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     return "unknown";
 }
@@ -805,10 +816,10 @@ void report(const Result& result) {
     std::printf("  vectors K=%.0f V=%.0f bytes cache logical=%.0f physical=%.0f bytes "
                 "qk_flops=%.0f pv_flops=%.0f qk_full_op=%7.2f TFLOP/s "
                 "pv_full_op=%7.2f TFLOP/s unique_kv=%.0f bytes "
-                "unique_cache_rate=%8.1f GB/s\n",
+                "unique_cache_rate=%8.1f GB/s output_fnv=%016llx\n",
                 result.key_vector_bytes, result.value_vector_bytes, result.logical_cache_bytes,
                 result.physical_cache_bytes, result.qk_flops, result.pv_flops, qk_tflops, pv_tflops,
-                result.unique_kv_bytes, cache_gbps);
+                result.unique_kv_bytes, cache_gbps, static_cast<unsigned long long>(result.output_hash));
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -893,13 +904,14 @@ std::vector<Geometry> selected_geometries(GeometryChoice choice) {
 
 std::vector<KvCacheStorage> selected_storages(KvChoice choice) {
     if (choice == KvChoice::Bf16) { return {KvCacheStorage::BFloat16}; }
+    if (choice == KvChoice::Bf16p) { return {KvCacheStorage::Bf16Packed}; }
     if (choice == KvChoice::Int8) { return {KvCacheStorage::Int8Group64}; }
     if (choice == KvChoice::Fp8) { return {KvCacheStorage::Fp8E4M3Row256}; }
     if (choice == KvChoice::Nvfp4) { return {KvCacheStorage::Nvfp4Group16}; }
     if (choice == KvChoice::K8V4) { return {KvCacheStorage::Fp8KeyNvfp4Value}; }
     if (choice == KvChoice::Vq2) { return {KvCacheStorage::Vq2}; }
     if (choice == KvChoice::K4V2) { return {KvCacheStorage::Q4KeyVq2Value}; }
-    return {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+    return {KvCacheStorage::BFloat16, KvCacheStorage::Bf16Packed, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
             KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
             KvCacheStorage::Q4KeyVq2Value};
 }
@@ -1065,6 +1077,7 @@ int main(int argc, char** argv) {
                                         result.timing.median_us /= result.graph_calls;
                                         result.timing.min_us /= result.graph_calls;
                                         result.timing.p95_us /= result.graph_calls;
+                                        result.output_hash = data.output_hash();
                                         report(result);
                                         results.push_back(result);
                                     }

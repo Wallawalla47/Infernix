@@ -4,7 +4,7 @@
 // GenerationRequest; response construction owns Anthropic aggregate, SSE, usage, and error shapes.
 // Visible Thinking text owns prompt semantics. With `thinking.display:"summarized"` its wire
 // signature is response metadata and never enters common request or Engine state. With
-// `display:"omitted"` the block's `thinking` is empty and the signature carries the reasoning
+// `display:"omitted"` (or the beta `"updates"`) the block's `thinking` is empty and the signature carries the reasoning
 // itself, so request lowering restores it from the returned block. A signature without the Infernix
 // marker stays non-semantic transport metadata.
 
@@ -41,7 +41,7 @@ struct AnthropicMessagesRequest {
     GenerationRequest generation;
     bool stream                 = false;
     bool output_tokens_explicit = false;
-    // `thinking.display:"omitted"`: reasoning travels only inside the block signature.
+    // `thinking.display:"omitted"` or `"updates"`: reasoning travels only inside the block signature.
     bool hide_thinking = false;
     std::vector<AnthropicToolSearch> tool_searches;
 };
@@ -160,6 +160,10 @@ public:
     std::string start(const infernix::GenerationStart& generation);
 
     [[nodiscard]] bool started() const noexcept { return started_; }
+
+    // A quiet stream's heartbeat (SseTransport::set_heartbeat): the protocol's `ping` event, which a client whose idle
+    // timer counts events takes as one; empty before message_start and after the stop.
+    [[nodiscard]] std::string ping() const;
 
     std::vector<std::string> reasoning_delta(const std::string& text);
     std::vector<std::string> content_delta(const std::string& text);

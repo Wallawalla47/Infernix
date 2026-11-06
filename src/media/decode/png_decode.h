@@ -16,7 +16,8 @@ ImageInfo png_image_info(std::span<const std::uint8_t> bytes, std::uint64_t max_
 
 // Decode a non-interlaced PNG into 24-bit RGB. Supports color types 0,2,3,4,6
 // (gray, RGB, palette, gray+alpha, RGBA) at bit depths 1,2,4,8,16. Alpha is
-// composited over white, matching the FFmpeg image path. Throws
+// dropped (the color samples stay as stored), as the FFmpeg image path and
+// Pillow's convert("RGB") (transformers' load_image) drop it. Throws
 // std::invalid_argument for malformed input and Error(ErrorKind::BudgetExceeded)
 // when the pixel budget is exceeded.
 Image decode_png(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_pixels);

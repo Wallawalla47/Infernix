@@ -51,9 +51,12 @@ private:
                                       std::uint64_t intermediate, const std::string& prefix,
                                       bool draft = false);
 // `stream_experts`: an offloaded bank stays in the artifact (LoadOptions::stream_experts).
+// `resident_experts`: a resident MoE's routed experts' residency (HostPinned: the MTP drafter behind the drafter
+// pool, Config::mtp_expert_slots).
 [[nodiscard]] BlockWeights bind_block(Bindings& bindings, const TextConfig& config,
                                       const std::string& prefix, MixerKind mixer,
-                                      bool stream_experts = false);
+                                      bool stream_experts                = false,
+                                      artifact::Residency resident_experts = artifact::Residency::Device);
 // Whether the block at `prefix` stores its routed experts as one bank (`moe/experts`), which binds
 // the offloaded form.
 [[nodiscard]] bool offloaded_expert_bank(const Bindings& bindings, const std::string& prefix);
@@ -62,7 +65,8 @@ private:
 [[nodiscard]] VisionWeights bind_vision(Bindings& bindings, const VisionConfig& config,
                                         const TextConfig& target, const LoadOptions& options);
 [[nodiscard]] MtpWeights bind_mtp(Bindings& bindings, const TextConfig& config,
-                                  const TextWeights& target);
+                                  const TextWeights& target,
+                                  artifact::Residency experts = artifact::Residency::Device);
 [[nodiscard]] DraftWeights bind_draft(Bindings& bindings, const DraftConfig& config,
                                       const TextConfig& target, const TextWeights& weights,
                                       const std::string& component);

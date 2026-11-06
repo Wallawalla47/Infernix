@@ -114,7 +114,8 @@ external evaluator can write a `--kl-reference` file for the same windows
 Qwen3.8-Flash-Next).
 
 `--fast-path NAME` (repeatable) also runs that fast path whether or not it is qualified for the
-configuration; it exists to measure a candidate. Qwen3.8-Flash-Next artifacts score through the
+configuration; it exists to measure a candidate. `--no-fast-path NAME` (repeatable) scores the default route
+without one path it selects (a leave-one-out arm; a path not selected fails startup). Qwen3.8-Flash-Next artifacts score through the
 same route as generation; `--ngram-volume FILE` names their n-gram volume when it is not
 `<artifact>.ngram`.
 `--expert-a4-activations` scores nvidia/Qwen3.8-Flash-Next-FP4-Local with 4-bit expert activations

@@ -54,6 +54,15 @@ struct SamplingConfig {
     // produced token's position, v). Speculative verification then compares each draft with that
     // token as greedy verification does, so speculation returns plain sampling's text.
     bool gumbel_max = false;
+    // A row whose reasoning is open at the call's first position (the frontend's thinking not yet closed):
+    // reasoning_close is the close token and reasoning_ends the end-of-turn tokens (-1: none), which take no
+    // probability at a position before which the row has not written reasoning_close (sample(): the call's one
+    // position; speculative verify column c: drafts[0..c-1]). reasoning_close -1: no such row. reasoning_withheld (-1:
+    // none) is excluded the same way: the tool-call opener of a row that declares tools, so a call starts only after
+    // the row closes its thinking.
+    std::int32_t reasoning_close    = -1;
+    std::int32_t reasoning_ends[2]  = {-1, -1};
+    std::int32_t reasoning_withheld = -1;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
@@ -116,5 +125,12 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
 // Adds every id in the contiguous non-empty I32 token_ids vector to the contiguous I32
 // [token_domain] committed count array. IDs must be in [0,token_domain).
 void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaStream_t stream);
+
+// increment_token_counts of each row's licensed tokens, with the counts read on the device: for every
+// row b whose device-resident configs[b].token_counts is non-null, adds licensed_tokens[0:L,b] with
+// L = clamp(licensed_counts[b],0,K+1). licensed_tokens is contiguous I32 [K+1,B] and licensed_counts
+// I32 [B] (a speculative acceptance's outputs); their ids must be in that row's count domain.
+void increment_licensed_token_counts(const Tensor& licensed_tokens, const Tensor& licensed_counts,
+                                     const SamplingConfig* configs, cudaStream_t stream);
 
 } // namespace infernix::ops

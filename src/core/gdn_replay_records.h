@@ -60,12 +60,13 @@ struct GdnReplayRecords {
     [[nodiscard]] GdnReplayRecordLayer layer(std::int32_t layer, std::int32_t rows) const;
 
     /**
-     * The same storage reinterpreted as dense records of a smaller width: every plane keeps its
-     * base address and outer extent, and row b of a layer starts at b * width columns. A round
-     * that records through this view must be replayed through a fold bound to the same view;
-     * the native and narrowed views alias and only one may hold a pending round.
+     * The same storage reinterpreted as dense records of `rows` rows of `width` columns a layer
+     * (width * rows at most the storage's width * record_capacity): every plane keeps its base
+     * address, layer l's row b starts at outer index l * rows + b. A round that records through
+     * this view must be replayed through a fold bound to the same view; the native and narrowed
+     * views alias and only one may hold a pending round.
      */
-    [[nodiscard]] GdnReplayRecords narrowed(std::int32_t width) const;
+    [[nodiscard]] GdnReplayRecords narrowed(std::int32_t width, std::int32_t rows) const;
 };
 
 } // namespace infernix

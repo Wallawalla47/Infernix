@@ -51,6 +51,10 @@ public:
     // Rank a device demand for the evictable arena suffix: higher ranks pack closer to the
     // arena end and are evicted first. Requires the object to be a device demand.
     void mark_device_evictable(ObjectHandle object, std::uint32_t evict_rank);
+    // A device demand the caller derives another representation from once it is loaded, then frees
+    // (MaterializedArtifact::release_transient): placed in a second arena. Requires an unranked device
+    // demand.
+    void mark_device_transient(ObjectHandle object);
     void require_pinned(ObjectHandle object, std::uint64_t alignment = 256);
     void require_streamed(ObjectHandle object);
     [[nodiscard]] std::span<const std::byte> host_object(ObjectHandle object);
@@ -68,6 +72,7 @@ private:
         bool host               = false;
         bool pinned             = false;
         bool streamed           = false;
+        bool transient          = false;
         std::uint64_t alignment = 256;
         std::uint32_t evict_rank = 0;
         std::vector<std::byte> host_data;

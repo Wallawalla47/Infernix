@@ -4,9 +4,13 @@
 #include "text/grammar.h"
 
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <iostream>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -17,15 +21,17 @@ void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
-// Byte tokens 0-255, EOS 256 and the model's `<tool_call>` token.
+// Byte tokens 0-255, EOS 256, the model's `<tool_call>` token and its `</think>` token.
 constexpr std::int32_t kEos      = 256;
 constexpr std::int32_t kToolCall = 257;
+constexpr std::int32_t kThinkEnd = 258;
 
 infernix::text::GrammarCompiler compiler() {
     std::vector<std::string> tokens;
     for (int i = 0; i < 256; ++i) tokens.emplace_back(1, static_cast<char>(i));
     tokens.emplace_back();
     tokens.emplace_back(frontend::kToolCallOpen);
+    tokens.emplace_back("</think>");
     return {std::move(tokens), {kEos}, 32 * 1024 * 1024};
 }
 
@@ -186,7 +192,8 @@ void basic_contracts(infernix::text::GrammarCompiler& compiled) {
     const auto two = reordered + "\n" + call("later");
     for (std::size_t cut = 0; cut < two.size(); ++cut) {
         frontend::ToolCallOutputDecoder decoder(basic, 64);
-        (void)feed(decoder, std::string_view(two).substr(0, cut));
+        // The engine reports where a token starts even when the cut falls inside its bytes.
+        (void)feed(decoder, two, 0, cut);
         const auto result = decoder.finish(infernix::FinishReason::OutputLimit);
         require(result.tool_calls.size() == (cut >= reordered.size() ? 1 : 0),
                 "non-strict truncation lost a completed call");
@@ -251,10 +258,213 @@ void selected_contracts(infernix::text::GrammarCompiler& compiled) {
     }
 }
 
+// A `<tool_call>` token inside Markdown code of an auto answer is a quoted example on the constrained
+// route as on the free one (Strata measured 9 of 9 such examples run as calls before): the grammar
+// stays in the answer's text there, so the answer goes on, and the decoder publishes the token's
+// spelling as content, at every chunking. A call outside code still opens, and a lookahead through
+// a quoted token finds no dead end.
+void quoted_calls(infernix::text::GrammarCompiler& compiled) {
+    const std::vector<std::string> quoted{"Format:\n```xml\n" + call("a") + "\n```\nDone.",
+                                          "````markdown\n```xml\n" + call("a") + "\n```\n````\nDone.",
+                                          "Use `" + call("a") + "` like this.",
+                                          "Example:\n\n    " + call("a") + "\n\nDone."};
+    // A span left open by a stray backtick on an earlier line does not reach the call at a line's start
+    // (Strata #4923).
+    const std::vector<std::string> real{"```\ncode\n```\n" + call("a"), "Example:\n    " + call("a"),
+                                        "Use `x` then " + call("a"), "Let me use `run_commands to check.\n" + call("a")};
+    for (const bool strict : {false, true}) {
+        const auto bound = contract(schema({{"type", "string"}}), strict);
+        for (const std::string& text : quoted) {
+            require(accepts(compiled, *bound, text), "the constraint opened a call at a token quoted in Markdown code");
+            for (const std::size_t width : {std::size_t{1}, std::size_t{3}, std::size_t{7}, text.size()}) {
+                frontend::ToolCallOutputDecoder decoder(bound, 64);
+                std::string content;
+                for (std::size_t at = 0; at < text.size(); at += width) { content += feed(decoder, text, at, width); }
+                const auto terminal = decoder.finish();
+                require(terminal.tool_calls.empty() && content + terminal.content == text,
+                        "the decoder read a quoted call token as a call or lost bytes");
+            }
+        }
+        for (const std::string& text : real) {
+            require(accepts(compiled, *bound, text), "the constraint refused a call outside Markdown code");
+            frontend::ToolCallOutputDecoder decoder(bound, 64);
+            (void)feed(decoder, text);
+            require(decoder.finish().tool_calls.size() == 1, "a call outside Markdown code did not open");
+        }
+        require(!accepts(compiled, *bound, "Use it: " + std::string(frontend::kToolCallOpen) + "` here."),
+                "a call token outside Markdown code did not open a call");
+        // Drafts through a quoted token: after it the answer's text goes on (inside a call the
+        // backtick that follows would be refused).
+        auto matcher      = frontend::compile_tool_grammar(compiled, *bound, kToolCall, {}, {});
+        const auto drafts = tokens("Use `" + std::string(frontend::kToolCallOpen) + "` here.");
+        const auto after  = static_cast<std::size_t>(std::find(drafts.begin(), drafts.end(), kToolCall) - drafts.begin()) + 1;
+        const std::size_t stride = matcher->mask_words();
+        std::vector<std::uint32_t> words(stride * (drafts.size() + 1));
+        require(matcher->masks(drafts, words) == 0, "a lookahead through a quoted call token found a dead end");
+        for (std::size_t p = after; p < drafts.size(); ++p) {
+            const auto token = static_cast<std::size_t>(drafts[p]);
+            require((words[p * stride + token / 32] >> (token % 32) & 1U) != 0,
+                    "a lookahead refused the answer's text after a quoted call token");
+        }
+    }
+}
+
+// A raw value holds the whole call's closing lines when more value text follows (a file that documents
+// the call format, Strata #4701, where the value was cut there): the grammar keeps the value open
+// after them, the call still ends at its own closers before the end or the next call's token, and the
+// decoder publishes the whole value, its streamed steps concatenating to the call. Text after closers
+// with no later closer cannot end the output, and a bounded string keeps the plain exclusion.
+void quoted_closers(infernix::text::GrammarCompiler& compiled) {
+    const std::string closers  = "\n</parameter>\n</function>\n</tool_call>";
+    const std::string document = "A call ends with:" + closers + "\nThen the reply goes on.";
+    for (const bool strict : {false, true}) {
+        const auto bound = contract(schema({{"type", "string"}}), strict);
+        require(accepts(compiled, *bound, call(document)), "the grammar cut a value at quoted closing lines");
+        require(accepts(compiled, *bound, "Writing.\n" + call(document) + "\n" + call("b")),
+                "a value with quoted closing lines and a following call were refused");
+        require(accepts(compiled, *bound, call("a")), "a plain call no longer ends at its closers");
+        require(!accepts(compiled, *bound, call("a") + "\nThat wrote it."), "a call ended with prose after it");
+        for (const std::size_t width : {std::size_t{1}, std::size_t{5}, std::size_t{4096}}) {
+            const std::string text = "Writing.\n" + call(document);
+            frontend::ToolCallOutputDecoder decoder(bound, 64);
+            std::string streamed;
+            const auto take = [&] {
+                for (const infernix::ToolCallDelta& delta : decoder.take_call_deltas()) { streamed += delta.arguments; }
+            };
+            for (std::size_t at = 0; at < text.size(); at += width) {
+                (void)feed(decoder, text, at, width);
+                take();
+            }
+            const auto terminal = decoder.finish();
+            take();
+            require(terminal.tool_calls.size() == 1 &&
+                        Json::parse(terminal.tool_calls[0].arguments_json) == Json{{"x", document}} &&
+                        streamed == terminal.tool_calls[0].arguments_json,
+                    "the decoder cut a value at quoted closing lines or streamed it differently");
+        }
+        // Drafts through the closers: the text after them is admitted, and so is the end after the
+        // value's own closers.
+        auto matcher = frontend::compile_tool_grammar(compiled, *bound, kToolCall, {}, {});
+        for (const std::int32_t token : tokens("<tool_call>\n<function=call>\n<parameter=x>\na" + closers)) {
+            matcher->accept(token);
+        }
+        matcher->confirm();
+        const auto drafts        = tokens("\nb" + closers);
+        const std::size_t stride = matcher->mask_words();
+        std::vector<std::uint32_t> words(stride * (drafts.size() + 1));
+        require(matcher->masks(drafts, words) == 0, "a lookahead through quoted closing lines found a dead end");
+        for (std::size_t p = 0; p < drafts.size(); ++p) {
+            const auto token = static_cast<std::size_t>(drafts[p]);
+            require((words[p * stride + token / 32] >> (token % 32) & 1U) != 0,
+                    "a lookahead refused the value text after quoted closing lines");
+        }
+        require((words[drafts.size() * stride + kEos / 32] >> (kEos % 32) & 1U) != 0,
+                "a value's own closers after quoted ones did not admit the end");
+    }
+    const auto bounded = contract(schema({{"type", "string"}, {"maxLength", 100}}), true);
+    require(!accepts(compiled, *bounded, call(document)), "a bounded string held quoted closing lines");
+}
+
+// Inside the reasoning a tool grammar refuses the `<tool_call>` token, which could never open a call
+// there and would leave the model unable to end the turn (EOS is refused until the reasoning closes;
+// ninferpro's incident: 65 and 145 calls written inside thinking). Its spelling in ordinary tokens stays
+// reasoning text; after `</think>` and the separator the token opens calls as before. An assistant
+// continuation holding the token inside the reasoning is not a prefix of the grammar.
+void calls_in_thinking(infernix::text::GrammarCompiler& compiled) {
+    const infernix::text::ReasoningFraming thinking{.close_token = kThinkEnd, .separator = "\n\n"};
+    infernix::ToolChoice required;
+    required.mode = infernix::ToolChoiceMode::Required;
+    const auto allowed = [](const std::vector<std::uint32_t>& words, std::int32_t token) {
+        return (words[static_cast<std::size_t>(token) / 32] >> (token % 32) & 1U) != 0;
+    };
+    for (const bool strict : {false, true}) {
+        for (const auto& choice : {infernix::ToolChoice{}, required}) {
+            const auto bound = contract(schema({{"type", "string"}}), strict, choice);
+            auto matcher     = frontend::compile_tool_grammar(compiled, *bound, kToolCall, thinking, {});
+            std::vector<std::uint32_t> words(matcher->mask_words());
+            const auto step = [&](std::int32_t token) {
+                require(matcher->masks({}, words) == 0 && allowed(words, token),
+                        "the grammar refused a token of the reasoning or of the call after it");
+                matcher->accept(token);
+                matcher->confirm();
+            };
+            for (const std::int32_t token : tokens("Let me check the file. ")) { step(token); }
+            require(matcher->masks({}, words) == 0 && !allowed(words, kToolCall) && !allowed(words, kEos) &&
+                        allowed(words, kThinkEnd),
+                    "the reasoning admitted the call token or the end, or refused its close");
+            for (const std::int32_t token : tokens("```\n" + call("a"), true)) { step(token); }
+            require(matcher->masks({}, words) == 0 && !allowed(words, kToolCall) && !allowed(words, kEos),
+                    "a call spelled in ordinary tokens left the reasoning");
+            step(kThinkEnd);
+            for (const std::int32_t token : tokens("\n\n")) { step(token); }
+            for (const std::int32_t token : tokens(call("a"))) { step(token); }
+            require(matcher->masks({}, words) == 0 && allowed(words, kEos),
+                    "a call after the reasoning did not complete the turn");
+        }
+    }
+    const auto automatic = contract(schema({{"type", "string"}}), false);
+    bool refused         = false;
+    try {
+        std::vector<std::int32_t> continuation = tokens("Plan: ");
+        continuation.push_back(kToolCall);
+        (void)frontend::compile_tool_grammar(compiled, *automatic, kToolCall, thinking, continuation);
+    } catch (const infernix::RequestError&) { refused = true; }
+    require(refused, "a continuation with the call token inside the reasoning was accepted");
+}
+
+// The grammar's raw string reads the `<tool_call>` token right after a call's closing lines (or after
+// them and their `\n` when calls are not parallel) as value text, which the decoder refuses as a
+// malformed call: the token is masked there for every choice, and a newline still opens the next call.
+void calls_after_closers(infernix::text::GrammarCompiler& compiled) {
+    infernix::ToolChoice required;
+    required.mode = infernix::ToolChoiceMode::Required;
+    infernix::ToolChoice single;
+    single.parallel = false;
+    for (const bool strict : {false, true}) {
+        for (const auto& choice : {infernix::ToolChoice{}, required}) {
+            const auto bound = contract(schema({{"type", "string"}}), strict, choice);
+            require(!accepts(compiled, *bound, call("a") + call("b")),
+                    "the call token right after a call's closing lines was admitted");
+            require(accepts(compiled, *bound, call("a") + "\n" + call("b")),
+                    "a call after a call's closing lines and a newline was refused");
+        }
+        const auto one = contract(schema({{"type", "string"}}), strict, single);
+        require(accepts(compiled, *one, call("a")), "a single call was refused");
+        require(!accepts(compiled, *one, call("a") + "\n" + call("b")),
+                "a second call token was admitted where calls are not parallel");
+    }
+    // Its decoder still refuses that sequence, so the mask is what keeps the request alive.
+    const auto bound = contract(schema({{"type", "string"}}), false);
+    frontend::ToolCallOutputDecoder decoder(bound, 64);
+    (void)feed(decoder, call("a") + call("b"));
+    bool refused = false;
+    try {
+        (void)decoder.finish();
+    } catch (const std::logic_error&) { refused = true; }
+    require(refused, "the decoder accepted a call token right after a call's closing lines");
+}
+
+// A parameter a declared non-strict tool does not declare counts as a schema mismatch on the constrained
+// (streamed) route, as the whole-text route counts it (candidates QA-14).
+void undeclared_parameters() {
+    const auto open        = contract(schema({{"type", "string"}}), false);
+    const std::string text = "<tool_call>\n<function=call>\n<parameter=extra>\n1\n</parameter>\n</function>\n</tool_call>";
+    frontend::ToolCallOutputDecoder decoder(open, 64);
+    (void)feed(decoder, text);
+    const auto terminal = decoder.finish();
+    require(terminal.tool_calls.size() == 1 && terminal.diagnostics.schema_mismatch_arguments == 1,
+            "a streamed call's undeclared parameter was not counted as a schema mismatch");
+}
+
 void run() {
     auto compiled = compiler();
+    undeclared_parameters();
     basic_contracts(compiled);
     selected_contracts(compiled);
+    quoted_calls(compiled);
+    quoted_closers(compiled);
+    calls_in_thinking(compiled);
+    calls_after_closers(compiled);
     infernix::ToolChoice required;
     required.mode = infernix::ToolChoiceMode::Required;
     auto fixed =
@@ -380,6 +590,54 @@ void run() {
         (void)feed(null_decoder, call("null"));
         require(Json::parse(null_decoder.finish().tool_calls.at(0).arguments_json)["x"].is_null(),
                 ("a nullable string's null was not null: " + nullable.dump()).c_str());
+    }
+    // A nullable string's enum or const keeps its members (NInfer #425's status filter, its anyOf
+    // form, Pydantic's Optional[Status] through a reference): the grammar takes the members and the
+    // text `null`, which reads as JSON null, and refuses other text. Bounds or a pattern that refuse
+    // the four characters still leave `null` to the grammar.
+    const auto decodes = [](const auto& bound, std::string_view text) {
+        frontend::ToolCallOutputDecoder decoder(bound, 64);
+        (void)feed(decoder, call(text));
+        return Json::parse(decoder.finish().tool_calls.at(0).arguments_json)["x"];
+    };
+    const Json statuses = Json::array({"pending", "completed"});
+    Json referenced = schema({{"anyOf", {{{"$ref", "#/$defs/Status"}}, {{"type", "null"}}}}});
+    referenced["$defs"] = {{"Status", {{"type", "string"}, {"enum", statuses}}}};
+    for (const Json& parameters :
+         {schema({{"type", {"string", "null"}}, {"enum", {"pending", "completed", nullptr}}}),
+          schema({{"anyOf", {{{"type", "string"}, {"enum", statuses}}, {{"type", "null"}}}}}),
+          referenced}) {
+        const auto bound = contract(parameters, true, required);
+        require(accepts(compiled, *bound, call("pending")) &&
+                    accepts(compiled, *bound, call("completed")) &&
+                    accepts(compiled, *bound, call("null")) &&
+                    !accepts(compiled, *bound, call("other")) &&
+                    !accepts(compiled, *bound, call("Pending")),
+                ("a nullable enum refused a member or null, or admitted other text: " +
+                 parameters.dump())
+                    .c_str());
+        require(decodes(bound, "pending") == "pending" && decodes(bound, "null").is_null(),
+                ("a nullable enum's member or null decoded wrongly: " + parameters.dump()).c_str());
+    }
+    for (const auto& [parameters, text, refused] :
+         {std::tuple{schema({{"type", {"string", "null"}}, {"maxLength", 2}}), "ab", "abc"},
+          std::tuple{schema({{"type", {"string", "null"}}, {"pattern", "^[0-9]+$"}}), "12", "ab"}}) {
+        const auto bound = contract(parameters, true, required);
+        require(accepts(compiled, *bound, call(text)) && accepts(compiled, *bound, call("null")) &&
+                    !accepts(compiled, *bound, call(refused)),
+                ("a bounded nullable string refused null: " + parameters.dump()).c_str());
+        require(decodes(bound, "null").is_null() && decodes(bound, text) == text,
+                ("a bounded nullable string decoded wrongly: " + parameters.dump()).c_str());
+    }
+    // The string "null" beside null has no raw text of its own.
+    for (const Json& ambiguous :
+         {schema({{"type", {"string", "null"}}, {"enum", {"null", "a", nullptr}}}),
+          schema({{"anyOf", {{{"const", "null"}}, {{"type", "null"}}}}})}) {
+        bool refused = false;
+        try {
+            (void)contract(ambiguous, true, required);
+        } catch (const infernix::RequestError&) { refused = true; }
+        require(refused, ("the string \"null\" beside null was accepted: " + ambiguous.dump()).c_str());
     }
     // A string mixed with another JSON value type stays ambiguous.
     bool rejected = false;

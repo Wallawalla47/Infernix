@@ -99,6 +99,8 @@ std::string format_kv_cache(infernix::KvCacheStorage storage) {
         return "vq2";
     case infernix::KvCacheStorage::Q4KeyVq2Value:
         return "k4v2";
+    case infernix::KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     return "unknown";
 }
@@ -331,7 +333,9 @@ int main(int argc, char** argv) {
          .level        = cli.log_level,
          .presentation = infernix::product::LogPresentation::Tool});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
-#ifdef INFERNIX_BUILD_ID
+#if defined(INFERNIX_BUILD_ID) && defined(INFERNIX_CUDA_COMPILER_VERSION)
+    logger->info("build {} (CUDA {})", INFERNIX_BUILD_ID, INFERNIX_CUDA_COMPILER_VERSION);
+#elif defined(INFERNIX_BUILD_ID)
     logger->info("build {}", INFERNIX_BUILD_ID);
 #endif
     if (cli.config_path) {
@@ -380,8 +384,11 @@ int main(int argc, char** argv) {
         engine_options.ngram_residency          = cli.ngram_residency;
         engine_options.expert_state_path        = cli.expert_state ? *cli.expert_state
                                                                    : std::filesystem::path(cli.artifact_path.string() + ".expert-state");
-        engine_options.ram_headroom_bytes       = cli.ram_headroom_bytes;
+        engine_options.expert_state_off         = cli.expert_state && cli.expert_state->empty(); // --expert-state off
+        engine_options.ram_free_bytes           = cli.ram_free_bytes;
+        engine_options.ram_resize               = false; // one generation: the Engine is never idle to resize
         engine_options.expert_ram_bytes         = cli.expert_ram_bytes;
+        engine_options.expert_ram_layout        = cli.expert_ram_layout;
         engine_options.expert_pin_bytes         = cli.expert_pin_bytes;
         engine_options.device                   = cli.device;
         engine_options.max_context              = cli.max_context;
@@ -391,6 +398,8 @@ int main(int argc, char** argv) {
         engine_options.vram_past_budget         = cli.vram_past_budget;
         engine_options.expert_tail_skip         = cli.expert_tail_skip;
         engine_options.expert_a4_activations    = cli.expert_a4_activations;
+        engine_options.expert_a16_activations   = cli.expert_a16_activations;
+        engine_options.a8_activations           = cli.a8_activations;
         engine_options.embedding_host           = cli.embedding_host;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
@@ -402,6 +411,7 @@ int main(int argc, char** argv) {
         engine_options.fast_paths                    = cli.fast_paths && !cli.lossless;
         engine_options.lossless                      = cli.lossless;
         engine_options.fast_path_candidates          = cli.fast_path_candidates;
+        engine_options.fast_path_exclusions          = cli.fast_path_exclusions;
         engine_options.speculative              = cli.speculative;
         engine_options.enable_vision            = cli.enable_vision;
         engine_options.vision_offload           = cli.vision_offload;

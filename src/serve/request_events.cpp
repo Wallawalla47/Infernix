@@ -1,5 +1,6 @@
 #include "serve/request_events.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace infernix::serve {
@@ -34,6 +35,8 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.sampling                          = prepared.sampling;
     context.acquisition_seconds               = prepared.acquisition_seconds;
     context.preparation                       = prepared.preparation;
+    context.prompt_tokens = static_cast<std::uint32_t>(std::max(prepared.prompt_tokens, 0));
+    context.started       = prepared.started;
     return context;
 }
 

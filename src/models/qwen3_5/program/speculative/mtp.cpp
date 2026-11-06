@@ -95,9 +95,6 @@ public:
         if (state.proposal_chain && (batch_size != 1 || !schedule.mtp_proposal_chain)) {
             throw std::logic_error("only a one-row round of the proposal chain's schedule proposes through it");
         }
-        if (state.step_chain && (!schedule.mtp_step_chain || state.proposal_chain || state.tree)) {
-            throw std::logic_error("only a round of the step chain's schedule proposes through it");
-        }
         tree_      = state.tree;
         frame_     = state.frame.narrowed(k, next_k_, tree_ ? state.chain_drafts : 0U);
         sampled_   = schedule.sampled_mtp_drafts;
@@ -105,7 +102,7 @@ public:
         if ((tree_ || state.tree_proposals) && (!sampled_ || frame_.tree_rows.data == nullptr)) {
             throw std::logic_error("MTP trees need sampled drafts and the frame's tree planes");
         }
-        // The confidence policy's, the cut's and the gate's input: each step's drafter probability.
+        // The confidence policy's and the cut's input: each step's drafter probability.
         confidence_ = schedule.mtp_draft_confidence;
         if (sampled_ && (confidence_ || frame_.current_candidates.data == nullptr)) {
             throw std::logic_error("sampled MTP drafts need the MTP draft window's sparse planes, without probabilities");
@@ -238,37 +235,13 @@ public:
                                    stream()));
     }
 
-    // The step chain's body `body` (ExecutionSchedule::mtp_step_chain): the alignment (the drafter's
-    // KV over the committed tokens and the first draft's hidden), then draft body - 1.
-    void step(std::uint32_t body) {
-        if (body == 0) {
-            nvtx::ScopedRange draft_range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp,
-                                          static_cast<std::uint64_t>(batch_));
-            align();
-        } else if (body == 1) {
-            draft(0, ar_hidden_);
-        } else {
-            propose(body - 1U);
-        }
-    }
-
-    // The step chain's gate after body `body`: the next body (draft `body`) runs while some row's
-    // proposal limit admits it and, past the alignment, that row's draft body - 1 clears the round's
-    // step threshold.
-    void step_gate(std::uint32_t body, cudaGraphConditionalHandle next) {
-        launch_graph_gate_rows(body == 0 ? nullptr : static_cast<const float*>(step_probability(body - 1U).data),
-                               frame_.step_threshold, static_cast<const std::int32_t*>(frame_.proposal_limits.data),
-                               batch_, static_cast<std::int32_t>(body), next, stream());
-    }
-
     // The proposal chain's gate after step `step`: the next step runs while the round's proposal
-    // limit allows it and, with the device gate, while draft `step` clears --spec-min-p (the host's
-    // cut, the same binary64 comparison). A skipped step leaves its draft and probability words
-    // stale, beyond the limit and the cut that read them.
+    // limit allows it. A skipped step leaves its draft and probability words stale, beyond the limit
+    // and the cut that read them. A device gate at --spec-min-p measured flat (27B 1.0065x, 35B
+    // 0.9963x; removed 2026-10-28).
     void gate(std::uint32_t step, cudaGraphConditionalHandle next) {
-        const ExecutionSchedule& schedule = state_.execution.execution_schedule;
-        const double threshold = schedule.mtp_gate ? schedule.mtp_min_p : -std::numeric_limits<double>::infinity();
-        launch_graph_gate(static_cast<const float*>(step_probability(step).data), threshold,
+        launch_graph_gate(static_cast<const float*>(step_probability(step).data),
+                          -std::numeric_limits<double>::infinity(),
                           static_cast<const std::int32_t*>(frame_.proposal_limits.data),
                           static_cast<std::int32_t>(step), next, stream());
     }
@@ -366,14 +339,6 @@ void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, s
     MtpRound round(state, batch_size, k, envelopes);
     if (phase == SpeculativePhase::Forward) {
         definition.capture(state.execution.device.stream, [&] { round.forward(); });
-    } else if (state.step_chain) {
-        definition.capture_gated_chain(
-            state.execution.device.stream, static_cast<std::int32_t>(round.proposal_steps()) + 1,
-            [&](std::int32_t body) { round.step(static_cast<std::uint32_t>(body)); },
-            [&](std::int32_t body, cudaGraphConditionalHandle next) {
-                round.step_gate(static_cast<std::uint32_t>(body), next);
-            },
-            [&] { round.publish(); });
     } else if (state.proposal_chain) {
         definition.capture_gated_chain(
             state.execution.device.stream, static_cast<std::int32_t>(round.proposal_steps()),

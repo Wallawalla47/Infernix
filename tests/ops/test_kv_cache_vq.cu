@@ -7,6 +7,7 @@
 #include "core/paged_kv_cache.h"
 #include "kv_cache_vq_reference.h"
 #include "infernix/ops/kv_cache_append.h"
+#include "ops/kv_cache/append/launch.h"
 #include "infernix/ops/speculative_tree.h"
 #include "ops/op_tester.h"
 
@@ -423,21 +424,26 @@ INFERNIX_OP_TEST(kv_cache_vq) {
         return 77;
     }
     int failures = 0;
-    for (const auto storage : {KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
-        for (const int heads : {4, 2}) {
-            failures += append_case(storage, heads, 3, 61, 0x1234u + heads);  // sink + page edge
-            failures += append_case(storage, heads, 9, 1015, 0x4321u + heads); // ring wrap
+    // The route by rows (0), then every call forced to the split encoder at 1, 2 and 8 pattern ranges, which also
+    // runs the short calls as partial passes.
+    for (const int split : {0, 1, 2, 8}) {
+        ops::detail::vq_append_force_split(split);
+        for (const auto storage : {KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
+            for (const int heads : {4, 2}) {
+                failures += append_case(storage, heads, 3, 61, 0x1234u + heads);  // sink + page edge
+                failures += append_case(storage, heads, 9, 1015, 0x4321u + heads); // ring wrap
+            }
+            // A wide append writes only its final ring span (and sinks) into the window.
+            failures += append_case(storage, 4, 1100, 0, 0x7777u);
+            // Mid-width calls: on 170 SMs the split encoder takes 8, 4 and 2 pattern ranges here by rows
+            // (Q4KeyVq2Value 8, 8 and 4); the 1,100-token call takes 1 (2).
+            failures += append_case(storage, 2, 100, 37, 0x5151u);
+            failures += append_case(storage, 4, 200, 0, 0x5252u);
+            failures += append_case(storage, 4, 401, 777, 0x5353u);
+            failures += compaction_case(storage);
         }
-        // A wide append writes only its final ring span (and sinks) into the window.
-        failures += append_case(storage, 4, 1100, 0, 0x7777u);
-        // Mid-width calls: on 170 SMs, INFERNIX_TMP_VQ_APPEND_V2's split encoder takes 8, 4 and 2
-        // pattern ranges here (Q4KeyVq2Value 8, 8 and 4); the 1,100-token call takes 1 (2). The
-        // forced-range variants also run the short calls as partial passes.
-        failures += append_case(storage, 2, 100, 37, 0x5151u);
-        failures += append_case(storage, 4, 200, 0, 0x5252u);
-        failures += append_case(storage, 4, 401, 777, 0x5353u);
-        failures += compaction_case(storage);
     }
+    ops::detail::vq_append_force_split(0);
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " kv_cache_vq (" << failures
               << " failures)\n";
     return failures == 0 ? 0 : 1;

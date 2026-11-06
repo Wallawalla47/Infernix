@@ -1,5 +1,6 @@
 // Fast-path selection (models/qwen3_5/program/planning/fast_paths.h): where each fast path's kernels
-// run, which configurations the registry qualifies it for, and how a configuration is described.
+// run, which configurations the registry qualifies it for, how a configuration is described, and the
+// routes --a8-activations gives it.
 // The selection itself (select_fast_paths) needs a loaded model; the engine real tests and startup
 // logs cover it.
 
@@ -219,18 +220,32 @@ int main() {
     failures += check(!q::fast_path_qualified(FastPath::IdleWidePrefill,
                                               {24, ActivationClass::A16, KvCacheStorage::Int8Group64}),
                       "idle-wide-prefill is not qualified at 16-bit activations");
-    // expert-a4-residual (either term count) acts on offloaded W4A16 experts (Qwen3.5-122B-A10B) only, as a
-    // candidate: it is qualified for no Qwen3.5 configuration, and it couples a column to its call.
+    // expert-a4-residual (either term count) acts on offloaded W4A16 experts (Qwen3.5-122B-A10B: 32 heads, 8-bit
+    // FP8 activations) only, and it couples a column to its call. Two terms are registered there on every KV
+    // format (measured faster, 2026-10-28); three terms stay a candidate.
     for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
                                     KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
                                     KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                                     KvCacheStorage::Q4KeyVq2Value}) {
-        const q::FastPathConfiguration offloaded{32, ActivationClass::A16, kv, false, true};
+        const q::FastPathConfiguration offloaded{32, ActivationClass::A8, kv, false, true};
         for (const FastPath path : {FastPath::ExpertA4Residual, FastPath::ExpertA4Residual3}) {
             failures += check(q::fast_path_applies(path, offloaded, options),
                               "expert-a4-residual applies to the 122B's offloaded experts");
-            failures += check(!q::fast_path_qualified(path, offloaded), "expert-a4-residual is not qualified on the 122B");
         }
+        failures += check(q::fast_path_qualified(FastPath::ExpertA4Residual, offloaded) &&
+                              !q::fast_path_qualified(FastPath::ExpertA4Residual3, offloaded),
+                          "two-term expert-a4-residual is registered on the 122B, three terms are not");
+        // free-cache-resume and preemption measured faster there (2026-11-03: continuing-turn TTFT, a short pool);
+        // gdn-f16-accumulate level.
+        failures += check(q::fast_path_qualified(FastPath::FreeCacheResume, offloaded) &&
+                              q::fast_path_qualified(FastPath::Preemption, offloaded) &&
+                              !q::fast_path_qualified(FastPath::GdnF16Accumulate, offloaded),
+                          "free-cache-resume and preemption are registered on the 122B, gdn-f16-accumulate is not");
+    }
+    for (const KvCacheStorage kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16,
+                                    KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
+        failures += check(q::fast_path_qualified(FastPath::PromptPv8, {32, ActivationClass::A8, kv, false, true}),
+                          "prompt-pv8 is registered on the 122B on every format its kernel serves (measured faster)");
     }
     failures += check(!q::fast_path_applies(FastPath::ExpertA4Residual, int8_24, options) &&
                           !q::fast_path_applies(FastPath::ExpertA4Residual3, int8_24, options),
@@ -294,6 +309,26 @@ int main() {
         failures += check(q::dflash_width_costs(offloaded, SpeculativeBackend::DFlash2).per_draft == 0.72 &&
                               q::dflash_width_costs(resident32, SpeculativeBackend::DFlash2).per_draft == 0.15,
                           "offloaded experts price a draft column at 0.72 of a plain round");
+    }
+    // --spec auto takes the bundled drafter measured fastest: with offloaded experts MTP (DFlash2's auto
+    // decodes plain there), else DFlash2 (the Qwen3.8-27Bs), then MTP (the 35B-A3B beside DFlash, the
+    // Qwen3.6-27Bs alone), then DFlash; none without a drafter worth binding.
+    {
+        const q::BundledDrafters all{.mtp = true, .dflash = true, .dflash2 = true};
+        const q::BundledDrafters qwen3_8_27b{.mtp = true, .dflash2 = true};
+        const q::BundledDrafters qwen3_6_35b{.mtp = true, .dflash = true};
+        failures += check(q::auto_speculative_backend(true, qwen3_8_27b) == SpeculativeBackend::Mtp &&
+                              q::auto_speculative_backend(true, all) == SpeculativeBackend::Mtp &&
+                              q::auto_speculative_backend(true, {.dflash2 = true}) == SpeculativeBackend::None &&
+                              q::auto_speculative_backend(true, {}) == SpeculativeBackend::None,
+                          "--spec auto with offloaded experts did not take MTP alone");
+        failures += check(q::auto_speculative_backend(false, qwen3_8_27b) == SpeculativeBackend::DFlash2 &&
+                              q::auto_speculative_backend(false, all) == SpeculativeBackend::DFlash2 &&
+                              q::auto_speculative_backend(false, qwen3_6_35b) == SpeculativeBackend::Mtp &&
+                              q::auto_speculative_backend(false, {.mtp = true}) == SpeculativeBackend::Mtp &&
+                              q::auto_speculative_backend(false, {.dflash = true}) == SpeculativeBackend::DFlash &&
+                              q::auto_speculative_backend(false, {}) == SpeculativeBackend::None,
+                          "--spec auto did not rank resident drafters DFlash2, MTP, DFlash");
     }
     failures += check(q::dflash_auto_ceiling(int8_24, SpeculativeBackend::DFlash2) == 15 &&
                           q::dflash_auto_ceiling({16, ActivationClass::A16, KvCacheStorage::Int8Group64},
@@ -361,6 +396,26 @@ int main() {
                       "q4-w4a8 failed its gate");
     failures += check(q::describe(groupwise) == "24 heads, 16-bit activations, int8 KV, Q4 gate/up",
                       "groupwise configuration description changed");
+
+    // --a8-activations' routes (A8Routes): the groupwise Q4 MLP gate/up's prefill calls take q4-w4a8's int8
+    // route, offloaded experts their 8-bit decode and prefill routes; the NVFP4 27B (its FP8 and NVFP4 sites
+    // already take the activations the artifact permits) and the 35B-A3B have none, so they refuse the flag.
+    {
+        const q::A8Routes groupwise_a8 = q::a8_activation_routes(groupwise);
+        failures += check(groupwise_a8.q4_gate_up && !groupwise_a8.experts && !groupwise_a8.experts_prefill &&
+                              groupwise_a8.describe().find("decode and verification: none") != std::string::npos,
+                          "the groupwise Q4 gate/up takes the 8-bit prefill route only");
+        FastPathConfiguration offloaded_a8 = int8_24;
+        offloaded_a8.offloaded_experts     = true;
+        const q::A8Routes experts_a8       = q::a8_activation_routes(offloaded_a8);
+        failures += check(experts_a8.experts && experts_a8.experts_prefill && !experts_a8.q4_gate_up &&
+                              experts_a8.describe().find("prefill: the routed experts") != std::string::npos,
+                          "offloaded experts take the 8-bit decode and prefill routes");
+        failures += check(!q::a8_activation_routes(int8_24).any() &&
+                              !q::a8_activation_routes({16, ActivationClass::A16, KvCacheStorage::Int8Group64}).any() &&
+                              !q::a8_activation_routes({24, ActivationClass::A16, KvCacheStorage::Int8Group64}).any(),
+                          "the NVFP4 27B, the 35B-A3B and a groupwise 27B without Q4 gate/up have no 8-bit route");
+    }
 
     // sampled-mtp-drafts: MTP rounds of resident experts without n-gram copies; not yet qualified on
     // any Qwen3.5 configuration (a candidate only).
@@ -447,12 +502,23 @@ int main() {
     failures += check(!q::fast_path_applies(FastPath::Q5KSplitMma,
                                             {24, ActivationClass::A4, KvCacheStorage::Int8Group64}, options),
                       "q5-ksplit-mma must not apply to 4-bit-activation artifacts");
+    // Both run on the KV formats below INT8's precision too (the owner's decision, 2026-11-01), not on BF16.
     failures += check(q::fast_path_qualified(FastPath::Q5KSplitMma, groupwise) &&
                           !q::fast_path_qualified(FastPath::Q5KSplitMma,
                                                   {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}),
                       "q5-ksplit-mma is qualified where it was measured faster only");
     failures += check(q::fast_path_qualified(FastPath::Fp16GdnState, groupwise),
                       "fp16-gdn-state is qualified on the groupwise 27B with INT8 KV");
+    for (const KvCacheStorage kv : {KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+                                    KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                                    KvCacheStorage::Q4KeyVq2Value}) {
+        failures += check(q::fast_path_qualified(FastPath::Q5KSplitMma, {24, ActivationClass::A16, kv, true}) &&
+                              q::fast_path_qualified(FastPath::Fp16GdnState, {24, ActivationClass::A16, kv, true}) &&
+                              q::fast_path_qualified(FastPath::Fp16GdnState, {24, ActivationClass::A4, kv}),
+                          "q5-ksplit-mma and fp16-gdn-state are qualified on the KV formats below INT8's precision");
+    }
+    failures += check(!q::fast_path_qualified(FastPath::Fp16GdnState, {16, ActivationClass::A16, KvCacheStorage::Vq2}),
+                      "fp16-gdn-state stays off the 35B-A3B");
     failures += check(!q::couples_requests(FastPath::Q5KSplitMma),
                       "q5-ksplit-mma must not couple requests");
 

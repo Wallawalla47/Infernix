@@ -64,6 +64,9 @@ struct GenerationOutcome {
     std::optional<std::uint64_t> output_4grams_in_prompt;
     // With the request JSONL: why a large re-prefill missed the prefix cache (prefix_miss.h).
     std::optional<PrefixMiss> prefix_miss;
+    // That explanation gave up somewhere, so prefix_miss holds less than the request would explain
+    // (prefix_miss.h). The generation itself is unaffected; only a real failure shows as one.
+    bool prefix_miss_diagnostic_failed = false;
 };
 
 // A transport may report an interrupted stream through a callback or is_cancelled().
@@ -111,6 +114,8 @@ struct PreparedRequest {
     std::vector<std::string> tool_schema_params;
     infernix::GenerationHandle generation;
     infernix::ResolvedSamplingParameters sampling;
+    // When the server took the request (its ingress reservation, before media acquisition).
+    std::chrono::steady_clock::time_point started{};
     // Service input acquisition/bookkeeping; Engine timings own prompt and constraint preparation.
     double service_prepare_seconds = 0.0;
     double acquisition_seconds = 0.0;
@@ -127,41 +132,114 @@ struct PreparedRequest {
     // output-overlap figure, and its token ids, for the prefix-miss record; empty otherwise.
     std::vector<std::uint64_t> prompt_4grams;
     std::vector<infernix::TokenId> prompt_ids;
+    // With idle-time prefill (HybridPrefixCacheOptions::next_turn_prefill_quiet): the request's lowered
+    // text conversation, to which run() appends the reply before handing it to
+    // Engine::prefill_next_turn. Unset for requests the next turn cannot follow (media, assistant
+    // continuation, readouts, token constraints, no prefix reuse).
+    std::optional<infernix::PromptInput> next_turn;
 };
 
-class GenerationService {
+// The Engine's options for serving with `options`: the one mapping a start (GenerationService) and
+// --plan (infernix::Engine::plan) both use, so a plan sizes exactly the start it stands for.
+[[nodiscard]] infernix::EngineOptions make_engine_options(const ServeOptions& options,
+                                                          StartupObserver startup_observer      = {},
+                                                          DiagnosticObserver diagnostic_observer = {});
+
+// What the HTTP routes ask of generation. GenerationService answers it over the Engine; a test of
+// the routes answers it with its own.
+class GenerationBackend {
+public:
+    virtual ~GenerationBackend() = default;
+
+    // Engine owns the once-normalized startup configuration. Serving diagnostics must use this
+    // value instead of reinterpreting optional defaults from ServeOptions.
+    [[nodiscard]] virtual const infernix::EngineOptions& engine_options() const = 0;
+    [[nodiscard]] virtual infernix::LoadSummary load_summary() const = 0;
+    [[nodiscard]] virtual infernix::ModelMetadata model_metadata() const = 0;
+    [[nodiscard]] virtual infernix::MemorySummary memory_summary() const = 0;
+    [[nodiscard]] virtual infernix::RuntimeStats runtime_stats() const = 0;
+    virtual void reset_execution_maxima() noexcept = 0;
+    [[nodiscard]] virtual bool is_available() const = 0;
+    // An Engine-wide execution failure, as opposed to an orderly stop.
+    [[nodiscard]] virtual bool has_failed() const = 0;
+    [[nodiscard]] virtual infernix::ModelSamplingDefaults sampling_defaults() const = 0;
+    // Artifact-tokenizer encoding of raw text, with no template or special token added.
+    [[nodiscard]] virtual std::vector<infernix::TokenId>
+    tokenize_text(std::string_view text) const = 0;
+
+    [[nodiscard]] virtual PreparedRequest
+    prepare(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
+            infernix::GenerationObservationOptions observation = {},
+            std::function<bool()> is_cancelled = {}) const = 0;
+    // The next generation of an admitted request that executed a server-side tool (tool search):
+    // the HTTP request still holds its ingress slot, so the continuation takes another without
+    // the queue bound refusing it, and gets a fresh pending deadline.
+    [[nodiscard]] virtual PreparedRequest
+    prepare_continuation(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
+                         infernix::GenerationObservationOptions observation = {},
+                         std::function<bool()> is_cancelled = {}) const = 0;
+    [[nodiscard]] virtual int count_prompt_tokens(const GenerationRequest& req,
+                                                  std::function<bool()> is_cancelled = {}) const = 0;
+
+    // Consumes prepared.generation. A PreparedRequest is single-use.
+    virtual GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
+                                  std::function<bool()> is_cancelled = {}) = 0;
+
+    // A streaming route calls it before committing its response: blocks until the Engine admits the
+    // request, so that the queue's own answers (a queue timeout, an orderly stop) still reach the
+    // client as a plain HTTP status, as on the non-streaming routes; after admission only
+    // mid-generation failures remain, which belong in the stream. Throws the ApiException run()
+    // would; a request cancelled while queued returns, and run() gives its answer.
+    virtual void admit(PreparedRequest& prepared,
+                       std::function<bool()> is_cancelled = {}) const = 0;
+
+    // Begins the Engine's orderly stop: running and queued generations fail as Unavailable.
+    virtual void stop() noexcept = 0;
+
+protected:
+    GenerationBackend()                                    = default;
+    GenerationBackend(const GenerationBackend&)            = default;
+    GenerationBackend& operator=(const GenerationBackend&) = default;
+};
+
+class GenerationService final : public GenerationBackend {
 public:
     explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {},
                                DiagnosticObserver diagnostic_observer = {});
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
 
-    // Engine owns the once-normalized startup configuration. Serving diagnostics must use this
-    // value instead of reinterpreting optional defaults from ServeOptions.
-    [[nodiscard]] const infernix::EngineOptions& engine_options() const { return engine_->options(); }
+    [[nodiscard]] const infernix::EngineOptions& engine_options() const override {
+        return engine_->options();
+    }
 
-    [[nodiscard]] infernix::LoadSummary load_summary() const { return engine_->load_summary(); }
+    [[nodiscard]] infernix::LoadSummary load_summary() const override {
+        return engine_->load_summary();
+    }
 
-    [[nodiscard]] infernix::ModelMetadata model_metadata() const {
+    [[nodiscard]] infernix::ModelMetadata model_metadata() const override {
         return engine_->model_metadata();
     }
 
-    [[nodiscard]] infernix::MemorySummary memory_summary() const { return engine_->memory_summary(); }
+    [[nodiscard]] infernix::MemorySummary memory_summary() const override {
+        return engine_->memory_summary();
+    }
 
-    [[nodiscard]] infernix::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
+    [[nodiscard]] infernix::RuntimeStats runtime_stats() const override {
+        return engine_->runtime_stats();
+    }
 
-    void reset_execution_maxima() noexcept { engine_->reset_execution_maxima(); }
+    void reset_execution_maxima() noexcept override { engine_->reset_execution_maxima(); }
 
-    [[nodiscard]] bool is_available() const { return engine_->is_available(); }
+    [[nodiscard]] bool is_available() const override { return engine_->is_available(); }
 
-    // An Engine-wide execution failure, as opposed to an orderly stop.
-    [[nodiscard]] bool has_failed() const { return engine_->has_failed(); }
+    [[nodiscard]] bool has_failed() const override { return engine_->has_failed(); }
 
     [[nodiscard]] infernix::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
     }
 
-    [[nodiscard]] infernix::ModelSamplingDefaults sampling_defaults() const {
+    [[nodiscard]] infernix::ModelSamplingDefaults sampling_defaults() const override {
         return engine_->sampling_defaults();
     }
 
@@ -169,40 +247,31 @@ public:
         return engine_->chat_template_role_support();
     }
 
-    // Artifact-tokenizer encoding of raw text, with no template or special token added.
-    [[nodiscard]] std::vector<infernix::TokenId> tokenize_text(std::string_view text) const {
+    [[nodiscard]] std::vector<infernix::TokenId>
+    tokenize_text(std::string_view text) const override {
         return engine_->tokenize_text(text);
     }
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
                                           GenerationConsumerMode consumer_mode,
                                           infernix::GenerationObservationOptions observation = {},
-                                          std::function<bool()> is_cancelled = {}) const;
-    // The next generation of an admitted request that executed a server-side tool (tool search):
-    // the HTTP request still holds its ingress slot, so the continuation takes another without
-    // the queue bound refusing it, and gets a fresh pending deadline.
+                                          std::function<bool()> is_cancelled = {}) const override;
     [[nodiscard]] PreparedRequest
     prepare_continuation(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
                          infernix::GenerationObservationOptions observation = {},
-                         std::function<bool()> is_cancelled = {}) const;
+                         std::function<bool()> is_cancelled = {}) const override;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
-                                          std::function<bool()> is_cancelled = {}) const;
+                                          std::function<bool()> is_cancelled = {}) const override;
 
-    // Consumes prepared.generation. A PreparedRequest is single-use.
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
-                          std::function<bool()> is_cancelled = {});
+                          std::function<bool()> is_cancelled = {}) override;
 
-    // A streaming route calls it before committing its response: blocks until the Engine admits the
-    // request, so that the queue's own answers (a queue timeout, an orderly stop) still reach the
-    // client as a plain HTTP status, as on the non-streaming routes; after admission only
-    // mid-generation failures remain, which belong in the stream. Throws the ApiException run()
-    // would; a request cancelled while queued returns, and run() gives its answer.
-    void admit(PreparedRequest& prepared, std::function<bool()> is_cancelled = {}) const;
+    void admit(PreparedRequest& prepared,
+               std::function<bool()> is_cancelled = {}) const override;
 
     void warmup();
 
-    // Begins the Engine's orderly stop: running and queued generations fail as Unavailable.
-    void stop() noexcept { engine_->stop(); }
+    void stop() noexcept override { engine_->stop(); }
 
 private:
     enum class CacheParticipation : std::uint8_t {
@@ -222,6 +291,8 @@ private:
                  DeadlinePolicy deadline_policy, bool admitted = false) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
     acquire_request_lifetime(DeadlinePolicy deadline_policy, bool admitted) const;
+    // Hands a finished conversation (prepared.next_turn plus the reply) to Engine::prefill_next_turn.
+    void schedule_next_turn(PreparedRequest& prepared, const GenerationOutcome& outcome) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
     acquire_lifetime(const std::shared_ptr<RequestCapacity>& capacity,
                      DeadlinePolicy deadline_policy, const char* full_message,

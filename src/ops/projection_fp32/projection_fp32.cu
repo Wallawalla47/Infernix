@@ -1,6 +1,8 @@
 #include "infernix/ops/projection_fp32.h"
 #include "ops/projection_fp32/projection_fp32_route.h"
 #include "ops/projection_fp32/projection_fp32_mma.h"
+#include "ops/projection_fp32/projection_fp32_p12.h"
+#include "ops/common/bytes.cuh"
 #include "ops/common/memory.cuh"
 #include "core/device.h"
 #include "core/pdl.cuh"
@@ -289,9 +291,8 @@ __global__ void projection_q8_kernel(const bf16* __restrict__ x, int k, int padd
             // Read once per call (a full-vocabulary head is 636 MB): it leaves L2 first.
             const uint2 packed = ld_nc_na_evict_first(w + chunk);
             const float scale  = __half2float(srow[chunk / 4]);
-            const auto* wv     = reinterpret_cast<const std::int8_t*>(&packed);
             float wf[8];
-            for (int i = 0; i < 8; ++i) { wf[i] = static_cast<float>(wv[i]) * scale; }
+            for (int i = 0; i < 8; ++i) { wf[i] = static_cast<float>(signed_byte_of(packed, i)) * scale; }
             for (int column = 0; column < kColumns; ++column) {
                 if (column < count) {
                     const uint4 xp = staged[column * chunks + chunk];
@@ -378,11 +379,27 @@ constexpr int kTallMinColumnsBf16 = 8;
 constexpr int kTallMinColumnsQ8   = 9;
 constexpr std::size_t kTallMaxSharedBytes = static_cast<std::size_t>(kTallMaxColumns) * kMaxK * sizeof(bf16);
 
+// ld_nc_na_evict_first (ops/common/memory.cuh) for 16 bytes: a BF16 head's chunks.
+__device__ __forceinline__ uint4 ld_nc_na_evict_first_v4(const void* ptr) {
+    std::uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+    uint4 value;
+    asm("ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0, %1, %2, %3}, [%4], %5;"
+        : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+        : "l"(ptr), "l"(policy));
+    return value;
+}
+
+// The tall codecs' weights are a vocabulary head's, read once per call: their loads leave L2 first (the
+// narrow q8 kernel's evict-first, design §19.3.20d), so the head does not push out the next round's L2 data
+// (against plain loads: Dense8 DFlash2 decode, which verifies 8 columns through the q8 head, 1.000x, 2026-10-27).
 struct TallBf16 {
     Segments segments;
     int k;
     using Chunk = uint4;
-    __device__ Chunk load(int row, int chunk) const { return *row_chunk(segments, row, k, chunk); }
+    __device__ Chunk load(int row, int chunk) const {
+        return ld_nc_na_evict_first_v4(row_chunk(segments, row, k, chunk));
+    }
     __device__ static void decode(const Chunk& c, float (&w)[8]) { widen8(c, w); }
 };
 
@@ -395,13 +412,12 @@ struct TallQ8 {
         float scale;
     };
     __device__ Chunk load(int row, int chunk) const {
-        return {reinterpret_cast<const uint2*>(codes + static_cast<std::size_t>(row) * padded_k)[chunk],
-                __half2float(scales[static_cast<std::size_t>(row) * (padded_k / 32) + chunk / 4])};
+        const auto* p = reinterpret_cast<const uint2*>(codes + static_cast<std::size_t>(row) * padded_k) + chunk;
+        return {ld_nc_na_evict_first(p), __half2float(scales[static_cast<std::size_t>(row) * (padded_k / 32) + chunk / 4])};
     }
     __device__ static void decode(const Chunk& c, float (&w)[8]) {
-        const auto* v = reinterpret_cast<const std::int8_t*>(&c.code);
 #pragma unroll
-        for (int i = 0; i < 8; ++i) { w[i] = static_cast<float>(v[i]) * c.scale; }
+        for (int i = 0; i < 8; ++i) { w[i] = static_cast<float>(signed_byte_of(c.code, i)) * c.scale; }
     }
 };
 
@@ -502,6 +518,14 @@ bool tall_route(int rows, int columns, int min_columns, detail::ProjectionRoute 
 } // namespace
 
 void projection_fp32(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    if (weight.qtype == QType::BF16_P12) {
+        require(x.data != nullptr && x.dtype == DType::BF16 && x.is_contiguous() && x.ne[2] == 1 && x.ne[3] == 1 &&
+                    aligned16(x.data),
+                "x must be contiguous, 16-byte aligned BF16 [K, T]");
+        require(out.data != nullptr && out.dtype == DType::FP32 && out.is_contiguous(), "out must be contiguous FP32");
+        detail::projection_fp32_bf16_p12(x, weight, out, stream);
+        return;
+    }
     detail::projection_fp32_route(x, weight, out, detail::ProjectionRoute::Automatic, stream);
 }
 

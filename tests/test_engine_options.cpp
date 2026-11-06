@@ -142,11 +142,25 @@ int main() {
     failures += check(candidate_invalid && candidate_text.find("fast paths") != std::string::npos,
                       "a fast-path candidate was accepted with the lossless route");
     options.fast_path_candidates.clear();
+    // The 8-bit activation routes (--a8-activations) are approximate: the lossless route refuses them.
+    options.a8_activations = true;
+    bool a8_invalid        = false;
+    const std::string a8_text = construction_error(options, a8_invalid);
+    failures += check(a8_invalid && a8_text.find("fast paths") != std::string::npos,
+                      "--a8-activations was accepted with the lossless route");
+    options.a8_activations = false;
     bool exact_invalid     = false;
     const std::string exact_text = construction_error(options, exact_invalid);
     failures += check(exact_text.find("fast paths") == std::string::npos,
                       "the reproducible route was rejected with the lossless route");
     options.lossless = false;
+    // --no-fast-path leaves a path out of the default route's selection: the reproducible route refuses it.
+    options.fast_path_exclusions = {infernix::FastPath::PromptPv8};
+    bool excluded_invalid        = false;
+    const std::string excluded_text = construction_error(options, excluded_invalid);
+    failures += check(excluded_invalid && excluded_text.find("--no-fast-path") != std::string::npos,
+                      "a fast-path exclusion was accepted on the reproducible route");
+    options.fast_path_exclusions.clear();
     // Every fast path round-trips through its name.
     for (const infernix::FastPath path : infernix::kFastPaths) {
         failures += check(infernix::parse_fast_path(infernix::fast_path_name(path)) == path,

@@ -24,7 +24,10 @@
 // narrow route's and the CPU engine's bits, so a W4A16 expert's output never depends on how many
 // other columns share its call. Their A4 residual fast paths (WideA16::kA4Residual, kA4Residual3)
 // run the grouped GEMM of wide_expert.cuh on two or three NVFP4 terms per x and h row instead, at
-// either registered geometry (A4Planes); their narrow experts, GPU or CPU-served, stay exact.
+// either registered geometry (A4Planes); their narrow experts, GPU or CPU-served, stay exact. Under
+// WideA16::kA8 (--a8-activations at prefill widths, with NarrowA16::kA8) they run wide_expert_a8.cuh's grouped
+// GEMM on int8 tensor cores over x and h as ggml_a8.h's 8-bit slices (calls of more than 128 columns; the
+// narrower ones run every job on the 8-bit narrow kernels).
 
 #include "infernix/ops/offloaded_sparse_moe.h"
 
@@ -124,13 +127,13 @@ inline constexpr int kRingCounterSlots = 3; // one per concurrent pass phase (Al
 }
 
 // Whether a call of this bank's arithmetic exists at `shape`: every bank at Flash-Next's geometry;
-// another registered geometry for NVFP4 W4A16 banks on the exact, A4 residual and lossless routes.
+// another registered geometry for NVFP4 W4A16 banks on the exact, A4 residual, lossless and 8-bit wide routes.
 [[nodiscard]] inline bool shape_supported(const ExpertShape& shape, ExpertActivation activation, WideA16 wide_a16,
                                           bool ggml) {
     if (shape == kFlashNextShape) { return true; }
     return registered_shape(shape) && activation == ExpertActivation::kA16 && !ggml &&
            (wide_a16 == WideA16::kExact || wide_a16 == WideA16::kA4Residual || wide_a16 == WideA16::kA4Residual3 ||
-            wide_a16 == WideA16::kLossless);
+            wide_a16 == WideA16::kLossless || wide_a16 == WideA16::kA8);
 }
 
 // The x column of a call's dispatch entry: routed entries are t * top_k + slot, a shared job's
@@ -195,22 +198,14 @@ struct ResidualTerms {
 };
 [[nodiscard]] ResidualTerms residual_terms(WideA16 route);
 
-// GGUF banks' kGgmlBf16 route (ggml_expert.cuh): every wide job's records decoded into planes
-// (ggml_tile.cuh CodeStage images: kGgmlCodeStageBytes per 64 rows x 64 elements), its gate and up
-// rows (2 kIntermediate x kHidden) then its down rows (kHidden x kIntermediate), kGgmlBf16Experts
-// jobs at a time. Calls of fewer than kGgmlBf16MinColumns columns carve no planes and keep the exact
-// tiles: below it the BF16 route measured no faster, its planes a per-expert cost (RTX 5090, IQ3_S banks:
-// 8,192 columns 0 to +7 %, 12,288 columns -10 to +3 %, 14,336 columns 7-9 % faster, 32,768 columns
-// 15-18 % faster; the walk's MoE groups reach it from 14,336-token prompts).
-inline constexpr int kGgmlBf16Experts         = 32;
-inline constexpr int kGgmlBf16MinColumns      = 14336;
-static_assert(MoeGgmlTiles{}.plane_min_columns == kGgmlBf16MinColumns, "MoeGgmlTiles' default is the measured threshold");
-inline constexpr std::size_t kGgmlCodeStageBytes = 6144;
-inline constexpr std::size_t kGgmlBf16GateUpImages = static_cast<std::size_t>(2 * kIntermediate / 64) * (kHidden / 64);
-inline constexpr std::size_t kGgmlBf16DownImages   = static_cast<std::size_t>(kHidden / 64) * (kIntermediate / 64);
-inline constexpr std::size_t kGgmlBf16ExpertBytes =
-    (kGgmlBf16GateUpImages + kGgmlBf16DownImages) * kGgmlCodeStageBytes;
-inline constexpr std::size_t kGgmlBf16PlaneBytes = kGgmlBf16Experts * kGgmlBf16ExpertBytes;
+// GGUF banks' kGgmlBf16 route (ggml_expert.cuh): calls of at least kGgmlStageDecodeMinColumns columns
+// run their wide jobs on the BF16 stage-decode tiles (each K stage's GGUF codes decoded into shared
+// memory; no workspace of their own), narrower calls on the exact tiles. RTX 5090, IQ3_S prefill
+// against the exact tiles below 14,336 columns and the decoded BF16 planes (removed 2026-10-28) from
+// there: pp512 +5.6 %, pp2048 +4.8 %, pp4096 1.13x, pp8192 +11.6 %, pp12288 +26.7 %, pp16384 +14.6 %,
+// pp32768 and pp65536 +9.1 % (pp1024 +1.8 %, two of three pairs; design §19.3.29). Narrower calls were
+// not timed.
+inline constexpr int kGgmlStageDecodeMinColumns = 512;
 
 // The layout of moe_experts' workspace, the single place that defines it. The bookkeeping comes
 // first, so its offsets depend only on max_jobs and entries; the activation planes follow.
@@ -224,17 +219,21 @@ struct ExpertsWorkspace {
     canon::A4Block* h_blocks;     // [entries][kHBlocks]; wide entries hold their A4(h) row here
     std::uint8_t* x_plane;        // [entries][kXRowBytes]
     // W4A16
-    std::uint8_t* x_limbs;        // [columns][a16_x_row_bytes(shape)]: every token's x limbs (wide calls)
+    std::uint8_t* x_limbs;        // [columns][a16_x_row_bytes(shape)]: every token's x limbs (wide calls), or its
+                                  // A8 codes on the 8-bit route (a8_x_rows)
     std::uint8_t* h_rows;         // [entries][a16_h_row_bytes(shape)]: BF16 h, rewritten as limbs for wide entries
     std::int32_t* x_emax;         // [columns]: column exponent of each token's x
-    std::int32_t* h_emax;         // [entries]: column exponent of each wide entry's h
+    std::int32_t* h_emax;         // [entries]: column exponent of each wide entry's h (and each narrow entry's on
+                                  // a GGUF bank's tensor-core route)
+    std::uint32_t* job_ctas;      // [max_jobs]: a GGUF bank's narrow gate/up CTAs finished per job (the last one
+                                  // encodes the job's h); cleared by the call's x encoder
     // W4A16, A4 residual (h_rows holds the BF16 h; x_emax and h_emax serve a ring call's narrow experts)
-    std::uint8_t* x_terms_plane;  // [entries][x_terms_row_bytes(shape, x terms)]
+    std::uint8_t* x_terms_plane;  // [entries][x_terms_row_bytes(shape, x terms)]; the 8-bit route's A8 codes (a8_x_rows)
     float* x_row_scale;           // [columns]
+    std::int32_t* x_slot_entries; // [entries]: the entry of each dispatch value (column * top_k + slot, then
+                                  // shared_first + column): the x terms' rows a column writes
     std::uint8_t* h_terms_plane;  // [entries][h_terms_row_bytes(shape, h terms)]
     float* h_row_scale;           // [entries]
-    // GGUF banks, kGgmlBf16 in calls of kGgmlBf16MinColumns or more (else null): kGgmlBf16PlaneBytes
-    std::uint8_t* ggml_planes;
     // kLossless: lossless_experts_bytes(shape, max_jobs, entries) (moe_layer.cu's lossless_expert.cuh)
     std::uint8_t* lossless;
     // The narrow ring (ring_call; else null): x_acts [columns][shape.hidden / 16] and h_acts
@@ -248,6 +247,24 @@ struct ExpertsWorkspace {
     std::uint32_t* ring_counters;
 };
 
+// The 8-bit activation route of NVFP4 W4A16 banks (NarrowA16::kA8; ops/offloaded_sparse_moe/nvfp4_a8.h): its calls
+// (at most 128 columns) take neither the wide route nor the narrow ring, so its encoded x reuses their x region:
+// every token's ggml::a8 codes then slice scales (column_words(hidden, false) words), a8_x_row_bytes apart, in the
+// x limbs (the exact wide route's workspace: a16_x_row_bytes per token) or, under the A4 residual wide routes, in
+// the x term plane (two or three term rows per entry and at least one entry per token; two term rows are exactly
+// one A8 row). Its h is the BF16 h rows'. A wider call under WideA16::kA8 (whose workspace is kExact's) reads the
+// same x rows in both its narrow kernels and its 8-bit wide GEMM, and rewrites a wide entry's h row in place as
+// its A8 codes then slice scales (a8_x_row_bytes(I-wide) bytes at most).
+INFERNIX_WIDE_HD constexpr int a8_x_row_bytes(const ExpertShape& shape) { return shape.hidden / 32 * 9 * 4; }
+[[nodiscard]] inline std::uint8_t* a8_x_rows(const ExpertsWorkspace& workspace) {
+    return workspace.x_limbs != nullptr ? workspace.x_limbs : workspace.x_terms_plane;
+}
+static_assert(a8_x_row_bytes(kFlashNextShape) <= A16Planes<FlashNextExperts>::kXRowBytes &&
+                  a8_x_row_bytes(kFlashNextShape) == A4Planes<FlashNextExperts>::x_terms_row_bytes(2) &&
+                  a8_x_row_bytes(kQwen3_5_122BShape) <= A16Planes<Qwen3_5_122BExperts>::kXRowBytes &&
+                  a8_x_row_bytes(kQwen3_5_122BShape) == A4Planes<Qwen3_5_122BExperts>::x_terms_row_bytes(2),
+              "a call's A8 x rows fit the x region of either wide route's workspace");
+
 // kLossless's region: per-job counts, the tile plan, records and column maps of every tile, and one
 // column chunk's gate/up and h planes with the projections' workspace, at the bank's geometry.
 inline constexpr int kLosslessChunkColumns = 2048;
@@ -257,6 +274,18 @@ inline constexpr int kLosslessChunkColumns = 2048;
 inline constexpr std::size_t kCpuCallBytes = 2304; // 2 words + 512 indices, rounded to 256
 
 [[nodiscard]] std::int32_t max_tiles(std::int32_t max_jobs, std::int32_t entries);
+// The narrow W4A16 jobs (at most kMaxColumns columns each) of calls of at most kA16NmmaCallColumns columns at
+// Flash-Next's geometry take the tensor-core narrow kernels (moe_layer.cu's a16_nmma_call), so the workspace holds
+// the call's x limbs, exponents and per-job gate/up CTA counts under the A4 residual wide routes too (the exact wide
+// route's workspace has them already); the wider jobs keep the wide route, a wider call's narrow jobs the dp4a
+// kernels. Decode and verification calls (up to 64 columns) and prefill calls up to 4,096 columns take them since
+// 2026-11-03 (FP4-Local's default route, op bench with every record in frames, the moe_experts call against the dp4a
+// narrow jobs, same hashes: 128 columns 0.52x, 256 0.44x, 512 0.43x, 1,024 0.55x, 2,048 0.95x, 4,096 0.99x; end to
+// end level at pp256-pp16384, where prefill waits on the expert stream). Wider calls (the layer walk's MoE groups of
+// up to 32,768 columns) have almost no narrow jobs, and encoding all their tokens' x limbs cost pp32768 -0.2 % and
+// pp65536 -0.4 %.
+inline constexpr int kA16NmmaCallColumns = 4096;
+INFERNIX_WIDE_HD constexpr bool a16_nmma_columns(int columns) { return columns <= kA16NmmaCallColumns; }
 // `columns` is the call's T (entries = top_k * T); the activation and W4A16 wide route select the planes.
 // `shape` is the bank's geometry (MoeExpertSource::shape; shape_supported).
 [[nodiscard]] std::size_t experts_workspace_bytes(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t entries,
@@ -264,6 +293,12 @@ inline constexpr std::size_t kCpuCallBytes = 2304; // 2 words + 512 indices, rou
 [[nodiscard]] ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, std::int32_t max_jobs,
                                                        std::int32_t entries, std::int32_t columns,
                                                        ExpertActivation activation, WideA16 wide_a16);
+
+// Calls of at least this many columns per expert on average (Call::mean_job_columns) run the W4A4 and
+// A4-residual grouped GEMMs on WarpTile64 schedules (the same bits), narrower ones on the 32-token warp
+// tiles. FP4-Local prefill with every call on WarpTile64 measured 1.0001x at pp4096, 0.9985x at pp16384
+// (~320 columns per expert) and 1.0127x at pp32768 (~640); Ornith (~256 at pp8192) flat (2026-10-28).
+inline constexpr std::int32_t kWarpTile64MinColumns = 512;
 
 // Device and host state of one moe_experts call's wide route; a plain value, valid until the call's
 // workspace is released. `descriptors` points to the call's staged TMA descriptors (W4A4 only).
@@ -278,7 +313,7 @@ struct Call {
     std::uint16_t* outputs                    = nullptr; // BF16 [H, entries]
     const void* descriptors                   = nullptr;
     std::int32_t passes                       = 0;
-    std::int32_t mean_job_columns             = 0; // entries / max_jobs (INFERNIX_TMP_WIDE_EXPERT_T64's rule)
+    std::int32_t mean_job_columns             = 0; // entries / max_jobs (kWarpTile64MinColumns' rule)
     bool a16                                  = false;
     // W4A16 (wide_expert_a16.cuh)
     const std::uint8_t* x_limbs = nullptr; // [T][kA16XRowBytes]
@@ -286,6 +321,9 @@ struct Call {
     const std::int32_t* x_emax  = nullptr; // [T]
     std::int32_t* h_emax        = nullptr; // [entries]
     std::int32_t top_k          = 0;
+    // W4A16 on 8-bit activations (WideA16::kA8; wide_expert_a8.cuh): x_limbs then holds every token's A8 codes
+    // (a8_x_rows, encoded by moe_experts), and h_rows a wide entry's A8 h codes once encode_h_a8 has run.
+    bool a8 = false;
     // W4A16 A4 residual (descriptors then name every term's plane)
     bool a4_residual                = false;
     ResidualTerms terms;
@@ -296,10 +334,12 @@ struct Call {
 
 // Plans the call's wide work tiles in passes of `pass_jobs` jobs (the passes moe_experts stages),
 // quantizes x for every wide entry and stages the TMA descriptors (W4A4), or encodes every token's
-// x limbs (W4A16). Enqueued on `stream`.
+// x limbs (W4A16; `x_limbs_encoded`: the tensor-core narrow kernels' prepare already did, in the same
+// encoding). Enqueued on `stream`.
 [[nodiscard]] Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                            std::int32_t top_k, std::int32_t max_jobs, std::int32_t pass_jobs,
-                           const ExpertsWorkspace& workspace, Tensor& outputs, cudaStream_t stream);
+                           const ExpertsWorkspace& workspace, Tensor& outputs, cudaStream_t stream,
+                           bool x_limbs_encoded = false);
 
 // Computes the wide experts among the jobs of `pass`, whose records job_records holds by then:
 // the gate/up GEMM with SwiGLU and the encoding of h (A4, or the W4A16 limbs), then the down GEMM

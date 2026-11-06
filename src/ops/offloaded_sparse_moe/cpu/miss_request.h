@@ -17,12 +17,15 @@ inline constexpr int kMaxLandingSlots   = 32;  // landing frames of one call (Mo
 // Written by the device: every field, a system-scope fence, then `sequence` (never 0: the device
 // counter skips it on wrap). The host answers by writing the same value to the channel's done
 // word after every output is written. With `tiered` set, record[j] is job j's host record (the
-// source's host_table entry); otherwise the service reads its own layer bank.
+// source's host_table entry); otherwise the service reads its own layer bank. With `a8` set (a GGUF
+// bank's call on the 8-bit activation route, MoeGgmlBank::a8), the jobs take the CPU route's 8-bit
+// functions.
 struct alignas(64) MissRequest {
     std::uint32_t sequence;
     std::int32_t layer;
     std::int32_t jobs;
     std::int32_t tiered;
+    std::int32_t a8;
     std::uint64_t record[kMaxCpuJobs];
     std::int32_t expert[kMaxCpuJobs];
     std::int32_t ncols[kMaxCpuJobs];

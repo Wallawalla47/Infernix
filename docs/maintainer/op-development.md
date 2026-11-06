@@ -297,8 +297,33 @@ concurrent requests. Kernels that stream most of their bytes in a main loop use
 `enter_streaming()` and call `pdl::trigger_dependents()` after that loop (or rely on the trigger at
 exit): an entry-time trigger lets later nodes occupy SMs and prefetch weights while the loop is
 still streaming, which measured about 10 % slower on the RTX 5090 DFlash2 round. A streaming kernel
-may stage its first weight tiles into shared memory before the wait. Attention over the KV cache
-stays an ordinary launch; it has no weights to stage and measured no faster as a dependent.
+may stage its first weight tiles into shared memory before the wait. Attention over the KV cache has
+no weights to stage and once measured no faster as a dependent; the grouped decode and verification
+kernels of every KV format are dependents now (they wait at entry): in the Qwen3.5 decode graphs they
+measured +0.24 % on the 35B-A3B's MTP rounds, +0.09 % on the groupwise 27B's DFlash2 rounds and level
+on the NVFP4 27B (candidates §58).
+
+A kernel's position in the chain also guards its successors. A consumer whose code before its own wait
+reads an input written two or more kernels back (the 35B-A3B MoE's D3 stages the router input, its
+small-T S3 too, a fork's joining sibling computes before it waits) is safe only while a serialized launch,
+or a kernel that triggers after its own wait, stands between that input's writer and it. So D2 and the
+small-T router S1 stay serialized launches, and so does the head of the groupwise 27B's GDN-input fork.
+When a launch becomes a programmatic dependent, list its successors' pre-wait loads (the SASS audit and
+the transitive chain check of candidates XB-05) against the new upstream set.
+
+Placing a read after the wait in the source does not keep it there: ptxas moved a non-coherent load
+(`const __restrict__`, `LDG.E.CONSTANT`) of the Flash-Next conv snapshot kernel's slot index above
+`griddepcontrol.wait` (SASS `ACQBULK`). That index is host-written ingress, which is safe, but producer output
+read through such a pointer could be read early in the same way. The PDL skew test build checks a model's
+captured rounds for such reads: configure a tree with `-DINFERNIX_PDL_SKEW=ON` (candidates LE-12). There,
+every `wait_for_dependencies()` first lets its dependents launch, then waits, then spins about 20 µs, so each
+producer writes its outputs late while its consumers already run their code before their own wait. A
+request's ids on the reproducible route must then equal a normal build's. `INFERNIX_PDL_SKEW_SELECT=k/n`
+launches as programmatic dependents only the kernels whose name hashes to k modulo n (`1/1`: none, a
+control), and `INFERNIX_PDL_SKEW_LOG=1` prints each kernel's choice, hash and name, so a difference can be
+narrowed to one consumer. The spin follows the wait so that the code before the wait compiles as in a
+normal build: an earlier version spun before the wait, and the compiler moved the QSA attention kernel's
+loads above it, a failure the normal binary does not have.
 
 #### Asynchronous-copy pipelines
 
@@ -649,8 +674,10 @@ rewritten:
    independent oracle;
 8. measure the Op when performance changes; measure a product route only for an explicitly scoped
    end-to-end claim; a kernel whose per-thread stack or local memory grows (a register spill or a
-   local array) fails `infernix_cuda_stack_check`, which compares `cuobjdump`'s resource usage of
-   `infernix-serve` with `tools/cuda_stack/cuda_stack_allowlist.json`; fix the spill, or after review
+   local array), or whose SASS gains local stores or loads (STL, LDL), fails
+   `infernix_cuda_stack_check`, which compares `cuobjdump`'s resource usage and the STL and LDL in the
+   code of `infernix-serve` with `tools/cuda_stack/cuda_stack_allowlist.json` (resource usage alone has
+   reported no spill for a kernel spilling inside its key-tile loop); fix the spill, or after review
    record it with `python tools/cuda_stack/check_cuda_stack.py update BINARY`;
 9. integrate models only through semantic contract headers and explicit operands;
 10. give every source and symbol one clear build and link owner.

@@ -95,6 +95,10 @@ public:
 
     // The snapshot keeps its host image but loses its device image copy.
     virtual void drop_snapshot_device_image(SnapshotRef /*snapshot*/) noexcept {}
+
+    // A Host tier shrink (PrefixCacheIndex::shrink_host) moves the bytes of slab `from` into the free slab `to`; no
+    // transfer reads or writes either (the caller shrinks with every transfer settled).
+    virtual void move_host_slab(std::uint32_t from, std::uint32_t to) noexcept = 0;
 };
 
 struct MatchCandidate {
@@ -184,12 +188,21 @@ struct RestoredBlock {
     std::uint32_t slab = kNoId;
 };
 
+// What a failed sequence published that PrefixCacheIndex::withdraw still has to remove (§7.8).
+struct Withdrawal {
+    std::vector<NodeRef> nodes;         // blocks whose Device copy was the sequence's page
+    std::vector<SnapshotRef> snapshots; // snapshots the sequence created
+
+    [[nodiscard]] bool empty() const noexcept { return nodes.empty() && snapshots.empty(); }
+};
+
 struct PrefixIndexStats {
     std::uint32_t nodes                   = 0;
     std::uint32_t snapshots               = 0;
     std::uint32_t device_resident_blocks  = 0;
     std::uint32_t device_evictable_blocks = 0;
     std::uint32_t host_free_slabs         = 0;
+    std::uint32_t host_slab_limit         = 0; // slabs in service (shrink_host / grow_host)
     std::uint32_t free_device_slots       = 0;
     std::uint64_t device_block_evictions  = 0;
     std::uint64_t unbacked_node_losses    = 0;
@@ -278,6 +291,7 @@ public:
     // Pins one node and its ancestors (in-flight transfer of that node).
     void pin_node(NodeRef node);
     void unpin_node(NodeRef node);
+    // Pins one snapshot and its anchor path (in-flight transfer of the snapshot's image or tail).
     void pin_snapshot(SnapshotRef snapshot);
     void unpin_snapshot(SnapshotRef snapshot);
 
@@ -369,6 +383,16 @@ public:
                                                       HostImageReservation&& image,
                                                       SnapshotKind kind);
 
+    // ---- withdrawal (§7.8) ---------------------------------------------------------------------
+    // Removes what a sequence published from state that may be wrong (its logits went non-finite):
+    // every snapshot of `withdrawal.snapshots`, and every node of `withdrawal.nodes` with its whole
+    // subtree and each snapshot anchored there (later sequences that extended the path computed
+    // over its pages). Call once the sequence has released its pins and its transfers have landed.
+    // An entry another sequence or a transfer still pins stays in `withdrawal` for a later call;
+    // below a pinned node the unpinned snapshots go now, so no admission resumes from them. Stale
+    // references (entries evicted meanwhile) are dropped. Returns the entries removed.
+    std::uint32_t withdraw(Withdrawal& withdrawal);
+
     // ---- persistence ---------------------------------------------------------------------------
     // What a saved Host tier keeps: every Host-resident snapshot whose anchor path is Host-resident
     // throughout, and exactly those paths, parents before children. Other Host content is dead
@@ -386,6 +410,18 @@ public:
     [[nodiscard]] std::optional<SnapshotRef>
     restore_host_snapshot(NodeRef anchor, std::uint32_t frontier, std::span<const TokenId> tail,
                           SnapshotKind kind, std::uint32_t hits);
+
+    // ---- Host tier resize (RAM pressure) -------------------------------------------------------
+    // Slabs [0, host_slab_limit()) are owned, reserved or free; the configured host_slabs past it are retired and
+    // hold nothing, so their memory can be released.
+    [[nodiscard]] std::uint32_t host_slab_limit() const noexcept { return host_limit_; }
+    // Retires the slabs from `limit` on: evicts as an allocation would (dead KV, superseded snapshots, then the GDSF
+    // minimum, whatever its priority) until the owned and reserved slabs fit below `limit`, then moves each owned
+    // slab at or past it into a free one below it (PrefixIndexBackend::move_host_slab). Returns the limit reached:
+    // `limit`, or more when pinned, held or reserved entries keep slabs (none while the Engine is idle).
+    std::uint32_t shrink_host(std::uint32_t limit);
+    // Brings the retired slabs below `limit` (at most host_slabs) back as free ones.
+    void grow_host(std::uint32_t limit);
 
     // ---- views
     // ------------------------------------------------------------------------------------
@@ -510,6 +546,9 @@ private:
     [[nodiscard]] bool allocate_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
                                       std::uint32_t protect_snapshot,
                                       double claim = std::numeric_limits<double>::infinity());
+    // One eviction of allocate_slabs's order that frees Host slabs; false when nothing (or nothing worth at most
+    // `claim`) can yield.
+    [[nodiscard]] bool evict_for_slabs(std::uint32_t protect_snapshot, double claim);
     void free_slab(std::uint32_t slab);
 
     // The publication shared by publish_snapshot and publish_host_snapshot: exactly one of
@@ -583,6 +622,7 @@ private:
     std::uint32_t dead_tail_ = kNoId;
 
     std::vector<std::uint32_t> free_slabs_;
+    std::uint32_t host_limit_ = 0; // shrink_host / grow_host
     // Slabs held by an outstanding HostImageReservation (owned by no node or snapshot).
     std::vector<bool> slab_reserved_;
     std::vector<SlotState> slot_state_;

@@ -43,6 +43,11 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
                                                               const httplib::Request& request,
                                                               httplib::Response& response);
 
+// GET /v1/responses. OpenAI's WebSocket mode for Responses (`response.create` over a GET upgrade) is not served: an
+// upgrade is answered 426 with the OpenAI error envelope, which Codex's built-in provider takes as a switch to HTTP for
+// the session instead of failing the turn (candidates IJ-02; Ollama answers it so too); any other GET answers 404.
+void handle_responses_upgrade(const httplib::Request& request, httplib::Response& response);
+
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
 
@@ -52,6 +57,10 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 // group, and canonical_api_path maps the doubled form back to the /v1/<endpoint> it names.
 [[nodiscard]] std::string api_route_pattern(std::string_view endpoint);
 [[nodiscard]] std::string_view canonical_api_path(std::string_view path) noexcept;
+
+// The HTTP server's worker pool (its new_task_queue, owned by the server): a worker for every
+// admitted or waiting request and one more, growing to --max-http-clients open connections.
+[[nodiscard]] httplib::TaskQueue* new_http_worker_pool(const ServeOptions& options);
 
 class HttpServer {
 public:
@@ -63,7 +72,7 @@ public:
     // Reserves the configured address before model loading. The service is attached only after its
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
     bool bind();
-    void attach(GenerationService& service);
+    void attach(GenerationBackend& service);
     // Returns once stop() or an Engine-wide failure (engine_failed()) ends the accept loop.
     bool listen();
     // Whether listen() returned because the Engine failed: it then answers nothing but errors
@@ -77,9 +86,14 @@ public:
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
 
 private:
+    // A generation request from its submission to the Engine to its terminal record; it is listed in
+    // live.active (live_requests_) until done() or failure(), or its destruction.
     class RequestLifecycle {
     public:
         RequestLifecycle(HttpServer& owner, RequestLogContext context);
+        ~RequestLifecycle();
+        RequestLifecycle(const RequestLifecycle&)            = delete;
+        RequestLifecycle& operator=(const RequestLifecycle&) = delete;
 
         void done(const GenerationOutcome& outcome);
         void failure(const RequestFailure& failure);
@@ -122,6 +136,8 @@ private:
     [[nodiscard]] infernix::GenerationSchedulingObserver
     scheduling_observer(std::uint64_t request_id, std::string http_request_id);
     [[nodiscard]] infernix::GenerationFirstTokenObserver first_token_observer();
+    // The Engine's progress observations of request `request_id`, into live.active.
+    [[nodiscard]] infernix::GenerationProgressObserver progress_observer(std::uint64_t request_id);
     void record_request_rejected(const RequestRejectionLogContext& context);
     void record_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void record_request_failure(const RequestLogContext& context, const RequestFailure& failure);
@@ -133,7 +149,7 @@ private:
     void run_engine_watch();
     void stop_engine_watch();
 
-    GenerationService* service_ = nullptr;
+    GenerationBackend* service_ = nullptr;
     ServeOptions options_;
     std::string public_model_id_;
     infernix::ModelMetadata model_metadata_;
@@ -149,6 +165,8 @@ private:
     JsonlRequestLog request_jsonl_;
     Metrics metrics_;
     RequestHistory metrics_json_history_;
+    // The generation requests in flight (GET /metrics?format=json live.active).
+    LiveRequests live_requests_;
     std::unique_ptr<ConsoleStatsPanel> console_stats_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};

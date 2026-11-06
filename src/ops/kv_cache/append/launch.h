@@ -21,6 +21,14 @@ void kv_cache_append_nvfp4_batch_launch(const Tensor& k, const Tensor& v, const 
 void kv_cache_append_k8v4_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                  PagedKVLayerView cache, cudaStream_t stream);
 
+// Packed BF16 rows (KvCacheStorage::Bf16Packed, ops/kv_cache/bf16p_codec.cuh): each row packed, or raw, by itself.
+void kv_cache_append_bf16p_launch(const Tensor& k, const Tensor& v, const Tensor& positions, PagedKVLayerView cache,
+                                  cudaStream_t stream);
+
+void kv_cache_append_bf16p_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                        const Tensor& valid_columns, const Tensor& table_rows,
+                                        PagedKVBatchLayerView cache, cudaStream_t stream);
+
 void kv_cache_append_k8v4_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                        const Tensor& valid_columns, const Tensor& table_rows,
                                        PagedKVBatchLayerView cache, cudaStream_t stream);
@@ -41,6 +49,10 @@ struct KVCacheVqStaging {
 // kv_cache_vq_window_commit_launch moves the slot-bound ones into the window afterwards.
 void kv_cache_append_vq_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                PagedKVLayerView cache, cudaStream_t stream);
+
+// Tests: every following vector-quantized append takes the split encoder at `split` (1, 2, 4 or 8) pattern
+// ranges, or 0 for the route by rows (the default).
+void vq_append_force_split(int split);
 
 void kv_cache_append_vq_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                      const Tensor& valid_columns, const Tensor& table_rows,

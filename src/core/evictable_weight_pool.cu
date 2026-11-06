@@ -54,6 +54,17 @@ struct EvictableWeightPool::Impl {
 
 bool EvictableWeightPool::supported(int device) { return vmm::supported(device); }
 
+std::size_t EvictableWeightPool::mapped_bytes(std::size_t arena_bytes) noexcept {
+    return align_up(arena_bytes, kChunkBytes);
+}
+
+std::size_t EvictableWeightPool::mirror_bytes(std::size_t arena_bytes, std::size_t evictable_tail_bytes) noexcept {
+    if (evictable_tail_bytes == 0 || evictable_tail_bytes > arena_bytes) { return 0; }
+    // The first evictable chunk (the constructor's tail_begin) to the arena's end.
+    const std::size_t tail_begin = align_up(arena_bytes - evictable_tail_bytes, kChunkBytes);
+    return tail_begin < arena_bytes ? arena_bytes - tail_begin : 0;
+}
+
 EvictableWeightPool::EvictableWeightPool(const Config& config) : impl_(std::make_unique<Impl>()) {
     if (config.arena_bytes == 0) {
         throw std::invalid_argument("evictable pool arena must not be empty");
@@ -70,7 +81,7 @@ EvictableWeightPool::EvictableWeightPool(const Config& config) : impl_(std::make
         throw std::runtime_error("evictable pool chunk is not a multiple of the VMM granularity");
     }
 
-    impl.arena_reserved = align_up(config.arena_bytes, kChunkBytes);
+    impl.arena_reserved = mapped_bytes(config.arena_bytes);
     // Chunk-align INTO the evictable suffix so no chunk ever covers non-evictable bytes.
     impl.tail_begin = align_up(config.arena_bytes - config.evictable_tail_bytes, kChunkBytes);
     // Address space is free: reserve overlay VA for the whole evictable tail so
@@ -142,7 +153,7 @@ void EvictableWeightPool::capture_tail_mirror(cudaStream_t stream) {
     if (impl.mirror != nullptr) {
         throw std::logic_error("evictable pool tail mirror was already captured");
     }
-    const std::size_t mirrored = impl.config.arena_bytes - impl.tail_begin;
+    const std::size_t mirrored = mirror_bytes(impl.config.arena_bytes, impl.config.evictable_tail_bytes);
     impl.mirror                = std::make_unique<PinnedHostBuffer>(mirrored);
     CUDA_CHECK(cudaMemcpyAsync(impl.mirror->data(),
                                reinterpret_cast<void*>(impl.home + impl.tail_begin), mirrored,

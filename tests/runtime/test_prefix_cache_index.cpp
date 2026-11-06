@@ -39,12 +39,15 @@ public:
         live.erase(id);
     }
 
+    void move_host_slab(std::uint32_t from, std::uint32_t to) noexcept override { moves.emplace_back(from, to); }
+
     std::uint32_t allocate() {
         const std::uint32_t id = next++;
         live.insert(id);
         return id;
     }
 
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> moves;
     std::vector<std::uint32_t> released;
     std::set<std::uint32_t> live;
     std::uint32_t next = 1;
@@ -299,6 +302,31 @@ void test_device_lru_order() {
     index.check_invariants();
 }
 
+// A snapshot whose Host write is in flight outlives its released path: the unbacked eviction that
+// would remove its anchor's subtree (the snapshot with it) waits until the write lands.
+void test_pinned_snapshot_keeps_anchor() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64), backend);
+    const auto tokens          = make_tokens(64 * 4, 70);
+    const auto path            = insert_sequence(index, backend, tokens);
+    const SnapshotRef endpoint = publish_tap(index, path[3]);
+    index.pin_snapshot(endpoint);
+    require(index.begin_snapshot_host_fill(endpoint), "no slabs for the snapshot's Host write");
+    index.release_path(path);
+    index.check_invariants();
+    require(index.device_evictable_blocks() == 0,
+            "a pinned snapshot's anchor path must not be evictable");
+    require(index.evict_device_blocks(4) == 0 && index.valid(endpoint),
+            "an unbacked eviction must not remove a pinned snapshot");
+    index.complete_snapshot_host_fill(endpoint);
+    index.unpin_snapshot(endpoint);
+    index.check_invariants();
+    require(index.device_evictable_blocks() == 4, "the path is evictable once the write lands");
+    require(index.evict_device_blocks(4) == 4 && backend.live.empty(),
+            "every page must be released after the write");
+    index.check_invariants();
+}
+
 void test_backed_before_unbacked() {
     RecordingBackend backend;
     PrefixCacheIndex index(small_config(64), backend);
@@ -428,22 +456,29 @@ void test_host_only_reattach() {
         require(index.node(node).device == CopyState::Absent, "block must be host-only");
     }
     const std::size_t live_before = backend.live.size();
+    const std::array<NodeRef, 1> reader{path[0]};
+    index.acquire_path(reader); // another sequence restores block 0 from its Host slab
 
-    // A sequence recomputing the same blocks re-establishes their Device copies.
+    // A sequence recomputing the same blocks re-establishes their Device copies. A recomputation need
+    // not repeat the earlier bits, so an unpinned block's earlier Host copy goes (the write-through
+    // backs the new page); a pinned block's slab may be under a restore copy, and stays.
     const auto again = insert_sequence(index, backend, tokens);
     require(again == path, "recomputed blocks must resolve to the existing nodes");
     require(backend.live.size() == live_before + 3, "the index must keep the recomputed pages");
-    for (const NodeRef node : path) {
-        const NodeView view = index.node(node);
-        require(view.device == CopyState::Resident && view.host == CopyState::Resident,
-                "a reattached block is resident on both tiers");
+    for (std::size_t b = 0; b < path.size(); ++b) {
+        const NodeView view = index.node(path[b]);
+        require(view.device == CopyState::Resident, "a reattached block has its Device copy");
+        require(view.host == (b == 0 ? CopyState::Resident : CopyState::Absent),
+                "a reattached block keeps its earlier Host copy only while another sequence pins it");
     }
     // Duplicates of Device copies another sequence pins stay private to the inserting sequence.
     const auto twice = insert_sequence(index, backend, tokens);
     require(backend.live.size() == live_before + 3, "a pinned resident duplicate must not be retained");
     index.release_path(twice);
     index.release_path(again);
+    index.release_path(reader);
     index.check_invariants();
+    for (std::size_t b = 1; b < path.size(); ++b) { backup_node(index, path[b]); } // the write-through
     require(index.evict_device_blocks(3) == 3, "reattached backed blocks are evictable again");
     index.check_invariants();
 }
@@ -480,8 +515,8 @@ void test_resident_duplicate_replacement() {
                 "an unpinned Device copy is replaced by the sequence's page");
         require(!backend.live.contains(old_ids[b]), "the replaced copy returns to the pool");
     }
-    require(index.node(path[1]).host == CopyState::Resident,
-            "a replaced block keeps its Host copy");
+    require(index.node(path[1]).host == CopyState::Absent,
+            "a replaced block's Host copy of the earlier computation goes");
     require(backend.live.size() == 3, "one page per block while the sequence holds the path");
     require(index.device_evictable_blocks() == 0, "the sequence pins its path");
     index.check_invariants();
@@ -491,6 +526,91 @@ void test_resident_duplicate_replacement() {
     require(index.device_evictable_blocks() == 3, "the replaced blocks are evictable again");
     require(index.evict_device_blocks(3) == 3 && backend.live.empty(),
             "evicting the blocks releases the adopted pages");
+    index.check_invariants();
+}
+
+// A sequence whose logits went non-finite withdraws what it published (§7.8): the blocks whose
+// Device copy is its page, with their subtrees, and its snapshots, so a resend resumes from what
+// was cached before it. Below a block another sequence still maps, the unpinned snapshots go at
+// once and the blocks with a later call; stale references are dropped.
+void test_withdrawal() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 6), backend);
+    const auto tokens = make_tokens(64 * 6 + 10, 70);
+    const auto n      = static_cast<std::uint32_t>(tokens.size());
+    const auto hashes = block_lookup_hashes(tokens, {});
+    // An earlier request cached blocks 0-1 and a tap at 128.
+    const std::vector<TokenId> prompt(tokens.begin(), tokens.begin() + 64 * 2);
+    const auto cached       = insert_sequence(index, backend, prompt);
+    const SnapshotRef clean = publish_tap(index, cached[1]);
+    index.release_path(cached);
+
+    // The failing request resumes at 128 (it maps blocks 0-1), inserts blocks 2-5 and taps at 256
+    // and 384.
+    const auto run = [&](std::vector<NodeRef>& path, std::vector<NodeRef>& owned) {
+        path = cached;
+        owned.clear();
+        index.acquire_path(cached);
+        for (std::size_t b = 2; b < 6; ++b) {
+            const std::span<const TokenId> block(tokens.data() + b * kBlockTokens, kBlockTokens);
+            const InsertResult result =
+                index.insert_block(path.back(), hashes[b], block, 0, backend.allocate(), true);
+            require(result.inserted && result.device_attached, "the request's blocks are new");
+            path.push_back(result.node);
+            owned.push_back(result.node);
+        }
+        index.check_invariants();
+    };
+    const auto only_clean = [&] {
+        const MatchResult match = index.match(tokens, hashes, {}, n);
+        return match.candidates.size() == 1 && match.candidates[0].snapshot == clean;
+    };
+    std::vector<NodeRef> path, owned;
+    run(path, owned);
+    const SnapshotRef tap4 = publish_tap(index, path[3]);
+    const SnapshotRef tap6 = publish_tap(index, path[5]);
+    index.release_path(path);
+    const std::size_t live = backend.live.size();
+    Withdrawal withdrawal{owned, {tap4, tap6}};
+    require(index.withdraw(withdrawal) == 6, "four blocks and two snapshots are withdrawn");
+    require(withdrawal.empty(), "nothing pinned stays to withdraw");
+    for (const NodeRef node : owned) { require(!index.valid(node), "a withdrawn block is gone"); }
+    require(!index.valid(tap4) && !index.valid(tap6), "the request's snapshots are gone");
+    require(index.valid(clean) && index.valid(cached[0]) && index.valid(cached[1]),
+            "what was cached before the request stays");
+    require(backend.live.size() == live - 4, "the withdrawn blocks' pages are released");
+    require(index.match(tokens, hashes, {}, n).path.size() == 2 && only_clean(),
+            "a resend resumes from the snapshot cached before the request");
+    index.check_invariants();
+
+    // Again, while a sibling that resumed from the request's tap at 256 maps blocks 0-4 and has
+    // published its own tap at 320.
+    const std::vector<NodeRef> stale = owned;
+    run(path, owned);
+    const SnapshotRef tap_a = publish_tap(index, path[3]);
+    const SnapshotRef tap_b = publish_tap(index, path[5]);
+    const std::vector<NodeRef> sibling(path.begin(), path.begin() + 5);
+    index.acquire_path(sibling);
+    const SnapshotRef tap_s = publish_tap(index, path[4]);
+    index.release_path(path);
+    withdrawal = Withdrawal{owned, {tap_a, tap_b}};
+    withdrawal.nodes.push_back(stale.front());
+    require(index.withdraw(withdrawal) == 4, "the unpinned snapshots and block 5 go at once");
+    require(!index.valid(tap_a) && !index.valid(tap_b) && !index.valid(tap_s),
+            "no snapshot over the withdrawn blocks stays resumable");
+    require(!index.valid(path[5]), "a block nothing maps goes at once");
+    require(withdrawal.snapshots.empty() && withdrawal.nodes.size() == 3 &&
+                withdrawal.nodes[0] == path[2] && withdrawal.nodes[1] == path[3] &&
+                withdrawal.nodes[2] == path[4],
+            "the blocks the sibling maps stay to withdraw, and the stale reference is dropped");
+    require(index.valid(path[2]) && index.node(path[4]).pins == 1, "the sibling's mapping is intact");
+    require(only_clean(), "a resend resumes from the snapshot cached before the request");
+    index.check_invariants();
+    index.release_path(sibling);
+    require(index.withdraw(withdrawal) == 3 && withdrawal.empty(),
+            "the blocks go once the sibling releases them");
+    require(index.valid(clean) && only_clean(), "the earlier snapshot still serves");
+    require(backend.live.size() == live - 4, "every withdrawn page returns");
     index.check_invariants();
 }
 
@@ -990,6 +1110,79 @@ void test_image_only_host_tier() {
 
 // Host-born snapshots (images copied straight to Host slabs) on an index without Device snapshot
 // slots: reservations, publication with and without a tail, duplicates, Device-tail eviction.
+// RAM pressure: shrink_host evicts as an allocation would until the owned slabs fit below the limit, then moves
+// those past it into free slabs below (the backend copies them); a pinned entry keeps its slabs, so the limit stays
+// above them; grow_host brings the slabs back as free ones.
+void test_host_tier_resize() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 0), backend);
+    constexpr double kAny = std::numeric_limits<double>::infinity();
+    std::vector<std::vector<NodeRef>> paths;
+    std::vector<SnapshotRef> snapshots;
+    for (std::uint32_t s = 0; s < 6; ++s) {
+        paths.push_back(insert_sequence(index, backend, make_tokens(64 * 2, 700 + s)));
+        auto image = index.reserve_host_image(false, kAny);
+        require(image.has_value(), "an image reservation");
+        snapshots.push_back(
+            index.publish_host_snapshot(paths.back()[1], 128, {}, std::nullopt, std::move(*image), SnapshotKind::Tap).snapshot);
+    }
+    for (const auto& path : paths) {
+        for (const NodeRef node : path) { backup_node(index, node); }
+        index.release_path(path); // the sequences ended: the Engine is idle
+    }
+    index.check_invariants();
+    require(index.stats().host_free_slabs == 64 - 36 && index.stats().host_slab_limit == 64,
+            "six images and twelve blocks take 36 slabs");
+    const auto owned_below = [&](std::uint32_t limit) {
+        for (const auto& path : paths) {
+            for (const NodeRef node : path) {
+                if (index.valid(node) && index.node(node).host == CopyState::Resident &&
+                    index.node(node).host_slab >= limit) {
+                    return false;
+                }
+            }
+        }
+        for (const SnapshotRef snapshot : snapshots) {
+            if (!index.valid(snapshot)) { continue; }
+            for (const std::uint32_t slab : index.snapshot(snapshot).host_slabs) {
+                if (slab >= limit) { return false; }
+            }
+        }
+        return true;
+    };
+
+    require(index.shrink_host(20) == 20 && index.stats().host_slab_limit == 20, "the limit is reached");
+    index.check_invariants();
+    require(owned_below(20) && !backend.moves.empty() &&
+                std::all_of(backend.moves.begin(), backend.moves.end(),
+                            [](const auto& move) { return move.first >= 20 && move.second < 20; }),
+            "what stayed was moved below the limit");
+    require(index.stats().host_snapshot_evictions > 0 && index.stats().host_free_slabs <= 20,
+            "the shrink evicted to fit");
+    // A pinned snapshot keeps its slabs: the limit stays above them.
+    const auto kept = std::find_if(snapshots.begin(), snapshots.end(), [&](SnapshotRef s) { return index.valid(s); });
+    require(kept != snapshots.end(), "a snapshot survives the shrink");
+    const std::vector<std::uint32_t> pinned_slabs(index.snapshot(*kept).host_slabs.begin(),
+                                                  index.snapshot(*kept).host_slabs.end());
+    const std::uint32_t top = *std::max_element(pinned_slabs.begin(), pinned_slabs.end());
+    index.pin_snapshot(*kept);
+    const std::uint32_t reached = index.shrink_host(0);
+    index.check_invariants();
+    require(reached > top && reached < 20 && owned_below(reached) && index.valid(*kept) &&
+                std::equal(pinned_slabs.begin(), pinned_slabs.end(), index.snapshot(*kept).host_slabs.begin()),
+            "a pinned snapshot's slabs moved or were retired");
+    index.unpin_snapshot(*kept);
+
+    index.grow_host(64);
+    index.check_invariants();
+    const PrefixIndexStats grown = index.stats();
+    require(grown.host_slab_limit == 64 && grown.host_free_slabs >= 64 - reached, "grow_host frees the retired slabs");
+    auto image = index.reserve_host_image(false, kAny);
+    require(image.has_value(), "a grown tier reserves again");
+    index.release_host_image(std::move(*image));
+    index.check_invariants();
+}
+
 void test_host_born_snapshots() {
     RecordingBackend backend;
     PrefixCacheIndex index(small_config(64, 0), backend);
@@ -1569,6 +1762,17 @@ void test_tap_planner() {
     }
     require(find(excluded, 12000).has_value(), "an excluded explicit tap moves to the span start");
 
+    // A media item's exclusion reaches the end of the block it begins in: an item lying wholly in a
+    // snapshot's partial tail block is in no key (only full blocks carry media keys).
+    const auto same = [](TapExclusion a, TapExclusion b) { return a.begin == b.begin && a.end == b.end; };
+    require(same(media_exclusion(10, 30), {10, 64}) && same(media_exclusion(10, 200), {10, 200}) &&
+                same(media_exclusion(64, 70), {64, 128}) && same(media_exclusion(63, 64), {63, 64}),
+            "a media exclusion does not reach the end of the item's first block");
+    const std::vector<TapHint> late{{12010, TapHintKind::Explicit}};
+    const std::vector<TapExclusion> short_item{media_exclusion(12000, 12005)};
+    require(find(plan_taps(30020, 0, late, {}, short_item, config), 12000).has_value(),
+            "a tap after a short media item in its own block did not move to the item's start");
+
     // Budget: the highest-priority tap survives.
     TapPlannerConfig one = config;
     one.max_new_taps     = 1;
@@ -1641,6 +1845,7 @@ int main() {
         test_match_and_choice();
         test_collisions_and_tails();
         test_device_lru_order();
+        test_pinned_snapshot_keeps_anchor();
         test_backed_before_unbacked();
         test_host_dead_and_gdsf();
         test_device_slots();
@@ -1654,10 +1859,12 @@ int main() {
         test_passed_endpoints();
         test_host_only_reattach();
         test_resident_duplicate_replacement();
+        test_withdrawal();
         test_tail_device_fill();
         test_persistence_roundtrip();
         test_restore_plan();
         test_image_only_host_tier();
+        test_host_tier_resize();
         test_host_born_snapshots();
         test_host_image_claims();
         test_queue_holds();

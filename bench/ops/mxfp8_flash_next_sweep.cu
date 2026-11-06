@@ -204,7 +204,7 @@ double e4m3_value(std::uint8_t code) {
 template <class T>
 std::vector<T> download(const void* device, std::size_t elements) {
     std::vector<T> host(elements);
-    CUDA_CHECK(cudaMemcpy(host.data(), device, elements * sizeof(T), cudaMemcpyDeviceToHost));
+    bench::read_back(host.data(), device, elements * sizeof(T));
     return host;
 }
 
@@ -347,7 +347,7 @@ void sweep_shape(const Shape& shape, const std::vector<Candidate>& list, const O
     const int max_t       = std::max(options.ts.back(), kCheckT);
     const HostWeight host = checkpoint_like(shape.n, shape.k, static_cast<std::uint32_t>(shape.n) * 31U + shape.k);
     DeviceBuffer storage(host.payload.size());
-    CUDA_CHECK(cudaMemcpy(storage.p, host.payload.data(), host.payload.size(), cudaMemcpyHostToDevice));
+    bench::upload(storage.p, host.payload.data(), host.payload.size());
     const Weight weight = device_weight(host, storage.p, shape.n, shape.k);
     std::vector<std::uint16_t> x_host(static_cast<std::size_t>(shape.k) * max_t);
     std::uint32_t state = 0x2545F491U ^ static_cast<std::uint32_t>(shape.k);
@@ -357,7 +357,7 @@ void sweep_shape(const Shape& shape, const std::vector<Candidate>& list, const O
         bits = static_cast<std::uint16_t>(((r >> 31) << 15) | ((107U + (r >> 8) % 25U) << 7) | (r & 0x7FU));
     }
     DeviceBuffer x(x_host.size() * 2);
-    CUDA_CHECK(cudaMemcpy(x.p, x_host.data(), x_host.size() * 2, cudaMemcpyHostToDevice));
+    bench::upload(x.p, x_host.data(), x_host.size() * 2);
     DeviceBuffer out(static_cast<std::size_t>(shape.n) * max_t * 2);
     const double bytes    = static_cast<double>(shape.n) * shape.k * (1.0 + 1.0 / 32.0);
     const double floor_us = bytes / (options.dram_gbps * 1e3);

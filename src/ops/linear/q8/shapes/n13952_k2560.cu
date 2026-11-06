@@ -1,12 +1,9 @@
 #include "ops/linear/common/output.cuh"
-#include "ops/linear/q8/q8_f16acc.h"
 #include "ops/linear/q8/q8_instances.cuh"
 #include "ops/linear/q8/q8_mma_launch.cuh"
 #include "ops/linear/q8/q8_shapes.h"
 #include "ops/linear/q8/q8_stream_launch.cuh"
 #include "ops/linear/qsa_group.h"
-
-#include <stdexcept>
 
 namespace infernix::ops::detail {
 namespace {
@@ -37,16 +34,7 @@ Q8Launch select_q8_n13952_k2560(std::int32_t tokens) {
     return launch_q8_a16_mma_r32_t128;
 }
 
-void q8_qsa_group(const Tensor& x, const Weight& w, const QsaGroupParts& parts, LinearRoutes routes,
-                  WorkspaceArena* workspace, cudaStream_t stream) {
-    if (has_route(routes, LinearRoutes::F16Accumulate) && q8_f16acc_admits(w.n, w.k, x.ne[1]) &&
-        w.padded_shape[1] == w.k) {
-        if (workspace == nullptr) {
-            throw std::invalid_argument("q8 qsa group: the f16-accumulate route requires caller workspace");
-        }
-        q8_qsa_group_f16acc(x, w, parts, *workspace, stream);
-        return;
-    }
+void q8_qsa_group(const Tensor& x, const Weight& w, const QsaGroupParts& parts, cudaStream_t stream) {
     const LinearBf16SegmentedOutput<6144, 6144, 512, 512, 512, 128> output{
         {parts.data[0], parts.data[1], parts.data[2], parts.data[3], parts.data[4], parts.data[5]}};
     launch_routes(q8_linear_operands(x, w), output, stream);

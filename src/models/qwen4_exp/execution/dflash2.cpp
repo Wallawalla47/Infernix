@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/execution/dflash2.h"
+#include "models/qwen4_exp/execution/forward.h"
 
 #include "core/nvtx.h"
 #include "infernix/ops/attn_input_proj.h"
@@ -38,13 +39,28 @@ void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceA
     ops::linear(x, p.weight, out, p.policy, work, s);
 }
 
-// Token rows: BF16, or a GGUF import's IQ4_XS rows decoded exactly (as Forward embeds them).
-void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t s) {
+// Token rows: BF16 (packed at load or not), or a GGUF import's IQ4_XS rows decoded exactly (as Forward embeds them).
+void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t s, std::uint32_t* error) {
+    const DeviceFault fault{.word = error, .value = kErrorTokenId};
     if (table.layout == QuantLayout::GgmlRows) {
-        ops::ggml_embedding(ids, table, out, s);
+        ops::ggml_embedding(ids, table, out, s, fault);
     } else {
-        ops::embedding(ids, table, out, s);
+        ops::embedding(ids, table, out, s, fault);
     }
+}
+
+// The norm and dynamic-conv prepare in an arena of its own carved from `work`; a call that needs no
+// scratch (the fused route: H 2560, at most 16 columns) runs in `work` itself, as an arena cannot be empty.
+void prepare(const Tensor& residual, const Tensor& norm, float eps, const Tensor& base, const Weight& projection,
+             Tensor& prepared, Tensor& delta, WorkspaceArena& work, cudaStream_t s) {
+    const std::size_t bytes = ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+        residual.ne[0], residual.ne[1], residual.ne[1], residual.ne[2], residual.ne[2]);
+    if (bytes == 0) {
+        ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm, eps, base, projection, prepared, delta, work, s);
+        return;
+    }
+    WorkspaceArena scratch(work.alloc_bytes(bytes));
+    ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm, eps, base, projection, prepared, delta, scratch, s);
 }
 
 // The fused Ops take Q8_G32_FP16 RowSplit projections (the official companion recipe's).
@@ -58,9 +74,10 @@ void require_q8(const Weight& weight, const char* name) {
 } // namespace
 
 DFlash2::DFlash2(const Parameters& parameters, const DFlash2Config& config, ProposalHead head, DeviceContext& device,
-                 WorkspaceArena& work, std::vector<CyclicKVCacheLayerView> ring, std::uint32_t max_context)
+                 WorkspaceArena& work, std::vector<CyclicKVCacheLayerView> ring, std::uint32_t max_context,
+                 std::uint32_t* error)
     : parameters_(parameters), p_(parameters.dflash2.value()), config_(config), text_(parameters.model.config().text),
-      head_(head), device_(device), work_(work), ring_(std::move(ring)), max_context_(max_context) {
+      head_(head), device_(device), work_(work), ring_(std::move(ring)), max_context_(max_context), error_(error) {
     if (ring_.size() != config_.layers || p_.layers.size() != config_.layers) {
         throw std::invalid_argument("Qwen4Exp DFlash2: one context ring layer per drafter layer");
     }
@@ -72,8 +89,8 @@ DFlash2::DFlash2(const Parameters& parameters, const DFlash2Config& config, Prop
     const bool fused = head_ == ProposalHead::Optimized
                            ? !parameters_.draft_head.rows->is_ggml() &&
                                  parameters_.draft_head.rows->weight.qtype == QType::Q4_G64_FP16 && rows == 131072
-                           : parameters_.output_head_q8 && !parameters_.output_head_q8->is_ggml() &&
-                                 parameters_.output_head_q8->weight.qtype == QType::Q8_G32_FP16;
+                           : parameters_.output_head_weight && !parameters_.output_head_weight->is_ggml() &&
+                                 parameters_.output_head_weight->weight.qtype == QType::Q8_G32_FP16;
     if (rows != dim(config_.head_rows) || fused != config_.fused_head) {
         throw std::logic_error("Qwen4Exp DFlash2: the bound head differs from the planned one");
     }
@@ -127,7 +144,7 @@ void DFlash2::head_candidates(const Tensor& hidden, Tensor& ids, Tensor& scores)
         if (head_ == ProposalHead::Optimized) {
             ops::linear_topk(hidden, head.rows->weight, head.token_ids, ids, scores, work_, s);
         } else {
-            ops::linear_topk(hidden, parameters_.output_head_q8->weight,
+            ops::linear_topk(hidden, parameters_.output_head_weight->weight,
                              dim(parameters_.model.resources().public_token_count), ids, scores, work_, s);
         }
         return;
@@ -142,10 +159,10 @@ void DFlash2::head_candidates(const Tensor& hidden, Tensor& ids, Tensor& scores)
         } else {
             ops::projection_fp32(hidden, head.rows->weight, logits, s);
         }
-    } else if (parameters_.output_head_q8 && parameters_.output_head_q8->is_ggml()) {
-        ops::ggml_linear(hidden, parameters_.output_head_q8->ggml, logits, nullptr, 0, work_, s, ops::LinearRoutes::Exact);
-    } else if (parameters_.output_head_q8) {
-        ops::projection_fp32(hidden, parameters_.output_head_q8->weight, logits, s);
+    } else if (parameters_.output_head_weight && parameters_.output_head_weight->is_ggml()) {
+        ops::ggml_linear(hidden, parameters_.output_head_weight->ggml, logits, nullptr, 0, work_, s, ops::LinearRoutes::Exact);
+    } else if (parameters_.output_head_weight) {
+        ops::projection_fp32(hidden, parameters_.output_head_weight->weight, logits, s);
     } else {
         const Tensor* rows_tensor[] = {&parameters_.output_head};
         ops::projection_fp32(hidden, rows_tensor, logits, s);
@@ -176,7 +193,7 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
     Tensor residual = work_.alloc(DType::BF16, {H, W, B});
     {
         Tensor flat = residual.view({H, columns});
-        embed_tokens(ids.view({columns}), parameters_.token_embedding, flat, s);
+        embed_tokens(ids.view({columns}), parameters_.token_embedding, flat, s, error_);
     }
     const ops::SlidingWindowAttentionExecutionEnvelope envelope{0, max_context_};
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(D)));
@@ -189,13 +206,8 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
             auto scope       = work_.scope();
             Tensor prepared  = work_.alloc(DType::BF16, {H, W, B});
             Tensor delta     = work_.alloc(DType::BF16, {G, 2, W, B});
-            {
-                WorkspaceArena scratch(work_.alloc_bytes(
-                    ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(H, W, W, B, B)));
-                ops::rmsnorm_dynamic_grouped_conv_prepare(residual, layer.input_norm, config_.rms_norm_eps,
-                                                          layer.attention_base, layer.attention_projection.weight,
-                                                          prepared, delta, scratch, s);
-            }
+            prepare(residual, layer.input_norm, config_.rms_norm_eps, layer.attention_base,
+                    layer.attention_projection.weight, prepared, delta, work_, s);
             Tensor q = work_.alloc(DType::BF16, {D, Hq, W, B});
             Tensor k = work_.alloc(DType::BF16, {D, Hk, W, B});
             Tensor v = work_.alloc(DType::BF16, {D, Hk, W, B});
@@ -217,13 +229,8 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
             auto scope      = work_.scope();
             Tensor prepared = work_.alloc(DType::BF16, {H, W, B});
             Tensor delta    = work_.alloc(DType::BF16, {G, 2, W, B});
-            {
-                WorkspaceArena scratch(work_.alloc_bytes(
-                    ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(H, W, W, B, B)));
-                ops::rmsnorm_dynamic_grouped_conv_prepare(residual, layer.post_attention_norm, config_.rms_norm_eps,
-                                                          layer.mlp_base, layer.mlp_projection.weight, prepared, delta,
-                                                          scratch, s);
-            }
+            prepare(residual, layer.post_attention_norm, config_.rms_norm_eps, layer.mlp_base,
+                    layer.mlp_projection.weight, prepared, delta, work_, s);
             Tensor product = work_.alloc(DType::BF16, {I, W, B});
             {
                 Tensor flat = product.view({I, columns});

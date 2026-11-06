@@ -642,6 +642,56 @@ int run_new_bf16(int selected_n = 0, int selected_k = 0) {
     return failures;
 }
 
+// The general runtime-shape GEMM (recipe C's QSA indexer [640, 2560] among its shapes): each output is one fmaf chain
+// over K in order whatever the tile and the call's width (candidates NQ-06), so a call's columns equal the same
+// columns of a call of another width, partial tiles included. Past the skinny route (T > 8), against a 4,096-column
+// call, bit for bit.
+int run_general_tile_widths() {
+    constexpr int kWidest = 4096;
+    const int n = 640, k = 2560;
+    const auto host = infernix::test::linear::make_bf16_weight(n, k, 467U);
+    std::vector<std::uint16_t> activation(static_cast<std::size_t>(k) * kWidest);
+    std::uint32_t state = 467U;
+    for (auto& bits : activation) {
+        state = state * 1664525U + 1013904223U;
+        bits  = infernix::test::f32_to_bf16(static_cast<float>(static_cast<std::int32_t>(state >> 8) - (1 << 23)) /
+                                            static_cast<float>(1 << 23));
+    }
+    void *weight = nullptr, *x = nullptr, *y = nullptr;
+    infernix::test::cuda_check(cudaMalloc(&weight, host.payload.size()), "weight");
+    infernix::test::cuda_check(cudaMalloc(&x, activation.size() * 2), "activation");
+    infernix::test::cuda_check(cudaMalloc(&y, static_cast<std::size_t>(n) * kWidest * 2), "output");
+    infernix::test::cuda_check(cudaMemcpy(weight, host.payload.data(), host.payload.size(), cudaMemcpyHostToDevice),
+                               "upload weight");
+    infernix::test::cuda_check(cudaMemcpy(x, activation.data(), activation.size() * 2, cudaMemcpyHostToDevice),
+                               "upload activation");
+    const infernix::Weight w = host.device_weight(weight);
+    const auto run = [&](int t) {
+        infernix::Tensor input(x, infernix::DType::BF16, {k, t});
+        infernix::Tensor output(y, infernix::DType::BF16, {n, t});
+        infernix::ops::linear(input, w, output, nullptr);
+        std::vector<std::uint16_t> out(static_cast<std::size_t>(n) * t);
+        infernix::test::cuda_check(cudaMemcpy(out.data(), y, out.size() * 2, cudaMemcpyDeviceToHost), "read columns");
+        return out;
+    };
+    const std::vector<std::uint16_t> widest = run(kWidest);
+    int failures = 0;
+    for (int t : {9, 33, 64, 65, 1023, 1024, 1087, 1088, 1089, 2048, 3000}) {
+        const std::vector<std::uint16_t> out = run(t);
+        std::size_t differing = 0;
+        for (std::size_t i = 0; i < out.size(); ++i) differing += out[i] != widest[i];
+        if (differing != 0) {
+            std::cerr << "BF16_A16 general [640,2560] T=" << t << ": " << differing << " outputs differ from a "
+                      << kWidest << "-column call's\n";
+            ++failures;
+        }
+    }
+    cudaFree(weight);
+    cudaFree(x);
+    cudaFree(y);
+    return failures;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(linear_bf16_a16) {
@@ -659,7 +709,7 @@ INFERNIX_OP_TEST(linear_bf16_a16) {
         } else if (argc != 1) {
             throw std::invalid_argument("usage: infernix_linear_bf16_a16_test [--shape N K]");
         }
-        const int failures = (n == 0 ? run_bf16_linear() : 0) + run_new_bf16(n, k);
+        const int failures = (n == 0 ? run_bf16_linear() + run_general_tile_widths() : 0) + run_new_bf16(n, k);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " BF16_A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

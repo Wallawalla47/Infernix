@@ -2,6 +2,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "infernix/ops/gdn_input_proj.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/linear_test_common.h"
 #include "ops/op_tester.h"
@@ -370,8 +371,10 @@ struct DeviceProblem {
     DeviceBuffer weight;
     Weight view;
 
-    DeviceProblem(std::int32_t n, std::int32_t k, std::uint32_t seed)
-        : host(make_fp8_weight(n, k, seed)), weight(host.payload.size()) {
+    DeviceProblem(std::int32_t n, std::int32_t k, std::uint32_t seed) : DeviceProblem(make_fp8_weight(n, k, seed)) {}
+
+    explicit DeviceProblem(test::quantized_weight::PackedWeight packed)
+        : host(std::move(packed)), weight(host.payload.size()) {
         weight.copy_from_host(host.payload.data(), host.payload.size());
         view = host.device_weight(weight.p);
     }
@@ -767,6 +770,97 @@ int pair_admission_seams() {
     return failures;
 }
 
+// FP4-Local's segmented MXFP8 projections under fp8-a8-pair-block32 (--a8-activations' prefill route there): the
+// GDN input projection's q/k/v and z rows and the QSA group's six parts hold linear's rows bit for bit (linear's
+// route is qualified against the oracle above), below the pair's admission (the exact route), at it and in the
+// 128-column tiles, within their own workspace queries.
+int mxfp8_pair_block32_segmented_rows() {
+    int failures      = 0;
+    const auto upload = [](std::int32_t k, std::int32_t t, std::uint32_t seed) {
+        const std::vector<std::uint16_t> bits = outlier_activations(k, t, seed);
+        DeviceBuffer x(bits.size() * sizeof(std::uint16_t));
+        x.copy_from_host(bits.data(), bits.size() * sizeof(std::uint16_t));
+        return x;
+    };
+    const auto host = [](const DeviceBuffer& buffer, std::size_t count) {
+        std::vector<std::uint16_t> bits(count);
+        buffer.copy_to_host(bits.data(), count * sizeof(std::uint16_t));
+        return bits;
+    };
+    {
+        constexpr std::int32_t kQkvRows = 10240, kZRows = 6144;
+        const DeviceProblem problem(make_mxfp8_weight(kQkvRows + kZRows, 2560, 3941U));
+        for (const std::int32_t t : {32, 33, 300, 2049}) {
+            const DeviceBuffer x = upload(2560, t, 3942U);
+            const auto linear    = run_linear(problem.view, x, t, ops::LinearPolicy::A16Only, kPairBlock32);
+            const std::size_t capacity = ops::gdn_input_proj_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_G32_E8M0, kQkvRows + kZRows, 2560, ops::LinearPolicy::A16Only, t, t);
+            DeviceArena workspace(std::max<std::size_t>(capacity, 256));
+            DeviceBuffer qkv(static_cast<std::size_t>(kQkvRows) * t * 2), z(static_cast<std::size_t>(kZRows) * t * 2);
+            Tensor input(x.p, DType::BF16, {2560, t});
+            Tensor qkv_out(qkv.p, DType::BF16, {kQkvRows, t}), z_out(z.p, DType::BF16, {kZRows, t});
+            ops::gdn_input_proj(input, problem.view, qkv_out, z_out, ops::LinearPolicy::A16Only, workspace, nullptr,
+                                kPairBlock32);
+            test::cuda_check(cudaDeviceSynchronize(), "block32 gdn_input_proj");
+            const auto q = host(qkv, static_cast<std::size_t>(kQkvRows) * t);
+            const auto r = host(z, static_cast<std::size_t>(kZRows) * t);
+            std::size_t differing = 0;
+            for (std::int32_t token = 0; token < t; ++token) {
+                for (std::int32_t row = 0; row < kQkvRows + kZRows; ++row) {
+                    const std::uint16_t got = row < kQkvRows ? q[static_cast<std::size_t>(token) * kQkvRows + row]
+                                                             : r[static_cast<std::size_t>(token) * kZRows + row - kQkvRows];
+                    differing += got != linear[static_cast<std::size_t>(token) * (kQkvRows + kZRows) + row];
+                }
+            }
+            if (differing != 0 || workspace.peak_used() > capacity) {
+                std::cerr << "MXFP8_A8PairBlock32 gdn_input_proj T=" << t << ": " << differing
+                          << " values differ from linear's rows (or the workspace query is short)\n";
+                ++failures;
+            }
+        }
+    }
+    constexpr std::int32_t kRows[ops::kQsaGroupSegments] = {6144, 6144, 512, 512, 512, 128};
+    const DeviceProblem problem(make_mxfp8_weight(13952, 2560, 3943U));
+    for (const std::int32_t t : {96, 97, 300, 2049}) {
+        const DeviceBuffer x = upload(2560, t, 3944U);
+        const auto linear    = run_linear(problem.view, x, t, ops::LinearPolicy::A16Only, kPairBlock32);
+        std::vector<DeviceBuffer> buffers;
+        std::vector<Tensor> tensors;
+        buffers.reserve(ops::kQsaGroupSegments);
+        tensors.reserve(ops::kQsaGroupSegments);
+        for (const std::int32_t rows : kRows) {
+            buffers.emplace_back(static_cast<std::size_t>(rows) * t * 2);
+            tensors.emplace_back(buffers.back().p, DType::BF16, std::initializer_list<std::int32_t>{rows, t});
+        }
+        Tensor* parts[ops::kQsaGroupSegments];
+        for (std::int32_t i = 0; i < ops::kQsaGroupSegments; ++i) { parts[i] = &tensors[static_cast<std::size_t>(i)]; }
+        const std::size_t capacity = ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_G32_E8M0, 13952, 2560,
+                                                                          ops::LinearPolicy::A16Only, t, t);
+        DeviceArena workspace(std::max<std::size_t>(capacity, 256));
+        Tensor input(x.p, DType::BF16, {2560, t});
+        ops::linear_qsa_group(input, problem.view, parts, ops::LinearPolicy::A16Only, workspace, nullptr, kPairBlock32);
+        test::cuda_check(cudaDeviceSynchronize(), "block32 qsa group");
+        std::size_t differing = 0;
+        std::int32_t first    = 0;
+        for (std::int32_t i = 0; i < ops::kQsaGroupSegments; ++i) {
+            const auto got = host(buffers[static_cast<std::size_t>(i)], static_cast<std::size_t>(kRows[i]) * t);
+            for (std::int32_t token = 0; token < t; ++token) {
+                for (std::int32_t row = 0; row < kRows[i]; ++row) {
+                    differing += got[static_cast<std::size_t>(token) * kRows[i] + row] !=
+                                 linear[static_cast<std::size_t>(token) * 13952 + first + row];
+                }
+            }
+            first += kRows[i];
+        }
+        if (differing != 0 || workspace.peak_used() > capacity) {
+            std::cerr << "MXFP8_A8PairBlock32 qsa group T=" << t << ": " << differing
+                      << " values differ from linear's rows (or the workspace query is short)\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(linear_fp8_a8) {
@@ -781,7 +875,7 @@ INFERNIX_OP_TEST(linear_fp8_a8) {
                         run_flash_next_pair_outliers(route);
         }
         failures += pair_admission_seams();
-        failures += run_flash_next_mxfp8_pair_block32();
+        failures += run_flash_next_mxfp8_pair_block32() + mxfp8_pair_block32_segmented_rows();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 A8 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

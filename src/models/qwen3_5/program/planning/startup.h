@@ -24,6 +24,8 @@
 
 namespace infernix::models::qwen3_5::detail {
 
+struct ProgramOffloadOptions;
+
 using TensorLayout                              = TensorRegion;
 
 // Where a speculative round's proposals come from: the backend's neural drafter, n-gram copies
@@ -59,8 +61,7 @@ struct SpeculativeRoundShape {
 // Whether a round of the family with `batch_size` rows proposes through the gated proposal chain
 // (ExecutionSchedule::mtp_proposal_chain): a one-row neural round then proposes up to the
 // configured window, and the device stops it at the round's proposal limit (the draft-length
-// policy's choice) and, with mtp_gate, after the first draft below --spec-min-p, so its verify width
-// (the family) and its proposal depth are chosen apart.
+// policy's choice), so its verify width (the family) and its proposal depth are chosen apart.
 [[nodiscard]] inline bool mtp_chained_round(const SpeculativeRoundShape& shape, std::uint32_t batch_size,
                                             bool chain) noexcept {
     return chain && shape.kind == SpeculativeRoundKind::Neural && batch_size == 1U;
@@ -146,6 +147,23 @@ struct TreeWidthPlan {
     return columns;
 }
 
+// The GDN replay records' rows a layer at their storage width draft_window + 1: enough for the widest
+// round's columns (verify_column_capacity; every lane without speculative round shapes), at most C.
+[[nodiscard]] inline std::uint32_t replay_record_rows(const std::vector<SpeculativeRoundShape>& shapes,
+                                                      const TreeWidthPlan& tree_widths, std::uint32_t max_concurrency,
+                                                      std::uint32_t draft_window) noexcept {
+    const std::uint32_t columns = verify_column_capacity(shapes, tree_widths, max_concurrency);
+    const std::uint32_t width   = draft_window + 1U;
+    return columns == 0 ? max_concurrency : std::min(max_concurrency, (columns + width - 1U) / width);
+}
+
+// The rows a round of `width` columns may record in storage of `rows` rows of draft_window + 1 columns
+// (as the verify logits' view: the rows the columns hold, at most C).
+[[nodiscard]] inline std::uint32_t replay_view_rows(std::uint32_t rows, std::uint32_t draft_window, std::uint32_t width,
+                                                    std::uint32_t max_concurrency) noexcept {
+    return std::min(max_concurrency, rows * (draft_window + 1U) / width);
+}
+
 // The columns one causal-scoring tile holds; its logits are [vocabulary, tile].
 inline constexpr std::uint32_t kCausalScoreTile = 512;
 
@@ -182,8 +200,9 @@ struct PersistentLayout {
     std::uint32_t text_kv_base_pages = 0;
 };
 
-// The text KV pages an elastic pool backs at startup: 32,768 tokens (Qwen3.8-Flash-Next's base).
-inline constexpr std::uint32_t kElasticKvBaseTokens = 32768;
+// The text KV pages an elastic pool backs at startup: 4,096 tokens (Qwen3.8-Flash-Next's base; candidates §22
+// VM-08, 2026-10-27: ~347 MiB of frames on the 122B while contexts stay short; longer prompts grow it).
+inline constexpr std::uint32_t kElasticKvBaseTokens = 4096;
 
 struct VisionWorkspacePlan {
     std::int32_t output_hidden         = 0;
@@ -203,7 +222,7 @@ struct WorkspacePlan {
     std::size_t text_prefill_wide = 0;
     std::size_t mtp_prefill_wide  = 0;
     // With lent passes: the wider of the two plans at widths 512, 1,024, ... below the chunk, then the chunk
-    // (ascending), so a pass can borrow what its width needs (INFERNIX_TMP_PROMPT_SIZED_LOAN).
+    // (ascending), so a pass can borrow what its width needs (ProgramOffload::wide_bytes).
     std::vector<std::pair<std::int32_t, std::size_t>> prefill_wide_ladder;
     std::size_t ordinary_round   = 0;
     std::size_t mtp_prefill      = 0;
@@ -248,6 +267,9 @@ struct SequencePlanningInputs {
     int device                        = 0;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
+    // Offloaded experts: the offload engine's staging and tables (ProgramOffload::fixed_bytes), allocated
+    // when the Program starts it; 0 otherwise.
+    std::uint64_t offload_fixed_bytes = 0;
 };
 
 struct SequencePlanImpl {
@@ -282,6 +304,7 @@ struct SequencePlanImpl {
     PersistentLayout persistent;
     WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;
+    std::uint64_t offload_fixed_bytes    = 0; // SequencePlanningInputs::offload_fixed_bytes
     std::size_t device_reservation_bytes = 0;
 };
 
@@ -292,10 +315,12 @@ struct SequencePlannerImpl {
 };
 
 // `idle_prefill_width` plans an idle-wide-prefill width (one of idle_prefill_widths_impl); zero
-// plans prefill steps of the chunk only.
+// plans prefill steps of the chunk only. `offload` (offloaded experts): the options of the Program's
+// offload engine, whose staging and tables the plan reserves (offload_fixed_bytes).
 [[nodiscard]] std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
-                           const EngineOptions& options, std::uint32_t idle_prefill_width = 0);
+                           const EngineOptions& options, std::uint32_t idle_prefill_width = 0,
+                           const ProgramOffloadOptions* offload = nullptr);
 // The idle-wide-prefill widths a plan may take, widest first (planning/idle_prefill.h); empty
 // unless the fast path is selected and some width is wider than the chunk.
 [[nodiscard]] std::vector<std::uint32_t>
@@ -308,26 +333,10 @@ idle_prefill_widths_impl(const execution::Parameters& parameters, const EngineOp
 
 // TEMPORARY A/B switches of the Qwen3.5 MTP drafting package (rank 5 of the 2026-10-21 candidates),
 // read once from the environment ("1" sets a flag); each defaults to today's behaviour:
-//   INFERNIX_TMP_QWEN35_MTP_PROBS       resident targets' drafts carry their drafter probability
-//                                       (ExecutionSchedule::mtp_draft_confidence) with nothing reading it,
-//                                       which isolates its cost; the cut, gate and calibrated extents imply it
-//   INFERNIX_TMP_QWEN35_MTP_GATE        the proposal chain stops at --spec-min-p on the device (mtp_gate)
 //   INFERNIX_TMP_QWEN35_MTP_CALIBRATED  one-row rounds verify their calibrated extent (mtp_calibrated_extent)
 //   INFERNIX_TMP_QWEN35_MTP_DRAFT_LOG   a file path: one line per verified MTP row (the offline cut replay)
-// and of the offloaded-expert drafter's round cost (candidates §11 OR-09; output-neutral):
-//   INFERNIX_TMP_QWEN35_MTP_PAD_MASK    the drafter's resident MoE skips each row's padding columns
-//                                       (mtp_drafter_mask)
-//   INFERNIX_TMP_QWEN35_MTP_STEP_GATE   offloaded MTP rounds propose through the step chain, whose device gate
-//                                       stops where no later draft could be verified (mtp_step_chain)
-//   INFERNIX_TMP_QWEN35_MTP_SKIP_ROUNDS with the step chain, rounds also run without drafting (the drafter's
-//                                       KV only) while that measures faster (mtp_draft_regime)
 struct MtpDraftSwitches {
-    bool probabilities = false;
-    bool gate          = false;
-    bool calibrated    = false;
-    bool pad_mask      = false;
-    bool step_gate     = false;
-    bool skip_rounds   = false;
+    bool calibrated = false;
     std::string draft_log;
 };
 [[nodiscard]] const MtpDraftSwitches& mtp_draft_switches();

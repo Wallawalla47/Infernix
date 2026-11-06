@@ -604,6 +604,55 @@ int test_tools() {
                      Json{{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "sunny"}}});
     failures += check(parse(history).generation.has_tool_history(),
                       "tool-call history follows wire types without inventing JSON validation");
+    // Arguments nested past the body's bound are a 400 at their path (the prompt render would recurse once a level;
+    // candidates WF-01); the bound itself is accepted, and the legacy function_call is bounded too.
+    const auto nested = [](std::size_t levels) { return std::string(levels, '[') + std::string(levels, ']'); };
+    history["messages"][1]["tool_calls"][0]["function"]["arguments"] = nested(257);
+    const ApiError deep = api_error([&] { (void)parse(history); });
+    failures += check(deep.status == 400 && deep.param == "messages[1].tool_calls[0].function.arguments",
+                      "history tool-call arguments nested past the bound were not refused at their path");
+    history["messages"][1]["tool_calls"][0]["function"]["arguments"] = nested(256);
+    failures += check(parse(history).generation.has_tool_history(), "arguments at the nesting bound were refused");
+    Json legacy_deep = base_request();
+    legacy_deep["messages"] =
+        Json::array({Json{{"role", "user"}, {"content", "go"}},
+                     Json{{"role", "assistant"},
+                          {"content", nullptr},
+                          {"function_call", Json{{"name", "legacy"}, {"arguments", nested(300)}}}}});
+    failures += check(api_error([&] { (void)parse(legacy_deep); }).param == "messages[1].function_call.arguments",
+                      "legacy function_call arguments nested past the bound were not refused");
+
+    // Results returned out of call order (as parallel runners finish) are put back in call order
+    // when their ids name exactly the turn's calls; any other run keeps the order received.
+    const auto call = [](const char* id, const char* name) {
+        return Json{{"id", id}, {"type", "function"}, {"function", Json{{"name", name}, {"arguments", "{}"}}}};
+    };
+    const auto result = [](const char* id, const char* text) {
+        return Json{{"role", "tool"}, {"tool_call_id", id}, {"content", text}};
+    };
+    const auto results_order = [&](Json results) {
+        Json body        = base_request();
+        body["messages"] = Json::array({Json{{"role", "user"}, {"content", "go"}},
+                                        Json{{"role", "assistant"},
+                                             {"content", nullptr},
+                                             {"tool_calls", Json::array({call("c1", "a"), call("c2", "b"),
+                                                                         call("c3", "c")})}}});
+        for (Json& item : results) { body["messages"].push_back(std::move(item)); }
+        std::vector<std::string> ids;
+        for (const auto& turn : parse(body).generation.messages) {
+            if (turn.role == infernix::ChatRole::Tool) { ids.push_back(turn.tool_call_id); }
+        }
+        return ids;
+    };
+    using Ids = std::vector<std::string>;
+    failures += check(results_order(Json::array({result("c3", "z"), result("c1", "x"), result("c2", "y")})) ==
+                          Ids{"c1", "c2", "c3"},
+                      "out-of-order tool results follow the call order");
+    failures += check(results_order(Json::array({result("c2", "y"), result("c1", "x")})) == Ids{"c2", "c1"},
+                      "a partial run keeps the order received");
+    failures += check(results_order(Json::array({result("c2", "y"), result("c2", "x"), result("c1", "z")})) ==
+                          Ids{"c2", "c2", "c1"},
+                      "a run with a repeated id keeps the order received");
 
     Json mixed_assistant        = base_request();
     mixed_assistant["messages"] = Json::array(
@@ -936,11 +985,10 @@ int test_stops_and_ranges() {
     Json body                               = base_request();
     body["stop"]                            = Json::array({"A", "B"});
     const infernix::RequestOptions translated = options(parse(body).generation);
-    failures += check(translated.stop.strings.size() == 4,
-                      "each stop string applies to Content and Reasoning");
-    failures += check(translated.stop.strings[0].channel == infernix::OutputChannel::Content &&
-                          translated.stop.strings[1].channel == infernix::OutputChannel::Reasoning,
-                      "stop channel ordering is explicit");
+    failures += check(translated.stop.strings.size() == 2 &&
+                          translated.stop.strings[0].channel == infernix::OutputChannel::Content &&
+                          translated.stop.strings[1].channel == infernix::OutputChannel::Content,
+                      "each stop string applies to the answer only");
 
     body["stop"] = Json::array({"1", "2", "3", "4", "5"});
     failures += check(api_error([&] { (void)parse(body); }).param == "stop",
@@ -989,6 +1037,7 @@ int test_aggregate_response() {
     Json response             = Json::parse(make_chat_completion_response(identity(), outcome));
     failures += check(response["choices"][0]["message"]["content"] == "answer" &&
                           response["choices"][0]["message"]["reasoning_content"] == "thought" &&
+                          response["choices"][0]["message"]["reasoning"] == "thought" &&
                           response["choices"][0]["message"]["refusal"].is_null(),
                       "aggregate response separates reasoning and content");
     failures += check(response["choices"][0]["logprobs"].is_null(),
@@ -1050,9 +1099,17 @@ int test_stream_response() {
     failures += check(role["choices"][0]["delta"]["role"] == "assistant" &&
                           role["choices"][0]["logprobs"].is_null() && role["usage"].is_null(),
                       "stream starts with role, nullable logprobs, and null usage");
+    // A quiet stream's heartbeat (UE-05): a chunk of the same completion whose delta is empty.
+    Json heartbeat = parse_sse(stream.keep_alive());
+    failures += check(heartbeat["object"] == "chat.completion.chunk" && heartbeat["id"] == role["id"] &&
+                          heartbeat["choices"][0]["delta"] == Json::object() &&
+                          heartbeat["choices"][0]["finish_reason"].is_null() && heartbeat["usage"].is_null(),
+                      "the stream heartbeat is not an empty-delta chunk of the completion");
     Json reasoning = parse_sse(stream.reasoning_delta("thought"));
     Json content   = parse_sse(stream.content_delta("ans"));
     failures += check(reasoning["choices"][0]["delta"]["reasoning_content"] == "thought" &&
+                          reasoning["choices"][0]["delta"]["reasoning"] == "thought" &&
+                          !content["choices"][0]["delta"].contains("reasoning") &&
                           content["choices"][0]["delta"]["content"] == "ans",
                       "stream separates reasoning and content deltas");
 
@@ -1073,6 +1130,7 @@ int test_stream_response() {
                           usage["timings"]["predicted_n"] == 7,
                       "dedicated stream usage carries token accounting and terminal timings");
     failures += check(events.back() == "data: [DONE]\n\n", "stream ends with DONE sentinel");
+    failures += check(stream.keep_alive().empty(), "a heartbeat followed the stream's finish");
     failures += check(usage["constraint"]["branch"] == "content" &&
                           usage["constraint"]["terminated"] == true &&
                           !parse_sse(events[0]).contains("constraint") &&
@@ -1159,6 +1217,16 @@ int test_stream_response() {
 
 int test_stream_observations() {
     int failures = 0;
+    // The HTTP stream opens with its first event, after the Engine's generation start (SY-07): before the
+    // role chunk a heartbeat is empty (the transport writes an SSE comment), and the start may come first.
+    OpenAIChatStream late(identity(), false);
+    failures += check(late.keep_alive().empty(), "a heartbeat before the role chunk is not a comment");
+    late.note_start(infernix::GenerationStart{.prompt = {.prompt_tokens = 8}, .reused_prompt_tokens = 0});
+    const Json late_role = parse_sse(late.start());
+    failures += check(late_role["choices"][0]["delta"]["role"] == "assistant" &&
+                          parse_sse(late.content_delta("x"))["choices"][0]["delta"]["content"] == "x",
+                      "a role chunk after the generation start lost its shape");
+
     OpenAIChatStream stream(identity(), true, true, true);
     const Json role = parse_sse(stream.start());
     failures += check(!role.contains("timings") && !role.contains("prompt_progress"),
@@ -1296,6 +1364,13 @@ int test_common_objects() {
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",
                       "OpenAI common error shape remains stable");
+    // A message quoting a URL id that is not UTF-8 (GET /v1/models/%ff) still renders (candidates QA-13).
+    std::string unrendered;
+    try {
+        unrendered = make_error_body(ApiError{.status = 404, .message = "model '\xff' not found", .code = "model_not_found"});
+    } catch (const std::exception&) {}
+    failures += check(!unrendered.empty() && Json::parse(unrendered)["error"]["code"] == "model_not_found",
+                      "an error message holding non-UTF-8 bytes could not be rendered");
 
     // A queue-pressure answer is a plain retryable status carrying the admission window as
     // Retry-After, on both surfaces; other answers send none.

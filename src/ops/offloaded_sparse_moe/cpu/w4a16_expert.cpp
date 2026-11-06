@@ -165,9 +165,15 @@ inline __m256i dot4_avxvnni(__m256i acc, __m256i u, __m256i s) {
     return _mm256_dpbusd_avx_epi32(acc, u, s);
 }
 
-// One body, two target attributes: AVX-VNNI must not leak into the plain AVX2 variant. Half h holds
-// rows 8h..8h+7 (low nibbles for h = 0, high nibbles for h = 1).
-#define INFERNIX_AVX2_ROW_SUMS_A16(NAME, DOT) \
+constexpr int kOnePassColumns = 2;
+
+// The single pass over a row group's blocks, both halves at once (rows 8h..8h+7: low nibbles for h = 0, high
+// for h = 1), for calls of at most kOnePassColumns columns: decode's CPU-served misses. Its 10N live vectors
+// spill, but the two-pass form below (candidates WB-01) decoded slower with the whole CPU team, where these calls
+// wait on memory: FP4-Local conv -1.1 %, struct -2.0 %, the 122B plain -4.2 %, MTP -3.8 % (2026-11-05, candidates
+// §58; its single-thread bench and prompt calls were faster). One body, two target attributes: AVX-VNNI must not
+// leak into the plain AVX2 variant.
+#define INFERNIX_AVX2_ROW_SUMS_A16_ONE(NAME, DOT) \
 void NAME(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end, \
           const A16Block* const* acts, std::int64_t* out, int prefetch_bytes) { \
     const __m256i lut_s = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kSignedCodes.data()))); \
@@ -216,6 +222,74 @@ void NAME(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end, \
                 alignas(32) std::int64_t e[4], o[4]; \
                 _mm256_store_si256(reinterpret_cast<__m256i*>(e), even[h][c]); \
                 _mm256_store_si256(reinterpret_cast<__m256i*>(o), odd[h][c]); \
+                for (int i = 0; i < 4; ++i) { \
+                    const std::size_t base = static_cast<std::size_t>(rg - rg_begin) * 16 + 8 * h; \
+                    out[(base + 2 * i) * N + c]     = e[i]; \
+                    out[(base + 2 * i + 1) * N + c] = o[i]; \
+                } \
+            } \
+        } \
+    } \
+}
+
+template <int N>
+INFERNIX_TARGET("avx2")
+INFERNIX_AVX2_ROW_SUMS_A16_ONE(row_sums_avx2_one, dot4_avx2)
+
+template <int N>
+INFERNIX_TARGET("avx2,avxvnni")
+INFERNIX_AVX2_ROW_SUMS_A16_ONE(row_sums_avxvnni_one, dot4_avxvnni)
+
+#undef INFERNIX_AVX2_ROW_SUMS_A16_ONE
+
+// One body, two target attributes: AVX-VNNI must not leak into the plain AVX2 variant. Half h holds
+// rows 8h..8h+7 (low nibbles for h = 0, high nibbles for h = 1). The halves run as two passes over a
+// row group's blocks (its ~23 KB of units stay in L1/L2 for the second, which issues no prefetch): one
+// half's 3N block accumulators and 2N row sums are live instead of both halves' 10N, which spilled to
+// the stack in every instance (candidates WB-01; Basalt #182 removed the same spill). The sums are exact
+// integers, so the pass order leaves the bits unchanged.
+#define INFERNIX_AVX2_ROW_SUMS_A16(NAME, DOT) \
+void NAME(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end, \
+          const A16Block* const* acts, std::int64_t* out, int prefetch_bytes) { \
+    const __m256i lut_s = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kSignedCodes.data()))); \
+    const __m256i lut_b = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kBiasedCodes.data()))); \
+    const __m256i low4  = _mm256_set1_epi8(0x0F); \
+    for (int rg = rg_begin; rg < rg_end; ++rg) { \
+        const std::uint8_t* const units = matrix + static_cast<std::size_t>(rg) * blocks * kUnitBytes; \
+        for (int h = 0; h < 2; ++h) { \
+            __m256i even[N], odd[N]; \
+            for (int c = 0; c < N; ++c) { even[c] = odd[c] = _mm256_setzero_si256(); } \
+            for (int b = 0; b < blocks; ++b) { \
+                const std::uint8_t* unit = units + static_cast<std::size_t>(b) * kUnitBytes; \
+                if (h == 0) { prefetch_unit(unit, prefetch_bytes); } \
+                __m256i plo[N], pmid[N], phi[N]; \
+                for (int c = 0; c < N; ++c) { plo[c] = pmid[c] = phi[c] = _mm256_setzero_si256(); } \
+                for (int q = 0; q < 4; ++q) { \
+                    const __m256i v   = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(unit + 32 * q)); \
+                    const __m256i idx = _mm256_and_si256(h == 0 ? v : _mm256_srli_epi16(v, 4), low4); \
+                    const __m256i ws  = _mm256_shuffle_epi8(lut_s, idx); \
+                    const __m256i wb  = _mm256_shuffle_epi8(lut_b, idx); \
+                    for (int c = 0; c < N; ++c) { \
+                        const A16Block& a = acts[c][b]; \
+                        plo[c]  = DOT(plo[c], _mm256_set1_epi32(quad_word(a.lo, q)), ws); \
+                        pmid[c] = DOT(pmid[c], _mm256_set1_epi32(quad_word(a.mid, q)), ws); \
+                        phi[c]  = DOT(phi[c], wb, _mm256_set1_epi32(quad_word(a.hi, q))); \
+                    } \
+                } \
+                const __m256i sw     = scales8_avx2(unit + 128 + 8 * h); \
+                const __m256i sw_odd = _mm256_srli_epi64(sw, 32); \
+                for (int c = 0; c < N; ++c) { \
+                    const __m256i hi = _mm256_sub_epi32(phi[c], _mm256_set1_epi32(kBias * acts[c][b].hi_sum)); \
+                    const __m256i p  = _mm256_add_epi32(_mm256_add_epi32(plo[c], _mm256_slli_epi32(pmid[c], 8)), \
+                                                        _mm256_slli_epi32(hi, 16)); \
+                    even[c] = _mm256_add_epi64(even[c], _mm256_mul_epi32(p, sw)); \
+                    odd[c]  = _mm256_add_epi64(odd[c], _mm256_mul_epi32(_mm256_srli_epi64(p, 32), sw_odd)); \
+                } \
+            } \
+            for (int c = 0; c < N; ++c) { \
+                alignas(32) std::int64_t e[4], o[4]; \
+                _mm256_store_si256(reinterpret_cast<__m256i*>(e), even[c]); \
+                _mm256_store_si256(reinterpret_cast<__m256i*>(o), odd[c]); \
                 for (int i = 0; i < 4; ++i) { \
                     const std::size_t base = static_cast<std::size_t>(rg - rg_begin) * 16 + 8 * h; \
                     out[(base + 2 * i) * N + c]     = e[i]; \
@@ -277,12 +351,16 @@ void rg16_row_sums_a16(CpuIsa isa, const std::uint8_t* matrix, int blocks, int r
 #    undef INFERNIX_CALL
         return;
     case CpuIsa::kAvxVnni:
-#    define INFERNIX_CALL(n) row_sums_avxvnni<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
+#    define INFERNIX_CALL(n)                                                                                  \
+        (n <= kOnePassColumns ? row_sums_avxvnni_one<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes) \
+                              : row_sums_avxvnni<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes))
         INFERNIX_MOE_DISPATCH(INFERNIX_CALL)
 #    undef INFERNIX_CALL
         return;
     case CpuIsa::kAvx2:
-#    define INFERNIX_CALL(n) row_sums_avx2<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
+#    define INFERNIX_CALL(n)                                                                                  \
+        (n <= kOnePassColumns ? row_sums_avx2_one<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes) \
+                              : row_sums_avx2<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes))
         INFERNIX_MOE_DISPATCH(INFERNIX_CALL)
 #    undef INFERNIX_CALL
         return;
@@ -301,11 +379,12 @@ void gate_up_units_a16(CpuIsa isa, const ExpertShape& shape, const std::uint8_t*
         // Unit u is row groups 2u, 2u+1: rows 32u..32u+31, gate_i at even rows, up_i at odd rows.
         rg16_row_sums_a16(isa, record, shape.gate_up_blocks(), 2 * u, 2 * u + 2, x, ncols, s, prefetch_bytes);
         for (int c = 0; c < ncols; ++c) {
+            std::uint16_t g[16], p[16];
             for (int i = 0; i < 16; ++i) {
-                const std::uint16_t g = canon::a16_row_output(s[static_cast<std::size_t>(2 * i) * ncols + c], x_exp[c], scales.alpha_gate);
-                const std::uint16_t p = canon::a16_row_output(s[static_cast<std::size_t>(2 * i + 1) * ncols + c], x_exp[c], scales.alpha_up);
-                h[c][16 * u + i] = canon::swiglu_bf16(g, p);
+                g[i] = canon::a16_row_output(s[static_cast<std::size_t>(2 * i) * ncols + c], x_exp[c], scales.alpha_gate);
+                p[i] = canon::a16_row_output(s[static_cast<std::size_t>(2 * i + 1) * ncols + c], x_exp[c], scales.alpha_up);
             }
+            swiglu_bf16_n(isa, g, p, 16, &h[c][16 * u]);
         }
     }
 }

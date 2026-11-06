@@ -80,13 +80,6 @@ public:
     // with no clock tick (the prompt's prefill calls ticked already) and no admission: the credit
     // ranks later admissions and evictions.
     void credit(std::span<const std::uint32_t> keys, std::span<const double> amounts);
-    // Prompt seeding's promotions (design §19.3.27; INFERNIX_TMP_PROMPT_SEED's budget, a temporary
-    // A/B): of `keys`, the non-resident ones (only those `admissible` accepts, when given) become
-    // resident best score first, each only if it outranks the victim it replaces (the lowest resident
-    // outside `keys`; with `evictable`, stopping at the first victim it refuses), at most `budget`.
-    // Counts and the clock are unchanged. out.admitted and out.victims list them.
-    void admit(std::span<const std::uint32_t> keys, std::size_t budget, Step& out,
-               const Admissible* admissible = nullptr, const Admissible* evictable = nullptr);
 
     // Promote a non-resident key (for example a staged prefetch whose frame changes role).
     // Returns the victim, or nothing when the pool still has room.
@@ -103,12 +96,31 @@ public:
 
     // Seeds residency and counts, for example from a saved state or a shipped profile.
     void seed(std::span<const std::uint32_t> resident_keys, std::span<const std::uint32_t> counts);
+    // Breaks the ties of seeded whole counts by the seeds' order (`ranked`, best first): the i-th of n gains
+    // 0.5 (n - i) / (n + 1), under half a use, so equal counts order by rank and unequal ones keep their order.
+    // Before the first round only.
+    void rank_seeds(std::span<const std::uint32_t> ranked);
 
     // Changes the capacity (the frame pool grew or shrank). Shrinking evicts the lowest-score
-    // residents, wherever their frames are, into `victims`; uses keep their counts.
-    void set_capacity(std::uint32_t capacity, std::vector<std::uint32_t>& victims);
+    // residents, wherever their frames are, into `victims`; uses keep their counts. With
+    // `first_choice`, the residents it accepts go first (lowest score first), then the others: the
+    // SSD tier's lends and shrinks take experts that keep a RAM copy before ones that would be lost.
+    void set_capacity(std::uint32_t capacity, std::vector<std::uint32_t>& victims,
+                      const Admissible* first_choice = nullptr);
     // Makes a resident key non-resident (its frame is lent); its count is kept.
     void evict(std::uint32_t key);
+    // Basalt's adaptive tier (ExpertResidency::VramPolicy::Adaptive, candidates §7.6 D12) decides the
+    // promotions. exchange makes the non-resident `in` resident in place of the resident `out`; admit_free
+    // makes `key` resident while the capacity has room (false when full or already resident).
+    void exchange(std::uint32_t in, std::uint32_t out) {
+        erase(out);
+        insert(in);
+    }
+    bool admit_free(std::uint32_t key) {
+        if (resident(key) || residents_.size() >= capacity_) { return false; }
+        insert(key);
+        return true;
+    }
 
 private:
     static constexpr std::uint32_t kNone = 0xFFFFFFFFU;
@@ -116,6 +128,22 @@ private:
     void erase(std::uint32_t key);
     void select_victims(std::size_t need, std::span<const std::uint32_t> protect,
                         std::vector<std::uint32_t>& out);
+    // The victim search's low set (select_victims without a guard): low_ holds every resident whose score can
+    // reach low_bound_ or less before tick low_until_. build_low takes the bound from the kLowSize lowest scores now
+    // and admits each resident scoring at or below it at low_until_: a resident's score only falls until its next use,
+    // so one left out stays above the bound until then. A resident whose count or last use changes, or a key that
+    // becomes resident, passes the same test (note_low). A search within low_ is the scan's answer when that answer
+    // scores at or below the bound; otherwise the set is rebuilt, and when a fresh set cannot answer either, every
+    // resident is scanned. A decode round's 48 calls scanned 9,125 residents for each of ~75 victims (Dense8
+    // struct, ~1 ms of host time per round).
+    static constexpr std::size_t kLowSize    = 256;
+    static constexpr std::uint64_t kLowTicks = 64;
+    void build_low();
+    void note_low(std::uint32_t key);
+    // The `need` lowest (score, key) residents outside the marked keys (mark_) from low_, appended to out; false when
+    // the low set cannot answer.
+    bool low_victims(std::size_t need, std::vector<std::uint32_t>& out);
+    bool try_low(std::size_t need, std::vector<std::uint32_t>& out);
     // Budgeted admission of `candidates` (non-resident keys): best score first, each only if it
     // outranks the victim (outside `protect`) it replaces; appends to out.admitted and out.victims.
     void admit_ranked(std::span<const std::uint32_t> protect, std::span<const std::uint32_t> candidates,
@@ -133,7 +161,14 @@ private:
     // every score equals score()'s.
     std::vector<double> resident_count_;
     std::vector<double> resident_last_;
-    std::vector<std::uint8_t> mark_;       // scratch: keys of the current group
+    std::vector<std::uint8_t> mark_;       // scratch: the protected residents of a victim search
+    std::vector<std::uint32_t> marked_;    // scratch: the keys mark_ flags
+    std::vector<std::uint32_t> low_;
+    std::vector<std::uint8_t> in_low_;     // per key: listed in low_ (resident or since evicted)
+    std::vector<double> low_scores_;       // scratch: build_low's selection
+    double low_bound_        = 0;
+    std::uint64_t low_until_ = 0;
+    bool low_valid_          = false;
     std::vector<std::pair<double, std::uint32_t>> scratch_;
     std::vector<double> scores_;           // scratch: residents' scores, in residents_ order
     std::vector<std::uint32_t> candidates_;
@@ -238,12 +273,6 @@ public:
                   const LfruPolicy::Guard* guard = nullptr);
     // A prompt's weighted routes at its end (LfruPolicy::credit); issues no command.
     void credit(std::span<const std::uint32_t> keys, std::span<const double> amounts) { policy_.credit(keys, amounts); }
-    // Promotions at a prompt's end (LfruPolicy::admit): admits up to `budget` of the credited `keys`,
-    // retires their victims' frames and loads them into free frames (the rest queue). Returns the
-    // number admitted.
-    std::size_t admit_credited(std::span<const std::uint32_t> keys, std::size_t budget, std::uint64_t round_started,
-                               std::vector<Command>& out, const LfruPolicy::Admissible* admissible = nullptr,
-                               const LfruPolicy::Admissible* evictable = nullptr);
     // The SSD tier's demotion (design §19.3.7 T4/T7): after on_route evicted an expert and before
     // on_quiescent, its retired frame is held while its record is copied to RAM; release_held frees
     // it once the copy completed and loads queued experts into free frames.
@@ -254,8 +283,9 @@ public:
     // Resizes the pool to `frames` while no round is in flight, every issued load has landed and no
     // frame is lent. Shrinking evicts the lowest-score residents (ABSENT writes) and relocates the
     // experts still above the new top into free frames below it (relocations precede no other
-    // command); growing admits queued experts into the new frames.
-    void resize(std::uint32_t frames, std::vector<Command>& out);
+    // command); growing admits queued experts into the new frames. `first_victims` as
+    // LfruPolicy::set_capacity's first_choice.
+    void resize(std::uint32_t frames, std::vector<Command>& out, const LfruPolicy::Admissible* first_victims = nullptr);
 
     // Frame lending (design §19.3.2): a contiguous run of frames serves another use of the memory
     // (the Vision window) and comes back later. choose_run picks the run of `count` frames whose
@@ -266,8 +296,9 @@ public:
     // At a quiescent boundary (no retiring frame, every issued load landed): shrinks the policy's
     // capacity by `count`, which evicts its lowest-score residents (ABSENT writes), relocates the
     // run's remaining experts into free frames outside it, and lends the run. Returns the number
-    // of evicted experts.
-    std::uint32_t lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);
+    // of evicted experts. `first_victims` as LfruPolicy::set_capacity's first_choice.
+    std::uint32_t lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out,
+                       const LfruPolicy::Admissible* first_victims = nullptr);
     // Returns the run: capacity grows back and queued experts load into it. With `refill`, the
     // experts the loans evicted then load into it too, best first, while the policy has room (a
     // prefill's loans would otherwise leave decode a cache short of them until misses re-admit them);
@@ -290,6 +321,11 @@ public:
     bool adopt(std::uint32_t key, std::uint32_t frame, std::span<const std::uint32_t> protect,
                std::uint64_t round_started, std::vector<Command>& out);
     void release(std::uint32_t frame);
+    // The adaptive tier's swap (ExpertResidency::VramPolicy::Adaptive, candidates §7.6 D12): the non-resident `in` becomes
+    // resident in place of the resident `victim` (its frame retires; ABSENT write) or, with none, in the
+    // policy's room, and loads into a free frame (or queues). False when it cannot.
+    bool exchange(std::uint32_t in, std::optional<std::uint32_t> victim, std::uint64_t round_started,
+                  std::vector<Command>& out);
     [[nodiscard]] std::uint32_t loaned_frames() const { return frames_.loaned_count(); }
     // The longest run of backed frames none of which is lent: the most one more lease can take, since
     // a lease is one contiguous run (an earlier lease in the middle of the pool splits the rest).

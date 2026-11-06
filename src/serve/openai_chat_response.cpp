@@ -166,8 +166,12 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
                                           const GenerationOutcome& outcome, std::vector<std::string>* call_ids) {
     Json message = {{"role", "assistant"}, {"content", outcome.text}, {"refusal", nullptr}};
     const bool has_tool_calls = !outcome.tool_calls.empty();
-    // vLLM/SGLang-compatible reasoning_content preserves the Engine's Reasoning/Content split.
-    if (!outcome.reasoning.empty()) { message["reasoning_content"] = outcome.reasoning; }
+    // The Engine's Reasoning/Content split, under both names clients read: `reasoning_content`
+    // (SGLang, earlier vLLM) and `reasoning` (current vLLM).
+    if (!outcome.reasoning.empty()) {
+        message["reasoning_content"] = outcome.reasoning;
+        message["reasoning"]         = outcome.reasoning;
+    }
     if (has_tool_calls) {
         const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
         message["content"]    = outcome.text.empty() ? Json(nullptr) : Json(outcome.text);
@@ -203,7 +207,7 @@ std::string OpenAIChatStream::start() {
 }
 
 void OpenAIChatStream::note_start(const infernix::GenerationStart& start) {
-    if (!started_ || admitted_ || finished_ ||
+    if (admitted_ || finished_ ||
         start.reused_prompt_tokens > start.prompt.prompt_tokens) {
         throw std::logic_error("invalid OpenAI Chat generation-start state");
     }
@@ -273,7 +277,7 @@ std::string OpenAIChatStream::reasoning_delta(const std::string& text) {
         throw std::logic_error("invalid OpenAI Chat reasoning delta state");
     }
     reasoning_ += text;
-    return chunk(identity_, Json{{"reasoning_content", text}}, nullptr, include_usage_,
+    return chunk(identity_, Json{{"reasoning_content", text}, {"reasoning", text}}, nullptr, include_usage_,
                  live_timings_json());
 }
 
@@ -284,6 +288,11 @@ std::string OpenAIChatStream::content_delta(const std::string& text) {
     content_started_ = true;
     content_ += text;
     return chunk(identity_, Json{{"content", text}}, nullptr, include_usage_, live_timings_json());
+}
+
+std::string OpenAIChatStream::keep_alive() const {
+    if (!started_ || finished_) { return {}; }
+    return chunk(identity_, Json::object(), nullptr, include_usage_);
 }
 
 std::string OpenAIChatStream::tool_call_delta(const infernix::ToolCallDelta& delta) {
@@ -334,8 +343,8 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
         if (content_started_) {
             throw std::logic_error("terminal reasoning appeared after streamed content");
         }
-        events.push_back(chunk(identity_, Json{{"reasoning_content", reasoning_suffix}}, nullptr,
-                               include_usage_, output_timings));
+        events.push_back(chunk(identity_, Json{{"reasoning_content", reasoning_suffix}, {"reasoning", reasoning_suffix}},
+                               nullptr, include_usage_, output_timings));
     }
     const std::string content_suffix = outcome.text.substr(content_.size());
     if (!content_suffix.empty()) {

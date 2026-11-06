@@ -26,21 +26,27 @@ with `--expert-stripe` in the SSD tier.
   x8 link halves their bandwidth. Check with
   `nvidia-smi --query-gpu=pcie.link.width.current --format=csv`.
 - **RAM.** About 96 GB for full speed. A run pins ~64.5 GiB. At startup a RAM ledger plans every
-  allocation and keeps `--ram-headroom-mib` (default 2048) free for the system; with the defaults
-  about 69.3 GiB must be available, and 73.3 GiB for `infernix-serve` with its prefix cache (see
-  [Prefix cache](#prefix-cache)). With less, the [SSD expert tier](#ssd-expert-tier) keeps the
+  allocation (experts, n-gram table, prefix cache) and keeps `--ram-free-mib` (default 8192; 2048
+  before 2026-10-26, when a desktop paged once the experts and the n-gram table took the rest) free
+  for other programs; with the defaults about 75.3 GiB must be available, and 83.3 GiB for
+  `infernix-serve` with its prefix cache (see [Prefix cache](#prefix-cache)). With less, the [SSD expert tier](#ssd-expert-tier) keeps the
   experts that fit in RAM and reads the others from the artifact; the ledger line names every term.
   Windows lets the GPU page-lock RAM only up to its *shared GPU memory* (Task Manager → Performance
   → GPU; often half of RAM). Experts past that limit stay in RAM unpinned and the CPU serves them
   (see [Page-locking limit](#page-locking-limit)), so the limit costs some speed, not RAM.
   An artifact whose experts exceed RAM (the FP8 conversion's 112.6 GiB) takes everything the
-  ledger allows, so only about the headroom stays available while it runs: other programs page,
-  and Windows may stall Infernix's own threads for a moment (rounds wait up to 10 s for its CPU
-  expert service and SSD reads before they fail). A larger `--ram-headroom-mib` leaves more for
-  other programs and costs the experts it keeps out of RAM: with the FP8 artifact on a 96 GB
-  machine (2026-10-17, one run each), plain tg512 measured 43.8 tok/s at 2048, 38.3 at 5120 and
-  35.6 at 8192; MTP 4 at 4K + 512 measured 36.3-43.5, 40.4-40.9 and 39.6-39.7 (two runs each; how
-  much RAM is free at startup moves it as much as the headroom does).
+  ledger allows, so only about `--ram-free-mib` stays available while it runs. A smaller
+  `--ram-free-mib` keeps more experts in RAM and leaves less for other programs (below a few GiB
+  they page, and Windows may stall Infernix's own threads for a moment: rounds wait up to 10 s for
+  its CPU expert service and SSD reads before they fail): with the FP8 artifact on a 96 GB machine
+  (2026-10-17, one run each), plain tg512 measured 43.8 tok/s at 2048, 38.3 at 5120 and 35.6 at
+  8192, today's default; MTP 4 at 4K + 512 measured 36.3-43.5, 40.4-40.9 and 39.6-39.7 (two runs
+  each; how much RAM is free at startup moves it as much as the setting does). On a machine that
+  runs little else, `--ram-free-mib 2048` gives that artifact its speed back. When other programs
+  later take the RAM (less than 2 GiB available), `--ram-resize auto` (the default) gives some back
+  between requests, the prefix cache's Host tier first and then the SSD tier's expert copies (those
+  experts are read from the artifact meanwhile), and takes it back once the reserve is free again
+  ([serving](serving.md#server-options)); `--ram-resize off` keeps every startup size.
 - **VRAM.** All of it: the expert cache takes what the dense weights, the KV cache, the
   workspaces and a reserve for CUDA graphs leave, less a headroom for the display and other
   programs (see [VRAM](#vram)).
@@ -171,7 +177,22 @@ is 56.8 GB, of which the routed experts are 46.9 GiB.
   RAM, with 24 GiB and with 8 GiB (400 tokens).
 - **Expert cache.** The records come in five sizes (mean 1.95 MiB, largest 2.54 MiB). The cache
   keeps one frame pool per size, each with its own frames and LFRU counters, so it holds 13,008
-  experts where frames of the largest size held about 10,200.
+  experts where frames of the largest size held about 10,200. A GGUF import's cache uses the adaptive
+  policy (Basalt's: per-window decayed route counts, decay 0.85, a 1.5x margin, at most 96 swaps a
+  round, planned off the decode path) instead of LFRU: DFlash2 decode after an 8K prompt 1.070-1.076x
+  at the median in three A/Bs (2026-10-27, ABBA 3 pairs each; pooled 1.051-1.052x, worst pair
+  1.002-1.005x, the first block's cold cache). Its candidate floor is 1 where Basalt's is 2, so any
+  expert a round routes may be promoted: decode +1.5 % after a 16K prompt, +5.4 % on the community
+  struct fixture and +2.7-4.2 % on its conv and prose fixtures (2026-10-29), for about 70 % more
+  promotions. Its margin is 1 where Basalt's is 1.5: a candidate replaces a resident once its count
+  leads by one route, struct +2.2 % (hits 96.2 -> 97.6 %) and +1.2 % after a 16K prompt, while
+  margins of 2 and 3 lost 6 % and 17.5 % on struct (2026-11-05). A round's swaps pair candidates with residents across all the layers of a frame pool,
+  not only within each layer, so a layer that routes more takes frames from one that routes fewer:
+  struct +1.1 % (494 -> 499 tok/s, hits 96.6 -> 96.9 %, about 7 % fewer CPU-served misses), 16K
+  unchanged (2026-10-30). The NVFP4 conversions keep LFRU, where the adaptive policy decoded 0.970x
+  (Dense8, MTP) and, with the floor of 1, 0.979x after a 16K prompt and 0.993x on the struct fixture
+  (NVIDIA FP4-Local, DFlash2 auto, exclusive layout, 3 interleaved runs, every pair slower, hits 88.9
+  against 89.4 %; 2026-10-30). Same bits either way.
 
 **Speed and quality** (RTX 5090 on PCIe 5.0 x8, i9-13900K, INT8 KV, one request, against recipe B
 in the same session on 2026-10-16; the n-gram table in RAM, `auto`; one run of `-r 3`, or `-r 1`
@@ -286,8 +307,9 @@ NVIDIA's quantization-aware distillation of the model, bit-exactly
 - `--screen-heads` adds 2-bit copies of `lm_head` (178.8 MB) and of the proposal head (94.4 MB),
   after every other object; every other tensor is unchanged. Only the screened heads read them: the
   MTP drafter's draft head with `--lm-head-draft` (decode +1.6 % at MTP 3), and the `screened-lm-head`
-  fast path for greedy rounds, on by default for this artifact with INT8 KV (decode +7.5 % plain, +3.7 %
-  at MTP 3; not yet quality-gated) and otherwise `--fast-path screened-lm-head`
+  fast path for greedy rounds, on by default for this artifact (16- and 4-bit expert activations) with INT8 KV
+  and every format below it (FP8, NVFP4, K8V4, VQ2, K4V2; decode +7.5 % plain, +3.7 % at MTP 3 on INT8; with
+  `--expert-a4-activations` +6.6 % plain; not yet quality-gated) and otherwise `--fast-path screened-lm-head`
   ([design §19.3.30](maintainer/qwen3_8-flash-next-design.md#19330-screened-heads-a-2-bit-screen-of-the-draft-and-lm-heads-2026-10-23-measured-2026-10-25)).
 
 ```text
@@ -311,7 +333,12 @@ Speed on the same day (RTX 5090, INT8 KV, n-gram rows read from the volume, one 
 repetitions): pp8192 3,352 and pp32768 11,299 tok/s (8,387 on the exact route; the
 `expert-a4-residual` fast path), tg256 110 plain and 150-162 with MTP; with
 `--expert-a4-activations` pp32768 11,985, tg256 135 plain and 216 with MTP. Dense8 in the same
-session: 11,531, 120 and 159.
+session: 11,531, 120 and 159. Since 2026-11-02, wide verification rounds give the CPU more of their misses and the
+4-bit route's CPU experts quantize and apply SwiGLU in AVX2 (the same bits); with DFlash2 auto and INT8 KV each step
+measured faster on its own: the 4-bit route's struct fixture +3.6 % and then +4.2 %, short context +0.3 % and +2.7 %,
+after a 16K prompt +0.7 % and +1.9 %, the default route's struct fixture +2.5 % and short context +0.7 %
+(Dense8's struct fixture +4.3 %)
+([design §19.3.47](maintainer/qwen3_8-flash-next-design.md#19347-fp4-locals-4-bit-route-wide-call-split-vector-cpu-kernels-2026-11-02-same-bits-default)).
 
 Its qualified fast paths (2026-10-21; on by default, `--reproducible` turns them off) are
 the request-coupling paths (two-row MTP rounds: two concurrent requests decode 84 -> 126 tok/s with
@@ -323,6 +350,15 @@ NVFP4 terms in decode and verification calls with 16-bit expert activations, on 
 CPU-served misses alike (exact sums, so where an expert runs changes no bit). Its exact route is
 deterministic and gives each request the same bits alone and with up to eight concurrent requests.
 
+Derivatives that keep FP4-Local's formats and n-gram table convert with the same recipe and bind
+FP4-Local's volume with `--ngram-reuse` instead of `--ngram-out`. edp1096's
+[Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local](https://huggingface.co/edp1096/Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local)
+(Huihui's abliteration transferred into 96 MXFP8 projections: each layer's attention or GDN output
+projection and its shared expert's down projection) is one: its artifact differs from FP4-Local's in
+those 96 objects only, verifies with no mismatch against its checkpoint, and scores 3.4939 on the
+quick corpus against FP4-Local's 3.4865 on the same build (BF16 KV, reproducible route; mean KL
+from FP4-Local 0.018, top-1 agreement 95.2 %).
+
 ## Run
 
 ```text
@@ -331,8 +367,10 @@ infernix <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8 --max
 infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8 --max-context 16384
 ```
 
-- `--kv-dtype` accepts every Infernix KV format: `int8` (recommended), `bf16`, `fp8`, `nvfp4`,
+- `--kv-dtype` accepts every Infernix KV format: `int8` (recommended), `bf16`, `bf16p`, `fp8`, `nvfp4`,
   `k8v4`, `vq2` and `k4v2`.
+  - `bf16p` holds `bf16`'s values exactly in 23 % less KV memory, with `bf16`'s output; a request
+    whose KV holds a row it cannot pack fails with an error (the Engine keeps serving).
   - `fp8`, `nvfp4` and `k8v4` measured within noise of `int8` in teacher-forced quality. `nvfp4`
     holds a context in 55 % of `int8`'s KV memory, which leaves more VRAM to the expert cache.
   - `vq2` and `k4v2` keep each sequence's recent and first tokens exact and quantize older ones
@@ -360,10 +398,18 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   (Dense8, INT8 KV, RTX 5090, 2026-10-16: 32K prompts 5,570 / 9,640 / 11,210 tok/s at chunks
   1,024 / 4,096 / 16,384, 64K prompts 5,700 / 9,890 / 11,270; tg512 unchanged; 26 fewer expert
   frames of ~8,560). A smaller `--prefill-chunk` only shrinks the prefill workspace. A long
-  prompt's prefill workspace is lent from the expert cache; a chunk whose workspace the cache could
-  never lend (more than three quarters of its frames, e.g. 65,536 tokens under the SSD tier, ~27
-  GiB) is halved at startup until it can, with a warning, since the output does not depend on the
-  chunk.
+  prompt's prefill workspace is lent from the expert cache (at most three quarters of the frames of
+  its largest frame pool; a GGUF import keeps a pool per record size), which also gives its frames to
+  the KV pool as contexts grow. A chunk whose workspace the cache cannot lend is cut at startup to
+  the widest one it can (a multiple of 128 tokens), with a warning: 65,536 tokens under the SSD tier
+  wanted ~27 GiB, and the IQ3_S import's 16,384 does not fit on a 32 GB card. A prompt whose
+  contexts have grown since runs its calls at the widest chunk the cache lends then. Calls of
+  different widths can round differently, so the chunk can change a near-tie token.
+  `--reproducible` keeps one chunk: the one the cache lends with every lane's context full (a lower
+  `--max-context` or `--max-concurrency` leaves it wider), sized as if 3 GiB of VRAM were in use
+  before loading, so the same options on the same GPU always get the same chunk. If other programs
+  hold more and the cache cannot lend that chunk, a warning names the narrower one this launch uses;
+  `--prefill-chunk` at that value pins it on every launch.
 - **`--spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto
   --lm-head-draft` (recommended)** drafts with Inco AI's DFlash2 drafter, a separate 776 MB
   companion artifact ([Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix)) that runs beside any Flash-Next
@@ -393,14 +439,25 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
     ahead of its quality gate; `--disable-fast-paths` or `--reproducible` turns it off.
 - `--spec mtp --draft-tokens auto --lm-head-draft` drafts with the model's MTP layer.
   - `auto`: each round drafts the number of tokens, 0 to 7, the request's recent acceptance makes
-    worthwhile (down to none on text it predicts poorly), and verifies them up to the first the
-    drafter gives below 0.5 probability (`--spec-min-p`).
-  - `--draft-tokens N` (1-7): every round drafts and verifies N tokens (fewer only near the output
-    limit), whatever the acceptance; `--spec-min-p` then defaults to 0.
+    worthwhile (down to none on text it predicts poorly). A one-request round of argmax drafts
+    (every greedy request; a sampled one unless `sampled-mtp-drafts` draws its drafts) verifies them
+    up to the first whose product of binned acceptance rates (the drafter's probabilities, binned)
+    falls below the request's threshold, 0.35 falling toward 0.25 as its drafts are accepted more
+    often than the table predicts: on Dense8 1.05x on conversational text and flat on structured
+    output against the earlier 0.5 probability cut. `--spec-min-p` does not apply here (startup
+    refuses it with `auto`).
+  - `--draft-tokens N` (1-7): every round drafts N tokens (fewer only near the output limit),
+    whatever the acceptance, and verifies every one unless `--spec-min-p P` cuts a one-request
+    round of argmax drafts at the first whose probability is below P. (The cumulative cut at MTP-3
+    measured 1.04x on conversational text but 0.99x on structured output, every pair worse, so a
+    fixed length keeps verifying its drafts.)
   - The drafter's 512 experts (1.34 GB), its workspace and the proposal head (178 MB) stay in
     VRAM, so the expert cache gets about 710 fewer frames.
   - Greedy output is the same as without it when one request runs at a time. For several lanes,
     see `--max-concurrency` below.
+- `--spec auto --draft-tokens auto`, the default without `--spec`, chooses between the two: DFlash2 when
+  `--draft-model` names its drafter or the drafter's companion artifact is the only one in the model's
+  folder, else MTP (startup reports which). `--spec off` decodes plain.
 - `--ngram-draft-tokens 7` verifies copy proposals. It works alone or beside MTP; a longer copy
   proposal replaces a round's MTP drafts. On code-editing prompts it accepts most drafts; on prose
   it finds none and costs nothing. In the agentic replay (`bench/agentic_ab`, greedy, seed 42, two
@@ -436,12 +493,20 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   workers measured slower: the CPU and the PCIe stage share the host's memory bandwidth.
   The GSQ-RCO IQ3_S artifact's CPU route decodes its GGUF blocks before multiplying, so it is
   compute-bound and starts 16 workers instead (decode 98.4 tok/s with six, 103.7 with 16).
+  Either way the team leaves four of the process's logical CPUs to the engine, the CUDA runtime
+  and the OS: a 16-vCPU host runs 12 workers. With 16 workers on 16 logical CPUs the spinning
+  threads starved each other and the IQ3_S decoded 61-87 tok/s, against 189-217 with 8 (the
+  startup log notes a reduced team).
 - On Windows the engine opts its process out of power throttling. Windows otherwise slows a
   process it considers in the background (a server whose console is not in front, a job without a
   window) and moves its threads to efficiency cores; a hidden run decoded 37.6 tok/s at 8K throttled
   and 98.7 exempt (design §19.3.19).
 - `--vision` enables images and video. The vision tower stays in pinned RAM and borrows expert
-  frames only while it encodes (`--vision-offload auto`).
+  frames only while it encodes (`--vision-offload auto`). A request whose encode the expert cache
+  cannot lend frames for while other requests hold them (a long prompt's prefill, a long context's
+  KV) waits in the queue; one it cannot lend for even when nothing else runs (many large images
+  beside a very long conversation) returns HTTP 400 `media_budget_exceeded`. The server keeps
+  serving either way.
 - The expert cache fills the VRAM that remains; see [VRAM](#vram).
 - **Warm start.** The engine saves the expert cache's state (which experts it holds and how often each
   was used) to `<artifact>.expert-state` when it stops and every 10 minutes between requests. The
@@ -449,13 +514,15 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   request (under a second), so the first few hundred tokens decode faster when the work resembles
   the last session's (measured +24 % plain and +30 % with MTP on a repeated coding prompt), and
   about as fast as a cold start when it does not; the other half stays free to fill quickly. With
-  no saved state yet (a first start, or a file of another artifact), the engine seeds the same way
-  from a built-in calibrated expert order (NInfer's, ranked over 128 tasks in nine domains), which
-  every Qwen3.8-Flash-Next artifact uses (measured against an empty cache on the first request, MTP
-  decode: +9 % on a coding prompt, +15 % on a math problem, +56 % with the SSD tier). `--expert-state
-  FILE` moves the file; `--expert-state off` starts with an empty cache and no seed, as cold
-  benchmarks need (`infernix_bench` always starts that way). Output is the same either way: where an
-  expert is computed never changes a bit.
+  no saved state (a first start, a file of another artifact, or a tool that keeps none:
+  `infernix_bench` without `--expert-state`, the scoring tools), the engine seeds the same way from
+  a built-in calibrated expert order (NInfer's, ranked over 128 tasks in nine domains), which every
+  Qwen3.8-Flash-Next artifact uses (measured against an empty cache on the first request, MTP
+  decode: +9 % on a coding prompt, +15 % on a math problem, +56 % with the SSD tier); with a saved
+  state, the SSD tier's RAM takes the experts that session never used in the calibrated order too.
+  `--expert-state FILE` moves the file; only `--expert-state off` starts with an empty cache and no
+  seed, as cold benchmarks need (`infernix_bench --expert-state off` likewise). Output is the same
+  either way: where an expert is computed never changes a bit.
 - The `infernix-serve` statistics panel's `experts` column shows the expert cache's hit rate over
   the session and the last ten requests. Each Chat Completions and Anthropic response's `timings`
   carries the request's `expert_routed_n` and `expert_hit_n`, and `/metrics` exports the cache's
@@ -474,16 +541,35 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
 `--ngram-residency auto|ram|volume` chooses where the PLE n-gram table lives:
 
 - `volume` reads rows from the NVMe volume on demand, through a host cache of 2^20 rows.
-- `ram` reads the whole volume into pinned RAM at startup and never touches the drive again. The
-  GGUF import's `IQ4_NL` table takes 27.1 GiB; NVIDIA's FP8 table takes 48.8 GiB. The read uses
-  unbuffered 1 GiB requests. The RAM ledger counts the table, and startup stops if it does not fit.
+- `ram` reads the whole volume into RAM at startup and never touches the drive again. The GGUF
+  import's `IQ4_NL` table takes 27.1 GiB; NVIDIA's FP8 table takes 48.8 GiB. The read uses
+  unbuffered 1 GiB requests. Only the CPU reads the table (it copies each round's rows), so it is
+  locked in the process's working set rather than page-locked for the GPU: it takes physical RAM but
+  none of the page-locking limit Windows sets (about 80 % of RAM), which the experts need. The RAM
+  ledger counts it, and startup stops if it does not fit.
 - `auto`, the default, takes RAM only when the ledger still holds every routed expert in RAM
-  beside the table, and the volume otherwise. On a 96 GB machine that means RAM for the GGUF
-  import (46.9 + 27.1 GiB) and the volume for recipes A and B (64.5 + 48.8 GiB do not fit).
+  beside the table with 8 GiB of RAM to spare beyond its plan, and the volume otherwise. On a 96 GB
+  desktop that means the volume for every import today: the GGUF import's experts and table (46.9 +
+  27.1 GiB) would leave too little for the other programs, and recipes A and B (64.5 + 48.8 GiB) do
+  not fit.
 
-The startup line names the choice: `n-gram table: in RAM (N MiB pinned)`, or `n-gram table: read
-from its volume`, which `auto` follows with `(the RAM ledger keeps the experts resident first)`.
+The startup `RAM plan:` line names the choice (`n-gram table N GiB` in RAM, or `n-gram table read from its
+volume`); `--log-level debug` adds `n-gram table: in RAM (N MiB, locked for the CPU)`, or `n-gram table:
+read from its volume`, which `auto` follows with `(the RAM ledger keeps the experts resident first)`.
+If Windows will not lock the table, a warning says so: it still serves rows, but under memory
+pressure part of it may be paged out.
 The rows are the same bytes either way, so outputs do not change.
+
+A table read from its volume is timed at startup with up to 16,384 random 4 KiB reads, issued the way
+a prompt chunk reads its rows (8 threads with 16 reads in flight each; milliseconds on a fast drive, a
+few seconds at most on a slow one), and logged
+at debug as `n-gram volume read probe: N reads/s`. A 128K-token prompt reads about 1.27M blocks; a
+Samsung 990 PRO and an Optane P5800X both read about 1.1M a second this way and prefilled at the same
+speed. Below 200,000 reads per second, where a 100K-token prompt spends 5 s or more reading rows, the
+line becomes a warning with that estimate; `--ngram-residency ram` (when the experts fit beside the
+table) or a faster drive fixes it. Reads one at a time measure the drive's latency, which the engine
+never waits on alone: they put a 990 PRO at 12,000-17,000 a second, which is why earlier builds warned
+about healthy drives. The probe only reports; it never changes where the table lives.
 
 ## N-gram table formats
 
@@ -566,8 +652,9 @@ leading System message is never touched (so the ordinary single leading System b
 conversation's prefix-cache anchor, stays byte-identical). The text, the number of turns and their
 positions stay as they arrived, only the role changes, so such a request never fails on the
 template. Each generation request shows its lowered turns as `instruction_role_lowerings` in the
-preparation block of `--request-log-jsonl`, and both programs state once at startup which roles
-the loaded template lowers. One consequence to know: a lowered turn counts as a user query for a
+preparation block of `--request-log-jsonl`; `infernix-serve` says so at info the first time a request
+has such a turn (most clients send one leading System message and never do), and both programs list
+the roles the loaded template lowers at startup with `--log-level debug`. One consequence to know: a lowered turn counts as a user query for a
 template that takes its thinking history from the last user turn, so `preserve_thinking: false` can
 then drop earlier `<think>` blocks that `qwen3_8.jinja` keeps. Passing
 `--chat-template tools/chat_templates/qwen3_8.jinja` (the file is also in the Windows release
@@ -645,6 +732,20 @@ would fail too, so the server stops with that cause. A round waits for either wh
 of life, and fails only when one has been silent for 10 s ("the CPU expert service stopped
 answering" or "the SSD expert tier's read agent stopped answering"); until 2026-10-17 that was 1 s,
 which RAM pressure alone could exceed (FP8 runs at the default headroom failed 8 times in 34).
+
+**Expert RAM layout (`--expert-ram-layout exclusive|full`, default `exclusive`).** When VRAM cannot hold
+every routed expert, `exclusive` keeps in RAM only the experts VRAM does not hold, plus copies of the ones a
+prefill borrows from VRAM and the KV cache's growth may take, and the tier serves them; `full` keeps a RAM
+copy of every expert whenever RAM allows it (the banks above). On an RTX 5090 at 16K the experts' RAM plan
+is 42.4 against 48.0 GiB on the IQ3_S import and 60.3 against 64.4 GiB on Dense8 (resident 47.4 against
+51.9 and 67.2 against 70.3 GiB). A VRAM eviction of an expert without a RAM copy reads its record back
+from the artifact into RAM (it stays readable in VRAM until the read lands), or copies it over the link
+when that read would land more than 4 ms late (a slower drive); RAM drops the copies of the most-used
+VRAM experts first, so such evictions are few. Outputs are the same bits in both layouts. Speed
+(2026-10-29): decode within run-to-run spread of `full` on IQ3_S and Dense8 (16K steady state, the struct
+fixture, also with the artifact read at 800 MB/s), the community suite 0.993x; a 16K prefill equal on
+IQ3_S (6,832-6,833 against 6,787-6,809 tok/s) and on Dense8.
+`--expert-ram-mib N` overrides either with an explicit cap.
 
 **A second drive (`--expert-stripe FILE`).** One drive bounds the tier's reads, most of all in
 prefill, which reads every expert missing from RAM (about 38 GiB for a 4K-token prompt with the FP8
@@ -729,7 +830,9 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
 - **No silent spill.** On Windows the driver can place an allocation that does not fit in shared
   system memory without an error, which slows everything down. The engine checks that every startup
   allocation lowered free VRAM by its size: dense weights or fixed buffers that spilled stop
-  startup; expert frames that spilled are given back once and the cache starts smaller. Setting the
+  startup; expert frames that spilled are given back once and the cache starts smaller. The error
+  prints the readings it compared: free VRAM before and after the allocations and, on Windows and
+  under WSL2, this process's shared system memory use, which a real spill raises. Setting the
   NVIDIA Control Panel's *CUDA - Sysmem Fallback Policy* to *Prefer No Sysmem Fallback* for the
   Infernix executables makes such an allocation fail instead (optional).
 - **At runtime** the cache follows free VRAM. When another program (a browser, a game, the
@@ -757,6 +860,10 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
   - If Windows lowers the budget later, the cache shrinks by the same amount.
   - The cost: memory past the budget may be moved to system memory if another program needs VRAM,
     which slows decode until the cache shrinks. It is off by default.
+  - Measured on an RTX 5090 (2026-10-30, greedy 500-token decodes, three runs a side,
+    `--vram-headroom-mib 128`): FP4-Local 9,023 frames against 8,780, single-lane decode 142.7
+    against 139.4 tok/s and two-lane 204.4 against 197.4 tok/s; Ornith-1.5-122B 4,924 experts
+    against 4,797, 73.4 against 71.4 and 84.4 against 82.0 tok/s.
 - With more than one CUDA device visible (Windows), free VRAM is read as the Windows budget less this
   process's usage: there CUDA's own free figure stopped following allocations, so the cache would size
   to almost nothing. `CUDA_VISIBLE_DEVICES` naming one device restores the single-device reading.
@@ -784,6 +891,56 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
     windows; it reports KL 0.003-0.006 and +10-20 % decode on 12-16 GB cards). Rank 7 failed
     Infernix's fast-path decode gate (model-quality §6; [design §19.3](maintainer/qwen3_8-flash-next-design.md)),
     which is why it is an option rather than a fast path. 9 skips least, 1 most.
+- <a id="a8-activations"></a>**`--a8-activations`** (approximate, off by default) runs calls with 8-bit
+  activations where that is faster, as llama.cpp, Strata and Basalt do.
+  - Decode and verification calls: each 32 values of an activation become int8 codes with one FP32
+    scale, and each slice's dot is one 8-bit sum instead of the exact route's 16-bit arithmetic. It
+    covers a GGUF import's dense projections in calls of up to 31 columns, and the routed experts (GGUF
+    blocks, and the NVFP4 W4A16 experts of the uncensored and FP4-Local artifacts) in calls of up to 128
+    columns with the misses the CPU computes for them (bit for bit the GPU's, so where an expert is
+    computed still changes nothing).
+  - Prefill calls: a GGUF import's dense projections in calls of 32 or more columns and the same routed
+    experts in calls of more than 128 columns take the same codes and slice scales on 8-bit tensor cores
+    (ahead of `ggml-bf16-prefill`'s BF16 tiles and of `expert-a4-residual`'s A4 terms), and FP4-Local's
+    MXFP8 dense projections take two E4M3 terms per 32 activation values (`fp8-a8-pair-block32`'s route,
+    in place of `f16-accumulate-prefill`). Recipe C's FP8 dense projections take those two terms in
+    prefill by default already.
+  - Recipes A and B (Dense8): NVIDIA's W4A4 experts load as 16-bit banks (as with `--a16-activations`)
+    and take the 8-bit route in place of their 4-bit one, and the engine warns at launch that the
+    default follows NVIDIA's specification.
+  - On a GGUF import (IQ3_S) it also changes weights at load and scheduling (2026-11-01): the BF16
+    hyper-connection matrices become 8-bit (`q8_g32_fp16`), the hyper-connection mix and the GDN gated norm write
+    the next projection's 8-bit codes themselves, the CPU team takes 24 workers, the side streams yield to the
+    resident expert pass, and the shared expert runs beside the router. No weight goes below 8 bits. Measured
+    2026-11-01 (RTX 5090, IQ3_S, DFlash2 auto, INT8 KV, one request, 8,448 context; Basalt's own bench prompts as
+    token ids: `conv`, 1,200 tokens at temperature 0.6, and `struct`, greedy to EOS; against the 2026-10-31 build
+    in the same block): `conv` 11.37 → 10.08 ms a round, 236.7 → 263.7 tok/s; `struct` 15.33 → 14.05 ms,
+    507.3 → 557.7 tok/s. Basalt measured 7.9-9.0 and 12.0 ms a window on the same prompts (288-334 and 618-622
+    tok/s), so it is still faster. The default route's output and speed are unchanged.
+  - Every other call keeps its route: the Q8, FP8 and BF16 dense projections (a GGUF import's as above) and heads
+    in decode (their 8-bit routes were slower than the exact ones and were removed), the MTP drafter's experts, FP4-Local's
+    experts under `--expert-a4-activations`, and block-FP8 experts (with expert-a4-residual-decode on, the
+    W4A16 experts keep its two A4 terms in decode and their exact or A4 wide routes in prefill).
+  - The output changes; `--reproducible` and `--lossless` refuse it, as does an artifact with none of
+    these routes (the official FP8 artifact).
+  - Measured 2026-10-27 (decode, RTX 5090): IQ3_S +15.8 % after a 16K prompt and +14.1 % in the A/B;
+    FP4-Local +2.5 % and the uncensored NVFP4 +1.5 % with the since-removed dense routes still on. None
+    is quality-tested yet ([design §19.3.31](maintainer/qwen3_8-flash-next-design.md)).
+  - Measured 2026-10-31 (RTX 5090, INT8 KV, DFlash2 auto, one request, 1,024 output tokens; the README
+    benchmark's prompts): IQ3_S reaches the first token 7 % sooner at 8K, 23 % at 128K and 22 % at
+    250K (13.99 against 18.10 s at 128K) and decodes level at 8K, 5 % faster at 128K and 11 % at 250K.
+    Dense8 runs 4 %, 7 % and 1 % more decode rounds a second at 8K, 128K and 250K (output 9 %, 13 % and
+    36 % faster, partly from different text), but its 16-bit-bank prefill reads 128K and 250K prompts
+    28 % slower than its 4-bit route (15.53 against 12.16 s at 128K). In the agentic replay (three seeds)
+    it decodes 5.8 % faster and reads uncached prompts 15.7 % slower, the same wall time.
+- <a id="a16-activations"></a>**`--a16-activations`** (off by default) runs NVIDIA's W4A4 experts
+  (recipes A and B, Dense8) with 16-bit activations: the stored NVFP4 codes, block scales and
+  multipliers on the weight-only banks' exact arithmetic (design §16.2.1), the activation scales left
+  unread. The output changes, and the engine warns at launch. Measured 2026-10-31 on Dense8 (as above):
+  5 %, 6 % and 2 % more decode rounds a second than the 4-bit route at 8K, 128K and 250K (the 16-bit
+  banks' tensor-core narrow kernels), the first token level at 8K but 38 % and 37 % later at 128K and
+  250K (16.73 against 12.16 s at 128K), since only the 4-bit route reads the prompt on FP4 tensor cores. Artifacts whose experts already run 16-bit accept it unchanged;
+  `--expert-a4-activations`, `--a8-activations` and `--lossless` refuse it.
 - On a system without CUDA virtual memory management the cache cannot resize: the headroom with a
   display is then 1 GiB, and a warning names the headroom to set when free VRAM runs short.
 - `--kv-capacity auto` means `--max-context` x `--max-concurrency`, the same as omitting it.
@@ -796,7 +953,7 @@ warms up over the first few hundred tokens of a session.
 The speed figures in this guide were measured before 2026-10-07 on an artifact converted from
 `RadixArk/Qwen3.8-Flash-Next-NVFP4` instead of NVIDIA's checkpoint. Re-measured on NVIDIA's, the
 README's context-length decode came out 1.6-4.1 % lower and the agentic replay level; the
-[README benchmarks](../README.md#qwen38-flash-next-nvfp4-infernix-vs-strata-and-strata-nvfp4) are the current figures.
+[README benchmarks](../README.md#qwen38-flash-next-nvfp4-infernix-vs-strata-strata-nvfp4-and-basalt) are the current figures.
 Recipe A (bit-exact) decodes about 18 % slower than recipe B and reaches the first token 6-8 %
 later at 8K, level from 128K (the bit-exact
 [model card's performance table](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix#performance)).

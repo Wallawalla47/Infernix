@@ -3,7 +3,6 @@
 #include "core/cpu_topology.h"
 #include "core/host_load.h"
 #include "core/link_probe.h"
-#include "core/machine_calibration.h"
 #include "core/temporary_switches.h"
 #include "ops/offloaded_sparse_moe/cpu/expert_team.h"
 #include "runtime/contract/execution.h"
@@ -23,6 +22,9 @@
 // their measured values and references.
 
 namespace infernix::runtime::expert_offload {
+
+// The tier shares its lent stream slots among the layers whose reads the stream holds at once.
+static_assert(HostExpertTier::kStreamWindow == ExpertStream::kReadAhead + 2);
 namespace {
 
 namespace moe = ops::offloaded_moe;
@@ -66,7 +68,7 @@ public:
 
     // The thinnest non-resident experts of the layer (n <= 8 columns, in order of n then id), as many
     // as minimise the later of the CPU's predicted time and the link's for the rest.
-    std::uint32_t choose(std::uint32_t layer, std::span<const std::int32_t> columns,
+    std::uint32_t choose(std::uint32_t layer, std::int32_t /*tokens*/, std::span<const std::int32_t> columns,
                          std::span<std::uint8_t> cpu) const override {
         const ExpertResidency& residency = offload_.residency();
         const std::uint32_t E      = static_cast<std::uint32_t>(columns.size());
@@ -115,13 +117,23 @@ private:
 
 // ------------------------------------------------------------------------------------- planning
 
+int ExpertOffload::side_stream_priority() {
+    int least = 0, greatest = 0;
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+    return greatest;
+}
+
 std::int32_t ExpertOffload::staging_slots(const OffloadSetup& setup, const OffloadOptions& options) noexcept {
     // INFERNIX_TMP_STAGING_SLOTS fixes the count (a temporary A/B of the rule below).
     if (const std::int32_t fixed = temporary_switches::offload().staging_slots; fixed > 0) { return fixed; }
     // Without the SSD tier a verification call's misses (up to top_k per column) stage in one pass,
-    // so it keeps the fork route; with the tier the larger staging took RAM and frames from the cache.
-    if (options.expert_ram_bytes != 0) { return kStagingSlots; }
-    return std::clamp(static_cast<std::int32_t>(setup.layout.top_k) * setup.max_width, kStagingSlots, kMaxStagingSlots);
+    // so it keeps the fork route; with a tier short of RAM the larger staging took RAM and frames from the
+    // cache. The exclusive layout's tier holds every expert VRAM does not, so it stages as full mode does.
+    if (options.expert_ram_bytes != 0 && !options.ram_exclusive) { return kStagingSlots; }
+    // top_k x (widest call + 1), no longer at least kStagingSlots (candidates §22 VM-09, 2026-10-27): the 122B's
+    // one-request plain decode (16 slots) and two-request MTP (56) measured faster with the frames the smaller
+    // staging gives back, in the VRAM defaults' A/B; the extra column keeps a call of the widest width forked.
+    return std::clamp(static_cast<std::int32_t>(setup.layout.top_k) * (setup.max_width + 1), 1, kMaxStagingSlots);
 }
 
 std::uint64_t ExpertOffload::record_stride(const OffloadSetup& setup) {
@@ -131,11 +143,11 @@ std::uint64_t ExpertOffload::record_stride(const OffloadSetup& setup) {
     return stride;
 }
 
-// Whether plain decode's one-column calls take the divisor by context: a GGUF import's (or, with
-// INFERNIX_TMP_PLAIN_DIVISOR_ALL, every bank's) without speculation or a fixed divisor.
+// Whether plain decode's one-column calls take the divisor by context: a GGUF import's without
+// speculation or a fixed divisor.
 static bool plain_by_context(const OffloadSetup& setup, const OffloadOptions& options) noexcept {
-    return (options.plain_divisor_by_context || temporary_switches::offload().plain_divisor_all) && !setup.speculative &&
-           options.cpu_pcie_divisor == 0 && options.cpu_expert_workers > 0 && options.cpu_expert_jobs > 0;
+    return options.plain_divisor_by_context && !setup.speculative && options.cpu_pcie_divisor == 0 &&
+           options.cpu_expert_workers > 0 && options.cpu_expert_jobs > 0;
 }
 
 std::uint64_t ExpertOffload::fixed_bytes(const OffloadSetup& setup, const OffloadOptions& options) {
@@ -172,10 +184,10 @@ ExpertOffload::ExpertOffload(OffloadSetup setup, OffloadOptions options, Diagnos
     }
     staging_slots_ = staging_slots(setup_, options_);
     staging_       = DeviceBuffer(static_cast<std::size_t>(staging_slots_) * record_stride_);
-    placement_     = cpu_placement(temporary_switches::offload(), options_.cpu_expert_workers);
+    placement_     = cpu_placement(temporary_switches::offload(), options_.cpu_expert_workers, options_.engine_isolate);
     if (plain_by_context(setup_, options_)) {
         divisor_word_ = DeviceBuffer(16);
-        divisor_now_  = plain_divisor(temporary_switches::offload(), 0);
+        divisor_now_  = plain_divisor(0);
         std::memset(divisor_host_.data(), 0, 16);
         *static_cast<std::int32_t*>(divisor_host_.data()) = divisor_now_;
         divisor_word_.copy_from_host(divisor_host_.data(), 16);
@@ -183,13 +195,7 @@ ExpertOffload::ExpertOffload(OffloadSetup setup, OffloadOptions options, Diagnos
     residency_     = std::make_unique<ExpertResidency>(layout, std::move(banks), record_stride_, setup_.columns,
                                                        setup_.device, host_strides_);
     std::memset(error_.data(), 0, 64);
-    // TEMPORARY (INFERNIX_TMP_STREAM_PRIORITY, candidates §11 D5, as Flash-Next's staging and shared-expert
-    // streams): the fork and staging-overlap stream at the device's greatest priority (graphs keep it per
-    // node, core/decode_graph.cpp), so its copies and side work are scheduled ahead of the round's kernels.
-    static const bool prioritized = temporary_switches::flag("INFERNIX_TMP_STREAM_PRIORITY");
-    int least = 0, greatest = 0;
-    if (prioritized) { CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest)); }
-    CUDA_CHECK(cudaStreamCreateWithPriority(&overlap_.stream, cudaStreamNonBlocking, prioritized ? greatest : 0));
+    CUDA_CHECK(cudaStreamCreateWithPriority(&overlap_.stream, cudaStreamNonBlocking, side_stream_priority()));
     for (auto& event : overlap_.events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
 }
 
@@ -213,28 +219,17 @@ void ExpertOffload::diagnostic(const std::string& text, DiagnosticLevel level) c
     } catch (...) {}
 }
 
-void ExpertOffload::start(cudaStream_t compute, const std::function<void(std::uint64_t, std::uint64_t)>& lendable_frames) {
+void ExpertOffload::start(cudaStream_t compute) {
     // What the offload switches resolved to (their values are in the startup log's temporary switches line).
     {
-        const OffloadSwitches& switches = temporary_switches::offload();
         std::string line =
             "expert offload (temporary switches resolved): staging slots " + std::to_string(staging_slots_);
         if (divisor_word_.p != nullptr) {
-            line += "; plain decode one-column divisor " + std::to_string(plain_divisor(switches, 0)) + " below " +
+            line += "; plain decode one-column divisor " + std::to_string(plain_divisor(0)) + " below " +
                     std::to_string(kPlainDivisorContext) + " context tokens, " +
-                    std::to_string(plain_divisor(switches, kPlainDivisorContext)) + " from there";
+                    std::to_string(plain_divisor(kPlainDivisorContext)) + " from there";
         }
-        if (switches.prompt_credit >= 0.0 || switches.prompt_budget > 0) {
-            line += "; prompt seed credit " + std::to_string(switches.credit_or(kPromptSeedCredit)) + ", " +
-                    std::to_string(switches.prompt_budget) + " promotions per layer";
-        }
-        diagnostic(line);
-    }
-    // The prefill chunk the cache can lend a wide workspace for, from the frames it will start with,
-    // before the SSD tier (whose tickets are sized by the chunk).
-    if (options_.expert_cache && lendable_frames) {
-        const std::uint64_t frames = size_expert_frames(vram_->query(), frame_demand(record_stride_)).frames;
-        lendable_frames(frames - frames / 4, record_stride_);
+        diagnostic(line, DiagnosticLevel::Debug);
     }
     if (setup_.store != nullptr) { create_tier(); }
     // After the tier (whose pinned slots probe the link when the banks stay in the artifact), before
@@ -242,11 +237,11 @@ void ExpertOffload::start(cudaStream_t compute, const std::function<void(std::ui
     measure_link();
     if (options_.prefill_stream && options_.expert_cache) { create_stream(); }
     create_cpu_service();
-    size_frames(compute, lendable_frames);
+    size_frames(compute);
     warm_start(compute);
     // The SSD tier has no records in RAM before its fill: the CPU team's rates are measured on its RAM
-    // copies now, so the decode divisor follows this record size and CPU (source() reads it).
-    if (tier_ && cpu_service_) { measure_cpu_rate(); }
+    // copies now, so the decode split follows this record size and CPU (source() reads it).
+    if (tier_ && cpu_service_) { measure_cpu_rate_settled(); }
     if (!options_.route_trace.empty()) {
         trace_ = std::make_unique<RouteTrace>(
             options_.route_trace, RouteTraceSetup{.layers             = setup_.layout.layers,
@@ -291,7 +286,8 @@ void ExpertOffload::create_tier() {
             kStreamBounceMax);
         tier.stream_bounce = ExpertStream::kBounceParts * per_part;
     }
-    tier.slots = static_cast<std::uint32_t>(std::min<std::uint64_t>(options_.expert_ram_bytes / record_stride_, keys + lists));
+    tier.slots = HostExpertTier::slots_for_bytes(store, options_.expert_ram_bytes, tier);
+    if (options_.ram_exclusive && options_.expert_cache) { plan_exclusive(store, tier); }
     if (options_.prefill_stream && options_.expert_cache) { tier.stream = std::min(kStreamReadSlots, tier.slots / 8); }
     const std::uint32_t reserved =
         options_.expert_unpinned_bytes >= record_stride_ ? lists + tier.bounce + tier.stream_bounce : lists;
@@ -317,11 +313,11 @@ void ExpertOffload::create_tier() {
         striped_store_.emplace(with_stripe(store, read_expert_stripe(options_.expert_stripe), setup_.artifact_id));
         records = &*striped_store_;
         tier.io.demand_depth *= 2;
-        tier.io.total_depth = tier.io.demand_depth + tier.io.prefetch_depth;
+        tier.io.total_depth = tier.io.demand_depth + tier.io.restore_depth + tier.io.prefetch_depth;
         diagnostic("SSD tier: expert record tails from " + options_.expert_stripe.string(), DiagnosticLevel::Info);
     }
     tier_ = std::make_unique<HostExpertTier>(*records, std::move(tier));
-    residency_->attach_tier(tier_.get());
+    residency_->attach_tier(tier_.get(), exclusive_.slots != 0);
     if (tier_->refused_slots() > 0) {
         diagnostic("SSD expert tier: Windows refused to page-lock " + std::to_string(tier_->refused_slots()) +
                        " of the planned expert slots (its limit is the GPU's shared memory); they are kept as "
@@ -334,6 +330,49 @@ void ExpertOffload::create_tier() {
                        "); they still work, but under memory pressure the OS may page them out and responses slow down",
                    DiagnosticLevel::Warning);
     }
+}
+
+// The exclusive RAM layout (OffloadOptions::ram_exclusive; Qwen3.5-122B design §11.3), sized now that the frames
+// are known (the Program's fixed allocations are made): RAM holds every expert the warm start leaves out of the
+// frames and shadows for what VRAM gives back without a promotion. The largest loan is a prefill pass's: the
+// stream's ring, two halves of at most a layer's experts and its slot tables (lend_stream), beside the pass's
+// wide workspace. A RAM budget short of it (the ledger's SSD tier) keeps the plain tier.
+void ExpertOffload::plan_exclusive(const ExpertStore& store, HostExpertTier::Options& tier) {
+    const std::uint64_t keys   = static_cast<std::uint64_t>(store.layers()) * store.experts();
+    const std::uint64_t frame  = residency_->frame_bytes();
+    const std::uint64_t frames = size_expert_frames(vram_->query(), frame_demand(frame)).frames;
+    const auto in_frames       = [frame](std::uint64_t bytes) { return (bytes + frame - 1) / frame; };
+    const std::uint64_t loan   = 2ULL * setup_.layout.experts + 1 + in_frames(setup_.loan_bytes);
+    // The warm start seeds half the frames, as the full layout's: seeding every frame the shadows leave kept 5.8 GiB
+    // more out of RAM but decoded 4.5 % slower after a 32K prompt (Ornith, 2026-10-30), as on Flash-Next.
+    const ExclusiveTier plan = plan_exclusive_tier(keys, frames, loan, in_frames(setup_.kv_growth_bytes), kSeedShare);
+    const std::uint64_t lists = static_cast<std::uint64_t>(tier.ring) + tier.prefetch + tier.demotion;
+    const bool one_size = std::all_of(host_strides_.begin(), host_strides_.end(),
+                                      [this](std::uint64_t stride) { return stride == record_stride_; });
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+    char line[512];
+    if (!one_size || plan.slots == 0 || plan.slots + lists > tier.slots) {
+        std::snprintf(line, sizeof(line),
+                      "expert RAM layout exclusive: not used (%s); the SSD tier keeps the RAM plan's %u slots",
+                      !one_size         ? "the banks' records differ in size"
+                      : plan.slots == 0 ? "the frames are too few to lend from beside their shadows"
+                                        : "the RAM plan's share holds fewer slots than it needs",
+                      tier.slots);
+        diagnostic(line, DiagnosticLevel::Warning);
+        return;
+    }
+    exclusive_        = plan;
+    tier.slots        = static_cast<std::uint32_t>(plan.slots + lists);
+    tier.shadow_floor = static_cast<std::uint32_t>(plan.shadows);
+    std::snprintf(line, sizeof(line),
+                  "expert RAM layout exclusive: RAM keeps the %llu experts outside the warm start's %llu of %llu frames "
+                  "and copies of %llu VRAM experts for a prefill's loan (%llu frames), decode's swaps and the KV growth: "
+                  "%.1f GiB of slots against the full layout's %.1f GiB of experts",
+                  static_cast<unsigned long long>(keys - plan.seeded), static_cast<unsigned long long>(plan.seeded),
+                  static_cast<unsigned long long>(frames), static_cast<unsigned long long>(plan.shadows),
+                  static_cast<unsigned long long>(loan), static_cast<double>((plan.slots + lists) * store.record_bytes()) / kGiB,
+                  static_cast<double>(keys * store.record_bytes()) / kGiB);
+    diagnostic(line, DiagnosticLevel::Debug);
 }
 
 const std::uint8_t* ExpertOffload::host_record(std::uint32_t layer, std::uint32_t expert) const {
@@ -351,31 +390,18 @@ void ExpertOffload::measure_link() {
     double rate        = options_.link_bytes_per_second;
     const void* source = setup_.banks.front()->planes.records;
     if (source == nullptr && tier_) { source = tier_->slot_bytes(0); }
-    std::string calibrated; // INFERNIX_TMP_MACHINE_CALIBRATION's note
     if (rate <= 0.0 && source != nullptr && staging_.p != nullptr && staging_.bytes > 0) {
         rate = measure_h2d_bytes_per_second(source, staging_.p, staging_.bytes, 3);
-        // TEMPORARY (INFERNIX_TMP_MACHINE_CALIBRATION, candidates §7.3 D11, as Flash-Next's probe): a reading far
-        // below this GPU's saved rate is taken again, and the saved rate kept when that is low too.
-        if (const auto calibration = MachineCalibration::from_switch(); calibration && rate > 0.0) {
-            char bus[32] = {};
-            (void)cudaDeviceGetPCIBusId(bus, sizeof(bus), setup_.device);
-            rate = calibration->resolve(
-                std::string("link|") + bus + "|" + std::to_string(staging_.bytes), rate,
-                [&] { return measure_h2d_bytes_per_second(source, staging_.p, staging_.bytes, 3); }, calibrated);
-        }
     }
     if (rate <= 0.0) { return; } // nothing to probe with: keep the reference rate
-    if (!calibrated.empty()) { diagnostic("PCIe link calibration: " + calibrated, DiagnosticLevel::Warning); }
     link_bytes_per_second_ = rate;
     char text[256];
     std::snprintf(text, sizeof(text),
-                  "host-to-device link: %.1f GB/s%s; decode promotes every %llu tokens; prefill CPU split up to %d columns",
-                  rate / 1e9, options_.link_bytes_per_second > 0.0 ? " (set)" : " measured",
+                  "PCIe link to the GPU: %.1f GB/s%s; decode promotes every %llu tokens; prefill CPU split up to %d "
+                  "columns",
+                  rate / 1e9, options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured",
                   static_cast<unsigned long long>(promotion_interval()), options_.prefill_cpu_split ? split_columns() : 0);
     diagnostic(text, DiagnosticLevel::Debug);
-    std::snprintf(text, sizeof(text), "PCIe link to the GPU: %.1f GB/s%s", rate / 1e9,
-                  options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured");
-    diagnostic(text);
 }
 
 double ExpertOffload::cpu_expert_rate() const noexcept {
@@ -385,30 +411,56 @@ double ExpertOffload::cpu_column_rate() const noexcept {
     return cpu_column_rate_ > 0.0 ? cpu_column_rate_ : options_.cpu_split_column_rate;
 }
 
-// The share of a decode call's misses the PCIe stage keeps, misses / d, from C t (C experts per second
-// on the CPU, t seconds per record on the link): d = floor(1.65 + C t) (§19.3.12: the measured fastest
-// divisors put the switch from 2 to 3 at C t = 1.35).
-int ExpertOffload::pcie_divisor() const noexcept {
-    if (options_.cpu_pcie_divisor > 0) { return options_.cpu_pcie_divisor; }
-    const double record_seconds = static_cast<double>(setup_.banks.front()->planes.record_stride) / link_bytes_per_second_;
-    return std::max(1, static_cast<int>(std::floor(1.65 + cpu_expert_rate() * record_seconds)));
-}
+int ExpertOffload::pcie_divisor() const noexcept { return options_.cpu_pcie_divisor; }
 
-// INFERNIX_TMP_LINK_SHARE (Strata's L / (L + 1.85 R)): R from the CPU-rate probe and the first bank's
-// record, as pcie_divisor's C t.
+// The link's share of a decode call's misses in 256ths: INFERNIX_TMP_LINK_SHARE when set (Strata's
+// L / (L + 1.85 R) or a fixed fraction), else the decode split (placement.h decode_link_share_256) from the
+// measured link, the CPU team's rate and the first bank's record. It replaced the divisor rule d = floor(1.65 + C t)
+// (Flash-Next §19.3.12), whose 1/3 decoded the 122B 7-11 % slower (design §11.4).
 int ExpertOffload::pcie_share() const noexcept {
     if (options_.cpu_pcie_divisor > 0) { return 0; } // a fixed divisor wins
-    return link_share_256(temporary_switches::offload(), link_bytes_per_second_, cpu_expert_rate(),
-                          static_cast<double>(setup_.banks.front()->planes.record_stride));
+    const double record = static_cast<double>(setup_.banks.front()->planes.record_stride);
+    if (const int set = link_share_256(temporary_switches::offload(), link_bytes_per_second_, cpu_expert_rate(), record);
+        set > 0) {
+        return set;
+    }
+    return decode_link_share_256(link_bytes_per_second_, cpu_expert_rate(), record);
+}
+
+// An NVFP4 W4A16 bank on the exact CPU arithmetic assists prompt calls to kWideAssistMaxColumns, streaming from one
+// more, as Flash-Next's FP4-Local does with the same CPU kernel (candidates §51: pp256 +51.9 %, pp384 +37.3 %, pp575
+// +17.2 % there). The 122B before (2026-11-05, -p N -n 1 in one process, INT8 KV): pp255 279.5 tok/s against pp256
+// 228.1, pp320 253.7, pp384 283.5 (candidates §58). Other banks keep kAssistMaxColumns.
+bool ExpertOffload::wide_assist() const noexcept {
+    const ExpertBank& bank = *setup_.banks.front();
+    return bank.planes.gate_up_format == QType::NVFP4_MUL && bank.activation == moe::ExpertActivation::kA16 &&
+           options_.narrow_a16 == moe::NarrowA16::kExact;
+}
+
+std::int32_t ExpertOffload::assist_max_columns() const noexcept {
+    return wide_assist() ? kWideAssistMaxColumns : kAssistMaxColumns;
+}
+
+// An assisted call's link share of its host-memory misses (MoeCpuChannel::assist_share and its ramp): on a wide-assist
+// bank Flash-Next's FP4-Local ramp, 77/256 to 64 columns rising to 104/256 at 255 and on with the same slope to
+// kWideAssistMaxColumns (149/256), measured there with the same CPU kernel (Flash-Next design §19.3.50); the others
+// keep the decode share. A fixed cpu_pcie_divisor or INFERNIX_TMP_LINK_SHARE leaves every width alone.
+ExpertOffload::AssistShare ExpertOffload::assist_link_share() const noexcept {
+    const bool fixed = options_.cpu_pcie_divisor > 0 ||
+                       temporary_switches::offload().link_share != temporary_switches::OffloadSwitches::LinkShare::kDivisor;
+    if (fixed || !wide_assist()) { return {}; }
+    constexpr int kShare = 77, kShareAt255 = 104, kRampFrom = 64;
+    constexpr int kWide  = kShare + (kShareAt255 - kShare) * (kWideAssistMaxColumns - kRampFrom) / (kAssistMaxColumns - kRampFrom);
+    return {kShare, std::min(256, kWide), kRampFrom};
 }
 
 int ExpertOffload::one_column_divisor() const noexcept {
-    return plain_by_context(setup_, options_) ? plain_divisor(temporary_switches::offload(), 0) : 0;
+    return plain_by_context(setup_, options_) ? plain_divisor(0) : 0;
 }
 
 void ExpertOffload::set_plain_position(std::int32_t position, cudaStream_t compute) {
     if (divisor_word_.p == nullptr) { return; }
-    const std::int32_t d = plain_divisor(temporary_switches::offload(), position);
+    const std::int32_t d = plain_divisor(position);
     if (d == divisor_now_) { return; }
     // The last upload has run (rounds synchronize), so the pinned source may change.
     *static_cast<std::int32_t*>(divisor_host_.data()) = d;
@@ -416,9 +468,15 @@ void ExpertOffload::set_plain_position(std::int32_t position, cudaStream_t compu
     divisor_now_ = d;
 }
 
+std::int32_t split_width(double configured, double reference_bytes_per_second, double link_bytes_per_second) noexcept {
+    constexpr double kTolerance = 0.05;
+    const double ratio = reference_bytes_per_second / link_bytes_per_second;
+    const double scale = ratio >= 1.0 - kTolerance && ratio <= 1.0 + kTolerance ? 1.0 : ratio;
+    return static_cast<std::int32_t>(std::min<double>(configured * scale, moe::kMaxCpuCallColumns));
+}
+
 std::int32_t ExpertOffload::split_columns() const noexcept {
-    const double scaled = options_.cpu_split_columns * kReferenceLinkBytesPerSecond / link_bytes_per_second_;
-    return static_cast<std::int32_t>(std::min<double>(scaled, moe::kMaxCpuCallColumns));
+    return split_width(options_.cpu_split_columns, kReferenceLinkBytesPerSecond, link_bytes_per_second_);
 }
 
 std::uint64_t ExpertOffload::promotion_interval() const noexcept {
@@ -430,7 +488,7 @@ std::uint64_t ExpertOffload::promotion_interval() const noexcept {
 // DRAM reads compete with the CPU's): experts per second on one-column jobs and expert columns per
 // second on kNarrowColumns-column jobs, the best of three batches each, retried while other processes
 // load the CPU (§19.3.28).
-void ExpertOffload::measure_cpu_rate() {
+std::optional<CpuRateReading> ExpertOffload::measure_cpu_rate() {
     const std::uint32_t L = setup_.layout.layers, E = setup_.layout.experts;
     std::vector<std::vector<std::uint32_t>> held(L); // per layer, the experts with a host copy
     bool measured = L > 0;
@@ -440,123 +498,120 @@ void ExpertOffload::measure_cpu_rate() {
         }
         measured = !held[l].empty();
     }
+    if (!measured) { return std::nullopt; }
+    const ExpertBank& front = *setup_.banks.front();
+    const moe::ExpertShape shape = front.shape();
+    // The service's team and placement (its worker 0, the service thread, is this thread here).
+    moe::CpuExpertTeam team({.workers    = static_cast<int>(placement_.workers),
+                             .max_jobs   = kRateJobs,
+                             .activation = front.activation,
+                             .narrow_a16 = options_.narrow_a16,
+                             .ggml       = ggml_format(front).valid(),
+                             .nvfp4_a8   = options_.narrow_a16 == moe::NarrowA16::kA8, // the misses' route sets the rates
+                             .shape      = shape,
+                             .cpus       = placement_.cpus});
+    const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
+    const auto H = static_cast<std::size_t>(shape.hidden);
+    std::vector<std::uint16_t> x(H * kNarrowColumns);
+    std::vector<std::uint16_t> y(H * kRateJobs * kNarrowColumns);
+    for (std::size_t i = 0; i < x.size(); ++i) { x[i] = static_cast<std::uint16_t>(0x3C00U + (i * 7919U) % 640U); }
+    std::vector<moe::CpuExpertJob> jobs(kRateJobs);
+    const auto fill = [&](int round, int columns) {
+        for (int k = 0; k < kRateJobs; ++k) {
+            const std::uint32_t layer = static_cast<std::uint32_t>(round * kRateJobs + k) % L;
+            const ExpertBank& bank    = *setup_.banks[layer];
+            const auto& experts       = held[layer];
+            const std::uint32_t expert =
+                experts[(static_cast<std::uint32_t>(round) * 131U + static_cast<std::uint32_t>(k) * 37U) % experts.size()];
+            auto& job  = jobs[static_cast<std::size_t>(k)];
+            job.record = host_record(layer, expert);
+            job.ggml   = ggml_format(bank);
+            job.a8     = options_.narrow_a16 == moe::NarrowA16::kA8 && !job.ggml.valid();
+            job.scales = job.ggml.valid() ? moe::ExpertScales{} : bank.scales[expert];
+            job.ncols  = columns;
+            for (int c = 0; c < columns; ++c) {
+                job.x[c] = x.data() + static_cast<std::size_t>(c) * H;
+                job.y[c] = y.data() + (static_cast<std::size_t>(k) * kNarrowColumns + c) * H;
+            }
+        }
+    };
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const std::uint64_t source_stride = front.planes.record_stride; // at most the staging pitch
+    const auto rate = [&](int columns, int first_round) {
+        fill(first_round + kRateRepeats * kRateRounds, columns); // warm-up round
+        team.run(jobs);
+        double best = 0.0;
+        for (int repeat = 0; repeat < kRateRepeats; ++repeat) {
+            for (int i = 0; i < kLoadCopies; ++i) {
+                const auto& first = held.front();
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(staging_.p) + (i % staging_slots_) * record_stride_,
+                                           host_record(0, first[static_cast<std::size_t>(i) % first.size()]),
+                                           source_stride, cudaMemcpyHostToDevice, stream));
+            }
+            const auto start = std::chrono::steady_clock::now();
+            for (int r = 0; r < kRateRounds; ++r) {
+                fill(first_round + repeat * kRateRounds + r, columns);
+                team.run(jobs);
+            }
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            best = std::max(best, kRateRounds * kRateJobs / seconds);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        return best;
+    };
+    const auto began = std::chrono::steady_clock::now();
+    CpuRateReading reading;
     int attempts = 0;
     bool quiet   = true;
     double first_share = 0.0, last_share = 0.0;
-    if (measured) {
-        const ExpertBank& front = *setup_.banks.front();
-        const moe::ExpertShape shape = front.shape();
-        // The service's team and placement (its worker 0, the service thread, is this thread here).
-        moe::CpuExpertTeam team({.workers    = static_cast<int>(placement_.workers),
-                                 .max_jobs   = kRateJobs,
-                                 .activation = front.activation,
-                                 .ggml       = ggml_format(front).valid(),
-                                 .shape      = shape,
-                                 .cpus       = placement_.cpus,
-                                 .shared_x   = temporary_switches::flag("INFERNIX_TMP_CPU_SHARED_X")});
-        const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
-        const auto H = static_cast<std::size_t>(shape.hidden);
-        std::vector<std::uint16_t> x(H * kNarrowColumns);
-        std::vector<std::uint16_t> y(H * kRateJobs * kNarrowColumns);
-        for (std::size_t i = 0; i < x.size(); ++i) { x[i] = static_cast<std::uint16_t>(0x3C00U + (i * 7919U) % 640U); }
-        std::vector<moe::CpuExpertJob> jobs(kRateJobs);
-        const auto fill = [&](int round, int columns) {
-            for (int k = 0; k < kRateJobs; ++k) {
-                const std::uint32_t layer = static_cast<std::uint32_t>(round * kRateJobs + k) % L;
-                const ExpertBank& bank    = *setup_.banks[layer];
-                const auto& experts       = held[layer];
-                const std::uint32_t expert =
-                    experts[(static_cast<std::uint32_t>(round) * 131U + static_cast<std::uint32_t>(k) * 37U) % experts.size()];
-                auto& job  = jobs[static_cast<std::size_t>(k)];
-                job.record = host_record(layer, expert);
-                job.ggml   = ggml_format(bank);
-                job.scales = job.ggml.valid() ? moe::ExpertScales{} : bank.scales[expert];
-                job.ncols  = columns;
-                for (int c = 0; c < columns; ++c) {
-                    job.x[c] = x.data() + static_cast<std::size_t>(c) * H;
-                    job.y[c] = y.data() + (static_cast<std::size_t>(k) * kNarrowColumns + c) * H;
-                }
-            }
-        };
-        cudaStream_t stream = nullptr;
-        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        const std::uint64_t source_stride = front.planes.record_stride; // at most the staging pitch
-        const auto rate = [&](int columns, int first_round) {
-            fill(first_round + kRateRepeats * kRateRounds, columns); // warm-up round
-            team.run(jobs);
-            double best = 0.0;
-            for (int repeat = 0; repeat < kRateRepeats; ++repeat) {
-                for (int i = 0; i < kLoadCopies; ++i) {
-                    const auto& first = held.front();
-                    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(staging_.p) + (i % staging_slots_) * record_stride_,
-                                               host_record(0, first[static_cast<std::size_t>(i) % first.size()]),
-                                               source_stride, cudaMemcpyHostToDevice, stream));
-                }
-                const auto start = std::chrono::steady_clock::now();
-                for (int r = 0; r < kRateRounds; ++r) {
-                    fill(first_round + repeat * kRateRounds + r, columns);
-                    team.run(jobs);
-                }
-                const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-                best = std::max(best, kRateRounds * kRateJobs / seconds);
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-            }
-            return best;
-        };
-        const auto began = std::chrono::steady_clock::now();
-        double expert_rate = 0.0, column_rate = 0.0;
-        for (;;) {
-            const HostCpuTimes before = host_cpu_times();
-            const double experts      = rate(1, 0);
-            const double columns      = rate(kNarrowColumns, (kRateRepeats + 1) * kRateRounds) * kNarrowColumns;
-            const double others       = other_process_cpu_share(before, host_cpu_times());
-            if (attempts == 0) { first_share = others; }
-            last_share = others;
-            ++attempts;
-            expert_rate = std::max(expert_rate, experts);
-            column_rate = std::max(column_rate, columns);
-            quiet       = others < kQuietShare;
-            if (quiet || std::chrono::steady_clock::now() - began >= kRetryBudget) { break; }
-            std::this_thread::sleep_for(kRetryPause);
-        }
-        // TEMPORARY (INFERNIX_TMP_MACHINE_CALIBRATION, as Flash-Next's): a rate far below this configuration's
-        // saved one is measured once more, and the saved rate kept when that is low too.
-        if (const auto calibration = MachineCalibration::from_switch()) {
-            const std::string key = "cpu|" + std::to_string(placement_.workers) + "|" + placement_.text + "|" +
-                                    std::to_string(static_cast<int>(front.activation)) + "|" +
-                                    std::to_string(ggml_format(front).valid() ? 1 : 0) + "|" +
-                                    std::to_string(front.planes.record_stride) + (tier_ ? "|tier" : "");
-            std::string note;
-            expert_rate = calibration->resolve(key + "|experts", expert_rate, [&] { return rate(1, 0); }, note);
-            if (!note.empty()) { calibration_note_ = "experts/s " + note; }
-            note.clear();
-            column_rate = calibration->resolve(
-                key + "|columns", column_rate,
-                [&] { return rate(kNarrowColumns, (kRateRepeats + 1) * kRateRounds) * kNarrowColumns; }, note);
-            if (!note.empty()) { calibration_note_ += (calibration_note_.empty() ? "" : "; ") + ("columns/s " + note); }
-        }
-        cpu_expert_rate_ = expert_rate;
-        cpu_column_rate_ = column_rate;
-        (void)set_current_thread_cpus(caller_cpus);
-        CUDA_CHECK(cudaStreamDestroy(stream));
+    for (;;) {
+        const HostCpuTimes before = host_cpu_times();
+        const double experts      = rate(1, 0);
+        const double columns      = rate(kNarrowColumns, (kRateRepeats + 1) * kRateRounds) * kNarrowColumns;
+        const double others       = other_process_cpu_share(before, host_cpu_times());
+        if (attempts == 0) { first_share = others; }
+        last_share = others;
+        ++attempts;
+        reading.experts = std::max(reading.experts, experts);
+        reading.columns = std::max(reading.columns, columns);
+        quiet           = others < kQuietShare;
+        if (quiet || std::chrono::steady_clock::now() - began >= kRetryBudget) { break; }
+        std::this_thread::sleep_for(kRetryPause);
     }
-    std::string how = measured ? (tier_ ? "measured on the SSD tier's RAM copies" : "measured")
-                               : "reference: no expert records in RAM yet";
-    if (!calibration_note_.empty()) { how += "; calibration: " + calibration_note_; }
+    (void)set_current_thread_cpus(caller_cpus);
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    reading.note = tier_ ? "measured on the SSD tier's RAM copies" : "measured";
     char share[160];
-    if (measured && attempts > 1) {
+    if (attempts > 1) {
         std::snprintf(share, sizeof(share), " after %d attempts: other processes used %.0f %% of the CPU at first, %.0f %% last",
                       attempts, 100.0 * first_share, 100.0 * last_share);
-        how += share;
-    } else if (measured) {
-        std::snprintf(share, sizeof(share), "; other processes used %.0f %% of the CPU", 100.0 * last_share);
-        how += share;
-    }
-    char kept[160];
-    if (const int share = pcie_share(); share > 0) {
-        std::snprintf(kept, sizeof(kept), "%d/256 (INFERNIX_TMP_LINK_SHARE; the divisor rule's 1/%d)", share, pcie_divisor());
     } else {
-        std::snprintf(kept, sizeof(kept), "1/%d", pcie_divisor());
+        std::snprintf(share, sizeof(share), "; other processes used %.0f %% of the CPU", 100.0 * last_share);
+    }
+    reading.note += share;
+    reading.busy_share = quiet ? -1.0 : last_share;
+    return reading;
+}
+
+// The CPU team's rates, settled (placement.h settle_cpu_rates), right after the banks' load or the tier's fill.
+void ExpertOffload::measure_cpu_rate_settled() {
+    const SettledCpuRates rates = settle_cpu_rates([this] { return measure_cpu_rate(); });
+    const bool measured         = !rates.readings.empty();
+    if (measured) {
+        cpu_expert_rate_ = rates.experts;
+        cpu_column_rate_ = rates.columns;
+    }
+    const std::string how = measured ? rates.note + rates.readings_text() : "reference: no expert records in RAM yet";
+    char kept[160];
+    const double ct = cpu_expert_rate() * static_cast<double>(setup_.banks.front()->planes.record_stride) /
+                      link_bytes_per_second_;
+    if (pcie_divisor() > 0) {
+        std::snprintf(kept, sizeof(kept), "1/%d (fixed)", pcie_divisor());
+    } else if (temporary_switches::offload().link_share != OffloadSwitches::LinkShare::kDivisor) {
+        std::snprintf(kept, sizeof(kept), "%d/256 (INFERNIX_TMP_LINK_SHARE)", pcie_share());
+    } else {
+        std::snprintf(kept, sizeof(kept), "%d/256 (C t %.2f)", pcie_share(), ct);
     }
     char text[640];
     std::snprintf(text, sizeof(text),
@@ -564,16 +619,19 @@ void ExpertOffload::measure_cpu_rate() {
                   "on the link: %s",
                   placement_.workers, moe::cpu_isa_name(moe::best_cpu_isa()), cpu_expert_rate_, cpu_column_rate_,
                   how.c_str(), kept);
-    diagnostic(text, DiagnosticLevel::Info);
+    // An A/B arm of the link share shows its choice without debug logging.
+    diagnostic(text, temporary_switches::offload().link_share != OffloadSwitches::LinkShare::kDivisor
+                         ? DiagnosticLevel::Info
+                         : DiagnosticLevel::Debug);
     if (moe::best_cpu_isa() == moe::CpuIsa::kScalar) {
         diagnostic("the CPU has no AVX2: the CPU expert team computes experts with scalar code, so the GPU serves "
                    "most misses over PCIe",
                    DiagnosticLevel::Warning);
     }
     if (measured && temporary_switches::flag("INFERNIX_TMP_CPU_PROBE_DETAIL")) { cpu_probe_detail(); }
-    if (measured && !quiet) {
+    if (measured && rates.busy_share >= 0.0) {
         diagnostic("the CPU expert team's rates were measured while other processes kept the CPU busy (" +
-                       std::to_string(static_cast<int>(100.0 * last_share + 0.5)) +
+                       std::to_string(static_cast<int>(100.0 * rates.busy_share + 0.5)) +
                        " %); the decode miss split follows them for this session and may leave decode slower; start "
                        "the engine when the machine is quieter",
                    DiagnosticLevel::Warning);
@@ -705,7 +763,7 @@ void ExpertOffload::create_stream() {
         };
         ssd.wait    = [tier = tier_.get()](std::int32_t slot) { return tier->stream_wait(slot); };
         ssd.release = [tier = tier_.get()](std::int32_t slot) { tier->stream_release(slot); };
-        ssd.slots   = [tier = tier_.get()] { return tier->stream_slots(); };
+        ssd.layer_cap = [tier = tier_.get()](std::uint32_t layer) { return tier->stream_layer_cap(layer); };
     }
     stream_ = std::make_unique<ExpertStream>(setup_.layout.layers, setup_.layout.experts, record_stride_, std::move(record_of),
                                              !tier_, std::move(hold), host_strides_, std::move(ssd));
@@ -723,14 +781,18 @@ void ExpertOffload::create_stream() {
 // CPU-served misses for decode and verification calls and every call of at most kMaxCpuColumns
 // columns (short prompts, chunk remainders, forced tokens), whose experts are all thin and so give the
 // same bits on either device (design §16.2); wider prefill chunks stay on the GPU, except the
-// assisted calls up to kAssistMaxColumns and the streamed chunks' split.
+// assisted calls up to assist_max_columns() and the streamed chunks' split.
 void ExpertOffload::create_cpu_service() {
     const std::uint32_t workers = placement_.workers, jobs = options_.cpu_expert_jobs;
     if (workers == 0 || jobs == 0) { return; }
-    if (!placement_.text.empty()) { diagnostic(placement_.text); }
-    if (!tier_) { measure_cpu_rate(); } // the tier's rates follow its fill (start)
+    // An A/B arm of the placement, or a team the host cut, shows without debug logging.
+    if (!placement_.text.empty()) {
+        diagnostic(placement_.text, placement_.announce ? DiagnosticLevel::Info : DiagnosticLevel::Debug);
+    }
+    if (!tier_) { measure_cpu_rate_settled(); } // the tier's rates follow its fill (start)
     const int decode_columns = std::max(moe::kMaxCpuColumns, setup_.lanes * setup_.max_width);
-    const bool assist        = options_.cpu_assist_jobs > 0 && decode_columns < kAssistMaxColumns;
+    const bool assist        = options_.cpu_assist_jobs > 0 && decode_columns < assist_max_columns();
+    const AssistShare share  = assist ? assist_link_share() : AssistShare{};
     std::vector<moe::CpuMissService::Layer> layers;
     for (const ExpertBank* bank : setup_.banks) {
         layers.push_back({.records       = reinterpret_cast<const std::uint8_t*>(bank->planes.records),
@@ -744,14 +806,19 @@ void ExpertOffload::create_cpu_service() {
         moe::CpuMissService::Options{
             .workers            = static_cast<int>(workers),
             .max_jobs           = static_cast<int>(std::min<std::uint32_t>(jobs, moe::kMaxCpuJobs)),
-            .max_columns        = assist ? kAssistMaxColumns : decode_columns,
+            .max_columns        = assist ? assist_max_columns() : decode_columns,
             .pcie_divisor       = pcie_divisor(),
             .one_column_divisor = one_column_divisor(),
             .pcie_share         = pcie_share(),
             .wide_from          = assist ? decode_columns + 1 : 0,
             .wide_jobs          = assist ? static_cast<int>(std::min<std::uint32_t>(options_.cpu_assist_jobs, moe::kMaxCpuJobs)) : 0,
+            .assist_share       = share.share,
+            .assist_share_wide  = share.wide,
+            .assist_ramp_from   = share.ramp_from,
             .cpus               = placement_.cpus,
             .activation         = front.activation,
+            .narrow_a16         = options_.narrow_a16,
+            .nvfp4_a8           = options_.narrow_a16 == moe::NarrowA16::kA8,
             .shape              = front.shape(),
             .records            = tier_.get(), // tier mode: SSD-only jobs read through the tier
             // Reported when it happens; the next round's check_error then stops the Engine with it.
@@ -807,7 +874,6 @@ VramDemand ExpertOffload::frame_demand(std::uint64_t frame_bytes) const {
     demand.headroom    = options_.vram_headroom;
     demand.elastic     = residency_->elastic() && options_.vram_monitor;
     demand.graphs      = setup_.graph_bound;
-    demand.eager_graphs = setup_.eager_graphs;
     demand.frame_bytes = frame_bytes;
     demand.max_frames  = residency_->frame_limit();
     return demand;
@@ -815,13 +881,13 @@ VramDemand ExpertOffload::frame_demand(std::uint64_t frame_bytes) const {
 
 // The frames take what the fixed allocations, the graph executables' reserve and the display headroom
 // leave (§19.3.7); a chunk the driver places in system memory is given back and the cache stops there.
-void ExpertOffload::size_frames(cudaStream_t compute, const std::function<void(std::uint64_t, std::uint64_t)>& lendable_frames) {
+void ExpertOffload::size_frames(cudaStream_t compute) {
     if (!options_.expert_cache) { return; }
     const VramDemand demand = frame_demand(residency_->frame_bytes());
     sizing_                 = size_expert_frames(vram_->query(), demand);
     // Each pool maps whole chunks: one chunk of slack per pool beyond the first.
-    const auto slack = static_cast<std::uint32_t>((residency_->pools() - 1) * ExpertResidency::kChunkBytes / residency_->frame_bytes());
-    sizing_.frames   = sizing_.frames > slack ? sizing_.frames - slack : 0U;
+    const std::uint32_t slack = pool_slack_frames(residency_->pools(), ExpertResidency::kChunkBytes, residency_->frame_bytes());
+    sizing_.frames            = sizing_.frames > slack ? sizing_.frames - slack : 0U;
     const auto grown = residency_->resize(sizing_.frames, compute, *vram_);
     if (grown.spilled != 0) {
         diagnostic(std::to_string(grown.spilled >> 20) + " MiB of the expert frames were placed in system memory and given "
@@ -837,7 +903,7 @@ void ExpertOffload::size_frames(cudaStream_t compute, const std::function<void(s
     {
         const std::uint64_t experts = static_cast<std::uint64_t>(setup_.layout.layers) * setup_.layout.experts;
         char line[192];
-        std::snprintf(line, sizeof(line), "expert cache: %u VRAM frames (%.1f GiB) for %llu routed experts (%.0f %%)",
+        std::snprintf(line, sizeof(line), "expert cache: %u experts in VRAM (%.1f GiB) of the %llu routed experts (%.0f %%)",
                       sizing_.frames,
                       static_cast<double>(sizing_.frames) * static_cast<double>(residency_->frame_bytes()) / kLedgerGiB,
                       static_cast<unsigned long long>(experts),
@@ -874,12 +940,19 @@ void ExpertOffload::size_frames(cudaStream_t compute, const std::function<void(s
         vram_epoch_     = Clock::now();
         monitor_ = std::make_unique<VramMonitor>(setup_.device, *vram_, [this](const VramSnapshot& s) { on_vram_snapshot(s); });
     }
-    if (grown.frames > 0 && lendable_frames) {
-        lendable_frames(residency_->lend_capacity_bytes() / residency_->lend_pitch(), residency_->lend_pitch());
-    }
 }
 
 double ExpertOffload::vram_seconds() const { return std::chrono::duration<double>(Clock::now() - vram_epoch_).count(); }
+
+ExpertCacheTotals ExpertOffload::totals() const noexcept {
+    const ExpertResidency::Stats& s = residency_->stats();
+    return ExpertCacheTotals{.frames     = residency_->frames(),
+                             .routed     = s.routed,
+                             .hits       = s.hits,
+                             .promotions = s.promotions,
+                             .landed     = s.landed,
+                             .cpu_served = cpu_service_ ? cpu_service_->served_experts() : 0};
+}
 
 ExpertCacheMemorySummary ExpertOffload::memory_summary() const noexcept {
     ExpertCacheMemorySummary out;
@@ -998,10 +1071,12 @@ void ExpertOffload::give_frames(std::uint64_t bytes, cudaStream_t compute) {
 // ------------------------------------------------------------------------------------- warm start
 
 // The SSD tier's RAM fill order (Flash-Next §19.3.7 §4.9): the saved ranking (the last session's VRAM
-// residents, best first), then every other key that session used, most used first, then the keys it
-// never used, one expert of every layer in turn, so no layer is left wholly on the SSD.
+// residents, best first), then every other key that session used, most used first, then the calibrated
+// order's ranking of the rest (`calibrated`, null without one or with --expert-state off), then the keys
+// left, one expert of every layer in turn, so no layer is left wholly on the SSD.
 static std::vector<std::uint32_t> tier_fill_order(std::uint32_t layers, std::uint32_t experts,
-                                                  const expert_cache::SavedState* state) {
+                                                  const expert_cache::SavedState* state,
+                                                  const expert_cache::SavedState* calibrated) {
     const std::uint32_t keys = layers * experts;
     const auto spread        = [&](std::uint32_t key) { return (key % experts) * layers + key / experts; };
     std::vector<std::uint32_t> order;
@@ -1029,6 +1104,16 @@ static std::vector<std::uint32_t> tier_fill_order(std::uint32_t layers, std::uin
             }
         }
     }
+    // The calibrated order ranks every key, so the keys a saved session never used follow its ranking
+    // rather than the file's.
+    if (calibrated != nullptr) {
+        for (const std::uint32_t key : calibrated->ranked) {
+            if (key < keys && listed[key] == 0) {
+                order.push_back(key);
+                listed[key] = 1;
+            }
+        }
+    }
     for (std::uint32_t i = 0; i < keys; ++i) {
         const std::uint32_t key = (i % layers) * experts + i / layers; // spread(key) == i
         if (listed[key] == 0) { order.push_back(key); }
@@ -1036,25 +1121,25 @@ static std::vector<std::uint32_t> tier_fill_order(std::uint32_t layers, std::uin
     return order;
 }
 
-// Fills the frames from the saved state before the first request; without one (a first start, or a
-// state of another artifact), from the model's calibrated order when it has one (S4b). With the SSD
-// tier, RAM is filled first (the frames load from it), then the seeds' RAM copies are released and
-// their slots refilled with the next keys of the fill order, so the two levels hold different experts.
+// Fills the frames from the saved state before the first request; without one (a first start, a
+// state of another artifact, or no file given: the bench and the tools), from the model's calibrated
+// order when it has one (S4b), unless --expert-state off asked for an empty cache
+// (expert_cache::choose_warm_start). With the SSD tier, RAM is filled first (the frames load from it),
+// then the seeds' RAM copies are released and their slots refilled with the next keys of the fill
+// order, so the two levels hold different experts. Only a given file is read or saved.
 void ExpertOffload::warm_start(cudaStream_t compute) {
     const std::uint32_t keys = setup_.layout.layers * setup_.layout.experts;
-    expert_cache::ExpertStateLoad load;
-    enum class Seed { None, Saved, Calibrated } seed = Seed::None;
-    if (!options_.expert_state.empty() && options_.expert_cache) {
-        load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, keys);
-        if (load.state) {
-            seed = Seed::Saved;
-        } else if (setup_.calibrated_state != nullptr) {
-            diagnostic("expert cache: no saved state used: " + load.message, DiagnosticLevel::Debug);
-            load.state = *setup_.calibrated_state;
-            seed       = Seed::Calibrated;
+    using Seed = expert_cache::WarmStartSource;
+    expert_cache::WarmStartSeed choice;
+    if (options_.expert_cache) {
+        choice = expert_cache::choose_warm_start(options_.expert_state, options_.expert_state_identity, keys,
+                                                 options_.expert_seed, setup_.calibrated_state);
+        if (choice.source == Seed::Calibrated && !choice.message.empty()) {
+            diagnostic("expert cache: no saved state used: " + choice.message, DiagnosticLevel::Debug);
         }
     }
-    const expert_cache::SavedState* state = load.state ? &*load.state : nullptr;
+    const Seed seed                       = choice.source;
+    const expert_cache::SavedState* state = choice.state ? &*choice.state : nullptr;
     // The tier's first RAM pass.
     std::vector<std::uint32_t> order;
     std::uint32_t filled = 0;
@@ -1062,20 +1147,27 @@ void ExpertOffload::warm_start(cudaStream_t compute) {
     if (tier_) {
         if (tier_->keys() != keys) { throw std::logic_error("expert offload: the SSD tier has another key count"); }
         const auto began = Clock::now();
-        order            = tier_fill_order(setup_.layout.layers, setup_.layout.experts, state);
+        order            = tier_fill_order(setup_.layout.layers, setup_.layout.experts, state,
+                                           options_.expert_seed ? setup_.calibrated_state : nullptr);
         if (state != nullptr && state->counts.size() == keys) { tier_->controller().seed_uses(state->counts, kSeedCountCap); }
         filled       = tier_->prefill(order);
         tier_seconds = std::chrono::duration<double>(Clock::now() - began).count();
     }
     // The frames.
     std::uint32_t seeded = 0;
-    if (!options_.expert_state.empty() && options_.expert_cache) {
+    if (options_.expert_cache) {
         if (seed == Seed::None) {
-            diagnostic("expert cache: no saved state yet, so it starts empty and fills as requests arrive");
-            diagnostic("expert cache starts empty: " + load.message, DiagnosticLevel::Debug);
+            diagnostic(!options_.expert_seed ? "expert cache: --expert-state off, so it starts empty and fills as requests arrive"
+                                             : "expert cache: no saved state yet, so it starts empty and fills as requests arrive");
+            if (!choice.message.empty()) { diagnostic("expert cache starts empty: " + choice.message, DiagnosticLevel::Debug); }
         } else {
-            const auto began    = Clock::now();
-            const auto max_keys = static_cast<std::uint32_t>(kSeedShare * residency_->frames());
+            const auto began = Clock::now();
+            // The exclusive layout's seeds never take the frames its shadows cover (plan_exclusive_tier).
+            const std::uint32_t frames   = residency_->frames();
+            const std::uint64_t unshadowed = frames > exclusive_.shadows ? frames - exclusive_.shadows : 0;
+            const auto max_keys = exclusive_.slots != 0
+                                      ? static_cast<std::uint32_t>(std::min<std::uint64_t>(exclusive_.seeded, unshadowed))
+                                      : static_cast<std::uint32_t>(kSeedShare * frames);
             seeded              = residency_->warm_start(*state, kSeedCountCap, max_keys, compute);
             CUDA_CHECK(cudaStreamSynchronize(compute));
             const double seconds = std::chrono::duration<double>(Clock::now() - began).count();
@@ -1098,29 +1190,52 @@ void ExpertOffload::warm_start(cudaStream_t compute) {
     }
     if (!tier_) { return; }
     // The seeds are in VRAM: their RAM copies (shadows) are released and their slots take the next keys
-    // of the fill order; the unpinned records take the next keys neither the slots nor the frames hold.
+    // of the fill order (all of it past the keys VRAM holds: the first pass passed over the keys of a record
+    // size whose slots it had filled, wherever they rank); the unpinned records take the next keys neither the
+    // slots nor the frames hold.
     const auto began       = Clock::now();
     std::uint32_t released = 0, refilled = 0;
+    const std::int32_t* in_vram = residency_->host_table();
+    const auto vram_holds = [in_vram](std::uint32_t key) { return in_vram != nullptr && in_vram[key] >= 0; };
     if (seeded > 0) {
         released = tier_->controller().release_shadows();
-        if (released > 0) { refilled = tier_->prefill(std::span<const std::uint32_t>(order).subspan(filled)); }
+        if (released > 0) { refilled = tier_->prefill(order, vram_holds); }
     }
-    const std::int32_t* in_vram = residency_->host_table();
-    const std::uint32_t unpinned =
-        tier_->fill_unpinned(order, [in_vram](std::uint32_t key) { return in_vram != nullptr && in_vram[key] >= 0; });
+    const std::uint32_t unpinned = tier_->fill_unpinned(order, vram_holds);
+    // Slots still free hold shadows of the least-used seeds (a loan's and decode's first victims), as
+    // Qwen3.8-Flash-Next's Program does.
+    std::uint32_t shadows = 0;
+    if (seeded > 0 && in_vram != nullptr) {
+        std::vector<std::uint32_t> least_used_seeds;
+        for (auto it = order.rbegin(); it != order.rend(); ++it) {
+            if (in_vram[*it] >= 0) { least_used_seeds.push_back(*it); }
+        }
+        shadows = tier_->prefill_shadows(least_used_seeds);
+    }
     const double seconds     = tier_seconds + std::chrono::duration<double>(Clock::now() - began).count();
     const std::uint32_t in_ram = filled - released + refilled;
-    const double gib           = static_cast<double>(tier_->record_bytes()) / (1ULL << 30);
-    char line[512];
+    const std::uint32_t on_ssd = keys - in_ram - released - unpinned;
+    char line[600];
+    if (on_ssd == 0) {
+        std::snprintf(line, sizeof(line),
+                      "experts in RAM: %u (read in %.1f s); with the expert cache they hold all %u experts, so none is "
+                      "read from the model files",
+                      in_ram + unpinned, seconds, keys);
+    } else {
+        std::snprintf(line, sizeof(line),
+                      "experts in RAM: %u (read in %.1f s); %u of the %u experts are read from the model files when used",
+                      in_ram + unpinned, seconds, on_ssd, keys);
+    }
+    diagnostic(line);
     std::snprintf(line, sizeof(line),
-                  "SSD expert tier: %u RAM slots (%.1f GiB) hold %u experts (%s), %u unpinned records %u more, read in %.1f s; "
-                  "%u of %u experts are read from the artifact when used",
-                  tier_->pinned_slots(), gib * tier_->pinned_slots(), in_ram,
+                  "SSD expert tier: %u RAM slots (%.1f GiB) hold %u experts (%s) and copies of %u of the least-used in "
+                  "VRAM, %u unpinned records %u more, read in %.1f s; %u of %u experts are read from the artifact when used",
+                  tier_->pinned_slots(), static_cast<double>(tier_->pinned_bytes()) / (1ULL << 30), in_ram,
                   seed == Seed::Saved        ? "the saved ranking, then the last session's use counts"
                   : seed == Seed::Calibrated ? "the calibrated expert order"
                                              : "spread across the layers",
-                  tier_->unpinned_records(), unpinned, seconds, keys - in_ram - released - unpinned, keys);
-    diagnostic(line);
+                  shadows, tier_->unpinned_records(), unpinned, seconds, on_ssd, keys);
+    diagnostic(line, DiagnosticLevel::Debug);
 }
 
 void ExpertOffload::save_state() noexcept {
@@ -1192,6 +1307,19 @@ std::string ExpertOffload::request_report(const ExpertResidency::Stats& at, std:
                       static_cast<unsigned long long>(t.demand_failures - tier_at->demand_failures),
                       static_cast<unsigned long long>(t.stream_reads - tier_at->stream_reads));
         out += text;
+        if (exclusive_.slots != 0) {
+            // Where its reads come from: the loans' and shrinks' victims without a RAM copy, and keys that left both
+            // tiers otherwise (since start).
+            const auto& l = tier_->controller().losses();
+            std::snprintf(text, sizeof(text),
+                          "; exclusive layout: loans and shrinks evicted %llu experts with a RAM copy and %llu without, "
+                          "%llu demotions; %zu shadows; since start %llu experts left both tiers",
+                          static_cast<unsigned long long>(s.loan_victims_kept - at.loan_victims_kept),
+                          static_cast<unsigned long long>(s.loan_victims_lost - at.loan_victims_lost),
+                          static_cast<unsigned long long>(s.demotions - at.demotions), tier_->controller().shadow_count(),
+                          static_cast<unsigned long long>(l.unpublished + l.no_slot + l.unworthy + l.residents_evicted));
+            out += text;
+        }
     }
     return out;
 }
@@ -1318,12 +1446,9 @@ void ExpertOffload::note_prompt_routes(std::uint32_t lane, std::int32_t columns)
     prompt.counted += static_cast<std::uint32_t>(columns);
 }
 
-void ExpertOffload::seed_prompt(std::uint32_t lane, cudaStream_t compute) {
+void ExpertOffload::seed_prompt(std::uint32_t lane) {
     if (lane >= prompt_.size() || prompt_[lane].counted == 0) { return; }
-    // INFERNIX_TMP_PROMPT_SEED overrides the credit and adds promotions at the prompt's end.
-    const OffloadSwitches& switches = temporary_switches::offload();
-    residency_->seed_prompt(prompt_[lane].uses, switches.credit_or(kPromptSeedCredit) / prompt_[lane].counted,
-                            switches.prompt_budget, compute);
+    residency_->seed_prompt(prompt_[lane].uses, kPromptSeedCredit / prompt_[lane].counted);
     clear_prompt_uses(lane);
 }
 
@@ -1337,7 +1462,7 @@ void ExpertOffload::clear_prompt_uses(std::uint32_t lane) {
 
 bool ExpertOffload::lend_stream(std::int32_t width, std::uint64_t wide_bytes, std::uint64_t walk_bytes,
                                 cudaStream_t compute) {
-    if (!stream_ || width < kStreamMinColumns || residency_->frames() == 0) { return false; }
+    if (!stream_ || width < stream_min_columns() || residency_->frames() == 0) { return false; }
     if (leases_.ring.valid()) { return true; }
     // The ring holds two halves of as many records as the layer with the most non-resident experts has
     // (+ one slot for the slot tables), so no streamed layer leaves misses to staging (F2: halves of 384
@@ -1377,6 +1502,7 @@ bool ExpertOffload::lend_stream(std::int32_t width, std::uint64_t wide_bytes, st
     leases_.ring = residency_->lend((2ULL * half + 1) * slot, compute, writers);
     leases_.wide = wide;
     leases_.walk = walk;
+    stream_at_lease_ = stream_->stats();
     return true;
 }
 
@@ -1386,6 +1512,25 @@ void ExpertOffload::return_stream(cudaStream_t compute) {
     residency_->give_back(leases_.wide, compute);
     residency_->give_back(leases_.walk, compute);
     leases_ = {};
+    // The copy-ahead (ExpertStream::plan_ahead): how well the guess served the gated layers.
+    const ExpertStream::Stats& now = stream_->stats();
+    if (const auto ahead = now.ahead - stream_at_lease_.ahead; ahead > 0) {
+        const auto used        = now.ahead_used - stream_at_lease_.ahead_used;
+        const auto heavy       = now.heavy - stream_at_lease_.heavy;
+        const auto heavy_ahead = now.heavy_ahead - stream_at_lease_.heavy_ahead;
+        char text[320];
+        std::snprintf(text, sizeof(text),
+                      "prefill copy-ahead: %llu experts ahead, %llu of them routed (precision %.3f); %llu of %llu heavy "
+                      "experts ahead (recall %.3f); %llu copied after their layer's routing; %llu experts (%.2f GiB) streamed",
+                      static_cast<unsigned long long>(ahead), static_cast<unsigned long long>(used),
+                      static_cast<double>(used) / static_cast<double>(ahead), static_cast<unsigned long long>(heavy_ahead),
+                      static_cast<unsigned long long>(heavy),
+                      heavy > 0 ? static_cast<double>(heavy_ahead) / static_cast<double>(heavy) : 0.0,
+                      static_cast<unsigned long long>(now.late - stream_at_lease_.late),
+                      static_cast<unsigned long long>(now.streamed - stream_at_lease_.streamed),
+                      static_cast<double>(now.bytes - stream_at_lease_.bytes) / (1ULL << 30));
+        diagnostic(text, DiagnosticLevel::Debug);
+    }
 }
 
 ExpertResidency::FrameLease ExpertOffload::lend(std::uint64_t bytes, cudaStream_t compute,

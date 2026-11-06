@@ -225,6 +225,195 @@ INFERNIX_AVX2_ROW_SUMS(row_sums_avxvnni, dot4_avxvnni)
 
 #undef INFERNIX_AVX2_ROW_SUMS
 
+// --------------------------------------------------------------- AVX2 canonical functions
+// canonical_math.h's exp_c, silu_c, f32_to_bf16_rn, e4m3_rn_satfinite and quantize_a4_block on eight
+// lanes: the same IEEE operations in the same order (vdivps, vaddps and vmulps round like the scalar
+// operations, and vfmadd once like std::fmaf), so every lane equals the scalar function bit for bit,
+// NaN lanes included. Every vector ISA here has AVX2 with FMA (detect_features).
+
+INFERNIX_TARGET("avx2")
+inline __m256 bf16x8_to_f32(const std::uint16_t* p) {
+    const __m256i w = _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+    return _mm256_castsi256_ps(_mm256_slli_epi32(w, 16));
+}
+
+INFERNIX_TARGET("avx2")
+inline __m256 canonical_nan8() { return _mm256_castsi256_ps(_mm256_set1_epi32(static_cast<int>(canon::kCanonicalNan))); }
+
+INFERNIX_TARGET("avx2,fma")
+inline __m256 exp_c_avx2(__m256 x) {
+    const __m256 magic = _mm256_set1_ps(12582912.0F);
+    const __m256 n  = _mm256_sub_ps(_mm256_add_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.44269502162933349609375F)), magic), magic);
+    const __m256 r0 = _mm256_fnmadd_ps(n, _mm256_set1_ps(0.693145751953125F), x); // fma(-n, c, x)
+    const __m256 r  = _mm256_fnmadd_ps(n, _mm256_set1_ps(1.428606765330187045e-06F), r0);
+    __m256 p = _mm256_set1_ps(1.0F / 5040.0F);
+    p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0F / 720.0F));
+    p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0F / 120.0F));
+    p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0F / 24.0F));
+    p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0F / 6.0F));
+    p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.5F));
+    p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0F));
+    p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0F));
+    // 2^n in two exact steps; k / 2 truncates toward zero like the scalar division. Lanes outside the
+    // range below hold garbage here and take their special value at the end.
+    const __m256i k  = _mm256_cvttps_epi32(n);
+    const __m256i k1 = _mm256_srai_epi32(_mm256_add_epi32(k, _mm256_srli_epi32(k, 31)), 1);
+    const __m256i k2 = _mm256_sub_epi32(k, k1);
+    const __m256i bias = _mm256_set1_epi32(127);
+    const __m256 s1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(k1, bias), 23));
+    const __m256 s2 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(k2, bias), 23));
+    __m256 y = _mm256_mul_ps(_mm256_mul_ps(p, s1), s2);
+    y = _mm256_blendv_ps(y, _mm256_castsi256_ps(_mm256_set1_epi32(0x7F800000)),
+                         _mm256_cmp_ps(x, _mm256_set1_ps(88.72283935546875F), _CMP_GT_OQ));
+    y = _mm256_blendv_ps(y, _mm256_setzero_ps(), _mm256_cmp_ps(x, _mm256_set1_ps(-103.97208404541015625F), _CMP_LT_OQ));
+    return _mm256_blendv_ps(y, canonical_nan8(), _mm256_cmp_ps(x, x, _CMP_UNORD_Q));
+}
+
+// silu_c: g >= 0 takes g / (1 + exp_c(-g)), else (g e) / (1 + e) with e = exp_c(g).
+INFERNIX_TARGET("avx2,fma")
+inline __m256 silu_c_avx2(__m256 g) {
+    const __m256 nonneg = _mm256_cmp_ps(g, _mm256_setzero_ps(), _CMP_GE_OQ);
+    const __m256 e      = exp_c_avx2(_mm256_blendv_ps(g, _mm256_xor_ps(g, _mm256_set1_ps(-0.0F)), nonneg));
+    const __m256 num    = _mm256_blendv_ps(_mm256_mul_ps(g, e), g, nonneg);
+    const __m256 r      = _mm256_div_ps(num, _mm256_add_ps(_mm256_set1_ps(1.0F), e));
+    return _mm256_blendv_ps(r, canonical_nan8(), _mm256_cmp_ps(r, r, _CMP_UNORD_Q));
+}
+
+// f32_to_bf16_rn, the BF16 word in each 32-bit lane.
+INFERNIX_TARGET("avx2")
+inline __m256i f32_to_bf16_rn_avx2(__m256 x) {
+    const __m256i u   = _mm256_castps_si256(x);
+    const __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(u, 16), _mm256_set1_epi32(1));
+    const __m256i r   = _mm256_srli_epi32(_mm256_add_epi32(_mm256_add_epi32(u, _mm256_set1_epi32(0x7FFF)), lsb), 16);
+    return _mm256_blendv_epi8(r, _mm256_set1_epi32(0x7FC0), _mm256_castps_si256(_mm256_cmp_ps(x, x, _CMP_UNORD_Q)));
+}
+
+INFERNIX_TARGET("avx2,fma")
+int swiglu_avx2(const std::uint16_t* g, const std::uint16_t* u, int n, std::uint16_t* h) {
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256i w = f32_to_bf16_rn_avx2(_mm256_mul_ps(silu_c_avx2(bf16x8_to_f32(g + i)), bf16x8_to_f32(u + i)));
+        // Words 0..3 and 4..7 sit in quads 0 and 2 after the in-lane pack.
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(h + i),
+                         _mm256_castsi256_si128(_mm256_permute4x64_epi64(_mm256_packus_epi32(w, w), 0x08)));
+    }
+    return i;
+}
+
+// e4m3_rn_satfinite of non-negative lanes (NaN gives 0x7F), one word per 32-bit lane.
+INFERNIX_TARGET("avx2")
+inline __m256i e4m3_rn_satfinite_avx2(__m256 x) {
+    const __m256i u   = _mm256_and_si256(_mm256_castps_si256(x), _mm256_set1_epi32(0x7FFFFFFF));
+    const __m256i exp = _mm256_srli_epi32(u, 23);
+    // Subnormal E4M3 (exp < 121): the value in units of 2^-9, rounded to nearest even by rint_rn.
+    const __m256 magic = _mm256_set1_ps(12582912.0F);
+    const __m256 q     = _mm256_mul_ps(_mm256_castsi256_ps(u), _mm256_set1_ps(512.0F));
+    const __m256i sub_word = _mm256_cvttps_epi32(_mm256_sub_ps(_mm256_add_ps(q, magic), magic));
+    // Normal: exponent and the 3 kept mantissa bits are u >> 20; a round-up carries into the exponent.
+    const __m256i rest  = _mm256_and_si256(u, _mm256_set1_epi32(0xFFFFF));
+    const __m256i half  = _mm256_set1_epi32(0x80000);
+    const __m256i odd   = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_srli_epi32(u, 20), _mm256_set1_epi32(1)), _mm256_set1_epi32(1));
+    const __m256i up    = _mm256_or_si256(_mm256_cmpgt_epi32(rest, half), _mm256_and_si256(_mm256_cmpeq_epi32(rest, half), odd));
+    const __m256i norm  = _mm256_min_epi32(_mm256_sub_epi32(_mm256_sub_epi32(_mm256_srli_epi32(u, 20), _mm256_set1_epi32(120 << 3)), up),
+                                           _mm256_set1_epi32(0x7E));
+    __m256i word = _mm256_blendv_epi8(norm, sub_word, _mm256_cmpgt_epi32(_mm256_set1_epi32(121), exp));
+    word = _mm256_blendv_epi8(word, _mm256_set1_epi32(0x7E), _mm256_cmpgt_epi32(u, _mm256_set1_epi32(0x43DFFFFF)));
+    return _mm256_blendv_epi8(word, _mm256_set1_epi32(0x7F), _mm256_cmpgt_epi32(u, _mm256_set1_epi32(0x7F800000)));
+}
+
+// e4m3_scaled of each lane's word.
+INFERNIX_TARGET("avx2")
+inline __m256i e4m3_scaled_avx2(__m256i w) {
+    const __m256i m    = _mm256_and_si256(w, _mm256_set1_epi32(7));
+    const __m256i e    = _mm256_and_si256(_mm256_srli_epi32(w, 3), _mm256_set1_epi32(15));
+    const __m256i norm = _mm256_sllv_epi32(_mm256_or_si256(m, _mm256_set1_epi32(8)), _mm256_sub_epi32(e, _mm256_set1_epi32(1)));
+    return _mm256_blendv_epi8(norm, m, _mm256_cmpeq_epi32(e, _mm256_setzero_si256()));
+}
+
+// e2m1_x2(e2m1_rn_satfinite(q)) per lane. The scalar if-chain's code is the number of its failed
+// tests (all of them for NaN), so each unordered-true negated compare adds one code step: steps 1..4
+// add 1 to the doubled value, 5 and 6 add 2, 7 adds 4; the sign of q (-0 included) negates it.
+INFERNIX_TARGET("avx2")
+inline __m256i e2m1_x2_avx2(__m256 q) {
+    const __m256 a = _mm256_and_ps(q, _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF)));
+    const __m256i s1 = _mm256_castps_si256(_mm256_cmp_ps(a, _mm256_set1_ps(0.25F), _CMP_NLE_UQ));
+    const __m256i s2 = _mm256_castps_si256(_mm256_cmp_ps(a, _mm256_set1_ps(0.75F), _CMP_NLT_UQ));
+    const __m256i s3 = _mm256_castps_si256(_mm256_cmp_ps(a, _mm256_set1_ps(1.25F), _CMP_NLE_UQ));
+    const __m256i s4 = _mm256_castps_si256(_mm256_cmp_ps(a, _mm256_set1_ps(1.75F), _CMP_NLT_UQ));
+    const __m256i s5 = _mm256_castps_si256(_mm256_cmp_ps(a, _mm256_set1_ps(2.5F), _CMP_NLE_UQ));
+    const __m256i s6 = _mm256_castps_si256(_mm256_cmp_ps(a, _mm256_set1_ps(3.5F), _CMP_NLT_UQ));
+    const __m256i s7 = _mm256_castps_si256(_mm256_cmp_ps(a, _mm256_set1_ps(5.0F), _CMP_NLE_UQ));
+    const __m256i two   = _mm256_set1_epi32(2);
+    const __m256i minus = _mm256_add_epi32(_mm256_add_epi32(s1, s2), _mm256_add_epi32(s3, s4)); // -(steps 1..4)
+    const __m256i plus  = _mm256_add_epi32(_mm256_add_epi32(_mm256_and_si256(s5, two), _mm256_and_si256(s6, two)),
+                                           _mm256_and_si256(s7, _mm256_set1_epi32(4)));
+    return _mm256_sign_epi32(_mm256_sub_epi32(plus, minus), _mm256_castps_si256(q));
+}
+
+// Lane b = the maximum over the eight lanes of m[b] (non-NaN lanes, so the order is free).
+INFERNIX_TARGET("avx2")
+inline __m256 lane_max8(const __m256 (&m)[8]) {
+    __m256 t[4];
+    for (int i = 0; i < 4; ++i) {
+        t[i] = _mm256_max_ps(_mm256_unpacklo_ps(m[2 * i], m[2 * i + 1]), _mm256_unpackhi_ps(m[2 * i], m[2 * i + 1]));
+    }
+    const __m256 u0 = _mm256_max_ps(_mm256_shuffle_ps(t[0], t[1], 0x44), _mm256_shuffle_ps(t[0], t[1], 0xEE));
+    const __m256 u1 = _mm256_max_ps(_mm256_shuffle_ps(t[2], t[3], 0x44), _mm256_shuffle_ps(t[2], t[3], 0xEE));
+    return _mm256_max_ps(_mm256_permute2f128_ps(u0, u1, 0x20), _mm256_permute2f128_ps(u0, u1, 0x31));
+}
+
+// quantize_a4_block for `blocks` consecutive blocks, eight at a time: the eight block scales in one
+// vector, then each block's 16 codes in two.
+INFERNIX_TARGET("avx2,fma")
+void quantize_a4_avx2(const std::uint16_t* v, int blocks, float input_scale, A4Block* out) {
+    const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    const __m256 six_g    = _mm256_set1_ps(canon::mul_rn(6.0F, input_scale));
+    for (int b0 = 0; b0 < blocks; b0 += 8) {
+        const int nb = blocks - b0 < 8 ? blocks - b0 : 8;
+        __m256 m[8];
+        for (int b = 0; b < 8; ++b) {
+            m[b] = _mm256_setzero_ps();
+            if (b < nb) {
+                // amax = a > amax ? a : amax, which is vmaxps(a, amax): NaN elements are skipped.
+                const std::uint16_t* p = v + 16 * static_cast<std::size_t>(b0 + b);
+                m[b] = _mm256_max_ps(_mm256_and_ps(bf16x8_to_f32(p), abs_mask), m[b]);
+                m[b] = _mm256_max_ps(_mm256_and_ps(bf16x8_to_f32(p + 8), abs_mask), m[b]);
+            }
+        }
+        const __m256i words  = e4m3_rn_satfinite_avx2(_mm256_div_ps(lane_max8(m), six_g));
+        const __m256i scaled = e4m3_scaled_avx2(words);
+        const __m256 d = _mm256_mul_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(scaled), _mm256_set1_ps(1.0F / 512.0F)),
+                                       _mm256_set1_ps(input_scale));
+        alignas(32) std::int32_t word_of[8], scaled_of[8];
+        alignas(32) float d_of[8];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(word_of), words);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(scaled_of), scaled);
+        _mm256_store_ps(d_of, d);
+        for (int b = 0; b < nb; ++b) {
+            A4Block& o     = out[b0 + b];
+            o.scale_word   = static_cast<std::uint8_t>(word_of[b]);
+            o.scale_scaled = scaled_of[b];
+            if (o.scale_scaled == 0) {
+                std::memset(o.c2, 0, sizeof o.c2);
+                o.c2_sum = 0;
+                continue;
+            }
+            const std::uint16_t* p = v + 16 * static_cast<std::size_t>(b0 + b);
+            const __m256 db    = _mm256_broadcast_ss(&d_of[b]);
+            const __m256i c_lo = e2m1_x2_avx2(_mm256_div_ps(bf16x8_to_f32(p), db));
+            const __m256i c_hi = e2m1_x2_avx2(_mm256_div_ps(bf16x8_to_f32(p + 8), db));
+            const __m128i w0 = _mm_packs_epi32(_mm256_castsi256_si128(c_lo), _mm256_extracti128_si256(c_lo, 1));
+            const __m128i w1 = _mm_packs_epi32(_mm256_castsi256_si128(c_hi), _mm256_extracti128_si256(c_hi, 1));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(o.c2), _mm_packs_epi16(w0, w1));
+            const __m256i s8 = _mm256_add_epi32(c_lo, c_hi);
+            __m128i s4 = _mm_add_epi32(_mm256_castsi256_si128(s8), _mm256_extracti128_si256(s8, 1));
+            s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0x4E));
+            s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0xB1));
+            o.c2_sum = _mm_cvtsi128_si32(s4);
+        }
+    }
+}
+
 #define INFERNIX_MOE_DISPATCH(CALL)                                                                   \
     switch (ncols) {                                                                                \
     case 1: CALL(1); break;                                                                         \
@@ -251,6 +440,7 @@ CpuFeatures detect_features() {
     const unsigned max_leaf = static_cast<unsigned>(r[0]);
     __cpuid(r, 1);
     c = static_cast<unsigned>(r[2]);
+    const unsigned leaf1_c = c;
     const bool osxsave = (c & (1U << 27)) != 0;
     const unsigned long long xcr0 = osxsave ? _xgetbv(0) : 0;
     if (max_leaf < 7) { return f; }
@@ -262,6 +452,7 @@ CpuFeatures detect_features() {
 #    else
     if (__get_cpuid_max(0, nullptr) < 7) { return f; }
     __cpuid(1, a, b, c, d);
+    const unsigned leaf1_c = c;
     const bool osxsave = (c & (1U << 27)) != 0;
     unsigned long long xcr0 = 0;
     if (osxsave) {
@@ -277,7 +468,9 @@ CpuFeatures detect_features() {
 #    endif
     const bool ymm = (xcr0 & 0x6) == 0x6;
     const bool zmm = (xcr0 & 0xE6) == 0xE6;
-    f.avx2    = ymm && (b & (1U << 5)) != 0;
+    // AVX2 (leaf 7 EBX 5) with FMA (leaf 1 ECX 12) and F16C (ECX 29): the GGUF 8-bit route's terms and weight
+    // scales (ggml_expert.cpp); every AVX2 CPU has both, but they are separate CPUID bits.
+    f.avx2    = ymm && (b & (1U << 5)) != 0 && (leaf1_c & (1U << 12)) != 0 && (leaf1_c & (1U << 29)) != 0;
     f.avxvnni = f.avx2 && (a & (1U << 4)) != 0;
     // AVX-512 F (EBX 16), BW (EBX 30), VL (EBX 31; the GGUF and FP8 routes' 256-bit EVEX forms) and
     // VNNI (ECX 11), with the OS saving the opmask and ZMM state.
@@ -355,8 +548,26 @@ void rg16_row_sums(CpuIsa isa, const std::uint8_t* matrix, int blocks, int rg_be
     throw std::invalid_argument("offloaded_moe: unsupported CPU ISA");
 }
 
-void quantize_a4(const std::uint16_t* v, int n, float input_scale, canon::A4Block* out) {
+void quantize_a4(CpuIsa isa, const std::uint16_t* v, int n, float input_scale, canon::A4Block* out) {
+#if defined(INFERNIX_MOE_X86)
+    if (isa != CpuIsa::kScalar) {
+        quantize_a4_avx2(v, n / 16, input_scale, out);
+        return;
+    }
+#else
+    (void)isa;
+#endif
     for (int b = 0; b < n / 16; ++b) { out[b] = canon::quantize_a4_block(v + 16 * b, input_scale); }
+}
+
+void swiglu_bf16_n(CpuIsa isa, const std::uint16_t* g, const std::uint16_t* u, int n, std::uint16_t* h) {
+    int i = 0;
+#if defined(INFERNIX_MOE_X86)
+    if (isa != CpuIsa::kScalar) { i = swiglu_avx2(g, u, n, h); }
+#else
+    (void)isa;
+#endif
+    for (; i < n; ++i) { h[i] = canon::swiglu_bf16(g[i], u[i]); }
 }
 
 void gate_up_units(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
@@ -374,15 +585,17 @@ void gate_up_units(CpuIsa isa, const std::uint8_t* record, const ExpertScales& s
             rg16_row_sums(isa, record, kGateUpBlocks, 2 * u, 2 * u + 2, x_up, ncols, s_up, prefetch_bytes);
             up_sums = s_up;
         }
+        std::uint16_t g[16 * kMaxColumns], p[16 * kMaxColumns], h[16 * kMaxColumns];
         for (int c = 0; c < ncols; ++c) {
-            std::uint16_t h[16];
             for (int i = 0; i < 16; ++i) {
-                const std::uint16_t g = canon::a4_row_output(s_gate[static_cast<std::size_t>(2 * i) * ncols + c], scales.alpha_gate);
-                const std::uint16_t p = canon::a4_row_output(up_sums[static_cast<std::size_t>(2 * i + 1) * ncols + c], scales.alpha_up);
-                h[i] = canon::swiglu_bf16(g, p);
+                g[16 * c + i] = canon::a4_row_output(s_gate[static_cast<std::size_t>(2 * i) * ncols + c], scales.alpha_gate);
+                p[16 * c + i] = canon::a4_row_output(up_sums[static_cast<std::size_t>(2 * i + 1) * ncols + c], scales.alpha_up);
             }
-            h_blocks[c][u] = canon::quantize_a4_block(h, scales.input_down);
         }
+        swiglu_bf16_n(isa, g, p, 16 * ncols, h);
+        canon::A4Block hq[kMaxColumns];
+        quantize_a4(isa, h, 16 * ncols, scales.input_down, hq);
+        for (int c = 0; c < ncols; ++c) { h_blocks[c][u] = hq[c]; }
     }
 }
 
@@ -413,10 +626,10 @@ void expert_forward(CpuIsa isa, const std::uint8_t* record, const ExpertScales& 
     const bool shared = scales.input_gate == scales.input_up;
     if (!shared) { xu.resize(xg.size()); }
     for (int c = 0; c < ncols; ++c) {
-        quantize_a4(x[c], kHidden, scales.input_gate, &xg[static_cast<std::size_t>(c) * kGateUpBlocks]);
+        quantize_a4(isa, x[c], kHidden, scales.input_gate, &xg[static_cast<std::size_t>(c) * kGateUpBlocks]);
         g_ptr[c] = &xg[static_cast<std::size_t>(c) * kGateUpBlocks];
         if (!shared) {
-            quantize_a4(x[c], kHidden, scales.input_up, &xu[static_cast<std::size_t>(c) * kGateUpBlocks]);
+            quantize_a4(isa, x[c], kHidden, scales.input_up, &xu[static_cast<std::size_t>(c) * kGateUpBlocks]);
             u_ptr[c] = &xu[static_cast<std::size_t>(c) * kGateUpBlocks];
         }
         h_ptr[c]  = &hb[static_cast<std::size_t>(c) * kHBlocks];

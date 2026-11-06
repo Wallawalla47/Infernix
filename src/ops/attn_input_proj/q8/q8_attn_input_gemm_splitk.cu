@@ -4,6 +4,7 @@
 #include "ops/attn_input_proj/q8/q8_attn_input_kernels.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear/q8/q8_sliced_k_launch.cuh"
 #include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
 
@@ -29,6 +30,12 @@ using TargetLauncher    = void (*)(const Tensor&, const Weight&, Tensor&, Tensor
 using CompanionLauncher = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
                                    cudaStream_t);
 
+// The exact-column and sliced calls (decode and verification widths) launch as programmatic dependents of the
+// kernel before them: the sliced-K kernel waits before any load and triggers after its K loop. The Qwen3.6-35B-A3B
+// (INT8 KV, 3 rotated reps, RTX 5090): its Q8 projections are 1.4 % of plain decode's +2.7 % and 0.5 % of MTP's
+// +1.1 % from the decode graphs' programmatic launches (candidates §58). Same bits.
+constexpr pdl::Dependency kDependency = pdl::Dependency::Programmatic;
+
 template <int ActiveCols, int Rows, class Output>
 void launch_output(const Tensor& x, const Weight& weight, Output output, cudaStream_t stream) {
     constexpr int TileCols = ActiveCols <= 8    ? 8
@@ -41,7 +48,7 @@ void launch_output(const Tensor& x, const Weight& weight, Output output, cudaStr
     using Schedule         = Q8SlicedKDefault<TileCols, ActiveCols>;
     launch_q8_a16_sliced_k_mma<
         typename Schedule::template with_problem<Geometry::kInputRows, ActiveCols, true>>(
-        q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
+        q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream, {}, kDependency);
 }
 
 template <int ActiveCols>
@@ -92,7 +99,7 @@ void launch_target_sliced48(const Tensor& x, const Weight& weight, Tensor& q, Te
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
     launch_q8_a16_sliced_k_mma<
         typename Schedule::template with_problem<Geometry::kInputRows, kLastTargetExactCols, false>>(
-        q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
+        q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream, {}, kDependency);
 }
 
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>

@@ -42,21 +42,33 @@ __device__ __forceinline__ void chunk_values(const std::uint8_t* row, int index,
     }
 }
 
-template <QType F>
+// The table lives in pinned host memory, so each read crosses the link: the row is first copied
+// into shared memory in Vector-byte loads (one request per vector, instead of a chunk's scale, sub-
+// scale and code reads each), then decoded there and written 16 bytes a chunk. Same values.
+template <QType F, typename Vector>
 __global__ void __launch_bounds__(kThreads)
     embedding_kernel(const std::int32_t* __restrict__ ids, const std::uint8_t* __restrict__ table, int vocab, int hidden,
-                     int row_bytes, std::uint16_t* __restrict__ out) {
+                     int row_bytes, std::uint16_t* __restrict__ out, DeviceFault fault) {
+    extern __shared__ __align__(16) std::uint8_t staged[];
     const int t  = blockIdx.x;
     const int id = ids[t];
-    if (id < 0 || id >= vocab) { __trap(); }
-    const std::uint8_t* row = table + static_cast<std::size_t>(id) * row_bytes;
+    if (id < 0 || id >= vocab) {
+        for (int i = threadIdx.x; i < hidden; i += blockDim.x) { out[static_cast<std::size_t>(t) * hidden + i] = 0; }
+        if (threadIdx.x == 0 && fault.word != nullptr) { *reinterpret_cast<volatile std::uint32_t*>(fault.word) = fault.value; }
+        return;
+    }
+    const auto* row = reinterpret_cast<const Vector*>(table + static_cast<std::size_t>(id) * row_bytes);
+    for (int i = threadIdx.x; i < row_bytes / static_cast<int>(sizeof(Vector)); i += blockDim.x) {
+        reinterpret_cast<Vector*>(staged)[i] = row[i];
+    }
+    __syncthreads();
     for (int i = threadIdx.x; i < hidden / 8; i += blockDim.x) {
         float v[8];
-        chunk_values<F>(row, i, v);
+        chunk_values<F>(staged, i, v);
+        std::uint16_t bits[8];
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            out[static_cast<std::size_t>(t) * hidden + 8 * i + j] = canon::f32_to_bf16_rn(v[j]);
-        }
+        for (int j = 0; j < 8; ++j) { bits[j] = canon::f32_to_bf16_rn(v[j]); }
+        *reinterpret_cast<uint4*>(out + static_cast<std::size_t>(t) * hidden + 8 * i) = *reinterpret_cast<const uint4*>(bits);
     }
 }
 
@@ -81,7 +93,7 @@ __global__ void __launch_bounds__(kThreads)
 
 } // namespace
 
-void ggml_embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+void ggml_embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream, DeviceFault fault) {
     require(ids.data != nullptr && ids.dtype == DType::I32 && ids.is_contiguous(), "ids must be contiguous I32 [T]");
     require(out.data != nullptr && out.dtype == DType::BF16 && out.is_contiguous(), "out must be contiguous BF16 [H, T]");
     require(table.layout == QuantLayout::GgmlRows && table.qdata != nullptr, "table must be a ggml_rows_v1 Weight");
@@ -91,9 +103,21 @@ void ggml_embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStr
     const auto* data    = static_cast<const std::uint8_t*>(table.qdata);
     auto* o             = static_cast<std::uint16_t*>(out.data);
     const auto* id      = static_cast<const std::int32_t*>(ids.data);
+    require(reinterpret_cast<std::uintptr_t>(o) % 16 == 0, "out must be 16-byte aligned");
+    // Rows in 16-byte vectors when every row starts on a 16-byte boundary, else in 8-byte ones
+    // (IQ4_XS rows are 136-byte blocks).
+    const bool wide = row_bytes % 16 == 0 && reinterpret_cast<std::uintptr_t>(data) % 16 == 0;
+    require(row_bytes % 8 == 0 && reinterpret_cast<std::uintptr_t>(data) % 8 == 0, "table rows must be 8-byte aligned");
+    const auto smem = static_cast<std::size_t>(row_bytes);
     switch (table.qtype) {
     case QType::GGML_IQ4_XS:
-        embedding_kernel<QType::GGML_IQ4_XS><<<columns, kThreads, 0, stream>>>(id, data, vocab, hidden, row_bytes, o);
+        if (wide) {
+            embedding_kernel<QType::GGML_IQ4_XS, uint4><<<columns, kThreads, smem, stream>>>(id, data, vocab, hidden,
+                                                                                               row_bytes, o, fault);
+        } else {
+            embedding_kernel<QType::GGML_IQ4_XS, uint2><<<columns, kThreads, smem, stream>>>(id, data, vocab, hidden,
+                                                                                               row_bytes, o, fault);
+        }
         break;
     default:
         // Other formats' products can exceed 24 significant bits (Q6_K), so they would need the

@@ -821,6 +821,12 @@ std::vector<std::string> OpenAIResponsesEventStream::start() {
             sse(impl_->event("response.in_progress", Json{{"response", response}}))};
 }
 
+std::string OpenAIResponsesEventStream::keep_alive() {
+    if (!impl_->started || impl_->finish_built) { return {}; }
+    const Json response = in_progress_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime);
+    return sse(impl_->event("response.in_progress", Json{{"response", response}}));
+}
+
 std::vector<std::string> OpenAIResponsesEventStream::reasoning_delta(const std::string& text) {
     if (!impl_->started || impl_->finish_built) {
         throw std::logic_error("invalid reasoning delta event state");
@@ -952,6 +958,17 @@ std::string OpenAIResponsesEventStream::failed(const ApiError& error) {
     response["error"]        = Json{{"code", error.code.empty() ? Json(nullptr) : Json(error.code)},
                                     {"message", error.message}};
     return sse(impl_->event("response.failed", Json{{"response", response}}));
+}
+
+std::string make_openai_failed_response_stream(const std::string& id, std::int64_t created_at,
+                                               OpenAIResponsesCreateRequest request,
+                                               const OpenAIResponsesRuntimeValues& runtime,
+                                               const ApiError& error) {
+    OpenAIResponsesEventStream stream(id, created_at, std::move(request), runtime);
+    std::string wire;
+    for (const std::string& event : stream.start()) { wire += event; }
+    wire += stream.failed(error);
+    return wire;
 }
 
 } // namespace infernix::serve

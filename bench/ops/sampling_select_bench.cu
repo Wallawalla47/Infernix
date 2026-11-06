@@ -180,13 +180,13 @@ DeviceBuffer make_logits(int cols) {
         }
     }
     DeviceBuffer device(host.size() * sizeof(std::uint16_t));
-    CUDA_CHECK(cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice));
+    upload(device.p, host.data(), device.bytes);
     return device;
 }
 
 DeviceBuffer make_i32(const std::vector<std::int32_t>& host) {
     DeviceBuffer device(host.size() * sizeof(std::int32_t));
-    CUDA_CHECK(cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice));
+    upload(device.p, host.data(), device.bytes);
     return device;
 }
 
@@ -201,7 +201,7 @@ DeviceBuffer make_config(DeviceBuffer& counts, Mode mode, bool counts_active, in
         mode == Mode::Stochastic && counts_active ? static_cast<std::int32_t*>(counts.p) : nullptr;
 
     DeviceBuffer device(sizeof(ops::SamplingConfig));
-    CUDA_CHECK(cudaMemcpy(device.p, &config, sizeof(config), cudaMemcpyHostToDevice));
+    upload(device.p, &config, sizeof(config));
     return device;
 }
 
@@ -228,7 +228,7 @@ DeviceBuffer make_batch_configs(DeviceBuffer& counts, int batch, Mode mode, bool
         }
     }
     DeviceBuffer device(configs.size() * sizeof(ops::SamplingConfig));
-    CUDA_CHECK(cudaMemcpy(device.p, configs.data(), device.bytes, cudaMemcpyHostToDevice));
+    upload(device.p, configs.data(), device.bytes);
     return device;
 }
 
@@ -240,7 +240,7 @@ double stochastic_payload_bytes(int cols, bool counts_active) {
 
 void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, int batch, Mode mode,
                 bool counts_active, int top_k) {
-    CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
+    fill_bytes(counts.p, 0, counts.bytes);
     DeviceBuffer configs = make_batch_configs(counts, batch, mode, counts_active, top_k);
     DeviceBuffer out(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
     std::vector<std::int32_t> positions(static_cast<std::size_t>(batch));
@@ -269,7 +269,7 @@ void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, int batch, Mode mode
 
 void run_mtp(DeviceBuffer& logits, DeviceBuffer& counts, int k, Mode mode, bool counts_active,
              int top_k) {
-    CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
+    fill_bytes(counts.p, 0, counts.bytes);
     DeviceBuffer config = make_config(counts, mode, counts_active, top_k);
     std::vector<std::int32_t> target_host(static_cast<std::size_t>(k + 1));
     std::vector<std::int32_t> draft_host(static_cast<std::size_t>(k));
@@ -323,7 +323,7 @@ void run_dflash2(DeviceBuffer& logits, DeviceBuffer& counts, const Options& opti
     const Mode mode          = options.mode;
     const bool counts_active = options.counts_active;
     const int top_k          = options.top_k;
-    CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
+    fill_bytes(counts.p, 0, counts.bytes);
     DeviceBuffer configs =
         make_batch_configs(counts, batch, mode, counts_active, top_k, options.mixed);
 
@@ -363,7 +363,7 @@ void run_dflash2(DeviceBuffer& logits, DeviceBuffer& counts, const Options& opti
     DeviceBuffer drafts     = make_i32(draft_host);
     DeviceBuffer candidates = make_i32(candidate_host);
     DeviceBuffer proposal_q(q_host.size() * sizeof(float));
-    CUDA_CHECK(cudaMemcpy(proposal_q.p, q_host.data(), proposal_q.bytes, cudaMemcpyHostToDevice));
+    upload(proposal_q.p, q_host.data(), proposal_q.bytes);
     DeviceBuffer extents =
         make_i32(std::vector<std::int32_t>(static_cast<std::size_t>(batch), extent));
     DeviceBuffer lengths =
@@ -453,7 +453,7 @@ int main(int argc, char** argv) {
             options.matrix ? 8 : (options.dflash2 || options.sample ? options.batch : 1);
         DeviceBuffer counts(static_cast<std::size_t>(kTokenDomain) * count_rows *
                             sizeof(std::int32_t));
-        CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
+        fill_bytes(counts.p, 0, counts.bytes);
 
         std::printf("payload: physical_rows=%d token_domain=%d logits=%.3f MiB/row "
                     "counts=%.3f MiB/row\n",

@@ -73,6 +73,13 @@ public:
     explicit Engine(EngineOptions options);
     ~Engine();
 
+    // Sizes a start with `options` on this machine without loading the model (EnginePlan): the same
+    // option checks and memory plans, on a CUDA context of options.device but with no weight read
+    // into device or pinned memory and no Program. A start that would not fit returns with
+    // EnginePlan::fits false and the refusing check's message; anything else a start would refuse
+    // (invalid options, an unreadable artifact) throws as the constructor does.
+    [[nodiscard]] static EnginePlan plan(EngineOptions options);
+
     Engine(Engine&&) noexcept;
     Engine& operator=(Engine&&) noexcept;
 
@@ -89,9 +96,13 @@ public:
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
 
-    // Artifact-tokenizer decoding of token ids, special tokens included. The bytes of a character
-    // that the ids cut are returned as they are (not necessarily valid UTF-8).
+    // Artifact-tokenizer decoding of token ids, special tokens included. A character the ids cut
+    // makes this throw: what it returns is always valid UTF-8.
     [[nodiscard]] std::string detokenize(std::span<const TokenId> token_ids) const;
+
+    // The same ids joined to the artifact's bytes without that validation, for a caller that
+    // handles an incomplete character itself (a window cut between two bytes of one character).
+    [[nodiscard]] std::string detokenize_bytes(std::span<const TokenId> token_ids) const;
 
     // The token ids of a text chat rendered with the artifact's chat template, whatever their number: unlike
     // prepare(), no max_context or capacity limit applies (a measurement tool cuts its windows from them).
@@ -122,6 +133,18 @@ public:
     GenerationResult generate(PreparedPrompt prompt, RequestOptions options,
                               OutputSink* sink                     = nullptr,
                               const CancellationView& cancellation = {});
+
+    // Idle-time prefill of a finished turn (docs/maintainer/hybrid-prefix-cache-spec.md §7.9).
+    // `conversation` is a request's text messages followed by its finished assistant reply as the
+    // client will send it back (content, reasoning, tool calls), with that request's prompt options.
+    // Off the caller's thread, the Engine renders it as the conversation's next request will
+    // (PromptContinuationMode::NextTurnHistory) and, once it has had nothing to run for
+    // HybridPrefixCacheOptions::next_turn_prefill_quiet, prefills that history into the prefix cache as an
+    // internal request. A newer conversation replaces one not yet started, a submitted request drops
+    // it, and a request arriving while it runs makes it stop at its next unit boundary. Outputs never
+    // change: the next request reuses it only where its tokens match. No effect when the option is
+    // zero, the prefix cache is off, or the Engine scores; never throws.
+    void prefill_next_turn(PromptInput conversation) noexcept;
 
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;

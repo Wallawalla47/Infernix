@@ -1,6 +1,7 @@
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/gdn_input_proj/gdn_conv.cuh"
 
 #include <cuda_bf16.h>
@@ -19,6 +20,9 @@ __global__ void gdn_projected_conv_kernel(
     __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value, std::int32_t width,
     Publish publish) {
     static_assert(Channels == QueryRows + KeyRows + ValueRows);
+    // Every input but the weights is a kernel's output (the projection, the state, the round's slots): wait before
+    // any of them (a no-op unless the launch is a programmatic dependent; dependents launch as CTAs exit).
+    pdl::enter_streaming();
     const std::int32_t row = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
     if (row >= Channels) { return; }
     const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
@@ -146,13 +150,18 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& st
             const Tensor& valid_columns, const Tensor& initial_state_slots, Tensor& query,
             Tensor& key, Tensor& value, Publish publish, cudaStream_t stream) {
     constexpr int kDefaultThreads = 256;
+    // A programmatic dependent of the projection before it (the kernel waits at entry): the Qwen3.5 decode graphs,
+    // INT8 KV, leave-one-out of every family's programmatic launches, 3 rotated reps: the 35B-A3B MTP +0.26 %, the
+    // groupwise 27B DFlash2 +0.18 %, the NVFP4 27B DFlash2 +0.12 % (candidates §58). Same bits.
+    constexpr pdl::Dependency dependency = pdl::Dependency::Programmatic;
     const std::int32_t width      = projected.ne[1];
     const std::int32_t batch      = projected.ne[2];
     if constexpr (Channels == 10240 || Channels == 12288) {
         if (width == 4 && batch == 1) {
             constexpr int kT4Threads = 64;
-            gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, 4>
-                <<<(Channels + kT4Threads - 1) / kT4Threads, kT4Threads, 0, stream>>>(
+            CUDA_CHECK(pdl::launch_with(
+                dependency, {dim3((Channels + kT4Threads - 1) / kT4Threads), dim3(kT4Threads), 0, stream},
+                gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, 4, Publish>,
                     static_cast<const __nv_bfloat16*>(projected.data),
                     static_cast<const __nv_bfloat16*>(conv_weight.data),
                     static_cast<const __nv_bfloat16*>(state_read.data),
@@ -161,15 +170,15 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& st
                         : static_cast<const std::int32_t*>(valid_columns.data),
                     static_cast<const std::int32_t*>(initial_state_slots.data),
                     static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
-                    static_cast<__nv_bfloat16*>(value.data), width, publish);
-            CUDA_CHECK(cudaGetLastError());
+                    static_cast<__nv_bfloat16*>(value.data), width, publish));
             return;
         }
     }
     const dim3 grid((Channels + kDefaultThreads - 1) / kDefaultThreads,
                     static_cast<unsigned>(batch));
-    gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, 0>
-        <<<grid, kDefaultThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_with(
+        dependency, {grid, dim3(kDefaultThreads), 0, stream},
+        gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, 0, Publish>,
             static_cast<const __nv_bfloat16*>(projected.data),
             static_cast<const __nv_bfloat16*>(conv_weight.data),
             static_cast<const __nv_bfloat16*>(state_read.data),
@@ -177,8 +186,7 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& st
                                           : static_cast<const std::int32_t*>(valid_columns.data),
             static_cast<const std::int32_t*>(initial_state_slots.data),
             static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
-            static_cast<__nv_bfloat16*>(value.data), width, publish);
-    CUDA_CHECK(cudaGetLastError());
+            static_cast<__nv_bfloat16*>(value.data), width, publish));
 }
 
 template <class Publish>

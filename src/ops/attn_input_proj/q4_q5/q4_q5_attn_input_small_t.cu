@@ -34,7 +34,7 @@ void launch_q4_gemv(const Tensor& x, const Weight& weight, Tensor& q, Tensor& ke
              static_cast<std::int64_t>(q.nb[1] / sizeof(__nv_bfloat16)), 0},
             {static_cast<__nv_bfloat16*>(key.data),
              static_cast<std::int64_t>(key.nb[1] / sizeof(__nv_bfloat16)), 0}},
-        LinearIdentityEpilogue{}, stream);
+        LinearIdentityEpilogue{}, stream, pdl::Dependency::Programmatic); // candidates §58
 }
 
 template <class Schedule>
@@ -138,7 +138,8 @@ void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& gate, Tensor&
                     cudaStream_t stream) {
     launch_q5_a16_gemv<q5_instances::GemvR16W1G16S2XK5120>(q5_linear_operands(x, weight),
                                                            q5_projection_output(gate, value),
-                                                           LinearIdentityEpilogue{}, stream);
+                                                           LinearIdentityEpilogue{}, stream,
+                                                           pdl::Dependency::Programmatic); // candidates §58
 }
 
 template <int Cols>

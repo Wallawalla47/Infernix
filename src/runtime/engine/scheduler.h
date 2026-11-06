@@ -256,9 +256,12 @@ public:
     }
 
     void admitted(const std::deque<RequestPtr>& fresh, const Request& admitted,
-                  std::uint32_t concurrency) const {
+                  std::uint32_t concurrency) {
         for (const auto& skipped : fresh) {
-            if (skipped->id == admitted.id) { return; }
+            if (skipped->id == admitted.id) {
+                service_order_.push_back(admitted.id);
+                return;
+            }
             if (skipped->admission_bypasses >= concurrency) {
                 throw std::logic_error("fresh admission exceeded the FIFO bypass allowance");
             }
@@ -267,47 +270,100 @@ public:
         throw std::logic_error("admitted request is absent from the fresh queue");
     }
 
-    template <class Slots>
-    [[nodiscard]] std::optional<std::uint32_t>
-    youngest_victim(const Slots& slots, std::uint32_t concurrency,
-                    std::optional<std::uint64_t> priority_ticket = std::nullopt) const noexcept {
-        std::optional<std::uint32_t> oldest;
-        std::optional<std::uint32_t> youngest;
-        for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
-            const auto& request = slots[lane];
-            if (!request || request->is_materializing() || request->is_model_finished()) {
-                continue;
-            }
-            if (!oldest || request->id < slots[*oldest]->id) { oldest = lane; }
-            if (!request->recovery_pending &&
-                (!priority_ticket || request->id > *priority_ticket) &&
-                (!youngest || request->id > slots[*youngest]->id)) {
-                youngest = lane;
-            }
-        }
-        if (!priority_ticket && youngest == oldest) { return std::nullopt; }
-        return youngest;
+    // Bounded service under KV pressure (resource-scheduling §5.1): while admitted requests
+    // contend for capacity, one of them owns each turn. The progress owner keeps the next
+    // capacity hand-over across reclamation, pause, binding and Replay (no other resident takes
+    // capacity released for it); turns rotate through the admitted requests in admission order.
+    [[nodiscard]] std::optional<std::uint64_t> progress_owner() const noexcept {
+        if (!pressure_ || service_order_.empty()) { return std::nullopt; }
+        return service_order_.front();
     }
 
-    void preempted() noexcept {
-        restoration_event_ = false;
-        // The paused request waits for a capacity event. Its free lane can immediately
-        // serve another request that fits the remaining physical capacity.
+    // `request` could not obtain its unit after reclamation. Without a turn in progress it takes
+    // the first; during one it only records contention (the turn then rotates instead of ending).
+    void require_progress(std::uint64_t request) {
+        contended_ = true;
+        if (pressure_) { return; }
+        const auto owner = std::find(service_order_.begin(), service_order_.end(), request);
+        if (owner == service_order_.end()) {
+            throw std::logic_error("capacity waiter is absent from admitted membership");
+        }
+        std::rotate(service_order_.begin(), owner, service_order_.end());
+        pressure_ = true;
+        reset_service();
+    }
+
+    // An executed unit with committed new progress for `request` (Replay and waiting for a grant
+    // are not service).
+    void served(std::uint64_t request, std::uint64_t elapsed_ns) noexcept {
+        if (progress_owner() != request) { return; }
+        served_ = true;
+        service_ns_ += std::min(elapsed_ns, maximum_service_ns - service_ns_);
+    }
+
+    // Replay toward the owner's paused frontier: lengthens its turn (up to maximum_service_ns),
+    // never counts as service.
+    void recovery_work(std::uint64_t request, std::uint64_t elapsed_ns) noexcept {
+        if (progress_owner() == request) {
+            recovery_ns_ += std::min(elapsed_ns, maximum_service_ns - recovery_ns_);
+        }
+    }
+
+    // At a cycle boundary with no context transaction: ends the turn once its owner has served
+    // max(service_quantum_ns, its recovery cost), never while a recovery is pending. Pressure
+    // ends when nothing is paused and no other request contended during the turn; otherwise the
+    // next admitted request takes the turn. Returns whether the turn ended.
+    bool advance_service(bool have_paused, bool recovering) noexcept {
+        if (!pressure_ || recovering || !served_) { return false; }
+        if (service_ns_ < std::max(service_quantum_ns, recovery_ns_) && service_order_.size() > 1) {
+            return false;
+        }
+        if (!have_paused && (!contended_ || service_order_.size() <= 1)) {
+            pressure_ = false;
+            begin_admission_scan();
+        } else {
+            std::rotate(service_order_.begin(), service_order_.begin() + 1, service_order_.end());
+        }
+        reset_service();
+        contended_ = false;
+        return true;
+    }
+
+    // A terminal request leaves the service order; an owner's turn passes to the next request.
+    void finished(std::uint64_t request) noexcept {
+        const bool owner = progress_owner() == request;
+        std::erase(service_order_, request);
+        if (owner) { reset_service(); }
+        if (service_order_.empty()) { pressure_ = false; }
         begin_admission_scan();
     }
 
-    // Completion, cancellation or a committed permanent shrink can make a snapshot fit.
-    // Returning speculative scratch at the end of an ordinary unit does not call this.
-    void capacity_released() noexcept { restoration_event_ = true; }
-
-    [[nodiscard]] bool should_restore(bool have_paused, bool resident_empty) const noexcept {
-        return have_paused && (resident_empty || restoration_event_);
+    // The resident a pressure turn pauses for its owner: the youngest one that is not the owner,
+    // not binding, not finished and not protecting a Native recovery, outside `excluded` (lanes
+    // that could not pause). None without a turn.
+    template <class Slots>
+    [[nodiscard]] std::optional<std::uint32_t>
+    preemption_victim(const Slots& slots, std::uint32_t concurrency,
+                      std::span<const std::uint32_t> excluded = {}) const noexcept {
+        const auto owner = progress_owner();
+        if (!owner) { return std::nullopt; }
+        std::optional<std::uint32_t> youngest;
+        for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
+            const auto& request = slots[lane];
+            if (!request || request->id == *owner || request->is_materializing() ||
+                request->is_model_finished() || request->recovery_pending ||
+                std::find(excluded.begin(), excluded.end(), lane) != excluded.end()) {
+                continue;
+            }
+            if (!youngest || request->id > slots[*youngest]->id) { youngest = lane; }
+        }
+        return youngest;
     }
 
-    // A successful restore keeps priority through replay and its first new execution unit.
-    void restoration_blocked() noexcept { restoration_event_ = false; }
-
-    void paused_queue_empty() noexcept { restoration_event_ = false; }
+    // A turn grants at least one second of useful execution; an expensive restore earns up to
+    // four seconds to amortize its Replay or transfer, a finite bound either way.
+    static constexpr std::uint64_t service_quantum_ns = 1'000'000'000;
+    static constexpr std::uint64_t maximum_service_ns = 4 * service_quantum_ns;
 
 private:
     std::uint32_t prefill_cursor_      = 0;
@@ -318,7 +374,18 @@ private:
     std::uint64_t admission_scan_head_ = 0;
     std::vector<std::uint64_t> admission_scan_remaining_;
     bool admission_scan_requested_ = false;
-    bool restoration_event_        = false;
+    std::deque<std::uint64_t> service_order_;
+    bool pressure_             = false;
+    bool contended_            = false;
+    bool served_               = false;
+    std::uint64_t service_ns_  = 0;
+    std::uint64_t recovery_ns_ = 0;
+
+    void reset_service() noexcept {
+        served_      = false;
+        service_ns_  = 0;
+        recovery_ns_ = 0;
+    }
 };
 
 } // namespace infernix::runtime

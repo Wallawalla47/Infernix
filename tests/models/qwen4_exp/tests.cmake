@@ -28,10 +28,6 @@ infernix_add_test(infernix_qwen4_exp_expert_activations_test
 infernix_add_test(infernix_qwen4_exp_ngram_volume_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_volume.cpp"
   LIBRARIES infernix_model_runtime)
-# TEMPORARY with INFERNIX_TMP_NGRAM_SCATTER: the large call's scattered reading order, same oracle.
-add_test(NAME infernix_qwen4_exp_ngram_volume_scatter_test COMMAND infernix_qwen4_exp_ngram_volume_test)
-set_tests_properties(infernix_qwen4_exp_ngram_volume_scatter_test
-  PROPERTIES ENVIRONMENT "INFERNIX_TMP_NGRAM_SCATTER=1")
 
 # The forward pass on the real artifact (INFERNIX_QWEN4_ARTIFACT) against the FP64 reference.
 infernix_add_test(infernix_qwen4_exp_forward_real_test
@@ -87,6 +83,24 @@ infernix_add_test(infernix_qwen4_exp_expert_fault_real_test
 set_tests_properties(infernix_qwen4_exp_expert_fault_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# A Vision window the expert cache cannot lend (a test hook's limit, and a long prefill's leases on the
+# other lane): the image request waits or is refused alone (media_budget_exceeded) and the Engine keeps
+# serving (candidates SS-01). Needs a Qwen4Exp artifact with the vision tower.
+infernix_add_test(infernix_qwen4_exp_vision_lend_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_lend_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_qwen4_exp_vision_lend_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
+# Non-finite logits after a request published prefix-cache entries (a test hook): its entries are
+# withdrawn, a retry resumes from nothing and equals a cache-off run, and a saved cache file cannot
+# bring them back (hybrid-prefix-cache-spec §7.8, candidates SQ-01).
+infernix_add_test(infernix_qwen4_exp_nonfinite_withdraw_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nonfinite_withdraw_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_qwen4_exp_nonfinite_withdraw_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 # The Vision encode window's placement and visual columns (host only).
 infernix_add_test(infernix_qwen4_exp_vision_window_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_window.cpp"
@@ -133,6 +147,26 @@ infernix_add_test(infernix_qwen4_exp_resume_cold_real_test
   LIBRARIES infernix_engine
   ARGS mtp dflash2)
 set_tests_properties(infernix_qwen4_exp_resume_cold_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+infernix_add_test(infernix_qwen4_exp_resume_width_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_resume_width_real.cpp"
+  LIBRARIES infernix_engine)
+set_tests_properties(infernix_qwen4_exp_resume_width_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
+# The reproducible route's prefill bits across call widths over one call grid: whether its chunk could follow the
+# expert cache by merging whole grid calls (real artifact).
+infernix_add_test(infernix_qwen4_exp_prefill_width_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefill_width_real.cpp"
+  LIBRARIES infernix_engine)
+set_tests_properties(infernix_qwen4_exp_prefill_width_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
+# TEMPORARY with INFERNIX_TMP_STARTUP_CAPTURE (candidates §23 NU-04): the graph set captured at startup against
+# capture at first use, plain, MTP and DFlash2 (INFERNIX_QWEN4_DFLASH2): reproducible-route ids equal, and no graph
+# captured after startup on either route.
+infernix_add_test(infernix_qwen4_exp_startup_capture_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_startup_capture_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime
+  ARGS plain mtp dflash2)
+set_tests_properties(infernix_qwen4_exp_startup_capture_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 # A long prompt's layer walk while another lane decodes, with SSD-only experts (issue #5): both
 # requests complete with their solo ids and no call reports a silent host.
@@ -147,25 +181,21 @@ infernix_add_test(infernix_qwen4_exp_preemption_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_preemption_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
-# Sampled MTP drafts keep the sampler's output distribution and greedy tokens (sampled-mtp-drafts).
-infernix_add_test(infernix_qwen4_exp_sampled_drafts_real_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sampled_drafts_real.cpp"
+# MTP drafts (one-hot and sampled-mtp-drafts) and a DFlash2 companion drafter (--draft-model) against
+# one plain-decoding reference: the sampler's output distribution, greedy tokens, concurrency and the
+# drafter's ring through a prefix resume.
+infernix_add_test(infernix_qwen4_exp_speculative_sampling_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_sampling_real.cpp"
   LIBRARIES infernix_engine)
-set_tests_properties(infernix_qwen4_exp_sampled_drafts_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
-
-# A DFlash2 companion drafter (--draft-model): greedy tokens, concurrency, the ring through a prefix
-# resume and the sampler's output distribution.
-infernix_add_test(infernix_qwen4_exp_dflash2_real_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash2_real.cpp"
-  LIBRARIES infernix_engine)
-set_tests_properties(infernix_qwen4_exp_dflash2_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+set_tests_properties(infernix_qwen4_exp_speculative_sampling_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 infernix_add_test(infernix_qwen4_exp_decide_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_decide_real.cpp"
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_decide_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
-# Fast-path selection rules: where each path applies and which configurations qualify it.
+# Fast-path selection rules: where each path applies and which configurations qualify it, and the routes
+# --a8-activations gives each configuration.
 infernix_add_test(infernix_qwen4_exp_fast_paths_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fast_paths.cpp"
   LIBRARIES infernix_model_runtime)

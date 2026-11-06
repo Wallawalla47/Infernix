@@ -4,7 +4,9 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <map>
 #include <stdexcept>
+#include <vector>
 
 namespace infernix::runtime::expert_offload {
 namespace {
@@ -58,6 +60,18 @@ HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const Host
     out.pin_limited     = out.placement == ExpertPlacement::Tier && out.expert_pageable > 0;
     out.pin_capped      = out.pin_capped && out.pin_limited;
     if (out.placement == ExpertPlacement::Full || out.capped) { out.commit_limited = false; }
+    return out;
+}
+
+ExclusiveTier plan_exclusive_tier(std::uint64_t keys, std::uint64_t frames, std::uint64_t loan_frames,
+                                  std::uint64_t kv_frames, double seed_share) {
+    ExclusiveTier out;
+    const std::uint64_t shadows = loan_frames + frames / 16 + kv_frames;
+    if (frames == 0 || shadows >= frames || keys == 0) { return out; }
+    const auto share = static_cast<std::uint64_t>(std::clamp(seed_share, 0.0, 1.0) * static_cast<double>(frames));
+    out.shadows      = shadows;
+    out.seeded       = std::min(frames - shadows, share);
+    out.slots        = std::min(keys, keys - std::min(keys, out.seeded) + shadows);
     return out;
 }
 
@@ -131,8 +145,15 @@ std::uint64_t display_headroom(DisplayState display, bool elastic, std::optional
 }
 
 std::uint64_t internal_reserve(std::uint32_t graphs, std::uint64_t graph_bytes, bool elastic) {
-    const std::uint64_t counted = elastic ? std::min<std::uint32_t>(graphs, 32) : graphs;
-    return std::max(256 * kLedgerMiB, 128 * kLedgerMiB + graph_bytes * counted);
+    // An elastic pool reserves 128 MiB (candidates §22 VM-04, adopted 2026-10-27): the rule a fixed pool keeps,
+    // max(256, 128 + 4 per graph) MiB, left 210-240 MiB unspent on Dense8 and the 122B (logged), and the fixed
+    // 128 MiB measured faster: Dense8 MTP decode +8.0 / +3.4 / +2.4 % and the 122B one-request decode +1.0-1.7 %
+    // with the other VRAM defaults (2026-10-27 window, same ids). An elastic pool shrinks by chunks while free
+    // memory is under half the headroom, so executables instantiated past its reserve take frames back; a fixed
+    // pool cannot, so it keeps room for every executable it may instantiate.
+    constexpr std::uint64_t kElasticReserveMiB = 128;
+    if (elastic) { return kElasticReserveMiB * kLedgerMiB; }
+    return std::max(256 * kLedgerMiB, 128 * kLedgerMiB + graph_bytes * graphs);
 }
 
 VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& demand) {
@@ -140,7 +161,7 @@ VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& de
     out.snapshot = snapshot;
     out.demand   = demand;
     out.headroom = display_headroom(snapshot.display, demand.elastic, demand.headroom);
-    out.reserve  = internal_reserve(demand.graphs, demand.graph_bytes, demand.elastic && !demand.eager_graphs);
+    out.reserve  = internal_reserve(demand.graphs, demand.graph_bytes, demand.elastic);
     const auto signed_bytes = [](std::uint64_t v) { return static_cast<std::int64_t>(v); };
     std::int64_t room = signed_bytes(snapshot.device_free) - signed_bytes(demand.fixed) - signed_bytes(out.headroom);
     if (snapshot.has_budget) {
@@ -157,6 +178,41 @@ VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& de
         out.frames = static_cast<std::uint32_t>(std::min<std::uint64_t>(frames, demand.max_frames));
     }
     return out;
+}
+
+std::size_t frame_pools(std::span<const std::uint64_t> strides) {
+    std::vector<std::uint64_t> distinct(strides.begin(), strides.end());
+    std::sort(distinct.begin(), distinct.end());
+    return static_cast<std::size_t>(std::unique(distinct.begin(), distinct.end()) - distinct.begin());
+}
+
+std::uint32_t pool_slack_frames(std::size_t pools, std::uint64_t chunk_bytes, std::uint64_t frame_bytes) noexcept {
+    if (pools < 2 || frame_bytes == 0) { return 0; }
+    return static_cast<std::uint32_t>((pools - 1) * chunk_bytes / frame_bytes);
+}
+
+LendCapacity lend_capacity(std::span<const std::uint64_t> strides, std::uint32_t experts, std::uint32_t frames) {
+    std::map<std::uint64_t, std::uint32_t> layers_of; // pitch -> its layers, as ExpertResidency groups them
+    for (const std::uint64_t stride : strides) { ++layers_of[stride]; }
+    const auto layers = static_cast<std::uint32_t>(strides.size());
+    LendCapacity best;
+    for (const auto& [pitch, count] : layers_of) {
+        const std::uint32_t limit    = count * experts - 1;
+        const std::uint32_t split    = layers_of.size() == 1 ? std::min(frames, limit) : std::min(frames / layers * count, limit);
+        const std::uint64_t lendable = split - split / 4;
+        if (lendable * pitch > best.frames * best.pitch) { best = {lendable, pitch}; }
+    }
+    return best;
+}
+
+VramSnapshot nominal_snapshot(VramSnapshot s, std::optional<std::uint64_t> in_use_before_load) noexcept {
+    if (!in_use_before_load) { return s; }
+    const std::uint64_t used = *in_use_before_load;
+    s.device_free = used >= kNominalInUseBytes ? s.device_free + (used - kNominalInUseBytes)
+                                               : s.device_free - std::min<std::uint64_t>(s.device_free, kNominalInUseBytes - used);
+    s.has_budget  = false;
+    s.display     = DisplayState::Attached;
+    return s;
 }
 
 VramControl::VramControl(const VramDemand& demand, std::uint64_t chunk_bytes, std::uint64_t usage,

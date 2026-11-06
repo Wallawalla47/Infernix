@@ -60,7 +60,7 @@ n-gram volume is needed.
 - About 70 GiB of free host RAM for the all-in-RAM mode. With less, the RAM ledger keeps as many
   experts as fit and reads the rest from the artifact (the SSD expert tier); `--expert-ram-mib` sets
   the split. Windows caps page-locked memory at 80 % of RAM.
-- About 75 GB of disk. An Infernix build from `main` at or after commit `5069e375`.
+- About 75 GB of disk. An Infernix build from `main` at or after commit `f5b2d84b`.
 
 ## What is bit-exact and what is quantized
 
@@ -80,8 +80,13 @@ mismatch.
 ```text
 infernix Ornith-1.5-122B-NVFP4-Infernix-00001-of-00003.infernix \
   --prompt "Explain why the sky is blue." --max-context 8192 --max-new 256
-infernix-serve Ornith-1.5-122B-NVFP4-Infernix-00001-of-00003.infernix --max-context 262144 --kv-dtype int8 --spec mtp --draft-tokens auto
+infernix-serve Ornith-1.5-122B-NVFP4-Infernix-00001-of-00003.infernix --max-context 262144 --max-concurrency 2 \
+  --kv-dtype int8 --spec mtp --draft-tokens auto --host-context-mib 4096
 ```
+
+The server command is the recommended configuration; `--host-context-mib 4096` keeps the prefix cache's
+RAM small beside the experts' ~70 GiB. Infernix builds from 2026-10-31 speculate the same way even
+without `--spec` (`--spec auto` takes MTP on this model).
 
 - **Context memory:** only the first 32,768 tokens of KV are held at startup; longer contexts take
   their KV from the expert cache as they grow and give it back when they end.

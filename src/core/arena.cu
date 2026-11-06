@@ -59,6 +59,10 @@ DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     void* ptr             = nullptr;
     const cudaError_t err = cudaMalloc(&ptr, bytes);
     if (err != cudaSuccess) {
+        // The failure is also the runtime's last error: consumed here, it is reported once, by this
+        // exception, and not again by the next launch's error check (which would abort a process that
+        // recovered from the failed allocation; closed PR #46).
+        (void)cudaGetLastError();
         throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
     }
     p = ptr;
@@ -156,6 +160,7 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     void* ptr             = nullptr;
     const cudaError_t err = cudaMalloc(&ptr, capacity_bytes);
     if (err != cudaSuccess) {
+        (void)cudaGetLastError(); // reported by this exception only (see DeviceBuffer)
         throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
     }
 
@@ -262,6 +267,7 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     void* ptr             = nullptr;
     const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
     if (err != cudaSuccess) {
+        (void)cudaGetLastError(); // reported by this exception only (see DeviceBuffer)
         throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
     }
 

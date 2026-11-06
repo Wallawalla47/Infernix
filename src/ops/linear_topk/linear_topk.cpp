@@ -188,9 +188,7 @@ void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
                             &candidate_ids,
                             &candidate_scores,
                             &scratch.partial_keys,
-                            &scratch.group_keys,
-                            &scratch.secondary_keys,
-                            &scratch.group_done,
+                            &scratch.slice_keys,
                             id_map};
     for (const Tensor* tensor : tensors) {
         if (tensor == nullptr) { continue; }
@@ -205,8 +203,7 @@ void require_scratch_nonoverlap(const Tensor& hidden, const Tensor& candidate_id
                                 const Tensor& candidate_scores, const Tensor* id_map,
                                 const detail::LinearTopKWorkspace& scratch) {
     const Tensor* live[]{&hidden, &candidate_ids, &candidate_scores, id_map};
-    const Tensor* work[]{&scratch.partial_keys, &scratch.group_keys, &scratch.secondary_keys,
-                         &scratch.group_done};
+    const Tensor* work[]{&scratch.partial_keys, &scratch.slice_keys};
     for (const Tensor* lhs : live) {
         if (lhs == nullptr) { continue; }
         for (const Tensor* rhs : work) {

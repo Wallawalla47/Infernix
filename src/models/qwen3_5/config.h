@@ -149,6 +149,12 @@ struct Config {
     std::optional<VisionConfig> vision;
     bool mtp = false;
     std::optional<DraftConfig> draft;
+    // LoadOptions::mtp_expert_pool: with offloaded experts, the MTP drafter's routed experts are pinned in host memory
+    // and its draft steps route among those held by this many device slots
+    // (runtime/expert_offload/drafter_pool.h); mtp_expert_bytes is one expert's gate/up and down rows (set by the load
+    // plan). 0: the drafter's bank is device-resident.
+    std::uint32_t mtp_expert_slots = 0;
+    std::uint64_t mtp_expert_bytes = 0;
 };
 
 // Runtime position envelope; native max_position_embeddings remains artifact metadata.

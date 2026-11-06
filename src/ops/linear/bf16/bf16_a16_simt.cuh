@@ -186,6 +186,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
     Epilogue epilogue, int input_rows, int tokens, int token_offset) {
     constexpr int ActiveTokens = Schedule::kBlockTokens;
     const int K                = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
+    // As bf16_a16_gemv_kernel: a programmatic dependent where its launcher says so (no-ops otherwise).
+    pdl::enter_streaming();
     // A whole-call specialization must not carry an unused token-grid offset through its
     // unrolled load loop: that extends register lifetimes at the small-T occupancy boundary.
     constexpr bool whole_call = Schedule::kTokenCapacity > 0;
@@ -205,6 +207,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
     bf16_simt_compute_rows<ActiveTokens, Schedule>(x + static_cast<std::int64_t>(token_begin) * K,
                                                    weight, row0, warp_in_row, lane, accumulators,
                                                    live_tokens, K);
+    pdl::trigger_dependents();
 #pragma unroll
     for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
         float values[ActiveTokens];

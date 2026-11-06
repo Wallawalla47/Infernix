@@ -57,7 +57,7 @@ public:
     }
 
     bool start_object(std::size_t size) {
-        clear_value();
+        enter();
         stack_.push_back({});
         return dom_.start_object(size);
     }
@@ -74,7 +74,7 @@ public:
     }
 
     bool start_array(std::size_t size) {
-        clear_value();
+        enter();
         stack_.push_back({.array = true});
         return dom_.start_array(size);
     }
@@ -118,6 +118,12 @@ private:
     void scalar() {
         clear_value();
         advance();
+    }
+
+    // Thrown, not refused through the SAX result: the parse ignores it and would keep a partial DOM.
+    void enter() {
+        if (stack_.size() == kMaxJsonNesting) { throw JsonNestingError(); }
+        clear_value();
     }
 
     ParsedJsonNumbers& result_;
@@ -170,6 +176,29 @@ ParsedJsonNumbers parse_json_numbers(std::string_view source) {
     NumberSax sax(parsed);
     Json::sax_parse(source, &sax);
     return parsed;
+}
+
+std::size_t json_text_nesting(std::string_view text) noexcept {
+    std::size_t depth = 0, deepest = 0;
+    bool quoted = false, escaped = false;
+    for (const char c : text) {
+        if (quoted) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                quoted = false;
+            }
+        } else if (c == '"') {
+            quoted = true;
+        } else if (c == '[' || c == '{') {
+            deepest = std::max(deepest, ++depth);
+        } else if ((c == ']' || c == '}') && depth > 0) {
+            --depth;
+        }
+    }
+    return deepest;
 }
 
 std::optional<std::string> inexact_schema_number(const ParsedJsonNumbers& parsed,

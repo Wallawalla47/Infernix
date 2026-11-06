@@ -1,6 +1,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -138,33 +139,45 @@ int main() {
     failures += expect_throw([&] { (void)records.layer(0, 0); }, "zero active rows");
     failures += expect_throw([&] { (void)records.layer(0, 6); }, "excess active rows");
 
+    // A narrower round's view holds the rows its width's columns fit in a layer's 4 x 5 columns (at most
+    // eight), each layer's rows dense from l * rows; every view stays inside the planes.
     for (int width = 1; width <= spec.width; ++width) {
-        const auto narrow = records.narrowed(width);
-        failures += expect(narrow.spec.width == width && narrow.spec.layers == spec.layers &&
-                               narrow.spec.record_capacity == spec.record_capacity,
-                           "narrowed spec differs");
-        failures += expect_shape(narrow.conv, 256, width, 15, 1, "narrowed conv plane");
-        failures += expect_shape(narrow.key, 128, 2, width, 15, "narrowed key plane");
-        failures += expect_shape(narrow.value, 128, 6, width, 15, "narrowed value plane");
-        failures += expect_shape(narrow.gate, 2, 6, width, 15, "narrowed gate plane");
-        failures += expect(narrow.conv.data == records.conv.data &&
-                               narrow.key.data == records.key.data &&
-                               narrow.value.data == records.value.data &&
-                               narrow.gate.data == records.gate.data,
-                           "narrowed view moved a plane base");
-        const auto narrow_layer = narrow.layer(2, 3);
-        failures += expect_shape(narrow_layer.key, 128, 2, width, 3, "narrowed layer key");
-        failures += expect(static_cast<std::byte*>(narrow_layer.key.data) -
-                                   static_cast<std::byte*>(records.key.data) ==
-                               static_cast<std::ptrdiff_t>(2 * spec.record_capacity *
-                                                           narrow.key.nb[3]),
-                           "narrowed layer offset is not dense at the narrowed width");
-        failures += expect(narrow_layer.key.is_contiguous() && narrow_layer.conv.is_contiguous(),
-                           "narrowed layer rows are not dense");
+        for (int rows = 1; rows <= std::min(8, spec.width * spec.record_capacity / width); ++rows) {
+            const auto narrow = records.narrowed(width, rows);
+            const int outer   = spec.layers * rows;
+            failures += expect(narrow.spec.width == width && narrow.spec.layers == spec.layers &&
+                                   narrow.spec.record_capacity == rows,
+                               "narrowed spec differs");
+            failures += expect_shape(narrow.conv, 256, width, outer, 1, "narrowed conv plane");
+            failures += expect_shape(narrow.key, 128, 2, width, outer, "narrowed key plane");
+            failures += expect_shape(narrow.value, 128, 6, width, outer, "narrowed value plane");
+            failures += expect_shape(narrow.gate, 2, 6, width, outer, "narrowed gate plane");
+            failures += expect(narrow.conv.data == records.conv.data && narrow.key.data == records.key.data &&
+                                   narrow.value.data == records.value.data && narrow.gate.data == records.gate.data,
+                               "narrowed view moved a plane base");
+            failures += expect(narrow.conv.bytes() <= records.conv.bytes() && narrow.key.bytes() <= records.key.bytes() &&
+                                   narrow.value.bytes() <= records.value.bytes() &&
+                                   narrow.gate.bytes() <= records.gate.bytes(),
+                               "narrowed view runs past its storage");
+            const int active        = std::min(rows, 3);
+            const auto narrow_layer = narrow.layer(2, active);
+            failures += expect_shape(narrow_layer.key, 128, 2, width, active, "narrowed layer key");
+            failures += expect(static_cast<std::byte*>(narrow_layer.key.data) -
+                                       static_cast<std::byte*>(records.key.data) ==
+                                   static_cast<std::ptrdiff_t>(2 * rows * narrow.key.nb[3]),
+                               "narrowed layer offset is not dense at the narrowed width");
+            failures += expect(narrow_layer.key.is_contiguous() && narrow_layer.conv.is_contiguous(),
+                               "narrowed layer rows are not dense");
+            failures += expect_throw([&] { (void)narrow.layer(0, rows + 1); }, "narrowed view past its rows");
+        }
     }
-    failures += expect_throw([&] { (void)records.narrowed(0); }, "zero narrowed width");
-    failures += expect_throw([&] { (void)records.narrowed(spec.width + 1); },
+    failures += expect_throw([&] { (void)records.narrowed(0, 1); }, "zero narrowed width");
+    failures += expect_throw([&] { (void)records.narrowed(spec.width + 1, 1); },
                              "narrowed width above the storage width");
+    failures += expect_throw([&] { (void)records.narrowed(spec.width, 0); }, "zero narrowed rows");
+    failures += expect_throw([&] { (void)records.narrowed(spec.width, spec.record_capacity + 1); },
+                             "narrowed rows past the storage's columns");
+    failures += expect_throw([&] { (void)records.narrowed(1, 9); }, "narrowed rows above eight");
 
     auto wide_spec  = spec;
     wide_spec.width = 64;

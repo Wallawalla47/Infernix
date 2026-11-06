@@ -26,6 +26,9 @@ namespace execution {
 class Parameters;
 }
 
+// --prefill-chunk's grid: a chunk is a nonzero multiple of it.
+inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
+
 namespace detail {
 struct ProgramOffloadOptions;
 struct SequencePlanImpl;
@@ -61,6 +64,12 @@ public:
     [[nodiscard]] std::uint32_t max_concurrency() const noexcept;
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
+    // The KV pages' payload (text KV and the drafter's paged KV) and the CUDA Graph allowance, both
+    // inside device_reservation_bytes.
+    [[nodiscard]] std::size_t kv_payload_bytes() const noexcept;
+    [[nodiscard]] std::size_t graph_allowance_bytes() const noexcept;
+    // The widest speculative round's drafts (0 without speculation).
+    [[nodiscard]] std::uint32_t draft_window() const noexcept;
     [[nodiscard]] std::size_t host_capacity_bytes() const noexcept;
     // Whether automatic tree widths are active: requested and verifiable by the target.
     [[nodiscard]] bool draft_tree_auto() const noexcept;
@@ -68,6 +77,9 @@ public:
     // to decode (idle-wide-prefill; the chunk when that fast path is off).
     [[nodiscard]] std::uint32_t prefill_chunk() const noexcept;
     [[nodiscard]] std::uint32_t idle_prefill_width() const noexcept;
+    // With offloaded experts: the workspace the expert cache lends the widest prefill pass (text or MTP,
+    // ProgramOffload's wide pass); 0 when no pass borrows.
+    [[nodiscard]] std::size_t offload_wide_pass_bytes() const noexcept;
 
 private:
     explicit SequencePlan(std::unique_ptr<detail::SequencePlanImpl> impl) noexcept;
@@ -97,9 +109,10 @@ private:
     std::unique_ptr<detail::SequencePlannerImpl> impl_;
 
     friend SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
-                                                 const EngineOptions&);
+                                                 const EngineOptions&, const detail::ProgramOffloadOptions*);
     friend SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
-                                                 const EngineOptions&, std::uint32_t);
+                                                 const EngineOptions&, std::uint32_t,
+                                                 const detail::ProgramOffloadOptions*);
 };
 
 class RequestBasePlan {
@@ -433,6 +446,14 @@ public:
     // through the waker, from its own thread, and the Engine calls maintain() under its execution lock.
     void maintain();
     void set_maintenance_waker(std::function<void()> waker);
+    // RAM pressure (EngineOptions::ram_resize, runtime::expert_offload::RamMonitor): starts the monitor under which
+    // maintain() shrinks the prefix cache's Host tier while the OS runs short and grows it back once more than
+    // `reserve_bytes` plus a step stays free, reporting each resize to `diagnostic`. A no-op without a Host tier.
+    // Before the Engine sets its maintenance waker.
+    void start_ram_resize(std::uint64_t reserve_bytes, std::function<void(const std::string&, DiagnosticLevel)> diagnostic);
+    // Offloaded experts: the logical CPUs the Engine's round thread runs on, a core the CPU expert team
+    // leaves free (runtime::expert_offload::CpuPlacement::engine); 0 (unpinned) otherwise.
+    [[nodiscard]] std::uint64_t engine_thread_cpus() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
 
     // The prefix cache, when the context cache is enabled. Admission binds a lane through a
@@ -462,6 +483,9 @@ public:
     [[nodiscard]] bool hybrid_holds_stale() const noexcept;
     // Changes when a queued request's choice of snapshot may have changed.
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
+    // The positions a request can resume from: every position with free-cache-resume, else the
+    // prefill chunk grid (the reproducible route).
+    [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     // Installs the Engine's calibrated machine model for hybrid admission choice and eviction.
     void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);
@@ -480,6 +504,9 @@ public:
     // HybridPrefixCacheOptions::persistent_save_interval). Absent without a file or a change.
     [[nodiscard]] std::optional<HybridCachePersistence> save_prefix_cache_now(const CancellationView& abandoned);
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    // With offloaded experts: the VRAM expert cache's counters since startup and its size now
+    // (RuntimeStats::expert_cache); nothing otherwise.
+    [[nodiscard]] std::optional<ExpertCacheTotals> expert_cache_totals() const noexcept;
     void reset_memory_peaks() noexcept;
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept;
@@ -489,13 +516,17 @@ private:
                                                    const detail::ProgramOffloadOptions*);
 };
 
+// `offload`: an artifact with offloaded experts plans the offload engine's staging and tables among the
+// fixed device bytes (ProgramOffload::fixed_bytes), with the options create_program will take.
 [[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
-                                                    const EngineOptions&);
+                                                    const EngineOptions&,
+                                                    const detail::ProgramOffloadOptions* offload = nullptr);
 // Plans prefill steps up to `idle_prefill_width` tokens while no other lane waits to decode: one
 // of idle_prefill_widths(parameters, options).
 [[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
                                                     const EngineOptions&,
-                                                    std::uint32_t idle_prefill_width);
+                                                    std::uint32_t idle_prefill_width,
+                                                    const detail::ProgramOffloadOptions* offload = nullptr);
 // The idle-wide-prefill widths to try, widest first: startup plans the widest whose runtime
 // reservation keeps the KV capacity (runtime/engine/model_instance.cpp). Empty unless the fast
 // path is selected and some width is wider than the effective chunk.

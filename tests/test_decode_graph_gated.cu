@@ -161,7 +161,7 @@ int main() {
         }
         std::cout << kSteps * scripts.size() << " limited chains replayed, " << limited_failures << " mismatching\n";
 
-        // The binned-product gate (INFERNIX_TMP_MTP_CUMULATIVE): body j + 1 runs while the product of
+        // The binned-product gate (Flash-Next MTP's cumulative cut): body j + 1 runs while the product of
         // steps 0..j's bin rates is not below the threshold word, which a replay may change; the host's
         // graph_gate_product decides the expected cut. Bin edges and rates as the Flash-Next MTP rule's.
         const infernix::GraphGateBins bins{

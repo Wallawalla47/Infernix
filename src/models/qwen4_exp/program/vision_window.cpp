@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/program/vision_window.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <stdexcept>
 
@@ -69,5 +70,17 @@ VisualSlice visual_slice(std::span<const std::uint32_t> visual, std::uint32_t a,
     }
     return out;
 }
+
+namespace testing {
+
+namespace {
+std::atomic<std::uint64_t> g_vision_lend_limit{0};
+} // namespace
+
+void set_vision_lend_limit(std::uint64_t bytes) noexcept { g_vision_lend_limit.store(bytes); }
+
+std::uint64_t vision_lend_limit() noexcept { return g_vision_lend_limit.load(std::memory_order_relaxed); }
+
+} // namespace testing
 
 } // namespace infernix::models::qwen4_exp

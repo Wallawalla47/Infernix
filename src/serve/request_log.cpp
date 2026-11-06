@@ -128,6 +128,8 @@ const char* kv_cache_json_name(infernix::KvCacheStorage storage) {
         return "vq2";
     case infernix::KvCacheStorage::Q4KeyVq2Value:
         return "k4v2";
+    case infernix::KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     return "unknown";
 }
@@ -355,7 +357,6 @@ Json speculative_json(const GenerationOutcome& outcome) {
         {"ngram_archive_rounds", outcome.speculative.ngram_archive_rounds},
         {"ngram_archive_drafted_tokens", outcome.speculative.ngram_archive_drafted_tokens},
         {"ngram_archive_accepted_tokens", outcome.speculative.ngram_archive_accepted_tokens},
-        {"ngram_gate_rejections", outcome.speculative.ngram_gate_rejections},
         {"tree_rounds", outcome.speculative.tree_rounds},
         {"tree_side_rounds", outcome.speculative.tree_side_rounds},
         {"tree_side_accepted_tokens", outcome.speculative.tree_side_accepted_tokens},
@@ -728,6 +729,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"reasoning_loop_detected", outcome.thinking.loop_detected},
              {"reasoning_loop_thinking_tokens", outcome.thinking.loop_thinking_tokens},
              {"reasoning_loop_coverage", outcome.thinking.loop_coverage},
+             {"reasoning_loop_run_on_chars", outcome.thinking.loop_run_on_chars},
              {"tool_call_count", outcome.tool_calls.size()},
              {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)}};
     record["timings_seconds"] = Json{
@@ -744,6 +746,10 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
                                          {"scheduling", scheduling_json(outcome.scheduling)},
                                          {"admission", admission_json(outcome.admission)}};
     record["prefix_miss"] = prefix_miss_json(outcome.prefix_miss);
+    // Only a request whose diagnosis gave up says so, so every other record stays as it was.
+    if (outcome.prefix_miss_diagnostic_failed) {
+        record["prefix_miss_diagnostic_failed"] = true;
+    }
     return record.dump();
 }
 
@@ -895,7 +901,14 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"held_device_evictions", delta(&RuntimeStats::hybrid_held_device_evictions)},
                  {"held_snapshot_losses", delta(&RuntimeStats::hybrid_held_snapshot_losses)},
                  {"held_host_refusals", delta(&RuntimeStats::hybrid_held_host_refusals)},
-                 {"tool_call_holds", delta(&RuntimeStats::hybrid_tool_call_holds)}};
+                 {"tool_call_holds", delta(&RuntimeStats::hybrid_tool_call_holds)},
+                 {"next_turn_prefill",
+                  Json{{"started", delta(&RuntimeStats::next_turn_prefills_started)},
+                       {"completed", delta(&RuntimeStats::next_turn_prefills_completed)},
+                       {"yielded", delta(&RuntimeStats::next_turn_prefills_yielded)},
+                       {"skipped", delta(&RuntimeStats::next_turn_prefills_skipped)},
+                       {"dropped", delta(&RuntimeStats::next_turn_prefills_dropped)},
+                       {"computed_tokens", delta(&RuntimeStats::next_turn_prefill_tokens)}}}};
     }
     // The device (NVML): readings at the interval's end, energy and policy-limited time over it;
     // null without NVML, and each figure null where the driver does not report it.

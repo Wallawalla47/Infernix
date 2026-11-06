@@ -6,6 +6,33 @@
 
 namespace infernix {
 
+namespace {
+
+// Creates, maps and opens one chunk at `va`; false when the device has no memory for it. Under WDDM the
+// driver may accept cuMemCreate and report the shortage only when the chunk is made resident (cuMemMap or
+// cuMemSetAccess), most of all past the OS budget (--vram-past-budget), so every step's out-of-memory is
+// the same answer.
+bool map_device_chunk(CUdeviceptr va, std::size_t bytes, int device, CUmemGenericAllocationHandle& handle) {
+    const CUmemAllocationProp prop = vmm::device_prop(device);
+    const CUresult created         = cuMemCreate(&handle, bytes, &prop, 0);
+    if (created == CUDA_ERROR_OUT_OF_MEMORY) { return false; }
+    vmm::check(created, "cuMemCreate");
+    if (const CUresult mapped = cuMemMap(va, bytes, 0, handle, 0); mapped != CUDA_SUCCESS) {
+        (void)cuMemRelease(handle);
+        if (mapped == CUDA_ERROR_OUT_OF_MEMORY) { return false; }
+        vmm::check(mapped, "cuMemMap");
+    }
+    if (const CUresult access = vmm::try_set_access(va, bytes, device); access != CUDA_SUCCESS) {
+        (void)cuMemUnmap(va, bytes);
+        (void)cuMemRelease(handle);
+        if (access == CUDA_ERROR_OUT_OF_MEMORY) { return false; }
+        vmm::check(access, "cuMemSetAccess");
+    }
+    return true;
+}
+
+} // namespace
+
 VmmArena::VmmArena(int device, std::size_t reserve_bytes, std::size_t chunk_bytes)
     : device_(device), chunk_(chunk_bytes) {
     if (!vmm::supported(device)) { throw std::runtime_error("VMM arena: the device lacks virtual memory management"); }
@@ -32,23 +59,8 @@ bool VmmArena::supported(int device) { return vmm::supported(device); }
 
 bool VmmArena::map_chunk() {
     if (mapped_bytes() + chunk_ > reserved_) { return false; }
-    const CUmemAllocationProp prop = vmm::device_prop(device_);
     CUmemGenericAllocationHandle handle{};
-    const CUresult created = cuMemCreate(&handle, chunk_, &prop, 0);
-    if (created == CUDA_ERROR_OUT_OF_MEMORY) { return false; }
-    vmm::check(created, "cuMemCreate");
-    const CUdeviceptr va = base_ + mapped_bytes();
-    if (const CUresult mapped = cuMemMap(va, chunk_, 0, handle, 0); mapped != CUDA_SUCCESS) {
-        (void)cuMemRelease(handle);
-        vmm::check(mapped, "cuMemMap");
-    }
-    try {
-        vmm::set_access(va, chunk_, device_);
-    } catch (...) {
-        (void)cuMemUnmap(va, chunk_);
-        (void)cuMemRelease(handle);
-        throw;
-    }
+    if (!map_device_chunk(base_ + mapped_bytes(), chunk_, device_, handle)) { return false; }
     chunks_.push_back(handle);
     return true;
 }
@@ -78,23 +90,8 @@ VmmRange::~VmmRange() {
 bool VmmRange::map(std::size_t chunk) {
     if (chunk >= handles_.size()) { throw std::out_of_range("VMM range: chunk outside the reservation"); }
     if (handles_[chunk] != 0) { return true; }
-    const CUmemAllocationProp prop = vmm::device_prop(device_);
     CUmemGenericAllocationHandle handle{};
-    const CUresult created = cuMemCreate(&handle, chunk_, &prop, 0);
-    if (created == CUDA_ERROR_OUT_OF_MEMORY) { return false; }
-    vmm::check(created, "cuMemCreate");
-    const CUdeviceptr va = base_ + chunk * chunk_;
-    if (const CUresult mapped = cuMemMap(va, chunk_, 0, handle, 0); mapped != CUDA_SUCCESS) {
-        (void)cuMemRelease(handle);
-        vmm::check(mapped, "cuMemMap");
-    }
-    try {
-        vmm::set_access(va, chunk_, device_);
-    } catch (...) {
-        (void)cuMemUnmap(va, chunk_);
-        (void)cuMemRelease(handle);
-        throw;
-    }
+    if (!map_device_chunk(base_ + chunk * chunk_, chunk_, device_, handle)) { return false; }
     handles_[chunk] = handle;
     ++mapped_;
     return true;

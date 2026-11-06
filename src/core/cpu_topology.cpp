@@ -92,6 +92,23 @@ std::vector<PhysicalCore> physical_cores() {
     return cores;
 }
 
+std::uint32_t process_logical_cpus() noexcept {
+#if defined(_WIN32)
+    DWORD_PTR process = 0, system = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) && process != 0) {
+        return static_cast<std::uint32_t>(std::popcount(static_cast<std::uint64_t>(process)));
+    }
+    return static_cast<std::uint32_t>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+#elif defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) != 0) { return 0; }
+    return static_cast<std::uint32_t>(CPU_COUNT(&set));
+#else
+    return 0;
+#endif
+}
+
 int first_cpu(std::uint64_t cpus) noexcept { return cpus == 0 ? -1 : std::countr_zero(cpus); }
 
 std::uint64_t set_current_thread_cpus(std::uint64_t cpus) noexcept {

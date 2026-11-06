@@ -91,6 +91,10 @@ enum class Name : std::size_t {
     TextLayer,
     PleRows,
     MoeCpuCompute,
+    ResidencyBeforeRound,
+    ResidencyAfterRound,
+    TierBeginRound,
+    TierUses,
     Count,
 };
 
@@ -215,6 +219,10 @@ enum class Name : std::size_t {
         "text.layer",
         "ple.rows",
         "moe.cpu.compute",
+        "residency.before_round",
+        "residency.after_round",
+        "tier.begin_round",
+        "tier.uses",
     });
     static_assert(names.size() == static_cast<std::size_t>(Name::Count));
     static const auto handles = [] {

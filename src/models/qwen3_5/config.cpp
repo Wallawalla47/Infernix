@@ -371,10 +371,9 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             options.speculative == SpeculativeBackend::DFlash2) {
             out.draft = draft(companion(directory, options.speculative_component()).config,
                               out.text, options.speculative == SpeculativeBackend::DFlash2);
-            out.draft->yarn_factor = options.rope_yarn_factor;
-            if (options.rope_yarn_factor > 1.0F && out.draft->rope_theta <= 1.0F) {
-                throw ArtifactError("YaRN requires draft rope_theta greater than one");
-            }
+            // The DFlash/DFlash2 drafter keeps its own unscaled RoPE under target YaRN, as NInfer
+            // runs it: the target's factor collapses its draft acceptance at long context.
+            out.draft->yarn_factor = 1.0F;
         }
         return out;
     } catch (const std::exception& error) {

@@ -27,6 +27,9 @@ struct LoadOptions {
     KvCacheStorage reference_kv = KvCacheStorage::BFloat16;
     // Qwen4Exp: routed expert banks whose 4-bit activations are optional run them (W4A4).
     bool expert_a4_activations = false;
+    // Qwen4Exp: banks that are W4A4 by their checkpoint run 16-bit activations instead
+    // (EngineOptions::expert_a16_activations, or a8_activations, whose 8-bit route runs on the 16-bit banks).
+    bool expert_a16_activations = false;
     // Offloaded routed expert banks (Qwen4Exp, Qwen3.5 with offloaded experts) stay in the artifact
     // and are read in place by the SSD expert tier (Flash-Next design §19.3.7) instead of being
     // pinned in host memory.
@@ -35,7 +38,8 @@ struct LoadOptions {
     std::filesystem::path draft_model;
     // Qwen4Exp: the artifact's 2-bit screens (--screen-heads), each bound when present for its consumer (an
     // artifact without them loads as before): the MTP drafter's proposal head (Generation with --spec mtp
-    // --lm-head-draft) and the LM head (Generation with fast paths, where screened-lm-head may be selected).
+    // --lm-head-draft) and the LM head (Generation with fast paths, where screened-lm-head may be selected; the Qwen4Exp
+    // instance clears it with a KV format where the path is qualified in no configuration).
     // screened_lm_head (the fast path asked for as a candidate) needs the LM head's screen: an artifact
     // without it is refused.
     bool proposal_head_screen = false;
@@ -44,6 +48,17 @@ struct LoadOptions {
     // Qwen3.5 (EngineOptions::embedding_host): the token embedding stays in pinned host memory, gathered
     // zero-copy, as an artifact with offloaded experts already keeps it.
     bool embedding_host = false;
+    // --spec mtp generation off the lossless route (candidates §22 VM-01 variant B): the MTP drafter's routed experts
+    // stay in pinned host memory and its draft steps route among the experts a pool of device slots holds
+    // (runtime/expert_offload/drafter_pool.h), where the model can pool them: Qwen4Exp, and Qwen3.5 with offloaded
+    // experts, each with its measured slot count (Config::mtp_expert_slots). False: the bank is device-resident.
+    bool mtp_expert_pool = false;
+    // Qwen4Exp off the lossless route: the BF16 weights whose every reader takes bf16_p12 are packed losslessly at
+    // load (core/weight.h), and their BF16 copies freed.
+    bool pack_bf16 = false;
+    // Qwen4Exp --a8-activations with fast paths: a GGUF import's hyper-connection matrices are repacked to Q8 at load
+    // (execution::Parameters' hc_q8), so its mixers stay BF16 for that repack; every other artifact's mixers pack.
+    bool hc_q8_repack = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -107,6 +122,8 @@ struct LoadOptions {
             .reference                = options.reference,
             .reference_kv             = options.reference ? options.kv_cache : KvCacheStorage::BFloat16,
             .expert_a4_activations    = options.expert_a4_activations,
+            .expert_a16_activations   = architecture == Architecture::Qwen4Exp &&
+                                      (options.expert_a16_activations || options.a8_activations),
             .draft_model              = options.speculative.draft_model,
             // The screens are Qwen4Exp's (a Qwen3.5 Program compares these options with its loaded ones).
             .proposal_head_screen     = architecture == Architecture::Qwen4Exp &&
@@ -118,7 +135,15 @@ struct LoadOptions {
                                     !options.lossless,
             .screened_lm_head         = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
                                                   FastPath::ScreenedLmHead) != options.fast_path_candidates.end(),
-            .embedding_host           = options.embedding_host};
+            .embedding_host           = options.embedding_host,
+            // The pool follows every request's drafts, so drafts depend on the other requests; outputs do not where
+            // verification decides alone (the fast route, and the reproducible route, whose verification is
+            // width-invariant and sampling Gumbel-max). No speculation is lossless.
+            .mtp_expert_pool = !options.lossless && options.purpose == EnginePurpose::Generation &&
+                               options.speculative.backend == SpeculativeBackend::Mtp,
+            .pack_bf16       = architecture == Architecture::Qwen4Exp && !options.lossless,
+            .hc_q8_repack    = architecture == Architecture::Qwen4Exp && options.a8_activations && !options.lossless &&
+                            options.fast_paths};
 }
 
 } // namespace infernix::models

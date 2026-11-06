@@ -3,7 +3,8 @@
 // packed Device slots and to Host images split over shuffled slabs, restored into other lanes group
 // by group, and must come back byte for byte without touching any other lane. A KV page moved to a
 // Host record and back into a different page per KV layer must also be byte-exact. A DFlash2
-// drafter's context ring (five layers of one lane's K and V) rides in the drafter group.
+// drafter's context ring (five layers of one lane's K and V) rides in the drafter group. A tap's
+// partial page that returns to the pool while the tap still copies it is reused only after the copy.
 
 #include "core/arena.h"
 #include "core/cyclic_kv_cache.h"
@@ -12,11 +13,14 @@
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
+#include "models/qwen4_exp/program/prefix/prefix_cache.h"
 #include "models/qwen4_exp/program/prefix/state_image.h"
+#include "runtime/prefix_cache/block_hash.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -25,6 +29,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace infernix;
@@ -409,6 +414,143 @@ void test_page_records(const TextConfig& c, KvCacheStorage storage, std::size_t 
                 geometry.planes_per_layer);
 }
 
+// A tap's tail is the lane's own partial page, which the cache copies on its transfer stream. When
+// the page returns to the pool while that copy is pending (the lane's release, or the eviction of
+// the block the page became), its next owner writes it on the compute stream: that write must wait
+// for the copy, or the snapshot holds the next owner's KV (candidates TM-01). The capture's producer
+// is held behind an unpublished gate, so its copy stays pending while the next owner zeroes the page.
+void test_tap_page_reuse(const TextConfig& c) {
+    namespace pc                   = runtime::prefix_cache;
+    constexpr std::uint32_t kLanes = 1;
+    const StateImageLayout layout  = plan_state_image(state_image_spec(c, true, KvCacheStorage::Int8Group64));
+    const StateImageSpec& spec     = layout.spec;
+    LayoutBuilder builder;
+    const LinearAttentionStatePoolSpec gdn_spec{.layers         = c.gdn_layers,
+                                                .conv_channels  = static_cast<std::int32_t>(c.gdn.conv_channels()),
+                                                .conv_width     = static_cast<std::int32_t>(c.gdn.conv_kernel - 1),
+                                                .value_heads    = static_cast<std::int32_t>(c.gdn.value_heads),
+                                                .value_head_dim = static_cast<std::int32_t>(c.gdn.value_head_dim),
+                                                .key_head_dim   = static_cast<std::int32_t>(c.gdn.key_head_dim),
+                                                .slot_count     = static_cast<std::int32_t>(kLanes)};
+    const auto gdn_layout = plan_linear_attention_state_pool(builder, gdn_spec);
+    DeviceBuffer state(builder.finish(256));
+    LinearAttentionStatePool gdn(DeviceSpan{state.p, state.bytes}, gdn_layout);
+    DeviceBuffer ple(spec.ple_bytes * kLanes);
+    DeviceBuffer tails(spec.qsa_tail_bytes * kLanes * (c.attention_layers + 1U));
+    DeviceBuffer saved(spec.mtp_saved_bytes * kLanes);
+    const LaneStateImage lanes(layout, LaneStateBuffers{.gdn       = &gdn,
+                                                        .lanes     = kLanes,
+                                                        .ple       = static_cast<std::byte*>(ple.p),
+                                                        .tails     = static_cast<std::byte*>(tails.p),
+                                                        .mtp_saved = static_cast<std::byte*>(saved.p)});
+    const KvPageGeometry geometry = kv_page_geometry(c, KvCacheStorage::Int8Group64, true);
+    LayoutBuilder pool_builder;
+    const auto pool_layout = plan_device_kv_page_pool(pool_builder, {.page_group_count = 4, .geometry = geometry.geometry});
+    DeviceBuffer backing(pool_builder.finish(256));
+    fill_random(backing.p, backing.bytes, 21);
+    DeviceKVPagePool pool(DeviceSpan{backing.p, backing.bytes}, pool_layout);
+    const HostKVPageLayout host = plan_host_kv_page_layout(geometry.geometry);
+
+    cudaStream_t compute = nullptr, producer = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&compute, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&producer, cudaStreamNonBlocking));
+    const PrefixHostLayout planned = plan_prefix_host_layout(geometry, layout, 1);
+    PrefixCacheConfig config;
+    config.kv_pages = 4;
+    PrefixCache cache(config, pool, geometry, lanes, (planned.image_slabs + 4ULL) * planned.slab_bytes, compute);
+
+    // The producer's gate: a 16-byte upload that waits until the host publishes the round's word.
+    PinnedHostBuffer gate_host(64);
+    DeviceBuffer gate_device(64);
+    auto* ready         = static_cast<std::uint32_t*>(gate_host.data());
+    auto* gate_src      = static_cast<std::byte*>(gate_host.data()) + 16;
+    std::uint32_t round = 0;
+    publish_pinned_word(ready, 0);
+    const auto hold_producer = [&] {
+        ++round;
+        CUDA_CHECK(cudaMemcpy(gate_device.p, &round, sizeof(round), cudaMemcpyHostToDevice));
+        upload_pinned_when(static_cast<std::byte*>(gate_device.p) + 16, gate_src, 16, ready,
+                           static_cast<const std::uint32_t*>(gate_device.p), nullptr, nullptr, {}, producer);
+    };
+    // A page's bytes as a zeroed Host record (padding stays zero).
+    const auto record_of = [&](DeviceKVPageHandle page) {
+        PinnedHostBuffer record(host.page_stride);
+        std::memset(record.data(), 0, host.page_stride);
+        std::byte* const at[1] = {static_cast<std::byte*>(record.data())};
+        pool.copy_to_host_records(std::span(&page, 1), std::span(at, 1), {}, host, compute);
+        CUDA_CHECK(cudaStreamSynchronize(compute));
+        return std::vector<std::byte>(at[0], at[0] + host.page_stride);
+    };
+
+    std::uint64_t id = 0;
+    for (const bool evicted : {false, true}) {
+        auto reservation = pool.reserve(3);
+        require(reservation.has_value(), "pages for the tap test");
+        std::vector<DeviceKVPageLease> pages;
+        pages.reserve(1);
+        pool.materialize(*reservation, 1, pages); // the lane's partial page
+        const DeviceKVPageHandle tail_page = pages[0].handle();
+        const std::vector<std::byte> want  = record_of(tail_page);
+
+        hold_producer();
+        PrefixCache::Capture tap;
+        tap.id        = ++id;
+        tap.frontier  = 10; // the root's block: a 10-token tail in the lane's first page
+        tap.tail.assign(10, 7);
+        tap.tail_page = tail_page;
+        tap.kind      = pc::SnapshotKind::Tap;
+        tap.claim     = cache.index().estimate_priority(0, 10, true);
+        tap.meta.frontier = 10;
+        require(cache.capture(0, std::move(tap), producer), "the tap reserves its Host slabs");
+        if (evicted) {
+            // The lane fills the block and publishes it; released by the lane and evicted, the page
+            // returns to the pool from the cache.
+            const std::vector<TokenId> tokens(pc::kBlockTokens, 7);
+            const pc::InsertResult block = cache.insert_block({}, pc::block_lookup_hash(pc::kRootLookupHash, tokens, 0),
+                                                              tokens, 0, pages[0], true, -1);
+            require(block.inserted && block.device_attached, "the lane's page becomes a cached block");
+            cache.index().release_path(std::span(&block.node, 1));
+            require(cache.index().evict_device_blocks(1) == 1, "the block is evicted");
+        } else {
+            // The lane is released (ProgramImpl::prefix_release, then its pages go back).
+            cache.order_page_reuse(pages);
+            pages.clear();
+        }
+        // The page's next owner writes it on the compute stream.
+        DeviceKVPageLease next          = pool.materialize_one(*reservation);
+        const DeviceKVPageHandle reused = next.handle();
+        pool.zero_pages(std::span(&reused, 1), compute);
+        cudaEvent_t written = nullptr;
+        CUDA_CHECK(cudaEventCreateWithFlags(&written, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(written, compute));
+        (void)cudaStreamQuery(compute); // submits the queued work (WDDM batches it)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const bool ordered = cudaEventQuery(written) == cudaErrorNotReady;
+        publish_pinned_word(ready, round);
+        CUDA_CHECK(cudaStreamSynchronize(producer));
+        CUDA_CHECK(cudaEventSynchronize(written));
+        CUDA_CHECK(cudaEventDestroy(written));
+        cache.drain();
+        require(ordered, std::string("the next writer of a tap's page did not wait for its copy (") +
+                             (evicted ? "an evicted block" : "a released lane") + ")");
+
+        // The snapshot's tail is the page as the lane left it, not as its next owner wrote it.
+        const auto published = cache.capture_result(id);
+        require(published && published->created, "the tap is published");
+        DeviceKVPageLease target = pool.materialize_one(*reservation);
+        cache.open_restore(compute);
+        cache.restore_tail_page(published->snapshot, target.handle());
+        cache.await_restore(cache.submit_restore());
+        require(record_of(target.handle()) == want, std::string("the snapshot's tail holds the next owner's KV (") +
+                                                       (evicted ? "an evicted block" : "a released lane") + ")");
+        cache.forget_capture(id);
+    }
+    cache.clear();
+    CUDA_CHECK(cudaStreamDestroy(producer));
+    CUDA_CHECK(cudaStreamDestroy(compute));
+    std::printf("tap page reuse: the next writer waits for the tap's copy after a lane release and a block eviction\n");
+}
+
 } // namespace
 
 int main() {
@@ -427,6 +569,7 @@ int main() {
         test_page_records(c, KvCacheStorage::Int8Group64, 931'840);
         // BF16 K and FP16 V: 2 x 2 heads x 256 x 2 bytes, plus 64 bytes of pooled keys, per position.
         test_page_records(c, KvCacheStorage::BFloat16, 13ULL * 64 * (2 * 2 * 256 * 2 + 64));
+        test_tap_page_reuse(c);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

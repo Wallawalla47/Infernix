@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -169,6 +170,41 @@ int test_multiple_calls() {
     return failures;
 }
 
+// Several functions inside one `<tool_call>` wrapper are each a call, strict and tolerant (candidates WD-43; vLLM
+// #43713); a malformed later function still fails a strict region as a whole.
+int test_functions_in_one_wrapper() {
+    const auto contract = contract_from_definitions({tool_definition("first", Json::object()),
+                                                     tool_definition("second", Json::object()),
+                                                     tool_definition("third", Json::object())});
+    const std::string text = "Working.\n<tool_call>\n<function=first>\n<parameter=a>\n1\n</parameter>\n</function>\n"
+                             "<function=second>\n</function>\n"
+                             "<function=third>\n<parameter=c>\nthree\n</parameter>\n</function>\n</tool_call>";
+    int failures = 0;
+    for (const bool tolerant : {false, true}) {
+        const auto parsed = parse(text, 64, *contract, tolerant);
+        failures += check(parsed.is_tool_call_response && parsed.content == "Working." &&
+                              parsed.tool_calls.size() == 3 && parsed.tool_calls[0].name == "first" &&
+                              parsed.tool_calls[1].name == "second" && parsed.tool_calls[2].name == "third" &&
+                              parsed.diagnostics.fallback_reason == infernix::ToolCallParseFallbackReason::None,
+                          tolerant ? "tolerant: functions in one wrapper were not each a call"
+                                   : "strict: functions in one wrapper were not each a call");
+        if (parsed.tool_calls.size() == 3) {
+            failures += check(Json::parse(parsed.tool_calls[0].arguments_json).at("a") == 1 &&
+                                  Json::parse(parsed.tool_calls[1].arguments_json).empty() &&
+                                  Json::parse(parsed.tool_calls[2].arguments_json).at("c") == "three",
+                              "a call in a shared wrapper lost its arguments");
+        }
+    }
+    const std::string broken = "<tool_call>\n<function=first>\n</function>\n<function=second>\n<parameter=x>\n1\n"
+                               "</function>\n</tool_call>";
+    failures += check_rejected(broken, *contract, infernix::ToolCallParseFallbackReason::MalformedStructure,
+                               "strict: a malformed second function in one wrapper did not fail the region");
+    const auto tolerant_broken = parse(broken, 64, *contract, true);
+    failures += check(tolerant_broken.tool_calls.size() == 1 && tolerant_broken.tool_calls[0].name == "first",
+                      "tolerant: the complete first function before a malformed one was not kept");
+    return failures;
+}
+
 int test_declared_strings_preserve_text() {
     const auto contract =
         contract_for("TaskUpdate",
@@ -275,13 +311,20 @@ int test_parameter_delimiters_in_values() {
         }
     }
 
-    // Markup the grammar could continue from stays ambiguous, so those calls still fall back.
+    // Markup the grammar could continue from stays ambiguous, so that call still falls back.
     failures += check_rejected(tool_call("bash", {{"command", "echo '<parameter=unterminated>'"}}),
                                contract, Reason::MalformedStructure,
                                "unbalanced nested parameter open was silently repaired");
-    failures += check_rejected(tool_call("bash", {{"command", "echo '</parameter></function>'"}}),
-                               contract, Reason::MalformedStructure,
-                               "a closer followed by a function closer was guessed to be text");
+    // A closer followed by the call's own closers and then text is value text when a later closer
+    // ends the call (SY-04): only that reading parses the whole output, and the constrained route
+    // reads such a value the same way.
+    {
+        const std::string command = "echo '</parameter></function>'";
+        const auto parsed         = parse(tool_call("bash", {{"command", command}}), 64, contract);
+        failures += check(parsed.tool_calls.size() == 1 &&
+                              Json::parse(parsed.tool_calls.front().arguments_json).at("command") == command,
+                          "a value quoting the call's closing tags was cut or demoted");
+    }
 
     // Tolerant truncation: a closer at the region end still closes the value, and a quoted closer
     // inside a value the budget cut stays part of the kept partial value.
@@ -303,6 +346,37 @@ int test_parameter_delimiters_in_values() {
         failures += check(closed_args.at("command") == "ls" &&
                               quoted_args.at("command") == "echo '" + close + "' more",
                           "a tolerant cut call ended its value at the wrong closer");
+    }
+
+    // Tolerant: a whole call whose value quotes an unmatched opener is not a cut call. The value
+    // keeps the opener and the call keeps its sibling, with no recovery flag; a call cut inside
+    // such a value still keeps the value to the cut.
+    for (const std::string command : {std::string("echo '<parameter=x>'"),
+                                      std::string("use <parameter=NAME> to name the argument")}) {
+        for (const bool sibling : {false, true}) {
+            const std::string text =
+                sibling ? tool_call("bash", {{"command", command}, {"timeout", "30"}})
+                        : tool_call("bash", {{"command", command}});
+            const auto parsed = parse(text, 64, contract, true);
+            failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                                  parsed.diagnostics.fallback_reason == Reason::None,
+                              "a tolerant whole call quoting an unmatched opener read as cut");
+            if (parsed.tool_calls.size() != 1) { continue; }
+            const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+            failures += check(args.at("command") == command,
+                              "a tolerant value quoting an unmatched opener was not kept exactly");
+            failures += check(!sibling || args.at("timeout") == 30,
+                              "the parameter after a quoted unmatched opener was not parsed");
+        }
+    }
+    const auto quoted_open_cut = parse(head + "echo '<parameter=x>' more", 64, contract, true);
+    failures += check(quoted_open_cut.is_tool_call_response && quoted_open_cut.tool_calls.size() == 1 &&
+                          quoted_open_cut.diagnostics.fallback_reason == Reason::TruncatedTail,
+                      "a tolerant cut call quoting an unmatched opener was not kept as a truncated tail");
+    if (quoted_open_cut.tool_calls.size() == 1) {
+        const Json args = Json::parse(quoted_open_cut.tool_calls.front().arguments_json);
+        failures += check(args.at("command") == "echo '<parameter=x>' more",
+                          "a tolerant cut value quoting an unmatched opener lost its tail");
     }
     return failures;
 }
@@ -342,6 +416,51 @@ int test_declared_json_types() {
         check(args.at("items").is_array() && args.at("items").at(1) == 2, "array was not decoded");
     failures += check(args.at("unset").is_null() && args.at("optional").is_null(),
                       "declared null was not decoded");
+    return failures;
+}
+
+// A multi-line edit's array argument with real line breaks, tabs and carriage returns inside its
+// strings (Strata #4630) decodes to the array the model meant, whole and at every streamed
+// chunking; a declared string keeps its raw text, and other invalid text stays a string.
+int test_control_bytes_inside_declared_json_strings() {
+    const auto contract = contract_for(
+        "edit_file", Json{{"path", Json{{"type", "string"}}},
+                          {"edits", Json{{"type", "array"}}},
+                          {"options", Json{{"type", "object"}}},
+                          {"broken", Json{{"type", "array"}}}});
+    const std::string edits = "[{\"old\":\"line one\nline two\",\"new\":\"a\tb\r\nc\"}]";
+    const std::string text  = tool_call("edit_file", {{"path", "notes\n.md"},
+                                                      {"edits", edits},
+                                                      {"options", "{\"note\":\"x\ny\",\"n\":1}"},
+                                                      {"broken", "[\"a\nb\", oops]"}});
+    int failures            = 0;
+    const auto expect       = [&](const std::string& arguments, const std::string& how) {
+        const Json args = Json::parse(arguments);
+        failures += check(args.at("edits").is_array() && args.at("edits").at(0).at("old") == "line one\nline two" &&
+                              args.at("edits").at(0).at("new") == "a\tb\r\nc",
+                          how + ": the array with raw control bytes in its strings was not decoded");
+        failures += check(args.at("options").is_object() && args.at("options").at("note") == "x\ny" &&
+                              args.at("options").at("n") == 1,
+                          how + ": the object with a raw line break in a string was not decoded");
+        failures += check(args.at("path") == "notes\n.md", how + ": a declared string lost its raw text");
+        failures += check(args.at("broken") == "[\"a\nb\", oops]", how + ": invalid JSON did not stay a string");
+    };
+    const auto whole = parse(text, 64, contract);
+    failures += check(whole.is_tool_call_response && whole.tool_calls.size() == 1, "the call was not parsed");
+    if (whole.tool_calls.size() == 1) { expect(whole.tool_calls.front().arguments_json, "whole"); }
+    for (std::size_t width = 1; width <= 7; ++width) {
+        fi::ToolCallOutputDecoder decoder(output_contract_for("edit_file", Json{{"path", Json{{"type", "string"}}},
+                                                                                {"edits", Json{{"type", "array"}}},
+                                                                                {"options", Json{{"type", "object"}}},
+                                                                                {"broken", Json{{"type", "array"}}}}),
+                                          64);
+        for (std::size_t at = 0; at < text.size(); at += width) { (void)feed(decoder, text, at, width); }
+        const auto terminal = decoder.finish();
+        failures += check(terminal.tool_calls.size() == 1, "a streamed chunking lost the call");
+        if (terminal.tool_calls.size() == 1) {
+            expect(terminal.tool_calls.front().arguments_json, "streamed at width " + std::to_string(width));
+        }
+    }
     return failures;
 }
 
@@ -592,35 +711,38 @@ int test_schema_mismatches_remain_structured() {
     return failures;
 }
 
-int test_unsupported_schema_uses_legacy_policy() {
+int test_unknown_schema_types_keep_inference() {
     const auto contract = contract_for(
         "configure",
         Json{{"missing_type", Json::object()},
              {"alias", Json{{"type", "int"}}},
              {"invalid_type_array", Json{{"type", Json::array({"integer", "int"})}}},
-             {"partial_anyof", Json{{"anyOf", Json::array({Json{{"type", "integer"}},
-                                                           Json{{"enum", Json::array({1, 2})}}})}}},
-             {"mixed_composition", Json{{"anyOf", Json::array({Json{{"type", "boolean"}}})},
-                                        {"oneOf", Json::array({Json{{"type", "null"}}})}}}});
+             {"enum_anyof", Json{{"anyOf", Json::array({Json{{"type", "integer"}},
+                                                        Json{{"enum", Json::array({1, 2})}}})}}},
+             {"empty_intersection", Json{{"anyOf", Json::array({Json{{"type", "boolean"}}})},
+                                         {"oneOf", Json::array({Json{{"type", "null"}}})}}}});
     const std::string text = tool_call("configure", {{"missing_type", "7"},
                                                      {"alias", "8"},
                                                      {"invalid_type_array", "9"},
-                                                     {"partial_anyof", "7.5"},
-                                                     {"mixed_composition", "True"},
+                                                     {"enum_anyof", "7.5"},
+                                                     {"empty_intersection", "True"},
                                                      {"undeclared", "{\"x\":1}"}});
     const auto parsed      = parse(text, 64, contract);
 
+    // A schema naming no type it can read keeps the value text's own type; a union whose branches
+    // are all typed (an enum's values type it) and a contradictory intersection are type hints, so
+    // their values are mismatches, kept for the client to judge.
     int failures = 0;
     failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
-                          parsed.diagnostics.schema_mismatch_arguments == 1,
-                      "unsupported schema did not retain legacy policy");
+                          parsed.diagnostics.schema_mismatch_arguments == 3,
+                      "unknown schema types did not keep inference or typed hints lost a mismatch");
     if (parsed.tool_calls.size() != 1) { return failures; }
     const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
     failures += check(args.at("missing_type") == 7 && args.at("alias") == 8 &&
                           args.at("invalid_type_array") == 9,
                       "legacy numeric inference changed");
-    failures += check(args.at("partial_anyof") == 7.5 && args.at("mixed_composition") == "True",
-                      "unsupported composition was partially inferred");
+    failures += check(args.at("enum_anyof") == 7.5 && args.at("empty_intersection") == "True",
+                      "a mismatched typed value was not kept as written");
     failures +=
         check(args.at("undeclared").at("x") == 1, "undeclared parameter legacy inference changed");
     return failures;
@@ -1347,6 +1469,20 @@ int test_tolerant_undeclared_and_value_cut() {
     failures += check(!strict.is_tool_call_response &&
                           strict.diagnostics.fallback_reason == Reason::UndeclaredTool,
                       "strict mode did not reject the undeclared-name call");
+    // A client that knows tools it does not declare (PromptOptions::open_tool_names: Claude Code's
+    // deferred MCP tools, SY-05) gets the call even from the strict parser, not as a repair; a drifted
+    // opener still needs a declared name.
+    auto open        = std::make_shared<fi::ToolCallOutputContract>(*contract);
+    open->open_names = true;
+    const auto opened = parse(undeclared, 64, *open);
+    failures += check(opened.is_tool_call_response && opened.tool_calls.size() == 1 &&
+                          opened.tool_calls.front().name == "not_a_declared_tool" &&
+                          opened.diagnostics.fallback_reason == Reason::None &&
+                          !opened.diagnostics.tolerant_recovered &&
+                          Json::parse(opened.tool_calls.front().arguments_json).at("filePath") == "/tmp/out.js",
+                      "open names did not keep the undeclared-name call");
+    const auto drifted = parse("<tool_call>\n<=not_a_declared_tool>\n</function>\n</tool_call>", 64, *open, true);
+    failures += check(!drifted.is_tool_call_response, "open names read an undeclared drifted opener as a call");
 
     const std::string value_cut = "Now\n"
                                   "<tool_call>\n"
@@ -1557,17 +1693,25 @@ int test_damaged_parameter_opener() {
     return failures;
 }
 
-// A call opener inside a Markdown code fence or inline code of the answer is a quoted example:
-// it stays text, with no byte lost, while calls at the top level still fire. Only the text before
-// an opener decides, so every streamed chunking agrees with the whole output.
+// A call opener inside Markdown code of the answer (CommonMark's fences, indented code blocks and
+// code spans) is a quoted example: it stays text, with no byte lost, while calls at the top level
+// still fire, on the free and the constrained route alike. Only the text before an opener decides,
+// so every streamed chunking agrees with the whole output.
 int test_markdown_quoted_calls() {
     const std::vector<std::string> definitions = {
         tool_definition("write", Json{{"path", Json{{"type", "string"}}}})};
-    const auto contract = contract_from_definitions(definitions);
-    const auto call     = tool_call("write", {{"path", "/tmp/a.txt"}});
+    const auto free_contract = contract_from_definitions(definitions);
+    const auto constrained   = fi::select_tool_call_contract(free_contract, infernix::ToolChoice{});
+    const auto call          = tool_call("write", {{"path", "/tmp/a.txt"}});
+    // The call as an indented code block: every line indented four columns.
+    std::string indented = "    " + call;
+    for (std::size_t at = indented.find('\n'); at != std::string::npos; at = indented.find('\n', at + 1)) {
+        indented.insert(at + 1, "    ");
+    }
     // (calls, content) of one output.
     using Outcome  = std::pair<std::size_t, std::string>;
-    const auto run = [&](const std::string& text, bool tolerant, std::size_t width) {
+    using Contract = std::shared_ptr<const fi::ToolCallOutputContract>;
+    const auto run = [&](const Contract& contract, const std::string& text, bool tolerant, std::size_t width) {
         fi::ToolCallOutputDecoder decoder(contract, 64, tolerant);
         std::string content;
         for (std::size_t at = 0; at < text.size(); at += width) {
@@ -1577,12 +1721,12 @@ int test_markdown_quoted_calls() {
         return Outcome(terminal.tool_calls.size(), content + terminal.content);
     };
     int failures       = 0;
-    const auto outcome = [&](const std::string& text, bool tolerant) {
+    const auto outcome = [&](const Contract& contract, const std::string& text, bool tolerant) {
         const auto whole = parse(text, 64, *contract, tolerant);
         Outcome reference(whole.tool_calls.size(), whole.content);
         const std::vector<std::size_t> widths{1, 2, 3, 5, 7, 64, text.size()};
         for (const std::size_t width : widths) {
-            if (run(text, tolerant, width) != reference) {
+            if (run(contract, text, tolerant, width) != reference) {
                 failures += fail("a streamed chunking of width " + std::to_string(width) +
                                  " disagrees with the whole output: " + text.substr(0, 40));
             }
@@ -1591,33 +1735,55 @@ int test_markdown_quoted_calls() {
     };
     const std::vector<std::string> quoted{
         "Format:\n```xml\n" + call + "\n```\nDone.", "Format:\n~~~\n" + call + "\n~~~\nDone.",
-        "Use `" + call + "` like this.", "Use `x`, then `\n" + call + "`", "```\n" + call,
-        "Text\n\n```python\nx = 1\n```\n```\n" + call};
+        "Use `" + call + "` like this.", "```\n" + call,
+        // A stray backtick on the call's own line still opens a span there.
+        "Let me use `run_commands " + call,
+        "Text\n\n```python\nx = 1\n```\n```\n" + call,
+        // A shorter run, or a run with an info string, does not close a fence (Strata #4702).
+        "````markdown\n```xml\n" + call + "\n```\n````\nDone.", "```\n```python\n" + call + "\n```",
+        // An indented code block after a blank line or a heading (Strata #4703). When only the opener's
+        // line is indented, the bare `<function=...>` after the quoted token is its wrapper's text.
+        "Example:\n\n" + indented + "\n\nDone.", "Example:\n\n    " + call + "\n\nDone.", "# Format\n    " + call,
+        // A code span closes only on a run of its own length.
+        "Use ``a`" + call + "`` like this."};
     const std::vector<std::string> real{call,
                                         "Let me do it.\n\n" + call,
                                         "Let me do it. " + call,
                                         "```\ncode\n```\n" + call,
                                         "`a` and `b` " + call,
-                                        "~~~\nx\n~~~\n\n" + call};
-    for (const bool tolerant : {false, true}) {
+                                        "~~~\nx\n~~~\n\n" + call,
+                                        "```\nx\n`````\n" + call,
+                                        // Right after text an indented line continues the paragraph.
+                                        "Example:\n    " + call,
+                                        // Indented four columns, a run of backticks is code, not a fence.
+                                        "Text\n\n    ```\n" + call,
+                                        "Use ``a`b`` then " + call,
+                                        "Run \\` first, then " + call,
+                                        // A span left open on an earlier line of the paragraph does not
+                                        // reach a call at a line's start (Strata #4923).
+                                        "Let me use `run_commands to check.\n" + call,
+                                        "Use `x`, then `\n   " + call};
+    const std::vector<std::pair<Contract, bool>> routes{{free_contract, false}, {free_contract, true}, {constrained, false}};
+    for (const auto& [contract, tolerant] : routes) {
+        const std::string route = contract->constrained ? " (constrained)" : tolerant ? " (tolerant)" : " (strict)";
         for (const std::string& body : quoted) {
-            const Outcome got = outcome(body, tolerant);
+            const Outcome got = outcome(contract, body, tolerant);
             failures += check(got.first == 0 && got.second == body,
-                              "a call quoted in Markdown code became a call or lost bytes: " +
+                              "a call quoted in Markdown code became a call or lost bytes" + route + ": " +
                                   body.substr(0, 30));
         }
         for (const std::string& body : real) {
-            failures += check(outcome(body, tolerant).first == 1,
-                              "a top-level call after closed Markdown code did not fire: " +
+            failures += check(outcome(contract, body, tolerant).first == 1,
+                              "a top-level call after closed Markdown code did not fire" + route + ": " +
                                   body.substr(0, 30));
         }
-        failures += check(outcome(call + "\n" + call, tolerant).first == 2,
-                          "two top-level calls did not both fire");
+        failures += check(outcome(contract, call + "\n" + call, tolerant).first == 2,
+                          "two top-level calls did not both fire" + route);
         // A quoted example before the real call stays text; the call still fires.
         const std::string mixed = "Example:\n```\n" + call + "\n```\nNow for real.\n\n" + call;
-        const Outcome both      = outcome(mixed, tolerant);
+        const Outcome both      = outcome(contract, mixed, tolerant);
         failures += check(both.first == 1 && both.second.starts_with("Example:\n```\n<tool_call>"),
-                          "a quoted example before a real call was not kept as text");
+                          "a quoted example before a real call was not kept as text" + route);
     }
     return failures;
 }
@@ -1908,7 +2074,11 @@ int test_constrained_call_streaming() {
         StreamedCalls streamed;
         (void)feed(decoder, "c\n</parameter>\n</function>\n</tool_call>");
         streamed.take(decoder);
+        // Closing lines that end the output close the call only at its end.
+        failures += check(streamed.calls.size() == 1 && streamed.complete.size() == 1 && !streamed.complete[0],
+                          "a call completed before the token after its closing lines");
         const auto terminal = decoder.finish(infernix::FinishReason::StopToken);
+        streamed.take(decoder);
         failures += check(terminal.tool_calls.size() == 1 && terminal.tool_calls[0].arguments_json == R"({"path":"abc"})" &&
                               streamed.calls.size() == 1 && streamed.calls[0].arguments_json == R"({"path":"abc"})",
                           "a continued call did not stream from its start");
@@ -1927,6 +2097,245 @@ int test_constrained_call_streaming() {
     return failures;
 }
 
+// A non-strict parameter's type hint follows a local `$ref`, the values of an `enum` or `const`,
+// and a one-branch `allOf` (as Pydantic writes a described enum field): a string-valued one keeps
+// every value as text. A reference that resolves to nothing, or only to itself, gives no hint, so
+// the value text decides its type. The region parser (free output) and the constrained stream
+// agree byte for byte.
+int test_reference_and_value_type_hints() {
+    const Json parameters = {
+        {"type", "object"},
+        {"$defs",
+         {{"Status", {{"type", "string"}, {"enum", Json::array({"1", "2"})}}},
+          {"Loop", {{"$ref", "#/$defs/Loop"}}}}},
+        {"properties",
+         {{"by_ref", {{"$ref", "#/$defs/Status"}}},
+          {"enum_text", {{"enum", Json::array({"1", "2"})}}},
+          {"constant", {{"const", "x"}}},
+          {"wrapped",
+           {{"allOf", Json::array({Json{{"$ref", "#/$defs/Status"}}})}, {"description", "state"}}},
+          {"unresolved", {{"$ref", "#/$defs/Missing"}}},
+          {"cyclic", {{"$ref", "#/$defs/Loop"}}}}}};
+    const auto declarations = contract_from_definitions(
+        {Json{{"type", "function"},
+              {"function", {{"name", "configure"}, {"parameters", parameters}}}}
+             .dump()});
+    const auto constrained = fi::select_tool_call_contract(declarations, infernix::ToolChoice{});
+
+    int failures = 0;
+    failures += check(constrained && constrained->constrained,
+                      "default tool choice did not constrain the calls");
+    if (!constrained) { return failures; }
+    const std::vector<std::string_view> hinted   = {"by_ref", "enum_text", "constant", "wrapped"};
+    const std::vector<std::string_view> unhinted = {"unresolved", "cyclic"};
+    // Each value, and its JSON as the unhinted parameters infer it from the text.
+    const std::vector<std::pair<std::string_view, std::string_view>> values = {
+        {"123", "123"}, {"true", "true"}, {"null", "null"}, {"007", "\"007\""}, {"abc", "\"abc\""}};
+    for (const auto& [value, inferred] : values) {
+        std::string text     = "<tool_call>\n<function=configure>\n";
+        std::string expected = "{";
+        for (const bool typed : {true, false}) {
+            for (const std::string_view name : typed ? hinted : unhinted) {
+                text += "<parameter=" + std::string(name) + ">\n" + std::string(value) +
+                        "\n</parameter>\n";
+                if (expected.size() > 1) { expected += ','; }
+                expected += "\"" + std::string(name) + "\":" +
+                            (typed ? Json(std::string(value)).dump() : std::string(inferred));
+            }
+        }
+        text += "</function>\n</tool_call>";
+        expected += '}';
+
+        const auto parsed = parse(text, 64, *declarations);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls.front().arguments_json == expected,
+                          "a referenced or enum-typed value was retyped: " + std::string(value));
+
+        fi::ToolCallOutputDecoder decoder(constrained, 64);
+        StreamedCalls streamed;
+        for (std::size_t at = 0; at < text.size(); ++at) {
+            (void)feed(decoder, text, at, 1);
+            streamed.take(decoder);
+        }
+        const auto terminal = decoder.finish(infernix::FinishReason::StopToken);
+        streamed.take(decoder);
+        failures += check(terminal.tool_calls.size() == 1 && streamed.calls.size() == 1 &&
+                              terminal.tool_calls.front().arguments_json == expected &&
+                              streamed.calls.front().arguments_json == expected,
+                          "streamed arguments differ from the parsed ones: " + std::string(value));
+    }
+    return failures;
+}
+
+// A non-strict tool whose parameters are a root `oneOf` / `anyOf` of object variants (a zod
+// discriminated union, Codex's `automation_update`; Basalt #208) declares its variants' properties:
+// a string-typed one keeps `2026`, `true` and `null` as text. A name the variants type differently
+// takes the union of their types (with a string among them it stays text); a variant that leaves it
+// untyped, or a branch that cannot be read (a remote reference), leaves the value text to decide, as
+// for an undeclared name. The free and the constrained route agree byte for byte.
+int test_root_union_type_hints() {
+    const Json zod = {
+        {"type", "object"},
+        {"properties", Json::object()},
+        {"$defs",
+         {{"Create", {{"type", "object"},
+                      {"properties", {{"mode", {{"const", "create"}}}, {"name", {{"type", "string"}}},
+                                      {"shared", {{"type", "string"}}}, {"loose", Json::object()}}}}},
+          {"Update", {{"type", "object"},
+                      {"properties", {{"mode", {{"const", "update"}}}, {"paused", {{"type", "boolean"}}},
+                                      {"shared", {{"type", "integer"}}}, {"loose", {{"type", "string"}}}}}}}}},
+        {"oneOf", Json::array({Json{{"$ref", "#/$defs/Create"}}, Json{{"$ref", "#/$defs/Update"}}})}};
+    const Json remote = {
+        {"type", "object"},
+        {"anyOf", Json::array({Json{{"$ref", "https://example.com/schema.json"}},
+                               Json{{"type", "object"}, {"properties", {{"name", {{"type", "string"}}}}}}})}};
+    const auto declarations = contract_from_definitions(
+        {Json{{"type", "function"}, {"function", {{"name", "automate"}, {"parameters", zod}}}}.dump(),
+         Json{{"type", "function"}, {"function", {{"name", "fetch"}, {"parameters", remote}}}}.dump()});
+    const auto constrained = fi::select_tool_call_contract(declarations, infernix::ToolChoice{});
+    int failures           = 0;
+    if (!constrained) { return check(false, "default tool choice did not constrain the calls"); }
+    // Each call's arguments and the JSON they must decode to.
+    const std::vector<std::tuple<std::string, std::vector<std::pair<std::string, std::string>>, std::string>> cases = {
+        {"automate",
+         {{"mode", "update"}, {"name", "2026"}, {"paused", "true"}, {"shared", "null"}, {"loose", "7"}},
+         R"({"mode":"update","name":"2026","paused":true,"shared":"null","loose":7})"},
+        {"automate", {{"name", "true"}, {"shared", "2026"}}, R"({"name":"true","shared":"2026"})"},
+        {"fetch", {{"name", "2026"}}, R"({"name":2026})"}};
+    for (const auto& [tool, arguments, expected] : cases) {
+        std::string text = "<tool_call>\n<function=" + tool + ">\n";
+        for (const auto& [name, value] : arguments) {
+            text += "<parameter=" + name + ">\n" + value + "\n</parameter>\n";
+        }
+        text += "</function>\n</tool_call>";
+        const auto parsed = parse(text, 64, *declarations);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls.front().arguments_json == expected,
+                          "a root union's arguments were typed wrongly: " + expected);
+        fi::ToolCallOutputDecoder decoder(constrained, 64);
+        (void)feed(decoder, text);
+        const auto terminal = decoder.finish(infernix::FinishReason::StopToken);
+        failures += check(terminal.tool_calls.size() == 1 && terminal.tool_calls.front().arguments_json == expected,
+                          "the constrained route typed a root union's arguments differently: " + expected);
+    }
+    return failures;
+}
+
+// A generated value nested deeper than 256 arrays or objects stays text (a JSON string, counted as a schema mismatch),
+// typed or not, so no call reaches a client as a tree too deep to serialize; 256 levels stay JSON (LE-14). A strict
+// value streams as the model writes it, so the constrained decoder ends the request at the 257th level instead.
+int test_argument_nesting_bound() {
+    const auto nested = [](int levels) { return std::string(levels, '[') + std::string(levels, ']'); };
+    const auto contract = contract_from_definitions(
+        {tool_definition("store", Json{{"data", Json::object()}, {"list", Json{{"type", "array"}}}})});
+    int failures = 0;
+    for (const char* name : {"data", "list"}) {
+        for (const int levels : {256, 257, 4000}) {
+            const std::string value = nested(levels);
+            const std::string text  = "<tool_call>\n<function=store>\n<parameter=" + std::string(name) + ">\n" + value +
+                                     "\n</parameter>\n</function>\n</tool_call>";
+            const auto parsed = parse(text, 64, *contract);
+            const Json expected{{name, levels <= 256 ? Json::parse(value) : Json(value)}};
+            failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                                  Json::parse(parsed.tool_calls.front().arguments_json) == expected &&
+                                  (levels <= 256) == (parsed.diagnostics.schema_mismatch_arguments == 0),
+                              "a value " + std::to_string(levels) + " levels deep in '" + name +
+                                  "' was not kept as JSON up to 256 levels and as text beyond");
+        }
+    }
+    const auto strict = fi::select_tool_call_contract(
+        contract_from_definitions({Json{{"type", "function"},
+                                        {"function", {{"name", "store"},
+                                                      {"strict", true},
+                                                      {"parameters", {{"type", "object"},
+                                                                      {"properties", {{"list", {{"type", "array"}}}}},
+                                                                      {"required", {"list"}},
+                                                                      {"additionalProperties", false}}}}}}
+                                       .dump()}),
+        infernix::ToolChoice{});
+    for (const int levels : {256, 257}) {
+        fi::ToolCallOutputDecoder decoder(strict, 64);
+        const std::string text = "<tool_call>\n<function=store>\n<parameter=list>\n" + nested(levels) +
+                                 "\n</parameter>\n</function>\n</tool_call>";
+        bool refused = false;
+        try {
+            (void)feed(decoder, text);
+            (void)decoder.finish(infernix::FinishReason::StopToken);
+        } catch (const std::length_error&) { refused = true; }
+        failures += check(refused == (levels > 256),
+                          "the constrained decoder did not stop a strict value at 257 levels, or stopped one at 256");
+    }
+    return failures;
+}
+
+// A file whose content documents the call format holds the call's own closing lines and then more
+// text (Strata #4701): those lines are value text, so the file keeps every byte, on the free route
+// (strict and tolerant, whole and at every chunking) and the constrained one, whose streamed steps
+// concatenate to the call. Without a later closer, or with another call after the prose, a call
+// still ends at its first closers, as before.
+int test_quoted_call_closers() {
+    const std::vector<std::string> definitions = {tool_definition(
+        "write_file", Json{{"path", Json{{"type", "string"}}}, {"content", Json{{"type", "string"}}}})};
+    const auto free_contract = contract_from_definitions(definitions);
+    const auto constrained   = fi::select_tool_call_contract(free_contract, infernix::ToolChoice{});
+    using Contract           = std::shared_ptr<const fi::ToolCallOutputContract>;
+    const std::string document =
+        "# Format\nA call ends with:\n</parameter>\n</function>\n</tool_call>\nThen the reply goes on.";
+    const std::string call      = tool_call("write_file", {{"path", "/tmp/format.md"}, {"content", document}});
+    const std::string arguments = Json{{"path", "/tmp/format.md"}, {"content", document}}.dump();
+    int failures                = 0;
+    const std::vector<std::pair<Contract, bool>> routes{{free_contract, false}, {free_contract, true}, {constrained, false}};
+    for (const auto& [contract, tolerant] : routes) {
+        const std::string route = contract->constrained ? " (constrained)" : tolerant ? " (tolerant)" : " (strict)";
+        const std::string text  = "Writing it.\n" + call;
+        if (!contract->constrained) {
+            const auto whole = parse(text, 64, *contract, tolerant);
+            failures += check(whole.tool_calls.size() == 1 && Json::parse(whole.tool_calls[0].arguments_json) ==
+                                                                   Json::parse(arguments),
+                              "the whole parse cut a file at its quoted closing lines" + route);
+        }
+        for (const std::size_t width : {std::size_t{1}, std::size_t{3}, std::size_t{7}, text.size()}) {
+            fi::ToolCallOutputDecoder decoder(contract, 64, tolerant);
+            StreamedCalls streamed;
+            std::string visible;
+            for (std::size_t at = 0; at < text.size(); at += width) {
+                visible += feed(decoder, text, at, width);
+                streamed.take(decoder);
+            }
+            const auto terminal = decoder.finish(infernix::FinishReason::StopToken);
+            streamed.take(decoder);
+            failures += check(terminal.tool_calls.size() == 1 &&
+                                  Json::parse(terminal.tool_calls[0].arguments_json) == Json::parse(arguments) &&
+                                  visible + terminal.content == "Writing it.",
+                              "a file was cut at its quoted closing lines" + route + ", width " + std::to_string(width));
+            if (contract->constrained && terminal.tool_calls.size() == 1) {
+                failures += check(streamed.ordered && streamed.calls.size() == 1 && streamed.complete[0] &&
+                                      streamed.calls[0].arguments_json == terminal.tool_calls[0].arguments_json,
+                                  "the streamed steps of a file holding closing lines differ, width " + std::to_string(width));
+            }
+        }
+    }
+    // Prose after a call with no later closer: strict demotes it to text, tolerant keeps it cut there.
+    const std::string plain   = tool_call("write_file", {{"path", "/tmp/a"}, {"content", "x"}});
+    const std::string trailed = plain + "\nThat wrote the file.";
+    failures += check(parse(trailed, 64, *free_contract).tool_calls.empty(), "strict kept a call with trailing prose");
+    const auto kept = parse(trailed, 64, *free_contract, true);
+    failures += check(kept.tool_calls.size() == 1 && Json::parse(kept.tool_calls[0].arguments_json)["content"] == "x",
+                      "tolerant did not keep a call before trailing prose");
+    // Another call after the prose: the first call's closers stay its closers (no value holds the
+    // `<tool_call>` token), as before: strict takes the second call, tolerant the first.
+    const std::string two = plain + "\nNext one.\n" + tool_call("write_file", {{"path", "/tmp/b"}, {"content", "y"}});
+    const auto strict_two = parse(two, 64, *free_contract);
+    failures += check(strict_two.tool_calls.size() == 1 &&
+                          Json::parse(strict_two.tool_calls[0].arguments_json)["path"] == "/tmp/b",
+                      "strict read prose between two calls differently");
+    const auto tolerant_two = parse(two, 64, *free_contract, true);
+    failures += check(tolerant_two.tool_calls.size() == 1 &&
+                          Json::parse(tolerant_two.tool_calls[0].arguments_json)["content"] == "x",
+                      "tolerant let a value swallow the next call");
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_constrained_call_streaming();
@@ -1936,16 +2345,21 @@ int main() {
     failures += test_invalid_utf8_parameter_value();
     failures += test_duplicate_parameter_keeps_last_value();
     failures += test_multiple_calls();
+    failures += test_functions_in_one_wrapper();
     failures += test_declared_strings_preserve_text();
     failures += test_string_values_preserve_embedded_tool_markup();
     failures += test_parameter_delimiters_in_values();
     failures += test_declared_json_types();
+    failures += test_control_bytes_inside_declared_json_strings();
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();
     failures += test_composed_schema_types();
     failures += test_empty_declared_non_string_is_omitted();
     failures += test_schema_mismatches_remain_structured();
-    failures += test_unsupported_schema_uses_legacy_policy();
+    failures += test_unknown_schema_types_keep_inference();
+    failures += test_reference_and_value_type_hints();
+    failures += test_root_union_type_hints();
+    failures += test_argument_nesting_bound();
     failures += test_strict_structure_and_active_tool_set();
     failures += test_name_limits_and_non_strict_omissions();
     failures += test_duplicate_tool_contracts_rejected();
@@ -1970,6 +2384,7 @@ int main() {
     failures += test_damaged_parameter_opener();
     failures += test_open_reasoning_recovery();
     failures += test_markdown_quoted_calls();
+    failures += test_quoted_call_closers();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

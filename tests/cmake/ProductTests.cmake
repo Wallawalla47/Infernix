@@ -67,13 +67,18 @@ infernix_add_test(infernix_serve_options_test NEEDS_SOURCE_DIR
 
 infernix_add_test(infernix_request_log_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_request_log.cpp"
-  LIBRARIES infernix_serve)
+  LIBRARIES infernix_serve infernix_product_logging)
 
 infernix_add_test(infernix_metrics_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_metrics.cpp"
   LIBRARIES infernix_serve)
 infernix_add_test(infernix_metrics_contract_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_metrics_contract.cpp"
+  LIBRARIES infernix_serve)
+
+# infernix-serve --plan's JSON (docs/serving.md, "Sizing a start without loading").
+infernix_add_test(infernix_plan_report_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_plan_report.cpp"
   LIBRARIES infernix_serve)
 infernix_add_test(infernix_prefix_miss_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_prefix_miss.cpp"
@@ -84,6 +89,18 @@ infernix_add_test(infernix_reasoning_store_test
 infernix_add_test(infernix_console_stats_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_console_stats.cpp"
   LIBRARIES infernix_serve infernix_product_logging)
+
+infernix_add_test(infernix_launcher_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_launcher.cpp"
+  LIBRARIES infernix_launcher)
+
+# A stand-in infernix-serve for the launcher's watchdog and web UI checks (docs/launcher.md).
+add_executable(infernix_launcher_fake_serve "${CMAKE_CURRENT_LIST_DIR}/../launcher_fake_serve.cpp")
+target_link_libraries(infernix_launcher_fake_serve PRIVATE infernix::json infernix::httplib Threads::Threads)
+if(WIN32)
+  target_compile_definitions(infernix_launcher_fake_serve PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_link_libraries(infernix_launcher_fake_serve PRIVATE ws2_32)
+endif()
 
 infernix_add_test(infernix_stop_control_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_stop_control.cpp"
@@ -96,6 +113,12 @@ infernix_add_test(infernix_http_error_handler_test
 infernix_add_test(infernix_http_routes_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_routes.cpp"
   LIBRARIES infernix_serve)
+
+# Streaming requests refused before their stream starts (queue answers, a context overflow), over
+# loopback HTTP against a refusing generation backend.
+infernix_add_test(infernix_http_stream_refusals_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_stream_refusals.cpp"
+  LIBRARIES infernix_serve infernix_product_logging)
 
 infernix_add_test(infernix_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"

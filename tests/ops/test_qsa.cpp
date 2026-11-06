@@ -22,7 +22,9 @@
 //   - qsa_attention: block selection by exact scores (the top budget / R blocks, lower ids on
 //     equal scores; every token while the visible context is at most budget + R - 1) and FP64
 //     softmax attention over the K/V decoded from their stored codes, for each implemented KV
-//     storage (bf16; int8-g64 and fp8-row with Hadamard-rotated keys; nvfp4 and k8v4 with rotated
+//     storage (bf16; bf16p, packed BF16 rows with escapes, zeros and subnormals, whose outputs must
+//     also equal bit for bit those of the bf16 storage holding the same K and V; int8-g64 and fp8-row
+//     with Hadamard-rotated keys; nvfp4 and k8v4 with rotated
 //     keys and values, the output rotated back; vq2 and k4v2 appended by the Op itself, with the
 //     exact recent-key window: slots with matching and stale tags, and a staged wide call), at
 //     decode, verification and prefill
@@ -32,7 +34,9 @@
 //     (-> Hadamard) under named one-rounding / codec criteria; values against kv_cache_append_batch's
 //     bytes; the tails exactly; every other cache byte untouched; and bit for bit: W = 8 against
 //     eight W = 1 calls, B = 4 against four B = 1 calls, K/V-only and in-place calls, page spaces and
-//     CUDA Graph replay over new device rows and positions.
+//     CUDA Graph replay over new device rows and positions. Packed BF16 rows decode to exactly the
+//     bf16 storage's K and V (the outputs and pooled keys are its bits too), and a value row with
+//     more escapes than a packed row keeps sets its sequence's flag, as kv_cache_append_batch does.
 #include "ops/op_family.h"
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
@@ -134,12 +138,14 @@ void expect(bool ok, const std::string& what) {
     }
 }
 
-// TEMPORARY (INFERNIX_TMP_QSA_PROMPT_V2): its scope runs the prompt kernel's other variant (the split
-// K/V stage or the combined gather) than the process's setting, which it restores.
+// Its scope runs the prompt kernel's other variant (the split K/V stage or the combined gather) than the
+// storage's default, then restores the setting.
 struct OtherPromptVariant {
-    bool was = ops::detail::qsa_prompt_v2();
-    OtherPromptVariant() { ops::detail::qsa_prompt_set_v2(!was); }
-    ~OtherPromptVariant() { ops::detail::qsa_prompt_set_v2(was); }
+    int was;
+    explicit OtherPromptVariant(KvCacheStorage storage) : was(ops::detail::qsa_prompt_forced()) {
+        ops::detail::qsa_prompt_force(ops::detail::qsa_prompt_split(storage) ? 0 : 1);
+    }
+    ~OtherPromptVariant() { ops::detail::qsa_prompt_force(was); }
     OtherPromptVariant(const OtherPromptVariant&)            = delete;
     OtherPromptVariant& operator=(const OtherPromptVariant&) = delete;
 };
@@ -726,6 +732,7 @@ void hadamard(std::vector<double>& x) {
 const char* storage_name(KvCacheStorage storage) {
     switch (storage) {
     case KvCacheStorage::BFloat16: return "bf16";
+    case KvCacheStorage::Bf16Packed: return "bf16p";
     case KvCacheStorage::Int8Group64: return "int8";
     case KvCacheStorage::Fp8E4M3Row256: return "fp8";
     case KvCacheStorage::Nvfp4Group16: return "nvfp4";
@@ -747,13 +754,62 @@ double from_e2m1(unsigned code) {
     return (code & 8U) != 0 ? -kMagnitude[code & 7U] : kMagnitude[code & 7U];
 }
 
+// Packed BF16 rows (ops/kv_cache/bf16p_codec.cuh), from the format alone: code byte d = sign << 7 | the seven
+// fraction bits; nibble d (the low nibble of byte 256 + d / 2 for even d) = exponent - base for exponents in [base,
+// base + 13], 14 for exponent 0, 15 for an escape; the side record holds the base, the escape count (bits 0-2; bit 7:
+// some value has exponent 0) and the escapes' exponents in column order.
+constexpr int kPackedRowBytes = 384, kPackedSideBytes = 8, kPackedEscapes = 6, kPackedWindow = 14;
+
+// Packs 256 BF16 values with window base `base` (the caller keeps the escapes to kPackedEscapes).
+void pack_bf16p(const std::uint16_t* bits, int base, std::uint8_t* row, std::uint8_t* side) {
+    std::memset(row, 0, kPackedRowBytes);
+    std::memset(side, 0, kPackedSideBytes);
+    side[0]     = static_cast<std::uint8_t>(base);
+    int escapes = 0;
+    bool zero   = false;
+    for (int d = 0; d < kD; ++d) {
+        const int e = (bits[d] >> 7) & 0xFF;
+        int nibble  = 15;
+        if (e == 0) {
+            nibble = 14;
+            zero   = true;
+        } else if (e != 255 && e >= base && e < base + kPackedWindow) {
+            nibble = e - base;
+        } else {
+            side[2 + escapes++] = static_cast<std::uint8_t>(e);
+        }
+        row[d] = static_cast<std::uint8_t>(((bits[d] >> 8) & 0x80) | (bits[d] & 0x7F));
+        row[256 + d / 2] |= static_cast<std::uint8_t>(nibble << (4 * (d & 1)));
+    }
+    side[1] = static_cast<std::uint8_t>(escapes | (zero ? 0x80 : 0));
+}
+
+// The BF16 values of a packed row.
+std::array<std::uint16_t, kD> unpack_bf16p(const std::uint8_t* row, const std::uint8_t* side) {
+    std::array<std::uint16_t, kD> out{};
+    int escape = 0;
+    for (int d = 0; d < kD; ++d) {
+        const int nibble = (row[256 + d / 2] >> (4 * (d & 1))) & 0xF;
+        const int e      = nibble == 15   ? (escape < kPackedEscapes ? side[2 + escape++] : 0)
+                           : nibble == 14 ? 0
+                                          : side[0] + nibble;
+        out[d]           = static_cast<std::uint16_t>(((row[d] & 0x80) << 8) | (e << 7) | (row[d] & 0x7F));
+    }
+    return out;
+}
+
+// The FP16 value the bf16 storage keeps of a BF16 value (its V plane).
+std::uint16_t bf16_value_as_fp16(std::uint16_t bits) { return to_fp16(static_cast<float>(from_bf16(bits))); }
+
 // One K or V vector plane pair of a storage: data bytes and scale bytes per token, stored
 // [leading bytes, 64 tokens, heads, pages] (paged_kv_storage_layout), with random codes whose
-// decoded values are O(1), and its exact FP64 decode.
+// decoded values are O(1), and its exact FP64 decode (`values`: the V plane).
 struct StoredVector {
     infernix::PagedKVVectorLayout layout;
+    bool values;
     std::vector<std::uint8_t> data, scales;
-    enum class Kind { Bf16, Fp16, Int8, Fp8, Nvfp4 } kind;
+    std::vector<std::uint16_t> source; // packed BF16: the rows' BF16 values
+    enum class Kind { Bf16, Fp16, Int8, Fp8, Nvfp4, Bf16Packed } kind;
 
     [[nodiscard]] int data_bytes() const {
         return layout.data_leading_extent * static_cast<int>(infernix::dtype_size(layout.data_dtype));
@@ -762,7 +818,7 @@ struct StoredVector {
         return layout.scale_leading_extent * static_cast<int>(infernix::dtype_size(layout.scale_dtype));
     }
 
-    StoredVector(infernix::PagedKVVectorLayout l, int pages, std::mt19937& rng) : layout(l) {
+    StoredVector(infernix::PagedKVVectorLayout l, int pages, std::mt19937& rng, bool v) : layout(l), values(v) {
         const std::size_t rows = static_cast<std::size_t>(kPage) * kKvHeads * pages;
         data.resize(rows * data_bytes());
         scales.resize(rows * scale_bytes());
@@ -770,6 +826,43 @@ struct StoredVector {
         const auto put16 = [](std::vector<std::uint8_t>& v, std::size_t i, std::uint16_t bits) {
             std::memcpy(v.data() + 2 * i, &bits, 2);
         };
+        if (layout.data_dtype == DType::U8 && layout.data_leading_extent == kPackedRowBytes) {
+            // N(0, 1) magnitudes clamped to [2^-10, 7.9] (13 binades: the window from base 117 holds them), and in
+            // each row up to six escapes at random columns, below the window (2^-40 .. 2^-11) or above it (2^4 ..
+            // 2^6 for keys, .. 2^12 for values), and in a quarter of the rows two signed zeros and a subnormal.
+            kind = Kind::Bf16Packed;
+            source.resize(rows * kD);
+            constexpr int kBase = 127 - 10;
+            std::uniform_int_distribution<int> count(0, kPackedEscapes), column(0, kD - 1), quarter(0, 3),
+                fraction(0, 127), tiny(127 - 40, kBase - 1), large(kBase + kPackedWindow, 127 + (values ? 12 : 6));
+            std::vector<char> planted(kD);
+            for (std::size_t r = 0; r < rows; ++r) {
+                std::uint16_t* x = source.data() + r * kD;
+                for (int d = 0; d < kD; ++d) {
+                    const double n = normal(rng);
+                    x[d]           = to_bf16(std::copysign(std::clamp(std::abs(n), 0x1p-10, 7.9), n));
+                }
+                std::fill(planted.begin(), planted.end(), 0);
+                const auto free_column = [&] {
+                    int d = column(rng);
+                    while (planted[d] != 0) { d = column(rng); }
+                    planted[d] = 1;
+                    return d;
+                };
+                for (int i = count(rng); i > 0; --i) {
+                    const int e    = quarter(rng) < 2 ? tiny(rng) : large(rng);
+                    const int sign = quarter(rng) & 1;
+                    x[free_column()] = static_cast<std::uint16_t>(sign << 15 | e << 7 | fraction(rng));
+                }
+                if (quarter(rng) == 0) {
+                    x[free_column()] = 0x0000;
+                    x[free_column()] = 0x8000;
+                    x[free_column()] = static_cast<std::uint16_t>(0x8000 | (1 + fraction(rng) % 127));
+                }
+                pack_bf16p(x, kBase, data.data() + r * kPackedRowBytes, scales.data() + r * kPackedSideBytes);
+            }
+            return;
+        }
         switch (layout.data_dtype) {
         case DType::BF16:
             kind = Kind::Bf16;
@@ -821,8 +914,22 @@ struct StoredVector {
             return static_cast<std::int8_t>(bytes[d]) * from_fp16(bits);
         case Kind::Fp8: std::memcpy(&bits, s, 2); return from_e4m3(bytes[d]) * from_fp16(bits);
         case Kind::Nvfp4: return from_e2m1((bytes[d / 2] >> (4 * (d % 2))) & 0xFU) * from_e4m3(s[d / 16]);
+        case Kind::Bf16Packed: {
+            // K as its BF16 value, V as the FP16 the bf16 storage keeps of it.
+            const std::uint16_t x = source[row * kD + d];
+            return values ? from_fp16(bf16_value_as_fp16(x)) : from_bf16(x);
+        }
         }
         return 0.0;
+    }
+
+    // Packed BF16: the bf16 storage's plane of the same values (K as BF16, V as FP16), 512 bytes a row.
+    [[nodiscard]] std::vector<std::uint16_t> bf16_twin() const {
+        std::vector<std::uint16_t> out(source.size());
+        for (std::size_t i = 0; i < source.size(); ++i) {
+            out[i] = values ? bf16_value_as_fp16(source[i]) : source[i];
+        }
+        return out;
     }
 
     [[nodiscard]] std::size_t data_page_bytes() const {
@@ -1136,10 +1243,53 @@ void test_vq_attention(KvCacheStorage storage, const VqCase& c, std::uint32_t se
     g_failures += t::verify_reduction(tag, got, ref, kAttentionCriterion);
 }
 
+// The output bits of a call over the bf16 storage holding a packed layer's K and V (K as BF16, V as FP16), with
+// the packed call's queries, pooled keys and batch.
+std::vector<std::uint16_t> bf16_twin_output(const ops::QsaKVLayer& packed, const StoredVector& key_plane,
+                                            const StoredVector& value_plane, int pages, const DeviceBuffer& dq,
+                                            const DeviceBuffer& diq, const ops::QsaBatch& batch, int max_context) {
+    const int columns = static_cast<int>(batch.positions.ne[0]);
+    DeviceBuffer dk = upload(key_plane.bf16_twin()), dv = upload(value_plane.bf16_twin());
+    ops::QsaKVLayer layer;
+    layer.kv.storage      = KvCacheStorage::BFloat16;
+    layer.kv.head_dim     = kD;
+    layer.kv.num_kv_heads = kKvHeads;
+    layer.kv.k_pages      = Tensor(dk.p, DType::BF16, {kD, kPage, kKvHeads, pages});
+    layer.kv.v_pages      = Tensor(dv.p, DType::FP16, {kD, kPage, kKvHeads, pages});
+    layer.pooled_pages    = packed.pooled_pages;
+    const std::size_t workspace_bytes =
+        ops::qsa_attention_workspace_bytes(kGeometry, columns, max_context, KvCacheStorage::BFloat16);
+    const std::size_t elements = static_cast<std::size_t>(kD) * kHeads * columns;
+    DeviceBuffer workspace(workspace_bytes), dout(elements * 2);
+    Tensor out(dout.p, DType::BF16, {kD, kHeads, columns});
+    ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, columns}),
+                       Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}), layer, batch, kGeometry, 1.0F / 16.0F,
+                       max_context, workspace.p, workspace_bytes, out, nullptr);
+    synchronize("attention, bf16 storage of the same K and V");
+    return download<std::uint16_t>(dout, elements);
+}
+
+// The output bits of a packed call given qsa_attention's `unpack` scratch, poisoned first (NaN BF16 and FP16 rows),
+// so a row the call reads but the unpack did not write shows.
+std::vector<std::uint16_t> unpacked_output(const ops::QsaKVLayer& layer, const DeviceBuffer& dq, const DeviceBuffer& diq,
+                                           const ops::QsaBatch& batch, int max_context, const DeviceBuffer& workspace) {
+    const int columns = static_cast<int>(batch.positions.ne[0]);
+    DeviceBuffer scratch(ops::qsa_attention_unpack_bytes(kGeometry, max_context));
+    scratch.fill(0xFF);
+    const std::size_t elements = static_cast<std::size_t>(kD) * kHeads * columns;
+    DeviceBuffer dout(elements * 2);
+    Tensor out(dout.p, DType::BF16, {kD, kHeads, columns});
+    ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, columns}),
+                       Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}), layer, batch, kGeometry, 1.0F / 16.0F,
+                       max_context, workspace.p, workspace.bytes, out, nullptr, nullptr, scratch.p);
+    synchronize("attention, unpacked");
+    return download<std::uint16_t>(dout, elements);
+}
+
 void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_t seed) {
     std::mt19937 rng(seed);
     const auto layout        = infernix::paged_kv_storage_layout(storage, kD);
-    const bool rotated_keys   = storage != KvCacheStorage::BFloat16;
+    const bool rotated_keys   = storage != KvCacheStorage::BFloat16 && storage != KvCacheStorage::Bf16Packed;
     const bool rotated_values = storage == KvCacheStorage::Nvfp4Group16 ||
                                 storage == KvCacheStorage::Fp8KeyNvfp4Value;
     const int rows = static_cast<int>(c.starts.size()), width = c.width, columns = rows * width;
@@ -1152,7 +1302,7 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
     std::shuffle(tables.begin(), tables.end(), rng);
 
     // Stored K/V in the storage's planes (rotated vectors in the normalized Hadamard domain).
-    const StoredVector key_plane(layout.key, pages, rng), value_plane(layout.value, pages, rng);
+    const StoredVector key_plane(layout.key, pages, rng, false), value_plane(layout.value, pages, rng, true);
     // Pooled keys fill the whole plane; selection reads only complete blocks. Pooled keys and index
     // queries lie on the exact grid, so the oracle's selection is the contract's (grid_bf16).
     const auto pooled = grid_bf16(rng, static_cast<std::size_t>(kSlotWidth) * kPage * pages);
@@ -1207,10 +1357,10 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
     synchronize("attention");
     const auto got = t::from_device_bf16(dout, static_cast<std::size_t>(kD) * kHeads * columns);
     const std::string tag = std::string("qsa_attention ") + storage_name(storage) + " " + c.name;
-    // The prompt kernel's temporary split stage (INFERNIX_TMP_QSA_PROMPT_V2) and its combined gather
-    // give the same bits (calls off the one-stage prompt route run the same kernel either way).
+    // The prompt kernel's split stage and its combined gather give the same bits (calls off the one-stage
+    // prompt route run the same kernel either way).
     {
-        const OtherPromptVariant other;
+        const OtherPromptVariant other(storage);
         DeviceBuffer dother(static_cast<std::size_t>(kD) * kHeads * columns * 2);
         Tensor other_out(dother.p, DType::BF16, {kD, kHeads, columns});
         ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, columns}),
@@ -1220,6 +1370,14 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
         const std::size_t n = static_cast<std::size_t>(kD) * kHeads * columns;
         expect(download<std::uint16_t>(dother, n) == download<std::uint16_t>(dout, n),
                tag + ": the prompt kernel's split stage and combined gather give the same bits");
+    }
+    if (storage == KvCacheStorage::Bf16Packed) {
+        const std::size_t n = static_cast<std::size_t>(kD) * kHeads * columns;
+        expect(bf16_twin_output(layer, key_plane, value_plane, pages, dq, diq, batch, max_context) ==
+                   download<std::uint16_t>(dout, n),
+               tag + ": the bf16 storage holding the same K and V gives the same bits");
+        expect(unpacked_output(layer, dq, diq, batch, max_context, workspace) == download<std::uint16_t>(dout, n),
+               tag + ": unpacked once a call (qsa_attention's unpack), the same bits");
     }
     // Width invariance inside the unsplit class: the row's last 100 columns as a call of their own
     // (also unsplit) give the same bits; the prefix cache resumes rely on it.
@@ -1352,7 +1510,7 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
         // Both prompt variants: the split stage's gathers translate the page spaces too.
         for (const bool other_variant : {false, true}) {
             std::optional<OtherPromptVariant> other;
-            if (other_variant) { other.emplace(); }
+            if (other_variant) { other.emplace(storage); }
             ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, columns}),
                                Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}), spaced, moved_batch,
                                kGeometry, 1.0F / 16.0F, max_context, workspace.p, workspace_bytes, spaced_out,
@@ -1361,6 +1519,11 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
             const auto spaced_got = t::from_device_bf16(dspaced, static_cast<std::size_t>(kD) * kHeads * columns);
             expect(spaced_got == got, tag + ": pages in host and lent spaces give the pool's bits" +
                                           (other_variant ? " (other prompt variant)" : ""));
+        }
+        if (storage == KvCacheStorage::Bf16Packed) {
+            expect(unpacked_output(spaced, dq, diq, moved_batch, max_context, workspace) ==
+                       download<std::uint16_t>(dout, static_cast<std::size_t>(kD) * kHeads * columns),
+                   tag + ": unpacked from host and lent spaces, the pool's bits");
         }
         cudaFreeHost(host_mem);
     }
@@ -1412,12 +1575,12 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
     g_failures += t::verify_reduction(tag, got, ref, kAttentionCriterion);
 }
 
-// TEMPORARY (INFERNIX_TMP_QSA_PROMPT_V2): the prompt kernel's split stage against its combined gather,
+// The prompt kernel's split stage against its combined gather,
 // bit for bit, at the real prefill shape: one 4,096-column chunk whose first column is at `start`
 // (0: a 4K prompt, dense columns, the dense/selected boundary and lists off the tile grid; 28,672: the
 // last chunk of a 32K prompt, every column on 2,048 selected tokens plus its tail), scattered pages.
 // The FP64 oracle qualifies the combined gather in test_attention at narrower widths; equal bits
-// carry it over.
+// carry it over. Packed BF16 has no split stage: its chunk must give the bf16 storage's bits instead.
 void test_prompt_variants(KvCacheStorage storage, int start, std::uint32_t seed) {
     constexpr int kWidth = 4096;
     std::mt19937 rng(seed);
@@ -1428,7 +1591,7 @@ void test_prompt_variants(KvCacheStorage storage, int start, std::uint32_t seed)
     std::vector<std::int32_t> tables(pages);
     std::iota(tables.begin(), tables.end(), 0);
     std::shuffle(tables.begin(), tables.end(), rng);
-    const StoredVector key_plane(layout.key, pages, rng), value_plane(layout.value, pages, rng);
+    const StoredVector key_plane(layout.key, pages, rng, false), value_plane(layout.value, pages, rng, true);
     const auto pooled = grid_bf16(rng, static_cast<std::size_t>(kSlotWidth) * kPage * pages);
     const auto q      = random_bf16(rng, static_cast<std::size_t>(kD) * kHeads * kWidth, 1.0);
     const auto iq     = grid_bf16(rng, static_cast<std::size_t>(kDi) * kIndexHeads * kWidth);
@@ -1467,15 +1630,15 @@ void test_prompt_variants(KvCacheStorage storage, int start, std::uint32_t seed)
     DeviceBuffer workspace(workspace_bytes);
     const std::size_t elements = static_cast<std::size_t>(kD) * kHeads * kWidth;
     const auto run = [&](bool split) {
-        const bool was = ops::detail::qsa_prompt_v2();
-        ops::detail::qsa_prompt_set_v2(split);
+        const int was = ops::detail::qsa_prompt_forced();
+        ops::detail::qsa_prompt_force(split ? 1 : 0);
         DeviceBuffer dout(elements * 2);
         Tensor out(dout.p, DType::BF16, {kD, kHeads, kWidth});
         ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, kWidth}),
                            Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, kWidth}), layer, batch, kGeometry,
                            1.0F / 16.0F, max_context, workspace.p, workspace_bytes, out, nullptr);
         synchronize("attention, prompt variant");
-        ops::detail::qsa_prompt_set_v2(was);
+        ops::detail::qsa_prompt_force(was);
         return download<std::uint16_t>(dout, elements);
     };
     const auto combined = run(false), split = run(true);
@@ -1488,6 +1651,12 @@ void test_prompt_variants(KvCacheStorage storage, int start, std::uint32_t seed)
     const std::string tag = std::string("qsa_attention ") + storage_name(storage) + " prompt W=4096 from " +
                             std::to_string(start);
     expect(finite, tag + ": finite output");
+    if (storage == KvCacheStorage::Bf16Packed) {
+        expect(bf16_twin_output(layer, key_plane, value_plane, pages, dq, diq, batch, max_context) == combined,
+               tag + ": the bf16 storage holding the same K and V gives the same bits");
+        expect(unpacked_output(layer, dq, diq, batch, max_context, workspace) == combined,
+               tag + ": unpacked once a call (qsa_attention's unpack), the same bits");
+    }
     expect(first_difference == elements,
            tag + ": the split stage gives the combined gather's bits" +
                (first_difference == elements
@@ -1684,6 +1853,10 @@ public:
         dtails_ = upload(tails_host_);
         if (spaces) { move_to_spaces(); }
         dtables_ = upload(tables_host_);
+        if (storage_ == KvCacheStorage::Bf16Packed) {
+            dflags_  = upload(std::vector<std::int32_t>(rows_, 0));
+            drflags_ = upload(std::vector<std::int32_t>(rows_, 0));
+        }
     }
 
     PrepareHarness(const PrepareHarness&)            = delete;
@@ -1719,6 +1892,11 @@ public:
                 append(q, projection_rows(seed_, Rows::Query, r, p));
                 append(k, projection_rows(seed_, Rows::Key, r, p));
                 append(v, projection_rows(seed_, Rows::Value, r, p));
+                if (planted_.count({r, p}) != 0) {
+                    for (int d = 0; d < 7; ++d) {
+                        v[v.size() - std::size_t{kD} * kKvHeads + d] = static_cast<std::uint16_t>(0x0080 | d); // ~2^-126
+                    }
+                }
                 append(iq, projection_rows(seed_, Rows::IndexQuery, r, p));
                 append(ik, projection_rows(seed_, Rows::IndexKey, r, p));
             }
@@ -1804,6 +1982,7 @@ public:
         reference.head_dim     = kD;
         reference.num_kv_heads = kKvHeads;
         reference.storage      = storage_;
+        reference.unpackable   = static_cast<std::int32_t*>(drflags_.p);
         ops::kv_cache_append_batch(Tensor(b.k.p, DType::BF16, {kD, kKvHeads, width, batch}),
                                    Tensor(b.v.p, DType::BF16, {kD, kKvHeads, width, batch}),
                                    Tensor(b.positions.p, DType::I32, {width, batch}), Tensor(b.rows.p, DType::I32, {batch}),
@@ -1855,11 +2034,14 @@ public:
                 const std::size_t row = (static_cast<std::size_t>(page) * kKvHeads + h) * kPage + p % kPage;
                 written_row[row]      = 1;
                 auto oracle           = head_oracle(in.data() + static_cast<std::size_t>(h) * kD, kD, wk_, at);
-                if (storage_ != KvCacheStorage::BFloat16) { hadamard(oracle); }
+                if (storage_ != KvCacheStorage::BFloat16 && storage_ != KvCacheStorage::Bf16Packed) { hadamard(oracle); }
                 ref_key.insert(ref_key.end(), oracle.begin(), oracle.end());
-                for (int d = 0; d < kD; ++d) {
-                    got_key.push_back(stored_key(storage_, kd.data() + row * kb,
-                                                 ksb > 0 ? ks.data() + row * ksb : nullptr, d));
+                const std::uint8_t* key_row    = kd.data() + row * kb;
+                const std::uint8_t* key_scales = ksb > 0 ? ks.data() + row * ksb : nullptr;
+                if (storage_ == KvCacheStorage::Bf16Packed) {
+                    for (const auto bits : unpack_bf16p(key_row, key_scales)) { got_key.push_back(from_bf16(bits)); }
+                } else {
+                    for (int d = 0; d < kD; ++d) { got_key.push_back(stored_key(storage_, key_row, key_scales, d)); }
                 }
             }
         }
@@ -1875,6 +2057,9 @@ public:
         expect(untouched, tag + ": key rows of no call's position are untouched");
         expect(vd == bytes_of(rv_) && vs == bytes_of(rvs_),
                tag + ": values (and every unwritten value byte) equal kv_cache_append_batch's");
+        if (storage_ == KvCacheStorage::Bf16Packed) {
+            expect(flags(false) == flags(true), tag + ": unpackable flags equal kv_cache_append_batch's");
+        }
         // Pooled keys: every block a call completed against the oracle, every other slot untouched.
         const auto pooled = download<std::uint16_t>(dpooled_, static_cast<std::size_t>(kSlotWidth) * kPage * pages_);
         std::vector<double> got_pooled, ref_pooled;
@@ -1931,6 +2116,36 @@ public:
     // Outputs of the same columns, bit for bit (both harnesses recorded them).
     bool same_outputs(const PrepareHarness& other) const { return q_ == other.q_ && iq_ == other.iq_; }
 
+    // Packed BF16: the outputs and pooled keys are the bits of `plain` (a bf16 harness of the same seed that made the
+    // same calls), and every written K and V row decodes to exactly the K and V it stored (its V as FP16).
+    bool holds_bf16_of(const PrepareHarness& plain) const {
+        bool same = same_outputs(plain) && bytes_of(dpooled_) == bytes_of(plain.dpooled_);
+        const auto kd = bytes_of(dk_), ks = bytes_of(dks_), vd = bytes_of(dv_), vs = bytes_of(dvs_);
+        const std::size_t elements = static_cast<std::size_t>(kD) * kPage * kKvHeads * pages_;
+        const auto plain_k = download<std::uint16_t>(plain.dk_, elements), plain_v = download<std::uint16_t>(plain.dv_, elements);
+        for (const auto& [r, p] : written_) {
+            const int page = page_of(r, p);
+            for (int h = 0; h < kKvHeads; ++h) {
+                const std::size_t row = (static_cast<std::size_t>(page) * kKvHeads + h) * kPage + p % kPage;
+                const auto key   = unpack_bf16p(kd.data() + row * kPackedRowBytes, ks.data() + row * kPackedSideBytes);
+                const auto value = unpack_bf16p(vd.data() + row * kPackedRowBytes, vs.data() + row * kPackedSideBytes);
+                for (int d = 0; d < kD; ++d) {
+                    same &= key[d] == plain_k[row * kD + d] && bf16_value_as_fp16(value[d]) == plain_v[row * kD + d];
+                }
+            }
+        }
+        return same;
+    }
+
+    // Packed BF16: the value row of (sequence r, position p), head 0, gets seven values far below its others (more
+    // escapes than a packed row keeps) in every later call.
+    void plant_unpackable(int r, int p) { planted_.insert({r, p}); }
+
+    // Packed BF16: the unpackable flag of each table row, set by the calls or (`reference`) by the reference appends.
+    std::vector<std::int32_t> flags(bool reference) const {
+        return download<std::int32_t>(reference ? drflags_ : dflags_, static_cast<std::size_t>(rows_));
+    }
+
     // Every pool-plane and pooled-key byte, bit for bit, and every tail byte with `tails` (calls that
     // end at different positions leave different stale slots; check() checks the defined ones).
     bool same_state(const PrepareHarness& other, bool tails = true) const {
@@ -1967,6 +2182,7 @@ private:
         out.kv.v_pages       = plane_tensor(dv_, layout_.value, false);
         out.kv.k_scale_pages = plane_tensor(dks_, layout_.key, true);
         out.kv.v_scale_pages = plane_tensor(dvs_, layout_.value, true);
+        out.kv.unpackable    = static_cast<std::int32_t*>(dflags_.p);
         out.pooled_pages     = Tensor(dpooled_.p, DType::BF16, {kSlotWidth, kPage, 1, pages_});
         out.spaces           = spaces_;
         return out;
@@ -2048,6 +2264,8 @@ private:
     std::vector<void*> host_planes_;
     std::vector<std::size_t> host_bytes_;
     DeviceBuffer lent_k_, lent_v_, lent_ks_, lent_vs_, spaces_pooled_;
+    DeviceBuffer dflags_, drflags_;           // packed BF16: the calls' and the reference appends' flags
+    std::set<std::pair<int, int>> planted_;   // (sequence, position): an unpackable value row
     std::vector<int> tail_last_;
     std::set<std::pair<int, int>> written_;                               // (sequence, position)
     std::map<std::pair<int, int>, std::vector<std::uint16_t>> q_, iq_; // the latest outputs of a column
@@ -2145,12 +2363,35 @@ void test_prepare(KvCacheStorage storage, std::uint32_t seed) {
         expect(graph->same_outputs(*eager) && graph->same_state(*eager),
                name + ": graph replays give the eager calls' bits");
     }
+    if (storage == KvCacheStorage::Bf16Packed) {
+        // The packed rows hold exactly the bf16 storage's K and V: a bf16 harness of the same seed (same tables,
+        // weights and rows) making the same calls - decode, verification and a prompt chunk.
+        auto packed = harness(seed + 7);
+        PrepareHarness plain(KvCacheStorage::BFloat16, first, images, kExtent, seed + 7);
+        for (PrepareHarness* h : {packed.get(), &plain}) {
+            h->call({0, 1, 2, 3}, first, 1, true);
+            h->call({1, 2}, {3007, 4094}, 6, false);
+            h->call({3}, {127}, 300, true);
+        }
+        expect(packed->holds_bf16_of(plain), name + ": rows, outputs and pooled keys are the bf16 storage's bits");
+        expect(packed->flags(false) == std::vector<std::int32_t>(4, 0), name + ": packable rows set no flag");
+        // A value row with seven escapes sets its sequence's flag (table row 2) and only that one.
+        auto planted = harness(seed + 8);
+        planted->plant_unpackable(2, 4095);
+        planted->call({0, 1, 2, 3}, first, 1, true);
+        expect(planted->flags(false) == std::vector<std::int32_t>(4, 0), name + ": no flag before the planted row");
+        planted->call({1, 2}, {3007, 4094}, 3, true);
+        expect(planted->flags(false) == std::vector<std::int32_t>({0, 0, 1, 0}),
+               name + ": an unpackable value row flags its own table row");
+        planted->check(name + " unpackable row");
+    }
 }
 
 // The index queries and pooled keys (plain RoPE, YaRN over a short span and Flash-Next's YaRN x4),
 // and the fused prepare under YaRN.
 void run_index_part() {
-    for (const int columns : {1, 5, 64, 1024}) { test_index_query(columns, 100U + columns); }
+    // 70,000 columns: a call wider than a grid's 65,535 rows (core/grid_rows.h).
+    for (const int columns : {1, 5, 64, 1024, 70000}) { test_index_query(columns, 100U + columns); }
     test_pool(7);
     // Under YaRN (factor 4 over an original span of 4096, so the ramp falls inside the rotary
     // pairs and positions reach past the span).
@@ -2224,7 +2465,7 @@ void run_vq_part(KvCacheStorage storage) {
 
 INFERNIX_OP_TEST(qsa) {
     // --part selects one independent part, so CTest runs them concurrently: `index` (index queries,
-    // pooled keys, the YaRN prepare), one KV storage (`bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`:
+    // pooled keys, the YaRN prepare), one KV storage (`bf16`, `bf16p`, `int8`, `fp8`, `nvfp4`, `k8v4`:
     // attention and the fused prepare) or one vector-quantized storage (`vq2`, `k4v2`). Each case
     // keeps its seed, so the parts together run exactly the cases of one unsharded invocation.
     std::string part = "all";
@@ -2232,15 +2473,16 @@ INFERNIX_OP_TEST(qsa) {
         part = argv[2];
     } else if (argc != 1) {
         std::fprintf(stderr,
-                     "usage: infernix_qsa_test [--part index|bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2]\n");
+                     "usage: infernix_qsa_test [--part index|bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2]\n");
         return 2;
     }
-    const std::array<std::pair<const char*, KvCacheStorage>, 5> scalar_storages{{
+    const std::array<std::pair<const char*, KvCacheStorage>, 6> scalar_storages{{
         {"bf16", KvCacheStorage::BFloat16},
         {"int8", KvCacheStorage::Int8Group64},
         {"fp8", KvCacheStorage::Fp8E4M3Row256},
         {"nvfp4", KvCacheStorage::Nvfp4Group16},
         {"k8v4", KvCacheStorage::Fp8KeyNvfp4Value},
+        {"bf16p", KvCacheStorage::Bf16Packed},
     }};
     const bool known = part == "all" || part == "index" || part == "vq2" || part == "k4v2" ||
                        std::any_of(scalar_storages.begin(), scalar_storages.end(),

@@ -218,7 +218,10 @@ The real loading test accepts an explicit artifact path and optional component s
 ```
 
 Add `--host-only` to check semantic binding without uploading weights. This does not construct a
-Program or establish native Op support.
+Program or establish native Op support. `--vision --vision-offload` checks the overlay window the
+offloaded Vision tower borrows from the device weights, and `--embedding-host` that the token
+embedding stays in pinned host memory; together they cover the combination the server runs with
+`--vision-offload on --embedding-host`.
 
 The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
 runs the real engine:
@@ -243,6 +246,10 @@ INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R infernix_qwen3_5_moe_real_test --output-on-failure
 ```
 
+With the 122B-A10B's artifact the same test also runs its offloaded experts: the first engine in the exclusive
+RAM layout (`--expert-ram-layout exclusive`), the 262,144-token configuration in the default full layout with
+the elastic KV grown from the expert frames.
+
 The Qwen3.8-Flash-Next (`qwen4_exp`) artifact tests read `INFERNIX_QWEN4_ARTIFACT` instead (the first
 shard of a `.infernix` artifact) and, when the n-gram volume is not beside it,
 `INFERNIX_QWEN4_NGRAM`:
@@ -254,7 +261,13 @@ INFERNIX_QWEN4_NGRAM=G:/out/qwen3_8_flash_next.ninfer.ngram \
 ```
 
 They cover the forward pass against the FP64 reference, the SSD tier's records, the route trace, VRAM
-pressure, the prefix cache, preemption, `/v1/decide` and recovery from a failed expert read.
+pressure, the prefix cache, preemption, `/v1/decide` and recovery from a failed expert read. Two use
+test hooks: `infernix_qwen4_exp_nonfinite_withdraw_real_test` reports a row's logits as non-finite
+after the request published prefix-cache entries (the entries are withdrawn, also from a saved cache
+file), and `infernix_qwen4_exp_vision_lend_real_test` (an artifact with the vision tower) limits the
+expert frames a Vision window may be lent (the image request waits or is refused alone with
+`media_budget_exceeded`). The hybrid prefix test's `nonfinite-withdraw` scenario
+(`INFERNIX_HYBRID_REAL_SCENARIO`) checks the withdrawal on Qwen3.5.
 
 Without their artifact variable, CTest marks these real Engine tests as skipped. Real-artifact targets
 carry the `real` label and `RUN_SERIAL` so CTest runs them alone. Run directly invoked GPU
@@ -312,10 +325,51 @@ decoded text are bit-identical; on the default route, which resumes from the dec
 endpoint, the mean log-probability difference stays within max(0.1, 4 x) that of a resume from a
 prefill-made state. The Qwen4Exp entry runs DFlash2 only with `INFERNIX_QWEN4_DFLASH2`.
 
+`infernix_qwen4_exp_startup_capture_real_test` (arguments `plain mtp dflash2`; TEMPORARY with
+`INFERNIX_TMP_STARTUP_CAPTURE`, Flash-Next design §19.3.37) runs two prompts, alone and then together, through an
+Engine that captures each CUDA graph at its first use and one that captures the graph set at startup: on the
+reproducible route the ids must be equal; on both routes no graph may be captured after the startup capture. It
+prints each Engine's construction time and free VRAM. It reads `INFERNIX_QWEN4_ARTIFACT`, `INFERNIX_QWEN4_NGRAM`,
+`INFERNIX_QWEN4_DFLASH2` (dflash2 skips without it) and `INFERNIX_QWEN4_KV`.
+
+The entries above compare requests inside one Engine. `tools/reproducible_digest.py` compares two processes: it
+starts `infernix-serve --reproducible` twice with launch arguments of your choice (`--a`, `--b`: fewer expert frames
+through `--vram-headroom-mib`, another `--ram-free-mib`, `--max-concurrency`), sends process B other requests first
+(`--b-warmup`) and, with `--b-concurrent`, the compared requests at once, and compares the SHA-256 digests of each
+compared request's committed token ids from the request log. Each process starts from its own copy of
+`--expert-state` (or `off`; `--b-cold`: B without it), and the ports default to 18431-18432. It exits 1 when a
+digest differs. The route resumes from the prefix cache only on the prefill chunk grid, so a request meant to resume
+in B needs a shared prefix longer than the chunk, and both processes the same `--prefill-chunk` (a narrower
+launch-fitted chunk is the route's documented launch-dependent case). `tests/test_reproducible_digest.py` covers its
+log reading.
+
+```bash
+python3.11 -I tools/reproducible_digest.py --serve build/apps/infernix-serve --model out/model.infernix \
+  --requests requests.json --b-warmup warmup.json --b "--vram-headroom-mib 3072 --max-concurrency 2" \
+  --b-concurrent --out /tmp/digest
+```
+
+`infernix_qwen3_5_calibrated_order_test` (host only) checks the Qwen3.5-122B-A10B's calibrated expert order: the
+shape guard (a table serves only its exact geometry), the conversion to the warm start's state, the built-in table
+(empty until generated, else 48 x 256 permutations), and that a usable saved state wins over the order while a
+missing, foreign or damaged file falls back to it and `--expert-state off` starts empty.
+`tests/test_expert_cache_calibrated_order.py` covers its generator (`tools/expert_cache_replay/calibrated_order.py`).
+
+`infernix_qwen3_5_tokenizer_golden_real_test` compares the tokenizer's ids with Hugging Face
+`tokenizers` on about 2,600 adversarial strings (whitespace families, combining marks, ZWJ emoji,
+numbers, paths, code, special-token spellings; `tests/fixtures/qwen3_5/tokenizer_golden.json`). It needs
+the tokenizer files the golden was made from, not an artifact: `py -3.11 -I
+tests/models/qwen3_5/generate_tokenizer_golden.py <artifact> <golden.json> <dir>` writes them from any
+Qwen3.5-family artifact (and regenerates the golden), and `INFERNIX_TEST_TOKENIZER_DIR=<dir>` runs the
+test (skipped without it, and for a tokenizer.json of another size).
+
 The agent entry checks multi-turn continuation and branching. The preemption entry exercises
 Replay recovery and cancellation while paused or replaying; `INFERNIX_PREEMPTION_REAL_SCENARIO`
-selects `all`, `replay`, `cancel-paused`, `cancel-replay` or `cache-replay` (the prefix cache on,
-each resume binding from a snapshot of its own prompt; skipped by `all` under a test constraint). Native transaction tests cover pause and
+selects `all`, `replay`, `cancel-paused`, `cancel-replay`, `cache-replay` (the prefix cache on,
+each resume binding from a snapshot of its own prompt; skipped by `all` under a test constraint),
+`fairness` or `cache-fairness` (two long generations in one context of KV: bounded service turns
+must give each at least two recoveries with new output before either ends, and a short request
+submitted under pressure keeps its queue deadline). Native transaction tests cover pause and
 Replay with the exact ledger splits, grammar-row failure and replayed sampling counts; their
 positional backend is `none`, `mtp`, `dflash` or `dflash2`. Each backend requires an artifact containing that component.
 Public-HTTP latency and output gaps are measured separately by the

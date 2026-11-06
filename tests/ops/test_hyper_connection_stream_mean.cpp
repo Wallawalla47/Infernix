@@ -8,6 +8,11 @@
 // (S = 4, H = 2560) at T = 1, 8, 17 and 512 into a contiguous output and into a row slice of a
 // wider feature matrix (pitch 5 H, the DFlash2 feature layout: the other rows stay untouched), a
 // graph-captured replay bit-identical to the eager call, and input preservation.
+//
+// A call wider than a grid's 65,535 rows (core/grid_rows.h), on small rows (S = 2, H = 16) at 70,001
+// columns: the stream mean against the same bound, hyper_connection_expand exactly (every stream is the
+// column's x), and hyper_connection_inject (R += inject * y per stream, one FP32 multiply-add rounded once
+// to BF16) within one BF16 rounding of the FP64 value.
 
 #include "ops/op_family.h"
 #include "infernix/ops/hyper_connection.h"
@@ -121,6 +126,65 @@ void run_case(int columns, int pitch, std::uint32_t seed, bool graph) {
     }
 }
 
+void wide_call(int columns) {
+    constexpr int S = 2, H = 16, W = S * H;
+    const std::string label = "wide call T=" + std::to_string(columns);
+    std::uint32_t state     = 0x77A1U;
+    const auto value        = [&](float range) {
+        const float unit = static_cast<float>(static_cast<std::int32_t>(next(state) >> 8) - (1 << 23)) /
+                           static_cast<float>(1 << 23);
+        return unit * range;
+    };
+    std::vector<std::uint16_t> r(static_cast<std::size_t>(W) * columns), y(static_cast<std::size_t>(H) * columns);
+    std::vector<float> inject(static_cast<std::size_t>(S) * columns);
+    for (auto& v : r) { v = t::f32_to_bf16(value(4.0F)); }
+    for (auto& v : y) { v = t::f32_to_bf16(value(2.0F)); }
+    for (auto& v : inject) { v = value(2.0F); }
+    infernix::DeviceBuffer d_r = t::to_device(r), d_y = t::to_device(y), d_inject = t::to_device(inject);
+    infernix::DeviceBuffer d_mean(static_cast<std::size_t>(H) * columns * sizeof(std::uint16_t));
+    infernix::DeviceBuffer d_expanded(r.size() * sizeof(std::uint16_t));
+    const Tensor residual(d_r.p, DType::BF16, {W, columns});
+    Tensor mean(d_mean.p, DType::BF16, {H, columns});
+    infernix::ops::hyper_connection_stream_mean(residual, S, mean, nullptr);
+    Tensor expanded(d_expanded.p, DType::BF16, {W, columns});
+    infernix::ops::hyper_connection_expand(Tensor(d_y.p, DType::BF16, {H, columns}), S, expanded, nullptr);
+    Tensor injected(d_r.p, DType::BF16, {W, columns}); // in place, after the mean has read it
+    infernix::ops::hyper_connection_inject(Tensor(d_y.p, DType::BF16, {H, columns}),
+                                           Tensor(d_inject.p, DType::FP32, {S, columns}), injected, nullptr);
+    t::cuda_synchronize();
+    const auto got_mean     = t::from_device<std::uint16_t>(d_mean, static_cast<std::size_t>(H) * columns);
+    const auto got_expanded = t::from_device<std::uint16_t>(d_expanded, r.size());
+    const auto got_injected = t::from_device<std::uint16_t>(d_r, r.size());
+    for (int c = 0; c < columns; ++c) {
+        for (int d = 0; d < H; ++d) {
+            const std::size_t at = static_cast<std::size_t>(c) * W + d;
+            const double a = t::bf16_to_f32(r[at]), b = t::bf16_to_f32(r[at + H]);
+            const double ref = (a + b) / S, magnitude = (std::abs(a) + std::abs(b)) / S;
+            const double fp32 = 3.0 * std::ldexp(magnitude, -24);
+            const double got  = t::bf16_to_f32(got_mean[static_cast<std::size_t>(c) * H + d]);
+            if (!(std::abs(got - ref) <= std::ldexp(std::abs(ref) + fp32, -8) + fp32)) {
+                check(false, label + ": mean column " + std::to_string(c) + " row " + std::to_string(d));
+                return;
+            }
+            for (int s = 0; s < S; ++s) {
+                const std::size_t i = static_cast<std::size_t>(c) * W + static_cast<std::size_t>(s) * H + d;
+                const std::uint16_t x = y[static_cast<std::size_t>(c) * H + d];
+                if (got_expanded[i] != x) {
+                    check(false, label + ": expand column " + std::to_string(c) + " stream " + std::to_string(s));
+                    return;
+                }
+                const double want = t::bf16_to_f32(r[i]) +
+                                    static_cast<double>(inject[static_cast<std::size_t>(c) * S + s]) * t::bf16_to_f32(x);
+                const double have = t::bf16_to_f32(got_injected[i]);
+                if (!(std::abs(have - want) <= std::ldexp(std::abs(want), -8) + 1.0e-6)) {
+                    check(false, label + ": inject column " + std::to_string(c) + " stream " + std::to_string(s));
+                    return;
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(hyper_connection_stream_mean) {
@@ -133,6 +197,7 @@ INFERNIX_OP_TEST(hyper_connection_stream_mean) {
             run_case(columns, kH, 0x5101U + static_cast<std::uint32_t>(columns), columns == 8);
             run_case(columns, kTaps * kH, 0x5201U + static_cast<std::uint32_t>(columns), columns == 8);
         }
+        wide_call(70001);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "hyper_connection_stream_mean: %s\n", error.what());
         return 1;

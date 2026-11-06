@@ -584,8 +584,7 @@ public:
         }
         input_.copy_from_host(input.data(), input_.bytes);
         residual_.copy_from_host(residual.data(), residual_.bytes);
-        CUDA_CHECK(
-            cudaMemcpy(destination_.p, residual_.p, destination_.bytes, cudaMemcpyDeviceToDevice));
+        bench::copy_device(destination_.p, residual_.p, destination_.bytes);
 
         x_                  = Tensor(input_.p, DType::BF16, {kHidden, tokens});
         destination_tensor_ = Tensor(destination_.p, DType::BF16, {kHidden, tokens});

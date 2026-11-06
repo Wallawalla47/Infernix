@@ -3,6 +3,7 @@
 #include "artifact/reader.h"
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen3_5/program/planning/fast_paths.h"
 #include "models/qwen3_5/program/runtime_types.h"
 #include "models/registry.h"
 #include "runtime/engine/context_cache/context_cost.h"
@@ -10,6 +11,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <vector>
 
 namespace infernix::runtime {
 
@@ -28,6 +30,20 @@ namespace infernix::runtime {
 // Whether a Qwen3.5 artifact stores its routed experts as offloaded banks (Qwen3.5-122B-A10B,
 // docs/maintainer/qwen3_5-122b-offload-design.md).
 [[nodiscard]] bool artifact_offloads_experts(const artifact::Reader& reader);
+
+// The drafter components an artifact bundles (Qwen3.8-Flash-Next's DFlash2 drafter is a companion
+// artifact, SpeculativeOptions::draft_model).
+[[nodiscard]] models::qwen3_5::BundledDrafters artifact_drafters(const artifact::Reader& reader);
+
+// --spec auto (SpeculativeOptions::backend_auto; the CLI's and the server's default): sets the backend to the
+// drafter measured fastest among those the artifact can run (Qwen3.8-Flash-Next: DFlash2 with a draft_model, or
+// with the one companion in `dflash2_companions` (dflash2_companions_beside), else MTP; the Qwen3.5 family:
+// models::qwen3_5::auto_speculative_backend), or turns speculation off without one and on the lossless route,
+// and reports the choice. The Engine runs it before normalize_engine_options, which refuses an unresolved auto;
+// a CausalScoring Engine leaves it to normalize_engine_options, which drops speculation.
+void resolve_auto_speculative_backend(EngineOptions& options, models::Architecture architecture,
+                                      bool offloaded_experts, const models::qwen3_5::BundledDrafters& drafters,
+                                      const std::vector<std::filesystem::path>& dflash2_companions = {});
 
 struct ModelInstance {
     using ModelContract = models::qwen3_5::RuntimeTypes;
@@ -57,6 +73,11 @@ struct ConstructedModel {
 void validate_engine_options(const EngineOptions& options, models::Architecture architecture,
                              bool offloaded_experts = false);
 
-[[nodiscard]] ConstructedModel construct_model(EngineOptions& options, DeviceContext& device);
+// With `plan` (Engine::plan) the construction stops before the Program: the weights are bound
+// plan-only (models::qwen3_5::plan_model), the capacity curve is resolved against the free memory
+// less the weights, and the sizing lands in *plan; the result is then empty. A start's memory
+// refusals become EnginePlan::fits false; anything else throws as a start would.
+[[nodiscard]] ConstructedModel construct_model(EngineOptions& options, DeviceContext& device,
+                                               EnginePlan* plan = nullptr);
 
 } // namespace infernix::runtime

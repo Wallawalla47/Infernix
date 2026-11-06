@@ -1,5 +1,4 @@
 #include "ops/linear/q8/q8_dispatch.h"
-#include "ops/linear/q8/q8_f16acc.h"
 #include "ops/linear/q8/q8_launch.h"
 #include "ops/linear/q8/q8_shapes.h"
 
@@ -40,10 +39,11 @@ constexpr std::array kShapes{
     ShapeEntry{2560, 2560, select_q8_n2560_k2560},
     ShapeEntry{1280, 2560, select_q8_n1280_k2560},
     ShapeEntry{2560, 6144, select_q8_n2560_k6144, select_q8_n2560_k6144_fast},
-    ShapeEntry{324, 10240, select_q8_n324_k10240},
-    ShapeEntry{320, 10240, select_q8_n320_k10240},
+    ShapeEntry{324, 10240, select_q8_n324_k10240, select_q8_n324_k10240_fast},
+    ShapeEntry{320, 10240, select_q8_n320_k10240, select_q8_n320_k10240_fast},
     ShapeEntry{10240, 320, select_q8_n10240_k320},
     ShapeEntry{2560, 640, select_q8_n2560_k640},
+    ShapeEntry{2560, 12800, select_q8_n2560_k12800},
     // NInfer's tunings for its own 2560-wide groupings.
     shape<Q8N6144K2560>(select_q8_n6144_k2560),   shape<Q8N10240K2560>(select_q8_n10240_k2560),
     shape<Q8N12288K2560>(select_q8_n12288_k2560),
@@ -115,17 +115,9 @@ Q8Launch select_q8_fp32_launch(std::int32_t n, std::int32_t k, std::int32_t t, L
 } // namespace
 
 void q8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                 LinearRoutes routes, WorkspaceArena* workspace, cudaStream_t stream) {
+                 LinearRoutes routes, cudaStream_t stream) {
     if (out.dtype == DType::FP32) {
         select_q8_fp32_launch(w.n, w.k, x.ne[1], policy)(x, w, out, stream);
-        return;
-    }
-    if (has_route(routes, LinearRoutes::F16Accumulate) && !column_invariant(policy) &&
-        q8_f16acc_admits(w.n, w.k, x.ne[1]) && w.padded_shape[1] == w.k) {
-        if (workspace == nullptr) {
-            throw std::invalid_argument("q8 linear: the f16-accumulate route requires caller workspace");
-        }
-        q8_linear_f16acc(x, w, out, *workspace, stream);
         return;
     }
     select_q8_launch(w.n, w.k, x.ne[1], policy, routes)(x, w, out, stream);

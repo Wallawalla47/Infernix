@@ -292,7 +292,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
         maximum              = fmaxf(maximum, tile_maximum);
         return previous == -CUDART_INF_F
                    ? 0.0F
-                   : causal_exp_scaled(previous, maximum * scale_l2, scale_l2);
+                   : causal_rescale(previous, maximum * scale_l2, scale_l2);
     };
     const auto step = [&]<bool FullTile>(int kb) {
         const int k0 = (first_owned_tile + kb) * Bc;
@@ -471,8 +471,8 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
             seen_m1        = fmaxf(seen_m1, bm1);
             const float f0 = bm0 == -CUDART_INF_F ? m0 : fmaxf(bm0, seen_m0 - frame_gap);
             const float f1 = bm1 == -CUDART_INF_F ? m1 : fmaxf(bm1, seen_m1 - frame_gap);
-            alpha0 = m0 == -CUDART_INF_F ? 0.0F : causal_exp_scaled(m0, f0 * scale_l2, scale_l2);
-            alpha1 = m1 == -CUDART_INF_F ? 0.0F : causal_exp_scaled(m1, f1 * scale_l2, scale_l2);
+            alpha0 = m0 == -CUDART_INF_F ? 0.0F : causal_rescale(m0, f0 * scale_l2, scale_l2);
+            alpha1 = m1 == -CUDART_INF_F ? 0.0F : causal_rescale(m1, f1 * scale_l2, scale_l2);
             m0     = f0;
             m1     = f1;
         } else {

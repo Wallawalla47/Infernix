@@ -11,6 +11,9 @@
 #include "ops/linear/fp8/fp8_a8_tma_mma.cuh"
 
 namespace infernix::ops::detail {
+// The SIMT, sliced-K and A8 MMA launches are programmatic dependents unless a caller says otherwise (each kernel waits
+// before reading its inputs and triggers after its K loop): the NVFP4 27B DFlash2 +0.27 % and the 122B's FP8 sites
+// within its decode's +1.2 % (INT8 KV, candidates §58). Same bits.
 template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows,
           class Scale = __nv_bfloat16>
 void launch_fp8_a16_gemv(const Fp8A16OperandsT<Scale>& p, Output output, Epilogue epilogue,
@@ -27,7 +30,7 @@ template <class Schedule, class Output, class Epilogue, class Rows = Fp8Identity
           class Scale = __nv_bfloat16>
 void launch_fp8_a16_simt(const Fp8A16OperandsT<Scale>& p, Output output, Epilogue epilogue,
                          cudaStream_t stream, Rows rows = {},
-                         pdl::Dependency dependency = pdl::Dependency::Serialized) {
+                         pdl::Dependency dependency = pdl::Dependency::Programmatic) {
     validate_fp8_operands<Schedule>(p);
     if (p.rows % Schedule::kBlockRows || p.k % (32 * Schedule::kValuesPerLane) ||
         (Schedule::kTokenCapacity && p.tokens > Schedule::kTokenCapacity) ||
@@ -73,7 +76,7 @@ template <class Schedule, class Output, class Epilogue, class Rows = Fp8Identity
           class Scale = __nv_bfloat16>
 void launch_fp8_a16_sliced_k_mma(const Fp8A16OperandsT<Scale>& p, Output output, Epilogue epilogue,
                                  cudaStream_t stream, Rows rows = {},
-                                 pdl::Dependency dependency = pdl::Dependency::Serialized) {
+                                 pdl::Dependency dependency = pdl::Dependency::Programmatic) {
     validate_fp8_operands<Schedule>(p);
     constexpr int capacity =
         Schedule::kTokenCapacity ? Schedule::kTokenCapacity : Schedule::kBlockTokens;
@@ -99,7 +102,7 @@ template <class Schedule, class Output, class Epilogue, class Rows = Fp8Identity
           class Scale = __nv_bfloat16>
 void launch_fp8_a8_mma(const Fp8A8OperandsT<Scale>& p, Output output, Epilogue epilogue,
                        cudaStream_t stream, Rows rows = {},
-                       pdl::Dependency dependency = pdl::Dependency::Serialized) {
+                       pdl::Dependency dependency = pdl::Dependency::Programmatic) {
     validate_fp8_operands<Schedule>(p);
     if (p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK ||
         p.k / Schedule::kBlockK < Schedule::kStages)

@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -548,6 +549,17 @@ int test_declared_frontend_semantics() {
                 !unicode::is_mark(value.value),
             "ASCII decoding or Unicode classification differs from classic character semantics");
     }
+    // Beyond ASCII, `\s` is the Unicode White_Space property (the Oniguruma class of the reference
+    // tokenizer): U+0085 and the Z categories, and none of the format characters that only look blank.
+    for (const std::int32_t space : {0x85, 0xa0, 0x1680, 0x2000, 0x2003, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f,
+                                      0x3000}) {
+        failures += check(infernix::text::unicode_internal::is_whitespace(space),
+                          "a Unicode White_Space character was not whitespace");
+    }
+    for (const std::int32_t blank : {0x1c, 0x1f, 0xad, 0x180e, 0x200b, 0x200c, 0x200d, 0x2060, 0xfeff}) {
+        failures += check(!infernix::text::unicode_internal::is_whitespace(blank),
+                          "a character outside the Unicode White_Space property was whitespace");
+    }
     for (const auto& [path, value] : std::vector<std::pair<const char*, nlohmann::json>>{
              {"/normalizer/type", "Lowercase"},
              {"/pre_tokenizer/pretokenizers/0/pattern/Regex", "\\w+"},
@@ -623,6 +635,91 @@ int test_tokenizer_config_merge() {
                                    .generation_config_json = conflicting.generation_config_json});
         }),
         "conflicting tokenizer/tokenizer_config added-token definitions were accepted");
+    return failures;
+}
+
+// A token window can start and end between two bytes of one character, which is the ordinary case
+// for a diagnosis: the byte-preserving route returns those bytes as they are, the strict route keeps
+// refusing them, and for every other input both join exactly the same bytes (serve/prefix_miss.h).
+int test_byte_preserving_decode(const Frontend& frontend) {
+    const fi::Tokenizer& tokenizer = fixture_tokenizer();
+    const auto byte = [](const std::uint8_t value) {
+        return static_cast<int>(fixture_byte_token(value));
+    };
+    const auto thrown = [](const auto& call) -> std::string {
+        try {
+            call();
+            return {};
+        } catch (const std::out_of_range&) { return "out_of_range"; }
+        catch (const std::invalid_argument&) { return "invalid_argument"; }
+        catch (const std::exception&) { return "other"; }
+    };
+    int failures = 0;
+
+    struct Cut {
+        std::vector<int> ids;
+        std::string bytes;
+    };
+    const std::vector<Cut> cuts = {
+        {{byte(0xe2)}, "\xe2"},                              // a lead byte alone
+        {{byte(0x82), byte(0xac)}, "\x82\xac"},               // continuations without their lead
+        {{byte(0xe2), byte(0x82)}, "\xe2\x82"},               // cut short of the last byte
+        {{byte(0xf0), byte(0x9f), byte(0x98)}, "\xf0\x9f\x98"}, // three of four bytes
+        {{byte(0xc0), byte(0x80)}, "\xc0\x80"},               // overlong
+        {{byte(0xed), byte(0xa0), byte(0x80)}, "\xed\xa0\x80"}, // a surrogate
+        {{byte(0xf4), byte(0x90), byte(0x80), byte(0x80)}, "\xf4\x90\x80\x80"}, // out of range
+        {{byte(0xe2), byte('A')}, "\xe2" "A"},           // ordinary text right after a cut
+        {{byte(0xe2), byte(0x82), byte('A'), byte(0xe2), byte(0x82), byte(0xac)},
+         "\xe2\x82" "A\xe2\x82\xac"}, // a later character keeps all of its bytes
+    };
+    for (const Cut& cut : cuts) {
+        failures += check(tokenizer.decode_bytes(cut.ids) == cut.bytes,
+                          "the byte-preserving decode did not return the window's bytes as they are");
+        failures += check(throws_invalid_argument([&] { (void)tokenizer.decode(cut.ids); }),
+                          "the strict decode accepted bytes a window cut");
+    }
+    failures += check(frontend.detokenize_bytes(cuts.front().ids) == cuts.front().bytes &&
+                          throws_invalid_argument(
+                              [&] { (void)frontend.detokenize(cuts.front().ids); }),
+                      "the front end's byte-preserving route did not keep a cut character's bytes");
+
+    for (const std::string& text :
+         {std::string(), std::string("a"), std::string("plain ascii text"), std::string("\xe2\x82\xac"),
+          std::string("caf\xc3\xa9"), std::string("\xe4\xb8\xad"), std::string("\xf0\x9d\x98\x80"),
+          std::string("a\xf0\x9f\x98\x80z"), std::string("\xe2\x82\xac\xef\xbf\xbd")}) {
+        const std::vector<int> ids = tokenizer.encode(text);
+        failures += check(tokenizer.decode_bytes(ids) == text && tokenizer.decode(ids) == text,
+                          "a valid text no longer decodes to its own bytes in both routes");
+    }
+
+    const std::vector<int> with_special = {byte('A'), 248045, byte('B')};
+    failures += check(tokenizer.decode_bytes(with_special) == "A<|im_start|>B" &&
+                          tokenizer.decode(with_special) == "A<|im_start|>B",
+                      "special tokens no longer decode the same way in both routes");
+    const fi::DecodeOptions skipped{.skip_special_tokens = true};
+    failures += check(tokenizer.decode_bytes(with_special, skipped) == "AB" &&
+                          tokenizer.decode(with_special, skipped) == "AB",
+                      "skip_special_tokens no longer applies to both routes");
+    const fi::DecodeOptions stop{.stop_token_ids = {6}};
+    failures += check(tokenizer.decode_bytes(std::vector<int>{byte('A'), 6}, stop) == "A" &&
+                          tokenizer.decode(std::vector<int>{byte('A'), 6}, stop) == "A",
+                      "a terminal stop token is no longer suppressed the same way in both routes");
+    failures += check(tokenizer.decode_bytes(std::vector<int>{6, byte('A')}, stop) == "<eos>A" &&
+                          tokenizer.decode(std::vector<int>{6, byte('A')}, stop) == "<eos>A",
+                      "a stop token inside the ids is no longer kept the same way in both routes");
+
+    for (const std::vector<int>& ids :
+         {std::vector<int>{-1}, std::vector<int>{999999}, std::vector<int>{byte('A'), -1}}) {
+        const std::string strict = thrown([&] { (void)tokenizer.decode(ids); });
+        failures += check(!strict.empty() &&
+                              thrown([&] { (void)tokenizer.decode_bytes(ids); }) == strict,
+                          "an id outside the vocabulary fails the two routes differently");
+    }
+
+    const std::vector<int> with_nul = {byte(0x00), byte('A')};
+    failures += check(tokenizer.decode_bytes(with_nul) == std::string("\0A", 2) &&
+                          tokenizer.decode(with_nul) == std::string("\0A", 2),
+                      "an embedded NUL did not decode the same way in both routes");
     return failures;
 }
 
@@ -1699,6 +1796,47 @@ int test_image_resize_rejection_policy() {
     return failures;
 }
 
+// The Vision canvas of the transformers smart resize (factor 32, size 8,192..4,194,304 pixels): the
+// grid rounds half to even, the maximum is tested on the rounded area and then floors, the minimum
+// scales up and ceils. The expected canvases are the reference's, recomputed by hand from the
+// published formula; each token is one 32x32 block.
+int test_image_smart_resize_canvases() {
+    FrontendResources owned = resources();
+    owned.preprocessor_config_json =
+        R"({"patch_size":16,"temporal_patch_size":2,"merge_size":2,"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"size":{"shortest_edge":8192,"longest_edge":4194304}})";
+    const Frontend frontend = make_frontend(owned);
+
+    struct Case {
+        int width, height, canvas_width, canvas_height;
+        const char* why;
+    };
+    const Case cases[] = {
+        {1280, 720, 1280, 704, "720/32 = 22.5 rounds to the even 22, not 23"},
+        {1000, 10, 928, 32, "a height that rounds to 0 takes the minimum-area branch"},
+        {2721, 1595, 2656, 1536, "the rounded area is over the maximum, so both sides floor after scaling"},
+        {90, 5, 384, 32, "a tiny image scales up to the minimum area and ceils"},
+        {1024, 1024, 1024, 1024, "an in-range multiple of the factor is kept"},
+        {2049, 1023, 2048, 1024, "a size just off the grid rounds to it"},
+    };
+    int failures = 0;
+    for (const Case& c : cases) {
+        const auto prepared = frontend.prepare(
+            image_text_input(block_ppm(c.width, c.height, 127), {}, "smart-resize.ppm"));
+        const auto& data = FrontendFactory::inspect(prepared);
+        const std::uint64_t expected =
+            static_cast<std::uint64_t>(c.canvas_width / 32) * static_cast<std::uint64_t>(c.canvas_height / 32);
+        const bool matches = data.vision_items.size() == 1 && data.prepare.vision_tokens == expected &&
+                             data.prepare.raw_patches == expected * 4;
+        if (!matches) {
+            std::cerr << "smart resize canvas differs from the reference for " << c.width << "x" << c.height
+                      << " (" << c.why << "): " << data.prepare.vision_tokens << " tokens, expected " << expected
+                      << '\n';
+        }
+        failures += matches ? 0 : 1;
+    }
+    return failures;
+}
+
 int test_explicit_leading_instruction_cache_boundary() {
     const Frontend frontend           = make_frontend(resources(), false);
     constexpr std::string_view stable = "stable cache section.";
@@ -2256,6 +2394,34 @@ int test_terminal_flush(const Frontend& frontend) {
     return failures;
 }
 
+// The Engine builds the constraint vocabulary index on a startup thread while requests may already
+// be arriving: concurrent warm-ups and a constrained request that races them share one build and
+// all succeed.
+int test_constraint_warm_up() {
+    const Frontend frontend = make_frontend(resources());
+    infernix::PromptInput input;
+    input.options.enable_thinking = false;
+    input.messages.push_back({.role  = infernix::ChatRole::User,
+                              .parts = {{.kind = infernix::MessagePartKind::Text, .text = "x"}}});
+    const auto prompt = frontend.prepare(input);
+
+    std::atomic<int> thrown{0};
+    std::vector<std::thread> warmers;
+    for (int index = 0; index < 2; ++index) {
+        warmers.emplace_back([&] {
+            try {
+                frontend.warm_constraints();
+            } catch (...) { ++thrown; }
+        });
+    }
+    auto session = frontend.make_output_session(prompt, {}, {}, {},
+                                                infernix::OutputConstraint::choice({"yes", "no"}));
+    for (std::thread& warmer : warmers) { warmer.join(); }
+    frontend.warm_constraints();
+    return check(thrown == 0 && session.constraint_observation().has_value(),
+                 "a constrained request racing the startup vocabulary warm-up failed");
+}
+
 int test_tools_and_json_output() {
     const Frontend frontend = make_frontend(resources());
     infernix::PromptInput input;
@@ -2671,6 +2837,83 @@ int test_reasoning_close_by_token_identity(const Frontend& frontend) {
     return failures;
 }
 
+// A close token after the reasoning has closed is the model's stray framing (NU-08): the answer publishes nothing for
+// it, whatever the decode rounds, so it never enters the history a client sends back; raw output keeps its bytes, and
+// its spelling in ordinary tokens stays answer text.
+int test_stray_reasoning_close_is_dropped(const Frontend& frontend) {
+    int failures = 0;
+    std::vector<infernix::TokenId> tokens = fixture_tokens("thought");
+    tokens.push_back(kFixtureThinkCloseToken);
+    const auto first = fixture_tokens("'; first");
+    tokens.insert(tokens.end(), first.begin(), first.end());
+    tokens.push_back(kFixtureThinkCloseToken);
+    const auto second = fixture_tokens(" second </think> spelled");
+    tokens.insert(tokens.end(), second.begin(), second.end());
+    const auto make_session = [&] { return frontend.make_output_session(thinking_prompt(frontend), {}); };
+    for (const std::size_t round : {0U, 1U, 3U}) {
+        const Published published = publish_rounds(make_session, tokens, round);
+        failures += check(published.reasoning == "thought" &&
+                              published.content == "'; first second </think> spelled",
+                          "a close token after the reasoning closed was published as answer text");
+    }
+    const auto make_raw = [&] {
+        return frontend.make_output_session(thinking_prompt(frontend), {}, infernix::OutputOptions{.raw = true});
+    };
+    const Published raw = publish_rounds(make_raw, tokens, 0);
+    failures += check(raw.content.find("first</think> second") != std::string::npos,
+                      "raw output dropped a close token's bytes");
+    return failures;
+}
+
+// A reply in open thinking reports its end-of-turn exclusion (the close token and the model's default stop tokens)
+// until it commits the close; a reply that starts outside thinking, or allows the end there, reports none.
+int test_reasoning_ban(const Frontend& frontend) {
+    auto prompt                     = thinking_prompt(frontend);
+    const auto& defaults            = frontend.default_stop_policy().token_ids;
+    auto session                    = frontend.make_output_session(prompt, {});
+    const infernix::runtime::ReasoningBan open = session.reasoning_ban();
+    int failures = check(open.active() && open.close == kFixtureThinkCloseToken && !defaults.empty() &&
+                             open.ends[0] == defaults[0] && (defaults.size() < 2 || open.ends[1] == defaults[1]),
+                         "an open thinking did not report the close token and the default stop tokens");
+    std::vector<infernix::TokenId> tokens = fixture_tokens("thought");
+    (void)session.preview_model(tokens, 64, infernix::FinishReason::OutputLimit);
+    (void)session.commit_preview();
+    failures += check(session.reasoning_ban().active(), "thinking without its close ended the exclusion");
+    tokens = {kFixtureThinkCloseToken};
+    const auto answer = fixture_tokens("\n\nanswer");
+    tokens.insert(tokens.end(), answer.begin(), answer.end());
+    (void)session.preview_model(tokens, 64, infernix::FinishReason::OutputLimit);
+    failures += check(session.reasoning_ban().active(), "a previewed close ended the exclusion before its commit");
+    (void)session.commit_preview();
+    failures += check(!session.reasoning_ban().active(), "the committed close did not end the exclusion");
+    auto allowed = frontend.make_output_session(prompt, {}, {}, infernix::ThinkingControlOptions{.end_turn_in_thinking = true});
+    failures += check(!allowed.reasoning_ban().active(), "end_turn_in_thinking did not lift the exclusion");
+
+    // A reply that declares tools also withholds the call opener while its thinking is open (candidates WD-40: on the
+    // unconstrained route a call written inside thinking could never end the turn); without tools nothing is withheld.
+    failures += check(open.withheld == -1, "a reply without tools withheld a token in its thinking");
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
+    message.parts.push_back(infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = "x", .media = {}});
+    infernix::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.continuation    = infernix::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}})");
+    const auto tool_prompt = frontend.prepare(std::move(input));
+    auto with_tools        = frontend.make_output_session(tool_prompt, {});
+    const infernix::runtime::ReasoningBan tool_ban = with_tools.reasoning_ban();
+    failures += check(tool_ban.active() && tool_ban.withheld == kFixtureToolCallToken &&
+                          tool_ban.close == kFixtureThinkCloseToken,
+                      "a reply with tools did not withhold the call opener in its open thinking");
+    auto tools_allowed = frontend.make_output_session(tool_prompt, {}, {},
+                                                      infernix::ThinkingControlOptions{.end_turn_in_thinking = true});
+    failures += check(!tools_allowed.reasoning_ban().active(),
+                      "end_turn_in_thinking did not lift the call opener's exclusion");
+    return failures;
+}
+
 // The request log's model_thinking_tokens counts the model's thinking without a budget too
 // (upstream Neroued/ninfer#373): the thinking and its close, as the presentation decoder counts
 // reasoning tokens, never the whole answer.
@@ -2842,8 +3085,27 @@ int test_reasoning_loop_guard(const Frontend& frontend) {
         const auto stats    = session.thinking_stats();
         failures += check(decision.finish_reason == infernix::FinishReason::OutputLimit && stats.loop_detected &&
                               stats.loop_coverage >= 0.25F && stats.loop_thinking_tokens >= 512 &&
-                              !stats.applied,
+                              !stats.applied && stats.loop_run_on_chars == 0,
                           "Stop did not end a looping reasoning at a check");
+    }
+    {
+        // Thinking that repeats nothing but degenerates into one hyphen-joined run-on (Strata #5218).
+        static const char* parts[] = {"so",   "then", "we",    "need", "to",    "check", "maybe", "again",
+                                      "the",  "list", "value", "is",   "fine",  "but",   "wait",  "hmm",
+                                      "okay", "and",  "next",  "edge", "case",  "right", "now",   "sure"};
+        std::string run_on = varied + " ";
+        unsigned rs        = 3;
+        for (int i = 0; i < 900; ++i) {
+            rs = rs * 1103515245U + 12345U;
+            run_on += (i == 0 ? "" : "-") + std::string(parts[(rs >> 8) % 24]);
+        }
+        auto session = frontend.make_output_session(thinking_prompt(frontend), {}, {},
+                                                    infernix::ThinkingControlOptions{.loop = infernix::ReasoningLoopAction::Stop});
+        const auto decision = run(session, fixture_tokenizer().encode(run_on), 1'000'000);
+        const auto stats    = session.thinking_stats();
+        failures += check(decision.finish_reason == infernix::FinishReason::OutputLimit && stats.loop_detected &&
+                              stats.loop_run_on_chars >= 200 && stats.loop_coverage < 0.25F && !stats.applied,
+                          "Stop did not end a hyphen run-on");
     }
     {
         auto session = frontend.make_output_session(
@@ -2978,6 +3240,62 @@ int test_open_reasoning_tool_recovery() {
 // Session-level tool calls by token identity, on the free and the constrained route: the model's
 // `<tool_call>` token opens a call even mid-line, the same spelling from ordinary tokens is content,
 // and every split into decode rounds publishes the same content and calls.
+// A client stop string ends the answer, never a tool call the model opened with its token: the
+// call's arguments are the tool's data (vLLM #64088). The same text in the answer, or after the
+// call's close, still stops it, at every round width.
+int test_stop_strings_skip_tool_calls() {
+    const Frontend frontend = make_frontend(resources());
+    infernix::PromptInput input;
+    input.messages.push_back({.role  = infernix::ChatRole::User,
+                              .parts = {{.kind = infernix::MessagePartKind::Text, .text = "x"}}});
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}})");
+    const auto prompt = frontend.prepare(std::move(input));
+    const infernix::TokenId eos = frontend.default_stop_policy().token_ids.front();
+    infernix::StopPolicy stop;
+    stop.strings.push_back(infernix::StopString{.text = "STOP"});
+    // Free tool calls: a constrained tool route refuses custom stops.
+    infernix::ToolChoice choice;
+    choice.constraints      = infernix::ToolConstraintMode::Automatic;
+    const auto make_session = [&] {
+        return frontend.make_output_session(prompt, stop, infernix::OutputOptions{.tool_name_max_length = 64}, {}, {},
+                                            choice);
+    };
+    const auto call = fixture_tokenizer().encode(
+        "<tool_call>\n<function=bash>\n<parameter=command>\necho STOP\n</parameter>\n</function>\n</tool_call>");
+
+    int failures = 0;
+    std::vector<infernix::TokenId> inside = fixture_tokens("Running it.");
+    inside.insert(inside.end(), call.begin(), call.end());
+    inside.push_back(eos);
+    std::vector<infernix::TokenId> after = inside;
+    after.pop_back();
+    const auto tail = fixture_tokens(" Then STOP here.");
+    after.insert(after.end(), tail.begin(), tail.end());
+    after.push_back(eos);
+    const std::vector<infernix::TokenId> answer = fixture_tokens("Say STOP now.");
+    for (const std::size_t round : {0U, 1U, 3U}) {
+        const std::string width = " (round width " + std::to_string(round) + ")";
+        const Published whole   = publish_rounds(make_session, inside, round);
+        failures += check(whole.content == "Running it." &&
+                              whole.calls == std::vector<std::string>{R"(bash {"command":"echo STOP"})"},
+                          ("a stop string cut a tool call's arguments" + width).c_str());
+        const Published later = publish_rounds(make_session, after, round);
+        // Text after a call keeps the call as content (calls end the output); the stop inside it
+        // was skipped and the one after its close ended the answer.
+        const std::size_t close = later.content.find("</tool_call>");
+        failures += check(close != std::string::npos && later.content.find("echo STOP") < close &&
+                              later.content.substr(close) == "</tool_call> Then ",
+                          ("a stop string after the call's close did not stop the answer" + width + ": [" +
+                           later.content + "]")
+                              .c_str());
+        failures += check(publish_rounds(make_session, answer, round).content == "Say ",
+                          ("a stop string in the answer did not stop it" + width).c_str());
+    }
+    return failures;
+}
+
 int test_tool_call_marker_by_token_identity() {
     const Frontend frontend = make_frontend(resources());
     infernix::PromptInput input;
@@ -3993,13 +4311,110 @@ int test_checkpoint_lowering_precedes_leading_instruction_tap() {
     return failures;
 }
 
-int main() {
+// The idle-time pass's prompt (hybrid-prefix-cache-spec §7.9): a finished reply rendered as the
+// conversation's next request will render it. Whatever follows the reply (a tool result after a
+// call, a user turn after an answer) and whichever reasoning the template keeps, the pass's tokens
+// are a prefix of that next request's tokens, end with the next turn's <|im_start|>, and carry an
+// exact opener tap at the history's end, one token before the prompt's.
+int test_next_turn_history() {
+    const auto text = [](infernix::ChatRole role, std::string content) {
+        infernix::ChatMessage message;
+        message.role = role;
+        message.parts.push_back(infernix::MessagePart{
+            .kind = infernix::MessagePartKind::Text, .text = std::move(content), .media = {}});
+        return message;
+    };
+    const std::string tool =
+        R"({"type":"function","function":{"name":"lookup","description":"Look up a city.","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}})";
+    int failures = 0;
+    for (const bool keeps_reasoning : {false, true}) {
+        // qwen3_6.jinja keeps reasoning only after the last user turn; qwen3_8.jinja keeps it.
+        const Frontend frontend =
+            make_frontend(resources(keeps_reasoning ? reasoning_effort_template_source()
+                                                    : thinking_toggle_template_source()),
+                          false);
+        for (const bool calls : {false, true}) {
+            infernix::PromptInput base;
+            base.options.enable_thinking = true;
+            base.options.tool_jsons.push_back(tool);
+            base.messages.push_back(text(infernix::ChatRole::System, "You help."));
+            base.messages.push_back(text(infernix::ChatRole::User, "Weather in Paris?"));
+            infernix::ChatMessage first = text(infernix::ChatRole::Assistant, "");
+            first.reasoning_content     = "first look";
+            first.tool_calls.push_back(
+                {.id = "call_a", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
+            base.messages.push_back(std::move(first));
+            infernix::ChatMessage result = text(infernix::ChatRole::Tool, "sunny");
+            result.tool_call_id          = "call_a";
+            base.messages.push_back(std::move(result));
+            infernix::ChatMessage reply = text(infernix::ChatRole::Assistant, calls ? "" : "It is sunny.");
+            reply.reasoning_content     = "then answer";
+            if (calls) {
+                reply.tool_calls.push_back(
+                    {.id = "call_b", .name = "lookup", .arguments_json = R"({"city":"Lyon"})"});
+            }
+            base.messages.push_back(std::move(reply));
+
+            infernix::PromptInput history = base;
+            history.options.continuation  = infernix::PromptContinuationMode::NextTurnHistory;
+            infernix::PromptInput next    = base;
+            if (calls) {
+                infernix::ChatMessage lyon = text(infernix::ChatRole::Tool, "rainy");
+                lyon.tool_call_id          = "call_b";
+                next.messages.push_back(std::move(lyon));
+            } else {
+                next.messages.push_back(text(infernix::ChatRole::User, "And tomorrow?"));
+            }
+            const auto pass    = frontend.prepare(std::move(history));
+            const auto request = frontend.prepare(std::move(next));
+            const auto& ids    = FrontendFactory::inspect(pass).token_ids;
+            const auto& full   = FrontendFactory::inspect(request).token_ids;
+            const bool prefix  = !ids.empty() && ids.size() < full.size() &&
+                                std::equal(ids.begin(), ids.end(), full.begin());
+            failures += check(prefix && ids.back() == 248045,
+                              "the next-turn history is not the next request's prefix through its "
+                              "<|im_start|>");
+            const auto& hints = FrontendFactory::inspect(pass).tap_hints.hints;
+            failures += check(std::any_of(hints.begin(), hints.end(),
+                                          [&](const TapHint& hint) {
+                                              return hint.kind == TapHintKind::GenerationOpener &&
+                                                     hint.position == ids.size() - 1;
+                                          }),
+                              "the next-turn history has no opener tap at its end");
+            // A user turn after an answer drops the tail's reasoning where the template does so.
+            const std::string rendered = frontend.detokenize(ids);
+            const bool kept            = rendered.find("first look") != std::string::npos;
+            failures += check(kept == (keeps_reasoning || calls),
+                              "the next-turn history kept or dropped earlier reasoning unlike the "
+                              "next request");
+            failures += check(!FrontendFactory::inspect(pass).starts_in_reasoning,
+                              "the next-turn history opened a reasoning block");
+        }
+        // The last message must be the reply.
+        infernix::PromptInput unanswered;
+        unanswered.messages.push_back(text(infernix::ChatRole::User, "Hi"));
+        unanswered.options.continuation = infernix::PromptContinuationMode::NextTurnHistory;
+        failures += check(throws_invalid_argument([&] { (void)frontend.prepare(unanswered); }),
+                          "a next-turn history without a final reply was rendered");
+    }
+    // Text only: a media item would take the Vision path the pass does not take.
+    const Frontend vision = make_frontend(resources(), true);
+    infernix::PromptInput media = image_text_input(gradient_ppm(), "what is this?", "inline.ppm");
+    media.messages.push_back(text(infernix::ChatRole::Assistant, "A gradient."));
+    media.options.continuation = infernix::PromptContinuationMode::NextTurnHistory;
+    failures += check(throws_invalid_argument([&] { (void)vision.prepare(media); }),
+                      "a next-turn history with media was rendered");
+    return failures;
+}
+
+int main() try {
     const FrontendResources owned = resources();
     const Frontend frontend       = make_frontend(owned);
     int failures                  = 0;
     failures += test_declared_frontend_semantics();
     failures += test_ngram_proposal_only_sources();
     failures += test_tokenizer_config_merge();
+    failures += test_byte_preserving_decode(frontend);
     failures += test_bpe_merge_order();
     failures += test_boundary_aware_tokenization();
     failures += test_rendered_special_tokens();
@@ -4021,6 +4436,7 @@ int main() {
     failures += test_media_token_ids_come_from_tokenizer();
     failures += test_template_media_contract();
     failures += test_image_resize_rejection_policy();
+    failures += test_image_smart_resize_canvases();
     failures += test_explicit_leading_instruction_cache_boundary();
     failures += test_trimmed_source_cache_boundaries();
     failures += test_source_part_recovery_boundary();
@@ -4036,14 +4452,18 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
     failures += test_deferred_tool_declarations();
+    failures += test_constraint_warm_up();
     failures += test_tools_and_json_output();
     failures += test_tool_marker_after_quoted_marker();
     failures += test_open_reasoning_tool_recovery();
     failures += test_tool_call_marker_by_token_identity();
+    failures += test_stop_strings_skip_tool_calls();
     failures += test_reasoning_split(frontend);
     failures += test_reasoning_close_by_token_identity(frontend);
+    failures += test_stray_reasoning_close_is_dropped(frontend);
     failures += test_reasoning_close_resolves_at_terminal(frontend);
     failures += test_thinking_tokens_without_budget(frontend);
+    failures += test_reasoning_ban(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_reasoning_loop_guard(frontend);
     failures += test_constrained_thinking_control(frontend);
@@ -4064,5 +4484,9 @@ int main() {
     failures += test_instruction_role_lowering();
     failures += test_checkpoint_template_prepare_lowers_instruction_roles();
     failures += test_checkpoint_lowering_precedes_leading_instruction_tap();
+    failures += test_next_turn_history();
     return failures == 0 ? 0 : 1;
+} catch (const std::exception& error) {
+    std::fprintf(stderr, "FAIL: uncaught exception: %s\n", error.what());
+    return 1;
 }

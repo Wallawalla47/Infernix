@@ -1,6 +1,7 @@
 // A focused regression test for the Windows-only NVFP4 W4A4 TMA descriptor-staging race.
 //
-// The Windows staging path stores the over-aligned CUtensorMap descriptor struct into one
+// The Windows staging path (the fallback to descriptors read in place from the kernel parameters; the
+// _staging CTest entry forces it) stores the over-aligned CUtensorMap descriptor struct into one
 // persistent device buffer that every eager launch reuses, and gives each launch captured into a
 // CUDA Graph a device copy of its own (core/tma_descriptor_staging.cuh). A launch that reads
 // another launch's descriptors (staged too early, too late, or a stale tensor map in the TMA

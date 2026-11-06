@@ -181,6 +181,10 @@ public:
     OpenAIResponsesEventStream& operator=(const OpenAIResponsesEventStream&) = delete;
 
     std::vector<std::string> start();
+    // A quiet stream's heartbeat (SseTransport::set_heartbeat): `response.in_progress` again, with the next sequence
+    // number, which a client whose idle timer counts events (Codex) takes as one; empty before start and after the
+    // finish.
+    [[nodiscard]] std::string keep_alive();
     std::vector<std::string> reasoning_delta(const std::string& text);
     std::vector<std::string> content_delta(const std::string& text);
     // A constrained call's step: its first adds the call's Item; a function call streams its
@@ -204,5 +208,13 @@ private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// The whole event stream of a streamed Response that fails before its generation starts:
+// response.created, response.in_progress, then response.failed carrying `error`. A prompt over the
+// context limit answers so, since Codex compacts its conversation on that failure only in the stream.
+std::string make_openai_failed_response_stream(const std::string& id, std::int64_t created_at,
+                                               OpenAIResponsesCreateRequest request,
+                                               const OpenAIResponsesRuntimeValues& runtime,
+                                               const ApiError& error);
 
 } // namespace infernix::serve

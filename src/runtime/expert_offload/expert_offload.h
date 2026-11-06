@@ -56,14 +56,22 @@
 namespace infernix::runtime::expert_offload {
 
 // The prefill CPU split's choice (Flash-Next design §19.3.12): for one layer of a gated streamed
-// chunk, marks cpu[e] = 1 for the non-resident experts the CPU computes (columns[e]: the chunk's
-// columns routed to expert e) and returns how many it marked.
+// chunk of `tokens` columns, marks cpu[e] = 1 for the non-resident experts the CPU computes
+// (columns[e]: the chunk's columns routed to expert e) and returns how many it marked.
 class CpuSplitPolicy {
 public:
     virtual ~CpuSplitPolicy() = default;
-    virtual std::uint32_t choose(std::uint32_t layer, std::span<const std::int32_t> columns,
+    virtual std::uint32_t choose(std::uint32_t layer, std::int32_t tokens, std::span<const std::int32_t> columns,
                                  std::span<std::uint8_t> cpu) const = 0;
 };
+
+// The widest prefill call the CPU split (the gated stream) takes: `configured` columns on the reference link
+// (`reference_bytes_per_second`), inversely to the measured one, at most the CPU channel's call width. Probes of one
+// link differ by a few percent (27.4-27.7 GB/s on the reference box), so a link within 5 % of the reference counts as
+// it: otherwise a call exactly at the width (4,096 columns) takes the gated stream in one process and the blind one in
+// the next (candidates BX-09's first A/B mixed both).
+[[nodiscard]] std::int32_t split_width(double configured, double reference_bytes_per_second,
+                                       double link_bytes_per_second) noexcept;
 
 // The model-independent subset of a Program's options the engine follows (the Program's own
 // ProgramOptions carry them from the EngineOptions).
@@ -79,25 +87,39 @@ struct OffloadOptions {
     std::uint32_t cpu_expert_jobs    = 16;  // CPU-served misses per decode or verification call
     std::uint32_t cpu_assist_jobs    = 256; // CPU-served misses per assisted prefill call (0: none)
     int cpu_pcie_divisor             = 0;  // > 0 fixes the decode miss divisor
-    // A GGUF import's one-column calls take the context's divisor (plain_divisor) without speculation
-    // (INFERNIX_TMP_PLAIN_DIVISOR_ALL: every bank's).
+    // The engine thread alone on a core no CPU expert worker uses (placement.h cpu_placement): the
+    // Qwen3.5 offloaded Program sets it (Ornith decode +0.3 %; Flash-Next flat, 2026-10-28).
+    bool engine_isolate              = false;
+    // A GGUF import's one-column calls take the context's divisor (plain_divisor) without speculation;
+    // every bank's lost on Dense8 (plain decode 0.731x / 0.933x, removed 2026-10-28).
     bool plain_divisor_by_context    = false;
     double link_bytes_per_second     = 0.0; // > 0 fixes the link rate (else measured)
     // The CPU team's reference rates (i9-13900K, 6 workers, NVFP4 records) until measured, and the
-    // widest call the prefill split takes on the reference link.
+    // widest call the prefill split takes on the reference link (split_width): 4,096 with the copy-ahead
+    // (ExpertStream::plan_ahead; without it the gated stream lost from 2,048 columns).
     double cpu_split_expert_rate = 21000.0;
     double cpu_split_column_rate = 66000.0;
-    double cpu_split_columns     = 1536.0;
+    double cpu_split_columns     = 4096.0;
     // The SSD tier's RAM (the RAM ledger's Tier placement): pinned and unpinned record bytes, and
     // the pinned bytes Infernix's later allocations need.
     std::uint64_t expert_ram_bytes      = 0;
     std::uint64_t expert_unpinned_bytes = 0;
     std::uint64_t later_pinned_bytes    = 0;
+    // The exclusive RAM layout (--expert-ram-layout exclusive; the SSD tier's banks): RAM holds the experts the
+    // frames do not, and shadows for what VRAM gives back without a promotion (plan_exclusive_tier, sized at
+    // start once the frames are known). A RAM budget too small for it keeps the plain SSD tier.
+    bool ram_exclusive = false;
     std::filesystem::path expert_state; // the saved expert state (warm start); empty: none
     std::string expert_state_identity;
+    // Without a usable saved state the warm start seeds from the model's calibrated order
+    // (OffloadSetup::calibrated_state); false (--expert-state off): the cache starts empty.
+    bool expert_seed = true;
     std::filesystem::path expert_stripe; // an expert stripe on a second drive (SSD tier)
     std::filesystem::path route_trace;   // the internal route trace; empty: none
     std::uint32_t expert_tail_skip = 0;  // approximate tail skip rank (0: off)
+    // The CPU service's arithmetic for narrow W4A16 jobs: the calls' MoeExpertSource::narrow_a16
+    // (--a8-activations: NarrowA16::kA8).
+    ops::offloaded_moe::NarrowA16 narrow_a16 = ops::offloaded_moe::NarrowA16::kExact;
 };
 
 // What the engine serves: the offloaded layers' routed banks and the Program's round geometry.
@@ -123,12 +145,14 @@ struct OffloadSetup {
     // The route trace's header: the most drafts an MTP or n-gram round verifies.
     std::uint32_t mtp_draft_tokens   = 0;
     std::uint32_t ngram_draft_tokens = 0;
-    // Graph executables the VRAM sizing reserves room for (memory_plan graph_bound), and whether the
-    // Program captures them all right after the frames are sized (VramDemand::eager_graphs).
+    // Graph executables the VRAM sizing reserves room for when the pool is fixed (memory_plan graph_bound).
     std::uint32_t graph_bound = 0;
-    bool eager_graphs         = false;
-    // A model's calibrated expert order (Qwen3.8-Flash-Next's): the warm start's seed when the saved
-    // state cannot be used; null: none.
+    // The exclusive RAM layout's shadows (plan_exclusive_tier): the largest wide workspace a prefill pass borrows
+    // beside the stream's ring, and what the elastic KV may still take from the frames.
+    std::uint64_t loan_bytes      = 0;
+    std::uint64_t kv_growth_bytes = 0;
+    // A model's calibrated expert order (the Qwen3.5-122B-A10B's, models/qwen3_5/program/calibrated_order.h):
+    // the warm start's seed when no saved state can be used; null: none. It outlives the engine.
     const expert_cache::SavedState* calibrated_state = nullptr;
     int device = 0;
 };
@@ -138,18 +162,19 @@ public:
     using Diagnostic = std::function<void(const std::string&, DiagnosticLevel)>;
 
     // Misses staged per pass of a layer's experts: every decode and verification call's misses in
-    // one pass, a prefill chunk's in several; at least kStagingSlots, with the SSD tier exactly that
-    // (Flash-Next: 80 slots +7.2 % MTP on IQ3_S; with the tier the larger staging cost frames and RAM).
+    // one pass, a prefill chunk's in several; with the SSD tier short of RAM kStagingSlots (Flash-Next:
+    // 80 slots +7.2 % MTP on IQ3_S; with the tier the larger staging cost frames and RAM).
     static constexpr std::int32_t kStagingSlots = 64, kMaxStagingSlots = 512;
     // Fewer frames than this make decode slow (runtime/engine's kFewExpertFrames for Flash-Next).
     static constexpr std::uint32_t kFewFrames = 2048;
     // Calls of at most this many columns are CPU-served (design §16.2); prefill calls up to
-    // kAssistMaxColumns are CPU-assisted (P7).
-    static constexpr std::int32_t kServedCallColumns = 8;
-    static constexpr std::int32_t kAssistMaxColumns  = 255;
-    // Chunks narrower than this keep the MoE's staging; wider ones stream (F2), the ring halves at
-    // least kStreamHalfMin records.
-    static constexpr std::int32_t kStreamMinColumns = 256;
+    // assist_max_columns() are CPU-assisted (P7): kWideAssistMaxColumns on an NVFP4 W4A16 bank on the exact CPU
+    // arithmetic, as Flash-Next's FP4-Local (candidates §51, carried in §58), else kAssistMaxColumns.
+    static constexpr std::int32_t kServedCallColumns    = 8;
+    static constexpr std::int32_t kAssistMaxColumns     = 255;
+    static constexpr std::int32_t kWideAssistMaxColumns = 575;
+    // Chunks of at least stream_min_columns() stream (F2); narrower ones keep the MoE's staging. The ring halves
+    // hold at least kStreamHalfMin records.
     static constexpr std::uint32_t kStreamHalfMin   = 16;
     // RAM slots a layer walk's span lends for its stream's reads of SSD-only experts.
     static constexpr std::uint32_t kStreamReadSlots = 1280;
@@ -157,6 +182,13 @@ public:
     static constexpr double kReferenceLinkBytesPerSecond = 27.5e9;
     // Promotions per layer and token at the decode rate (a forced-token call takes one).
     static constexpr std::size_t kDecodePromotionsPerLayer = 1;
+
+    // The priority of the streams beside the routed experts (the staging fork's here, the Program's shared-expert
+    // and split streams): the device's greatest, which the decode graphs keep as node priorities
+    // (core/decode_graph.cpp), so their short kernels take an SM as the routed experts' CTAs retire, as
+    // Qwen3.8-Flash-Next's Program measured. Ornith, full layout, MTP auto, 2 interleaved pairs (2026-10-30):
+    // decode after a 1,280-token prompt 101.24 against 101.04 tok/s, after 32,768 101.73 against 100.72.
+    [[nodiscard]] static int side_stream_priority();
 
     // The staging slots and the device bytes the constructor allocates (staging and the residency's
     // tables), for the Program's device plan.
@@ -175,9 +207,9 @@ public:
 
     // After the Program's fixed allocations: the SSD tier, the link, the stream, the CPU service and
     // its rates, the frames (sized from free memory for `demand`'s graphs and headroom), the VRAM
-    // monitor, the warm start and the route trace. `lendable_frames` (optional) tells the Program how
-    // many frames it may borrow for a wide workspace (fit_wide_work_to_cache), before and after sizing.
-    void start(cudaStream_t compute, const std::function<void(std::uint64_t frames, std::uint64_t pitch)>& lendable_frames = {});
+    // monitor, the warm start and the route trace. The prefill chunk is fitted to the cache before
+    // (the Engine's offloaded_prefill_lent, from the frames Engine::plan estimates).
+    void start(cudaStream_t compute);
 
     // A layer's MoE source: its frames, host records (or tier tables), scales, geometry, staging, CPU
     // channel, fetch channel and error word. The per-call fields stay unset: landing (landing_slots(),
@@ -208,6 +240,8 @@ public:
     [[nodiscard]] HostExpertTier* tier() noexcept { return tier_.get(); }
     [[nodiscard]] ExpertStream* stream() noexcept { return stream_.get(); }
     [[nodiscard]] ops::offloaded_moe::CpuMissService* cpu_service() noexcept { return cpu_service_.get(); }
+    // The cache's counters since startup and its size now (RuntimeStats::expert_cache).
+    [[nodiscard]] ExpertCacheTotals totals() const noexcept;
     [[nodiscard]] const CpuSplitPolicy* split_policy() const noexcept { return split_.get(); }
     [[nodiscard]] double link_bytes_per_second() const noexcept { return link_bytes_per_second_; }
     [[nodiscard]] std::uint32_t frames() const noexcept { return residency_->frames(); }
@@ -263,10 +297,9 @@ public:
     // routes (read from the route log its after_call is about to apply; a layer walk's span counts
     // its last chunk) add to its lane's uses, and at the prompt's end, after its last after_call, an
     // expert every counted token routed to gains kPromptSeedCredit of count, the others in
-    // proportion (INFERNIX_TMP_PROMPT_SEED: another credit, and promotions on `compute`). A lane's
-    // uses clear when it binds a new request.
+    // proportion. A lane's uses clear when it binds a new request.
     void note_prompt_routes(std::uint32_t lane, std::int32_t columns);
-    void seed_prompt(std::uint32_t lane, cudaStream_t compute);
+    void seed_prompt(std::uint32_t lane);
     void clear_prompt_uses(std::uint32_t lane);
 
     // ---- frames and memory ----
@@ -318,9 +351,18 @@ public:
     // ---- CPU ----
     [[nodiscard]] double cpu_expert_rate() const noexcept;
     [[nodiscard]] double cpu_column_rate() const noexcept;
+    // A fixed decode miss divisor (OffloadOptions::cpu_pcie_divisor; 0: the share decides).
     [[nodiscard]] int pcie_divisor() const noexcept;
-    // INFERNIX_TMP_LINK_SHARE: the link's share of a call's misses in 256ths (0: pcie_divisor).
+    // The link's share of a decode call's misses in 256ths (0 with a fixed divisor).
     [[nodiscard]] int pcie_share() const noexcept;
+    // The widest CPU-assisted prefill call, and the narrowest streamed one (one more).
+    [[nodiscard]] std::int32_t assist_max_columns() const noexcept;
+    [[nodiscard]] std::int32_t stream_min_columns() const noexcept { return assist_max_columns() + 1; }
+    struct AssistShare {
+        int share = 0, wide = 0, ramp_from = 0;
+    };
+    [[nodiscard]] bool wide_assist() const noexcept;
+    [[nodiscard]] AssistShare assist_link_share() const noexcept;
     // Plain decode's one-column divisor by context (placement.h plain_divisor; Flash-Next: d = 1
     // below 1,536 tokens, 2 from there): its startup value, 0 when the rule does not apply.
     [[nodiscard]] int one_column_divisor() const noexcept;
@@ -329,6 +371,8 @@ public:
     void set_plain_position(std::int32_t position, cudaStream_t compute);
     // The widest call the prefill CPU split takes at the measured link.
     [[nodiscard]] std::int32_t split_columns() const noexcept;
+    // The engine thread's logical CPUs (OffloadOptions::engine_isolate; 0: unpinned).
+    [[nodiscard]] std::uint64_t engine_cpus() const noexcept { return placement_.engine; }
 
     // The route trace (optional; settle and after_call append their rounds).
     [[nodiscard]] RouteTrace* trace() noexcept { return trace_.get(); }
@@ -340,15 +384,22 @@ public:
 
 private:
     void measure_link();
-    void measure_cpu_rate();
+    // One reading of the CPU team's rates; nullopt without expert records in RAM (the reference rates stand).
+    [[nodiscard]] std::optional<CpuRateReading> measure_cpu_rate();
+    // The rates the decode split takes: readings until they settle (settle_cpu_rates), the best standing, and their
+    // report.
+    void measure_cpu_rate_settled();
     // INFERNIX_TMP_CPU_PROBE_DETAIL=1 (candidates §11.2 OR-08): the team's rates on the same 32 records
     // where they live (the tier's slots or the registered banks), in registered VirtualAlloc copies and
     // in cudaHostAlloc copies, logged once at startup.
     void cpu_probe_detail();
     void create_tier();
+    // The exclusive layout's slots and shadow floor in `tier` (exclusive_), or the plain tier's when its budget
+    // or the frames are short of them.
+    void plan_exclusive(const ExpertStore& store, HostExpertTier::Options& tier);
     void create_stream();
     void create_cpu_service();
-    void size_frames(cudaStream_t compute, const std::function<void(std::uint64_t, std::uint64_t)>& lendable_frames);
+    void size_frames(cudaStream_t compute);
     void warm_start(cudaStream_t compute);
     [[nodiscard]] VramDemand frame_demand(std::uint64_t frame_bytes) const;
     void on_vram_snapshot(const VramSnapshot& snapshot);
@@ -370,19 +421,19 @@ private:
     DeviceBuffer divisor_word_;
     PinnedHostBuffer divisor_host_{16};
     std::int32_t divisor_now_ = 0;
-    // The CPU expert team's worker count and CPUs (INFERNIX_TMP_CPU_PLACEMENT / _ENGINE_ISOLATE).
+    // The CPU expert team's worker count and CPUs (INFERNIX_TMP_CPU_PLACEMENT, OffloadOptions::engine_isolate).
     CpuPlacement placement_;
     std::unique_ptr<ExpertResidency> residency_;
     std::optional<ExpertStore> striped_store_;
     std::unique_ptr<ops::offloaded_moe::FetchChannel> fetch_channel_;
     std::unique_ptr<HostExpertTier> tier_;
+    ExclusiveTier exclusive_; // the exclusive layout's tier (slots 0: not exclusive)
     PinnedHostBuffer error_{64};
     std::unique_ptr<ExpertStream> stream_;
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
     std::unique_ptr<CpuSplitPolicy> split_;
     double link_bytes_per_second_ = kReferenceLinkBytesPerSecond;
     double cpu_expert_rate_ = 0.0, cpu_column_rate_ = 0.0; // 0 until measured
-    std::string calibration_note_; // INFERNIX_TMP_MACHINE_CALIBRATION's note on the CPU rates (the startup line)
     bool failed_round_ = false;
 
     // The fork / overlap stream and its events (start, staged[2], consumed[2]; the fork uses the first two).
@@ -415,6 +466,8 @@ private:
     std::vector<PromptUses> prompt_;
 
     StreamLeases leases_;
+    // The stream's counters when the ring was lent (the copy-ahead's report at its return).
+    ExpertStream::Stats stream_at_lease_;
 
     // VRAM monitor (design §19.3.7).
     using Clock = std::chrono::steady_clock;

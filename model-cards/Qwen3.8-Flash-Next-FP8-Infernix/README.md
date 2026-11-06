@@ -76,7 +76,8 @@ infernix-serve <this model's part 1>.infernix --spec dflash2 \
   --draft-model <dir>/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto
 ```
 
-It needs an Infernix build whose `--help` lists `--draft-model`; see the drafter's card for details.
+It needs an Infernix build whose `--help` lists `--draft-model`; builds from 2026-10-31 also find it
+in the model's folder by themselves when no `--spec` is given. See the drafter's card for details.
 
 ## PLE n-gram tables
 
@@ -150,9 +151,18 @@ tensors are listed, not compared).
 ```text
 infernix-serve Qwen3.8-Flash-Next-FP8-Infernix-00001-of-00005.infernix \
   --ngram-volume <nvme>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram \
-  --max-context 262144 --kv-dtype int8 \
-  --spec mtp --draft-tokens auto --lm-head-draft --max-concurrency 2
+  --max-context 262144 --kv-dtype int8 --max-concurrency 2 \
+  --spec dflash2 --draft-model <dir>/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix \
+  --draft-tokens auto --lm-head-draft --vram-past-budget
 ```
+
+This is the recommended configuration: DFlash2 drafting with
+[Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix)
+and the proposal head. Without the drafter, `--spec mtp --draft-tokens auto --lm-head-draft` drafts
+with the model's MTP layer, about 10 % slower. `--vram-past-budget` (Windows) also gives the expert
+cache the ~0.6 GiB of VRAM the per-process budget withholds; leave it out when another program
+needs that memory. Infernix builds from 2026-10-31 speculate even without `--spec` (`--spec auto`):
+with DFlash2 when its drafter is the only one in the model's folder, else with MTP.
 
 The command uses the recommended FP8 n-gram table; for the bit-exact BF16 table, with which the
 figures below were measured, pass `--ngram-volume <nvme>/Qwen3.8-Flash-Next-BF16.ngram` instead.
@@ -200,14 +210,15 @@ the 4-bit conversions are several times faster
 ([Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix):
 146 tok/s plain, 260 with MTP on the same machine).
 
-With the experts taking all the RAM they may, little stays free for other programs while this model
-runs; `--ram-headroom-mib N` (default 2048) leaves more, at some decode speed.
+With the experts taking all the RAM they may, only `--ram-free-mib` (default 8192) stays free for other
+programs while this model runs; a smaller value such as 2048 keeps more experts in RAM and decodes faster
+(43.8 against 35.6 tok/s plain on a 96 GB machine) on a machine that runs little else.
 
 ## Provenance
 
 Converted with `tools.convert` (recipe `qwen3_8_flash_next_fp8`, `--ngram-reuse` with the BF16
 volume) and renamed into numbered parts with `tools.artifact.rename --numbered`; `artifact_id`
-`fd83b9068589467cb776f0354139f63e`, the recipe as in Infernix `4ee28eb1`. The conversion report and the artifact's own
+`fd83b9068589467cb776f0354139f63e`, the recipe as in Infernix `1bd307c5`. The conversion report and the artifact's own
 provenance record the paths of the machine that converted it. The BF16 n-gram volume was written
 with `tools.flash_next.ngram_bf16` from the BF16 table of
 [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) and checked against it.

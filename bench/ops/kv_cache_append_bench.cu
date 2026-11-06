@@ -41,7 +41,7 @@ constexpr std::size_t kFlushBytes           = std::size_t{256} << 20;
 
 enum class Mode : std::uint8_t { Full, Prefix, All };
 enum class FullGeometryChoice : std::uint8_t { Kv4, Kv2, All };
-enum class KvChoice : std::uint8_t { Bf16, Int8, Fp8, Nvfp4, K8V4, Vq2, K4V2, All };
+enum class KvChoice : std::uint8_t { Bf16, Bf16p, Int8, Fp8, Nvfp4, K8V4, Vq2, K4V2, All };
 enum class LayoutChoice : std::uint8_t { Paged, Cyclic, All };
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -102,7 +102,7 @@ struct Result {
                  "error: %s\n"
                  "usage: infernix_kv_cache_append_bench [--mode full|prefix|all] "
                  "[--full-geometry d256-kv4|d256-kv2|all] "
-                 "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2|all] "
+                 "[--kv-dtype bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2|all] "
                  "[--layout paged|cyclic|all] [--tokens T,...] [--counts C,...] "
                  "[--cyclic-capacity 2048|4096] [--batch B] "
                  "[--context L] [--execution eager|graph|both] [--cache cold|warm|both] "
@@ -185,10 +185,12 @@ Options parse_options(int argc, char** argv) {
                 options.kv = KvChoice::Vq2;
             else if (value == "k4v2")
                 options.kv = KvChoice::K4V2;
+            else if (value == "bf16p")
+                options.kv = KvChoice::Bf16p;
             else if (value == "all")
                 options.kv = KvChoice::All;
             else
-                usage("--kv-dtype expects bf16, int8, fp8, nvfp4, k8v4, vq2, k4v2, or all");
+                usage("--kv-dtype expects bf16, bf16p, int8, fp8, nvfp4, k8v4, vq2, k4v2, or all");
         } else if (argument == "--layout") {
             const std::string_view value(next("--layout requires a value"));
             if (value == "paged")
@@ -388,10 +390,8 @@ public:
         for (std::int32_t page = 0; page < static_cast<std::int32_t>(host_table.size()); ++page) {
             host_table[static_cast<std::size_t>(page)] = page;
         }
-        CUDA_CHECK(cudaMemcpy(positions_.p, host_positions.data(), positions_.bytes,
-                              cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(block_table_.p, host_table.data(), block_table_.bytes,
-                              cudaMemcpyHostToDevice));
+        bench::upload(positions_.p, host_positions.data(), positions_.bytes);
+        bench::upload(block_table_.p, host_table.data(), block_table_.bytes);
     }
 
     void launch(cudaStream_t stream) {
@@ -500,26 +500,22 @@ public:
                 host_positions[static_cast<std::size_t>(b * tokens + token)] = start + token;
             }
         }
-        CUDA_CHECK(cudaMemcpy(positions_.p, host_positions.data(), positions_.bytes,
-                              cudaMemcpyHostToDevice));
+        bench::upload(positions_.p, host_positions.data(), positions_.bytes);
         if (!cyclic) {
             std::vector<std::int32_t> host_table(kPagedPrefixCapacity / kPagedKVPageSize);
             for (std::int32_t page = 0; page < static_cast<std::int32_t>(host_table.size());
                  ++page) {
                 host_table[static_cast<std::size_t>(page)] = page;
             }
-            CUDA_CHECK(cudaMemcpy(block_table_.p, host_table.data(), block_table_.bytes,
-                                  cudaMemcpyHostToDevice));
+            bench::upload(block_table_.p, host_table.data(), block_table_.bytes);
         }
         const std::vector<std::int32_t> host_counts(static_cast<std::size_t>(batch), committed);
-        CUDA_CHECK(cudaMemcpy(commit_count_.p, host_counts.data(), commit_count_.bytes,
-                              cudaMemcpyHostToDevice));
+        bench::upload(commit_count_.p, host_counts.data(), commit_count_.bytes);
         std::vector<std::int32_t> host_selectors(static_cast<std::size_t>(batch));
         for (std::int32_t b = 0; b < batch; ++b) {
             host_selectors[static_cast<std::size_t>(b)] = cyclic ? b : 0;
         }
-        CUDA_CHECK(cudaMemcpy(selector_.p, host_selectors.data(), selector_.bytes,
-                              cudaMemcpyHostToDevice));
+        bench::upload(selector_.p, host_selectors.data(), selector_.bytes);
     }
 
     void launch(cudaStream_t stream) {
@@ -572,6 +568,8 @@ const char* storage_name(KvCacheStorage storage) {
         return "vq2";
     case KvCacheStorage::Q4KeyVq2Value:
         return "k4v2";
+    case KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     return "unknown";
 }
@@ -708,13 +706,14 @@ std::vector<FullGeometry> selected_geometries(FullGeometryChoice choice) {
 
 std::vector<KvCacheStorage> selected_storages(KvChoice choice) {
     if (choice == KvChoice::Bf16) return {KvCacheStorage::BFloat16};
+    if (choice == KvChoice::Bf16p) return {KvCacheStorage::Bf16Packed};
     if (choice == KvChoice::Int8) return {KvCacheStorage::Int8Group64};
     if (choice == KvChoice::Fp8) return {KvCacheStorage::Fp8E4M3Row256};
     if (choice == KvChoice::Nvfp4) return {KvCacheStorage::Nvfp4Group16};
     if (choice == KvChoice::K8V4) return {KvCacheStorage::Fp8KeyNvfp4Value};
     if (choice == KvChoice::Vq2) return {KvCacheStorage::Vq2};
     if (choice == KvChoice::K4V2) return {KvCacheStorage::Q4KeyVq2Value};
-    return {KvCacheStorage::BFloat16,     KvCacheStorage::Int8Group64,
+    return {KvCacheStorage::BFloat16,     KvCacheStorage::Bf16Packed,    KvCacheStorage::Int8Group64,
             KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
             KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
             KvCacheStorage::Q4KeyVq2Value};

@@ -7,6 +7,7 @@
 #include "ops/softmax_attention/oracle.h"
 
 #include <algorithm>
+#include <type_traits>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -174,6 +175,13 @@ struct AttentionCase {
     std::size_t split_workspace_bytes = ops::kCausalPromptSplitWorkspaceDefaultBytes;
     // The decode-split64 fast path (FastPath::DecodeSplit64).
     bool decode_split64 = false;
+    // Every cache row past the attended positions holds NaN / out-of-range bytes (poison_tail).
+    bool poison_tail = false;
+    // Q and every key hold qk_amplitude, so every key scores the same and the row maximum holds from the first key
+    // tile on; V is value_amplitude on the first half of the keys and half of it after. A history rescale
+    // that is not exactly 1 while the maximum holds compounds over the key tiles and weights the halves apart
+    // (candidates UV-01, FlashInfer #6907).
+    bool flat_scores = false;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -768,14 +776,24 @@ void for_each_cache_row(const Geometry& geometry, std::int32_t logical_capacity,
     });
 }
 
+// flat_half >= 0: AttentionCase::flat_scores' cache, its keys all qk_amplitude and V value_amplitude before
+// position flat_half and half of it from there.
 HostCache make_cache(const Geometry& geometry, KvCacheStorage storage, std::int32_t max_context,
                      std::uint32_t seed, float qk_amplitude = 0.25f,
-                     float value_amplitude = 1.0f) {
+                     float value_amplitude = 1.0f, std::int32_t flat_half = -1) {
     const std::int32_t logical_capacity = align_up_page(max_context);
     const std::size_t elements          = cache_elements(geometry, logical_capacity);
     std::vector<float> logical_k = make_bf16_values(elements, seed, -qk_amplitude, qk_amplitude);
     std::vector<float> logical_v =
         make_bf16_values(elements, seed + 1u, -value_amplitude, value_amplitude);
+    if (flat_half >= 0) {
+        std::fill(logical_k.begin(), logical_k.end(), qk_amplitude);
+        for (std::int32_t head = 0; head < geometry.kv_heads; ++head)
+            for (std::int32_t position = 0; position < logical_capacity; ++position)
+                for (std::int32_t d = 0; d < kHeadDim; ++d)
+                    logical_v[cache_index(geometry, logical_capacity, head, position, d)] =
+                        position < flat_half ? value_amplitude : 0.5f * value_amplitude;
+    }
 
     HostCache cache{geometry, storage, max_context, logical_capacity};
     if (storage == KvCacheStorage::BFloat16) {
@@ -877,6 +895,46 @@ HostCache make_cache(const Geometry& geometry, KvCacheStorage storage, std::int3
         }
     });
     return cache;
+}
+
+// The bytes a released page's stale rows may hold (NVIDIA flare #116: masked positions read 0 x NaN
+// into P.V), in every row from `from` to the page-rounded capacity: NaN in each 16-bit float field
+// (0x7FFF is NaN as FP16 and as BF16), E4M3 NaN codes and scales, and INT8 / FP4 codes outside the
+// encoders' range. Attention over positions before `from` must not see them.
+void poison_tail(HostCache& cache, std::int32_t from) {
+    constexpr std::uint16_t kNan16  = 0x7FFF;
+    constexpr std::uint8_t kE4m3Nan = 0x7F;
+    const Geometry& geometry        = cache.geometry;
+    const std::int32_t capacity     = cache.logical_capacity;
+    const auto fill = [](auto& plane, std::size_t at, std::size_t count, auto value) {
+        if (plane.empty()) return;
+        using Value = typename std::remove_reference_t<decltype(plane)>::value_type;
+        std::fill_n(plane.begin() + static_cast<std::ptrdiff_t>(at), count, static_cast<Value>(value));
+    };
+    for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+        for (std::int32_t position = from; position < capacity; ++position) {
+            const std::size_t row = cache_index(geometry, capacity, head, position, 0);
+            fill(cache.k_bf16, row, kHeadDim, kNan16);
+            fill(cache.v_fp16, row, kHeadDim, kNan16);
+            fill(cache.k_i8, row, kHeadDim, -128);
+            fill(cache.v_i8, row, kHeadDim, -128);
+            fill(cache.k_fp8, row, kHeadDim, kE4m3Nan);
+            fill(cache.v_fp8, row, kHeadDim, kE4m3Nan);
+            if (cache.storage == KvCacheStorage::Int8Group64) {
+                fill(cache.k_scale, scale_index(geometry, capacity, head, position, 0), kQuantGroups, kNan16);
+                fill(cache.v_scale, scale_index(geometry, capacity, head, position, 0), kQuantGroups, kNan16);
+            } else {
+                fill(cache.k_scale, fp8_scale_index(geometry, capacity, head, position), 1, kNan16);
+                fill(cache.v_scale, fp8_scale_index(geometry, capacity, head, position), 1, kNan16);
+            }
+            const std::size_t codes  = logical_plane_index(kNvfp4CodeBytes, geometry, capacity, head, position, 0);
+            const std::size_t scales = logical_plane_index(kNvfp4QuantGroups, geometry, capacity, head, position, 0);
+            fill(cache.k_nvfp4, codes, kNvfp4CodeBytes, 0xFF);
+            fill(cache.v_nvfp4, codes, kNvfp4CodeBytes, 0xFF);
+            fill(cache.k_nvfp4_scale, scales, kNvfp4QuantGroups, kE4m3Nan);
+            fill(cache.v_nvfp4_scale, scales, kNvfp4QuantGroups, kE4m3Nan);
+        }
+    }
 }
 
 void append_cache(HostCache& cache, const std::vector<float>& k, const std::vector<float>& v,
@@ -1967,7 +2025,25 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
         make_bf16_values(kv_elements, test_case.seed + 1u, -amplitude, amplitude);
     std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u,
                                             -test_case.value_amplitude, test_case.value_amplitude);
-    inject_codec_edges(geometry, test_case.tokens, k, v);
+    const std::int32_t flat_half = test_case.flat_scores ? total / 2 : -1;
+    if (test_case.flat_scores) {
+        std::fill(q.begin(), q.end(), amplitude);
+        std::fill(k.begin(), k.end(), amplitude);
+        for (std::int32_t head = 0; head < geometry.kv_heads; ++head)
+            for (std::int32_t d = 0; d < kHeadDim; ++d)
+                for (std::int32_t token = 0; token < test_case.tokens; ++token)
+                    v[kv_input_index(geometry, head, d, token)] = test_case.base + token < flat_half
+                                                                      ? test_case.value_amplitude
+                                                                      : 0.5f * test_case.value_amplitude;
+    } else {
+        inject_codec_edges(geometry, test_case.tokens, k, v);
+    }
+    // Equal keys score equally however Q and K are quantized, so the flat case's exact weights are uniform in every
+    // storage and its output is the mean of the decoded V: BF16's criterion holds it, the storages' looser budgets
+    // (Q quantization) would hide the history drift it looks for. The 8-bit PV form also rounds V to E4M3.
+    const ReductionCriterion criterion = test_case.flat_scores && !test_case.fast_prompt_pv8
+                                             ? kAttentionBf16Criterion
+                                             : attention_criterion(storage, test_case.fast_prompt_pv8);
     std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
         positions[static_cast<std::size_t>(token)] = test_case.base + token;
@@ -1980,7 +2056,7 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     envelope.decode_split64               = test_case.decode_split64;
 
     const HostCache initial = make_cache(geometry, storage, total + 3, test_case.seed + 10u,
-                                         amplitude, test_case.value_amplitude);
+                                         amplitude, test_case.value_amplitude, flat_half);
     HostCache expected = initial;
     append_cache(expected, k, v, positions);
     const std::vector<double> reference =
@@ -2046,8 +2122,7 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
                 verify_attention(std::string(cache_name(storage)) + " attention envelope update",
                                  bf16_bits_to_double(select_query_columns(
                                      actual, kHeadDim * geometry.q_heads, oracle_queries)),
-                                 reference,
-                                 attention_criterion(storage, test_case.fast_prompt_pv8));
+                                 reference, criterion);
         }
     }
 
@@ -2059,8 +2134,7 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
                    verify_attention(label,
                                     bf16_bits_to_double(select_query_columns(
                                         output_bits, kHeadDim * geometry.q_heads, oracle_queries)),
-                                    reference,
-                                    attention_criterion(storage, test_case.fast_prompt_pv8));
+                                    reference, criterion);
     failures += verify_cache(label, cache.snapshot(), expected);
     if (storage == KvCacheStorage::Nvfp4Group16 || storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         DeviceCache standalone(initial, mapping, max_context);
@@ -2109,8 +2183,9 @@ int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     envelope.prompt_split_workspace_bytes = test_case.split_workspace_bytes;
     envelope.decode_split64               = test_case.decode_split64;
 
-    const HostCache cache_host = make_cache(geometry, storage, total + 3, test_case.seed + 10u,
-                                            amplitude, test_case.value_amplitude);
+    HostCache cache_host = make_cache(geometry, storage, total + 3, test_case.seed + 10u, amplitude,
+                                      test_case.value_amplitude);
+    if (test_case.poison_tail) { poison_tail(cache_host, total); }
     const std::vector<double> reference =
         ideal_attention(select_query_columns(q, kHeadDim * geometry.q_heads, oracle_queries),
                         cache_host, select_query_columns(positions, 1, oracle_queries));
@@ -2182,7 +2257,12 @@ struct BatchAttentionCase {
     // Speculative verification-tree ancestor masks, [B][W] row-major (one per column of every
     // row); empty is the causal Op.
     std::vector<std::uint32_t> tree_masks;
+    // One-row causal cases only: > 0 checks the first and last kOracleEdgeColumns valid columns and every
+    // oracle_stride-th one between against the FP64 oracle (with a stride below the 64-query tile, every tile at
+    // several of its row positions), instead of every column; 0 checks every column.
+    std::int32_t oracle_stride = 0;
 };
+constexpr std::int32_t kOracleEdgeColumns = 64;
 
 std::vector<float> extract_request_columns(const std::vector<float>& source,
                                            std::size_t column_elements, std::int32_t width,
@@ -2332,7 +2412,26 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
             return std::vector<int>(positions.begin() + b * width,
                                     positions.begin() + b * width + valid[b]);
         };
+        // test_case.oracle_stride: the columns the oracle and the comparison see (empty: every column).
+        std::vector<int> oracle_columns;
+        if (test_case.oracle_stride > 0) {
+            if (batch != 1 || tree) throw std::invalid_argument("oracle_stride takes one-row causal cases");
+            for (int j = 0; j < valid[0]; ++j)
+                if (j < kOracleEdgeColumns || j >= valid[0] - kOracleEdgeColumns || j % test_case.oracle_stride == 0)
+                    oracle_columns.push_back(j);
+        }
         const auto oracle = [&](int b) {
+            if (!oracle_columns.empty()) {
+                const std::vector<int> all = row_positions(b);
+                const std::vector<double> subset = ideal_attention(
+                    select_query_columns(extract_request_columns(q, q_column_elements, width, b, valid[b]),
+                                         q_column_elements, oracle_columns),
+                    expected[lanes[b]], select_query_columns(all, 1, oracle_columns));
+                for (std::size_t i = 0; i < oracle_columns.size(); ++i)
+                    std::copy_n(subset.begin() + static_cast<std::ptrdiff_t>(i * q_column_elements), q_column_elements,
+                                reference.begin() + static_cast<std::ptrdiff_t>(oracle_columns[i] * q_column_elements));
+                return;
+            }
             insert_request_columns(
                 ideal_attention(extract_request_columns(q, q_column_elements, width, b, valid[b]),
                                 expected[lanes[b]], row_positions(b),
@@ -2395,15 +2494,23 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
                                   (test_case.column_invariant ? " column-invariant" : "") +
                                   (test_case.bf16_prompt_split ? " bf16-prompt-split" : "");
         const auto output = copy_from_guarded<std::uint16_t>(dout, q.size());
-        failures += verify_attention(label, bf16_bits_to_double(output), reference,
-                                     attention_criterion(storage, test_case.fast_prompt_pv8));
+        if (oracle_columns.empty()) {
+            failures += verify_attention(label, bf16_bits_to_double(output), reference,
+                                         attention_criterion(storage, test_case.fast_prompt_pv8));
+        } else {
+            failures += verify_attention(label + " (" + std::to_string(oracle_columns.size()) + " oracle columns)",
+                                         bf16_bits_to_double(select_query_columns(output, q_column_elements,
+                                                                                  oracle_columns)),
+                                         select_query_columns(reference, q_column_elements, oracle_columns),
+                                         attention_criterion(storage, test_case.fast_prompt_pv8));
+        }
         failures += verify_invalid_columns_zero(label, output, geometry, width, valid);
         BatchDeviceCache::Bytes after = cache.snapshot_bytes();
         failures += cache.verify(label, expected, after);
         failures += cache.verify_untouched(label, before, after, positions, lanes, valid, width);
         if (test_case.column_invariant && !tree && phase == 0) {
-            // The column-invariant contract, whichever variant ran (the column loop, or
-            // INFERNIX_TMP_VERIFY_ROWS_ATTENTION's rows): column j equals a one-column call made
+            // The column-invariant contract, whichever variant ran (the rows variant, or the VQ
+            // formats' column loop): column j equals a one-column call made
             // after columns 0..j-1 appended, bit for bit, and the caches end byte-identical.
             BatchDeviceCache columns(initial, test_case.mapping, envelope.max_visible_keys);
             ops::CausalAttentionExecutionEnvelope one = envelope;
@@ -2711,8 +2818,7 @@ int run_tree_mask_cases(DeviceExecutionView execution, KvCacheStorage storage) {
 // The exact route's row-invariant partition: every row splits its keys as if alone, so batched
 // Column-invariant rounds: each column equals a one-column call made in column order (run_batch_case
 // checks it bit for bit), every row full or ending early (its later columns masked), with and
-// without the row-invariant partition. CTest also runs these with INFERNIX_TMP_VERIFY_ROWS_ATTENTION=1
-// (--column-invariant-only).
+// without the row-invariant partition.
 int run_column_invariant_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     int failures       = 0;
     std::uint32_t seed = 3900u;
@@ -2772,7 +2878,9 @@ int run_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
                                {16, {0}, {1}, {0}, MappingPattern::Fragmented, 1502u});
     if (storage == KvCacheStorage::BFloat16) {
         // bf16-prompt-split: prompt-route widths over short and long prefixes, a ragged last query
-        // tile and a masked tail, against the oracle on every geometry.
+        // tile and a masked tail, against the oracle on every geometry. The oracle sees the first and last 64
+        // columns and every 29th between (each 64-query tile at two or three row positions): every column of these
+        // 12 cases took ~90 s of the entry's ~200 s (candidates XB-08).
         for (const Geometry& geometry : kGeometries) {
             std::uint32_t split_seed = 4200u;
             for (const auto& [width, context, valid] :
@@ -2780,6 +2888,7 @@ int run_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
                   std::tuple{2048, 17000, 1500}}) {
                 BatchAttentionCase split{width, {context}, {valid}, {0}, MappingPattern::Fragmented, split_seed++};
                 split.bf16_prompt_split = true;
+                split.oracle_stride     = 29;
                 failures += run_batch_case(execution, geometry, storage, split);
             }
         }
@@ -2835,6 +2944,13 @@ int run_geometry(DeviceExecutionView execution, const Geometry& geometry, KvCach
     };
     for (const AttentionCase& test_case : a3_cases) {
         failures += run_a3_case(execution, geometry, storage, test_case, MappingPattern::Identity);
+    }
+    // Stale bytes past the live rows (the last page's tail, its codes and scales) never reach the
+    // output: decode at a page's first row and short prompts, through a fragmented table.
+    for (AttentionCase test_case : {AttentionCase{1, 128, 129, 311u}, AttentionCase{17, 31, 48, 312u},
+                                    AttentionCase{7, 17, 512, 313u}}) {
+        test_case.poison_tail = true;
+        failures += run_a3_case(execution, geometry, storage, test_case, MappingPattern::Fragmented);
     }
 
     if (geometry.kv_heads == 2) {
@@ -3610,8 +3726,38 @@ int run_masked_prefix_invariance_cases(DeviceExecutionView execution, KvCacheSto
     return failures;
 }
 
+// The row maximum holds from the first key tile on (AttentionCase::flat_scores; candidates UV-01): 65,536 cached keys
+// at a scaled score near 4,200, where the old history factor (an FMA against the rounded new scaled maximum) sat a
+// rounding residual off 1 at every key tile, and over the tiles tilted the weights between the two halves of V. Equal
+// keys make the exact weights uniform in every storage, so BF16's criterion holds these cases (run_a1_case). With the
+// old factor restored, the unsplit tiled prompt kernels failed here (BF16, INT8, NVFP4; 2026-11-02, also at other
+// amplitudes); the kernels that split the keys (the fast prompt kernels, MXFP8's, the decode kernels) keep the drift
+// inside each split's run of equal V and passed either way. Width 1 takes the grouped decode kernels, width 512 the
+// tiled prompt kernels: each storage's default, INT8's and NVFP4's fast prompt kernels, and K8V4's 8-bit PV form.
+int run_flat_score_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+    int failures = 0;
+    const std::array<int, 3> queries{0, 255, 511};
+    const auto flat = [](std::int32_t width, bool fast_prompt, bool pv8) {
+        AttentionCase test_case{width, 65536, static_cast<std::uint32_t>(65536 + width), 1401u, false, false, 13.5f};
+        test_case.flat_scores        = true;
+        test_case.fast_prompt_kernel = fast_prompt;
+        test_case.fast_prompt_pv8    = pv8;
+        return test_case;
+    };
+    std::vector<AttentionCase> cases{flat(1, false, false), flat(512, false, false)};
+    if (storage == KvCacheStorage::Int8Group64 || storage == KvCacheStorage::Nvfp4Group16)
+        cases.push_back(flat(512, true, false));
+    if (storage == KvCacheStorage::Fp8KeyNvfp4Value) cases.push_back(flat(512, false, true));
+    for (const AttentionCase& test_case : cases) {
+        failures += run_a1_case(execution, kGeometries[0], storage, test_case, MappingPattern::Fragmented,
+                                test_case.tokens == 1 ? std::span<const int>{} : std::span<const int>(queries));
+    }
+    return failures;
+}
+
 int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     int failures = verify_workspace_capacity_contract(execution, storage);
+    failures += run_flat_score_cases(execution, storage);
     if (storage == KvCacheStorage::Nvfp4Group16) {
         failures += run_nvfp4_cases(execution);
         failures += run_quantized_batch_cases(execution, storage, 720u);

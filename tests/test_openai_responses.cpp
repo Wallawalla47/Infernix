@@ -937,6 +937,34 @@ int test_namespace_tools() {
 // (its grammar described, not enforced); a generated call returns as a custom_tool_call with the raw
 // input, in the aggregate response and in SSE; custom_tool_call / custom_tool_call_output history
 // replays as the same call and result; tool_choice and allowed_tools accept custom entries.
+// Codex declares the hosted web search tool on every turn by default (cached and live forms).
+int test_hosted_web_search_declaration() {
+    int failures = 0;
+    for (const bool live : {false, true}) {
+        const Json web_search = {{"type", "web_search"}, {"external_web_access", live}};
+        const Json body       = {{"model", "m"},
+                                 {"input", "fix the bug"},
+                                 {"tools", Json::array({Json{{"type", "function"}, {"name", "shell"}}, web_search,
+                                                        Json{{"type", "custom"}, {"name", "apply_patch"}}})}};
+        const OpenAIResponsesCreateRequest request = parse_openai_responses_create_request(body, limits());
+        const auto& tools                          = request.prompt.generation.tools;
+        failures += check(tools.size() == 2 && tools[0].name == "shell" && tools[1].name == "apply_patch" &&
+                              request.tools.size() == 3 && request.tools[1] == web_search,
+                          std::string("a declared web_search tool (") + (live ? "live" : "cached") +
+                              ") is accepted and echoed, and not offered to the model");
+        const BuiltOpenAIResponse built = make_openai_response_object("resp_web", 1, request, {}, GenerationOutcome{});
+        failures += check(built.body.at("tools").at(1) == web_search, "the response echoes the web_search declaration");
+    }
+    Json forced = {{"model", "m"},
+                   {"input", "search"},
+                   {"tools", Json::array({Json{{"type", "web_search"}}})},
+                   {"tool_choice", Json{{"type", "web_search"}}}};
+    failures += check(api_error([&] { (void)parse_openai_responses_create_request(forced, limits()); }).param ==
+                          "tool_choice",
+                      "a tool_choice naming the hosted web search is refused");
+    return failures;
+}
+
 int test_custom_tools() {
     const std::string grammar = "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF";
     const Json apply_patch    = {{"type", "custom"},
@@ -1811,6 +1839,82 @@ int test_sse_sequence_and_failures() {
     return failures;
 }
 
+// A streamed Response refused before its generation (a prompt over the context limit) is a whole
+// event stream: created, in_progress, then failed with the error's code and message, numbered from
+// zero, every event the same Response. Codex compacts its conversation on exactly this failure.
+// A quiet stream's heartbeat (UE-05) is `response.in_progress` again: the response in progress, the next sequence
+// number, between the stream's other events; nothing before the start or after the finish.
+int test_stream_keep_alive() {
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(Json{{"model", "m"}, {"input", "hi"}, {"stream", true}}, limits());
+    OpenAIResponsesEventStream stream("resp_keep_alive", 1, request, {});
+    int failures = check(stream.keep_alive().empty(), "a heartbeat preceded the stream's start");
+    std::vector<std::string> wire = stream.start();
+    wire.push_back(stream.keep_alive());
+    const std::vector<std::string> delta = stream.content_delta("Hello.");
+    wire.insert(wire.end(), delta.begin(), delta.end());
+    wire.push_back(stream.keep_alive());
+    GenerationOutcome outcome;
+    outcome.text          = "Hello.";
+    outcome.finish_reason = infernix::FinishReason::StopToken;
+    const OpenAIResponsesStreamFinish finish = stream.finish(outcome);
+    failures += check(stream.keep_alive().empty(), "a heartbeat followed the stream's finish");
+    std::uint64_t sequence = 0;
+    int heartbeats         = 0;
+    for (const std::string& event_wire : wire) {
+        const Json event = parse_event(event_wire);
+        failures += check(event.at("sequence_number") == sequence++, "a heartbeat broke the event sequence");
+        if (event_wire.find("response.in_progress") != std::string::npos && sequence > 2) {
+            ++heartbeats;
+            failures += check(event.at("type") == "response.in_progress" && event.at("response").at("id") == "resp_keep_alive" &&
+                                  event.at("response").at("status") == "in_progress",
+                              "a heartbeat was not the response in progress");
+        }
+    }
+    failures += check(heartbeats == 2 && finish.response.body.at("status") == "completed",
+                      "the heartbeats were not two in_progress events, or changed the response");
+    return failures;
+}
+
+int test_failed_before_generation_stream() {
+    const OpenAIResponsesCreateRequest request = parse_openai_responses_create_request(
+        Json{{"model", "m"}, {"input", "hello"}, {"stream", true}, {"temperature", 0.5}}, limits());
+    const ApiError overflow = request_error_to_api_error(infernix::RequestError(
+        infernix::ContextLengthDetails{.prompt_tokens = 9000, .max_context = 8192}));
+    const std::string wire =
+        make_openai_failed_response_stream("resp_overflow", 123, request, {.temperature = 0.5F}, overflow);
+
+    std::vector<Json> events;
+    for (std::size_t begin = 0; begin < wire.size();) {
+        const std::size_t end = wire.find("\n\n", begin);
+        if (end == std::string::npos) { break; }
+        events.push_back(parse_event(wire.substr(begin, end + 2 - begin)));
+        begin = end + 2;
+    }
+    int failures = 0;
+    failures += check(events.size() == 3 && wire.ends_with("\n\n"),
+                      "a refused streamed Response is not three framed events");
+    if (events.size() != 3) { return failures; }
+    const std::vector<std::string> types = {"response.created", "response.in_progress",
+                                            "response.failed"};
+    for (std::size_t index = 0; index < events.size(); ++index) {
+        failures += check(events[index].at("type") == types[index] &&
+                              events[index].at("sequence_number") == index &&
+                              events[index].at("response").at("id") == "resp_overflow" &&
+                              events[index].at("response").at("output").empty(),
+                          "a refused streamed Response's events are out of order or misnumbered");
+    }
+    const Json& failed = events[2].at("response");
+    failures += check(events[0].at("response").at("status") == "in_progress" &&
+                          failed.at("status") == "failed" && failed.at("completed_at").is_null() &&
+                          failed.at("usage").is_null() && failed.at("temperature") == 0.5 &&
+                          failed.at("error").at("code") == "context_length_exceeded" &&
+                          failed.at("error").at("message") == overflow.message &&
+                          overflow.message.starts_with("This model's maximum context length is 8192"),
+                      "a refused streamed Response lost the context error Codex compacts on");
+    return failures;
+}
+
 int test_input_tokens_uses_shared_state_path() {
     OpenAIResponsesStore store(8, 1ULL << 20);
     store.put(stored_parent(
@@ -1925,13 +2029,16 @@ int main() try {
     failures += test_tools_and_effective_subset();
     failures += test_namespace_tools();
     failures += test_custom_tools();
+    failures += test_hosted_web_search_declaration();
     failures += test_explicit_rejections();
     failures += test_deferred_tools_and_hosted_search();
     failures += test_client_tool_search_and_additional_tools();
     failures += test_previous_response_call_graph();
     failures += test_response_object();
     failures += test_sse_sequence_and_failures();
+    failures += test_failed_before_generation_stream();
     failures += test_streamed_function_calls();
+    failures += test_stream_keep_alive();
     failures += test_input_tokens_uses_shared_state_path();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

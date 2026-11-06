@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/linear/bf16/bf16_schedule.cuh"
 #include "ops/common/math.cuh"
 #include "ops/linear/common/epilogue.cuh"
@@ -208,6 +209,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_g
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
     Epilogue epilogue, int input_rows) {
     const int K = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
+    // A programmatic dependent where its launcher says so (pdl::Dependency): it waits before reading x and lets its
+    // dependents launch once its rows are summed. Both are no-ops in an ordinary launch.
+    pdl::enter_streaming();
 
     __shared__ Bf16GemvSharedStorage<Schedule> shared;
     const __nv_bfloat16* activation = x;
@@ -231,6 +235,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_g
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
 
     compute_bf16_gemv_rows<Schedule>(activation, weight, row0, warp_in_row, lane, accumulators, K);
+    pdl::trigger_dependents();
 
     float warp_totals[Schedule::kRowsPerWarp];
 #pragma unroll

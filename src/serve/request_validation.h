@@ -17,6 +17,11 @@ void validate_schema_number_input(const text::ParsedJsonNumbers& parsed);
 
 [[noreturn]] void bad_request(std::string message, std::string param = {}, std::string code = {});
 
+// A history tool call's `arguments` JSON string nested deeper than text::kMaxJsonNesting is a 400 at `param`: the
+// body's parse bounds its own nesting but never sees inside a string, and the prompt render converts the parsed
+// arguments recursively, so a client's degenerate value could exhaust the stack (candidates WF-01).
+void require_bounded_arguments(std::string_view arguments, const std::string& param);
+
 std::optional<int> optional_int(const RequestJson& object, const char* key);
 std::optional<double> optional_number(const RequestJson& object, const char* key);
 bool optional_bool(const RequestJson& object, const char* key, bool fallback);

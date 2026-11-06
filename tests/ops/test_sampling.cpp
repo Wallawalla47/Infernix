@@ -48,7 +48,9 @@ bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
            a.min_p == b.min_p && a.presence_penalty == b.presence_penalty &&
            a.frequency_penalty == b.frequency_penalty && a.seed == b.seed &&
            a.token_counts == b.token_counts && a.mask.words == b.mask.words &&
-           a.mask.stride == b.mask.stride && a.nonfinite == b.nonfinite;
+           a.mask.stride == b.mask.stride && a.nonfinite == b.nonfinite && a.reasoning_close == b.reasoning_close &&
+           a.reasoning_ends[0] == b.reasoning_ends[0] && a.reasoning_ends[1] == b.reasoning_ends[1] &&
+           a.reasoning_withheld == b.reasoning_withheld;
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -433,6 +435,47 @@ int deterministic_stochastic_contract() {
     return failures;
 }
 
+// A row in open reasoning (SamplingConfig::reasoning_close): its end-of-turn tokens and its withheld token (the
+// tool-call opener) take no probability, greedy and sampled alike, on the one-tile route (domain <= 256) and the
+// multi-block one, FP32 and BF16 logits; a row without it, or whose ends or withheld token name other tokens, keeps
+// them.
+int reasoning_end_ban_contract() {
+    int failures = 0;
+    for (const int token_domain : {200, 248320}) {
+        for (const DType dtype : {DType::BF16, DType::FP32}) {
+            const int physical_rows = token_domain + 3;
+            constexpr int batch     = 6;
+            std::vector<float> logits(static_cast<std::size_t>(physical_rows) * batch, -8.0f);
+            for (int row = 0; row < batch; ++row) {
+                logits[static_cast<std::size_t>(row) * physical_rows + 7]   = 6.0f; // an end of turn, the best
+                logits[static_cast<std::size_t>(row) * physical_rows + 20]  = 5.5f; // the withheld call opener
+                logits[static_cast<std::size_t>(row) * physical_rows + 150] = 5.0f; // the second end, next
+                logits[static_cast<std::size_t>(row) * physical_rows + 3]   = 4.0f; // the best other token
+            }
+            round_to_bf16(logits);
+            std::vector<ops::SamplingConfig> configs(batch);
+            for (auto& config : configs) {
+                config.reasoning_close    = 11;
+                config.reasoning_ends[0]  = 7;
+                config.reasoning_ends[1]  = 150;
+                config.reasoning_withheld = 20;
+            }
+            configs[1].temperature = 0.7f; // sampled, top-1: the best allowed token
+            configs[1].top_k       = 1;
+            configs[1].seed        = 9;
+            configs[2].reasoning_close = -1; // no open reasoning
+            configs[3].reasoning_ends[0] = 9; // only 150 is an end here
+            configs[4].presence_penalty = 0.5f; // with a penalty too
+            configs[5].reasoning_withheld = -1; // ends banned, nothing withheld
+            const RunResult result = run_batch(logits, physical_rows, token_domain, std::move(configs),
+                                               {1, 2, 3, 4, 5, 6}, ops::kSamplePurposeDecode, {}, dtype);
+            failures += result.integrity_failures;
+            failures += verify_exact("sample open-reasoning end-of-turn exclusion", result.tokens, {3, 3, 7, 7, 3, 20});
+        }
+    }
+    return failures;
+}
+
 int heterogeneous_batch_contract() {
     constexpr int physical_rows = 260;
     constexpr int token_domain  = 257;
@@ -532,6 +575,60 @@ int capped_distribution_contract() {
                                           config, 900, ops::kSamplePurposePrefill);
     return result.integrity_failures +
            verify_distribution("sample top-k public cap", result.tokens, oracle);
+}
+
+// A tie at the support's edge keeps the lower id, as the speculative verifier's target support does
+// (FlashInfer #7921: a verifier that accepted a token tied with the boundary token): at the
+// 20-candidate cap, and inside the top-p cut.
+int tied_boundary_distribution_contract() {
+    int failures = 0;
+    {
+        // Ids 5 and 20 tie at ranks 19 and 20; the 19 other leading ids are all larger.
+        std::vector<float> column(24, -2.0f);
+        int rank = 0;
+        for (int token = 0; token < 20; ++token) {
+            if (token != 5) { column[static_cast<std::size_t>(token)] = 2.0f - 0.1f * static_cast<float>(rank++); }
+        }
+        column[5] = column[20] = 0.0f;
+        round_to_bf16(column);
+        ops::SamplingConfig config;
+        config.temperature = 1.0f;
+        config.top_k       = 64;
+        config.top_p       = 1.0f;
+        config.seed        = 20261030;
+        const Distribution oracle = distribution_oracle(column, static_cast<int>(column.size()), config);
+        const auto has = [&](int token) {
+            return std::find(oracle.tokens.begin(), oracle.tokens.end(), token) != oracle.tokens.end();
+        };
+        if (oracle.tokens.size() != 20 || !has(5) || has(20)) {
+            std::cerr << "top-k tie fixture did not put the tie at the cap\n";
+            return 1;
+        }
+        const RunResult result = run_repeated(column, static_cast<int>(column.size()), 16384, 8, config, 910,
+                                              ops::kSamplePurposeDecode);
+        failures += result.integrity_failures + verify_distribution("sample top-k cap tie", result.tokens, oracle);
+    }
+    {
+        // Ids 1 and 3 tie after id 0; the top-p cut falls between them.
+        std::vector<float> column(8, -3.0f);
+        column[0] = 2.0f;
+        column[1] = column[3] = 1.0f;
+        round_to_bf16(column);
+        ops::SamplingConfig config;
+        config.temperature = 1.0f;
+        config.top_k       = 64;
+        config.top_p       = 0.65f;
+        config.seed        = 20261031;
+        const Distribution oracle = distribution_oracle(column, static_cast<int>(column.size()), config);
+        if (oracle.tokens != std::vector<int>{0, 1}) {
+            std::cerr << "top-p tie fixture did not cut inside the tie\n";
+            return failures + 1;
+        }
+        const RunResult result = run_repeated(column, static_cast<int>(column.size()), 16384, 8, config, 920,
+                                              ops::kSamplePurposeDecode);
+        failures += result.integrity_failures + verify_distribution("sample top-p cut tie", result.tokens, oracle);
+    }
+    return failures;
 }
 
 int real_shape_distribution_contract() {
@@ -875,6 +972,52 @@ int increment_counts_contract() {
     return failures;
 }
 
+// Rows of a [K+1 = 4, B = 3] acceptance: row 0 licenses 2 tokens, row 1 has no count array, row 2's
+// count is past the width (clamped to 4); the oracle adds each row's licensed prefix on the host.
+int increment_licensed_counts_contract() {
+    constexpr std::int32_t kWidth = 4, kDomain = 8;
+    const std::vector<std::int32_t> licensed{3, 5, 0, 0, /**/ 1, 1, 0, 0, /**/ 2, 2, 7, 6};
+    const std::vector<std::int32_t> counts{2, 2, 9};
+    const std::vector<std::vector<std::int32_t>> initial{{0, 1, 0, 0, 0, 0, 0, 0}, {}, {1, 0, 0, 0, 0, 0, 0, 3}};
+    std::vector<std::vector<std::int32_t>> expected = initial;
+    for (std::size_t row = 0; row < counts.size(); ++row) {
+        if (expected[row].empty()) { continue; }
+        const std::int32_t n = std::clamp(counts[row], 0, kWidth);
+        for (std::int32_t j = 0; j < n; ++j) { ++expected[row][static_cast<std::size_t>(licensed[row * kWidth + j])]; }
+    }
+    std::vector<std::unique_ptr<GuardedDeviceBuffer>> device_counts;
+    std::vector<ops::SamplingConfig> configs(counts.size());
+    for (std::size_t row = 0; row < counts.size(); ++row) {
+        if (initial[row].empty()) {
+            device_counts.push_back(nullptr);
+            continue;
+        }
+        auto buffer = std::make_unique<GuardedDeviceBuffer>(kDomain * sizeof(std::int32_t));
+        buffer->copy_from_host(initial[row].data(), buffer->bytes());
+        configs[row].token_counts = static_cast<std::int32_t*>(buffer->data());
+        device_counts.push_back(std::move(buffer));
+    }
+    DeviceBuffer device_licensed = to_device(licensed);
+    DeviceBuffer device_row_counts = to_device(counts);
+    DeviceBuffer device_configs  = to_device(configs);
+    const Tensor licensed_tensor(device_licensed.p, DType::I32, {kWidth, static_cast<std::int32_t>(counts.size())});
+    const Tensor counts_tensor(device_row_counts.p, DType::I32, {static_cast<std::int32_t>(counts.size())});
+    ops::increment_licensed_token_counts(licensed_tensor, counts_tensor,
+                                         static_cast<const ops::SamplingConfig*>(device_configs.p), nullptr);
+    cuda_synchronize();
+
+    int failures = 0;
+    for (std::size_t row = 0; row < counts.size(); ++row) {
+        if (!device_counts[row]) { continue; }
+        const std::string name = "increment licensed token counts row " + std::to_string(row);
+        failures += verify_exact(name.c_str(), from_device<std::int32_t>(device_counts[row]->data(), kDomain), expected[row]);
+        failures += device_counts[row]->verify_guards(name + " guards");
+    }
+    failures += verify_exact("increment licensed token counts read-only tokens",
+                             from_device<std::int32_t>(device_licensed, licensed.size()), licensed);
+    return failures;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(sampling) {
@@ -899,8 +1042,10 @@ INFERNIX_OP_TEST(sampling) {
     failures += greedy_contract();
     failures += deterministic_stochastic_contract();
     failures += heterogeneous_batch_contract();
+    failures += reasoning_end_ban_contract();
     failures += filtered_distribution_contract();
     failures += capped_distribution_contract();
+    failures += tied_boundary_distribution_contract();
     failures += real_shape_distribution_contract();
     failures += fp32_greedy_contract();
     failures += fp32_distribution_contract();
@@ -909,6 +1054,7 @@ INFERNIX_OP_TEST(sampling) {
     failures += workspace_route_rng_contract();
     failures += fp32_gumbel_route_contract();
     failures += increment_counts_contract();
+    failures += increment_licensed_counts_contract();
     failures += grammar_mask_contract();
     failures += nonfinite_contract();
 

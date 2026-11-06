@@ -17,8 +17,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace infernix::models::qwen4_exp {
@@ -26,15 +28,20 @@ namespace infernix::models::qwen4_exp {
 class NgramVolume {
 public:
     // Validates the header against the artifact's table geometry and volume id. With `resident`,
-    // the whole table is read into pinned host memory here (large unbuffered reads, then one
-    // registration) and every read_rows call is served from RAM; the row cache is not allocated.
+    // the whole table is read into host memory kept in RAM for the CPU (ResidentHostBuffer: locked in
+    // the working set, not page-locked for the device, since only read_rows' CPU copies read it, so it
+    // stays outside Windows' limit on page-locked memory) with large unbuffered reads, and every
+    // read_rows call is served from RAM; the row cache is not allocated.
     NgramVolume(const std::filesystem::path& path, const NgramTableConfig& table, bool resident = false);
 
-    // Host bytes a resident table pins: its blocks (the 4 KiB padding included).
+    // Host bytes a resident table takes: its blocks (the 4 KiB padding included).
     [[nodiscard]] static std::uint64_t resident_bytes(const NgramTableConfig& table) noexcept {
         return table.blocks * table.block_bytes;
     }
     [[nodiscard]] bool resident() const noexcept { return resident_ != nullptr; }
+    // Empty when a resident table is locked in RAM; otherwise the OS's reason (it still serves rows, but
+    // Windows may page it out under memory pressure).
+    [[nodiscard]] std::string resident_lock_failure() const { return resident_ ? resident_->lock_failure() : std::string(); }
 
     [[nodiscard]] const NgramTableConfig& table() const noexcept { return table_; }
 
@@ -43,6 +50,22 @@ public:
 
     // Whether every row is in the host cache, so read_rows would read nothing from the volume.
     [[nodiscard]] bool cached(std::span<const std::uint32_t> rows) const noexcept;
+
+    // Times up to `reads` unbuffered reads of random blocks the way a prompt chunk's misses are read
+    // (kReadThreads threads, kParallelInFlight blocks in flight each), for a startup warning about a
+    // drive too slow to serve the table. A read at a time measures latency instead, which the engine
+    // never waits on alone: a Samsung 990 PRO read 12,300 a second that way and 1.11M this way, as fast
+    // as an Optane P5800X in prefill (design §19.3.8 F9). Rounds double from kReadThreads *
+    // kParallelInFlight reads; it stops after the round that reaches `max_seconds`, touches neither
+    // the row cache nor the counters, and reads nothing for a resident table.
+    struct ReadProbe {
+        std::size_t reads = 0;
+        double seconds    = 0.0;
+        [[nodiscard]] double reads_per_second() const noexcept { return seconds > 0.0 ? static_cast<double>(reads) / seconds : 0.0; }
+    };
+    [[nodiscard]] ReadProbe probe_reads(std::size_t reads = 16384, double max_seconds = 2.0) const;
+    static constexpr std::size_t kReadThreads      = 8;  // threads of a large call
+    static constexpr std::size_t kParallelInFlight = 16; // blocks in flight per thread of a large call
 
     // Row traffic since the volume was opened: rows requested, rows served by the host cache, 4 KiB
     // blocks read from the volume, and the wall time of the calls' volume reads.
@@ -59,26 +82,22 @@ public:
 private:
     static constexpr unsigned kCacheBits  = 20; // 2^20 rows, ~170 MB with 160-byte rows
     static constexpr std::size_t kInFlight         = 64;  // blocks read at once (one thread)
-    static constexpr std::size_t kReadThreads      = 8;   // threads of a large call
-    static constexpr std::size_t kParallelInFlight = 16;  // blocks in flight per thread of a large call
     static constexpr std::size_t kParallelBlocks = 512; // distinct blocks that make a call large
-    // INFERNIX_TMP_NGRAM_PARALLEL_GATHER (candidates §8.3 GX-08): a RAM-mode call of at least this many
-    // rows gathers them on kReadThreads threads (the same bytes), not one.
-    static constexpr std::size_t kParallelGatherRows = 16384;
-    bool parallel_gather_ = false;
-    // INFERNIX_TMP_NGRAM_SCATTER (candidates BX-04, Basalt edbdde8): a large call's threads read its
-    // blocks in a scattered order (a stride permutation over the sorted blocks) instead of each sweeping
-    // one contiguous range. The rows read and the cache fill are the same.
-    bool scatter_ = false;
 
     // The direct-mapped cache slot of a row.
     static std::size_t slot_of(std::uint32_t row) noexcept {
         return static_cast<std::size_t>((row * 2654435761U) >> (32U - kCacheBits));
     }
+    // The kReadThreads rings of kParallelInFlight blocks a large call reads into (allocated on first use).
+    std::byte* parallel_rings() const;
+    // Reads the blocks at `offsets` on kReadThreads threads, each a contiguous range into its own ring;
+    // consume(i, block) runs on the thread that read block i.
+    void read_parallel(std::span<const std::uint64_t> offsets,
+                       const std::function<void(std::size_t, std::span<const std::byte>)>& consume) const;
 
     ReadOnlyFile file_;
     NgramTableConfig table_;
-    std::unique_ptr<RegisteredHostBuffer> resident_; // the whole table's blocks (RAM mode)
+    std::unique_ptr<ResidentHostBuffer> resident_; // the whole table's blocks (RAM mode)
     mutable std::vector<std::byte> ring_storage_; // kInFlight blocks, 4 KiB-aligned at ring_
     mutable std::byte* ring_ = nullptr;
     mutable std::vector<std::byte> parallel_storage_; // kReadThreads rings of kParallelInFlight blocks
@@ -90,9 +109,6 @@ private:
     mutable std::vector<std::uint64_t> misses_;
     mutable std::vector<std::uint64_t> offsets_;
     mutable std::vector<std::size_t> first_miss_;
-    // INFERNIX_TMP_NGRAM_SCATTER: the blocks' offsets in reading order, and each one's sorted index.
-    mutable std::vector<std::uint64_t> scattered_offsets_;
-    mutable std::vector<std::size_t> scattered_blocks_;
     mutable Counters counters_;
 };
 

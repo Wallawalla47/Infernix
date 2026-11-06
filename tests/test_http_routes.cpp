@@ -2,9 +2,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
+#include <exception>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -70,6 +74,7 @@ int main() {
                    const std::string id = req.matches.size() > 1 ? req.matches[1].str() : "";
                    res.set_content(id, "text/plain");
                });
+    server.Get(api_route_pattern("/responses"), infernix::serve::handle_responses_upgrade);
     const int port = server.bind_to_any_port("127.0.0.1");
     failures += check(port > 0, "test server could not bind a loopback port");
     if (port > 0) {
@@ -90,8 +95,161 @@ int main() {
         const httplib::Result model = client.Get("/v1/v1/models/qwen3.8-27b");
         failures += check(model && model->status == 200 && model->body == "qwen3.8-27b",
                           "a doubled prefix must not shift the route's capture groups");
+        // A Responses WebSocket upgrade (Codex's built-in provider) answers 426 with the OpenAI envelope under either
+        // prefix, so the client switches to HTTP at once; a plain GET still finds nothing (IJ-02).
+        const httplib::Headers upgrade{{"Connection", "Upgrade"},
+                                       {"Upgrade", "WebSocket"},
+                                       {"Sec-WebSocket-Version", "13"},
+                                       {"Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="}};
+        for (const char* path : {"/v1/responses", "/v1/v1/responses"}) {
+            const httplib::Result refused = client.Get(path, upgrade);
+            failures += check(refused && refused->status == 426 &&
+                                  Json::parse(refused->body).at("error").at("code") == "websocket_not_supported",
+                              "a Responses WebSocket upgrade did not answer 426 with the OpenAI error");
+        }
+        const httplib::Result plain = client.Get("/v1/responses");
+        failures += check(plain && plain->status == 404, "a plain GET on /v1/responses did not answer 404");
         server.stop();
         listener.join();
+    }
+
+    // The server advertises its keep-alive timeout and closes an idle connection only after the
+    // buffer: a request 1.5 s after the first, past the advertised 1 s, still arrives on the same
+    // connection (the same client port), so a client that retires at the advertised deadline
+    // always closes first.
+    {
+        httplib::Server server;
+        std::vector<int> ports;
+        std::mutex ports_mutex;
+        server.Get("/ping", [&](const httplib::Request& req, httplib::Response& res) {
+            const std::lock_guard<std::mutex> lock(ports_mutex);
+            ports.push_back(req.remote_port);
+            res.set_content("pong", "text/plain");
+        });
+        server.set_keep_alive_timeout(1);
+        server.set_keep_alive_timeout_buffer(2);
+        const int port = server.bind_to_any_port("127.0.0.1");
+        failures += check(port > 0, "keep-alive buffer test server could not bind a loopback port");
+        if (port > 0) {
+            std::thread listener([&server] { server.listen_after_bind(); });
+            server.wait_until_ready();
+            httplib::Client client("127.0.0.1", port);
+            client.set_keep_alive(true);
+            const auto first = client.Get("/ping");
+            failures += check(first && first->status == 200 &&
+                                  first->get_header_value("Keep-Alive").starts_with("timeout=1,"),
+                              "the response must advertise the keep-alive timeout, not the buffered close");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+            const auto second = client.Get("/ping");
+            failures += check(second && second->status == 200, "the request after the advertised timeout failed");
+            const std::lock_guard<std::mutex> lock(ports_mutex);
+            failures += check(ports.size() == 2 && ports[0] == ports[1],
+                              "an idle connection must stay open past the advertised timeout until the buffer ends");
+            server.stop();
+            listener.join();
+        }
+    }
+
+    // Idle sockets must not starve admission (the pool-sizing half of the keep-alive fix):
+    // cpp-httplib parks one pool worker per open connection for its whole idle window, so the
+    // server's pool grows past request admission up to --max-http-clients. With one lane and one
+    // waiting request (three base workers), four idle connections must still leave room for a new one.
+    {
+        httplib::Server server;
+        server.Get("/ping", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content("pong", "text/plain");
+        });
+        server.set_keep_alive_timeout(30);
+        infernix::serve::ServeOptions pool_options;
+        pool_options.max_concurrency      = 1;
+        pool_options.max_pending_requests = 1;
+        server.new_task_queue = [&pool_options] { return infernix::serve::new_http_worker_pool(pool_options); };
+        const int port = server.bind_to_any_port("127.0.0.1");
+        failures += check(port > 0, "pool test server could not bind a loopback port");
+        if (port > 0) {
+            std::thread listener([&server] { server.listen_after_bind(); });
+            server.wait_until_ready();
+            std::vector<httplib::Client> idle_clients;
+            bool all_warm = true;
+            for (int i = 0; i < 4; ++i) {
+                idle_clients.emplace_back("127.0.0.1", port);
+                idle_clients.back().set_keep_alive(true);
+                const auto warm = idle_clients.back().Get("/ping");
+                all_warm = all_warm && warm && warm->status == 200;
+            }
+            failures += check(all_warm, "idle connections could not each get their warm-up response");
+            // All four connections are now open and idle, each holding a worker.
+            httplib::Client fresh("127.0.0.1", port);
+            fresh.set_read_timeout(5, 0);
+            const auto admitted = fresh.Get("/ping");
+            failures += check(admitted && admitted->status == 200,
+                              "idle keep-alive connections must not starve request admission");
+            server.stop();
+            listener.join();
+        }
+    }
+
+    // The ceiling is a real bound (the pool-full case): with every worker held and the queue
+    // full, a further connection is refused by the accept loop — closed without a response,
+    // not crashed or wedged. One lane and no waiting requests give two base workers and a
+    // one-request queue; --max-http-clients 3 lets one more worker spawn. A, B and C hold the
+    // three workers as idle keep-alive sockets, D occupies the queue slot, E is overflow.
+    {
+        httplib::Server server;
+        server.Get("/ping", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content("pong", "text/plain");
+        });
+        server.set_keep_alive_timeout(30);
+        infernix::serve::ServeOptions pool_options;
+        pool_options.max_concurrency      = 1;
+        pool_options.max_pending_requests = 0;
+        pool_options.max_http_clients     = 3;
+        server.new_task_queue = [&pool_options] { return infernix::serve::new_http_worker_pool(pool_options); };
+        const int port = server.bind_to_any_port("127.0.0.1");
+        failures += check(port > 0, "pool-full test server could not bind a loopback port");
+        if (port > 0) {
+            std::thread listener([&server] { server.listen_after_bind(); });
+            server.wait_until_ready();
+            std::vector<httplib::Client> held;
+            bool all_served = true;
+            for (int i = 0; i < 3; ++i) {
+                held.emplace_back("127.0.0.1", port);
+                held.back().set_keep_alive(true);
+                const auto warm = held.back().Get("/ping");
+                all_served = all_served && warm && warm->status == 200;
+            }
+            failures += check(all_served, "the connections up to the ceiling must be served");
+            // D is accepted but queued behind the three held workers: no worker frees within
+            // its read timeout, so it goes unanswered while the ceiling is held.
+            httplib::Client d("127.0.0.1", port);
+            d.set_read_timeout(0, 300000);
+            const auto queued = d.Get("/ping");
+            failures += check(!queued, "a connection queued behind a full pool must go unanswered");
+            // E arrives with the queue full too: the accept loop refuses it outright.
+            httplib::Client e("127.0.0.1", port);
+            e.set_read_timeout(0, 300000);
+            const auto refused = e.Get("/ping");
+            failures += check(!refused, "a connection beyond pool and queue must be refused");
+            server.stop();
+            listener.join();
+        }
+    }
+
+    // A ceiling below admission is raised to it: cpp-httplib's ThreadPool rejects a ceiling below
+    // its base, and --max-http-clients must never refuse what --max-concurrency promises.
+    {
+        infernix::serve::ServeOptions pool_options;
+        pool_options.max_concurrency      = 2;
+        pool_options.max_pending_requests = 4;
+        pool_options.max_http_clients     = 1;
+        bool created = false;
+        try {
+            httplib::TaskQueue* pool = infernix::serve::new_http_worker_pool(pool_options);
+            pool->shutdown();
+            delete pool;
+            created = true;
+        } catch (const std::exception&) {}
+        failures += check(created, "a --max-http-clients below admission must be raised, not rejected");
     }
 
     if (failures == 0) { std::cout << "http routes tests passed\n"; }

@@ -1,6 +1,8 @@
 #include "models/qwen3_5/load.h"
 
+#include "artifact/formats.h"
 #include "artifact/reader.h"
+#include "core/weight_view.h"
 #include "models/qwen3_5/load/bindings.h"
 #include "models/qwen3_5/load/vision_overlay.h"
 
@@ -42,6 +44,7 @@ struct LoadPlan::Impl {
     FrontendResources resources;
     InstanceInfo info;
     std::uint64_t embedding_bytes = 0; // offloaded experts: the token embedding's stored bytes (pinned)
+    std::uint64_t mtp_expert_pinned = 0; // the MTP drafter's routed experts' stored bytes, pinned behind the drafter pool
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -64,7 +67,7 @@ void LoadPlan::set_host_reserve(std::uint64_t reserve_bytes, std::uint64_t later
 bool LoadPlan::offloaded_experts() const { return impl_->config.text.offloaded_experts; }
 
 std::uint64_t LoadPlan::pinned_other_bytes() const {
-    std::uint64_t bytes = impl_->embedding_bytes;
+    std::uint64_t bytes = impl_->embedding_bytes + impl_->mtp_expert_pinned;
     if (impl_->vision_overlay) {
         const auto& v = *impl_->vision_overlay;
         bytes += v.prelude.bytes + v.merger.bytes;
@@ -132,7 +135,48 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         out->weights.vision = loading::bind_vision(bindings, *out->config.vision, text, options);
     }
     if (out->config.mtp) {
-        out->weights.mtp = loading::bind_mtp(bindings, text, out->weights.text);
+        // LoadOptions::mtp_expert_pool: with offloaded experts, the drafter's routed experts pinned in RAM behind a pool
+        // of device slots, 64 as measured best on the 122B (2026-10-27, MTP decode, ABBA: one request +4.6 %, 128
+        // +3.9 %), at least top_k + 2. Two requests with distinct prompts (TensorFold review TF-01, ABBA 4 pairs): the
+        // pool off measured 1.0037x median, worst 0.9971x, within the control's own spread (0.9956x).
+        constexpr std::uint32_t kPoolSlots = 64;
+        const auto* moe = std::get_if<MoeConfig>(&text.ffn);
+        if (moe != nullptr && text.offloaded_experts && options.mtp_expert_pool && kPoolSlots < moe->num_experts) {
+            out->config.mtp_expert_slots = std::min(moe->num_experts - 1,
+                                                    std::max(kPoolSlots, moe->num_experts_per_tok + 2U));
+        }
+        const bool pooled = out->config.mtp_expert_slots > 0;
+        out->weights.mtp  = loading::bind_mtp(bindings, text, out->weights.text,
+                                              pooled ? artifact::Residency::HostPinned : artifact::Residency::Device);
+        if (pooled) {
+            // One expert's rows (the pool's slot) and the pinned bytes, a term of the RAM ledger.
+            const auto& experts = std::get<MoeWeights>(out->weights.mtp->layer.ffn).experts;
+            std::vector<artifact::ObjectHandle> objects;
+            const auto row_bytes = [&](WeightId id) {
+                const auto& tensor = reader.directory().tensor(bindings.at(id).reference.binding.parts.front().object);
+                const auto g = weight_geometry(artifact::parse_format(tensor.format), artifact::parse_layout(tensor.layout),
+                                               tensor.shape);
+                if (g.layout != QuantLayout::RowSplit || g.high_bytes_per_row != 0) {
+                    throw artifact::ArtifactError("the drafter pool needs the MTP drafter's "
+                                                  "experts as row-split Q2/Q4/Q8 banks");
+                }
+                return g.code_bytes_per_row + g.scale_bytes_per_row;
+            };
+            for (const auto& expert : experts) {
+                for (const WeightId id : {expert.gate, expert.up, expert.down}) {
+                    for (const auto& part : bindings.at(id).reference.binding.parts) {
+                        if (std::find(objects.begin(), objects.end(), part.object) == objects.end()) {
+                            objects.push_back(part.object);
+                        }
+                    }
+                }
+            }
+            out->config.mtp_expert_bytes = 2ULL * moe->moe_intermediate_size * row_bytes(experts.front().gate) +
+                                           text.hidden_size * row_bytes(experts.front().down);
+            for (const auto object : objects) {
+                out->mtp_expert_pinned += artifact::object_bytes(reader.directory().object(object));
+            }
+        }
     }
     if (out->config.draft) {
         out->weights.draft =
@@ -176,6 +220,8 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         for (auto& pending : out->pending) {
             const auto rank = overlay_evict_rank(pending.reference.name);
             if (rank == 0) { continue; }
+            // --embedding-host keeps the token embedding in pinned host memory: nothing to evict.
+            if (rank == kEvictRankEmbedding && options.embedding_host) { continue; }
             for (const auto& part : pending.reference.binding.parts) {
                 binder.mark_device_evictable(part.object, rank);
             }
@@ -192,6 +238,107 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->info.provenance_json = reader.directory().provenance.dump();
     out->info.artifact_id     = reader.artifact_id();
     return LoadPlan(std::move(out));
+}
+
+namespace {
+
+// The weights bound to their materialized (or plan-only) parents, and the offloaded layers' expert
+// banks over them: what a Model holds beside its plan's configuration and resources.
+struct BoundModel {
+    std::vector<BoundWeight> bound;
+    std::vector<runtime::expert_offload::ExpertBank> banks, shared_banks;
+    std::vector<std::vector<float>> shared_multipliers;
+    std::optional<runtime::expert_offload::ExpertStore> store;
+};
+
+BoundModel bind_model(const Config& config, const LoadOptions& options, const ModelWeights& weights,
+                      std::vector<loading::PendingWeight>&& pending, const artifact::MaterializedArtifact& backing,
+                      const artifact::Reader& reader) {
+    // Streamed banks (the SSD tier, LoadOptions::stream_experts): their objects, before the pending
+    // weights resolve.
+    const bool streamed = config.text.offloaded_experts && options.stream_experts;
+    std::vector<artifact::ObjectHandle> bank_objects, shared_objects;
+    if (config.text.offloaded_experts) {
+        for (const auto& layer : weights.text.layers) {
+            const auto& w = std::get<OffloadedMoeWeights>(layer.ffn);
+            if (streamed) {
+                bank_objects.push_back(pending.at(w.experts.index).reference.binding.parts.front().object);
+            }
+            if (w.shared_expert) {
+                shared_objects.push_back(pending.at(w.shared_expert->index).reference.binding.parts.front().object);
+            }
+        }
+    }
+    BoundModel out;
+    out.bound = loading::resolve_weights(std::move(pending), backing);
+    // Offloaded MoE layers: the banks' planes and scalars. A pinned routed bank's multipliers (its scale
+    // tail) are read in place; a streamed bank's records stay in the artifact and a shared expert's are in
+    // device memory only, so their scale tails are read from the artifact into Model memory.
+    std::vector<std::uint64_t> bank_strides;
+    std::vector<std::vector<float>> multipliers;
+    const auto read_scale_tail = [&](const artifact::ObjectHandle& object, const WeightView& view) {
+        const auto& geometry = view.parts.front().parent->geometry;
+        std::vector<float> words(geometry.scale_bytes / sizeof(float));
+        reader.read_into(artifact::object_offset(reader.directory().object(object)) + geometry.scale_offset,
+                         std::as_writable_bytes(std::span(words)));
+        return words;
+    };
+    if (config.text.offloaded_experts) {
+        const auto& moe = std::get<MoeConfig>(config.text.ffn);
+        for (std::size_t i = 0; i < weights.text.layers.size(); ++i) {
+            const auto& w      = std::get<OffloadedMoeWeights>(weights.text.layers[i].ffn);
+            const auto& routed = out.bound.at(w.experts.index);
+            try {
+                if (streamed) {
+                    std::vector<float> words = read_scale_tail(bank_objects[i], routed.view);
+                    out.banks.push_back(runtime::expert_offload::a16_nvfp4_streamed_bank(
+                        routed.view, words.data(), moe.num_experts, config.text.hidden_size,
+                        moe.moe_intermediate_size, routed.name));
+                    bank_strides.push_back(out.banks.back().planes.record_stride);
+                    multipliers.push_back(std::move(words)); // the buffer moves: the planes' pointer holds
+                } else {
+                    out.banks.push_back(runtime::expert_offload::a16_nvfp4_bank(
+                        routed.view, moe.num_experts, config.text.hidden_size,
+                        moe.moe_intermediate_size, routed.name));
+                }
+                // A dense shared expert (an FP8 checkpoint's) binds as ordinary device projections.
+                if (w.shared_expert) {
+                    const auto& shared = out.bound.at(w.shared_expert->index);
+                    std::vector<float> words = read_scale_tail(shared_objects[out.shared_banks.size()], shared.view);
+                    out.shared_banks.push_back(runtime::expert_offload::a16_nvfp4_device_bank(
+                        shared.view, words.data(), 1, config.text.hidden_size,
+                        moe.shared_expert_intermediate_size, shared.name));
+                    out.shared_multipliers.push_back(std::move(words));
+                }
+            } catch (const std::invalid_argument& error) {
+                throw artifact::ArtifactError(error.what());
+            }
+        }
+    }
+    if (streamed) {
+        out.store.emplace(backing.stream_source(), bank_objects, std::move(bank_strides),
+                          std::get<MoeConfig>(config.text.ffn).num_experts, std::move(multipliers));
+    }
+    return out;
+}
+
+} // namespace
+
+std::unique_ptr<Model> plan_model(LoadPlan&& plan) {
+    if (!plan.impl_) { throw artifact::ArtifactError("load plan was already consumed"); }
+    auto data = std::move(plan.impl_);
+    if (data->config.text.offloaded_experts && !data->options.stream_experts) {
+        throw std::logic_error("a plan-only model reads offloaded experts' scales from the artifact: plan the load "
+                               "with stream_experts");
+    }
+    const artifact::Reader& reader = *data->materialization.source;
+    auto backing = artifact::materialize_geometry(reader, std::move(data->materialization));
+    BoundModel parts =
+        bind_model(data->config, data->options, data->weights, std::move(data->pending), backing, reader);
+    return std::unique_ptr<Model>(new Model(
+        std::move(data->config), data->options, std::move(data->weights), std::move(parts.bound),
+        std::move(data->resources), std::move(data->info), std::nullopt, std::move(backing), std::move(parts.banks),
+        std::move(parts.shared_banks), std::move(parts.shared_multipliers), std::move(parts.store)));
 }
 
 std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
@@ -251,77 +398,13 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             .ladder_bytes = eviction->evictable_tail_bytes(),
             .layout       = std::move(*data->vision_overlay)};
     }
-    // Streamed banks (the SSD tier, LoadOptions::stream_experts): their objects, before the pending
-    // weights resolve.
-    const bool streamed = data->config.text.offloaded_experts && data->options.stream_experts;
-    std::vector<artifact::ObjectHandle> bank_objects, shared_objects;
-    if (data->config.text.offloaded_experts) {
-        for (const auto& layer : data->weights.text.layers) {
-            const auto& w = std::get<OffloadedMoeWeights>(layer.ffn);
-            if (streamed) {
-                bank_objects.push_back(data->pending.at(w.experts.index).reference.binding.parts.front().object);
-            }
-            if (w.shared_expert) {
-                shared_objects.push_back(data->pending.at(w.shared_expert->index).reference.binding.parts.front().object);
-            }
-        }
-    }
-    auto bound = loading::resolve_weights(std::move(data->pending), backing);
-    // Offloaded MoE layers: the banks' planes and scalars. A pinned routed bank's multipliers (its scale
-    // tail) are read in place; a streamed bank's records stay in the artifact and a shared expert's are in
-    // device memory only, so their scale tails are read from the artifact into Model memory.
-    std::vector<runtime::expert_offload::ExpertBank> banks, shared_banks;
-    std::vector<std::uint64_t> bank_strides;
-    std::vector<std::vector<float>> multipliers, shared_multipliers;
-    const auto read_scale_tail = [&](const artifact::ObjectHandle& object, const WeightView& view) {
-        const auto& geometry = view.parts.front().parent->geometry;
-        std::vector<float> words(geometry.scale_bytes / sizeof(float));
-        reader.read_into(artifact::object_offset(reader.directory().object(object)) + geometry.scale_offset,
-                         std::as_writable_bytes(std::span(words)));
-        return words;
-    };
-    if (data->config.text.offloaded_experts) {
-        const auto& moe = std::get<MoeConfig>(data->config.text.ffn);
-        for (std::size_t i = 0; i < data->weights.text.layers.size(); ++i) {
-            const auto& w = std::get<OffloadedMoeWeights>(data->weights.text.layers[i].ffn);
-            const auto& routed = bound.at(w.experts.index);
-            try {
-                if (streamed) {
-                    std::vector<float> words = read_scale_tail(bank_objects[i], routed.view);
-                    banks.push_back(runtime::expert_offload::a16_nvfp4_streamed_bank(
-                        routed.view, words.data(), moe.num_experts, data->config.text.hidden_size,
-                        moe.moe_intermediate_size, routed.name));
-                    bank_strides.push_back(banks.back().planes.record_stride);
-                    multipliers.push_back(std::move(words)); // the buffer moves: the planes' pointer holds
-                } else {
-                    banks.push_back(runtime::expert_offload::a16_nvfp4_bank(
-                        routed.view, moe.num_experts, data->config.text.hidden_size,
-                        moe.moe_intermediate_size, routed.name));
-                }
-                // A dense shared expert (an FP8 checkpoint's) binds as ordinary device projections.
-                if (w.shared_expert) {
-                    const auto& shared = bound.at(w.shared_expert->index);
-                    std::vector<float> words = read_scale_tail(shared_objects[shared_banks.size()], shared.view);
-                    shared_banks.push_back(runtime::expert_offload::a16_nvfp4_device_bank(
-                        shared.view, words.data(), 1, data->config.text.hidden_size,
-                        moe.shared_expert_intermediate_size, shared.name));
-                    shared_multipliers.push_back(std::move(words));
-                }
-            } catch (const std::invalid_argument& error) {
-                throw artifact::ArtifactError(error.what());
-            }
-        }
-    }
-    std::optional<runtime::expert_offload::ExpertStore> store;
-    if (streamed) {
-        store.emplace(backing.stream_source(), bank_objects, std::move(bank_strides),
-                      std::get<MoeConfig>(data->config.text.ffn).num_experts, std::move(multipliers));
-    }
+    BoundModel parts =
+        bind_model(data->config, data->options, data->weights, std::move(data->pending), backing, reader);
     return std::unique_ptr<Model>(new Model(
-        std::move(data->config), data->options, std::move(data->weights), std::move(bound),
+        std::move(data->config), data->options, std::move(data->weights), std::move(parts.bound),
         std::move(data->resources), std::move(data->info), std::move(overlay),
-        std::move(backing), std::move(banks), std::move(shared_banks), std::move(shared_multipliers),
-        std::move(store)));
+        std::move(backing), std::move(parts.banks), std::move(parts.shared_banks),
+        std::move(parts.shared_multipliers), std::move(parts.store)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

@@ -1,6 +1,5 @@
 #include "models/qwen3_5/execution/parameters.h"
 
-#include "core/temporary_switches.h"
 #include "core/weight_view.h"
 #include "infernix/ops/gdn_input_proj.h"
 #include "infernix/ops/linear.h"
@@ -436,13 +435,11 @@ void limit_precision(ops::ProjectionWeights& projection, DecodePrecision precisi
     }
 }
 
-// `precision` for one projection of `kind` in text layer `layer` (-1 for the head): under
-// `a8_subset` the projections temporary_switches::a8_subset() covers take one 8-bit term.
-DecodePrecision for_projection(DecodePrecision precision, temporary_switches::A8SubsetClass kind,
-                               std::int32_t layer) {
-    if (precision.a8_subset && temporary_switches::a8_subset().covers(kind, layer)) {
-        precision.a8 = true;
-    }
+// `precision` for an attention or GDN input projection or a dense MLP gate/up, where one 8-bit term
+// beats 16 bits by the most per op: under `a8_subset` they take one term, in every text layer (the
+// output and down projections and the head keep `precision`).
+DecodePrecision a8_subset_projection(DecodePrecision precision) {
+    precision.a8 = precision.a8 || precision.a8_subset;
     return precision;
 }
 
@@ -587,29 +584,23 @@ MtpParameters column_invariant_mtp(const MtpParameters& mtp) {
 }
 
 TextParameters precision_decode_text(const TextParameters& text, DecodePrecision precision) {
-    using temporary_switches::A8SubsetClass;
     TextParameters out = text;
     // The vocabulary head keeps 16-bit activations unless its class's one-term profile is on.
-    const DecodePrecision head = for_projection(precision, A8SubsetClass::Head, -1);
-    limit_precision(out.output_head, {head.a8, head.a4, false, false}, false);
-    for (std::size_t index = 0; index < out.layers.size(); ++index) {
-        BlockParameters& block       = out.layers[index];
-        const auto layer             = static_cast<std::int32_t>(index);
-        const DecodePrecision input  = for_projection(precision, A8SubsetClass::Input, layer);
-        const DecodePrecision output = for_projection(precision, A8SubsetClass::Output, layer);
+    limit_precision(out.output_head, {precision.a8, precision.a4, false, false}, false);
+    const DecodePrecision input = a8_subset_projection(precision);
+    for (BlockParameters& block : out.layers) {
         // A sparse MoE runs A16 at every policy.
         if (auto* dense = std::get_if<DenseParameters>(&block.ffn)) {
-            limit_precision(dense->gate_up, for_projection(precision, A8SubsetClass::GateUp, layer),
-                            true);
-            limit_precision(dense->down, for_projection(precision, A8SubsetClass::Down, layer), true);
+            limit_precision(dense->gate_up, input, true);
+            limit_precision(dense->down, precision, true);
         }
         if (auto* attention = std::get_if<AttentionParameters>(&block.mixer)) {
             limit_precision(attention->projection, input);
-            limit_precision(attention->output, output, false);
+            limit_precision(attention->output, precision, false);
         } else {
             auto& gdn = std::get<GdnParameters>(block.mixer);
             limit_precision(gdn.projection, input);
-            limit_precision(gdn.output, output, false);
+            limit_precision(gdn.output, precision, false);
         }
     }
     return out;

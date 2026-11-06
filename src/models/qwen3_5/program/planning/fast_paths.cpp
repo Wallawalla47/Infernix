@@ -284,10 +284,26 @@ constexpr std::array kQualified{
     // groupwise 27B, INT8 KV: q5-ksplit-mma decode +4.5 % (3 of 3 blocks, +4.48 to +4.54 %), fp16-gdn-state
     // decode +0.7 % (3 of 3, at least +0.70 %); pp4096 neutral for both. NVFP4 27B, INT8 KV: fp16-gdn-state
     // decode +0.7 % (3 of 3, at least +0.67 %), pp8192 neutral. Not the 35B-A3B (fp16-gdn-state one block
-    // -3 %, q5-ksplit-mma neutral).
+    // -3 %, q5-ksplit-mma neutral). The KV formats below INT8's precision (FP8, NVFP4, K8V4, VQ2, K4V2) take them
+    // too by the owner's decision of 2026-11-01: neither path's kernels read the KV cache.
     Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
     Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
     Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
     // gdn-tree-closed-form by the owner's rule of 2026-10-25 (a path measured faster goes on before its gate), where
     // measured (ABBA, RTX 5090, INT8 KV, greedy pp1280+tg256, fixed trees of 16, 6 blocks): NVFP4 27B DFlash2
     // decode +1.19 % (6 of 6, at least +1.01 %; rounds 1.0-1.3 % shorter), 35B-A3B DFlash rounds 1.0-1.7 % shorter in
@@ -307,6 +323,49 @@ constexpr std::array kQualified{
     Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::Vq2}},
     Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    // expert-a4-residual on the Qwen3.5-122B-A10B (32 heads, 8-bit FP8 activations, offloaded NVFP4 W4A16 experts)
+    // by the owner's rule of 2026-10-25 (a path measured faster goes on before its gate): Ornith-1.5-122B MTP
+    // decode +2.0 % (ABBA, RTX 5090, 2026-10-28, 4 of 4 pairs, worst +1.69 %). Only the experts' wide calls change,
+    // so every KV format.
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::BFloat16, false, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, false, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, false, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, false, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, false, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Vq2, false, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, false, true}},
+    // free-cache-resume on the Qwen3.5-122B-A10B by the same rule: infernix-serve, Ornith-1.5-122B, INT8 KV, a
+    // 15,027-token first turn and a short continuing one (2026-11-03, two servers an arm, ABBA): continuing-turn TTFT
+    // 1.69 / 1.65 / 1.69 / 1.65 s (the 16,384-token grid holds no point below the first turn: 0 % reused) -> 0.44 /
+    // 0.35 / 0.44 / 0.37 s (99.1 % reused). Where a cache resumes does not depend on the KV format, so every format.
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::BFloat16, false, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, false, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, false, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, false, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, false, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Vq2, false, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, false, true}},
+    // preemption by the same rule: infernix-serve, Ornith-1.5-122B, INT8 KV, a 16,640-token pool, four concurrent
+    // 3,027-token prompts reserving 4,096 output tokens and answering in 98-152 (2026-11-03, two servers an arm,
+    // ABBA, the same replies): wall 9.25 / 9.28 s -> 8.88 / 8.95 s (+3.8 % aggregate), the third and fourth
+    // requests' TTFT 5.4 / 7.0 s -> 3.1 / 4.2 s (held extents let two in at once). Where a request is admitted does
+    // not depend on the KV format, so every format.
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::BFloat16, false, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, false, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, false, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, false, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, false, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Vq2, false, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, false, true}},
+    // prompt-pv8 at the 122B's GQA group of 16, by the same rule: Ornith-1.5-122B, pp65536 from one expert state, two
+    // rotated runs a format, every run ahead (2026-11-03): INT8 KV 6,588.0 -> 6,678.0 tok/s (+1.37 %), NVFP4 6,810.4
+    // -> 6,971.6 (+2.37 %), K8V4 6,750.3 -> 6,934.2 (+2.73 %), VQ2 6,406.4 -> 6,448.7 (+0.66 %), K4V2 6,365.7 ->
+    // 6,421.6 (+0.88 %); runs of one arm within 0.1 %. gdn-f16-accumulate was level there (+0.01 %): not registered.
+    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, false, true}},
+    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, false, true}},
+    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, false, true}},
+    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Vq2, false, true}},
+    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, false, true}},
 };
 
 const char* kv_name(KvCacheStorage kv) {
@@ -318,6 +377,7 @@ const char* kv_name(KvCacheStorage kv) {
     case KvCacheStorage::Fp8KeyNvfp4Value: return "k8v4";
     case KvCacheStorage::Vq2: return "vq2";
     case KvCacheStorage::Q4KeyVq2Value: return "k4v2";
+    case KvCacheStorage::Bf16Packed: return "bf16p";
     }
     return "unknown";
 }
@@ -373,7 +433,9 @@ FastPathConfiguration fast_path_configuration(const Model& model, const EngineOp
     const auto& attention = model.config().text.attention;
     return {.query_heads       = attention ? static_cast<std::uint32_t>(attention->num_attention_heads) : 0U,
             .activations       = activations,
-            .kv                = options.kv_cache,
+            // Packed BF16 KV gives attention bf16's K and V bits: it is qualified as bf16.
+            .kv                = options.kv_cache == KvCacheStorage::Bf16Packed ? KvCacheStorage::BFloat16
+                                                                                 : options.kv_cache,
             .q4_gate_up        = q4_gate_up,
             .offloaded_experts = model.offloaded_experts()};
 }
@@ -400,6 +462,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
         case KvCacheStorage::Vq2:
         case KvCacheStorage::Q4KeyVq2Value: return true;
         case KvCacheStorage::BFloat16:
+        case KvCacheStorage::Bf16Packed:
         case KvCacheStorage::Fp8E4M3Row256: return false;
         }
         return false;
@@ -428,8 +491,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     // The W4A8 gate/up kernel runs only on groupwise Q4 weights (the text MLP's linear_swiglu).
     case FastPath::Q4W4A8: return configuration.q4_gate_up;
     // The offloaded experts' wide calls (Qwen3.5-122B-A10B: every offloaded bank is NVFP4 W4A16, its
-    // shared expert one more job of the call). Not qualified for any Qwen3.5 configuration: it runs
-    // only as a --fast-path candidate.
+    // shared expert one more job of the call). Two terms are registered on the 122B (kQualified); three
+    // run only as a --fast-path candidate.
     case FastPath::ExpertA4Residual:
     case FastPath::ExpertA4Residual3: return configuration.offloaded_experts;
     // The narrow form is Flash-Next's geometry only (its CPU engine and narrow A4 kernels).
@@ -438,8 +501,12 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     // adaptive-speculation's.
     case FastPath::DFlash2Pairs: return false;
     // MTP rounds with resident experts and no n-gram copies (its sparse proposal rides the MTP
-    // drafts' window; --ngram-draft-tokens auto keeps copies off beside MTP); qualified nowhere on
-    // Qwen3.5 yet, so it runs only as a candidate.
+    // drafts' window; --ngram-draft-tokens auto keeps copies off beside MTP). A candidate only: timed
+    // 2026-11-03 (sampled MTP auto, -p 512 -n 1024, top-k 20 top-p 0.95, BF16 KV, 4 ABBA blocks; its
+    // distribution check and the invariance test pass) the 35B-A3B was slower on every workload (T 0.7
+    // 0.953x and 0.967x, T 1.0 0.869x: +0.94 ms a round) and the NVFP4 27B mixed (0.744x, 1.117x,
+    // 1.017x at the same round time): the default route's rejection test accepts a draw from the
+    // head's top four less often than the argmax where the target is peaked.
     case FastPath::SampledMtpDrafts:
         return options.speculative.backend == SpeculativeBackend::Mtp && !configuration.offloaded_experts &&
                options.speculative.ngram_draft_tokens == 0;
@@ -489,6 +556,22 @@ bool fast_path_qualified(FastPath path, const FastPathConfiguration& configurati
     return std::any_of(kQualified.begin(), kQualified.end(), [&](const Qualification& entry) {
         return entry.path == path && entry.configuration == configuration;
     });
+}
+
+SpeculativeBackend auto_speculative_backend(bool offloaded_experts, const BundledDrafters& drafters) noexcept {
+    // Offloaded experts (Qwen3.5-122B-A10B, Ornith-1.5-122B, which bundle MTP and DFlash2): MTP's two gated
+    // drafts were 14 % faster than plain decode at one request (auto_fixed_draft_tokens), while DFlash2's auto
+    // decodes plain there (auto_drafts_nothing), so its drafter is not worth binding.
+    if (offloaded_experts) { return drafters.mtp ? SpeculativeBackend::Mtp : SpeculativeBackend::None; }
+    // Resident: DFlash2 where bundled (the Qwen3.8-27Bs: groupwise at one request DFlash2's 7 drafts 54 % faster
+    // than MTP's 3 on code and 40 % on docs; NVFP4 DFlash2 7 ahead of MTP 3 in every category of
+    // docs/performance/qwen3.8-27b.md but Story, level there), then MTP (the Qwen3.6-35B-A3B: MTP auto 8-28 %
+    // faster than DFlash auto with several requests and on sampled docs, model-quality.md 6.7; the Qwen3.6-27Bs
+    // bundle MTP alone), then DFlash.
+    if (drafters.dflash2) { return SpeculativeBackend::DFlash2; }
+    if (drafters.mtp) { return SpeculativeBackend::Mtp; }
+    if (drafters.dflash) { return SpeculativeBackend::DFlash; }
+    return SpeculativeBackend::None;
 }
 
 bool auto_drafts_nothing(bool offloaded_experts, SpeculativeBackend backend) noexcept {
@@ -610,9 +693,38 @@ FastPathSelection select_fast_paths(const Model& model, const EngineOptions& opt
         const bool qualified = options.fast_paths &&
                                fast_path_applies(path, out.configuration, options) &&
                                fast_path_qualified(path, out.configuration);
-        if (candidate || qualified) { out.paths.push_back(path); }
+        const bool excluded = std::find(options.fast_path_exclusions.begin(), options.fast_path_exclusions.end(),
+                                        path) != options.fast_path_exclusions.end();
+        if (excluded && (candidate || !qualified)) {
+            throw std::invalid_argument(std::string("--no-fast-path ") + fast_path_name(path) +
+                                        (candidate ? ": also asked for as a candidate (--fast-path)"
+                                                   : ": not selected for " + describe(out.configuration)));
+        }
+        if ((candidate || qualified) && !excluded) { out.paths.push_back(path); }
     }
     return out;
+}
+
+A8Routes a8_activation_routes(const FastPathConfiguration& configuration) noexcept {
+    // One line per route (design §19.3.31); a route measured slower than the one it replaces is withdrawn on its line.
+    A8Routes out;
+    // Decode: Ornith-1.5-122B's W4A8 expert kernels 630 against 906 ms, its CPU team 47,490 against 15,831 columns/s.
+    out.experts = configuration.offloaded_experts;
+    // Prefill: the experts' wide calls on the 8-bit tiles (beside their narrow route); not yet measured end to end.
+    out.experts_prefill = out.experts;
+    // Prefill: the groupwise Qwen3.8-27B, INT8 KV, pp4096 +11.7 %, pp16384 +11.5 % (q4-w4a8, 2026-10-15).
+    out.q4_gate_up = configuration.q4_gate_up;
+    return out;
+}
+
+std::string A8Routes::describe() const {
+    std::string prefill = experts_prefill ? "the routed experts (calls of more than 128 columns)" : "";
+    if (q4_gate_up) {
+        prefill += std::string(prefill.empty() ? "" : ", ") + "the MLP gate/up (int8 per token, calls of 256 or more columns)";
+    }
+    return std::string("decode and verification: ") +
+           (experts ? "the routed experts (calls of up to 128 columns) with their CPU-served misses" : "none") +
+           "; prefill: " + (prefill.empty() ? std::string("none") : prefill);
 }
 
 } // namespace infernix::models::qwen3_5

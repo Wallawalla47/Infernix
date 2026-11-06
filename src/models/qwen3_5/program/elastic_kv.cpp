@@ -81,7 +81,8 @@ bool ProgramImpl::grow_kv(std::uint32_t need) {
     kv_busy();
     engine.report("KV pool grew to " + std::to_string(target) + " pages (" + std::to_string(kv_vmm->mapped_bytes() >> 20) +
                   " MiB); expert cache " + std::to_string(before) + " -> " + std::to_string(engine.residency().frames()) +
-                  " frames");
+                  " frames",
+                  DiagnosticLevel::Debug);
     return true;
 }
 
@@ -117,7 +118,8 @@ void ProgramImpl::shrink_kv(bool evict) {
     kv_grown.store(target > kv_base_pages);
     engine.give_frames(mapped - kv_vmm->mapped_bytes(), device.stream);
     engine.report("KV pool shrank to " + std::to_string(target) + " pages; expert cache " + std::to_string(before) +
-                  " -> " + std::to_string(engine.residency().frames()) + " frames");
+                      " -> " + std::to_string(engine.residency().frames()) + " frames",
+                  DiagnosticLevel::Debug);
 }
 
 bool ProgramImpl::kv_idle_due() const noexcept {

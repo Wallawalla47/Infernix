@@ -14,7 +14,8 @@
 // Unpinned records: Windows page-locks memory for the device only up to the adapter's shared system
 // memory (often half of RAM), so the RAM past that holds a fixed set of records in pageable memory
 // kept resident (ResidentHostBuffer), filled at startup after the slots (fill_unpinned) and never
-// replaced (HostTier::held). The device cannot read them: they are absent from its record table, so
+// replaced (HostTier::held), except that a RAM shrink gives the lowest-ranked back and a growth
+// refills them. The device cannot read them: they are absent from its record table, so
 // the device treats them as SSD-only. A CPU demand is served in place, without a read; a fetch
 // request copies the record into a ring slot (copy threads, memory speed), and the copy is never
 // admitted (the key keeps its unpinned record). Promotions read them through host_record().
@@ -25,6 +26,14 @@
 // records, at any time); the CPU service thread calls demand / wait / done during a round. The
 // agent is internal: it spins while a round is open (begin_round to end_round), so a request waits
 // for no timer, and sleeps otherwise.
+//
+// Size classes (HostTier): when the layers' records differ in size (a GGUF import), the pinned slots
+// are pooled by record size, each class's slots exactly its records' size, so the tier's RAM holds
+// ~29 % more IQ3_S records than slots of the largest record did. The transit slots (the ring, the
+// prefetch list and the bounce slots) take any record and keep the largest size; a landing admitted
+// into a smaller class is copied there at the next boundary. Each layer gets the same share of its
+// class's resident slots, as each layer gets the same share of the VRAM frames. Records of one size
+// (NVFP4, block-FP8) keep one pool of slots with the transit slots carved from it.
 
 #include "core/direct_read_queue.h"
 #include "core/host_memory.h"
@@ -51,7 +60,9 @@ namespace infernix::runtime::expert_offload {
 class HostExpertTier final : public ops::offloaded_moe::RecordProvider {
 public:
     struct Options {
-        std::uint32_t slots     = 0; // every pinned slot: residents, ring, prefetch and demotion lists
+        // Every pinned slot: residents, ring, prefetch and demotion lists, bounce slots. With records of
+        // several sizes a class slot is its record's size (slots_for_bytes converts a RAM budget).
+        std::uint32_t slots     = 0;
         std::uint32_t ring      = 128;
         std::uint32_t prefetch  = 16;
         std::uint32_t demotion  = 32;
@@ -76,6 +87,9 @@ public:
         // Further pinned slots set aside, with unpinned records, as the prefill expert stream's
         // bounce (two halves of a layer's unpinned records each; ExpertStream::Staging).
         std::uint32_t stream_bounce = 0;
+        // Shadows (RAM copies of VRAM experts) kept for a prefill's loan of VRAM frames, shared by the
+        // classes by their layers (HostTier::Class::shadow_floor; the exclusive layout). 0: none kept.
+        std::uint32_t shadow_floor = 0;
         DirectReadQueue::Options io;
         // Pinned memory the device can read (default: cudaHostAlloc portable | mapped), null when the
         // OS refuses, and its release.
@@ -102,6 +116,7 @@ public:
 
     struct Stats {
         std::uint64_t demand_reads = 0, demand_failures = 0, prefill_reads = 0, admitted = 0, discarded = 0;
+        std::uint64_t copied_admissions = 0; // admissions copied into a class of smaller records
         std::uint64_t fetch_requests = 0, fetch_records = 0, fetch_from_ram = 0; // the fetch channel's
         std::uint64_t read_ns = 0; // demand reads, submit to landing, summed
         // Scatter reads of records that follow each other in a file, and the records they read.
@@ -114,6 +129,15 @@ public:
     HostExpertTier(const ExpertStore& store, Options options);
     ~HostExpertTier() override;
 
+    // The Options::slots that `bytes` of pinned memory hold for `store`'s records with `options`'s
+    // lists: one slot per largest record when the records share a size (at most every key plus the
+    // ring, prefetch and demotion lists), else the transit slots of the largest record plus class
+    // slots at the layers' mean record size (at most every key plus the classes' demotion lists).
+    [[nodiscard]] static std::uint32_t slots_for_bytes(const ExpertStore& store, std::uint64_t bytes, const Options& options);
+    // Layers a prefill stream holds reads for at once (ExpertStream::kReadAhead + 2): stream_layer_cap
+    // shares each class's lent slots among min(its layers, this), so each layer's reads fit them.
+    static constexpr std::uint32_t kStreamWindow = 4;
+
     HostExpertTier(const HostExpertTier&)            = delete;
     HostExpertTier& operator=(const HostExpertTier&) = delete;
 
@@ -121,10 +145,14 @@ public:
     [[nodiscard]] std::uint32_t key(std::uint32_t layer, std::uint32_t expert) const noexcept {
         return layer * store_.experts() + expert;
     }
+    // The largest record: the size of a transit slot and of an unpinned record.
     [[nodiscard]] std::size_t record_bytes() const noexcept { return store_.record_bytes(); }
 
-    // The pinned slots (Options::slots, less those the OS refused) and the unpinned records.
+    // The pinned slots (Options::slots, less those the OS refused and those shrink gave back) and the unpinned
+    // records at their startup count (shrink gives some back: growable_bytes).
     [[nodiscard]] std::uint32_t pinned_slots() const noexcept { return pinned_.slots; }
+    // The pinned slots' bytes (each class's slots at its record size).
+    [[nodiscard]] std::uint64_t pinned_bytes() const noexcept { return pinned_.bytes; }
     [[nodiscard]] std::uint32_t unpinned_records() const noexcept { return unpinned_count_; }
     // Slots of Options::slots the OS refused to pin (they became unpinned records); 0 normally.
     [[nodiscard]] std::uint32_t refused_slots() const noexcept { return pinned_.refused; }
@@ -132,12 +160,18 @@ public:
     [[nodiscard]] const std::string& unpinned_lock_failure() const noexcept;
 
     // ---- engine thread, no round in flight
-    // Reads the keys of `ranked` (best first) that have no host copy into free resident slots until
-    // none is left; returns how many.
-    std::uint32_t prefill(std::span<const std::uint32_t> ranked);
+    // Reads the keys of `ranked` (best first) that have no host copy and that `skip` (when given) rejects
+    // into free resident slots of their record size until none is left; returns how many. A key whose
+    // size has no free slot is passed over, so later keys can be read before it.
+    std::uint32_t prefill(std::span<const std::uint32_t> ranked, const std::function<bool(std::uint32_t)>& skip = {});
     // Reads the keys of `ranked` (best first) that have no host copy and that `skip` rejects into
     // unpinned records until none is left; they keep them for good. Returns how many.
     std::uint32_t fill_unpinned(std::span<const std::uint32_t> ranked, const std::function<bool(std::uint32_t)>& skip);
+    // The warm start's spare pinned slots (every key outside VRAM already has a host copy): reads the
+    // keys of `ranked` that VRAM holds, in its order (the caller passes the least-used first: a prefill
+    // loan's and decode's next victims), as their shadows until no slot is left (HostTier::prefill_shadow).
+    // Returns how many.
+    std::uint32_t prefill_shadows(std::span<const std::uint32_t> ranked);
     // A round boundary: admits the last round's landings (T10), refills the demotion list, then hands
     // the agent a fresh ring and opens the round. `allowance` is the boundary's demotion allowance (HostTier::begin_round).
     void begin_round(std::uint32_t allowance);
@@ -169,13 +203,11 @@ public:
     // The bounce slots for promotions of unpinned records (0 without unpinned records); pinned,
     // outside the controller's slots.
     [[nodiscard]] std::uint32_t bounce_slots() const noexcept { return bounce_; }
-    [[nodiscard]] std::uint8_t* bounce_slot(std::uint32_t i) const noexcept {
-        return const_cast<std::uint8_t*>(slot_bytes(pinned_.slots - bounce_ - stream_bounce_ + i));
-    }
+    [[nodiscard]] std::uint8_t* bounce_slot(std::uint32_t i) const noexcept { return bounce_address_[i]; }
     // The prefill stream's bounce slots (0 without unpinned records), after the promotions'.
     [[nodiscard]] std::uint32_t stream_bounce_slots() const noexcept { return stream_bounce_; }
     [[nodiscard]] std::uint8_t* stream_bounce_slot(std::uint32_t i) const noexcept {
-        return const_cast<std::uint8_t*>(slot_bytes(pinned_.slots - stream_bounce_ + i));
+        return bounce_address_[bounce_ + i];
     }
     // Engine thread: copies whole records (destination, source) on the copy threads and this
     // thread, and returns once all have landed.
@@ -188,13 +220,14 @@ public:
     void take_dirty(std::vector<std::uint32_t>& keys) { tier_.take_dirty(keys); }
     // ---- stream slots (Options::stream)
     // Engine thread, no round in flight: lends up to min(n, Options::stream) resident slots to the
-    // stream (the lowest-ranked RAM residents leave RAM; HostTier::lend) and returns how many; and
-    // takes them back as free resident slots (every stream slot released), which admissions refill.
+    // stream, each class its share by its layers (free slots first, then the lowest-ranked RAM
+    // residents, which leave RAM; HostTier::lend) and returns how many; and takes them back as free
+    // resident slots (every stream slot released), which admissions refill.
     std::uint32_t lend_stream(std::uint32_t n);
     void return_stream();
     // The engine thread, during a round or between rounds: queues a read of `key`'s record into a
-    // free stream slot and returns the slot, or -1 when none is free (or the agent has stopped);
-    // the record is the artifact's whatever the key's RAM state.
+    // free stream slot of its class and returns the slot, or -1 when none is free (or the agent has
+    // stopped); the record is the artifact's whatever the key's RAM state.
     std::int32_t stream_read(std::uint32_t key);
     // The record of stream slot `slot` once its read has landed (waits), or null when it failed.
     const std::uint8_t* stream_wait(std::int32_t slot) noexcept;
@@ -205,8 +238,57 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return static_cast<std::uint32_t>(stream_slot_.size());
     }
+    // The stream reads a layer may hold at once: kStreamWindow layers' reads of its class fit the class's
+    // lent slots.
+    [[nodiscard]] std::uint32_t stream_layer_cap(std::uint32_t layer) const noexcept;
+    // ---- refills (a demotion that reads the evicted expert's record from the artifact instead of copying its frame
+    // back over the GPU's link)
+    // The engine thread, between rounds: queues a read of `key`'s record into `slot` (the demotion slot
+    // HostTier::vram_evicted chose) and returns its id, or kNoRefill when kRefills are in flight already.
+    // refill_state(id) is 0 while the read is in flight, 1 once it landed, 2 when it failed; refill_release(id) lets
+    // the id be reused once the state has been read.
+    static constexpr std::uint32_t kRefills  = 1024;
+    static constexpr std::uint32_t kNoRefill = 0xFFFFFFFFU;
+    std::uint32_t refill(std::uint32_t key, std::uint32_t slot);
+    [[nodiscard]] std::uint32_t refill_state(std::uint32_t id) const noexcept {
+        return refill_state_[id].load(std::memory_order_acquire);
+    }
+    void refill_release(std::uint32_t id) {
+        refill_slot_[id] = kNoSlot;
+        refill_free_.push_back(id);
+    }
+    [[nodiscard]] bool refill_available() const noexcept { return !refill_free_.empty(); }
+    // Whether one more refill, behind those in flight, lands within the given seconds at the rate the startup fill read the
+    // artifact (true before the fill measured it).
+    [[nodiscard]] bool refill_within(double seconds) const noexcept;
+    // ---- RAM resize (engine thread, no round open; the caller also guarantees that no prefill expert stream is under
+    // way and that the VRAM residency's copies have settled with no promotion of an unpinned record pending, which
+    // nothing here pins)
+    // Gives back at least `bytes` if it can (fewer when pins, loans, refills or Options::min_slots stop it): first the
+    // unpinned records, unused ones and then the lowest-ranked held keys' (HostTier::unhold; their pages decommitted),
+    // then whole pinned chunks, those holding the least valuable residents first (decayed LFU): their slots are
+    // retired (HostTier::retire) and the chunks released (Options::release). The transit region (records of several
+    // sizes) and a chunk holding a bounce slot stay; a chunk with a pinned or lent slot, or a slot an issued refill
+    // still reads into, is passed over. Waits for the agent's demands first. Returns the bytes given back; the keys
+    // whose host copy changed are dirty (take_dirty), and the caller uploads the device's record table before the
+    // next round.
+    std::uint64_t shrink(std::uint64_t bytes);
+    // Takes back at most `bytes`, up to the startup sizes: retired chunks are allocated again (Options::allocate, until
+    // it refuses one) and their slots restored, then decommitted unpinned records are committed again (until the OS
+    // refuses); the room is filled from the artifact, before it returns, with the keys without a host copy that
+    // `skip` (when given) rejects, the best first by the decayed LFU (prefill, fill_unpinned). Returns the bytes taken
+    // back; the filled keys are dirty.
+    std::uint64_t grow(std::uint64_t bytes, const std::function<bool(std::uint32_t)>& skip = {});
+    // What shrink could give back now (every unpinned record and the chunks it would retire) and what grow could
+    // take back (the retired chunks and the decommitted records).
+    [[nodiscard]] std::uint64_t shrinkable_bytes() const;
+    [[nodiscard]] std::uint64_t growable_bytes() const noexcept;
+    // The largest pinned chunk: the least a growth must allow to pin any retired chunk.
+    [[nodiscard]] std::uint64_t largest_chunk_bytes() const noexcept;
+
     [[nodiscard]] expert_cache::HostTier& controller() noexcept { return tier_; }
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
+    // A controller slot's bytes (null while retired).
     [[nodiscard]] const std::uint8_t* slot_bytes(std::uint32_t slot) const noexcept;
 
     // ---- RecordProvider: the CPU service thread, during a round
@@ -244,31 +326,59 @@ private:
         std::uint32_t slot = 0;
         std::uint64_t serial = 0;
     };
-    // The pinned slots: chunks of slots_per_chunk slots (the last may be shorter), released on
-    // destruction.
+    // The pinned slots' layout: regions of slots of one size, pinned in chunks of slots_per_chunk
+    // slots. Records of one size: one region (the controller's slots, then the bounce slots). Several
+    // sizes: region 0 holds the transit slots (ring, prefetch, bounce, stream bounce) at the largest
+    // record's size, region 1 + c class c's slots; `classes` sizes the controller's classes.
+    struct Region {
+        std::uint64_t pitch = 0;
+        std::uint32_t slots = 0;
+    };
+    struct Plan {
+        std::vector<Region> regions;
+        std::vector<expert_cache::HostTier::Class> classes; // empty: records of one size
+        std::vector<std::uint8_t> layer_class;
+        std::vector<std::uint32_t> class_layers;
+        std::uint32_t transit = 0; // region 0's slots outside the controller (several sizes): the bounce slots
+    };
+    // A pinned chunk: slots [first, first + slots) of its region, null while shrink has given it back.
+    struct Chunk {
+        std::byte* memory = nullptr;
+        std::uint32_t region = 0, first = 0, slots = 0;
+        std::uint64_t bytes = 0;
+    };
+    // The pinned slots: chunks released on destruction, and each region's slot addresses in order (null in a chunk
+    // given back).
     struct Pinned {
-        std::vector<std::byte*> chunks;
+        std::vector<Chunk> chunks;
+        std::vector<std::vector<std::uint8_t*>> regions;
         std::uint32_t slots   = 0;
         std::uint32_t refused = 0; // slots the OS refused to pin
+        std::uint64_t bytes   = 0;
         std::function<void(void*)> release;
         Pinned() = default;
         Pinned(Pinned&& other) noexcept;
         Pinned& operator=(Pinned&&) = delete;
         ~Pinned();
     };
-    // A copy of an unpinned record into pinned memory (copy threads): a fetch's ring slot, tagged
-    // as a demand read, or a copy_records batch counting down `left`.
+    // A copy into pinned memory (copy threads): a fetch's ring slot from an unpinned record, tagged
+    // as a demand read, or a batch (copy_records, the admissions' copies) counting down `left`.
     struct Copy {
         std::uint8_t* destination   = nullptr;
         const std::uint8_t* source  = nullptr;
         std::uint64_t tag           = 0;
-        std::uint32_t* left         = nullptr; // copy_records: guarded by copy_mutex_
+        std::uint32_t* left         = nullptr; // a batch: guarded by copy_mutex_
+        std::size_t bytes           = 0;       // 0: the largest record
     };
     // Runs `copy` and reports it (copy_mutex_ not held).
     void finish_copy(const Copy& copy);
+    // Runs a batch of copies on the copy threads and this thread; returns once all have landed.
+    void run_copies(std::vector<Copy>& batch);
 
     static Options normalized(Options options);
-    static Pinned pin_slots(const ExpertStore& store, const Options& options);
+    static Plan plan_slots(const ExpertStore& store, const Options& options);
+    static Pinned pin_slots(const Plan& plan, const Options& options);
+    expert_cache::HostTier::Config controller_config() const;
     void copier_main() noexcept;
 
     // The agent thread: agent_loop, and agent_failed when it throws.
@@ -279,13 +389,27 @@ private:
     // A pending ticket that will never be read (its request failed, or the agent stopped).
     void fail_ticket(std::uint32_t t) noexcept;
     // Agent: submits the reads of `key` into `destination` with tags (kind, index, segment).
-    void submit(std::uint32_t key, std::uint8_t* destination, std::uint64_t tag_base);
+    void submit(std::uint32_t key, std::uint8_t* destination, std::uint64_t tag_base,
+                DirectReadQueue::Priority priority = DirectReadQueue::Priority::Demand);
     // Whether `key`'s record starts where `before`'s ends, each in one segment of the same file.
     [[nodiscard]] bool follows(std::uint32_t before, std::uint32_t key) const;
     // Agent: one scatter read of a run of (key, destination) whose records follow each other in a file.
     void submit_run(std::span<const std::pair<std::uint32_t, std::uint8_t*>> run, std::uint64_t tag);
-    // Reads (key, destination) records before the first round (prefill, fill_unpinned).
-    void read_at_startup(const std::vector<std::pair<std::uint32_t, std::uint8_t*>>& jobs);
+    // Reads (key, destination) records with no round open (prefill, fill_unpinned, grow) and returns once all landed.
+    void read_records(const std::vector<std::pair<std::uint32_t, std::uint8_t*>>& jobs);
+    // prefill's reads: the keys of `ranked` it places into free resident slots, with their destinations.
+    std::vector<std::pair<std::uint32_t, std::uint8_t*>> slot_jobs(std::span<const std::uint32_t> ranked,
+                                                                   const std::function<bool(std::uint32_t)>& skip);
+    // ---- RAM resize
+    // The first controller slot of a chunk shrink may give back, or -1 (the transit region; a chunk holding a bounce slot).
+    [[nodiscard]] std::int64_t chunk_base(const Chunk& chunk) const noexcept;
+    // The pinned chunks shrink may give back now (allocated, no slot an issued refill reads into), the least valuable
+    // first: by the decayed-LFU values of their residents, ties to the later chunk.
+    [[nodiscard]] std::vector<std::size_t> shrink_order() const;
+    std::uint64_t shrink_unpinned(std::uint64_t bytes);
+    std::uint64_t shrink_pinned(std::uint64_t bytes);
+    // Keys without a host copy, held or in a slot, the best-ranked first (decayed LFU, ties to the lower key).
+    [[nodiscard]] std::vector<std::uint32_t> ranked_without_copy() const;
     // A new ticket of this round for `key` (kNoTicket when the round has run out); resident when the
     // key is in RAM, else pending a read.
     std::uint32_t new_ticket(std::uint32_t key, std::int32_t fetch);
@@ -296,14 +420,18 @@ private:
 
     const ExpertStore& store_;
     Options options_;
+    Plan plan_;
     Pinned pinned_;
-    std::uint32_t bounce_ = 0, stream_bounce_ = 0; // the last pinned slots, outside the controller
+    std::uint32_t bounce_ = 0, stream_bounce_ = 0; // pinned slots outside the controller
+    std::vector<std::uint8_t*> slot_address_;      // the controller's slots
+    std::vector<std::uint8_t*> bounce_address_;    // the bounce slots, then the stream bounce slots
     expert_cache::HostTier tier_;
-    std::uint32_t per_chunk_ = 0;
-    // Unpinned records: key -> index (-1 none), the buffer, and how many are allocated and filled.
+    // Unpinned records: key -> index (-1 none), the buffer, how many it has, the committed indices holding no record
+    // (the lowest last, taken first) and those shrink decommitted.
     std::vector<std::int32_t> unpinned_of_;
     std::unique_ptr<ResidentHostBuffer> unpinned_;
-    std::uint32_t unpinned_count_ = 0, unpinned_filled_ = 0;
+    std::uint32_t unpinned_count_ = 0;
+    std::vector<std::uint32_t> unpinned_free_, unpinned_decommitted_;
     // Copy threads and their queue (copier_main); completions are drained by the agent.
     std::mutex copy_mutex_;
     std::condition_variable copy_wake_, copy_done_;
@@ -326,15 +454,30 @@ private:
     std::uint32_t prefill_pending_ = 0;
     std::condition_variable prefill_done_;
     std::atomic<std::uint32_t> in_flight_{0}; // demands and prefill reads not yet completed
-    std::vector<std::uint32_t> round_ticket_of_key_; // ticket + 1 of a key demanded this round, 0 none
+    // Ticket + 1 of a key demanded this round, 0 none. The engine thread (demands) and the read agent
+    // (read-ahead adoption) both publish entries, each after filling its ticket (release / acquire).
+    std::vector<std::atomic<std::uint32_t>> round_ticket_of_key_;
     // Stream slots: the lent tier slots (stream slot s is slot stream_slot_[s]), queued reads
     // (key, stream slot), the free stream slots (all guarded by mutex_), and each stream slot's
     // state (0 pending, 1 landed, 2 failed).
     std::vector<std::uint32_t> stream_slot_;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> stream_jobs_;
-    std::vector<std::uint32_t> stream_free_;
+    std::vector<std::vector<std::uint32_t>> stream_free_; // by class
+    std::vector<std::uint32_t> stream_lent_;              // by class: lent stream slots
+    std::vector<std::uint8_t> stream_class_;              // by stream slot: its class
     std::unique_ptr<std::atomic<std::uint32_t>[]> stream_state_;
     std::atomic<std::uint64_t> agent_stream_reads_{0};
+    // Refills: queued reads (key, slot, id) (guarded by mutex_), each id's state (0 in flight, 1 landed, 2 failed),
+    // and the free ids (the engine thread's).
+    struct RefillJob {
+        std::uint32_t key, slot, id;
+    };
+    std::vector<RefillJob> refill_jobs_;
+    std::unique_ptr<std::atomic<std::uint32_t>[]> refill_state_;
+    std::vector<std::uint32_t> refill_free_;
+    static constexpr std::uint32_t kNoSlot = 0xFFFFFFFFU;
+    std::vector<std::uint32_t> refill_slot_; // per id: its slot from refill to refill_release, else kNoSlot
+    double read_rate_ = 0; // bytes a second of the startup fill (prefill), 0 before it
 
     // Tickets of the current round (stable addresses; reset at each boundary).
     std::unique_ptr<Ticket[]> tickets_;

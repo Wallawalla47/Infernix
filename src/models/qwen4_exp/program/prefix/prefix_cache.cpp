@@ -3,6 +3,7 @@
 #include "core/device.h"
 
 #include <algorithm>
+#include <cstring>
 #include <exception>
 #include <stdexcept>
 #include <string>
@@ -16,7 +17,8 @@ namespace {
 
 // Largest single pinned allocation of the slab pool: one very large pinned allocation can fail or
 // stall under WDDM where several smaller ones succeed. A slab never crosses chunks.
-constexpr std::size_t kHostChunkBytes = std::size_t{4} << 30U;
+// The Host tier is pinned in chunks of this size, which is also its resize step under RAM pressure.
+constexpr std::size_t kHostChunkBytes = std::size_t{1} << 30U;
 constexpr std::size_t kSlabAlignment  = 4096;
 
 std::size_t align_slab(std::size_t bytes) { return (bytes + kSlabAlignment - 1U) / kSlabAlignment * kSlabAlignment; }
@@ -38,9 +40,9 @@ PrefixHostLayout plan_prefix_host_layout(const KvPageGeometry& pages, const Stat
 }
 
 PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool, const KvPageGeometry& pages,
-                         const LaneStateImage& lanes, std::uint64_t host_bytes)
+                         const LaneStateImage& lanes, std::uint64_t host_bytes, cudaStream_t compute)
     : taps_(config.taps), pool_(&pool), geometry_(pages), lanes_(&lanes),
-      host_(plan_prefix_host_layout(pages, lanes.layout(), host_bytes)) {
+      host_(plan_prefix_host_layout(pages, lanes.layout(), host_bytes)), compute_(compute) {
     if (pool.plane_count() != pages.geometry.planes.size()) {
         throw std::invalid_argument("Qwen4Exp prefix cache: the page geometry does not match the pool");
     }
@@ -343,6 +345,17 @@ std::span<const cudaEvent_t> PrefixCache::capture_events(std::uint64_t id) const
     return {};
 }
 
+void PrefixCache::order_page_reuse(std::span<const DeviceKVPageLease> pages) const {
+    for (const PendingCapture& c : captures_) {
+        // An endpoint's tail page is its own (tail_lease); a tap's or boundary's is the lane's.
+        if (!c.capture.tail_page || c.capture.tail_lease) { continue; }
+        const bool reads = std::any_of(pages.begin(), pages.end(), [&](const DeviceKVPageLease& page) {
+            return page.valid() && page.handle() == *c.capture.tail_page;
+        });
+        if (reads) { CUDA_CHECK(cudaStreamWaitEvent(compute_, c.events.back(), 0)); }
+    }
+}
+
 void PrefixCache::write_blocks(std::span<const pc::NodeRef> nodes, cudaStream_t producer) {
     std::vector<pc::NodeRef> written;
     std::vector<DeviceKVPageHandle> pages;
@@ -621,10 +634,65 @@ void PrefixCache::clear() noexcept {
     index_.emplace(config, *this);
 }
 
+// ---- Host tier resize ----------------------------------------------------------------------------------
+
+std::uint64_t PrefixCache::host_tier_shrinkable_bytes() const noexcept {
+    const std::uint32_t floor = (host_.image_slabs + 2U + host_.slabs_per_chunk - 1U) / host_.slabs_per_chunk;
+    std::uint64_t bytes       = 0;
+    for (std::size_t i = floor; i < chunks_.size(); ++i) { bytes += chunks_[i].size(); }
+    return bytes;
+}
+
+std::uint64_t PrefixCache::shrink_host_tier(std::uint64_t bytes) {
+    const std::uint32_t per_chunk = host_.slabs_per_chunk;
+    const std::uint64_t chunk     = static_cast<std::uint64_t>(per_chunk) * host_.slab_bytes;
+    const auto have               = static_cast<std::uint32_t>(chunks_.size());
+    const std::uint32_t floor     = (host_.image_slabs + 2U + per_chunk - 1U) / per_chunk;
+    const auto drop               = static_cast<std::uint32_t>(std::min<std::uint64_t>(have, (bytes + chunk - 1U) / chunk));
+    const std::uint32_t keep      = std::max(floor, have - drop);
+    if (bytes == 0 || keep >= have) { return 0; }
+    drain();
+    const std::uint32_t reached = index_->shrink_host(keep * per_chunk);
+    const std::uint32_t kept    = (reached + per_chunk - 1U) / per_chunk;
+    std::uint64_t released      = 0;
+    while (chunks_.size() > kept) {
+        released += chunks_.back().size();
+        chunks_.pop_back();
+    }
+    return released;
+}
+
+std::uint64_t PrefixCache::grow_host_tier(std::uint64_t bytes) {
+    const std::uint32_t per_chunk = host_.slabs_per_chunk;
+    std::uint64_t grown           = 0;
+    while (chunks_.size() * per_chunk < host_.slabs) {
+        const auto first          = static_cast<std::uint32_t>(chunks_.size() * per_chunk);
+        const std::size_t size    = static_cast<std::size_t>(std::min(per_chunk, host_.slabs - first)) * host_.slab_bytes;
+        if (grown + size > bytes) { break; }
+        try {
+            chunks_.emplace_back(size);
+        } catch (const std::exception&) {
+            break; // the OS refuses to pin it now
+        }
+        grown += size;
+    }
+    index_->grow_host(static_cast<std::uint32_t>(std::min<std::uint64_t>(host_.slabs, chunks_.size() * per_chunk)));
+    return grown;
+}
+
 // ---- PrefixIndexBackend ------------------------------------------------------------------------------
+
+void PrefixCache::move_host_slab(std::uint32_t from, std::uint32_t to) noexcept {
+    std::memcpy(slab(to), slab(from), host_.slab_bytes);
+}
 
 void PrefixCache::release_device_block(std::uint32_t device_id) noexcept {
     if (device_id >= blocks_.size() || !blocks_[device_id]) { std::terminate(); }
+    // A published block was its lane's partial page when a tap captured it, and the tap may still
+    // be copying it. A wait that fails has failed the context: nothing writes the page after it.
+    try {
+        order_page_reuse(std::span<const DeviceKVPageLease>(&*blocks_[device_id], 1));
+    } catch (...) {}
     blocks_[device_id].reset(); // the lease returns its page to the pool
     free_blocks_.push_back(device_id);
 }

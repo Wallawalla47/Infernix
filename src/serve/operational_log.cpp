@@ -317,9 +317,14 @@ OperationalRecord render_request_done(const RequestLogContext& context,
     }
     if (outcome.thinking.loop_detected) {
         out << " | reasoning loop after "
-            << product::format_pretty_count(outcome.thinking.loop_thinking_tokens) << " thinking tokens ("
-            << static_cast<int>(outcome.thinking.loop_coverage * 100.0F + 0.5F) << "% repeated), "
-            << (outcome.thinking.applied ? "concluded" : "stopped");
+            << product::format_pretty_count(outcome.thinking.loop_thinking_tokens) << " thinking tokens (";
+        if (outcome.thinking.loop_run_on_chars != 0) {
+            out << "a " << product::format_pretty_count(outcome.thinking.loop_run_on_chars)
+                << "-character hyphen run-on";
+        } else {
+            out << static_cast<int>(outcome.thinking.loop_coverage * 100.0F + 0.5F) << "% repeated";
+        }
+        out << "), " << (outcome.thinking.applied ? "concluded" : "stopped");
     }
     if (outcome.timings.vision_offload_window_seconds > 0.0) {
         out << " vision_offload_ms=" << outcome.timings.vision_offload_window_seconds * 1000.0
@@ -489,10 +494,10 @@ std::optional<OperationalRecord> render_output_limit_note(std::uint32_t max_cont
         return std::nullopt;
     }
     std::ostringstream out;
-    out << "output limit | a request that sets none stops after "
+    out << "output limit | a request that sets no output limit stops after "
         << product::format_pretty_count(static_cast<std::uint64_t>(default_max_tokens))
-        << " tokens of its " << product::format_pretty_count(max_context)
-        << " context (--default-max-tokens)";
+        << " tokens (--default-max-tokens), though its context allows "
+        << product::format_pretty_count(max_context);
     return OperationalRecord{.severity = OperationalSeverity::Info, .message = out.str()};
 }
 
@@ -521,6 +526,19 @@ void OperationalLog::write(OperationalRecord record) const {
 
 void OperationalLog::request_start(const RequestLogContext& context) const {
     write(render_request_start(context));
+    // The artifact's chat template refused a system or developer turn where the client put it (the
+    // published Flash-Next artifacts store the checkpoint's template, which takes system only first).
+    // Said once, when it first happens: most clients send one leading system message and never meet it.
+    if (const std::size_t lowered = context.preparation.instruction_role_lowerings;
+        lowered != 0 && !role_lowering_noted_.exchange(true)) {
+        logger_->info("chat template | req#{}: {} system or developer {} sent under another role, since the "
+                      "artifact's template cannot place {} there (a later one as user, a leading developer "
+                      "one as system; text and position unchanged; later requests count theirs in "
+                      "--request-log-jsonl) | to keep every role, pass --chat-template "
+                      "tools/chat_templates/qwen3_8.jinja (also in the release zip's chat_templates folder)",
+                      context.id, lowered, lowered == 1 ? "message was" : "messages were",
+                      lowered == 1 ? "it" : "them");
+    }
 }
 
 void OperationalLog::request_rejected(const RequestRejectionLogContext& context) const {
@@ -642,8 +660,8 @@ void OperationalLog::warmup_failure(double seconds, std::string_view detail) con
                       product::format_pretty_text(detail));
 }
 
-void OperationalLog::bind_failure(std::string_view host, int port) const {
-    logger_->error("cannot bind {}:{}", product::format_pretty_text(host), port);
+void OperationalLog::bind_failure(std::string_view host, int port, std::string_view reason) const {
+    logger_->error("cannot bind {}:{}: {}", product::format_pretty_text(host), port, reason);
 }
 
 void OperationalLog::listen_failure(std::string_view host, int port) const {

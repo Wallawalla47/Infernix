@@ -35,6 +35,14 @@ workload. These changes establish a new input/timing baseline: older constant or
 fixtures and repeated in-place chains are not directly comparable. Compare implementations using
 the same fixture, seed, cache policy, and timing mode.
 
+Op benchmarks launch on non-blocking streams, which order neither after nor before the legacy
+stream, while a legacy-stream `cudaMemcpy` from pageable memory may return before its data lands
+(and `cudaMemset` or a device-to-device copy before it runs). Fixture transfers therefore go through
+`ops/infernix_bench_common.h`'s `upload`, `read_back`, `fill_bytes` and `copy_device`, which wait for
+the device on both sides; `SavedBuffer` snapshots the same way. (Until 2026-11-02 the benchmarks
+called `cudaMemcpy` directly: `infernix_offloaded_moe_wide_bench`'s routing then read its logits
+before they landed and gave different outputs from run to run at every width after a process's first.)
+
 ## Build
 
 `CMakeLists.txt` includes explicit registrations from `ops/`, `inference/`, `decode_quality/`,
@@ -82,14 +90,14 @@ infernix_bench --weights <artifact.ninfer>
           [-n, --n-gen <list>]
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
-          [--concurrency <1..8>]
+          [--concurrency <1..8>] [--rows distinct|same]
           [--grammar-file <path> | --json-schema-file <path> | --json-object | --regex <pattern> | --choice <text> ...]
           [--mixed-constraints]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2>] [--use-original-int8-prefill-kernel]
+          [--kv-dtype <bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2>] [--use-original-int8-prefill-kernel]
           [--use-original-nvfp4-prefill-kernel] [--prefill-split-workspace-mib <n>]
-          [--reproducible] [--fast-path <name>]...
-          [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
+          [--reproducible] [--fast-path <name>]... [--no-fast-path <name>]...
+          [--spec <mtp|dflash|dflash2|auto> --draft-tokens <n|auto>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
 ```
@@ -118,8 +126,9 @@ Example:
 ```
 
 Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (MTP K=1..5, DFlash/DFlash2
-K=1..15); `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
-enabled by default.
+K=1..15), or let the Engine pick the artifact's drafter with `--spec auto --draft-tokens auto` (the
+report records the backend it chose); `--lm-head-draft` selects the optimized proposal head. CUDA
+Graph decode is enabled by default.
 
 `--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with
@@ -134,7 +143,11 @@ For a DFlash2 companion artifact:
   --max-ctx 4096 --kv-dtype bf16 --warmup 1 -r 3
 ```
 
-`--concurrency` submits that many prepared requests per repetition. `--grammar-file`,
+`--concurrency` submits that many prepared requests per repetition. Each row's prompt starts its own share of
+the corpus (`--rows distinct`, the default), so a MoE model's rows route to different experts as separate requests
+do; `--rows same` repeats the first row's prompt, which routes every row to the same experts and understates the
+expert work of real concurrency (rows before 2026-10-27 ran that way). `--prompt-ids` gives every row its one
+prompt. `--grammar-file`,
 `--json-schema-file`, `--json-object`, `--regex` and repeated `--choice` select mutually exclusive output constraints and enable
 normal text output and default EOS; a constrained request may finish before the output limit.
 `--mixed-constraints` applies the selected constraint to alternate requests and requires concurrency
@@ -160,7 +173,13 @@ hardware thread reading its share of 512 MiB before the model loads). `null` is 
 prints the same as one `machine:` line. Each test also carries `execution`: the measured repetitions'
 Engine execution units by kind (`prefill`, `replay`, `control`, `decode`: count, `mean_ms`, and
 `max_ms`, the maxima restarted after the warm-ups) and `decode_by_batch`, the decode rounds of each
-batch size that ran.
+batch size that ran. Schema v26 adds `expert_state` to `config` (`calibrated`: no `--expert-state`, so
+an offloaded model's expert cache starts from its built-in calibrated order, where it has one (Qwen3.8-Flash-Next;
+the Qwen3.5-122B-A10B's is not generated yet, so it starts empty), and no file is read or
+written; `off`: `--expert-state off`, an empty cache, as cold measurements need; otherwise the state
+file read at startup and written at exit), `ram_free_mib` (`--ram-free-mib`, the RAM the offloaded
+models' RAM plan leaves free) and `a8_activations` (`--a8-activations`, the approximate 8-bit
+activation route; its speeds are not the engine's quoted ones).
 
 `--ngram-draft-tokens 1..63 --ngram-min-match 4..64` enables the single-request
 [ngram copy proposer](../docs/ngram.md) alongside the selected neural backend.
@@ -190,8 +209,10 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   DFlash2 with 7 drafts and the optimized proposal head, INT8 KV, CUDA Graph decode, prefix reuse
   off. `ngram` adds the production n-gram drafting (15 drafts, minimum match 12); `mtp` drafts with
   the MTP layer instead (4 drafts), Qwen3.8-Flash-Next's production path, and `auto` with it lets each
-  round choose its length with the `--spec-min-p` 0.5 cut (`--draft-tokens auto`), `min-p=P` sets that
-  cut for the fixed length; `plain` drafts nothing
+  round choose its length (`--draft-tokens auto`), whose one-row rounds of argmax drafts stop at the
+  cumulative acceptance cut; `min-p=P` (`--spec-min-p`) cuts the fixed length's (the Engine refuses it
+  with `auto`);
+  `plain` drafts nothing
   (one token per round through the single-column decode kernels). Fast paths run as in
   `infernix-serve`; `reproducible` runs the reproducible route and `path=NAME` also runs a candidate fast path.
   It writes one line per segment: the corpus token offset, the prompt length and the generated
@@ -441,6 +462,43 @@ bytes with the measured `1674.5 GB/s` pure-read ceiling from `tools/hbm_bandwidt
 the practical utilization measure for read-dominated points. Physical traffic and instruction
 utilization still require NCU.
 
+## GGUF projection and expert 8-bit wide routes
+
+`infernix_ggml_linear_bench` times one public `ops::ggml_linear` call per point (all of a shape's segments, BF16
+outputs, a workspace of exactly `ggml_linear_workspace_bytes`; the plane decode and column encoding are inside the
+timed call) on each selected route: `exact` (`LinearRoutes::Exact`), `bf16` (`GgmlBf16Wide`, ggml-bf16-prefill) and
+`a8` (`GgmlA8 | GgmlA8Wide`, `--a8-activations`; LOSSY). The built-in shapes are the Qwen3.8-Flash-Next IQ3_S
+import's dense projections (`gdn_qkvz`, `attn_qgkv`, `shexp_gate_up`, `ssm_out`, `attn_output`, `attn_qkv_q5k`,
+`attn_gate_q4k`, `iq3s_6144`); `--shape NAME=FORMAT:ROWS:K[:tiled][:permN]` adds others. It prints the median, min and
+p95 time, `2*N*K*T` TOPS, the time relative to the first route and an output hash.
+
+```bash
+cmake --build build -j --target infernix_ggml_linear_bench infernix_offloaded_moe_wide_bench
+./build/bench/infernix_ggml_linear_bench --tokens 512,2048,4096 --routes exact,bf16,a8
+./build/bench/infernix_ggml_linear_bench --tokens 4096 --shapes gdn_qkvz,ssm_out --routes bf16,a8 --cold
+```
+
+`infernix_offloaded_moe_wide_bench` covers the routed experts' 8-bit wide route (`WideA16::kA8`) on both bank
+kinds: `--activation a8` gives NVFP4 W4A16 banks `NarrowA16::kA8` with `WideA16::kA8` (against `--activation a16`,
+the exact W4A16 wide route, or `a16x2`, expert-a4-residual), and `--bank ggml --formats GU,DOWN --ggml-wide
+exact|bf16|a8` GGUF records at Flash-Next's geometry (`bf16` takes the BF16 stage-decode tiles from 4,096 columns,
+`kGgmlStageDecodeMinColumns`, the exact tiles below it). `--staging-slots 0` (frames only) runs one pass over every
+job with no staging, the shape of a decode call's resident pass; with `--cold` and decode widths it times the narrow
+expert kernels as decode and verification find them. Each line ends with an FNV-1a hash of the call's outputs (equal
+hashes: bit-identical outputs across builds and runs; a line reports output values no launch wrote). `--dump
+<prefix>` writes each call's dispatch and outputs (`<prefix>_T<tokens>_<placement>.bin`, an int32 header then the
+offsets, jobs, entries and BF16 outputs) for comparing runs entry by entry, and `--fill-workspace <byte>` sets the
+experts workspace to that byte before each width's calls.
+
+```bash
+./build/bench/infernix_offloaded_moe_wide_bench --activation a16 --tokens 512,2048,4096 --placement frames
+./build/bench/infernix_offloaded_moe_wide_bench --activation a8 --tokens 512,2048,4096 --placement frames
+./build/bench/infernix_offloaded_moe_wide_bench --activation a8 --geometry 122b --tokens 512,2048,4096 --placement frames
+./build/bench/infernix_offloaded_moe_wide_bench --bank ggml --formats iq3_s,iq4_nl --ggml-wide exact --tokens 512,2048,4096 --placement frames
+./build/bench/infernix_offloaded_moe_wide_bench --bank ggml --formats iq3_s,iq4_nl --ggml-wide a8 --tokens 512,2048,4096 --placement frames
+./build/bench/infernix_offloaded_moe_wide_bench --bank ggml --formats iq3_s,iq4_nl --ggml-wide a8 --tokens 1,2,4,8 --placement frames --staging-slots 0 --cold
+```
+
 ## LinearTopK Op benchmark
 
 `infernix_linear_topk_bench` measures the complete public projection-plus-stable-top-16 Op for the
@@ -449,8 +507,9 @@ Q8 and row-FP8 full heads and the mapped Q4 optimized head. Its independent matr
 positive `--columns U` also exercises larger matrices; `--columns U,...` selects a representative
 set without a full sweep. Codes and stored scales vary across the physical head, including signs,
 so ranking is not timed only on identical weight rows. Each sample replays the complete Op in a
-CUDA Graph after a 256 MiB L2 eviction read; projection, partial-key reduction, workspace counter
-initialization, and final ids/scores publication are included. Defaults are 8 warmups and 60 samples.
+CUDA Graph after a 256 MiB L2 eviction read; projection, partial-key selection and final ids/scores
+publication are included. The head width is Qwen3.8-27B's 5120 unless `--hidden 2560` selects
+Qwen3.8-Flash-Next's (Q8 and Q4 heads). Defaults are 8 warmups and 60 samples.
 Reported logical bandwidth counts the encoded head once, useful FLOPs count candidate-eligible rows, and
 workspace bytes and Graph nodes describe the actual public call. These are Op measurements.
 
@@ -458,6 +517,7 @@ workspace bytes and Graph nodes describe the actual public call. These are Op me
 cmake --build build -j --target infernix_linear_topk_bench
 ./build/bench/infernix_linear_topk_bench
 ./build/bench/infernix_linear_topk_bench --profile q8-full --columns 7
+./build/bench/infernix_linear_topk_bench --profile q4-optimized --hidden 2560 --columns 1,7,8,16
 ./build/bench/infernix_linear_topk_bench --columns 1,7,16,24,64,120 --repeat 25
 ./build/bench/infernix_linear_topk_bench --profile fp8-full --columns 120
 ./build/bench/infernix_linear_topk_bench --profile q4-optimized --columns 129 --repeat 60
@@ -577,13 +637,16 @@ cmake --build build -j --target infernix_gdn_gating_proj_bench
 
 `infernix_dynamic_grouped_conv_prepare_bench` measures the complete BF16
 `rmsnorm_dynamic_grouped_conv_prepare` contract at every registered `B=1..8`. Each timed call
-includes RMSNorm, the `[1280,5120]` coefficient projection, the input-side two-tap grouped
-convolution, and both public output writes. Every sample follows a 256 MiB L2 eviction; the report
-contains complete-Op latency, useful coefficient-projection TFLOP/s, and exact workspace capacity.
+includes RMSNorm, the `[H/4,H]` coefficient projection, the input-side two-tap grouped
+convolution, and both public output writes. `--hidden` selects the drafter geometry: 5120
+(Qwen3.8-27B's, the default), 2560 (Qwen3.8-Flash-Next's, whose calls of at most 16 columns take the
+one-kernel route) or 3072. Every sample follows a 256 MiB L2 eviction; the report contains
+complete-Op latency, useful coefficient-projection TFLOP/s, and exact workspace capacity.
 
 ```bash
 cmake --build build -j --target infernix_dynamic_grouped_conv_prepare_bench
 ./build/bench/infernix_dynamic_grouped_conv_prepare_bench --warmup 10 --repeat 80
+./build/bench/infernix_dynamic_grouped_conv_prepare_bench --hidden 2560 --width 8 --batch 1
 ```
 
 ## Gated DeltaNet Op benchmark
@@ -734,7 +797,8 @@ so broad Graph-envelope measurements can be distinguished from exact-length meas
 `--prefill-split-workspace-mib`). `--decode-split64` selects the decode-split64 fast path's
 schedule (INT8 KV: 64-key splits for 24-head single-column rows). In `infernix_bench`, the fast
 paths qualified for the configuration (the artifact's kernels and KV format) run unless `--reproducible`, and `--fast-path NAME`
-also runs a candidate path; the report records the paths that ran as `fast_paths`.
+also runs a candidate path; `--no-fast-path NAME` leaves one selected path out (a leave-one-out arm of the default
+route; a path not selected fails startup); the report records the paths that ran as `fast_paths`.
 
 ```bash
 cmake --build build --parallel --target infernix_causal_softmax_attention_bench
@@ -1358,7 +1422,9 @@ intentionally separate: replay reuses captured addresses without advancing the h
 
 `reps` contains request samples in repetition-major order, with explicit `repetition` and `row`.
 `output_tok_s` divides each repetition's actual outputs by its wall time.
-`decode_output_tok_s` counts actual outputs after the first token, allowing early grammar EOS.
+`decode_output_tok_s` counts actual outputs after the first token, allowing early grammar EOS, over
+the Program's decode time (each round's decode and commit calls; reports before 2026-11-01 left the
+commits out, up to ~4 % higher on speculative routes).
 `decode_engine_tok_s` uses the Program's speculative round statistics, so it also describes work performed by a final partially
 committed speculative round. Reports also contain the command and machine information needed to
 interpret a local measurement.

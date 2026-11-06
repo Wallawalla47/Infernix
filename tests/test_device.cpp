@@ -112,7 +112,7 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
     for (const std::size_t bytes : {std::size_t{2560}, std::size_t{12800}, kMaxBytes}) {
         CUDA_CHECK(cudaMemset(stats, 0, 2 * sizeof(std::uint64_t)));
         if (!produce(bytes, ++round, [&] {
-                infernix::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr, ctx.stream);
+                infernix::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr, {}, ctx.stream);
             })) {
             ++failures;
             std::cerr << "gated copy of " << bytes << " bytes does not hold the published data\n";
@@ -133,7 +133,7 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
         fill(2560, ++round);
         std::memcpy(src, host.data(), 2560);
         infernix::publish_pinned_word(ready, word);
-        infernix::upload_pinned_when(dst, src, 2560, ready, expected, stats, nullptr, ctx.stream);
+        infernix::upload_pinned_when(dst, src, 2560, ready, expected, stats, nullptr, {}, ctx.stream);
         ctx.synchronize();
         std::uint64_t waited[2] = {};
         read_stats(waited);
@@ -149,7 +149,7 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
         cudaGraph_t graph       = nullptr;
         cudaGraphExec_t exec    = nullptr;
         CUDA_CHECK(cudaStreamBeginCapture(ctx.stream, cudaStreamCaptureModeThreadLocal));
-        infernix::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr, ctx.stream);
+        infernix::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr, {}, ctx.stream);
         CUDA_CHECK(cudaStreamEndCapture(ctx.stream, &graph));
         CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
         CUDA_CHECK(cudaMemset(stats, 0, 2 * sizeof(std::uint64_t)));
@@ -169,10 +169,47 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
         CUDA_CHECK(cudaGraphDestroy(graph));
     }
     try {
-        infernix::upload_pinned_when(dst, src, 2561, ready, expected, nullptr, nullptr, ctx.stream);
+        infernix::upload_pinned_when(dst, src, 2561, ready, expected, nullptr, nullptr, {}, ctx.stream);
         ++failures;
         std::cerr << "a gated copy of a size that is not a 16-byte multiple did not throw\n";
     } catch (const std::invalid_argument&) {}
+    // A word never published: past its bound (50 ms here) the gate stores its fault, skips the copy and
+    // records no wait, and the context stays usable: the next gate of the stream copies its round.
+    {
+        constexpr std::size_t bytes        = 12800;
+        constexpr std::uint32_t kFault     = 0x0001FF10;
+        constexpr std::uint64_t kBoundNs   = 50ULL * 1000 * 1000;
+        std::uint32_t* const fault         = expected_h + 1; // mapped pinned, beside the staged word
+        *reinterpret_cast<volatile std::uint32_t*>(fault) = 0;
+        CUDA_CHECK(cudaMemset(stats, 0, 2 * sizeof(std::uint64_t)));
+        CUDA_CHECK(cudaMemset(dst, 0x5a, bytes));
+        *expected_h = ++word; // the host never publishes this round's word
+        CUDA_CHECK(cudaMemcpyAsync(expected, expected_h, sizeof(std::uint32_t), cudaMemcpyHostToDevice, ctx.stream));
+        std::memset(src, 0xa5, bytes);
+        const auto start = std::chrono::steady_clock::now();
+        infernix::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr,
+                                     infernix::DeviceFault{.word = fault, .value = kFault}, ctx.stream, kBoundNs);
+        const cudaError_t status = cudaStreamSynchronize(ctx.stream);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        std::vector<std::byte> out(bytes);
+        CUDA_CHECK(cudaMemcpy(out.data(), dst, bytes, cudaMemcpyDeviceToHost));
+        std::uint64_t waited[2] = {};
+        read_stats(waited);
+        if (status != cudaSuccess || *reinterpret_cast<volatile std::uint32_t*>(fault) != kFault ||
+            out != std::vector<std::byte>(bytes, std::byte{0x5a}) || waited[1] != 0 || ms < 40.0) {
+            ++failures;
+            std::cerr << "an unpublished gate past its bound: " << cudaGetErrorString(status) << " after " << ms
+                      << " ms, fault word " << std::hex << *reinterpret_cast<volatile std::uint32_t*>(fault) << std::dec
+                      << ", " << waited[1] << " waits (expected the fault, the copy skipped and no wait)\n";
+        }
+        if (!produce(bytes, ++round, [&] {
+                infernix::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr,
+                                             infernix::DeviceFault{.word = fault, .value = kFault}, ctx.stream, kBoundNs * 100);
+            })) {
+            ++failures;
+            std::cerr << "the gate after a timed-out one did not copy its round\n";
+        }
+    }
     CUDA_CHECK(cudaFree(stats));
     CUDA_CHECK(cudaFree(expected));
     CUDA_CHECK(cudaFree(dst));

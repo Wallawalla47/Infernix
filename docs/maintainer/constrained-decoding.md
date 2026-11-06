@@ -197,9 +197,14 @@ it does not infer semantics by treating every control token as an ordinary strin
 Each Frontend holds a compiler/cache bound to its vocabulary. A CompiledGrammar is immutable and the
 OutputSession holds a shared reference.
 
-The constraint vocabulary index and compiler initialize thread-safely on first constrained use; that
-time belongs to that prepare. The ordinary tokenizer keeps its initialization. Requests without
-constraints trigger no extra CPU indexing.
+The constraint vocabulary index and compiler initialize thread-safely, once per Frontend. The Engine
+builds them on a startup thread beside model loading's end (`Frontend::warm_constraints`, logged at
+debug as `constraint vocabulary index built in N s`), so the first constrained request no longer pays them in
+its prepare; one that arrives while the build runs waits for it, as it would have built it itself
+(measured before the warm-up: `prepare` 0.85 s for the first constrained request against 0.00 s for
+every unconstrained one, the index and that tool set's grammar together). A tool set's grammar
+compiles at its first request, as the cache key above says. The ordinary tokenizer keeps its
+initialization.
 
 The cache key combines the constraint kind and source, the compile options and the model's output
 framing. Different starting content phases can produce different framings; a continuation's concrete
@@ -389,11 +394,19 @@ not close the argument set from properties or enforce required or value assertio
 schemas and open objects do not trigger the strict compiler. Argument values keep the existing
 normalization hints. A call names each argument once: an open name set has no context-free uniqueness
 rule, so the grammar session carries a companion (`text::GrammarStateConstraint`, the Qwen frontend's
-`ParameterNameConstraint` in `tool_grammar.cpp`) that follows the canonical framing of the tokens the
+`ToolCallRules` in `tool_grammar.cpp`) that follows the canonical framing of the tokens the
 matcher accepts and clears, in every lookahead mask, the tokens that would complete a name the call
 has used. It shares the matcher's transaction (lookahead, accept, confirm, discard and the assistant
-continuation) and runs only when a non-strict tool is declared. Strict arguments generate in declared
-order, which forbids repeats already.
+continuation); the name rule runs only when a non-strict tool is declared. Strict arguments generate
+in declared order, which forbids repeats already.
+
+The same companion keeps a quoted call token in the answer's text. Before the first call of an Auto
+grammar without a JSON answer, it tracks the text's Markdown code (`MarkdownCodeTracker`, the rules
+the output decoder applies): a `<tool_call>` token inside a fence, an indented code block or a code
+span is `literal` there, so the session advances the companion alone and the matcher stays in free
+text (where the token is a dispatch tag the mask admits anyway). The decoder publishes its spelling
+as content, streamed or whole. Masking the token inside code instead would change what the model
+writes; until 2026-10-31 the grammar opened a call at any such token (candidates SY-01, TM-03).
 
 Because names never repeat and every value's encoding is known from its parameter before its bytes
 arrive, the output decoder reads constrained calls once as they are generated
@@ -442,10 +455,25 @@ The choice between a Qwen raw string and a JSON value must be unambiguous. Pure 
 raw string; type unions without string use JSON values. A raw argument mixing string with other types
 whose branch the model format cannot determine is rejected for strict composition while preparing; the
 existing "any argument that allows string is read as string" cannot be claimed to enforce the other
-branches.
+branches. The one admitted mix is a nullable string (string and null, through a type list, an
+enum/const or anyOf/oneOf branches): it is raw text, the grammar takes its string branches and enum
+members plus the text `null`, and the decoder reads that text as null; an enum or const listing the
+string `"null"` beside null is rejected, since its raw text would be the same. The decoder reads every
+strict argument with the types the parameter's schema admits (`type`, enum/const values, local
+`$ref`, `allOf`, `anyOf`/`oneOf`), the same domain that chose its encoding.
 
-A raw string argument ends at `\n</parameter>`, which must not occur in the value. Grammar and parser
-use the same delimiter rule and strict output generates only losslessly representable values; a
+A raw string argument ends at `\n</parameter>`, which occurs in the value only inside the whole
+call's closing lines, `\n</parameter>\n</function>\n</tool_call>`, that more value text follows (a
+document quoting them; candidates SY-04, Strata #4701). The free string rule is a segment without the
+delimiter, then any number of those closing lines and another segment (`xml_string` in the vendored
+converter), so the matcher keeps both readings after the closers until the next token decides: the
+end of the output or `\n` and the next call's `<tool_call>` token closes the call, other text
+continues the value. The `<tool_call>` token is the next call's opener only after that `\n` (and only
+when calls are parallel), while the raw string would read it as value text right after the closers:
+the companion, which every tool grammar has, masks it there (candidates QA-02). The companion and
+`ConstrainedToolStream` follow the same rule; the stream holds the call's last fragment until then. Strings with a length bound or a pattern keep the plain
+exclusion. Grammar and parser use the same delimiter rule and strict output generates only
+losslessly representable values; a
 required const/enum value that cannot be represented returns an explicit error instead of being
 changed. A string's pattern/length and the delimiter exclusion hold together. The outer framing has no
 optional whitespace, so value whitespace is never pushed outside the schema. Nested JSON uses the
@@ -497,6 +525,15 @@ content bytes after the separator publish as generated, with no unbounded trimmi
 whitespace. A line break directly before the close token is framing too (the canonical serialization
 is `\n</think>\n\n`) and is not published as reasoning.
 
+A Qwen tool grammar also withholds the `<tool_call>` token from the reasoning branch
+(`ReasoningFraming::withheld_token`): a call written there would never run, and since EOS is refused
+until the reasoning closes, the model could not end the turn and would write on to its thinking budget
+(ninferpro measured turns of 65 and 145 such calls). With the token refused, the model closes its
+thinking and calls after it. The token's spelling in ordinary tokens stays reasoning text, as
+`</think>`'s does; an assistant continuation holding the token inside its reasoning is not a prefix of
+the grammar, and a `--thinking-budget-message` holding it is refused at startup (the budget's control
+span is reasoning that passes the same grammar).
+
 Free reasoning cannot reach a different phase in decoder and matcher: `</think>` spelled with ordinary
 tokens is reasoning in both, and the close token without the separator is refused by the grammar. The
 separator is matched at the byte level after the token, so a token that holds both the end of the
@@ -507,9 +544,9 @@ separator belongs to the content and is kept. JSON mode uses the same boundary r
 JSON's ignorable whitespace.
 
 The tool grammars open every call with the model's `<tool_call>` token: Auto's free text is a
-`TokenTagDispatch` on that token, Required and the JSON union start with `Token`, and each further
-call is `\n` and the token. A `<tool_call>` spelled with ordinary tokens is free text, as the output
-decoder reads it. With a content constraint, tool-marker extraction is off and a legal `<tool_call>`
+`TokenTagDispatch` on that token (outside Markdown code: the companion above takes a token inside
+code as text), Required and the JSON union start with `Token`, and each further call is `\n` and the
+token. A `<tool_call>` spelled with ordinary tokens is free text, as the output decoder reads it. With a content constraint, tool-marker extraction is off and a legal `<tool_call>`
 string in the content publishes as content. Chat content/tool constraints cannot be combined with `output.raw=true` or
 options that publish special-token text; a raw token/text grammar publishes all its new text and hides
 the terminating EOS.

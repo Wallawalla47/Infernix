@@ -5,16 +5,19 @@ A predictor names, at each round's boundary, the experts it expects the next rou
 host_tier.TierSim then evicts them only when no unprotected resident is left (protection only: the
 prefetch half of SeqMoE is the rejected prefetch class). Both are guards for TierSim.guard:
 
-- NextRoundsOracle: the keys the next `horizon` decode or verification rounds actually compute. It
-  is the ceiling of any protection predictor at that horizon: when protection with perfect
-  knowledge gains too little, no learned predictor can gain more.
+- NextRoundsOracle: the keys the next `horizon` decode or verification rounds actually compute, all
+  layers' guarded at every layer's step (a round-wide guard, wider than the engine's). It is the
+  ceiling the topic's rule reads: when protection with perfect knowledge gains too little, no learned
+  predictor is expected to gain more.
 - TransitionPredictor: the engine's causal routing-sequence model (INFERNIX_TMP_ROUTE_PROTECT,
   src/runtime/expert_offload/route_predictor.h), operation for operation in FP32. Per layer,
   exponentially decayed counts of expert b at a lane's live token t + 1 after expert a at its token t
   (prompt tokens included; each row of a round contributes its last MAX_ROUND_TOKENS live tokens);
   at a boundary each lane of the round predicts, per layer, the `per_layer` experts b with the
   largest sum over its last token's experts a of counts[a, b] / out[a] (ties: the lower expert),
-  positive scores only. It runs on the host beside the policy, so it costs no frames.
+  positive scores only. As in ExpertResidency::after_round, a layer's step guards only that layer's
+  predictions (LfruPolicy::step's guard is predict(layer)), so the step may evict another layer's
+  predicted experts. It runs on the host beside the policy, so it costs no frames.
 """
 import numpy as np
 
@@ -32,7 +35,8 @@ def lane_columns(r):
 
 
 class NextRoundsOracle:
-    """The keys the next `horizon` decode or verification rounds compute (every column, as read)."""
+    """The keys the next `horizon` decode or verification rounds compute (every column, as read), as one
+    round-wide guard."""
 
     def __init__(self, rounds, layers, experts, horizon):
         base = (np.arange(layers) * experts)[:, None]
@@ -51,7 +55,7 @@ class NextRoundsOracle:
             ahead = decode[at:at + horizon]
             if ahead:
                 self.guards[i] = np.unique(np.concatenate([keys[j] for j in ahead]))
-        self.name = f'next {horizon} round{"s" if horizon > 1 else ""} (oracle)'
+        self.name = f'next {horizon} round{"s" if horizon > 1 else ""} (oracle, round-wide guard)'
 
     def __call__(self, index, r):
         return self.guards[index]
@@ -69,7 +73,7 @@ class TransitionPredictor:
         self.weight = 1.0
         self.last = {}  # lane -> [layers, top_k] experts of its last live token
         self.lanes = []  # the lanes of the last observed round
-        self.name = f'transition predictor, {self.P} per layer'
+        self.name = f'transition predictor, {self.P} per layer (layer guard)'
 
     def _add(self, prev, cur, weights):
         """Adds one weight per token pair (prev[:, i] -> cur[:, i]) in order, as the engine does."""
@@ -110,24 +114,25 @@ class TransitionPredictor:
                 self._add(seq[:, start:-1], seq[:, start + 1:], weights)
             self.last[lane] = tokens[:, -1, :]
 
-    def predict(self, lanes=None):
+    def predict(self, layer, lanes=None):
+        """Layer `layer`'s keys (layer * experts + expert) for the next round, ascending (RoutePredictor::
+        predict): each lane of the last observed round (or `lanes`) names its `per_layer` best experts."""
         out = []
-        layer_base = np.arange(self.L) * self.E
         experts = np.arange(self.E)
         for lane in (self.lanes if lanes is None else lanes):
             prev = self.last.get(int(lane))
             if prev is None:
                 continue
-            for layer in range(self.L):
-                score = np.zeros(self.E, np.float32)
-                for a in prev[layer]:
-                    if 0 <= a < self.E and self.out[layer, a] > 0:
-                        score += self.counts[layer, a] / self.out[layer, a]
-                top = np.lexsort((experts, -score))[:self.P]
-                top = top[score[top] > 0]
-                out.append(top + layer_base[layer])
-        return np.unique(np.concatenate(out)) if out else None
+            score = np.zeros(self.E, np.float32)
+            for a in prev[layer]:
+                if 0 <= a < self.E and self.out[layer, a] > 0:
+                    score += self.counts[layer, a] / self.out[layer, a]
+            top = np.lexsort((experts, -score))[:self.P]
+            out.append(top[score[top] > 0])
+        keys = np.unique(np.concatenate(out)) if out else np.empty(0, np.int64)
+        return keys.astype(np.int64) + layer * self.E
 
     def __call__(self, index, r):
+        """TierSim.guard: observes the round, then guards each layer's step with that layer's predictions."""
         self.observe(r)
-        return self.predict()
+        return self.predict

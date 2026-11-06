@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/nvtx.h"
+#include "core/io_priority.h"
 #include "core/power_throttling.h"
 #include "core/startup.h"
 #include "core/temporary_switches.h"
@@ -18,23 +19,85 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace infernix {
 namespace {
 
+// The per-thread stack an Engine reserves (design note candidates §22 VM-12). The driver keeps stack x resident
+// threads of local memory for it (1 KiB by default, ~267 MiB on an RTX 5090), taken before the Programs size their
+// frames and KV. Every kernel off the lossless route has a frame of at most 240 bytes (cuobjdump of the 2026-10-26
+// build: the GGUF dense tiles), so 256 bytes serve them; the lossless route's attention and fallback GEMMs need up to
+// 1,472 (twenty-two functions over 256), so a lossless Engine reserves 1.5 KiB up front instead of the driver growing
+// the stack outside the plan at their first launch.
+constexpr std::size_t kStackBytes         = 256;
+constexpr std::size_t kLosslessStackBytes = 1536;
+
 DeviceContext initialize_device(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
     DeviceContext device(options.device);
+    // Every kernel is built for sm_120a alone: another GPU is refused by name here, before the artifact is read, rather
+    // than at its first kernel launch after a long load (candidates IH-01).
+    if (device.compute_capability() != 120) {
+        throw std::runtime_error("Infernix needs an NVIDIA GPU of compute capability 12.0 (sm_120a: GeForce RTX 50 "
+                                 "series, RTX PRO Blackwell); device " + std::to_string(options.device) + ", " +
+                                 device.props.name + ", is compute capability " + std::to_string(device.props.major) +
+                                 "." + std::to_string(device.props.minor));
+    }
+    const std::size_t stack = options.lossless ? kLosslessStackBytes : kStackBytes;
+    device.bind_to_current_thread();
+    if (const cudaError_t err = cudaDeviceSetLimit(cudaLimitStackSize, stack); err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaDeviceSetLimit(cudaLimitStackSize) failed: ") + cudaGetErrorString(err));
+    }
     phase.complete();
     return device;
+}
+
+// Options are checked before the artifact is opened; defaults that depend on the model (the hybrid
+// prefix cache's, --spec auto's drafter) need the artifact's architecture and drafters, read once
+// here. An unreadable artifact is reported by the (Qwen3.5) model construction, after option
+// validation, or here when --spec auto (the CLI's and server's default) needs its drafters.
+EngineOptions normalize_options(EngineOptions engine_options, models::Architecture& architecture) {
+    bool offloaded_experts = false;
+    std::optional<models::qwen3_5::BundledDrafters> drafters;
+    std::vector<std::filesystem::path> dflash2_companions;
+    std::exception_ptr unreadable;
+    try {
+        const artifact::Reader reader(engine_options.artifact_path);
+        if (runtime::artifact_is_qwen4_exp(reader)) {
+            architecture = models::Architecture::Qwen4Exp;
+            const SpeculativeOptions& speculative = engine_options.speculative;
+            if (speculative.backend_auto && speculative.draft_model.empty() && !engine_options.lossless &&
+                engine_options.purpose == EnginePurpose::Generation) {
+                dflash2_companions = runtime::dflash2_companions_beside(engine_options.artifact_path,
+                                                                        reader.directory());
+            }
+        } else {
+            offloaded_experts = runtime::artifact_offloads_experts(reader);
+        }
+        drafters = runtime::artifact_drafters(reader);
+    } catch (const std::exception&) {
+        unreadable = std::current_exception();
+    }
+    runtime::validate_engine_options(engine_options, architecture, offloaded_experts);
+    if (drafters) {
+        runtime::resolve_auto_speculative_backend(engine_options, architecture, offloaded_experts, *drafters,
+                                                  dflash2_companions);
+    } else if (engine_options.speculative.backend_auto &&
+               engine_options.purpose == EnginePurpose::Generation && unreadable) {
+        std::rethrow_exception(unreadable);
+    }
+    return runtime::normalize_engine_options(std::move(engine_options), architecture, offloaded_experts);
 }
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
@@ -299,21 +362,8 @@ public:
         finalize_phase.complete();
     }
 
-    // Options are checked before the artifact is opened; defaults that depend on the model (the
-    // hybrid prefix cache's) need the artifact's architecture, read once here. An unreadable
-    // artifact is reported by the (Qwen3.5) model construction, after option validation.
     EngineOptions normalize(EngineOptions engine_options) {
-        bool offloaded_experts = false;
-        try {
-            const artifact::Reader reader(engine_options.artifact_path);
-            if (runtime::artifact_is_qwen4_exp(reader)) {
-                architecture = models::Architecture::Qwen4Exp;
-            } else {
-                offloaded_experts = runtime::artifact_offloads_experts(reader);
-            }
-        } catch (const std::exception&) {}
-        runtime::validate_engine_options(engine_options, architecture, offloaded_experts);
-        return runtime::normalize_engine_options(std::move(engine_options), architecture, offloaded_experts);
+        return normalize_options(std::move(engine_options), architecture);
     }
 
     ~Impl() noexcept {
@@ -405,11 +455,46 @@ public:
 
 Engine::Engine(EngineOptions options) {
     // Before any host thread starts: a throttled process runs every one of them slower.
-    exempt_process_from_power_throttling();
+    if (const auto refused = exempt_process_from_power_throttling()) {
+        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                                    "Windows refused the power-throttling exemption (error %lu): run in a "
+                                    "background window, the host threads may be slowed many times over",
+                                    *refused);
+    }
+    // Before the artifact is read: an inherited low I/O priority throttles every direct read.
+    if (const auto io = raise_low_io_priority()) {
+        if (io->after >= kIoPriorityNormal) {
+            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                        "raised the I/O priority this process inherited (%d, below normal) to normal: "
+                                        "Windows throttles low-priority reads",
+                                        io->before);
+        } else {
+            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                                        "this process inherited I/O priority %d (below normal) and Windows refused to "
+                                        "raise it: model, n-gram and SSD-tier reads may be several times slower; start "
+                                        "the engine from a normal-priority process",
+                                        io->before);
+        }
+    }
     StartupObserver startup_observer = options.startup_observer;
     StartupPhaseScope startup_phase(startup_observer, StartupPhase::EngineStartup);
     impl_ = std::make_shared<Impl>(std::move(options));
     startup_phase.complete();
+}
+
+EnginePlan Engine::plan(EngineOptions engine_options) {
+    models::Architecture architecture = models::Architecture::Qwen3_5;
+    EngineOptions options             = normalize_options(std::move(engine_options), architecture);
+    // The start's CUDA context and stack reserve come first there too, so the free memory the plan
+    // reads is the free memory a start would read.
+    DeviceContext device = initialize_device(options);
+    EnginePlan plan;
+    if (architecture == models::Architecture::Qwen4Exp) {
+        (void)runtime::construct_qwen4_exp(options, device, &plan);
+    } else {
+        (void)runtime::construct_model(options, device, &plan);
+    }
+    return plan;
 }
 
 Engine::~Engine()                            = default;
@@ -458,6 +543,11 @@ std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
 std::string Engine::detokenize(std::span<const TokenId> token_ids) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->frontend().detokenize(token_ids);
+}
+
+std::string Engine::detokenize_bytes(std::span<const TokenId> token_ids) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->frontend().detokenize_bytes(token_ids);
 }
 
 ChatTokens Engine::tokenize_chat(PromptInput input) const {
@@ -560,6 +650,10 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             throw std::invalid_argument("constraint token is outside the tokenizer domain");
         }
     }
+    // A token constraint chooses every output step itself, the end of the turn included.
+    if (!resolved_options.execution.constraint.empty()) {
+        resolved_options.execution.thinking.end_turn_in_thinking = true;
+    }
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
     if (prompt_summary.prompt_tokens > impl_->options.max_context) {
@@ -610,6 +704,18 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                                  pending_deadline);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
+            }
+        },
+        impl_->core);
+}
+
+void Engine::prefill_next_turn(PromptInput conversation) noexcept {
+    if (impl_ == nullptr) { return; }
+    std::visit(
+        [&](auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (!std::is_same_v<CoreState, std::monostate> && !Impl::kScoring<CoreState>) {
+                if (core != nullptr) { core->prefill_next_turn(std::move(conversation)); }
             }
         },
         impl_->core);

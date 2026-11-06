@@ -10,6 +10,8 @@
 // experts (checked when copied, and by the calibrated-order test).
 #include "models/qwen4_exp/program/calibrated_order.h"
 
+#include "runtime/expert_offload/expert_state.h"
+
 #include <array>
 
 namespace infernix::models::qwen4_exp {
@@ -1655,21 +1657,9 @@ constexpr std::array<std::array<std::uint16_t, 512>, 48> kCalibratedOrder{{
 runtime::expert_offload::expert_cache::SavedState calibrated_expert_order() {
     // Counts are the experts' ranks reversed (a weak prior that real use soon outweighs); the ranked
     // list interleaves the layers by rank (every layer's first expert, then every layer's second).
-    runtime::expert_offload::expert_cache::SavedState out;
-    out.counts.assign(static_cast<std::size_t>(kCalibratedLayers) * kCalibratedExperts, 0);
-    out.ranked.reserve(out.counts.size());
-    for (std::uint32_t layer = 0; layer < kCalibratedLayers; ++layer) {
-        for (std::uint32_t rank = 0; rank < kCalibratedExperts; ++rank) {
-            out.counts[static_cast<std::size_t>(layer) * kCalibratedExperts + kCalibratedOrder[layer][rank]] =
-                kCalibratedExperts - rank;
-        }
-    }
-    for (std::uint32_t rank = 0; rank < kCalibratedExperts; ++rank) {
-        for (std::uint32_t layer = 0; layer < kCalibratedLayers; ++layer) {
-            out.ranked.push_back(layer * kCalibratedExperts + kCalibratedOrder[layer][rank]);
-        }
-    }
-    return out;
+    return runtime::expert_offload::expert_cache::calibrated_order_state(
+        kCalibratedLayers, kCalibratedExperts,
+        [](std::uint32_t layer, std::uint32_t rank) -> std::uint32_t { return kCalibratedOrder[layer][rank]; });
 }
 
 } // namespace infernix::models::qwen4_exp

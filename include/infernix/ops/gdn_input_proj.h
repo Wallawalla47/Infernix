@@ -84,11 +84,13 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
  *
  * The policy-bearing form uses caller-owned call-scoped transient storage sized by
  * gdn_input_proj_workspace_capacity_bytes(). A16 requires zero bytes, except that the MXFP8
- * [16384,2560] query also covers its LinearRoutes::F16Accumulate route from that route's admission
- * width (the query takes no route flags). With that flag (and any policy but A16ColumnInvariant), the
- * MXFP8 parent runs linear's f16-accumulate-prefill route for the shape (include/infernix/ops/linear.h)
- * at the same widths, so qkv and z still hold the bits of linear's rows under the same flag; every
- * other parent ignores that flag, and LinearRoutes::Q8SlicedK acts as in the routes overload below.
+ * [16384,2560] query also covers its LinearRoutes::F16Accumulate and LinearRoutes::Fp8A8PairBlock32
+ * routes from their admission widths (the query takes no route flags). With either flag (and any policy
+ * but A16ColumnInvariant), the MXFP8 parent runs linear's route for the shape under that flag
+ * (f16-accumulate-prefill, or fp8-a8-pair-block32's two E4M3 activation terms from 33 columns;
+ * F16Accumulate first where both are set; include/infernix/ops/linear.h) at the same widths, so qkv and
+ * z still hold the bits of linear's rows under the same flags; every other parent ignores
+ * Fp8A8PairBlock32, and LinearRoutes::Q8SlicedK acts as in the routes overload below.
  * The convenience overload selects A16Only and requires no
  * transient workspace.
  */

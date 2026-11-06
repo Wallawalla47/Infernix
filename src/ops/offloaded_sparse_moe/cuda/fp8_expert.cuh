@@ -490,19 +490,23 @@ __global__ void __launch_bounds__(fp8t::kThreads, 3)
 void launch_expert_pass_fp8(const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                             const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                             const moe::wide::ExpertsWorkspace& layout, bf16* outputs, cudaStream_t stream,
-                            PassPhase phase, int entries) {
-    // As launch_pass_ggml: the wide tiles run every job of the pass, so no phase split.
-    if (entries > 0 && phase != PassPhase::All) {
+                            PassPhase phase, int entries, PassPart part) {
+    // As launch_pass_ggml: the wide tiles run every job of the pass, so no phase or part split.
+    if (entries > 0 && (phase != PassPhase::All || part != PassPart::Both)) {
         throw std::logic_error("offloaded_sparse_moe: the block-FP8 wide tiles do not split by pass phase");
     }
     auto* h_plane        = reinterpret_cast<std::uint16_t*>(layout.h_rows);
     const int narrow_max = entries > 0 ? moe::kMaxColumns : std::numeric_limits<int>::max();
-    gate_up_kernel_fp8<<<dim3(moe::kIntermediate / kGgmlGateUpUnits, jobs), kGgmlThreads, 0, stream>>>(
-        layout.x_limbs, layout.x_emax, dispatch, source, top_k, job_records, flags, base, h_plane, phase, narrow_max);
-    check_launch("fp8 gate/up");
-    CUDA_CHECK(pdl::launch_consumer({dim3(moe::kHidden / kGgmlDownRows, jobs), dim3(kGgmlThreads), 0, stream},
-                                    down_kernel_fp8, dispatch, source, static_cast<int>(moe::kHidden), job_records,
-                                    flags, base, static_cast<const std::uint16_t*>(h_plane), outputs, phase, narrow_max));
+    if (part != PassPart::Down) {
+        gate_up_kernel_fp8<<<dim3(moe::kIntermediate / kGgmlGateUpUnits, jobs), kGgmlThreads, 0, stream>>>(
+            layout.x_limbs, layout.x_emax, dispatch, source, top_k, job_records, flags, base, h_plane, phase, narrow_max);
+        check_launch("fp8 gate/up");
+    }
+    if (part == PassPart::GateUp) { return; }
+    CUDA_CHECK(pdl::launch_with(part == PassPart::Down ? pdl::Dependency::Serialized : pdl::Dependency::Programmatic,
+                                {dim3(moe::kHidden / kGgmlDownRows, jobs), dim3(kGgmlThreads), 0, stream},
+                                down_kernel_fp8, dispatch, source, static_cast<int>(moe::kHidden), job_records,
+                                flags, base, static_cast<const std::uint16_t*>(h_plane), outputs, phase, narrow_max));
     if (entries == 0) { return; }
     const unsigned tile_bound = static_cast<unsigned>(jobs + (entries + kGgmlTileColumns - 1) / kGgmlTileColumns);
     gate_up_tile_fp8<<<dim3(moe::kIntermediate / 16, tile_bound, 2), fp8t::kThreads, 0, stream>>>(

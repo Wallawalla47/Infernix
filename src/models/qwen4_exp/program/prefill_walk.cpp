@@ -16,7 +16,7 @@
 // stream lease after the ring. Each advance_prefill call enqueues about one call's work (a few
 // layers of every chunk) and synchronizes, so cancellation and other lanes interleave as between
 // chunk-major calls; the walk's own state stays valid across them. A span ends before a call too
-// narrow to stream and at kWalkMaxTokens. A prefix tap due at an inner chunk end is captured in place
+// narrow to stream (the prompt's last joins a span of one or more streamed calls as an MoE group of its own) and at kWalkMaxTokens. A prefix tap due at an inner chunk end is captured in place
 // (walk_plan_taps): each layer's state is copied once the walk has enqueued that layer of the chunk,
 // before the next chunk overwrites it, and the snapshot is committed after the span. Ending the span
 // there instead would stream every non-resident expert once more per tap (a cold 128K prompt's taps
@@ -27,14 +27,11 @@
 #include "core/temporary_switches.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cstdlib>
 #include <cstring>
-#include <exception>
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -45,6 +42,8 @@ namespace pc = runtime::prefix_cache;
 namespace {
 
 constexpr std::size_t kWalkAlign = 256;
+// The narrowest prompt's last call that joins a span (walk_span_end).
+constexpr std::uint32_t kWalkJoinMinTokens = 2;
 constexpr std::uint32_t kBlock   = pc::kBlockTokens;
 
 std::size_t walk_align(std::size_t bytes) { return (bytes + kWalkAlign - 1) / kWalkAlign * kWalkAlign; }
@@ -76,6 +75,30 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
         if (width < static_cast<std::uint32_t>(kStreamMinColumns) || total + width > kWalkMaxTokens) { break; }
         total += width;
         from = lane.calls[end];
+        ++end;
+        tokens.push_back(total);
+    }
+    // One streamed call alone does not walk: it keeps its gated stream and copy-ahead. With the prompt's narrow
+    // last call after it, the two walk: as its own call the last one stages its misses again right after the
+    // streamed call (FP4-Local pp16413, a 29-token last call after 16,384 tokens: 299 ms, mostly CPU-served
+    // misses; walked 6,999 -> 7,684 tok/s, 2026-10-30; pp4125 on IQ3_S and Dense8 1.000x, 2026-10-27).
+    // A span's calls stream their experts once, as one call of their summed width would: it walks only from that
+    // width's stream boundary (stream_min_columns; FP4-Local's 16-bit route assists calls to 575 columns, §19.3.50),
+    // so a call of 256-575 columns before the prompt's narrow last one stays CPU-assisted.
+    if (total < static_cast<std::uint32_t>(stream_min_columns())) { return first; }
+    const bool one_then_last = end - first == 1U && end + 1 == lane.calls.size() && lane.calls[end] - from >= kWalkJoinMinTokens;
+    if (end - first < 2U && !one_then_last) { return first; }
+    // The prompt's last call, too narrow to stream, joins a
+    // span of streamed calls (as its own MoE group, walk_begin), so its experts are read from the span's ring
+    // instead of being staged again right after it. It also puts a divergence inside that last call (a /v1/decide
+    // fan-out's questions) inside a running span, where a sibling cannot coalesce (prefix_await_sibling). pp16413:
+    // IQ3_S +4.1 %, Dense8 +0.06 % (2026-10-28). A one-token last call stays its own call, so the span ends at a
+    // divergence one token before the prompt's end and a sibling coalesces there (test_decide_real's coalesce).
+    // (It once also gave wrong bits as a walk chunk, run as a decode call; streamed calls now run eagerly at any
+    // width, Forward::begin_call, candidates SA-12.)
+    if (end + 1 == lane.calls.size() && lane.calls[end] - from >= kWalkJoinMinTokens &&
+        total + (lane.calls[end] - from) <= kWalkMaxTokens) {
+        total += lane.calls[end] - from;
         ++end;
         tokens.push_back(total);
     }
@@ -118,13 +141,15 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
     walk_.residual_bytes = walk_align(2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(offset));
     walk_.moe_offset     = walk_.residual_bytes + n * walk_.io_stride;
     // MoE groups: consecutive chunks while their columns fit kWalkMoeColumns and the arena the calls
-    // run in (WideWork of the span's widest chunk: the wide arena when it exceeds the static one's).
+    // run in (WideWork of the span's widest chunk: the wide arena when it exceeds the static one's). A
+    // chunk too narrow to stream (the prompt's last, walk_span_end) is a group of its own, so its router
+    // takes the chunk-major call's form (router-mma acts on calls of kRouterMmaMinColumns or more).
     const std::int32_t widest = *std::max_element(walk_.widths.begin(), walk_.widths.end());
     const std::size_t arena   = widest > plan_.static_columns && wide_work_ > 0 ? wide_work_ : plan_.work;
     for (std::size_t c = 0; c < n;) {
         std::size_t e       = c + 1;
         std::int32_t columns = walk_.widths[c];
-        while (e < n && columns + walk_.widths[e] <= kWalkMoeColumns &&
+        while (e < n && walk_.widths[e] >= kStreamMinColumns && columns + walk_.widths[e] <= kWalkMoeColumns &&
                execution::Forward::moe_workspace_bytes(c_, columns + walk_.widths[e], wide_a16(options_)) <= arena) {
             columns += walk_.widths[e];
             ++e;
@@ -159,81 +184,20 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         return t;
     };
     if (cpu_service_) { cpu_service_->wake(); }
+    settle_round(); // a deferred update precedes the next forward
     residency_->before_round(s, /*landing=*/false, /*walking=*/false, kStreamReadSlots);
     expert_stream_->begin(ring_span(), residency_->host_table(), s, /*gated=*/false, /*ssd=*/true);
-    // INFERNIX_TMP_NGRAM_FIRST_SPAN_ASYNC (candidates §8.3 GX-08): when the previous span prefetched
-    // nothing for this one (the prompt's first span), chunk 0 reads its rows here, then a worker reads
-    // chunks 1..n-1's into their host slots while this thread stages and launches them. Only the worker
-    // touches the volume until it ends; chunk c waits for its rows before its upload.
-    const bool async_rows = ngram_first_span_async_ && n > 1 &&
-                            !walk_prefetched(index, walk_.first_call, 0, walk_.begins[0], walk_.widths[0]);
-    std::atomic<std::size_t> rows_ready{1};
-    std::exception_ptr rows_error;
-    std::thread rows_worker;
-    NgramVolume::Counters rows_before{};
-    const auto join_rows = [&] {
-        if (!rows_worker.joinable()) { return; }
-        rows_worker.join();
-        const NgramVolume::Counters& after = volume_.counters();
-        lane.ngram.rows += after.rows - rows_before.rows;
-        lane.ngram.hits += after.hits - rows_before.hits;
-        lane.ngram.reads += after.reads - rows_before.reads;
-        lane.ngram.read_ns += after.read_ns - rows_before.read_ns;
-        if (rows_error) { std::rethrow_exception(rows_error); }
-    };
-    struct JoinOnExit {
-        std::thread& worker;
-        ~JoinOnExit() {
-            if (worker.joinable()) { worker.join(); }
-        }
-    } join_on_exit{rows_worker};
+    tier_losses_at_span_ = tier_losses();
+    // The first span's later chunks read their n-gram rows here, chunk by chunk: a worker reading them
+    // while chunk 0 ran (candidates §8.3 GX-08) measured flat (prefill is compute-bound; removed 2026-10-28).
     for (std::size_t c = 0; c < n; ++c) {
         const std::int32_t b = walk_.begins[c], w = walk_.widths[c];
-        // Rows the previous span prefetched (or this span's worker read) already stand at this
-        // chunk's slot.
-        const bool from_worker = async_rows && c > 0;
-        if (from_worker) {
-            for (std::size_t ready = rows_ready.load(std::memory_order_acquire); ready <= c;
-                 ready             = rows_ready.load(std::memory_order_acquire)) {
-                rows_ready.wait(ready, std::memory_order_acquire);
-            }
-            if (rows_error) { join_rows(); }
-        }
-        const bool prefetched = from_worker || walk_prefetched(index, walk_.first_call, c, b, w);
+        // Rows the previous span prefetched already stand at this chunk's slot.
+        const bool prefetched = walk_prefetched(index, walk_.first_call, c, b, w);
         {
             const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
                                                static_cast<std::uint64_t>(w));
             stage_sequence(index, b, w, lane.history, !prefetched);
-        }
-        if (async_rows && c == 0) {
-            rows_before = volume_.counters();
-            rows_worker = std::thread([&, host_area] {
-                try {
-                    const std::int32_t context = static_cast<std::int32_t>(c_.ple.ngram.ngram_size) - 1;
-                    const std::size_t heads    = hash_.heads();
-                    const std::size_t row_bytes = ngram_table().row_bytes;
-                    std::vector<std::int32_t> window;
-                    std::vector<std::uint32_t> ids;
-                    for (std::size_t k = 1; k < n; ++k) {
-                        const std::int32_t from = walk_.begins[k], count = walk_.widths[k];
-                        window.clear();
-                        for (std::int32_t p = from - context; p < from + count; ++p) {
-                            window.push_back(p < 0 ? static_cast<std::int32_t>(c_.eos_token_id)
-                                                   : lane.history[static_cast<std::size_t>(p)]);
-                        }
-                        ids.resize(static_cast<std::size_t>(count) * heads);
-                        hash_.row_ids(window, static_cast<std::size_t>(count), ids.data());
-                        std::byte* rows = host_area + k * walk_.io_stride + io_layout_.ngram;
-                        volume_.read_rows(ids, std::span<std::byte>(rows, static_cast<std::size_t>(count) * heads * row_bytes));
-                        rows_ready.store(k + 1, std::memory_order_release);
-                        rows_ready.notify_all();
-                    }
-                } catch (...) {
-                    rows_error = std::current_exception();
-                    rows_ready.store(n, std::memory_order_release);
-                    rows_ready.notify_all();
-                }
-            });
         }
         std::optional<execution::MtpChunk> chunk = stage_mtp_chunk(lane, index, b, w);
         const execution::VisionInput* vision     = stage_vision(lane, static_cast<std::uint32_t>(b), w);
@@ -275,7 +239,6 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
             if (walk_.groups[g].second == c + 1) { walk_moe(g, 0); }
         }
     }
-    join_rows();
     walk_.next_layer = 1;
     walk_prefetch_   = WalkPrefetch{}; // consumed; the slots now hold this span's chunks
     ++walk_spans_;
@@ -324,7 +287,9 @@ void ProgramImpl::walk_prefetch_rows(Lane& lane, std::uint32_t index, std::size_
         }
         const std::uint32_t from  = lane.calls[call - 1];
         const std::uint32_t width = lane.calls[call] - from;
-        if (width < static_cast<std::uint32_t>(kStreamMinColumns) || tokens + width > kWalkMaxTokens) {
+        // A narrow call joins only as the prompt's last, after a streamed call (walk_span_end).
+        const bool narrow_last = call + 1 == lane.calls.size() && k >= 1 && width >= kWalkJoinMinTokens;
+        if ((width < static_cast<std::uint32_t>(kStreamMinColumns) && !narrow_last) || tokens + width > kWalkMaxTokens) {
             f.done = true;
             break;
         }
@@ -360,6 +325,7 @@ execution::ForwardBatch ProgramImpl::walk_batch(std::size_t c) {
     }
     fb.stream         = true;
     fb.release_stream = c + 1 == walk_.widths.size();
+    fb.stream_whole   = tier_losses() == tier_losses_at_span_;
     if (scoring_) { fb.residual_out = score_residuals(walk_.begins[c], w); } // a scored prompt's (causal_score)
     return fb;
 }
@@ -540,7 +506,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
             const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
             device_.synchronize();
         }
-        check_expert_error();
+        check_device_error();
         PrefillProgress out;
         out.summary                 = prefill_summary(lane);
         out.processed_prompt_tokens = 0;
@@ -571,7 +537,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
             const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
             device_.synchronize();
         }
-        check_expert_error();
+        check_device_error();
         const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                 static_cast<std::uint64_t>(width));
         // The route log holds the span's last chunk (every chunk routes nearly every expert).

@@ -49,9 +49,11 @@ struct Options {
     std::vector<int> widths{1, 5};
     int warmup = 5;
     int repeat = 50;
-    // TEMPORARY (INFERNIX_TMP_QSA_PROMPT_V2): the prompt-kernel variants timed per case, in order
-    // (-1: the process's setting; e.g. 0,1,1,0 for an in-process ABBA).
+    // The prompt-kernel variants timed per case, in order (-1: the storage's default; e.g. 0,1,1,0 for an
+    // in-process ABBA).
     std::vector<int> prompt_v2{-1};
+    // Packed BF16: give qsa_attention its `unpack` scratch (prompt calls unpack the sequence once).
+    bool unpack = true;
 };
 
 const char* storage_name(KvCacheStorage s) {
@@ -63,6 +65,7 @@ const char* storage_name(KvCacheStorage s) {
     case KvCacheStorage::Fp8KeyNvfp4Value: return "k8v4";
     case KvCacheStorage::Vq2: return "vq2";
     case KvCacheStorage::Q4KeyVq2Value: return "k4v2";
+    case KvCacheStorage::Bf16Packed: return "bf16p";
     }
     return "?";
 }
@@ -70,7 +73,7 @@ const char* storage_name(KvCacheStorage s) {
 KvCacheStorage parse_storage(std::string_view s) {
     for (const auto k : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
                          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
-                         KvCacheStorage::Q4KeyVq2Value}) {
+                         KvCacheStorage::Q4KeyVq2Value, KvCacheStorage::Bf16Packed}) {
         if (s == storage_name(k)) { return k; }
     }
     throw std::invalid_argument("unknown storage " + std::string(s));
@@ -112,11 +115,15 @@ Options parse_options(int argc, char** argv) {
             o.repeat = std::atoi(argv[++i]);
         } else if (arg == "--prompt-v2") {
             o.prompt_v2 = ints(value());
+        } else if (arg == "--unpack") {
+            o.unpack = std::atoi(value().data()) != 0;
         } else if (arg == "--help") {
-            std::printf("infernix_qsa_attention_bench [--storage bf16,int8,fp8,nvfp4,k8v4,vq2,k4v2] "
-                        "[--contexts 8192,131072] [--widths 1,5] [--warmup N] [--repeat N] [--prompt-v2 0,1,1,0]\n"
-                        "  --prompt-v2: TEMPORARY, the prompt kernel's variants timed per case in this order "
-                        "(0 combined gather, 1 split K/V stage; default: INFERNIX_TMP_QSA_PROMPT_V2)\n");
+            std::printf("infernix_qsa_attention_bench [--storage bf16,bf16p,int8,fp8,nvfp4,k8v4,vq2,k4v2] "
+                        "[--contexts 8192,131072] [--widths 1,5] [--warmup N] [--repeat N] [--prompt-v2 0,1,1,0] "
+                        "[--unpack 0|1]\n"
+                        "  --prompt-v2: the prompt kernel's variants timed per case in this order "
+                        "(0 combined gather, 1 split K/V stage, -1 the storage's default; default -1)\n"
+                        "  --unpack: bf16p calls get qsa_attention's unpack scratch (default 1)\n");
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown option " + std::string(arg));
@@ -128,6 +135,15 @@ Options parse_options(int argc, char** argv) {
 DeviceBuffer filled(std::size_t bytes, std::uint64_t seed) {
     // Fixture BF16 values in [0.002, 0.01]: finite under every storage's interpretation.
     return bench::make_bf16((bytes + 1) / 2, seed, 0.002F, 0.01F);
+}
+
+// Packed BF16 rows (ops/kv_cache/bf16p_codec.cuh) as real KV packs: the fixture's code bytes, exponent nibbles
+// 0..7 over base 120 (magnitudes 2^-7 .. 1), no escapes or zeros (real rows hold 0.05-0.08 escapes on average).
+__global__ void packed_fixture(std::uint8_t* rows, std::uint8_t* sides, unsigned count) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) { return; }
+    for (int b = 256; b < 384; ++b) { rows[std::size_t{i} * 384 + b] &= 0x77; }
+    for (int b = 0; b < 8; ++b) { sides[std::size_t{i} * 8 + b] = b == 0 ? 120 : 0; }
 }
 
 Tensor plane(const DeviceBuffer& b, DType dtype, int leading, int pages) {
@@ -143,8 +159,9 @@ struct Case {
     ops::QsaBatch batch;
     ops::QsaAppend append;
     bool vq = false;
+    DeviceBuffer unpacked; // packed BF16 with --unpack 1: qsa_attention's unpack scratch
 
-    Case(KvCacheStorage storage, int width_, int context_) : width(width_), context(context_) {
+    Case(KvCacheStorage storage, int width_, int context_, bool unpack) : width(width_), context(context_) {
         pages                = (context + kPage - 1) / kPage;
         const auto layout    = paged_kv_storage_layout(storage, kD);
         const auto bytes     = [&](DType t, int leading) {
@@ -166,6 +183,15 @@ struct Case {
             layer.kv.v_scale_pages =
                 plane(vs, layout.value.scale_dtype, layout.value.scale_leading_extent, pages);
         }
+        if (storage == KvCacheStorage::Bf16Packed) {
+            const unsigned rows_n = static_cast<unsigned>(kPage) * kKvHeads * pages;
+            for (auto [data, side] : {std::pair{&k, &ks}, std::pair{&v, &vs}}) {
+                packed_fixture<<<(rows_n + 255) / 256, 256>>>(static_cast<std::uint8_t*>(data->p),
+                                                              static_cast<std::uint8_t*>(side->p), rows_n);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
         pooled             = bench::make_bf16(static_cast<std::size_t>(kDi / kR) * kPage * pages, 15);
         layer.pooled_pages = Tensor(pooled.p, DType::BF16, {kDi / kR, kPage, 1, pages});
         q                  = bench::make_bf16(static_cast<std::size_t>(kD) * kHeads * width, 16);
@@ -175,7 +201,7 @@ struct Case {
         for (int j = 0; j < width; ++j) { position[j] = context - width + j; }
         const auto upload = [](const std::vector<std::int32_t>& h) {
             DeviceBuffer d(h.size() * sizeof(std::int32_t));
-            CUDA_CHECK(cudaMemcpy(d.p, h.data(), d.bytes, cudaMemcpyHostToDevice));
+            bench::upload(d.p, h.data(), d.bytes);
             return d;
         };
         tables    = upload(table);
@@ -212,13 +238,17 @@ struct Case {
         workspace_bytes = ops::qsa_attention_workspace_bytes(kGeometry, width, pages * kPage, storage);
         workspace       = DeviceBuffer(workspace_bytes);
         out             = DeviceBuffer(static_cast<std::size_t>(kD) * kHeads * width * 2);
+        if (storage == KvCacheStorage::Bf16Packed && unpack) {
+            unpacked = DeviceBuffer(ops::qsa_attention_unpack_bytes(kGeometry, pages * kPage));
+        }
     }
 
     void attention(cudaStream_t s) {
         Tensor o(out.p, DType::BF16, {kD, kHeads, width});
         ops::qsa_attention(Tensor(q.p, DType::BF16, {kD, kHeads, width}),
                            Tensor(iq.p, DType::BF16, {kDi, kIndexHeads, width}), layer, batch, kGeometry,
-                           1.0F / 16.0F, pages * kPage, workspace.p, workspace_bytes, o, s, vq ? &append : nullptr);
+                           1.0F / 16.0F, pages * kPage, workspace.p, workspace_bytes, o, s, vq ? &append : nullptr,
+                           unpacked.p);
     }
 
     // The selection qsa_attention runs first, into the head of the same workspace layout.
@@ -260,17 +290,16 @@ int main(int argc, char** argv) {
         std::printf("%s\n", temporary_switches::describe(temporary_switches::Scope::Qwen4Exp).c_str());
         std::printf("storage context width v2   total_us  select_us  attention_us  (median of %d, cold L2, graph)\n",
                     options.repeat);
-        const bool process_v2 = ops::detail::qsa_prompt_v2();
         for (const auto storage : options.storages) {
             for (const int context : options.contexts) {
                 for (const int width : options.widths) {
-                    Case data(storage, width, context);
+                    Case data(storage, width, context, options.unpack);
                     try {
                         const auto select = time(flush, stream, options.warmup, options.repeat,
                                                  [&](cudaStream_t s) { data.selection(s); });
                         for (const int variant : options.prompt_v2) {
-                            const bool v2 = variant < 0 ? process_v2 : variant != 0;
-                            ops::detail::qsa_prompt_set_v2(v2);
+                            ops::detail::qsa_prompt_force(variant);
+                            const bool v2 = ops::detail::qsa_prompt_split(storage);
                             const auto total = time(flush, stream, options.warmup, options.repeat,
                                                     [&](cudaStream_t s) { data.attention(s); });
                             std::printf("%-7s %7d %5d %2d %10.2f %10.2f %13.2f\n", storage_name(storage), context,
@@ -278,7 +307,7 @@ int main(int argc, char** argv) {
                                         total.median_us - select.median_us);
                             std::fflush(stdout);
                         }
-                        ops::detail::qsa_prompt_set_v2(process_v2);
+                        ops::detail::qsa_prompt_force(-1);
                     } catch (const std::invalid_argument& e) {
                         std::printf("%-7s %7d %5d unsupported: %s\n", storage_name(storage), context, width,
                                     e.what());

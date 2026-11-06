@@ -4,6 +4,7 @@
 #include "models/qwen3_5/vision_config.h"
 #include "models/registry.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -302,8 +303,15 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         }
         out.text.lossless         = options.lossless;
         out.text.design_reference = options.lossless && options.reference;
-        out.text.design_kv        = out.text.design_reference ? options.reference_kv : KvCacheStorage::BFloat16;
-        out.text.moe.a16_experts = out.text.moe.a4_optional ? !options.expert_a4_activations : !scales;
+        // Packed BF16 KV stores bf16's values exactly: the design reference reads it as bf16 (no codec).
+        out.text.design_kv = out.text.design_reference && options.reference_kv != KvCacheStorage::Bf16Packed
+                                 ? options.reference_kv
+                                 : KvCacheStorage::BFloat16;
+        // Banks that are W4A4 by their checkpoint (scales, not optional) run 16-bit activations only when asked
+        // (--a16-activations, or --a8-activations, whose 8-bit route runs on the 16-bit banks).
+        out.text.moe.a4_native   = scales && !out.text.moe.a4_optional;
+        out.text.moe.a16_experts = out.text.moe.a4_optional ? !options.expert_a4_activations
+                                                            : !scales || options.expert_a16_activations;
         if (options.rope_yarn_factor > 1.0F && out.text.rope.theta <= 1.0F) {
             throw ArtifactError("YaRN needs a RoPE theta above 1");
         }
@@ -326,6 +334,14 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
                 throw ArtifactError("the artifact has no MTP component");
             }
             out.mtp = options.mtp();
+            // The drafter pool's slots (LoadOptions::mtp_expert_pool), measured best per bank kind (2026-10-27, MTP
+            // decode with three drafts, ABBA): GGUF imports 128 (IQ3_S +4.0 %; 256 +1.1 %), NVFP4 banks 256 (Dense8
+            // +1.9 %; 128 -0.5 %). At least top_k + 2 (a swap holds a slot out of the route, two at a time at most).
+            const std::uint32_t experts = out.text.moe.experts;
+            const std::uint32_t slots   = out.text.ggml_weights ? 128U : 256U;
+            if (out.mtp && options.mtp_expert_pool && slots < experts) {
+                out.mtp_expert_slots = std::min(experts - 1, std::max(slots, out.text.moe.top_k + 2U));
+            }
             if (options.proposal_head == ProposalHead::Optimized) {
                 const auto& proposal = directory.component("text").proposal;
                 if (!proposal || !proposal->indexed || proposal->rows == 0 ||
@@ -413,6 +429,16 @@ DFlash2Config parse_dflash2_config(const artifact::Directory& companion, const T
         return out;
     } catch (const std::exception& error) {
         throw ArtifactError(std::string("DFlash2 companion config: ") + error.what());
+    }
+}
+
+bool dflash2_companion_fits(const artifact::Directory& companion, const artifact::Directory& target) noexcept {
+    try {
+        if (!companion.companion || !target.components.contains("text")) { return false; }
+        (void)parse_dflash2_config(companion, text(target.component("text").config));
+        return true;
+    } catch (...) {
+        return false;
     }
 }
 

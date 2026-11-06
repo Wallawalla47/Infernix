@@ -55,7 +55,7 @@ same source builds in an NInfer checkout for a like-for-like comparison.
 
 ## 3. Recorded results
 
-Measured on 2026-10-05 on an RTX 5090 (CUDA 13.4, Windows), Gold-Star-Infer at `5fbfc3db` against
+Measured on 2026-10-05 on an RTX 5090 (CUDA 13.4, Windows), Gold-Star-Infer at `f40fca5f` against
 NInfer `68c54356` plus the Windows port (with only a `--prefill-chunk` option added to its
 perplexity tool), official Qwen3.8-27B NVFP4 artifact unless stated. The reference in these runs
 lifted only the 4-bit (MLP) sites to 16-bit activations; sites that run 8-bit activations (FP8
@@ -178,7 +178,7 @@ saving (at least 3x), or index-plane pressure the deployed contexts do not have:
 per lane at 256K and 832 MiB at 1M, against an expert pool of roughly 8,300 frames ([the design
 record](qwen3_8-flash-next-design.md) §4.2). The bar's numbers come from a CPU-only prototype over
 captures from the fork's engine revision `51601ea2` (2026-10-13, a descendant of this repository's
-`bbc2771c`), not from the GPU measurement the rest of this section describes; scan time was not
+`7a876856`), not from the GPU measurement the rest of this section describes; scan time was not
 measured and was deliberately non-gating.
 
 ## 4. Qwen3.8-Flash-Next: NVFP4 artifact against the Unsloth UD-Q4_K_XL GGUF
@@ -194,7 +194,7 @@ measurements**: no UD-Q4_K_XL support exists in Infernix.
 
 Teacher-forced on identical token ids
 ([design §16.5](qwen3_8-flash-next-design.md#165-precision-boundaries-and-measured-quality-2026-10-04-rtx-5090)),
-recorded 2026-10-07. Infernix ran recipe B (`e3be72cde`) with INT8 KV; Strata 0.1.40 ran UD-Q4_K_XL
+recorded 2026-10-07. Infernix ran recipe B (`c2e3735ba`) with INT8 KV; Strata 0.1.40 ran UD-Q4_K_XL
 with INT8 KV. The texts were 2,557 positions of code, a document and a chat transcript, all ≤ 1,024
 tokens.
 
@@ -373,8 +373,9 @@ standard a path is certified against is under revision and is not published here
   there and a draft is accepted exactly when it equals it. The default route keeps speculative
   rejection sampling (same distribution, other text for a seed). The real test
   `infernix_qwen3_5_speculation_invariance_real_test` checks MTP, DFlash2 and DFlash2 with n-gram
-  proposals (or the drafters it is given) against one plain run, greedy and sampled, and that a
-  raw one-token prompt verifies drafts too.
+  proposals (or the drafters it is given) against one plain run, greedy and sampled, also with
+  presence penalty 1.5 and frequency penalty 0.3 for those three drafters, and that a raw
+  one-token prompt verifies drafts too.
   Prompt and decode need not agree with each other. An option
   whose effect depends on load (lossy Host-tier prefix state, whose use depends on eviction) is
   refused with `--reproducible` at startup, never silently overridden. A
@@ -402,7 +403,9 @@ standard a path is certified against is under revision and is not published here
   whether the routed experts take 4-bit activations, and the KV format. A configuration names
   kernels, never a checkpoint, so every artifact that runs the same kernels shares its paths. A path runs only
   in the configurations the registry (6.7) lists, so each configuration gets the fast paths that
-  meet its own budget and no others; startup logs the selection (`fast paths | ...`) and
+  meet its own budget and no others; startup logs how many run and whether outputs stay
+  request-invariant (`fast paths | on (N) | ...`), `--log-level debug` names them and the
+  configuration (`fast paths | <names> | qualified for <configuration>`), and
   `LoadSummary::fast_paths` reports it. A fast path stays deterministic for a fixed configuration
   and keeps every invariant the exact route guarantees: exact token constraints, sampling and
   speculative acceptance; Replay recovery and prefix-cache equivalence; masked-prefix and
@@ -494,41 +497,42 @@ their request-coupling paths are listed like the others (since 2026-10-22). The 
 | Fast path | Kernels run with | Qualified configurations |
 |---|---|---|
 | `decode-split64` | INT8 KV, 24 query heads | NVFP4 27B and groupwise 27B, INT8 KV |
-| `prompt-pv8` | INT8 KV (fast prompt kernel), NVFP4 KV (fast kernel), K8V4, VQ2, K4V2 KV | NVFP4 27B, groupwise 27B and 35B-A3B, with INT8, NVFP4, K8V4, VQ2 or K4V2 KV |
+| `prompt-pv8` | INT8 KV (fast prompt kernel), NVFP4 KV (fast kernel), K8V4, VQ2, K4V2 KV | NVFP4 27B, groupwise 27B and 35B-A3B, with INT8, NVFP4, K8V4, VQ2 or K4V2 KV; 32 heads, 8-bit activations, offloaded experts (Qwen3.5-122B-A10B and Ornith-1.5-122B) with INT8, NVFP4, K8V4, VQ2 or K4V2 KV, by the owner's rule ahead of its gate, where measured faster: Ornith pp65536 INT8 +1.37 %, NVFP4 +2.37 %, K8V4 +2.73 %, VQ2 +0.66 %, K4V2 +0.88 % (2026-11-03, 2 of 2 runs each, an arm's runs within 0.1 %; `gdn-f16-accumulate` level there, +0.01 %) |
 | `batched-decode`, `batch-split-attention` | every Qwen3.5 artifact | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `single-column-decode` | Qwen3.5 artifacts without `batched-decode`: decode and verify calls of one column | groupwise 27B, every format (2026-10-22, below); not the 35B-A3B (1 % slower at four requests) |
 | `batched-a8-decode`, `batched-a4-decode` | the same, with 8-bit (FP8) or 4-bit (NVFP4) activations | `batched-a8-decode`: 24 heads, 4-bit activations, every KV format, by the owner's decision (2026-10-24) although it fails (below); `batched-a4-decode`: none (fails, below) |
 | `batched-a4-residual-decode` | the same, with 4-bit (NVFP4) MLP activations | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `batched-a8-residual-decode` | the same, with 8-bit (FP8) input-projection activations | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2); groupwise 27B and 35B-A3B, every format (2026-10-22, below) |
-| `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2); groupwise 27B and 35B-A3B, every format (2026-10-22, below) |
-| `preemption` | every Qwen3.5 artifact | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2); groupwise 27B and 35B-A3B, every format (2026-10-22, below) |
-| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8, IQ3_S, FP8, recipe A, recipe C (since 2026-10-21) and NVIDIA FP4-Local (16- and 4-bit expert activations), every format |
-| Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
+| `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2); groupwise 27B and 35B-A3B, every format (2026-10-22, below); 32 heads, 8-bit activations, offloaded experts (the 122Bs), every format, by the owner's rule ahead of its gate, where measured faster: Ornith continuing-turn TTFT after a 15,027-token turn 1.65-1.69 s -> 0.35-0.44 s (2026-11-03, INT8 KV, 4 of 4 conversations; where a cache resumes does not depend on the KV format) |
+| `preemption` | every Qwen3.5 artifact | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2); groupwise 27B and 35B-A3B, every format (2026-10-22, below); 32 heads, 8-bit activations, offloaded experts (the 122Bs), every format, by the owner's rule ahead of its gate, where measured faster: Ornith, a 16,640-token pool, four 3,027-token prompts reserving 4,096 tokens, wall 9.25-9.28 s -> 8.88-8.95 s, the queued requests' TTFT 5.4 / 7.0 s -> 3.1 / 4.2 s (2026-11-03, INT8 KV, 2 of 2 servers, the same replies) |
+| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8 (4- and 16-bit expert activations), IQ3_S, FP8, recipe A, recipe C (since 2026-10-21) and NVIDIA FP4-Local (16- and 4-bit expert activations), every format |
+| Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves); Q8 dense, 16-bit experts (Dense8 under `--a16-activations` or `--a8-activations`), below |
 | `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, every KV format (INT8 fails its decode tail, below; registered by the owner's decision, 2026-10-24) |
-| `fp8-a8-pair-block32` | the same, its two terms scaled per 32-value block (it takes precedence over `fp8-a8-pair`) | wherever `fp8-a8-pair` is, by the owner's decision (2026-10-25) ahead of its gate: tied in speed (recipe C, INT8 KV, pp4096 and pp16384 within 0.03 %, 4 blocks) and never less precise (a value is exact within 2^14 of its block's maximum instead of its column's) |
-| `q5-ksplit-mma`, `fp16-gdn-state` (Qwen3.5) | the groupwise artifacts' Q5 projections; every GDN state pool | by the owner's decision (2026-10-25) ahead of their gates, where measured faster with INT8 KV (MTP 3 decode, 3 blocks): groupwise 27B `q5-ksplit-mma` +4.5 % and `fp16-gdn-state` +0.7 %, NVFP4 27B `fp16-gdn-state` +0.7 %; not the 35B-A3B (no gain beyond spread) |
-| `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
+| `fp8-a8-pair-block32` | the same, its two terms scaled per 32-value block (it takes precedence over `fp8-a8-pair`) | wherever `fp8-a8-pair` is, by the owner's decision (2026-10-25) ahead of its gate: tied in speed (recipe C, INT8 KV, pp4096 and pp16384 within 0.03 %, 4 blocks) and never less precise (a value is exact within 2^14 of its block's maximum instead of its column's); its route runs on FP4-Local's MXFP8 dense prefill under the `--a8-activations` opt-in only |
+| `q5-ksplit-mma`, `fp16-gdn-state` (Qwen3.5) | the groupwise artifacts' Q5 projections; every GDN state pool | by the owner's decision (2026-10-25) ahead of their gates, where measured faster with INT8 KV (MTP 3 decode, 3 blocks): groupwise 27B `q5-ksplit-mma` +4.5 % and `fp16-gdn-state` +0.7 %, NVFP4 27B `fp16-gdn-state` +0.7 %; not the 35B-A3B (no gain beyond spread). The same configurations with FP8, NVFP4, K8V4, VQ2 and K4V2 KV by the owner's decision (2026-11-01: a path registered on INT8 KV runs on every format below its precision; neither path reads the KV cache) |
+| `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below); its route runs under the `--a8-activations` opt-in only |
 | `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | NVFP4 27B, groupwise 27B and 35B-A3B, every format |
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format |
 | `adaptive-dflash` | Qwen3.8-27B / Qwen3.6-35B-A3B with DFlash or DFlash2 and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format (2026-10-22, below); not the groupwise 27B |
 | `gdn-tree-closed-form` | tree rounds' GDN records of at most 16 columns (wider rows walk) | NVFP4 27B and 35B-A3B, every format, by the owner's decision (2026-10-25) ahead of its gate, where measured faster (ABBA, INT8 KV, greedy pp1280+tg256, fixed trees of 16, 6 blocks): NVFP4 27B DFlash2 decode +1.19 % (6 of 6, at least +1.01 %), 35B-A3B DFlash rounds 1.0-1.7 % shorter in 6 of 6 (decode +1.6 % where the greedy text matched); its kernel 0.65-0.93 of the walk's time at 1-4 rows (`gdn_replay_bench --component tree`) |
 | `block-verification` | sampled chain rounds (DFlash2, sampled MTP) | none: re-timed after its keys were made round-unique (2026-10-25, ABBA, sampled, 6 blocks): Dense8 MTP no resolved difference (median +1.9 %, worst -14.9 %), Dense8 DFlash2 `auto` -14.2 % (6 of 6 worse), NVFP4 27B DFlash2 7 no resolved difference (median -0.1 %, worst -4.8 %) |
+| `expert-a4-residual` (Qwen3.5) | Qwen3.5-122B-A10B's offloaded NVFP4 W4A16 experts, expert calls of more than eight columns | 32 heads, 8-bit (FP8) activations, offloaded experts (Qwen3.5-122B-A10B and Ornith-1.5-122B), every KV format, by the owner's rule (2026-10-25) ahead of its gate, where measured faster: Ornith MTP decode +2.0 % (ABBA, RTX 5090, 2026-10-28, 4 of 4 pairs, worst +1.69 %); only the experts' wide calls change, so every format |
 | Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with NVFP4 W4A16 experts (recipe C; NVIDIA FP4-Local at its default 16-bit expert activations), expert calls of more than eight columns | FP8 dense (recipe C) and MXFP8 dense (FP4-Local, by recipe C's kernel verdicts and its own timing), 16-bit expert activations, every KV format (BF16 by FP4-Local's gates against the precise reference, below) |
 | Qwen3.8-Flash-Next: `expert-a4-residual-3` | the same calls as `expert-a4-residual`, three NVFP4 terms per x and h row (its more precise form, design §19.3.23; it takes precedence where both are selected) | none: two terms pass on every configuration and format they run in (2026-10-21), so it stays an unregistered candidate (`--fast-path expert-a4-residual-3`) for a cell where two terms fail; three terms cost 7-8 points of prefill speed (below) |
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
 | Qwen3.8-Flash-Next: `dflash2-pairs` | two-row rounds with the DFlash2 drafter (`--spec dflash2 --draft-model`) | every Flash-Next configuration, every format, by the owner's decision (2026-10-24) ahead of its gate (not run); timed on Dense8, two requests, INT8 KV: decode +28 % median, 4 of 4 blocks |
-| Qwen3.8-Flash-Next: `screened-lm-head`, `f16-accumulate-prefill` | greedy decode and verification rounds of at most 16 columns through the LM head's 2-bit screen (artifacts with `--screen-heads`); FP8, MXFP8 and Q8 dense prefill calls of 256+ columns | NVIDIA FP4-Local (MXFP8 dense, 16-bit experts), INT8 KV, by the owner's decision (2026-10-25) ahead of their gates: `screened-lm-head` plain decode +7.5 %, MTP 3 +3.7 % (4 of 4 blocks); `f16-accumulate-prefill` pp32768 +5.3 % (3 of 3), pp4096 neutral; not Dense8 or recipe C (no gain beyond spread) |
-| Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S, every format (BF16 KV since 2026-10-20, against the precise reference; below) |
+| Qwen3.8-Flash-Next: `screened-lm-head`, `f16-accumulate-prefill` | greedy decode and verification rounds of at most 16 columns through the LM head's 2-bit screen (artifacts with `--screen-heads`); FP8 and MXFP8 dense prefill calls of 256+ columns | NVIDIA FP4-Local (MXFP8 dense, 16-bit experts), INT8 KV, by the owner's decision (2026-10-25) ahead of their gates: `screened-lm-head` plain decode +7.5 %, MTP 3 +3.7 % (4 of 4 blocks); `f16-accumulate-prefill` pp32768 +5.3 % (3 of 3), pp4096 neutral. FP4-Local with `--expert-a4-activations` (4-bit experts, the same head and dense kernels) since 2026-11-02, where measured faster on INT8 KV: `screened-lm-head` plain decode +6.6 % (2 of 2), the struct fixture with DFlash2 +2.3 % (3 of 3, the same text and rounds); `f16-accumulate-prefill` pp32768 +5.7 % (2 of 2), pp1024 and pp4096 within their spread. Both configurations with FP8, NVFP4, K8V4, VQ2 and K4V2 KV by the owner's decision (2026-11-01: a path registered on INT8 KV runs on every format below its precision; neither path reads the KV cache); not recipe C (no gain beyond spread); Dense8's Q8 route was removed (2026-10-28: pp32768 0.984x, pp65536 0.981x) |
+| Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 512+ columns (the stage-decode tiles since 2026-10-28; the planes from 14,336 columns before, which the gates measured) | IQ3_S, every format (BF16 KV since 2026-10-20, against the precise reference; below) |
 | `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B, FP8 and IQ3_S, every format (FP8 with BF16 KV by its prefill gate against the precise reference, 2026-10-21; IQ3_S with BF16 since 2026-10-20, below); not the 35B-A3B, Dense8 or FP4-Local (no gain beyond spread, below; recipe C and recipe A are timed in the 2026-10-20 queue) |
 
 **`sampled-mtp-drafts`: drafts drawn from the draft head's top four tokens (Flash-Next, qualified
 2026-10-17).** It changes no logit: a sampled request's drafts are drawn from the head's four most
 probable tokens under its sampler and verified by sparse rejection sampling against that proposal,
-and its rounds verify every draft (no `--spec-min-p` cut). The output distribution stays the
+and its rounds verify every draft (no cumulative cut). The output distribution stays the
 sampler's, but a seeded request's text changes, so it cannot be the exact route; greedy requests
 keep the argmax drafts. Its gate is therefore the distribution, not the model-level arms
-(`tests/models/qwen4_exp/test_sampled_drafts_real.cpp`, Dense8, INT8 KV, exact route otherwise):
+(`tests/models/qwen4_exp/test_speculative_sampling_real.cpp`, Dense8, INT8 KV, exact route otherwise):
 2,000 seeded requests x 8 tokens per arm at T 1.0 / top-p 0.95 / top-k 20, two-sample chi-square
 against plain decoding at each position and jointly for the first two tokens (family alpha 1e-3,
 Bonferroni 1.1e-4): sampled drafts least p 0.21 (7,115 rounds, 5,717 of 12,545 drafts accepted),
@@ -620,7 +624,7 @@ the Engine, and each acts only where the artifact can be request-invariant
   columns, and fails. The 4-bit activations alone add two thirds of the floor at every prompt
   length. Perplexity cannot see either: the NLL excess is negative in every arm.
 - `batched-a4-residual-decode`: with `batched-decode`, wide rounds of the NVFP4 MLP projections
-  (gate/up and down from 9 columns) quantize each column's activations into NVFP4 terms that
+  (gate/up and down from 5 columns) quantize each column's activations into NVFP4 terms that
   sum to it, the first being the 4-bit encoding and each later one the NVFP4 encoding of what the
   earlier ones left (`LinearPolicy::AllowA4Residual`), and multiply every term by the same weight
   tile into one accumulator. Weight traffic is the 4-bit route's; the activation error is roughly
@@ -653,8 +657,18 @@ Qwen3.8-Flash-Next decodes request-invariant at every batch already (its plain a
 output was identical across concurrency 1-8 and to plain decode, 2026-10-14), so only three apply
 (`ProgramOptions` holds them): `adaptive-speculation` is its two-row MTP rounds, which share one
 draft length chosen from both rows (without it two rows decode plain, as three or more do);
-`free-cache-resume` is prefill calls, taps and resumes off its 16-token GDN sub-chunk grid,
-sibling coalescing, and endpoints and blocks holding decode-computed state; `preemption` as above.
+`free-cache-resume` is prefill calls, taps and resumes off the prefill-chunk grid, sibling
+coalescing off it, and endpoints and blocks holding decode-computed state; `preemption` as above.
+Without it the exact route taps, coalesces and resumes only on the prefill-chunk grid, so a resumed
+prefill runs the cold prefill's calls. Until 2026-10-27 it used the 16-token GDN grid, assuming every
+prefill route width-invariant; several are not (GDN: the decode update at one column, the recurrent
+kernel to 15, the chunked kernel from 16; Q8 dense SIMT to 8 columns, MMA tiles beyond; BF16 dense by
+width; QSA attention split or unsplit; the hyper-connection mix fused at decode widths), and a resume
+at a prompt's end left the cold bits (`infernix_qwen4_exp_resume_cold_real_test`: mean |dlogprob|
+0.0011). Width-invariant prefill routes would restore 16-token resumes (planned). Wide calls over one
+grid already are: prompts whose calls of 1,024 to 12,288 tokens start on the same grid and end in the
+same last call gave the same bits on every Flash-Next configuration and KV format
+(`infernix_qwen4_exp_prefill_width_real_test`, 2026-10-31; design, the prefill chunk fit).
 Its kernel path `q8-sliced-k` (below) couples requests too: its routes depend on the round's width;
 so does `ggml-bf16-prefill`, whose routes depend on a prompt's call boundaries and MoE grouping.
 
@@ -797,7 +811,17 @@ Recipe A (BF16 dense, 4-bit experts) is registered for the three coupling paths 
 without runs of its own, at the owner's request (2026-10-18): `free-cache-resume` takes FP8's timing
 (the same dense kernels), `adaptive-speculation` Dense8's and IQ3_S's (4-bit experts streamed as
 Dense8's), `preemption` IQ3_S's and FP8's, and the quality verdicts Dense8's. Its exact-route
-equivalences were not run on the artifact. Recipe C first failed (2026-10-18): its real tests
+equivalences were not run on the artifact.
+
+Dense8 at 16-bit expert activations (Q8 dense, 16-bit experts: NVIDIA's W4A4 banks loaded as 16-bit
+banks under `--a16-activations`, and `--a8-activations`, which takes its 8-bit route from there) is
+registered for Dense8's paths (`adaptive-speculation`, `dflash2-pairs`, `free-cache-resume`,
+`preemption`, `sampled-mtp-drafts`, `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused`) by the
+kernel rule (6.1, item 2), without runs of its own (2026-10-31): those paths change only the dense,
+attention, GDN and scheduling kernels, which are Dense8's at either expert precision, and the experts'
+W4A16 kernels are the ones recipe C and FP4-Local qualified. Without these entries the options dropped
+every path: the agentic replay reused 63 % of prompt tokens from the cache instead of 84 % (no endpoint
+snapshots) and decoded 21 % fewer rounds a second. Recipe C first failed (2026-10-18): its real tests
 diverged on the exact route at token 29 (a resumed request against a cold one, and concurrent
 against solo), so its exact route was not request-invariant, and its joint gate failed the p99.9 KL
 ratio (1.33) against the 16-bit reference. A bisect (2026-10-20, plain decode at
@@ -927,7 +951,7 @@ does not fall with a third term. The plain arm never reaches 9 columns, so it al
 `batched-decode` after its [5120, 17408] down tile changed (8 K-warps at 5-16 columns, 35.6-51.8
 against 41.6-60.8 us). That tile is `batched-decode`'s own route (`ops::LinearRoutes::WideDownTile`,
 decode and verification rounds only): until 2026-10-18 it also served exact-route prefill calls of
-5-16 columns, an unqualified exact-route numerics change since `1fe367b4`, and those now run the
+5-16 columns, an unqualified exact-route numerics change since `4fe28055`, and those now run the
 release's 4 K-warp tiles again. Every arm passes, jointly with the paths above:
 
 | 27B, KV | Arm | TV excess (bound) / budget | Top-1 excess, points (bound) / budget | KL excess / cap |
@@ -1043,7 +1067,9 @@ of the CLI and server, the default route now runs the qualified fast paths.
 resume) on both routes. Where a path is not listed, the default route runs its request-invariant
 counterpart, which costs decode throughput (27B: 10 % at one request, 6-12 % at two to eight),
 prefix-cache reuse (no endpoints, so a conversation's next turn resumes from its last grid tap
-and recomputes the previous output) or admission (whole extents held without `preemption`).
+and recomputes the previous output, unless the idle-time next-turn prefill already computed it on
+the grid, [hybrid prefix cache](hybrid-prefix-cache-spec.md) §7.9) or admission (whole extents held
+without `preemption`).
 
 **`decode-split64`: INT8 KV decode attention, 64-key splits.** Measured on 2026-10-13 on an RTX
 5090 (CUDA 13.4, Windows).
@@ -1248,7 +1274,7 @@ and recomputes the previous output) or admission (whole extents held without `pr
   rewrite prompts at two streams 0 of 960 (27 copy rounds); 35B-A3B one request 55 of 960 against 48
   for fixed 7-draft chains (2026-10-21), two streams with plain 3-draft batches 54 of 960 (worst
   1.63).
-- **Speed** (RTX 5090, INT8 KV, main 0e91f862, `infernix_decode_quality_gen` with N workers keeping
+- **Speed** (RTX 5090, INT8 KV, main 560b4e51, `infernix_decode_quality_gen` with N workers keeping
   N requests decoding: 1,280-token slices of Infernix's code continued greedily and of its Markdown
   docs sampled at temperature 1 with top-k 20 and top-p 0.95, 384 tokens each; 24 slices on the
   27B, 48 on the 35B-A3B; wall-clock tok/s):
@@ -1315,8 +1341,8 @@ and recomputes the previous output) or admission (whole extents held without `pr
   2048 and 1024 tokens, each clamped and rounded to whole prompt-attention waves as the chunk is
   (3584 and 1792 on the RTX 5090 with 24 heads), then down to a multiple of the chunk, and keeps
   the widest whose larger prefill buffers and workspace keep the KV capacity (an explicit one
-  whole, an automatic one down to every lane's full context); the `fast paths |` startup line
-  reports it. Beside a lane that waits to decode the step stays one chunk, so that lane's stall
+  whole, an automatic one down to every lane's full context); the debug `fast paths |` startup
+  line reports it. Beside a lane that waits to decode the step stays one chunk, so that lane's stall
   is unchanged. Only the pass boundaries move, and every boundary stays on the chunk grid from the
   step's start: a wide step ends where a chunk-wide prefill would realize the lane's next flexible
   prefix-cache tap, and exact taps split it where they split a chunk, so snapshots land at the same
@@ -1373,8 +1399,11 @@ and recomputes the previous output) or admission (whole extents held without `pr
 - **What changes:** `q8-sliced-k` runs NInfer's GEMV, sliced-K and grouped sliced-K tables for the
   Q8 [16384, 2560] GDN projection and the [2560, 6144] GDN and QSA output projections, where they
   are faster than the exact routes (above T = 128, and at T = 321-384 and 449-511 on [16384,
-  2560], they keep the exact routes). Their reduction order depends on the call's width, so it
-  couples a request's decode to the other requests of its round (`request_invariant` is false).
+  2560], they keep the exact routes), and since 2026-11-03 sliced-K tiles for the hyper-connection
+  [324, 10240] and [320, 10240] projections at 65-1,344 and 65-2,048 columns (candidates NQ-01: the
+  q8 oracle test at every route seam; no model-level arm was run for them). Their reduction order
+  depends on the call's width, so it couples a request's decode to the other requests of its round
+  (`request_invariant` is false).
   `gdn-conv-fused` feeds plain decode's GDN convolution the projection's FP32 q/k/v; and
   `qsa-prepare-fused` keeps FP32 between the QSA layer's norm, rotation and append steps. With them
   MTP output no longer equals plain decode.
@@ -1467,7 +1496,7 @@ and recomputes the previous output) or admission (whole extents held without `pr
   decode (MTP at concurrency 2, 256 segments) TV excess 4.4e-4 (bound 8.0e-4), top-1 7.9e-4
   (3.1e-3), KL 2.7e-4, p99.9 ratio 0.97. It is registered on BF16 KV for FP4-Local and recipe C; the
   KV format does not enter the expert kernels, so each one's timing holds there.
-- **Speed:** `infernix_bench` INT8 KV, chunk 4,096, ABBA (2026-10-14/15, before main 2ec268c2,
+- **Speed:** `infernix_bench` INT8 KV, chunk 4,096, ABBA (2026-10-14/15, before main 952587ce,
   whose changes leave recipe C's route alone): pp4096 1,631 → 1,637 tok/s (level), pp16384 6,175 →
   6,380 (+3.3 %), pp32768 6,620 → 8,803 (+33 %), pp65536 6,730 → 9,067 (+35 %); short prompts are
   bound by the expert stream over the x8 link.
@@ -1584,9 +1613,11 @@ NVFP4, K8V4, VQ2 or K4V2 KV, qualified 2026-10-19; BF16 KV, 2026-10-20).**
   (`ops::ggml_linear`, `LinearRoutes::GgmlBf16Wide`) as BF16 m16n8k16 MMAs with FP32 accumulation over
   the exact route's decoded planes: each code is exact in BF16, x is read as stored, each
   sub-block's FP32 sum is scaled by d · sub (exact in binary32), the K-quants subtract
-  dmin · min · Σx, and κ applies at the end. The GGUF expert banks' MoE calls of 14,336 or more
-  columns run the same tiles over expert planes decoded into the experts' workspace
-  (`WideA16::kGgmlBf16`). The exact route rounds every activation column to 21-bit integers and sums
+  dmin · min · Σx, and κ applies at the end. The GGUF expert banks' MoE calls of 512 or more
+  columns (`WideA16::kGgmlBf16`, `kGgmlStageDecodeMinColumns`) run the same arithmetic on the
+  stage-decode tiles, which decode each K stage of an expert's codes into shared memory: the bits of
+  the expert planes the gates below measured in calls of 14,336 or more columns (planes removed
+  2026-10-28, Flash-Next design §19.3.29). The exact route rounds every activation column to 21-bit integers and sums
   exactly; this one keeps x exact and rounds the sums. A prompt's bits depend on its call boundaries
   and the layer walk's MoE grouping, so it couples requests (`request_invariant` is false). Decode,
   verification and drafting keep their kernels (graph calls never take it).
@@ -1694,7 +1725,8 @@ NVFP4, K8V4, VQ2 or K4V2 KV, qualified 2026-10-19; BF16 KV, 2026-10-20).**
   | NVFP4 | 3.5e-3 / 2.24 % | 3.7e-3 (4.0e-3) / 3.5e-4 | +1.25 (1.38) / 0.22 | 1.3e-3 (1.0013) |
 
   Every criterion fails in both formats (p99.9 KL ratio 11.9 and 2.1), so the path runs in no
-  configuration.
+  configuration. Its route runs under `--a8-activations` (2026-10-27: the lossy opt-in, never a fast path
+  or a default; [design §19.3.31](qwen3_8-flash-next-design.md)), on the groupwise 27B's prefill calls.
 
 ### 6.8 Exact-route numerics changes
 
@@ -1765,12 +1797,12 @@ one prompt came from that text's acceptance (597 rounds against 576, time per ro
 16 prompts of the bench corpus the pooled acceptance length is 2.219 against 2.172 (+2.1 %; per prompt
 +0.030, standard error 0.035; ahead on 9, behind on 6), so it costs nothing.
 
-**35B-A3B Q8 shared-expert prefill (`4f0bb18f`, NInfer `610f79e9d`).** The Q8 gate/up and down
+**35B-A3B Q8 shared-expert prefill (`15602c92`, NInfer `610f79e9d`).** The Q8 gate/up and down
 prefill kernels of `Qwen3.6-35B-A3B` apply each 32-wide group's FP16 scale to the FP32 partial sum
 and pass the SiLU output as a BF16 high/low pair, where the old route rounded each code × scale to
 BF16 before the MMA. Against the FP64 oracle the worst relative L2 error fell 3× (Q4/Q5) and 5× (Q8);
 prefill got 2.3-2.6 % slower, decode is unchanged. It shipped without the model-level gate 6.1 asks
-for; the gate was run on 2026-10-18 (`compare-prefill`, the build before `4f0bb18f` as base and the
+for; the gate was run on 2026-10-18 (`compare-prefill`, the build before `15602c92` as base and the
 current one as candidate, both `--reproducible`; `qwen3_6_35b_a3b.ninfer`, the quick corpus,
 14,336-token windows at stride 7,168, chunks 896-7,168, 36 windows, 1,044,668 positions per route).
 The reference route runs the same shared-expert kernels as the route that writes it, so the gate ran

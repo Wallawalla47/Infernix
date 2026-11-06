@@ -64,6 +64,8 @@ struct MoeParameters {
     LinearParameters shared_down;    // [H, I_shared]
     const ExpertBank* bank = nullptr;
     const ops::offloaded_moe::ExpertScales* device_scales = nullptr; // [E]
+    // A W4A4 bank whose every expert's gate and up input scales are equal (MoeExpertSource::a4_shared_input).
+    bool a4_shared_input = false;
     // The lossless route's (TextConfig::lossless): each NVFP4 matrix's weight multiplier in alpha_* (an
     // A4 bank's alpha also folds in its input scale); [E], null without the route. The design reference
     // (TextConfig::design_reference) adds a W4A4 bank's input scales in input_*.
@@ -130,17 +132,23 @@ struct BlockParameters {
 
 class Parameters {
 public:
-    explicit Parameters(const Model& model);
+    // hc_q8 (--a8-activations, LOSSY, opt-in): on a GGUF import, every block's and the final mixer's BF16
+    // hyper-connection matrices are rewritten in their own bytes as Q8_G32_FP16 RowSplit
+    // (ops::hyper_connection_repack_q8), so each mix reads half the weight bytes; the MTP drafter keeps its own.
+    // Other artifacts keep theirs (the repack was measured faster on a GGUF import only). The Model's views of those matrices are not BF16
+    // afterwards: only these Parameters may read them.
+    explicit Parameters(const Model& model, bool hc_q8 = false);
     ~Parameters();
     Parameters(const Parameters&)            = delete;
     Parameters& operator=(const Parameters&) = delete;
 
     const Model& model;
-    Weight token_embedding; // BF16 (or a GGUF import's IQ4_XS) rows in pinned host memory, read zero-copy
+    Weight token_embedding; // BF16 (packed at load or not; or a GGUF import's IQ4_XS) rows in pinned host memory, read zero-copy
     Tensor output_head; // BF16 [H, V]: one vocabulary row per column (FP32 logits)
-    // Recipe B's 8-bit head (q8_g32_fp16 [V, H], FP32 logits), or a GGUF import's head (ggml blocks,
-    // FP32 logits from ops::ggml_linear); output_head is then empty.
-    std::optional<LinearParameters> output_head_q8;
+    // Recipe B's 8-bit head (q8_g32_fp16 [V, H], FP32 logits), a GGUF import's head (ggml blocks, FP32
+    // logits from ops::ggml_linear) or a BF16 head packed at load (bf16_p12 [V, H], FP32 logits from
+    // ops::projection_fp32); output_head is then empty.
+    std::optional<LinearParameters> output_head_weight;
     // output_head's 2-bit screen (q2_g64_fp16 [V, H]) when bound (the screened-lm-head fast path).
     std::optional<Weight> output_head_screen;
     HyperConnectionParameters final_mixer;
@@ -149,6 +157,7 @@ public:
     std::optional<DFlash2Parameters> dflash2;
     DraftHeadParameters draft_head;
     std::optional<qwen3_5::execution::VisionParameters> vision; // --vision (shared tower types)
+    std::uint32_t hc_q8_repacked = 0; // matrices the hc_q8 repack rewrote
 
 private:
     // Device copy of every layer's ExpertScales, [layers][E], and the lossless route's.

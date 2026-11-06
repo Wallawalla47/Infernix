@@ -9,6 +9,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "core/pdl.cuh"
+#include "ops/kernel/sigmoid_gate_mul_pair.cuh"
 
 #include <cuda_bf16.h>
 
@@ -17,13 +18,6 @@
 namespace infernix::ops {
 
 inline constexpr int kSigmoidGateMulPairsPerThread = 4;
-
-__device__ __forceinline__ __nv_bfloat162 sigmoid_gate_mul_pair(__nv_bfloat162 gate,
-                                                                __nv_bfloat162 x) {
-    const float r0 = __low2float(x) * sigmoid(__low2float(gate));
-    const float r1 = __high2float(x) * sigmoid(__high2float(gate));
-    return __floats2bfloat162_rn(r0, r1);
-}
 
 __global__ void sigmoid_gate_mul_scalar_kernel(const __nv_bfloat16* gate, __nv_bfloat16* x,
                                                std::int64_t n) {

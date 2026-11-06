@@ -224,6 +224,78 @@ void test_quantizer() {
     check(s.scale_word == 0x7E && s.c2[0] == -12 && s.c2[1] == 12, "saturating block");
 }
 
+// The vector forms of SwiGLU and the A4 quantizer against the scalar canonical functions, bit for
+// bit: SwiGLU exhaustively over BF16 gates for a set of up values (zeros, infinities, NaN,
+// subnormals, random), and blocks whose values sit on the E2M1 decision points, carry -0, NaN,
+// infinities, subnormals or saturate, over a block count that leaves a partial group of eight.
+void test_vector_canon() {
+    const moe::CpuIsa isa = moe::best_cpu_isa();
+    if (isa == moe::CpuIsa::kScalar) {
+        std::printf("vector canonical functions: no vector ISA on this host (skipped)\n");
+        return;
+    }
+    std::mt19937 rng(11);
+    std::vector<std::uint16_t> g(65536), u(65536), h(65536);
+    for (std::uint32_t i = 0; i < 65536; ++i) { g[i] = static_cast<std::uint16_t>(i); }
+    std::vector<std::uint16_t> ups = {0x0000, 0x8000, 0x3F80, 0xBF80, 0x7F80, 0xFF80, 0x7FC0, 0xFFC1, 0x0001, 0x8001, 0x7F7F};
+    while (ups.size() < 64) { ups.push_back(static_cast<std::uint16_t>(rng())); }
+    long bad = 0;
+    for (const std::uint16_t up : ups) {
+        std::fill(u.begin(), u.end(), up);
+        moe::swiglu_bf16_n(isa, g.data(), u.data(), 65536, h.data());
+        for (std::uint32_t i = 0; i < 65536; ++i) { bad += h[i] != canon::swiglu_bf16(g[i], up); }
+    }
+    for (int it = 0; it < 16; ++it) {
+        for (std::uint32_t i = 0; i < 65536; ++i) { u[i] = static_cast<std::uint16_t>(rng()); }
+        moe::swiglu_bf16_n(isa, g.data(), u.data(), 65531, h.data()); // a scalar tail of 3
+        for (std::uint32_t i = 0; i < 65531; ++i) { bad += h[i] != canon::swiglu_bf16(g[i], u[i]); }
+    }
+    check(bad == 0, "vector SwiGLU equals canon::swiglu_bf16");
+
+    constexpr int kBlocks = 13;
+    const float grid[] = {0.0F, 0.25F, 0.5F, 0.75F, 1.0F, 1.25F, 1.5F, 1.75F, 2.0F, 2.5F, 3.0F, 3.5F, 4.0F, 5.0F, 6.0F};
+    std::normal_distribution<float> n(0.0F, 1.0F);
+    std::vector<std::uint16_t> v(16 * kBlocks);
+    std::vector<canon::A4Block> q(kBlocks);
+    bad = 0;
+    for (int it = 0; it < 20000; ++it) {
+        const int kind = it % 8;
+        // A power-of-two input scale keeps the decision-point blocks exact; the others take any scale.
+        const float gs = kind <= 2 ? std::exp2(-static_cast<float>(3 + rng() % 10))
+                                   : std::exp2(std::uniform_real_distribution<float>(-12.0F, -2.0F)(rng));
+        for (int b = 0; b < kBlocks; ++b) {
+            // kind 0..2: decision points of x / d with d = e4m3(s) * gs, s from an amax of 6 * gs * 2^k
+            // (an exact E4M3 value, so x / d is the grid value itself); 3: normal; 4: saturating;
+            // 5: tiny (subnormal BF16 and E4M3 scales); 6: specials; 7: all-zero and -0 blocks.
+            const float d = gs * std::exp2(static_cast<float>(static_cast<int>(rng() % 9) - 4));
+            for (int j = 0; j < 16; ++j) {
+                float x = 0.0F;
+                switch (kind) {
+                case 0: case 1: case 2: x = grid[rng() % 15] * d * (rng() % 2 ? -1.0F : 1.0F); break;
+                case 3: x = n(rng) * std::exp2(std::uniform_real_distribution<float>(-8.0F, 8.0F)(rng)); break;
+                case 4: x = n(rng) * 1e30F; break;
+                case 5: x = n(rng) * 1e-38F; break;
+                case 6: x = n(rng); break;
+                default: x = rng() % 2 ? -0.0F : 0.0F; break;
+                }
+                v[16 * b + j] = fixtures::to_bf16(x);
+            }
+            if (kind <= 2) { v[16 * b + rng() % 16] = fixtures::to_bf16(6.0F * d); } // amax 6 d: s = e4m3(d / gs)
+            if (kind == 6) {
+                const std::uint16_t specials[] = {0x7F80, 0xFF80, 0x7FC0, 0xFFC0, 0x8000, 0x0001, 0x7F7F};
+                v[16 * b + rng() % 16] = specials[rng() % 7];
+            }
+        }
+        moe::quantize_a4(isa, v.data(), 16 * kBlocks, gs, q.data());
+        for (int b = 0; b < kBlocks; ++b) {
+            const canon::A4Block r = canon::quantize_a4_block(&v[16 * b], gs);
+            bad += r.scale_word != q[b].scale_word || r.scale_scaled != q[b].scale_scaled || r.c2_sum != q[b].c2_sum ||
+                   std::memcmp(r.c2, q[b].c2, sizeof r.c2) != 0;
+        }
+    }
+    check(bad == 0, "vector A4 quantizer equals canon::quantize_a4_block");
+}
+
 // ---------------------------------------------------------------------------- experts
 
 std::vector<std::uint16_t> run(moe::CpuIsa isa, const Expert& e, const std::vector<std::uint16_t>& x, int ncols) {
@@ -277,7 +349,7 @@ void test_split_invariance() {
     std::vector<std::uint16_t> y(static_cast<std::size_t>(ncols) * moe::kHidden);
     std::uint16_t* yp[8];
     for (int c = 0; c < ncols; ++c) {
-        moe::quantize_a4(&x[static_cast<std::size_t>(c) * moe::kHidden], moe::kHidden, e.scales.input_gate, &xq[static_cast<std::size_t>(c) * moe::kGateUpBlocks]);
+        moe::quantize_a4(moe::best_cpu_isa(), &x[static_cast<std::size_t>(c) * moe::kHidden], moe::kHidden, e.scales.input_gate, &xq[static_cast<std::size_t>(c) * moe::kGateUpBlocks]);
         xp[c] = &xq[static_cast<std::size_t>(c) * moe::kGateUpBlocks];
         hp[c] = &hb[static_cast<std::size_t>(c) * moe::kHBlocks];
         hcp[c]          = hp[c];
@@ -296,7 +368,7 @@ void test_fp64_oracle() {
     const Expert e  = random_expert(rng, false);
     const auto x    = random_activations(rng, 1);
     std::vector<canon::A4Block> xq(moe::kGateUpBlocks);
-    moe::quantize_a4(x.data(), moe::kHidden, e.scales.input_gate, xq.data());
+    moe::quantize_a4(moe::best_cpu_isa(), x.data(), moe::kHidden, e.scales.input_gate, xq.data());
     const canon::A4Block* xp[1] = {xq.data()};
     std::vector<std::int64_t> s(static_cast<std::size_t>(moe::kGateUpRowGroups) * 16);
     moe::rg16_row_sums(moe::best_cpu_isa(), e.record.data(), moe::kGateUpBlocks, 0, moe::kGateUpRowGroups, xp, 1, s.data());
@@ -407,6 +479,7 @@ INFERNIX_OP_TEST(offloaded_moe_cpu) {
     test_bf16_round();
     test_exp_silu();
     test_quantizer();
+    test_vector_canon();
     test_isa_equality();
     test_split_invariance();
     test_fp64_oracle();

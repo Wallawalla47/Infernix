@@ -1,7 +1,6 @@
 #include <charconv>
 #include "serve/generation_service.h"
 
-#include "core/temporary_switches.h"
 #include "product/media_acquire/acquire.h"
 #include "serve/translate.h"
 
@@ -350,61 +349,77 @@ std::uint64_t token_4gram_hash(const infernix::TokenId* tokens) {
 
 } // namespace
 
+infernix::EngineOptions make_engine_options(const ServeOptions& options, StartupObserver startup_observer,
+                                            DiagnosticObserver diagnostic_observer) {
+    infernix::EngineOptions engine_options;
+    engine_options.artifact_path            = options.artifact_path;
+    engine_options.chat_template_path       = options.chat_template_path;
+    engine_options.ngram_volume_path        = options.ngram_volume_path;
+    engine_options.ngram_residency          = options.ngram_residency;
+    engine_options.expert_stripe_path       = options.expert_stripe_path;
+    engine_options.expert_state_path        = options.expert_state ? *options.expert_state
+                                                                   : std::filesystem::path(options.artifact_path +
+                                                                                           ".expert-state");
+    engine_options.expert_state_off         = options.expert_state && options.expert_state->empty(); // --expert-state off
+    engine_options.thinking_budget_message  = options.thinking_budget_message;
+    engine_options.route_trace_path        = options.route_trace;
+    engine_options.device                   = options.device;
+    engine_options.max_context              = options.max_context;
+    engine_options.rope_yarn_factor          = options.rope_yarn_factor;
+    engine_options.kv_capacity              = options.kv_capacity;
+    engine_options.vram_headroom_bytes      = options.vram_headroom_bytes;
+    engine_options.vram_past_budget         = options.vram_past_budget;
+    engine_options.expert_tail_skip         = options.expert_tail_skip;
+    engine_options.expert_a4_activations    = options.expert_a4_activations;
+    engine_options.expert_a16_activations   = options.expert_a16_activations;
+    engine_options.a8_activations           = options.a8_activations;
+    engine_options.embedding_host           = options.embedding_host;
+    engine_options.max_concurrency          = options.max_concurrency;
+    engine_options.max_pending_requests     = options.max_pending_requests;
+    engine_options.pending_timeout_ms       = options.pending_timeout_ms;
+    engine_options.prefill_chunk            = options.prefill_chunk;
+    engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
+    engine_options.prefill_split_workspace_mib  = options.prefill_split_workspace_mib;
+    engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
+    // The lossless route runs no fast path.
+    engine_options.fast_paths                    = options.fast_paths && !options.lossless;
+    engine_options.lossless                      = options.lossless;
+    engine_options.fast_path_candidates          = options.fast_path_candidates;
+    engine_options.fast_path_exclusions          = options.fast_path_exclusions;
+    engine_options.kv_cache                  = options.kv_cache;
+    engine_options.logits_dtype              = options.logits_dtype;
+    engine_options.enable_vision             = options.enable_vision;
+    engine_options.vision_offload            = options.vision_offload;
+    engine_options.vision_max_merged_tokens  = options.vision_max_merged_tokens;
+    engine_options.use_cuda_graph            = options.use_cuda_graph;
+    engine_options.speculative              = options.speculative;
+    engine_options.context_cache            = options.context_cache;
+    engine_options.context_cost.preset_path = options.context_cost_presets;
+    engine_options.media_cache_bytes        = options.media_cache_bytes;
+    engine_options.media_live_bytes         = options.media_live_bytes;
+    engine_options.ram_free_bytes           = options.ram_free_bytes;
+    engine_options.ram_resize               = options.ram_resize;
+    engine_options.expert_ram_bytes         = options.expert_ram_bytes;
+    engine_options.expert_ram_layout        = options.expert_ram_layout;
+    engine_options.expert_pin_bytes         = options.expert_pin_bytes;
+    engine_options.media_preprocess_threads = options.media_preprocess_threads;
+    engine_options.startup_observer         = std::move(startup_observer);
+    engine_options.diagnostic_observer      = std::move(diagnostic_observer);
+    return engine_options;
+}
+
 GenerationService::GenerationService(ServeOptions options, StartupObserver startup_observer,
                                      DiagnosticObserver diagnostic_observer)
     : options_(std::move(options)) {
-    infernix::EngineOptions engine_options;
-    engine_options.artifact_path            = options_.artifact_path;
-    engine_options.chat_template_path       = options_.chat_template_path;
-    engine_options.ngram_volume_path        = options_.ngram_volume_path;
-    engine_options.ngram_residency          = options_.ngram_residency;
-    engine_options.expert_stripe_path       = options_.expert_stripe_path;
-    engine_options.expert_state_path        = options_.expert_state ? *options_.expert_state
-                                                                    : std::filesystem::path(options_.artifact_path +
-                                                                                            ".expert-state");
-    engine_options.thinking_budget_message  = options_.thinking_budget_message;
-    engine_options.route_trace_path        = options_.route_trace;
-    engine_options.device                   = options_.device;
-    engine_options.max_context              = options_.max_context;
-    engine_options.rope_yarn_factor          = options_.rope_yarn_factor;
-    engine_options.kv_capacity              = options_.kv_capacity;
-    engine_options.vram_headroom_bytes      = options_.vram_headroom_bytes;
-    engine_options.vram_past_budget         = options_.vram_past_budget;
-    engine_options.expert_tail_skip         = options_.expert_tail_skip;
-    engine_options.expert_a4_activations    = options_.expert_a4_activations;
-    engine_options.embedding_host           = options_.embedding_host;
-    engine_options.max_concurrency          = options_.max_concurrency;
-    engine_options.max_pending_requests     = options_.max_pending_requests;
-    engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
-    engine_options.prefill_chunk            = options_.prefill_chunk;
-    engine_options.original_int8_prefill_kernel = options_.original_int8_prefill_kernel;
-    engine_options.prefill_split_workspace_mib  = options_.prefill_split_workspace_mib;
-    engine_options.original_nvfp4_prefill_kernel = options_.original_nvfp4_prefill_kernel;
-    // The lossless route runs no fast path.
-    engine_options.fast_paths                    = options_.fast_paths && !options_.lossless;
-    engine_options.lossless                      = options_.lossless;
-    engine_options.fast_path_candidates          = options_.fast_path_candidates;
-    engine_options.kv_cache                  = options_.kv_cache;
-    engine_options.logits_dtype              = options_.logits_dtype;
-    engine_options.enable_vision             = options_.enable_vision;
-    engine_options.vision_offload            = options_.vision_offload;
-    engine_options.vision_max_merged_tokens  = options_.vision_max_merged_tokens;
-    engine_options.use_cuda_graph            = options_.use_cuda_graph;
-    engine_options.speculative              = options_.speculative;
-    engine_options.context_cache            = options_.context_cache;
-    engine_options.context_cost.preset_path = options_.context_cost_presets;
-    engine_options.media_cache_bytes        = options_.media_cache_bytes;
-    engine_options.media_live_bytes         = options_.media_live_bytes;
-    engine_options.ram_headroom_bytes       = options_.ram_headroom_bytes;
-    engine_options.expert_ram_bytes         = options_.expert_ram_bytes;
-    engine_options.expert_pin_bytes         = options_.expert_pin_bytes;
-    engine_options.media_preprocess_threads = options_.media_preprocess_threads;
-    engine_options.startup_observer         = std::move(startup_observer);
-    engine_options.diagnostic_observer      = std::move(diagnostic_observer);
-    engine_           = std::make_unique<infernix::Engine>(std::move(engine_options));
+    engine_ = std::make_unique<infernix::Engine>(
+        make_engine_options(options_, std::move(startup_observer), std::move(diagnostic_observer)));
     if (!options_.request_log_jsonl.empty()) {
+        // The bytes, not the validated text: a window starts and ends on a token, so its first and
+        // last character are usually cut, and the tracker replaces those bytes itself.
         prefix_misses_ = std::make_unique<PrefixMissTracker>(
-            [engine = engine_.get()](std::span<const infernix::TokenId> ids) { return engine->detokenize(ids); });
+            [engine = engine_.get()](std::span<const infernix::TokenId> ids) {
+                return engine->detokenize_bytes(ids);
+            });
     }
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
@@ -472,6 +487,13 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                                 CacheParticipation cache_participation,
                                                 DeadlinePolicy deadline_policy,
                                                 bool admitted) const {
+    // Without vision, a tool result's media becomes a text note (omit_tool_result_media); the user's still fails below.
+    if (!options_.enable_vision && request.media_item_count() != 0) {
+        if (std::optional<GenerationRequest> noted = omit_tool_result_media(request)) {
+            return prepare_impl(*noted, consumer_mode, std::move(observation), std::move(is_cancelled),
+                                cache_participation, deadline_policy, admitted);
+        }
+    }
     PreparedRequest prepared;
     prepared.constraint_param               = request.constraint_param;
     prepared.tool_schema_params             = tool_declaration_params(request);
@@ -488,6 +510,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         throw_invalid_input(error, "vision_disabled");
     }
     prepared.lifetime = acquire_request_lifetime(deadline_policy, admitted);
+    prepared.started  = prepared.lifetime->started;
 
     try {
         const auto acquisition_started = Clock::now();
@@ -502,6 +525,16 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         check_preparation_control(prepared.lifetime->deadline, is_cancelled,
                                   queue_retry_after_seconds());
+        // Idle-time prefill of the finished turn (hybrid-prefix-cache-spec §7.9): a text chat whose
+        // next request appends to it keeps its lowered conversation for run().
+        const auto& cache = engine_->options().context_cache;
+        if (cache_participation == CacheParticipation::ReadWrite && cache.enabled &&
+            cache.hybrid.next_turn_prefill_quiet.value_or(std::chrono::milliseconds{0}).count() > 0 &&
+            request.continuation == infernix::PromptContinuationMode::NewAssistantTurn &&
+            !request_has_media && request.readout_tokens.empty() &&
+            request.token_constraint.empty() && !request.ignore_eos && request.max_tokens > 0) {
+            prepared.next_turn = input;
+        }
         const PreparationControl control{
             .deadline     = prepared.lifetime->deadline,
             .cancellation = CancellationView(is_cancelled),
@@ -513,14 +546,13 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         if (!prepared.enable_thinking) {
             request_options.execution.thinking.budget.reset();
             prepared.thinking_budget.reset();
-        } else if (semantics.enable_thinking != false &&
-                   !request_options.execution.thinking.budget) {
+        } else if (semantics.enable_thinking != false) {
             // The answer room follows the limit the request actually has: a prompt that leaves
             // less context than max_tokens would otherwise think to the end of the context.
-            request_options.execution.thinking.budget = thinking_answer_room_budget(
-                options_, effective_output_limit(
-                              request_options.execution.requested_output_tokens,
-                              engine_->options().max_context, prompt.summary().prompt_tokens));
+            request_options.execution.thinking.budget = settle_thinking_budget(
+                options_, request.thinking_budget,
+                effective_output_limit(request_options.execution.requested_output_tokens,
+                                       engine_->options().max_context, prompt.summary().prompt_tokens));
             prepared.thinking_budget = request_options.execution.thinking.budget;
         }
         prepared.prompt_tokens           = static_cast<int>(prompt.summary().prompt_tokens);
@@ -569,6 +601,11 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
 
 int GenerationService::count_prompt_tokens(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
+    if (!options_.enable_vision && request.media_item_count() != 0) {
+        if (std::optional<GenerationRequest> noted = omit_tool_result_media(request)) {
+            return count_prompt_tokens(*noted, std::move(is_cancelled));
+        }
+    }
     const bool request_has_media = request.media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
@@ -682,14 +719,51 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.expert_cache                = result.expert_cache;
     outcome.ngram_archive               = result.ngram_archive;
     if (prefix_misses_ != nullptr && !prepared.prompt_ids.empty()) {
-        outcome.prefix_miss = prefix_misses_->settle(
-            outcome.engine_request_id, prepared.prompt_ids, outcome.generated_token_ids,
-            outcome.reused_prompt_tokens, outcome.computed_prefill_tokens);
+        // The optional diagnosis cannot fail this request any more than a cut window can: whatever
+        // it gives up on, the finished generation and its own context stay intact.
+        auto settlement = prefix_misses_->settle(outcome.engine_request_id, prepared.prompt_ids,
+                                                 outcome.generated_token_ids, outcome.reused_prompt_tokens,
+                                                 outcome.computed_prefill_tokens);
+        outcome.prefix_miss                   = std::move(settlement.miss);
+        outcome.prefix_miss_diagnostic_failed = settlement.diagnostic_failed;
     }
 
     outcome.tool_calls      = std::move(result.tool_calls);
     outcome.tool_call_parse = result.tool_call_parse;
+    schedule_next_turn(prepared, outcome);
     return outcome;
+}
+
+// A reply that ended on its own (a stop token or string; not cut by its limit, not cancelled) is
+// followed by the conversation's next request: the Engine prefills that request's history while it
+// is idle (hybrid-prefix-cache-spec §7.9). The reply is appended as the client receives it and
+// sends it back: content, reasoning and tool calls (the template renders no call identifier).
+void GenerationService::schedule_next_turn(PreparedRequest& prepared,
+                                           const GenerationOutcome& outcome) const {
+    if (!prepared.next_turn) { return; }
+    infernix::PromptInput conversation = std::move(*prepared.next_turn);
+    prepared.next_turn.reset();
+    if (outcome.finish_reason != infernix::FinishReason::StopToken &&
+        outcome.finish_reason != infernix::FinishReason::StopString) {
+        return;
+    }
+    try {
+        infernix::ChatMessage reply;
+        reply.role = ChatRole::Assistant;
+        if (!outcome.text.empty()) {
+            reply.parts.push_back(infernix::MessagePart{
+                .kind = infernix::MessagePartKind::Text, .text = outcome.text, .media = {}});
+        }
+        reply.reasoning_content = outcome.reasoning;
+        reply.tool_calls.reserve(outcome.tool_calls.size());
+        for (std::size_t i = 0; i < outcome.tool_calls.size(); ++i) {
+            reply.tool_calls.push_back(infernix::ToolCall{.id             = "call_" + std::to_string(i),
+                                                          .name           = outcome.tool_calls[i].name,
+                                                          .arguments_json = outcome.tool_calls[i].arguments_json});
+        }
+        conversation.messages.push_back(std::move(reply));
+    } catch (...) { return; }
+    engine_->prefill_next_turn(std::move(conversation));
 }
 
 void GenerationService::warmup() {
@@ -711,13 +785,13 @@ void GenerationService::warmup() {
         run(prepared, nullptr);
     };
     generate(4, false);
-    // TEMPORARY (INFERNIX_TMP_WARMUP_GRAPHS, candidates §7.6 D14): before READY, max-concurrency
-    // requests at the server's default sampling, of staggered lengths (32 + 16 i tokens, end of
-    // sequence ignored), so the decode rounds pass every batch size from 1 to the maximum and back,
-    // each for several rounds: a Program's decode, verification and draft graphs run eagerly once and
-    // are captured on the next round, so a fresh server's first requests replay them instead. The
-    // widths are those the default draft policy picks; requests use no prefix cache. Startup only.
-    if (!temporary_switches::flag("INFERNIX_TMP_WARMUP_GRAPHS")) { return; }
+    // Before READY, max-concurrency requests at the server's default sampling, of staggered lengths
+    // (32 + 16 i tokens, end of sequence ignored), so the decode rounds pass every batch size from 1 to
+    // the maximum and back, each for several rounds: a Program's decode, verification and draft graphs
+    // run eagerly once and are captured on the next round, so a fresh server's first requests replay
+    // them instead. The widths are those the default draft policy picks; requests use no prefix cache.
+    // Candidates §7.6 D14: Dense8, the slower of the first two concurrent requests' TTFT 0.535 -> 0.389 s
+    // (three servers each), startup about 1 s longer (2026-10-28).
     const std::uint32_t rows = std::max<std::uint32_t>(1, options_.max_concurrency);
     std::vector<std::exception_ptr> errors(rows);
     std::vector<std::thread> threads;

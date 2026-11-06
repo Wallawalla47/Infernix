@@ -1,0 +1,539 @@
+{
+  "entries": [
+    {
+      "repo": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix",
+      "title": "Qwen3.8-Flash-Next NVIDIA NVFP4 Dense8",
+      "family": "qwen3.8-flash-next",
+      "kind": "model",
+      "description": "NVIDIA's NVFP4 experts and FP8 n-gram table bit-exact, dense projections in 8 bits: about 22 % faster than the bit-exact conversion at the same quality (perplexity 4.654 against 4.666). The one benchmarked against Strata.",
+      "recommended": true,
+      "source_repo": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "tags": [
+        "NVFP4",
+        "MoE",
+        "vision",
+        "MTP",
+        "262K context"
+      ],
+      "approx_bytes": 76867265280,
+      "drafter_repo": "wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix",
+      "ngram_options": [
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix",
+          "file": "Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram",
+          "format": "fp8",
+          "bytes": 52429058048,
+          "recommended": true
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix",
+          "file": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram",
+          "format": "iq4_nl",
+          "bytes": 29127258112,
+          "recommended": false
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix",
+          "file": "Qwen3.8-Flash-Next-BF16.ngram",
+          "format": "bf16",
+          "bytes": 109227196416,
+          "recommended": false
+        }
+      ],
+      "notes": "The experts live in system RAM (96 GB recommended) behind a VRAM expert cache; the n-gram volume belongs on an NVMe drive."
+    },
+    {
+      "repo": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix",
+      "title": "Qwen3.8-Flash-Next NVIDIA NVFP4 (bit-exact)",
+      "family": "qwen3.8-flash-next",
+      "kind": "model",
+      "description": "Every weight exactly as NVIDIA stores it. Slower decode than Dense8 at the same measured quality. Its repository also hosts the recommended FP8 n-gram volume.",
+      "recommended": false,
+      "source_repo": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "tags": [
+        "NVFP4",
+        "bit-exact",
+        "MoE",
+        "vision",
+        "MTP"
+      ],
+      "approx_bytes": 80370610944,
+      "drafter_repo": "wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix",
+      "ngram_options": [
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix",
+          "file": "Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram",
+          "format": "fp8",
+          "bytes": 52429058048,
+          "recommended": true
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix",
+          "file": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram",
+          "format": "iq4_nl",
+          "bytes": 29127258112,
+          "recommended": false
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix",
+          "file": "Qwen3.8-Flash-Next-BF16.ngram",
+          "format": "bf16",
+          "bytes": 109227196416,
+          "recommended": false
+        }
+      ],
+      "notes": null
+    },
+    {
+      "repo": "wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix",
+      "title": "Qwen3.8-Flash-Next GSQ-RCO IQ3_S",
+      "family": "qwen3.8-flash-next",
+      "kind": "model",
+      "description": "ISTA-DASLab's IQ3_S GGUF, every tensor bit-exact, plus MTP and vision. Fastest decode, experts in 46.9 GiB of RAM; slower long prefill.",
+      "recommended": false,
+      "source_repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+      "tags": [
+        "IQ3_S",
+        "GGUF import",
+        "MoE",
+        "vision",
+        "MTP"
+      ],
+      "approx_bytes": 56755219968,
+      "drafter_repo": "wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix",
+      "ngram_options": [
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix",
+          "file": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram",
+          "format": "iq4_nl",
+          "bytes": 29127258112,
+          "recommended": true
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix",
+          "file": "Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram",
+          "format": "fp8",
+          "bytes": 52429058048,
+          "recommended": false
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix",
+          "file": "Qwen3.8-Flash-Next-BF16.ngram",
+          "format": "bf16",
+          "bytes": 109227196416,
+          "recommended": false
+        }
+      ],
+      "notes": "Measured with its own IQ4_NL n-gram table."
+    },
+    {
+      "repo": "wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix",
+      "title": "Qwen3.8-Flash-Next FP8 (official)",
+      "family": "qwen3.8-flash-next",
+      "kind": "model",
+      "description": "Qwen's FP8 checkpoint bit-exact with its BF16 n-gram table: the most accurate and the slowest. Its 112.6 GiB of experts need the SSD expert tier on 96 GB of RAM.",
+      "recommended": false,
+      "source_repo": "Qwen/Qwen3.8-Flash-Next-FP8",
+      "tags": [
+        "FP8",
+        "bit-exact",
+        "MoE",
+        "MTP"
+      ],
+      "approx_bytes": 132689672704,
+      "drafter_repo": "wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix",
+      "ngram_options": [
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix",
+          "file": "Qwen3.8-Flash-Next-BF16.ngram",
+          "format": "bf16",
+          "bytes": 109227196416,
+          "recommended": true
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix",
+          "file": "Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram",
+          "format": "fp8",
+          "bytes": 52429058048,
+          "recommended": false
+        }
+      ],
+      "notes": "Measured with the BF16 n-gram table it is bound to."
+    },
+    {
+      "repo": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix",
+      "title": "Qwen3.8-Flash-Next NVIDIA FP4-Local",
+      "family": "qwen3.8-flash-next",
+      "kind": "model",
+      "description": "NVIDIA's quantization-aware-distilled FP4 checkpoint bit-exact (NVFP4 experts, MXFP8 dense, its own NVFP4 n-gram volume), the closest conversion to the official FP8 one.",
+      "recommended": false,
+      "source_repo": "nvidia/Qwen3.8-Flash-Next-FP4-Local",
+      "tags": [
+        "NVFP4",
+        "MXFP8",
+        "QAD",
+        "MoE"
+      ],
+      "approx_bytes": 77375571200,
+      "drafter_repo": "wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix",
+      "ngram_options": [
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix",
+          "file": "Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram",
+          "format": "nvfp4",
+          "bytes": 29127258112,
+          "recommended": true
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix",
+          "file": "Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram",
+          "format": "fp8",
+          "bytes": 52429058048,
+          "recommended": false
+        }
+      ],
+      "notes": null
+    },
+    {
+      "repo": "wallawalla47/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix",
+      "title": "Qwen3.8-Flash-Next Uncensored NVFP4",
+      "family": "qwen3.8-flash-next",
+      "kind": "model",
+      "description": "orcarouter's abliterated weights (refusals removed; see its card), NVFP4 experts and FP8 projections bit-exact, other dense classes 8-bit as Dense8. Perplexity 4.772.",
+      "recommended": false,
+      "source_repo": "orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4",
+      "tags": [
+        "NVFP4",
+        "uncensored",
+        "MoE"
+      ],
+      "approx_bytes": 76302074624,
+      "drafter_repo": "wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix",
+      "ngram_options": [
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix",
+          "file": "Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram",
+          "format": "fp8",
+          "bytes": 52429058048,
+          "recommended": true
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix",
+          "file": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram",
+          "format": "iq4_nl",
+          "bytes": 29127258112,
+          "recommended": false
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix",
+          "file": "Qwen3.8-Flash-Next-BF16.ngram",
+          "format": "bf16",
+          "bytes": 109227196416,
+          "recommended": false
+        }
+      ],
+      "notes": "Its repository carries no n-gram volume."
+    },
+    {
+      "repo": "wallawalla47/Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local-Infernix",
+      "title": "Huihui Qwen3.8-Flash-Next abliterated FP4-Local",
+      "family": "qwen3.8-flash-next",
+      "kind": "model",
+      "description": "NVIDIA FP4-Local with Huihui's abliteration (refusals removed; see its card) transferred into 96 MXFP8 projections by edp1096, every weight bit-exact. Perplexity 3.4939 against FP4-Local's 3.4865.",
+      "recommended": false,
+      "source_repo": "edp1096/Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local",
+      "tags": [
+        "NVFP4",
+        "MXFP8",
+        "uncensored",
+        "MoE"
+      ],
+      "approx_bytes": 77375558912,
+      "drafter_repo": "wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix",
+      "ngram_options": [
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix",
+          "file": "Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram",
+          "format": "nvfp4",
+          "bytes": 29127258112,
+          "recommended": true
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix",
+          "file": "Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram",
+          "format": "fp8",
+          "bytes": 52429058048,
+          "recommended": false
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix",
+          "file": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram",
+          "format": "iq4_nl",
+          "bytes": 29127258112,
+          "recommended": false
+        },
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix",
+          "file": "Qwen3.8-Flash-Next-BF16.ngram",
+          "format": "bf16",
+          "bytes": 109227196416,
+          "recommended": false
+        }
+      ],
+      "notes": "Its repository carries no n-gram volume; NVIDIA FP4-Local's is the table it stores."
+    },
+    {
+      "repo": "wallawalla47/Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix",
+      "title": "Swift 1.5 Qwen3.8-Flash-Next NVFP4 Dense8",
+      "family": "qwen3.8-flash-next",
+      "kind": "model",
+      "description": "UkisAI's fine-tune that thinks in fewer tokens, converted like Dense8. Smoke-tested; quality and speed not measured.",
+      "recommended": false,
+      "source_repo": "ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4",
+      "tags": [
+        "NVFP4",
+        "fine-tune",
+        "MoE"
+      ],
+      "approx_bytes": 76865512192,
+      "drafter_repo": "wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix",
+      "ngram_options": [
+        {
+          "repo": "wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix",
+          "file": "Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram",
+          "format": "fp8",
+          "bytes": 52429058048,
+          "recommended": true
+        }
+      ],
+      "notes": "Its repository carries no n-gram volume."
+    },
+    {
+      "repo": "wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix",
+      "title": "Qwen3.8-Flash-Next DFlash2 drafter",
+      "family": "qwen3.8-flash-next",
+      "kind": "drafter",
+      "description": "Inco AI's DFlash2 drafter in 8 bits for every Flash-Next conversion: 8-11 % faster decode than the model's MTP drafter (26 % on sampled code), with VRAM for 330 more cached experts.",
+      "recommended": true,
+      "source_repo": "incoai/Qwen3.8-Flash-Next-DFlash2",
+      "tags": [
+        "DFlash2",
+        "drafter",
+        "776 MB"
+      ],
+      "approx_bytes": 776075776,
+      "drafter_repo": null,
+      "ngram_options": [],
+      "notes": null
+    },
+    {
+      "repo": "wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-NInferV3",
+      "title": "Qwen3.8-27B NVIDIA NVFP4",
+      "family": "qwen3.8-27b",
+      "kind": "model",
+      "description": "NVIDIA's NVFP4 checkpoint with a DFlash2 drafter and a proposal head for --lm-head-draft. Fits a 32 GB GPU with 240K context.",
+      "recommended": true,
+      "source_repo": "nvidia/Qwen3.8-27B-NVFP4",
+      "tags": [
+        "NVFP4",
+        "dense",
+        "DFlash2",
+        "vision"
+      ],
+      "approx_bytes": 22783240452,
+      "drafter_repo": null,
+      "ngram_options": [],
+      "notes": null
+    },
+    {
+      "repo": "wallawalla47/Qwen3.8-27B-Quasar-NVFP4-NInferV3",
+      "title": "Qwen3.8-27B Quasar NVFP4",
+      "family": "qwen3.8-27b",
+      "kind": "model",
+      "description": "The QAT-trained NVFP4 model with the same drafter and proposal head.",
+      "recommended": false,
+      "source_repo": "QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4",
+      "tags": [
+        "NVFP4",
+        "QAT",
+        "dense",
+        "DFlash2"
+      ],
+      "approx_bytes": 21600126976,
+      "drafter_repo": null,
+      "ngram_options": [],
+      "notes": null
+    },
+    {
+      "repo": "wallawalla47/Qwen3.8-27B-Uncensored-NVFP4-NInferV3",
+      "title": "Qwen3.8-27B Uncensored NVFP4",
+      "family": "qwen3.8-27b",
+      "kind": "model",
+      "description": "Abliterated (safety alignment largely removed; see its card), with the same drafter and proposal head.",
+      "recommended": false,
+      "source_repo": "orcarouter/Qwen3.8-27B-Uncensored-NVFP4",
+      "tags": [
+        "NVFP4",
+        "uncensored",
+        "dense",
+        "DFlash2"
+      ],
+      "approx_bytes": 23719715844,
+      "drafter_repo": null,
+      "ngram_options": [],
+      "notes": null
+    },
+    {
+      "repo": "wallawalla47/Swift-Qwen3.8-27B-NVFP4-NInferV3",
+      "title": "Swift Qwen3.8-27B NVFP4",
+      "family": "qwen3.8-27b",
+      "kind": "model",
+      "description": "UkisAI's token-efficient fine-tune, converted like the NVIDIA artifact. Smoke-tested; quality and speed not measured.",
+      "recommended": false,
+      "source_repo": "ukisai/Swift-Qwen3.8-27B-NVFP4",
+      "tags": [
+        "NVFP4",
+        "fine-tune",
+        "dense",
+        "DFlash2"
+      ],
+      "approx_bytes": 22783240704,
+      "drafter_repo": null,
+      "ngram_options": [],
+      "notes": null
+    },
+    {
+      "repo": "neroued/Qwen3.8-27B-nvfp4-NInfer",
+      "title": "Qwen3.8-27B nvfp4 (NInfer official)",
+      "family": "qwen3.8-27b",
+      "kind": "model",
+      "description": "NInfer's official NVFP4 artifact, the one benchmarked against NInfer.",
+      "recommended": false,
+      "source_repo": "Qwen/Qwen3.8-27B",
+      "tags": [
+        "NInfer official",
+        "NVFP4",
+        "dense",
+        "DFlash2"
+      ],
+      "approx_bytes": 23719715844,
+      "drafter_repo": null,
+      "ngram_options": [],
+      "notes": null
+    },
+    {
+      "repo": "neroued/Qwen3.8-27B-NInfer",
+      "title": "Qwen3.8-27B groupwise (NInfer official)",
+      "family": "qwen3.8-27b",
+      "kind": "model",
+      "description": "NInfer's official groupwise-int artifact.",
+      "recommended": false,
+      "source_repo": "Qwen/Qwen3.8-27B",
+      "tags": [
+        "NInfer official",
+        "groupwise INT",
+        "dense",
+        "DFlash2"
+      ],
+      "approx_bytes": 20437521664,
+      "drafter_repo": null,
+      "ngram_options": [],
+      "notes": null
+    },
+    {
+      "repo": "neroued/Qwen3.6-27B-NInfer",
+      "title": "Qwen3.6-27B groupwise (NInfer official)",
+      "family": "qwen3.6-27b",
+      "kind": "model",
+      "description": "NInfer's official groupwise-int artifact.",
+      "recommended": false,
+      "source_repo": "Qwen/Qwen3.6-27B",
+      "tags": [
+        "NInfer official",
+        "groupwise INT",
+        "dense",
+        "MTP"
+      ],
+      "approx_bytes": 17495538688,
+      "drafter_repo": null,
+      "ngram_options": [],
+      "notes": null
+    },
+    {
+      "repo": "neroued/Qwen3.6-27B-nvfp4-NInfer",
+      "title": "Qwen3.6-27B nvfp4 (NInfer official)",
+      "family": "qwen3.6-27b",
+      "kind": "model",
+      "description": "NInfer's official NVFP4 artifact.",
+      "recommended": false,
+      "source_repo": "Qwen/Qwen3.6-27B",
+      "tags": [
+        "NInfer official",
+        "NVFP4",
+        "dense",
+        "MTP"
+      ],
+      "approx_bytes": 18324354820,
+      "drafter_repo": null,
+      "ngram_options": [],
+      "notes": null
+    },
+    {
+      "repo": "neroued/Qwen3.6-35B-A3B-NInfer",
+      "title": "Qwen3.6-35B-A3B (NInfer official)",
+      "family": "qwen3.6-35b-a3b",
+      "kind": "model",
+      "description": "NInfer's official groupwise-int mixture-of-experts artifact, with a DFlash drafter.",
+      "recommended": false,
+      "source_repo": "Qwen/Qwen3.6-35B-A3B",
+      "tags": [
+        "NInfer official",
+        "groupwise INT",
+        "MoE",
+        "DFlash"
+      ],
+      "approx_bytes": 22790484480,
+      "drafter_repo": null,
+      "ngram_options": [],
+      "notes": null
+    },
+    {
+      "repo": "wallawalla47/Ornith-1.5-122B-NVFP4-Infernix",
+      "title": "Ornith-1.5-122B NVFP4",
+      "family": "qwen3.5-122b-a10b",
+      "kind": "model",
+      "description": "A 122B mixture-of-experts model on one 32 GB GPU: NVFP4 experts in about 70 GiB of RAM behind a VRAM expert cache, FP8 projections, MTP and DFlash2 drafters, vision and its card's sampling defaults.",
+      "recommended": true,
+      "source_repo": "ornith-ai/Ornith-1.5-122B-NVFP4",
+      "tags": [
+        "NVFP4",
+        "MoE",
+        "MTP",
+        "vision"
+      ],
+      "approx_bytes": 75331296516,
+      "drafter_repo": null,
+      "ngram_options": [],
+      "notes": "The routed experts need about 70 GiB of system RAM."
+    },
+    {
+      "repo": "wallawalla47/Ornith-1.5-122B-UNCENSORED-NVFP4-Infernix",
+      "title": "Ornith-1.5-122B UNCENSORED NVFP4",
+      "family": "qwen3.5-122b-a10b",
+      "kind": "model",
+      "description": "The refusal-removed export with the same drafters, vision, proposal head and its card's sampling defaults. Support is preliminary: verified, optimisation in progress.",
+      "recommended": false,
+      "source_repo": "dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4",
+      "tags": [
+        "NVFP4",
+        "uncensored",
+        "MoE",
+        "preliminary"
+      ],
+      "approx_bytes": 75864907776,
+      "drafter_repo": null,
+      "ngram_options": [],
+      "notes": "The routed experts need about 70 GiB of system RAM."
+    }
+  ]
+}

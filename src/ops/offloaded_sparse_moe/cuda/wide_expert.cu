@@ -1,11 +1,11 @@
 // The wide route of offloaded_sparse_moe: work planning, A4 quantization of x for the wide
-// entries, TMA descriptors and the per-pass GEMM launches (wide_expert.h, wide_expert.cuh), and the
-// W4A16 route's limb encodings and exact integer GEMMs (wide_expert_a16.cuh).
+// entries, TMA descriptors and the per-pass GEMM launches (wide_expert.h, wide_expert.cuh), the
+// W4A16 route's limb encodings and exact integer GEMMs (wide_expert_a16.cuh), and its 8-bit activation
+// GEMMs with the h encoding between them (WideA16::kA8, wide_expert_a8.cuh).
 
-#include "ops/offloaded_sparse_moe/cuda/wide_expert_a16.cuh"
+#include "ops/offloaded_sparse_moe/cuda/wide_expert_a8.cuh"
 
 #include "core/device.h"
-#include "core/temporary_switches.h"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 
 #include <cuda_bf16.h>
@@ -165,13 +165,12 @@ namespace {
 struct Offsets {
     std::size_t job_records, cpu_flags, cpu_call, tiles, pass_tiles;
     std::size_t h_blocks, x_plane;                      // W4A4
-    std::size_t x_limbs, h_rows, x_emax, h_emax;        // W4A16
-    std::size_t x_terms_plane, x_row_scale, h_terms_plane, h_row_scale; // W4A16 two-term A4
-    std::size_t ggml_planes;                            // GGUF banks' kGgmlBf16
-    bool has_ggml_planes;
-    std::size_t lossless;                               // kLossless
+    std::size_t x_limbs, h_rows, x_emax, h_emax, job_ctas; // W4A16
+    std::size_t x_terms_plane, x_row_scale, x_slot_entries, h_terms_plane, h_row_scale; // W4A16 two-term A4
+    std::size_t lossless;                              // kLossless
     std::size_t x_acts, h_acts, ring_jobs, ring_counters; // the narrow ring (ring_call)
     bool has_ring;
+    bool has_nmma; // the A4 residual routes' x limbs, x_emax and job_ctas for the tensor-core narrow jobs
     std::size_t end;
 };
 
@@ -207,10 +206,18 @@ Offsets offsets(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t en
         // The narrow route still needs its h rows (BF16 h of every entry) and exponents, and a ring
         // call (ring_call) its x exponents.
         o.h_rows = take(e * h_row);
-        if (ring_call(shape, activation, wide_a16, columns)) { o.x_emax = take(t * sizeof(std::int32_t)); }
+        // The narrow jobs take the tensor-core narrow kernels, which read the call's x limbs and their gate/up CTA
+        // counts (a16_x_row_bytes per token: 7,680 at Flash-Next's geometry).
+        o.has_nmma = shape == kFlashNextShape && a16_nmma_columns(columns) && !ring_call(shape, activation, wide_a16, columns);
+        if (ring_call(shape, activation, wide_a16, columns) || o.has_nmma) { o.x_emax = take(t * sizeof(std::int32_t)); }
+        if (o.has_nmma) {
+            o.x_limbs  = take(t * x_row);
+            o.job_ctas = take(j * sizeof(std::uint32_t));
+        }
         o.h_emax        = take(e * sizeof(std::int32_t));
-        o.x_terms_plane = take(e * static_cast<std::size_t>(x_terms_row_bytes(shape, terms.x)));
-        o.x_row_scale   = take(t * sizeof(float));
+        o.x_terms_plane  = take(e * static_cast<std::size_t>(x_terms_row_bytes(shape, terms.x)));
+        o.x_row_scale    = take(t * sizeof(float));
+        o.x_slot_entries = take(e * sizeof(std::int32_t));
         o.h_terms_plane = take(e * static_cast<std::size_t>(h_terms_row_bytes(shape, terms.h)));
         o.h_row_scale   = take(e * sizeof(float));
     } else if (activation == ExpertActivation::kA16) {
@@ -218,12 +225,7 @@ Offsets offsets(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t en
         o.h_rows  = take(e * h_row);
         o.x_emax  = take(t * sizeof(std::int32_t));
         o.h_emax  = take(e * sizeof(std::int32_t));
-        // TEMPORARY: the threshold from the environment (MoeGgmlTiles, default kGgmlBf16MinColumns),
-        // the same for every call of the process, so that a call's layout matches its sizing.
-        if (wide_a16 == WideA16::kGgmlBf16 && columns >= MoeGgmlTiles::from_environment().plane_min_columns) {
-            o.ggml_planes     = take(kGgmlBf16PlaneBytes);
-            o.has_ggml_planes = true;
-        }
+        o.job_ctas = take(j * sizeof(std::uint32_t));
     } else {
         o.h_blocks = take(e * kHBlocks * sizeof(canon::A4Block));
         o.x_plane  = take(e * kXRowBytes);
@@ -296,6 +298,66 @@ __global__ void __launch_bounds__(kEncodeWarps * 32)
     }
 }
 
+// The pass's wide entries' BF16 h rows rewritten in place as their 8-bit codes (WideA16::kA8): ggml_a8.h's codec,
+// the narrow 8-bit down kernels' codes of the same h. One warp per entry; lane l < I / 32 holds slice l (64 bytes)
+// in registers before any lane writes: its codes at byte 32 l, its scale at byte I + 4 l.
+template <class G>
+__global__ void __launch_bounds__(kEncodeWarps * 32)
+    encode_h_a8_kernel(MoeDispatch dispatch, const std::int32_t* __restrict__ tiles, const std::int32_t* __restrict__ pass_tiles,
+                       int pass, std::uint8_t* __restrict__ h_rows) {
+    namespace a8          = ::infernix::ggml::a8;
+    constexpr int kSlices = G::kIntermediate / 32; // 20 or 32
+    static_assert(kSlices <= 32 && G::kIntermediate + 4 * kSlices <= A16Planes<G>::kHRowBytes);
+    const int lane  = static_cast<int>(threadIdx.x) % 32;
+    const int warp  = static_cast<int>(blockIdx.x) * kEncodeWarps + static_cast<int>(threadIdx.x) / 32;
+    const int warps = static_cast<int>(gridDim.x) * kEncodeWarps;
+    const int first_tile = pass_tiles[pass], tile_count = pass_tiles[pass + 1] - first_tile;
+    const bool mine = lane < kSlices;
+    for (int task = warp; task < tile_count * kTileColumns; task += warps) {
+        const int tile = first_tile + task / kTileColumns, c = task % kTileColumns;
+        const int job = tiles[2 * tile], column = tiles[2 * tile + 1];
+        const int expert = dispatch.jobs[job];
+        const int entry  = dispatch.offsets[expert] + column + c;
+        if (entry >= dispatch.offsets[expert + 1]) { continue; } // warp-uniform
+        std::uint8_t* row = h_rows + static_cast<std::size_t>(entry) * A16Planes<G>::kHRowBytes;
+        std::uint16_t v[32] = {};
+        if (mine) {
+            const auto* source = reinterpret_cast<const uint4*>(row + 64 * lane);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint4 u       = source[i];
+                const unsigned w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    v[8 * i + 2 * k]     = static_cast<std::uint16_t>(w[k] & 0xFFFFU);
+                    v[8 * i + 2 * k + 1] = static_cast<std::uint16_t>(w[k] >> 16);
+                }
+            }
+        }
+        __syncwarp(); // every lane has read its slice before any lane writes the row
+        if (mine) {
+            unsigned key = 0;
+#pragma unroll
+            for (int e = 0; e < 32; ++e) { key = max(key, static_cast<unsigned>(v[e] & 0x7FFFU)); }
+            const a8::SliceScale sc = a8::slice_scale(key);
+            int words[8];
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                const unsigned b0 = static_cast<unsigned>(a8::code(v[4 * q], sc.inv)) & 0xFFU;
+                const unsigned b1 = static_cast<unsigned>(a8::code(v[4 * q + 1], sc.inv)) & 0xFFU;
+                const unsigned b2 = static_cast<unsigned>(a8::code(v[4 * q + 2], sc.inv)) & 0xFFU;
+                const unsigned b3 = static_cast<unsigned>(a8::code(v[4 * q + 3], sc.inv)) & 0xFFU;
+                words[q]          = static_cast<int>(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            }
+            auto* codes = reinterpret_cast<int4*>(row + 32 * lane);
+            codes[0]    = make_int4(words[0], words[1], words[2], words[3]);
+            codes[1]    = make_int4(words[4], words[5], words[6], words[7]);
+            reinterpret_cast<float*>(row + G::kIntermediate)[lane] = sc.d;
+        }
+        __syncwarp(); // the row is written before the warp's next task
+    }
+}
+
 // ---------------------------------------------------------- W4A16 two-term A4 (design §19.3.23)
 
 // A row scale: amax / (6 * 448), so every block's first-term E4M3 scale stays finite. An all-zero row
@@ -354,15 +416,33 @@ __device__ __forceinline__ void store_terms(std::uint8_t* row, int b, int code_b
     }
 }
 
-// Every token's x row scale: one CTA per token, one 16-element block per thread (160 or 192).
-template <class G>
+// The entry of each dispatch value (column * top_k + slot, then shared_first + column with a shared job): every
+// entry p holds one value, so the map covers every slot of every column.
+__global__ void x_slot_entries_kernel(MoeDispatch dispatch, int entries, std::int32_t* __restrict__ slot_entries) {
+    for (int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); p < entries;
+         p += static_cast<int>(gridDim.x * blockDim.x)) {
+        slot_entries[dispatch.entries[p]] = p;
+    }
+}
+
+// Every token's x row scale and the terms of x for every entry of its column: one CTA per token, one 16-element
+// block per thread (160 or 192). A block's terms are formed once and stored in each entry's row (the column's
+// top_k routed entries and its shared one; a narrow entry's row is written too and never read), where the
+// terms were formed once per wide entry (11 times a token at top_k 10; candidates NQ-09). The same scale and
+// terms: the row's amax is exact in any order and each block's terms take the same inputs.
+template <class G, int Terms>
 __global__ void __launch_bounds__(G::kHidden / 16)
-    x_row_scale_kernel(const std::uint16_t* __restrict__ x, float* __restrict__ row_scale) {
+    x_terms_kernel(const std::uint16_t* __restrict__ x, int top_k, MoeDispatch dispatch,
+                   const std::int32_t* __restrict__ slot_entries, float* __restrict__ row_scale,
+                   std::uint8_t* __restrict__ plane) {
+    using P                = A4Planes<G>;
     constexpr int kThreads = G::kHidden / 16;
-    static_assert(kThreads % 32 == 0);
+    static_assert(kThreads % 32 == 0 && kThreads == G::kGateUpBlocks);
     __shared__ float maxima[kThreads / 32];
+    __shared__ float scale;
     const int t = static_cast<int>(blockIdx.x), b = static_cast<int>(threadIdx.x);
-    const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * G::kHidden + 16 * b);
+    const std::uint16_t* block = x + static_cast<std::size_t>(t) * G::kHidden + 16 * b;
+    const auto* source         = reinterpret_cast<const uint4*>(block);
     std::uint16_t v[16];
     unpack16(source[0], source[1], v);
     float amax = 0.0F;
@@ -382,35 +462,17 @@ __global__ void __launch_bounds__(G::kHidden / 16)
         float all = 0.0F;
 #pragma unroll
         for (int w = 0; w < kThreads / 32; ++w) { all = maxima[w] > all || maxima[w] != maxima[w] ? maxima[w] : all; }
-        row_scale[t] = residual_row_scale(all);
+        scale        = residual_row_scale(all);
+        row_scale[t] = scale;
     }
-}
-
-// The terms of every wide entry's x (its token's row, entry_column: a shared-expert job's entries
-// follow the routed ones), as quantize_kernel does for A4.
-template <class G, int Terms>
-__global__ void __launch_bounds__(kQuantizeThreads)
-    quantize_x_terms_kernel(const std::uint16_t* __restrict__ x, int top_k, MoeDispatch dispatch,
-                       const std::int32_t* __restrict__ tiles, const std::int32_t* __restrict__ pass_tiles, int passes,
-                       const float* __restrict__ row_scale, std::uint8_t* __restrict__ plane) {
-    using P            = A4Planes<G>;
-    constexpr int kBlocks = G::kGateUpBlocks; // 160 or 192
-    const int total = pass_tiles[passes];
-    for (int tile = static_cast<int>(blockIdx.x); tile < total; tile += static_cast<int>(gridDim.x)) {
-        const int job = tiles[2 * tile], column = tiles[2 * tile + 1];
-        const int expert = dispatch.jobs[job];
-        const int first  = dispatch.offsets[expert] + column;
-        const int count  = min(kTileColumns, dispatch.offsets[expert + 1] - first);
-        for (int task = static_cast<int>(threadIdx.x); task < count * kBlocks; task += kQuantizeThreads) {
-            const int i = task / kBlocks, b = task % kBlocks;
-            const int p = first + i;
-            const int t = entry_column(dispatch.entries[p], top_k, dispatch.shared_first);
-            TermBlock<Terms> q;
-            term_block(x + static_cast<std::size_t>(t) * G::kHidden + 16 * b, row_scale[t], q);
-            store_terms(plane + static_cast<std::size_t>(p) * P::x_terms_row_bytes(Terms), b, P::kXCodeBytes,
-                        P::kXRowBytes, q);
-        }
-    }
+    __syncthreads();
+    TermBlock<Terms> q;
+    term_block(block, scale, q);
+    const auto store = [&](int p) {
+        store_terms(plane + static_cast<std::size_t>(p) * P::x_terms_row_bytes(Terms), b, P::kXCodeBytes, P::kXRowBytes, q);
+    };
+    for (int slot = 0; slot < top_k; ++slot) { store(slot_entries[t * top_k + slot]); }
+    if (dispatch.shared_first != 0x7FFFFFFF) { store(slot_entries[dispatch.shared_first + t]); }
 }
 
 // The pass's wide entries' h (BF16 rows) as terms with their row scales: one warp per entry.
@@ -505,7 +567,15 @@ Descriptors make_descriptors_terms(const std::uint8_t* x_terms_plane, const std:
 
 std::size_t experts_workspace_bytes(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t entries,
                                     std::int32_t columns, ExpertActivation activation, WideA16 wide_a16) {
-    return offsets(shape, max_jobs, entries, columns, activation, wide_a16).end;
+    std::size_t bytes = offsets(shape, max_jobs, entries, columns, activation, wide_a16).end;
+    // A call of at most kA16NmmaCallColumns columns may hold x limbs a wider one does not (a16_nmma_columns): callers
+    // size the widest call they make, so its bytes cover the widest call that holds them too.
+    if (columns > kA16NmmaCallColumns) {
+        const auto narrower = static_cast<std::int32_t>(
+            (static_cast<std::int64_t>(entries) * kA16NmmaCallColumns + columns - 1) / columns);
+        bytes = std::max(bytes, offsets(shape, max_jobs, narrower, kA16NmmaCallColumns, activation, wide_a16).end);
+    }
+    return bytes;
 }
 
 ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, std::int32_t max_jobs,
@@ -523,10 +593,13 @@ ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, s
         w.lossless = reinterpret_cast<std::uint8_t*>(p + o.lossless);
     } else if (activation == ExpertActivation::kA16 && residual_terms(wide_a16).x != 0) {
         w.h_rows      = reinterpret_cast<std::uint8_t*>(p + o.h_rows);
-        w.x_emax      = o.has_ring ? reinterpret_cast<std::int32_t*>(p + o.x_emax) : nullptr;
+        w.x_emax      = o.has_ring || o.has_nmma ? reinterpret_cast<std::int32_t*>(p + o.x_emax) : nullptr;
+        w.x_limbs     = o.has_nmma ? reinterpret_cast<std::uint8_t*>(p + o.x_limbs) : nullptr;
+        w.job_ctas    = o.has_nmma ? reinterpret_cast<std::uint32_t*>(p + o.job_ctas) : nullptr;
         w.h_emax      = reinterpret_cast<std::int32_t*>(p + o.h_emax);
         w.x_terms_plane = reinterpret_cast<std::uint8_t*>(p + o.x_terms_plane);
         w.x_row_scale = reinterpret_cast<float*>(p + o.x_row_scale);
+        w.x_slot_entries = reinterpret_cast<std::int32_t*>(p + o.x_slot_entries);
         w.h_terms_plane = reinterpret_cast<std::uint8_t*>(p + o.h_terms_plane);
         w.h_row_scale = reinterpret_cast<float*>(p + o.h_row_scale);
     } else if (activation == ExpertActivation::kA16) {
@@ -534,7 +607,7 @@ ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, s
         w.h_rows  = reinterpret_cast<std::uint8_t*>(p + o.h_rows);
         w.x_emax  = reinterpret_cast<std::int32_t*>(p + o.x_emax);
         w.h_emax  = reinterpret_cast<std::int32_t*>(p + o.h_emax);
-        w.ggml_planes = o.has_ggml_planes ? reinterpret_cast<std::uint8_t*>(p + o.ggml_planes) : nullptr;
+        w.job_ctas = reinterpret_cast<std::uint32_t*>(p + o.job_ctas);
     } else {
         w.h_blocks = reinterpret_cast<canon::A4Block*>(p + o.h_blocks);
         w.x_plane  = reinterpret_cast<std::uint8_t*>(p + o.x_plane);
@@ -561,7 +634,7 @@ int persistent_ctas() {
 
 Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source, std::int32_t top_k,
              std::int32_t max_jobs, std::int32_t pass_jobs, const ExpertsWorkspace& workspace, Tensor& outputs,
-             cudaStream_t stream) {
+             cudaStream_t stream, bool x_limbs_encoded) {
     if (pass_jobs <= 0 || max_jobs <= 0) { throw std::invalid_argument("offloaded_sparse_moe wide: empty passes"); }
     const int entries = outputs.ne[1];
     Call call;
@@ -578,11 +651,20 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source.scales, max_jobs, pass_jobs, call.passes,
                                                 workspace.tiles, workspace.pass_tiles);
     check_launch("plan");
+    if (source.activation == ExpertActivation::kA16 && source.wide_a16 == WideA16::kA8) {
+        // W4A16 on 8-bit activations: every token's codes are already in the x region (moe_experts encodes them
+        // once per call for the narrow kernels too, a8_x_rows); h is encoded per pass.
+        call.a8      = true;
+        call.x_limbs = a8_x_rows(workspace);
+        call.h_rows  = workspace.h_rows;
+        call.top_k   = top_k;
+        return call;
+    }
     const ResidualTerms terms =
         source.activation == ExpertActivation::kA16 ? residual_terms(source.wide_a16) : ResidualTerms{};
     if (terms.x != 0) {
-        // W4A16 A4 residual: every token's row scale, then each wide entry's x terms; h's terms are
-        // formed per pass from the BF16 h the gate/up epilogue writes.
+        // W4A16 A4 residual: every token's row scale and its x terms, stored in each of its entries' rows; h's
+        // terms are formed per pass from the BF16 h the gate/up epilogue writes.
         call.a4_residual   = true;
         call.terms         = terms;
         call.h_rows        = workspace.h_rows;
@@ -592,13 +674,13 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
         call.h_row_scale   = workspace.h_row_scale;
         Descriptors descriptors{};
         with_expert_geometry(source.shape, [&]<class G>() {
-            x_row_scale_kernel<G><<<x.ne[1], G::kHidden / 16, 0, stream>>>(static_cast<const std::uint16_t*>(x.data),
-                                                                          workspace.x_row_scale);
-            check_launch("x row scale");
+            x_slot_entries_kernel<<<persistent_ctas(), kQuantizeThreads, 0, stream>>>(dispatch, entries,
+                                                                                   workspace.x_slot_entries);
+            check_launch("x slot entries");
             const auto quantize_x = [&]<int Terms>() {
-                quantize_x_terms_kernel<G, Terms><<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
-                    static_cast<const std::uint16_t*>(x.data), top_k, dispatch, workspace.tiles, workspace.pass_tiles,
-                    call.passes, workspace.x_row_scale, workspace.x_terms_plane);
+                x_terms_kernel<G, Terms><<<x.ne[1], G::kHidden / 16, 0, stream>>>(
+                    static_cast<const std::uint16_t*>(x.data), top_k, dispatch, workspace.x_slot_entries,
+                    workspace.x_row_scale, workspace.x_terms_plane);
             };
             terms.x == 3 ? quantize_x.template operator()<3>() : quantize_x.template operator()<2>();
             check_launch("quantize A4 residual x");
@@ -620,6 +702,7 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
         call.x_emax  = workspace.x_emax;
         call.h_emax  = workspace.h_emax;
         call.top_k   = top_k;
+        if (x_limbs_encoded) { return call; }
         with_expert_geometry(source.shape, [&]<class G>() {
             encode_x_kernel<G><<<x.ne[1], G::kHidden / 16, 0, stream>>>(static_cast<const std::uint16_t*>(x.data),
                                                                        workspace.x_limbs, workspace.x_emax);
@@ -641,18 +724,29 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     return call;
 }
 
-// TEMPORARY (INFERNIX_TMP_WIDE_EXPERT_T64=<n>, candidates P5), until its A/B: the W4A4 and A4-residual
-// grouped GEMMs on WarpTile64 schedules (the same bits) in calls of at least n columns per expert on
-// average (unset: never; 1: every call). Op bench 2026-10-24: 1.05-1.11x the time at 80 columns per
-// expert (Flash-Next 4K tokens), 0.94-0.97x from about 128 (the 122B at 4K, either model at 16K+).
-bool wide_t64(const Call& call) {
-    static const std::int64_t threshold =
-        temporary_switches::integer("INFERNIX_TMP_WIDE_EXPERT_T64", 0, 0, 1 << 30);
-    return threshold > 0 && call.mean_job_columns >= threshold;
-}
+// The W4A4 and A4-residual grouped GEMMs on WarpTile64 schedules (the same bits) from
+// kWarpTile64MinColumns columns per expert on average.
+bool wide_t64(const Call& call) { return call.mean_job_columns >= kWarpTile64MinColumns; }
 
 void run_pass(const Call& call, std::int32_t pass, cudaStream_t stream) {
     if (pass < 0 || pass >= call.passes) { throw std::out_of_range("offloaded_sparse_moe wide: pass out of range"); }
+    if (call.a8) {
+        with_expert_geometry(call.shape, [&]<class G>() {
+            // A call with shared-expert jobs maps entries through entry_column; a routed-only call keeps the token row.
+            const GateUpEpilogueA8<G> gate_up{call.scales, call.h_rows};
+            if (call.dispatch.shared_first != 0x7FFFFFFF) {
+                launch_a8<A8Matrix<G, Matrix::GateUp, true>>(call, pass, gate_up, stream);
+            } else {
+                launch_a8<A8Matrix<G, Matrix::GateUp>>(call, pass, gate_up, stream);
+            }
+            encode_h_a8_kernel<G><<<persistent_ctas(), kEncodeWarps * 32, 0, stream>>>(call.dispatch, call.tiles,
+                                                                                       call.pass_tiles, pass, call.h_rows);
+            check_launch("encode h a8");
+            launch_a8<A8Matrix<G, Matrix::Down>>(call, pass, DownEpilogueA8<G>{call.scales, call.dispatch.entries, call.outputs},
+                                                 stream);
+        });
+        return;
+    }
     if (call.a4_residual) {
         with_expert_geometry(call.shape, [&]<class G>() {
             const auto gate_up = [&]<int Terms>() {

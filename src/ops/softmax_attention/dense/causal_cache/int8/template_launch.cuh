@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/grouped_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/grouped_pipelined.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/tiled_mma.cuh"
@@ -42,12 +43,15 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
         }
         const dim3 grid(G::KVHeads * (ParallelQueries ? div_up(p.width, S::kTokenTile) : 1),
                         partition.capacity, p.batch);
-        kernel<<<grid, S::kThreads, bytes, stream>>>(
+        // A programmatic dependent of the RoPE / append kernel before it (the kernel waits at entry): the Qwen3.5 decode
+        // graphs, INT8 KV, leave-one-out: the 35B-A3B MTP +0.24 %, the groupwise 27B DFlash2 +0.09 %, the NVFP4 27B
+        // level (candidates §58). Same bits.
+        CUDA_CHECK(pdl::launch_consumer(
+                                    {grid, dim3(S::kThreads), static_cast<std::size_t>(bytes), stream}, kernel,
             p.q, input, p.positions, cache.keys, cache.values, cache.key_scales, cache.value_scales,
             cache.tables, cache.valid_columns, cache.table_rows, cache.table_stride, p.width,
             p.visible_capacity, partition, p.scale, partial.acc, partial.maximum, partial.sum,
-            cache.tree_masks);
-        CUDA_CHECK(cudaGetLastError());
+            cache.tree_masks));
     };
     if constexpr (TreeCapable) {
         if (cache.tree_masks) {

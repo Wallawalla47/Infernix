@@ -10,7 +10,9 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/logger.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <mutex>
@@ -32,6 +34,14 @@ void write_exception(httplib::Response& res, const std::exception& ex) {
 
 bool is_anthropic_path(std::string_view path) {
     return canonical_api_path(path).starts_with("/v1/messages");
+}
+
+// A WebSocket upgrade: `websocket` among the Upgrade field's protocols, matched case-insensitively (RFC 9110 7.8).
+bool requests_websocket(const httplib::Request& request) {
+    std::string upgrade = request.get_header_value("Upgrade");
+    std::transform(upgrade.begin(), upgrade.end(), upgrade.begin(),
+                   [](unsigned char c) { return static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c); });
+    return upgrade.find("websocket") != std::string::npos;
 }
 
 bool is_openai_path(std::string_view path) {
@@ -164,6 +174,19 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
     return httplib::Server::HandlerResponse::Handled;
 }
 
+void handle_responses_upgrade(const httplib::Request& request, httplib::Response& response) {
+    if (!requests_websocket(request)) {
+        response.status = 404;
+        return;
+    }
+    ApiError error;
+    error.status  = 426;
+    error.type    = "invalid_request_error";
+    error.code    = "websocket_not_supported";
+    error.message = "the Responses WebSocket mode is not supported: send POST /v1/responses over HTTP";
+    write_openai_error(response, error);
+}
+
 bool matches_bearer_credential(std::string_view authorization, std::string_view api_key) noexcept {
     if (api_key.empty()) { return false; }
     const auto is_whitespace = [](char value) { return value == ' ' || value == '\t'; };
@@ -204,23 +227,34 @@ std::string_view canonical_api_path(std::string_view path) noexcept {
     return path;
 }
 
+httplib::TaskQueue* new_http_worker_pool(const ServeOptions& options) {
+    const std::size_t queued_requests =
+        static_cast<std::size_t>(options.max_concurrency) + options.max_pending_requests;
+    const std::size_t worker_count = queued_requests + 1;
+    // cpp-httplib runs each accepted connection's keep-alive loop as one pool task, so an
+    // open connection — idle or not — occupies its worker for the whole idle window. Stock
+    // sizes the pool max_n == base, capping both workers and, with them, simultaneous
+    // connections; the keep-alive window makes that cap worth stating openly rather than
+    // leaving hardwired: base workers keep request admission permanently reachable, and
+    // connections up to --max-http-clients hold a worker each, with the rest queueing
+    // (max_pending_requests deep) before the accept loop starts refusing them.
+    const std::size_t worker_ceiling =
+        std::max(worker_count, static_cast<std::size_t>(options.max_http_clients));
+    return new httplib::ThreadPool(worker_count, worker_ceiling, queued_requests);
+}
+
 HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger,
                        std::shared_ptr<product::TerminalPanel> panel)
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
                                                             options_.response_store_max_bytes),
       operational_log_(logger), request_jsonl_(options_.request_log_jsonl, options_.artifact_path,
                                                std::move(logger), options_.request_log_rotation) {
-    if (options_.log_stats_panel && panel != nullptr && panel->enabled()) {
-        console_stats_ = std::make_unique<ConsoleStatsPanel>(
-            std::move(panel), options_.speculative.ngram_draft_tokens != 0 ||
-                                  options_.speculative.ngram_draft_tokens_auto);
-    }
-    const std::size_t queued_requests =
-        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
-    const std::size_t worker_count = queued_requests + 1;
-    server_.new_task_queue         = [queued_requests, worker_count] {
-        return new httplib::ThreadPool(worker_count, worker_count, queued_requests);
-    };
+    // Always aggregated (GET /metrics?format=json reports them); drawn only on a terminal panel.
+    const bool draw_panel = options_.log_stats_panel && panel != nullptr && panel->enabled();
+    console_stats_        = std::make_unique<ConsoleStatsPanel>(
+        draw_panel ? std::move(panel) : nullptr, options_.speculative.ngram_draft_tokens != 0 ||
+                                                     options_.speculative.ngram_draft_tokens_auto);
+    server_.new_task_queue = [this] { return new_http_worker_pool(options_); };
     server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
@@ -229,19 +263,27 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
 HttpServer::RequestLifecycle::RequestLifecycle(HttpServer& owner, RequestLogContext context)
     : owner_(&owner), context_(std::move(context)) {
     owner_->record_request_start(context_);
+    owner_->live_requests_.begin(context_.id, context_.label, context_.protocol, context_.prompt_tokens,
+                                 context_.started);
 }
+
+HttpServer::RequestLifecycle::~RequestLifecycle() { owner_->live_requests_.end(context_.id); }
 
 bool HttpServer::RequestLifecycle::claim(State terminal) noexcept {
     State expected = State::Pending;
     return state_.compare_exchange_strong(expected, terminal, std::memory_order_acq_rel);
 }
 
+// A request leaves live.active once its terminal record is written (a poll in between lists it in
+// both live.active and requests).
 void HttpServer::RequestLifecycle::done(const GenerationOutcome& outcome) {
     if (claim(State::Done)) { owner_->record_request_done(context_, outcome); }
+    owner_->live_requests_.end(context_.id);
 }
 
 void HttpServer::RequestLifecycle::failure(const RequestFailure& failure) {
     if (claim(State::Error)) { owner_->record_request_failure(context_, failure); }
+    owner_->live_requests_.end(context_.id);
 }
 
 void HttpServer::RequestLifecycle::response_failure(const RequestFailure& failure) {
@@ -270,6 +312,12 @@ void HttpServer::record_request_rejected(const RequestRejectionLogContext& conte
 infernix::GenerationFirstTokenObserver HttpServer::first_token_observer() {
     return [this](const infernix::GenerationFirstTokenObservation& observation) {
         metrics_.first_token(observation);
+    };
+}
+
+infernix::GenerationProgressObserver HttpServer::progress_observer(std::uint64_t request_id) {
+    return [this, request_id](const infernix::GenerationProgressObservation& observation) {
+        live_requests_.progress(request_id, observation);
     };
 }
 
@@ -327,9 +375,11 @@ std::string HttpServer::metrics_json_body() const {
                                     .cancelled = counts.cancelled,
                                     .failed    = counts.failed,
                                     .rejected  = counts.rejected};
+    snapshot.active              = live_requests_.rows(LiveRequests::Clock::now());
     snapshot.requests            = metrics_json_history_.rows();
     snapshot.rates_valid         = metrics_json_history_.rates(snapshot.decode_tokens_per_second,
                                                                snapshot.prefill_tokens_per_second);
+    snapshot.session_stats       = console_stats_->snapshot();
     return render_metrics_json(snapshot);
 }
 
@@ -422,6 +472,19 @@ void HttpServer::stop_stats_reporter() {
 }
 
 void HttpServer::register_routes() {
+    // HTTP keep-alive window after a response finishes (cpp-httplib defaults to 5 s, which
+    // closes pooled connections between agent turns; clients then pay a reconnect — or race
+    // the close if their pool outlives it). The library's timeout close is already graceful
+    // (drain_and_close_socket: a half-close, then a bounded drain), and a live request re-arms
+    // the window on both sides, so no per-response retirement is needed. A client that probes a
+    // pooled socket before reuse still loses a request written between its probe and a close in
+    // flight (a POST is not retried), so the server must not close first: clients that read the
+    // Keep-Alive header retire at the advertised timeout, which the close follows by
+    // kKeepAliveBufferSec; clients that do not (Bun's fetch: 4-5 minutes) are outlasted by the
+    // default window. Idle connections hold a worker each — bounded by the pool ceiling
+    // (--max-http-clients), not by the window.
+    server_.set_keep_alive_timeout(options_.keep_alive_timeout_sec);
+    server_.set_keep_alive_timeout_buffer(kKeepAliveBufferSec);
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
         return handle_unrendered_http_error(options_, request, response);
     });
@@ -554,6 +617,7 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_responses(req, res);
                  });
+    server_.Get(api_route_pattern("/responses"), handle_responses_upgrade);
     server_.Post(api_route_pattern("/responses/input_tokens"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_input_tokens(req, res);
@@ -619,7 +683,7 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
 
 bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
 
-void HttpServer::attach(GenerationService& service) {
+void HttpServer::attach(GenerationBackend& service) {
     if (service_ != nullptr) {
         throw std::logic_error("HTTP generation service is already attached");
     }

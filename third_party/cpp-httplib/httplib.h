@@ -2208,6 +2208,10 @@ public:
   template <class Rep, class Period>
   Server &
   set_keep_alive_timeout(const std::chrono::duration<Rep, Period> &duration);
+  // Infernix local change (third_party/cpp-httplib/LOCAL_CHANGES.md): an idle
+  // connection stays open this many seconds past the advertised Keep-Alive
+  // timeout, so a client that follows the header always closes first.
+  Server &set_keep_alive_timeout_buffer(time_t sec);
 
   Server &set_read_timeout(time_t sec, time_t usec = 0);
   template <class Rep, class Period>
@@ -2290,6 +2294,7 @@ protected:
 
   size_t keep_alive_max_count_ = CPPHTTPLIB_KEEPALIVE_MAX_COUNT;
   time_t keep_alive_timeout_sec_ = CPPHTTPLIB_KEEPALIVE_TIMEOUT_SECOND;
+  time_t keep_alive_timeout_buffer_sec_ = 0; // Infernix local change
   time_t read_timeout_sec_ = CPPHTTPLIB_SERVER_READ_TIMEOUT_SECOND;
   time_t read_timeout_usec_ = CPPHTTPLIB_SERVER_READ_TIMEOUT_USECOND;
   time_t write_timeout_sec_ = CPPHTTPLIB_SERVER_WRITE_TIMEOUT_SECOND;
@@ -12960,6 +12965,11 @@ inline Server &Server::set_keep_alive_timeout(time_t sec) {
   return *this;
 }
 
+inline Server &Server::set_keep_alive_timeout_buffer(time_t sec) {
+  keep_alive_timeout_buffer_sec_ = sec;
+  return *this;
+}
+
 template <class Rep, class Period>
 inline Server &Server::set_keep_alive_timeout(
     const std::chrono::duration<Rep, Period> &duration) {
@@ -14457,7 +14467,8 @@ inline bool Server::process_and_close_socket(socket_t sock) {
   bool websocket_upgraded = false;
   auto ret = serve_guarded([&]() {
     return detail::process_server_socket(
-        svr_sock_, sock, keep_alive_max_count_, keep_alive_timeout_sec_,
+        svr_sock_, sock, keep_alive_max_count_,
+        keep_alive_timeout_sec_ + keep_alive_timeout_buffer_sec_,
         read_timeout_sec_, read_timeout_usec_, write_timeout_sec_,
         write_timeout_usec_,
         [&](Stream &strm, bool close_connection, bool &connection_closed) {
@@ -17869,7 +17880,8 @@ inline bool SSLServer::process_and_close_socket(socket_t sock) {
   ret = serve_guarded([&]() {
     return detail::process_server_socket_ssl(
         svr_sock_, session, sock, keep_alive_max_count_,
-        keep_alive_timeout_sec_, read_timeout_sec_, read_timeout_usec_,
+        keep_alive_timeout_sec_ + keep_alive_timeout_buffer_sec_,
+        read_timeout_sec_, read_timeout_usec_,
         write_timeout_sec_, write_timeout_usec_,
         [&](Stream &strm, bool close_connection, bool &connection_closed) {
           return process_request(

@@ -270,8 +270,13 @@ output head. Backend selection, draft width and proposal-head choice are fixed a
 
 The current native processor uses 16×16 spatial patches, pairs of frames, and 2×2 spatial merge.
 It consumes bytes already acquired by the CLI or server, decodes images/video frames (JPEG images
-through libjpeg with Pillow's settings, so their pixels equal the Hugging Face processor's input;
-other images and every video through FFmpeg, chroma interpolated bilinearly), resizes to
+through libjpeg with Pillow's settings, and lossy WebP through FFmpeg's VP8 planes with libwebp's
+fancy upsampling and YUV conversion, so their pixels equal the Hugging Face processor's input;
+lossless WebP and GIF through FFmpeg and PNG through FFmpeg or the Windows build's native decoder,
+also equal to Pillow's; other images and every video through FFmpeg, chroma interpolated bilinearly).
+An image's alpha is dropped, as `load_image` drops it and most engines do (llama.cpp, Ollama,
+LMDeploy, mlx-vlm, TGI; vLLM, SGLang and TensorRT-LLM composite over a background instead); video
+frames with alpha are composited over white. It then resizes to
 merge-aligned dimensions, normalizes RGB and packs BF16 patch rows. Each row contains
 `3 * 2 * 16 * 16 = 1536` values in the defined channel/temporal/spatial order. Images repeat their
 frame to supply the temporal pair.

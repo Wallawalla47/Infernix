@@ -271,10 +271,10 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
             const float nm1_scaled = nm1 * scale_l2;
             const float alpha0     = running_m0 == -CUDART_INF_F
                                          ? 0.0f
-                                         : causal_exp_scaled(running_m0, nm0_scaled, scale_l2);
+                                         : causal_rescale(running_m0, nm0_scaled, scale_l2);
             const float alpha1     = running_m1 == -CUDART_INF_F
                                          ? 0.0f
-                                         : causal_exp_scaled(running_m1, nm1_scaled, scale_l2);
+                                         : causal_rescale(running_m1, nm1_scaled, scale_l2);
             float bl0              = 0.0f;
             float bl1              = 0.0f;
 #pragma unroll

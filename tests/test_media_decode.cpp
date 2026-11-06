@@ -1,14 +1,17 @@
 #include "media/decode/decode.h"
 #include "fixtures/media/jpeg.h"
+#include "fixtures/media/webp_gif.h"
 
 #ifdef INFERNIX_MEDIA_NATIVE_PNG
 #include "media/decode/png_decode.h"
 #include "png_fixtures_generated.h"
 #endif
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <functional>
 #include <iostream>
@@ -171,6 +174,33 @@ void test_jpeg_references() {
         const auto expected = decode_base64(fixture.rgb);
         expect_image(encoded, fixture.width, fixture.height, expected, fixture.name);
     }
+}
+
+// WebP (lossless, lossy at both parities of width and height, animated, with alpha), GIF (static, animated) and
+// transparent PNG (RGBA, gray + alpha, palette + tRNS) against Pillow's RGB8 of the first frame, as transformers'
+// load_image returns it (candidates MJ-01: the Launcher accepts them and no test decoded WebP or GIF). Every case
+// equals Pillow's pixels, alpha dropped as most engines drop it (llama.cpp, Ollama, LMDeploy, mlx-vlm, TGI; vLLM,
+// SGLang and TensorRT-LLM composite instead): lossy WebP through libwebp's upsampling and conversion, PNG through
+// the native decoder where the build has it, the rest through FFmpeg.
+void test_webp_gif_references() {
+    std::string failures;
+    for (const auto& fixture : webp_gif_fixtures::cases) {
+        const auto encoded  = decode_base64(fixture.encoded);
+        const auto expected = decode_base64(fixture.rgb);
+        const auto info     = infernix::media::decode::inspect_image(encoded, {});
+        const auto image    = infernix::media::decode::decode_image(encoded, {});
+        const std::string name(fixture.name);
+        if (info.width != fixture.width || info.height != fixture.height || image.width != fixture.width ||
+            image.height != fixture.height || image.rgb.size() != expected.size()) {
+            throw std::runtime_error(name + ": geometry mismatch");
+        }
+        int worst = 0;
+        for (std::size_t i = 0; i < expected.size(); ++i) {
+            worst = std::max(worst, std::abs(static_cast<int>(image.rgb[i]) - static_cast<int>(expected[i])));
+        }
+        if (worst != 0) { failures += " " + name + " (largest channel difference " + std::to_string(worst) + ")"; }
+    }
+    if (!failures.empty()) { throw std::runtime_error("RGB differs from Pillow's:" + failures); }
 }
 
 // EXIF orientations 1..8 against ImageOps.exif_transpose().
@@ -404,20 +434,20 @@ void test_png_decoders() {
         }
     }
 
-    // 8-bit RGBA, 2x1. Pixel 0 alpha 128 composited over white; pixel 1 opaque.
+    // 8-bit RGBA, 2x1. Pixel 0 has alpha 128: alpha is dropped, so its stored color; pixel 1 opaque.
     {
         auto s = sp(png_rgba8, std::size(png_rgba8));
         const Image image = decode_image(s, {});
-        expect_exact(image, 0, 0, {255, 127, 127});
+        expect_exact(image, 0, 0, {255, 0, 0});
         expect_exact(image, 1, 0, {0, 255, 0});
     }
 
-    // palette + tRNS, 3x1. Middle entry alpha 128 composited over white.
+    // palette + tRNS, 3x1. The middle entry's alpha 128 is dropped: its palette color.
     {
         auto s = sp(png_palette_trns, std::size(png_palette_trns));
         const Image image = decode_image(s, {});
         expect_exact(image, 0, 0, {10, 20, 30});
-        expect_exact(image, 1, 0, {147, 152, 157});
+        expect_exact(image, 1, 0, {40, 50, 60});
         expect_exact(image, 2, 0, {70, 80, 90});
     }
 
@@ -516,6 +546,7 @@ int main() {
     try {
         test_issue_20_unaligned_jpeg();
         test_jpeg_references();
+        test_webp_gif_references();
         test_jpeg_orientation();
         test_ffmpeg_odd_width();
         test_jpeg_errors();

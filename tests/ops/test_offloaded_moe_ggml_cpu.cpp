@@ -173,7 +173,9 @@ void run(QType gu, QType down, std::mt19937& rng) {
     const moe::CpuIsa isas[] = {moe::CpuIsa::kScalar, moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni};
     for (const auto isa : isas) {
         if (!moe::cpu_isa_supported(isa) || (!g_only_isa.empty() && g_only_isa != moe::cpu_isa_name(isa))) { continue; }
-        for (const int ncols : {1, 2, 3, 5, 8}) {
+        // The 256-bit ISAs' tiled rows have a kernel per width 1-8; the other ISAs and FP8 take fewer.
+        const bool tiled = !fp8 && (isa == moe::CpuIsa::kAvx2 || isa == moe::CpuIsa::kAvxVnni);
+        for (const int ncols : tiled ? std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8} : std::vector<int>{1, 2, 3, 5, 8}) {
             // Columns are taken from the end for the narrow widths, so the special columns are covered.
             const int first = moe::kMaxColumns - ncols;
             std::vector<std::uint16_t> y(static_cast<std::size_t>(H) * ncols, 0xFFFF);
@@ -212,8 +214,9 @@ void run(QType gu, QType down, std::mt19937& rng) {
                 static_cast<int>(down), us, moe::cpu_isa_name(best), static_cast<double>(record.size()) / us / 1e3);
 }
 
-// The worker team's GGUF route (CpuExpertTeam::work_ggml) against ggml_expert_forward: three jobs of
-// one, two and three columns at 1, 3 and 16 workers.
+// The worker team's GGUF route (CpuExpertTeam::work_ggml, no barriers between the phases) against
+// ggml_expert_forward: three jobs of one, two and three columns at 1, 3 and 16 workers, spinning or
+// parking between rounds, three rounds each (later rounds reuse the per-job countdowns).
 void check_team_ggml(std::mt19937& rng) {
     const int H = moe::kHidden, I = moe::kIntermediate;
     const QType gu = QType::GGML_IQ2_S, down = QType::GGML_IQ4_NL;
@@ -239,8 +242,13 @@ void check_team_ggml(std::mt19937& rng) {
         }
         moe::ggml_expert_forward(moe::best_cpu_isa(), bank.data() + j * record, f, j + 1, xp, yp);
     }
-    for (const int workers : {1, 3, 16}) {
-        moe::CpuExpertTeam team({.workers = workers, .max_jobs = kJobs, .activation = moe::ExpertActivation::kA16, .ggml = true});
+    for (const int workers : {1, 3, 16})
+    for (const int spin : {1 << 16, 0}) { // 0: idle workers park at once
+        moe::CpuExpertTeam team({.workers         = workers,
+                                 .max_jobs        = kJobs,
+                                 .spin_iterations = spin,
+                                 .activation      = moe::ExpertActivation::kA16,
+                                 .ggml            = true});
         std::vector<std::uint16_t> got(want.size(), 0);
         std::vector<moe::CpuExpertJob> jobs(kJobs);
         for (int j = 0; j < kJobs; ++j) {
@@ -253,10 +261,57 @@ void check_team_ggml(std::mt19937& rng) {
                 job.y[c] = got.data() + at(j, c);
             }
         }
-        team.run(jobs);
-        if (got != want) {
-            std::fprintf(stderr, "FAIL: the worker team's GGUF route at %d workers differs from ggml_expert_forward\n", workers);
-            ++g_failures;
+        for (int round = 0; round < 3; ++round) {
+            std::fill(got.begin(), got.end(), std::uint16_t{0});
+            team.run(jobs);
+            if (got != want) {
+                std::fprintf(stderr, "FAIL: the worker team's GGUF route at %d workers (spin %d) differs from ggml_expert_forward\n",
+                             workers, spin);
+                ++g_failures;
+                break;
+            }
+        }
+    }
+}
+
+// ggml_encode_column (AVX2 on this CPU when it has it) against canon::a16_column_exponent and a16_value
+// split into limbs: the same exponent and limbs for normal, subnormal, zero, signed, wide-range and
+// non-finite columns.
+void check_encode() {
+    std::mt19937 rng(20261028);
+    std::uniform_int_distribution<int> bits(0, 0xFFFF);
+    std::uniform_real_distribution<float> exponent(-140.0F, 20.0F);
+    std::normal_distribution<float> normal(0.0F, 1.0F);
+    for (int kind = 0; kind < 8; ++kind) {
+        for (const int n : {moe::kHidden, moe::kIntermediate}) {
+            std::vector<std::uint16_t> v(static_cast<std::size_t>(n));
+            for (int j = 0; j < n; ++j) {
+                std::uint16_t w = 0;
+                switch (kind) {
+                case 0: w = bf16(normal(rng)); break;
+                case 1: w = bf16(std::ldexp(normal(rng), static_cast<int>(exponent(rng)))); break; // incl. subnormals
+                case 2: w = static_cast<std::uint16_t>(bits(rng) & 0x807F); break;               // subnormals and zeros only
+                case 3: w = j % 3 == 0 ? std::uint16_t{0x8000} : bf16(normal(rng) * 1e-3F); break;
+                case 4: w = static_cast<std::uint16_t>(bits(rng)); if ((w & 0x7F80) == 0x7F80) { w &= 0xBFFF; } break;
+                case 5: w = 0; break;                                                              // all zero
+                case 6: w = bf16(normal(rng)); if (j == n / 2) { w = 0xFF80; } break;              // -inf
+                default: w = bf16(normal(rng)); if (j == 7) { w = 0x7FC1; } break;                 // NaN
+                }
+                v[static_cast<std::size_t>(j)] = w;
+            }
+            std::vector<moe::CpuLimbSlice> a(static_cast<std::size_t>(n / 32)), b(static_cast<std::size_t>(n / 32));
+            std::memset(a.data(), 0, sizeof(moe::CpuLimbSlice) * a.size());
+            const int ea = canon::a16_column_exponent(v.data(), n);
+            for (int j = 0; j < n; ++j) {
+                const std::int32_t x = ea == canon::kA16NonFinite ? 0 : canon::a16_value(v[static_cast<std::size_t>(j)], ea);
+                a[static_cast<std::size_t>(j / 32)].lo[j % 32] = static_cast<std::int16_t>(x & 2047);
+                a[static_cast<std::size_t>(j / 32)].hi[j % 32] = static_cast<std::int16_t>(x >> 11);
+            }
+            const int eb = moe::ggml_encode_column(v.data(), n, b.data());
+            if (ea != eb || std::memcmp(a.data(), b.data(), sizeof(moe::CpuLimbSlice) * a.size()) != 0) {
+                std::fprintf(stderr, "FAIL: the column encode differs from the A16 oracle (kind %d, n %d)\n", kind, n);
+                ++g_failures;
+            }
         }
     }
 }
@@ -315,8 +370,7 @@ void rates(bool fp8) {
 }
 
 // --columns: one expert call on one thread at 1-8 columns, every supported ISA, for the GGUF pairs of the
-// IQ3_S and IQ4_XS imports (candidates §14 SR-03: the 256-bit routes take columns four at a time, so 5-8
-// decode every slice twice). Prints µs per call and per column; information only.
+// IQ3_S and IQ4_XS imports. Prints µs per call and per column; information only.
 void columns() {
     std::mt19937 rng(20261024);
     const int H = moe::kHidden, I = moe::kIntermediate;
@@ -383,6 +437,7 @@ INFERNIX_OP_TEST(offloaded_moe_ggml_cpu) {
         for (const auto& [gu, down] : pairs) { run(gu, down, rng); }
         run(QType::FP8_E4M3FN_B128, QType::FP8_E4M3FN_B128, rng); // block-FP8 banks (cpu/fp8_expert.h)
         check_team_ggml(rng);
+        check_encode();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "error: %s\n", error.what());
         return 1;

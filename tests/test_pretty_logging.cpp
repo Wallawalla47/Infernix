@@ -9,6 +9,7 @@
 #ifdef _WIN32
 #    include <fcntl.h>
 #    include <io.h>
+#    include <process.h>
 #else
 #    include <unistd.h>
 #endif
@@ -18,7 +19,10 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <regex>
 #include <stdexcept>
 #include <string>
@@ -36,6 +40,7 @@ inline int port_close(int fd)      { return _close(fd); }
 inline int port_read(int fd, void* buffer, unsigned long count) {
     return _read(fd, buffer, static_cast<unsigned int>(count));
 }
+inline int port_pid() { return _getpid(); }
 #else
 inline int port_pipe(int fds[2])   { return ::pipe(fds); }
 inline int port_dup(int fd)        { return ::dup(fd); }
@@ -44,6 +49,7 @@ inline int port_close(int fd)      { return ::close(fd); }
 inline int port_read(int fd, void* buffer, std::size_t count) {
     return static_cast<int>(::read(fd, buffer, count));
 }
+inline int port_pid() { return static_cast<int>(::getpid()); }
 #endif
 
 class StderrCapture {
@@ -215,11 +221,130 @@ int main() {
             startup_output.find("loading prefix cache | 24.0 GiB") != std::string::npos &&
             startup_output.find("prefix cache read | 24.0 GiB | 4.0s | 6.00 GiB/s") !=
                 std::string::npos &&
-            startup_output.find("engine ready | qwen3.6-27b | total 3.0s | weights 16.0 GiB") !=
+            startup_output.find("engine ready | qwen3.6-27b | total 3.0s | GPU weights 16.0 GiB\n") !=
                 std::string::npos &&
-            startup_output.find("CUDA sync blocking") != std::string::npos &&
+            startup_output.find("CUDA sync") == std::string::npos &&
             startup_output.find("CUDA initialized") == std::string::npos,
         "normal startup pretty output is noisy or incomplete");
+
+    // Engine detail at startup is debug: the CUDA graphs and the pinned host context (a terminal's
+    // transient line while they run), the fast paths' names, every temporary switch's value and
+    // the CUDA sync mode. Info says whether fast paths run and names the switches that are set; a
+    // drafter's weights read as their own phase.
+    for (const infernix::product::LogLevel level :
+         {infernix::product::LogLevel::Info, infernix::product::LogLevel::Debug}) {
+        std::string output;
+        {
+            StderrCapture capture;
+            {
+                infernix::product::LoggingRuntime logging(
+                    {.logger_name  = "infernix-serve",
+                     .level        = level,
+                     .color        = infernix::product::LogColorMode::Never,
+                     .presentation = infernix::product::LogPresentation::Service});
+                infernix::product::StartupLogRenderer startup(logging);
+                infernix::StartupObserver observer = startup.observer();
+                for (const infernix::StartupPhase phase :
+                     {infernix::StartupPhase::HostContextPin,
+                      infernix::StartupPhase::CudaGraphPrepare}) {
+                    observer.callback({.phase = phase, .status = infernix::StartupStatus::Begin});
+                    observer.callback({.phase      = phase,
+                                       .status     = infernix::StartupStatus::Complete,
+                                       .elapsed_ns = 1'000'000'000});
+                }
+                observer.callback({.phase         = infernix::StartupPhase::DraftWeightsMaterialize,
+                                   .status        = infernix::StartupStatus::Begin,
+                                   .progress_unit = infernix::StartupProgressUnit::Bytes,
+                                   .total         = 1ULL << 30});
+                observer.callback({.phase         = infernix::StartupPhase::DraftWeightsMaterialize,
+                                   .status        = infernix::StartupStatus::Complete,
+                                   .progress_unit = infernix::StartupProgressUnit::Bytes,
+                                   .current       = 1ULL << 30,
+                                   .total         = 1ULL << 30,
+                                   .elapsed_ns    = 500'000'000});
+                infernix::LoadSummary load;
+                load.model_name              = "qwen3.8-flash-next";
+                load.cuda_sync_mode          = "spin";
+                load.fast_path_configuration = "Q8 dense, int8 KV";
+                load.fast_paths              = {"q8-sliced-k", "preemption"};
+                load.temporary_switches =
+                    "INFERNIX_TMP_A=unset | INFERNIX_TMP_B=64 | INFERNIX_TMP_C=unset";
+                startup.engine_ready(load);
+                // The reproducible route: no fast path and no switch set.
+                load.fast_paths          = {};
+                load.fast_paths_disabled = true;
+                load.request_invariant   = true;
+                load.temporary_switches  = "INFERNIX_TMP_A=unset";
+                startup.engine_ready(load);
+                logging.flush();
+            }
+            output = capture.finish();
+        }
+        const bool debug = level == infernix::product::LogLevel::Debug;
+        const auto has   = [&output](const char* text) {
+            return output.find(text) != std::string::npos;
+        };
+        failures += check(
+            has("loading drafter weights | 1.00 GiB\n") &&
+                has("drafter weights ready | 1.00 GiB | 500 ms | 2.00 GiB/s\n") &&
+                has("fast paths | on (2) | a request's output can depend on the requests running "
+                    "beside it\n") &&
+                has("fast paths | off | request-invariant: a request's output never depends on "
+                    "other requests\n") &&
+                has("temporary switches | INFERNIX_TMP_B=64\n") &&
+                has("CUDA graphs ready | 1.0s") == debug &&
+                has("host context pinned | 1.0s") == debug &&
+                has("fast paths | q8-sliced-k, preemption | qualified for Q8 dense, int8 KV\n") ==
+                    debug &&
+                has("temporary switches | INFERNIX_TMP_A=unset | INFERNIX_TMP_B=64 | "
+                    "INFERNIX_TMP_C=unset\n") == debug &&
+                has("CUDA sync spin") == debug,
+            debug ? "debug startup output lacks the engine detail"
+                  : "info startup output shows engine detail or lacks a milestone");
+        // At info the unset switches never show, and the reproducible route sets none.
+        if (!debug) {
+            failures += check(!has("=unset") && line_count(output) == 7,
+                              "info startup output lists unset temporary switches");
+        }
+    }
+
+    // A template that cannot render an instruction role where it arrives is stated once at debug,
+    // with the role each such message is sent under; at info startup says nothing (the serve says it
+    // when a request first has such a turn).
+    for (const infernix::product::LogLevel level :
+         {infernix::product::LogLevel::Info, infernix::product::LogLevel::Debug}) {
+        std::string output;
+        {
+            StderrCapture capture;
+            {
+                infernix::product::LoggingRuntime logging(
+                    {.logger_name  = "infernix-serve",
+                     .level        = level,
+                     .color        = infernix::product::LogColorMode::Never,
+                     .presentation = infernix::product::LogPresentation::Service});
+                infernix::product::StartupLogRenderer startup(logging);
+                startup.chat_template_roles({.late_system       = false,
+                                             .late_developer    = false,
+                                             .leading_developer = false},
+                                            {});
+                startup.chat_template_roles({}, {});
+                logging.flush();
+            }
+            output = capture.finish();
+        }
+        const bool debug = level == infernix::product::LogLevel::Debug;
+        failures += check(
+            debug ? line_count(output) == 1 &&
+                        output.find("chat template | the active template cannot render a system "
+                                    "message after the first (sent as a user message), a developer message "
+                                    "after the first (sent as a user message) or a leading developer "
+                                    "message (sent as a system message); each such message keeps its text "
+                                    "and position | to keep every role, pass --chat-template ") !=
+                            std::string::npos
+                  : output.empty(),
+            debug ? "the chat template role notice is unclear or repeated at debug"
+                  : "the chat template role notice shows at info");
+    }
 
     // A Host tier smaller than the saved file warns with what was kept and what the file needs.
     std::string partial_output;
@@ -386,5 +511,66 @@ int main() {
     }
     failures += check(!decode::set_library_log_handler({}),
                       "the logging runtime left its FFmpeg route installed after it ended");
+
+    // --log-file: each record reaches the file in its plain pattern as it is logged, read here while
+    // the logger is open and unflushed (as an abort would leave it), beside the console's record.
+    {
+        const std::filesystem::path path =
+            std::filesystem::temp_directory_path() /
+            ("infernix-log-file-test-" + std::to_string(port_pid()) + ".log");
+        std::filesystem::remove(path);
+        std::string file_text;
+        std::string console;
+        {
+            StderrCapture capture;
+            {
+                infernix::product::LoggingRuntime logging(
+                    {.logger_name  = "infernix-serve",
+                     .level        = infernix::product::LogLevel::Debug,
+                     .color        = infernix::product::LogColorMode::Never,
+                     .presentation = infernix::product::LogPresentation::Service,
+                     .log_file     = path.string()});
+                logging.logger()->info("engine ready | sample");
+                logging.logger()->debug("engine | detail");
+                std::ifstream in(path, std::ios::binary);
+                file_text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            }
+            console = capture.finish();
+        }
+        std::filesystem::remove(path);
+        const std::string stamp = R"(\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\] )";
+        failures += check(std::regex_match(file_text, std::regex(stamp + R"(\[info\] engine ready \| sample\r?\n)" +
+                                                                  stamp + R"(\[debug\] engine \| detail\r?\n)")),
+                          "--log-file must hold every record in its plain pattern before any flush");
+        failures += check(console.find("engine ready | sample") != std::string::npos &&
+                              console.find("engine | detail") != std::string::npos,
+                          "--log-file must keep the console's records");
+    }
+    // A log file that cannot be opened (its folder is a file) leaves the console logging, with a warning.
+    {
+        const std::filesystem::path blocker =
+            std::filesystem::temp_directory_path() /
+            ("infernix-log-file-blocker-" + std::to_string(port_pid()));
+        { std::ofstream(blocker) << "not a folder"; }
+        std::string console;
+        {
+            StderrCapture capture;
+            {
+                infernix::product::LoggingRuntime logging(
+                    {.logger_name  = "infernix-serve",
+                     .color        = infernix::product::LogColorMode::Never,
+                     .presentation = infernix::product::LogPresentation::Service,
+                     .log_file     = (blocker / "serve.log").string()});
+                logging.logger()->info("engine ready | sample");
+                logging.flush();
+            }
+            console = capture.finish();
+        }
+        std::filesystem::remove(blocker);
+        failures += check(console.find("  WARN  log file | ") != std::string::npos &&
+                              console.find("(logging to the console only)") != std::string::npos &&
+                              console.find("engine ready | sample") != std::string::npos,
+                          "a log file that cannot be opened must warn and keep the console logging");
+    }
     return failures == 0 ? 0 : 1;
 }

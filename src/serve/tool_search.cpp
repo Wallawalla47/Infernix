@@ -58,9 +58,10 @@ Field make_field(std::string_view text) {
     return field;
 }
 
-// Python's str.isspace() set: Unicode Zs/Zl/Zp, the ASCII controls \t..\r, and \x1c-\x1f, \x85.
+// Python's str.isspace() set: the Unicode White_Space property (Zs/Zl/Zp, \t..\r, U+0085) and
+// \x1c-\x1f.
 bool python_space(std::int32_t value) {
-    return unicode::is_whitespace(value) || (value >= 0x1c && value <= 0x1f) || value == 0x85;
+    return unicode::is_whitespace(value) || (value >= 0x1c && value <= 0x1f);
 }
 
 bool python_word(std::int32_t value, bool ascii) {
@@ -227,6 +228,20 @@ private:
         }
     }
 
+    // Verbose whitespace and comment groups (?#...): a comment is no item, so a quantifier after it
+    // repeats the item before it, as Python's parser skips it.
+    void skip_ignored() {
+        for (;;) {
+            skip_verbose();
+            if (peek() != '(' || peek(1) != '?' || peek(2) != '#') { return; }
+            const std::size_t start = position_;
+            position_ += 3U;
+            while (!at_end() && peek() != ')') { ++position_; }
+            if (at_end()) { invalid_pattern("missing ), unterminated comment", start); }
+            ++position_;
+        }
+    }
+
     static bool flag_letter(std::int32_t value) {
         return value == 'a' || value == 'i' || value == 'L' || value == 'm' || value == 's' ||
                value == 'u' || value == 'x';
@@ -292,7 +307,7 @@ private:
     std::size_t parse_concatenation(std::size_t depth) {
         std::vector<std::size_t> items;
         for (;;) {
-            skip_verbose();
+            skip_ignored();
             if (at_end() || peek() == '|' || peek() == ')') { break; }
             items.push_back(parse_repeat(depth));
         }
@@ -347,7 +362,7 @@ private:
         std::size_t atom             = parse_atom(depth);
         bool repeated                = false;
         for (;;) {
-            skip_verbose();
+            skip_ignored();
             const std::size_t at = position_;
             std::int32_t minimum = 0;
             std::int32_t maximum = 0;
@@ -371,11 +386,14 @@ private:
             }
             if (repeated) { invalid_pattern("multiple repeat", at); }
             const NodeKind kind = nodes[atom].kind;
-            if (kind == NodeKind::Empty || kind == NodeKind::Assert) {
-                invalid_pattern("nothing to repeat", atom_start);
-            }
+            if (kind == NodeKind::Assert) { invalid_pattern("nothing to repeat", atom_start); }
             if (peek() == '+') { unsupported_pattern("possessive repeat", position_); }
             if (peek() == '?') { ++position_; } // lazy: the same matches exist
+            if (kind == NodeKind::Empty) {
+                // An empty group repeated is still empty (Python accepts (?:){5}): no repeat node.
+                repeated = true;
+                continue;
+            }
             Node node;
             node.kind     = NodeKind::Repeat;
             node.children = {atom};
@@ -476,12 +494,6 @@ private:
                 unsupported_pattern("atomic group", start);
             } else if (kind == '(') {
                 unsupported_pattern("conditional group", start);
-            } else if (kind == '#') {
-                while (!at_end() && peek() != ')') { ++position_; }
-                if (at_end()) { invalid_pattern("missing ), unterminated comment", start); }
-                ++position_;
-                Node node;
-                return add(std::move(node));
             } else if (flag_letter(kind) || kind == '-') {
                 parse_scoped_flags(start);
             } else {
@@ -548,11 +560,12 @@ private:
             if (nibble < 0) {
                 invalid_pattern(std::string("incomplete escape \\") + letter, start);
             }
+            // Checked before the step, so an eighth digit cannot overflow (\U80000000 and up).
+            if (value > (kMaximumCodePoint - nibble) / 16) {
+                invalid_pattern(std::string("bad escape \\") + letter, start);
+            }
             value = value * 16 + nibble;
             ++position_;
-        }
-        if (value > kMaximumCodePoint) {
-            invalid_pattern(std::string("bad escape \\") + letter, start);
         }
         return value;
     }

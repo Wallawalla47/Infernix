@@ -13,6 +13,9 @@
 // - Host writes run on the transfer stream after a producer event; restores run on the restore
 //   stream in forward order, one event per decoder layer and one for the MTP group, so a lane's
 //   first call waits for each layer's state just before that layer reads it.
+// - A tap's tail is the lane's own partial page, read on the transfer stream: a page that returns
+//   to the pool (the lane's release, a block's eviction) while such a copy is pending orders the
+//   compute stream, where its next writer runs, after the copy (order_page_reuse).
 
 #include "core/arena.h"
 #include "core/host_kv_arena.h"
@@ -105,8 +108,10 @@ struct RestoreTicket {
 
 class PrefixCache final : public runtime::prefix_cache::PrefixIndexBackend {
 public:
+    // `compute` is the stream every writer of a pool page runs on or after (a restore opens behind
+    // it): a page returned to the pool while a capture still reads it is ordered there.
     PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool, const KvPageGeometry& pages,
-                const LaneStateImage& lanes, std::uint64_t host_bytes);
+                const LaneStateImage& lanes, std::uint64_t host_bytes, cudaStream_t compute);
     ~PrefixCache() override;
 
     PrefixCache(const PrefixCache&)            = delete;
@@ -180,6 +185,11 @@ public:
     // The capture's copy-out events in layer order (decoder layers, then MTP): each is recorded once
     // that layer's state (and its planes of the tail page) has been read. Empty once it has landed.
     [[nodiscard]] std::span<const cudaEvent_t> capture_events(std::uint64_t id) const noexcept;
+    // Orders the compute stream after every pending capture whose tail is one of `pages`, before
+    // those pages return to the pool: a tap or boundary reads the lane's partial page on the
+    // transfer stream, and another request writing the page under that copy would put its KV into
+    // the snapshot. Free once the copies have landed.
+    void order_page_reuse(std::span<const DeviceKVPageLease> pages) const;
     // Copies every Device-only node of `nodes` to a Host slab, after `producer`'s queued work.
     void write_blocks(std::span<const runtime::prefix_cache::NodeRef> nodes, cudaStream_t producer);
     // Publishes landed captures and writes and retires landed restores. Non-blocking.
@@ -224,6 +234,21 @@ public:
     // Releases every reference the cache holds; the index is rebuilt empty.
     void clear() noexcept;
 
+    // ---- Host tier resize (RAM pressure, runtime::HostMemoryGovernor) --------------------------
+    // With no lane bound (the Engine idle): drains the transfers, then gives back whole chunks worth at least `bytes`
+    // (the lowest-valued entries go, the rest move below the cut), keeping image_slabs + 2 slabs. Returns the bytes
+    // released.
+    std::uint64_t shrink_host_tier(std::uint64_t bytes);
+    // Pins chunks of at most `bytes` back, up to the startup size; returns the bytes added (fewer when the OS
+    // refuses to pin one).
+    std::uint64_t grow_host_tier(std::uint64_t bytes);
+    // The startup size of the Host tier, and what shrink_host_tier could release and grow_host_tier add now.
+    [[nodiscard]] std::uint64_t host_tier_capacity_bytes() const noexcept {
+        return static_cast<std::uint64_t>(host_.slabs) * host_.slab_bytes;
+    }
+    [[nodiscard]] std::uint64_t host_tier_shrinkable_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t host_tier_growable_bytes() const noexcept { return host_tier_capacity_bytes() - pinned_bytes(); }
+
     // ---- persistence (persist.cpp) -------------------------------------------------------------
     // Writes every Host-backed snapshot and its Host block path to `path` (through `path.tmp`,
     // renamed when complete). Requires idle transfers. `abandoned` stops the save, deleting the
@@ -239,6 +264,7 @@ public:
     void release_device_block(std::uint32_t device_id) noexcept override;
     void release_snapshot(runtime::prefix_cache::SnapshotRef snapshot) noexcept override;
     void drop_snapshot_device_image(runtime::prefix_cache::SnapshotRef snapshot) noexcept override;
+    void move_host_slab(std::uint32_t from, std::uint32_t to) noexcept override;
 
 private:
     struct PendingCapture {
@@ -293,6 +319,7 @@ private:
     const LaneStateImage* lanes_ = nullptr;
     PrefixHostLayout host_;
     std::vector<PinnedHostBuffer> chunks_;
+    cudaStream_t compute_  = nullptr; // not owned
     cudaStream_t transfer_ = nullptr;
     cudaStream_t restore_stream_ = nullptr;
     std::vector<std::optional<DeviceKVPageLease>> blocks_;

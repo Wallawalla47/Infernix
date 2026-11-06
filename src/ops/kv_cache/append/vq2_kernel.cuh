@@ -66,23 +66,8 @@ struct KVCacheVqBlockShared {
     int word_pattern[kKVCacheVq2Words];
 };
 
-__device__ __forceinline__ void kv_cache_vq2_stage_encoder_codebook(KVCacheVqCodebookShared& book,
-                                                                    int thread, int threads) {
-    for (int i = thread; i < kKVCacheVq2Patterns * 8; i += threads)
-        book.codebook[i] = static_cast<float>(g_kv_cache_vq2_codebook[i]);
-    for (int p = thread; p < kKVCacheVq2Patterns; p += threads) {
-        int norm = 0;
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const int v = g_kv_cache_vq2_codebook[8 * p + j];
-            norm += v * v;
-        }
-        book.norm[p] = static_cast<float>(norm);
-    }
-}
-
-// The same staging from the FP32 table: two 16-byte loads per pattern and its norm from them (the
-// values are integers, so every product and sum is exact and equals the integer norm).
+// Stages the encoder's codebook from the FP32 table: two 16-byte loads per pattern and its norm from them
+// (the values are integers, so every product and sum is exact and equals the integer norm).
 __device__ __forceinline__ void kv_cache_vq2_stage_encoder_codebook_f32(KVCacheVqCodebookShared& book,
                                                                         int thread, int threads) {
     const auto* table = reinterpret_cast<const float4*>(g_kv_cache_vq2_codebook_f32);
@@ -317,33 +302,6 @@ __device__ __forceinline__ void kv_cache_vq_append_row_block(const KVCacheVqRowT
     kv_cache_vq_store_row<kKVCacheVq2CodeBytes / 4>(row, lane, dot, target);
 }
 
-// Encodes one row with one warp: lane = word scans every pattern.
-template <KVCacheVqKeyCodec KeyCodec>
-__device__ __forceinline__ void kv_cache_vq_append_row_warp(const KVCacheVqRowTarget& target,
-                                                            const KVCacheVqCodebookShared& book,
-                                                            KVCacheVqRowShared& row) {
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    kv_cache_vq_rotate_row(target.source, row, lane);
-    __syncwarp();
-    const float sigma = sqrtf(row.sum_square * (1.0f / 256.0f));
-    if (KeyCodec == KVCacheVqKeyCodec::Q4 && !target.value) {
-        const float dot = kv_cache_q4_encode_warp(row, lane, sigma);
-        __syncwarp();
-        kv_cache_vq_store_row<kKVCacheQ4CodeBytes / 4>(row, lane, dot, target);
-        return;
-    }
-    float A[8];
-    unsigned negative = 0;
-    kv_cache_vq2_word_magnitudes(row, lane, sigma, A, negative);
-    const bool odd = (__popc(negative) & 1) != 0;
-    float best     = 0.0f;
-    int best_p     = 0;
-    kv_cache_vq2_scan<kKVCacheVq2Patterns>(book, A, odd, 0, best, best_p);
-    const float dot = kv_cache_vq2_finish_word(book, row, lane, sigma, A, negative, best_p);
-    __syncwarp();
-    kv_cache_vq_store_row<kKVCacheVq2CodeBytes / 4>(row, lane, dot, target);
-}
-
 // Item x of an append: K (x even) or V (x odd) of unit x / 2 = token * KVHeads + kv_head. Window
 // copies follow `Mode`: Slots writes positions in the row's final kKVWindowRingTokens and the sink;
 // Staging writes every column's staging row.
@@ -421,13 +379,12 @@ __device__ __forceinline__ void kv_cache_append_vq_select_batch(int batch, Metad
     }
 }
 
-// Grid (blocks, 1, batch) of 1024-thread blocks: each block stages the codebook once, then encodes
+// Grid (blocks, 1, batch) of 1024-thread blocks: each block stages the FP32 codebook once, then encodes
 // items blockIdx.x, blockIdx.x + gridDim.x, ... of its batch row with the whole block (the lowest
-// latency per row: a decode step's few rows). TableF32 (TEMPORARY, INFERNIX_TMP_VQ_APPEND_V2) stages
-// the FP32 table instead, and the first row's sync after its rotation publishes it, so the staging
-// overlaps warp 0's rotation.
+// latency per row: a decode step's few rows). The first row's sync after its rotation publishes the
+// table, so the staging overlaps warp 0's rotation.
 template <typename Geometry, typename Metadata, KVCacheVqKeyCodec KeyCodec, KVCacheVqWindowMode Mode,
-          bool MultiBatch = false, bool TableF32 = false>
+          bool MultiBatch = false>
 __launch_bounds__(kKVCacheVqAppendThreads) __global__ void kv_cache_append_vq_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, Metadata metadata,
@@ -446,15 +403,8 @@ __launch_bounds__(kKVCacheVqAppendThreads) __global__ void kv_cache_append_vq_ke
     const int tokens = metadata.valid_tokens(width);
     const int items  = 2 * tokens * Geometry::KVHeads;
     if (static_cast<int>(blockIdx.x) >= items) return;
-    if constexpr (TableF32) {
-        // Read only after kv_cache_vq_append_row_block's first __syncthreads.
-        kv_cache_vq2_stage_encoder_codebook_f32(book, static_cast<int>(threadIdx.x),
-                                                static_cast<int>(blockDim.x));
-    } else {
-        kv_cache_vq2_stage_encoder_codebook(book, static_cast<int>(threadIdx.x),
-                                            static_cast<int>(blockDim.x));
-        __syncthreads();
-    }
+    // Read only after kv_cache_vq_append_row_block's first __syncthreads.
+    kv_cache_vq2_stage_encoder_codebook_f32(book, static_cast<int>(threadIdx.x), static_cast<int>(blockDim.x));
     for (int item = static_cast<int>(blockIdx.x); item < items;
          item += static_cast<int>(gridDim.x)) {
         const KVCacheVqRowTarget target =
@@ -466,47 +416,9 @@ __launch_bounds__(kKVCacheVqAppendThreads) __global__ void kv_cache_append_vq_ke
     }
 }
 
-// Warps per block of the row-per-warp append.
-inline constexpr int kKVCacheVqAppendWarpRows = 8;
-
-// Grid (blocks, 1, batch) of 8-warp blocks: each block stages the codebook once, then each warp
-// encodes items blockIdx.x * 8 + warp, + gridDim.x * 8, ... by itself (the highest throughput: a
-// wide call's many rows).
-template <typename Geometry, typename Metadata, KVCacheVqKeyCodec KeyCodec, KVCacheVqWindowMode Mode,
-          bool MultiBatch = false>
-__launch_bounds__(32 * kKVCacheVqAppendWarpRows) __global__ void kv_cache_append_vq_warp_kernel(
-    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
-    const std::int32_t* __restrict__ positions, Metadata metadata,
-    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
-    __half* __restrict__ scale_k, __half* __restrict__ scale_v, KVCacheVqWindowTarget window,
-    std::int32_t width) {
-    __shared__ KVCacheVqCodebookShared book;
-    __shared__ KVCacheVqRowShared rows[kKVCacheVqAppendWarpRows];
-    pdl::trigger_dependents();
-    const int batch = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
-    kv_cache_append_vq_select_batch<Geometry, Metadata, MultiBatch>(batch, metadata, k, v,
-                                                                   positions, width);
-    const int tokens = metadata.valid_tokens(width);
-    const int items  = 2 * tokens * Geometry::KVHeads;
-    if (static_cast<int>(blockIdx.x) * kKVCacheVqAppendWarpRows >= items) return;
-    kv_cache_vq2_stage_encoder_codebook(book, static_cast<int>(threadIdx.x),
-                                        static_cast<int>(blockDim.x));
-    __syncthreads();
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    for (int item = static_cast<int>(blockIdx.x) * kKVCacheVqAppendWarpRows + warp; item < items;
-         item += static_cast<int>(gridDim.x) * kKVCacheVqAppendWarpRows) {
-        const KVCacheVqRowTarget target =
-            kv_cache_append_vq_target<Geometry, Metadata, KeyCodec, Mode>(
-                item, batch, tokens, k, v, positions, metadata, cache_k, cache_v, scale_k, scale_v,
-                window, width);
-        kv_cache_vq_append_row_warp<KeyCodec>(target, book, rows[warp]);
-        __syncwarp();
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
-// TEMPORARY (INFERNIX_TMP_VQ_APPEND_V2, candidates §2.3 VQ append): the parity-sorted split encoder,
-// the same codes, scales, window slots and tags as the kernels above.
+// The parity-sorted split encoder (candidates §2.3 VQ append): the same codes, scales, window slots and
+// tags as the block kernel above.
 //
 // A 256-thread CTA encodes one pass of rows at a time:
 //   1. one warp per row rotates it into shared memory; a Q4 key row is finished there, and a VQ2
@@ -515,7 +427,8 @@ __launch_bounds__(32 * kKVCacheVqAppendWarpRows) __global__ void kv_cache_append
 //      pattern ranges. A slice of even words skips the parity term, so all its lanes share one
 //      path, and a lane's two words share each pattern read;
 //   3. with split > 1, each word's range bests reduce to one (min distance, earlier range on ties);
-//   4. one warp per VQ2 row finishes it as kv_cache_vq_append_row_warp does.
+//   4. one warp per VQ2 row finishes it: each lane's word from its best pattern, then the row's dot
+//      product and store, as the block kernel's warp 0 does.
 // A pass holds 16 / split VQ2 rows (and as many Q4 key rows on Q4KeyVq2Value), so each pass is 8
 // units of work, one per warp.
 //

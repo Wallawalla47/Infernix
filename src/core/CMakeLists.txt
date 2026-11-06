@@ -19,8 +19,8 @@ add_library(infernix_core STATIC
   host_load.cpp
   host_memory.cpp
   host_worker_pool.cpp
+  io_priority.cpp
   link_probe.cu
-  machine_calibration.cpp
   power_throttling.cpp
   temporary_switches.cpp
   vram_budget.cpp
@@ -36,6 +36,9 @@ add_library(infernix_core STATIC
   decode_graph.cpp
   decode_graph_gate.cu
 )
+if(INFERNIX_PDL_SKEW)
+  target_sources(infernix_core PRIVATE pdl_skew.cpp)
+endif()
 infernix_internal_includes(infernix_core)
 infernix_cuda_archive(infernix_core)
 target_link_libraries(infernix_core PUBLIC infernix_cuda_runtime CUDA::nvtx3 CUDA::cuda_driver Threads::Threads)

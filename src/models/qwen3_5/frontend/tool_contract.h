@@ -48,7 +48,8 @@ struct ToolCallOutputContract {
         std::vector<Parameter> parameters;
         std::string schema_json;
         // A strict tool's grammar schema when it differs from schema_json: each nullable string parameter
-        // as its string branches (its value is raw text; `null` reads back as JSON null). Empty otherwise.
+        // as its string branches and members with the text `null` (its value is raw text; `null` reads
+        // back as JSON null). Empty otherwise.
         std::string grammar_schema_json;
         std::size_t declaration_index = 0;
         bool strict                   = false;
@@ -58,13 +59,17 @@ struct ToolCallOutputContract {
     bool constrained = false;
     bool required    = false;
     bool parallel    = true;
+    // The client knows tools the request does not declare (PromptOptions::open_tool_names): a
+    // well-formed call to an undeclared name is the client's to judge, so the parser keeps it a call.
+    bool open_names  = false;
 };
 
 // Listed declarations come first, then deferred ones (declared but absent from the prompt's tool
 // section); declaration_index counts across both.
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons,
-                                std::span<const std::string> deferred_tool_jsons = {});
+                                std::span<const std::string> deferred_tool_jsons = {},
+                                bool open_names = false);
 
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
 select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& declarations,

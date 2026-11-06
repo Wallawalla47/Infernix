@@ -33,8 +33,6 @@ struct Header {
 
 struct Palette {
     std::vector<std::array<std::uint8_t, 3>> rgb;
-    std::vector<std::uint8_t> alpha; // populated when has_alpha
-    bool has_alpha = false;
 };
 
 struct Parse {
@@ -56,7 +54,8 @@ struct Parse {
     }
 }
 
-// Walk the chunk stream, collecting IHDR, PLTE, tRNS, and the concatenated IDAT.
+// Walk the chunk stream, collecting IHDR, PLTE and the concatenated IDAT. Transparency (tRNS, and the alpha
+// samples of color types 4 and 6) is not read: the decode drops alpha.
 void parse_chunks(std::span<const std::uint8_t> bytes, Parse& out) {
     std::size_t offset = 8;
     while (offset + 8 <= bytes.size()) {
@@ -95,16 +94,6 @@ void parse_chunks(std::span<const std::uint8_t> bytes, Parse& out) {
             for (std::size_t i = 0; i < entries; ++i) {
                 out.palette.rgb[i] = {data[3 * i], data[3 * i + 1], data[3 * i + 2]};
             }
-        } else if (std::memcmp(tag, "tRNS", 4) == 0) {
-            if (out.header.color_type == 3) {
-                if (out.palette.rgb.empty() || length > out.palette.rgb.size()) {
-                    throw std::invalid_argument("png tRNS chunk is malformed");
-                }
-                out.palette.has_alpha = true;
-                out.palette.alpha.assign(out.palette.rgb.size(), 255);
-                for (std::size_t i = 0; i < length; ++i) { out.palette.alpha[i] = data[i]; }
-            }
-            // tRNS for gray/rgb (a single transparent color) is treated as opaque.
         } else if (std::memcmp(tag, "IDAT", 4) == 0) {
             out.idat.insert(out.idat.end(), data, data + length);
         }
@@ -203,13 +192,6 @@ void parse_chunks(std::span<const std::uint8_t> bytes, Parse& out) {
     if (bit_depth == 8) { return static_cast<std::uint8_t>(v); }
     const int maxv = (1 << bit_depth) - 1;
     return static_cast<std::uint8_t>((static_cast<int>(v) * 255 + maxv / 2) / maxv);
-}
-
-// Composite a channel over white by an 8-bit alpha (matches the FFmpeg image path).
-[[nodiscard]] std::uint8_t composite_white(std::uint8_t channel, std::uint8_t alpha) {
-    if (alpha >= 255) { return channel; }
-    return static_cast<std::uint8_t>(((255 - alpha) * 255 + alpha * static_cast<int>(channel) + 127) /
-                                     255);
 }
 
 } // namespace
@@ -313,29 +295,18 @@ Image decode_png(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_
                     r = parse.palette.rgb[idx][0];
                     g = parse.palette.rgb[idx][1];
                     b = parse.palette.rgb[idx][2];
-                    const std::uint8_t a =
-                        parse.palette.has_alpha ? parse.palette.alpha[idx] : 255;
-                    if (a < 255) {
-                        r = composite_white(r, a);
-                        g = composite_white(g, a);
-                        b = composite_white(b, a);
-                    }
                     break;
                 }
-                case 4: {
+                case 4: { // gray + alpha: the gray sample
                     const std::uint8_t v = to8(raw_value(x, y, 0), bit_depth);
-                    const std::uint8_t a = to8(raw_value(x, y, 1), bit_depth);
-                    const std::uint8_t c = composite_white(v, a);
-                    r = g = b = c;
+                    r = g = b = v;
                     break;
                 }
-                case 6: {
-                    const std::uint8_t a = to8(raw_value(x, y, 3), bit_depth);
-                    r = composite_white(to8(raw_value(x, y, 0), bit_depth), a);
-                    g = composite_white(to8(raw_value(x, y, 1), bit_depth), a);
-                    b = composite_white(to8(raw_value(x, y, 2), bit_depth), a);
+                case 6: // RGBA: the color samples
+                    r = to8(raw_value(x, y, 0), bit_depth);
+                    g = to8(raw_value(x, y, 1), bit_depth);
+                    b = to8(raw_value(x, y, 2), bit_depth);
                     break;
-                }
             }
             px[0] = r;
             px[1] = g;

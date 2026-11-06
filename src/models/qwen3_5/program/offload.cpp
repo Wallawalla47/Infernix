@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/offload.h"
 
+#include "models/qwen3_5/program/calibrated_order.h"
 #include "core/device.h"
 #include "core/temporary_switches.h"
 #include "infernix/types.h"
@@ -7,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -16,6 +18,18 @@
 namespace infernix::models::qwen3_5::detail {
 
 namespace expert_offload = runtime::expert_offload;
+
+namespace {
+
+// The engine's round thread alone on the last P-core, which no CPU expert worker uses (placement.h
+// cpu_placement): the 122B's CPU-bound offloaded decode +0.3 % (Ornith, 4/4 pairs, 2026-10-28;
+// Flash-Next measured flat or slower and stays unpinned).
+expert_offload::OffloadOptions with_isolated_engine(expert_offload::OffloadOptions options) {
+    options.engine_isolate = true;
+    return options;
+}
+
+} // namespace
 
 runtime::expert_offload::OffloadSetup offload_setup(const execution::Parameters& parameters,
                                                     const OffloadGeometry& geometry) {
@@ -48,10 +62,34 @@ runtime::expert_offload::OffloadSetup offload_setup(const execution::Parameters&
     setup.mtp_draft_tokens          = geometry.mtp_draft_tokens;
     setup.ngram_draft_tokens        = geometry.ngram_draft_tokens;
     setup.graph_bound               = geometry.graph_bound;
-    // The Program captures every executable right after start() (program_impl.cpp prepare_graphs).
-    setup.eager_graphs              = true;
+    setup.loan_bytes                = geometry.wide_pass_bytes;
+    setup.kv_growth_bytes           = geometry.kv_growth_bytes;
     setup.device                    = geometry.device;
+    // The warm start's seed without a usable saved state: the built-in calibrated order of the model's shape (the
+    // 122B's), null for any other shape or while none is generated (calibrated_order.h).
+    setup.calibrated_state = calibrated_expert_order({.hidden              = model.config().text.hidden_size,
+                                                      .layers              = setup.layout.layers,
+                                                      .experts             = moe.num_experts,
+                                                      .top_k               = moe.num_experts_per_tok,
+                                                      .intermediate        = moe.moe_intermediate_size,
+                                                      .shared_intermediate = moe.shared_expert_intermediate_size});
     return setup;
+}
+
+OffloadGeometry offload_round_geometry(std::uint32_t max_concurrency, std::uint32_t draft_window,
+                                       std::uint32_t prefill_chunk, std::uint32_t idle_prefill_width,
+                                       SpeculativeBackend backend, std::uint32_t neural_draft_window,
+                                       std::uint32_t ngram_draft_window, int device) {
+    return OffloadGeometry{
+        .lanes       = static_cast<std::int32_t>(max_concurrency),
+        .max_width   = static_cast<std::int32_t>(draft_window + 1U),
+        .columns     = static_cast<std::int32_t>(std::max<std::uint32_t>(std::max(idle_prefill_width, prefill_chunk),
+                                                                      max_concurrency * (draft_window + 1U))),
+        .chunk       = static_cast<std::int32_t>(prefill_chunk),
+        .speculative = backend != SpeculativeBackend::None || ngram_draft_window != 0,
+        .mtp_draft_tokens   = backend == SpeculativeBackend::Mtp ? neural_draft_window : 0U,
+        .ngram_draft_tokens = ngram_draft_window,
+        .device             = device};
 }
 
 std::uint64_t ProgramOffload::fixed_bytes(const execution::Parameters& parameters, const OffloadGeometry& geometry,
@@ -62,10 +100,10 @@ std::uint64_t ProgramOffload::fixed_bytes(const execution::Parameters& parameter
 ProgramOffload::ProgramOffload(const execution::Parameters& parameters, const OffloadGeometry& geometry,
                                expert_offload::OffloadOptions options, Diagnostic diagnostic)
     : parameters_(parameters), wide_pass_bytes_(geometry.wide_pass_bytes),
-      wide_ladder_(temporary_switches::flag("INFERNIX_TMP_PROMPT_SIZED_LOAN") ? geometry.wide_pass_ladder
-                                                                             : decltype(geometry.wide_pass_ladder){}),
-      expert_wide_(geometry.expert_wide), router_mma_(geometry.router_mma),
-      engine_(offload_setup(parameters, geometry), std::move(options), std::move(diagnostic)) {}
+      wide_ladder_(geometry.wide_pass_ladder),
+      expert_wide_(geometry.expert_wide), expert_narrow_(geometry.expert_narrow), router_mma_(geometry.router_mma),
+      diagnostic_(diagnostic),
+      engine_(offload_setup(parameters, geometry), with_isolated_engine(std::move(options)), std::move(diagnostic)) {}
 
 ProgramOffload::~ProgramOffload() {
     if (experts_.split_ready != nullptr) { cudaEventDestroy(experts_.split_ready); }
@@ -73,12 +111,53 @@ ProgramOffload::~ProgramOffload() {
         if (event != nullptr) { cudaEventDestroy(event); }
     }
     if (experts_.shared_stream != nullptr) { cudaStreamDestroy(experts_.shared_stream); }
+    for (cudaEvent_t event : experts_.split_events) {
+        if (event != nullptr) { cudaEventDestroy(event); }
+    }
+    if (experts_.split_stream != nullptr) { cudaStreamDestroy(experts_.split_stream); }
 }
 
-void ProgramOffload::start(cudaStream_t compute,
-                           const std::function<void(std::uint64_t, std::uint64_t)>& lendable_frames) {
-    engine_.start(compute, lendable_frames);
+void ProgramOffload::start(cudaStream_t compute) {
+    create_drafter_pool(compute); // before the engine sizes its frames from the free memory
+    engine_.start(compute);
     build_experts();
+}
+
+void ProgramOffload::create_drafter_pool(cudaStream_t compute) {
+    const Config& config = parameters_.model.config();
+    if (config.mtp_expert_slots == 0) { return; }
+    if (!parameters_.mtp) { throw std::logic_error("Qwen3.5 offload: a drafter pool without MTP parameters"); }
+    const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters_.mtp->ffn);
+    if (moe == nullptr) { throw std::logic_error("Qwen3.5 offload: the drafter pool needs the drafter's resident MoE"); }
+    const std::int32_t E = moe->router_shared_gate.n - 1, I = moe->routed_down.k, H = moe->router_shared_gate.k;
+    const auto slots     = static_cast<std::int32_t>(config.mtp_expert_slots);
+    if (expert_offload::DrafterExpertPool::expert_bytes(moe->routed_gate_up, moe->routed_down, I, H) != config.mtp_expert_bytes) {
+        throw std::logic_error("Qwen3.5 offload: the drafter's bound experts differ from the drafter pool's plan");
+    }
+    const std::size_t bytes = expert_offload::DrafterExpertPool::device_bytes(config.mtp_expert_bytes, slots, E);
+    drafter_pool_memory_    = DeviceBuffer(bytes);
+    drafter_pool_ = std::make_unique<expert_offload::DrafterExpertPool>(moe->routed_gate_up, moe->routed_down, E, I, H,
+                                                                        slots, drafter_pool_memory_.p, bytes, compute);
+    drafter_reported_ = std::chrono::steady_clock::now();
+    if (diagnostic_) {
+        diagnostic_("MTP drafter pool: " + std::to_string(slots) + " of its " + std::to_string(E) +
+                        " routed experts in a VRAM pool (" + std::to_string(bytes >> 20) +
+                        " MiB), the rest pinned in RAM; draft steps route among the pooled experts",
+                    DiagnosticLevel::Debug);
+    }
+}
+
+void ProgramOffload::report_drafter_pool() {
+    const auto now = std::chrono::steady_clock::now();
+    if (!diagnostic_ || now - drafter_reported_ < std::chrono::seconds(10)) { return; }
+    drafter_reported_ = now;
+    const auto& s     = drafter_pool_->stats();
+    if (s.picks == 0) { return; }
+    char line[192];
+    std::snprintf(line, sizeof(line), "MTP drafter pool: %.1f %% of %llu draft picks pooled, %llu swaps",
+                  100.0 * static_cast<double>(s.picks - s.misses) / static_cast<double>(s.picks),
+                  static_cast<unsigned long long>(s.picks), static_cast<unsigned long long>(s.swaps));
+    diagnostic_(line, DiagnosticLevel::Debug);
 }
 
 void ProgramOffload::build_experts() {
@@ -105,7 +184,8 @@ void ProgramOffload::build_experts() {
         } else if (!layer.shared) {
             throw std::logic_error("Qwen3.5 offload: a layer has neither a shared expert bank nor projections");
         } else if (experts_.shared_stream == nullptr) {
-            CUDA_CHECK(cudaStreamCreateWithFlags(&experts_.shared_stream, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaStreamCreateWithPriority(&experts_.shared_stream, cudaStreamNonBlocking,
+                                                    expert_offload::ExpertOffload::side_stream_priority()));
             for (cudaEvent_t& event : experts_.shared_events) {
                 CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
             }
@@ -114,6 +194,7 @@ void ProgramOffload::build_experts() {
     }
     experts_.tail_skip_rank = engine_.tail_skip_rank();
     experts_.wide_a16       = expert_wide_;
+    experts_.narrow_a16     = expert_narrow_;
     experts_.router_mma     = router_mma_;
     experts_.route_log     = engine_.route_log();
     experts_.route_stride  = engine_.route_stride();
@@ -123,24 +204,43 @@ void ProgramOffload::build_experts() {
     experts_.side_stream   = engine_.overlap_stream();
     const auto events      = engine_.overlap_events();
     for (std::size_t i = 0; i < events.size(); ++i) { experts_.side_events[i] = events[i]; }
+    // The stream on which a graphed round's staged misses compute (their down rows stage beside the gate/up
+    // pass: Ornith two-request MTP decode +1.6 / +8.0 / +4.6 %, Dense8 MTP +6.7 / +1.3 / +10.3 %, IQ3_S within
+    // spread, 2026-10-27, design §19.3.33).
+    if (experts_.side_stream != nullptr && experts_.split_stream == nullptr) {
+        CUDA_CHECK(cudaStreamCreateWithPriority(&experts_.split_stream, cudaStreamNonBlocking,
+                                                expert_offload::ExpertOffload::side_stream_priority()));
+        for (cudaEvent_t& event : experts_.split_events) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        }
+    }
     experts_.stream = engine_.stream();
     experts_.split  = engine_.split_policy();
-    // A gated split reads the layer's dispatch offsets ([E + 2] with the shared job) on the host.
-    experts_.split_offsets = PinnedHostBuffer((static_cast<std::size_t>(moe.num_experts) + 2) * sizeof(std::int32_t));
+    // A gated split reads the layer's dispatch offsets ([E + 2] with the shared job) on the host, and
+    // the copy-ahead's guess of the next layer's after them.
+    experts_.split_offsets = PinnedHostBuffer(2 * (static_cast<std::size_t>(moe.num_experts) + 2) * sizeof(std::int32_t));
     if (experts_.split_ready == nullptr) {
         CUDA_CHECK(cudaEventCreateWithFlags(&experts_.split_ready, cudaEventDisableTiming));
     }
     experts_.split_columns.assign(moe.num_experts, 0);
+    experts_.split_priced.assign(moe.num_experts, 0);
     experts_.split_cpu.assign(moe.num_experts, 0);
+    experts_.guess_columns.assign(moe.num_experts, 0);
     experts_.engine = &engine_;
+    if (drafter_pool_) {
+        experts_.drafter_slots   = drafter_pool_->slots();
+        experts_.drafter_gate_up = drafter_pool_->gate_up();
+        experts_.drafter_down    = drafter_pool_->down();
+        experts_.drafter_slot_of = drafter_pool_->slot_of();
+        experts_.drafter_demand  = drafter_pool_->demand();
+    }
 }
 
 std::uint64_t ProgramOffload::wide_bytes(std::int32_t columns) const {
-    // The planner's full-width pass (0 on the lossless route, whose layers run their own path): one
-    // size for every wide pass, so a prompt's passes reuse one lease. TEMPORARY (INFERNIX_TMP_PROMPT_SIZED_LOAN,
-    // candidates BX-01, Flash-Next's default), until its A/B: the ladder's first width holding the pass, so a
-    // short prompt no longer evicts a whole chunk's workspace of experts (a wider later pass's lease
-    // replaces the held one, wide_workspace).
+    // The ladder's first width holding the pass (candidates BX-01, as on Flash-Next), so a short prompt
+    // does not evict a whole chunk's workspace of experts; a wider later pass's lease replaces the held
+    // one (wide_workspace). Ornith-122B prefill +0.2 % over one chunk-sized lease (5/6 pairs, 2026-10-28).
+    // The planner's full-width pass caps it (0 on the lossless route, whose layers run their own path).
     if (columns <= execution::kOffloadedMoeStaticColumns) { return 0; }
     for (const auto& [width, bytes] : wide_ladder_) {
         if (columns <= width) { return std::min<std::uint64_t>(bytes, wide_pass_bytes_); }
@@ -235,7 +335,7 @@ void ProgramOffload::end_pass(cudaStream_t compute, const execution::OffloadedCa
                         .position = position,
                         .lanes    = std::span<const std::int32_t>(&lane_id, 1)},
                        silent ? std::span<const std::uint8_t>(silent_columns_) : std::span<const std::uint8_t>{});
-    if (prompt && prompt_end && !silent) { engine_.seed_prompt(lane, compute); }
+    if (prompt && prompt_end && !silent) { engine_.seed_prompt(lane); }
 }
 
 bool ProgramOffload::continuing_prompt(std::uint32_t reused, std::uint32_t prompt) {
@@ -256,6 +356,10 @@ void ProgramOffload::abandon_pass(const execution::OffloadedCall& call) noexcept
 
 void ProgramOffload::begin_round(cudaStream_t compute, std::int32_t position) {
     engine_.settle(compute);
+    if (drafter_pool_) { // the drafter pool: before the round's drafts
+        drafter_pool_->step(compute);
+        report_drafter_pool();
+    }
     if (position >= 0) { engine_.set_plain_position(position, compute); }
     engine_.before_round(compute, /*landing=*/true);
 }

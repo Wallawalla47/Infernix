@@ -5,14 +5,19 @@
 // stacking the headroom on it, the graph reserve, fixed allocations that do not fit, the frame
 // clamp, and the spill test with noisy free-memory readings. RT9, the runtime law of the elastic
 // pool: shrink on low free memory or an exceeded budget, hysteresis, the grow delay and per-boundary
-// cap, display hot-plug, and the reserve spent by Infernix's own later allocations.
+// cap, display hot-plug, and the reserve spent by Infernix's own later allocations. The exclusive RAM
+// layout's tier for one record size (the Qwen3.5-122B-A10B's, plan_exclusive_tier): the shadows cover the
+// loan, a sixteenth of the frames and the KV growth, the seeds never take the frames they cover, and RAM holds
+// every other expert.
 
 #include "runtime/expert_offload/memory_plan.h"
+#include "runtime/expert_offload/ram_monitor.h"
 
 #include <cstdio>
 #include <deque>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using namespace infernix;
 using namespace infernix::runtime::expert_offload;
@@ -254,11 +259,12 @@ void test_display_headroom() {
 }
 
 void test_internal_reserve() {
-    require(internal_reserve(1, kGraphExecutableBytes, false) == 256 * kMiB, "few graphs: the 256 MiB floor");
+    require(internal_reserve(1, kGraphExecutableBytes, false) == 256 * kMiB, "a fixed pool, few graphs: the 256 MiB floor");
     require(internal_reserve(40, kGraphExecutableBytes, false) == 128 * kMiB + 160 * kMiB,
             "a fixed pool reserves for every graph");
-    require(internal_reserve(320, kGraphExecutableBytes, true) == 256 * kMiB,
-            "an elastic pool counts at most 32 graphs");
+    require(internal_reserve(1, kGraphExecutableBytes, true) == 128 * kMiB &&
+                internal_reserve(320, kGraphExecutableBytes, true) == 128 * kMiB,
+            "an elastic pool reserves 128 MiB at any graph count (its shrinks absorb the executables)");
 }
 
 void test_sizing() {
@@ -273,16 +279,15 @@ void test_sizing() {
     const VramSizing attached = size_expert_frames(card(free, DisplayState::Attached), demand(fixed, 20));
     require(attached.frame_bytes == expect - static_cast<std::int64_t>(768 * kMiB),
             "a display takes 768 MiB more with a fixed pool");
-    // A Program that captures every executable right after the sizing (Qwen3.5's) reserves for all of
-    // them, elastic or not.
-    VramDemand eager = demand(fixed, 320);
-    eager.elastic      = true;
-    eager.eager_graphs = true;
-    require(size_expert_frames(card(free, DisplayState::Headless), eager).reserve == 128 * kMiB + 320 * 4 * kMiB,
-            "eager graphs: the reserve covers every executable");
-    eager.eager_graphs = false;
-    require(size_expert_frames(card(free, DisplayState::Headless), eager).reserve == 256 * kMiB,
-            "lazy graphs on an elastic pool: at most 32 counted");
+    // An elastic pool reserves 128 MiB however many executables the Program may instantiate; a fixed
+    // pool reserves for every one.
+    VramDemand many = demand(fixed, 320);
+    many.elastic    = true;
+    require(size_expert_frames(card(free, DisplayState::Headless), many).reserve == 128 * kMiB,
+            "an elastic pool: 128 MiB");
+    many.elastic = false;
+    require(size_expert_frames(card(free, DisplayState::Headless), many).reserve == 128 * kMiB + 320 * 4 * kMiB,
+            "a fixed pool: the reserve covers every executable");
 
     // An OS budget below free memory bounds the frames with its 64 MiB margin only: the display
     // headroom is not stacked on top of it.
@@ -321,18 +326,27 @@ void test_sizing() {
             "the sizing line names the headroom's source and the display: " + line);
 }
 
+// Free device memory per query, and optionally this process's shared system memory use (a source
+// with an adapter: Windows, WSL2) in step with it.
 class ScriptedSource final : public VramBudgetSource {
 public:
-    explicit ScriptedSource(std::deque<std::uint64_t> readings) : readings_(std::move(readings)) {}
+    explicit ScriptedSource(std::deque<std::uint64_t> readings, std::deque<std::uint64_t> nonlocal = {})
+        : readings_(std::move(readings)), nonlocal_(std::move(nonlocal)) {}
     VramSnapshot query() override {
         VramSnapshot s;
         s.device_free = readings_.front();
         if (readings_.size() > 1) { readings_.pop_front(); }
+        if (!nonlocal_.empty()) {
+            s.shared_system  = 76 * kGiB;
+            s.nonlocal_usage = nonlocal_.front();
+            if (nonlocal_.size() > 1) { nonlocal_.pop_front(); }
+        }
         return s;
     }
 
 private:
     std::deque<std::uint64_t> readings_;
+    std::deque<std::uint64_t> nonlocal_;
 };
 
 void test_spill() {
@@ -352,6 +366,18 @@ void test_spill() {
     SpillGuard confirm(spilled);
     confirm.begin();
     require(confirm.end(n) == n - 100 * kMiB, "a confirmed shortfall is reported");
+    require(confirm.readings(n) == "free device memory 10240 MiB before and 10140 MiB after 1024 MiB of allocations",
+            "the failure names the free-memory readings it compared");
+    // Where the source reads this process's shared system memory use (Windows, WSL2), the readings
+    // carry it: a real sysmem fallback raises it, a misread free-memory figure does not.
+    ScriptedSource shared({10 * kGiB, 10 * kGiB - 100 * kMiB, 10 * kGiB - 100 * kMiB},
+                          {200 * kMiB, 1124 * kMiB, 1124 * kMiB});
+    SpillGuard fallback(shared);
+    fallback.begin();
+    require(fallback.end(n) == n - 100 * kMiB, "a shortfall with shared-memory readings is reported");
+    require(fallback.readings(n) == "free device memory 10240 MiB before and 10140 MiB after 1024 MiB of allocations; "
+                                    "this process's shared system memory use 200 MiB before and 1124 MiB after",
+            "the failure names the shared system memory readings where the source has them");
 
     // The test seam replaces the sources opened afterwards.
     infernix::testing::set_vram_budget_source([] { return card(5 * kGiB, DisplayState::Headless); });
@@ -387,8 +413,8 @@ void test_control_law() {
     d.frame_bytes = kRecord;
     d.max_frames  = 48 * 512 - 1;
     const std::uint64_t other = 6 * kGiB; // dense weights, KV, workspace, staging, context
-    // Sizing left headroom (256) + reserve (256) free, on the chunk grid.
-    const std::uint64_t pool = (31'419 * kMiB - other - 512 * kMiB) / kChunk * kChunk;
+    // Sizing left headroom (256) + reserve (128, an elastic pool's) free, on the chunk grid.
+    const std::uint64_t pool = (31'419 * kMiB - other - 384 * kMiB) / kChunk * kChunk;
     VramControl control(d, kChunk, pool + other, pool);
     const std::uint32_t frames = frames_in(pool);
     double t = 0.0;
@@ -440,7 +466,7 @@ void test_control_law() {
     // the target falls by what remains of the reserve's use, and growth never eats into it.
     VramControl reserve(d, kChunk, pool + other, pool);
     const VramSnapshot graphs = wddm(pool, other + 64 * kMiB);
-    require(reserve.reserve_left(graphs, pool) == 256 * kMiB - 64 * kMiB, "graph memory spends the reserve");
+    require(reserve.reserve_left(graphs, pool) == 128 * kMiB - 64 * kMiB, "graph memory spends the reserve");
     require(reserve.target(graphs, pool) <= frames, "an idle start never grows into the internal reserve");
     require(!reserve.decide(graphs, pool, frames, 100.0, true).shrink, "spending the reserve is not pressure");
 
@@ -451,10 +477,116 @@ void test_control_law() {
     require(control.decide(trimmed, pool, frames, 200.0, false).shrink, "an exceeded budget shrinks the pool");
 }
 
+void test_exclusive_tier() {
+    // The 122B: 48 x 256 experts, 4,993 frames, a ring of 2 x 256 + 1 and a 304-frame wide workspace, 57 frames of
+    // KV growth.
+    constexpr std::uint64_t keys = 48 * 256, frames = 4'993, loan = 2 * 256 + 1 + 304, kv = 57;
+    const ExclusiveTier half = plan_exclusive_tier(keys, frames, loan, kv, 0.5);
+    require(half.shadows == loan + frames / 16 + kv, "the shadows cover the loan, a sixteenth of the frames and the KV");
+    require(half.seeded == frames / 2, "half the frames seeded");
+    require(half.slots == keys - half.seeded + half.shadows, "RAM holds every key but the seeds, and the shadows");
+    const ExclusiveTier rest = plan_exclusive_tier(keys, frames, loan, kv, 1.0);
+    require(rest.seeded == frames - rest.shadows, "the seeds never take the frames the shadows cover");
+    require(rest.slots == keys - rest.seeded + rest.shadows && rest.slots < half.slots, "more seeds, fewer slots");
+    require(plan_exclusive_tier(keys, 1'000, 900, 100, 0.5).slots == 0, "shadows taking every frame: no exclusive tier");
+    require(plan_exclusive_tier(keys, 0, loan, kv, 0.5).slots == 0, "no frames: no exclusive tier");
+    // More frames than keys need: the slots never exceed the keys.
+    const ExclusiveTier ample = plan_exclusive_tier(1'000, 100'000, 10, 0, 0.0);
+    require(ample.seeded == 0 && ample.slots == 1'000, "no seeds: RAM holds every key, never more");
+}
+
 } // namespace
+
+// What the prefill-chunk fits read (Flash-Next's start; the offloaded Qwen3.5's Engine plan, candidates RF-04 (c)):
+// the reproducible route's nominal launch, and the lend capacity of a cache not built yet, split among the
+// pools of its strides as resize splits it.
+void test_nominal_and_lend() {
+    VramSnapshot s;
+    s.device_free  = 20 * kGiB;
+    s.device_total = 32 * kGiB;
+    s.has_budget   = true;
+    s.display      = DisplayState::Headless;
+    require(nominal_snapshot(s, std::nullopt).device_free == s.device_free && nominal_snapshot(s, std::nullopt).has_budget,
+            "without a reading the snapshot stands");
+    const VramSnapshot busier = nominal_snapshot(s, 5 * kGiB);
+    require(busier.device_free == 22 * kGiB && !busier.has_budget && busier.display == DisplayState::Attached,
+            "5 GiB in use before loading: sized as if 3 GiB, an attached display and no OS budget");
+    require(nominal_snapshot(s, 1 * kGiB).device_free == 18 * kGiB, "1 GiB in use: 2 GiB less free than measured");
+    VramSnapshot tight = s;
+    tight.device_free  = 1 * kGiB;
+    require(nominal_snapshot(tight, 0).device_free == 0, "the nominal free memory stops at zero");
+
+    const std::vector<std::uint64_t> one(48, 10 * kMiB);
+    const auto lend = lend_capacity(one, 256, 1000);
+    require(lend.frames == 750 && lend.pitch == 10 * kMiB, "one pool lends what it keeps above a quarter");
+    require(lend_capacity(one, 256, 1000000).frames == (48 * 256 - 1) - (48 * 256 - 1) / 4,
+            "a pool lends at most what its limit keeps above a quarter");
+    require(lend.lends(749 * 10 * kMiB) && !lend.lends(749 * 10 * kMiB + 1) && !lend.lends(750 * 10 * kMiB),
+            "a run lends with a frame to spare");
+    std::vector<std::uint64_t> two(40, 4 * kMiB);
+    two.insert(two.end(), 8, 9 * kMiB);
+    // 4,800 frames over 48 layers: 4,000 for the 40 layers of 4 MiB (lending 12,000 MiB), 800 for the 8 of 9 MiB
+    // (5,400 MiB).
+    const auto split = lend_capacity(two, 256, 4800);
+    require(split.frames == 3000 && split.pitch == 4 * kMiB, "two pools: the one that lends the most bytes");
+    require(!LendCapacity{}.lends(1), "an empty cache lends nothing");
+}
+
+// The RAM tiers' resize law (--ram-resize auto): below 2 GiB available a release in whole steps up to 3 GiB free,
+// capped by what the tiers can give; growth only after more than the growth floor (the reserve, at least 3 GiB, plus a
+// step) has held for 10 s since the last release, by what stays above it, its pieces then due one after another;
+// nothing due when the tiers have no room, which is measured again every 30 s under pressure.
+void test_ram_control() {
+    using infernix::runtime::expert_offload::RamControl;
+    RamControl control(8 * kGiB);
+    control.set_room(10 * kGiB, 0);
+    require(control.observe(kGiB + kGiB / 2, 0.0) && control.decide(kGiB + kGiB / 2, 0.0).release == 2 * kGiB &&
+                control.decide(kGiB + kGiB / 2, 0.0).grow == 0,
+            "1.5 GiB available: release 2 GiB (whole steps to 3 GiB free)");
+    require(control.decide(2 * kGiB - 1, 0.0).release == 2 * kGiB, "just under 2 GiB: 1 GiB and a byte, two steps");
+    require(!control.observe(5 * kGiB, 1.0) && control.decide(5 * kGiB, 1.0).release == 0, "5 GiB: no pressure");
+    control.set_room(kGiB, 0);
+    require(control.decide(kGiB / 2, 2.0).release == kGiB, "the release stops at what the tiers can give");
+    control.set_room(0, 0);
+    control.checked(3.0);
+    require(!control.observe(kGiB / 2, 3.0) && !control.observe(kGiB / 2, 32.0) &&
+                control.decide(kGiB / 2, 33.0).release == 0,
+            "no room: nothing due under pressure");
+    require(control.observe(kGiB / 2, 33.0), "no room under pressure: the tiers are asked again after 30 s");
+    require(!control.observe(5 * kGiB, 100.0), "no pressure, no room: nothing to ask");
+
+    control.resized(100.0, true);
+    control.set_room(0, 6 * kGiB);
+    require(!control.observe(12 * kGiB, 100.0) && !control.observe(12 * kGiB, 105.0),
+            "growth waits while the threshold has not held for 10 s");
+    require(control.observe(12 * kGiB, 110.5) && control.decide(12 * kGiB, 110.5).grow == 3 * kGiB,
+            "12 GiB available after 10 s: grow by what stays above the reserve plus a step (3 GiB)");
+    require(!control.observe(8 * kGiB + kGiB / 2, 111.0), "a dip below the reserve plus a step restarts the hold");
+    require(!control.observe(12 * kGiB, 113.0) && !control.observe(12 * kGiB, 120.0) &&
+                control.observe(12 * kGiB, 123.5),
+            "the hold restarts from the dip");
+    control.resized(124.0, true);
+    require(!control.observe(12 * kGiB, 130.0) && control.observe(12 * kGiB, 134.5), "a release restarts the hold");
+    control.resized(135.0, false);
+    require(control.observe(11 * kGiB, 135.0) && control.decide(11 * kGiB, 135.0).grow == 2 * kGiB,
+            "a growth piece does not: the next is due at once");
+    control.set_room(0, kGiB);
+    require(control.decide(12 * kGiB, 135.0).grow == kGiB, "growth stops at the startup size");
+
+    // A reserve under 3 GiB: growth still leaves 3 GiB plus a step, or it would grow back into pressure.
+    RamControl small(2 * kGiB);
+    small.set_room(0, 8 * kGiB);
+    require(small.growth_floor() == 4 * kGiB, "growth floor: at least 3 GiB plus a step");
+    require(!small.observe(4 * kGiB, 0.0) && !small.observe(4 * kGiB, 20.0), "4 GiB available: nothing to grow into");
+    require(!small.observe(6 * kGiB + kGiB / 2, 21.0) && small.observe(6 * kGiB + kGiB / 2, 31.0) &&
+                small.decide(6 * kGiB + kGiB / 2, 31.0).grow == 2 * kGiB,
+            "6.5 GiB for 10 s: grow 2 GiB, leaving 4.5");
+}
 
 int main() {
     try {
+        test_nominal_and_lend();
+        test_ram_control();
         test_full_mode_boundary();
         test_reserve_applied_once();
         test_planned_terms();
@@ -468,6 +600,7 @@ int main() {
         test_sizing();
         test_spill();
         test_control_law();
+        test_exclusive_tier();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

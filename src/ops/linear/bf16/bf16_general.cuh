@@ -13,13 +13,18 @@
 #include <cstdint>
 
 namespace infernix::ops::detail {
-constexpr std::int32_t kTileN         = 32;
-constexpr std::int32_t kTileT         = 32;
+// A 64 x 64 output tile per CTA, 4 x 4 outputs a thread. Every output is one fmaf chain over k = 0 .. K - 1 in order,
+// so the tile does not enter the bits: the 32 x 32 tile it replaced gave the same ones at a quarter of the
+// arithmetic per shared-memory read (candidates NQ-06: recipe C's QSA indexer [640, 2560], infernix_linear_bench,
+// cold L2, three rounds, 32 against 64: 64 columns 270.9 -> 246.4 us, 1,024 373.9 -> 257.2, 4,096 1,131.7 -> 605.3,
+// 16,384 4,117.6 -> 2,143.8; ahead at every width of a 64-column sweep, 2026-11-04).
+constexpr std::int32_t kTileN         = 64;
+constexpr std::int32_t kTileT         = 64;
 constexpr std::int32_t kTileK         = 32;
 constexpr std::int32_t kThreads       = 256;
-constexpr std::int32_t kThreadCols    = kThreads / 16;      // 16
-constexpr std::int32_t kRowsPerThread = kTileN / 16;        // 2
-constexpr std::int32_t kColsPerThread = kTileT / kThreadCols;  // 2
+constexpr std::int32_t kThreadCols    = kThreads / 16;          // 16
+constexpr std::int32_t kRowsPerThread = kTileN / 16;            // 4
+constexpr std::int32_t kColsPerThread = kTileT / kThreadCols;   // 4
 
 // An output element from its FP32 sum: rounded to BF16, or the sum itself.
 __device__ __forceinline__ void bf16_linear_store(__nv_bfloat16* out, float value) { *out = __float2bfloat16_rn(value); }

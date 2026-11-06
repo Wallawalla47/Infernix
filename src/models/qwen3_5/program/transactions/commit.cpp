@@ -59,8 +59,12 @@ PendingBatch ProgramImpl::wrap_pending(std::span<const std::uint32_t> lanes,
         // The round has synchronized, so the sampler's flag is final; it is cleared for the
         // lane's next round. Placeholder tokens make any grammar verdict on them meaningless.
         std::int32_t* const nonfinite = nonfinite_flag(lanes[row]);
+        const bool nonfinite_row = std::exchange(*nonfinite, 0) != 0;
+        // Likewise the packed BF16 KV's flags: a row with no packed form left the KV unlike the bf16 storage's.
+        const bool unpackable_row = take_unpackable(sequences[lanes[row]]);
         ContractAccess::row_failure(pending, row,
-                                    std::exchange(*nonfinite, 0) != 0
+                                    unpackable_row ? runtime::PendingRowFailure::UnpackableKv
+                                    : nonfinite_row || runtime::testing::take_nonfinite_fault()
                                         ? runtime::PendingRowFailure::NonFiniteLogits
                                     : (grammar_dead_positions[row] & reached) != 0
                                         ? runtime::PendingRowFailure::ConstraintDeadEnd
@@ -386,14 +390,20 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
                                  std::span<const runtime::CommitDecision> decisions,
                                  runtime::CommitObservation observation,
                                  runtime::ExecutionTiming* failed_timing) {
+    const auto started = Clock::now();
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
     std::array<SequenceHandle, kMaximumConcurrency> members{};
     const auto input_rows       = ContractAccess::rows(pending);
     const std::size_t row_count = input_rows.size();
     for (std::size_t row = 0; row < row_count; ++row) { members[row] = input_rows[row]; }
     std::array<bool, kMaximumConcurrency> row_failed{};
+    // Failures whose request may have published state unlike the model's: non-finite values, or KV with no packed form.
+    std::array<bool, kMaximumConcurrency> row_withdraw{};
     for (std::size_t row = 0; row < row_count; ++row) {
-        row_failed[row] = pending.row_failure(row) != runtime::PendingRowFailure::None;
+        const runtime::PendingRowFailure failure = pending.row_failure(row);
+        row_failed[row]   = failure != runtime::PendingRowFailure::None;
+        row_withdraw[row] = failure == runtime::PendingRowFailure::NonFiniteLogits ||
+                            failure == runtime::PendingRowFailure::UnpackableKv;
     }
     const bool valid = valid_pending(pending);
     ContractAccess::consume(pending);
@@ -448,6 +458,10 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
             terminal[row]                = decision.terminal ? 1U : 0U;
             discarded[row]               = (decision.cancelled || decision.failed) ? 1U : 0U;
             prefix_execution_splits[row] = decision.prefix_execution_split_after;
+            // A row whose logits went non-finite, or whose KV has a row with no packed form (discarded either way),
+            // may have published state it never computed correctly: its release withdraws its prefix-cache entries
+            // (spec §7.8).
+            if (row_withdraw[row] && hybrid_) { hybrid_lanes_[lane].withdraw = true; }
             if (discarded[row]) {
                 timings[row]     = requests[lane].timings;
                 speculative[row] = std::move(requests[lane].speculative_stats);
@@ -468,6 +482,18 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
 
         for (std::size_t row = 0; row < row_count; ++row) {
             if (!discarded[row]) { settle_unit(lanes[row]); }
+        }
+        // A round's commit is part of its execution: its span joins its rows' decode time (the prefill's for the
+        // prefill's first token), as the decode and prefill calls charge theirs.
+        const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        for (std::size_t row = 0; row < row_count; ++row) {
+            GenerationTimings& charged = discarded[row] ? timings[row] : requests[lanes[row]].timings;
+            if (pending_kinds[row] == PendingKind::Begin) {
+                charged.prefill_seconds += seconds;
+            } else {
+                charged.decode_seconds += seconds;
+                charged.decode_share_seconds += seconds / static_cast<double>(row_count);
+            }
         }
         CommitResult out;
         out.row_count = row_count;
@@ -593,6 +619,7 @@ bool ProgramImpl::recover_after_failure() noexcept {
         if (offload->engine().take_failed_round() && hybrid_) {
             if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
             hybrid_->clear();
+            hybrid_withdrawal_ = {}; // its references would name the rebuilt index's entries
         }
     }
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
@@ -625,6 +652,7 @@ void ProgramImpl::fail_all_cleanup() noexcept {
             (void)cudaStreamSynchronize(device.transfer_stream);
         }
         hybrid_->clear();
+        hybrid_withdrawal_ = {};
     }
 }
 

@@ -25,6 +25,18 @@ namespace infernix::models::qwen3_5::detail {
 
 static_assert(std::is_nothrow_move_assignable_v<SpeculativeStats>);
 
+namespace {
+
+// A spill guard over `source` that has read free memory (none without a source).
+std::optional<SpillGuard> begun_spill_guard(VramBudgetSource* source) {
+    if (source == nullptr) { return std::nullopt; }
+    std::optional<SpillGuard> guard(std::in_place, *source);
+    guard->begin();
+    return guard;
+}
+
+} // namespace
+
 ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const SequencePlanImpl& plan,
                          DeviceContext& device_in, const StartupObserver& startup_observer,
                          const ProgramOffloadOptions* offload_options)
@@ -47,7 +59,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
-      persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
+      // Every Program checks its fixed allocations against the driver's sysmem fallback (VR-04): a
+      // resident model's KV and arenas are as exposed to it as an offloaded one's.
+      spill_source(open_vram_budget_source(
+          device_in.device, offload_options != nullptr && offload_options->engine.vram_past_budget)),
+      spill_guard(begun_spill_guard(spill_source.get())), persistent(plan.persistent.bytes),
+      workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
       round_host(plan.causal_scoring
                      ? std::nullopt
@@ -96,7 +113,6 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         // round); the fit replaces it.
         mtp_confidence.emplace(plan.dflash_width_costs.per_draft);
     }
-    if (execution_schedule.mtp_draft_regime) { mtp_regime.emplace(); }
     if (const std::string& path = mtp_draft_switches().draft_log;
         !path.empty() && speculative_backend == SpeculativeBackend::Mtp) {
         mtp_draft_log = std::make_unique<std::ofstream>(path, std::ios::app);
@@ -187,7 +203,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                             })) {
                 continue;
             }
-            GdnReplayRecords narrowed = replay_records->narrowed(width);
+            // The rows this width's columns hold in the storage (the records hold the widest round's
+            // columns a layer, persistent_layout), as the verify logits' view.
+            const auto rows = static_cast<std::int32_t>(
+                replay_view_rows(static_cast<std::uint32_t>(replay_records->spec.record_capacity), draft_window,
+                                 static_cast<std::uint32_t>(width), plan.max_concurrency));
+            GdnReplayRecords narrowed = replay_records->narrowed(width, rows);
             ops::GdnReplayFoldPlan fold(narrowed, state_images->linear().all_layers_view());
             narrow_replay_views.push_back(NarrowReplayView{narrowed, std::move(fold)});
         }
@@ -220,6 +241,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         backend_kv_addresses = std::make_unique<KVAddressSpaceStore>(
             *backend_kv_pages, backend->execution_tables(), max_concurrency + 1U,
             backend->execution_tables().logical_page_capacity());
+    }
+    {
+        const auto text_rows = static_cast<std::size_t>(decoder->text_kv.execution_tables().row_count());
+        auto* backend        = backend_kv_cache();
+        const auto rows = text_rows + (backend ? static_cast<std::size_t>(backend->execution_tables().row_count()) : 0);
+        unpackable_flags.emplace(sizeof(std::int32_t) * rows);
+        auto* flags = static_cast<std::int32_t*>(unpackable_flags->data());
+        std::fill_n(flags, rows, 0);
+        decoder->text_kv.bind_unpackable(flags);
+        if (backend) { backend->bind_unpackable(flags + text_rows); }
     }
 
     io = qwen3_5::RoundState(backing, plan.persistent.round);
@@ -316,27 +347,42 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
     }
     device.synchronize();
+    if (spill_guard) {
+        // The fixed allocations: the persistent and workspace arenas and the elastic text KV's base pages
+        // (the rest of its region is reserved, not backed).
+        const std::uint64_t fixed = plan.persistent.bytes + plan.workspace.capacity + (kv_vmm ? kv_vmm->mapped_bytes() : 0U);
+        if (const std::uint64_t spilled = spill_guard->end(fixed); spilled != 0) {
+            throw std::runtime_error(
+                std::to_string(spilled >> 20) +
+                " MiB of the Program's VRAM allocations were placed in shared system memory by the driver's sysmem "
+                "fallback: free VRAM, or lower --max-context, --max-concurrency or --prefill-chunk. Setting the NVIDIA "
+                "Control Panel 'CUDA - Sysmem Fallback Policy' to 'Prefer No Sysmem Fallback' for this program makes "
+                "this fail at allocation instead. Readings: " + spill_guard->readings(fixed) + ".");
+        }
+        spill_guard.reset();
+        spill_source.reset();
+    }
     if (offload_options != nullptr) {
         // Offloaded experts (design §9.2): the engine after every fixed allocation, its frames sized
         // from what they leave less the graphs' allowance, started before the graphs capture the
         // experts' sources.
-        const OffloadGeometry geometry{
-            .lanes       = static_cast<std::int32_t>(max_concurrency),
-            .max_width   = static_cast<std::int32_t>(draft_window + 1U),
-            .columns     = static_cast<std::int32_t>(std::max<std::uint32_t>(
-                std::max(idle_prefill_width, prefill_chunk), max_concurrency * (draft_window + 1U))),
-            .chunk       = static_cast<std::int32_t>(prefill_chunk),
-            .speculative = speculative_backend != SpeculativeBackend::None || ngram_draft_window != 0,
-            .mtp_draft_tokens   = speculative_backend == SpeculativeBackend::Mtp ? neural_draft_window : 0U,
-            .ngram_draft_tokens = ngram_draft_window,
-            .graph_bound = static_cast<std::uint32_t>(
-                (graph_allowance_bytes + runtime::expert_offload::kGraphExecutableBytes - 1) /
-                runtime::expert_offload::kGraphExecutableBytes),
-            .wide_pass_bytes = std::max(workspace_plan.text_prefill_wide, workspace_plan.mtp_prefill_wide),
-            .wide_pass_ladder = workspace_plan.prefill_wide_ladder,
-            .expert_wide     = execution_schedule.expert_wide,
-            .router_mma      = execution_schedule.router_mma,
-            .device      = device.device};
+        OffloadGeometry geometry =
+            offload_round_geometry(max_concurrency, draft_window, prefill_chunk, idle_prefill_width, speculative_backend,
+                                   neural_draft_window, ngram_draft_window, device.device);
+        geometry.graph_bound = static_cast<std::uint32_t>(
+            (graph_allowance_bytes + runtime::expert_offload::kGraphExecutableBytes - 1) /
+            runtime::expert_offload::kGraphExecutableBytes);
+        geometry.wide_pass_bytes  = std::max(workspace_plan.text_prefill_wide, workspace_plan.mtp_prefill_wide);
+        geometry.wide_pass_ladder = workspace_plan.prefill_wide_ladder;
+        geometry.kv_growth_bytes  = kv_vmm ? kv_vmm->reserved_bytes() - kv_vmm->mapped_bytes() : 0U;
+        geometry.expert_wide      = execution_schedule.expert_wide;
+        geometry.expert_narrow    = execution_schedule.a8_experts ? ops::offloaded_moe::NarrowA16::kA8
+                                                                  : ops::offloaded_moe::NarrowA16::kExact;
+        geometry.router_mma       = execution_schedule.router_mma;
+        // The plan reserved the engine's staging and tables (make_sequence_planner with these options).
+        if (ProgramOffload::fixed_bytes(parameters, geometry, offload_options->engine) != plan.offload_fixed_bytes) {
+            throw std::logic_error("the offload engine's staging and tables differ from the sequence plan's reservation");
+        }
         offload = std::make_unique<ProgramOffload>(parameters, geometry, offload_options->engine,
                                                    offload_options->diagnostic);
         offload->start(device.stream);
@@ -348,7 +394,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             offload->engine().report("elastic text KV: " + std::to_string(kv_base_pages) + " of " +
                                      std::to_string(decoder->text_kv.page_pool().capacity_pages()) +
                                      " pages backed at startup (" + std::to_string(kv_vmm->mapped_bytes() >> 20) +
-                                     " MiB); the rest grows from the expert frames as requests need it");
+                                         " MiB); the rest grows from the expert frames as requests need it",
+                                     DiagnosticLevel::Debug);
         }
         device.synchronize();
     }
@@ -375,13 +422,6 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
 ProgramImpl::~ProgramImpl() noexcept {
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
-    // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_SKIP_ROUNDS): how often the regime chose draft-free rounds.
-    if (mtp_regime && offload) {
-        try {
-            offload->engine().report("MTP draft-free rounds: " + std::to_string(mtp_regime->draft_free_rounds()) +
-                                     " of " + std::to_string(mtp_regime->rounds()));
-        } catch (...) {}
-    }
 }
 
 ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t first_target,
@@ -458,6 +498,8 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
             throw std::logic_error("causal score did not bind the unique Main KV row");
         }
         text_kv_addresses->ensure_mapped_to_tokens(*address, predictor_count, device.stream);
+        std::int32_t* const unpackable = decoder->text_kv.unpackable(0); // packed BF16 KV (unpackable_flags)
+        if (unpackable != nullptr) { *unpackable = 0; }
 
         const std::int32_t state_slot = state_store->physical_slot(*state);
         const auto flush              = [&] {
@@ -635,6 +677,11 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
         flush();
         if (output.logprobs.size() != scored_positions) {
             throw std::logic_error("causal score produced the wrong number of logprobs");
+        }
+        // flush() synchronized: the appends' flag is final.
+        if (unpackable != nullptr && std::exchange(*unpackable, 0) != 0) {
+            throw std::runtime_error("a K or V row of the scored text has more values outside its exponent window "
+                                     "than --kv-dtype bf16p can store exactly (--kv-dtype bf16 stores every row)");
         }
         cleanup();
         return output;

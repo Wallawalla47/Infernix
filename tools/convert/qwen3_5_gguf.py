@@ -32,6 +32,8 @@ from typing import Mapping
 import numpy as np
 import torch
 
+from tools.artifact.codecs.ggml import BY_GGML_ID, GGUF_BF16, GGUF_F16, GGUF_F32, GGUF_Q8_0
+
 from . import qwen3_5
 from .model import Model, Parameter
 from .resources import load_resources
@@ -147,6 +149,20 @@ class _Builder:
         self.group(*roles[:2])
         self.group(*roles[2:])
 
+    def control(self, tensor, shape):
+        """A GDN control projection (ssm_alpha / ssm_beta) as exact BF16 values: Qwen3.5's control step reads BF16
+        only (ops::prepare_gdn_gating_proj_weights), and a quantized row (code times scale) is no BF16 value in
+        general, so a GGUF that stores them quantized (Q8_0, a K-quant or IQ4_XS, as some third-party files do:
+        Strata #3925) cannot be imported exactly; F32/F16/BF16 ones can (as convert_hf_to_gguf.py writes them)."""
+
+        stored = self.store.tensor(tensor).ggml_type
+        if stored not in (GGUF_F32, GGUF_F16, GGUF_BF16):
+            kind = "Q8_0" if stored == GGUF_Q8_0 else BY_GGML_ID[stored].name if stored in BY_GGML_ID else f"type {stored}"
+            raise ValueError(f"{tensor}: stored as {kind}; Qwen3.5's GDN control projections run in BF16, which a "
+                             "quantized row cannot match exactly, so this GGUF cannot be imported bit-exactly: use a "
+                             "GGUF that keeps ssm_alpha / ssm_beta in F32, F16 or BF16, or the Hugging Face checkpoint")
+        return plain(self.store, tensor, shape)
+
     def gdn(self, prefix, blk):
         c = self.config
         h = c["hidden_size"]
@@ -163,7 +179,7 @@ class _Builder:
             (2 * kg + g * dv, 2 * kg + (g + 1) * dv) for g in value_head_slots(nv, nk)))
         self.add(p + "convolution", transpose_source(conv, (1, 0), (taps, channels)))
         for role, tensor in (("a_projection", "ssm_alpha.weight"), ("b_projection", "ssm_beta.weight")):
-            self.add(p + role, head_rows(plain(self.store, blk + tensor, (nv, h)), nv, 1, nk), inputs=inputs)
+            self.add(p + role, head_rows(self.control(blk + tensor, (nv, h)), nv, 1, nk), inputs=inputs)
         qkv = ggml_or_plain(self.store, blk + "attn_qkv.weight", (channels, h))
         self.add(p + "query", select_rows(qkv, ((0, kg),)), inputs=inputs)
         self.add(p + "key", select_rows(qkv, ((kg, 2 * kg),)), inputs=inputs)

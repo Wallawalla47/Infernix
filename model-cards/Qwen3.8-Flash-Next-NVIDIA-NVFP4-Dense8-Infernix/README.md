@@ -75,7 +75,8 @@ infernix-serve <this model's part 1>.infernix --spec dflash2 \
   --draft-model <dir>/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto
 ```
 
-It needs an Infernix build whose `--help` lists `--draft-model`; see the drafter's card for details.
+It needs an Infernix build whose `--help` lists `--draft-model`; builds from 2026-10-31 also find it
+in the model's folder by themselves when no `--spec` is given. See the drafter's card for details.
 
 ## PLE n-gram tables
 
@@ -168,9 +169,18 @@ The n-gram volume's 8.19 includes its 4 KiB block padding; the table itself is 8
 ```text
 infernix-serve Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix \
   --ngram-volume <nvme>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram \
-  --max-context 262144 --kv-dtype int8 \
-  --spec mtp --draft-tokens auto --lm-head-draft --max-concurrency 2
+  --max-context 262144 --kv-dtype int8 --max-concurrency 2 \
+  --spec dflash2 --draft-model <dir>/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix \
+  --draft-tokens auto --lm-head-draft --vram-past-budget
 ```
+
+This is the recommended configuration: DFlash2 drafting with
+[Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix)
+and the proposal head. Without the drafter, `--spec mtp --draft-tokens auto --lm-head-draft` drafts
+with the model's MTP layer, about 10 % slower. `--vram-past-budget` (Windows) also gives the expert
+cache the ~0.6 GiB of VRAM the per-process budget withholds; leave it out when another program
+needs that memory. Infernix builds from 2026-10-31 speculate even without `--spec` (`--spec auto`):
+with DFlash2 when its drafter is the only one in the model's folder, else with MTP.
 
 It serves the OpenAI Chat Completions and Responses APIs and the Anthropic Messages API. The
 [Flash-Next guide](https://github.com/Wallawalla47/Infernix/blob/main/docs/qwen3_8-flash-next.md)
@@ -208,7 +218,7 @@ dense projections in 8 bits cost no measurable quality on these texts.
 
 RTX 5090 in a PCIe Gen5 **x8** link (x16 is likely faster, most of all for this model, whose
 expert-cache misses cross PCIe on every token), Core i9-13900K, 96 GB DDR5, Windows 11; Infernix
-at `3b35ccf9`, INT8 KV, MTP with 4 drafts and the proposal head. Strata 0.1.40 on the same machine
+at `9c8bd5e6`, INT8 KV, MTP with 4 drafts and the proposal head. Strata 0.1.40 on the same machine
 runs the Unsloth UD-Q4_K_XL GGUF with its own MTP drafter.
 
 | Context | TTFT, Infernix | TTFT, Strata | Decode tok/s, Infernix | Decode tok/s, Strata |

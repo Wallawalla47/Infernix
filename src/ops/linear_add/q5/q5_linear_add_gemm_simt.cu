@@ -19,7 +19,8 @@ void launch_split2(const Tensor& x, const Weight& w, Tensor& residual_out, cudaS
     const auto stride = std::int64_t(residual_out.nb[1] / sizeof(__nv_bfloat16));
     launch_q5_a16_direct_simt<Schedule>(q5_linear_operands(x, w),
                                         LinearBf16StridedOutput{data, stride, 0},
-                                        LinearResidualAddEpilogue{{data, stride, 0}}, stream);
+                                        LinearResidualAddEpilogue{{data, stride, 0}}, stream,
+                                        pdl::Dependency::Programmatic); // candidates §58
 }
 
 template <int Cols>

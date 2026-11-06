@@ -88,6 +88,35 @@ int run_tests() {
                       "--spec-min-p accepted a value above 1");
     failures += check(infernix::cli::usage_text("infernix").find("--spec-min-p") != std::string::npos,
                       "CLI help omits --spec-min-p");
+    // --spec auto: the Engine chooses the drafter; it needs an automatic draft length.
+    const auto automatic = parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "auto",
+                                  "--draft-tokens", "auto", "--lm-head-draft"});
+    failures += check(automatic.speculative.backend_auto &&
+                          automatic.speculative.backend == infernix::SpeculativeBackend::None &&
+                          automatic.speculative.draft_tokens_auto,
+                      "--spec auto did not leave the drafter to the Engine");
+    failures += check(rejects([] {
+                          (void)parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "auto",
+                                       "--draft-tokens", "3"});
+                      }),
+                      "--spec auto was accepted with a fixed draft length");
+    // Without --spec the CLI speculates as --spec auto --draft-tokens auto; --spec off decodes plain, and a
+    // setting of one drafter still needs its --spec.
+    const auto unspecified = parse({"infernix", "model.ninfer", "--prompt", "hello", "--lm-head-draft"});
+    failures += check(unspecified.speculative.backend_auto && unspecified.speculative.draft_tokens_auto &&
+                          unspecified.speculative.backend == infernix::SpeculativeBackend::None,
+                      "the CLI's default speculation is not --spec auto --draft-tokens auto");
+    const auto off = parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "off"});
+    failures += check(!off.speculative.backend_auto && !off.speculative.draft_tokens_auto &&
+                          off.speculative.backend == infernix::SpeculativeBackend::None,
+                      "--spec off did not decode plain");
+    failures += check(rejects([] { (void)parse({"infernix", "model.ninfer", "--prompt", "hello", "--draft-tokens", "3"}); }) &&
+                          rejects([] { (void)parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec-min-p", "0.5"}); }) &&
+                          rejects([] {
+                              (void)parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "off",
+                                           "--draft-tokens", "auto"});
+                          }),
+                      "a drafter's setting was accepted without its --spec");
     failures += check(
         parse({"infernix", "model.ninfer", "--prompt", "hello", "--grammar-file", "answer.gbnf"})
                 .grammar_path == "answer.gbnf",
@@ -160,7 +189,7 @@ int run_tests() {
                           ngram_auto.speculative.ngram_draft_tokens == 0,
                       "CLI did not select the automatic ngram window");
     failures += check(rejects([] {
-                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x",
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "off",
                                        "--ngram-draft-tokens", "auto"});
                       }),
                       "CLI admitted an automatic ngram window without a neural drafter");
@@ -194,9 +223,10 @@ int run_tests() {
                       }),
                       "CLI admitted --draft-tokens Auto");
     failures += check(rejects([&] {
-                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--draft-tokens", "auto"});
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "off",
+                                       "--draft-tokens", "auto"});
                       }),
-                      "CLI admitted --draft-tokens auto without --spec");
+                      "CLI admitted --draft-tokens auto with --spec off");
     // Qwen3.8-Flash-Next's DFlash2 drafter: a companion artifact by path, and the automatic length.
     const auto companion = parse({"infernix-cli", "model.infernix", "--prompt", "x", "--spec", "dflash2",
                                   "--draft-tokens", "auto", "--draft-model", "drafter.infernix", "--lm-head-draft"});
@@ -315,10 +345,14 @@ int run_tests() {
     failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "k4v2"})
                               .kv_cache == infernix::KvCacheStorage::Q4KeyVq2Value,
                       "--kv-dtype k4v2 did not select 4-bit K / 2-bit V KV");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "bf16p"})
+                              .kv_cache == infernix::KvCacheStorage::Bf16Packed,
+                      "--kv-dtype bf16p did not select packed BF16 KV");
     const std::string help = infernix::cli::usage_text("infernix-cli");
     failures +=
         check(help.find("nvfp4") != std::string::npos && help.find("k8v4") != std::string::npos &&
-                  help.find("vq2") != std::string::npos && help.find("k4v2") != std::string::npos,
+                  help.find("vq2") != std::string::npos && help.find("k4v2") != std::string::npos &&
+                  help.find("bf16p") != std::string::npos,
               "CLI help omits a production KV storage mode");
     failures += check(!k8v4.original_int8_prefill_kernel,
                       "the CLI original INT8 prefill kernel must default off");
@@ -375,6 +409,12 @@ int run_tests() {
                       "--expert-ram-mib must parse a MiB count and auto");
     failures += check(rejects([] { (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-ram-mib", "0"}); }),
                       "--expert-ram-mib must reject zero");
+    failures += check(help.find("--expert-ram-layout") != std::string::npos, "CLI help omits the expert RAM layout control");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-ram-layout", "full"}).expert_ram_layout ==
+                          infernix::ExpertRamLayout::Full,
+                      "--expert-ram-layout must parse full");
+    failures += check(!parse({"infernix-cli", "model.ninfer", "--prompt", "x"}).expert_ram_layout.has_value(),
+                      "without --expert-ram-layout the model's default must stand");
     failures += check(help.find("--expert-pin-mib") != std::string::npos, "CLI help omits the expert pin control");
     failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-pin-mib", "24576"}).expert_pin_bytes ==
                               (24576ULL << 20) &&
@@ -422,6 +462,18 @@ int run_tests() {
                           (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--fast-path", "no-such-path"});
                       }),
                       "CLI accepted an unknown fast path");
+    // --no-fast-path NAME: a leave-one-out exclusion, repeatable; unknown names are refused.
+    const auto excluded = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--no-fast-path", "prompt-pv8",
+                                 "--no-fast-path", "preemption"});
+    failures += check(excluded.fast_path_exclusions ==
+                              std::vector<infernix::FastPath>{infernix::FastPath::PromptPv8,
+                                                              infernix::FastPath::Preemption} &&
+                          excluded.fast_path_candidates.empty(),
+                      "CLI --no-fast-path must collect each named exclusion");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--no-fast-path", "no-such-path"});
+                      }),
+                      "CLI accepted an unknown excluded fast path");
 
     // --config FILE: the model and options from a TOML file; [cli] overrides the top level, [serve]
     // is infernix-serve's and is not read here, repeatable options take arrays, and the command

@@ -43,6 +43,7 @@
 
 
 #include "ops/common/math.cuh"
+#include "ops/softmax_attention/common/causal_softmax.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
@@ -396,10 +397,10 @@ __global__ __launch_bounds__(
         const float nm1_scaled = nm1 == -CUDART_INF_F ? 0.0f : nm1 * scale_l2;
         tile_alpha0            = running_m0 == -CUDART_INF_F
                                      ? 0.0f
-                                     : exp2_approx(__fmaf_rn(running_m0, scale_l2, -nm0_scaled));
+                                     : causal_rescale(running_m0, nm0_scaled, scale_l2);
         tile_alpha1            = running_m1 == -CUDART_INF_F
                                      ? 0.0f
-                                     : exp2_approx(__fmaf_rn(running_m1, scale_l2, -nm1_scaled));
+                                     : causal_rescale(running_m1, nm1_scaled, scale_l2);
         running_m0             = nm0;
         running_m1             = nm1;
 

@@ -24,9 +24,10 @@ inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
-// Physical Host memory left free for the OS and other programs once every pinned allocation is
-// locked, when --ram-headroom-mib is not given.
-inline constexpr std::uint64_t kDefaultRamHeadroomBytes = 2ULL << 30;
+// Physical Host memory Infernix leaves free for the OS and other programs after its weights, experts,
+// n-gram table and caches, when --ram-free-mib is not given (8 GiB since 2026-10-26: with 2 GiB a desktop paged
+// once Qwen3.8-Flash-Next's experts and n-gram table took the rest; Basalt's RAM-low guard sits at ~8.3 GiB).
+inline constexpr std::uint64_t kDefaultRamFreeBytes = 8ULL << 30;
 // Prompt-attention split workspace when --prefill-split-workspace-mib is not given.
 inline constexpr std::uint32_t kDefaultPrefillSplitWorkspaceMiB = 256;
 inline constexpr std::uint32_t kMaximumPrefillSplitWorkspaceMiB = 16384;
@@ -36,6 +37,10 @@ inline constexpr std::size_t kDefaultHybridHostCacheBytes = 8ULL << 30;
 // How long the prefix cache holds a conversation's state after a reply ending in a tool call,
 // when --cache-tool-hold-secs is not given (Qwen3.5): longer than most tools take to run.
 inline constexpr std::chrono::milliseconds kDefaultToolCallHold{30'000};
+// How long the Engine must have been idle before it prefills a finished turn's history for the
+// conversation's next request, when --cache-next-turn-ms is not given (TensorFold's measured
+// quiet period: a request sent the moment a reply ended was not delayed).
+inline constexpr std::chrono::milliseconds kDefaultNextTurnPrefillQuiet{150};
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -47,6 +52,10 @@ enum class KvCacheStorage : std::uint8_t {
     Vq2,
     // Rotated 4-bit Lloyd-Max K codes, 2-bit vector V codes and the same exact recent-key window.
     Q4KeyVq2Value,
+    // BFloat16's K and V values packed losslessly to 12 bits a value and an 8-byte side record a row
+    // (ops/kv_cache/bf16p_codec.cuh): 23 % fewer bytes than BFloat16; a request appending a row with no
+    // packed form fails.
+    Bf16Packed,
 };
 
 // The vocabulary head's logits (EngineOptions::logits_dtype), which the sampler, greedy argmax, draft
@@ -74,6 +83,8 @@ enum class LogitsDtype : std::uint8_t {
         return "vq2";
     case KvCacheStorage::Q4KeyVq2Value:
         return "k4v2";
+    case KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     return "unknown";
 }
@@ -164,9 +175,9 @@ enum class FastPath : std::uint8_t {
     // batched-a8-decode takes precedence. Without either they stay at 16 bits.
     BatchedA8ResidualDecode,
     // With batched-decode, wide decode and verify rounds take the artifact's one-term 8-bit
-    // activations in a subset of the FP8 projections only: rounds of at least a minimum width, the
-    // chosen projection classes, the chosen layers (temporary_switches::A8Subset, default rounds of
-    // 65+ columns, the input projections and gate/up of every layer). The others keep their route
+    // activations in a subset of the FP8 projections only: rounds of 65+ columns, the attention and
+    // GDN input projections and the dense MLP gate/up of every layer (qwen3_5 kA8SubsetMinColumns,
+    // execution::precision_decode_text). The others keep their route
     // (the A8 residual profile where batched-a8-residual-decode is selected, else 16 bits).
     // batched-a8-decode takes precedence. The narrower rung of batched-a8-decode, which failed its
     // decode gate (docs/maintainer/model-quality.md, 6.7).
@@ -230,10 +241,14 @@ enum class FastPath : std::uint8_t {
     // Qwen3.8-Flash-Next GGUF imports: dense projections of prefill calls of 32 or more columns run on
     // BF16 tensor cores (each code exact in BF16, x as stored, FP32 sums of each sub-block scaled by
     // d * sub; ops::LinearRoutes::GgmlBf16Wide) instead of the exact A16 integer tiles, and the GGUF
-    // expert banks' MoE calls of 14,336 or more columns run the same tiles over decoded expert planes.
-    // A prompt's arithmetic then depends on where its calls start and how the layer walk groups them
-    // (a narrower tail call stays exact), which prefix-cache resumes share between requests. Without
-    // it every GGUF projection and expert is exact.
+    // expert banks' MoE calls of 512 or more columns the same arithmetic, each K stage of an expert's
+    // codes decoded into shared memory (offloaded_moe::wide::kGgmlStageDecodeMinColumns; an expert taking
+    // at most eight of a call's columns keeps the exact narrow kernels). A prompt's arithmetic then
+    // depends on where its calls start, on how the layer walk groups its chunks into MoE calls (a group's
+    // total columns choose the experts' route) and on how many of a call's columns each expert takes (a
+    // narrower tail call stays exact), all of which a prefix-cache resume changes: a resumed prompt reads
+    // within this route's error of its cold run rather than equal to it. Without it every GGUF projection
+    // and expert is exact.
     GgmlBf16Prefill,
     // Qwen3.8-Flash-Next with row-FP8 (recipe C) or MXFP8 (NVIDIA FP4-Local) dense weights: dense
     // projections of prefill calls of 256 or more columns run on FP16 Tensor Cores at twice the
@@ -377,10 +392,6 @@ enum class KvCapacityMode : std::uint8_t {
     Automatic,
 };
 
-// Qwen3.5's automatic KV capacity leaves this much device memory free unless
-// EngineOptions::vram_headroom_bytes says otherwise.
-inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
-
 struct KvCapacityPolicy {
     KvCapacityMode mode           = KvCapacityMode::Explicit;
     std::uint32_t explicit_tokens = 2048;
@@ -421,13 +432,20 @@ draft_tree_auto_widths(std::uint32_t draft_tokens) noexcept {
 
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
+    // --spec auto (backend None until the Engine resolves it; requires draft_tokens_auto and no
+    // draft_min_p): startup chooses, among the drafters the artifact can run, the one measured fastest
+    // overall: Qwen3.8-Flash-Next DFlash2 with a draft_model, else MTP; a Qwen3.5-family artifact with
+    // offloaded experts MTP; any other Qwen3.5-family artifact DFlash2, then MTP, then DFlash, as
+    // bundled. Without one the Engine decodes plain. Engine::options() then reports false and the
+    // chosen backend.
+    bool backend_auto = false;
     // Startup-fixed K: MTP 1..7 (Qwen3.5/3.6 1..5); DFlash and DFlash2 1..15 (query width K+1).
     // With draft_tokens_auto it is the most a round may draft; 0 there takes the model's most
     // (Qwen3.8-Flash-Next 7, Qwen3.5/3.6 5), which Engine::options() reports.
     std::uint32_t draft_tokens = 0;
     // MTP (--draft-tokens auto): each round chooses its draft length, 0..draft_tokens, from the
     // request's learned acceptance; Qwen3.8-Flash-Next's one-row rounds also verify only the drafts
-    // above draft_min_p (default 0.5). DFlash and DFlash2: each all-neural round proposes the whole
+    // before their cumulative acceptance cut. DFlash and DFlash2: each all-neural round proposes the whole
     // block of draft_tokens and verifies as many as the drafts' calibrated probabilities make
     // fastest. On Qwen3.5/3.6 these are the adaptive-mtp and adaptive-dflash fast paths; where
     // they do not run, startup makes it the configuration's fastest fixed length (Engine::options()
@@ -453,9 +471,10 @@ struct SpeculativeOptions {
     // fixed (every round would verify the n-gram window). Engine::options() then reports false and
     // the resolved values.
     bool ngram_draft_tokens_auto = false;
-    // Qwen3.8-Flash-Next MTP (--spec-min-p): a one-row round verifies its drafts up to the first
-    // whose draft-head probability is below this value; 0 verifies every draft. In [0, 1]; unset
-    // is the measured 0.5 with draft_tokens_auto and 0 with a fixed draft length. Other models
+    // --spec-min-p (MTP, Qwen3.8-Flash-Next DFlash2): a one-row round verifies its drafts up to the
+    // first whose drafter probability is below this value; 0 verifies every draft. In [0, 1]; unset
+    // is 0. Qwen3.8-Flash-Next MTP takes it with a fixed draft length only (with draft_tokens_auto its
+    // argmax chains stop at a cumulative acceptance cut, and startup refuses it); other backends
     // refuse it.
     std::optional<float> draft_min_p;
     // DFlash2, DFlash or MTP tree verification by batch size: entry c-1 is the column count (anchor
@@ -482,6 +501,8 @@ enum class StartupPhase : std::uint8_t {
     ArtifactInspect,
     TargetPlan,
     WeightsMaterialize,
+    // A companion drafter's weights (--draft-model), read after the model's own.
+    DraftWeightsMaterialize,
     WeightsStagingPin,
     TargetFinalize,
     FrontendInitialize,
@@ -533,7 +554,9 @@ struct Diagnostic {
 };
 
 struct DiagnosticObserver {
-    // Receives every diagnostic, from the worker thread or the destructor; the product decides
+    // Receives every diagnostic, from the worker thread, the Engine's helper threads (the startup
+    // constraint warm-up, expert offload workers) or the destructor, so it must be thread-safe; the
+    // product decides
     // which levels to show. Without a callback, Info and above go to stderr. Callback exceptions
     // are ignored so a logging failure cannot disturb execution.
     std::function<void(const Diagnostic& diagnostic)> callback;
@@ -617,6 +640,11 @@ struct HybridPrefixCacheOptions {
     // since the client usually returns within the tool's run time. Zero disables them. Default
     // kDefaultToolCallHold on Qwen3.5; Qwen3.8-Flash-Next has none.
     std::optional<std::chrono::milliseconds> tool_call_hold;
+    // Idle-time prefill of a finished turn (hybrid-prefix-cache-spec §7.9): once the Engine has had
+    // nothing to run for this long after Engine::prefill_next_turn, it prefills that conversation's
+    // history as the next request will render it, as an internal request that yields to any real one
+    // at its next unit boundary. Zero disables it. Default kDefaultNextTurnPrefillQuiet with the cache.
+    std::optional<std::chrono::milliseconds> next_turn_prefill_quiet;
     // Host form of snapshot recurrent state (Qwen3.5). Changing it changes the Host image size.
     HybridHostStatePrecision host_state_precision = HybridHostStatePrecision::Fp32;
 };
@@ -632,6 +660,11 @@ struct ContextCacheOptions {
     // kDefaultHybridHostCacheBytes, 0 disables the Host tier; 0 when the cache is disabled). This
     // does not bound total process RAM. Engine::options() returns the resolved capacity.
     std::optional<std::size_t> host_capacity_bytes;
+    // --host-context-mib auto (host_capacity_bytes unset): Qwen3.8-Flash-Next sizes the Host tier after its
+    // experts and n-gram table from the RAM they leave beyond ram_free_bytes, min(8 GiB, 0.4 x left) in 256 MiB
+    // steps and at least 1 GiB (after Strata v0.2.6's rule); other models take kDefaultHybridHostCacheBytes.
+    // Engine::options() reports the resolved size in host_capacity_bytes.
+    bool host_capacity_auto = false;
 };
 
 struct ContextCostOptions {
@@ -656,6 +689,29 @@ inline NgramResidency parse_ngram_residency(std::string_view value) {
     throw std::invalid_argument("--ngram-residency must be auto, ram or volume");
 }
 
+// Which offloaded routed experts (Qwen3.8-Flash-Next, the Qwen3.5-122B-A10B) keep a copy in Host RAM when VRAM
+// cannot hold them all.
+enum class ExpertRamLayout : std::uint8_t {
+    Exclusive, // only the experts VRAM does not hold, plus shadows for what a prefill borrows (the SSD tier)
+    Full,      // every expert, whenever the RAM ledger allows it (else the SSD tier with the ledger's share)
+};
+
+// The CLI spelling: exclusive or full.
+inline ExpertRamLayout parse_expert_ram_layout(std::string_view value) {
+    if (value == "exclusive") { return ExpertRamLayout::Exclusive; }
+    if (value == "full") { return ExpertRamLayout::Full; }
+    throw std::invalid_argument("--expert-ram-layout must be exclusive or full");
+}
+
+inline const char* expert_ram_layout_name(ExpertRamLayout layout) {
+    return layout == ExpertRamLayout::Exclusive ? "exclusive" : "full";
+}
+
+// The layout without --expert-ram-layout, by model: Qwen3.8-Flash-Next exclusive (Full's decode speed with 4-6 GiB
+// less RAM, design §19.3.7, 2026-10-29), the Qwen3.5-122B-A10B full (exclusive's 3.9 GiB less RAM cost 1.0 % of its
+// decode after a 32K prompt and 0.4 % of prefill, 2026-10-30; its design §11.3).
+inline constexpr const char* kExpertRamLayoutDefaults = "exclusive for Qwen3.8-Flash-Next, full for the 122B";
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -664,8 +720,11 @@ struct EngineOptions {
     NgramResidency ngram_residency = NgramResidency::Auto;
     // Qwen3.8-Flash-Next's saved expert-cache state: read at startup to fill the VRAM expert cache
     // before the first request (warm start), written at stop and every 10 minutes between requests.
-    // Empty: no warm start (the cache starts empty and nothing is saved).
+    // Without a usable file (none given, a first start, another artifact's) the cache is seeded from the
+    // built-in calibrated expert order instead, and only a given file is saved.
     std::filesystem::path expert_state_path;
+    // --expert-state off: no file and no seed, so the expert cache starts empty (cold benchmarks).
+    bool expert_state_off = false;
     // Qwen3.8-Flash-Next's expert stripe (tools/flash_next/expert_stripe.py): the tail of every routed
     // expert record on a second drive, read beside each record's head in the artifact when the SSD
     // expert tier serves the experts. Empty: whole records from the artifact.
@@ -687,10 +746,10 @@ struct EngineOptions {
     // Extends only the allowed ceiling, never max_context itself or artifact metadata.
     float rope_yarn_factor             = 1.0F;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
-    // Device memory startup sizing leaves free; empty selects the model's automatic value.
-    // Qwen3.5: what --kv-capacity auto leaves after the KV cache (requires it; automatic 1 GiB).
-    // Qwen3.8-Flash-Next: what the expert cache leaves for the display and other programs once
-    // every fixed allocation is made (automatic: 1 GiB with a display attached, 256 MiB headless).
+    // Device memory startup sizing leaves free for the display and other programs; empty selects the
+    // automatic value, 1 GiB with a display attached (or unknown) and 256 MiB headless
+    // (expert_offload::display_headroom). Qwen3.5: what --kv-capacity auto leaves after the KV cache
+    // (requires it). Offloaded experts: what the expert cache leaves once every fixed allocation is made.
     std::optional<std::size_t> vram_headroom_bytes;
     // Qwen3.8-Flash-Next on Windows: also size the expert cache into the physical VRAM the OS
     // budget withholds (~0.6 GiB on an RTX 5090), measured at startup (--vram-past-budget). That
@@ -755,6 +814,28 @@ struct EngineOptions {
     // default 16-bit activations. Other artifacts refuse it, as does the lossless route without the
     // design reference.
     bool expert_a4_activations         = false;
+    // Qwen3.8-Flash-Next artifacts whose routed experts are W4A4 by their checkpoint (NVIDIA's NVFP4 recipes A and
+    // B, Dense8): run them with 16-bit activations (--a16-activations), the arithmetic of the weight-only banks
+    // (design §16.2.1), instead of the 4-bit activations at NVIDIA's calibrated scales. Changes the output; the
+    // engine warns at launch that the default follows NVIDIA's specification and is recommended. Artifacts whose
+    // experts already run 16-bit activations accept it unchanged; --expert-a4-activations, --a8-activations
+    // and the lossless route refuse it.
+    bool expert_a16_activations        = false;
+    // The 8-bit activation routes (--a8-activations; approximate, opt-in, never a default), each where it
+    // measured faster than the route it replaces (or is being measured; docs/maintainer/qwen3_8-flash-next-design.md
+    // §19.3.31). Decode and verification calls: int8 codes with an FP32 scale per 32 values (llama.cpp's Q8_1
+    // form) in a GGUF import's dense projections (calls of 1-31 columns) and in routed experts (GGUF and NVFP4
+    // W4A16 banks, calls of at most 128 columns) with their CPU-served misses (the CPU returns the GPU's bits).
+    // Prefill calls: on the same codec, a GGUF import's dense projections (calls of 32 or more columns) and the
+    // same routed experts (calls of more than 128 columns, in place of expert-a4-residual's A4 terms where that
+    // runs); a groupwise Q4 MLP gate/up's int8 activations per token (q4-w4a8's route, calls of 256 or more
+    // columns); MXFP8 dense projections' two E4M3 terms per 32 values (fp8-a8-pair-block32's route, in place of
+    // f16-accumulate-prefill). Flash-Next routed experts that are W4A4 by their checkpoint (Dense8, recipe A) take
+    // the 8-bit route in place of their 4-bit one (the engine warns at launch, as for expert_a16_activations).
+    // Every other call keeps its route. An artifact with none of these (the NVFP4 Qwen3.8-27B, whose FP8 and NVFP4
+    // projections already take the activations their artifact permits, the 35B-A3B and the official FP8 import),
+    // the reproducible route and the lossless route refuse it.
+    bool a8_activations                = false;
     // Qwen3.5-family artifacts (--embedding-host): keep the token embedding in pinned host memory and
     // gather its rows zero-copy, as artifacts with offloaded experts already do, so its VRAM (1.18 GiB on
     // the 27B) goes to the KV and prefix caches. Same bits; a prefill chunk reads its rows over the link.
@@ -772,6 +853,10 @@ struct EngineOptions {
     // whether or not they are qualified for this configuration, so their cost can be measured.
     // Each must apply to the configuration (its kernel must run in it).
     std::vector<FastPath> fast_path_candidates;
+    // Measurement only (leave-one-out arms on the default route): leave these out of the fast paths `fast_paths`
+    // selects. Each must be one the configuration selects (not a candidate as well); the reproducible route refuses
+    // them.
+    std::vector<FastPath> fast_path_exclusions;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     // The head's logits on every route (--logits-dtype): FP32, or BF16 for comparisons with engines and
     // references that round them; a startup choice (the round buffers and CUDA Graphs are planned for it).
@@ -779,13 +864,24 @@ struct EngineOptions {
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
-    // Physical Host memory every pinned allocation (weights, caches, buffers) must leave free for
-    // the OS and other programs; startup refuses a lock that would take it.
-    std::uint64_t ram_headroom_bytes = kDefaultRamHeadroomBytes;
+    // --ram-free-mib: physical Host memory everything Infernix plans in RAM (weights, experts, the n-gram table,
+    // the prefix cache's Host tier, buffers) leaves free for the OS and other programs; startup refuses a lock
+    // that would take it, the n-gram table goes to RAM only beside it, and an automatic Host tier sizes from
+    // what is left beyond it.
+    std::uint64_t ram_free_bytes = kDefaultRamFreeBytes;
+    // --ram-resize auto|off: between requests the RAM tiers (the prefix cache's Host tier; the expert tier's slots
+    // and records) give memory back while less than 2 GiB of physical memory is available, and take it back in
+    // pieces, up to their startup sizes, once more than ram_free_bytes (at least 3 GiB) plus 1 GiB has stayed
+    // available for 10 s (runtime::expert_offload::RamMonitor). Off: every tier keeps its startup size.
+    bool ram_resize = true;
     // Qwen3.8-Flash-Next (--expert-ram-mib): at most this much Host RAM for the routed experts.
     // Less than every expert needs selects the SSD tier: the experts not in RAM are read from the
     // artifact when used. Empty: what the RAM ledger leaves after the reserve and every other pin.
     std::optional<std::uint64_t> expert_ram_bytes;
+    // Offloaded experts (--expert-ram-layout), without expert_ram_bytes: Exclusive keeps in RAM only the experts VRAM
+    // does not hold (plus shadows for a prefill's loan and the KV growth), Full a copy of every expert. Empty: the
+    // model's default (kExpertRamLayoutDefaults).
+    std::optional<ExpertRamLayout> expert_ram_layout;
     // Qwen3.8-Flash-Next (--expert-pin-mib): at most this much of the experts' RAM page-locked for
     // the GPU; the rest stays in RAM unpinned and the CPU serves it. Empty: what Windows lets the
     // process page-lock (the GPU's shared memory) after every other pin; no limit elsewhere.
@@ -889,6 +985,10 @@ struct ThinkingControlOptions {
     // not this model-origin budget.
     std::optional<std::uint32_t> budget;
     ReasoningLoopAction loop = ReasoningLoopAction::Off;
+    // false (default): the model's end-of-turn tokens take no probability while the thinking phase is open, so a turn
+    // cannot end inside its thinking with an empty reply (a constrained request's grammar refuses them there already);
+    // true: they keep their probability.
+    bool end_turn_in_thinking = false;
 };
 
 // Most tokens one prompt readout may name.
@@ -1207,6 +1307,11 @@ enum class ReasoningEffort : std::uint8_t {
 enum class PromptContinuationMode : std::uint8_t {
     NewAssistantTurn,
     ContinueFinalAssistant,
+    // The conversation's history as its next request will render it: the messages end with the
+    // finished assistant reply, which renders as history before the next turn (a tool result when
+    // the reply calls tools, else a user turn), and the prompt ends with that turn's <|im_start|>.
+    // Prefilled by the Engine's idle-time pass (Engine::prefill_next_turn); text only.
+    NextTurnHistory,
 };
 
 struct PromptOptions {
@@ -1222,6 +1327,10 @@ struct PromptOptions {
     // constraints cover them after tool_jsons, in this order, while the template's tool section
     // omits them; a message that loads one carries its definition in its own content.
     std::vector<std::string> deferred_tool_jsons;
+    // The client knows tools the request does not declare (it defers tools behind its own search, as
+    // Claude Code does with its MCP tools): a well-formed call to an undeclared name stays a call for
+    // the client to judge instead of turning into text. The prompt does not change.
+    bool open_tool_names = false;
 };
 
 enum class PromptCacheMarkerKind : std::uint8_t {
@@ -1534,9 +1643,26 @@ struct GenerationFirstTokenObservation {
 
 using GenerationFirstTokenObserver = std::function<void(const GenerationFirstTokenObservation&)>;
 
+// A request's latest position, for a live view of the requests in flight (a server's metrics). The
+// Engine worker publishes it at admission, after each completed prefill unit and at each committed
+// output, and keeps only the newest: wait() delivers it on the consumer thread, in either consumer
+// mode, at its next wakeup (within about 10 ms), so a consumer sees the latest state rather than
+// every step. Nothing is published before admission. processed_prompt_tokens counts the reused
+// prefix, as PromptProgress does; generated_tokens counts accepted tokens, as
+// GenerationTimingObservation does.
+struct GenerationProgressObservation {
+    std::uint32_t prompt_tokens           = 0;
+    std::uint32_t reused_prompt_tokens    = 0;
+    std::uint32_t processed_prompt_tokens = 0;
+    std::uint32_t generated_tokens        = 0;
+};
+
+using GenerationProgressObserver = std::function<void(const GenerationProgressObservation&)>;
+
 // Observation affects only request publication. It never changes model execution, output
 // semantics, scheduling, or cache selection. Live output timings and prompt progress require a
-// Streaming consumer; phase timings and scheduling observations also support Aggregate consumers.
+// Streaming consumer; phase timings and the scheduling, first-token and progress observers also
+// support Aggregate consumers.
 struct GenerationObservationOptions {
     bool phase_timings   = false;
     bool live_timings    = false;
@@ -1544,6 +1670,8 @@ struct GenerationObservationOptions {
     // Optional for either consumer mode. No scheduling events are retained when unset.
     GenerationSchedulingObserver scheduling;
     GenerationFirstTokenObserver first_token;
+    // Optional for either consumer mode; nothing is published when unset.
+    GenerationProgressObserver progress;
 };
 
 class CancellationView {
@@ -1565,9 +1693,11 @@ struct PreparationControl {
 };
 
 // Request-stage wall timings retained for end-to-end latency/rate reporting. Prefill/decode are
-// Program execution elapsed time and include Device completion waits; total also includes queueing
-// and other request lifetime. They are not Host-work phases. GenerationEngineTiming below is the
-// direct, mutually-exclusive Host observation contract.
+// Program execution elapsed time and include Device completion waits: prefill is the prompt's calls
+// and the commit of its first token, decode each later round's decode and commit calls (the Engine's
+// work between them is not counted); total also includes queueing and other request lifetime. They
+// are not Host-work phases. GenerationEngineTiming below is the direct, mutually-exclusive Host
+// observation contract.
 struct GenerationTimings {
     double prepare_seconds     = 0.0;
     double first_token_seconds = 0.0;
@@ -1670,8 +1800,6 @@ struct SpeculativeStats {
     std::uint64_t ngram_archive_rounds          = 0;
     std::uint64_t ngram_archive_drafted_tokens  = 0;
     std::uint64_t ngram_archive_accepted_tokens = 0;
-    // Qwen3.8-Flash-Next with INFERNIX_TMP_NGRAM_AGREE: copy proposals the agreement gate refused.
-    std::uint64_t ngram_gate_rejections = 0;
     // Tree-verified rounds, those whose accepted path left the main chain, and the drafts those
     // paths accepted after leaving it (what the main chain alone would not have accepted).
     std::uint64_t tree_rounds               = 0;
@@ -1696,10 +1824,13 @@ struct ThinkingBudgetStats {
     std::uint32_t injected_tokens = 0;
     bool applied                  = false;
     // The reasoning-loop guard fired: after this many model-origin thinking tokens, at this
-    // repeated-passage coverage (ThinkingControlOptions::loop decided the action).
+    // repeated-passage coverage (ThinkingControlOptions::loop decided the action). loop_run_on_chars is
+    // the hyphen-joined run-on that fired it, in characters, or 0 when repeated passages or a periodic
+    // tail did.
     bool loop_detected               = false;
     std::uint32_t loop_thinking_tokens = 0;
     float loop_coverage              = 0.0F;
+    std::uint32_t loop_run_on_chars  = 0;
 };
 
 enum class ConstraintCacheAccess : std::uint8_t { Hit, Built, Waited };
@@ -1774,8 +1905,9 @@ struct ExpertCacheStats {
     std::uint64_t decode_hits   = 0;
 };
 
-// Qwen3.8-Flash-Next: the VRAM expert cache's cumulative counters since startup and its current
-// size (RuntimeStats::expert_cache, exported by /metrics). Absent for models without one.
+// An offloaded-expert model (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): the VRAM expert cache's
+// cumulative counters since startup and its current size (RuntimeStats::expert_cache, exported by
+// /metrics). Absent for models without one.
 struct ExpertCacheTotals {
     std::uint32_t frames     = 0; // frames backed now, one routed expert each
     std::uint64_t routed     = 0; // routed (layer, expert) uses
@@ -1926,6 +2058,94 @@ struct MemorySummary {
     std::optional<ExpertCacheMemorySummary> expert_cache;
 };
 
+// Engine::plan's device: the free memory it planned against is read live, so another process's use
+// counts as used.
+struct EnginePlanGpu {
+    std::string name;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t free_bytes  = 0;
+    // The OS's video-memory budget for this process (Windows WDDM), when it reports one.
+    std::optional<std::uint64_t> budget_bytes;
+};
+
+// Engine::plan's device memory. Empty optionals are quantities the architecture does not have.
+struct EnginePlanVram {
+    // The dense weights' device arena (with offloaded experts: everything but the routed experts).
+    std::uint64_t weights_bytes = 0;
+    // The KV cache's payload and token capacity as the start would size them (0 when nothing fits).
+    std::uint64_t kv_bytes  = 0;
+    std::uint32_t kv_tokens = 0;
+    // The least device memory the Program needs beside the weights at these options (its persistent
+    // buffers, the smallest KV a start accepts, its workspace and CUDA Graph allowance).
+    std::uint64_t minimum_reservation_bytes = 0;
+    // Qwen3.5 family: each further KV page group's bytes and tokens (the capacity curve's slope).
+    std::optional<std::uint64_t> bytes_per_page_group;
+    std::optional<std::uint32_t> page_group_tokens;
+    std::optional<std::uint64_t> workspace_bytes;
+    std::optional<std::uint64_t> graph_allowance_bytes;
+    // Offloaded experts: the VRAM expert cache's frames and bytes.
+    std::optional<std::uint64_t> expert_cache_bytes;
+    std::optional<std::uint32_t> expert_frames;
+    // Left free for the display and other programs (--vram-headroom-mib or the automatic headroom).
+    std::uint64_t headroom_bytes = 0;
+    // Everything planned on the device (weights, the Program's reservation, expert frames), and what
+    // the free memory leaves beside it and the headroom (0 when it does not fit).
+    std::uint64_t planned_bytes = 0;
+    std::uint64_t left_bytes    = 0;
+};
+
+enum class EnginePlanExpertTier : std::uint8_t {
+    // No routed expert is read from the artifact: every one is in RAM, or with the exclusive RAM
+    // layout in RAM or in the VRAM expert cache.
+    Full,
+    Ssd, // RAM holds part of the experts; the rest is read from the artifact on use
+};
+
+// Engine::plan's Host memory.
+struct EnginePlanRam {
+    std::uint64_t total_bytes     = 0;
+    std::uint64_t available_bytes = 0;
+    // The reserve left free for the system (--ram-free-mib).
+    std::uint64_t ram_free_bytes = 0;
+    // Offloaded experts: the RAM the routed experts take.
+    std::optional<std::uint64_t> experts_bytes;
+    // The weights the load pins in RAM (offloaded experts, the token embedding, an offloaded vision
+    // tower and the pinned mirror of the device weights its window evicts); empty when it pins none.
+    std::optional<std::uint64_t> pinned_bytes;
+    // The prefix cache's Host tier; empty without the prefix cache.
+    std::optional<std::uint64_t> host_context_bytes;
+    // Qwen3.8-Flash-Next's n-gram table: its bytes in RAM (the whole table, or the row cache of a table
+    // read from its volume) and where it is read from.
+    std::optional<std::uint64_t> ngram_bytes;
+    std::optional<NgramResidency> ngram_residency; // Ram or Volume once resolved
+    std::optional<EnginePlanExpertTier> tier;
+    // Offloaded experts: the RAM layout the start takes (--expert-ram-layout, or the model's default).
+    std::optional<ExpertRamLayout> expert_ram_layout;
+    // Everything planned in RAM, and what available memory leaves beside it and the reserve.
+    std::uint64_t planned_bytes = 0;
+    std::uint64_t left_bytes    = 0;
+};
+
+// Engine::plan: the Engine's startup sizing of a set of options on this machine, made as a start
+// makes it (the same option checks, RAM ledger, VRAM checks and capacity curves) but without reading
+// the weights into device or pinned memory or allocating the Program, its KV cache, workspace,
+// expert frames or CUDA Graphs. What a start measures only once those exist (the free memory after
+// the weights, the CUDA Graphs' actual cost, the expert frames of a Qwen3.5 model with offloaded
+// experts) is estimated from the plan.
+struct EnginePlan {
+    // Whether a start would pass its memory checks now; `error` holds the refusing check's own
+    // message otherwise.
+    bool fits = true;
+    std::string error;
+    std::string architecture;
+    EnginePlanGpu gpu;
+    EnginePlanVram vram;
+    EnginePlanRam ram;
+    // The largest --max-context whose smallest reservation (and for Qwen3.8-Flash-Next, one expert
+    // frame) fits beside the weights with the other options as given; empty when not computed.
+    std::optional<std::uint32_t> max_context;
+};
+
 // A count and total of durations, and the longest since Engine::reset_execution_maxima().
 struct DurationCounter {
     std::uint64_t count    = 0;
@@ -2027,7 +2247,8 @@ struct RuntimeStats {
     std::uint32_t device_main_kv_occupied_pages    = 0;
     std::uint32_t device_backend_kv_occupied_pages = 0;
 
-    // The VRAM expert cache of an offloaded-expert model (Qwen3.8-Flash-Next); absent otherwise.
+    // The VRAM expert cache of an offloaded-expert model (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B);
+    // absent otherwise.
     std::optional<ExpertCacheTotals> expert_cache;
 
     // The prefix cache; zero when it is disabled. Block and snapshot gauges are absolute; the
@@ -2081,6 +2302,17 @@ struct RuntimeStats {
     std::uint64_t hybrid_held_host_refusals      = 0;
     // Holds placed after a reply ending in a tool call (HybridPrefixCacheOptions::tool_call_hold).
     std::uint64_t hybrid_tool_call_holds         = 0;
+    // Idle-time prefill of finished turns (HybridPrefixCacheOptions::next_turn_prefill_quiet): passes
+    // started, run to their end, yielded to a request at a unit boundary, skipped because the cache
+    // already held all but a few of their tokens, and turns dropped before a pass started (a
+    // request or a newer turn came first, or preparation failed); and the prompt tokens the passes
+    // computed (also in computed_prefill_tokens).
+    std::uint64_t next_turn_prefills_started          = 0;
+    std::uint64_t next_turn_prefills_completed        = 0;
+    std::uint64_t next_turn_prefills_yielded          = 0;
+    std::uint64_t next_turn_prefills_skipped          = 0;
+    std::uint64_t next_turn_prefills_dropped          = 0;
+    std::uint64_t next_turn_prefill_tokens            = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

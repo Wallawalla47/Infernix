@@ -73,7 +73,7 @@ using CallIdentifier = std::function<std::vector<ToolCall>(const GenerationOutco
 
 // Runs `prepared` and every continuation its searches lead to, leaving the final generation in
 // `state`. `prepared` ends holding the last generation's request (and its ingress reservation).
-void run_anthropic_response(GenerationService& service, AnthropicResponseState& state,
+void run_anthropic_response(GenerationBackend& service, AnthropicResponseState& state,
                             PreparedRequest& prepared, const StreamSink* sink,
                             const std::function<bool()>& is_cancelled,
                             const ContinuationPreparer& prepare_next,
@@ -204,7 +204,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         prepared = service_->prepare(request.generation, consumer_mode,
                                      {.phase_timings = true,
                                       .scheduling    = scheduling_observer(req_id, metadata.http_request_id),
-                                      .first_token   = first_token_observer()},
+                                      .first_token   = first_token_observer(),
+                                      .progress      = progress_observer(req_id)},
                                      [&req] { return client_disconnected(req); });
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());
@@ -240,7 +241,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                                      cancelled](const GenerationRequest& next) {
             return service_->prepare_continuation(
                 next, consumer_mode,
-                {.phase_timings = true, .scheduling = scheduling_observer(req_id, http_request_id)},
+                {.phase_timings = true,
+                 .scheduling    = scheduling_observer(req_id, http_request_id),
+                 .progress      = progress_observer(req_id)},
                 cancelled);
         });
     };
@@ -328,6 +331,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     return true;
                 }
                 SseTransport transport(sink, stream->cancelled);
+                transport.set_heartbeat([&] { return encoder->ping(); });
                 const auto send_error = [&](const ApiError& error) {
                     try {
                         if (!encoder->started()) {

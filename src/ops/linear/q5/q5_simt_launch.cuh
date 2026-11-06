@@ -1,5 +1,6 @@
 #pragma once
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/q5/q5_a16_simt.cuh"
@@ -60,7 +61,8 @@ void launch_q5_a16_simt(const Q5LinearOperands& operands, Output output, Epilogu
 template <class Schedule, bool TriggerPdl = false, bool JoinPdl = false, bool Dependent = false,
           class Output, class Epilogue>
 void launch_q5_a16_direct_simt(const Q5LinearOperands& operands, Output output, Epilogue epilogue,
-                               cudaStream_t stream) {
+                               cudaStream_t stream,
+                               pdl::Dependency dependency = pdl::Dependency::Serialized) {
     validate_q5_operands(operands);
     if (operands.k % 8 != 0) throw std::invalid_argument("Q5 direct SIMT requires K aligned to 8");
     if constexpr (Schedule::kStaticK > 0) {
@@ -85,11 +87,12 @@ void launch_q5_a16_direct_simt(const Q5LinearOperands& operands, Output output, 
                     x, operands.codes, operands.high, operands.scales, output, epilogue,
                     operands.rows, operands.k, count, operands.padded_k, offset));
             } else {
-                q5_a16_direct_simt_kernel<Schedule, FullK, FullTokens, Output, Epilogue, TriggerPdl,
-                                          JoinPdl><<<grid, block, 0, stream>>>(
+                CUDA_CHECK(pdl::launch_with(
+                    dependency, {grid, block, 0, stream},
+                    q5_a16_direct_simt_kernel<Schedule, FullK, FullTokens, Output, Epilogue, TriggerPdl,
+                                              JoinPdl>,
                     x, operands.codes, operands.high, operands.scales, output, epilogue,
-                    operands.rows, operands.k, count, operands.padded_k, offset);
-                CUDA_CHECK(cudaGetLastError());
+                    operands.rows, operands.k, count, operands.padded_k, offset));
             }
         };
         const auto select_tokens = [&]<bool FullK>() {

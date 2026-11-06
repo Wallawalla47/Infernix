@@ -1,6 +1,6 @@
 # Qwen3.5-122B-A10B with offloaded experts on one RTX 5090: implementation plan
 
-**Status: in progress (2026-10-22): runs end to end on the RTX 5090 (§0), on main 3d1931c7.** This is a temporary planning document for running
+**Status: in progress (2026-10-22): runs end to end on the RTX 5090 (§0), on main a0527d1d.** This is a temporary planning document for running
 [ornith-ai/Ornith-1.5-122B-NVFP4](https://huggingface.co/ornith-ai/Ornith-1.5-122B-NVFP4) (revision
 `f049036f`), a training instance of `Qwen3_5MoeForCausalLM` at the Qwen3.5-122B-A10B geometry, with
 its routed experts in host RAM behind a VRAM expert cache, as Qwen3.8-Flash-Next runs. When the work
@@ -45,7 +45,7 @@ RTX 5090, i9-13900K, 96 GB DDR5-5800, PCIe link measured 27.6-27.7 GB/s; the art
   64 tokens past the root; its first turn was 6 tokens): its first turn is now a 64+-token message,
   with `free-cache-resume` requested as the other prefix tests do.
 - Non-real `ctest`: 241 of 243 pass. `infernix_hybrid_cache_defaults_test` fails on main as well
-  (3d1931c7 accepts `--draft-tokens auto` with DFlash2; the test still expects a refusal).
+  (a0527d1d accepts `--draft-tokens auto` with DFlash2; the test still expects a refusal).
   `infernix_cuda_stack_check`: the 149 new kernel keys (this geometry's attention, RoPE, conv, Q8
   and drafter shapes, the rg16 head, the FP32-scale FP8 route, Flash-Next's renamed wide down
   instance at its old 40 bytes) are recorded after review, 86 of them equal to their 16-head
@@ -125,9 +125,10 @@ each arm twice in ABBA order; bf16 KV.
   (gated 2 drafts 93.2 / 92.5 against 92.8 / 93.2). The greedy bench decodes after a one-token seed
   prompt; on real prompts gated MTP wins greedy too (2026-10-25, §12.2), so `--spec mtp
   --draft-tokens auto` drafts 2 behind the gate.
-- **Elastic text KV (§11.1)**: the first 32,768 tokens backed at startup, growth from the expert frames
-  in 4,096-token steps, shrink at lane release and after 60 s idle. The MoE real test grows the pool
-  512 -> 704 pages for a 40,960-token prompt and back, outputs identical.
+- **Elastic text KV (§11.1)**: the first 4,096 tokens backed at startup (32,768 until 2026-10-27: the
+  VRAM defaults, candidates §22 VM-08), growth from the expert frames in 4,096-token steps, shrink at
+  lane release and after 60 s idle. The MoE real test grows the pool 512 -> 704 pages for a
+  40,960-token prompt and back, outputs identical (measured at the old base).
 - **SSD tier**: with `--expert-ram-mib 40000` (the rest read from the artifact) the reproducible
   route's tokens equal all-in-RAM's; decode 33.2 tok/s against 62.2 (reproducible route). The tier's
   RAM copies measured 4,887 CPU experts/s against ~10,300 for pinned RAM (not investigated).
@@ -156,7 +157,7 @@ the CPU (~53 GB/s); split misses add their down rows to the busy link (stage 428
 bound by miss bytes over both paths (about 96 misses of 5.3 MB per token at ~80 GB/s combined), plus
 ~60 µs of dense work and a ~18 µs routing/plan kernel per layer.
 
-**No regression on main's models** (main 1acbc468 against the branch, infernix_bench ABBA, tok/s):
+**No regression on main's models** (main fc07d378 against the branch, infernix_bench ABBA, tok/s):
 
 | Model | pp4096 main / branch | tg256 main / branch | MTP 3 tg256 main / branch |
 |---|---:|---:|---:|
@@ -239,7 +240,7 @@ model to this geometry and gives it offloaded routed experts. The same code then
 
 A route's processing cost is D(lossless, route) − D(lossless, design reference), measured with
 `compare-prefill`/`compare-decode` on an `infernix-perplexity --reference` or an
-`infernix_decode_quality_forced --reference --observe` run as the base (main ccbc95c2). The
+`infernix_decode_quality_forced --reference --observe` run as the base (main 67dc619b). The
 precise reference this plan first extended was retired on main; `--lossless` is the gates'
 reference.
 
@@ -631,7 +632,8 @@ Per token at a 32K fresh prompt, on the exact route:
 - **Rewritten for the Qwen3.5 Program:** about 2,050 lines that are `qwen4_exp::ProgramImpl`
   members (CPU/link rates, prefill walk, promotions, loans, split policy, `Forward::moe`).
 - **Not moved:** Flash-Next's calibrated expert order is shape-guarded data, and the n-gram, PLE,
-  QSA and hyper-connection code stay in `qwen4_exp`.
+  QSA and hyper-connection code stay in `qwen4_exp`. The 122B's own order is model data in
+  `qwen3_5/program/calibrated_order.*` (§9.2.1); the shared engine takes it as `OffloadSetup::calibrated_state`.
 
 ---
 
@@ -823,7 +825,9 @@ Flash-Next kernel integer-issue-bound at 74 TFLOP/s.
   i9-13900K, AVX-512 VNNI where present (tested under Intel SDE). Records stream once per miss;
   three byte products per weight (Flash-Next §16.2.1).
 - **Workers.** Six by default, dynamic handout, worker 0 the miss service. Flash-Next measured
-  that more workers lose.
+  that more workers lose. The Engine's round thread runs alone on the last P-core (both its logical
+  CPUs), which the workers leave free (`OffloadOptions::engine_isolate`, placement.h): Ornith's
+  CPU-bound offloaded decode +0.3 % in 4/4 pairs (2026-10-28); Flash-Next measured flat or slower and stays unpinned.
 - **Budget.** Memory-bound at ~55 GB/s: ~100 µs per 5.31 MB record at T = 1.
 - **Startup calibration.** The engine measures its rate per column count for the divisor and the
   CPU cap.
@@ -882,7 +886,8 @@ re-tried.
     +48.7 % MTP cold).
 - **Admission and eviction.** Global LFRU f/(now − last + 1), promotion on CPU-served misses (one
   per layer per token while frames fill, then every 4th, scaled by the link), a prompt-route
-  credit of 256, warm start from saved state. Experts used only by rejected drafts earn nothing.
+  credit of 256, warm start from the saved state, else from the calibrated expert order (§9.2.1). Experts used
+  only by rejected drafts earn nothing.
   The policy runs synchronously at commit (+1.4 % / +3.7 %).
 - **Shared expert.** It runs inside the routed kernels as a resident job (§8.6). Flash-Next needed
   a side stream because its shared expert was a dense projection.
@@ -894,6 +899,58 @@ re-tried.
   - megakernel fronts;
   - graph splitting;
   - tail skip as a default (it failed the gate; it stays an approximate opt-in).
+
+### 9.2.1 Calibrated expert order
+
+Candidates §23 NU-43; built 2026-10-27, the order not yet generated. Flash-Next seeds a first session's expert cache from a built-in calibrated order (Flash-Next design §19.3.24: first
+request decode +9 % on code, +15 % on AIME, +56 % with the SSD tier, against an empty cache). The 122B now has the
+same mechanism:
+
+- **Seed.** `ExpertOffload::warm_start` takes its seed from `expert_cache::choose_warm_start`: the saved state when
+  it is usable (it always wins), else, unless `--expert-state off`, the model's calibrated order
+  (`OffloadSetup::calibrated_state`), else none. A first start, another artifact's state, a damaged file and no file
+  given (the bench, the tools) all fall back to the order. With the SSD tier the RAM fill order takes the saved
+  ranking, the saved session's other used keys, then the order's ranking, then the layers in turn. The log lines are
+  Flash-Next's ("no saved state yet, so it starts with the N highest-ranked experts of the calibrated order").
+- **Shape guard.** `models/qwen3_5/program/calibrated_order.h`: the order applies only to H 3072, 48 layers, 256
+  experts, top-8, I 1024 and shared I 1024 (Ornith-1.5-122B, its UNCENSORED export and any other artifact of the
+  geometry: formats do not change the keys); every other model, including the resident Qwen3.5 MoE models, gets
+  null. A generated table of another geometry fails to compile.
+- **Data.** As Flash-Next's, an embedded source table: `models/qwen3_5/program/calibrated_order.inc`, generated by
+  `tools/expert_cache_replay/calibrated_order.py`, one row per layer, highest priority first, its provenance in its
+  header. It ships empty (0 x 0): until it is generated nothing changes for a first session (the cache starts empty
+  and each prompt's routes seed it), apart from a "no saved state yet" line also without a file.
+- **Method** (NInfer `c996baa8`, which made Flash-Next's): route traces of a mixed task set per speculative arm;
+  per request, each layer's routed uses in rounds of at most 64 columns (decode, verification, forced tokens and
+  narrow prefill; rejected drafts included) normalized to frequencies; each arm's mean over its requests; the arms
+  mixed plain / MTP / DFlash2 at 50 / 25 / 25; each layer ranked by the mixed score, ties to the lower id.
+  `tools/expert_cache_replay/collect_traces.py` collects the traces: one `infernix-serve` per arm (`--route-trace`,
+  one lane, `--expert-state off` so the saved state is neither read nor overwritten; plain, `--spec mtp
+  --draft-tokens 3`, `--spec dflash2 --draft-tokens 7`) over the examples manifest's code, AIME, logic, story,
+  translation, structured-output and chat fixtures (18 requests) and, with `--agent-plan`, the agentic A/B plan's
+  14 opening agent turns with their tools, each sampled at the model's defaults to at most 2,048 tokens.
+
+Generating it (Windows, from the worktree root; about 30-45 minutes of GPU for the three arms):
+
+```bat
+py -3.11 -m tools.expert_cache_replay.collect_traces ^
+  --serve E:\Infernix\.local\build-r26\apps\Release\infernix-serve.exe ^
+  --artifact E:\Infernix\.local\ornith\artifact\Ornith-1.5-122B-NVFP4-Infernix-00001-of-00003.infernix ^
+  --agent-plan E:\Infernix\.local\bench-r1026\replay\fn\seed-42\plan.json ^
+  --out profiles\calibration\ornith-122b
+py -3.11 -m tools.expert_cache_replay.calibrated_order --expect 48,256,8 ^
+  --plain profiles\calibration\ornith-122b\plain.bin --mtp profiles\calibration\ornith-122b\mtp.bin ^
+  --dflash profiles\calibration\ornith-122b\dflash2.bin ^
+  --out src\models\qwen3_5\program\calibrated_order.inc --json profiles\calibration\ornith-122b\order.json
+```
+
+Then rebuild. Before timing it, `py -3.11 -m tools.expert_cache_replay.replay <held-out trace> --headroom --seed
+calibrated` against `--seed none` replays the engine arm with and without the seed on a trace the order was not
+made from (for example an agentic A/B run's `--route-trace`).
+**Test.** `infernix_qwen3_5_calibrated_order_test` (host): the shape guard, the conversion, the built-in table and
+the saved state's precedence. **A/B (pending, after generation):** a fresh process per run, an empty saved state
+(a missing file) against the seed, the first 256 greedy tokens of a code and an AIME prompt, ABBA; a saved state
+must still win (its "restored" line).
 
 ---
 
@@ -910,7 +967,28 @@ re-tried.
   The exact route's bits follow the chunk grid on Qwen3.5, as today (Flash-Next design §19.3,
   "The prefill chunk"). The A8 projections, the canonical experts and the head add no seam of
   their own (§8.2, §8.6).
-- **CPU assist.** For short prompts, capped at 1,536 × 27.5 GB/s / link columns (Flash-Next P7).
+- **Chunk fit (2026-11-03, candidates RF-04 (c)).** A pass wider than the static arena runs on a
+  workspace the expert cache lends (`ProgramOffload::wide_workspace`); one it cannot lend is
+  allocated per prompt, which fails on a full card after admission. The Engine plans the widest
+  chunk at most `--prefill-chunk`, on its 128-token grid, whose widest pass (text or MTP, idle-wide
+  included) the cache lends with a frame to spare once every lane's context is full: its frames
+  estimated as Engine::plan estimates them, beside the elastic KV region whole, and on the
+  reproducible route also at a nominal launch (3 GiB in use before loading, Flash-Next's
+  `nominal_snapshot`). The Program is then planned at that chunk (its buffers shrink with it, as
+  Engine::plan reports them), with a warning naming both chunks. Unlike Flash-Next's per-call
+  re-fit, the chunk here is the prefill grid (taps, resumes, Replay steps), so it is fitted once,
+  for full contexts; a launch whose live frames come out below the estimate still allocates per
+  prompt when it must.
+- **CPU assist.** For calls of at most 4,096 × 27.5 GB/s / link columns (Flash-Next P7; a link within
+  5 % of 27.5 GB/s counts as it), with the next layer's guessed heavy experts copied ahead (Flash-Next
+  design §19.3.12; the cap was 1,536 before copy-ahead, 2026-10-26).
+- **Assisted prompt calls.** Calls of at most 575 columns stage their misses with the CPU team serving
+  some (`ExpertOffload::assist_max_columns`, on an NVFP4 W4A16 bank on the exact CPU arithmetic; 255
+  otherwise), keeping FP4-Local's link share of their host-memory misses: 77/256 to 64 columns, 104/256
+  at 255, on to 149/256 at 575 (Flash-Next §19.3.50); wider passes stream. Streaming from 256 had left
+  the cliff Flash-Next removed in XB-02 (pp255 279.5 tok/s, pp256 228.1); assisted to 575 (2026-11-05,
+  candidates §58): pp256 +40 %, pp320 +34 %, pp384 +26 %, pp512 +10 %, pp575 +4 %, and pp128-255
+  +6-16 % from the ramp.
 - **Prefill never promotes.** The prompt's routes credit the cache instead.
 - **Kernels.** The A8 TMA projections (§8.2), the exact wide experts with the int32-group epilogue
   (§8.6), the group-16 prompt attention with FP16 P×V, and the GDN chunk kernel at 64 heads.
@@ -941,9 +1019,17 @@ re-tried.
   elastic pool, §0.1; before it, the whole `--max-context × --max-concurrency` KV was allocated at
   startup).
 - **Inherited from Flash-Next.** One `plan_device` ledger function, the spill guard, the VMM frame
-  pool that follows free VRAM, and `--vram-past-budget` (~120 more frames here).
+  pool that follows free VRAM, and `--vram-past-budget` (~120 more frames here). Until 2026-10-31 the
+  sequence plan left out the engine's staging and tables (`ProgramOffload::fixed_bytes`, ~324 MiB: the
+  frames absorbed them unplanned) and only the dense weights had the spill guard (candidates RF-04). The plan
+  now reserves them, from the same round geometry the Program starts the engine with
+  (`offload_round_geometry`, checked at startup), and the Program's persistent and workspace arenas and the
+  elastic KV's base pages pass the spill guard before the engine starts.
 - **Second frame pool.** Flash-Next keeps one frame pool per record stride. Here the shared-expert
-  and drafter banks are resident outside it, so there is one stride.
+  and drafter banks are resident outside it, so there is one stride. Since 2026-10-27 the drafter pool
+  (candidates §22 VM-01 variant B; Flash-Next design §19.3.35) pins the drafter's routed bank in RAM instead and
+  keeps 64 of its experts in a demand-following device pool (MTP decode +4.6 % at one request; at two requests with
+  distinct prompts no resolved difference, the pool off 1.0037x median, worst 0.9971x); draft steps route among those.
 
 ### 11.2 Host RAM (96 GB; Windows pins up to 76.0 GiB here)
 
@@ -960,6 +1046,102 @@ re-tried.
 That is the same class as Flash-Next's 69.3 / 73.3 GiB. The pinned total (~63.6 GiB) is under the
 76 GiB ceiling, so no record is unpinned. With less RAM the SSD tier serves the rest from the
 artifact in place.
+
+### 11.3 Exclusive RAM layout (`--expert-ram-layout exclusive`, 2026-10-30)
+
+**Rule.** Flash-Next's layout (its design §19.3.7), in the shared engine (`ExpertOffload::plan_exclusive`,
+`memory_plan.h` `plan_exclusive_tier`). The Program sizes its frames after its fixed allocations, so the engine
+sizes the tier at start, once the frames are known; the banks load as the SSD tier's with the RAM ledger's share
+as its budget. The tier pins every expert the warm start leaves out of the frames, plus the shadows (RAM copies of
+VRAM experts, the tier's shadow floor):
+- the largest prefill loan: the stream's ring (2 × 256 + 1 records) and the widest pass workspace;
+- a sixteenth of the frames for the copies decode's swaps hold then (Flash-Next's measurement);
+- the elastic KV's growth (its reserved range less the startup pages).
+
+The warm start seeds half the frames, never those the shadows cover. Unlike Flash-Next there are no stream read
+slots, since the 122B runs no layer walk and its stream never lends them, and the reserve is not counted twice.
+A budget short of the slots, or banks of several record sizes, keeps the plain SSD tier. `full` stays the 122B's
+default (the owner asked for the option; its cost below); Flash-Next keeps `exclusive`.
+
+**Measured** (RTX 5090, i9-13900K, 96 GB; Ornith-1.5-122B-NVFP4, INT8 KV, MTP auto; `infernix_bench -pg
+"1280,256;32768,16" -r 3 --max-ctx 34816`; 4,993 frames, 0 SSD reads in every run). The decode split is pinned
+(`INFERNIX_TMP_LINK_SHARE` 85/256), because the measured rule picks 1/3 or 1/4 from a CPU rate that read up to
+15 % higher on the tier's copies than on the banks (below); A B C C B A:
+
+| Layout | Expert RAM | Decode after 1,280 tokens | Decode after 32,768 | Prefill 32K |
+|---|---:|---:|---:|---:|
+| full | 60.8 GiB | 107.69 tok/s | 99.38 | 6,987 |
+| exclusive, half the frames seeded | 56.9 | 107.82 (+0.1 %) | 98.36 (−1.0 %, both pairs) | 6,963 (−0.4 %) |
+| exclusive, every unshadowed frame seeded | 51.1 | 107.31 | 94.94 (−4.5 %) | 6,957 |
+
+The real tests pass in the exclusive layout: invariance (none, MTP), preemption (MTP) and the MoE test, whose
+262,144-token engine keeps the plain tier (its KV shadows exceed the budget) with every expert in VRAM or RAM.
+
+**The tier's CPU rate.** Right after the tier's fill the CPU team read 5,536-6,027 one-column experts/s against
+the banks' 9,515-10,770, so decode kept half its misses on the link: 76.5 against 100.9 tok/s (−24 %, before the
+fix). Flash-Next's Program had met the same slow memory after the fill (Dense8 9,377 against 18,942 experts/s 5 s
+later) and measures twice; the engine now does too (a 4 s pause, the better reading stands): 10,390-12,805. The
+fix also serves the plain SSD tier, which read the same low rate (§0.1's 4,887 experts/s).
+
+**Side streams at the greatest priority** (the staging fork, shared-expert and split streams, as Flash-Next's
+Program): full layout, A B B A, 101.24 against 101.04 tok/s after 1,280 tokens and 101.73 against 100.72 after
+32,768, every pair; flat (76.52 against 76.54) while the slow rate kept half the misses on the link. Kept.
+
+**Copy-engine staging of decode misses (rejected, probe only).** The SM-driven stage kernel reads a 5.06 MiB record
+at 23.1 GB/s (229.8 µs). A handoff in which the host sees the layer's plan, issues `cudaMemcpyAsync` and a kernel
+on the copy stream frees the waiting consumer took 249.2 µs for one record and 455.2 against 451.6 µs for two; with
+a promotion batch in flight (one H2D copy engine, FIFO) 629-2,195 µs against 390-724 µs for the SM path
+(`.local/redesign-2026-10-28/phase2/ce_handoff_probe.cu`). The copy engine's higher rate does not survive the
+handoff and the promotions' queue.
+
+**The decode split** at a pinned share first suggested a context-dependent optimum (64/256 +3.1 % after 1,280 tokens,
+−5.0 % after 32,768). Those 32K figures were 16 tokens right after the prompt, while the cache still held the
+prompt's experts; steady decode on real text has one optimum (§11.4).
+
+### 11.4 Decode split (2026-10-30)
+
+A decode or verification call's M host-memory misses split between the link (the SM stage, 230 µs a record) and
+the CPU team. The engine used Flash-Next's divisor rule, M / d with d = floor(1.65 + C t) (C the team's experts/s, t
+a record's link seconds; d = 3 here, 4 when C reads above ~12,200/s). The share form keeps (M × s) >> 8.
+
+**Grid** (`infernix_decode_quality_gen` on real code, greedy, MTP auto, INT8 KV, 384 new tokens a segment; 6 / 4 / 3
+segments at 1,536 / 8,192 / 32,768 tokens; two interleaved rounds, decode tok/s):
+
+| Split | 1,536 | 8,192 | 32,768 |
+|---|---:|---:|---:|
+| rule (1/3) | 84.53 | 83.48 | 85.10 |
+| 107/256 | 77.59 | 77.32 | 78.41 |
+| 85/256 | 91.35 | 87.90 | 90.37 |
+| 64/256 | 95.28 (+12.7 %) | 90.16 (+8.0 %) | 92.55 (+8.8 %) |
+| 43/256 | 95.50 | 89.20 | 92.55 |
+
+The optimum hardly moves with the context: from 85/256 down the CPU team, which serves a miss in ~90 µs of its 6
+workers' bandwidth, should take the misses of a narrow call, and the link only the excess of a wide one (64/256 sends
+nothing below four misses). At 32K the 43 and 64 runs decoded identically (no call held enough misses to differ).
+
+**Rule.** `placement.h` `decode_link_share_256`: s = 256 / (1 + 1.46 C t), the two legs' balance with the weight
+fitted to 64/256 at this machine's C t of 2.06 (link 27.5 GB/s, 10,650 experts/s, 5.06 MiB records), so a faster link
+or a slower CPU team moves the share the same way as the divisor rule did. It replaces the divisor rule in
+`ExpertOffload` (the 122B); `INFERNIX_TMP_LINK_SHARE` still overrides it, and Flash-Next's Program keeps its own
+rule. Same bits: placement only.
+
+**A/B** (main f7a52de4's generator against the rule's build, the same workload, two rounds A B / B A; the rule's
+measured share 63-68/256; greedy outputs equal in all 10 pairs):
+
+| Workload | Divisor rule | Share rule | Change |
+|---|---:|---:|---:|
+| MTP auto, 1,536-token prompts | 87.64 | 95.86 | +9.4 % (one pair; the other below) |
+| MTP auto, 8,192 | 83.77 | 90.27 | +7.8 % (+7.3, +8.2) |
+| MTP auto, 32,768 | 85.23 | 92.37 | +8.4 % (+8.1, +8.7) |
+| plain decode, 1,536 | 70.17 | 72.37 | +3.1 % (+3.1, +3.2) |
+| MTP auto, two requests at once, 1,536 (wall clock, prefill included) | 65.99 | 73.84 | +11.9 % (+11.2, +12.6) |
+
+**A slow first reading.** The other 1,536 pair's rule run started right after another session's tens-of-GiB runs
+ended: its single reading in the full layout found 4,923 experts/s, kept half its misses on the link and decoded
+52.4 tok/s. The share rule would have taken 107/256 from that reading. The engine now measures in both layouts
+until the readings settle (§11.3's pause, again while a reading beats the best by 10 %, at most three), and the
+best stands. The rule is `placement.h` `settle_cpu_rates`, which Flash-Next's Program takes in both its layouts too
+(2026-10-31); the busy warning stays only when every reading was busy.
 
 ---
 
@@ -1042,24 +1224,15 @@ draft, higher for later ones), and an MTP round averaged 0.75. Two changes targe
   rounds plain at one draft -18.3 %; each row's verify columns bring their own misses, and a
   draft-free MTP round still runs the drafter. Over one and two requests MTP's 2 drafts gain about
   3.6 % and adaptive-dflash loses about 1.6 % (eight corpus pairs at one request: +13.5 %), so
-  DFlash2's `auto` decodes without its drafter. Skipping the drafter in batched rounds (a round kind
-  that appends the MTP layer's KV without its MoE and head) is the open item.
+  DFlash2's `auto` decodes without its drafter. A round kind that appends only the MTP layer's KV,
+  without its MoE and head, would remove part of the alignment of one layer (estimated from its weight
+  bytes at a few hundred MB, 0.2-0.3 ms of a 12 ms round) and is not planned.
   DFlash2 with the forced adaptive policy and `auto`: 68.8 / 69.1 tok/s sampled, below plain.
-- **The drafter's round cost (candidates §11 OR-09, unmeasured; three output-neutral switches, read in
-  `models/qwen3_5/program/planning/startup.h`).** The drafter's MoE is resident here (`resident_moe`),
-  but each round still runs the alignment over every verify column, then each draft step's layer and
-  proposal head:
-  - `INFERNIX_TMP_QWEN35_MTP_PAD_MASK`: the alignment's padding columns (past a row's licensed tokens)
-    route no resident expert.
-  - `INFERNIX_TMP_QWEN35_MTP_STEP_GATE`: Finish is captured as a step chain (the alignment, then each draft
-    behind a device gate), whose gates stop where no later draft could be verified. The threshold
-    (`MtpConfidencePolicy::step_threshold`) is the lowest bucket edge below which every bucket's
-    acceptance times the best bucket's is at most the column cost; a row's drafts end at its first
-    one below it.
-  - `INFERNIX_TMP_QWEN35_MTP_SKIP_ROUNDS` (with the step chain): `MtpDraftRegime` runs rounds without
-    drafting (the alignment's KV only) while their measured tokens per second beat drafting rounds',
-    probing the other regime 4 rounds in 32; the release log reports "MTP draft-free rounds: X of Y".
-    The aim is greedy decode at plain speed without unloading the drafter, and the sampled gain kept.
+- **The drafter's round cost (candidates §11 OR-09; measured and removed 2026-10-28).** Three
+  output-neutral switches trimmed the drafter's round: padding columns of the alignment routing no
+  resident expert, a device step gate stopping the draft steps where no later draft could be verified,
+  and draft-free rounds while those measured faster. MTP `auto`'s confidence gate does the job better
+  (+15.5 % against +13.9 % with the switches), so all three were removed.
 - **DFlash2.** The adaptive-dflash policy already chooses each round's verify width from the
   block's per-draft probabilities after a split proposal (a host wait that costs nothing next to a
   14 ms round). It is not qualified here, so the A/B forces it (`adaptive-speculation`,

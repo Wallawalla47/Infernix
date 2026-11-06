@@ -96,8 +96,8 @@ void run(int tokens, int candidate_block, bench::L2FlushBuffer* flush, int warmu
     DeviceBuffer delta(sizeof(std::int32_t));
     DeviceBuffer destination(host.size() * sizeof(std::int32_t));
     const std::int32_t delta_value = -17;
-    cudaMemcpy(source.p, host.data(), source.bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(delta.p, &delta_value, sizeof(delta_value), cudaMemcpyHostToDevice);
+    upload(source.p, host.data(), source.bytes);
+    upload(delta.p, &delta_value, sizeof(delta_value));
     Tensor tsource(source.p, DType::I32, {tokens});
     Tensor tdelta(delta.p, DType::I32, {1});
     Tensor tdestination(destination.p, DType::I32, {tokens});

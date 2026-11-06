@@ -1,4 +1,5 @@
 #include "core/direct_read_queue.h"
+#include "core/temporary_switches.h"
 
 #ifdef _WIN32
 #    ifndef NOMINMAX
@@ -18,12 +19,31 @@
 #include <algorithm>
 #include <deque>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 
 namespace infernix {
 namespace {
+
+// Diagnostic: INFERNIX_TMP_SSD_MBPS=<MB/s> emulates a slower drive: every finished read is held until
+// a device of that rate, shared by every queue of the process and serving reads in finishing order, would have
+// delivered its bytes (0: off).
+struct SlowDevice {
+    std::mutex lock;
+    std::chrono::steady_clock::time_point clock{};
+    double bytes_per_ns = 0.0;
+};
+SlowDevice& slow_device() {
+    static SlowDevice device;
+    static const bool configured = [] {
+        device.bytes_per_ns = static_cast<double>(temporary_switches::integer("INFERNIX_TMP_SSD_MBPS", 0, 0, 100000)) * 1e-3;
+        return true;
+    }();
+    (void)configured;
+    return device;
+}
 
 using Clock = std::chrono::steady_clock;
 
@@ -125,12 +145,13 @@ struct DirectReadQueue::Impl {
     std::vector<std::size_t> free_requests;
     std::deque<Io> ios;
     std::vector<std::size_t> free_ios;
-    std::deque<std::size_t> waiting[2];
+    static constexpr int kClasses = 3; // Priority's values, in issue order
+    std::deque<std::size_t> waiting[kClasses];
     std::vector<std::size_t> backoff;
     std::vector<std::size_t> flight;
     std::vector<Finished> held;
     std::vector<Completion> ready;
-    std::uint32_t in_class[2] = {};
+    std::uint32_t in_class[kClasses] = {};
     std::size_t live = 0;
     bool cancelling  = false;
 
@@ -154,9 +175,10 @@ struct DirectReadQueue::Impl {
 #endif
 
     explicit Impl(const Options& o) : options(o) {
-        if (options.demand_depth == 0 || options.prefetch_depth == 0 || options.total_depth == 0 ||
-            options.prefetch_split < kAlignment || options.prefetch_split % kAlignment != 0) {
-            throw std::invalid_argument("DirectReadQueue: depths must be positive and the split a positive multiple of 4 KiB");
+        if (options.demand_depth == 0 || options.restore_depth == 0 || options.prefetch_depth == 0 ||
+            options.total_depth == 0 || options.prefetch_split < kAlignment || options.prefetch_split % kAlignment != 0 ||
+            options.restore_split < kAlignment || options.restore_split % kAlignment != 0) {
+            throw std::invalid_argument("DirectReadQueue: depths must be positive and the splits positive multiples of 4 KiB");
         }
 #ifdef _WIN32
         port = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
@@ -387,8 +409,9 @@ struct DirectReadQueue::Impl {
             r = requests.size();
             requests.emplace_back();
         }
-        const std::size_t piece =
-            read.priority == Priority::Prefetch ? std::min(read.bytes, options.prefetch_split) : read.bytes;
+        const std::size_t piece = read.priority == Priority::Prefetch ? std::min(read.bytes, options.prefetch_split)
+                                  : read.priority == Priority::Restore ? std::min(read.bytes, options.restore_split)
+                                                                       : read.bytes;
         const auto pieces = static_cast<std::uint32_t>((read.bytes + piece - 1) / piece);
         requests[r]       = Request{.tag = read.tag, .remaining = pieces, .submitted = Clock::now()};
         for (std::uint32_t k = 0; k < pieces; ++k) {
@@ -427,10 +450,10 @@ struct DirectReadQueue::Impl {
                 ++k;
             }
         }
-        const std::uint32_t caps[2] = {options.demand_depth, options.prefetch_depth};
+        const std::uint32_t caps[kClasses] = {options.demand_depth, options.restore_depth, options.prefetch_depth};
         while (in_flight() < options.total_depth) {
             int c = -1;
-            for (int k = 0; k < 2 && c < 0; ++k) {
+            for (int k = 0; k < kClasses && c < 0; ++k) {
                 if (!waiting[k].empty() && in_class[k] < caps[k]) { c = k; }
             }
             if (c < 0) { break; }
@@ -472,8 +495,16 @@ struct DirectReadQueue::Impl {
     // A device read has finished: apply the delay fault, then its outcome.
     void arrive(const Finished& f) {
         const Io& io = ios[f.io];
-        const auto release = io.issued + faults.delay;
-        if (!cancelling && faults.delay.count() > 0 && release > f.release) {
+        auto release = io.issued + faults.delay;
+        bool hold    = faults.delay.count() > 0;
+        if (SlowDevice& slow = slow_device(); slow.bytes_per_ns > 0.0 && f.bytes > 0) {
+            const std::lock_guard<std::mutex> guard(slow.lock);
+            const auto start = std::max(slow.clock, io.issued);
+            slow.clock       = start + std::chrono::nanoseconds(static_cast<std::int64_t>(static_cast<double>(f.bytes) / slow.bytes_per_ns));
+            release          = std::max(release, slow.clock);
+            hold             = true;
+        }
+        if (!cancelling && hold && release > f.release) {
             held.push_back({f.io, f.error, f.bytes, release});
         } else {
             finish(f.io, f.error, f.bytes);

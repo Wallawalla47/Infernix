@@ -46,6 +46,8 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--max-concurrency"},
     ServeOptionArity{"--max-pending-requests"},
     ServeOptionArity{"--pending-timeout-ms"},
+    ServeOptionArity{"--keep-alive-timeout-sec"},
+    ServeOptionArity{"--max-http-clients"},
     ServeOptionArity{"--prefill-chunk"},
     ServeOptionArity{"--use-original-int8-prefill-kernel", false},
     ServeOptionArity{"--prefill-split-workspace-mib"},
@@ -53,12 +55,16 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--reproducible", false},
     ServeOptionArity{"--lossless", false},
     ServeOptionArity{"--fast-path", true, true},
+    ServeOptionArity{"--no-fast-path", true, true},
     ServeOptionArity{"--expert-a4-activations", false},
+    ServeOptionArity{"--a16-activations", false},
+    ServeOptionArity{"--a8-activations", false},
     ServeOptionArity{"--embedding-host", false},
     ServeOptionArity{"--context-cost-presets"},
     ServeOptionArity{"--log-stats-interval-ms"},
     ServeOptionArity{"--log-colours"},
     ServeOptionArity{"--log-stats-panel"},
+    ServeOptionArity{"--log-file"},
     ServeOptionArity{"--max-request-mib"},
     ServeOptionArity{"--media-cache-mib"},
     ServeOptionArity{"--media-live-mib"},
@@ -70,6 +76,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--prefix-cache-save-mins"},
     ServeOptionArity{"--no-queue-holds", false},
     ServeOptionArity{"--cache-tool-hold-secs"},
+    ServeOptionArity{"--cache-next-turn-ms"},
     ServeOptionArity{"--cache-host-state"},
     ServeOptionArity{"--cache-tap-min-gap"},
     ServeOptionArity{"--host-context-mib"},
@@ -80,8 +87,10 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--response-store-max-records"},
     ServeOptionArity{"--response-store-max-mib"},
     ServeOptionArity{"--device"},
-    ServeOptionArity{"--ram-headroom-mib"},
+    ServeOptionArity{"--ram-free-mib"},
+    ServeOptionArity{"--ram-resize"},
     ServeOptionArity{"--expert-ram-mib"},
+    ServeOptionArity{"--expert-ram-layout"},
     ServeOptionArity{"--expert-pin-mib"},
     ServeOptionArity{"--kv-dtype"},
     ServeOptionArity{"--logits-dtype"},
@@ -101,6 +110,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--thinking-budget-message"},
     ServeOptionArity{"--no-thinking-answer-room", false},
     ServeOptionArity{"--reasoning-loop"},
+    ServeOptionArity{"--end-in-thinking"},
     ServeOptionArity{"--vision", false},
     ServeOptionArity{"--vision-offload"},
     ServeOptionArity{"--vision-max-merged"},
@@ -123,6 +133,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--seed"},
     ServeOptionArity{"--greedy", false},
     ServeOptionArity{"--log-level"},
+    ServeOptionArity{"--plan"},
 };
 
 const ServeOptionArity* find_option(std::string_view name) noexcept {
@@ -143,9 +154,11 @@ const product::ConfigProgram& serve_config_program() {
 }
 
 int parse_nonnegative_int(const char* text, const char* label) {
+    // ERANGE: where long is int's size (Windows), an overflow saturates at the bound checked below.
+    errno            = 0;
     char* end        = nullptr;
     const long value = std::strtol(text, &end, 10);
-    if (end == text || *end != '\0' || value < 0 ||
+    if (errno == ERANGE || end == text || *end != '\0' || value < 0 ||
         value > static_cast<long>(std::numeric_limits<int>::max())) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
     }
@@ -232,6 +245,7 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     if (value == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
     if (value == "vq2") { return KvCacheStorage::Vq2; }
     if (value == "k4v2") { return KvCacheStorage::Q4KeyVq2Value; }
+    if (value == "bf16p") { return KvCacheStorage::Bf16Packed; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
@@ -268,6 +282,11 @@ std::string serve_usage_text(const char* argv0) {
            "                             names the artifact; keys in a [serve] table apply only\n"
            "                             here, [cli] only to infernix. Options on the command\n"
            "                             line override the file\n"
+           "  --plan FILE                size a start with these options on this machine\n"
+           "                             without loading the model (no port is bound, no\n"
+           "                             weight is uploaded), write the plan to FILE as\n"
+           "                             JSON and exit: 0 it fits, 3 it does not (the\n"
+           "                             plan's error says why), 1 no plan could be made\n"
            "\n"
            "MODEL & CONTEXT\n"
            "  --max-context N            max context tokens per request (default 8192)\n"
@@ -302,11 +321,33 @@ std::string serve_usage_text(const char* argv0) {
            "                             (docs/maintainer/lossless-route.md)\n"
            "  --fast-path NAME           also run this fast path, qualified or not\n"
            "                             (qualification and timing runs; repeatable)\n"
+           "  --no-fast-path NAME        leave this selected fast path out of the default\n"
+           "                             route (leave-one-out timing runs; repeatable)\n"
            "  --expert-a4-activations    nvidia/Qwen3.8-Flash-Next-FP4-Local only: run its\n"
            "                             routed experts with 4-bit (NVFP4) activations, using\n"
            "                             the activation scales NVIDIA calibrated for them.\n"
            "                             Changes the output. No other artifact supports it\n"
            "                             (default: 16-bit activations, as NVIDIA serves it)\n"
+           "  --a16-activations          Qwen3.8-Flash-Next artifacts whose routed experts are\n"
+           "                             NVIDIA's W4A4 NVFP4 (Dense8, recipe A): run them with\n"
+           "                             16-bit activations instead of the 4-bit activations\n"
+           "                             the checkpoint specifies. Changes the output; the\n"
+           "                             default follows NVIDIA and is recommended (default:\n"
+           "                             off; other artifacts already run 16-bit)\n"
+           "  --a8-activations           8-bit activations where they measured faster: decode\n"
+           "                             and verification calls of GGUF dense projections and\n"
+           "                             routed experts (GGUF and NVFP4 W4A16 banks, CPU-served\n"
+           "                             misses included; int8 with one scale per 32 values, as\n"
+           "                             llama.cpp's Q8_1), and prefill calls of GGUF dense\n"
+           "                             projections and those experts (the same codec), a\n"
+           "                             groupwise Q4 MLP gate/up (int8 per token) and MXFP8\n"
+           "                             dense projections (two E4M3 terms per 32 values).\n"
+           "                             NVIDIA's W4A4 experts (Dense8, recipe A) take the 8-bit\n"
+           "                             route in place of their 4-bit one. A GGUF import's BF16\n"
+           "                             hyper-connection matrices become 8-bit at load.\n"
+           "                             Other calls keep their routes. Approximate: changes\n"
+           "                             the output; --reproducible and artifacts without such\n"
+           "                             a route refuse it (default: off)\n"
            "  --embedding-host           Qwen3.5-family artifacts: keep the token embedding in\n"
            "                             pinned host memory, read zero-copy, so its VRAM\n"
            "                             (1.18 GiB on the 27B) goes to the KV and prefix caches.\n"
@@ -318,12 +359,15 @@ std::string serve_usage_text(const char* argv0) {
            ")\n"
            "  --default-thinking-budget N  cap model-origin thinking for enabled\n"
            "                             requests; control tokens count toward the\n"
-           "                             request output limit\n"
-           "  --no-thinking-answer-room  without a budget, thinking may use all of the\n"
-           "                             output limit (default: from a limit of 1024, thinking\n"
-           "                             closes early enough to leave a quarter for the answer;\n"
-           "                             the limit is max_tokens or the context the prompt\n"
-           "                             leaves, whichever is less)\n"
+           "                             request output limit, and the answer room\n"
+           "                             lowers the cap where it would leave less\n"
+           "  --no-thinking-answer-room  thinking may use all of the output limit (default:\n"
+           "                             from a limit of 1024, thinking closes early enough\n"
+           "                             to leave a quarter for the answer, with no budget,\n"
+           "                             under --default-thinking-budget, or with a request\n"
+           "                             budget at or above the limit; the limit is\n"
+           "                             max_tokens or the context the prompt leaves,\n"
+           "                             whichever is less)\n"
            "  --thinking-budget-message S  message fed to the model when it hits its thinking\n"
            "                             budget, replacing the built-in end-of-thinking notice\n"
            "                             (wrap the message in double quotes, e.g.\n"
@@ -335,6 +379,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             repeat 12-word passages seen 3 times; stop ends the\n"
            "                             reply as length, conclude closes the thinking with\n"
            "                             the thinking-budget message and lets the model answer\n"
+           "  --end-in-thinking MODE     refuse (default) or allow: whether a reply may end,\n"
+           "                             or with tools open a call, while its thinking is\n"
+           "                             open (refuse: the end-of-turn tokens and <tool_call>\n"
+           "                             get no probability until the thinking closes)\n"
            "  --model-id ID              override the artifact metadata.name reported by\n"
            "                             the server\n"
            "  --any-model-name           serve OpenAI requests whatever model name they\n"
@@ -352,7 +400,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             (default: the artifact path + .ngram)\n"
            "  --ngram-residency auto|ram|volume\n"
            "                             where the n-gram table lives: ram reads it all into\n"
-           "                             pinned RAM at startup, volume reads rows on demand;\n"
+           "                             RAM (locked for the CPU) at startup, volume reads rows\n"
+           "                             on demand;\n"
            "                             auto (default) takes RAM while every expert still\n"
            "                             fits in RAM beside it\n"
            "  --expert-state FILE|off    Qwen3.8-Flash-Next expert-cache state: read at\n"
@@ -368,14 +417,27 @@ std::string serve_usage_text(const char* argv0) {
            "                             (default 1); startup-fixed, extends the allowed\n"
            "                             ceiling only, not --max-context\n"
            "  --device N                 CUDA device ordinal (default 0)\n"
-           "  --ram-headroom-mib N       physical Host RAM in MiB that pinned weights and\n"
-           "                             caches leave free for the system (default " +
-           std::to_string(kDefaultRamHeadroomBytes >> 20) +
+           "  --ram-free-mib N           physical Host RAM in MiB that Infernix's weights,\n"
+           "                             experts, n-gram table and caches leave free for\n"
+           "                             other programs (default " +
+           std::to_string(kDefaultRamFreeBytes >> 20) +
            ")\n"
+           "  --ram-resize auto|off      auto (default): between requests the RAM tiers (the\n"
+           "                             prefix cache's Host tier, then offloaded experts'\n"
+           "                             RAM copies) give RAM back while less than 2 GiB is\n"
+           "                             available and take it back once --ram-free-mib\n"
+           "                             (at least 3 GiB) plus 1 GiB stays free; off keeps\n"
+           "                             their startup sizes\n"
            "  --expert-ram-mib N|auto    Offloaded experts: Host RAM in MiB for the routed\n"
-           "                             experts (auto: what --ram-headroom-mib and the other\n"
+           "                             experts (auto: what --ram-free-mib and the other\n"
            "                             pins leave); less than all of them need reads the\n"
            "                             rest from the artifact (the SSD tier)\n"
+           "  --expert-ram-layout exclusive|full\n"
+           "                             Offloaded experts VRAM cannot hold (Qwen3.8-Flash-Next,\n"
+           "                             Qwen3.5-122B-A10B): exclusive keeps in RAM only the\n"
+           "                             experts VRAM does not hold; full keeps a RAM copy of\n"
+           "                             every expert (more RAM)\n"
+           "                             (default " + std::string(kExpertRamLayoutDefaults) + ")\n"
            "  --expert-pin-mib N|auto    Offloaded experts: at most this much of the experts'\n"
            "                             RAM page-locked for the GPU; the rest stays in RAM\n"
            "                             and the CPU serves it (auto: what Windows allows,\n"
@@ -387,12 +449,11 @@ std::string serve_usage_text(const char* argv0) {
            "                             to free VRAM less --vram-headroom-mib;\n"
            "                             offloaded experts:\n"
            "                             auto = --max-context x --max-concurrency)\n"
-           "  --vram-headroom-mib N|auto VRAM in MiB startup sizing leaves free: Qwen3.5,\n"
-           "                             after --kv-capacity auto (auto " +
-           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           "); Qwen3.8-Flash-\n"
-           "                             Next, after the expert cache, for the display and\n"
-           "                             other programs (auto: 1024 with a display on the\n"
+           "  --vram-headroom-mib N|auto\n"
+           "                             VRAM in MiB startup sizing leaves free for the\n"
+           "                             display and other programs: Qwen3.5, after\n"
+           "                             --kv-capacity auto; offloaded experts, after the\n"
+           "                             expert cache (auto: 1024 with a display on the\n"
            "                             GPU, else 256)\n"
            "  --vram-past-budget         Qwen3.8-Flash-Next on Windows: also use the VRAM\n"
            "                             the OS budget withholds (~0.6 GiB more expert\n"
@@ -405,9 +466,12 @@ std::string serve_usage_text(const char* argv0) {
            "                             10 on Flash-Next, 8 on the 122B). Changes the output; not\n"
            "                             with --reproducible. Default off; Strata's\n"
            "                             default is 7\n"
-           "  --kv-dtype T               KV storage: bf16 (default) | int8 | fp8 | nvfp4 | k8v4 |\n"
-           "                             vq2 | k4v2; bf16 stores K as BF16 and V as FP16 (exact\n"
-           "                             for 2^-17 <= |v| < 2^16), with --lossless V as BF16\n"
+           "  --kv-dtype T               KV storage: bf16 (default) | bf16p | int8 | fp8 | nvfp4 |\n"
+           "                             k8v4 | vq2 | k4v2; bf16 stores K as BF16 and V as FP16\n"
+           "                             (exact for 2^-17 <= |v| < 2^16), with --lossless V as\n"
+           "                             BF16; bf16p stores bf16's values in 23 % fewer bytes (12\n"
+           "                             bits a value; same output as bf16; a request with a KV\n"
+           "                             row it cannot pack fails)\n"
            "  --logits-dtype T           fp32 (default) | bf16: the head's logits the sampler,\n"
            "                             greedy choice, draft acceptance and constraints read;\n"
            "                             bf16 rounds each once, as Transformers returns them\n"
@@ -420,9 +484,11 @@ std::string serve_usage_text(const char* argv0) {
            "  Content-addressed 64-token KV blocks shared across requests plus sparse model\n"
            "  state snapshots. It configures itself: free VRAM becomes Device block cache\n"
            "  (--kv-capacity defaults to auto) and every option below is optional.\n"
-           "  --host-context-mib N       pinned Host pool in decimal MiB (whole bytes) that\n"
+           "  --host-context-mib N|auto  pinned Host pool in decimal MiB (whole bytes) that\n"
            "                             KV blocks and state snapshots share (default 8192;\n"
-           "                             0 = GPU only; Qwen3.8-Flash-Next: must be positive)\n"
+           "                             0 = GPU only; Qwen3.8-Flash-Next: must be positive;\n"
+           "                             auto: Qwen3.8-Flash-Next sizes it from the RAM its\n"
+           "                             experts and n-gram table leave, up to 8192)\n"
            "  --prefix-cache-file PATH   restore the host tier from PATH at startup when\n"
            "                             present (written by this binary for the same\n"
            "                             artifact and KV format) and save it there on clean\n"
@@ -455,14 +521,29 @@ std::string serve_usage_text(const char* argv0) {
            "                             conversation's cached prefix ahead of other cache\n"
            "                             entries for N seconds (default 30, 0 turns it off;\n"
            "                             Qwen3.8-Flash-Next has none)\n"
+           "  --cache-next-turn-ms N     once the server has been idle for N ms after a\n"
+           "                             reply, prefill that conversation's history as its\n"
+           "                             next request will render it (yields to any request\n"
+           "                             at its next unit; never changes output). Default\n"
+           "                             150, 0 turns it off; Qwen3.8-Flash-Next: default 0,\n"
+           "                             refused with --reproducible and --lossless\n"
            "  --cache-host-state fp32|fp24|bf16\n"
            "                             host tier form of snapshot recurrent state: fp24\n"
            "                             and bf16 shrink each 27B snapshot by 36 and 72 MiB\n"
            "                             but resume host-restored snapshots from a rounded\n"
            "                             state (default fp32: exact)\n"
            "\n"
-           "SPECULATIVE DECODING (off by default)\n"
-           "  --spec mtp|dflash|dflash2    speculative decoding backend\n"
+           "SPECULATIVE DECODING (auto by default)\n"
+           "  --spec auto|off|mtp|dflash|dflash2\n"
+           "                             speculative decoding backend. auto (the default,\n"
+           "                             with --draft-tokens auto): the drafter measured\n"
+           "                             fastest for the artifact: Qwen3.8-Flash-Next dflash2\n"
+           "                             with --draft-model or its companion artifact alone\n"
+           "                             in the model's folder, else mtp; offloaded-expert\n"
+           "                             Qwen3.5 (122B) mtp; other Qwen3.5/3.6 dflash2, then\n"
+           "                             mtp, then dflash, as bundled; plain decode without\n"
+           "                             one and on --lossless (startup reports the choice).\n"
+           "                             off: plain decode\n"
            "  --draft-tokens N|auto      drafts per round: mtp 1-7 (Qwen3.5/3.6 1-5),\n"
            "                             dflash/dflash2 1-15 (Qwen3.8-Flash-Next\n"
            "                             dflash2 1-7)\n"
@@ -474,15 +555,15 @@ std::string serve_usage_text(const char* argv0) {
            "                                     drafts' probabilities favour (Qwen3.5/3.6:\n"
            "                                     where qualified, else the fastest fixed\n"
            "                                     length)\n"
-           "  --draft-model FILE         Qwen3.8-Flash-Next dflash2: the DFlash2 drafter's\n"
-           "                             companion artifact (Qwen3.5/3.6 artifacts bundle\n"
-           "                             theirs)\n"
+           "  --draft-model FILE         Qwen3.8-Flash-Next dflash2 (or auto): the DFlash2\n"
+           "                             drafter's companion artifact (auto finds one alone\n"
+           "                             beside the model; Qwen3.5/3.6 artifacts bundle theirs)\n"
            "  --lm-head-draft            use the optimized proposal head\n"
-           "  --spec-min-p P             mtp (and Qwen3.8-Flash-Next dflash2): one-request\n"
-           "                             rounds verify drafts only up to the first below\n"
-           "                             probability P, 0-1 (Flash-Next default 0.5 with\n"
-           "                             --draft-tokens auto, else 0 = all; Qwen3.5/3.6\n"
-           "                             default 0)\n"
+           "  --spec-min-p P             mtp (on Qwen3.8-Flash-Next with a fixed\n"
+           "                             --draft-tokens N only) and Qwen3.8-Flash-Next dflash2:\n"
+           "                             one-request rounds verify drafts only up to the\n"
+           "                             first below probability P, 0-1 (default 0 = all);\n"
+           "                             Flash-Next mtp with auto cuts by cumulative acceptance\n"
            "  --draft-tree-nodes auto|LIST\n"
            "                             dflash2: verify a small tree of alternative drafts\n"
            "                             each round instead of a single draft, so more drafted\n"
@@ -554,6 +635,13 @@ std::string serve_usage_text(const char* argv0) {
            "                             pre-parse)\n"
            "  --max-pending-requests N   max queued requests (default 16)\n"
            "  --pending-timeout-ms N     queue timeout in ms (default 30000)\n"
+           "  --keep-alive-timeout-sec N seconds an HTTP connection stays open after its response,\n"
+           "                             advertised as Keep-Alive: timeout=N and closed 10 s\n"
+           "                             later (default 360, longer than common client pools'\n"
+           "                             idle timeouts; range 1..3600)\n"
+           "  --max-http-clients N       ceiling on simultaneous open HTTP connections, each of\n"
+           "                             which holds a request worker while open (default 64;\n"
+           "                             raised to the admission size if smaller)\n"
            "  --request-log-jsonl FILE   append full-precision server/request records\n"
            "  --request-log-max-mib N    rotate FILE when it reaches N MiB: it becomes\n"
            "                             FILE.1, older files shift up (default: one file\n"
@@ -574,6 +662,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             terminals only)\n"
            "  --log-level L              pretty stderr verbosity (trace|debug|info|warning|\n"
            "                             error|critical|off; default info)\n"
+           "  --log-file PATH            also append plain timestamped log records to PATH\n"
+           "                             beside the console (each written as it is logged)\n"
            "  --cors                     send permissive CORS headers for browser UIs\n"
            "  --usage-chunk-choice       give the streamed usage chunk a zero-delta choice so\n"
            "                             strict parsers that reject choices:[] accept it\n"
@@ -624,6 +714,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool kv_capacity_explicit        = false;
     bool request_log_keep_explicit = false;
     bool host_context_explicit     = false;
+    bool spec_explicit             = false; // without --spec: product::apply_default_speculation
     // Last prefix-cache flag seen, for the --no-prefix-reuse error.
     const char* cache_option_flag = nullptr;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
@@ -708,6 +799,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
+        } else if (arg == "--keep-alive-timeout-sec") {
+            options.keep_alive_timeout_sec = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--keep-alive-timeout-sec"), "keep-alive-timeout-sec"));
+        } else if (arg == "--max-http-clients") {
+            options.max_http_clients = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--max-http-clients"), "max-http-clients"));
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
@@ -730,8 +827,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             const std::optional<FastPath> path = parse_fast_path(name);
             if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
             options.fast_path_candidates.push_back(*path);
+        } else if (arg == "--no-fast-path") {
+            const std::string name(require_value("--no-fast-path"));
+            const std::optional<FastPath> path = parse_fast_path(name);
+            if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
+            options.fast_path_exclusions.push_back(*path);
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
+        } else if (arg == "--a16-activations") {
+            options.expert_a16_activations = true;
+        } else if (arg == "--a8-activations") {
+            options.a8_activations = true;
         } else if (arg == "--embedding-host") {
             options.embedding_host = true;
         } else if (arg == "--context-cost-presets") {
@@ -759,6 +865,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 options.log_stats_panel = false;
             } else {
                 throw std::invalid_argument("--log-stats-panel accepts on or off");
+            }
+        } else if (arg == "--log-file") {
+            options.log_file = require_value("--log-file");
+            if (options.log_file.empty()) {
+                throw std::invalid_argument("--log-file needs a path");
             }
         } else if (arg == "--max-request-mib") {
             const std::uint64_t mib =
@@ -824,6 +935,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.context_cache.hybrid.tool_call_hold = std::chrono::seconds(seconds);
             cache_option_flag                           = "--cache-tool-hold-secs";
+        } else if (arg == "--cache-next-turn-ms") {
+            const int milliseconds = parse_nonnegative_int(require_value("--cache-next-turn-ms"),
+                                                           "cache-next-turn-ms");
+            if (milliseconds > 3'600'000) {
+                throw std::invalid_argument("--cache-next-turn-ms must be in [0,3600000]");
+            }
+            options.context_cache.hybrid.next_turn_prefill_quiet = std::chrono::milliseconds(milliseconds);
+            cache_option_flag                               = "--cache-next-turn-ms";
         } else if (arg == "--cache-host-state") {
             const std::string value = require_value("--cache-host-state");
             if (value == "fp32") {
@@ -841,8 +960,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--cache-tap-min-gap"), "cache-tap-min-gap"));
             cache_option_flag = "--cache-tap-min-gap";
         } else if (arg == "--host-context-mib") {
-            options.context_cache.host_capacity_bytes =
-                parse_host_context_mib(require_value("--host-context-mib"));
+            const char* text = require_value("--host-context-mib");
+            if (std::string_view(text) == "auto") {
+                options.context_cache.host_capacity_bytes.reset();
+                options.context_cache.host_capacity_auto = true;
+            } else {
+                options.context_cache.host_capacity_bytes = parse_host_context_mib(text);
+                options.context_cache.host_capacity_auto  = false;
+            }
             host_context_explicit = true;
             cache_option_flag     = "--host-context-mib";
         } else if (arg == "--request-log-jsonl") {
@@ -886,12 +1011,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
-        } else if (arg == "--ram-headroom-mib") {
-            const std::uint64_t mib = parse_u64(require_value("--ram-headroom-mib"), "ram-headroom-mib");
+        } else if (arg == "--ram-free-mib") {
+            const std::uint64_t mib = parse_u64(require_value("--ram-free-mib"), "ram-free-mib");
             if (mib > (std::numeric_limits<std::uint64_t>::max() >> 20)) {
-                throw std::invalid_argument("--ram-headroom-mib is out of range");
+                throw std::invalid_argument("--ram-free-mib is out of range");
             }
-            options.ram_headroom_bytes = mib << 20;
+            options.ram_free_bytes = mib << 20;
+        } else if (arg == "--ram-resize") {
+            const std::string mode = require_value("--ram-resize");
+            if (mode != "auto" && mode != "off") { throw std::invalid_argument("--ram-resize must be auto or off"); }
+            options.ram_resize = mode == "auto";
         } else if (arg == "--expert-ram-mib") {
             const std::string text = require_value("--expert-ram-mib");
             if (text == "auto") {
@@ -903,6 +1032,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 }
                 options.expert_ram_bytes = mib << 20;
             }
+        } else if (arg == "--expert-ram-layout") {
+            options.expert_ram_layout = parse_expert_ram_layout(require_value("--expert-ram-layout"));
         } else if (arg == "--expert-pin-mib") {
             const std::string text = require_value("--expert-pin-mib");
             if (text == "auto") {
@@ -919,8 +1050,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--logits-dtype") {
             options.logits_dtype = product::parse_logits_dtype(require_value("--logits-dtype"));
         } else if (arg == "--spec") {
-            options.speculative.backend =
-                product::parse_speculative_backend(require_value("--spec"));
+            product::apply_speculative_backend(options.speculative, require_value("--spec"));
+            spec_explicit = true;
         } else if (arg == "--draft-tokens") {
             product::apply_draft_tokens(options.speculative, require_value("--draft-tokens"));
         } else if (arg == "--draft-model") {
@@ -976,6 +1107,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 options.reasoning_loop = infernix::ReasoningLoopAction::Conclude;
             } else {
                 throw std::invalid_argument("--reasoning-loop must be off, stop or conclude");
+            }
+        } else if (arg == "--end-in-thinking") {
+            const std::string_view value = require_value("--end-in-thinking");
+            if (value == "refuse") {
+                options.end_turn_in_thinking = false;
+            } else if (value == "allow") {
+                options.end_turn_in_thinking = true;
+            } else {
+                throw std::invalid_argument("--end-in-thinking must be refuse or allow");
             }
         } else if (arg == "--vision") {
             options.enable_vision = true;
@@ -1042,6 +1182,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.greedy = true;
         } else if (arg == "--log-level") {
             options.log_level = product::parse_log_level(require_value("--log-level"));
+        } else if (arg == "--plan") {
+            options.plan_path = require_value("--plan");
+            if (options.plan_path.empty()) { throw std::invalid_argument("--plan must name a file"); }
         } else {
             throw std::logic_error("serve option " + arg + " has no parser");
         }
@@ -1097,11 +1240,24 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");
     }
-    if (options.max_pending_requests == 0) {
-        throw std::invalid_argument("--max-pending-requests must be positive");
+    // The HTTP pool starts one worker per admitted or pending request (and the Engine sizes its queue for them).
+    if (options.max_pending_requests == 0 || options.max_pending_requests > kMaximumPendingRequests) {
+        throw std::invalid_argument("--max-pending-requests must be in [1," + std::to_string(kMaximumPendingRequests) +
+                                    "]");
     }
     if (options.pending_timeout_ms == 0) {
         throw std::invalid_argument("--pending-timeout-ms must be positive");
+    }
+    // 1..3600 s; 0 would make every pooled connection die on the spot and rejoin the race
+    // the option exists to remove.
+    if (options.keep_alive_timeout_sec == 0 || options.keep_alive_timeout_sec > 3600) {
+        throw std::invalid_argument("--keep-alive-timeout-sec must be in [1,3600]");
+    }
+    // Smaller values are legal but clamped up to the admission size at startup — an
+    // HTTP surface smaller than admitted requests would refuse connections the
+    // concurrency options just promised to serve.
+    if (options.max_http_clients == 0) {
+        throw std::invalid_argument("--max-http-clients must be positive");
     }
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
@@ -1113,6 +1269,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.prefill_split_workspace_mib > kMaximumPrefillSplitWorkspaceMiB) {
         throw std::invalid_argument("--prefill-split-workspace-mib must be in [0,16384]");
     }
+    if (!spec_explicit) { product::apply_default_speculation(options.speculative); }
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_offload == VisionOffload::On && !options.enable_vision) {
         throw std::invalid_argument("--vision-offload on requires --vision");

@@ -1024,6 +1024,72 @@ struct SparseAcceptSuite {
                                           extents, lengths, anchors, configs, history, {false});
     }
 
+    // A rejection whose residual rounds to zero under a grammar mask (candidates UV-42; vLLM #65176 emitted token 0
+    // from a logit gap of ~14). The mask allows a and b only, logit(a) = 0 and logit(b) = -gap; one draft, b, with
+    // q(b) above p(b) (twice it, at least 2^-25) and q(a) = 1 - q(b). The draft is rejected (its uniform above 0.6),
+    // and the correction max(p - q, 0) has mass ~ q(b) - p(b): positive in FP32 at the small gaps, rounded to zero
+    // from about 17 (p(a) and q(a) both 1.0f), where the rule falls back to the support's first token. Both give a,
+    // never b, the masked token 0 or a token outside the mask, on the token rule and on block verification.
+    int zero_residual_mask_case(bool block) {
+        constexpr int kGaps[] = {10, 14, 17, 18, 24, 40, 64, 87};
+        std::vector<int> targets(kSparseColumns * kSparseBatch, 0), drafts(kSparseDrafts * kSparseBatch, 0),
+            ids(kSparseCandidates * kSparseDrafts * kSparseBatch), extents(kSparseBatch, 1),
+            lengths(kSparseBatch, 300), anchors(kSparseBatch, 0);
+        std::vector<std::uint16_t> logits(static_cast<std::size_t>(kSparsePhysicalRows) * kSparseColumns *
+                                              kSparseBatch,
+                                          f32_to_bf16(12.0f));
+        std::vector<float> q(ids.size(), 0.0f);
+        std::vector<ops::SamplingConfig> configs(kSparseBatch);
+        std::vector<int> history(kSparseTokenDomain * kSparseBatch, 0);
+        masks.assign(kSparseColumns * kSparseBatch * mask_words, 0);
+        const int a = kSparseTokenDomain - 2, b = kSparseTokenDomain - 1;
+        for (int row = 0; row < kSparseBatch; ++row) {
+            const double gap = kGaps[row % 8];
+            const double pb  = std::exp(-gap) / (1.0 + std::exp(-gap));
+            const auto qb    = static_cast<float>(std::max(2.0 * pb, std::ldexp(1.0, -25)));
+            configs[row].temperature = 1.0f;
+            std::uint64_t seed       = 1;
+            while (!(oracle_uniform(seed, lengths[row] + 1, ops::kSamplePurposeSpeculativeAccept) > 0.6f &&
+                     oracle_uniform(seed, lengths[row] + 1, ops::kSamplePurposeSpeculativeBlockAccept, 1) > 0.6f)) {
+                ++seed;
+            }
+            configs[row].seed = seed;
+            for (int col = 0; col < kSparseColumns; ++col) {
+                for (int token : {a, b}) {
+                    masks[(row * kSparseColumns + col) * mask_words + token / 32] |= 1u << (token % 32);
+                }
+                logits[sparse_logit_index(row, col, a)] = f32_to_bf16(0.0f);
+                logits[sparse_logit_index(row, col, b)] = f32_to_bf16(static_cast<float>(-gap));
+                targets[row * kSparseColumns + col]     = a;
+            }
+            for (int col = 0; col < kSparseDrafts; ++col) {
+                const std::size_t base = sparse_candidate_index(row, col, 0);
+                for (int c = 0; c < kSparseCandidates; ++c) { ids[base + c] = 100 + c; }
+                ids[base]     = a;
+                ids[base + 1] = b;
+                q[base]       = 1.0f - qb;
+                q[base + 1]   = qb;
+            }
+            drafts[row * kSparseDrafts] = b;
+        }
+        const ops::SpeculativeAcceptExecutionEnvelope envelope{.all_rows_greedy_without_penalties = false,
+                                                               .block_verification         = block};
+        const SparseExpected oracle =
+            sparse_accept_oracle(logits, drafts, ids, q, extents, lengths, configs, history, block);
+        int failures = 0;
+        for (int row = 0; row < kSparseBatch; ++row) {
+            if (oracle.accepted[row] != 0 || oracle.anchors[row] != a) {
+                std::cerr << "zero-residual oracle row " << row << ": accepted " << oracle.accepted[row] << ", token "
+                          << oracle.anchors[row] << " (expected 0 and the support's a)\n";
+                ++failures;
+            }
+        }
+        return failures + execute_sparse_accept_case(std::string("sparse zero residual under a mask") +
+                                                         (block ? " block" : ""),
+                                                     targets, logits, drafts, ids, q, extents, lengths, anchors,
+                                                     configs, history, envelope);
+    }
+
     int repeated_history_case(bool stochastic, bool mtp_onehot = false) {
         std::vector<int> targets(kSparseColumns * kSparseBatch, 100),
             drafts(kSparseDrafts * kSparseBatch, 100);
@@ -1397,6 +1463,34 @@ int greedy_penalty_case(int token_domain) {
     return execute_accept_case(
         "speculative greedy penalty token-domain=" + std::to_string(token_domain), raw_targets,
         bits, token_domain, drafts, 100, token_domain, config, counts, expected);
+}
+
+// A row in open reasoning (SamplingConfig::reasoning_close 11, ends 7 and 9): an end-of-turn token is refused at a
+// verify column unless a draft before the column is the close token. Drafts {11, 7}: column 1 follows the close, so
+// its best token 7 verifies the second draft, and column 2 adds 3. Drafts {5, 7}: column 1's 7 is refused, so its
+// next best 2 corrects the second draft. Single-block (64) and multi-block (257) routes.
+int reasoning_ban_accept_case(int token_domain, bool closed) {
+    constexpr int k = 2;
+    const std::vector<std::int32_t> drafts{closed ? 11 : 5, 7};
+    const std::vector<std::int32_t> raw_targets{drafts[0], 7, 3};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0F);
+    logits[static_cast<std::size_t>(drafts[0])] = 5.0F;
+    logits[7]                                   = 4.0F;
+    logits[token_domain + 7]                    = 5.0F;
+    logits[token_domain + 2]                    = 4.5F;
+    logits[2 * token_domain + 3]                = 5.0F;
+    std::vector<std::uint16_t> bits(logits.size());
+    for (std::size_t index = 0; index < logits.size(); ++index) { bits[index] = f32_to_bf16(logits[index]); }
+    ops::SamplingConfig config{};
+    config.temperature       = 0.0F;
+    config.reasoning_close   = 11;
+    config.reasoning_ends[0] = 7;
+    config.reasoning_ends[1] = 9;
+    const std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
+    const auto expected = closed ? accept_state_oracle(drafts, 2, 3, 100) : accept_state_oracle(drafts, 1, 2, 100);
+    return execute_accept_case("speculative open-reasoning end-of-turn token-domain=" + std::to_string(token_domain) +
+                                   (closed ? " after a drafted close" : " without a close"),
+                               raw_targets, bits, token_domain, drafts, 100, token_domain, config, counts, expected);
 }
 
 // A verification column without a finite logit (every value NaN) sets the row's
@@ -1785,14 +1879,18 @@ int transforms_conformance() {
 // rule's acceptance and residual both matter. The emitted text must follow the target: the first
 // token, and the second (the round's own, or for a round that emitted one token the next round's
 // first, a fresh target draw since the columns repeat) with the first, by token and pair.
-int block_distribution_case(int k) {
+// `boundary_tie`: ids 2 and 3 tie at top_k = 3, so the target's support is {0, 1, 2} (the lower id
+// wins a tie, as in the sampler): a proposed 3 must never be accepted or emitted (FlashInfer #7921).
+int block_distribution_case(int k, bool boundary_tie = false) {
     constexpr int batch = 8, trials = 8192 / batch;
     const int width     = k + 1;
-    const std::array<float, 4> requested{0.6F, 0.25F, 0.1F, 0.05F};
+    const std::array<float, 4> requested = boundary_tie ? std::array<float, 4>{0.4F, 0.3F, 0.15F, 0.15F}
+                                                        : std::array<float, 4>{0.6F, 0.25F, 0.1F, 0.05F};
     const std::array<double, 4> proposal{0.3, 0.4, 0.2, 0.1};
+    const int support = boundary_tie ? 3 : 4;
     std::array<double, 4> probabilities{};
     double total = 0;
-    for (int id = 0; id < 4; ++id) {
+    for (int id = 0; id < support; ++id) {
         probabilities[id] = std::exp(bf16_to_f32(f32_to_bf16(std::log(requested[id]))));
         total += probabilities[id];
     }
@@ -1823,7 +1921,7 @@ int block_distribution_case(int k) {
     std::vector<ops::SamplingConfig> configs(batch);
     for (int row = 0; row < batch; ++row) {
         configs[row].temperature  = 1;
-        configs[row].top_k        = 4;
+        configs[row].top_k        = support;
         configs[row].top_p        = 1;
         configs[row].token_counts = static_cast<int*>(d_history.p) + row * kSparseTokenDomain;
     }
@@ -1909,9 +2007,14 @@ int block_distribution_case(int k) {
             failures += within(pairs[id * 4 + other], probabilities[id] * probabilities[other]) ? 0 : 1;
         }
     }
+    if (boundary_tie && (first[3] != 0 || second[3] != 0)) {
+        std::cerr << "block distribution: the token tied at the top-k boundary with a lower id was emitted\n";
+        ++failures;
+    }
     failures += scratch.verify_guards("block distribution workspace");
     failures += licensed.verify_guards("block distribution output");
-    std::cout << "block distribution K=" << k << " trials=" << n << " accepted/round="
+    std::cout << "block distribution K=" << k << (boundary_tie ? " (top-k boundary tie)" : "") << " trials=" << n
+              << " accepted/round="
               << static_cast<double>(accepted_total) / static_cast<double>(n) << " first=";
     for (const auto count : first) { std::cout << count << ','; }
     std::cout << " second=";
@@ -2718,6 +2821,10 @@ INFERNIX_OP_TEST(speculative_round) {
     failures += greedy_accept_case(31, 30, 257);
     failures += greedy_penalty_case(64);
     failures += greedy_penalty_case(257);
+    for (const int domain : {64, 257}) {
+        failures += reasoning_ban_accept_case(domain, true);
+        failures += reasoning_ban_accept_case(domain, false);
+    }
     failures += nonfinite_column_case(64);
     failures += nonfinite_column_case(257);
     failures += raw_greedy_nonfinite_case(64);
@@ -2758,6 +2865,7 @@ INFERNIX_OP_TEST(speculative_round) {
     // block-verification: its output distribution, then its sampled rows against the block rule's
     // host oracle, greedy rows unchanged.
     for (const int k : {1, 3, 7}) failures += block_distribution_case(k);
+    failures += block_distribution_case(3, true);
     for (const int k : {4, 7}) failures += block_chain_distribution_case(k);
     for (const int k : {1, 3, 7, 15, 31}) {
         for (const int batch : {1, 8}) {
@@ -2771,6 +2879,8 @@ INFERNIX_OP_TEST(speculative_round) {
         SparseAcceptSuite suite(k, 8);
         failures += suite.sparse_general_mixed_case();
         failures += SparseAcceptSuite(k, 8).grammar_mask_case();
+        failures += SparseAcceptSuite(k, 8).zero_residual_mask_case(false);
+        failures += SparseAcceptSuite(k, 8).zero_residual_mask_case(true);
         failures += suite.sparse_greedy_direct_case(0, true);
         failures += SparseAcceptSuite(k, 1).repeated_history_case(false);
         failures += SparseAcceptSuite(k, 1).repeated_history_case(true);

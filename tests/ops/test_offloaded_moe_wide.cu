@@ -323,8 +323,9 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
             wide_entries += counts[static_cast<std::size_t>(e)];
         }
     }
-    std::printf("   %d wide experts with %d of %d entries; largest expert %d columns\n", wide_experts, wide_entries,
-                entries, max_count);
+    std::printf("   %d wide experts with %d of %d entries; largest expert %d columns; %s warp tiles\n", wide_experts,
+                wide_entries, entries, max_count,
+                entries / std::min(experts, entries) >= wide::kWarpTile64MinColumns ? "64-token" : "32-token");
     // entry (t * k + slot) -> packed row p, and whether its expert is wide.
     std::vector<int> packed(static_cast<std::size_t>(entries));
     for (int p = 0; p < entries; ++p) { packed[static_cast<std::size_t>(order[static_cast<std::size_t>(p)])] = p; }
@@ -506,8 +507,8 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
         const auto probe_gu   = host_copy(d_probe_gu, static_cast<std::size_t>(entries) * 2 * moe::kIntermediate);
         const auto probe_down = host_copy(d_probe_down, static_cast<std::size_t>(entries) * moe::kHidden);
         {
-            // TEMPORARY with INFERNIX_TMP_WIDE_EXPERT_T64 (candidates P5): the 64-token warp tile's accumulators
-            // are the default schedule's bit for bit (every output keeps its K-ordered MMA chain).
+            // P5: the 64-token warp tile's accumulators are the 32-token schedule's bit for bit (every output
+            // keeps its K-ordered MMA chain), at every call width.
             using T64 = wide::WarpTile64<wide::Schedule>;
             cuda_check(cudaMemset(d_probe_gu, 0xFF, sizeof(float) * entries * 2 * moe::kIntermediate), "cudaMemset");
             cuda_check(cudaMemset(d_probe_down, 0xFF, sizeof(float) * entries * moe::kHidden), "cudaMemset");
@@ -526,7 +527,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
                                          sizeof(float) * moe::kHidden) != 0;
             }
             std::printf("   P5 64-token warp tile: %ld wide entries' accumulators differ\n", differing);
-            check(differing == 0, "P5: WarpTile64 accumulators equal the default schedule's bit for bit");
+            check(differing == 0, "P5: WarpTile64 accumulators equal the 32-token schedule's bit for bit");
         }
 
         std::vector<long> c1_bad(static_cast<std::size_t>(entries), 0), c2_bad(static_cast<std::size_t>(entries), 0),
@@ -739,7 +740,8 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
             wide_entries += counts[static_cast<std::size_t>(e)];
         }
     }
-    std::printf("   %d of %d entries on the wide route\n", wide_entries, entries);
+    const bool t64 = a4_residual && entries / std::min(experts, entries) >= wide::kWarpTile64MinColumns;
+    std::printf("   %d of %d entries on the wide route%s\n", wide_entries, entries, t64 ? "; 64-token warp tiles" : "");
 
     const int max_jobs = std::min(experts, entries);
     std::uint8_t* d_staging = nullptr;
@@ -921,6 +923,10 @@ INFERNIX_OP_TEST(offloaded_moe_wide) {
         test_layer("n = 65", 2, 65, 2, std::vector<double>(2, 1.0), {}, 31);
         // A verification-width call: 10 columns at top-10 over 12 experts.
         test_layer("T = 10", 12, 10, 10, std::vector<double>(12, 1.0), {}, 37);
+        // The cases above run the 32-token warp tiles; two experts of 600 columns each (nine full tiles and
+        // a partial one) run the 64-token ones (kWarpTile64MinColumns on average).
+        static_assert(2 * 600 / 2 >= wide::kWarpTile64MinColumns && 4 * 300 / 20 < wide::kWarpTile64MinColumns);
+        test_layer("n = 600", 2, 600, 2, std::vector<double>(2, 1.0), {}, 71);
         // W4A16 (§16.2.1): the same prefill mix, the 9- and 65-column boundaries (one with an Inf in
         // a column), and a verification width.
         test_layer_a16("prefill mix", 20, 300, 4, popularity, 41);
@@ -933,6 +939,7 @@ INFERNIX_OP_TEST(offloaded_moe_wide) {
             test_layer_a16("n = 9", 4, 9, 4, std::vector<double>(4, 1.0), 43, false, route);
             test_layer_a16("n = 65", 2, 65, 2, std::vector<double>(2, 1.0), 47, true, route);
             test_layer_a16("T = 10", 12, 10, 10, std::vector<double>(12, 1.0), 53, false, route);
+            test_layer_a16("n = 600", 2, 600, 2, std::vector<double>(2, 1.0), 73, false, route);
         }
         // The two-term narrow route (expert-a4-residual-decode), beside exact and two-term wide calls:
         // decode (one column, ten experts), MTP verification widths, the mix and the boundaries.

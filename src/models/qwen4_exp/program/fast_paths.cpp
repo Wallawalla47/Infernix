@@ -1,14 +1,16 @@
 // Qwen3.8-Flash-Next fast-path selection (EngineOptions::fast_paths): which numerics-changing routes
-// run for a loaded artifact, from the registry of configurations each passed the acceptance gate in
-// (docs/maintainer/model-quality.md section 6.7).
+// run for an artifact (its stored formats), from the registry of configurations each passed the
+// acceptance gate in (docs/maintainer/model-quality.md section 6.7).
 #include "models/qwen4_exp/program/fast_paths.h"
 
-#include "models/qwen4_exp/execution/parameters.h"
+#include "models/qwen4_exp/config.h"
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <stdexcept>
-#include <variant>
+#include <string>
 
 namespace infernix::models::qwen4_exp {
 namespace {
@@ -440,15 +442,106 @@ constexpr std::array kQualified{
     Qualification{FastPath::DFlash2Pairs, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::DFlash2Pairs, {DenseKernels::Mxfp8, true, KvCacheStorage::Vq2}},
     Qualification{FastPath::DFlash2Pairs, {DenseKernels::Mxfp8, true, KvCacheStorage::Q4KeyVq2Value}},
+    // NVIDIA NVFP4 Dense8 at 16-bit expert activations (--a16-activations, and --a8-activations, which takes its
+    // 8-bit route from there): Dense8's verdicts by the kernel rule (model-quality.md 6.1, item 2), not run on
+    // this configuration itself (2026-10-31). The paths change only the dense, attention, GDN and scheduling
+    // kernels, which are Dense8's at either expert precision; the experts' W4A16 kernels are the ones recipe C
+    // and FP4-Local qualified. Without these entries the option dropped every path (the agentic replay's cache
+    // reuse 84 -> 63 %, endpoints unpublished).
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Q8, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Q8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Q8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Q8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Q8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Q8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Q8, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Q8, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Q8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Q8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Q8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Q8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Q8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Q8, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Q8, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Q8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Q8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Q8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Q8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Q8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Q8, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::Preemption, {DenseKernels::Q8, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Preemption, {DenseKernels::Q8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Preemption, {DenseKernels::Q8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Preemption, {DenseKernels::Q8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Preemption, {DenseKernels::Q8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Preemption, {DenseKernels::Q8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Preemption, {DenseKernels::Q8, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Q8, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Q8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Q8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Q8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Q8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Q8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Q8, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Q8, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Q8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Q8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Q8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Q8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Q8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Q8, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Q8, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Q8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Q8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Q8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Q8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Q8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Q8, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Q8, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Q8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Q8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Q8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Q8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
     // On by the owner's decision of 2026-10-25 (a new path measured faster goes on by default before its
     // quality gate; the owner may turn it off once the gating regime is settled), in the configuration
     // measured, each against the default route (ABBA, RTX 5090, 2026-10-25):
     // NVIDIA FP4-Local, INT8 KV: screened-lm-head, plain decode (pp1024+tg256) +7.5 % (4 of 4 blocks, worst
     // +7.2 %), MTP 3 with --lm-head-draft +3.7 % (4 of 4, worst +3.3 %); it runs where the artifact carries the
     // LM head's screen (select_fast_paths). f16-accumulate-prefill, pp32768 +5.3 % with the route's row raster
-    // and B fragments (3 of 3), pp4096 neutral.
+    // and B fragments (3 of 3), pp4096 neutral. The KV formats below INT8's precision (FP8, NVFP4, K8V4, VQ2,
+    // K4V2) take them too by the owner's decision of 2026-11-01: neither path's kernels read the KV cache.
     Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Q4KeyVq2Value}},
+    // FP4-Local with --expert-a4-activations (the same head and screen): screened-lm-head measured faster on INT8 KV
+    // (RTX 5090, 2026-11-02, interleaved runs, DFlash2 auto with --lm-head-draft unless plain): plain decode
+    // 117.3 -> 125.0 tok/s (+6.6 %, 2 of 2), the struct fixture 378.3 -> 386.9 (+2.3 %, 3 of 3, the same text and
+    // rounds: 20.24 -> 19.79 ms a round); without it the exact BF16 head took 706 us of a 9.5 ms round after a 16K
+    // prompt (the screen 135 us). The formats below INT8's precision by the owner's rule above.
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Q4KeyVq2Value}},
     Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, false, KvCacheStorage::Q4KeyVq2Value}},
+    // FP4-Local with --expert-a4-activations (the same MXFP8 dense kernels): f16-accumulate-prefill measured faster on
+    // INT8 KV (RTX 5090, 2026-11-02, interleaved): pp32768 11,891 -> 12,567 tok/s (+5.7 %, 2 of 2); pp1024 and pp4096
+    // within their spread. The formats below INT8's precision by the owner's rule above.
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, true, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* dense_name(DenseKernels dense) {
@@ -473,6 +566,7 @@ const char* kv_name(KvCacheStorage kv) {
     case KvCacheStorage::Fp8KeyNvfp4Value: return "k8v4";
     case KvCacheStorage::Vq2: return "vq2";
     case KvCacheStorage::Q4KeyVq2Value: return "k4v2";
+    case KvCacheStorage::Bf16Packed: return "bf16p";
     }
     return "unknown";
 }
@@ -482,7 +576,9 @@ const char* kv_name(KvCacheStorage kv) {
 DenseKernels dense_kernels(QType qtype) noexcept {
     switch (qtype) {
     case QType::Q8_G32_FP16: return DenseKernels::Q8;
-    case QType::BF16: return DenseKernels::Bf16;
+    // bf16_p12 decodes to the BF16 weights and runs the BF16 kernels' arithmetic on them.
+    case QType::BF16:
+    case QType::BF16_P12: return DenseKernels::Bf16;
     case QType::FP8_E4M3FN_ROW_BF16: return DenseKernels::Fp8Row;
     case QType::FP8_E4M3FN_G32_E8M0: return DenseKernels::Mxfp8;
     case QType::NVFP4: return DenseKernels::Nvfp4;
@@ -505,20 +601,13 @@ std::string describe(const FastPathConfiguration& configuration) {
            kv_name(configuration.kv) + " KV";
 }
 
-FastPathConfiguration fast_path_configuration(const execution::Parameters& parameters,
-                                              const EngineOptions& options) {
-    FastPathConfiguration out{.dense      = DenseKernels::Bf16,
-                              .a4_experts = !parameters.model.config().text.moe.a16_experts,
-                              .kv         = options.kv_cache};
-    // The dense layers share one kernel family; the GDN q/k/v/z projection is the one the fast
-    // routes serve.
-    for (const execution::BlockParameters& block : parameters.layers) {
-        if (const auto* gdn = std::get_if<execution::GdnParameters>(&block.mixer)) {
-            out.dense = dense_kernels(gdn->projection.weight.qtype);
-            break;
-        }
-    }
-    return out;
+FastPathConfiguration fast_path_configuration(const Config& config, const EngineOptions& options) {
+    // The dense layers share one kernel family; the GDN q/k/v/z projection is the one the fast routes serve.
+    // Packed BF16 KV gives attention bf16's K and V bits (and the fused prepare stores them through the packed
+    // codec): it is qualified as bf16.
+    return {.dense      = dense_kernels(config.text.dense_format),
+            .a4_experts = !config.text.moe.a16_experts,
+            .kv         = options.kv_cache == KvCacheStorage::Bf16Packed ? KvCacheStorage::BFloat16 : options.kv_cache};
 }
 
 bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration,
@@ -572,12 +661,11 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
                (configuration.dense == DenseKernels::Fp8Row || configuration.dense == DenseKernels::Mxfp8);
     // The GGUF imports' dense projections (ops::ggml_linear's BF16 prefill tiles).
     case FastPath::GgmlBf16Prefill: return configuration.dense == DenseKernels::Ggml;
-    // The 8-bit-code dense projections: recipe C's row FP8 and NVIDIA FP4-Local's MXFP8 (E4M3 codes), and
-    // Dense8's Q8 (int8 codes, FP16 group scales; ops/linear/q8/q8_f16acc.h), all at 16-bit activations;
-    // the official FP8 import's dense weights are BF16.
+    // The E4M3-code dense projections at 16-bit activations: recipe C's row FP8 and NVIDIA FP4-Local's MXFP8;
+    // the official FP8 import's dense weights are BF16. Dense8's Q8 has no route (1.6-1.9 % slower on its
+    // pp32K/64K prefill, removed 2026-10-28).
     case FastPath::F16AccumulatePrefill:
-        return configuration.dense == DenseKernels::Fp8Row || configuration.dense == DenseKernels::Mxfp8 ||
-               configuration.dense == DenseKernels::Q8;
+        return configuration.dense == DenseKernels::Fp8Row || configuration.dense == DenseKernels::Mxfp8;
     // Qwen3.5's dense causal attention only (Flash-Next attends through QSA).
     case FastPath::Bf16PromptSplit: return false;
     // Every Flash-Next artifact's BF16 router (512 experts plus the shared expert's score).
@@ -598,8 +686,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::UniverTrees: return false; // Qwen3.5's tree rounds only
     case FastPath::GdnTreeClosedForm: return false; // Qwen3.5's tree rounds only
     case FastPath::QsaPrepareFused:
-        // ops::qsa_prepare_supports's KV formats (bf16, int8, fp8, nvfp4, k8v4); VQ2 and K4V2 append
-        // inside qsa_attention and keep the composed prepare.
+        // ops::qsa_prepare_supports's KV formats (bf16 and bf16p, int8, fp8, nvfp4, k8v4); VQ2 and K4V2
+        // append inside qsa_attention and keep the composed prepare.
         return configuration.kv == KvCacheStorage::Int8Group64 || configuration.kv == KvCacheStorage::BFloat16 ||
                configuration.kv == KvCacheStorage::Fp8E4M3Row256 || configuration.kv == KvCacheStorage::Nvfp4Group16 ||
                configuration.kv == KvCacheStorage::Fp8KeyNvfp4Value;
@@ -610,6 +698,14 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
 bool fast_path_qualified(FastPath path, const FastPathConfiguration& configuration) {
     return std::any_of(kQualified.begin(), kQualified.end(), [&](const Qualification& entry) {
         return entry.path == path && entry.configuration == configuration;
+    });
+}
+
+bool screened_lm_head_qualified_with(KvCacheStorage kv) noexcept {
+    // Packed BF16 KV is qualified as bf16 (fast_path_configuration).
+    const KvCacheStorage qualified = kv == KvCacheStorage::Bf16Packed ? KvCacheStorage::BFloat16 : kv;
+    return std::any_of(kQualified.begin(), kQualified.end(), [&](const Qualification& entry) {
+        return entry.path == FastPath::ScreenedLmHead && entry.configuration.kv == qualified;
     });
 }
 
@@ -642,9 +738,12 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
     if (selected(FastPath::Fp8A8Pair)) { routes = routes | ops::LinearRoutes::Fp8A8Pair; }
     // Where several are set the FP8 dispatch takes f16-accumulate, then the block-scaled pair, then the pair.
     if (selected(FastPath::Fp8A8PairBlock32)) { routes = routes | ops::LinearRoutes::Fp8A8PairBlock32; }
-    if (selected(FastPath::GgmlBf16Prefill)) { routes = routes | ops::LinearRoutes::GgmlBf16Wide; }
-    if (selected(FastPath::F16AccumulatePrefill)) { routes = routes | ops::LinearRoutes::F16Accumulate; }
+    // The prefill paths: prefill calls only.
+    ops::LinearRoutes prefill = ops::LinearRoutes::Exact;
+    if (selected(FastPath::GgmlBf16Prefill)) { prefill = prefill | ops::LinearRoutes::GgmlBf16Wide; }
+    if (selected(FastPath::F16AccumulatePrefill)) { prefill = prefill | ops::LinearRoutes::F16Accumulate; }
     return {.dense_routes       = routes,
+            .prefill_routes     = prefill,
             .gdn_conv_fused     = selected(FastPath::GdnConvFused),
             .qsa_prepare_fused  = selected(FastPath::QsaPrepareFused),
             .expert_a4_terms    = selected(FastPath::ExpertA4Residual3) ? 3
@@ -656,8 +755,8 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
             .router_mma        = selected(FastPath::RouterMma)};
 }
 
-FastPathSelection select_fast_paths(const execution::Parameters& parameters, const EngineOptions& options) {
-    FastPathSelection out{.configuration = fast_path_configuration(parameters, options), .paths = {}};
+FastPathSelection select_fast_paths(const Config& config, bool output_head_screen, const EngineOptions& options) {
+    FastPathSelection out{.configuration = fast_path_configuration(config, options), .paths = {}};
     for (const FastPath path : options.fast_path_candidates) {
         if (!fast_path_applies(path, out.configuration, options)) {
             throw std::invalid_argument(std::string("fast path ") + fast_path_name(path) +
@@ -672,10 +771,78 @@ FastPathSelection select_fast_paths(const execution::Parameters& parameters, con
         // --screen-heads); without it the configuration keeps the exact head.
         const bool qualified = options.fast_paths && fast_path_applies(path, out.configuration, options) &&
                                fast_path_qualified(path, out.configuration) &&
-                               (path != FastPath::ScreenedLmHead || parameters.output_head_screen.has_value());
-        if (candidate || qualified) { out.paths.push_back(path); }
+                               (path != FastPath::ScreenedLmHead || output_head_screen);
+        const bool excluded = std::find(options.fast_path_exclusions.begin(), options.fast_path_exclusions.end(),
+                                        path) != options.fast_path_exclusions.end();
+        if (excluded && (candidate || !qualified)) {
+            throw std::invalid_argument(std::string("--no-fast-path ") + fast_path_name(path) +
+                                        (candidate ? ": also asked for as a candidate (--fast-path)"
+                                                   : ": not selected for " + describe(out.configuration)));
+        }
+        if ((candidate || qualified) && !excluded) { out.paths.push_back(path); }
     }
     return out;
+}
+
+A8Routes a8_activation_routes(const FastPathConfiguration& configuration, QType expert_format,
+                              std::size_t ggml_projections, bool expert_a4_narrow) noexcept {
+    const bool nvfp4 = expert_format == QType::NVFP4_MUL;
+    A8Routes out{.ggml_projections = ggml_projections};
+    // One line per route (design §19.3.31); a route measured slower than the one it replaces is withdrawn on its line.
+    // Decode: IQ3_S's dense kernel sums 62 ms 8-bit against 145 ms exact (2026-10-27).
+    out.ggml_dense = ggml_projections != 0;
+    // Decode: IQ3_S's expert kernels 195 against 274 ms, its CPU team 69,454 against 30,585 columns/s.
+    out.ggml_experts = !nvfp4 && expert_format != QType::FP8_E4M3FN_B128;
+    // Decode: Ornith-122B's W4A8 expert kernels 630 against 906 ms, FP4-Local's CPU team 80,926 against 29,371
+    // columns/s (W4A4 banks keep their 4-bit route).
+    out.nvfp4_experts = nvfp4 && !configuration.a4_experts && !expert_a4_narrow;
+    // Prefill: a GGUF import's dense projections on the 8-bit tiles; not yet measured end to end.
+    out.ggml_dense_prefill = ggml_projections != 0;
+    // Prefill: FP4-Local's MXFP8 dense on the block-scaled pair; not yet measured end to end.
+    out.mxfp8_dense = configuration.dense == DenseKernels::Mxfp8;
+    // Prefill: the experts' wide calls on the 8-bit tiles (beside their narrow route); not yet measured end to end.
+    out.experts_prefill = out.ggml_experts || out.nvfp4_experts;
+    return out;
+}
+
+A8Routes a8_activation_routes(const Config& config, const FastPathSelection& fast) {
+    return a8_activation_routes(fast.configuration, config.text.expert_format, config.text.ggml_projections,
+                                fast.selected(FastPath::ExpertA4ResidualDecode));
+}
+
+void A8Routes::apply(execution::ForwardFastPaths& fast) const noexcept {
+    if (ggml_dense) { fast.dense_routes = fast.dense_routes | ops::LinearRoutes::GgmlA8; }
+    fast.a8_experts      = ggml_experts || nvfp4_experts;
+    fast.a8_experts_wide = experts_prefill && fast.a8_experts; // the wide route needs the narrow one
+    // ggml_linear takes the 8-bit tiles ahead of ggml-bf16-prefill's, whose flag stays (the GGUF experts' wide calls
+    // take its BF16 tiles without experts_prefill).
+    if (ggml_dense_prefill) { fast.prefill_routes = fast.prefill_routes | ops::LinearRoutes::GgmlA8Wide; }
+    // The 8-bit pair replaces f16-accumulate-prefill, which the dispatch would otherwise take first from 256 columns.
+    if (mxfp8_dense) {
+        constexpr auto kF16 = static_cast<std::uint16_t>(ops::LinearRoutes::F16Accumulate);
+        fast.prefill_routes = static_cast<ops::LinearRoutes>(static_cast<std::uint16_t>(fast.prefill_routes) & ~kF16) |
+                              ops::LinearRoutes::Fp8A8PairBlock32;
+    }
+}
+
+std::string A8Routes::describe() const {
+    const auto add = [](std::string& list, const std::string& item) {
+        list += (list.empty() ? "" : ", ") + item;
+    };
+    std::string decode, prefill;
+    if (ggml_dense) {
+        add(decode, std::to_string(ggml_projections) + " GGUF dense projections (calls of up to 31 columns)");
+    }
+    if (ggml_experts || nvfp4_experts) {
+        add(decode, "the routed experts (calls of up to 128 columns) with their CPU-served misses");
+    }
+    if (ggml_dense_prefill) {
+        add(prefill, std::to_string(ggml_projections) + " GGUF dense projections (calls of 32 or more columns)");
+    }
+    if (mxfp8_dense) { add(prefill, "the MXFP8 dense projections (two E4M3 terms per 32 values, fp8-a8-pair-block32)"); }
+    if (experts_prefill) { add(prefill, "the routed experts (calls of more than 128 columns)"); }
+    return "decode and verification: " + (decode.empty() ? std::string("none") : decode) +
+           "; prefill: " + (prefill.empty() ? std::string("none") : prefill);
 }
 
 } // namespace infernix::models::qwen4_exp

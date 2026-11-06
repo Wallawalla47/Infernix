@@ -19,7 +19,6 @@ import subprocess
 import sys
 import tempfile
 from decimal import Decimal, getcontext
-from fractions import Fraction
 from pathlib import Path
 
 getcontext().prec = 60
@@ -39,20 +38,25 @@ def round_binary(value: Decimal, prec: int) -> int:
     exponent range (BF16: prec 8, returned in the low 16 bits; binary32: prec 24). The sign is the value's,
     zeros included (-0, and a negative value rounding to zero, give -0)."""
     sign = 1 if value.is_signed() else 0
-    a = Fraction(abs(value))
-    if a == 0:
+    # |value| = digits 10^exponent exactly: num / den in integers (no gcd: the rounding needs none).
+    _, digits, exponent = value.as_tuple()
+    num = int("".join(map(str, digits))) if digits else 0
+    if num == 0:
         return (sign << (15 if prec == 8 else 31))
-    e = a.numerator.bit_length() - a.denominator.bit_length()
-    if Fraction(2) ** e > a:
+    den = 1
+    if exponent >= 0:
+        num *= 10 ** exponent
+    else:
+        den = 10 ** -exponent
+    # floor(log2 |value|) is e or e - 1 for this e.
+    e = num.bit_length() - den.bit_length()
+    if (num << max(0, -e)) < (den << max(0, e)):
         e -= 1
-    while Fraction(2) ** (e + 1) <= a:
-        e += 1
     e = max(e, -126)
-    quantum = Fraction(2) ** (e - prec + 1)
-    q = a / quantum
-    n = q.numerator // q.denominator
-    rem = q - n
-    if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and n % 2 == 1):
+    shift = e - prec + 1
+    divisor = den << max(0, shift)
+    n, rem = divmod(num << max(0, -shift), divisor)
+    if 2 * rem > divisor or (2 * rem == divisor and n % 2 == 1):
         n += 1
     if n == 2 ** prec:
         n //= 2

@@ -52,7 +52,7 @@ void launch_q4_a16_sliced_k_mma(const Q4LinearOperands& operands, Output output,
             launch_sliced_k_pipelined<Q4SlicedKPipelinedFamily<Schedule>>(
                 SlicedKOperands{operands.x, operands.codes, nullptr, operands.scales, operands.rows,
                                 operands.k, operands.tokens, operands.padded_k},
-                output, epilogue, stream, row_policy, dependency, route);
+                output, epilogue, stream, row_policy, route);
             return;
         }
     }

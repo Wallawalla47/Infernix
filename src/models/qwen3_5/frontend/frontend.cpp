@@ -692,6 +692,9 @@ public:
             }
             defaults.token_ids.push_back(token);
         }
+        for (std::size_t i = 0; i < markers.turn_ends.size() && i < defaults.token_ids.size(); ++i) {
+            markers.turn_ends[i] = defaults.token_ids[i];
+        }
         std::string control_suffix(kThinkingControl);
         const char* control_name = "canonical thinking control suffix";
         if (!options.thinking_budget_message.empty()) {
@@ -726,6 +729,11 @@ public:
                 defaults.token_ids.end()) {
                 throw std::invalid_argument(std::string(control_name) +
                                             " contains a default terminal token");
+            }
+            // The control is reasoning, which a tool grammar keeps free of the call token.
+            if (token == markers.tool_call) {
+                throw std::invalid_argument(std::string(control_name) +
+                                            " contains the <tool_call> token");
             }
         }
         thinking_control_tokens = std::make_shared<const std::vector<TokenId>>(std::move(encoded));
@@ -891,8 +899,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     if (cache_hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
     }
-    const auto tool_call_output =
-        fi::build_tool_call_output_contract(options.tool_jsons, options.deferred_tool_jsons);
+    const auto tool_call_output = fi::build_tool_call_output_contract(
+        options.tool_jsons, options.deferred_tool_jsons, options.open_tool_names);
     std::vector<PromptCacheMarker> rendered_markers = cache_hints.markers;
     std::optional<std::size_t> engine_tool_marker_index;
     if (cache_hints.allow_engine_automatic_shared_prefixes && !options.tool_jsons.empty()) {
@@ -1179,6 +1187,11 @@ std::string Frontend::detokenize(std::span<const TokenId> token_ids) const {
     return impl_->tokenizer->decode(token_ids);
 }
 
+std::string Frontend::detokenize_bytes(std::span<const TokenId> token_ids) const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    return impl_->tokenizer->decode_bytes(token_ids);
+}
+
 ChatTokens Frontend::tokenize_chat(PromptInput input) const {
     if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
     const PromptOptions options           = input.options;
@@ -1221,6 +1234,8 @@ ChatTokens Frontend::tokenize_chat(PromptInput input) const {
     }
     return out;
 }
+
+void Frontend::warm_constraints() const { (void)impl_->grammars(); }
 
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,

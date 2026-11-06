@@ -320,6 +320,7 @@ infernix::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.preserve_thinking         = semantics.preserve_thinking;
     input.options.chat_template_kwargs_json = semantics.chat_template_kwargs_json;
     input.options.add_vision_id             = false;
+    input.options.open_tool_names           = request.open_tool_names;
     // Listed tools render in the prompt's tool section in request order; deferred ones only join
     // the output contract, so declaring one never changes the prompt.
     for (const ToolDefinition& tool : request.tools) {
@@ -356,10 +357,13 @@ infernix::RequestOptions to_request_options(const GenerationRequest& request,
     if (semantics.enable_thinking != false) {
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
-        // Without a budget, the answer room (thinking_answer_room_budget) is set once the prompt
-        // length, and so the room the context leaves, is known.
+        // The budget as set; GenerationService settles it against the answer room
+        // (settle_thinking_budget) once the prompt length, and so the room the context leaves, is known.
         // A token constraint owns every output step, so the guard's injected close has no room.
         if (request.token_constraint.empty()) { options.execution.thinking.loop = server.reasoning_loop; }
+        // A token constraint chooses every output step itself, the end of the turn included.
+        options.execution.thinking.end_turn_in_thinking =
+            server.end_turn_in_thinking || !request.token_constraint.empty();
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
@@ -369,20 +373,15 @@ infernix::RequestOptions to_request_options(const GenerationRequest& request,
     options.output.tolerant_tool_calls  = server.tolerant_tool_calls;
     options.stop.include_model_defaults = !request.ignore_eos;
     options.stop.token_ids              = request.stop_token_ids;
-    options.stop.strings.reserve(request.stop_strings.size() *
-                                 (request.stop_strings_apply_to_reasoning ? 2U : 1U));
+    // Client stop strings end the answer only: reasoning is the model's working, and a tool call's
+    // arguments are the tool's data (the output session does not match inside a call).
+    options.stop.strings.reserve(request.stop_strings.size());
     for (const std::string& stop : request.stop_strings) {
         if (!stop.empty()) {
             options.stop.strings.push_back(
                 infernix::StopString{.text              = stop,
                                    .channel           = infernix::OutputChannel::Content,
                                    .include_in_output = false});
-            if (request.stop_strings_apply_to_reasoning) {
-                options.stop.strings.push_back(
-                    infernix::StopString{.text              = stop,
-                                       .channel           = infernix::OutputChannel::Reasoning,
-                                       .include_in_output = false});
-            }
         }
     }
     return options;
@@ -409,6 +408,39 @@ std::optional<std::uint32_t> thinking_answer_room_budget(const ServeOptions& ser
         std::min(std::max(static_cast<std::uint32_t>(kThinkingAnswerRoomMinReserve), output_limit / 4U),
                  output_limit / 2U);
     return output_limit - reserve;
+}
+
+std::optional<std::uint32_t> settle_thinking_budget(const ServeOptions& server,
+                                                    std::optional<std::uint32_t> request_budget,
+                                                    std::uint32_t output_limit) {
+    const std::optional<std::uint32_t> room = thinking_answer_room_budget(server, output_limit);
+    if (request_budget) {
+        // The client's own budget stands unless the limit would end thinking before it.
+        return room && *request_budget >= output_limit ? room : request_budget;
+    }
+    if (server.default_thinking_budget) {
+        // The server's default serves every max_tokens a client sends: it never takes the answer's room.
+        return room ? std::min(*server.default_thinking_budget, *room) : server.default_thinking_budget;
+    }
+    return room;
+}
+
+std::optional<GenerationRequest> omit_tool_result_media(const GenerationRequest& req) {
+    std::optional<GenerationRequest> out;
+    for (std::size_t m = 0; m < req.messages.size(); ++m) {
+        if (req.messages[m].role != ChatRole::Tool) { continue; }
+        for (std::size_t p = 0; p < req.messages[m].content.size(); ++p) {
+            const ContentKind kind = req.messages[m].content[p].kind;
+            if (kind == ContentKind::Text) { continue; }
+            if (!out) { out = req; }
+            ContentPart& part = out->messages[m].content[p];
+            part.kind         = ContentKind::Text;
+            part.text = std::string(kind == ContentKind::Image ? kToolImageOmittedNote : kToolVideoOmittedNote);
+            part.type_raw = "text";
+            part.source   = {};
+        }
+    }
+    return out;
 }
 
 } // namespace infernix::serve

@@ -2,6 +2,7 @@
 
 #include "core/pdl.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/epilogue.cuh"
+#include "ops/softmax_attention/dense/causal_cache/bf16/packed_tile_io.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/split_policy.h"
 #include "ops/softmax_attention/common/causal_partition.h"
@@ -44,22 +45,36 @@ bf16_kv_load_grouped_tile(__nv_bfloat16* key_tile, __half* value_tile, const __n
 
 // Packed-query tiles and KV partitions are independent grid axes. Each KV row
 // has one append owner; all query CTAs read new rows from the immutable inputs. Tree instances
-// also apply the per-row ancestor masks of speculative verification trees.
-template <class G, class S, bool MultiBatch, bool Masked, class Input, bool Tree = false>
-__launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
+// also apply the per-row ancestor masks of speculative verification trees. Packed instances read the
+// packed BF16 storage (packed_tile_io.cuh: the same tiles, so the same bits); its rows are appended
+// before the call (no fused append). Their CTAs add kBf16pProducerWarps<S> producer warps after the MMA
+// warps: the producers copy the packed rows into a ring of tile buffers and decode them there in place
+// ahead of the MMA warps, so the decode overlaps the stream and the MMAs (one CTA an SM). Packed calls
+// of 65-96 query rows take a 96-row tile (six MMA warps, two producers), so one CTA decodes each tile.
+template <class G, class S, bool MultiBatch, bool Masked, class Input, bool Tree = false, bool Packed = false>
+__launch_bounds__(Packed ? S::kThreads + 32 * kBf16pProducerWarps<S> : S::kLaunchBoundThreads,
+                  Packed ? 1 : S::kMinBlocks) __global__
     void bf16_kv_grouped_mma_kernel(const __nv_bfloat16* q, Input input, const int* positions,
                                     typename Bf16KvCacheView<Input::writes_cache>::Key* cache_k,
                                     typename Bf16KvCacheView<Input::writes_cache>::Value* cache_v,
                                     const int* tables, const int* validity, const int* table_rows,
                                     int table_stride, int runtime_width, int visible_capacity,
                                     float scale, Bf16KvPartition partition,
-                                    CausalPartialView partial, const std::uint32_t* tree_masks) {
+                                    CausalPartialView partial, const std::uint32_t* tree_masks,
+                                    const std::uint8_t* key_side, const std::uint8_t* value_side) {
+    // Every input but the scale and the geometry is a kernel's output (q, the appended K/V, the cache and its
+    // tables): wait before any of them (a no-op unless the launch is a programmatic dependent, candidates §58).
+    pdl::enter_streaming();
+    static_assert(!(Packed && Input::writes_cache), "the packed storage appends before its attention");
     const int width = S::kFixedWidth ? S::kFixedWidth : runtime_width;
     constexpr int D = G::kHeadDim, M = S::kQueryRows, N = S::kKeyRows;
     constexpr int NK = N / S::kWarpsKV, QKNt = NK / 8, QKKs = D / 16;
     constexpr int PVNt = D / 8, PVKs = NK / 16;
-    using Storage = Bf16KvGroupedStorage<G, S>;
+    using Storage = Bf16KvGroupedStorage<G, S, Packed ? kBf16pTileRing : 1>;
     static_assert(sizeof(Storage) <= 99 * 1024);
+    // The queries stage in the K/V buffer; a packed instance's may span ring slots (QSlots of them, M <= 96).
+    constexpr int QSlots = (M + 2 * N - 1) / (2 * N);
+    static_assert(Packed ? QSlots < kBf16pTileRing : M <= 2 * N);
     Storage* storage;
     if constexpr (sizeof(Storage) <= 48 * 1024) {
         __shared__ Storage fixed;
@@ -133,6 +148,42 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
         neutral();
         return;
     }
+    // The page window: the table's pages from page_window on (a CTA's keys start at a multiple of N, so a tile
+    // lies in one page).
+    int page_window      = -Storage::kPageWindow;
+    const auto load_pages = [&](int logical_page) {
+        page_window          = logical_page;
+        const int page_count = min(Storage::kPageWindow, div_up(end, kPagedKVPageSize) - page_window);
+        for (int i = tid; i < page_count; i += S::kThreads)
+            storage->pages[i] = table[page_window + i];
+        __syncthreads();
+    };
+    // Packed: warps from S::kWarps on are producers (bf16p_kv_produce_tiles), from the kernel's start; the ring's full
+    // and empty barriers hand its tile buffers between them and the MMA warps, which alone run what follows (their
+    // queries pass through the ring's first QSlots slots, which they release on those slots' empty barriers).
+    using Ring = Bf16pTileRing<N, Packed ? kBf16pProducerWarps<S> : 1, Packed ? QSlots : 1>;
+    [[maybe_unused]] Ring* ring = nullptr;
+    if constexpr (Packed) {
+        __shared__ Ring shared_ring;
+        ring = &shared_ring;
+        if (tid == 0) ring->init(S::kWarps);
+        __syncthreads();
+        if (warp >= S::kWarps) {
+            bf16p_kv_produce_tiles<G, N, kBf16pProducerWarps<S>, QSlots>(
+                storage->qkv, *ring, reinterpret_cast<const std::uint8_t*>(cache_k),
+                reinterpret_cast<const std::uint8_t*>(cache_v), key_side, value_side, table, head, start, end,
+                load_end, warp - S::kWarps, lane);
+            return;
+        }
+    }
+    // The MMA warps' barrier: the CTA's, or theirs alone when producers run beside them.
+    [[maybe_unused]] const auto consumer_sync = [&]() {
+        if constexpr (Packed) {
+            asm volatile("bar.sync 1, %0;" : : "r"(S::kThreads) : "memory");
+        } else {
+            __syncthreads();
+        }
+    };
     for (int i = tid; i < M * (D / 8); i += S::kThreads) {
         const int row = i / (D / 8), d = i % (D / 8) * 8, packed = row_begin + row;
         const int token = packed / G::GroupSize, h = head * G::GroupSize + packed % G::GroupSize;
@@ -144,7 +195,7 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     }
     cp_commit();
     cp_wait<0>();
-    __syncthreads();
+    consumer_sync();
     unsigned q_frag[QKKs][4];
     const int a_row = warp_q * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
 #pragma unroll
@@ -153,7 +204,16 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
         ldmatrix_x4(q_frag[k][0], q_frag[k][1], q_frag[k][2], q_frag[k][3],
                     smem_addr(k_s + a_row * D + causal_swizzle(a_row, d)));
     }
-    __syncthreads();
+    if constexpr (Packed) {
+        // This warp's queries have left the ring's first QSlots slots.
+        __syncwarp();
+        if (lane == 0) {
+#pragma unroll
+            for (int slot = 0; slot < QSlots; ++slot) cta_mbarrier_arrive(ring->empty + slot);
+        }
+    } else {
+        __syncthreads();
+    }
     float acc[PVNt][4] = {};
     Bf16KvSoftmaxRow state[2];
     const float scale_log2 = scale * kLog2E;
@@ -165,36 +225,88 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     const std::uint32_t tree[2] = {
         tokens[0] < live ? causal_tree_mask<Tree>(tree_masks, batch, width, tokens[0]) : ~0u,
         tokens[1] < live ? causal_tree_mask<Tree>(tree_masks, batch, width, tokens[1]) : ~0u};
-    int page_window = -Storage::kPageWindow;
+    // A 96-row tile runs the rows of two of the plan's 64-row tiles: each warp stops where its 64-row tile's CTA
+    // stops (a key tile masked for all of a warp's rows still rescales their state by exp2 of a rounding residual),
+    // so the bits are the 64-row tiles'.
+    int warp_end = end;
+    if constexpr (M > 64) {
+        const int plan_begin = (row_begin + warp_q * 16) / 64 * 64;
+        warp_end = min(stop, first + min(width, div_up(plan_begin + 64, G::GroupSize)));
+    }
+    // The K and V fragments' shared addresses. causal_swizzle XORs a row's 16-byte chunk with row & 7, which in every
+    // fragment this lane loads is lane & 7: an address is a per-lane register (the XOR's result for the chunk's low
+    // three bits) plus a compile-time offset (the row block and chunk >> 3). No fragment load computes its address, and
+    // few registers stay live across the tile (the computed form kept dozens, and spilled them: up to 30 stores and
+    // loads a tile). Instances that never spilled measured 1-8 % slower in this form (their fragment loads sat right
+    // before their MMAs, where the address arithmetic had hidden the shared-memory latency): the packed 32-row tile,
+    // and on two-KV-head geometries the single-sequence fused append when masked (verification) or 32 rows wide. They
+    // keep the computed addresses and one K fragment a load.
+    constexpr bool LaneAddresses =
+        !((Packed && M == 32) || (G::KVHeads == 2 && Input::writes_cache && !MultiBatch && (Masked || M == 32)));
+    const unsigned swizzle = lane & 7, upper = (lane >> 3) & 1;
+    const unsigned k_lane  = (warp_kv * NK + (lane >> 4) * 8 + swizzle) * (2 * D);
+    const unsigned v_lane  = (warp_kv * NK + upper * 8 + swizzle) * (2 * D);
+    [[maybe_unused]] int t = 0;
     for (int k0 = start; k0 < end; k0 += N) {
-        const int logical_page = k0 >> kPagedKVPageShift;
-        if (logical_page >= page_window + Storage::kPageWindow) {
-            page_window = logical_page;
-            const int page_count =
-                min(Storage::kPageWindow, div_up(end, kPagedKVPageSize) - page_window);
-            for (int i = tid; i < page_count; i += S::kThreads)
-                storage->pages[i] = table[page_window + i];
+        if constexpr (Packed) {
+            const int slot = Ring::slot(t);
+            cta_mbarrier_wait(ring->full + slot, Ring::full_parity(t));
+            k_s = reinterpret_cast<__nv_bfloat16*>(storage->qkv + slot * (2 * N * D));
+            v_s = reinterpret_cast<__half*>(storage->qkv + slot * (2 * N * D) + N * D);
+            if constexpr (M > 64) {
+                if (k0 >= warp_end) {
+                    // Past this warp's 64-row tile: only hand the buffer back.
+                    __syncwarp();
+                    if (lane == 0) cta_mbarrier_arrive(ring->empty + slot);
+                    ++t;
+                    continue;
+                }
+            }
+        } else {
+            const int logical_page = k0 >> kPagedKVPageShift;
+            if (logical_page >= page_window + Storage::kPageWindow) load_pages(logical_page);
+            bf16_kv_load_grouped_tile<G, S>(k_s, v_s, cache_k, cache_v, input,
+                                            storage->pages[logical_page - page_window], head, k0, load_end,
+                                            first, tid);
+            cp_commit();
+            cp_wait<0>();
             __syncthreads();
         }
-        bf16_kv_load_grouped_tile<G, S>(k_s, v_s, cache_k, cache_v, input,
-                                        storage->pages[logical_page - page_window], head, k0,
-                                        load_end, first, tid);
-        cp_commit();
-        cp_wait<0>();
-        __syncthreads();
         float score[QKNt][4] = {};
-        // Q and O already occupy 192 registers per lane at D=256. Keep one
-        // K fragment live at a time; double buffering all N fragments spills.
+        // One ldmatrix x4 a k step and pair of key blocks: K rows warp_kv * NK + p * 16 + (lane >> 4) * 8 + lane & 7,
+        // chunk 2 k + upper, at kq[k & 3] + p * 16 rows + 128 * (k >> 2) bytes; its registers 0-1 are block 2 p's
+        // fragment, 2-3 block 2 p + 1's. Each score block still sums its k steps in order (the bits are unchanged).
+        const unsigned k_tile = smem_addr(k_s) + k_lane;
+        unsigned kq[4];
 #pragma unroll
-        for (int n = 0; n < QKNt; ++n) {
+        for (int q = 0; q < 4; ++q) kq[q] = k_tile + 16 * ((2 * q + upper) ^ swizzle);
+        // Q and O already occupy 192 registers per lane at D=256. Keep one
+        // K fragment (pair) live at a time; double buffering all N fragments spills.
+        if constexpr (LaneAddresses) {
 #pragma unroll
             for (int k = 0; k < QKKs; ++k) {
-                unsigned bf[2];
-                const int row = warp_kv * NK + n * 8 + (lane & 7);
-                const int d   = k * 16 + ((lane >> 3) & 1) * 8;
-                ldmatrix_x2(bf[0], bf[1], smem_addr(k_s + row * D + causal_swizzle(row, d)));
-                mma_bf16(score[n][0], score[n][1], score[n][2], score[n][3], q_frag[k][0],
-                         q_frag[k][1], q_frag[k][2], q_frag[k][3], bf[0], bf[1]);
+#pragma unroll
+                for (int p = 0; p < QKNt / 2; ++p) {
+                    unsigned bf[4];
+                    ldmatrix_x4(bf[0], bf[1], bf[2], bf[3], kq[k & 3] + p * (16 * 2 * D) + 128 * (k >> 2));
+                    mma_bf16(score[2 * p][0], score[2 * p][1], score[2 * p][2], score[2 * p][3], q_frag[k][0],
+                             q_frag[k][1], q_frag[k][2], q_frag[k][3], bf[0], bf[1]);
+                    mma_bf16(score[2 * p + 1][0], score[2 * p + 1][1], score[2 * p + 1][2], score[2 * p + 1][3],
+                             q_frag[k][0], q_frag[k][1], q_frag[k][2], q_frag[k][3], bf[2], bf[3]);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int n = 0; n < QKNt; ++n) {
+#pragma unroll
+                for (int k = 0; k < QKKs; ++k) {
+                    unsigned bf[2];
+                    const int row = warp_kv * NK + n * 8 + (lane & 7);
+                    const int d   = k * 16 + ((lane >> 3) & 1) * 8;
+                    ldmatrix_x2(bf[0], bf[1], smem_addr(k_s + row * D + causal_swizzle(row, d)));
+                    mma_bf16(score[n][0], score[n][1], score[n][2], score[n][3], q_frag[k][0],
+                             q_frag[k][1], q_frag[k][2], q_frag[k][3], bf[0], bf[1]);
+                }
             }
         }
         float maximum[2] = {-CUDART_INF_F, -CUDART_INF_F};
@@ -203,7 +315,7 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int key = k0 + warp_kv * NK + n * 8 + 2 * lid + (j & 1);
-                if (key >= end || key > qabs[j / 2] ||
+                if (key >= warp_end || key > qabs[j / 2] ||
                     (Tree && !causal_tree_visible(key, first, tree[j / 2])))
                     score[n][j] = -CUDART_INF_F;
                 maximum[j / 2] = fmaxf(maximum[j / 2], score[n][j]);
@@ -236,13 +348,17 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
         // Batched and read-only wide tiles benefit from paired V loads. Single-row
         // fused append uses scalar fragments to leave room for its input state.
         if constexpr (S::kWarpsQ >= 4 && (MultiBatch || !Input::writes_cache)) {
+            // V rows warp_kv * NK + k * 16 + upper * 8 + lane & 7, chunk n + (lane >> 4) (n even):
+            // vp[(n & 7) >> 1] + k * 16 rows + 128 * (n >> 3) bytes.
+            const unsigned v_tile = smem_addr(v_s) + v_lane, pair = lane >> 4;
+            unsigned vp[4];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) vp[q] = v_tile + 16 * ((2 * q + pair) ^ swizzle);
             unsigned vf[2][4];
             const auto load_v = [&](int i, int slot) {
                 const int k = i / (PVNt / 2), n = i % (PVNt / 2) * 2;
-                const int row = warp_kv * NK + k * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
-                const int d   = n * 8 + (lane >> 4) * 8;
                 ldmatrix_x4_t(vf[slot][0], vf[slot][1], vf[slot][2], vf[slot][3],
-                              smem_addr(v_s + row * D + causal_swizzle(row, d)));
+                              vp[(n & 7) >> 1] + k * (16 * 2 * D) + 128 * (n >> 3));
             };
             load_v(0, 0);
 #pragma unroll
@@ -255,21 +371,36 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
                         pf[k][1], pf[k][2], pf[k][3], vf[slot][2], vf[slot][3]);
             }
         } else {
-            // Limit live V fragments too; the grouped path is bandwidth-bound.
+            // Limit live V fragments too; the grouped path is bandwidth-bound. V rows as above, chunk n:
+            // vq[n & 7] + k * 16 rows + 128 * (n >> 3) bytes.
+            const unsigned v_tile = smem_addr(v_s) + v_lane;
+            unsigned vq[8];
+#pragma unroll
+            for (int q = 0; q < 8; ++q) vq[q] = v_tile + 16 * (q ^ swizzle);
 #pragma unroll
             for (int n = 0; n < PVNt; ++n) {
 #pragma unroll
                 for (int k = 0; k < PVKs; ++k) {
                     unsigned vf[2];
-                    const int row = warp_kv * NK + k * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
-                    const int d   = n * 8;
-                    ldmatrix_x2_t(vf[0], vf[1], smem_addr(v_s + row * D + causal_swizzle(row, d)));
+                    if constexpr (LaneAddresses) {
+                        ldmatrix_x2_t(vf[0], vf[1], vq[n & 7] + k * (16 * 2 * D) + 128 * (n >> 3));
+                    } else {
+                        const int row = warp_kv * NK + k * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
+                        ldmatrix_x2_t(vf[0], vf[1], smem_addr(v_s + row * D + causal_swizzle(row, n * 8)));
+                    }
                     mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[k][0], pf[k][1],
                             pf[k][2], pf[k][3], vf[0], vf[1]);
                 }
             }
         }
-        __syncthreads();
+        if constexpr (Packed) {
+            // This warp's reads of the buffer are done: the producers may refill it.
+            __syncwarp();
+            if (lane == 0) cta_mbarrier_arrive(ring->empty + Ring::slot(t));
+            ++t;
+        } else {
+            __syncthreads();
+        }
     }
     // The KV stream is done: a programmatic merge may begin launching as CTAs finish (it waits for
     // this grid before reading any partial).
@@ -279,7 +410,7 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     float m[2]    = {state[0].maximum * scale_log2, state[1].maximum * scale_log2};
     float sums[2] = {state[0].sum, state[1].sum};
     if constexpr (S::kWarpsKV > 1) {
-        __syncthreads();
+        consumer_sync();
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
             const int row = warp_kv * M + warp_q * 16 + gid + j * 8;
@@ -294,7 +425,7 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
                     make_float2(acc[n][j * 2], acc[n][j * 2 + 1]);
             }
         }
-        __syncthreads();
+        consumer_sync();
         if (warp_kv != 0) return;
 #pragma unroll
         for (int j = 0; j < 2; ++j) {

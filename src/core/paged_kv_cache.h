@@ -50,6 +50,9 @@ struct PagedKVLayerView {
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
     PagedKVWindowView window;
+    // Packed BF16 storage: the sequence's flag (device-visible host memory), which an append sets to 1 when a row
+    // has no packed form (ops/kv_cache/bf16p_codec.cuh); null where nothing reads it.
+    std::int32_t* unpackable = nullptr;
 };
 
 /** Non-owning multi-sequence view consumed by batched growing-cache Ops. */
@@ -63,6 +66,8 @@ struct PagedKVBatchLayerView {
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
     PagedKVWindowView window;
+    // Packed BF16 storage: one flag per execution table row, as PagedKVLayerView::unpackable.
+    std::int32_t* unpackable = nullptr;
 };
 
 /** Rebinds one checked single-sequence table row as a one-row batched view. */
@@ -138,6 +143,8 @@ public:
     DeviceKVPageHandle() noexcept = default;
 
     [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
+    // The same page of the same pool, under the same lease.
+    friend bool operator==(const DeviceKVPageHandle&, const DeviceKVPageHandle&) = default;
 
 private:
     friend class DeviceKVPagePool;
@@ -312,10 +319,14 @@ private:
 
     [[nodiscard]] bool valid_handle(DeviceKVPageHandle handle) const noexcept;
     [[nodiscard]] std::int32_t physical_index(DeviceKVPageHandle handle) const;
+    // One run of `count` consecutive physical pages from `first` whose host records advance by
+    // host_pitch: a HeadMajor plane copies head by head (one strided transfer of the run per head)
+    // or, when the run has fewer pages than the plane has heads and the head stride is within
+    // max_pitch, page by page (one strided transfer of the page's heads). Returns the copies issued.
     std::uint32_t copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin, std::size_t plane_end,
                                 std::int32_t first, std::size_t count, std::byte* host_base,
-                                std::size_t host_pitch, const HostKVPageLayout& host,
-                                cudaStream_t stream) const;
+                                std::size_t host_pitch, std::size_t max_pitch,
+                                const HostKVPageLayout& host, cudaStream_t stream) const;
     [[nodiscard]] static std::size_t host_record_run_end(std::span<const DeviceKVPageHandle> pages,
                                                          std::span<const std::byte* const> records,
                                                          std::span<const std::uint32_t> groups,

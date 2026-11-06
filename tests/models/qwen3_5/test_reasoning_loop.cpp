@@ -152,6 +152,33 @@ int main() {
         expect(periodic_tail(cjk(64)), "64-character period of 3-byte characters");
         expect(!periodic_tail(cjk(65)), "65-character period is beyond the limit");
     }
+    // A run-on of hyphen-joined words repeats nothing (Strata #5218): the chain measure follows
+    // `[A-Za-z]+(?:-[A-Za-z]+)+`.
+    {
+        expect(longest_hyphen_chain("") == 0 && longest_hyphen_chain("no hyphens here") == 0, "no chain");
+        expect(longest_hyphen_chain("a well-known self-check") == 10, "longest of two chains");
+        expect(longest_hyphen_chain("x-") == 0 && longest_hyphen_chain("-x") == 0, "a lone hyphen joins nothing");
+        expect(longest_hyphen_chain("ab--cd") == 0, "a double hyphen ends the chain");
+        expect(longest_hyphen_chain("state-of-the-art.") == 16, "punctuation ends the chain");
+        expect(longest_hyphen_chain("utf-8 x86-64") == 0, "digits break chains");
+        expect(longest_hyphen_chain("123e4567-e89b-12d3-a456-426614174000 snake_case-name") == 9,
+               "a UUID is no chain; an underscore ends one");
+        expect(longest_hyphen_chain(varied(300)) == 0, "varied prose has no chain");
+        static const char* parts[] = {"so",   "then", "we",    "need", "to",    "check", "maybe", "again",
+                                      "the",  "list", "value", "is",   "fine",  "but",   "wait",  "hmm",
+                                      "okay", "and",  "next",  "edge", "case",  "right", "now",   "sure"};
+        std::string run_on = varied(40) + " ";
+        unsigned state     = 11;
+        for (int i = 0; i < 120; ++i) {
+            state = state * 1103515245U + 12345U;
+            run_on += (i == 0 ? "" : "-") + std::string(parts[(state >> 8) % 24]);
+        }
+        const std::size_t chain = longest_hyphen_chain(run_on);
+        expect(chain >= kLoopRunOnChars, "run-on chain " + std::to_string(chain));
+        expect(repeated_passage_coverage(words_of(varied(200) + run_on)) < kLoopCoverage,
+               "a run-on is not repeated passages");
+        expect(!periodic_tail(run_on), "a run-on is not periodic");
+    }
     // The tail stays bounded and keeps its characters however the bytes arrive.
     {
         std::string tail;

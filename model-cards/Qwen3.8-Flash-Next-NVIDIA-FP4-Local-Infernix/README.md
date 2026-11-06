@@ -55,7 +55,7 @@ n-gram volume on an NVMe drive and pass it with `--ngram-volume`. Any of the oth
 [Qwen3.8-Flash-Next n-gram tables](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix#ple-n-gram-tables)
 also runs this model.
 
-This version (2026-10-24) needs an Infernix build from GitHub `main` at commit `257789da` or later, which
+This version (2026-10-24) needs an Infernix build from GitHub `main` at commit `51bdd498` or later, which
 runs the vision MLPs in NVFP4; with an older build, update Infernix first.
 
 ## DFlash2 drafting
@@ -71,7 +71,8 @@ infernix-serve <this model's part 1>.infernix --spec dflash2 \
   --draft-model <dir>/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto
 ```
 
-It needs an Infernix build whose `--help` lists `--draft-model`; see the drafter's card for details.
+It needs an Infernix build whose `--help` lists `--draft-model`; builds from 2026-10-31 also find it
+in the model's folder by themselves when no `--spec` is given. See the drafter's card for details.
 
 ## What is bit-exact and what is converted
 
@@ -102,8 +103,14 @@ and no tensor rounded.
 infernix-serve Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-00003.infernix \
   --ngram-volume Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram --kv-dtype int8 \
   --max-context 262144 --max-concurrency 2 \
-  --spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft
+  --spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft \
+  --vram-past-budget
 ```
+
+`--vram-past-budget` (Windows) also gives the expert cache the ~0.6 GiB of VRAM the per-process
+budget withholds; leave it out when another program needs that memory. Infernix builds from
+2026-10-31 speculate even without `--spec` (`--spec auto`): with DFlash2 when its drafter is the only
+one in the model's folder, else with MTP.
 
 The DFlash2 drafter is
 [Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix);

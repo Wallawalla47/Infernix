@@ -2,6 +2,7 @@
 
 #include "runtime/contract/request.h"
 #include "runtime/contract/timing.h"
+#include <atomic>
 #include <compare>
 #include <cstdint>
 #include <span>
@@ -32,15 +33,41 @@ enum class PendingRowFailure : std::uint8_t {
     // The row's emitted tokens reach a position where its grammar admits no token.
     ConstraintDeadEnd,
     // The round's sampler found no finite logit to select from (ops::SamplingConfig::nonfinite):
-    // the row's tokens are placeholders.
+    // the row's tokens are placeholders. The Program withdraws the prefix-cache entries the
+    // request published (hybrid-prefix-cache-spec §7.8): its state may be non-finite too.
     NonFiniteLogits,
+    // The packed BF16 KV storage (--kv-dtype bf16p) met a K or V row of the request with no
+    // packed form (more values outside its exponent window than the row's record holds): its KV
+    // is not the bf16 storage's, so its tokens are not either. The Program withdraws what the
+    // request published, as for NonFiniteLogits.
+    UnpackableKv,
 };
+
+namespace testing {
+// Fault injection for engine-level tests: the `rows`-th later row a Program checks for a failure (one
+// per row of a sampled round, the prompt's first token included; process-wide) reports non-finite
+// logits, as a NaN reaching the sampler would. 0 disarms.
+inline std::atomic<std::uint32_t>& nonfinite_fault_rows() noexcept {
+    static std::atomic<std::uint32_t> rows{0};
+    return rows;
+}
+inline void set_nonfinite_fault(std::uint32_t rows) noexcept { nonfinite_fault_rows().store(rows); }
+// Consumes one row check; true on the armed one.
+[[nodiscard]] inline bool take_nonfinite_fault() noexcept {
+    std::uint32_t left = nonfinite_fault_rows().load(std::memory_order_relaxed);
+    while (left != 0) {
+        if (nonfinite_fault_rows().compare_exchange_weak(left, left - 1)) { return left == 1; }
+    }
+    return false;
+}
+} // namespace testing
 
 // Borrowed for one synchronous Program call. Engine maps compact rows to request-owned matchers.
 class TokenMaskProvider {
 public:
     virtual ~TokenMaskProvider()                                           = default;
     [[nodiscard]] virtual bool constrained(std::size_t row) const noexcept = 0;
+    [[nodiscard]] virtual ReasoningBan reasoning_ban(std::size_t /*row*/) const noexcept { return {}; }
     // Returns dead-end position bits. Even dead/unreachable positions receive a safe nonempty
     // device mask. A dead end fails a row only if verification reaches that position.
     [[nodiscard]] virtual std::uint64_t fill(std::size_t row, std::span<const TokenId> drafts,

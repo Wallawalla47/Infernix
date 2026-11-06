@@ -1,6 +1,7 @@
 #include "infernix/ops/rows.h"
 
 #include "core/device.h"
+#include "core/grid_rows.h"
 #include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
@@ -29,30 +30,46 @@ bool contiguous_bf16(const Tensor& t) {
     return t.data != nullptr && t.dtype == DType::BF16 && t.is_contiguous() && t.ne[2] == 1 && t.ne[3] == 1;
 }
 
-__global__ void split_kernel(const __nv_bfloat16* __restrict__ in, int rows, SplitTargets targets) {
+// The output holding row `row`: the last one beginning at or before it (an empty output begins where the next one
+// does, which then wins). The scan is unrolled over constant indices, so `targets` stays in the parameter bank; the
+// former `while` over a runtime index copied all 104 bytes of it to local memory in every thread.
+struct SplitTarget {
+    __nv_bfloat16* data;
+    int begin, width;
+};
+__device__ __forceinline__ SplitTarget split_target(const SplitTargets& targets, int row) {
+    SplitTarget out{targets.data[0], 0, targets.begin[1]};
+#pragma unroll
+    for (int i = 1; i < kMaxOutputs; ++i) {
+        if (row >= targets.begin[i]) { out = {targets.data[i], targets.begin[i], targets.begin[i + 1] - targets.begin[i]}; }
+    }
+    return out;
+}
+
+// The split kernels give each row of blocks every gridDim.y-th column (core/grid_rows.h).
+__global__ void split_kernel(const __nv_bfloat16* __restrict__ in, int rows, int columns, SplitTargets targets) {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
     if (r >= rows) { return; }
-    int i = 0;
-    while (r >= targets.begin[i + 1]) { ++i; }
-    const int width = targets.begin[i + 1] - targets.begin[i];
-    targets.data[i][static_cast<std::size_t>(t) * width + (r - targets.begin[i])] =
-        in[static_cast<std::size_t>(t) * rows + r];
+    const SplitTarget target = split_target(targets, r);
+    for (int t = blockIdx.y; t < columns; t += gridDim.y) {
+        target.data[static_cast<std::size_t>(t) * target.width + (r - target.begin)] =
+            in[static_cast<std::size_t>(t) * rows + r];
+    }
 }
 
 // Eight rows (16 bytes) per thread: every output boundary, the row count and every pointer are
 // multiples of eight elements, so a thread's rows lie in one output and both accesses are aligned.
-__global__ void split_vector_kernel(const uint4* __restrict__ in, int rows8, SplitTargets targets) {
+__global__ void split_vector_kernel(const uint4* __restrict__ in, int rows8, int columns, SplitTargets targets) {
     pdl::enter(); // launched as a programmatic dependent
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
     if (r >= rows8) { return; }
-    const int row = r * 8;
-    int i         = 0;
-    while (row >= targets.begin[i + 1]) { ++i; }
-    const int width = targets.begin[i + 1] - targets.begin[i];
-    auto* out       = reinterpret_cast<uint4*>(targets.data[i]);
-    out[(static_cast<std::size_t>(t) * width + (row - targets.begin[i])) / 8] = in[static_cast<std::size_t>(t) * rows8 + r];
+    const int row            = r * 8;
+    const SplitTarget target = split_target(targets, row);
+    auto* out                = reinterpret_cast<uint4*>(target.data);
+    for (int t = blockIdx.y; t < columns; t += gridDim.y) {
+        out[(static_cast<std::size_t>(t) * target.width + (row - target.begin)) / 8] =
+            in[static_cast<std::size_t>(t) * rows8 + r];
+    }
 }
 
 __global__ void gather_kernel(const __nv_bfloat16* __restrict__ in, int rows,
@@ -83,13 +100,14 @@ void split_rows(const Tensor& in, std::span<Tensor* const> outs, cudaStream_t st
     for (std::size_t i = 0; i < outs.size(); ++i) {
         vector = vector && targets.begin[i + 1] % 8 == 0 && aligned(targets.data[i]);
     }
+    const int columns = static_cast<int>(in.ne[1]);
     if (vector) {
         const int rows8 = in.ne[0] / 8;
-        CUDA_CHECK(pdl::launch_consumer({dim3((rows8 + kThreads - 1) / kThreads, in.ne[1]), dim3(kThreads), 0, stream},
-                                        split_vector_kernel, static_cast<const uint4*>(in.data), rows8, targets));
+        CUDA_CHECK(pdl::launch_consumer({dim3((rows8 + kThreads - 1) / kThreads, grid_rows(columns)), dim3(kThreads), 0, stream},
+                                        split_vector_kernel, static_cast<const uint4*>(in.data), rows8, columns, targets));
     } else {
-        split_kernel<<<dim3((in.ne[0] + kThreads - 1) / kThreads, in.ne[1]), kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(in.data), in.ne[0], targets);
+        split_kernel<<<dim3((in.ne[0] + kThreads - 1) / kThreads, grid_rows(columns)), kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(in.data), in.ne[0], columns, targets);
     }
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) { throw std::runtime_error(std::string("split_rows: ") + cudaGetErrorString(error)); }

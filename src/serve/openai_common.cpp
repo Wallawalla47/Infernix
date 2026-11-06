@@ -272,7 +272,9 @@ std::string make_error_body(const ApiError& error) {
     Json rendered     = {{"message", error.message}, {"type", error.type}};
     rendered["param"] = error.param.empty() ? Json(nullptr) : Json(error.param);
     rendered["code"]  = error.code.empty() ? Json(nullptr) : Json(error.code);
-    return Json{{"error", std::move(rendered)}}.dump();
+    // A message may quote client bytes that are not UTF-8 (an id from the URL path): they are replaced, so the
+    // error is reported rather than becoming a serialization failure (a 500 in place of a 404).
+    return Json{{"error", std::move(rendered)}}.dump(-1, ' ', false, Json::error_handler_t::replace);
 }
 
 std::int64_t unix_time_now() {

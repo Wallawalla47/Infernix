@@ -177,8 +177,8 @@ __device__ __forceinline__ void issue_first_unit(StagedRows<F>& st, Row row, int
 }
 
 // The sums of unit u (its first `unit_slices` slices) of rows g and g + 8, whose bytes rg and rg8
-// hold in shared memory (any alignment): accumulate's arithmetic, block by block.
-template <QType F>
+// hold in shared memory (any alignment; A2: every block starts 2-byte aligned): accumulate's arithmetic, block by block.
+template <QType F, bool A2 = false>
 __device__ __forceinline__ void unit_sums(I128 (&acc)[4], const std::uint8_t* rg, const std::uint8_t* rg8, int u,
                                           int unit_slices, const std::int32_t* bcol, const std::int32_t* xs0,
                                           const std::int32_t* xs1, int t) {
@@ -199,8 +199,8 @@ __device__ __forceinline__ void unit_sums(I128 (&acc)[4], const std::uint8_t* rg
             for (int j = 0; j < kBlockSlices; ++j) {
                 const int e  = (b0 + j) * 32 + 8 * t; // element of the unit
                 const int s  = u * (kUnitElems / 32) + b0 + j;
-                const tile::TileChunk cg = tile::tile_chunk<F>(rg + e / kBlockElems * kBlockBytes, e % kBlockElems / 8);
-                const tile::TileChunk ch = tile::tile_chunk<F>(rg8 + e / kBlockElems * kBlockBytes, e % kBlockElems / 8);
+                const tile::TileChunk cg = tile::tile_chunk<F, fast::DeviceCodebook<F>, A2>(rg + e / kBlockElems * kBlockBytes, e % kBlockElems / 8);
+                const tile::TileChunk ch = tile::tile_chunk<F, fast::DeviceCodebook<F>, A2>(rg8 + e / kBlockElems * kBlockBytes, e % kBlockElems / 8);
                 const std::int32_t* bs = bcol + static_cast<std::size_t>(s) * fast::kSliceWords;
                 int2 b[3];
 #pragma unroll
@@ -286,7 +286,7 @@ __device__ __forceinline__ void unit_sums(I128 (&acc)[4], const std::uint8_t* rg
 // multiplies every tile's B fragments (bcol[nt], xs0[nt], xs1[nt] as unit_sums' for tile nt's columns),
 // so a call of 9-16 columns reads and decodes its weights once instead of in four-column passes. Every
 // tile's integers are unit_sums'.
-template <QType F, int NT>
+template <QType F, int NT, bool A2 = false>
 __device__ __forceinline__ void unit_sums_columns(I128 (*acc)[4], const std::uint8_t* rg, const std::uint8_t* rg8, int u,
                                                   int unit_slices, const std::int32_t* const* bcol,
                                                   const std::int32_t* const* xs0, const std::int32_t* const* xs1, int t) {
@@ -310,8 +310,8 @@ __device__ __forceinline__ void unit_sums_columns(I128 (*acc)[4], const std::uin
         for (int j = 0; j < kBlockSlices; ++j) {
             const int e  = (b0 + j) * 32 + 8 * t; // element of the unit
             const int s  = u * (kUnitElems / 32) + b0 + j;
-            const tile::TileChunk cg = tile::tile_chunk<F>(rg + e / kBlockElems * kBlockBytes, e % kBlockElems / 8);
-            const tile::TileChunk ch = tile::tile_chunk<F>(rg8 + e / kBlockElems * kBlockBytes, e % kBlockElems / 8);
+            const tile::TileChunk cg = tile::tile_chunk<F, fast::DeviceCodebook<F>, A2>(rg + e / kBlockElems * kBlockBytes, e % kBlockElems / 8);
+            const tile::TileChunk ch = tile::tile_chunk<F, fast::DeviceCodebook<F>, A2>(rg8 + e / kBlockElems * kBlockBytes, e % kBlockElems / 8);
             if constexpr (tile::kHalfSub<F>) {
                 const int packed = (cg.sub & 0xFFFF) | (ch.sub << 16);
                 const int other  = __shfl_xor_sync(0xFFFFFFFFU, packed, 2);

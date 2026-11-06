@@ -1383,6 +1383,12 @@ void lower_tools(const Json& body, GenerationRequest& request,
         }
         request.tools.push_back(std::move(tool.definition));
     }
+    // A deferred tool without a server tool search is a client deferring behind its own search
+    // (Claude Code's DeferredToolPlaceholder for its MCP tools, which its system reminder names): a
+    // direct call to one of those names is the client's to answer, not text. A server search's
+    // deferred tools are all declared, so its name set stays closed.
+    request.open_tool_names = searches.empty() && std::any_of(request.tools.begin(), request.tools.end(),
+                                                              [](const ToolDefinition& tool) { return tool.deferred; });
 }
 
 void parse_thinking(const Json& body, GenerationRequest& request) {
@@ -1399,24 +1405,29 @@ void parse_thinking(const Json& body, GenerationRequest& request) {
     } else if (type == "enabled") {
         request.enable_thinking         = true;
         const std::optional<int> budget = optional_int(thinking, "budget_tokens");
-        if (!budget || *budget < 1024) {
-            bad_request("thinking.budget_tokens must be an integer of at least 1024", "thinking");
+        // Unlike the Anthropic API, budget_tokens may be absent (ZCode sends none): thinking is on with the
+        // server's default budget (--default-thinking-budget, none unless set), as with adaptive.
+        if (budget) {
+            if (*budget < 1024) {
+                bad_request("thinking.budget_tokens must be an integer of at least 1024", "thinking");
+            }
+            // Unlike the Anthropic API, a budget at or above max_tokens is accepted, and the answer
+            // room takes its place (settle_thinking_budget): the output limit would end thinking
+            // first, with no answer. Clients such as Qwen Code send a fixed budget while shrinking
+            // max_tokens to the context window left.
+            request.thinking_budget = static_cast<std::uint32_t>(*budget);
         }
-        // Unlike the Anthropic API, a budget at or above max_tokens is accepted: the output limit
-        // is reached before the budget, so it never takes effect. Clients such as Qwen Code send
-        // a fixed budget while shrinking max_tokens to the context window left.
-        request.thinking_budget = static_cast<std::uint32_t>(*budget);
     } else {
         bad_request("thinking.type must be 'disabled', 'adaptive', or 'enabled'", "thinking");
     }
 
     if (thinking.contains("display") && !thinking.at("display").is_null()) {
         if (!thinking.at("display").is_string()) {
-            bad_request("thinking.display must be 'summarized' or 'omitted'", "thinking");
+            bad_request("thinking.display must be 'summarized', 'omitted' or 'updates'", "thinking");
         }
         const std::string display = thinking.at("display").get<std::string>();
-        if (display != "summarized" && display != "omitted") {
-            bad_request("thinking.display must be 'summarized' or 'omitted'", "thinking");
+        if (display != "summarized" && display != "omitted" && display != "updates") {
+            bad_request("thinking.display must be 'summarized', 'omitted' or 'updates'", "thinking");
         }
         if (type == "disabled") {
             bad_request("thinking.display is valid only when thinking is adaptive or enabled",
@@ -1425,10 +1436,14 @@ void parse_thinking(const Json& body, GenerationRequest& request) {
     }
 }
 
-bool thinking_display_omitted(const Json& body) {
+// display:"omitted", and the beta display:"updates" (Anthropic: reasoning blocks empty as under "omitted", plus the
+// progress-update blocks some models write between tool calls, which Qwen models do not): the reasoning travels in the
+// signature only.
+bool thinking_display_hidden(const Json& body) {
     if (!body.contains("thinking") || !body.at("thinking").is_object()) { return false; }
     const Json& thinking = body.at("thinking");
-    return thinking.contains("display") && thinking.at("display") == "omitted";
+    return thinking.contains("display") &&
+           (thinking.at("display") == "omitted" || thinking.at("display") == "updates");
 }
 
 void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose purpose) {
@@ -1610,7 +1625,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
 
     result.tool_searches = parse_common_prompt(body, result.generation, ParsePurpose::Messages,
                                                limits.claude_code_prompt);
-    result.hide_thinking = thinking_display_omitted(body);
+    result.hide_thinking = thinking_display_hidden(body);
     parse_generation_fields(body, result.generation);
     parse_structured_outputs(body, result.generation);
     return result;

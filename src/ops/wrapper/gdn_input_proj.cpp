@@ -11,7 +11,6 @@
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 #include "ops/gdn_input_proj/q8/q8_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/q8/q8_gdn_input_plan.h"
-#include "ops/linear/q8/q8_f16acc.h"
 #include "ops/linear/q8/q8_shapes.h"
 #include "ops/linear/fp8/fp8_geometry.h"
 #include "ops/linear/fp8/fp8_format.h"
@@ -412,14 +411,6 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
                 detail::launch_q8_n16384_k2560_split(x_column, weight, qkv_column, z_column,
                                                      LinearRoutes::Exact, stream);
             }
-            return;
-        }
-        if (has_route(routes, LinearRoutes::F16Accumulate) && detail::q8_f16acc_admits(weight.n, weight.k, cols) &&
-            weight.padded_shape[1] == weight.k) {
-            if (workspace == nullptr) {
-                throw std::invalid_argument("q8 gdn_input_proj: the f16-accumulate route requires caller workspace");
-            }
-            detail::q8_gdn_input_f16acc(x, weight, qkv, z, *workspace, stream);
             return;
         }
         detail::launch_q8_n16384_k2560_split(x, weight, qkv, z, routes, stream);
@@ -893,9 +884,8 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
         return column_invariant(policy) ? 0 : detail::mxfp8_gdn_input_workspace_capacity_bytes(max_tokens);
     }
     if (parent_qtype == QType::Q8_G32_FP16 && parent_rows == 16384 && input_rows == 2560) {
-        // The exact routes and the column-by-column one need none; the f16-accumulate route (the query
-        // takes no route flags) its encoded activation.
-        return column_invariant(policy) ? 0 : detail::q8_f16acc_workspace_capacity_bytes(parent_rows, input_rows, max_tokens);
+        // The exact routes and the column-by-column one need none.
+        return 0;
     }
     if (parent_qtype == QType::Q8_G32_FP16 && parent_rows == 12288 && input_rows == 2048) {
         (void)detail::q8_gdn_input_resolve_plan(

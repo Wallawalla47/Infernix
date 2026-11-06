@@ -14,7 +14,7 @@ namespace infernix::ops::detail {
 void causal_column_valid_launch(const Tensor& counts, Tensor& flags, std::int32_t width,
                                 std::int32_t batch, cudaStream_t stream);
 
-// The rows variant of that round (INFERNIX_TMP_VERIFY_ROWS_ATTENTION) runs every column as a row of
+// The rows variant of that round (BF16, INT8, FP8, NVFP4 and K8V4 KV) runs every column as a row of
 // one launch: rows [width][batch] receives row b's KV table row (table_rows[b], or 0 when the call
 // has no table rows) for each column, so a column-major row reads its round row's pages.
 void causal_column_table_rows_launch(const Tensor& table_rows, Tensor& rows, std::int32_t width,

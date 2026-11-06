@@ -122,21 +122,26 @@ GdnReplayRecords::GdnReplayRecords(DeviceSpan backing, const GdnReplayRecordLayo
     validate_layout(layout);
 }
 
-GdnReplayRecords GdnReplayRecords::narrowed(std::int32_t width) const {
+GdnReplayRecords GdnReplayRecords::narrowed(std::int32_t width, std::int32_t rows) const {
     validate_spec(spec);
     if (width <= 0 || width > spec.width) {
         throw std::invalid_argument("GDN replay narrowed width must be in [1,spec.width]");
+    }
+    if (rows <= 0 || rows > kMaximumRecordCapacity ||
+        static_cast<std::int64_t>(width) * rows > static_cast<std::int64_t>(spec.width) * spec.record_capacity) {
+        throw std::invalid_argument("GDN replay narrowed rows must fit the storage's columns a layer");
     }
     for (const Tensor* plane : {&conv, &key, &value, &gate}) {
         if (plane->data == nullptr || !plane->is_contiguous()) {
             throw std::invalid_argument("GDN replay narrowed view requires bound dense planes");
         }
     }
-    const std::int32_t outer = checked_outer_extent(spec);
     GdnReplayRecords result;
-    result.spec       = spec;
-    result.spec.width = width;
-    result.conv       = Tensor(conv.data, DType::BF16, {spec.conv_channels, width, outer});
+    result.spec                 = spec;
+    result.spec.width           = width;
+    result.spec.record_capacity = rows;
+    const std::int32_t outer    = checked_outer_extent(result.spec);
+    result.conv                 = Tensor(conv.data, DType::BF16, {spec.conv_channels, width, outer});
     result.key   = Tensor(key.data, DType::BF16, {spec.key_dim, spec.qk_heads, width, outer});
     result.value = Tensor(value.data, DType::BF16, {spec.value_dim, spec.value_heads, width, outer});
     result.gate  = Tensor(gate.data, DType::FP32, {2, spec.value_heads, width, outer});

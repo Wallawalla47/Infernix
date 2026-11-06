@@ -122,13 +122,20 @@ enum class ExpertActivation : std::uint8_t { kA4, kA16 };
 // row to two NVFP4 terms (the row's NVFP4 and the NVFP4 of its remainder, one FP32 row scale) and runs
 // them on the FP4 Tensor Cores, so its outputs depend on that rounding and on the tensor core's FP32
 // order, not only on the weights; kA4Residual3, the same with three terms (the third encodes what two
-// left: more precise, slower); kGgmlBf16 (GGUF banks, the ggml-bf16-prefill fast path), BF16 tiles over
-// each expert's decoded planes with x and h as stored and FP32 sums (ops/ggml/ggml_bf16_tile.cuh).
+// left: more precise, slower); kGgmlBf16 (GGUF banks, the ggml-bf16-prefill fast path), in calls of at least
+// wide::kGgmlStageDecodeMinColumns columns BF16 tiles that decode each expert's codes per K stage, with x and h
+// as stored and FP32 sums (ops/ggml/ggml_bf16_tile.cuh compute_decode); narrower calls keep the exact tiles.
 // Every other bank ignores the value it does not name. kLossless (every bank, A4 banks too, GPU only)
 // is the --lossless route (docs/maintainer/lossless-route.md): x as stored times each weight's exact
 // value (an NVFP4 bank's multipliers in ExpertScales::alpha_*), every projection's exact sum correctly
-// rounded to BF16, h = bf16(bf16(silu(y_gate)) y_up) (ops::lossless_linear_tiles).
-enum class WideA16 : std::uint8_t { kExact, kA4Residual, kA4Residual3, kGgmlBf16, kLossless };
+// rounded to BF16, h = bf16(bf16(silu(y_gate)) y_up) (ops::lossless_linear_tiles). kA8 (--a8-activations at
+// prefill widths, LOSSY, opt-in; GGUF banks with MoeGgmlBank::a8, NVFP4 W4A16 banks with NarrowA16::kA8, at either
+// registered geometry): a call of more than nvfp4_a8::kMaxCallColumns (128) columns stays on 8-bit activations
+// (ops/ggml/ggml_a8.h's codec): its jobs of at most kMaxColumns columns on the 8-bit narrow kernels, its wider jobs
+// on int8 tensor-core tiles (ops/ggml/ggml_a8_tile.cuh for GGUF banks, cuda/wide_expert_a8.cuh for NVFP4 banks)
+// whose FP32 sums take a fixed per-output order, so a wide job's bits depend on neither placement nor its column
+// count but are not the narrow kernels'; the workspace is kExact's.
+enum class WideA16 : std::uint8_t { kExact, kA4Residual, kA4Residual3, kGgmlBf16, kLossless, kA8 };
 
 // The narrow route of 16-bit-activation experts (calls of at most kMaxColumns columns per expert:
 // decode and verification) and of the CPU engine: kExact, the exact limb arithmetic of §16.2.1;
@@ -136,8 +143,11 @@ enum class WideA16 : std::uint8_t { kExact, kA4Residual, kA4Residual3, kGgmlBf16
 // each x and h row as two NVFP4 terms with one FP32 row scale (canon::a4r_block_terms, the wide
 // route's encoding) and the terms' products summed exactly in int64 (canon::a4r_row_output), so the
 // GPU narrow kernels and the CPU engine give the same bits and an expert's output does not depend
-// on where it is computed. Wide calls follow WideA16.
-enum class NarrowA16 : std::uint8_t { kExact, kA4Residual };
+// on where it is computed. Wide calls follow WideA16. kA8 (--a8-activations, LOSSY, opt-in; NVFP4 W4A16
+// banks off the lossless route): a call of at most nvfp4_a8::kMaxCallColumns columns runs every job on the
+// 8-bit activation kernels (../nvfp4_a8.h; the CPU engine's w4a8_expert.h for its misses, MissRequest::a8),
+// whatever its column count; wider calls keep kExact's routes, or WideA16::kA8's.
+enum class NarrowA16 : std::uint8_t { kExact, kA4Residual, kA8 };
 
 // The design reference's routed-expert activations (kLossless only; docs/maintainer/lossless-route.md §3b):
 // none (the lossless route's x as stored), or a W4A4 bank's declared A4 inputs, each column quantized with
@@ -159,8 +169,13 @@ void rg16_row_sums(CpuIsa isa, const std::uint8_t* matrix, int blocks, int rg_be
                    const canon::A4Block* const* acts, int ncols, std::int64_t* out,
                    int prefetch_bytes = kDefaultPrefetchBytes);
 
-// Quantizes a BF16 vector of `n` (a multiple of 16) elements to A4 blocks.
-void quantize_a4(const std::uint16_t* v, int n, float input_scale, canon::A4Block* out);
+// Quantizes a BF16 vector of `n` (a multiple of 16) elements to A4 blocks: canon::quantize_a4_block
+// per block, eight blocks at a time in AVX2 on the vector ISAs, bit for bit.
+void quantize_a4(CpuIsa isa, const std::uint16_t* v, int n, float input_scale, canon::A4Block* out);
+
+// h[i] = canon::swiglu_bf16(g[i], u[i]) for i < n, eight at a time in AVX2 on the vector ISAs, bit
+// for bit (the SwiGLU of every CPU expert route: NVFP4, GGUF and block FP8).
+void swiglu_bf16_n(CpuIsa isa, const std::uint16_t* g, const std::uint16_t* u, int n, std::uint16_t* h);
 
 // Phase A for 16-intermediate units [unit_begin, unit_end): gate/up rows, SwiGLU, and A4 of h
 // with the down input scale. `x_gate[col]` / `x_up[col]` are x quantized with the gate and up

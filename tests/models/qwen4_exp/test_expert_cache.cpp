@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <cstdio>
 #include <fstream>
@@ -162,6 +163,57 @@ void test_budgeted_admission() {
     check(named == scanned, "a scan names the partial sort's first resident");
     std::printf("budgeted LFRU step at 9,000 residents: %.2f us; one sort-based victim selection: %.2f us\n",
                 us / kSteps, us_sort / kSteps);
+}
+
+// The victim search's low set (more residents than LfruPolicy::kLowSize): every step's victims are the lowest
+// (score, key) residents outside its group, as a scan of every resident orders them, across the set's rebuilds, a
+// shifting hot set, halving periods, credits, and each admission path (budgets 0 to unlimited, an eviction gate).
+void test_low_set() {
+    std::mt19937 rng(9);
+    const LfruPolicy::Admissible gate = [](std::uint32_t) { return true; };
+    for (const std::uint32_t halving : {0U, 300U}) {
+        LfruPolicy policy(24576, 3000, halving);
+        LfruPolicy::Step step;
+        std::size_t checked = 0;
+        for (int i = 0; i < 6000; ++i) {
+            std::set<std::uint32_t> g;
+            const auto hot = static_cast<std::uint32_t>(i / 1000) * 3000;
+            while (g.size() < 24) { g.insert((hot + static_cast<std::uint32_t>(rng() % 6000)) % 24576); }
+            const std::vector<std::uint32_t> group(g.begin(), g.end());
+            if (i % 97 == 0 && policy.resident_count() > 0) { // a prompt's credit of some residents
+                std::vector<std::uint32_t> keys;
+                std::vector<double> amounts;
+                for (int c = 0; c < 8; ++c) {
+                    keys.push_back(policy.residents()[rng() % policy.resident_count()]);
+                    amounts.push_back(0.25 * static_cast<double>(1 + rng() % 8));
+                }
+                policy.credit(keys, amounts);
+            }
+            const std::size_t budget = i % 4 == 3 ? static_cast<std::size_t>(-1) : static_cast<std::size_t>(i % 4);
+            policy.step(group, step, budget, nullptr, i % 8 == 7 ? &gate : nullptr);
+            if (step.victims.empty()) { continue; }
+            // Evictions leave the other scores unchanged: every resident outside the group ranks above every victim.
+            double top_score     = -1;
+            std::uint32_t top_key = 0;
+            for (const std::uint32_t v : step.victims) {
+                check(!g.count(v) && !policy.resident(v), "a victim is outside the group and evicted");
+                const double s = policy.score(v);
+                if (s > top_score || (s == top_score && v > top_key)) {
+                    top_score = s;
+                    top_key   = v;
+                }
+            }
+            for (const std::uint32_t r : policy.residents()) {
+                if (g.count(r)) { continue; }
+                const double s = policy.score(r);
+                check(s > top_score || (s == top_score && r > top_key), "victims are the lowest (score, key) residents");
+            }
+            checked += step.victims.size();
+            if (g_failures) { return; }
+        }
+        std::printf("low set (halving %u): %zu victims checked\n", halving, checked);
+        check(checked > 2000, "the low-set run evicted enough victims");
+    }
 }
 
 void test_frame_epochs() {
@@ -514,6 +566,59 @@ void test_lending() {
     check(threw, "a frame is given back only while lent");
 }
 
+// The SSD tier's lends and shrinks (design §19.3.7): with first_victims, the experts it accepts (those
+// with a RAM copy) leave first, lowest score first, then the others; without, the lowest scores leave.
+void test_lending_prefers_host_copies() {
+    constexpr std::uint32_t kKeys = 32, kFrames = 8;
+    // The policy alone: keys 0..7 resident, key k routed k + 1 times.
+    LfruPolicy policy(kKeys, kFrames);
+    LfruPolicy::Step step;
+    for (std::uint32_t k = 0; k < kFrames; ++k) {
+        for (std::uint32_t use = 0; use <= k; ++use) {
+            const std::uint32_t group[] = {k};
+            policy.step(group, step);
+        }
+    }
+    const LfruPolicy::Admissible copies = [](std::uint32_t k) { return k == 2 || k == 5 || k == 7; };
+    std::vector<std::uint32_t> victims;
+    policy.set_capacity(5, victims, &copies);
+    check(victims == std::vector<std::uint32_t>({2, 5, 7}), "the experts with a copy leave first, lowest score first");
+    const LfruPolicy::Admissible one = [](std::uint32_t k) { return k == 6; };
+    victims.clear();
+    policy.set_capacity(3, victims, &one);
+    check(victims == std::vector<std::uint32_t>({6, 0}), "then the lowest-score others");
+    victims.clear();
+    policy.set_capacity(2, victims);
+    check(victims == std::vector<std::uint32_t>({1}) && policy.resident_count() == 2, "without a preference, the lowest score");
+
+    // The controller's lend: the loan of three frames evicts the two keys with a copy (4 and 6) and
+    // the lowest-score other (0); the run's experts move out of it.
+    CacheController cache(kKeys, kFrames, 0, 1);
+    std::vector<CacheController::Command> cmds;
+    std::uint64_t round = 0;
+    for (std::uint32_t k = 0; k < kFrames; ++k) {
+        for (std::uint32_t use = 0; use <= k; ++use) {
+            const std::uint32_t group[] = {k};
+            cache.on_route(group, ++round, cmds);
+            cache.on_quiescent(cmds);
+        }
+    }
+    for (const auto& c : cmds) {
+        if (c.kind == CacheController::Command::Kind::kCopy) { check(cache.complete_load(c.key, c.frame, c.serial), "a load publishes"); }
+    }
+    cmds.clear();
+    const LfruPolicy::Admissible host = [](std::uint32_t k) { return k == 4 || k == 6; };
+    const auto run = cache.choose_run(3, std::vector<std::uint8_t>(kFrames, 0));
+    check(run.has_value(), "a run to lend");
+    check(cache.lend(*run, 3, cmds, &host) == 3, "the loan evicts three experts");
+    bool expected = true;
+    for (std::uint32_t k = 0; k < kFrames; ++k) {
+        const bool absent = cache.entry(k).state == ResidencyState::kAbsent;
+        expected &= absent == (k == 0 || k == 4 || k == 6);
+    }
+    check(expected, "the loan's victims: the keys with a copy, then the lowest-score other");
+}
+
 // Warm start (design §19.3.5 S4b): seed sets the counts, then loads the ranked keys best first into
 // free frames while the policy has capacity (frames - slack), skipping keys already resident or out
 // of range; each loaded key issues one copy into a distinct frame and publishes when that copy lands.
@@ -537,10 +642,38 @@ void test_seed() {
     check(frames.size() == loaded && keys.size() == loaded, "each seeded key copies into its own frame");
     check(keys.count(40) == 1 && keys.count(3) == 1 && keys.count(99) == 0, "duplicates and out-of-range keys are skipped");
     check(keys.count(11) == 0 && keys.count(13) == 0, "keys past the capacity are not loaded");
-    check(cache.policy().resident(40) && cache.policy().count(40) == 40 % 7, "seeded keys are resident with their counts");
+    check(cache.policy().resident(40) && std::floor(cache.policy().count(40)) == 40 % 7,
+          "seeded keys are resident with their counts (and a rank fraction under half a use)");
     check(cache.policy().count(50) == 50 % 7, "counts are seeded for every key");
     cmds.clear();
     check(cache.seed(ranked, {}, cmds) == 0 && cmds.empty(), "a full cache seeds nothing more");
+
+    // Ties at the callers' cap break by rank (candidates QA-19): keys 9, 2, 5 seeded in that order with one count
+    // leave lowest rank first (5, then 2), not lowest key first; a higher count still outranks a better rank.
+    CacheController tied(kKeys, 4, 0, 1);
+    std::vector<std::uint32_t> capped(kKeys, 16);
+    capped[1] = 3;
+    capped[7] = 4;
+    const std::vector<std::uint32_t> order{9, 2, 5, 1};
+    cmds.clear();
+    check(tied.seed(order, capped, cmds) == 4, "four seeds fill four frames");
+    const LfruPolicy& p = tied.policy();
+    check(p.score(9) > p.score(2) && p.score(2) > p.score(5), "equal counts order by rank");
+    check(p.score(5) > p.score(1), "unequal counts keep their order");
+    check(p.count(7) == 4.0, "a key not seeded keeps its whole count");
+    for (const auto& c : cmds) {
+        if (c.kind == CacheController::Command::Kind::kCopy) { check(tied.complete_load(c.key, c.frame, c.serial), "a seed publishes"); }
+    }
+    cmds.clear();
+    const std::uint32_t miss[] = {7};
+    tied.on_route(miss, 1, cmds);
+    tied.on_quiescent(cmds);
+    check(!p.resident(1) && p.resident(5) && p.resident(7), "the lowest count leaves first");
+    const std::uint32_t both[] = {7, 8}; // 7 hits and 8 misses: the victim is one of the tied seeds
+    tied.on_route(both, 2, cmds);
+    tied.on_quiescent(cmds);
+    check(p.resident(8) && !p.resident(5) && p.resident(9) && p.resident(2),
+          "then the lowest-ranked of the tied seeds, not the lowest key");
 }
 
 // Prompt seeding (design §19.3.27): credit adds weighted uses, marked used now, with no clock tick
@@ -582,59 +715,6 @@ void test_prompt_credit() {
     cache.credit(prompt, credit);
     check(cache.policy().count(40) == 8.0 && !cache.policy().resident(40) && cache.queued_loads() == 0,
           "the controller credits without loading");
-}
-
-// Prompt seeding's promotions (INFERNIX_TMP_PROMPT_SEED's budget, design §19.3.27): admit makes the
-// best credited misses resident, each only if it outranks the lowest resident outside the credited
-// keys, up to the budget, counting no use and ticking no clock; the controller loads them.
-void test_prompt_promotions() {
-    LfruPolicy policy(64, 3);
-    LfruPolicy::Step step;
-    const std::vector<std::uint32_t> fill{0, 1, 2};
-    policy.step(fill, step); // now 1: keys 0, 1, 2 count 1, score 1
-    const std::vector<std::uint32_t> keys{10, 11, 1};
-    const std::vector<double> amounts{5.0, 0.5, 2.0};
-    policy.credit(keys, amounts); // 10 scores 5, 11 0.5, resident 1 3
-    const std::uint64_t now = policy.now();
-    policy.admit(keys, 0, step);
-    check(step.admitted.empty() && !policy.resident(10), "a zero budget admits nothing");
-    // Admission is filtered: with key 10 inadmissible, 11 (0.5) does not outrank the victim (1).
-    const LfruPolicy::Admissible not_ten = [](std::uint32_t k) { return k != 10; };
-    policy.admit(keys, 8, step, &not_ten);
-    check(step.admitted.empty() && step.victims.empty(), "an inadmissible key is passed over, and a weak one stops");
-    // Key 10 (5) replaces key 0 (the lowest-key resident of score 1 outside the credited keys); key 11
-    // (0.5) does not outrank key 2 (1), so admission stops there although the budget allows more.
-    policy.admit(keys, 8, step);
-    check(step.admitted == std::vector<std::uint32_t>{10} && step.victims == std::vector<std::uint32_t>{0},
-          "the best credited miss replaces the lowest resident outside the prompt's keys");
-    check(policy.resident(1) && policy.resident(2) && !policy.resident(11), "the credited resident is protected");
-    check(policy.now() == now && policy.count(10) == 5.0 && policy.count(11) == 0.5,
-          "promotions count no use and tick no clock");
-
-    // The controller: the victim's frame retires, so the load waits for the quiescent boundary.
-    CacheController cache(64, 4, 0, 1);
-    std::vector<CacheController::Command> cmds;
-    const std::vector<std::uint32_t> warm{0, 1, 2, 3};
-    cache.on_route(warm, 1, cmds);
-    cmds.clear();
-    const std::vector<std::uint32_t> prompt{20, 21};
-    const std::vector<double> credit{9.0, 6.0};
-    cache.credit(prompt, credit);
-    check(cache.admit_credited(prompt, 1, 1, cmds) == 1, "the budget caps the promotions");
-    check(cache.policy().resident(20) && !cache.policy().resident(21) && !cache.policy().resident(0),
-          "the best credited miss is admitted in place of the lowest resident");
-    bool copied = false;
-    for (const auto& c : cmds) { copied |= c.kind == CacheController::Command::Kind::kCopy; }
-    check(!copied && cache.queued_loads() == 1, "with every frame held the promotion queues");
-    cache.on_quiescent(cmds);
-    std::uint32_t copies = 0;
-    for (const auto& c : cmds) {
-        if (c.kind == CacheController::Command::Kind::kCopy) {
-            ++copies;
-            check(c.key == 20, "the queued promotion loads into the victim's retired frame");
-        }
-    }
-    check(copies == 1 && cache.queued_loads() == 0, "the quiescent boundary loads the promotion");
 }
 
 // The saved state file: a round trip keeps counts and ranking; another identity, key count, version
@@ -771,6 +851,33 @@ void test_tier_gates() {
     }
 }
 
+// The adaptive tier (candidates §7.6 D12): Basalt's swaps through CacheController::exchange. A swap
+// retires the victim's frame (ABSENT write) and loads the newcomer once a frame is free; with no victim the newcomer
+// takes the policy's room, and nothing happens without room or for a resident newcomer or a non-resident victim.
+void test_exchange() {
+    CacheController cache(8, 2, 0, 1);
+    std::vector<CacheController::Command> cmds;
+    const std::uint32_t a[] = {1, 2};
+    cache.on_route(a, 1, cmds);
+    cache.on_quiescent(cmds);
+    const std::uint32_t frame_of_1 = cache.entry(1).frame;
+    cmds.clear();
+    check(!cache.exchange(3, std::nullopt, 2, cmds) && cmds.empty(), "no room: a swap without a victim is refused");
+    check(!cache.exchange(2, 1, 2, cmds) && !cache.exchange(3, 5, 2, cmds) && cmds.empty(),
+          "a resident newcomer or a non-resident victim is refused");
+    check(cache.exchange(3, 1, 2, cmds), "the swap is made");
+    check(cache.policy().resident(3) && !cache.policy().resident(1) && cache.entry(1).state == ResidencyState::kAbsent,
+          "the newcomer replaces the victim in the policy and the table");
+    const bool absent_written = std::any_of(cmds.begin(), cmds.end(), [](const CacheController::Command& c) {
+        return c.kind == CacheController::Command::Kind::kWriteEntry && c.key == 1;
+    });
+    check(absent_written && cache.entry(3).state == ResidencyState::kAbsent, "the victim's frame retires first");
+    cmds.clear();
+    cache.on_quiescent(cmds);
+    check(cache.entry(3).state != ResidencyState::kAbsent && cache.entry(3).frame == frame_of_1,
+          "the newcomer loads into the victim's frame once it is free");
+}
+
 // INFERNIX_TMP_ROUTE_PROTECT (candidates §13 PUB-22): guarded residents are evicted last, as
 // tools/expert_cache_replay's TierSim.guard (test_guarded_residents_are_evicted_last) decides.
 void test_route_guard() {
@@ -834,20 +941,23 @@ void test_route_predictor() {
 
 int main() {
     test_route_guard();
+    test_exchange();
+
     test_route_predictor();
     test_residency_entries();
     test_tier_gates();
     test_lfru_conformance();
     test_budgeted_admission();
+    test_low_set();
     test_frame_epochs();
     test_agent_simulation();
     test_pool_resize();
     test_controller_resize();
     test_load_serials();
     test_lending();
+    test_lending_prefers_host_copies();
     test_seed();
     test_prompt_credit();
-    test_prompt_promotions();
     test_landing();
     test_state_file();
     test_calibrated_order();

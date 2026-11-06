@@ -32,18 +32,25 @@ std::optional<ExpertCacheTotals> Program::expert_cache_totals() const noexcept {
 
 void Program::set_maintenance_waker(std::function<void()> waker) { impl_->set_maintenance_waker(std::move(waker)); }
 
+// A verification round's expert-cache update may wait for the next round's proposal (ProgramImpl::DeferredRound), and
+// a DFlash2 verification's commit waits on the device behind a host gate until commit() (ProgramImpl::CommitGate):
+// the entry points that can touch the expert cache, launch a forward or report on it release the gate with no
+// committed column and settle the update first; decode settles it while its proposal drafts, commit defers it, and
+// planning and accessors leave both.
 void Program::maintain() {
+    impl_->settle_deferred();
     impl_->apply_vram_target(true);
     impl_->maintain_expert_state();
+    impl_->maintain_ram();
 }
+
+void Program::start_ram_resize(std::uint64_t reserve_bytes) { impl_->start_ram_resize(reserve_bytes); }
 
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->prefix_stats(); }
 
 RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options) {
     return impl_->plan_request(std::move(prompt), options);
 }
-
-bool Program::isolated_request_feasible(const RequestBasePlan& base) const noexcept { return impl_->feasible(base); }
 
 std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base, std::uint32_t maximum_frontier) {
     return impl_->hybrid_sources(base, maximum_frontier);
@@ -52,14 +59,12 @@ std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base
 BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane,
                                           const SourceCandidate& source, ResumeState* resume,
                                           ExecutionUnitKind, std::uint32_t) {
-    const runtime::ResourceReservation reserved = impl_->start_binding(base, lane, source, resume);
-    BindingReservation out;
-    out.reserved = static_cast<bool>(reserved);
-    out.shortage = reserved.shortage;
-    return out;
+    impl_->settle_deferred();
+    return impl_->start_binding(base, lane, source, resume);
 }
 
 ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation) {
+    impl_->settle_deferred();
     return impl_->poll_context(cancellation);
 }
 
@@ -67,26 +72,36 @@ bool Program::has_context_transaction() const noexcept { return impl_->in_transa
 
 bool Program::context_blocks(SequenceHandle sequence) const noexcept { return impl_->context_blocks(sequence); }
 
-bool Program::hybrid_reclaim(runtime::ContextResourceUsage shortage) { return impl_->hybrid_reclaim(shortage); }
-std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base) { return impl_->hybrid_prefetch(base); }
+bool Program::hybrid_reclaim(runtime::ContextResourceUsage shortage) {
+    impl_->settle_deferred();
+    return impl_->hybrid_reclaim(shortage);
+}
+std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base) {
+    impl_->settle_deferred();
+    return impl_->hybrid_prefetch(base);
+}
 std::uint32_t Program::hybrid_prefetch_room() const noexcept { return impl_->hybrid_prefetch_room(); }
 void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) { impl_->hybrid_hold_queue(queue); }
 std::uint64_t Program::hybrid_cache_epoch() const noexcept { return impl_->hybrid_cache_epoch(); }
+std::uint32_t Program::hybrid_resume_grid() const noexcept { return impl_->hybrid_resume_grid(); }
 
 runtime::ResourceReservation Program::reserve_units(std::span<const ExecutionUnit> units) {
     return impl_->reserve_units(units);
 }
 
 bool Program::start_pause(SequenceHandle sequence, runtime::ExecutionTiming*) {
+    impl_->settle_deferred();
     return impl_->start_pause(sequence);
 }
 
 ReplayProgress Program::advance_replay(SequenceHandle sequence, runtime::ExecutionTiming*) {
+    impl_->settle_deferred();
     return impl_->advance_replay(sequence);
 }
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming*,
                                          runtime::TokenMaskProvider* masks) {
+    impl_->settle_deferred();
     return impl_->advance_prefill(sequence, masks);
 }
 
@@ -100,6 +115,7 @@ runtime::ExecutionTiming Program::append_forced_tokens(std::span<const SequenceH
                                                        std::uint32_t row_stride,
                                                        std::span<const std::optional<std::uint32_t>>,
                                                        runtime::ExecutionTiming*) {
+    impl_->settle_deferred();
     return impl_->append_forced(sequences, row_major_tokens, row_stride);
 }
 
@@ -110,15 +126,22 @@ CommitResult Program::commit(PendingBatch&& pending, std::span<const runtime::Co
 
 DiscardResult Program::abort_pending(PendingBatch&& pending) noexcept { return impl_->discard(std::move(pending)); }
 
-FinishResult Program::finish(SequenceHandle sequence) noexcept { return impl_->finish(sequence); }
+FinishResult Program::finish(SequenceHandle sequence) noexcept {
+    impl_->settle_deferred_or_drop();
+    return impl_->finish(sequence);
+}
 
-AbortResult Program::abort(SequenceHandle sequence) noexcept { return impl_->abort(sequence); }
+AbortResult Program::abort(SequenceHandle sequence) noexcept {
+    impl_->settle_deferred_or_drop();
+    return impl_->abort(sequence);
+}
 
 void Program::fail_all_cleanup() noexcept { impl_->release_all(); }
 
 bool Program::recover_after_failure() noexcept { return impl_->recover_after_failure(); }
 
 void Program::shutdown_cleanup() noexcept {
+    impl_->settle_deferred_or_drop();
     impl_->report_cache_layers();
     impl_->release_all();
     impl_->save_expert_state();
@@ -127,16 +150,19 @@ void Program::shutdown_cleanup() noexcept {
 
 PrefixCachePersistence Program::attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
                                                          const StartupObserver& observer) {
+    impl_->settle_deferred();
     return impl_->attach_prefix_cache_file(path, std::move(fingerprint), observer);
 }
 
 std::optional<PrefixCachePersistence> Program::prefix_shutdown_save() const { return impl_->prefix_shutdown_save(); }
 
 std::optional<PrefixCachePersistence> Program::save_prefix_cache_now(const CancellationView& abandoned) {
+    impl_->settle_deferred();
     return impl_->save_prefix_cache_now(abandoned);
 }
 
 ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target, const ScoreOptions& options) {
+    impl_->settle_deferred();
     return impl_->causal_score(std::move(prompt), first_target, options);
 }
 

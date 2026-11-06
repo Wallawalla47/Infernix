@@ -5,6 +5,7 @@
 // supplies dimensions and the n-gram hash and table geometry
 // (docs/maintainer/qwen3_8-flash-next-design.md §2, §12).
 
+#include "core/weight.h"
 #include "models/load_options.h"
 #include "models/qwen3_5/config.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
@@ -70,8 +71,12 @@ struct MoeConfig {
     std::uint32_t shared_intermediate = 0;
     // The routed experts' arithmetic (parse_config): W4A16 when the banks carry no activation scales
     // (design §16.2.1), else W4A4 (§16.2); banks whose 4-bit activations are optional run W4A16
-    // unless LoadOptions::expert_a4_activations asks for W4A4.
+    // unless LoadOptions::expert_a4_activations asks for W4A4, and W4A4 banks run W4A16 when
+    // LoadOptions::expert_a16_activations asks for it.
     bool a16_experts = false;
+    // The banks are W4A4 by their checkpoint: they carry activation scales that are not optional (NVIDIA's
+    // NVFP4 recipes A and B), whatever a16_experts resolved to.
+    bool a4_native = false;
     // The text config's expert_a4_activations: optional (NVIDIA FP4-Local, design §6.1.2): the banks
     // carry their calibrated activation scales and permit 4-bit activations, but default to 16-bit.
     bool a4_optional = false;
@@ -176,8 +181,19 @@ struct TextConfig {
     // stream-ring and RAM slots take it), set by the loader from the stored banks; 0 means the NVFP4
     // record's. expert_frame_bytes: the mean stride, rounded up (the expert cache's sizing unit: its
     // pools give every layer the same frame count; ExpertResidency::average_frame_bytes).
+    // expert_frame_pools: the cache's pools, one per distinct stride (runtime::expert_offload::frame_pools).
     std::uint64_t expert_frame_stride = 0;
     std::uint64_t expert_frame_bytes  = 0;
+    std::uint32_t expert_frame_pools  = 1;
+    // What the fast-path selection and --a8-activations' routes read of the weights (program/fast_paths.h),
+    // set by the loader from their stored formats, so a start decides before it reads them and Engine::plan
+    // as it does: the GDN q/k/v/z projection's format (one dense kernel family serves every layer; a BF16
+    // one packed at load runs the BF16 kernels' arithmetic), the routed experts' gate/up plane format
+    // (ExpertBankPlanes::gate_up_format), and how many dense projections are GGUF blocks (each layer's mixer
+    // input and output and its shared expert's gate/up and down).
+    QType dense_format             = QType::BF16;
+    QType expert_format            = QType::NVFP4_MUL;
+    std::uint32_t ggml_projections = 0;
 
     // The positions a context may use: the native ones times the YaRN factor, at most 1,048,576.
     [[nodiscard]] std::uint32_t context_ceiling() const noexcept {
@@ -222,6 +238,11 @@ struct Config {
     bool mtp = false;                // the MTP drafter is bound (--spec mtp)
     std::optional<DFlash2Config> dflash2; // the DFlash2 drafter is bound (--spec dflash2 --draft-model)
     std::uint32_t proposal_rows = 0; // rows of the bound proposal head (--lm-head-draft), else 0
+    // LoadOptions::mtp_expert_pool: the MTP drafter's routed experts are pinned in host memory and its draft steps
+    // route among those held by this many device slots (runtime/expert_offload/drafter_pool.h);
+    // mtp_expert_bytes is one expert's gate/up and down rows (set by plan_load). 0: the bank is device-resident.
+    std::uint32_t mtp_expert_slots = 0;
+    std::uint64_t mtp_expert_bytes = 0;
     // The Vision tower (--vision): Qwen3.5's tower except its output width, which the merger's
     // bound fc2 gives (design §19.3.2).
     std::optional<qwen3_5::VisionConfig> vision;
@@ -233,5 +254,9 @@ struct Config {
 // records the target identity it was converted for, tools/convert/qwen4_exp.py), checked against
 // the target's text config.
 [[nodiscard]] DFlash2Config parse_dflash2_config(const artifact::Directory& companion, const TextConfig& target);
+
+// Whether `companion` is a DFlash2 drafter for `target`'s text (parse_dflash2_config accepts it); false for any
+// other artifact or a malformed one.
+[[nodiscard]] bool dflash2_companion_fits(const artifact::Directory& companion, const artifact::Directory& target) noexcept;
 
 } // namespace infernix::models::qwen4_exp
