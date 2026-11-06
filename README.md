@@ -28,8 +28,8 @@ matrices and a 2-bit head screen), has the highest decode tok/s at Infernix's de
 NVFP4 weights Infernix still reaches the first token 5-8× sooner and finishes the agentic workload
 36 % sooner, and with its experts at 8 bits as Basalt runs them it matches or passes Basalt's decode
 too. On the IQ3_S GGUF Basalt is ahead overall (4.4 against 5.5 min); with the same 8-bit
-activations Infernix matches its first tokens, but Basalt still decodes faster. Measured quality for
-every engine follows in a later update.
+activations Infernix matches its first tokens, but Basalt still decodes faster. Measured quality on
+IQ3_S and the 27B, against the exact model: [Quality](#quality) (NVIDIA's NVFP4 weights not yet).
 
 | Infernix vs | First token | Decode | Replay: mean first token | Replay: wall time |
 |---|---|---|---|---|
@@ -208,8 +208,9 @@ sooner.
 | Dense layers (BF16 in the checkpoint) | 8-bit (Dense8; the bit-exact conversion keeps BF16) | 8-bit | 8-bit | **6-bit** (+10 % KL divergence by Basalt's measure) |
 | n-gram table (FP8 in the checkpoint) | FP8 | FP8 | FP8 | re-blocked to 8-bit |
 
-None of these engines has a lossy default that could be turned off. Measured quality (KL divergence
-against an exact reference) follows in a later update.
+None of these engines has a lossy default that could be turned off. Quality (KL divergence against
+an exact reference) is measured on IQ3_S and the 27B in [Quality](#quality), not yet on these NVFP4
+weights.
 
 **Context length with 8-bit expert activations** (`--a8-activations`, closer to the others'
 arithmetic in decode):
@@ -403,6 +404,73 @@ NVFP4 Dense8, INT8 KV, `infernix_bench` (means of 3-5 runs, tok/s per request).
   (Samsung 990 PRO); no thinking caps; every draft verified; and every switchable option that
   computes below the checkpoint's precision or changes which experts run turned off (* where that
   differs from the default).
+
+## Quality
+
+How far each engine's output is from the exact model, with llama.cpp's KL-divergence statistics on
+WikiText-2 (580 chunks of 512 tokens, 147,900 scored positions; the same PC, 2026-11-05/06). The
+reference is Infernix's lossless route on the same weights (every operation correctly rounded).
+**Honest rounding** is that route with every rounding made stochastic: an ideal implementation off by
+at most one unit in the last place at every rounding, so its distance from the reference is the
+model's own sensitivity to rounding. Lower KLD and higher top-1 agreement are closer to the exact
+model; × rounding is the mean KLD over honest rounding's. Full results with 95 % intervals,
+definitions and how to repeat the runs: [Quality](docs/quality.md).
+
+**Qwen3.8-27B NVFP4**: NInfer's official artifact for every engine (vLLM, which cannot load it: Unsloth's
+checkpoint with the artifact's embedding, the same model); BF16 KV.
+
+| Path | Engine | Mean KLD | × rounding | KLD 99.9 % | Top-1 agreement | PPL vs reference |
+|---|---|---:|---:|---:|---:|---|
+| — | Honest rounding | 0.00160 | 1.0 | 0.046 | 98.15 % | +0.07 % [+0.03, +0.10] |
+| Prompt | Infernix | 0.01690 | 10.5 | 0.655 | 94.47 % | +0.69 % [+0.56, +0.82] |
+| Prompt | NInfer `a754fcf3b` | 0.01660 | 10.4 | 0.660 | 94.48 % | +0.67 % [+0.50, +0.84] |
+| Prompt | vLLM 0.33.0 | 0.01796 | 11.2 | 0.685 | 94.28 % | +0.70 % [+0.55, +0.84] |
+| Prompt | TensorSharp `0c45b34c` | 0.01695 | 10.6 | 0.645 | 94.42 % | +0.76 % [+0.62, +0.90] |
+| Decode | Infernix (DFlash2 + n-gram drafts) | 0.00442 | 2.76 | 0.197 | 97.38 % | −0.10 % [−0.20, +0.00] |
+| Decode | NInfer (MTP, 3 drafts) | 0.00439 | 2.74 | 0.201 | 97.52 % | −0.02 % [−0.10, +0.06] |
+| Decode | vLLM (MTP, 3 drafts) | 0.01783 | 11.1 | 0.647 | 94.23 % | +0.79 % [+0.64, +0.94] |
+| Decode | TensorSharp (DFlash2, 7 drafts) | 0.01504 | 9.4 | 0.611 | 94.94 % | +0.60 % [+0.45, +0.75] |
+
+**Qwen3.8-Flash-Next IQ3_S**: ISTA-DASLab's GSQ-RCO GGUF for every engine (Infernix's import of it,
+Strata's and Basalt's own packs); 8-bit KV (INT8, llama.cpp Q8_0).
+
+| Path | Engine | Mean KLD | × rounding | KLD 99.9 % | Top-1 agreement | PPL vs reference |
+|---|---|---:|---:|---:|---:|---|
+| — | Honest rounding | 0.01601 | 1.00 | 0.577 | 95.36 % | +0.04 % [−0.08, +0.15] |
+| Prompt | Infernix | 0.01465 | 0.91 | 0.496 | 95.59 % | +0.08 % [−0.03, +0.19] |
+| Prompt | llama.cpp b12128 | 0.01505 | 0.94 | 0.499 | 95.43 % | −0.03 % [−0.13, +0.08] |
+| Decode | Infernix (DFlash2 drafts) | 0.01443 | 0.90 | 0.472 | 95.59 % | −0.04 % [−0.15, +0.07] |
+| Decode | llama.cpp (forced 4-token windows) | 0.01514 | 0.95 | 0.508 | 95.53 % | +0.05 % [−0.06, +0.16] |
+| Decode | Basalt v0.2.1 (verify windows of 4) | 0.01922 | 1.20 | 0.579 | 95.29 % | +0.47 % [+0.33, +0.60] |
+| Decode | Strata v0.2.11 (route tail skip on, its default) | 0.02314 | 1.45 | 0.803 | 94.44 % | −0.00 % [−0.16, +0.14] |
+
+- **27B prompt path**: every engine sits at 10-11× honest rounding with perplexity up about 0.7 %.
+  This is the artifact's prompt path, not any one engine's: it computes with quantized activations
+  (4-bit in the NVFP4 layers, 8-bit in the FP8 layers).
+- **27B decode path**: Infernix and NInfer keep 16-bit activations when decoding and fall to 2.7×,
+  with no measurable perplexity change. vLLM stays at its prompt path's 11×, consistent with 4-bit
+  activations on every path. TensorSharp quantizes the NVFP4 inputs in any verify window of 4 or more
+  rows, and its shipped configuration verifies 8; its exact 16-bit verify is an opt-in it does not load.
+- **IQ3_S**: honest rounding is 10× the 27B's here, because a small rounding difference can change
+  which experts the router picks. Infernix and llama.cpp come in slightly below it, most likely because
+  rounding to nearest has less error than stochastic rounding. Basalt is at 1.20× and the only IQ3_S
+  engine whose perplexity rises measurably (+0.47 %); Strata is at 1.45×, with its default tail skip
+  leaving out 3.9 million expert computations over the run.
+- **Perplexity hides noise**: rounding errors raise some tokens' probabilities and lower others about
+  equally, so they cancel in perplexity. Strata's distributions are 1.45× further from the exact model
+  than honest rounding's, yet its perplexity matches the reference's.
+
+*Method*: the **prompt** rows read each chunk in one forward. The **decode** rows prefill each chunk's
+first half and generate the rest in one request with the engine's own speculative decoding, the
+text's tokens forced: a draft is accepted only when it equals the text, so every row is computed on
+the real text by the engine's decode and verify kernels. Every row's logits are rounded to BF16
+before scoring. *PPL vs reference* is the engine's perplexity as a change from the reference's on the
+same positions (reference: 7.035 on the 27B, 4.647 on IQ3_S); absolute perplexities are not quoted,
+because every engine runs the same weights and their intervals mostly measure which text was sampled.
+Each engine ran its latest version with its own default or recommended configuration; small patches
+only take the logits out. Strata and Basalt compute no logits on their prompt paths, so they have
+decode rows only, and Strata reads each whole chunk through its verify windows. Versions, settings,
+patches and configurations: [Quality](docs/quality.md#engines).
 
 ## Infernix Launcher (beta)
 
@@ -639,7 +707,7 @@ behind a VRAM expert cache, as for Flash-Next ([guide](docs/qwen3_5-122b.md)).
 
 [Launcher](docs/launcher.md), [CLI](docs/cli.md), [serving](docs/serving.md), [Qwen3.8-Flash-Next](docs/qwen3_8-flash-next.md),
 [Qwen3.5-122B-A10B](docs/qwen3_5-122b.md), [perplexity](docs/perplexity.md),
-[performance](docs/performance.md) and the [documentation map](docs/README.md).
+[performance](docs/performance.md), [quality](docs/quality.md) and the [documentation map](docs/README.md).
 
 ## Contributing
 

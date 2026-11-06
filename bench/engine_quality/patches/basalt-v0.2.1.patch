@@ -1,0 +1,31 @@
+diff --git a/include/basalt/program/ppl_gate.hpp b/include/basalt/program/ppl_gate.hpp
+index 2fa65302..09766811 100644
+--- a/include/basalt/program/ppl_gate.hpp
++++ b/include/basalt/program/ppl_gate.hpp
+@@ -12,6 +12,7 @@
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <future>
+ #include <string>
+@@ -124,6 +125,18 @@ private:
+ 
+     // the same arithmetic as llama-perplexity's KL-divergence pass
+     bool row(int64_t pos, const std::vector<float>& lg) {
++        // BASALT_PPL_ROWS=<file> (Infernix's engine comparison, tools/quality/engines/basalt.py): each scored row's
++        // logits as the engine computed them, appended as int64 position, int64 vocabulary, then binary32 values; the
++        // file is opened per row, so a reader may consume and delete it between requests.
++        static const char* rows_path = std::getenv("BASALT_PPL_ROWS");
++        if (rows_path != nullptr && *rows_path != '\0') {
++            std::FILE* rows_out = std::fopen(rows_path, "ab");
++            if (rows_out == nullptr) return false;
++            const int64_t header[2] = {pos, (int64_t) lg.size()};
++            std::fwrite(header, sizeof header, 1, rows_out);
++            std::fwrite(lg.data(), sizeof(float), lg.size(), rows_out);
++            std::fclose(rows_out);
++        }
+         const int64_t r = pos - first(), rows = n_ctx_ - 1 - first();
+         const uint64_t off = 20 + (uint64_t) n_chunk_ * n_ctx_ * 4 +
+                              ((uint64_t) chunk_ * rows + (uint64_t) r) * (uint64_t) row_u16_ * 2;

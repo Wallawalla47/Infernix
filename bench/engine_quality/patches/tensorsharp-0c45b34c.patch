@@ -1,0 +1,304 @@
+diff --git a/TensorSharp.Backends.Cuda/Qwen35/Q35CudaEngine.cs b/TensorSharp.Backends.Cuda/Qwen35/Q35CudaEngine.cs
+index a9639870..3cd53367 100644
+--- a/TensorSharp.Backends.Cuda/Qwen35/Q35CudaEngine.cs
++++ b/TensorSharp.Backends.Cuda/Qwen35/Q35CudaEngine.cs
+@@ -652,6 +652,33 @@ namespace TensorSharp.Cuda
+                 HeadLastRows(1, Math.Min(_m.NUbatch, tokens.Length - (tokens.Length - 1) / _m.NUbatch * _m.NUbatch), logitsOut, null);
+         }
+ 
++        /// <summary>
++        /// Engine comparison (engcmp/kld-rows): <see cref="Forward"/> of one prompt chunk (at most one
++        /// ubatch), then the final norm and LM head over its rows <paramref name="firstRow"/> ..
++        /// <paramref name="firstRow"/> + <paramref name="rows"/> - 1 into <paramref name="logitsOut"/>
++        /// ([rows][vocab]): each row as <see cref="HeadLastRows"/> computes the last one, in slices of the
++        /// head's <see cref="MaxVerifyRows"/>-row logits buffer. The forward's arithmetic is unchanged.
++        /// </summary>
++        public void ForwardRows(int[] tokens, int firstRow, int rows, float[] logitsOut)
++        {
++            if (tokens == null || tokens.Length == 0 || tokens.Length > _m.NUbatch)
++                throw new ArgumentException($"[q35-cuda] ForwardRows takes one prompt chunk of 1 .. {_m.NUbatch} tokens");
++            if (firstRow < 0 || rows < 1 || firstRow + rows > tokens.Length || logitsOut == null
++                || logitsOut.LongLength < (long)rows * _m.NVocab)
++                throw new ArgumentOutOfRangeException(nameof(rows));
++            Forward(tokens, null);
++            int e = _m.NEmbd;
++            var slice = new float[(long)MaxVerifyRows * _m.NVocab];
++            for (int s = 0; s < rows; s += MaxVerifyRows)
++            {
++                int m = Math.Min(MaxVerifyRows, rows - s);
++                long offset = (long)(firstRow + s) * e * 4;
++                FinalNorm(_x + (nint)offset, _block + (nint)offset, _outputNorm, _xn, m, e, _m.Eps, Stream);
++                Head(_xn, m, slice, null);
++                Array.Copy(slice, 0, logitsOut, (long)s * _m.NVocab, (long)m * _m.NVocab);
++            }
++        }
++
+         /// <summary>
+         /// One decode step for several sequences: token i advances sequence i. Fills
+         /// <paramref name="logitsOut"/> ([n][vocab], optional) and <paramref name="argmaxOut"/> ([n],
+diff --git a/TensorSharp.Backends.Cuda/native/ninfer/chunk/tensorsharp_ninfer_gdn_chunk.cu b/TensorSharp.Backends.Cuda/native/ninfer/chunk/tensorsharp_ninfer_gdn_chunk.cu
+index 4d55843c..db803b09 100644
+--- a/TensorSharp.Backends.Cuda/native/ninfer/chunk/tensorsharp_ninfer_gdn_chunk.cu
++++ b/TensorSharp.Backends.Cuda/native/ninfer/chunk/tensorsharp_ninfer_gdn_chunk.cu
+@@ -20,24 +20,28 @@ static_assert(chunk::output::kernel_dims::SMEM_BYTES==24576);
+ 
+ // Instantiate the actual original global kernels. No private copy, wrapper
+ // body, arithmetic edit or alternate compilation of upstream source is used.
++// engcmp/kld-rows: the declarations' __restrict__ spelled out - with an MSVC host (Windows) the front end
++// matches an explicit instantiation's parameter types with their restrict qualifiers.
++#define R __restrict__
+ namespace ninfer::ops::detail::gated_delta_net::chunked::prepare_wy_wu {
+ template __global__ void prepare_wy_wu_kernel<64,32,8>(
+-    const __nv_bfloat16*,const __nv_bfloat16*,const float*,const float*,
+-    __nv_bfloat16*,__nv_bfloat16*,float*,head_map);
++    const __nv_bfloat16* R,const __nv_bfloat16* R,const float* R,const float* R,
++    __nv_bfloat16* R,__nv_bfloat16* R,float* R,head_map);
+ }
+ namespace ninfer::ops::detail::gated_delta_net::chunked::state_passing {
+ template __global__ void state_passing_kernel<16>(
+-    const __nv_bfloat16*,const __nv_bfloat16*,const __nv_bfloat16*,const float*,const float*,
+-    __nv_bfloat16*,__nv_bfloat16*,float*,head_map,int);
++    const __nv_bfloat16* R,const __nv_bfloat16* R,const __nv_bfloat16* R,const float* R,const float*,
++    __nv_bfloat16* R,__nv_bfloat16* R,float*,head_map,int);
+ }
+ namespace ninfer::ops::detail::gated_delta_net::chunked::output {
+ template __global__ void output_kernel<false>(
+-    const __nv_bfloat16*,const __nv_bfloat16*,const __nv_bfloat16*,const float*,
+-    const __nv_bfloat16*,__nv_bfloat16*,head_map,float,int);
++    const __nv_bfloat16* R,const __nv_bfloat16* R,const __nv_bfloat16* R,const float* R,
++    const __nv_bfloat16* R,__nv_bfloat16* R,head_map,float,int);
+ template __global__ void output_kernel<true>(
+-    const __nv_bfloat16*,const __nv_bfloat16*,const __nv_bfloat16*,const float*,
+-    const __nv_bfloat16*,__nv_bfloat16*,head_map,float,int);
++    const __nv_bfloat16* R,const __nv_bfloat16* R,const __nv_bfloat16* R,const float* R,
++    const __nv_bfloat16* R,__nv_bfloat16* R,head_map,float,int);
+ }
++#undef R
+ 
+ // The incoming packed Q/K are already L2-normalized F32 values. Chunked NInfer
+ // materializes normalized Q/K in BF16 before the three original stages. V was
+diff --git a/TensorSharp.Backends.Cuda/native/ninfer/prefill_attention/tensorsharp_ninfer_prefill_attention.cu b/TensorSharp.Backends.Cuda/native/ninfer/prefill_attention/tensorsharp_ninfer_prefill_attention.cu
+index 90e4ee8e..17274dfe 100644
+--- a/TensorSharp.Backends.Cuda/native/ninfer/prefill_attention/tensorsharp_ninfer_prefill_attention.cu
++++ b/TensorSharp.Backends.Cuda/native/ninfer/prefill_attention/tensorsharp_ninfer_prefill_attention.cu
+@@ -12,16 +12,20 @@ static_assert(sizeof(GqaPrefillDirectMetadata) == 8);
+ static_assert(offsetof(TsNinferPrefillPlane, blocks) == 0 && offsetof(TsNinferPrefillPlane, offset) == 8);
+ 
+ namespace ninfer::ops {
++// engcmp/kld-rows: the declarations' __restrict__ spelled out - with an MSVC host (Windows) the front end
++// matches an explicit instantiation's parameter types with their restrict qualifiers.
+ #define TS_PREFILL_ARGUMENTS \
+-    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, GqaPrefillDirectMetadata, \
+-    const std::int32_t*, float, __nv_bfloat16*, std::int32_t, std::int32_t, std::int32_t, std::int32_t, \
+-    __nv_bfloat16*, float*, float*, std::int32_t, float*, float*, float*, std::int32_t
++    const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, \
++    GqaPrefillDirectMetadata, const std::int32_t* __restrict__, float, __nv_bfloat16* __restrict__, std::int32_t, \
++    std::int32_t, std::int32_t, std::int32_t, __nv_bfloat16* __restrict__, float* __restrict__, float* __restrict__, \
++    std::int32_t, float* __restrict__, float* __restrict__, float* __restrict__, std::int32_t
+ template __global__ void ts_ni_prefill_bf16_kernel<Gqa27Geometry, GqaPrefillDirectMetadata, false, false>(TS_PREFILL_ARGUMENTS);
+ // The independent component oracle runs the exact original page64 entry on
+ // separately serialized contiguous original cache planes and I32 page tables.
+ template __global__ void gqa_attention_prefill_bf16_kernel<Gqa27Geometry, GqaPrefillDirectMetadata, false, false>(TS_PREFILL_ARGUMENTS);
+ template __global__ void gqa_attention_prefill_reduce_kernel<Gqa27Geometry>(
+-    const float*, const float*, const float*, float, std::int32_t, std::int32_t, __nv_bfloat16*);
++    const float* __restrict__, const float* __restrict__, const float* __restrict__, float, std::int32_t, std::int32_t,
++    __nv_bfloat16* __restrict__);
+ #undef TS_PREFILL_ARGUMENTS
+ }
+ 
+diff --git a/TensorSharp.Backends.Cuda/native/ninfer/shortlist/tensorsharp_ninfer_shortlist.cu b/TensorSharp.Backends.Cuda/native/ninfer/shortlist/tensorsharp_ninfer_shortlist.cu
+index 4cf373c8..9ab175d4 100644
+--- a/TensorSharp.Backends.Cuda/native/ninfer/shortlist/tensorsharp_ninfer_shortlist.cu
++++ b/TensorSharp.Backends.Cuda/native/ninfer/shortlist/tensorsharp_ninfer_shortlist.cu
+@@ -19,14 +19,16 @@ static_assert(Q4GemvR4W1DirectSchedule::kThreads == 128 && Q4GemvR4W1DirectSched
+ // The ORIGINAL global templates are instantiated unchanged, not cloned into
+ // a private numerical kernel. Schedule selections are q4_dispatch.cpp's K5120
+ // shortlist routes: T1 GEMV, T2..8 exact small-T, T>=9 r64_c128 MMA.
++// engcmp/kld-rows: the declarations' __restrict__ spelled out - with an MSVC host (Windows) the front end
++// matches an explicit instantiation's parameter types with their restrict qualifiers.
+ template __global__ void q4_rowsplit_gemv_kernel<Q4GemvR4W1DirectSchedule>(
+-    const __nv_bfloat16*, const std::uint8_t*, const std::uint8_t*,
+-    __nv_bfloat16*, __nv_bfloat16*, std::int32_t, std::int32_t, Q4GemvStoreEpilogue);
++    const __nv_bfloat16* __restrict__, const std::uint8_t* __restrict__, const std::uint8_t* __restrict__,
++    __nv_bfloat16* __restrict__, __nv_bfloat16* __restrict__, std::int32_t, std::int32_t, Q4GemvStoreEpilogue);
+ 
+ #define TS_NINFER_SHORTLIST_SMALL(T) \
+ template __global__ void q4_small_t_mma_kernel<Q4DraftHeadGeometry<5120>,8,T>( \
+-    const __nv_bfloat16*, const std::uint8_t*, const std::uint8_t*, \
+-    __nv_bfloat16*, Q4SmallTMmaStoreEpilogue, Q4SmallTMmaIdentityRows);
++    const __nv_bfloat16* __restrict__, const std::uint8_t* __restrict__, const std::uint8_t* __restrict__, \
++    __nv_bfloat16* __restrict__, Q4SmallTMmaStoreEpilogue, Q4SmallTMmaIdentityRows);
+ TS_NINFER_SHORTLIST_SMALL(2)
+ TS_NINFER_SHORTLIST_SMALL(3)
+ TS_NINFER_SHORTLIST_SMALL(4)
+@@ -43,8 +45,8 @@ static_assert(TsNinferShortlistMmaSchedule::kSharedBytes == 45568);
+ // T9..33 always uses the original boundary variant (Full=false): no token
+ // count in this module is divisible by the original128-column physical tile.
+ template __global__ void q4_rowsplit_gemm_mma_kernel<TsNinferShortlistMmaSchedule,false>(
+-    const __nv_bfloat16*, const std::uint8_t*, const std::uint8_t*,
+-    __nv_bfloat16*, std::int32_t, std::int32_t, std::int32_t, std::int32_t);
++    const __nv_bfloat16* __restrict__, const std::uint8_t* __restrict__, const std::uint8_t* __restrict__,
++    __nv_bfloat16* __restrict__, std::int32_t, std::int32_t, std::int32_t, std::int32_t);
+ }
+ 
+ // Original speculative_round.cuh442..448 range behavior, exported separately.
+diff --git a/TensorSharp.Models/Models/Qwen35/Qwen35CudaModel.cs b/TensorSharp.Models/Models/Qwen35/Qwen35CudaModel.cs
+index 4fa6db69..c6561e57 100644
+--- a/TensorSharp.Models/Models/Qwen35/Qwen35CudaModel.cs
++++ b/TensorSharp.Models/Models/Qwen35/Qwen35CudaModel.cs
+@@ -150,6 +150,19 @@ namespace TensorSharp.Models
+             }
+         }
+ 
++        /// <summary>Engine comparison (engcmp/kld-rows): one prompt chunk on the active slot, with the logits
++        /// of its rows <paramref name="firstRow"/> .. <paramref name="firstRow"/> + <paramref name="rows"/> - 1
++        /// ([rows][vocab]) from the prompt path's own forward.</summary>
++        public void ForwardPromptRows(int[] tokens, int firstRow, int rows, float[] logitsOut)
++        {
++            lock (_sync)
++            {
++                _exec.Engine.TraceBindSequence(_activeSlotKey, _exec.Engine.Active);
++                _exec.Engine.ForwardRows(tokens, firstRow, rows, logitsOut);
++                _cacheSeqLen = _exec.NPast;
++            }
++        }
++
+         /// <summary>A forward of the active slot that consumes the queued image rows and (T,H,W)
+         /// position table, if any (under _sync).</summary>
+         private void ForwardWithMedia(int[] tokens, float[] logitsOut)
+diff --git a/eng/KldRows/KldRows.csproj b/eng/KldRows/KldRows.csproj
+new file mode 100644
+index 00000000..a51169b0
+--- /dev/null
++++ b/eng/KldRows/KldRows.csproj
+@@ -0,0 +1,15 @@
++<Project Sdk="Microsoft.NET.Sdk">
++  <!-- Engine comparison (engcmp/kld-rows): logits rows of a llama.cpp `_logits_` base's chunks for
++       infernix-certify llama-rows. The direct-CUDA route only: no GGML or MLX native library. -->
++  <PropertyGroup>
++    <OutputType>Exe</OutputType>
++    <TargetFramework>net10.0</TargetFramework>
++    <ImplicitUsings>enable</ImplicitUsings>
++    <Nullable>enable</Nullable>
++    <TensorSharpSkipGgmlNative>true</TensorSharpSkipGgmlNative>
++    <TensorSharpSkipMlxNative>true</TensorSharpSkipMlxNative>
++  </PropertyGroup>
++  <ItemGroup>
++    <ProjectReference Include="../../TensorSharp.Models/TensorSharp.Models.csproj" />
++  </ItemGroup>
++</Project>
+diff --git a/eng/KldRows/Program.cs b/eng/KldRows/Program.cs
+new file mode 100644
+index 00000000..73895c6f
+--- /dev/null
++++ b/eng/KldRows/Program.cs
+@@ -0,0 +1,109 @@
++// Engine comparison (engcmp/kld-rows): TensorSharp's logits on the chunks of a llama.cpp `_logits_` base file,
++// streamed to standard output for infernix-certify llama-rows: rows n_ctx/2 .. n_ctx-2 of every chunk, in base order,
++// binary32, the base's vocabulary wide.
++//
++//   KldRows MODEL BASE --mode prompt|decode [--chunks N]
++//
++// prompt: each chunk is one prompt forward (the prompt path); the scored rows go through the model's own final norm
++//         and LM head (Qwen35CudaModel.ForwardPromptRows; the forward computes only its last row's logits otherwise).
++// decode: tokens 0 .. n_ctx/2 are one prompt (its last row is the first scored row); the rest goes through the calls
++//         TensorSharp's speculative loop makes (SpeculativeExecution.Step): DraftBlock drafts K tokens after the
++//         current token, SpecForward verifies the window [token, d1..dK] with every row's logits, and
++//         SpecOnVerifyAccepted commits the token and the accepted drafts. The text's tokens are forced: a draft is
++//         accepted while it equals the text's next token, and each position's row is the one of the window that
++//         commits it (rows past the first rejected draft are recomputed by the next window).
++using System.Runtime.InteropServices;
++using TensorSharp;
++using TensorSharp.Models;
++using TensorSharp.Runtime;
++
++if (args.Length < 2)
++{
++    Console.Error.WriteLine("usage: KldRows MODEL BASE --mode prompt|decode [--chunks N]");
++    return 2;
++}
++// Standard output carries the binary rows only: the library's console text (its "Model: ..." line) goes to stderr.
++var output = Console.OpenStandardOutput();
++Console.SetOut(Console.Error);
++string modelPath = args[0], basePath = args[1];
++string mode = Option("--mode") ?? "prompt";
++if (mode != "prompt" && mode != "decode") throw new ArgumentException("--mode prompt|decode");
++int chunksWanted = int.Parse(Option("--chunks") ?? "0");
++
++using var file = File.OpenRead(basePath);
++var magic = new byte[8];
++file.ReadExactly(magic);
++if (System.Text.Encoding.ASCII.GetString(magic) != "_logits_") throw new InvalidDataException(basePath + " is not a _logits_ file");
++var head = new int[3];
++file.ReadExactly(MemoryMarshal.AsBytes(head.AsSpan()));
++int context = head[0], vocab = head[1], baseChunks = head[2];
++var tokens = new int[(long)context * baseChunks];
++file.ReadExactly(MemoryMarshal.AsBytes(tokens.AsSpan()));
++int chunks = chunksWanted == 0 ? baseChunks : Math.Min(chunksWanted, baseChunks);
++int first = context / 2, rows = context - 1 - first;
++
++KvCacheDtypeConfig.ConfigureFromEnvironment();
++using var model = ModelBase.Create(modelPath, BackendType.Cuda);
++var q35 = model as Qwen35CudaModel ?? throw new NotSupportedException($"{modelPath}: not the direct-CUDA Qwen3.5/3.8 model");
++if (model.Config.VocabSize != vocab)
++    throw new InvalidDataException($"the model's head has {model.Config.VocabSize} rows; the base's vocabulary is {vocab}");
++int k = mode == "decode" ? q35.SpecMaxDraftTokens : 0;
++if (mode == "decode" && k < 1) throw new InvalidOperationException("decode needs the drafter (TS_Q35_NINFER_DRAFT_PTX)");
++Console.Error.WriteLine($"kld-rows: {mode}, {chunks} chunks of {context}, rows {first}..{context - 2}, vocabulary {vocab}" +
++    (k > 0 ? $", {k} drafts per window" : ""));
++
++var rowsOut =new float[(long)rows * vocab];
++var window = new float[(long)(k + 1) * vocab];
++var drafts = new int[Math.Max(k, 1)];
++var confidence = new float[Math.Max(k, 1)];
++long drafted = 0, accepted = 0, windows = 0;
++for (int c = 0; c < chunks; c++)
++{
++    int[] chunk = tokens.AsSpan(c * context, context).ToArray();
++    model.ResetKVCache();
++    if (mode == "prompt")
++        q35.ForwardPromptRows(chunk, first, rows, rowsOut);
++    else
++    {
++        float[] last = model.ForwardPrompt(chunk[..(first + 1)]);
++        Array.Copy(last, 0, rowsOut, 0, vocab);
++        int position = first + 1;   // committed tokens; chunk[position] is the next token in
++        while (position <= context - 2)
++        {
++            int token = chunk[position];
++            int kMax = Math.Min(k, context - 2 - position);   // rows past n_ctx - 2 are not scored
++            int n = kMax > 0 ? Math.Min(q35.DraftBlock(token, null, position, drafts, confidence), kMax) : 0;
++            if (n == 0)
++            {
++                q35.SpecForward(new[] { token }, null, window, allLogitsRows: false);
++                Array.Copy(window, 0, rowsOut, (long)(position - first) * vocab, vocab);
++                position++;
++                continue;
++            }
++            var batch = new int[n + 1];
++            batch[0] = token;
++            Array.Copy(drafts, 0, batch, 1, n);
++            q35.SpecForward(batch, null, window, allLogitsRows: true);
++            int m = 0;
++            while (m < n && drafts[m] == chunk[position + 1 + m]) m++;
++            Array.Copy(window, 0, rowsOut, (long)(position - first) * vocab, (long)(m + 1) * vocab);
++            q35.SpecOnVerifyAccepted(m, n);
++            position += m + 1;
++            drafted += n;
++            accepted += m;
++            windows++;
++        }
++    }
++    output.Write(MemoryMarshal.AsBytes(rowsOut.AsSpan()));
++    output.Flush();
++    if ((c + 1) % 20 == 0 || c + 1 == chunks)
++        Console.Error.WriteLine($"kld-rows: {c + 1}/{chunks} chunks" +
++            (windows > 0 ? $", {windows} windows, {accepted} of {drafted} drafts accepted" : ""));
++}
++return 0;
++
++string? Option(string name)
++{
++    int at = Array.IndexOf(args, name);
++    return at < 0 ? null : at + 1 < args.Length ? args[at + 1] : throw new ArgumentException("missing " + name);
++}

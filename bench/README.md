@@ -19,6 +19,10 @@ TTFT, cold prefill and output rates. It and the decode-saturation suite of
 [README](../README.md#benchmarks). The older serve A/B rig
 under [`ab/`](ab/README.md) predates the `e31bc99b` merge.
 
+[`engine_quality/`](engine_quality/) holds the output-quality comparison's configurations, the other
+engines' logits patches and the vLLM checkpoint script; [Quality](../docs/quality.md) describes the
+method and how to repeat it.
+
 ## Benchmark inputs
 
 Synthetic numerical inputs use reproducible pseudorandom values with distinct operand seeds,

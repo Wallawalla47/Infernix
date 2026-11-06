@@ -1,0 +1,21 @@
+{
+ "comment": "Strata v0.2.11 (c3b3f503, engine 0.1.57) built with STRATA_LOGPOS_ROWS: the IQ3_S engine arguments its setup writes for this PC (setup.py: --prefill auto --spec 4 --spec-min-p 0.5 --mtp rt; v0.2.11 drops the --prefill auto:32768 tip on one NVIDIA card), --kv int8, every expert in RAM (expert cache auto), its default route tail skip (no STRATA_ROUTE_TAIL_SKIP). tools/quality/engines/strata.py replaces --max-context and --short-read.",
+ "exe": "E:\\Infernix\\.local\\engine-compare\\strata-v0211-build\\strata.exe",
+ "args": [
+  "--pack", "E:\\Strata\\Strata-data\\packs\\iq3_s",
+  "--native", "E:\\Strata\\Strata-data\\models\\gsq-rco-iq3_s\\IQ3_S\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+  "--ple-gguf", "E:\\Strata\\Strata-data\\models\\gsq-rco-iq3_s\\IQ3_S\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+  "--expert-profile", "E:\\Infernix\\.local\\engine-compare\\strata-v0211\\data\\expert-profile.bin",
+  "--expert-cache", "auto",
+  "--prefill", "auto",
+  "--spec", "4",
+  "--spec-min-p", "0.5",
+  "--mtp", "E:\\Strata\\Strata-data\\mtp\\rt",
+  "--max-context", "262144",
+  "--kv", "int8",
+  "--kv-resident", "32768",
+  "--pool-workers", "15"
+ ],
+ "cwd": "E:\\Infernix\\.local\\engine-compare\\strata-v0211",
+ "lib_dirs": ["C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.0\\bin", "E:\\Strata\\Strata\\.venv\\Lib\\site-packages\\nvidia\\cu13\\bin\\x86_64"]
+}

@@ -1,0 +1,455 @@
+diff --git a/apps/CMakeLists.txt b/apps/CMakeLists.txt
+index 99ccf2fde..7e3f5c319 100644
+--- a/apps/CMakeLists.txt
++++ b/apps/CMakeLists.txt
+@@ -16,6 +16,10 @@ add_executable(ninfer-serve serve/main.cpp)
+ ninfer_internal_includes(ninfer-serve)
+ target_link_libraries(ninfer-serve PRIVATE ninfer_serve ninfer_product_logging)
+ 
++add_executable(ninfer-kld-rows kld_rows/main.cpp)
++ninfer_internal_includes(ninfer-kld-rows)
++target_link_libraries(ninfer-kld-rows PRIVATE ninfer_engine)
++
+ add_executable(ninfer-perplexity
+   perplexity/main.cpp
+   perplexity/options.cpp
+diff --git a/apps/kld_rows/main.cpp b/apps/kld_rows/main.cpp
+new file mode 100644
+index 000000000..ee5e9c3d5
+--- /dev/null
++++ b/apps/kld_rows/main.cpp
+@@ -0,0 +1,214 @@
++// ninfer-kld-rows: NInfer's logits on a llama.cpp `_logits_` base file's chunks (Infernix's engine comparison,
++// tools/quality/engine_compare.py), written to standard output as binary32 rows of the base's vocabulary: per chunk
++// the rows of positions n_ctx/2 .. n_ctx-2 in order, for infernix-certify llama-rows to score.
++//
++//   ninfer-kld-rows <artifact> --base BASE --dump FILE [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--chunks N]
++//                   [--decode [--spec none|mtp|dflash|dflash2] [--draft-tokens K]]
++//
++// Prompt path (default): each chunk is one Engine::score_tokens call (the CausalScoring route, NInfer's perplexity
++// path) with its first target at n_ctx/2 + 1; the head logits it computes are read back through
++// NINFER_SCORE_LOGITS_DUMP=FILE (src/core/score_logits_dump.h), BF16 as NInfer computes them.
++//
++// Decode path (--decode): each chunk is one Engine::generate request (the Generation route, eager, one request at a
++// time) of the chunk's first n_ctx/2 + 1 tokens, greedy, generating the remaining n_ctx/2 - 1 tokens with the chunk's own
++// tokens forced (src/core/forced_decode.h): the prompt's last row comes from the prompt path, every other row from a
++// decode step or a verify window of the --spec drafter. Rows go through NINFER_DECODE_ROWS_DUMP=FILE; the last row
++// written for a position is the one its token was emitted from.
++
++#include "core/forced_decode.h"
++#include "ninfer/engine.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <exception>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <map>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#ifdef _WIN32
++#include <fcntl.h>
++#include <io.h>
++#endif
++
++namespace {
++
++struct Base {
++    std::uint32_t context = 0;
++    std::int32_t vocab = 0, chunks = 0;
++    std::vector<ninfer::TokenId> tokens;
++};
++
++Base read_base(const std::filesystem::path& path) {
++    std::ifstream in(path, std::ios::binary);
++    char magic[8] = {};
++    std::int32_t header[3] = {};
++    in.read(magic, sizeof magic);
++    in.read(reinterpret_cast<char*>(header), sizeof header);
++    if (!in || std::memcmp(magic, "_logits_", 8) != 0) { throw std::runtime_error(path.string() + " is not a _logits_ file"); }
++    Base out{.context = static_cast<std::uint32_t>(header[0]), .vocab = header[1], .chunks = header[2]};
++    out.tokens.resize(static_cast<std::size_t>(out.chunks) * out.context);
++    in.read(reinterpret_cast<char*>(out.tokens.data()), static_cast<std::streamsize>(out.tokens.size() * sizeof(ninfer::TokenId)));
++    if (!in) { throw std::runtime_error(path.string() + ": truncated tokens"); }
++    return out;
++}
++
++ninfer::KvCacheStorage kv_storage(std::string_view name) {
++    if (name == "bf16") { return ninfer::KvCacheStorage::BFloat16; }
++    if (name == "int8") { return ninfer::KvCacheStorage::Int8Group64; }
++    if (name == "fp8") { return ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0; }
++    if (name == "nvfp4") { return ninfer::KvCacheStorage::Nvfp4Group16; }
++    if (name == "k8v4") { return ninfer::KvCacheStorage::Fp8KeyNvfp4Value; }
++    throw std::invalid_argument("--kv-dtype must be bf16, int8, fp8, nvfp4 or k8v4");
++}
++
++ninfer::SpeculativeBackend spec_backend(std::string_view name) {
++    if (name == "none") { return ninfer::SpeculativeBackend::None; }
++    if (name == "mtp") { return ninfer::SpeculativeBackend::Mtp; }
++    if (name == "dflash") { return ninfer::SpeculativeBackend::DFlash; }
++    if (name == "dflash2") { return ninfer::SpeculativeBackend::DFlash2; }
++    throw std::invalid_argument("--spec must be none, mtp, dflash or dflash2");
++}
++
++// The prompt path's dump: int64 rows, int64 columns, then each column's rows as binary32.
++void write_score_rows(const std::filesystem::path& dump, std::size_t rows, std::size_t vocab, std::int32_t c) {
++    std::ifstream in(dump, std::ios::binary);
++    std::size_t written = 0;
++    std::vector<float> column;
++    while (written < rows) {
++        std::int64_t header[2] = {};
++        if (!in.read(reinterpret_cast<char*>(header), sizeof header)) {
++            throw std::runtime_error("chunk " + std::to_string(c) + ": the dump holds " + std::to_string(written) + " of " +
++                                     std::to_string(rows) + " rows");
++        }
++        if (header[0] < static_cast<std::int64_t>(vocab)) { throw std::runtime_error("NInfer's head has fewer rows than the base's vocabulary"); }
++        column.resize(static_cast<std::size_t>(header[0]));
++        for (std::int64_t k = 0; k < header[1]; ++k) {
++            in.read(reinterpret_cast<char*>(column.data()), static_cast<std::streamsize>(column.size() * sizeof(float)));
++            if (!in) { throw std::runtime_error("chunk " + std::to_string(c) + ": a truncated dump"); }
++            // The base's vocabulary: NInfer's rows beyond it (head padding) are not tokens.
++            std::fwrite(column.data(), sizeof(float), vocab, stdout);
++            ++written;
++        }
++    }
++    if (in.peek() != std::char_traits<char>::eof()) {
++        throw std::runtime_error("chunk " + std::to_string(c) + ": the dump holds more than the chunk's rows");
++    }
++}
++
++// The decode path's dump: int64 position, int64 vocabulary, then the row as binary32; the last row of a position wins.
++void write_decode_rows(const std::filesystem::path& dump, std::uint32_t first, std::uint32_t last, std::size_t vocab,
++                       std::int32_t c) {
++    std::ifstream in(dump, std::ios::binary);
++    std::map<std::int64_t, std::vector<float>> rows;
++    for (;;) {
++        std::int64_t header[2] = {};
++        if (!in.read(reinterpret_cast<char*>(header), sizeof header)) { break; }
++        if (header[1] < static_cast<std::int64_t>(vocab)) { throw std::runtime_error("NInfer's head has fewer rows than the base's vocabulary"); }
++        std::vector<float> row(static_cast<std::size_t>(header[1]));
++        in.read(reinterpret_cast<char*>(row.data()), static_cast<std::streamsize>(row.size() * sizeof(float)));
++        if (!in) { throw std::runtime_error("chunk " + std::to_string(c) + ": a truncated decode dump"); }
++        rows[header[0]] = std::move(row);
++    }
++    for (std::uint32_t p = first; p <= last; ++p) {
++        const auto found = rows.find(p);
++        if (found == rows.end()) { throw std::runtime_error("chunk " + std::to_string(c) + ": no row for position " + std::to_string(p)); }
++        std::fwrite(found->second.data(), sizeof(float), vocab, stdout);
++    }
++}
++
++} // namespace
++
++int main(int argc, char** argv) {
++    try {
++        if (argc < 2) { throw std::invalid_argument("usage: ninfer-kld-rows <artifact> --base BASE --dump FILE [--kv-dtype K] [--chunks N] [--decode [--spec S] [--draft-tokens K]]"); }
++        std::filesystem::path base_path, dump;
++        std::string kv = "bf16", spec = "none";
++        std::int32_t chunks = 0;
++        std::uint32_t draft_tokens = 0;
++        bool decode = false;
++        for (int i = 2; i < argc; ++i) {
++            const std::string_view option = argv[i];
++            if (option == "--decode") { decode = true; continue; }
++            if (i + 1 >= argc) { throw std::invalid_argument(std::string(option) + " needs a value"); }
++            const std::string value = argv[++i];
++            if (option == "--base") { base_path = value; }
++            else if (option == "--dump") { dump = value; }
++            else if (option == "--kv-dtype") { kv = value; }
++            else if (option == "--chunks") { chunks = std::stoi(value); }
++            else if (option == "--spec") { spec = value; }
++            else if (option == "--draft-tokens") { draft_tokens = static_cast<std::uint32_t>(std::stoul(value)); }
++            else { throw std::invalid_argument("unknown option " + std::string(option)); }
++        }
++        const char* env_dump = std::getenv(decode ? "NINFER_DECODE_ROWS_DUMP" : "NINFER_SCORE_LOGITS_DUMP");
++        if (dump.empty() || env_dump == nullptr || dump != std::filesystem::path(env_dump)) {
++            throw std::invalid_argument(std::string("--dump FILE must name the file ") +
++                                        (decode ? "NINFER_DECODE_ROWS_DUMP" : "NINFER_SCORE_LOGITS_DUMP") + " holds");
++        }
++        const Base base = read_base(base_path);
++        if (chunks <= 0 || chunks > base.chunks) { chunks = base.chunks; }
++        ninfer::EngineOptions options;
++        options.artifact_path = argv[1];
++        options.purpose       = decode ? ninfer::EnginePurpose::Generation : ninfer::EnginePurpose::CausalScoring;
++        options.max_context   = (base.context + 127) / 128 * 128;
++        options.kv_cache      = kv_storage(kv);
++        if (decode) {
++            options.max_concurrency       = 1;
++            options.use_cuda_graph        = false; // the forced rows are read and raised between kernels
++            options.speculative.backend   = spec_backend(spec);
++            options.speculative.draft_tokens = draft_tokens;
++        }
++        ninfer::Engine engine(std::move(options));
++#ifdef _WIN32
++        if (_setmode(_fileno(stdout), _O_BINARY) == -1) { throw std::runtime_error("cannot write standard output as binary"); }
++#endif
++        const std::uint32_t half = base.context / 2;
++        const std::size_t rows   = base.context - 1 - half;
++        const auto vocab         = static_cast<std::size_t>(base.vocab);
++        for (std::int32_t c = 0; c < chunks; ++c) {
++            std::filesystem::remove(dump);
++            const auto* first = base.tokens.data() + static_cast<std::size_t>(c) * base.context;
++            if (decode) {
++                auto& forced         = ninfer::core::forced_decode();
++                forced.tokens        = first;
++                forced.length        = base.context;
++                forced.prompt_length = half + 1;
++                ninfer::RequestOptions request;
++                request.execution.requested_output_tokens = static_cast<std::uint32_t>(rows);
++                request.execution.allow_prefix_reuse      = false;
++                request.execution.sampling.temperature       = 0.0F;
++                request.execution.sampling.presence_penalty  = 0.0F;
++                request.execution.sampling.frequency_penalty = 0.0F;
++                request.stop.include_model_defaults = false;
++                const auto result = engine.generate(engine.prepare_tokens(std::vector<ninfer::TokenId>(first, first + half + 1), false),
++                                                    std::move(request));
++                forced = {};
++                if (result.generated_token_ids.size() != rows ||
++                    !std::equal(result.generated_token_ids.begin(), result.generated_token_ids.end(), first + half + 1)) {
++                    throw std::runtime_error("chunk " + std::to_string(c) + ": generated " +
++                                             std::to_string(result.generated_token_ids.size()) + " tokens, not the chunk's " +
++                                             std::to_string(rows));
++                }
++                write_decode_rows(dump, half, base.context - 2, vocab, c);
++            } else {
++                const std::vector<ninfer::TokenId> tokens(first, first + base.context);
++                // Targets half + 1 .. n_ctx - 1: the rows of positions half .. n_ctx - 2.
++                (void)engine.score_tokens(tokens, half + 1);
++                write_score_rows(dump, rows, vocab, c);
++            }
++            std::fflush(stdout);
++            if ((c + 1) % 20 == 0 || c + 1 == chunks) { std::cerr << "ninfer-kld-rows: " << c + 1 << "/" << chunks << " chunks\n"; }
++        }
++        std::filesystem::remove(dump);
++        return 0;
++    } catch (const std::exception& error) {
++        std::cerr << "ninfer-kld-rows: " << error.what() << '\n';
++        return 2;
++    }
++}
+diff --git a/src/core/forced_decode.h b/src/core/forced_decode.h
+new file mode 100644
+index 000000000..f40610aa5
+--- /dev/null
++++ b/src/core/forced_decode.h
+@@ -0,0 +1,27 @@
++#pragma once
++
++// Forced decoding for Infernix's engine comparison (apps/kld_rows --decode, local only). While a ForcedDecode sequence is
++// set, every target head row the decode path computes (the prompt's last row, each plain decode step and each verify
++// window column) is appended to NINFER_DECODE_ROWS_DUMP as int64 position, int64 vocabulary, then the row's BF16 logits
++// widened to binary32, exactly as computed; then the logit of the sequence's next token at that row is raised to 16384 so
++// greedy selection takes the text's token (verification accepts a draft exactly when it is the text's token). The
++// computation itself is unchanged; a position's row computed after a rejected draft is rewritten by the later window that
++// recomputes it, so the last row written for a position is the one its token was emitted from. Measurement only: the
++// engine side (forced_decode_rows.h) synchronizes the stream.
++
++#include <cstdint>
++
++namespace ninfer::core {
++
++struct ForcedDecode {
++    const std::int32_t* tokens   = nullptr; // the whole text: prompt then continuation
++    std::uint32_t length         = 0;
++    std::uint32_t prompt_length  = 0;
++};
++
++inline ForcedDecode& forced_decode() {
++    static ForcedDecode value;
++    return value;
++}
++
++} // namespace ninfer::core
+diff --git a/src/core/forced_decode_rows.h b/src/core/forced_decode_rows.h
+new file mode 100644
+index 000000000..f52e73ac4
+--- /dev/null
++++ b/src/core/forced_decode_rows.h
+@@ -0,0 +1,58 @@
++#pragma once
++
++// Forced decoding's row dump and logit raise (core/forced_decode.h); the engine side only.
++
++#include "core/forced_decode.h"
++
++#include <cuda_runtime.h>
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++#include <vector>
++
++namespace ninfer::core {
++
++// `logits`: BF16, column-major [rows, columns] on the device; columns 0 .. valid - 1 hold positions first .. first + valid - 1.
++inline void force_decode_rows(void* logits, std::int64_t rows, std::int64_t vocabulary, std::int64_t valid,
++                              std::int64_t first, cudaStream_t stream) {
++    const ForcedDecode& forced = forced_decode();
++    if (forced.tokens == nullptr || valid <= 0) { return; }
++    static const char* path = std::getenv("NINFER_DECODE_ROWS_DUMP");
++    if (path == nullptr || *path == '\0') { throw std::runtime_error("forced decoding needs NINFER_DECODE_ROWS_DUMP"); }
++    std::vector<std::uint16_t> bf16(static_cast<std::size_t>(rows * valid));
++    if (cudaStreamSynchronize(stream) != cudaSuccess ||
++        cudaMemcpy(bf16.data(), logits, bf16.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
++        throw std::runtime_error("NINFER_DECODE_ROWS_DUMP: the logits copy failed");
++    }
++    std::FILE* out = std::fopen(path, "ab");
++    if (out == nullptr) { throw std::runtime_error("NINFER_DECODE_ROWS_DUMP: cannot open the file"); }
++    // The head's whole row (its padded output rows, as the prompt path's dump writes them): the base file's vocabulary
++    // includes the tokens past the public ones.
++    (void)vocabulary;
++    std::vector<float> widened(static_cast<std::size_t>(rows));
++    for (std::int64_t column = 0; column < valid; ++column) {
++        const std::int64_t header[2] = {first + column, rows};
++        for (std::int64_t t = 0; t < rows; ++t) {
++            const std::uint32_t bits = static_cast<std::uint32_t>(bf16[static_cast<std::size_t>(column * rows + t)]) << 16;
++            std::memcpy(&widened[static_cast<std::size_t>(t)], &bits, sizeof bits);
++        }
++        std::fwrite(header, sizeof header, 1, out);
++        std::fwrite(widened.data(), sizeof(float), widened.size(), out);
++    }
++    std::fclose(out);
++    const std::uint16_t raised = 0x4680; // BF16 16384
++    for (std::int64_t column = 0; column < valid; ++column) {
++        const std::int64_t next = first + column + 1;
++        if (next < 0 || next >= static_cast<std::int64_t>(forced.length)) { continue; }
++        const std::int32_t token = forced.tokens[next];
++        auto* at = static_cast<std::uint16_t*>(logits) + column * rows + token;
++        if (cudaMemcpy(at, &raised, sizeof raised, cudaMemcpyHostToDevice) != cudaSuccess) {
++            throw std::runtime_error("forced decoding: the logit write failed");
++        }
++    }
++}
++
++} // namespace ninfer::core
+diff --git a/src/core/score_logits_dump.h b/src/core/score_logits_dump.h
+new file mode 100644
+index 000000000..4c4abd323
+--- /dev/null
++++ b/src/core/score_logits_dump.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++// NINFER_SCORE_LOGITS_DUMP=<file> (Infernix's engine comparison, apps/kld_rows): every causal-scoring call's head
++// logits as computed, appended as int64 rows, int64 columns, then each column's rows widened from BF16 to binary32.
++// Measurement only: it synchronizes the stream and never changes a result.
++
++#include <cuda_runtime.h>
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++#include <vector>
++
++namespace ninfer::core {
++
++inline void dump_score_logits(const void* device_bf16, std::int64_t rows, std::int64_t columns, cudaStream_t stream) {
++    static const char* path = std::getenv("NINFER_SCORE_LOGITS_DUMP");
++    if (path == nullptr || *path == '\0' || rows <= 0 || columns <= 0) { return; }
++    std::vector<std::uint16_t> bf16(static_cast<std::size_t>(rows * columns));
++    if (cudaStreamSynchronize(stream) != cudaSuccess ||
++        cudaMemcpy(bf16.data(), device_bf16, bf16.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
++        throw std::runtime_error("NINFER_SCORE_LOGITS_DUMP: the logits copy failed");
++    }
++    std::vector<float> widened(bf16.size());
++    for (std::size_t i = 0; i < bf16.size(); ++i) {
++        const std::uint32_t bits = static_cast<std::uint32_t>(bf16[i]) << 16;
++        std::memcpy(&widened[i], &bits, sizeof bits);
++    }
++    std::FILE* out = std::fopen(path, "ab");
++    if (out == nullptr) { throw std::runtime_error("NINFER_SCORE_LOGITS_DUMP: cannot open the file"); }
++    const std::int64_t header[2] = {rows, columns};
++    std::fwrite(header, sizeof header, 1, out);
++    std::fwrite(widened.data(), sizeof(float), widened.size(), out);
++    std::fclose(out);
++}
++
++} // namespace ninfer::core
+diff --git a/src/models/qwen3_5/program/decision.cpp b/src/models/qwen3_5/program/decision.cpp
+index 1b23f6b1c..35ab1cd79 100644
+--- a/src/models/qwen3_5/program/decision.cpp
++++ b/src/models/qwen3_5/program/decision.cpp
+@@ -3,6 +3,7 @@
+ #include "ninfer/ops/argmax.h"
+ #include "ninfer/ops/indexing.h"
+ #include "ninfer/ops/speculative_accept.h"
++#include "core/forced_decode_rows.h"
+ 
+ #include <algorithm>
+ #include <cstring>
+@@ -59,6 +60,11 @@ void RankProgramImpl::project_decode(std::uint32_t batch_value, std::uint32_t wi
+     Tensor flat_logits   = logits.view({rows, width * batch});
+     execution::project(hidden.view({hidden.ne[0], width * batch}), parameters.text.output_head,
+                        flat_logits, resources.work, device.execution_view());
++    if (core::forced_decode().tokens != nullptr) {
++        if (batch != 1) throw std::logic_error("forced decoding runs one request at a time");
++        core::force_decode_rows(flat_logits.data, rows, vocabulary, frame.host_ingress->valid_columns[0],
++                                frame.host_ingress->frontiers[0], device.stream());
++    }
+     if (width == 1) return;
+     Tensor argmax      = prefix(frame.target_argmax, {width, batch});
+     Tensor flat_argmax = argmax.view({width * batch});
+@@ -173,6 +179,13 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
+         Tensor logits = prefix(frame.logits, {rows, batch});
+         execution::project(hidden, parameters.text.output_head, logits, resources.work,
+                            device.execution_view());
++        if (const auto& forced = core::forced_decode(); forced.tokens != nullptr) {
++            if (batch != 1) throw std::logic_error("forced decoding runs one request at a time");
++            core::force_decode_rows(logits.data, rows, vocabulary, 1,
++                                    forward ? static_cast<std::int64_t>(forced.prompt_length) - 1
++                                            : static_cast<std::int64_t>(frame.host_ingress->frontiers[0]),
++                                    device.stream());
++        }
+         Tensor tokens = prefix(frame.output_tokens, {batch});
+         ops::sample(logits, tokens, vocabulary, frame.sampling,
+                     frame.sampling_positions.slice(0, 0, batch), purpose, resources.work,
+diff --git a/src/models/qwen3_5/program/scoring.cpp b/src/models/qwen3_5/program/scoring.cpp
+index 8c0ddc86c..ecb641b1f 100644
+--- a/src/models/qwen3_5/program/scoring.cpp
++++ b/src/models/qwen3_5/program/scoring.cpp
+@@ -1,6 +1,7 @@
+ #include "models/qwen3_5/program/internal.h"
+ #include "models/qwen3_5/execution/linear.h"
+ #include "ninfer/ops/target_logprobs.h"
++#include "core/score_logits_dump.h"
+ 
+ #include <algorithm>
+ 
+@@ -33,6 +34,7 @@ void RankProgramImpl::launch_score(ComputeOperation& operation) {
+     Tensor logits = resources.work.alloc(DType::BF16, {frame.spec.output_rows, count});
+     execution::project(hidden, parameters.text.output_head, logits, resources.work,
+                        device.execution_view());
++    core::dump_score_logits(logits.data, logits.ne[0], logits.ne[1], device.stream());
+     Tensor scores = frame.score_logprobs.slice(0, 0, count);
+     ops::target_logprobs(logits, targets, execution::dimension(parameters.profile->public_tokens),
+                          scores, device.execution_view());
+diff --git a/src/models/qwen4_exp/program/scoring.cpp b/src/models/qwen4_exp/program/scoring.cpp
+index a48e49e0d..755e455bb 100644
+--- a/src/models/qwen4_exp/program/scoring.cpp
++++ b/src/models/qwen4_exp/program/scoring.cpp
+@@ -1,6 +1,7 @@
+ #include "models/qwen4_exp/program/internal.h"
+ #include "core/transfer.h"
+ #include "ninfer/ops/target_logprobs.h"
++#include "core/score_logits_dump.h"
+ 
+ #include <algorithm>
+ 
+@@ -35,6 +36,7 @@ void RankProgramImpl::score_next() {
+                      {host, n * sizeof(TokenId), Device::cpu(), true}, cuda);
+     execution::project_head(f.sample.slice(1, work.first_target_column + f.score_at, n),
+                             parameters.text.head, buffers.logits, resources.workspace, cuda);
++    core::dump_score_logits(buffers.logits.data, buffers.logits.ne[0], buffers.logits.ne[1], cuda.stream());
+     if (parallel) {
+         auto stats    = resources.workspace.alloc(DType::FP32, {3, static_cast<int>(n)});
+         auto gathered = resources.workspace.alloc(

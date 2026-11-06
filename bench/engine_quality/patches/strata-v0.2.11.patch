@@ -1,0 +1,28 @@
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 47977c15..6d44a3fd 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -3804,6 +3804,23 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
+         return false;
+     }
+ #endif
++    // STRATA_LOGPOS_ROWS=<file> (Infernix's engine comparison, tools/quality/engines/strata.py): every row of the
++    // window's head logits as it is, appended as int64 position, int64 vocabulary, then the binary32 logits. The
++    // file is opened per window, so a reader may consume and delete it between requests.
++    static const char* rows_path = std::getenv("STRATA_LOGPOS_ROWS");
++    if (rows_path != nullptr && *rows_path != '\0') {
++        std::FILE* rows_out = std::fopen(rows_path, "ab");
++        if (rows_out == nullptr) {
++            err = "window_logprobs: cannot open STRATA_LOGPOS_ROWS";
++            return false;
++        }
++        for (int t = 0; t < T; ++t) {
++            const int64_t header[2] = {(int64_t) (pos0 + t), (int64_t) n_vocab_};
++            std::fwrite(header, sizeof header, 1, rows_out);
++            std::fwrite(h.data() + (size_t) t * (size_t) n_vocab_, sizeof(float), (size_t) n_vocab_, rows_out);
++        }
++        std::fclose(rows_out);
++    }
+     for (int t = 0; t < T; ++t) {
+         const float* row = h.data() + (size_t) t * (size_t) n_vocab_;
+         const int32_t tgt = targets[t];

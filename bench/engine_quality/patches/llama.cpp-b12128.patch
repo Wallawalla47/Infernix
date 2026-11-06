@@ -1,0 +1,87 @@
+diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
+index 601361a..84dd801 100644
+--- a/tools/perplexity/perplexity.cpp
++++ b/tools/perplexity/perplexity.cpp
+@@ -1771,6 +1771,21 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+ 
+     const int first = n_ctx/2;
+ 
++    // LLAMA_KLD_DECODE_T=T (Infernix's engine comparison): the decode path instead of the prompt path. Each chunk's first
++    // n_ctx/2 + 1 tokens are one prompt batch (its last row scored), then the chunk's own tokens are fed in windows of T
++    // tokens, every row with logits: what a speculative verify of T - 1 drafts computes when every draft is the text's
++    // token. One chunk at a time (-b n_ctx).
++    const int decode_t = std::getenv("LLAMA_KLD_DECODE_T") ? std::max(1, atoi(std::getenv("LLAMA_KLD_DECODE_T"))) : 0;
++    std::vector<float> dec_logits;
++    if (decode_t > 0) {
++        if (n_seq != 1) {
++            LOG_ERR("%s: LLAMA_KLD_DECODE_T needs one chunk per batch (-b %u)\n", __func__, n_ctx);
++            return;
++        }
++        dec_logits.reserve(size_t(n_ctx - 1 - first) * n_vocab);
++        LOG_INF("%s: decode path, windows of %d tokens\n", __func__, decode_t);
++    }
++
+     for (int i = 0; i < n_chunk; i += n_seq) {
+         const int start =     i * n_ctx;
+         const int end   = start + n_ctx;
+@@ -1782,6 +1797,35 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+         // clear the KV cache
+         llama_memory_clear(llama_get_memory(ctx), true);
+ 
++        if (decode_t > 0) {
++            dec_logits.clear();
++            batch.clear();
++            for (int k = 0; k <= first; ++k) {
++                const llama_token t = (add_bos && k == 0) ? llama_vocab_bos(vocab) : tokens[start + k];
++                batch.add(t, k, 0, k == first);
++            }
++            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
++                LOG_ERR("%s : failed to decode the prompt\n", __func__);
++                return;
++            }
++            const float * row = llama_get_logits_ith(ctx, -1);
++            dec_logits.insert(dec_logits.end(), row, row + n_vocab);
++            for (int pos = first + 1; pos <= static_cast<int>(n_ctx) - 2; pos += decode_t) {
++                const int w = std::min(decode_t, static_cast<int>(n_ctx) - 1 - pos);
++                batch.clear();
++                for (int k = 0; k < w; ++k) {
++                    batch.add(tokens[start + pos + k], pos + k, 0, true);
++                }
++                if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
++                    LOG_ERR("%s : failed to decode a window\n", __func__);
++                    return;
++                }
++                for (int k = 0; k < w; ++k) {
++                    const float * r = llama_get_logits_ith(ctx, k);
++                    dec_logits.insert(dec_logits.end(), r, r + n_vocab);
++                }
++            }
++        } else
+         for (int j = 0; j < num_batches; ++j) {
+             const int batch_start = start + j * n_batch;
+             const int batch_size  = std::min(end - batch_start, n_batch);
+@@ -1844,7 +1888,23 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+                 return;
+             }
+ 
+-            const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
++            const float * all_logits = decode_t > 0 ? dec_logits.data()
++                                     : num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
++
++            // LLAMA_KLD_ROUND_BF16=1 (Infernix's engine comparison): every logit rounded to nearest-even BF16 before it
++            // is scored, so engines whose heads write FP32 and BF16 are compared at one precision.
++            static const bool round_bf16 = std::getenv("LLAMA_KLD_ROUND_BF16") != nullptr;
++            static std::vector<float> rounded;
++            if (round_bf16) {
++                rounded.assign(all_logits, all_logits + size_t(n_ctx - 1 - first)*n_vocab);
++                for (float & v : rounded) {
++                    uint32_t bits;
++                    memcpy(&bits, &v, sizeof bits);
++                    if ((bits & 0x7FFFFFFFu) <= 0x7F800000u) { bits = ((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16) << 16; }
++                    memcpy(&v, &bits, sizeof bits);
++                }
++                all_logits = rounded.data();
++            }
+ 
+             process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
+                     workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
