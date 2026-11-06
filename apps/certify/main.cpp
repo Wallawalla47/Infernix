@@ -243,6 +243,8 @@ Options parse(int argc, char** argv) {
             infernix::product::apply_draft_tree_nodes(out.speculative, value());
         } else if (option == "--draft-model") {
             out.speculative.draft_model = std::filesystem::path(std::string(value()));
+        } else if (option == "--lm-head-draft") {
+            out.speculative.proposal_head = infernix::ProposalHead::Optimized;
         } else if (option == "--prefix-reuse") {
             out.prefix_reuse = true;
         } else if (option == "--warm-tokens") {
