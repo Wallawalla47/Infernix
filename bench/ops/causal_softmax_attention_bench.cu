@@ -86,6 +86,9 @@ struct Options {
 bool envelope_fast_prompt                 = false;
 bool envelope_fast_prompt_pv8             = false;
 bool envelope_decode_split64              = false;
+// --shared-pages N: every row's first N logical pages map to row 0's physical pages, as the lanes that
+// fork one cached prefix share it (append entry; N pages must lie inside every row's context).
+std::int32_t shared_prefix_pages = 0;
 std::size_t envelope_split_workspace_bytes = ops::kCausalPromptSplitWorkspaceDefaultBytes;
 
 struct Result {
@@ -131,7 +134,7 @@ struct Result {
                  "[--mapping identity|fragmented] "
                  "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--fast-prompt] "
                  "[--fast-prompt-pv8] [--split-workspace-mib N] [--decode-split64] "
-                 "[--csv-out PATH]\n",
+                 "[--shared-pages N] [--csv-out PATH]\n",
                  message);
     std::exit(2);
 }
@@ -285,6 +288,9 @@ Options parse_options(int argc, char** argv) {
                 << 20;
         } else if (argument == "--csv-out") {
             options.csv_out = next("--csv-out requires a path");
+        } else if (argument == "--shared-pages") {
+            shared_prefix_pages = parse_i32(next("--shared-pages requires a value"), 0, 4096,
+                                            "--shared-pages");
         } else if (argument == "--help" || argument == "-h") {
             usage("help");
         } else {
@@ -560,8 +566,11 @@ public:
         }
         std::vector<std::int32_t> host_table(static_cast<std::size_t>(logical_pages_) * batch_);
         for (std::int32_t row = 0; row < batch_; ++row) {
+            if (shared_prefix_pages * kPagedKVPageSize > contexts[static_cast<std::size_t>(row)]) {
+                throw std::invalid_argument("--shared-pages reaches past a row's context");
+            }
             for (std::int32_t page = 0; page < logical_pages_; ++page) {
-                const std::int32_t linear = row * logical_pages_ + page;
+                const std::int32_t linear = (page < shared_prefix_pages ? 0 : row) * logical_pages_ + page;
                 host_table[static_cast<std::size_t>(row) * logical_pages_ + page] =
                     mapping_ == PageMapping::Identity ? linear : 2 * linear + 1;
             }
@@ -803,13 +812,13 @@ void report(const Result& result) {
     const double pv_tflops     = result.pv_flops / seconds / 1.0e12;
     std::printf(
         "entry=%-6s geometry=%-14s kv=%-6s mapping=%-10s execution=%-5s cache=%-4s "
-        "B=%d W=%d contexts=%s valid=%s rows=%s envelope=[%u,%u] "
+        "B=%d W=%d contexts=%s valid=%s rows=%s shared_pages=%d envelope=[%u,%u] "
         "workspace=%9zu peak=%9zu nodes=%zu calls=%d median=%10.3f us min=%10.3f us p95=%10.3f us "
         "logical_payload=%8.1f GB/s physical_payload=%8.1f GB/s math=%7.2f TFLOP/s\n",
         entry_name(result.entry), result.geometry.name, storage_name(result.storage),
         mapping_name(result.mapping), execution_name(result.execution), cache_name(result.cache),
         result.batch, result.tokens, result.row_contexts.c_str(), result.valid_columns.c_str(),
-        result.table_rows.c_str(), result.envelope.min_visible_keys,
+        result.table_rows.c_str(), shared_prefix_pages, result.envelope.min_visible_keys,
         result.envelope.max_visible_keys, result.workspace_bytes, result.workspace_peak,
         result.graph_nodes, result.graph_calls, result.timing.median_us, result.timing.min_us,
         result.timing.p95_us, logical_gbps, physical_gbps, tflops);
@@ -834,7 +843,7 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
               "qk_full_op_tflops,pv_full_op_tflops,"
               "unique_kv_bytes,"
               "unique_kv_gbps,median_us,min_us,p95_us,graph_nodes,workspace_peak_bytes,graph_calls,"
-              "envelope_min,envelope_max\n";
+              "envelope_min,envelope_max,shared_pages\n";
     for (const Result& result : results) {
         output << entry_name(result.entry) << ',' << result.geometry.name << ','
                << storage_name(result.storage) << ',' << mapping_name(result.mapping) << ','
@@ -851,7 +860,7 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
         output << ',' << result.timing.median_us << ',' << result.timing.min_us << ','
                << result.timing.p95_us << ',' << result.graph_nodes << ',' << result.workspace_peak
                << ',' << result.graph_calls << ',' << result.envelope.min_visible_keys << ','
-               << result.envelope.max_visible_keys << '\n';
+               << result.envelope.max_visible_keys << ',' << shared_prefix_pages << '\n';
     }
 }
 

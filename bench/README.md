@@ -792,6 +792,10 @@ submission gaps. Reported times are normalized per Op, and the CSV records `grap
 append calls overwrite the same positions with identical values; this is a warm Op measurement,
 not 32 speculative rounds. Cold measurements require one call per graph.
 
+`--shared-pages N` (append entry) maps every row's first N logical pages to row 0's physical pages,
+as the lanes that fork one cached prefix share it; N pages must lie inside every row's context. Against
+the default distinct pages it shows how much of a shared prefix the batch reads only once.
+
 `--envelope-max N` uses a fixed `[1,N]` execution envelope while actual contexts vary; N must
 cover every visible row. The default uses the exact visible length. CSV rows record both bounds,
 so broad Graph-envelope measurements can be distinguished from exact-length measurements.
