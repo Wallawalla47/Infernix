@@ -53,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--chunks", type=int, default=0)
     parser.add_argument("--t", type=int, default=3, help="tokens per verify window (ppl_gate.py's default)")
     parser.add_argument("--wsl", action="store_true")
+    parser.add_argument("--cwd", help="the engine's working directory (its repository: data/profiles)")
     parser.add_argument("extra", nargs=argparse.REMAINDER, help="-- then engine arguments")
     args = parser.parse_args(argv)
     extra = args.extra[1:] if args.extra[:1] == ["--"] else args.extra
@@ -67,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     print("basalt: " + subprocess.list2cmdline(command), file=sys.stderr, flush=True)
     with (args.work / "basalt.stderr.txt").open("w", encoding="utf-8") as err:
         engine = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, text=True,
-                                  env=env, bufsize=1)
+                                  env=env, bufsize=1, cwd=args.cwd)
         for line in engine.stdout:
             if line.startswith("READY"):
                 break
