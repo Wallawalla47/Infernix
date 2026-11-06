@@ -18,9 +18,11 @@
 namespace infernix::ops {
 
 inline constexpr int kTopLogprobsBlock = 256;
-// Largest K the K-pass selection serves: the sampled-draft (4) and DFlash2 candidate (16) heads
-// stay on it until the radix selection is timed at their shapes.
-inline constexpr int kTopLogprobsSerialMaximum = 16;
+// Largest K the K-pass selection serves. Over the 248,077-token vocabulary it costs about 82 us plus
+// 25.6 us per K a column and the radix selection 230-310 us at any K (bench/ops/top_logprobs_bench.cu,
+// RTX 5090, 2026-11-06, 1-32 columns, FP32 and BF16): the sampled-draft head (4) stays here, the
+// DFlash2 candidate head (16) takes the radix selection (490 against 244 us, FP32).
+inline constexpr int kTopLogprobsSerialMaximum = 6;
 // Largest K the radix selection serves (its shared key buffer).
 inline constexpr int kTopLogprobsSelectMaximum = 1024;
 inline constexpr int kTopLogprobsDigitBits     = 11;

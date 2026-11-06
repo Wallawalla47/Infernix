@@ -230,8 +230,17 @@ INFERNIX_OP_TEST(top_logprobs) {
                          make_fp32_logits(248320, 248077, 3));
     failures += run_case("top_logprobs FP32 below BF16 spacing C=129 K=8", 523, 509, 129, 8,
                          make_fp32_logits(523, 509, 129));
-    // K above kTopLogprobsSerialMaximum (16) up to kTopLogprobsSelectMaximum (1024) takes the radix
-    // selection; K=1025 the K-pass selection again.
+    // K above kTopLogprobsSerialMaximum (6) up to kTopLogprobsSelectMaximum (1024) takes the radix
+    // selection; K=1025 the K-pass selection again. The boundary, and the DFlash2 candidate head's
+    // K=16 over 16 columns of the full vocabulary.
+    failures += run_case("top_logprobs K-pass boundary FP32 K=6", 248320, 248077, 4, 6,
+                         make_fp32_logits(248320, 248077, 4));
+    failures += run_case("top_logprobs radix boundary FP32 K=7", 248320, 248077, 4, 7,
+                         make_fp32_logits(248320, 248077, 4));
+    failures += run_case("top_logprobs radix DFlash2 head FP32 C=16 K=16", 248320, 248077, 16, 16,
+                         make_fp32_logits(248320, 248077, 16));
+    failures += run_case("top_logprobs radix DFlash2 head C=16 K=16", 248320, 248077, 16, 16,
+                         make_logits(248320, 248077, 16, random_value));
     failures += run_case("top_logprobs radix full vocabulary K=256", 248320, 248077, 3, 256,
                          make_logits(248320, 248077, 3, random_value));
     failures += run_case("top_logprobs radix FP32 full vocabulary K=256", 248320, 248077, 3, 256,

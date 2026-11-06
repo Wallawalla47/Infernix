@@ -527,6 +527,20 @@ cmake --build build -j --target infernix_linear_topk_bench
 ./build/bench/infernix_linear_topk_bench --profile q4-optimized --columns 129 --repeat 60
 ```
 
+## TopLogprobs selection benchmark
+
+`infernix_top_logprobs_bench` times the two selections of `ops::top_logprobs`, the K-pass selection and the radix
+selection, on the same warm logits over the 248,077-row vocabulary (a head's logits are in L2 when the selection
+runs), for each `--k` and `--columns` (defaults 4, 16, 20 and 1, 8, 16, 32) in FP32 and BF16, and checks that both
+give the same ids and values bit for bit. `kTopLogprobsSerialMaximum` (`ops/kernel/top_logprobs.cuh`) records the
+crossover it measured.
+
+```bash
+cmake --build build -j --target infernix_top_logprobs_bench
+./build/bench/infernix_top_logprobs_bench
+./build/bench/infernix_top_logprobs_bench --k 1,4,6,7,16 --columns 1,16 --dtype fp32
+```
+
 ## CandidateSelectorPath Op benchmark
 
 `infernix_candidate_selector_bench` measures the complete public conditional selector for
