@@ -104,6 +104,9 @@ def test_the_default_plan_measures_the_shipped_configuration(tmp_path):
     assert graphs.base == "D-default-int8-spec-c1-eager" and "--spec" in graphs.argv and "--observed-only" in graphs.argv
     assert "--no-cuda-graph" in eager["D-default-int8-spec-c1"].argv
     assert [s.id for s in engine_compare.plan(_config(tmp_path, spec=[]))[0]][-1] == "P-default-int8"
+    # Concurrency 1: the one-request arm is the concurrency arm, listed (and reported) once.
+    single = _ids(engine_compare.plan(_config(tmp_path, concurrency=1))[0])
+    assert single.count("D-default-int8-spec-c1") == 1 and len(single) == len(set(single))
 
 
 def test_the_report_divides_the_defaults_by_the_floor(tmp_path):
@@ -119,7 +122,11 @@ def test_the_report_divides_the_defaults_by_the_floor(tmp_path):
     ratios = result["default_ratios"]["P-default-int8"]
     assert abs(ratios["mean_kld"][0] - 3.0) < 1e-6 and ratios["mean_kld"][1] < 3.0 < ratios["mean_kld"][2]
     assert 1.5 < ratios["disagreement"][0] < 2.5 and ratios["disagreement"][1] <= ratios["disagreement"][2]
-    assert "Infernix defaults against the floor" in result["markdown"]
+    assert "## Every row against honest rounding" in result["markdown"]
+    # Perplexity as a change from the reference's on the same positions, not as two absolute columns.
+    assert "| Mean KLD | KLD 99.9% | Top-1 agreement | PPL vs reference |" in result["markdown"]
+    assert "The reference's perplexity on the scored positions is" in result["markdown"]
+    assert "## Checks" not in result["markdown"]  # no checks ran, no empty heading
 
 
 def _arm(tmp_path, arm_id, kld, same_top, chunks=40, nll_shift=0.0, **meta):

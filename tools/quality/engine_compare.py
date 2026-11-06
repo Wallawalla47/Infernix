@@ -214,11 +214,12 @@ def plan(config: dict) -> tuple[list[Step], list[str]]:
     steps.append(_arm(config, f"P-default-{kv}", "P", ["--kv-dtype", kv], "default"))
     if config["decode"]:
         steps.append(_arm(config, f"D-reproducible-{kv}-c{conc}", "D", reproducible, "reproducible", conc))
-        # The reproducible route's request invariance, on the first chunks: one row at a time must give the bits
-        # of eight together.
-        check = 40 if config["chunks"] == 0 else min(40, config["chunks"])
-        steps.append(_arm(config, f"D-reproducible-{kv}-c1-check", "D", reproducible + ["--chunks", str(check)],
-                          "invariance", 1, base=f"D-reproducible-{kv}-c{conc}"))
+        if conc != 1:
+            # The reproducible route's request invariance, on the first chunks: one row at a time must give the bits
+            # of `concurrency` together.
+            check = 40 if config["chunks"] == 0 else min(40, config["chunks"])
+            steps.append(_arm(config, f"D-reproducible-{kv}-c1-check", "D", reproducible + ["--chunks", str(check)],
+                              "invariance", 1, base=f"D-reproducible-{kv}-c{conc}"))
         steps.append(_arm(config, f"D-default-{kv}-c1", "D", ["--kv-dtype", kv], "default", 1))
         if not config["decode_cuda_graph"]:
             # The arms capture rows on eager rounds: the observed form with and without CUDA graphs must agree bit
@@ -227,7 +228,8 @@ def plan(config: dict) -> tuple[list[Step], list[str]]:
             steps.append(_arm(config, f"D-default-{kv}-c1-graphs", "D", check + ["--cuda-graph"], "graphs", 1,
                               base=f"D-default-{kv}-c1-eager"))
             steps.append(_arm(config, f"D-default-{kv}-c1-eager", "D", check, "graphs", 1))
-        steps.append(_arm(config, f"D-default-{kv}-c{conc}", "D", ["--kv-dtype", kv], "default", conc))
+        if conc != 1:  # concurrency 1: the arm above
+            steps.append(_arm(config, f"D-default-{kv}-c{conc}", "D", ["--kv-dtype", kv], "default", conc))
         if config["spec"]:
             steps.append(_arm(config, f"D-reproducible-{kv}-spec-c1", "D", reproducible + config["spec"], "reproducible", 1))
             steps.append(_arm(config, f"D-default-{kv}-spec-c1", "D", ["--kv-dtype", kv, *config["spec"]], "default", 1))
@@ -279,7 +281,8 @@ def _default_plan(config: dict, steps: list[Step]) -> list[Step]:
             steps.append(_arm(config, f"D-default-{kv}-spec-c1-graphs", "D", check + ["--cuda-graph"], "graphs", 1,
                               base=f"D-default-{kv}-spec-c1-eager"))
             steps.append(_arm(config, f"D-default-{kv}-spec-c1-eager", "D", check, "graphs", 1))
-        steps.append(_arm(config, f"D-default-{kv}-spec-c{conc}", "D", spec, "default", conc))
+        if conc != 1:  # concurrency 1: the arm above
+            steps.append(_arm(config, f"D-default-{kv}-spec-c{conc}", "D", spec, "default", conc))
     for engine in config["engines"]:
         steps.append(_engine_step(config, engine))
     return steps
@@ -416,8 +419,12 @@ def run(config: dict, dry_run: bool = False, only: set[str] | None = None) -> in
 
 # ------------------------------------------------------------------------------------------------ report
 
-LABELS = {"ppl": "PPL", "ln_ppl_ratio": "ln(PPL/PPL ref)", "mean_kld": "Mean KLD", "p999_kld": "KLD 99.9%",
-          "same_top": "Top-1 agreement"}
+# The comparison tables' columns. Perplexity is shown as a change from the reference's on the same positions (the
+# paired ln ratio as a percentage): every engine runs the same weights on the same text, so absolute perplexities
+# differ in the third decimal while their intervals measure which text was sampled, not the engine.
+COLUMNS = ("mean_kld", "p999_kld", "same_top", "ln_ppl_ratio")
+LABELS = {"mean_kld": "Mean KLD", "p999_kld": "KLD 99.9%", "same_top": "Top-1 agreement",
+          "ln_ppl_ratio": "PPL vs reference"}
 
 
 def _arm_stats(config: dict, arm_id: str, resamples: int) -> tuple[llama_kld.Arm | None, dict | None]:
@@ -458,6 +465,10 @@ def _cell(metric: str, row: dict | None) -> str:
     if row is None or metric not in row:
         return "-"
     r = row[metric]
+    if metric == "ln_ppl_ratio":  # the perplexity ratio as a percentage change: 100 (exp(ln ratio) - 1)
+        change = {k: 100.0 * float(np.expm1(r[k])) for k in ("value", "low", "high")}
+        value = f"{change['value']:+.2f} %"
+        return value if np.isnan(r["low"]) else f"{value} [{change['low']:+.2f}, {change['high']:+.2f}]"
     scale, digits = (100.0, 3) if metric == "same_top" else (1.0, 6)
     value = f"{r['value'] * scale:.{digits}f}" + (" %" if metric == "same_top" else "")
     if np.isnan(r["low"]):
@@ -514,28 +525,35 @@ def report(config: dict, resamples: int = llama_kld.RESAMPLES) -> dict:
              f"lossless route (every operation correctly rounded, {config['logits'].upper()} logits, BF16 KV) on "
              f"`{config['artifact']}`, "
              "as a llama.cpp `--kl-divergence-base` file. Statistics are llama-perplexity's; brackets are 95 % "
-             "intervals (a bootstrap over chunks, or llama.cpp's own ±).", ""]
+             "intervals (a bootstrap over chunks, or llama.cpp's own ±)."
+             + (f" The reference's perplexity on the scored positions is "
+                f"{float(np.exp(next(iter(arms.values())).nll_base.mean())):.4f}; PPL vs reference is each row's "
+                "perplexity as a change from it, 100 (exp(mean(ln p_ref - ln p_row)) - 1) %, on the same positions."
+                if arms else ""), ""]
     for protocol, title in (("P", "Prompt path (llama-perplexity -b n_ctx)"),
-                            ("D", "Decode path (first half prefilled, the rest decoded token by token)")):
+                            ("D", "Decode path (the first half prefilled, the rest decoded with each engine's drafting, "
+                                  "the text's tokens forced)")):
         rows = [s for s in steps if s.protocol == protocol and s.role in ("twin", "reproducible", "default", "engine")
                 and s.id in stats]
         if not rows:
             continue
-        lines += [f"## {title}", "", "| Engine / route | " + " | ".join(LABELS[m] for m in llama_kld.METRICS) + " |",
-                  "|---|" + "---|" * len(llama_kld.METRICS)]
+        lines += [f"## {title}", "", "| Engine / route | " + " | ".join(LABELS[m] for m in COLUMNS) + " |",
+                  "|---|" + "---|" * len(COLUMNS)]
         for step in rows:
             out["arms"][step.id] = {"label": _describe(step, config), "protocol": protocol, "stats": stats[step.id],
                                     "seconds": (_read(config, step.id) or {}).get("seconds")}
-            lines.append(f"| {_describe(step, config)} | " + " | ".join(_cell(m, stats[step.id]) for m in llama_kld.METRICS) + " |")
+            lines.append(f"| {_describe(step, config)} | " + " | ".join(_cell(m, stats[step.id]) for m in COLUMNS) + " |")
         lines.append("")
     if floor is not None:
-        defaults = [s for s in steps if s.role == "default" and s.id in stats]
+        defaults = [s for s in steps if s.role in ("default", "engine") and s.id in stats]
         if defaults:
-            lines += ["## Infernix defaults against the floor", "",
-                      f"Each default arm's statistic divided by the noise twin's (mean of {len(twins)} seeds: mean KLD "
+            lines += ["## Every row against honest rounding", "",
+                      f"Each row's statistic divided by the noise twin's (honest rounding: the exact model with every "
+                      f"rounding made stochastically; mean of {len(twins)} seed(s): mean KLD "
                       f"{floor['mean_kld']:.6f}, KLD 99.9% {floor['p999_kld']:.6f}, top-1 disagreement "
-                      f"{100 * floor['disagreement']:.3f} %); brackets divide the arm's 95 % interval by the floor.", "",
-                      "| Route | Mean KLD / floor | KLD 99.9% / floor | Top-1 disagreement / floor |", "|---|---|---|---|"]
+                      f"{100 * floor['disagreement']:.3f} %); brackets divide the row's 95 % interval by the floor.", "",
+                      "| Engine / route | Path | Mean KLD / floor | KLD 99.9% / floor | Top-1 disagreement / floor |",
+                      "|---|---|---|---|---|"]
             for step in defaults:
                 s = stats[step.id]
                 ratios = {"mean_kld": tuple(s["mean_kld"][k] / floor["mean_kld"] for k in ("value", "low", "high")),
@@ -544,7 +562,8 @@ def report(config: dict, resamples: int = llama_kld.RESAMPLES) -> dict:
                           "disagreement": tuple((1 - s["same_top"][k]) / floor["disagreement"]
                                                 for k in ("value", "high", "low"))}
                 out.setdefault("default_ratios", {})[step.id] = ratios
-                lines.append(f"| {_describe(step, config)} | " + " | ".join(
+                path = "prompt" if step.protocol == "P" else "decode"
+                lines.append(f"| {_describe(step, config)} | {path} | " + " | ".join(
                     f"{v:.2f}" if np.isnan(lo) else f"{v:.2f} [{lo:.2f}, {hi:.2f}]" for v, lo, hi in ratios.values()) + " |")
             lines.append("")
         path_steps = [s for s in steps if s.role == "path" and s.id in arms and s.base in arms]
@@ -567,7 +586,7 @@ def report(config: dict, resamples: int = llama_kld.RESAMPLES) -> dict:
                              f"{_delta('p999_kld', inc)} | {_delta('same_top', inc)} | {_delta('ln_ppl_ratio', inc)} | "
                              f"{worst:.2f} | {v['label']} |")
             lines.append("")
-    lines += ["## Checks", ""]
+    body = len(lines)
     for step in steps:
         if step.role == "invariance" and step.id in arms and step.base in arms:
             a, b = arms[step.id], arms[step.base]
@@ -590,6 +609,8 @@ def report(config: dict, resamples: int = llama_kld.RESAMPLES) -> dict:
                          f"the comparison's {config['logits'].upper()} (its tool scores inside itself).")
     for note in notes:
         lines.append(f"- {note}")
+    if len(lines) > body:  # a heading only over checks or notes
+        lines[body:body] = ["## Checks", ""]
     out["markdown"] = "\n".join(lines) + "\n"
     return out
 
