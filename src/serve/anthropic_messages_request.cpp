@@ -1603,6 +1603,13 @@ std::vector<AnthropicToolSearch> parse_common_prompt(const Json& body, Generatio
     parse_messages(body, request, LoweringContext{.request = request, .searches = searches});
     parse_thinking(body, request);
     parse_effort(body, request, purpose);
+    // Anthropic's effort applies "with or without thinking": with thinking off (disabled, or between_tools on a user
+    // turn) the turn stays without thinking, and the effort, which the Qwen templates read only while thinking, is
+    // dropped instead of conflicting with it (NInfer #441).
+    if (request.enable_thinking == false && request.reasoning_effort &&
+        *request.reasoning_effort != RequestedReasoningEffort::None) {
+        request.reasoning_effort.reset();
+    }
     apply_anthropic_prompt_cache_policy(body, request);
     if (body.contains("container") && !body.at("container").is_null()) {
         bad_request("container requires an external execution environment that Infernix does not "

@@ -738,6 +738,22 @@ int test_thinking_and_count_tokens() {
     between["thinking"] = Json{{"type", "between_tools"}, {"budget_tokens", 2048}};
     failures += check(api_param([&] { (void)parse(between); }) == "thinking",
                       "budget_tokens was accepted with between_tools Thinking");
+
+    // Anthropic's effort applies with or without thinking (NInfer #441): thinking stays off, and the
+    // effort no longer conflicts with it when the prompt semantics resolve.
+    Json effort             = base_request();
+    effort["thinking"]      = Json{{"type", "disabled"}};
+    effort["output_config"] = Json{{"effort", "high"}};
+    const GenerationRequest effort_off = parse(effort).generation;
+    failures += check(effort_off.enable_thinking == false && !effort_off.reasoning_effort &&
+                          api_code([&] { (void)semantics(effort_off); }).empty() &&
+                          semantics(effort_off).enable_thinking == false,
+                      "disabled Thinking with an effort was refused or turned thinking on");
+    effort["thinking"]                    = Json{{"type", "adaptive"}};
+    const GenerationRequest effort_on     = parse(effort).generation;
+    failures += check(effort_on.reasoning_effort == RequestedReasoningEffort::High &&
+                          semantics(effort_on).enable_thinking == true,
+                      "adaptive Thinking lost its effort");
     body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
 
     body["max_tokens"]                        = 0;

@@ -1390,7 +1390,10 @@ trusted server, and the value is the same reasoning text `summarized` display sh
 empty the same way and adds readable progress-update blocks between tool calls, which the served models
 do not write. Count Tokens ignores `display`. `preserve_thinking` remains a Infernix extension for closed-turn reasoning
 history. `output_config.effort` passes its protocol-validated value to the
-selected template, substituting the nearest value the template accepts as described above.
+selected template, substituting the nearest value the template accepts as described above. As in
+the Anthropic API, an effort is accepted with or without Thinking: with Thinking off (`disabled`, or
+`between_tools` on a user turn) the turn stays without Thinking and the effort, which the served
+models' templates read only while thinking, has no effect.
 `output_config.format` accepts JSON Schema output as described above.
 
 User-defined tools support `name`, `description`, object `input_schema`, `input_examples`, and
