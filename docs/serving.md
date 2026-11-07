@@ -203,8 +203,8 @@ saturation does not make the Engine unavailable. The endpoint remains unauthenti
 How failures end:
 
 - An out-of-memory condition or a failed internal check during one unit of work fails the requests
-  that unit involved, logs `worker out of memory: ... - recovering` or `worker recovering from a
-  failed request`, and the Engine carries on with its queue.
+  that unit involved, logs the error with `: failed N running request(s); the Engine keeps
+  serving`, and the Engine carries on with its queue.
 - Logits with no finite value to sample from (NaN or infinity, a numerical failure of the model's
   execution) fail only the request whose row produced them, with an HTTP 500 `internal_error`
   (an error event once its stream has started), and log `the model produced non-finite logits:
@@ -215,9 +215,10 @@ How failures end:
   that refuses a committed token, or reaches a position with no legal token, likewise fails only
   its own request.
 - A failure after eight such recoveries in a row, with no successful unit between them, fails every
-  queued and running request and stops the Engine. Any other exception on the worker (`worker
-  crash: ...`) ends the Engine the same way. Nothing can be served until a restart, so within about
-  250 ms the server stops accepting connections, logs `inference engine failed; server stopped,
+  queued and running request and stops the Engine. Any other exception on the worker ends the
+  Engine the same way. The log names the cause first, as the error with `: the Engine failed; all
+  requests failed`, then each request's failure. Nothing can be served until a restart, so within
+  about 250 ms the server stops accepting connections, logs `inference engine failed; server stopped,
   exit status 2`, and `infernix-serve` exits with status **2**. A launcher or service manager can
   restart it on that status; until it exits, `/health` answers 503.
 - A CUDA error other than out of memory (an illegal address, a lost device) cannot be recovered
