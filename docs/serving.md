@@ -503,7 +503,12 @@ By default the unconstrained parser keeps that all-or-nothing behaviour. With
 complete call, a second call is malformed, a single final call is cut by the output budget before
 its closing tags, or the closing bracket after the function name is missing: the recovered call is
 reported structurally with a `truncated_tail` diagnostic (logged at Info severity) rather than
-demoted to text, and an undeclared tool name stays structured for the consumer to judge.
+demoted to text, and an undeclared tool name stays structured for the consumer to judge. A final
+call is kept cut only when the generation was cut short (the output limit, the context window, or
+a cancellation); when the model itself ended the turn inside a parameter value or before the
+function's closing tag (its end-of-turn token, or a stop string), the call may be missing input, so
+it is returned as text with the `truncated_tail` diagnostic instead, and the finish reason stays
+the turn's own (`stop` / `end_turn`), not a tool call.
 
 Tolerant mode also reads a drifted function opener inside `<tool_call>` as `<function=NAME>`: a
 doubled or dropped `<` or a leaked `<|im_start|>` before it, `<=NAME>`, `<function:NAME>`

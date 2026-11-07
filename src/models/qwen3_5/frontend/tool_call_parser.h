@@ -79,10 +79,13 @@ private:
 // also reads the wrapper-less agent-harness openers (`<function=...>`, `<invoke ...>`,
 // `<function_calls>`), which have no token of their own, by their spelling; a marker inside
 // Markdown code is text there, and `code` is the code state of the text before `output`.
+// `cut_short`: the generation was cut short (output or context budget, cancellation) rather than
+// ended by the model. Tolerant mode keeps a final call the end left inside its arguments only
+// then; otherwise such a call is returned as text with a truncated-tail diagnostic.
 [[nodiscard]] ParsedToolCallOutput
 parse_qwen_tool_call_output(GeneratedText output, std::size_t max_tool_name_length,
                             const ToolCallOutputContract& contract, bool tolerant = false,
-                            MarkdownCodeTracker code = {});
+                            MarkdownCodeTracker code = {}, bool cut_short = false);
 
 class ConstrainedToolStream;
 

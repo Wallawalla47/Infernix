@@ -32,6 +32,9 @@ struct RawToolCall {
     std::vector<RawParameter> parameters;
     // Tolerant mode repaired its opener or kept an undeclared name the strict parser rejects.
     bool repaired = false;
+    // Tolerant mode: the text ended inside the call's arguments (inside a value, or before the
+    // function's closing tag), so they may be incomplete.
+    bool cut = false;
 };
 
 enum class JsonValueKind : std::uint8_t {
@@ -509,11 +512,13 @@ NormalizedParameter normalize_parameter(std::string_view encoded_value,
 // whole text the region starts at `base` of.
 class QwenToolRegionParser {
 public:
+    // `keep_cut_call`: the generation was cut short (output or context budget, cancellation), so in
+    // tolerant mode a final call the cut left inside its arguments is kept as a truncation.
     QwenToolRegionParser(std::string_view text, std::span<const std::size_t> tool_calls,
                          std::size_t base, std::size_t max_name_length, const Contract& contract,
-                         bool tolerant)
+                         bool tolerant, bool keep_cut_call = false)
         : text_(text), tool_calls_(tool_calls), base_(base), max_name_length_(max_name_length),
-          contract_(contract), tolerant_(tolerant) {}
+          contract_(contract), tolerant_(tolerant), keep_cut_call_(keep_cut_call) {}
 
     [[nodiscard]] std::uint32_t duplicate_parameters_repaired() const noexcept {
         return duplicate_parameters_repaired_;
@@ -583,8 +588,11 @@ private:
     // Applies tolerant recovery to a sub-parse result and reports whether parse() should
     // terminate. In tolerant mode, a malformed suffix after one or more complete calls is
     // discarded, and a single truncated final call whose name and at least one parameter are
-    // complete is retained; the recovered calls are never demoted to text. The strict parser
-    // returns the raw failure unchanged.
+    // complete is retained; the recovered calls are never demoted to text. A call whose arguments
+    // the text ended inside is retained only when the generation was cut short: the model ending
+    // its turn there (a stop token or stop string inside a value) wrote no complete call, and
+    // running it would run a truncated command (vLLM #65693). The strict parser returns the raw
+    // failure unchanged.
     FallbackReason finish_call(std::vector<RawToolCall>& calls, RawToolCall& call,
                                FallbackReason failure) {
         if (failure == FallbackReason::None) {
@@ -593,7 +601,7 @@ private:
         }
         if (tolerant_ && !calls.empty()) { return FallbackReason::TruncatedTail; }
         if (tolerant_ && failure == FallbackReason::TruncatedTail && calls.empty() &&
-            !call.parameters.empty()) {
+            !call.parameters.empty() && (!call.cut || keep_cut_call_)) {
             calls.push_back(std::move(call));
             return FallbackReason::TruncatedTail;
         }
@@ -762,6 +770,7 @@ private:
             // function close is a truncation, not a malformed structure. parse() retains the
             // recovered parameters; the strict parser still requires the closing tag.
             if (tolerant_ && at_region_end(pos)) {
+                call.cut = true;
                 return FallbackReason::TruncatedTail;
             }
             const FallbackReason failure = parse_parameter(pos, call);
@@ -815,7 +824,8 @@ private:
                 } else {
                     call.parameters.push_back(RawParameter{.name = name, .value = partial});
                 }
-                pos = text_.size();
+                call.cut = true;
+                pos      = text_.size();
                 return FallbackReason::TruncatedTail;
             }
             return FallbackReason::MalformedStructure;
@@ -984,6 +994,7 @@ private:
     const Contract& contract_;
     std::uint32_t duplicate_parameters_repaired_ = 0;
     bool tolerant_ = false;
+    bool keep_cut_call_ = false;
     // The current call's `</NAME>` when it opened as a bare `<NAME>` (tolerant), else empty.
     std::string bare_close_;
     // The current call's declared tool, or null for an undeclared name.
@@ -1667,7 +1678,8 @@ bool MarkdownCodeTracker::in_code() const noexcept {
 ParsedToolCallOutput parse_qwen_tool_call_output(GeneratedText output,
                                                  std::size_t max_tool_name_length,
                                                  const ToolCallOutputContract& contract,
-                                                 bool tolerant, MarkdownCodeTracker code) {
+                                                 bool tolerant, MarkdownCodeTracker code,
+                                                 bool cut_short) {
     const std::string_view source = output.text;
     // A marker inside Markdown code is a quoted example, never a call, on the constrained route too
     // (its grammar keeps such a token in the answer text). Candidates only move forward, so the
@@ -1710,7 +1722,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(GeneratedText output,
     while (candidate != std::string::npos) {
         std::vector<RawToolCall> calls;
         QwenToolRegionParser parser(source.substr(candidate), output.tool_call_tokens, candidate,
-                                    max_tool_name_length, contract, tolerant);
+                                    max_tool_name_length, contract, tolerant, cut_short);
         const FallbackReason failure = parser.parse(calls);
         if (failure == FallbackReason::None ||
             (failure == FallbackReason::TruncatedTail && !calls.empty())) {
@@ -1941,9 +1953,14 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reaso
         throw std::logic_error("required tool grammar ended without a call");
     if (contract_->constrained && contract_->required) return {};
 
+    // A call the end left inside its arguments is a truncation only when the generation was cut
+    // short; a turn the model ended there (a stop token or a stop string) wrote no complete call.
+    const bool cut_short = reason == FinishReason::OutputLimit ||
+                           reason == FinishReason::ContextCapacity ||
+                           reason == FinishReason::Cancelled;
     ParsedToolCallOutput parsed =
         parse_qwen_tool_call_output({tool_region_, region_tool_calls_}, max_tool_name_length_,
-                                    *contract_, tolerant_, region_code_);
+                                    *contract_, tolerant_, region_code_, cut_short);
     if (saw_tool_marker_ && parsed.is_tool_call_response) {
         // The parser reports the held bytes before the accepted structured region, which are the
         // bytes after an earlier quoted marker that this decoder has not published yet.

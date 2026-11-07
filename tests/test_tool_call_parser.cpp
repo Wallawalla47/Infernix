@@ -40,11 +40,13 @@ std::vector<std::size_t> tool_call_tokens(std::string_view text) {
     return found;
 }
 
+// `cut_short`: the output ended at its budget (as opposed to the model's own stop).
 fi::ParsedToolCallOutput parse(const std::string& text, std::size_t max_tool_name_length,
-                              const fi::ToolCallOutputContract& contract, bool tolerant = false) {
+                              const fi::ToolCallOutputContract& contract, bool tolerant = false,
+                              bool cut_short = false) {
     const std::vector<std::size_t> tokens = tool_call_tokens(text);
     return fi::parse_qwen_tool_call_output({text, tokens}, max_tool_name_length, contract,
-                                           tolerant);
+                                           tolerant, {}, cut_short);
 }
 
 // Feeds bytes [begin, begin + size) of a generated text, with the `<tool_call>` tokens that start
@@ -332,9 +334,9 @@ int test_parameter_delimiters_in_values() {
     const std::string close = std::string("</") + "parameter>";
     const std::string head  = "<tool_call>\n<function=bash>\n" + open;
     const auto closed_cut =
-        parse(head + "ls\n" + close + "\n", 64, contract, true);
+        parse(head + "ls\n" + close + "\n", 64, contract, true, /*cut_short*/ true);
     const auto quoted_cut = parse(
-        head + "echo '" + close + "' more", 64, contract, true);
+        head + "echo '" + close + "' more", 64, contract, true, /*cut_short*/ true);
     for (const auto* cut : {&closed_cut, &quoted_cut}) {
         failures += check(cut->is_tool_call_response && cut->tool_calls.size() == 1 &&
                               cut->diagnostics.fallback_reason == Reason::TruncatedTail,
@@ -369,7 +371,8 @@ int test_parameter_delimiters_in_values() {
                               "the parameter after a quoted unmatched opener was not parsed");
         }
     }
-    const auto quoted_open_cut = parse(head + "echo '<parameter=x>' more", 64, contract, true);
+    const auto quoted_open_cut =
+        parse(head + "echo '<parameter=x>' more", 64, contract, true, /*cut_short*/ true);
     failures += check(quoted_open_cut.is_tool_call_response && quoted_open_cut.tool_calls.size() == 1 &&
                           quoted_open_cut.diagnostics.fallback_reason == Reason::TruncatedTail,
                       "a tolerant cut call quoting an unmatched opener was not kept as a truncated tail");
@@ -1380,7 +1383,7 @@ int test_tolerant_truncated_final_call() {
         {"missing function close", truncated_function_close}};
     int failures = 0;
     for (const auto& [label, text] : cases) {
-        const auto parsed = parse(text, 64, *contract, /*tolerant*/ true);
+        const auto parsed = parse(text, 64, *contract, /*tolerant*/ true, /*cut_short*/ true);
         failures += check(parsed.is_tool_call_response,
                           std::string("tolerant did not recover ") + label);
         failures += check(parsed.tool_calls.size() == 1,
@@ -1400,6 +1403,18 @@ int test_tolerant_truncated_final_call() {
         failures += check(strict.tool_calls.empty(),
                           std::string("strict retained a truncated final call: ") + label);
     }
+    // When the model itself ended the turn (a stop token), a call whose function was closed keeps
+    // its complete arguments, but one the end left before its function's closing tag may be missing
+    // arguments and stays text (vLLM #65693).
+    const auto stopped_tool_close = parse(truncated_tool_close, 64, *contract, true);
+    failures += check(stopped_tool_close.is_tool_call_response && stopped_tool_close.tool_calls.size() == 1,
+                      "a stop after a closed function lost the complete call");
+    const auto stopped_function_close = parse(truncated_function_close, 64, *contract, true);
+    failures += check(!stopped_function_close.is_tool_call_response &&
+                          stopped_function_close.tool_calls.empty() &&
+                          stopped_function_close.diagnostics.fallback_reason == Reason::TruncatedTail &&
+                          stopped_function_close.content.find("<function=delete_file>") != std::string::npos,
+                      "a stop before the function's closing tag ran the call instead of returning text");
     return failures;
 }
 
@@ -1488,10 +1503,33 @@ int test_tolerant_undeclared_and_value_cut() {
                                   "<tool_call>\n"
                                   "<function=delete_file>\n"
                                   + open_tag + "/tmp/out";
-    const auto cut_tolerant = parse(value_cut, 64, *contract, true);
+    const auto cut_tolerant = parse(value_cut, 64, *contract, true, /*cut_short*/ true);
     failures += check(cut_tolerant.is_tool_call_response && cut_tolerant.tool_calls.size() == 1 &&
                           cut_tolerant.tool_calls.front().name == "delete_file",
                       "tolerant mode did not keep the value-cut call");
+    // The same cut at the model's own stop token (vLLM #65693: a 44,271-character command ended at
+    // the end-of-message token) is not a call: the turn returns it as text, flagged.
+    const auto cut_stopped = parse(value_cut, 64, *contract, true);
+    failures += check(!cut_stopped.is_tool_call_response && cut_stopped.tool_calls.empty() &&
+                          cut_stopped.diagnostics.fallback_reason == Reason::TruncatedTail &&
+                          !cut_stopped.diagnostics.tolerant_recovered,
+                      "tolerant mode kept a call its own stop token cut inside a value");
+    {
+        fi::ToolCallOutputDecoder stopped(contract, 64, /*tolerant*/ true);
+        std::string visible = feed(stopped, value_cut);
+        const auto at_stop  = stopped.finish(infernix::FinishReason::StopToken);
+        visible += at_stop.content;
+        failures += check(at_stop.tool_calls.empty() && visible == value_cut,
+                          "the decoder ran a call cut by a stop token instead of returning its text");
+        fi::ToolCallOutputDecoder budget(contract, 64, /*tolerant*/ true);
+        (void)feed(budget, value_cut);
+        failures += check(budget.finish(infernix::FinishReason::OutputLimit).tool_calls.size() == 1,
+                          "the decoder dropped a call the output budget cut");
+        fi::ToolCallOutputDecoder by_string(contract, 64, /*tolerant*/ true);
+        (void)feed(by_string, value_cut);
+        failures += check(by_string.finish(infernix::FinishReason::StopString).tool_calls.empty(),
+                          "the decoder ran a call cut by a stop string");
+    }
     if (cut_tolerant.tool_calls.size() == 1) {
         const Json args = Json::parse(cut_tolerant.tool_calls.front().arguments_json);
         failures += check(args.at("filePath").get<std::string>() == "/tmp/out",
