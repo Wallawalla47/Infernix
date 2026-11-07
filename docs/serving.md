@@ -1359,7 +1359,11 @@ completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, 
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
 `model_context_window_exceeded`.
 
-Thinking supports `disabled`, `adaptive`, and `enabled`. Enabled Thinking takes
+Thinking supports `disabled`, `adaptive`, `enabled` and `between_tools`. `between_tools` (no
+thinking up front, thinking between tool calls) answers a user turn without Thinking and thinks
+when the request continues after `tool_result` blocks; only the generation prompt differs, so the
+history and its cached prefix stay the same. It takes no `budget_tokens` or `display`, as in the
+Anthropic API. Enabled Thinking takes
 `budget_tokens >= 1024`, and that budget is passed to Engine. Unlike the Anthropic API,
 `budget_tokens` may be omitted (ZCode sends none): Thinking is then on with the server's default
 budget (`--default-thinking-budget`, none unless set), as with `adaptive`. A budget at

@@ -1391,6 +1391,22 @@ void lower_tools(const Json& body, GenerationRequest& request,
                                                               [](const ToolDefinition& tool) { return tool.deferred; });
 }
 
+// Whether the request continues the assistant's turn after tool results: its last message is a user
+// message carrying tool_result blocks.
+bool continues_after_tool_results(const Json& body) {
+    if (!body.contains("messages") || !body.at("messages").is_array() || body.at("messages").empty()) {
+        return false;
+    }
+    const Json& last = body.at("messages").back();
+    if (!last.is_object() || last.value("role", "") != "user" || !last.contains("content") ||
+        !last.at("content").is_array()) {
+        return false;
+    }
+    return std::any_of(last.at("content").begin(), last.at("content").end(), [](const Json& block) {
+        return block.is_object() && block.contains("type") && block.at("type") == "tool_result";
+    });
+}
+
 void parse_thinking(const Json& body, GenerationRequest& request) {
     if (!body.contains("thinking") || body.at("thinking").is_null()) { return; }
     const Json& thinking = body.at("thinking");
@@ -1417,8 +1433,16 @@ void parse_thinking(const Json& body, GenerationRequest& request) {
             // max_tokens to the context window left.
             request.thinking_budget = static_cast<std::uint32_t>(*budget);
         }
+    } else if (type == "between_tools") {
+        // Anthropic: no thinking up front, thinking between tool calls (Claude Sonnet 5.5's lowest setting, which
+        // refuses "disabled"). The model answers a user turn without thinking and thinks when it continues after
+        // tool results; only the generation prompt differs, so the history and its cached prefix do not.
+        if (thinking.contains("budget_tokens") && !thinking.at("budget_tokens").is_null()) {
+            bad_request("thinking.budget_tokens is valid only when thinking is enabled", "thinking");
+        }
+        request.enable_thinking = continues_after_tool_results(body);
     } else {
-        bad_request("thinking.type must be 'disabled', 'adaptive', or 'enabled'", "thinking");
+        bad_request("thinking.type must be 'disabled', 'adaptive', 'enabled' or 'between_tools'", "thinking");
     }
 
     if (thinking.contains("display") && !thinking.at("display").is_null()) {
@@ -1429,7 +1453,7 @@ void parse_thinking(const Json& body, GenerationRequest& request) {
         if (display != "summarized" && display != "omitted" && display != "updates") {
             bad_request("thinking.display must be 'summarized', 'omitted' or 'updates'", "thinking");
         }
-        if (type == "disabled") {
+        if (type == "disabled" || type == "between_tools") {
             bad_request("thinking.display is valid only when thinking is adaptive or enabled",
                         "thinking");
         }

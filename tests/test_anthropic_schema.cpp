@@ -715,6 +715,29 @@ int test_thinking_and_count_tokens() {
     body["thinking"] = Json{{"type", "disabled"}, {"display", "omitted"}};
     failures += check(api_param([&] { (void)parse(body); }) == "thinking",
                       "display was accepted with disabled Thinking");
+
+    // between_tools (Claude Sonnet 5.5's lowest setting): no thinking on a user turn, thinking after tool results.
+    Json between        = base_request();
+    between["thinking"] = Json{{"type", "between_tools"}};
+    failures += check(parse(between).generation.enable_thinking == false,
+                      "between_tools thought up front on a user turn");
+    between["messages"].push_back(Json{
+        {"role", "assistant"},
+        {"content", Json::array({Json{{"type", "tool_use"}, {"id", "toolu_1"}, {"name", "probe"}, {"input", Json::object()}}})}});
+    between["messages"].push_back(Json{
+        {"role", "user"},
+        {"content", Json::array({Json{{"type", "tool_result"}, {"tool_use_id", "toolu_1"}, {"content", "ok"}}})}});
+    between["tools"] = Json::array({Json{{"name", "probe"}, {"input_schema", Json{{"type", "object"}}}}});
+    failures += check(parse(between).generation.enable_thinking == true,
+                      "between_tools did not think after tool results");
+    failures += check(parse_anthropic_count_tokens_request(between).generation.enable_thinking == true,
+                      "Count Tokens refused or misread between_tools");
+    between["thinking"] = Json{{"type", "between_tools"}, {"display", "omitted"}};
+    failures += check(api_param([&] { (void)parse(between); }) == "thinking",
+                      "display was accepted with between_tools Thinking");
+    between["thinking"] = Json{{"type", "between_tools"}, {"budget_tokens", 2048}};
+    failures += check(api_param([&] { (void)parse(between); }) == "thinking",
+                      "budget_tokens was accepted with between_tools Thinking");
     body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
 
     body["max_tokens"]                        = 0;
