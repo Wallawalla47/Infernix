@@ -2471,6 +2471,14 @@ private:
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
     void fail_all_locked(std::exception_ptr error, bool shutdown = false) noexcept {
+        if (!shutdown) {
+            std::string what = "unknown error";
+            try {
+                std::rethrow_exception(error);
+            } catch (const std::exception& e) { what = e.what(); } catch (...) {}
+            publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                               "%s: the Engine failed; all requests failed", what.c_str());
+        }
         std::deque<std::shared_ptr<Request>> pending;
         std::optional<NextTurnCandidate> next_turn_candidate;
         {
