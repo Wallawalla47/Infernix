@@ -1755,6 +1755,7 @@ public:
         impl->vision   = base.vision;
         SourceCandidate out;
         if (selection) {
+            out.cached_block_tokens = selection->cached_tokens;
             if (selection->snapshot) {
                 // Items inside the reused prefix are not encoded again (design §19.3.2).
                 if (impl->vision && selection->frontier > 0) { impl->vision = plan_vision(data, selection->frontier); }

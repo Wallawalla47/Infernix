@@ -410,22 +410,31 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
   next save. Either way an unfinished save leaves the previous file in place.
   `Program::shutdown_cleanup` releases every lane first, so requests still in flight write their
   committed blocks through, and saves before the cleanup drops the cache. Every Host write
-  lands, then every retained (not superseded, §9.3) Host-resident snapshot whose anchor path is
-  Host-resident, and exactly those paths, are written parents first with their slab bytes (a
-  temporary file renamed into place). Dead KV, superseded snapshots and Device-only content are
-  not saved. A worker that ended on a fatal error saves
+  lands, then every Host-resident snapshot whose anchor path is Host-resident, and exactly those
+  paths, are written parents first with their slab bytes (a temporary file renamed into place).
+  Superseded snapshots (§9.3) are saved too, with their flag, after the retained ones and oldest
+  supersession first: a retry, a regenerate or a re-sent prompt resumes from the tap its first
+  request resumed from, which that request's endpoint superseded, so leaving them out lost exactly
+  those resume points across a restart (GitHub #59: a 22K-token prompt resent after a restart
+  reused nothing). Dead KV and Device-only content are not saved. A worker that ended on a fatal
+  error saves
   nothing, so the previous file stays in place. A worker recovery (OOM or recoverable logic
   error) empties the cache like every cleanup, so a later save holds only what was cached after it.
 - **Load**, at Engine construction before any request: the file is used only when its fingerprint
   (absolute artifact path, size and modification time, prefill signature, KV storage, speculative
-  backend, RoPE scaling, and the product binary's identity — build id plus executable size and
-  time, so any rebuild invalidates it) and its Host geometry equal the running Engine's, and its
-  size matches its tables. The file (format 3) holds the header, the block table, the snapshot
-  table and only then the slab bytes, so the loader chooses before it reads any slab. A Host tier
-  that holds the whole file restores all of it. A smaller one restores whole snapshots, greedily
-  by the GDSF density of §9.3 without its time-dependent base — (1 + hits) × the prefill a
-  restore saves from the root, per byte of image, tail and anchor path — each with the path
-  blocks it needs and no others, and reads only those slabs (`plan_host_restore`); the startup
+  backend, RoPE scaling, prefill chunk, Host state form, the fast-path, lossless, 8-bit activation
+  and expert tail skip settings, the product binary's identity — build id plus executable size
+  and time, so any rebuild invalidates it — and the GPU's name, compute capability and SM count)
+  and its Host geometry equal the running Engine's, and
+  its size matches its tables. The file (format 4; Qwen3.8-Flash-Next's own layout is format 2)
+  holds the header, the block table, the snapshot table (each snapshot's kind, hits and superseded
+  flag) and only then the slab bytes, so the loader chooses before it reads any slab. A Host tier
+  that holds the whole file restores all of it, superseded snapshots coming back superseded (they
+  are evicted first again, and a hit retains one as it does in a running cache). A smaller one
+  restores whole snapshots, retained ones before superseded ones and each group greedily by the
+  GDSF density of §9.3 without its time-dependent base — (1 + hits) × the prefill a restore saves
+  from the root, per byte of image, tail and anchor path — each with the path blocks it needs and
+  no others, and reads only those slabs (`plan_host_restore`); the startup
   log then warns `prefix cache partly restored` with the kept and saved counts and the Host tier
   the file needs. A tier that holds none of the snapshots restores nothing, since a restore keeps
   only the blocks its snapshots resume through; the log then warns `prefix cache not restored`
@@ -2259,8 +2268,8 @@ rules, measurements and the build record are in the
 | Supersession | Unlike §9.3, a request's captures never supersede its own earlier ones: its first capture (tap or endpoint) supersedes the snapshot it resumed from and the endpoints it went past; its ladder taps, system-block boundary and the prompt's last tap stay retained and GDSF values them. In agentic replays the edits and loop-detection side calls diverge at exactly those taps: superseded first, a full Host tier evicted them before they were reused |
 | Prefill calls | The plan's calls from the resume frontier: without exact taps `F, F + chunk, ...` (for F = 0 the cold grid). Calls of at most 8 columns are CPU-served and promote experts at the decode rate. Without `free-cache-resume` (the reproducible route) every tap, coalescing point and resume frontier lies on the prefill-chunk grid (`ProgramImpl::resume_grid`), so a resumed prefill's calls are the cold prefill's: several prefill routes change their arithmetic with the call's width (model-quality.md §6.7) |
 | Vision | A resume frontier strictly inside an item, or past its start in the block it begins in (rule 3 of §6.1), is never chosen; items ending at or before the frontier are not encoded again (the encode window is planned from the frontier); suffix M-RoPE positions come from the prompt |
-| Statistics | `RuntimeStats::hybrid_*` and the request log's `cached_prefix_tokens` / `restored_host_bytes` as in Qwen3.5 |
-| Persistence | As §5.5, own format (`prefix/persist.cpp`, `NINFQ4PC` version 1): the block table also stores each block's `mtp_next`; snapshot meta travels inside each image's header slab and is validated by the state-image layout fingerprint, which the file's geometry also records. Saved at the Engine's stop after every lane is released; loaded into the empty cache at startup |
+| Statistics | `RuntimeStats::hybrid_*` and the request log's `prefix_cache_hit_tokens` / `prefix_cache_block_tokens` as in Qwen3.5 |
+| Persistence | As §5.5, own format (`prefix/persist.cpp`, `NINFQ4PC` version 2): the block table also stores each block's `mtp_next`, the snapshot table each snapshot's superseded flag; snapshot meta travels inside each image's header slab and is validated by the state-image layout fingerprint, which the file's geometry also records. Saved at the Engine's stop after every lane is released; loaded into the empty cache at startup |
 | SSD tier | As §5.7 (`prefix_select` promotes the source a quote chooses; a binding skips sources only on the SSD). Snapshot meta and `mtp_next` stay with their index entries, so an SSD copy is the Host slabs' bytes alone, and it leaves out the DFlash2 ring (`ssd_image_slabs`: 136 of 184 FP4-Local image slabs; a promotion zero-fills the rest) |
 | Preemption | A pause publishes the lane's blocks and its state at the frontier to the cache, as a consistent abort does, and releases the lane (design §19.3.13); the resume binds from the deepest snapshot, without replay when it sits at the paused frontier |
 | Failure | A row with non-finite logits withdraws the request's entries (§7.8): its captures are Host-born, so the release first drains the transfer stream and reads each capture's publication (the lane keeps its capture ids until its release). A `RecoverableExecutionError` (an expert record that could not be read) still empties the whole cache, since the failed round's state is unknown for every lane |

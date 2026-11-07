@@ -6,7 +6,8 @@
 // and the Host geometry (slab, page record and state-image layout) match; a damaged or foreign file
 // loads nothing.
 //
-// Layout (version 1): the header, the block table (parents first), the snapshot table, then the
+// Layout (version 2): the header, the block table (parents first), the snapshot table (each entry
+// with its superseded flag: retained snapshots first, then superseded ones oldest first), then the
 // slab bytes of every block and of every snapshot in table order, then the footer. The tables come
 // first so a Host tier smaller than the file can choose what to restore before reading any slab.
 
@@ -32,7 +33,7 @@ namespace {
 
 constexpr std::array<char, 8> kMagic  = {'N', 'I', 'N', 'F', 'Q', '4', 'P', 'C'};
 constexpr std::array<char, 8> kFooter = {'N', 'I', 'N', 'F', 'Q', '4', 'E', 'D'};
-constexpr std::uint32_t kVersion      = 1;
+constexpr std::uint32_t kVersion      = 2;
 constexpr std::int32_t kRootIndex     = -1;
 constexpr std::uint64_t kFooterBytes  = kFooter.size() + 2U * sizeof(std::uint32_t);
 constexpr const char* kSaveAbandoned  = "abandoned; the previous file is kept";
@@ -71,6 +72,7 @@ struct SavedSnapshot {
     std::array<TokenId, pc::kBlockTokens> tail{};
     pc::SnapshotKind kind = pc::SnapshotKind::Tap;
     std::uint32_t hits    = 0;
+    bool superseded       = false;
     std::uint32_t slabs   = 0;
     // First slab of this snapshot, counted from the start of the slab bytes.
     std::uint64_t first_slab = 0;
@@ -205,6 +207,7 @@ PersistResult PrefixCache::save(const std::filesystem::path& path, std::string_v
             writer.bytes(view.tail.data(), view.tail.size_bytes());
             writer.value(static_cast<std::uint8_t>(view.kind));
             writer.value(view.hits);
+            writer.value(static_cast<std::uint8_t>(view.superseded ? 1U : 0U));
         }
         for (const pc::NodeRef node : nodes) {
             check_abandoned();
@@ -321,13 +324,17 @@ PersistResult PrefixCache::load(const std::filesystem::path& path, std::string_v
             }
             snapshot.kind       = static_cast<pc::SnapshotKind>(kind_byte);
             snapshot.hits       = reader.value<std::uint32_t>();
+            const std::uint8_t superseded_byte = reader.value<std::uint8_t>();
+            if (superseded_byte > 1U) { throw std::runtime_error("prefix cache file snapshot flag is damaged"); }
+            snapshot.superseded = superseded_byte != 0U;
             snapshot.slabs      = host_.image_slabs + (snapshot.tail_len != 0 ? 1U : 0U);
             snapshot.first_slab = slabs;
             slabs += snapshot.slabs;
-            shapes[index] = pc::SavedSnapshotShape{.anchor   = snapshot.anchor,
-                                                   .frontier = snapshot.frontier,
-                                                   .slabs    = snapshot.slabs,
-                                                   .hits     = snapshot.hits};
+            shapes[index] = pc::SavedSnapshotShape{.anchor     = snapshot.anchor,
+                                                   .frontier   = snapshot.frontier,
+                                                   .slabs      = snapshot.slabs,
+                                                   .hits       = snapshot.hits,
+                                                   .superseded = snapshot.superseded};
         }
         const std::uint64_t payload = reader.position();
         if (file_bytes != payload + slabs * slab_bytes + kFooterBytes) {
@@ -376,7 +383,7 @@ PersistResult PrefixCache::load(const std::filesystem::path& path, std::string_v
             const std::optional<pc::SnapshotRef> snapshot = index_->restore_host_snapshot(
                 anchor, saved_snapshot.frontier,
                 std::span<const TokenId>(saved_snapshot.tail.data(), saved_snapshot.tail_len), saved_snapshot.kind,
-                saved_snapshot.hits);
+                saved_snapshot.hits, saved_snapshot.superseded);
             if (!snapshot) { continue; }
             reader.seek(payload + saved_snapshot.first_slab * slab_bytes);
             const std::span<const std::uint32_t> slab_ids = index_->snapshot(*snapshot).host_slabs;

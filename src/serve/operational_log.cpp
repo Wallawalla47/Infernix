@@ -245,6 +245,12 @@ OperationalRecord render_request_done(const RequestLogContext& context,
     if (outcome.prefix_reuse_path != infernix::PrefixReusePath::Root) {
         out << ", " << prefix_reuse_path_name(outcome.prefix_reuse_path);
     }
+    // Cached blocks past the reused prefix had no state to resume from (its snapshot evicted, or not
+    // saved before a restart): they were prefilled again.
+    if (outcome.cached_block_tokens > outcome.reused_prompt_tokens) {
+        out << "; " << product::format_pretty_count(outcome.cached_block_tokens)
+            << " in cached blocks, no state to resume";
+    }
     out << ") | TTFT " << product::format_pretty_duration(outcome.timings.first_token_seconds)
         << " | total " << product::format_pretty_duration(outcome.timings.total_seconds);
     if (outcome.engine_timing.queue_wait_seconds >= 0.01) {

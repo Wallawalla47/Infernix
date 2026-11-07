@@ -168,9 +168,10 @@ prefix_cache::CacheCostModel hybrid_cache_cost(const ContextMachineCostModel& mo
 } // namespace
 
 // The exact artifact, its execution signature, the KV and speculative formats, RoPE scaling, the
-// prefill chunk and the product binary's build identity. Any difference makes the saved state meaningless, so the file is
-// ignored.
-std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::string& signature) {
+// prefill chunk, the options that change the numbers cached state holds (fast paths, routes, tail skip) and the product
+// binary's build identity. Any difference makes the saved state meaningless, so the file is ignored.
+std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::string& signature,
+                                     const cudaDeviceProp& device) {
     std::error_code error;
     const auto size = std::filesystem::file_size(options.artifact_path, error);
     const auto time = std::filesystem::last_write_time(options.artifact_path, error);
@@ -192,9 +193,15 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";lossless=" + std::to_string(options.lossless ? 1 : 0);
     // The 8-bit activation routes change the KV and state their calls write (decode, short and prefill calls).
     if (options.a8_activations) { out += ";a8"; }
+    // Tail skip leaves experts out of decode and verification rounds, so the KV and state those rounds wrote
+    // (endpoints, continued turns) differ from what a run without it computes, and the reverse.
+    if (options.expert_tail_skip != 0) { out += ";tail_skip=" + std::to_string(options.expert_tail_skip); }
     for (const FastPath path : options.fast_path_candidates) { out += std::string(",") + fast_path_name(path); }
     for (const FastPath path : options.fast_path_exclusions) { out += std::string(",-") + fast_path_name(path); }
     out += ";build=" + options.context_cache.hybrid.persistent_identity;
+    // The reproducible route's bits hold for one GPU: split-K and wave-filling shares follow the SM count.
+    out += ";device=" + std::string(device.name) + ";cc=" + std::to_string(device.major) + "." +
+           std::to_string(device.minor) + ";sm=" + std::to_string(device.multiProcessorCount);
     return out;
 }
 
@@ -1232,7 +1239,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         if (!file.empty()) {
             const models::qwen3_5::HybridCachePersistence loaded =
                 instance->program->attach_hybrid_cache_file(
-                    file, hybrid_cache_fingerprint(options, signature), options.startup_observer);
+                    file, hybrid_cache_fingerprint(options, signature, device.props),
+                    options.startup_observer);
             restore = LoadSummary::PrefixCacheRestore{
                 .attempted           = true,
                 .restored            = loaded.ok,

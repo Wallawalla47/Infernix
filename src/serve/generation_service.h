@@ -47,6 +47,7 @@ struct GenerationOutcome {
     std::uint64_t engine_request_id       = 0;
     std::uint32_t computed_prefill_tokens = 0;
     std::uint32_t reused_prompt_tokens    = 0;
+    std::uint32_t cached_block_tokens     = 0;
     std::optional<std::uint32_t> cache_created_prompt_tokens;
     infernix::PrefixReusePath prefix_reuse_path = infernix::PrefixReusePath::Root;
     infernix::GenerationTimings timings;

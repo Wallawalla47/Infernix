@@ -639,12 +639,17 @@ void test_persistence_roundtrip() {
                                   SnapshotKind::Tap);
     source.release_path(path);
     source.release_path(other_path);
+    // The tap a request resumed from is superseded once that request publishes its endpoint; a
+    // retry resumes from it again, so the file keeps it (issue #59), after the retained ones.
+    require(source.supersede(backed), "the resumed tap must be superseded");
 
     std::vector<NodeRef> nodes;
     std::vector<SnapshotRef> snapshots;
     source.collect_persistable(nodes, snapshots);
     require(nodes.size() == 3 && snapshots.size() == 2,
-            "only Host-backed snapshots and their paths are persistable");
+            "only Host-backed snapshots and their paths are persistable, superseded ones included");
+    require(snapshots[0] == endpoint.snapshot && snapshots[1] == backed,
+            "retained snapshots are saved before superseded ones");
 
     PrefixCacheIndex restored(small_config(64, 2), backend);
     std::vector<std::pair<NodeRef, NodeRef>> mapping;
@@ -661,15 +666,17 @@ void test_persistence_roundtrip() {
         require(block.has_value(), "a persisted block did not restore");
         mapping.emplace_back(node, block->node);
     }
+    std::optional<SnapshotRef> restored_tap;
     for (const SnapshotRef snapshot : snapshots) {
         const SnapshotView view = source.snapshot(snapshot);
-        require(restored
-                    .restore_host_snapshot(mapped(view.anchor), view.frontier, view.tail, view.kind,
-                                           view.hits)
-                    .has_value(),
-                "a persisted snapshot did not restore");
+        const auto restored_snapshot = restored.restore_host_snapshot(
+            mapped(view.anchor), view.frontier, view.tail, view.kind, view.hits, view.superseded);
+        require(restored_snapshot.has_value(), "a persisted snapshot did not restore");
+        if (snapshot == backed) { restored_tap = restored_snapshot; }
     }
     restored.check_invariants();
+    require(restored.snapshot(*restored_tap).superseded,
+            "a superseded snapshot must come back superseded");
 
     auto prompt = tokens;
     prompt.insert(prompt.end(), tail_tokens.begin(), tail_tokens.end());
@@ -680,6 +687,19 @@ void test_persistence_roundtrip() {
     require(match.candidates.size() == 2 && match.candidates[0].frontier == 202 &&
                 match.candidates[0].host_only_blocks == 3 && !match.candidates[0].image_on_device,
             "a restored Host tier must match through host-only blocks and images");
+
+    // The retry of #59: a prompt that ends before the endpoint resumes from the superseded tap.
+    std::vector<TokenId> retry(tokens.begin(), tokens.begin() + 64 * 2 + 5);
+    const auto retry_hashes = block_lookup_hashes(retry, {});
+    const MatchResult retry_match =
+        restored.match(retry, retry_hashes, {}, static_cast<std::uint32_t>(retry.size()));
+    require(retry_match.candidates.size() == 1 &&
+                retry_match.candidates[0].frontier == source.snapshot(backed).frontier,
+            "a retry after a restart must resume from the restored superseded tap");
+    restored.note_hit(*restored_tap);
+    require(!restored.snapshot(*restored_tap).superseded,
+            "a hit must retain a restored superseded snapshot again");
+    restored.check_invariants();
 
     // A full Host tier restores what fits and nothing else.
     PrefixCacheIndex tiny(small_config(1, 2), backend);
@@ -2311,6 +2331,19 @@ void test_restore_plan() {
     const HostRestorePlan used = plan_host_restore(roots, equals, 5, config);
     require(!used.snapshots[0] && used.snapshots[1] && !used.blocks[0] && used.blocks[1],
             "the more used of two equal snapshots must be kept");
+
+    // A running cache evicts superseded snapshots first, so a small tier restores the retained
+    // one even when the superseded one is denser.
+    const std::vector<SavedSnapshotShape> lineage = {
+        {.anchor = 0, .frontier = 64, .slabs = 4, .hits = 3, .superseded = true},
+        {.anchor = 1, .frontier = 64, .slabs = 4, .hits = 0},
+    };
+    const HostRestorePlan retained = plan_host_restore(roots, lineage, 5, config);
+    require(!retained.snapshots[0] && retained.snapshots[1] && !retained.blocks[0] &&
+                retained.blocks[1],
+            "a retained snapshot must be restored before a superseded one");
+    const HostRestorePlan both = plan_host_restore(roots, lineage, 10, config);
+    require(both.snapshots[0] && both.snapshots[1], "a tier that holds both restores both");
 
     require_throws([&] { (void)plan_host_restore(std::vector<std::int32_t>{0}, {}, 8, config); },
                    "a block that is its own parent must be rejected");

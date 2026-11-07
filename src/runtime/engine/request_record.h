@@ -181,6 +181,9 @@ struct RequestRecord {
     std::optional<GenerationBudget> budget;
     std::optional<BeginSummary> admitted_begin;
     std::optional<BeginSummary> begin;
+    // The prompt prefix the prefix cache held as full blocks at the first admission (diagnostics:
+    // GenerationResult::cached_block_tokens).
+    std::uint32_t cached_block_tokens = 0;
     std::vector<TokenId> generated;
     std::string content;
     std::string reasoning;

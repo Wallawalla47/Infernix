@@ -819,7 +819,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
             }
         }
         const models::qwen4_exp::PrefixCachePersistence loaded = instance->program->attach_prefix_cache_file(
-            file, hybrid_cache_fingerprint(options, signature), options.startup_observer);
+            file, hybrid_cache_fingerprint(options, signature, device.props),
+            options.startup_observer);
         restore = LoadSummary::PrefixCacheRestore{
             .attempted           = true,
             .restored            = loaded.ok,

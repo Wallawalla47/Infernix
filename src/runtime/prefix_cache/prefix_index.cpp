@@ -2385,10 +2385,9 @@ void PrefixCacheIndex::collect_persistable(std::vector<NodeRef>& nodes,
     std::vector<bool> keep(nodes_.size(), false);
     for (std::uint32_t index = 0; index < snapshots_.size(); ++index) {
         const Snapshot& snapshot = snapshots_[index];
-        // Superseded snapshots are the first to go and rarely resumed from: not worth saving.
-        if (!snapshot.occupied || snapshot.host != CopyState::Resident || snapshot.superseded) {
-            continue;
-        }
+        // Superseded snapshots are saved too: a retry, a regenerate or a re-sent prompt resumes
+        // from the tap it resumed from before, which its own endpoint superseded (issue #59).
+        if (!snapshot.occupied || snapshot.host != CopyState::Resident) { continue; }
         bool backed = true;
         for (std::uint32_t current = snapshot.anchor; current != kNoId && backed;
              current               = nodes_[current].parent) {
@@ -2401,6 +2400,14 @@ void PrefixCacheIndex::collect_persistable(std::vector<NodeRef>& nodes,
         }
         snapshots.push_back(ref_of_snapshot(index));
     }
+    // Retained first, then superseded oldest supersession first: a restore in file order gives
+    // the superseded ones increasing ticks, so they are evicted in the order they were saved.
+    std::stable_sort(snapshots.begin(), snapshots.end(), [&](SnapshotRef left, SnapshotRef right) {
+        const Snapshot& a = snapshots_[left.index];
+        const Snapshot& b = snapshots_[right.index];
+        if (a.superseded != b.superseded) { return !a.superseded; }
+        return a.superseded && a.superseded_tick < b.superseded_tick;
+    });
     for (std::uint32_t index = 0; index < nodes_.size(); ++index) {
         if (keep[index]) { nodes.push_back(ref_of_node(index)); }
     }
@@ -2471,7 +2478,8 @@ std::optional<SnapshotRef> PrefixCacheIndex::restore_host_snapshot(NodeRef ancho
                                                                    std::uint32_t frontier,
                                                                    std::span<const TokenId> tail,
                                                                    SnapshotKind kind,
-                                                                   std::uint32_t hits) {
+                                                                   std::uint32_t hits,
+                                                                   bool superseded) {
     if (!config_.host_blocks || tail.size() >= kBlockTokens) {
         throw std::invalid_argument("prefix cache restored snapshot is inconsistent");
     }
@@ -2523,15 +2531,15 @@ std::optional<SnapshotRef> PrefixCacheIndex::restore_host_snapshot(NodeRef ancho
     snapshot.hits             = hits;
     snapshot.last_hit_tick    = ++tick_;
     snapshot.priority_base    = inflation_;
-    snapshot.superseded       = false;
-    snapshot.superseded_tick  = 0;
+    snapshot.superseded       = superseded;
+    snapshot.superseded_tick  = superseded ? ++tick_ : 0;
     snapshot.hold             = kNoHold;
     ++snapshot_epoch_;
     anchored.push_back(index);
     ++snapshot_count_;
     if (anchor.valid()) {
         adjust_live(anchor_index, +1);
-        adjust_retained(anchor_index, +1);
+        if (!superseded) { adjust_retained(anchor_index, +1); }
     }
     link_snapshot(index);
     std::vector<std::uint32_t> dependents;
@@ -2588,6 +2596,10 @@ HostRestorePlan plan_host_restore(std::span<const std::int32_t> block_parents,
     std::vector<std::uint32_t> order(snapshots.size());
     for (std::uint32_t index = 0; index < order.size(); ++index) { order[index] = index; }
     std::stable_sort(order.begin(), order.end(), [&](std::uint32_t left, std::uint32_t right) {
+        // A running cache evicts superseded snapshots first: they are restored last.
+        if (snapshots[left].superseded != snapshots[right].superseded) {
+            return !snapshots[left].superseded;
+        }
         if (density[left] != density[right]) { return density[left] > density[right]; }
         return snapshots[left].frontier > snapshots[right].frontier;
     });

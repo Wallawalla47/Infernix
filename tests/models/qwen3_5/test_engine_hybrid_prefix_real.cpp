@@ -332,13 +332,23 @@ int exercise_persist(const char* artifact) {
         (void)engine.generate(engine.prepare_tokens(first), greedy(8));
         reference = engine.generate(engine.prepare_tokens(second), greedy(24)).generated_token_ids;
     }
-    int failures = 0;
+    int failures                      = 0;
+    std::uint32_t retry_reused_tokens = 0;
     {
         // The Engine stops the way infernix-serve does: stop() while a generation is still far from
         // its output limit. It fails as Unavailable instead of running on, new work is refused,
         // and the Host tier is still saved.
         infernix::Engine saver(options("persist-test"));
         (void)saver.generate(saver.prepare_tokens(first), greedy(8));
+        // A retry resumes from the tap the first request captured, and its endpoint supersedes
+        // that tap: the file must still keep it (issue #59), or `second` below and a retry after
+        // the restart prefill from an earlier tap.
+        retry_reused_tokens =
+            saver.generate(saver.prepare_tokens(first), greedy(8)).reused_prompt_tokens;
+        if (retry_reused_tokens == 0) {
+            std::cerr << "persist: a retry did not resume from the first request's tap\n";
+            ++failures;
+        }
         infernix::GenerationHandle running =
             saver.submit(saver.prepare_tokens(synthetic_tokens(200, 6)), greedy(3500));
         std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -427,6 +437,13 @@ int exercise_persist(const char* artifact) {
         }
         if (resumed.generated_token_ids != reference) {
             std::cerr << "persist: the restarted Engine generated different tokens\n";
+            ++failures;
+        }
+        const std::uint32_t retried =
+            loader.generate(loader.prepare_tokens(first), greedy(8)).reused_prompt_tokens;
+        if (retried < retry_reused_tokens) {
+            std::cerr << "persist: a retry after the restart reused " << retried << " tokens, before it "
+                      << retry_reused_tokens << "\n";
             ++failures;
         }
     }

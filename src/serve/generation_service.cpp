@@ -713,6 +713,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.engine_request_id           = result.engine_request_id;
     outcome.computed_prefill_tokens     = result.computed_prefill_tokens;
     outcome.reused_prompt_tokens        = result.reused_prompt_tokens;
+    outcome.cached_block_tokens         = result.cached_block_tokens;
     outcome.cache_created_prompt_tokens = result.cache_created_prompt_tokens;
     outcome.prefix_reuse_path           = result.prefix_reuse_path;
     outcome.speculative                 = std::move(result.speculative);

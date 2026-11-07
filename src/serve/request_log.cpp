@@ -723,6 +723,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"generated_token_ids", outcome.generated_token_ids},
              {"computed_prefill_tokens", outcome.computed_prefill_tokens},
              {"prefix_cache_hit_tokens", outcome.reused_prompt_tokens},
+             {"prefix_cache_block_tokens", outcome.cached_block_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.prefix_reuse_path)},
              {"thinking_budget", outcome.thinking.configured_budget
                                      ? Json(*outcome.thinking.configured_budget)

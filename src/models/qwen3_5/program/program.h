@@ -155,6 +155,8 @@ struct SourceCandidate {
     std::uint32_t reused_tokens = 0;
     std::shared_ptr<const detail::HybridQuoteImpl> hybrid;
     PrefixReusePath reuse_path = PrefixReusePath::Root;
+    // The prompt prefix held as cached full blocks, reusable or not (diagnostics).
+    std::uint32_t cached_block_tokens = 0;
 };
 
 struct BindingReservation {

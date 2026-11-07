@@ -1053,6 +1053,7 @@ private:
         if (request->begin) {
             result.reused_prompt_tokens = request->begin->reused_prompt_tokens;
             result.prefix_reuse_path    = request->begin->prefix_reuse_path;
+            result.cached_block_tokens  = request->cached_block_tokens;
         }
         result.timings                 = request->generation_timings;
         result.timings.prepare_seconds = request->prepare_seconds;
@@ -2067,6 +2068,7 @@ private:
                     request->host_timing.queue_wait_ns =
                         elapsed_ns(request->submitted, *request->admitted_at);
                     request->queue_wait_recorded = true;
+                    request->cached_block_tokens = source.cached_block_tokens;
                     publish_generation_start(request, begin);
                 }
                 return true;

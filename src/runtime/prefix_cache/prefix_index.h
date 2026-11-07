@@ -471,20 +471,24 @@ public:
     // ---- persistence ---------------------------------------------------------------------------
     // What a saved Host tier keeps: every Host-resident snapshot whose anchor path is Host-resident
     // throughout, and exactly those paths, parents before children. Other Host content is dead
-    // (no snapshot can resume through it) or unreachable after a restart.
+    // (no snapshot can resume through it) or unreachable after a restart. Superseded snapshots are
+    // kept too (a retry or a re-sent prompt resumes from them, issue #59), after the retained ones
+    // and in supersession order, so a restore can keep their eviction order.
     void collect_persistable(std::vector<NodeRef>& nodes,
                              std::vector<SnapshotRef>& snapshots) const;
     [[nodiscard]] BlockIdentity block_identity(NodeRef node) const;
     // Rebuild a saved Host tier into a fresh index, parents before children and anchors before
     // their snapshots, in the selection plan_host_restore made. Nothing is evicted to make room;
-    // absent means no slab, node or snapshot entry was free, or the entry already exists.
+    // absent means no slab, node or snapshot entry was free, or the entry already exists. A
+    // `superseded` snapshot comes back superseded (evicted first, oldest restored first), as it was
+    // when saved; a hit retains it again.
     [[nodiscard]] std::optional<RestoredBlock> restore_host_block(NodeRef parent,
                                                                   std::uint64_t lookup_hash,
                                                                   std::span<const TokenId> tokens,
                                                                   std::uint64_t extra);
     [[nodiscard]] std::optional<SnapshotRef>
     restore_host_snapshot(NodeRef anchor, std::uint32_t frontier, std::span<const TokenId> tail,
-                          SnapshotKind kind, std::uint32_t hits);
+                          SnapshotKind kind, std::uint32_t hits, bool superseded);
 
     // ---- Host tier resize (RAM pressure) -------------------------------------------------------
     // Slabs [0, host_slab_limit()) are owned, reserved or free; the configured host_slabs past it are retired and
@@ -852,6 +856,7 @@ struct SavedSnapshotShape {
     // Host slabs it takes: the image's, plus one for a tail.
     std::uint32_t slabs = 0;
     std::uint32_t hits  = 0;
+    bool superseded     = false;
 };
 
 struct HostRestorePlan {
@@ -862,9 +867,10 @@ struct HostRestorePlan {
 };
 
 // Chooses what an empty Host tier of `host_slabs` restores from a saved one: everything when it
-// fits. Otherwise snapshots are taken greedily by the GDSF density of §9.3 without its
-// time-dependent base — (1 + hits) times the prefill a restore saves from the root, per byte of
-// image, tail and anchor path. Each takes its own slabs and the path blocks not yet chosen; one
+// fits. Otherwise retained snapshots are taken before superseded ones (which a running cache
+// evicts first), each group greedily by the GDSF density of §9.3 without its time-dependent base —
+// (1 + hits) times the prefill a restore saves from the root, per byte of image, tail and anchor
+// path. Each takes its own slabs and the path blocks not yet chosen; one
 // that does not fit is passed over for later ones that may. Blocks are chosen only on a chosen
 // snapshot's path, so no restored block is dead. `block_parents` lists every saved block's parent
 // index (-1 for the root), parents first.

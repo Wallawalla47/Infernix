@@ -578,6 +578,22 @@ int main() {
                       "cancelled prefill rate must use completed work, not the remaining prompt");
     failures += check(done.at("result").at("prefix_reuse_path") == "hybrid_snapshot",
                       "prefix reuse path missing");
+    // Cached blocks past the reused prefix with no state to resume from (issue #59: a restored
+    // file whose snapshots did not cover the prompt) show in the record and the log line.
+    auto stateless                 = outcome;
+    stateless.reused_prompt_tokens = 0;
+    stateless.prefix_reuse_path    = infernix::PrefixReusePath::Root;
+    stateless.cached_block_tokens  = 384;
+    const Json stateless_done =
+        Json::parse(format_request_done_json("serve-test", 3000, context, stateless));
+    failures += check(stateless_done.at("result").at("prefix_cache_block_tokens") == 384 &&
+                          stateless_done.at("result").at("prefix_cache_hit_tokens") == 0,
+                      "cached blocks without a resumable state missing from the record");
+    failures += check(render_request_done(context, stateless).message.find(
+                          "cache 0 (0.0%; 384 in cached blocks, no state to resume)") != std::string::npos,
+                      "the log line does not show cached blocks left without a resumable state");
+    failures += check(render_request_done(context, outcome).message.find("in cached blocks") == std::string::npos,
+                      "a resumed request was reported as missing a resumable state");
     failures += check(done.at("result").at("thinking_budget") == 256 &&
                           done.at("result").at("model_thinking_tokens") == 256 &&
                           done.at("result").at("thinking_control_tokens") == 19 &&

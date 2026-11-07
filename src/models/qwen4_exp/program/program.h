@@ -127,6 +127,8 @@ struct SourceCandidate {
     std::uint32_t reused_tokens = 0;
     std::shared_ptr<const detail::QuoteImpl> hybrid;
     PrefixReusePath reuse_path = PrefixReusePath::Root;
+    // The prompt prefix held as cached full blocks, reusable or not (diagnostics).
+    std::uint32_t cached_block_tokens = 0;
 };
 
 // A binding's outcome for the Engine's admission (the shape Qwen3.5's binding returns). The prefix

@@ -258,9 +258,10 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
     }
     const auto source = [](std::shared_ptr<HybridQuoteImpl> quote, PrefixReusePath path) {
         SourceCandidate candidate;
-        candidate.reused_tokens = quote->reuse_frontier;
-        candidate.reuse_path    = path;
-        candidate.hybrid        = std::move(quote);
+        candidate.reused_tokens       = quote->reuse_frontier;
+        candidate.reuse_path          = path;
+        candidate.cached_block_tokens = quote->cached_prefix_tokens;
+        candidate.hybrid              = std::move(quote);
         return candidate;
     };
     auto root = std::make_shared<HybridQuoteImpl>();

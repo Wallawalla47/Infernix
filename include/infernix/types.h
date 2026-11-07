@@ -1961,6 +1961,10 @@ struct GenerationResult {
     // Completed initial prefill, excluding cached tokens and separately counted replay work.
     std::uint32_t computed_prefill_tokens = 0;
     PrefixReusePath prefix_reuse_path     = PrefixReusePath::Root;
+    // With the prefix cache: the longest prompt prefix it held as full blocks at admission, whether a
+    // snapshot made it reusable or not. Above reused_prompt_tokens, the blocks were there but no state
+    // to resume from them was (an evicted or unsaved snapshot), so the rest was prefilled again.
+    std::uint32_t cached_block_tokens = 0;
     GenerationTimings timings;
     GenerationEngineTiming engine_timing;
     GenerationSchedulingStats scheduling;
