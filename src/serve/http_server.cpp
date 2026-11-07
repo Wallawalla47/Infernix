@@ -485,6 +485,8 @@ void HttpServer::register_routes() {
     // (--max-http-clients), not by the window.
     server_.set_keep_alive_timeout(options_.keep_alive_timeout_sec);
     server_.set_keep_alive_timeout_buffer(kKeepAliveBufferSec);
+    // A response write waits up to kWriteTimeoutSec for a client that stops reading (5 s by default).
+    server_.set_write_timeout(static_cast<time_t>(kWriteTimeoutSec));
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
         return handle_unrendered_http_error(options_, request, response);
     });

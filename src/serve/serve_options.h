@@ -28,6 +28,11 @@ inline constexpr std::uint32_t kMaximumPendingRequests    = 1024;
 // Seconds an idle connection stays open past the Keep-Alive timeout the server advertises, so a
 // client that retires its pooled connection at the advertised deadline always closes first.
 inline constexpr std::uint32_t kKeepAliveBufferSec = 10;
+// Seconds a response write may wait for the client to take bytes (its socket buffers full): a
+// streaming client that stops reading keeps its request this long. cpp-httplib's 5 s default
+// ended such streams, with no finish, after a 5 s pause (Flare #199). A peer that stops
+// acknowledging is still cut sooner by the TCP retransmission limit (http_transport.cpp).
+inline constexpr std::uint32_t kWriteTimeoutSec = 60;
 
 // Size-based rotation of the request JSONL log.
 struct RequestLogRotation {

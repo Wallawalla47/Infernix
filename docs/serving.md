@@ -251,7 +251,10 @@ keepalive and a 15-second retransmission limit (`TCP_USER_TIMEOUT` on Linux, `TC
 Windows); together with the heartbeat, a dead or unacknowledging peer is normally cancelled within
 about 20 seconds, including while the request is waiting (TCP alone) or prefilling. A peer whose TCP stack remains connected and acknowledges data
 cannot be distinguished from a reading application; proxies must close their upstream Infernix
-connection when the downstream client disappears.
+connection when the downstream client disappears. A client that stops reading keeps its stream:
+the generation goes on, and a write waits up to 60 seconds for the client once its socket buffers
+are full (on Linux a zero receive window held for the 15-second retransmission limit can end the
+connection sooner) before the request is cancelled as disconnected.
 
 ## Models
 
