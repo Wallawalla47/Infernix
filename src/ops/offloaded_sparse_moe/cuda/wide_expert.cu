@@ -416,12 +416,22 @@ __device__ __forceinline__ void store_terms(std::uint8_t* row, int b, int code_b
     }
 }
 
-// The entry of each dispatch value (column * top_k + slot, then shared_first + column with a shared job): every
-// entry p holds one value, so the map covers every slot of every column.
+// The entry of each dispatched value (column * top_k + slot, then shared_first + column with a shared job), over
+// the map the caller cleared to -1. Only the dispatched entries hold values: a masked column's (MoeColumnMask: a
+// verification round's padding columns) are not dispatched, so the entries past the last job's end are stale
+// and the masked slots keep -1. The dispatched count is the furthest job's end in offsets[] (an exclusive scan;
+// the jobs need not be in expert order). Writing every output row's value instead read stale entries: an
+// out-of-range value faulted (Ornith-1.5-122B, fixed MTP rounds of a 16-column copy window, 2026-11-07), an
+// in-range one moved a live slot's row (live outputs wrong by up to 6x their norm under the mask).
 __global__ void x_slot_entries_kernel(MoeDispatch dispatch, int entries, std::int32_t* __restrict__ slot_entries) {
-    for (int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); p < entries;
+    const int jobs = *dispatch.job_count;
+    int dispatched = 0;
+    for (int j = 0; j < jobs; ++j) { dispatched = max(dispatched, dispatch.offsets[dispatch.jobs[j] + 1]); }
+    dispatched = min(entries, dispatched);
+    for (int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); p < dispatched;
          p += static_cast<int>(gridDim.x * blockDim.x)) {
-        slot_entries[dispatch.entries[p]] = p;
+        const int value = dispatch.entries[p];
+        if (value >= 0 && value < entries) { slot_entries[value] = p; }
     }
 }
 
@@ -468,7 +478,9 @@ __global__ void __launch_bounds__(G::kHidden / 16)
     __syncthreads();
     TermBlock<Terms> q;
     term_block(block, scale, q);
+    // A masked column's slots were not dispatched (-1): no row of theirs is read.
     const auto store = [&](int p) {
+        if (p < 0) { return; }
         store_terms(plane + static_cast<std::size_t>(p) * P::x_terms_row_bytes(Terms), b, P::kXCodeBytes, P::kXRowBytes, q);
     };
     for (int slot = 0; slot < top_k; ++slot) { store(slot_entries[t * top_k + slot]); }
@@ -674,6 +686,8 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
         call.h_row_scale   = workspace.h_row_scale;
         Descriptors descriptors{};
         with_expert_geometry(source.shape, [&]<class G>() {
+            CUDA_CHECK(cudaMemsetAsync(workspace.x_slot_entries, 0xFF, sizeof(std::int32_t) * static_cast<std::size_t>(entries),
+                                       stream));
             x_slot_entries_kernel<<<persistent_ctas(), kQuantizeThreads, 0, stream>>>(dispatch, entries,
                                                                                    workspace.x_slot_entries);
             check_launch("x slot entries");

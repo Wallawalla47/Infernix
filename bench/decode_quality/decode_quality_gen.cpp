@@ -13,7 +13,7 @@
 // segments decoding on an Engine of N lanes (N workers, each taking the next segment as soon as its
 // last completes) and reports their wall-clock throughput. `ngram=N` and
 // `min-match=M` set the n-gram copy window and minimum match (`ngram`: 15 and 12; `ngram=auto` the
-// Engine's), `tree=auto` or
+// Engine's), `ngram-tree=N` n-gram trees of N columns (--ngram-tree-nodes), `tree=auto` or
 // `tree=N` DFlash2 tree verification. `prompts` reads the corpus as whole prompts, each ended by a line
 // "<<<END>>>" (prompt_tokens their limit), for workloads such as copy-heavy edits. `temperature=T` samples
 // instead (top-k 20, top-p 0.95, segment s seeded s + 1: a speed workload; the judge scores greedy
@@ -26,8 +26,9 @@
 // decode with NInfer's.
 //
 // Usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> <prompt_tokens>
-//                                  <new_tokens> [ngram | ngram=N] [min-match=M] [tree=auto|N] [prompts]
-//                                  [concurrency=N] [mtp [auto] [min-p=P]] [dflash [auto]] [plain] [reproducible]
+//                                  <new_tokens> [ngram | ngram=N] [min-match=M] [ngram-tree=N] [tree=auto|N] [prompts]
+//                                  [concurrency=N] [lanes=N] [tree-paths=N]
+//                                  [mtp [auto] [min-p=P]] [dflash [auto]] [plain] [reproducible]
 //                                  [a8] [path=NAME]...
 //                                  [draft-model=FILE [drafts=N] [auto] [full-head]] (Qwen3.8-Flash-Next DFlash2)
 //                                  [temperature=T] [logits=fp32|bf16] (the head's logits; bf16 for comparisons)
@@ -66,12 +67,14 @@ int main(int argc, char** argv) {
         const auto new_tokens    = static_cast<std::uint32_t>(std::stoul(argv[6]));
         bool ngram = false, mtp = false, dflash = false, plain = false, reproducible = false, draft_auto = false,
              full_head = false, tree_auto = false, prompt_records = false, ngram_auto = false, a8 = false;
-        std::uint32_t ngram_drafts = 15, ngram_min_match = 12, tree_nodes = 0;
+        std::uint32_t ngram_drafts = 15, ngram_min_match = 12, tree_nodes = 0, ngram_tree_nodes = 0, tree_paths = 0;
         std::vector<std::string> paths;
         std::string ngram_volume, route_trace, draft_model;
         std::uint32_t drafts = 7;
         bool drafts_set      = false;
         std::uint32_t concurrency = 1;
+        // `lanes=N`: the Engine's lanes (--max-concurrency) when they differ from the decoding workers.
+        std::uint32_t lanes = 0;
         float temperature    = 0.0F;
         std::optional<float> min_p;
         infernix::KvCacheStorage kv = infernix::KvCacheStorage::Int8Group64;
@@ -88,6 +91,10 @@ int main(int argc, char** argv) {
                 ngram_drafts = static_cast<std::uint32_t>(std::stoul(flag.substr(6)));
             } else if (flag.starts_with("min-match=")) {
                 ngram_min_match = static_cast<std::uint32_t>(std::stoul(flag.substr(10)));
+            } else if (flag.starts_with("ngram-tree=")) {
+                ngram_tree_nodes = static_cast<std::uint32_t>(std::stoul(flag.substr(11)));
+            } else if (flag.starts_with("tree-paths=")) {
+                tree_paths = static_cast<std::uint32_t>(std::stoul(flag.substr(11)));
             } else if (flag == "tree=auto") {
                 tree_auto = true;
             } else if (flag.starts_with("tree=")) {
@@ -120,6 +127,8 @@ int main(int argc, char** argv) {
                     std::cerr << "concurrency must be 1..8\n";
                     return 2;
                 }
+            } else if (flag.starts_with("lanes=")) {
+                lanes = static_cast<std::uint32_t>(std::stoul(flag.substr(6)));
             } else if (flag.starts_with("drafts=")) {
                 drafts     = static_cast<std::uint32_t>(std::stoul(flag.substr(7)));
                 drafts_set = true;
@@ -153,7 +162,7 @@ int main(int argc, char** argv) {
                 }
             } else {
                 std::cerr << "unknown option " << flag
-                          << " (ngram, ngram=N, min-match=M, tree=auto|N, prompts, mtp, dflash, auto, min-p=P, "
+                          << " (ngram, ngram=N, min-match=M, ngram-tree=N, tree=auto|N, prompts, mtp, dflash, auto, min-p=P, "
                              "plain, reproducible, a8, path=NAME, draft-model=FILE, drafts=N, full-head, temperature=T, "
                              "ngram-volume=FILE, route-trace=FILE, kv=NAME, logits=fp32|bf16)\n";
                 return 2;
@@ -180,7 +189,12 @@ int main(int argc, char** argv) {
         options.artifact_path = argv[1];
         options.max_context   = (prompt_tokens + new_tokens + 64 + 127) / 128 * 128;
         // Every lane's whole context: the Qwen3.5 planner refuses a capacity past it.
-        options.kv_capacity   = infernix::KvCapacityPolicy::explicit_capacity(options.max_context * concurrency);
+        if (lanes == 0) { lanes = concurrency; }
+        if (lanes < concurrency || lanes > 8) {
+            std::cerr << "lanes must be concurrency..8\n";
+            return 2;
+        }
+        options.kv_capacity   = infernix::KvCapacityPolicy::explicit_capacity(options.max_context * lanes);
         options.kv_cache      = kv;
 #if !defined(INFERNIX_DECODE_QUALITY_NINFER)
         options.logits_dtype  = bf16_logits ? infernix::LogitsDtype::BF16 : infernix::LogitsDtype::FP32;
@@ -190,7 +204,7 @@ int main(int argc, char** argv) {
             return 2;
         }
 #endif
-        options.max_concurrency                   = concurrency;
+        options.max_concurrency                   = lanes;
         options.prefill_chunk                     = 4096;
         options.speculative.backend      = dflash ? infernix::SpeculativeBackend::DFlash
                                                   : infernix::SpeculativeBackend::DFlash2;
@@ -232,7 +246,12 @@ int main(int argc, char** argv) {
             options.speculative.ngram_draft_tokens      = ngram_auto ? 0U : ngram_drafts;
             options.speculative.ngram_draft_tokens_auto = ngram_auto;
             options.speculative.ngram_min_match         = ngram_min_match;
+            // `ngram-tree=N`: --ngram-tree-nodes N, divergent copy sources verified as one tree.
+            options.speculative.ngram_tree_nodes = ngram_tree_nodes;
 #endif
+        } else if (ngram_tree_nodes != 0) {
+            std::cerr << "ngram-tree=N needs ngram drafting (ngram or ngram=N)\n";
+            return 2;
         }
         if (tree_auto || tree_nodes != 0) {
 #if defined(INFERNIX_DECODE_QUALITY_NINFER)
@@ -245,6 +264,10 @@ int main(int argc, char** argv) {
             if (tree_nodes != 0) { options.speculative.draft_tree_nodes.fill(tree_nodes); }
 #endif
         }
+#if !defined(INFERNIX_DECODE_QUALITY_NINFER)
+        // `tree-paths=N`: --draft-tree-paths N (trees' most root-to-leaf paths).
+        if (tree_paths != 0) { options.speculative.draft_tree_paths = tree_paths; }
+#endif
         if (plain) { options.speculative = {}; }
 #if defined(INFERNIX_DECODE_QUALITY_NINFER)
         if (reproducible || a8 || !paths.empty() || !route_trace.empty()) {
@@ -416,6 +439,9 @@ int main(int argc, char** argv) {
             speculative.tree_rounds += result.speculative.tree_rounds;
             speculative.tree_side_rounds += result.speculative.tree_side_rounds;
             speculative.tree_side_accepted_tokens += result.speculative.tree_side_accepted_tokens;
+            speculative.ngram_tree_rounds += result.speculative.ngram_tree_rounds;
+            speculative.ngram_tree_side_rounds += result.speculative.ngram_tree_side_rounds;
+            speculative.ngram_tree_side_accepted_tokens += result.speculative.ngram_tree_side_accepted_tokens;
 #endif
         }
         std::cerr << "generated " << generated << " tokens in " << seconds << " s\n";
@@ -434,7 +460,9 @@ int main(int argc, char** argv) {
         std::cerr << "ngram: " << speculative.ngram_rounds << " rounds, accepted " << speculative.ngram_accepted_tokens
                   << " of " << speculative.ngram_drafted_tokens << " drafts; tree: " << speculative.tree_rounds
                   << " rounds, " << speculative.tree_side_rounds << " side, " << speculative.tree_side_accepted_tokens
-                  << " side drafts\n";
+                  << " side drafts; ngram trees: " << speculative.ngram_tree_rounds << " rounds, "
+                  << speculative.ngram_tree_side_rounds << " other-source, "
+                  << speculative.ngram_tree_side_accepted_tokens << " other-source drafts\n";
         {
             // Batch occupancy: decode batch executions and the rows they carried.
             const infernix::RuntimeStats stats = engine.runtime_stats();

@@ -54,7 +54,14 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                                   })),
       ngram_draft_window(plan.ngram_draft_window),
       ngram_batch_window(plan.ngram_batch_window != 0 ? plan.ngram_batch_window : plan.ngram_draft_window),
-      ngram_min_match(plan.ngram_min_match), speculative_backend(plan.speculative_backend),
+      ngram_min_match(plan.ngram_min_match),
+      ngram_tree_nodes(std::any_of(plan.round_shapes.begin(), plan.round_shapes.end(),
+                                   [](const SpeculativeRoundShape& shape) {
+                                       return shape.kind == SpeculativeRoundKind::NgramTree;
+                                   })
+                           ? plan.ngram_tree_nodes
+                           : 0U),
+      speculative_backend(plan.speculative_backend),
       kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),

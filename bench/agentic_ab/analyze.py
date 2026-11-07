@@ -697,7 +697,10 @@ def main(argv):
     exes = {"control": cfg["control_exe"], "treatment": cfg["treatment_exe"],
             "alt": cfg.get("alt_exe") or cfg["treatment_exe"]}
     for a in arms:
-        extra = (" with `%s`" % " ".join(cfg.get("alt_extra_flags") or [])) if a == "alt" else ""
+        # The runner records extra flags as [flag, value] pairs (value null for a switch).
+        flags = [item if isinstance(item, str) else (item[0] if item[1] is None else "%s=%s" % tuple(item))
+                 for item in cfg.get("alt_extra_flags") or []]
+        extra = (" with `%s`" % " ".join(flags)) if a == "alt" else ""
         L.append("- %s: `%s`%s - %s" % (LABEL[a], exes[a], extra, server_row(A[a])))
     L.append("- Total benchmark time including model loads: %.1f min.\n"
              % (cfg.get("total_seconds", 0) / 60))

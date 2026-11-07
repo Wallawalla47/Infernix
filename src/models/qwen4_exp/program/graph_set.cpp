@@ -86,7 +86,12 @@ void ProgramImpl::capture_graph_set() {
     // draft length of at most kPairMaxDrafts (n-gram copies included). Every other round decodes plain.
     std::vector<std::pair<std::int32_t, std::int32_t>> verified;
     if (max_width_ > 1) {
-        verified.emplace_back(1, max_width_);
+        // A one-row round's widths past its drafter's are n-gram copies', which copy_choice takes only where they beat
+        // the drafter's rounds: those are captured at their first use. Captured graphs cost every round (FP4-Local,
+        // DFlash2 auto, copies enabled but never taken, the same 352 rounds: 49 graphs against 25, decode +1.2 %,
+        // prefill +1.0 %; 2026-11-07).
+        const std::int32_t drafter_width = neural_k() > 0 ? 1 + neural_k() : 1;
+        verified.emplace_back(1, drafter_width > 1 ? std::min(max_width_, drafter_width) : max_width_);
         const std::int32_t pair_width = 1 + std::min(kPairMaxDrafts, neural_k());
         if (options_.pair_speculation && pair_width > 1 && lanes >= 2 && (mtp_ || dflash2_)) {
             verified.emplace_back(2, pair_width);

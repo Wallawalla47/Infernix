@@ -116,11 +116,18 @@ bool plan_has_split(const SequencePlanImpl& plan) {
                        [](const SpeculativeRoundShape& shape) { return shape.split; });
 }
 
+// Whether the plan builds draft trees on the device (from the drafter's candidates).
 bool plan_has_tree(const SequencePlanImpl& plan) {
     return std::any_of(plan.round_shapes.begin(), plan.round_shapes.end(),
                        [](const SpeculativeRoundShape& shape) {
                            return shape.kind == SpeculativeRoundKind::Tree;
                        });
+}
+
+// Whether the plan verifies tree rows: device-built draft trees or n-gram trees.
+bool plan_verifies_tree(const SequencePlanImpl& plan) {
+    return std::any_of(plan.round_shapes.begin(), plan.round_shapes.end(),
+                       [](const SpeculativeRoundShape& shape) { return verifies_tree(shape.kind); });
 }
 
 // The speculative round families an engine captures. Neural rounds verify at the drafter's window
@@ -189,6 +196,11 @@ std::vector<SpeculativeRoundShape> speculative_round_shapes(const EngineOptions&
         shapes.push_back({.kind          = SpeculativeRoundKind::Ngram,
                           .verify_drafts = spec.ngram_draft_tokens,
                           .single_row    = narrow_batches && options.max_concurrency > 1});
+    }
+    // N-gram tree rounds verify at their own width; its rows without a divergent copy verify their
+    // chain in it (a copy within the width, or the neural proposal, which it holds: validate_target_options).
+    if (spec.ngram_draft_tokens != 0 && spec.ngram_tree_nodes != 0) {
+        shapes.push_back({SpeculativeRoundKind::NgramTree, spec.ngram_tree_nodes - 1U});
     }
     // One tree family per distinct tree width.
     for (const std::uint32_t nodes : tree_widths.widths()) {
@@ -439,7 +451,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                                                                   plan.max_concurrency),
                                          .logits         = plan.execution_schedule.logits,
                                          .block_drafts   = plan_has_split(plan) ? plan.neural_draft_window : 0U,
-                                         .tree           = plan_has_tree(plan)});
+                                         .tree           = plan_verifies_tree(plan)});
     out.prefill_hidden =
         add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
                    "step prefill hidden");
@@ -577,7 +589,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     } else if (path == GdnWorkspacePath::ReplayRecord) {
                         scratch(layout, execution::gdn_record_workspace_bytes(
                                             gdn, *config.gdn, batch_size, min_width, max_width,
-                                            plan_has_tree(plan)));
+                                            plan_verifies_tree(plan)));
                     } else {
                         (void)workspace::gdn_prefill_conv(layout, config, last);
                         scratch(layout,
@@ -864,7 +876,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     : ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(domain, drafts, drafts,
                                                                                      batch, batch);
             for (const SpeculativeRoundShape& shape : plan.round_shapes) {
-                if (shape.kind != SpeculativeRoundKind::Tree) { continue; }
+                if (!verifies_tree(shape.kind)) { continue; }
                 bytes = std::max(bytes, ops::speculative_accept_sparse_tree_workspace_capacity_bytes(
                                             domain, static_cast<std::int32_t>(shape.verify_drafts + 1U),
                                             batch, batch));
@@ -1135,7 +1147,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                               dimension(parameters.model.resources().public_token_count), drafts,
                               drafts, batch, batch);
                 for (const SpeculativeRoundShape& shape : plan.round_shapes) {
-                    if (shape.kind != SpeculativeRoundKind::Tree) { continue; }
+                    if (!verifies_tree(shape.kind)) { continue; }
                     accept = std::max(
                         accept,
                         ops::speculative_accept_sparse_tree_workspace_capacity_bytes(
@@ -1172,6 +1184,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
     return out;
 }
+
+ExecutionSchedule execution_schedule(const execution::Parameters& parameters, const EngineOptions& options);
 
 void validate_target_options(const execution::Parameters& parameters,
                              const EngineOptions& options) {
@@ -1297,6 +1311,38 @@ void validate_target_options(const execution::Parameters& parameters,
     if (options.speculative.ngram_batch_draft_tokens > options.speculative.ngram_draft_tokens) {
         throw std::invalid_argument("the batched ngram window must lie within the ngram window");
     }
+    if (const std::uint32_t nodes = options.speculative.ngram_tree_nodes; nodes != 0) {
+        if (options.speculative.ngram_draft_tokens == 0) {
+            throw std::invalid_argument("n-gram trees (--ngram-tree-nodes) require ngram drafting");
+        }
+        // Rows without a divergent copy verify their chain in the tree's round: a batched row without a
+        // copy its neural proposal (adaptive-dflash's batch length where it has one), which the width must
+        // hold. A one-row copy round runs no drafter.
+        const std::uint32_t batch_drafts =
+            dflash_batch_drafts(select_fast_paths(parameters.model, options).configuration, options.speculative.backend);
+        const std::uint32_t batched_proposal =
+            options.max_concurrency <= 1 ? 0U
+            : execution_schedule(parameters, options).adaptive_dflash && batch_drafts != 0
+                ? std::min(batch_drafts, options.speculative.draft_tokens)
+                : options.speculative.draft_tokens;
+        if (nodes < 4 || nodes > static_cast<std::uint32_t>(ops::kSpeculativeTreeMaxNodes) ||
+            nodes < batched_proposal + 2U) {
+            throw std::invalid_argument("--ngram-tree-nodes must be in [4, 32] and hold a batched row's neural "
+                                        "proposal (" + std::to_string(batched_proposal) + " drafts) and its anchor");
+        }
+        ops::validate_speculative_tree_shape(
+            {static_cast<std::int32_t>(nodes),
+             static_cast<std::int32_t>(std::min<std::uint32_t>(nodes - 2U, ops::kSpeculativeTreeMaxPathLength - 1)),
+             static_cast<std::int32_t>(options.speculative.draft_tree_paths)});
+        if (!tree_verification_supported(parameters)) {
+            throw std::invalid_argument("n-gram trees require single FP8, NVFP4 or Q8 GDN input projections");
+        }
+        // Fixed speculation (the reproducible route) verifies every copy round at the n-gram window.
+        if (execution_schedule(parameters, options).fixed_speculation) {
+            throw std::invalid_argument("n-gram trees need adaptive speculation; the reproducible route verifies "
+                                        "copies as chains");
+        }
+    }
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
@@ -1324,6 +1370,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->ngram_draft_window   = inputs.ngram_draft_window;
     impl->ngram_batch_window   = inputs.ngram_batch_window;
     impl->ngram_min_match      = inputs.ngram_min_match;
+    impl->ngram_tree_nodes     = inputs.ngram_tree_nodes;
     impl->speculative_backend  = inputs.speculative_backend;
     impl->proposal_head        = inputs.proposal_head;
     impl->features             = inputs.features;
@@ -1659,6 +1706,8 @@ std::uint32_t resolve_auto_ngram_impl(const Model& model, EngineOptions& options
     spec.ngram_draft_tokens       = settings.window;
     spec.ngram_batch_draft_tokens = settings.window != 0 ? settings.batch_window : 0U;
     if (settings.window != 0) { spec.ngram_min_match = settings.min_match; }
+    // N-gram trees verify copies: with copies off there are none.
+    if (settings.window == 0) { spec.ngram_tree_nodes = 0; }
     return settings.window;
 }
 
@@ -1737,6 +1786,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .ngram_draft_window  = options.speculative.ngram_draft_tokens,
         .ngram_batch_window  = options.speculative.ngram_batch_draft_tokens,
         .ngram_min_match     = options.speculative.ngram_min_match,
+        .ngram_tree_nodes    = options.speculative.ngram_tree_nodes,
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = effective_prefill_chunk(parameters, options),

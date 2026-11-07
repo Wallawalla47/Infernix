@@ -341,6 +341,9 @@ struct PrefixCachePersistence {
     std::uint64_t host_bytes          = 0;
 };
 
+// N-gram trees: the most root-to-leaf paths (verification rows) one tree round verifies (ProgramOptions::ngram_tree_paths).
+inline constexpr std::uint32_t kNgramTreeMaximumPaths = 3;
+
 struct ProgramOptions {
     std::uint32_t max_context     = 0;
     std::uint32_t max_concurrency = 1;
@@ -406,6 +409,12 @@ struct ProgramOptions {
     // ngram_min_match tokens (4..64) earlier in the request.
     std::uint32_t ngram_draft_tokens = 0;
     std::uint32_t ngram_min_match    = 12;
+    // N-gram trees (--ngram-tree-nodes; docs/maintainer/tree-verification.md, "N-gram trees"): a one-row copy
+    // round whose sources continue differently verifies a tree of at most ngram_tree_nodes tokens (4..32) as
+    // ngram_tree_paths (2..kNgramTreeMaximumPaths) verification rows, one per root-to-leaf path over the row's
+    // state, and accepts by tree acceptance. 0 keeps copies on chain verification.
+    std::uint32_t ngram_tree_nodes = 0;
+    std::uint32_t ngram_tree_paths = 0;
     // MTP drafts per round when the drafter is loaded (design section 11, at most 7). A longer
     // n-gram proposal, when enabled, replaces a round's MTP drafts.
     std::uint32_t mtp_draft_tokens = 0;

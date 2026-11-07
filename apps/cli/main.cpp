@@ -308,6 +308,13 @@ void print_generation_summary(const infernix::GenerationResult& result,
             print_metric(backend + " tree side drafts",
                          std::to_string(speculative.tree_side_accepted_tokens));
         }
+        if (speculative.ngram_tree_rounds != 0) {
+            print_metric(backend + " ngram tree rounds", std::to_string(speculative.ngram_tree_rounds));
+            print_metric(backend + " ngram tree other-source rounds",
+                         std::to_string(speculative.ngram_tree_side_rounds));
+            print_metric(backend + " ngram tree other-source drafts",
+                         std::to_string(speculative.ngram_tree_side_accepted_tokens));
+        }
     }
 }
 

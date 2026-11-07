@@ -162,7 +162,25 @@ void validate(const EngineOptions& options) {
     if (options.speculative.draft_tree_auto ||
         std::any_of(options.speculative.draft_tree_nodes.begin(), options.speculative.draft_tree_nodes.end(),
                     [](std::uint32_t nodes) { return nodes != 0; })) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next verifies chains: --draft-tree-nodes is not supported");
+        throw std::invalid_argument("Qwen3.8-Flash-Next verifies neural drafts as chains: --draft-tree-nodes is not "
+                                    "supported (--ngram-tree-nodes verifies n-gram copies as trees)");
+    }
+    // N-gram trees verify each root-to-leaf path as its own row over the lane's state: side rows write their KV
+    // into copy-on-write pages, which the vector-quantized storages' per-lane exact window and the packed BF16
+    // storage's per-row flags do not follow.
+    if (options.speculative.ngram_tree_nodes != 0) {
+        if (options.speculative.ngram_draft_tokens == 0) {
+            throw std::invalid_argument("--ngram-tree-nodes needs n-gram copies (--ngram-draft-tokens)");
+        }
+        if (options.speculative.ngram_tree_nodes < 4 || options.speculative.ngram_tree_nodes > 32) {
+            throw std::invalid_argument("--ngram-tree-nodes must be 0 or in [4,32]");
+        }
+        if (options.kv_cache == KvCacheStorage::Vq2 || options.kv_cache == KvCacheStorage::Q4KeyVq2Value ||
+            options.kv_cache == KvCacheStorage::Bf16Packed) {
+            throw std::invalid_argument("Qwen3.8-Flash-Next n-gram trees need a KV storage without per-lane windows "
+                                        "or packed rows (bf16, int8, fp8, nvfp4 or k8v4)");
+        }
+        if (options.lossless) { throw std::invalid_argument("the lossless route verifies no n-gram trees"); }
     }
     // The lossless route (TextConfig::lossless; docs/maintainer/lossless-route.md §2a, §3a): every
     // operation correctly rounded; causal scoring takes each window in one call (its prefill chunk),
@@ -325,6 +343,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         options.kv_capacity.mode == KvCapacityMode::Explicit ? options.kv_capacity.explicit_tokens : 0U;
     program_options.ngram_draft_tokens = options.speculative.ngram_draft_tokens;
     program_options.ngram_min_match    = options.speculative.ngram_min_match;
+    if (options.speculative.ngram_tree_nodes != 0) {
+        program_options.ngram_tree_nodes = options.speculative.ngram_tree_nodes;
+        program_options.ngram_tree_paths = std::min<std::uint32_t>(options.speculative.draft_tree_paths,
+                                                                    models::qwen4_exp::kNgramTreeMaximumPaths);
+    }
     program_options.mtp_draft_tokens   = options.speculative.backend == SpeculativeBackend::Mtp
                                              ? options.speculative.draft_tokens
                                              : 0U;

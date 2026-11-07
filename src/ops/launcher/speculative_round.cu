@@ -69,6 +69,19 @@ void speculative_overlay_copy_proposals_launch(const Tensor& copy_rows, const Te
     CUDA_CHECK(cudaGetLastError());
 }
 
+void speculative_one_hot_proposals_launch(const Tensor& skip_rows, const Tensor& drafts, std::int32_t token_domain,
+                                          Tensor& candidates, Tensor& proposal_q, cudaStream_t stream) {
+    constexpr int kBlock = 128;
+    const int k          = drafts.ne[0];
+    const int batch      = drafts.ne[1];
+    CUDA_CHECK(pdl::launch_consumer({dim3(batch), dim3(kBlock), 0, stream}, speculative_one_hot_proposals_kernel,
+                                    static_cast<const std::int32_t*>(skip_rows.data),
+                                    static_cast<const std::int32_t*>(drafts.data),
+                                    static_cast<std::int32_t*>(candidates.data), static_cast<float*>(proposal_q.data),
+                                    k, kSparseSpeculativeCandidates, token_domain));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 namespace {
 
 template <class Logit>

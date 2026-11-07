@@ -427,6 +427,91 @@ void run(int columns, std::mt19937& rng) {
                   where + ": the dispatch lists exactly the live columns' routed and shared entries");
             check(log == ids, where + ": the route log keeps the router's ids for every column");
         }
+        // expert-a4-residual's wide route under the mask: it forms each token's x terms once and stores them in
+        // its entries' rows through a map of the dispatched entries, which a masked column's slots are not in (a
+        // map over every output row read stale entries and faulted on the 122B's verification rounds,
+        // 2026-11-07). Masked entries are never written; live entries stay within the two-term route's bounds
+        // of test_offloaded_moe_a4_residual_122b against the exact bits (relative L2 <= 2^-5 an entry, mean
+        // <= 2^-7).
+        if (columns > 8) {
+            // The route's own workspace (its x and h term planes) and outputs, so the exact route's stay intact.
+            void* d_a4_workspace       = nullptr;
+            std::uint16_t* d_a4_out    = nullptr;
+            cuda_check(cudaMalloc(&d_a4_workspace,
+                                  infernix::ops::moe_experts_workspace_bytes(kShape, max_jobs, entries, columns,
+                                                                             moe::ExpertActivation::kA16,
+                                                                             moe::WideA16::kA4Residual)),
+                       "cudaMalloc");
+            cuda_check(cudaMalloc(&d_a4_out, expected.size() * sizeof(std::uint16_t)), "cudaMalloc");
+            cuda_check(cudaMemset(d_a4_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
+            infernix::ops::MoeExpertSource source{.frame_base    = d_frame_base,
+                                                  .frames        = d_frames,
+                                                  .host_records  = host_device,
+                                                  .record_stride = stride,
+                                                  .scales        = d_scales,
+                                                  .staging_base  = d_staging,
+                                                  .staging_slots = 64};
+            source.activation    = moe::ExpertActivation::kA16;
+            source.wide_a16      = moe::WideA16::kA4Residual;
+            source.frame_stride  = pitch;
+            source.shape         = kShape;
+            source.shared_expert = kExperts;
+            source.shared_record = d_shared_record;
+            const Tensor tx(d_x, DType::BF16, {H, columns});
+            Tensor out(d_a4_out, DType::BF16, {H, entries});
+            // The route's outputs under `use` (the unmasked routing, or the mask), with every entry's relative L2
+            // error against the exact bits for the live ones and the masked entries it wrote.
+            struct Score {
+                double worst = 0.0, mean = 0.0;
+                std::size_t written_masked = 0;
+            };
+            const auto score = [&](infernix::ops::MoeRouting use, bool apply_mask) {
+                cuda_check(cudaMemset(d_a4_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
+                infernix::ops::moe_route_dispatch(logits_tensor, kTopK, use, dispatch, d_log, nullptr,
+                                                  infernix::ops::RouterLogits::kBf16, true);
+                infernix::ops::moe_experts(tx, dispatch, source, kTopK, max_jobs, d_a4_workspace, out, nullptr, true,
+                                           false);
+                cuda_check(cudaDeviceSynchronize(), "moe_experts (a4 residual)");
+                std::vector<std::uint16_t> got(expected.size());
+                cuda_check(cudaMemcpy(got.data(), d_a4_out, got.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
+                           "cudaMemcpy");
+                Score s;
+                double sum = 0.0;
+                int counted = 0;
+                for (int i = 0; i < entries; ++i) {
+                    const bool live_entry = !apply_mask || entry_live(i);
+                    double err = 0.0, ref = 0.0;
+                    for (int r = 0; r < H; ++r) {
+                        const std::size_t at = static_cast<std::size_t>(i) * H + r;
+                        if (!live_entry) {
+                            s.written_masked += got[at] != 0xFFFF;
+                            continue;
+                        }
+                        const double want = bf16_float(expected[at]), have = bf16_float(got[at]);
+                        err += (have - want) * (have - want);
+                        ref += want * want;
+                    }
+                    if (!live_entry) { continue; }
+                    const double rel = ref > 0.0 ? std::sqrt(err / ref) : std::sqrt(err);
+                    s.worst = std::isnan(rel) ? rel : std::max(s.worst, rel);
+                    sum += rel;
+                    ++counted;
+                }
+                s.mean = counted > 0 ? sum / counted : 0.0;
+                return s;
+            };
+            const Score plain = score(routing, false);
+            const Score live  = score(masked, true);
+            cudaFree(d_a4_workspace);
+            cudaFree(d_a4_out);
+            const std::string where = "T " + std::to_string(columns) + " in rows of " + std::to_string(width) + ", " +
+                                      std::to_string(live_columns) + " live, expert-a4-residual";
+            std::printf("%s: unmasked worst %.4f mean %.5f; masked live worst %.4f mean %.5f, %zu masked written\n",
+                        where.c_str(), plain.worst, plain.mean, live.worst, live.mean, live.written_masked);
+            check(live.written_masked == 0 && live.worst <= std::max(1.0 / 32.0, 2.0 * plain.worst) &&
+                      live.mean <= std::max(1.0 / 128.0, 2.0 * plain.mean),
+                  where + ": masked entries never written, live entries as accurate as the unmasked call's");
+        }
 
         // The combine: live columns equal the unmasked combine's bits, masked columns are 0.
         std::uint16_t *d_plain = nullptr, *d_masked = nullptr;

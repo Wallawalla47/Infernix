@@ -95,6 +95,41 @@ namespace infernix::models::qwen3_5::detail {
 
 namespace {
 
+// An n-gram tree row's round: its accepted path left the main chain at draft `branch` (> 0) or stayed on
+// it (0); the drafts it accepted after leaving it are what the main chain's copy alone would not have. The
+// request's tree gain learns the round's tokens over its copy's alone (`copy` drafts, of which the tree's main
+// chain held `main_depth`): the copy stops where the path left it, or, where the path took the whole main
+// chain, goes on through the rest of the copy at the request's copy acceptance.
+void record_ngram_tree_row(RequestControl& request, std::int32_t branch, std::int32_t accepted,
+                           std::uint32_t main_depth, std::uint32_t copy) {
+    SpeculativeStats& stats = request.speculative_stats;
+    stats.ngram_tree_rounds += 1;
+    if (branch > accepted) { throw std::runtime_error("an n-gram tree row returned an invalid branch"); }
+    double chain = branch > 0 ? static_cast<double>(branch) : static_cast<double>(accepted + 1);
+    if (branch <= 0 && static_cast<std::uint32_t>(accepted) == main_depth && copy > main_depth) {
+        const double p = stats.ngram_drafted_tokens >= 64
+                             ? static_cast<double>(stats.ngram_accepted_tokens) / static_cast<double>(stats.ngram_drafted_tokens)
+                             : kNgramTreeCopyAcceptancePrior;
+        double reach = 1.0;
+        for (std::uint32_t k = main_depth; k < copy; ++k) {
+            reach *= p;
+            chain += reach;
+        }
+    }
+    request.ngram_tree_gain = (1.0 - kNgramTreeGainWeight) * request.ngram_tree_gain +
+                              kNgramTreeGainWeight * static_cast<double>(accepted + 1) / chain;
+    if (branch <= 0) { return; }
+    stats.ngram_tree_side_rounds += 1;
+    stats.ngram_tree_side_accepted_tokens += static_cast<std::uint64_t>(accepted - branch + 1);
+}
+
+// Whether a row whose copy sources form a tree verifies it: while the request's tree rounds gain over their copies
+// alone, else every kNgramTreeProbeInterval-th eligible round (so a text whose sources start to differ is seen).
+bool ngram_tree_wanted(RequestControl& request) {
+    if (request.ngram_tree_gain >= 1.0) { return true; }
+    return ++request.ngram_tree_skipped % kNgramTreeProbeInterval == 0;
+}
+
 // The sparse acceptance's proposal of a deterministic draft (sampled-mtp-drafts verifying an
 // argmax draft or a padding column): the draft with q 1, then the smallest other ids with q 0, as
 // ops::speculative_sample_sparse_drafts fills a one-hot column.
@@ -494,6 +529,34 @@ std::uint32_t ProgramImpl::ngram_copy_floor(std::uint32_t batch_rows) const noex
     return neural_draft_window;
 }
 
+NgramTreeLimits ProgramImpl::ngram_tree_limits(std::uint32_t frontier,
+                                               const runtime::RoundBudget& budget) const noexcept {
+    // Columns F..F+nodes-1 of the context, and at most the drafts the budget leaves past the bonus.
+    const std::uint32_t room  = frontier < capacity ? capacity - frontier : 0U;
+    const std::uint32_t nodes = std::min(ngram_tree_nodes, room);
+    const std::uint32_t emit  = budget.generated_tokens_remaining > 1 ? budget.generated_tokens_remaining - 1U : 0U;
+    std::uint32_t depth       = std::min<std::uint32_t>(ops::kSpeculativeTreeMaxPathLength - 1, emit);
+    depth                     = nodes >= 2U ? std::min(depth, nodes - 2U) : 0U;
+    return {.depth = depth, .nodes = nodes, .paths = draft_tree_paths};
+}
+
+NgramTree ProgramImpl::ngram_tree(std::uint32_t lane, const NgramProposer::Match& main,
+                                  NgramTreeLimits limits) const {
+    const RequestControl& request = requests[lane];
+    if (!request.ngram || main.tokens.empty() || limits.depth == 0) { return {}; }
+    const auto& ledger = active_sequence(lane).ledger;
+    const auto history =
+        std::span<const TokenId>(ledger).last(std::min(kNgramMatchHistoryTokens, ledger.size()));
+    // The round's copy is the main chain (it may come from the archive); the request's own index gives
+    // the other sources, best first, each to the tree's depth.
+    std::vector<NgramProposer::Match> candidates{main};
+    for (auto& other : request.ngram->propose_candidates(history, limits.depth, ngram_min_match, 2U * limits.paths)) {
+        candidates.push_back(std::move(other));
+    }
+    return build_ngram_tree(candidates, limits,
+                            static_cast<std::int32_t>(parameters.model.resources().public_token_count));
+}
+
 void ProgramImpl::take_ngram_index(RequestControl& request, const RequestBasePlanImpl& base) {
     if (!base.ngram_index || !base.ngram_index->index) {
         throw std::logic_error("request plan carries no ngram index while ngram drafting is on");
@@ -600,6 +663,25 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         constrained |= masks && masks->constrained(row);
     }
     const bool tree_eligible = mtp_tree_rounds && !fixed_width && !any_ngram && !constrained;
+    // N-gram trees: as for DFlash, a copy round in which some row's copy sources continue differently
+    // verifies at the n-gram tree width, that row its sources' tree and every other row its chain.
+    std::array<NgramTree, kMaximumConcurrency> ngram_trees{};
+    bool ngram_tree_round = false;
+    if (ngram_tree_nodes != 0 && any_ngram && !fixed_width && !constrained) {
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            if (matches[row].tokens.empty()) { continue; }
+            const NgramTreeLimits limits =
+                ngram_tree_limits(active_sequence(lanes[row]).execution_frontier, budgets[row]);
+            if (limits.depth == 0 || limits.nodes < limits.depth + 2U) { continue; }
+            NgramTree tree = ngram_tree(lanes[row], matches[row], limits);
+            // A request whose tree rounds have not gained over its copies verifies them as chains (probing now and then).
+            if (tree.tree() && !ngram_tree_wanted(requests[lanes[row]])) { continue; }
+            if (tree.tree()) {
+                ngram_trees[row] = std::move(tree);
+                ngram_tree_round = true;
+            }
+        }
+    }
     std::uint32_t tree_nodes =
         tree_eligible && !tree_controller ? tree_widths.fixed[lanes.size() - 1U] : 0U;
     const bool policy_round = !fixed_width && execution_schedule.adaptive_mtp && mtp_draft_policy && !any_ngram &&
@@ -687,6 +769,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                                                 ? budgets[row].generated_tokens_remaining - 1
                                                 : 0;
         const bool row_ngram = !matches[row].tokens.empty();
+        // An n-gram tree row verifies every column of its tree (ngram_tree_limits bound it).
+        if (ngram_trees[row].tree()) { return ngram_trees[row].columns - 1U; }
         std::uint32_t extent = std::min({row_ngram ? static_cast<std::uint32_t>(matches[row].tokens.size())
                                                    : sequence.mtp_draft_count,
                                          window, max_by_budget, capacity - sequence.execution_frontier - 1});
@@ -713,6 +797,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         fixed_width ? (ngram_draft_window != 0
                            ? round_family(SpeculativeRoundKind::Ngram, ngram_draft_window)
                            : round_family(SpeculativeRoundKind::Neural, neural_draft_window))
+        : ngram_tree_round ? round_family(SpeculativeRoundKind::NgramTree, ngram_tree_nodes - 1U)
         : any_ngram  ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
         : tree_round ? round_family(SpeculativeRoundKind::Tree, tree_nodes - 1U)
         : chained    ? round_family(SpeculativeRoundKind::Neural, std::max(chained_extent, 1U))
@@ -722,6 +807,9 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         throw std::logic_error("an MTP round's proposal chain does not match its captured family");
     }
     const std::uint32_t verify_drafts = family.shape.verify_drafts;
+    if (ngram_tree_round && verify_drafts + 1U != ngram_tree_nodes) {
+        throw std::logic_error("the n-gram tree round has no family of its width");
+    }
     const std::uint32_t mtp_ar_depth =
         mtp_proposal_drafts(family.shape, neural_draft_window, static_cast<std::uint32_t>(lanes.size()),
                             execution_schedule.mtp_proposal_chain);
@@ -760,6 +848,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             const bool tree_row = tree_round && chain_extent == neural_draft_window &&
                                   sequence.mtp_draft_proposals && capacity - frontier - 1U >= verify_drafts;
             const std::uint32_t extent = tree_row ? verify_drafts : chain_extent;
+            const NgramTree& ngram     = ngram_trees[row];
             if (mtp_confidence) { mtp_confidence_round.columns += extent; }
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
@@ -769,11 +858,38 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             mtp_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1);
             for (std::uint32_t j = 0; j < verify_drafts; ++j) {
                 mtp_host_ingress->current_drafts[row * verify_drafts + j] =
-                    j < chain_extent ? (row_ngram ? matches[row].tokens[j] : sequence.mtp_drafts[j])
-                                     : sequence.ledger.back();
+                    ngram.tree()       ? (j < ngram.drafts.size() ? ngram.drafts[j] : sequence.ledger.back())
+                    : j < chain_extent ? (row_ngram ? matches[row].tokens[j] : sequence.mtp_drafts[j])
+                                       : sequence.ledger.back();
+            }
+            if (ngram_tree_round) {
+                // The row's tree row and masks, and each column's law: a tree's parents' laws, a chain's
+                // drafts' own (an MTP draft's sampled proposal, else the one-hot law of a deterministic draft).
+                const ops::SpeculativeTreeRow tree = ngram.tree() ? ngram.row : ngram_chain_row(extent);
+                mtp_host_ingress->ngram_tree_rows[row] = tree;
+                write_ngram_tree_masks(tree, width,
+                                       std::span<std::uint32_t>(mtp_host_ingress->ngram_tree_masks)
+                                           .subspan(row * width, width));
+                for (std::uint32_t j = 0; j < verify_drafts; ++j) {
+                    const std::size_t base = (row * verify_drafts + j) * kMtpSparseSlots;
+                    const auto ids = std::span<TokenId>(mtp_host_ingress->ngram_tree_candidates).subspan(base, kMtpSparseSlots);
+                    const auto q   = std::span<float>(mtp_host_ingress->ngram_tree_q).subspan(base, kMtpSparseSlots);
+                    if (ngram.tree() && j < ngram.drafts.size()) {
+                        std::copy_n(ngram.candidate_ids.begin() + static_cast<std::ptrdiff_t>(j * kMtpSparseSlots),
+                                    kMtpSparseSlots, ids.begin());
+                        std::copy_n(ngram.proposal_q.begin() + static_cast<std::ptrdiff_t>(j * kMtpSparseSlots),
+                                    kMtpSparseSlots, q.begin());
+                    } else if (!row_ngram && j < chain_extent && sequence.mtp_draft_proposals &&
+                               execution_schedule.sampled_mtp_drafts) {
+                        std::copy_n(sequence.mtp_draft_candidates[j].begin(), kMtpSparseSlots, ids.begin());
+                        std::copy_n(sequence.mtp_draft_q[j].begin(), kMtpSparseSlots, q.begin());
+                    } else {
+                        one_hot_proposal(mtp_host_ingress->current_drafts[row * verify_drafts + j], ids, q);
+                    }
+                }
             }
             for (std::uint32_t j = 0; j < width; ++j) {
-                const std::uint32_t position = frontier + (tree_row ? 0U : std::min(j, extent));
+                const std::uint32_t position = frontier + ((tree_row || ngram.tree()) ? 0U : std::min(j, extent));
                 mtp_host_ingress->target_rope_positions[row * width + j] =
                     checked_i32(position, "MTP batch RoPE position") + sequence.rope_delta;
             }
@@ -789,10 +905,11 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             mtp_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
             bind_reasoning_ban(masks, row, mtp_host_ingress->sampling[row]);
             mtp_host_ingress->proposal_limits[row]         = static_cast<std::int32_t>(proposal_limit);
-            if (execution_schedule.sampled_mtp_drafts) {
+            if (execution_schedule.sampled_mtp_drafts && !ngram_tree_round) {
                 // Each verified draft's sparse proposal: a sampled draft's own, one-hot at an argmax
                 // draft (the prompt's) or a padding column. A tree round's planes hold its chain
                 // (the window) with each draft's ranking scores; the tree builder writes its columns'.
+                // (An n-gram tree round's laws are in its own planes above.)
                 const std::uint32_t sparse = tree_round ? neural_draft_window : verify_drafts;
                 for (std::uint32_t j = 0; j < sparse; ++j) {
                     const std::size_t base = (row * sparse + j) * kMtpSparseSlots;
@@ -843,6 +960,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         schedule_state.chain_drafts           = neural_draft_window;
         schedule_state.tree_paths             = draft_tree_paths;
         schedule_state.tree_proposals         = mtp_tree_rounds;
+        schedule_state.ngram_tree             = ngram_tree_round;
         mark_workspace_usage(workspace_plan.mtp_round);
         const auto batch = static_cast<std::int32_t>(lanes.size());
         if (offload) { offload->begin_round(device.stream); }
@@ -865,10 +983,14 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             device.synchronize();
         }
         timing.end_wait();
-        // Offloaded experts: the committed columns of each row are the round's uses.
+        // Offloaded experts: the committed columns of each row are the round's uses; in an n-gram tree
+        // round a row's every verified column (its accepted path is not a prefix of the round's columns).
         if (offload) {
             end_offloaded_round(lanes, width,
-                                std::span<const std::int32_t>(mtp_host_egress->licensed_counts.data(), lanes.size()));
+                                std::span<const std::int32_t>(mtp_host_egress->licensed_counts.data(), lanes.size()),
+                                ngram_tree_round ? std::span<const std::int32_t>(
+                                                       mtp_host_ingress->target_valid_columns.data(), lanes.size())
+                                                 : std::span<const std::int32_t>{});
         }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
@@ -962,6 +1084,11 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                     *mtp_draft_log << ',' << sequence.mtp_draft_probabilities[j];
                 }
                 *mtp_draft_log << '\n';
+            }
+            if (ngram_trees[row].tree()) {
+                record_ngram_tree_row(request, mtp_host_egress->accepted_branch[row], accepted_i,
+                                      static_cast<std::uint32_t>(ngram_trees[row].row.main_depth),
+                                      static_cast<std::uint32_t>(matches[row].tokens.size()));
             }
             if (!matches[row].tokens.empty()) {
                 request.speculative_stats.ngram_rounds += 1;
@@ -1079,6 +1206,26 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
     // (the n-gram window when n-gram drafting is configured, else the drafter's), and the drafter
     // runs for every row: no tree tables or controller, and nothing taken from the other rows.
     const bool fixed_width   = execution_schedule.fixed_speculation;
+    // N-gram trees: a copy round in which some row's copy sources continue differently within the
+    // tree's depth verifies at the n-gram tree width, that row its sources' tree and every other row its
+    // chain (a copy within the width, or the neural proposal). Grammar masks follow one chain.
+    std::array<NgramTree, kMaximumConcurrency> ngram_trees{};
+    bool ngram_tree_round = false;
+    if (ngram_tree_nodes != 0 && any_ngram && !fixed_width && !constrained) {
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            if (matches[row].tokens.empty()) { continue; }
+            const NgramTreeLimits limits =
+                ngram_tree_limits(active_sequence(lanes[row]).execution_frontier, budgets[row]);
+            if (limits.depth == 0 || limits.nodes < limits.depth + 2U) { continue; }
+            NgramTree tree = ngram_tree(lanes[row], matches[row], limits);
+            // A request whose tree rounds have not gained over its copies verifies them as chains (probing now and then).
+            if (tree.tree() && !ngram_tree_wanted(requests[lanes[row]])) { continue; }
+            if (tree.tree()) {
+                ngram_trees[row] = std::move(tree);
+                ngram_tree_round = true;
+            }
+        }
+    }
     // (Choosing an automatic round's width after its proposal, from its own draft probabilities,
     // measured flat: 27B DFlash2 1.0002x; removed 2026-10-28.)
     std::uint32_t tree_nodes = 0;
@@ -1105,6 +1252,11 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         family = &(ngram_draft_window != 0
                        ? round_family(SpeculativeRoundKind::Ngram, ngram_draft_window)
                        : round_family(SpeculativeRoundKind::Neural, neural_draft_window));
+    } else if (ngram_tree_round) {
+        family = &round_family(SpeculativeRoundKind::NgramTree, ngram_tree_nodes - 1U);
+        if (family->shape.verify_drafts + 1U != ngram_tree_nodes) {
+            throw std::logic_error("the n-gram tree round has no family of its width");
+        }
     } else if (any_ngram) {
         // Rows of a batch without a copy keep their neural proposal, which the family must hold.
         family = &round_family(SpeculativeRoundKind::Ngram,
@@ -1127,6 +1279,23 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         dflash_host_ingress->copy_rows[row] = any_ngram && !matches[row].tokens.empty() ? 1 : 0;
     }
     for (std::size_t row = 0; any_ngram && row < lanes.size(); ++row) {
+        const NgramTree& tree = ngram_trees[row];
+        if (tree.tree()) {
+            // A tree row's columns 1..nodes-1: their drafts and their parents' laws.
+            constexpr std::uint32_t slots = ops::kSparseSpeculativeCandidates;
+            for (std::uint32_t step = 0; step < verify_drafts; ++step) {
+                const bool live = step < tree.drafts.size();
+                dflash_host_ingress->ngram_tokens[row * verify_drafts + step] = live ? tree.drafts[step] : 0;
+                for (std::uint32_t slot = 0; slot < slots; ++slot) {
+                    const auto cand = (row * verify_drafts + step) * slots + slot;
+                    dflash_host_ingress->ngram_candidates[cand] =
+                        live ? tree.candidate_ids[step * slots + slot] : static_cast<TokenId>(slot);
+                    dflash_host_ingress->ngram_q[cand] = live ? tree.proposal_q[step * slots + slot]
+                                                              : (slot == 0 ? 1.0F : 0.0F);
+                }
+            }
+            continue;
+        }
         const std::uint32_t row_extent = static_cast<std::uint32_t>(matches[row].tokens.size());
         for (std::uint32_t step = 0; step < verify_drafts; ++step) {
             const auto token = step < row_extent ? matches[row].tokens[step] : 0;
@@ -1147,10 +1316,12 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                                 ? budgets[row].generated_tokens_remaining - 1U
                                                 : 0U;
         const bool row_copy               = any_ngram && !matches[row].tokens.empty();
+        // An n-gram tree row verifies every column of its tree (ngram_tree_limits bound it).
+        if (ngram_trees[row].tree()) { return ngram_trees[row].columns - 1U; }
         const std::uint32_t extent =
             std::min({row_copy ? static_cast<std::uint32_t>(matches[row].tokens.size())
                                : (drafter_runs ? proposal_drafts : 0U),
-                      max_by_budget, capacity - frontier - 1U});
+                      max_by_budget, capacity - frontier - 1U, verify_drafts});
         // A constrained row verifies its chain: the constraint names one step per chain column.
         if (tree_round && extent == neural_draft_window &&
             capacity - frontier - 1U >= verify_drafts && constraint_plan(lanes[row]) == nullptr) {
@@ -1219,7 +1390,15 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             const RequestControl& request     = requests[lanes[row]];
             const std::uint32_t frontier      = sequence.execution_frontier;
             const std::uint32_t extent        = row_extent(row, frontier);
-            const bool tree_row               = tree_round && extent == verify_drafts;
+            const bool tree_row = (tree_round && extent == verify_drafts) || ngram_trees[row].tree();
+            if (ngram_tree_round) {
+                const ops::SpeculativeTreeRow tree =
+                    ngram_trees[row].tree() ? ngram_trees[row].row : ngram_chain_row(extent);
+                dflash_host_ingress->ngram_tree_rows[row] = tree;
+                write_ngram_tree_masks(tree, width,
+                                 std::span<std::uint32_t>(dflash_host_ingress->ngram_tree_masks)
+                                     .subspan(row * width, width));
+            }
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -1265,6 +1444,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             state.neural_proposal_drafts = proposal_drafts;
             state.tree                   = tree_round;
             state.tree_paths             = draft_tree_paths;
+            state.ngram_tree             = ngram_tree_round;
             return state;
         };
         mark_workspace_usage(workspace_plan.dflash_round);
@@ -1363,9 +1543,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         if (offload) {
             const std::span<const std::int32_t> committed(dflash_host_egress->licensed_counts.data(), lanes.size());
             end_offloaded_round(lanes, width, committed,
-                                tree_round ? std::span<const std::int32_t>(
-                                                 dflash_host_ingress->target_valid_columns.data(), lanes.size())
-                                           : std::span<const std::int32_t>{});
+                                tree_round || ngram_tree_round
+                                    ? std::span<const std::int32_t>(dflash_host_ingress->target_valid_columns.data(),
+                                                                    lanes.size())
+                                    : std::span<const std::int32_t>{});
         }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
@@ -1432,6 +1613,11 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                     request.speculative_stats.ngram_archive_drafted_tokens += extent;
                     request.speculative_stats.ngram_archive_accepted_tokens += accepted_i;
                 }
+            }
+            if (ngram_trees[row].tree()) {
+                record_ngram_tree_row(request, dflash_host_egress->accepted_branch[row], accepted_i,
+                                      static_cast<std::uint32_t>(ngram_trees[row].row.main_depth),
+                                      static_cast<std::uint32_t>(matches[row].tokens.size()));
             }
             if (tree_round && extent == verify_drafts) {
                 if (tree_controller) {

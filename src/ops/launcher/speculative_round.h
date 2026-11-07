@@ -19,6 +19,8 @@ void speculative_overlay_copy_proposals_launch(const Tensor& copy_rows, const Te
                                                const Tensor& copy_candidates, const Tensor& copy_q,
                                                Tensor& drafts, Tensor& candidates,
                                                Tensor& proposal_q, cudaStream_t stream);
+void speculative_one_hot_proposals_launch(const Tensor& skip_rows, const Tensor& drafts, std::int32_t token_domain,
+                                          Tensor& candidates, Tensor& proposal_q, cudaStream_t stream);
 
 void speculative_sample_sparse_drafts_launch(const Tensor& rows, const Tensor& logprobs,
                                              const std::int32_t* token_ids,

@@ -526,3 +526,19 @@ CTest runs it on INT8, K8V4, NVFP4, VQ2 and K4V2, and the block rounds of both d
 and its two-stream form run DFlash trees (16 columns at K=7) on the 35B-A3B;
 `infernix_qwen3_5_mtp_tree_greedy_real_test` and its two-stream form run MTP trees (8 columns on a
 3-draft chain, with the drafter argument `mtp`) on the NVFP4 27B.
+
+`infernix_qwen3_5_ngram_tree_real_test` checks n-gram trees (`--ngram-tree-nodes 16` beside copies of
+up to 31 drafts) on a prompt that shows a fragment in two versions and asks for one of them again:
+the tree arm must accept the other source's branch, and its greedy stream must equal the chain
+arm's up to their first difference, where both tokens must be a near-tie of the target (within
+1.5 nats on a CausalScoring Engine). Arguments: the drafter (`dflash2`, `mtp`, or `dflash` for the
+35B-A3B), the streams decoded at once and the KV format; CTest runs DFlash2 at one and two streams
+and MTP on the NVFP4 27B, and DFlash at two streams on the 35B-A3B. On Qwen3.8-Flash-Next,
+`infernix_qwen4_exp_ngram_tree_real_test` (`INFERNIX_QWEN4_ARTIFACT`, and `INFERNIX_QWEN4_DFLASH2`
+for its DFlash2 section) runs both arms with the copy and tree choice overridden
+(`testing::set_ngram_policy_override`: copies to a two-path tree's depth, every eligible tree), as
+the cost policy rarely verifies a tree on an offloaded artifact, and checks the path-row trees
+against the lossless route instead: each arm's
+stream scored on its own prefix, the tree arm may have at most two more tokens than the chain arm
+whose regret exceeds 1 nat, and none above 5 nats (FP4-Local's fast route flips near-ties of up to
+2.2 nats between verification widths, beyond the 1.5-nat bound).

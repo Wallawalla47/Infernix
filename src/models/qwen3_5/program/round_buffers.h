@@ -4,6 +4,7 @@
 #include "core/tensor.h"
 #include "infernix/ops/sampling.h"
 #include "infernix/ops/speculative_round.h"
+#include "infernix/ops/speculative_tree.h"
 #include "infernix/ops/token_constraint.h"
 #include "infernix/types.h"
 
@@ -28,6 +29,8 @@ inline constexpr std::uint32_t kDFlashVerifyMaximumWidth  = kDFlashVerifyMaximum
 // kSampledDraftRanks), its proposal spread over the sparse acceptance's candidates.
 inline constexpr std::int32_t kMtpSampledDraftRanks = 4;
 inline constexpr std::uint32_t kMtpSparseSlots      = ops::kSparseSpeculativeCandidates;
+// N-gram tree rounds (--ngram-tree-nodes): at most one tree row's columns.
+inline constexpr std::uint32_t kNgramTreeMaximumWidth = ops::kSpeculativeTreeMaxNodes;
 
 namespace execution {
 struct OffloadedExperts;
@@ -104,6 +107,16 @@ struct MtpDecodeIngress {
     // sparse planes at the chain length:
     //   current_scores[(row * k + step) * kMtpSampledDraftRanks + rank].
     alignas(16) std::array<float, kMaximumConcurrency * kMtpDecodeMaximumDrafts * kMtpSampledDraftRanks> current_scores{};
+    // N-gram tree rounds only (the round copies these planes only then, up to its rows and width): every
+    // row's tree row (an n-gram tree, or a chain row of its extent), its ancestor masks at the round's width
+    // W and each verified column's candidates and law (its parent's, as the tree acceptance reads them), at
+    // the round's draft width k = W - 1:
+    //   ngram_tree_masks[row * W + column]; ngram_tree_candidates/q[(row * k + column - 1) * slots + slot].
+    alignas(16) std::array<ops::SpeculativeTreeRow, kMaximumConcurrency> ngram_tree_rows{};
+    std::array<std::uint32_t, kMaximumConcurrency * kNgramTreeMaximumWidth> ngram_tree_masks{};
+    alignas(16) std::array<TokenId, kMaximumConcurrency * (kNgramTreeMaximumWidth - 1) * kMtpSparseSlots>
+        ngram_tree_candidates{};
+    alignas(16) std::array<float, kMaximumConcurrency * (kNgramTreeMaximumWidth - 1) * kMtpSparseSlots> ngram_tree_q{};
 };
 
 struct MtpDecodeEgress {
@@ -171,6 +184,12 @@ struct DFlashDecodeIngress {
     std::array<float,
                kMaximumConcurrency * ops::kSparseSpeculativeCandidates * kDFlashVerifyMaximumDrafts>
         ngram_q{};
+    // N-gram tree rounds only (the round copies these only then): every row's tree row (an n-gram tree,
+    // or a chain row of its extent: a copy without divergent sources, or the neural proposal) and its
+    // ancestor masks at the round's width W, ngram_tree_masks[row * W + column]. A tree row's drafts and
+    // laws are its copy payload above (copy_rows marks it).
+    alignas(16) std::array<ops::SpeculativeTreeRow, kMaximumConcurrency> ngram_tree_rows{};
+    std::array<std::uint32_t, kMaximumConcurrency * kNgramTreeMaximumWidth> ngram_tree_masks{};
 };
 
 struct DFlashDecodeEgress {

@@ -105,6 +105,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--draft-tree-paths"},
     ServeOptionArity{"--ngram-draft-tokens"},
     ServeOptionArity{"--ngram-min-match"},
+    ServeOptionArity{"--ngram-tree-nodes"},
     ServeOptionArity{"--ngram-archive-mib"},
     ServeOptionArity{"--ngram-session-mib"},
     ServeOptionArity{"--ngram-native-sessions", false},
@@ -605,6 +606,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             auto: the configuration's measured window and minimum\n"
            "                             match (Qwen3.8-27B / Qwen3.6-35B-A3B)\n"
            "  --ngram-min-match N        minimum ngram match length, 4-64\n"
+           "  --ngram-tree-nodes N       where ngram copy sources continue differently, verify\n"
+           "                             them as one tree of N tokens, 4-32 (Qwen3.8-Flash-Next:\n"
+           "                             one row per path, at most 3); same output\n"
+           "                             distribution (default 0 = off)\n"
            "  --ngram-archive-mib N      MiB of retained source archive for ngram proposals\n"
            "  --ngram-session-mib N      MiB session-scoped ngram source budget (default 128);\n"
            "                             used only with --ngram-archive-mib\n"
@@ -1113,6 +1118,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--ngram-min-match"), "ngram-min-match"));
+        } else if (arg == "--ngram-tree-nodes") {
+            options.speculative.ngram_tree_nodes = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--ngram-tree-nodes"), "ngram-tree-nodes"));
         } else if (arg == "--ngram-archive-mib" || arg == "--ngram-session-mib") {
             const auto mib = parse_u64(require_value(arg.c_str()), arg.c_str());
             if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {

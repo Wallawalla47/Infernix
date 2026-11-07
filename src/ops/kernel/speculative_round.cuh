@@ -62,6 +62,25 @@ __global__ void speculative_overlay_copy_proposals_kernel(
     }
 }
 
+// One block per row. Rows whose device flag is set keep their laws; every other row's drafts get the
+// one-hot law of a deterministic draft.
+__global__ void speculative_one_hot_proposals_kernel(const std::int32_t* skip_rows, const std::int32_t* drafts,
+                                                     std::int32_t* candidates, float* proposal_q, std::int32_t k,
+                                                     std::int32_t slots, std::int32_t token_domain) {
+    pdl::enter();
+    const int row = static_cast<int>(blockIdx.x);
+    if (skip_rows != nullptr && skip_rows[row] != 0) { return; }
+    const int plane = k * slots;
+    for (int i = threadIdx.x; i < plane; i += blockDim.x) {
+        const int j      = i / slots;
+        const int slot   = i - j * slots;
+        const int draft  = drafts[row * k + j];
+        const int id     = draft + slot;
+        candidates[row * plane + i] = id >= token_domain ? id - token_domain : id;
+        proposal_q[row * plane + i] = slot == 0 ? 1.0f : 0.0f;
+    }
+}
+
 template <typename T>
 __device__ inline T* speculative_workspace_offset(T* ptr, std::size_t byte_offset) {
     return ptr == nullptr

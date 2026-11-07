@@ -200,7 +200,8 @@ int main() {
     failures +=
         check(server.at("engine").at("draft_tree_nodes") == Json::array({0, 0, 0, 0, 0, 0, 0, 0}) &&
                   server.at("engine").at("draft_tree_auto") == false &&
-                  server.at("engine").at("draft_tree_paths") == 8,
+                  server.at("engine").at("draft_tree_paths") == 8 &&
+                  server.at("engine").at("ngram_tree_nodes") == 0,
               "tree verification table missing");
     options.kv_cache        = infernix::KvCacheStorage::Nvfp4Group16;
     engine_options.kv_cache = options.kv_cache;
@@ -500,6 +501,9 @@ int main() {
     outcome.engine_request_id                     = 991;
     outcome.speculative.ngram_archive_rounds      = 7;
     outcome.speculative.tree_side_accepted_tokens = 11;
+    outcome.speculative.ngram_tree_rounds               = 5;
+    outcome.speculative.ngram_tree_side_rounds          = 2;
+    outcome.speculative.ngram_tree_side_accepted_tokens = 7;
     outcome.speculative.ngram_archive_drafted_tokens  = 441;
     outcome.speculative.ngram_archive_accepted_tokens = 400;
     outcome.ngram_archive                             = {.enabled       = true,
@@ -597,6 +601,10 @@ int main() {
     failures += check(done.at("speculative").at("tree_side_accepted_tokens") == 11 &&
                           done.at("speculative").at("tree_rounds") == 0,
                       "speculative tree counters missing");
+    failures += check(done.at("speculative").at("ngram_tree_rounds") == 5 &&
+                          done.at("speculative").at("ngram_tree_side_rounds") == 2 &&
+                          done.at("speculative").at("ngram_tree_side_accepted_tokens") == 7,
+                      "n-gram tree counters missing");
     failures += check(done.at("speculative").at("ngram_archive_accepted_tokens") == 400 &&
                           done.at("speculative").at("ngram_archive").at("generation") == 3 &&
                           done.at("speculative").at("ngram_archive").at("bound") == true &&
@@ -738,7 +746,8 @@ int main() {
         pretty_done.message ==
             "req#7 done | openai-chat | output limit | prompt 401 | output 1,024 | cache 101 "
             "(25.2%, hybrid_snapshot) | TTFT 358 ms | total 5.7s | prefill 1.28k tok/s | "
-            "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | archive bound 400/441 accepted, "
+            "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | ngram trees 5 rounds, 7 other-source drafts | "
+            "archive bound 400/441 accepted, "
             "gen 3, 12 sources | thinking 256/256, control 19",
         "pretty request-done record mismatch");
 

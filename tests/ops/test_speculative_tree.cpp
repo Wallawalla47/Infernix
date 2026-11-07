@@ -1082,6 +1082,187 @@ int transport_distribution_case() {
     return failures;
 }
 
+// Deterministic transport rows (n-gram trees: every child a fixed token, no residual draw, laws
+// one-hot on the first child with filler candidates). Sampled rows: the first emitted token follows
+// the anchor's target and the token after a reached column follows that column's target, as for
+// any exact verifier; greedy rows take the path whose drafts are the target tokens. Tree (columns):
+// main chain 1-2-3, a sibling 4 of column 1 with child 5, and a sibling 6 of column 2 with child 7.
+int deterministic_transport_case() {
+    constexpr int n = 8, k = n - 1, batch = 8, kSupport = 7;
+    const std::vector<int> parent{-1, 0, 1, 2, 0, 4, 1, 6};
+    ops::SpeculativeTreeRow row = host_row(parent, 3, true);
+    row.transport               = 1;
+    row.sampled                 = 0U;
+    const std::vector<ops::SpeculativeTreeRow> rows(static_cast<std::size_t>(batch), row);
+    auto tree_rows = upload_rows(rows);
+    AcceptBuffers b(n, batch);
+    const std::array<int, kSupport> support{1000, 1001, 1002, 1003, 1004, 1005, 3000};
+    // Column drafts (index c-1): siblings carry distinct tokens; column 7 repeats column 1's.
+    const std::array<int, k> tokens{1000, 1001, 1002, 1003, 1004, 1005, 1000};
+    const auto logit = [](int c, int s) {
+        return 1.1F - 0.3F * static_cast<float>(s) + 0.3F * static_cast<float>(c) * static_cast<float>((s + 2 * c) % 3) -
+               (s == kSupport - 1 ? 0.5F : 0.0F);
+    };
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(kPhysicalRows) * n * batch, f32_to_bf16(-100.0F));
+    std::array<std::array<double, kSupport>, n> target{};
+    for (int c = 0; c < n; ++c) {
+        double z = 0.0;
+        for (int s = 0; s < kSupport; ++s) z += std::exp(static_cast<double>(bf16_to_f32(f32_to_bf16(logit(c, s)))));
+        for (int s = 0; s < kSupport; ++s)
+            target[static_cast<std::size_t>(c)][static_cast<std::size_t>(s)] =
+                std::exp(static_cast<double>(bf16_to_f32(f32_to_bf16(logit(c, s))))) / z;
+        for (int r = 0; r < batch; ++r)
+            for (int s = 0; s < kSupport; ++s)
+                logits[(static_cast<std::size_t>(r) * n + c) * kPhysicalRows + support[static_cast<std::size_t>(s)]] =
+                    f32_to_bf16(logit(c, s));
+    }
+    // Each column stores its parent's law: the parent's children's tokens first, then fillers, q
+    // one-hot on the first (the n-gram tree builder's form).
+    std::vector<int> drafts(static_cast<std::size_t>(k) * batch);
+    std::vector<int> candidates(static_cast<std::size_t>(kCandidates) * k * batch);
+    std::vector<float> proposal(candidates.size(), 0.0F);
+    for (int r = 0; r < batch; ++r)
+        for (int c = 1; c < n; ++c) {
+            drafts[static_cast<std::size_t>(r) * k + c - 1] = tokens[static_cast<std::size_t>(c - 1)];
+            const std::size_t at = (static_cast<std::size_t>(r) * k + c - 1) * kCandidates;
+            int slot             = 0;
+            for (int s = row.first_child[parent[static_cast<std::size_t>(c)]]; s >= 0; s = row.next_sibling[s])
+                candidates[at + slot++] = tokens[static_cast<std::size_t>(s - 1)];
+            for (int filler = 5000; slot < kCandidates; ++filler) candidates[at + slot++] = filler;
+            proposal[at] = 1.0F;
+        }
+    write_logits(b.logits, logits);
+    write_buffer(b.drafts, drafts);
+    write_buffer(b.candidates, candidates);
+    write_buffer(b.q, proposal);
+    b.targets.fill(0);
+    write_buffer(b.extents, std::vector<int>(static_cast<std::size_t>(batch), k));
+    GuardedDeviceBuffer ws(ops::speculative_accept_sparse_tree_workspace_capacity_bytes(kTokenDomain, n, batch, batch));
+    const auto index_of = [&](int token) {
+        const auto it = std::find(support.begin(), support.end(), token);
+        return it == support.end() ? -1 : static_cast<int>(it - support.begin());
+    };
+    const std::string label = "deterministic transport tree";
+    int failures            = 0;
+
+    constexpr int kLaunches = 3000;
+    std::array<std::int64_t, kSupport> first{};
+    std::array<std::array<std::int64_t, kSupport>, n> after{};
+    std::array<std::int64_t, n> reached{};
+    std::int64_t outside = 0, inconsistent = 0;
+    std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch));
+    for (int launch = 0; launch < kLaunches; ++launch) {
+        for (int r = 0; r < batch; ++r) {
+            auto& config       = configs[static_cast<std::size_t>(r)];
+            config.temperature = 1.0F;
+            config.seed        = 0xD1B54A32D192ED03ULL * static_cast<std::uint64_t>(launch * batch + r + 11);
+        }
+        write_buffer(b.configs, configs);
+        write_buffer(b.lengths, std::vector<int>(static_cast<std::size_t>(batch), 60));
+        write_buffer(b.anchors, std::vector<int>(static_cast<std::size_t>(batch), 1));
+        run_tree_accept(b, tree_rows, ws, nullptr);
+        cuda_synchronize();
+        const auto licensed = read_buffer<int>(b.licensed, static_cast<std::size_t>(n) * batch);
+        const auto path     = read_buffer<int>(b.path, static_cast<std::size_t>(n) * batch);
+        const auto accepted = read_buffer<int>(b.accepted, static_cast<std::size_t>(batch));
+        for (int r = 0; r < batch; ++r) {
+            const int a = accepted[static_cast<std::size_t>(r)];
+            for (int i = 0; i <= a; ++i) {
+                const int s = index_of(licensed[static_cast<std::size_t>(r) * n + i]);
+                if (s < 0) {
+                    ++outside;
+                    continue;
+                }
+                if (i == 0) {
+                    ++first[static_cast<std::size_t>(s)];
+                } else {
+                    const int c = path[static_cast<std::size_t>(r) * n + i];
+                    ++after[static_cast<std::size_t>(c)][static_cast<std::size_t>(s)];
+                    ++reached[static_cast<std::size_t>(c)];
+                }
+            }
+            for (int i = 1; i <= a; ++i) {
+                const int c = path[static_cast<std::size_t>(r) * n + i];
+                if (c < 1 || c >= n || parent[static_cast<std::size_t>(c)] != path[static_cast<std::size_t>(r) * n + i - 1] ||
+                    tokens[static_cast<std::size_t>(c - 1)] != licensed[static_cast<std::size_t>(r) * n + i - 1])
+                    ++inconsistent;
+            }
+        }
+    }
+    const auto chi2_of = [&](const std::array<std::int64_t, kSupport>& observed, std::int64_t trials,
+                             const std::array<double, kSupport>& p) {
+        double chi2 = 0.0;
+        for (int s = 0; s < kSupport; ++s) {
+            const double expected = static_cast<double>(trials) * p[static_cast<std::size_t>(s)];
+            const double diff     = static_cast<double>(observed[static_cast<std::size_t>(s)]) - expected;
+            chi2 += diff * diff / expected;
+        }
+        return chi2;
+    };
+    // Six degrees of freedom; 35 is a tail probability near 4e-6.
+    const double root_chi2 = chi2_of(first, static_cast<std::int64_t>(kLaunches) * batch, target[0]);
+    std::cout << label << " anchor chi2=" << root_chi2 << '\n';
+    failures += expect(root_chi2 < 35.0, label + ": the first token follows the anchor's target");
+    int tested = 0;
+    for (int c = 1; c < n; ++c) {
+        if (reached[static_cast<std::size_t>(c)] < 500) continue;
+        ++tested;
+        const double chi2 = chi2_of(after[static_cast<std::size_t>(c)], reached[static_cast<std::size_t>(c)],
+                                    target[static_cast<std::size_t>(c)]);
+        std::cout << label << " column " << c << " chi2=" << chi2 << " over " << reached[static_cast<std::size_t>(c)]
+                  << '\n';
+        failures += expect(chi2 < 35.0, label + ": the token after column " + std::to_string(c) + " follows its target");
+    }
+    failures += expect(reached[1] >= 500 && reached[4] >= 500 && tested >= 3, label + ": side branches are reached");
+    failures += expect(outside == 0, label + ": emitted a token outside the target support");
+    failures += expect(inconsistent == 0, label + ": accepted path disagrees with its tokens");
+
+    // Greedy rows: row 0 the side branch 4-5 then a bonus, row 1 the main chain then the side
+    // branch 6-7 and a bonus, row 2 no child.
+    std::vector<int> targets(static_cast<std::size_t>(n) * batch, 7);
+    const auto set = [&](int r, int c, int token) { targets[static_cast<std::size_t>(r) * n + c] = token; };
+    set(0, 0, 1003);
+    set(0, 4, 1004);
+    set(0, 5, 777);
+    set(1, 0, 1000);
+    set(1, 1, 1005);
+    set(1, 6, 1000);
+    set(1, 7, 888);
+    set(2, 0, 999);
+    // Greedy rows read the target tokens from the logits' argmax.
+    std::vector<std::uint16_t> greedy_logits(static_cast<std::size_t>(kPhysicalRows) * n * batch, f32_to_bf16(-10.0F));
+    for (int r = 0; r < batch; ++r)
+        for (int c = 0; c < n; ++c)
+            greedy_logits[(static_cast<std::size_t>(r) * n + c) * kPhysicalRows + targets[static_cast<std::size_t>(r) * n + c]] =
+                f32_to_bf16(5.0F);
+    write_logits(b.logits, greedy_logits);
+    write_buffer(b.targets, targets);
+    for (auto& config : configs) config.temperature = 0.0F;
+    write_buffer(b.configs, configs);
+    write_buffer(b.lengths, std::vector<int>(static_cast<std::size_t>(batch), 60));
+    write_buffer(b.anchors, std::vector<int>(static_cast<std::size_t>(batch), 1));
+    run_tree_accept(b, tree_rows, ws, nullptr);
+    cuda_synchronize();
+    const auto out = read_outputs(b);
+    const std::vector<std::vector<int>> paths{{0, 4, 5}, {0, 1, 6, 7}, {0}};
+    const std::vector<int> terminals{777, 888, 999};
+    for (int r = 0; r < 3; ++r) {
+        const auto& p = paths[static_cast<std::size_t>(r)];
+        const int a   = static_cast<int>(p.size()) - 1;
+        bool ok       = out.accepted[static_cast<std::size_t>(r)] == a &&
+                  out.anchors[static_cast<std::size_t>(r)] == terminals[static_cast<std::size_t>(r)];
+        for (int i = 0; i <= a; ++i) {
+            const auto at = static_cast<std::size_t>(r) * n + i;
+            ok = ok && out.path[at] == p[static_cast<std::size_t>(i)] &&
+                 out.licensed[at] == (i < a ? tokens[static_cast<std::size_t>(p[static_cast<std::size_t>(i) + 1] - 1)]
+                                            : terminals[static_cast<std::size_t>(r)]);
+        }
+        failures += expect(ok, label + ": greedy row " + std::to_string(r));
+    }
+    failures += ws.verify_guards(label);
+    return failures;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Tree builder
 
@@ -1902,15 +2083,19 @@ std::vector<ops::SpeculativeTreeRow> gdn_rows(int k, int n) {
     (void)n;
 }
 
-// value_rows 6144 is the 27B's geometry, 4096 the 35B-A3B's (Q8 parent).
-int gdn_conv_case(int vrows) {
+std::vector<ops::SpeculativeTreeRow> ngram_gdn_rows();
+
+// value_rows 6144 is the 27B's geometry, 4096 the 35B-A3B's (Q8 parent). The rows (default gdn_rows(4, 9))
+// verify n columns each.
+int gdn_conv_case(int vrows, const std::vector<ops::SpeculativeTreeRow>& rows = gdn_rows(4, 9), int n = 9) {
     constexpr int qrows = 2048, krows = 2048, slots = 4;
     const int channels  = qrows + krows + vrows;
-    constexpr int k = 4, n = 9, batch = 3;
-    const auto rows = gdn_rows(k, n);
-    std::vector<int> valid;
-    for (const auto& row : rows) valid.push_back(row.nodes);
-    const std::vector<int> initial{1, 3, 2};
+    const int batch     = static_cast<int>(rows.size());
+    std::vector<int> valid, initial;
+    for (const auto& row : rows) {
+        valid.push_back(row.nodes);
+        initial.push_back(static_cast<int>((initial.size() * 2 + 1) % slots));
+    }
     const auto projected =
         random_bf16(static_cast<std::size_t>(channels) * n * batch, 11U, -1.0F, 1.0F);
     const auto weight = random_bf16(static_cast<std::size_t>(channels) * 4, 12U, -0.5F, 0.5F);
@@ -2013,6 +2198,13 @@ std::vector<ops::SpeculativeTreeRow> nested_gdn_rows() {
 // chains below main columns 0, 2 and 5 and below a side column, and a 20-column chain row.
 std::vector<ops::SpeculativeTreeRow> wide_gdn_rows() {
     return {host_row(branched_parents(15, {{0, 3}, {2, 2}, {5, 1}, {16, 2}}), 15, true), chain_row(19, 15)};
+}
+
+// N-gram tree shapes: long main chains (a copy) with side columns as deep as the main chain (another
+// source leaving it late), and a chain row of a copy within the width.
+std::vector<ops::SpeculativeTreeRow> ngram_gdn_rows() {
+    return {host_row(branched_parents(14, {{13, 1}}), 14, true), host_row(branched_parents(14, {{6, 1}}), 14, true),
+            host_row(branched_parents(9, {{8, 1}, {4, 3}, {0, 2}}), 9, true), chain_row(12, 14)};
 }
 
 int gdn_record_case(int value_heads, const std::vector<ops::SpeculativeTreeRow>& rows, int n) {
@@ -2304,16 +2496,19 @@ INFERNIX_OP_TEST(speculative_tree) {
         failures += candidate_tree_case(12, 8, true);
         failures += candidate_tree_case(32, 3, true);
         failures += transport_distribution_case();
+        failures += deterministic_transport_case();
         failures += chain_tree_case(16, 8);
         failures += chain_tree_case(9, 3);
         failures += chain_tree_case(32, 8);
         failures += gdn_conv_case(6144);
         failures += gdn_conv_case(4096);
+        failures += gdn_conv_case(6144, ngram_gdn_rows(), 16);
         failures += gdn_record_case(48, gdn_rows(4, 9), 9);
         failures += gdn_record_case(32, gdn_rows(4, 9), 9);
         failures += gdn_record_case(48, nested_gdn_rows(), 16);
         failures += gdn_record_case(48, wide_gdn_rows(), 24);
         failures += gdn_record_case(32, wide_gdn_rows(), 24);
+        failures += gdn_record_case(48, ngram_gdn_rows(), 16);
     } catch (const std::exception& error) {
         std::cerr << "speculative tree test threw: " << error.what() << '\n';
         return 1;

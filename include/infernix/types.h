@@ -488,8 +488,16 @@ struct SpeculativeOptions {
     // same-text acceptance favour at its batch size and context length. A target whose GDN input
     // projections cannot verify trees resolves this to false (chain verification).
     bool draft_tree_auto = false;
-    // Most root-to-leaf paths a tree row may hold, 2..8.
+    // Most root-to-leaf paths a tree row may hold, 2..8 (neural and n-gram trees alike).
     std::uint32_t draft_tree_paths = 8;
+    // N-gram trees (docs/maintainer/tree-verification.md, "N-gram trees"): the columns, anchor
+    // included, of a copy round whose copy sources continue differently within the tree's depth. Such a
+    // row verifies the best source's copy as its main chain (at most min(15, N-2) drafts deep) and the
+    // other sources' continuations as branches of one tree; every draft is a deterministic proposal, so
+    // greedy rows emit the target's argmax continuation and sampled rows its processed distribution.
+    // 0 (the default) keeps copy rounds on chain verification; enabled 4..32 (Qwen3.8-Flash-Next 4..16).
+    // Requires ngram drafting.
+    std::uint32_t ngram_tree_nodes = 0;
     // CPU-only retention, separate from KV. Zero keeps request-local drafting.
     std::size_t ngram_archive_bytes = 0;
     std::size_t ngram_session_bytes = 128ULL << 20;
@@ -1819,6 +1827,12 @@ struct SpeculativeStats {
     std::uint64_t tree_rounds               = 0;
     std::uint64_t tree_side_rounds          = 0;
     std::uint64_t tree_side_accepted_tokens = 0;
+    // N-gram trees (--ngram-tree-nodes): the rounds in which a copy row verified its sources' tree (part
+    // of ngram_rounds), those whose accepted path left the main chain (the best source's copy) for another
+    // source, and the drafts those paths accepted after leaving it.
+    std::uint64_t ngram_tree_rounds               = 0;
+    std::uint64_t ngram_tree_side_rounds          = 0;
+    std::uint64_t ngram_tree_side_accepted_tokens = 0;
     // Every verified round in order (fallback steps excluded): the drafts it verified, how many it
     // accepted and whether they were n-gram (copy) drafts. Qwen3.5-family MTP and DFlash rounds and
     // Qwen3.8-Flash-Next rounds; empty for other models.

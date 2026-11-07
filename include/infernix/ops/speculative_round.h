@@ -93,6 +93,31 @@ void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& c
                                         cudaStream_t stream);
 
 /**
+ * Op: speculative_one_hot_proposals
+ *
+ * Math / indexing:
+ *   For row b with skip_rows[b] == 0 (every row when skip_rows is empty), 0<=j<K and 0<=s<S, with
+ *   d = drafts[j,b]:
+ *     candidates[s,j,b] = (d + s) mod token_domain;
+ *     proposal_q[s,j,b] = 1 when s == 0, else 0.
+ *   That is the sparse law of a deterministic draft (an argmax or copied token): sparse acceptance of
+ *   it is the deterministic-draft verification. Rows with skip_rows[b] != 0 are left unchanged.
+ *
+ * Logical shapes:
+ *   skip_rows I32 [B] or empty; drafts I32 [K,B]; candidates I32 [S,K,B] and proposal_q FP32
+ *   [S,K,B], S = kSparseSpeculativeCandidates, K>=1, B in [1,8]; drafts in [0, token_domain) and
+ *   token_domain > S. Contiguous; inputs and outputs do not overlap.
+ *
+ * Effects:
+ *   Exact element writes. The row selection is read on the device.
+ *
+ * Workspace:
+ *   None.
+ */
+void speculative_one_hot_proposals(const Tensor& skip_rows, const Tensor& drafts, std::int32_t token_domain,
+                                   Tensor& candidates, Tensor& proposal_q, cudaStream_t stream);
+
+/**
  * Op: speculative_accept_greedy_drafts
  *
  * Algorithm:

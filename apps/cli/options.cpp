@@ -115,6 +115,7 @@ constexpr std::array kCliOptions{
     CliOption{"--ngram-min-match"},
     CliOption{"--draft-tree-nodes"},
     CliOption{"--draft-tree-paths"},
+    CliOption{"--ngram-tree-nodes"},
     CliOption{"--lm-head-draft", false},
     CliOption{"--raw-output", false},
     CliOption{"--print-token-ids", false},
@@ -188,7 +189,7 @@ std::string usage_text(const char* argv0) {
            "N|auto]\n"
            "       [--draft-model FILE]\n"
            "       [--lm-head-draft] [--spec-min-p P] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
-           "       [--ngram-draft-tokens 1..63|auto] [--ngram-min-match 4..64]\n"
+           "       [--ngram-draft-tokens 1..63|auto] [--ngram-min-match 4..64] [--ngram-tree-nodes N]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
@@ -376,6 +377,11 @@ std::string usage_text(const char* argv0) {
            "                           single draft is draft tokens + 1; 16 suits\n"
            "                           --draft-tokens 7). Seeded runs repeat exactly only with N\n"
            "  --draft-tree-paths N     most branches per tree (2-8, default 8)\n"
+           "  --ngram-tree-nodes N     with --ngram-draft-tokens: where copy sources continue\n"
+           "                           differently, verify them as one tree of N tokens\n"
+           "                           (4-32; Flash-Next: one row per path, at most 3)\n"
+           "                           instead of one copy (same output distribution;\n"
+           "                           default 0 = off)\n"
            "  --no-cuda-graph          disable CUDA-graph decode rounds\n"
            "\n"
            "SAMPLING\n"
@@ -549,6 +555,8 @@ Options parse_options(int argc, char** argv) {
             product::apply_draft_tree_nodes(options.speculative, value(arg));
         } else if (arg == "--draft-tree-paths") {
             options.speculative.draft_tree_paths = parse_u32(value(arg), "draft-tree-paths");
+        } else if (arg == "--ngram-tree-nodes") {
+            options.speculative.ngram_tree_nodes = parse_u32(value(arg), "ngram-tree-nodes");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--raw-output") {

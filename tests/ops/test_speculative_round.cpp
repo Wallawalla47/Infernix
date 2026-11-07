@@ -238,6 +238,52 @@ int overlay_case(int k, int batch, bool sparse) {
     return failures;
 }
 
+// Exact oracle: an unskipped row's drafts get the one-hot law of a deterministic draft (ids wrapped at
+// the token domain, which some drafts sit next to), a skipped row keeps its laws; an empty selection
+// writes every row.
+int one_hot_proposals_case(int k, int batch, bool all_rows) {
+    constexpr int kDomain = 248077;
+    const int slots       = ops::kSparseSpeculativeCandidates;
+    const int plane       = slots * k * batch;
+    std::vector<std::int32_t> drafts(k * batch), own_candidates(plane);
+    std::vector<float> own_q(plane);
+    for (int i = 0; i < k * batch; ++i) drafts[i] = i % 3 == 0 ? kDomain - 1 - i % 7 : 1000 + 11 * i;
+    for (int i = 0; i < plane; ++i) {
+        own_candidates[i] = 500000 + i;
+        own_q[i]          = 0.5F + static_cast<float>(i) * 1.0e-4F;
+    }
+    std::vector<std::int32_t> skip(batch);
+    for (int b = 0; b < batch; ++b) skip[b] = all_rows ? 0 : (b % 2 == 1 ? b : 0);
+    DeviceBuffer d_skip = to_device(skip), d_drafts = to_device(drafts);
+    GuardedDeviceBuffer d_candidates(plane * sizeof(std::int32_t)), d_q(plane * sizeof(float));
+    d_candidates.copy_from_host(own_candidates.data(), plane * sizeof(std::int32_t));
+    d_q.copy_from_host(own_q.data(), plane * sizeof(float));
+    Tensor t_skip = all_rows ? Tensor{} : Tensor(d_skip.p, DType::I32, {batch});
+    Tensor t_drafts(d_drafts.p, DType::I32, {k, batch});
+    Tensor t_candidates(d_candidates.data(), DType::I32, {slots, k, batch});
+    Tensor t_q(d_q.data(), DType::FP32, {slots, k, batch});
+    ops::speculative_one_hot_proposals(t_skip, t_drafts, kDomain, t_candidates, t_q, nullptr);
+    cuda_synchronize();
+    std::vector<std::int32_t> expected_candidates = own_candidates;
+    std::vector<float> expected_q                 = own_q;
+    for (int b = 0; b < batch; ++b) {
+        if (skip[b] != 0) continue;
+        for (int j = 0; j < k; ++j)
+            for (int s = 0; s < slots; ++s) {
+                const int at             = (b * k + j) * slots + s;
+                expected_candidates[at]  = (drafts[b * k + j] + s) % kDomain;
+                expected_q[at]           = s == 0 ? 1.0F : 0.0F;
+            }
+    }
+    const std::string label = "one-hot proposals K=" + std::to_string(k) + " B=" + std::to_string(batch) +
+                              (all_rows ? " all rows" : " skipping odd rows");
+    int failures = verify_exact((label + " candidates").c_str(), read<std::int32_t>(d_candidates, plane),
+                                expected_candidates);
+    failures += verify_exact((label + " q").c_str(), read<float>(d_q, plane), expected_q);
+    failures += d_candidates.verify_guards(label.c_str()) + d_q.verify_guards(label.c_str());
+    return failures;
+}
+
 struct AcceptExpected {
     std::vector<std::int32_t> sampled;
     std::int32_t num_sampled;
@@ -1863,6 +1909,9 @@ int transforms_conformance() {
     for (int k : {1, 7, 15})
         for (int batch : {1, 2, 8})
             for (bool sparse : {false, true}) failures += overlay_case(k, batch, sparse);
+    for (int k : {1, 15, 31})
+        for (int batch : {1, 8})
+            for (bool all_rows : {false, true}) failures += one_hot_proposals_case(k, batch, all_rows);
     for (int width = 2; width <= 32; ++width)
         for (int batch : {1, 8}) failures += batched_select_hidden_case(width, batch);
     failures += select_hidden_case(5120, 6, 0);

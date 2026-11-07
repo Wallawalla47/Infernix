@@ -95,6 +95,10 @@ struct MtpBatchContext {
     bool tree                  = false;
     std::uint32_t chain_drafts = 0;
     std::uint32_t tree_paths   = 0;
+    // An n-gram tree round (tree false): every row verifies the tree row, ancestor masks and column laws
+    // the host wrote into the ingress (MtpDecodeIngress::ngram_tree_*), an n-gram tree or a chain, by tree
+    // acceptance.
+    bool ngram_tree = false;
     // Tree families: every round publishes its proposal's ranking log-probabilities for the next.
     bool tree_proposals = false;
 };
@@ -119,6 +123,10 @@ struct DFlashBatchContext {
     // tree_paths root-to-leaf paths.
     bool tree                = false;
     std::uint32_t tree_paths = 0;
+    // An n-gram tree round (an ngram round, tree false): every row verifies the tree row and ancestor
+    // masks the host wrote into the ingress (DFlashDecodeIngress::ngram_tree_rows), an n-gram tree or a
+    // chain, by tree acceptance; the drafter's proposal stays a chain.
+    bool ngram_tree = false;
 };
 
 struct DFlashAppendContext {

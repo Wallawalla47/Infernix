@@ -13,6 +13,7 @@
 #include <optional>
 #include <span>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace infernix {
@@ -269,6 +270,11 @@ public:
     void zero_pages(std::span<const DeviceKVPageHandle> pages, cudaStream_t stream) const;
     TransferWork copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,
                            cudaStream_t stream) const;
+    // copy_page for each (source, destination) pair, in stream order. Page-major planes copy in one driver
+    // batch of every plane's pages; head-major planes page by page. The destinations are distinct and none
+    // is another pair's source.
+    TransferWork copy_pages(std::span<const std::pair<DeviceKVPageHandle, DeviceKVPageHandle>> pairs,
+                            cudaStream_t stream) const;
 
     // One run assumes contiguous Host records and contiguous Device page IDs. Before Device
     // allocation, sum this work over known Host runs as a nominal transfer estimate.

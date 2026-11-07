@@ -95,16 +95,21 @@ public:
         if (state.proposal_chain && (batch_size != 1 || !schedule.mtp_proposal_chain)) {
             throw std::logic_error("only a one-row round of the proposal chain's schedule proposes through it");
         }
-        tree_      = state.tree;
-        frame_     = state.frame.narrowed(k, next_k_, tree_ ? state.chain_drafts : 0U);
-        sampled_   = schedule.sampled_mtp_drafts;
+        tree_       = state.tree;
+        ngram_tree_ = state.ngram_tree;
+        frame_      = state.frame.narrowed(k, next_k_, tree_ ? state.chain_drafts : 0U);
+        sampled_    = schedule.sampled_mtp_drafts;
+        if (ngram_tree_ && (tree_ || k + 1U > kNgramTreeMaximumWidth)) {
+            throw std::logic_error("an n-gram tree round is a copy round within one tree row");
+        }
         // A tree extends each row's chain over its drafts' sparse proposals.
         if ((tree_ || state.tree_proposals) && (!sampled_ || frame_.tree_rows.data == nullptr)) {
             throw std::logic_error("MTP trees need sampled drafts and the frame's tree planes");
         }
         // The confidence policy's and the cut's input: each step's drafter probability.
         confidence_ = schedule.mtp_draft_confidence;
-        if (sampled_ && (confidence_ || frame_.current_candidates.data == nullptr)) {
+        // (An n-gram tree round's laws are its own planes.)
+        if (sampled_ && (confidence_ || (frame_.current_candidates.data == nullptr && !ngram_tree_))) {
             throw std::logic_error("sampled MTP drafts need the MTP draft window's sparse planes, without probabilities");
         }
         state.execution.work.reset();
@@ -113,6 +118,22 @@ public:
                       state.execution.prefill_chunk, 0, PagedKVCacheView{}, &state.text_cache, &state.mtp_cache);
         card_->set_execution_schedule(schedule);
         const auto rows = [&](const Tensor& tensor, int dim) { return tensor.slice(dim, 0, batch_size); };
+        // An n-gram tree round's host-built tree rows, masks and column laws, read in the ingress at the
+        // round's width.
+        Tensor ngram_rows, ngram_masks, ngram_candidates, ngram_q;
+        if (ngram_tree_) {
+            auto* ingress    = static_cast<std::byte*>(frame_.ingress.data);
+            const auto width = static_cast<std::int32_t>(k + 1U);
+            constexpr auto slots = static_cast<std::int32_t>(kMtpSparseSlots);
+            ngram_rows  = Tensor(ingress + offsetof(qwen3_5::MtpDecodeIngress, ngram_tree_rows), DType::I32,
+                                 {ops::kSpeculativeTreeRowWords, batch_size});
+            ngram_masks = Tensor(ingress + offsetof(qwen3_5::MtpDecodeIngress, ngram_tree_masks), DType::I32,
+                                 {width, batch_size});
+            ngram_candidates = Tensor(ingress + offsetof(qwen3_5::MtpDecodeIngress, ngram_tree_candidates),
+                                      DType::I32, {slots, width - 1, batch_size});
+            ngram_q = Tensor(ingress + offsetof(qwen3_5::MtpDecodeIngress, ngram_tree_q), DType::FP32,
+                             {slots, width - 1, batch_size});
+        }
         anchors_            = rows(frame_.anchors, 0);
         frontiers_          = rows(frame_.base_frontiers, 0);
         budgets_            = rows(frame_.remaining_budgets, 0);
@@ -152,12 +173,14 @@ public:
                         .current_extents         = current_extents_,
                         // sampled-mtp-drafts: sparse acceptance against each draft's proposal (a
                         // tree round's columns: the tree builder's).
-                        .candidate_ids           = tree_      ? rows(frame_.tree_candidates, 2)
-                                                   : sampled_ ? rows(frame_.current_candidates, 2)
-                                                              : Tensor{},
-                        .proposal_q              = tree_      ? rows(frame_.tree_q, 2)
-                                                   : sampled_ ? rows(frame_.current_q, 2)
-                                                              : Tensor{},
+                        .candidate_ids           = tree_         ? rows(frame_.tree_candidates, 2)
+                                                   : ngram_tree_ ? ngram_candidates
+                                                   : sampled_    ? rows(frame_.current_candidates, 2)
+                                                                 : Tensor{},
+                        .proposal_q              = tree_         ? rows(frame_.tree_q, 2)
+                                                   : ngram_tree_ ? ngram_q
+                                                   : sampled_    ? rows(frame_.current_q, 2)
+                                                                 : Tensor{},
                         .frontiers               = frontiers_,
                         .anchors                 = anchors_,
                         .licensed_tokens         = rows(frame_.licensed_tokens, 1),
@@ -166,8 +189,12 @@ public:
                         .selected_hidden         = rows(frame_.target_continuation_hidden, 1),
                         .replay_records          = state.execution.replay_records,
                         .sampling                = frame_.sampling,
-                        .tree_rows               = tree_ ? rows(frame_.tree_rows, 1) : Tensor{},
-                        .tree_masks              = tree_ ? rows(frame_.tree_masks, 1) : Tensor{},
+                        .tree_rows               = tree_         ? rows(frame_.tree_rows, 1)
+                                                   : ngram_tree_ ? ngram_rows
+                                                                 : Tensor{},
+                        .tree_masks              = tree_         ? rows(frame_.tree_masks, 1)
+                                                   : ngram_tree_ ? ngram_masks
+                                                                 : Tensor{},
                         .accepted_path           = rows(frame_.accepted_path, 1),
                         .accepted_branch         = rows(frame_.accepted_branch, 0),
         };
@@ -177,8 +204,12 @@ public:
 
     // The ingress (the sparse planes only with sampled drafts), the verify inputs and the target.
     void forward() {
-        const std::size_t ingress = sampled_ ? sizeof(qwen3_5::MtpDecodeIngress)
-                                             : offsetof(qwen3_5::MtpDecodeIngress, current_candidates);
+        // An n-gram tree round copies its own planes up to its rows' laws.
+        const std::size_t ingress =
+            ngram_tree_ ? offsetof(qwen3_5::MtpDecodeIngress, ngram_tree_q) +
+                              sizeof(float) * kMtpSparseSlots * k_ * static_cast<std::size_t>(batch_)
+            : sampled_ ? offsetof(qwen3_5::MtpDecodeIngress, ngram_tree_rows)
+                       : offsetof(qwen3_5::MtpDecodeIngress, current_candidates);
         CUDA_CHECK(cudaMemcpyAsync(frame_.ingress.data, &state_.host_ingress, ingress, cudaMemcpyHostToDevice,
                                    stream()));
         if (tree_) {
@@ -200,6 +231,9 @@ public:
                                       drafts, column_candidates, column_q, tree_rows, tree_masks, valid,
                                       stream());
             ops::speculative_prepare_tree_verify_inputs(anchors_, current_drafts_, frontiers_, tree_rows,
+                                                        verify_ids_, target_positions_, target_rope_, stream());
+        } else if (ngram_tree_) {
+            ops::speculative_prepare_tree_verify_inputs(anchors_, current_drafts_, frontiers_, verify_.tree_rows,
                                                         verify_ids_, target_positions_, target_rope_, stream());
         } else {
             ops::speculative_prepare_verify_inputs(anchors_, current_drafts_, frontiers_, current_extents_,
@@ -248,8 +282,9 @@ public:
 
     // The round's egress (the sparse planes only with sampled drafts).
     void publish() {
-        const std::size_t egress = sampled_ ? sizeof(qwen3_5::MtpDecodeEgress)
-                                            : offsetof(qwen3_5::MtpDecodeEgress, next_candidates);
+        // An n-gram tree round's accepted path and branch (after the sparse planes) are read with them.
+        const std::size_t egress = sampled_ || ngram_tree_ ? sizeof(qwen3_5::MtpDecodeEgress)
+                                                           : offsetof(qwen3_5::MtpDecodeEgress, next_candidates);
         CUDA_CHECK(cudaMemcpyAsync(&state_.host_egress, frame_.egress.data, egress, cudaMemcpyDeviceToHost, stream()));
     }
 
@@ -323,6 +358,7 @@ private:
     bool sampled_    = false;
     bool confidence_ = false;
     bool tree_       = false;
+    bool ngram_tree_ = false;
     std::optional<TextContext> card_;
     Tensor anchors_, frontiers_, budgets_, current_extents_, current_drafts_, target_rope_, mtp_rows_,
         state_destinations_, rope_deltas_, verify_ids_, target_positions_, target_hidden_, licensed_counts_,

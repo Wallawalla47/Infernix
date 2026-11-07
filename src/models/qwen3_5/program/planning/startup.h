@@ -29,9 +29,17 @@ struct ProgramOffloadOptions;
 using TensorLayout                              = TensorRegion;
 
 // Where a speculative round's proposals come from: the backend's neural drafter, n-gram copies
-// (rows of a batched copy round without a copy keep their neural proposal), or a DFlash2 draft
-// tree built from the drafter's lattice (verify_drafts = tree columns - 1).
-enum class SpeculativeRoundKind : std::uint8_t { Neural, Ngram, Tree };
+// (rows of a batched copy round without a copy keep their neural proposal), a draft tree built on
+// the device from the drafter's candidates (verify_drafts = tree columns - 1), or an n-gram tree
+// round (--ngram-tree-nodes): a copy round in which some row's copy sources continue differently,
+// whose rows verify the host-built tree of their sources, or a chain (a copy, or the neural proposal),
+// at the tree's width.
+enum class SpeculativeRoundKind : std::uint8_t { Neural, Ngram, Tree, NgramTree };
+
+// Whether rounds of `kind` verify tree rows (ancestor masks, tree acceptance and compaction).
+[[nodiscard]] constexpr bool verifies_tree(SpeculativeRoundKind kind) noexcept {
+    return kind == SpeculativeRoundKind::Tree || kind == SpeculativeRoundKind::NgramTree;
+}
 
 // One CUDA-Graph family of speculative decode rounds. Every round of the family verifies
 // verify_drafts proposals per row on the decode frame viewed at that width and records ReplaySSM
@@ -250,6 +258,8 @@ struct SequencePlanningInputs {
     // The copy window of rounds of several rows (0: ngram_draft_window).
     std::uint32_t ngram_batch_window        = 0;
     std::uint32_t ngram_min_match           = 12;
+    // N-gram tree rounds' columns (the NgramTree family's width), 0 without them.
+    std::uint32_t ngram_tree_nodes          = 0;
     std::uint32_t capacity                  = 0;
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
@@ -284,6 +294,7 @@ struct SequencePlanImpl {
     std::uint32_t ngram_draft_window        = 0;
     std::uint32_t ngram_batch_window        = 0;
     std::uint32_t ngram_min_match           = 12;
+    std::uint32_t ngram_tree_nodes          = 0;
     std::uint32_t capacity                  = 0;
     std::uint32_t kv_capacity               = 0;
     std::uint32_t main_page_groups          = 0;

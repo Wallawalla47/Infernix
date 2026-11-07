@@ -1,5 +1,7 @@
 #include "core/paged_kv_cache.h"
 
+#include "core/copy_batch.h"
+
 #include "core/device.h"
 #include "core/host_kv_arena.h"
 
@@ -699,6 +701,32 @@ TransferWork DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPage
         }
     }
     return device_copy_work(1);
+}
+
+TransferWork DeviceKVPagePool::copy_pages(std::span<const std::pair<DeviceKVPageHandle, DeviceKVPageHandle>> pairs,
+                                          cudaStream_t stream) const {
+    if (pairs.empty()) { return {}; }
+    if (spec_.geometry.device_plane_order != PagedKVPlaneOrder::PageMajor) {
+        for (const auto& [source, destination] : pairs) { (void)copy_page(source, destination, stream); }
+        return device_copy_work(static_cast<std::uint32_t>(pairs.size()));
+    }
+    std::vector<std::pair<std::int32_t, std::int32_t>> indices;
+    indices.reserve(pairs.size());
+    for (const auto& [source, destination] : pairs) {
+        indices.emplace_back(physical_index(source), physical_index(destination));
+    }
+    CopyBatch batch(stream);
+    for (const Tensor& plane : planes_) {
+        auto* base       = static_cast<unsigned char*>(plane.data);
+        const auto bytes = static_cast<std::size_t>(plane.nb[3]);
+        for (const auto& [source, destination] : indices) {
+            if (source == destination) { continue; }
+            batch.add(base + static_cast<std::int64_t>(destination) * plane.nb[3],
+                      base + static_cast<std::int64_t>(source) * plane.nb[3], bytes);
+        }
+    }
+    batch.flush();
+    return device_copy_work(static_cast<std::uint32_t>(pairs.size()));
 }
 
 std::uint32_t DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin,

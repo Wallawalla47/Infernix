@@ -16,8 +16,10 @@ configuration. [DFlash](dflash.md) owns the drafter and the chain round it exten
 
 ## Scope
 
-- DFlash2, DFlash and MTP neural rounds only; n-gram copy rounds keep chain verification. MTP
-  trees need `--fast-path sampled-mtp-drafts` with resident experts (see [MTP](#mtp)).
+- DFlash2, DFlash and MTP neural rounds, and n-gram copy rounds whose copy sources continue
+  differently ([N-gram trees](#n-gram-trees), `--ngram-tree-nodes`, also on Qwen3.8-Flash-Next).
+  MTP neural trees need `--fast-path sampled-mtp-drafts` with resident experts (see [MTP](#mtp));
+  n-gram trees do not.
 - Every KV storage (`bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`): each format's grouped
   and parallel verification attention applies per-row ancestor masks, and compaction moves every
   stored plane. For `vq2` and `k4v2` it also moves each accepted column's exact-window slot in the
@@ -55,7 +57,8 @@ a chain.
 |---|---|---|
 | `--draft-tree-nodes auto` | every all-neural round of up to four rows chooses chain verification or a tree of K+5 or K+9 columns from measured round time and acceptance ([Automatic widths](#automatic-widths)) | off |
 | `--draft-tree-nodes LIST` | fixed columns per tree row by batch size: entry c applies to rounds of c rows and the last entry to every larger batch; `0` keeps that batch size on chain verification; nonzero entries are `draft tokens + 2 .. 32` | off |
-| `--draft-tree-paths N` | most root-to-leaf paths per tree row, `2..8` | `8` |
+| `--draft-tree-paths N` | most root-to-leaf paths per tree row, `2..8` (n-gram trees too; Qwen3.8-Flash-Next at most 3) | `8` |
+| `--ngram-tree-nodes N` | with `--ngram-draft-tokens`: a copy round in which a row's copy sources continue differently verifies them as one tree of at most N columns, `4..32` and, with several requests, at least a batched round's neural draft tokens + 2 (Qwen3.8-Flash-Next 4..32, verified as at most 3 path rows whose columns together fit a one-row round's 16, when they beat the copy by expected tokens per measured round time) ([N-gram trees](#n-gram-trees)); `0` keeps copies on chain verification | `0` |
 
 A tree widens every target projection, the LM head, attention, the GDN replay and the per-column
 target distribution of a row from K+1 to N columns. A column
@@ -328,7 +331,8 @@ and records beyond the committed prefix are unreachable, as for rejected chain d
 
 - An all-neural round of c rows uses the tree family of width `nodes[c]` when that entry is
   nonzero, or the width the controller chooses in automatic mode; a round with an n-gram copy
-  keeps its n-gram family. A row of a tree round is a tree row when its whole main chain fits
+  keeps its n-gram family, or the n-gram tree family when a row's copy sources continue
+  differently ([N-gram trees](#n-gram-trees)). A row of a tree round is a tree row when its whole main chain fits
   (extent K and
   `F + W <= capacity`): it gets extent W-1 and KV mapped through `F+W`, and its RoPE positions are
   the anchor's (the device adds depths). Any other row (budget tail, capacity) is a chain row with
@@ -370,6 +374,12 @@ Op tests (`tests/ops/test_speculative_tree.cpp`, `tests/ops/softmax_attention/ca
    and nest three deep (beyond the walk's two slots, so a branch state is rebuilt), up to 16
    columns at K=7; idle columns zero; records exact.
 5. Compaction: record-plane columns and every KV storage's planes, exact.
+6. N-gram trees: deterministic transport rows (one-hot laws, no residual draw) emit the anchor's
+   target distribution first and every reached column's target after it (chi-square), and greedy
+   rows take the branch whose drafts are the target tokens; GDN convolution and records on n-gram
+   shapes (14-deep main chains with side columns as deep); `speculative_one_hot_proposals` exact.
+   Host (`tests/models/qwen3_5/test_ngram_tree.cpp`): every layout rule, the main chain yielding to
+   branches, the limits, and `propose_candidates` (propose's choice first, one per source).
 
 Host (`tests/models/qwen3_5/test_tree_width_controller.cpp`): the controller's same-text gains are
 the exact token ratios of known accepted paths (and a narrower round measures no wider width),
@@ -394,6 +404,110 @@ Real model (`INFERNIX_TEST_ARTIFACT`, see `tests/README.md`):
    (tree, 8- and 16-column chain) picks a third token, and chain decoding shows the same effect
    (1.25 nats); a state or compaction error would instead leave the target's choice at most later
    positions.
+8. `test_engine_ngram_tree_real` (Qwen3.5: DFlash2 and MTP on the NVFP4 27B, DFlash on the 35B-A3B,
+   one stream and two) and `test_ngram_tree_real` (Qwen3.8-Flash-Next: copies alone and beside the
+   DFlash2 companion): greedy copies of a two-version prompt verified as trees accept the other
+   source's branch, and commit the chain arm's tokens up to their first difference, where both
+   tokens must be a near-tie of the target (a scoring pass: within 1.5 nats); a state error would
+   leave the tree arm's token far below the target's choice. The Flash-Next test scores each arm's
+   whole stream with the lossless route instead (at most two more tokens than the chain arm above
+   1 nat of regret, none above 5 nats): on FP4-Local with DFlash2 the arms first differ at a token
+   whose fast-route scoring gap is 4.5 nats but whose exact regret is 2.2, where both arms' first
+   token already has a regret of 1.9.
+
+## N-gram trees
+
+An n-gram copy round verifies one copy: the continuation of the earlier occurrence whose suffix
+match is longest (`NgramProposer::propose`). When the text occurs several times with different
+continuations (two versions of a file, repeated boilerplate that diverges), the copy is wrong at the
+first place its source differs from the one the model is following, and the round ends there.
+`--ngram-tree-nodes N` verifies the sources together instead: a row whose sources continue
+differently within the tree's depth verifies one tree of their continuations, and the round goes on
+along whichever source the target accepts.
+
+**Sources.** `NgramProposer::propose_candidates` returns every source whose suffix match qualifies
+(at least `--ngram-min-match` tokens), one per source position, best first in `propose`'s order
+(longer match, then longer continuation), each with its own continuation. The round's copy (which
+may come from the archive) is the main chain; the row's own index gives the others.
+
+**Tree** (`program/ngram_tree.h`, `build_ngram_tree`). Column 0 is the anchor and columns
+1..D the copy's first D drafts, so both layout rules hold. D is the depth limit
+(`min(15, N - 2)`, the row's output budget less its bonus, and its context room), shortened while
+the other sources' branches would not reach one draft short of it, but never below three quarters
+of the columns: a copy is usually right, so the main chain keeps the larger share, and a late
+divergence costs it nothing (a floor of half the columns lost to chains at 16 columns,
+[Measurements](#n-gram-trees-1)). Each other source then follows the tree while it agrees with it and continues as
+a new branch from where it leaves it, at most D deep, in candidate order while columns and
+`--draft-tree-paths` leaves last; a node takes at most 16 children. A row with no branch is a chain
+and keeps its full copy (up to the n-gram window).
+
+**Exactness.** Every draft is a deterministic proposal. The row is a transport row (UniVer,
+[above](#univer-trees-univer-trees)) with no residual draw (`sampled = 0`): a sampled row accepts a
+child d of v with probability `pt_v p_v(d)` (Z_v is 1 when nothing is drawn) and otherwise draws
+the correction from `p_v` outside v's children, so the emitted sequence has the processed target
+distribution; greedy and Gumbel rows take the child equal to the target's token. The laws each
+child stores (its parent's children first, one-hot on the first) are never read: without a residual
+draw the transport rule needs no proposal probability.
+
+**Rounds.** A copy round in which some row has a tree is an n-gram tree round: it verifies at width
+N, every tree row its tree, every other row its chain as a chain row (a copy of at most N-1 drafts,
+or the neural proposal of a row without a copy, which N must hold: with several requests startup
+requires N >= a batched round's neural draft tokens + 2, `adaptive-dflash`'s batch length where it
+applies; a one-row copy round runs no drafter). Rounds with a grammar-constrained row keep chains,
+and startup refuses trees with fixed speculation (the reproducible route, or a configuration
+without `adaptive-speculation`). Request statistics count
+`ngram_tree_rounds`, `ngram_tree_side_rounds` (the accepted path left the copy for another source)
+and `ngram_tree_side_accepted_tokens` (the drafts after leaving it: what the copy alone would not
+have accepted); `ngram_drafted_tokens` counts every verified tree column.
+
+**Qwen3.5 family.** One `NgramTree` round family of width N, captured for every batch size. The
+host writes each row's `ops::SpeculativeTreeRow` and ancestor masks into the round's ingress
+(`ngram_tree_rows`, `ngram_tree_masks`) and a tree row's drafts and laws into its copy payload; the
+verification reads them there, so one captured graph serves every tree. A batched round still runs
+the drafter for its rows without a copy, at its own width; DFlash's argmax drafts then take the
+one-hot law of a deterministic draft on the device (`ops::speculative_one_hot_proposals`). MTP
+rounds carry every column's law in their own planes (`ngram_tree_candidates`, `ngram_tree_q`): a
+tree's parents' laws, an MTP chain's own drafts' proposals. Verification, acceptance, compaction
+and the commit are the device-built trees' above.
+
+**Qwen3.8-Flash-Next** (`program/ngram_tree_program.cpp`). QSA's block-sparse attention has no tree
+form: a tree column's visible keys, its block count and the pooled key of a block completing inside
+the round all follow its own path. A one-row copy round with a tree therefore verifies each
+root-to-leaf path as a verification row of its own (at most 3, `--draft-tree-paths` capped), with
+every chain kernel, at the width W of the longest path. The rows together verify at most a one-row
+round's columns (R x W <= the copy window + 1, 16): two paths of up to 8 columns or three of up to
+5, so the plan needs no records, logits, io or graphs beyond a one-row round's, only the side rows'
+pages and table rows.
+
+1. Every path row reads the lane's state in place (GDN states, PLE history, QSA tails: verification
+   leaves them unchanged) and the lane's KV pages. Side row r maps the round's positions (one or two
+   64-position pages) to two pages of its own through a table row of its own: the lane's mapping
+   copied on the device, with the lane's last pages copied into its own first (copy-on-write, one
+   batched copy of every plane).
+2. The forward runs R rows x W columns, as a chain round of R rows, uncaptured, through a view of
+   the GDN records of R rows of W columns a layer (within a one-row round's storage). Each tree
+   column's target is the logits column of the first path holding it, gathered into a [vocab, N]
+   workspace buffer; `speculative_accept_sparse_tree` verifies the tree as above.
+3. The row of the first path through the accepted path's last column becomes row 0 of an ordinary
+   one-row round of width W: its GDN records re-laid layer by layer into the one-row view, its PLE
+   and QSA records, MTP residual columns and DFlash2 features copied into place, and for a side row
+   its pages (K/V of every attention layer, MTP cells, pooled keys) copied over the lane's. The
+   commit, the MTP catch-up and the DFlash2 context are a one-row round's, unchanged.
+
+A path row costs its whole path: columns shared by several paths are computed once per path, and
+every column routes its own experts, so a tree round costs about its path count's chains. A round
+verifies a tree only when it beats the round's copy by expected tokens per measured round time
+(the copy's tokens at its bucket's acceptance times the request's learned tree gain, over the tree
+round's estimated cycle; the copy choice and its measurements are in [Measurements](#n-gram-trees-1)),
+so on an offloaded artifact it rarely does. Tree rounds run uncaptured: graphs of every row count and
+width captured at startup cost every round (below). KV storages with a per-lane exact window
+(`vq2`, `k4v2`) or per-row packed flags (`bf16p`) are refused, as is the lossless route.
+
+**Qwen3.5 family gain gate.** A request learns its tree rounds' tokens over its copies' alone (the
+copy stops where the accepted path left it, or goes on past the tree's main chain at the request's
+copy acceptance; weight 0.25 from 1.1); below 1 it verifies its copies as chains, with a tree every
+8th eligible round. NVFP4 27B, one request: single-source copies with trees of 16 +0.6 % -> +0.2 %
+against chains, two versions unchanged (-15.4 %).
 
 ## Measurements
 
@@ -559,3 +673,128 @@ loses 4.2-5.4 % at 128K and 6.3 % on highly predictable text. The three-request 
 not resolved by the direct runs: +2.4 to +3.0 % by the same-text estimate, while seven direct passes
 of 10 columns ranged from -2.8 to +4.4 % (mean +0.9 %). The suite is reasoning text at temperature
 0.6; trees apply only to neural rounds, so workloads with more n-gram rounds gain less.
+
+### N-gram trees
+
+RTX 5090, CUDA 13.4, Windows, 2026-11-07; `infernix_decode_quality_gen` with `prompts`, greedy,
+INT8 KV. Two copy workloads made from this repository's sources. *Two versions*: six prompts, each
+a source file shown as version 1 and as version 2 (its three most frequent long identifiers renamed,
+small numbers changed) and then asked for version 1 again, 400 tokens each; the newer version is
+the copy's main chain, so a copy of version 1 meets its other source at every edit. *Single
+source*: twelve `bench/decode_quality/copy_prompts.py` prompts (a file, then its header with one
+identifier renamed), 512 tokens each, whose sources rarely disagree. One-request runs repeat bit
+for bit (two runs each, within 0.3 %); two-request runs vary with scheduling, so both runs are
+listed.
+
+**NVFP4 27B** (`qwen3_8_27b_nvfp4-official`), DFlash2 `--draft-tokens auto` with
+`--ngram-draft-tokens auto` (63 drafts, 31 in batched rounds); one request decode seconds, two
+requests wall seconds:
+
+| Workload | Requests | Chains | Trees of 16 | Trees of 32 |
+|---|---|---|---|---|
+| Two versions | 1 | 3.03 | 2.53 (-16.5 %) | 2.44 (-19.6 %) |
+| Two versions | 2 | 3.17, 3.17 | 3.01, 2.79 | 3.07, 3.07 |
+| Single source | 1 | 3.30 | 3.32 (+0.6 %) | 3.31 (+0.4 %) |
+| Single source | 2 | 4.16, 4.16 | 4.17, 4.17 | 4.13, 4.13 |
+
+Trees replace a copy round's single source only where another source leaves it within the tree's
+depth: on the single-source prompts 3 (one request) and 7-9 (two) of 108-178 copy rounds verified
+a tree, none took the other source, and the time is the chains'. With two versions 11-20 rounds
+verified a tree and 3-6 took the other source; at one request 32 columns accept 1,914 drafts
+against the chains' 1,796 in 49 against 45 copy rounds, although the tree's main chain holds at
+most 15 drafts where a chain copies up to 63.
+
+**Main-chain floor.** The builder shortens the main chain for the other sources' branches down to a
+floor. Two versions, 16 columns: decode 3.51 s at one request with a floor of half the columns, 2.53
+s at three quarters (the default) and 2.72 s without shortening; two requests 2.56 / 2.82, 3.01 /
+2.79 and 2.80 / 2.80 s (wall). 32 columns hold a 15-draft main chain and a branch at every floor
+(2.44 s). A copy is usually right after its first divergence (the match that took the other source
+becomes the next round's main chain), so columns taken from the main chain cost more than the
+branch gains.
+
+**Qwen3.8-Flash-Next FP4-Local**, DFlash2 `--draft-tokens auto` (the companion), one request,
+decode seconds. As first built, a one-row round took the whole copy (up to 15 drafts) when its
+expected tokens per round beat the drafter's at a flat cost a column (`kWidthCost`), and trees
+verified rows of up to 16 columns each:
+
+| Workload | DFlash2 alone | + copies of 15 | + copies of 15, trees of 16 |
+|---|---:|---:|---:|
+| Two versions | 10.48 | 13.10 (+25 %) | 14.00 (+34 %) |
+| Single source | 29.22, 29.36 | 32.54, 32.60 (+11 %) | 33.55 (+15 %) |
+
+Copies lost even where they accepted 98 % of their drafts (two versions: 1,693 of 1,726). DFlash2
+alone accepts 94 % of its 8-column rounds' drafts on that text (6.8 tokens a round at 29.8 ms); with
+copies, if its 123 remaining rounds cost the same, each 16-column copy round took about 81 ms for
+15.6 tokens, where the flat cost charged about 51: past the narrow expert kernels every column
+routes its own experts at a higher marginal cost.
+
+**Copy choice by measured round time** (`ProgramImpl::copy_choice`). Every one-row round's
+start-to-start cycle is measured by kind (drafter, copy, tree) and verified columns (EWMAs); an
+unmeasured width is interpolated between its kind's measured widths, else taken from another kind
+at that width, else extended past the widest by the steeper of the measured slope and the flat
+model. A round takes the copy's first e drafts that maximize its expected tokens (its match
+bucket's acceptance) per estimated cycle, when they beat by 5 % the drafter's round where a copy
+was available (its tokens and columns learned in such rounds: copied text is text the drafter
+predicts well); every 8th eligible round runs the drafter instead and every 8th, offset, one draft
+more, so both estimates stay current. Copy widths past the drafter's are captured at their first
+use. Two runs each (the choices follow measured times, so runs differ), against DFlash2 alone:
+
+| Workload | Copies of 15 enabled, never taken | + copies of 15 | + copies of 15, trees of 16 |
+|---|---:|---:|---:|
+| Two versions | +1.2 % | +3.0 % (+2.9, +3.1) | +3.1 % (+4.4, +1.9) |
+| Single source | +1.4 % | +1.8 % | +1.7 % |
+| Prose, twelve 1,024-token slices of `engine-architecture.md` | +0.7 % | +0.9 % (+2.2, -0.4) | +1.2 % |
+
+The never-taken arm (copies enabled, the margin set past any copy: the same 352 rounds and stream)
+is the configured cost: a copy window of 15 plans 16-column rounds, whose graph allowance (4 MiB a
+graph), records and logits leave 87 fewer experts in VRAM (8,882 against 8,969), decode +1.1 to
++1.4 %, prefill +1.0 %. With MTP instead of DFlash2 (four drafts), copies gain: two versions 12.15 ->
+11.16 s (-8.1 %), prose 16.07 -> 15.87 s (-1.3 %).
+
+**Configured cost of trees (Flash-Next).** As first built, trees captured every path count's
+verification at every width at startup and planned rows of 16 columns: FP4-Local with one lane
+captured 90 CUDA Graphs (335 MiB) against 49 (160 MiB) for copies alone, 35 fewer experts in VRAM,
+and on greedy prose where no tree formed (the same 855 rounds) decode +1.6 %, prefill +1.2 %; with
+two lanes +1.3 %, and +0.1 % with the tree graphs left out (the expert cache the same), so the
+graphs themselves cost every round. Trees now verify uncaptured within a one-row round's columns,
+and cost as much as copies alone (the table above).
+
+**Agentic coding (FP4-Local).** `bench/agentic_ab/runner.py`, the owner's launch flags (DFlash2
+auto, two lanes, INT8 KV, 262,144-token context), 130 sampled requests per arm, workload seeds 42
+and 43, every arm starting from the same saved expert state (`AB_EXPERT_STATE_RESET`); arms in the
+order copies, copies + trees, none. Mean over the seeds against no copies (per-seed range), as first
+built:
+
+| | Copies of 15 | Copies of 15, trees of 16 |
+|---|---|---|
+| Decode rounds/s, one request decoding | -4.5 % (-5.6..-3.4) | -9.1 % (-9.2..-8.9) |
+| Output tok/s, one request decoding | -2.9 % (-5.5..-0.2) | -9.5 % (-10.5..-8.5) |
+| Output tok/s, all decoding | -2.9 % (-4.3..-1.5) | -9.1 % (-9.4..-8.8) |
+| Prefill tok/s, no cache hit (client TTFT) | -2.0 % (-2.1..-1.9) | -5.2 % (-6.1..-4.2) |
+| Average TTFT | +1.1 % (+0.3..+1.9) | +6.8 % (+6.7..+6.9) |
+
+Copies supplied 0.3-0.5 % of the output (60-87 copy rounds of 35,000-37,000, 29-41 % of their
+drafts accepted), and no tree round formed in either seed. By decode seconds over rounds in the
+request logs, copies cost nothing a round (15.97 / 16.15 ms against 15.83 / 16.24) and trees 6 %
+(17.04 / 17.05 ms). Without the expert-state reset an arm starts from the state the arm before it
+saved: in an earlier run the first arm decoded at 90 tok/s (request log, tokens per decode second)
+against 133 for the same flags after the reset.
+
+The same sweep with the measured-cost copy choice, trees within a one-row round's columns and copy
+widths captured at first use (the same seeds, arms and order):
+
+| | Copies of 15 | Copies of 15, trees of 16 |
+|---|---|---|
+| Output tok/s, one request decoding | -1.7 % (-2.0..-1.5) | -1.0 % (-1.9..-0.1) |
+| Output tok/s, all decoding | -1.9 % (-4.6..+0.8) | -3.2 % (-3.4..-3.0) |
+| Prefill tok/s, no cache hit (client TTFT) | +1.5 % (+0.5..+2.4) | -0.2 % (-0.9..+0.4) |
+| Decode ms a round (request logs) | +3.1 %, +2.2 % | +1.0 %, +0.4 % |
+
+Copies verified 32-46 rounds a seed (they had 60-87), no tree round formed, and the two copy arms,
+which differ only by the unused tree flag, differ by 1-2 % a round: the run-to-run spread of these
+sampled texts (completion tokens 83-105 thousand an arm).
+
+**On FP4-Local both off is fastest** for agentic coding and for every DFlash2 copy workload
+measured: DFlash2 already predicts copied text well, so copies at best match its rounds, and
+enabling them costs about 1 % of VRAM-bound speed. N-gram trees pay on the NVFP4 27B (32 columns),
+where copies themselves are cheap, and copies pay beside Flash-Next's MTP drafter.

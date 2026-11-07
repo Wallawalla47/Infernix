@@ -203,10 +203,12 @@ void ProgramImpl::prepare_graphs() {
         };
     // capture_tree selects a tree round: rows whose whole tree fits verify a tree of
     // capture_drafts + 1 columns built from capture_proposal_drafts main-chain proposals.
+    // capture_ngram_tree: an n-gram tree family's representative, whose rows verify chain rows (the
+    // round's tree rows and masks come from the ingress).
     const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size,
                                             std::uint32_t capture_drafts,
                                             std::uint32_t capture_proposal_drafts,
-                                            bool capture_tree = false) {
+                                            bool capture_tree = false, bool capture_ngram_tree = false) {
         if (batch_size == 0 || batch_size > max_concurrency) {
             throw std::logic_error("CUDA Graph representative batch is invalid");
         }
@@ -281,6 +283,13 @@ void ProgramImpl::prepare_graphs() {
                 dflash_host_ingress->state_destination_slots[row] = capture_state_slot(row);
                 dflash_host_ingress->sampling[row]                = {};
                 dflash_host_ingress->copy_rows[row]               = 1;
+                if (capture_ngram_tree) {
+                    const ops::SpeculativeTreeRow chain = ngram_chain_row(extent);
+                    dflash_host_ingress->ngram_tree_rows[row] = chain;
+                    write_ngram_tree_masks(chain, width,
+                                           std::span<std::uint32_t>(dflash_host_ingress->ngram_tree_masks)
+                                               .subspan(row * width, width));
+                }
             }
         }
         if (io.mtp_decode) {
@@ -336,6 +345,21 @@ void ProgramImpl::prepare_graphs() {
                 mtp_host_ingress->state_destination_slots[row] = capture_state_slot(row);
                 mtp_host_ingress->rope_deltas[row]             = 0;
                 mtp_host_ingress->sampling[row]                = {};
+                if (capture_ngram_tree) {
+                    // Chain rows of one-hot laws at the representative drafts.
+                    const ops::SpeculativeTreeRow chain = ngram_chain_row(extent);
+                    mtp_host_ingress->ngram_tree_rows[row] = chain;
+                    write_ngram_tree_masks(chain, width,
+                                           std::span<std::uint32_t>(mtp_host_ingress->ngram_tree_masks)
+                                               .subspan(row * width, width));
+                    for (std::uint32_t step = 0; step < capture_drafts; ++step) {
+                        const auto base = (row * capture_drafts + step) * kMtpSparseSlots;
+                        for (std::uint32_t slot = 0; slot < kMtpSparseSlots; ++slot) {
+                            mtp_host_ingress->ngram_tree_candidates[base + slot] = static_cast<TokenId>(slot);
+                            mtp_host_ingress->ngram_tree_q[base + slot]          = slot == 0 ? 1.0F : 0.0F;
+                        }
+                    }
+                }
             }
         }
         if (io.ordinary) {
@@ -494,7 +518,8 @@ void ProgramImpl::prepare_graphs() {
         // at the configured depth (the round's limit stops them), its other rounds at its length.
         const bool chain = execution_schedule.mtp_proposal_chain;
         for (SpeculativeRoundFamily& round : round_families) {
-            const bool ngram                  = round.shape.kind == SpeculativeRoundKind::Ngram;
+            const bool ngram_tree             = round.shape.kind == SpeculativeRoundKind::NgramTree;
+            const bool ngram                  = round.shape.kind == SpeculativeRoundKind::Ngram || ngram_tree;
             const bool tree                   = round.shape.kind == SpeculativeRoundKind::Tree;
             const std::uint32_t verify_drafts = round.shape.verify_drafts;
             const std::uint32_t ar_depth = mtp_family_proposal_drafts(round.shape, neural_draft_window, chain);
@@ -516,9 +541,9 @@ void ProgramImpl::prepare_graphs() {
                 : ngram && dflash_batch_drafts != 0                             ? dflash_batch_drafts
                                                                                 : neural_draft_window;
             const auto forward_phase            = split ? SpeculativePhase::Verify : SpeculativePhase::Forward;
-            const auto prepare = [&, verify_drafts, proposal_drafts, tree](std::uint32_t frontier,
-                                                                           std::uint32_t batch) {
-                prepare_representative(frontier, batch, verify_drafts, proposal_drafts, tree);
+            const auto prepare = [&, verify_drafts, proposal_drafts, tree, ngram_tree](std::uint32_t frontier,
+                                                                                       std::uint32_t batch) {
+                prepare_representative(frontier, batch, verify_drafts, proposal_drafts, tree, ngram_tree);
             };
             auto& forward_family = round.forward;
             auto& finish_family  = round.finish;
@@ -548,6 +573,7 @@ void ProgramImpl::prepare_graphs() {
                 state.chain_drafts           = neural_draft_window;
                 state.tree_paths             = draft_tree_paths;
                 state.tree_proposals         = mtp_tree_rounds;
+                state.ngram_tree             = ngram_tree;
                 return state;
             };
             const auto dflash_context = [&] {
@@ -567,6 +593,7 @@ void ProgramImpl::prepare_graphs() {
                 state.neural_proposal_drafts = split ? neural_draft_window : proposal_drafts;
                 state.tree                   = tree;
                 state.tree_paths             = draft_tree_paths;
+                state.ngram_tree             = ngram_tree;
                 return state;
             };
             // A split family's Verify reads the block the proposal graph of its batch size and
@@ -649,13 +676,15 @@ void ProgramImpl::prepare_graphs() {
                         capture(phase, profile);
                     }
                 }
-                const char* label = forward ? (ngram   ? "ngram forward"
-                                               : tree  ? "tree forward"
-                                               : split ? "dflash verify"
-                                                       : "speculative forward")
-                                            : (ngram  ? "ngram finish"
-                                               : tree ? "tree finish"
-                                                      : "speculative finish");
+                const char* label = forward ? (ngram_tree ? "ngram tree forward"
+                                               : ngram    ? "ngram forward"
+                                               : tree     ? "tree forward"
+                                               : split    ? "dflash verify"
+                                                          : "speculative forward")
+                                            : (ngram_tree ? "ngram tree finish"
+                                               : ngram    ? "ngram finish"
+                                               : tree     ? "tree finish"
+                                                          : "speculative finish");
                 instantiate_graph_family(family, label, device);
             }
 

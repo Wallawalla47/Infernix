@@ -1,6 +1,11 @@
 infernix_add_test(infernix_ngram_proposer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_proposer.cpp")
 
+# N-gram trees on the host: the proposer's candidates and the tree rows they build.
+infernix_add_test(infernix_ngram_tree_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_tree.cpp"
+  LIBRARIES infernix_ops)
+
 infernix_add_test(infernix_ngram_archive_test SOURCES
   "${CMAKE_CURRENT_LIST_DIR}/test_ngram_archive.cpp"
   "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/ngram.cpp")
@@ -214,6 +219,19 @@ add_test(NAME infernix_qwen3_5_dflash_tree_greedy_real_test
   COMMAND infernix_qwen3_5_dflash2_tree_greedy_real_test int8 16 160 7 dflash)
 add_test(NAME infernix_qwen3_5_dflash_tree_batch_greedy_real_test
   COMMAND infernix_qwen3_5_dflash2_tree_greedy_real_test int8 16 160 7 dflash 0 2)
+
+# N-gram trees: two-version copies verified as 16-column trees take the other source's branch and commit the
+# chain arm's tokens up to a near-tie of the target. DFlash2 and MTP (the NVFP4 27B), DFlash (the 35B-A3B), one
+# stream and two at once.
+infernix_add_test(infernix_qwen3_5_ngram_tree_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_ngram_tree_real.cpp"
+  LIBRARIES infernix_engine)
+add_test(NAME infernix_qwen3_5_ngram_tree_batch_real_test COMMAND infernix_qwen3_5_ngram_tree_real_test dflash2 2)
+add_test(NAME infernix_qwen3_5_mtp_ngram_tree_real_test COMMAND infernix_qwen3_5_ngram_tree_real_test mtp)
+add_test(NAME infernix_qwen3_5_dflash_ngram_tree_real_test COMMAND infernix_qwen3_5_ngram_tree_real_test dflash 2)
+set_tests_properties(infernix_qwen3_5_ngram_tree_real_test infernix_qwen3_5_ngram_tree_batch_real_test
+  infernix_qwen3_5_mtp_ngram_tree_real_test infernix_qwen3_5_dflash_ngram_tree_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")
 
 foreach(kv IN ITEMS k8v4 nvfp4 vq2 k4v2)
   add_test(NAME infernix_qwen3_5_dflash2_tree_greedy_${kv}_real_test

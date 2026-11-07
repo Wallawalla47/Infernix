@@ -109,6 +109,65 @@ public:
         return match;
     }
 
+    // Every source whose suffix match qualifies, best first by propose()'s order (longer match, then
+    // longer draft; the first found among equals), at most `limit`, each with its own continuation of
+    // up to `maximum` tokens. Sources are told apart by their end position, so a window found at
+    // several widths counts once. The first is propose()'s choice: an n-gram tree's main chain.
+    [[nodiscard]] std::vector<Match> propose_candidates(std::span<const Token> history, std::uint32_t maximum,
+                                                        std::uint32_t minimum_match, std::size_t limit) const {
+        std::vector<Match> found;
+        if (maximum == 0 || limit == 0) { return found; }
+        std::array<std::uint64_t, widths_.size() * 4> ends{};
+        std::size_t seen = 0;
+        for (const auto n : widths_) {
+            if (history.size() < n) { continue; }
+            const auto tail = history.last(n);
+            if (std::find_if(tail.begin(), tail.end(), [](Token t) { return t < 0; }) != tail.end()) {
+                continue;
+            }
+            const auto& bucket = buckets_[hash(tail, n) & (buckets_.size() - 1)];
+            for (const auto entry : bucket) {
+                if (entry.width != n || entry.end < n || entry.end - n < live_begin() || entry.end >= end_) {
+                    continue;
+                }
+                if (std::find(ends.begin(), ends.begin() + static_cast<std::ptrdiff_t>(seen), entry.end) !=
+                    ends.begin() + static_cast<std::ptrdiff_t>(seen)) {
+                    continue;
+                }
+                bool equal = true;
+                for (std::uint32_t j = 0; j < n; ++j) {
+                    if (at(entry.end - n + j) != tail[j]) {
+                        equal = false;
+                        break;
+                    }
+                }
+                if (!equal) { continue; }
+                ends[seen++] = entry.end;
+                std::uint32_t matched = n;
+                while (matched < history.size() && entry.end - matched > live_begin()) {
+                    const auto token = at(entry.end - matched - 1);
+                    if (token < 0 || token != history[history.size() - matched - 1]) { break; }
+                    ++matched;
+                }
+                if (matched < minimum_match) { continue; }
+                std::vector<Token> draft;
+                for (std::uint64_t p = entry.end; p < end_ && draft.size() < maximum; ++p) {
+                    const auto token = at(p);
+                    if (token < 0) { break; }
+                    draft.push_back(token);
+                }
+                if (!draft.empty()) { found.push_back({std::move(draft), matched}); }
+            }
+        }
+        // propose() keeps the first of equals unless a later one is strictly better: a stable sort
+        // by (matched, then draft length) descending puts its choice first.
+        std::stable_sort(found.begin(), found.end(), [](const Match& a, const Match& b) {
+            return a.matched != b.matched ? a.matched > b.matched : a.tokens.size() > b.tokens.size();
+        });
+        if (found.size() > limit) { found.resize(limit); }
+        return found;
+    }
+
     [[nodiscard]] Match propose(std::span<const Token> history, std::uint32_t maximum,
                                 std::uint32_t minimum_match = 12) const {
         Match best;

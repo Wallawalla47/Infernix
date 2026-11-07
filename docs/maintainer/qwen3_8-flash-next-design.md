@@ -1984,8 +1984,17 @@ E[tokens(K)] / E[t_round(K)],
 Experts used only by rejected draft columns are not credited as uses in the LFRU state, so a
 rejected path cannot pollute the cache.
 
-N-gram copy proposals ([ngram](../ngram.md)) and tree verification stay available, and the same
-cost model decides them.
+N-gram copy proposals ([ngram](../ngram.md)) stay available. A one-row round takes a copy, and how
+many of its drafts, by expected tokens per measured round time (`copy_choice`): one-row rounds'
+cycles are measured by kind (drafter, copy, tree) and verified columns, against the drafter's round
+where a copy was available (2026-11-07; the flat `kWidthCost` a column had priced a 16-column FP4-Local
+copy round at about 51 ms against its measured 81, and copies lost 11-25 % beside DFlash2 on copy-heavy
+prompts, now 1.8-3.0 %). This is not the per-width MTP draft length measured and not adopted below:
+there the drafter's own length followed round times; here the copy competes with the drafter's
+round, and both sides are measured. Neural drafts verify as chains; n-gram copies whose sources
+continue differently verify as trees (`--ngram-tree-nodes`), each root-to-leaf path as a
+verification row of its own over the lane's state, because QSA has no tree form
+([Tree verification](tree-verification.md#n-gram-trees)).
 
 K = 0 (plain decode) is always a candidate, so the policy turns speculation off where it does not
 pay. TensorSharp's shared-MTP head is the counterexample this guards against on this model: 1.7×
@@ -10457,7 +10466,13 @@ Since 2026-11-04 (candidates NQ-09) one CTA a token forms its row scale and its 
 of its entries' rows (an inverse of the dispatch's entries), where the terms were formed once per wide entry (11
 times a token): the same bits (the wide bench's output hashes equal at 256-16,384 columns), the routed experts'
 call at FP4-Local's geometry 1,378.9 / 1,525.8 / 2,020.8 / 6,272.9 -> 1,316.1 / 1,457.8 / 1,911.3 / 5,772.5 us at
-256 / 1,024 / 4,096 / 16,384 columns (-4.6 / -4.5 / -5.4 / -8.0 %, three rounds, frames).
+256 / 1,024 / 4,096 / 16,384 columns (-4.6 / -4.5 / -5.4 / -8.0 %, three rounds, frames). The inverse covers the
+dispatched entries only (2026-11-07): a masked call (MoeColumnMask, a verification round's padding columns) does
+not dispatch its masked columns' entries, and the map built over every output row read stale entries past the
+dispatched ones, which faulted on the Qwen3.5-122B-A10B's fixed MTP rounds of a 16-column copy window and moved
+live slots' rows (live outputs wrong by up to 6x their norm). The map is cleared to -1, holds the entries up to the
+furthest job's end, and a masked slot stores nothing; test_offloaded_moe_qwen3_5_122b's masked case runs the
+two-term route (live entries within its unmasked bounds, masked ones never written).
 
 *Two terms first (2026-10-14/15).* `test_offloaded_moe_wide` against the exact arithmetic: mean
 relative L2 0.31-0.41 % per case, worst entry 2.0 %. End to end on the recipe C artifact

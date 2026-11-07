@@ -387,6 +387,16 @@ export const SPEC_CONTROLS: Control[] = [
     placeholder: "0 (off)",
   },
   {
+    kind: "number",
+    flag: "--ngram-tree-nodes",
+    label: "N-gram trees",
+    help: "Where copy sources continue differently (such as two versions of a file), verify them as one tree of up to N tokens instead of one copy (4-32, same output; needs n-gram copy drafts). 0 keeps single copies.",
+    placeholder: "0 (off)",
+    min: 0,
+    max: 32,
+    step: 1,
+  },
+  {
     kind: "text",
     flag: "--draft-tree-nodes",
     label: "Tree verification",

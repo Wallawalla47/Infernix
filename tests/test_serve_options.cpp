@@ -145,6 +145,21 @@ int main() {
         check(ngram.speculative.ngram_draft_tokens == 15 && ngram.speculative.draft_tokens == 5 &&
                   ngram.speculative.ngram_min_match == 12,
               "ngram and neural widths were not kept separate");
+    const auto ngram_tree = parse({"infernix-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "5",
+                                   "--ngram-draft-tokens", "31", "--ngram-tree-nodes", "16"});
+    failures += check(ngram_tree.speculative.ngram_tree_nodes == 16 && ngram_tree.speculative.ngram_draft_tokens == 31,
+                      "--ngram-tree-nodes was not kept");
+    for (const auto& tail : std::vector<std::vector<std::string>>{{"--ngram-tree-nodes", "16"},
+                                                                  {"--ngram-draft-tokens", "15", "--ngram-tree-nodes", "3"},
+                                                                  {"--ngram-draft-tokens", "15", "--ngram-tree-nodes", "33"}}) {
+        std::vector<std::string> arguments{"infernix-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "5"};
+        arguments.insert(arguments.end(), tail.begin(), tail.end());
+        bool rejected = false;
+        try {
+            (void)parse(arguments);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "n-gram trees without copies or outside 4..32 were admitted");
+    }
     const auto ngram_auto = parse({"infernix-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens",
                                    "auto", "--ngram-draft-tokens", "auto"});
     failures += check(ngram_auto.speculative.ngram_draft_tokens_auto &&

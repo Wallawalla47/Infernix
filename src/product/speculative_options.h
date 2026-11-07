@@ -226,6 +226,14 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     if (options.draft_tree_paths < 2 || options.draft_tree_paths > 8) {
         throw std::invalid_argument("--draft-tree-paths must be in [2,8]");
     }
+    if (options.ngram_tree_nodes != 0) {
+        if (options.ngram_draft_tokens == 0 && !options.ngram_draft_tokens_auto) {
+            throw std::invalid_argument("--ngram-tree-nodes requires ngram drafting: enable --ngram-draft-tokens");
+        }
+        if (options.ngram_tree_nodes < 4 || options.ngram_tree_nodes > 32) {
+            throw std::invalid_argument("--ngram-tree-nodes must be 0 or in [4,32]");
+        }
+    }
     if (options.backend_auto) { return; }
     switch (options.backend) {
     case SpeculativeBackend::None:

@@ -1787,6 +1787,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--draft-tree-paths N` | most root-to-leaf paths per tree row, `2..8` | `8` |
 | `--ngram-draft-tokens N\|auto` | verified n-gram copy proposals per round beside the `--spec` drafter (Qwen3.8-Flash-Next: also alone, `1..15`), `1..63`; `0` disables. `auto` (Qwen3.8-27B / Qwen3.6-35B-A3B) takes the configuration's measured window and minimum match: beside the NVFP4 27B's `--spec dflash2 --draft-tokens auto`, copies of up to 63 drafts (31 in rounds of several requests) at a minimum match of 12; elsewhere copies stay off (none was measured faster), which startup reports; see [ngram copy proposals](ngram.md#automatic-window) | `0` |
 | `--ngram-min-match N` | minimum matched tokens for an n-gram proposal, `4..64` | `12` |
+| `--ngram-tree-nodes N` | with `--ngram-draft-tokens`: where a copy round's sources continue differently (several earlier occurrences of the text, such as two versions of a file), verify them as one tree of at most N tokens instead of one copy, so the round continues along whichever source the model follows; same output distribution. `4..32`, and with `--max-concurrency` above 1 at least a batched round's neural draft tokens + 2 (Qwen3.5/3.6 family); Qwen3.8-Flash-Next verifies each path of the tree as its own row (at most 3); see [n-gram trees](ngram.md#n-gram-trees) | `0` |
 | `--ngram-archive-mib N` | RAM archive that keeps n-gram sources across the requests of a conversation; requires `--ngram-draft-tokens`; `0` keeps drafting request-local | `0` |
 | `--ngram-session-mib N` | one conversation's share of the n-gram archive; no effect without `--ngram-archive-mib` | `128` |
 | `--ngram-native-sessions` | also recognize Kilo, Codex and Claude session metadata as conversation identities; requires `--ngram-archive-mib` | off |
@@ -2203,7 +2204,7 @@ are the part of those whose copy source was the retained draft archive (see [n-g
 drafting](ngram.md)). With tree verification (`--draft-tree-nodes`), `tree_rounds` counts
 rounds that verified a tree, `tree_side_rounds` those whose accepted path left the main chain, and
 `tree_side_accepted_tokens` the drafts those paths accepted after leaving it, which a chain round
-would not have accepted; `drafted_tokens` counts every verified tree column. The `speculative.ngram_archive` object reports that archive at the end of the
+would not have accepted; `drafted_tokens` counts every verified tree column. With n-gram trees (`--ngram-tree-nodes`), `ngram_tree_rounds` counts the copy rounds that verified a tree of their copy sources, `ngram_tree_side_rounds` those whose accepted path left the main copy for another source, and `ngram_tree_side_accepted_tokens` the drafts accepted after leaving it; `ngram_drafted_tokens` counts every verified tree column. The `speculative.ngram_archive` object reports that archive at the end of the
 request: `enabled` when the server has one (`--ngram-archive-mib`), `bound` when the request was
 bound to a draft session, `published` when its input and output were published into it,
 `generation` as the session's latest completed generation, `sources` and `session_bytes` as the
@@ -2233,7 +2234,8 @@ entries, one per batch size, all zero for `auto`), `draft_tree_auto` and `draft_
 record `--draft-tree-nodes` and `--draft-tree-paths`; `draft_tree_auto` is the resolved value,
 false when the artifact cannot verify trees or `--draft-tokens auto`'s `adaptive-dflash` widths
 run. `ngram_draft_window` and `ngram_min_match` record `--ngram-draft-tokens` (`0` disables n-gram
-drafting; `auto` records the resolved window) and `--ngram-min-match`; `ngram_batch_draft_window`
+drafting; `auto` records the resolved window) and `--ngram-min-match`; `ngram_tree_nodes` records
+`--ngram-tree-nodes` (`0`: copies verify as chains); `ngram_batch_draft_window`
 is the most drafts a copy of a round of several requests holds (`0`: the window; `auto` may set
 it); `ngram_archive_bytes` and `ngram_session_bytes` are the draft-archive budgets
 from `--ngram-archive-mib` (`0` keeps drafting request-local) and `--ngram-session-mib`; and

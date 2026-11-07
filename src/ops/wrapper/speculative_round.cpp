@@ -188,6 +188,23 @@ void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& c
                                                       stream);
 }
 
+void speculative_one_hot_proposals(const Tensor& skip_rows, const Tensor& drafts, std::int32_t token_domain,
+                                   Tensor& candidates, Tensor& proposal_q, cudaStream_t stream) {
+    constexpr const char* op = "speculative_one_hot_proposals";
+    const std::int32_t k     = drafts.ne[0];
+    const std::int32_t batch = drafts.ne[1];
+    if (k < 1 || batch < 1 || batch > static_cast<std::int32_t>(kMaximumConcurrency) ||
+        token_domain <= kSparseSpeculativeCandidates) {
+        throw std::invalid_argument(
+            "speculative_one_hot_proposals: K must be >=1, B in [1,8] and the token domain above 16");
+    }
+    if (skip_rows.data != nullptr) { require_vector(skip_rows, DType::I32, batch, op, "skip_rows"); }
+    require_matrix(drafts, DType::I32, k, batch, op, "drafts");
+    require_tensor3(candidates, DType::I32, kSparseSpeculativeCandidates, k, batch, op, "candidates");
+    require_tensor3(proposal_q, DType::FP32, kSparseSpeculativeCandidates, k, batch, op, "proposal_q");
+    detail::speculative_one_hot_proposals_launch(skip_rows, drafts, token_domain, candidates, proposal_q, stream);
+}
+
 void speculative_sample_sparse_drafts(const Tensor& rows, const Tensor& logprobs, const std::int32_t* token_ids,
                                       const SamplingConfig* configs, const Tensor& positions, std::uint32_t draw,
                                       Tensor& drafts,

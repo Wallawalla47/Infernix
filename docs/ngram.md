@@ -33,7 +33,10 @@ This example is not a memory-sizing recommendation.
 | none (Qwen3.8-Flash-Next only) | — | 1..15 | 1..15 |
 
 Qwen3.8-Flash-Next verifies copy proposals without a neural drafter. Each verified column routes its
-own experts, so wide rounds pay off only at high acceptance (repeated code or text).
+own experts, so wide rounds pay off only at high acceptance (repeated code or text). A one-request
+round takes the copy's first drafts that maximize its expected tokens per round time, both measured
+online by width (EWMAs of the rounds' cycles), when they beat the drafter's round where a copy was
+available by 5 %; widths past the drafter's are captured as CUDA Graphs at their first use.
 
 ## Automatic window
 
@@ -118,6 +121,57 @@ quantization with the round it shares, and the error a shared 8-bit round leaves
 the KV and GDN state can flip a later greedy near-tie. Narrower multi-request rounds
 still cross those thresholds. Weight and KV formats and prefill are unchanged. This
 does not promise identical floating-point results between different widths.
+
+## N-gram trees
+
+A copy proposal follows one earlier occurrence of the text. When the text occurs several times
+with different continuations (two versions of a file, a function and its edited copy, repeated
+boilerplate), the copy is wrong wherever its occurrence differs from the one the model follows, and
+the round stops there. `--ngram-tree-nodes N` verifies the occurrences together: a round in which a
+request's copy sources continue differently within the tree's depth verifies one tree of at most N
+tokens, the best source as its main chain and every other source as a branch from where it leaves
+it, and the round continues along whichever source the model takes. The output distribution is
+unchanged (greedy requests emit the model's argmax continuation, sampled ones its distribution).
+
+```sh
+--spec dflash2 --draft-tokens auto --ngram-draft-tokens auto --ngram-tree-nodes 32
+```
+
+- A tree's main chain holds at most 15 drafts (and yields columns to the other sources, down to
+  three quarters of the tree), so a round with a tree verifies a shorter copy than the n-gram
+  window; rounds whose sources agree keep the full copy.
+- Qwen3.5/3.6 family: N is `4..32`, and with `--max-concurrency` above 1 at least a batched
+  round's neural draft tokens + 2 (requests of a batched round without a copy verify their neural
+  proposal in the tree's round; with `--draft-tokens auto`, the batch length), and the artifact's
+  GDN input projections must be single FP8, NVFP4 or Q8 tensors (as for `--draft-tree-nodes`).
+- Qwen3.8-Flash-Next: a one-request round verifies each root-to-leaf path of the tree as its own
+  row (at most 3, `--draft-tree-paths` capped), the rows together within a one-row round's 16
+  columns (two paths of up to 8, three of up to 5), and only when the tree beats the round's copy
+  by expected tokens per measured round time, so a tree costs about as many chains as it has
+  paths and is rare on an offloaded artifact; it needs a KV format other than `vq2`, `k4v2` and
+  `bf16p`.
+- A request whose tree rounds have not gained over its copies alone verifies them as chains (Qwen3.5
+  family; a tree every 8th eligible round, so a text whose sources start to differ is still seen).
+- Trees need adaptive speculation: startup refuses them with fixed speculation (`--reproducible`, or
+  a configuration without `adaptive-speculation`, such as the offloaded Qwen3.5-122B-A10B's), where
+  every round verifies the whole window. Grammar-constrained requests verify chains.
+
+Measured on an RTX 5090 (2026-11-07, greedy, INT8 KV): on the NVFP4 27B with
+`--draft-tokens auto --ngram-draft-tokens auto`, prompts that show a file in two versions and ask
+for one again decode 20.0 % faster with 32 nodes at one request (2.42 against 3.03 s) and 15.4 %
+with 16, and prompts with one source within 0.3 %. On Qwen3.8-Flash-Next FP4-Local beside its
+DFlash2 companion, copies at best match DFlash2's rounds on copied text, which DFlash2 already
+predicts well: with the measured-cost choice, copies cost +0.9 to +3.0 % decode time (of which
+about 1 % is the 16-column plan they need, even when no copy is taken) and trees no more than
+copies; in an agentic coding replay copies cost 1.7 % one-request output speed and copies with trees
+1.0 % (no tree formed); keep both off there. Beside Flash-Next's MTP drafter, copies gain (two
+versions -8 %).
+[Measurements](maintainer/tree-verification.md#n-gram-trees-1) has the details.
+
+The request log's `ngram_tree_rounds`, `ngram_tree_side_rounds` and
+`ngram_tree_side_accepted_tokens` count the tree rounds, those that took another source and the
+drafts accepted after leaving the main copy. The design is in
+[Tree verification](maintainer/tree-verification.md#n-gram-trees).
 
 ## Operation
 

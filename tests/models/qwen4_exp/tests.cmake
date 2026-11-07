@@ -189,6 +189,13 @@ infernix_add_test(infernix_qwen4_exp_speculative_sampling_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_speculative_sampling_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# N-gram trees (verify_paths): greedy copies of a two-version prompt verified as trees take the other source's
+# branch, and commit the chain arm's tokens up to a near-tie of the target.
+infernix_add_test(infernix_qwen4_exp_ngram_tree_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_tree_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_qwen4_exp_ngram_tree_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 infernix_add_test(infernix_qwen4_exp_decide_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_decide_real.cpp"
   LIBRARIES infernix_engine)

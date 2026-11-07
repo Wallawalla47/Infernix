@@ -296,6 +296,12 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << product::format_pretty_count(outcome.speculative.tree_side_accepted_tokens)
             << " side-branch drafts";
     }
+    if (outcome.speculative.ngram_tree_rounds != 0) {
+        out << " | ngram trees " << product::format_pretty_count(outcome.speculative.ngram_tree_rounds)
+            << " rounds, "
+            << product::format_pretty_count(outcome.speculative.ngram_tree_side_accepted_tokens)
+            << " other-source drafts";
+    }
     if (outcome.ngram_archive.enabled) {
         out << " | archive " << (outcome.ngram_archive.bound ? "bound" : "unbound");
         if (outcome.ngram_archive.bound) {
@@ -612,6 +618,10 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     if (product::draft_tree_enabled(engine.speculative)) {
         logger_->info("draft trees | {} | up to {} paths",
                       product::draft_tree_nodes_text(engine.speculative),
+                      engine.speculative.draft_tree_paths);
+    }
+    if (engine.speculative.ngram_tree_nodes != 0) {
+        logger_->info("ngram trees | {} tokens | up to {} paths", engine.speculative.ngram_tree_nodes,
                       engine.speculative.draft_tree_paths);
     }
 

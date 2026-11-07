@@ -842,12 +842,27 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                     k > static_cast<std::uint32_t>(frame.block_drafts.ne[0]))) {
             throw std::logic_error("an adaptive-dflash phase needs a neural round and its block");
         }
+        // An n-gram tree round's host-built tree rows and ancestor masks, read in the ingress.
+        const bool ngram_tree = state.ngram_tree;
+        if (ngram_tree && (!state.ngram || state.tree || width > ops::kSpeculativeTreeMaxNodes ||
+                           !frame.candidate_ids.data || !frame.proposal_q.data)) {
+            throw std::logic_error("an n-gram tree round needs an ngram round within a tree row and sparse planes");
+        }
+        Tensor ngram_tree_rows, ngram_tree_masks;
+        if (ngram_tree) {
+            auto* ingress    = static_cast<std::byte*>(frame.ingress.data);
+            ngram_tree_rows  = Tensor(ingress + offsetof(qwen3_5::DFlashDecodeIngress, ngram_tree_rows), DType::I32,
+                                      {ops::kSpeculativeTreeRowWords, batch_size});
+            ngram_tree_masks = Tensor(ingress + offsetof(qwen3_5::DFlashDecodeIngress, ngram_tree_masks),
+                                      DType::I32, {width, batch_size});
+        }
         // Verify uploads the controls again: the host wrote the round's extents, valid columns and
         // target positions for its chosen width after the proposal.
         if (forward || propose || verify) {
             const std::size_t ingress_bytes =
-                state.ngram ? sizeof(qwen3_5::DFlashDecodeIngress)
-                            : offsetof(qwen3_5::DFlashDecodeIngress, ngram_tokens);
+                ngram_tree    ? sizeof(qwen3_5::DFlashDecodeIngress)
+                : state.ngram ? offsetof(qwen3_5::DFlashDecodeIngress, ngram_tree_rows)
+                              : offsetof(qwen3_5::DFlashDecodeIngress, ngram_tokens);
             CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress, ingress_bytes,
                                        cudaMemcpyHostToDevice, state.execution.device.stream));
         }
@@ -984,8 +999,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 Tensor candidates;
                 Tensor proposal_q;
                 // DFlash keeps its deterministic-draft verifier and count publication contract.
-                // DFlash2 represents the same deterministic proposal as a one-hot sparse law.
-                if (state.execution.parameters.model.config().draft->dflash2.has_value()) {
+                // DFlash2 represents the same deterministic proposal as a one-hot sparse law, as
+                // every n-gram tree round does.
+                const bool dflash2 = state.execution.parameters.model.config().draft->dflash2.has_value();
+                if (dflash2 || ngram_tree) {
                     if (!frame.candidate_ids.data || !frame.proposal_q.data) {
                         throw std::logic_error("DFlash2 ngram requires a sparse acceptance frame");
                     }
@@ -1003,6 +1020,13 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 ops::speculative_overlay_copy_proposals(copy_rows, copy_drafts, copy_candidates,
                                                         copy_q, drafts, candidates, proposal_q,
                                                         state.execution.device.stream);
+                // DFlash's argmax drafts of rows without a copy take the one-hot law of a deterministic draft.
+                if (ngram_tree && !dflash2) {
+                    ops::speculative_one_hot_proposals(
+                        copy_rows, drafts,
+                        dimension(state.execution.parameters.model.resources().public_token_count), candidates,
+                        proposal_q, state.execution.device.stream);
+                }
             }
             // Constrained rounds build masks from the verified drafts, rows with and without a
             // copy alike; the Host reads them while the target model runs.
@@ -1018,9 +1042,9 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             } else {
                 state.drafts_ready.record(state.execution.device.stream);
             }
-            if (tree_round) {
+            if (tree_round || ngram_tree) {
                 ops::speculative_prepare_tree_verify_inputs(
-                    anchors, drafts, frontiers, frame.tree_rows.slice(1, 0, batch_size),
+                    anchors, drafts, frontiers, ngram_tree ? ngram_tree_rows : frame.tree_rows.slice(1, 0, batch_size),
                     verify_ids, target_positions, target_rope, state.execution.device.stream);
             } else {
                 ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents,
@@ -1042,8 +1066,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             const bool tree_round = state.tree;
             // DFlash's chain rounds keep their deterministic-draft verifier; its tree rounds carry
             // the tree's sparse laws, as every DFlash2 round does.
-            const bool sparse =
-                tree_round || state.execution.parameters.model.config().draft->dflash2.has_value();
+            const bool sparse = tree_round || ngram_tree ||
+                                state.execution.parameters.model.config().draft->dflash2.has_value();
             TargetVerifyFrameView verify_view{
                 .ids                     = verify_ids,
                 .cache_positions         = target_positions,
@@ -1072,8 +1096,12 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 .replay_records  = state.execution.replay_records,
                 .sampling        = frame.sampling,
                 .feature_sink    = &sink,
-                .tree_rows  = tree_round ? frame.tree_rows.slice(1, 0, batch_size) : Tensor{},
-                .tree_masks = tree_round ? frame.tree_masks.slice(1, 0, batch_size) : Tensor{},
+                .tree_rows  = tree_round   ? frame.tree_rows.slice(1, 0, batch_size)
+                              : ngram_tree ? ngram_tree_rows
+                                           : Tensor{},
+                .tree_masks = tree_round   ? frame.tree_masks.slice(1, 0, batch_size)
+                              : ngram_tree ? ngram_tree_masks
+                                           : Tensor{},
                 .accepted_path    = frame.accepted_path.slice(1, 0, batch_size),
                 .accepted_branch  = frame.accepted_branch.slice(0, 0, batch_size),
                 .active_lanes     = active_lanes,

@@ -23,6 +23,7 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
 #include "models/qwen3_5/program/ngram_proposer.h"
+#include "models/qwen3_5/program/ngram_tree.h"
 #include "models/qwen3_5/program/offload.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 #include "runtime/expert_offload/ram_monitor.h"
@@ -236,6 +237,10 @@ struct SequenceState {
 
 struct RequestControl {
     std::unique_ptr<NgramProposer> ngram;
+    // N-gram trees (decode.cpp, ngram_tree_wanted): the request's tree rounds' tokens over their copies' alone,
+    // and the eligible rounds it verified as chains since its gain fell below 1.
+    double ngram_tree_gain           = kNgramTreeGainPrior;
+    std::uint32_t ngram_tree_skipped = 0;
     std::shared_ptr<const NgramSnapshot> ngram_snapshot;
     std::uint64_t ngram_copy_source = 0;
     std::uint32_t ngram_copy_offset = 0;
@@ -521,6 +526,8 @@ public:
     // Rounds of several rows propose copies of at most this many drafts.
     const std::uint32_t ngram_batch_window;
     const std::uint32_t ngram_min_match;
+    // N-gram tree rounds' columns (--ngram-tree-nodes; the NgramTree family's width), 0 without them.
+    const std::uint32_t ngram_tree_nodes;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
@@ -848,6 +855,16 @@ public:
     // The drafts a round of batch_rows rows would propose neurally: the drafter's window, or
     // adaptive-dflash's batch length for several rows.
     [[nodiscard]] std::uint32_t ngram_copy_floor(std::uint32_t batch_rows) const noexcept;
+    // N-gram trees: the tree of a copy row's sources within `limits`, its round's copy `main` the main
+    // chain and every other source the row's index finds a branch where it continues differently; a chain
+    // (tree() false) when none does (docs/maintainer/tree-verification.md, "N-gram trees").
+    [[nodiscard]] NgramTree ngram_tree(std::uint32_t lane, const NgramProposer::Match& main,
+                                       NgramTreeLimits limits) const;
+    // The limits of a row's n-gram tree in a round of ngram_tree_nodes columns: its context room and its
+    // output budget (a tree may verify no more drafts than the row may still emit, less its bonus) bound
+    // its columns and its depth. A depth of 0 leaves the row on its chain.
+    [[nodiscard]] NgramTreeLimits ngram_tree_limits(std::uint32_t frontier,
+                                                    const runtime::RoundBudget& budget) const noexcept;
     // Moves the prepared prompt's ngram index and archive snapshot into an admitted request.
     static void take_ngram_index(RequestControl& request, const RequestBasePlanImpl& base);
     [[nodiscard]] runtime::BatchedGeneratedRound decode_ordinary_batch(

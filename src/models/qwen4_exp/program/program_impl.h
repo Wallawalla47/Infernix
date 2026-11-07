@@ -21,8 +21,10 @@
 #include "core/weight_view.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/ngram_proposer.h"
+#include "models/qwen3_5/program/ngram_tree.h"
 #include "models/qwen4_exp/execution/dflash2.h"
 #include "models/qwen4_exp/execution/forward.h"
+#include "models/qwen4_exp/program/ngram_tree_testing.h"
 #include "runtime/speculative/draft_length.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
@@ -267,6 +269,15 @@ struct SpecLayout {
                 accepted = 0, commit = 0, words = 0;
 };
 
+// I32/FP32 words of an n-gram tree round's acceptance (one row, N = the tree's most columns): the target
+// argmax [N], drafts [N - 1], candidates and FP32 laws [16, N - 1], the extent, round length and anchor, the
+// tree row (ops::SpeculativeTreeRow), then the outputs: licensed tokens [N], count, accepted drafts, accepted
+// path [N] and branch. Everything before `licensed` is uploaded per round, everything from it read back.
+struct TreeIo {
+    std::size_t target = 0, drafts = 0, candidates = 0, q = 0, extents = 0, lengths = 0, anchors = 0, row = 0,
+                licensed = 0, counts = 0, accepted = 0, path = 0, branch = 0, words = 0;
+};
+
 // I32 MTP drafter io: chain ids [B], cells [K, B], per draft step the cells' RoPE positions and
 // pooled-block starts [K][3][B] (axis-major per step), the draft rows' state slots and table rows
 // [B] each, the one-row round's FP32 cumulative threshold [1] (MtpCumulative),
@@ -311,6 +322,12 @@ struct DeviceLayout {
     // The widest rounds decode() forms (ProgramImpl::verify_rows / verify_columns / round_columns): the rows and
     // columns of its widest verification (0 without speculation), and every round's columns.
     std::int32_t verify_rows = 0, verify_columns = 0, round_columns = 0;
+    // N-gram trees (ProgramOptions::ngram_tree_nodes): the most paths (verification rows) and columns of a tree
+    // round, 0 without them; the rows a round's io holds (the lanes, or a tree round's paths); the side rows'
+    // copy-on-write KV pages and the tree's acceptance io (its gathered logits are workspace).
+    std::int32_t tree_paths = 0, tree_nodes = 0, io_rows = 0;
+    std::uint32_t tree_pages = 0;
+    TreeIo tree_io;
     bool mtp = false;
     std::uint32_t kv_pages = 0, kv_layers = 0;
     std::uint64_t record_stride = 0; // the largest expert record
@@ -444,6 +461,10 @@ struct ResumeStateImpl {
     MtpCumulative mtp_cumulative;
     runtime::speculative::DraftCalibration dflash_calibration; // DFlash2: acceptance by selector-probability decile
     std::array<double, 4> ngram_accept{}; // the n-gram copies' acceptance per match-length bucket
+    double drafter_tokens = 0.0, drafter_columns = 0.0, tree_gain = 0.0; // copy_choice / tree_score inputs
+    std::uint64_t drafter_rounds = 0;
+    double copyable_tokens = 0.0, copyable_columns = 0.0;
+    std::uint64_t copyable_rounds = 0;
     std::vector<ConstrainedDraw> constraint_trace;
     ExpertResidency::Stats cache_at_admission;
     std::uint64_t cpu_served_at_admission = 0;
@@ -519,6 +540,15 @@ public:
         // Conditional acceptance of an n-gram copy
         // position by the proposal's match length (kNgramBuckets).
         std::array<double, 4> ngram_accept{};
+        // The drafter's one-row rounds (copy_choice): EWMAs of their tokens and verified columns, over
+        // `drafter_rounds` rounds, and over the `copyable_rounds` of them in which a copy was available (text a
+        // copy covers is text the drafter predicts better than its average); and an n-gram tree round's tokens
+        // over its main chain's (tree_score).
+        double drafter_tokens = 0.0, drafter_columns = 0.0;
+        std::uint64_t drafter_rounds = 0;
+        double copyable_tokens = 0.0, copyable_columns = 0.0;
+        std::uint64_t copyable_rounds = 0;
+        double tree_gain = 0.0;
         LanePrefix prefix;
         // Prompt seeding (design §19.3.27): of the prompt's prefilled tokens counted, how many
         // routed to each (layer, expert); [layers][experts], allocated on first use.
@@ -575,6 +605,19 @@ public:
         d.dflash_k      = d.dflash2 ? static_cast<std::int32_t>(o.dflash2_draft_tokens) : 0;
         d.dflash2_config = config.dflash2;
         d.max_width     = 1 + std::max({static_cast<std::int32_t>(o.ngram_draft_tokens), d.mtp_k, d.dflash_k});
+        if (o.ngram_tree_nodes != 0 &&
+            (o.ngram_draft_tokens == 0 || o.ngram_tree_nodes < 4 || o.ngram_tree_nodes > 32 || o.ngram_tree_paths < 2 ||
+             o.ngram_tree_paths > kNgramTreeMaximumPaths)) {
+            throw std::invalid_argument("Qwen4Exp: n-gram trees need n-gram copies, 4..32 tokens and 2.." +
+                                        std::to_string(kNgramTreeMaximumPaths) + " paths");
+        }
+        // A tree round verifies one row's paths as rows whose columns together fit one row's widest round
+        // (verify_paths), so its records, logits and io need no more columns than a one-row round's.
+        d.tree_paths    = o.ngram_tree_nodes != 0 ? static_cast<std::int32_t>(o.ngram_tree_paths) : 0;
+        d.tree_nodes    = d.tree_paths != 0 ? static_cast<std::int32_t>(std::min<std::uint32_t>(o.ngram_tree_nodes,
+                                                                                               static_cast<std::uint32_t>(d.max_width)))
+                                            : 0;
+        d.io_rows       = std::max(d.lanes, d.tree_paths);
         d.columns       = std::max(d.chunk, d.lanes * d.max_width);
         d.pages_per_row = (dim(o.max_context) + kPagedKVPageSize - 1) / kPagedKVPageSize;
         const auto kv_tokens = o.kv_capacity_tokens != 0 ? o.kv_capacity_tokens : o.max_context * o.max_concurrency;
@@ -585,6 +628,10 @@ public:
         d.round_columns  = round_columns(o, d, lanes);
         // One copy-on-write page per lane, so a whole-extent resume always fits (design §19.3.1).
         if (o.prefix_cache) { d.kv_pages += static_cast<std::uint32_t>(lanes); }
+        // A tree round's side rows write their columns into copies of the row's last pages: two per side row (a
+        // round's max_width <= 16 columns span at most two 64-position pages).
+        d.tree_pages = d.tree_paths > 1 ? 2U * static_cast<std::uint32_t>(d.tree_paths - 1) : 0U;
+        d.kv_pages += d.tree_pages;
         const std::size_t width = c.residual_width(), di = c.qsa.index_head_dim, r = c.qsa.compress_ratio;
 
         // Recurrent state: one slot per lane; the PLE history; one QSA tail slab per attention
@@ -612,8 +659,10 @@ public:
         const prefix::KvPageGeometry kv_geometry = prefix::kv_page_geometry(c, o.kv_cache, d.mtp);
         LayoutBuilder kv_builder;
         d.pool   = plan_device_kv_page_pool(kv_builder, {.page_group_count = d.kv_pages, .geometry = kv_geometry.geometry});
+        // Side rows of a tree round map through table rows of their own after the lanes'.
         d.tables = plan_kv_execution_tables(
-            kv_builder, {.logical_page_capacity = static_cast<std::uint32_t>(d.pages_per_row), .table_rows = lanes});
+            kv_builder, {.logical_page_capacity = static_cast<std::uint32_t>(d.pages_per_row),
+                         .table_rows            = lanes + std::max(0, d.tree_paths - 1)});
         d.kv = kv_builder.finish(256);
         // Pages [0, n) are a prefix of each page-major plane, so growth maps whole chunks at each plane's end.
         d.kv_elastic = d.pool.spec.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor;
@@ -628,9 +677,10 @@ public:
         d.io.positions      = align(d.io.ids + 4ULL * columns);
         d.io.rope           = align(d.io.positions + 4ULL * columns);
         d.io.block_rope     = align(d.io.rope + 12ULL * columns);
-        d.io.slots          = align(d.io.block_rope + 12ULL * lanes);
-        d.io.rows           = align(d.io.slots + 4ULL * lanes);
-        d.io.columns        = align(d.io.rows + 4ULL * lanes);
+        const auto io_rows  = static_cast<std::size_t>(d.io_rows);
+        d.io.slots          = align(d.io.block_rope + 12ULL * io_rows);
+        d.io.rows           = align(d.io.slots + 4ULL * io_rows);
+        d.io.columns        = align(d.io.rows + 4ULL * io_rows);
         d.io.gate           = align(d.io.columns + 4ULL * columns);
         d.io.divisor        = d.io.gate + 4; // I32: plain decode's one-column CPU divisor this round
         d.io.ngram          = align(d.io.divisor + 4);
@@ -641,7 +691,7 @@ public:
         d.io.vision_columns     = align(d.io.mtp_block_rope + 12ULL * mtp_subchunks);
         d.io.mtp_vision_columns = align(d.io.vision_columns + 4ULL * columns);
         d.io.bytes              = align(d.io.mtp_vision_columns + 4ULL * (columns + 1));
-        if (d.io.block_rope + 12ULL * lanes > d.io.ngram || d.io.columns + 4ULL * columns > d.io.ngram) {
+        if (d.io.block_rope + 12ULL * io_rows > d.io.ngram || d.io.columns + 4ULL * columns > d.io.ngram) {
             throw std::logic_error("Qwen4Exp: decode io must precede the n-gram rows");
         }
         // The head's FP32 logits, which the sampler, verification, constraints and the prompt readout read; with
@@ -698,6 +748,29 @@ public:
             d.spec.accepted = take(lanes);
             d.spec.commit   = take(lanes);
             d.spec.words    = at;
+        }
+        if (d.tree_paths != 0) {
+            const auto N   = static_cast<std::size_t>(d.tree_nodes);
+            const auto C   = static_cast<std::size_t>(ops::kSparseSpeculativeCandidates);
+            auto take_tree = [at = std::size_t{0}](std::size_t words) mutable {
+                const std::size_t begin = at;
+                at += (words + 63) / 64 * 64;
+                return begin;
+            };
+            d.tree_io.target     = take_tree(N);
+            d.tree_io.drafts     = take_tree(N - 1);
+            d.tree_io.candidates = take_tree(C * (N - 1));
+            d.tree_io.q          = take_tree(C * (N - 1));
+            d.tree_io.extents    = take_tree(1);
+            d.tree_io.lengths    = take_tree(1);
+            d.tree_io.anchors    = take_tree(1);
+            d.tree_io.row        = take_tree(static_cast<std::size_t>(ops::kSpeculativeTreeRowWords));
+            d.tree_io.licensed   = take_tree(N);
+            d.tree_io.counts     = take_tree(1);
+            d.tree_io.accepted   = take_tree(1);
+            d.tree_io.path       = take_tree(N);
+            d.tree_io.branch     = take_tree(1);
+            d.tree_io.words      = take_tree(0);
         }
 
         // The MTP drafter (design 11.2): residual columns, the saved and chain columns, its QSA
@@ -810,7 +883,7 @@ public:
         b.state     = d.gdn_bytes + d.ple + d.tails + d.window + d.records_bytes + d.ple_records + d.qsa_records +
                   (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0) + d.dflash_features +
                   d.dflash_ring + d.drafter_pool;
-        b.io = d.io.bytes + d.logits32 + d.logits16 + 4ULL * lanes + 4ULL * lanes +
+        b.io = d.io.bytes + d.logits32 + d.logits16 + 4ULL * d.tree_io.words + 4ULL * lanes + 4ULL * lanes +
                sizeof(ops::SamplingConfig) * lanes + d.token_counts + 4ULL * d.spec.words + d.mtp_ones +
                4ULL * d.mtp_io.words + 4ULL * d.dflash_io.words + kGateStatsBytes * lanes +
                (o.ngram_table && o.ngram_table->fp8_scale ? sizeof(std::uint16_t) : 0) +
@@ -950,6 +1023,13 @@ public:
                                               d.token_domain, ops::SpeculativeAcceptExecutionEnvelope{}, 1, W - 1, 1,
                                               rows));
             }
+            // An n-gram tree round's gathered logits [vocab, tree_nodes] beside its acceptance (verify_paths).
+            if (d.tree_paths != 0) {
+                const std::size_t gathered = (o.bf16_logits ? 2ULL : 4ULL) * static_cast<std::size_t>(c.vocab_size) *
+                                             static_cast<std::size_t>(d.tree_nodes);
+                accept = std::max(accept, align(gathered) + ops::speculative_accept_sparse_tree_workspace_capacity_bytes(
+                                                                d.token_domain, d.tree_nodes, 1, 1));
+            }
             bytes += accept;
         }
         if (d.mtp) {
@@ -1074,12 +1154,26 @@ public:
         pool_   = std::make_unique<DeviceKVPagePool>(kv_span_, plan_.pool);
         tables_ = std::make_unique<KVExecutionTablePool>(kv_span_, plan_.tables, *pool_);
         if (plan_.kv_elastic) { pool_->set_backed_pages(plan_.kv_base_pages); }
+        // N-gram trees: each side row's table row and copy-on-write pages, held for the Program's life (the lowest
+        // pages, inside an elastic pool's base).
+        if (plan_.tree_paths > 1) {
+            for (std::int32_t r = 1; r < plan_.tree_paths; ++r) { tree_rows_.push_back(tables_->acquire(lanes + r - 1)); }
+            std::optional<DeviceKVPageReservation> reservation = pool_->reserve(plan_.tree_pages);
+            if (!reservation) { throw std::runtime_error("Qwen4Exp: the KV pool holds no n-gram tree pages"); }
+            tree_reservation_ = std::move(*reservation);
+            tree_pages_.reserve(plan_.tree_pages);
+            pool_->materialize(tree_reservation_, plan_.tree_pages, tree_pages_);
+        }
 
         io_layout_ = plan_.io;
         allocate(io_device_, io_layout_.bytes, allocated);
         io_host_ = PinnedHostBuffer(io_layout_.bytes);
         allocate(logits32_, plan_.logits32, allocated);
         allocate(logits16_, plan_.logits16, allocated);
+        if (plan_.tree_paths != 0) {
+            allocate(tree_device_, 4ULL * plan_.tree_io.words, allocated);
+            tree_host_ = PinnedHostBuffer(4ULL * plan_.tree_io.words);
+        }
         allocate(sampled_, 4ULL * lanes, allocated);
         allocate(sample_pos_, 4ULL * lanes, allocated);
         allocate(configs_, sizeof(ops::SamplingConfig) * lanes, allocated);
@@ -1822,6 +1916,14 @@ public:
         lane.mtp_cumulative.reset();
         lane.dflash_calibration = dflash_process_calibration_;
         lane.ngram_accept       = kNgramAcceptancePriors;
+        // A new request's drafter rounds start from the process's (copy_choice), its tree gain from the prior.
+        lane.drafter_tokens     = process_drafter_tokens_;
+        lane.drafter_columns    = process_drafter_columns_;
+        lane.drafter_rounds     = process_drafter_rounds_ > 0 ? 1U : 0U;
+        lane.copyable_tokens    = process_copyable_tokens_;
+        lane.copyable_columns   = process_copyable_columns_;
+        lane.copyable_rounds    = process_copyable_rounds_ > 0 ? 1U : 0U;
+        lane.tree_gain          = kTreeGainPrior;
         if (max_width_ > 1) {
             if (options_.ngram_draft_tokens > 0) {
                 lane.proposer =
@@ -1897,6 +1999,13 @@ public:
         r.mtp_cumulative          = lane.mtp_cumulative;
         r.dflash_calibration      = lane.dflash_calibration;
         r.ngram_accept            = lane.ngram_accept;
+        r.drafter_tokens          = lane.drafter_tokens;
+        r.drafter_columns         = lane.drafter_columns;
+        r.drafter_rounds          = lane.drafter_rounds;
+        r.copyable_tokens         = lane.copyable_tokens;
+        r.copyable_columns        = lane.copyable_columns;
+        r.copyable_rounds         = lane.copyable_rounds;
+        r.tree_gain               = lane.tree_gain;
         r.constraint_trace        = lane.constraint_trace;
         r.cache_at_admission      = lane.cache_at_admission;
         r.cpu_served_at_admission = lane.cpu_served_at_admission;
@@ -1916,6 +2025,13 @@ public:
         lane.mtp_cumulative          = r.mtp_cumulative;
         lane.dflash_calibration      = r.dflash_calibration;
         lane.ngram_accept            = r.ngram_accept;
+        lane.drafter_tokens          = r.drafter_tokens;
+        lane.drafter_columns         = r.drafter_columns;
+        lane.drafter_rounds          = r.drafter_rounds;
+        lane.copyable_tokens         = r.copyable_tokens;
+        lane.copyable_columns        = r.copyable_columns;
+        lane.copyable_rounds         = r.copyable_rounds;
+        lane.tree_gain               = r.tree_gain;
         lane.constraint_trace        = r.constraint_trace;
         lane.cache_at_admission      = r.cache_at_admission;
         lane.cpu_served_at_admission = r.cpu_served_at_admission;
@@ -2561,7 +2677,8 @@ public:
         for (std::int32_t b = 0; b < batch && max_width_ > 1; ++b) {
             Lane& lane = lanes_[lanes[b]];
             drafts_[b].clear();
-            from_ngram_[b] = false;
+            from_ngram_[b]     = false;
+            copy_available_[b] = false;
             const std::uint32_t remaining =
                 static_cast<std::size_t>(b) < budgets.size() ? budgets[b].generated_tokens_remaining : 0U;
             if (remaining < 2) { continue; }
@@ -2573,26 +2690,16 @@ public:
             ngram_bucket_[b] = -1;
             if (speculate && lane.proposer) {
                 auto match = lane.proposer->propose(lane.history, limit, options_.ngram_min_match);
-                const int bucket = ngram_bucket(match.matched);
-                // A longer copy proposal replaces the row's MTP drafts; a one-row round takes it only when
-                // its expected tokens per round time (its bucket's learned acceptance per position) beat the
-                // MTP drafts' (Strata's DraftPolicy).
+                const int bucket   = ngram_bucket(match.matched);
+                copy_available_[b] = !match.tokens.empty();
+                // A longer copy proposal replaces a pair round's drafts. A one-row round takes the copy's first
+                // drafts that maximize its expected tokens per measured round time (its bucket's learned
+                // acceptance per position), when they beat the drafter's round (copy_choice).
                 bool take = match.tokens.size() > static_cast<std::size_t>(extents[b]);
-                if (take && batch == 1) {
-                    const double cost = width_cost();
-                    double reach = 1.0, mtp_tokens = 1.0;
-                    for (std::int32_t k = 0; k < extents[b]; ++k) {
-                        reach *= lane.mtp_accept[static_cast<std::size_t>(k)];
-                        mtp_tokens += reach;
-                    }
-                    const double p = lane.ngram_accept[static_cast<std::size_t>(bucket)];
-                    double copy_reach = 1.0, copy_tokens = 1.0;
-                    for (std::size_t k = 0; k < match.tokens.size(); ++k) {
-                        copy_reach *= p;
-                        copy_tokens += copy_reach;
-                    }
-                    take = copy_tokens / (1.0 + cost * static_cast<double>(match.tokens.size())) >
-                           mtp_tokens / (1.0 + cost * extents[b]);
+                if (batch == 1) {
+                    const std::int32_t copy = copy_choice(lane, bucket, match.tokens.size(), extents[b]);
+                    take = copy > 0;
+                    if (take) { match.tokens.resize(static_cast<std::size_t>(copy)); }
                 }
                 if (take) {
                     drafts_[b]       = std::move(match.tokens);
@@ -2684,6 +2791,19 @@ public:
                 for (std::int32_t b = 0; b < batch; ++b) { neural = neural || (!from_ngram_[b] && extents[b] > 0); }
             }
             dflash_round_ = neural && width > 1;
+        }
+        // N-gram trees: a one-row copy round whose sources continue differently verifies their tree when it beats
+        // the copy by expected tokens per measured round time (never a grammar's or a constraint's row: their
+        // masks follow one chain).
+        if (width > 1 && batch == 1 && from_ngram_[0] && plan_.tree_paths > 1 &&
+            (grammar_ == nullptr || !grammar_->constrained(0)) && lanes_[lanes[0]].constraint == nullptr) {
+            const qwen3_5::detail::NgramTree tree = ngram_tree_for(lanes[0], budgets[0]);
+            if (tree.tree()) { return verify_paths(sequences, lanes[0], positions[0], tree, start); }
+        }
+        // The round's kind and columns, whose cycle the next one-row round measures (copy_choice).
+        if (batch == 1) {
+            last_kind_    = from_ngram_[0] ? CycleKind::Copy : width > 1 ? CycleKind::Drafter : CycleKind::Plain;
+            last_columns_ = width;
         }
         if (width > 1) {
             return verify(sequences, std::span<const std::uint32_t>(lanes.data(), batch),
@@ -5477,6 +5597,9 @@ private:
             stats.drafted_tokens += n;
             stats.accepted_tokens += static_cast<std::uint64_t>(A);
             if (!from_ngram_[b]) {
+                // A one-row drafter round's tokens and columns, which a copy proposal is chosen against
+                // (copy_choice).
+                if (batch == 1) { observe_drafter_round(lane, static_cast<double>(A + 1), W, copy_available_[b]); }
                 // Positions 1..A were accepted; position A + 1 (when drafted) was the first rejected.
                 for (std::uint64_t j = 0; j < n && j <= static_cast<std::uint64_t>(A); ++j) {
                     const double hit = j < static_cast<std::uint64_t>(A) ? 1.0 : 0.0;
@@ -5844,6 +5967,12 @@ private:
     // At a decode round's start: the previous round's cycle when both are one-row MTP rounds (an
     // n-gram round's width does not follow its drafter steps: not sampled).
     void observe_round(Clock::time_point start, std::int32_t batch) {
+        // The previous one-row round's cycle by its kind and columns (copy_choice).
+        if (last_kind_ != CycleKind::None && batch == 1) {
+            record_cycle(last_kind_, last_columns_, std::chrono::duration<double>(start - last_round_start_).count());
+        }
+        last_kind_    = CycleKind::None;
+        last_columns_ = 0;
         if (last_round_steps_ >= 0 && batch == 1) {
             const double seconds = std::chrono::duration<double>(start - last_round_start_).count();
             RoundCostFit& f      = round_cost_;
@@ -5861,6 +5990,215 @@ private:
         }
         last_round_start_ = start;
         last_round_steps_ = -1; // set by the round once its drafts are known
+    }
+
+    // Copy and tree rounds by measured round time (design 11.3): one-row rounds' start-to-start cycles by
+    // kind and verified columns, EWMAs of kTimeWeight. The width model's flat cost a column (kWidthCost) does
+    // not hold past the narrow expert kernels: on FP4-Local (2026-11-07) an 8-column DFlash2 round took about
+    // 30 ms and a 16-column copy round about 81 ms, where the model charged 51 ms, so 15-draft copies were
+    // taken that lost to DFlash2's rounds (+25 % decode time on copy-heavy prompts).
+    enum class CycleKind : std::uint8_t { Plain = 0, Drafter = 1, Copy = 2, Tree = 3, None = 4 };
+    static constexpr std::size_t kCycleColumns       = 33;
+    static constexpr double kTimeWeight              = 0.1;
+    static constexpr std::uint32_t kTimeSamples      = 3;
+    static constexpr double kFirstCycleSeconds       = 0.5; // before any measurement, a longer cycle is a gap
+    static constexpr double kTreeRoundSurcharge      = 0.2; // a tree round's eager verify, page copies and gather
+    static constexpr double kTreeGainPrior           = 1.1; // a tree's tokens over its main chain's, before rounds
+    struct CycleTimes {
+        std::array<double, kCycleColumns> seconds{};
+        std::array<std::uint32_t, kCycleColumns> samples{};
+    };
+    std::array<CycleTimes, 5> cycle_times_{};
+    CycleKind last_kind_       = CycleKind::None; // the round's kind and columns, when it is a one-row round
+    std::int32_t last_columns_ = 0;
+    std::uint64_t copy_policy_rounds_ = 0;
+    // Every lane's drafter rounds, and those with a copy available (a new request's starting point, copy_choice).
+    double process_drafter_tokens_ = 0.0, process_drafter_columns_ = 0.0;
+    std::uint64_t process_drafter_rounds_ = 0;
+    double process_copyable_tokens_ = 0.0, process_copyable_columns_ = 0.0;
+    std::uint64_t process_copyable_rounds_ = 0;
+    // A copy must beat the drafter's round by this share of its expected tokens per cycle (the estimates' noise).
+    static constexpr double kCopyMargin = 0.05;
+
+    [[nodiscard]] static double width_model(std::int32_t columns) noexcept {
+        return 1.0 + kWidthCost * static_cast<double>(columns - 1);
+    }
+    [[nodiscard]] bool cycle_measured(CycleKind kind, std::int32_t columns) const noexcept {
+        return columns > 0 && static_cast<std::size_t>(columns) < kCycleColumns &&
+               cycle_times_[static_cast<std::size_t>(kind)].samples[static_cast<std::size_t>(columns)] >= kTimeSamples;
+    }
+    [[nodiscard]] double cycle_at(CycleKind kind, std::int32_t columns) const noexcept {
+        return cycle_times_[static_cast<std::size_t>(kind)].seconds[static_cast<std::size_t>(columns)];
+    }
+    // The kinds whose measurements stand in for `kind`'s, nearest first.
+    [[nodiscard]] static std::array<CycleKind, 4> cycle_stand_ins(CycleKind kind) noexcept {
+        switch (kind) {
+        case CycleKind::Tree: return {CycleKind::Copy, CycleKind::Drafter, CycleKind::Plain, CycleKind::None};
+        case CycleKind::Copy: return {CycleKind::Drafter, CycleKind::Tree, CycleKind::Plain, CycleKind::None};
+        case CycleKind::Drafter: return {CycleKind::Copy, CycleKind::Plain, CycleKind::Tree, CycleKind::None};
+        default: return {CycleKind::Drafter, CycleKind::Copy, CycleKind::Tree, CycleKind::None};
+        }
+    }
+    // The estimated cycle (seconds) of a one-row round of `kind` and `columns`: its measurement; else between its
+    // kind's nearest measured columns (linear); else a stand-in kind's measurement at these columns; else its
+    // kind's, then a stand-in's, nearest measurement scaled by the width model; else the width model alone, in
+    // its units (then nothing is measured, so every estimate is in them). A tree from another kind's adds
+    // kTreeRoundSurcharge.
+    [[nodiscard]] double cycle_seconds(CycleKind kind, std::int32_t columns) const noexcept {
+        columns = std::clamp<std::int32_t>(columns, 1, static_cast<std::int32_t>(kCycleColumns) - 1);
+        const double surcharge = kind == CycleKind::Tree ? 1.0 + kTreeRoundSurcharge : 1.0;
+        if (cycle_measured(kind, columns)) { return cycle_at(kind, columns); }
+        const auto nearest = [&](CycleKind k, std::int32_t& below, std::int32_t& above) {
+            below = above = 0;
+            for (std::int32_t c = 1; c < static_cast<std::int32_t>(kCycleColumns); ++c) {
+                if (!cycle_measured(k, c)) { continue; }
+                if (c <= columns) { below = c; }
+                if (c >= columns && above == 0) { above = c; }
+            }
+        };
+        std::int32_t below = 0, above = 0;
+        nearest(kind, below, above);
+        if (below > 0 && above > 0) {
+            const double t = static_cast<double>(columns - below) / static_cast<double>(above - below);
+            return (1.0 - t) * cycle_at(kind, below) + t * cycle_at(kind, above);
+        }
+        const auto stand_ins = cycle_stand_ins(kind);
+        for (const CycleKind k : stand_ins) {
+            if (k != CycleKind::None && cycle_measured(k, columns)) { return cycle_at(k, columns) * surcharge; }
+        }
+        // Past a kind's widest measurement, its cycle grows by the steeper of its two widest measurements' slope and
+        // the width model's (wider rounds leave the narrow expert kernels); below its narrowest, by the model.
+        const auto scaled = [&](CycleKind k, std::int32_t at) {
+            const double model = cycle_at(k, at) * width_model(columns) / width_model(at);
+            if (columns <= at) { return model; }
+            std::int32_t lower = 0;
+            for (std::int32_t c = at - 1; c >= 1 && lower == 0; --c) {
+                if (cycle_measured(k, c)) { lower = c; }
+            }
+            if (lower == 0) { return model; }
+            const double slope = (cycle_at(k, at) - cycle_at(k, lower)) / static_cast<double>(at - lower);
+            return std::max(model, cycle_at(k, at) + slope * static_cast<double>(columns - at));
+        };
+        if (below > 0 || above > 0) { return scaled(kind, below > 0 ? below : above); }
+        for (const CycleKind k : stand_ins) {
+            if (k == CycleKind::None) { continue; }
+            nearest(k, below, above);
+            if (below > 0 || above > 0) { return scaled(k, below > 0 ? below : above) * surcharge; }
+        }
+        return width_model(columns) * surcharge;
+    }
+    [[nodiscard]] bool any_cycle_measured() const noexcept {
+        for (const CycleTimes& t : cycle_times_) {
+            for (const std::uint32_t n : t.samples) {
+                if (n >= kTimeSamples) { return true; }
+            }
+        }
+        return false;
+    }
+    void record_cycle(CycleKind kind, std::int32_t columns, double seconds) {
+        if (kind == CycleKind::None || columns < 1 || static_cast<std::size_t>(columns) >= kCycleColumns) { return; }
+        // A cycle that held an idle gap or another call (a prefill chunk, an admission) is not a round's.
+        if (any_cycle_measured() ? seconds > kCostGapRatio * cycle_seconds(kind, columns) : seconds > kFirstCycleSeconds) {
+            return;
+        }
+        CycleTimes& t = cycle_times_[static_cast<std::size_t>(kind)];
+        auto& mean    = t.seconds[static_cast<std::size_t>(columns)];
+        auto& n       = t.samples[static_cast<std::size_t>(columns)];
+        mean          = n == 0 ? seconds : (1.0 - kTimeWeight) * mean + kTimeWeight * seconds;
+        n             = std::min<std::uint32_t>(n + 1U, 1U << 30);
+    }
+    // A one-row drafter round's tokens and columns; `copyable` when a copy was available (the drafter ran by the
+    // policy's choice or its probe).
+    void observe_drafter_round(Lane& lane, double tokens, std::int32_t columns, bool copyable) {
+        const auto ewma = [](double& mean, double x, std::uint64_t n) { mean = n == 0 ? x : (1.0 - kAcceptanceWeight) * mean + kAcceptanceWeight * x; };
+        const auto width = static_cast<double>(columns);
+        ewma(lane.drafter_tokens, tokens, lane.drafter_rounds);
+        ewma(lane.drafter_columns, width, lane.drafter_rounds);
+        ++lane.drafter_rounds;
+        ewma(process_drafter_tokens_, tokens, process_drafter_rounds_);
+        ewma(process_drafter_columns_, width, process_drafter_rounds_);
+        ++process_drafter_rounds_;
+        if (copyable) {
+            ewma(lane.copyable_tokens, tokens, lane.copyable_rounds);
+            ewma(lane.copyable_columns, width, lane.copyable_rounds);
+            ++lane.copyable_rounds;
+            ewma(process_copyable_tokens_, tokens, process_copyable_rounds_);
+            ewma(process_copyable_columns_, width, process_copyable_rounds_);
+            ++process_copyable_rounds_;
+        }
+    }
+    // A copy of `drafts` drafts at acceptance p per position: its expected tokens (the bonus included).
+    [[nodiscard]] static double copy_tokens(double p, std::int32_t drafts) noexcept {
+        double reach = 1.0, tokens = 1.0;
+        for (std::int32_t k = 0; k < drafts; ++k) {
+            reach *= p;
+            tokens += reach;
+        }
+        return tokens;
+    }
+    // A one-row round's copy against its alternative, by expected tokens per estimated cycle: the copy's first e
+    // drafts (e in 1..available) at its match bucket's acceptance per position, against the drafter's round (its
+    // tokens and columns as its rounds measured them; before any, its per-position acceptance over
+    // `drafter_extent` drafts) or, without a drafter, a plain round. Every kProbeInterval-th copy verifies one draft
+    // more than its choice, so the next width's cycle is measured. Returns the drafts to copy, 0 for none.
+    std::int32_t copy_choice(const Lane& lane, int bucket, std::size_t available, std::int32_t drafter_extent) {
+        if (available == 0 || bucket < 0) { return 0; }
+        // The tree real test's coverage (ngram_tree_testing.h): every copy longer than the drafter's drafts, to a
+        // two-path tree's depth, so a divergence falls inside some round's tree.
+        if (testing::ngram_policy_override()) {
+            const auto depth = static_cast<std::size_t>(std::max(1, max_width_ / 2 - 1));
+            return available > static_cast<std::size_t>(drafter_extent)
+                       ? static_cast<std::int32_t>(std::min(available, depth))
+                       : 0;
+        }
+        double alternative = 1.0 / cycle_seconds(CycleKind::Plain, 1);
+        if (drafter_extent > 0) {
+            double tokens = 0.0;
+            std::int32_t columns = 1;
+            // The drafter where a copy is available (its rounds there), else everywhere, else its acceptance model.
+            if (lane.copyable_rounds > 0 || lane.drafter_rounds > 0) {
+                const bool copyable = lane.copyable_rounds > 0;
+                tokens  = copyable ? lane.copyable_tokens : lane.drafter_tokens;
+                columns = std::clamp<std::int32_t>(
+                    static_cast<std::int32_t>(std::lround(copyable ? lane.copyable_columns : lane.drafter_columns)), 1,
+                    max_width_);
+            } else {
+                double reach = 1.0;
+                tokens       = 1.0;
+                for (std::int32_t k = 0; k < drafter_extent; ++k) {
+                    reach *= lane.mtp_accept[static_cast<std::size_t>(k)];
+                    tokens += reach;
+                }
+                columns = 1 + drafter_extent;
+            }
+            alternative = tokens / cycle_seconds(CycleKind::Drafter, columns);
+        }
+        const double p = lane.ngram_accept[static_cast<std::size_t>(bucket)];
+        double best      = 0.0;
+        std::int32_t pick = 0;
+        const auto most  = static_cast<std::int32_t>(std::min<std::size_t>(available, static_cast<std::size_t>(max_width_ - 1)));
+        for (std::int32_t e = 1; e <= most; ++e) {
+            const double score = copy_tokens(p, e) / cycle_seconds(CycleKind::Copy, 1 + e);
+            if (score > best) {
+                best = score;
+                pick = e;
+            }
+        }
+        if (pick == 0 || best <= alternative * (1.0 + kCopyMargin)) { return 0; }
+        // Probes, kProbeInterval rounds apart each: the drafter's round where a copy is available (its estimate
+        // there stays current), and one draft more than the choice (the next width's cycle is measured).
+        const std::uint64_t round = ++copy_policy_rounds_;
+        if (drafter_extent > 0 && round % kProbeInterval == 0) { return 0; }
+        if (round % kProbeInterval == kProbeInterval / 2) { pick = std::min(pick + 1, most); }
+        return pick;
+    }
+    // An n-gram tree round's expected tokens per estimated cycle: its main chain's copy tokens times the lane's
+    // learned tree gain, over a tree round of its rows' columns (rows x its longest path).
+    [[nodiscard]] double tree_score(const Lane& lane, const qwen3_5::detail::NgramTree& tree, int bucket) const {
+        std::int32_t W = 0;
+        for (std::int32_t r = 0; r < tree.row.paths; ++r) { W = std::max<std::int32_t>(W, tree.row.path_length[r]); }
+        const double p = bucket >= 0 ? lane.ngram_accept[static_cast<std::size_t>(bucket)] : 0.0;
+        return lane.tree_gain * copy_tokens(p, tree.row.main_depth) / cycle_seconds(CycleKind::Tree, tree.row.paths * W);
     }
 
     // Two-row rounds (design 19.3.5): the K in [0, kPairMaxDrafts] that maximizes both rows' expected
@@ -6805,6 +7143,13 @@ private:
     prefix::KvPageGeometry kv_geometry_;
     std::unique_ptr<DeviceKVPagePool> pool_;
     std::unique_ptr<KVExecutionTablePool> tables_;
+    // N-gram trees (verify_paths): the side rows' table rows, their copy-on-write pages (two a side row, in row
+    // order) and the reservation they came from, and a tree's acceptance io.
+    std::vector<KVExecutionRowLease> tree_rows_;
+    DeviceKVPageReservation tree_reservation_;
+    std::vector<DeviceKVPageLease> tree_pages_;
+    DeviceBuffer tree_device_;
+    PinnedHostBuffer tree_host_{1};
     std::size_t work_capacity_ = 0;
     std::unique_ptr<WorkspaceArena> work_;
     // SSD tier mode (design §19.3.7): the fetch channel and the tier outlive everything that reads
@@ -7071,6 +7416,7 @@ private:
     std::array<std::vector<std::int32_t>, kMaximumConcurrency> mtp_drafts_;
     std::array<std::int32_t, kMaximumConcurrency> mtp_confident_{}; // per row: drafts kept by the cumulative cut
     std::array<bool, kMaximumConcurrency> from_ngram_{};
+    std::array<bool, kMaximumConcurrency> copy_available_{}; // per row: the round's proposer found a copy
     // Copy proposals are chosen against the MTP drafts by expected tokens per round time, their
     // acceptance learned per match-length bucket (4-7, 8-11, 12-15, 16+ tokens; Strata's priors).
     // IQ3_S import, 4K + 512 tokens, MTP 4 and 7 n-gram drafts: 190.2 -> 194.2 tok/s (2026-10-15).
@@ -7182,6 +7528,17 @@ private:
     // One proposal of dflash_k_ drafts for every row of a decode round (the rows' drafts land in
     // dflash_drafts_, their candidates and laws in the io); `while_drafting` runs on the host after
     // it is submitted, before its wait.
+    // N-gram trees (ngram_tree_program.cpp). The tree of a one-row copy round's sources (drafts_[0] the copy) within
+    // the row's budget, a chain (tree() false) when no other source continues differently.
+    [[nodiscard]] qwen3_5::detail::NgramTree ngram_tree_for(std::uint32_t index, const runtime::RoundBudget& budget) const;
+    // A tree round of lane `index` at `position`: each root-to-leaf path a verification row over the lane's state
+    // (side rows writing copy-on-write pages), tree acceptance over the gathered columns, then the accepted path's
+    // row as row 0 of a one-row round of the round's width (promote_path_row), committed by commit_verified.
+    PendingBatch verify_paths(std::span<const SequenceHandle> sequences, std::uint32_t index, std::int32_t position,
+                              const qwen3_5::detail::NgramTree& tree, Clock::time_point start);
+    // Row `row` of a `rows`-row verification of width W as row 0 of a one-row round: its GDN, PLE and QSA records
+    // and the drafter's inputs (QSA records re-laid for one row even when row is 0).
+    void promote_path_row(std::int32_t row, std::int32_t rows, std::int32_t W);
     void dflash2_propose(std::span<const std::uint32_t> lanes, const std::function<void()>& while_drafting);
     // dflash2_propose's call over `batch` rows of the staged io (the proposal graph's body and the startup capture's).
     [[nodiscard]] execution::DFlash2ProposalCall dflash2_proposal_call(std::int32_t batch);

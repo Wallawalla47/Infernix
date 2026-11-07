@@ -235,6 +235,9 @@ SpeculativeStats aggregate_speculative(const TestResult& result) {
         out.tree_rounds += in.tree_rounds;
         out.tree_side_rounds += in.tree_side_rounds;
         out.tree_side_accepted_tokens += in.tree_side_accepted_tokens;
+        out.ngram_tree_rounds += in.ngram_tree_rounds;
+        out.ngram_tree_side_rounds += in.ngram_tree_side_rounds;
+        out.ngram_tree_side_accepted_tokens += in.ngram_tree_side_accepted_tokens;
         if (out.accepted_per_position.size() < in.accepted_per_position.size()) {
             out.accepted_per_position.resize(in.accepted_per_position.size());
         }
@@ -307,6 +310,9 @@ void append_speculative_json(std::ostringstream& out, const SpeculativeStats& st
         << indent << "  \"tree_rounds\": " << stats.tree_rounds << ",\n"
         << indent << "  \"tree_side_rounds\": " << stats.tree_side_rounds << ",\n"
         << indent << "  \"tree_side_accepted_tokens\": " << stats.tree_side_accepted_tokens << ",\n"
+        << indent << "  \"ngram_tree_rounds\": " << stats.ngram_tree_rounds << ",\n"
+        << indent << "  \"ngram_tree_side_rounds\": " << stats.ngram_tree_side_rounds << ",\n"
+        << indent << "  \"ngram_tree_side_accepted_tokens\": " << stats.ngram_tree_side_accepted_tokens << ",\n"
         << indent << "  \"acceptance_rate\": ";
     if (stats.drafted_tokens == 0) {
         out << "null";
@@ -557,6 +563,7 @@ std::string usage_text(std::string_view program) {
         << "                             draft-confidence gate 0..1 (default 0: every draft)\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"
         << "  --ngram-min-match <n>      copy admission 4..64 (default: 12)\n"
+        << "  --ngram-tree-nodes <n>     tree columns 4..32 where copy sources diverge (default: 0 = off)\n"
         << "  --draft-tree-nodes <auto|list>  DFlash2 tree verification (default: off): auto\n"
            "                             picks a tree or the single draft each round from\n"
            "                             measured speed (recommended); a list fixes tree sizes\n"
@@ -785,6 +792,9 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match =
                 parse_u32(value("--ngram-min-match"), "ngram-min-match");
+        } else if (arg == "--ngram-tree-nodes") {
+            options.speculative.ngram_tree_nodes =
+                parse_u32(value("--ngram-tree-nodes"), "ngram-tree-nodes", true);
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--draft-tree-nodes") {
@@ -1114,6 +1124,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << env.speculative.draft_tree_paths
         << " ngram_draft_tokens=" << env.speculative.ngram_draft_tokens
         << " ngram_min_match=" << env.speculative.ngram_min_match
+        << " ngram_tree_nodes=" << env.speculative.ngram_tree_nodes
         << " spec_min_p=" << product::draft_min_p_text(env.speculative)
         << " proposal_head=" << proposal_head_name(env.speculative.proposal_head)
         << " decode_path=" << decode_path_name(env.use_cuda_graph, env.speculative)
@@ -1274,6 +1285,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"draft_tokens_auto\": " << (env.speculative.draft_tokens_auto ? "true" : "false") << ",\n"
         << "    \"ngram_draft_tokens\": " << env.speculative.ngram_draft_tokens << ",\n"
         << "    \"ngram_min_match\": " << env.speculative.ngram_min_match << ",\n"
+        << "    \"ngram_tree_nodes\": " << env.speculative.ngram_tree_nodes << ",\n"
         << "    \"spec_min_p\": "
         << (env.speculative.draft_min_p ? product::draft_min_p_text(env.speculative) : "null")
         << ",\n"
