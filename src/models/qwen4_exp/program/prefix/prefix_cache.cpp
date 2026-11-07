@@ -74,6 +74,17 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
     index.block_bytes           = host_.page.page_stride;
     index.image_bytes           = host_.image_bytes;
     index.host_blocks           = true;
+    // The DFlash2 ring only steers drafts (dflash2_program.cpp): SSD copies leave out the image slabs
+    // holding nothing else, and a promotion leaves zeros there (a stale ring costs acceptance only).
+    const StateImageLayout& image_layout = lanes.layout();
+    if (image_layout.spec.draft_ring.layers != 0 && ssd_slabs != 0) {
+        const auto ring = std::find_if(image_layout.parts.begin(), image_layout.parts.end(), [](const StateImagePart& part) {
+            return part.kind == StateImagePart::Kind::DraftRingK;
+        });
+        if (ring != image_layout.parts.end()) {
+            index.ssd_image_slabs = static_cast<std::uint32_t>((ring->offset + host_.slab_bytes - 1U) / host_.slab_bytes);
+        }
+    }
     if (config.device_snapshot_slots != 0) {
         throw std::invalid_argument("Qwen4Exp prefix cache: Device snapshot slots are not supported");
     }
@@ -97,7 +108,8 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
         // Its slabs are Host slabs byte for byte (page records and image segments), so a transfer is a
         // plain copy, and a snapshot's meta stays with its index entry.
         ssd_ = std::make_unique<pc::SsdTier>(config.ssd_directory, index.ssd_slabs, host_.slab_bytes,
-                                             [this](std::uint32_t id) { return slab(id); });
+                                             [this](std::uint32_t id) { return slab(id); }, config.ssd_write_bytes_per_hour,
+                                             /*codec=*/true);
     }
     node_mtp_next_.assign(index.max_nodes, -1);
     snapshot_meta_.assign(index.max_snapshots, StateImageHeader{});

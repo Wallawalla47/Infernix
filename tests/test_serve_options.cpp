@@ -979,6 +979,22 @@ int main() {
         failures += check(rejected_ssd({"--ssd-context-gib", "64", "--ssd-context-dir", temp.string(),
                                         "--no-prefix-reuse"}),
                           "the SSD tier was accepted with --no-prefix-reuse");
+        // The write budget: unset until the Engine resolves it (8 GiB an hour), a GiB count or
+        // unlimited, and only with the tier.
+        failures += check(on.context_cache.ssd_write_bytes_per_hour == 0, "the write budget was set without the flag");
+        const ServeOptions budget = parse({"infernix-serve", "model.ninfer", "--ssd-context-gib", "64", "--ssd-context-dir",
+                                           temp.string(), "--ssd-context-gib-per-hour", "16"});
+        failures += check(budget.context_cache.ssd_write_bytes_per_hour == (16ULL << 30U),
+                          "--ssd-context-gib-per-hour 16 did not set a 16 GiB budget");
+        const ServeOptions unlimited = parse({"infernix-serve", "model.ninfer", "--ssd-context-gib", "64",
+                                              "--ssd-context-dir", temp.string(), "--ssd-context-gib-per-hour", "unlimited"});
+        failures += check(unlimited.context_cache.ssd_write_bytes_per_hour == infernix::ContextCacheOptions::kSsdWritesUnlimited,
+                          "--ssd-context-gib-per-hour unlimited did not lift the budget");
+        failures += check(rejected_ssd({"--ssd-context-gib", "64", "--ssd-context-dir", temp.string(),
+                                        "--ssd-context-gib-per-hour", "0"}),
+                          "--ssd-context-gib-per-hour accepted zero");
+        failures += check(rejected_ssd({"--ssd-context-gib-per-hour", "16"}),
+                          "--ssd-context-gib-per-hour was accepted without an SSD tier");
     }
     failures += check(rejected_cache_file({"--prefix-cache-file", "file.cache", "--prefix-cache-save-mins", "0"}),
                       "--prefix-cache-save-mins accepted zero");

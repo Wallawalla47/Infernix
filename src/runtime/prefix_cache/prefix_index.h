@@ -2,10 +2,12 @@
 
 #include "runtime/prefix_cache/block_hash.h"
 #include "runtime/prefix_cache/cost.h"
+#include "runtime/prefix_cache/ssd_stats.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <span>
@@ -82,6 +84,10 @@ struct PrefixIndexConfig {
     // SSD tier slabs (spec §5.7), each the size of a Host slab; 0: no SSD tier. Requires a Host
     // tier with host_blocks: every SSD transfer copies one Host slab.
     std::uint32_t ssd_slabs = 0;
+    // Image slabs an SSD copy keeps (0: all). The image slabs past them hold state the binding can
+    // restore without, as stale-but-finite data (Qwen4Exp's DFlash2 ring, which only steers drafts):
+    // a promotion fills them with zeros.
+    std::uint32_t ssd_image_slabs = 0;
     CacheCostModel cost;
 };
 
@@ -214,6 +220,23 @@ struct SsdJob {
     std::vector<NodeRef> nodes;          // blocks whose copy moves, in path order
     bool image = false;                  // the snapshot's image (and tail) moves
     std::vector<SsdTransfer> transfers;  // the nodes' slabs, then the image's (then the tail's)
+    // A promotion's Host image slabs the SSD copy does not hold (PrefixIndexConfig::ssd_image_slabs):
+    // the tier fills them with zeros before completing it.
+    std::vector<std::uint32_t> zero_host_slabs;
+    // A packed image (pack_ssd_write): the SSD slabs holding its codec stream and the Host image slabs
+    // it encodes, in order; `transfers` then hold only the blocks' slabs and the tail's.
+    bool packed = false;
+    std::vector<std::uint32_t> image_ssd_slabs;
+    std::vector<std::uint32_t> image_host_slabs;
+};
+
+// A write-back candidate offered to the SSD tier's write policy (§5.7).
+struct SsdWriteCandidate {
+    SnapshotKind kind   = SnapshotKind::Tap;
+    std::uint32_t hits  = 0;
+    std::uint32_t slabs = 0;  // SSD slabs the write takes: its image and its unwritten path
+    double value        = 0.0; // GDSF value density: (1 + hits) x seconds saved per byte its eviction frees
+    bool first_offer    = false; // not offered before since it was published or last left the SSD
 };
 
 enum class SsdPromotionStatus : std::uint8_t {
@@ -269,6 +292,8 @@ struct PrefixIndexStats {
     std::uint64_t ssd_dead_reclaims        = 0;
     std::uint64_t ssd_backup_drops         = 0;
     std::uint64_t ssd_snapshot_evictions   = 0;
+    std::array<SsdKindStats, kSnapshotKinds> ssd_by_kind{};
+    std::uint64_t ssd_declined_snapshots = 0; // snapshots the write policy passed over (once each)
 };
 
 class PrefixCacheIndex {
@@ -477,16 +502,25 @@ public:
     // Host slabs that can be freed without losing anything: free ones, dead blocks', and every Host
     // copy (block or image) the SSD also holds. Pinned and held entries are counted too.
     [[nodiscard]] std::uint64_t host_lossless_slabs() const noexcept;
+    // The SSD image fates by kind so far (PrefixIndexStats::ssd_by_kind, without computing the rest).
+    [[nodiscard]] const std::array<SsdKindStats, kSnapshotKinds>& ssd_kind_stats() const noexcept { return counters_.ssd_by_kind; }
     // Starts the next write-back: the retained, unpinned, unheld, Host-resident snapshot of lowest
     // priority whose image has no SSD copy and whose anchor path has a Host or SSD copy throughout
     // (a block another write-back is writing defers it). Reserves SSD slabs for the image (and tail)
     // and for every path block that is Host-resident without an SSD copy, evicting from the SSD tier
     // (dead blocks, backups of Host- or Device-resident images, then SSD-only snapshots by priority,
     // never the job's own), marks them Filling and pins the snapshot. Absent when no snapshot
-    // qualifies or the SSD tier cannot free the slabs.
-    [[nodiscard]] std::optional<SsdJob> begin_ssd_write();
+    // qualifies or the SSD tier cannot free the slabs. `admit`, when given, sees each candidate
+    // first (the tier's write policy); a declined one is passed over.
+    [[nodiscard]] std::optional<SsdJob>
+    begin_ssd_write(const std::function<bool(const SsdWriteCandidate&)>& admit = {});
     // The write landed: the copies are SSD Resident and the snapshot is unpinned.
     void complete_ssd_write(SsdJob& job);
+    // Before its write is issued: the job's image is stored as a codec stream in its first
+    // `stream_slabs` image SSD slabs (fewer than it reserved); the rest return to the SSD tier.
+    void pack_ssd_write(SsdJob& job, std::uint32_t stream_slabs);
+    // Image slabs an SSD copy keeps raw, or encodes when packed (PrefixIndexConfig::ssd_image_slabs).
+    [[nodiscard]] std::uint32_t ssd_image_slab_count() const noexcept;
     // The write failed: the SSD slabs are freed and the entries stay as they were.
     void abort_ssd_write(SsdJob& job);
     // Starts reading the parts of `snapshot` that are only on the SSD (path blocks, image, tail)
@@ -571,6 +605,10 @@ private:
         CopyState host                = CopyState::Absent;
         std::vector<std::uint32_t> ssd_slabs; // the Host layout: image slabs, then the tail slab
         CopyState ssd                 = CopyState::Absent;
+        bool ssd_read                 = false; // its SSD image was read since it was written
+        bool ssd_packed               = false; // its SSD image is a codec stream (pack_ssd_write)
+        bool ssd_offered              = false; // offered to the write policy (SsdWriteCandidate::first_offer)
+        bool ssd_declined             = false; // the write policy passed it over at least once
         // Counted in the anchor path's warm_below, and in host_clean_image_slabs_.
         bool warm_counted             = false;
         bool clean_counted            = false;
@@ -680,6 +718,13 @@ private:
     [[nodiscard]] bool allocate_ssd_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
                                           std::uint32_t protect, double claim);
     [[nodiscard]] std::uint32_t snapshot_slab_count(const Snapshot& snapshot) const noexcept;
+    // An SSD copy's slabs with the tail's (PrefixIndexConfig::ssd_image_slabs).
+    [[nodiscard]] std::uint32_t ssd_snapshot_slab_count(const Snapshot& snapshot) const noexcept;
+    // The Host slab position (in Snapshot::host_slabs) of an SSD copy's slab k.
+    [[nodiscard]] std::size_t ssd_to_host_position(std::size_t k) const noexcept;
+    [[nodiscard]] SsdKindStats& kind_stats(const Snapshot& snapshot) noexcept {
+        return counters_.ssd_by_kind[static_cast<std::size_t>(snapshot.kind)];
+    }
 
     [[nodiscard]] bool take_free_slabs(std::uint32_t count, std::vector<std::uint32_t>& out);
     // Evicts dead KV, superseded snapshots, then retained snapshots in GDSF order until `count`

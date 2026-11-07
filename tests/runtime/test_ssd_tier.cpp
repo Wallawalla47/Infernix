@@ -6,10 +6,15 @@
 #include "runtime/prefix_cache/block_hash.h"
 #include "runtime/prefix_cache/prefix_index.h"
 #include "runtime/prefix_cache/ssd_tier.h"
+#include "runtime/prefix_cache/fp32_row_codec.h"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -65,15 +70,15 @@ bool holds(const Backend& backend, std::uint32_t slab, std::uint32_t entity) {
     return true;
 }
 
-PrefixIndexConfig config() {
+PrefixIndexConfig config(std::uint32_t image_slabs = 4) {
     PrefixIndexConfig c;
     c.max_nodes                 = 128;
     c.max_snapshots             = 16;
     c.host_slabs                = kHostSlabs;
-    c.image_slabs               = 4;
+    c.image_slabs               = image_slabs;
     c.device_snapshot_slots     = 0;
     c.block_bytes               = kSlabBytes;
-    c.image_bytes               = 4 * kSlabBytes;
+    c.image_bytes               = image_slabs * kSlabBytes;
     c.ssd_slabs                 = 64;
     c.cost.token_seconds        = 1.0e-4;
     c.cost.h2d_bytes_per_second = 50.0e9;
@@ -132,6 +137,240 @@ void settle(SsdTier& tier, PrefixCacheIndex& index) {
     index.check_invariants();
 }
 
+// FP32 words like a recurrent state's: random signs and mantissas, exponents within a few binades.
+void fill_state(std::byte* p, std::size_t bytes, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    for (std::size_t i = 0; i < bytes; i += 4) {
+        const std::uint32_t word = (rng() & 0x807FFFFFU) | ((118U + rng() % 9U) << 23U);
+        std::memcpy(p + i, &word, 4);
+    }
+}
+
+// The image codec (fp32_row_codec): exact for every bit pattern, smaller on state-like words, raw where
+// nothing shrinks, and a damaged payload is refused.
+void test_codec() {
+    constexpr std::size_t kBytes = 64 * 1024;
+    std::vector<std::byte> in(kBytes), payload(codec_payload_bound(kBytes)), out(kBytes);
+    const auto round_trip = [&](const char* what) {
+        const std::size_t size = encode_slab(in.data(), kBytes, payload.data());
+        require(size <= codec_payload_bound(kBytes) && payload_size(payload.data()) == size, std::string(what) + ": payload size");
+        require(decode_slab(payload.data(), size, out.data(), kBytes) && out == in, std::string(what) + ": round trip");
+        return size;
+    };
+    fill_state(in.data(), kBytes, 7);
+    const std::size_t state = round_trip("state-like words");
+    require(state < kBytes * 92 / 100, "state-like words shrink by more than 8 % (" + std::to_string(state) + ")");
+    // Outliers in one row (escapes), the 14/15 escape boundary and special values in another.
+    const std::uint32_t specials[] = {0x00000000U, 0x80000000U, 0x7F800000U, 0xFF800000U, 0x7FC00001U,
+                                      0x00000001U, 0x807FFFFFU, 0x3F800000U};
+    for (std::size_t i = 0; i < 8; ++i) { std::memcpy(in.data() + 4 * i, &specials[i], 4); }
+    const std::uint32_t edge14 = (126U - 14U) << 23U, edge15 = (126U - 15U) << 23U;
+    std::memcpy(in.data() + 512, &edge14, 4);
+    std::memcpy(in.data() + 516, &edge15, 4);
+    (void)round_trip("special values and escapes");
+    std::fill(in.begin(), in.end(), std::byte{0});
+    require(round_trip("zeros") < kBytes, "zeros shrink");
+    std::mt19937 rng(9);
+    for (std::byte& b : in) { b = static_cast<std::byte>(rng()); }
+    require(round_trip("random bytes") == 4U + kBytes, "an incompressible slab is stored raw");
+    // A damaged payload is refused.
+    fill_state(in.data(), kBytes, 11);
+    const std::size_t size = encode_slab(in.data(), kBytes, payload.data());
+    require(!decode_slab(payload.data(), size - 1, out.data(), kBytes), "a truncated payload is refused");
+    payload[4] = std::byte{7}; // the first row's kind
+    require(!decode_slab(payload.data(), size, out.data(), kBytes), "a damaged row is refused");
+}
+
+// With INFERNIX_TEST_CODEC_DUMP naming a saved Flash-Next Host tier (--prefix-cache-file), times the codec
+// on its state images (found by their header magic) and reports the ratio and the encode and decode rates,
+// one thread and eight. Not a check: the numbers are for the SSD tier's design notes.
+void bench_codec(const char* dump) {
+    constexpr std::size_t kSlab = 860'160; // FP4-Local INT8 KV with DFlash2 (no MTP planes)
+    std::FILE* file = std::fopen(dump, "rb");
+    require(file != nullptr, "the codec dump opens");
+    std::vector<std::byte> bytes(static_cast<std::size_t>(std::filesystem::file_size(dump)));
+    require(std::fread(bytes.data(), 1, bytes.size(), file) == bytes.size(), "the codec dump reads");
+    std::fclose(file);
+    const std::size_t end = bytes.size() - 16;
+    std::vector<std::size_t> images;
+    for (std::size_t k = 1; k * kSlab <= end; ++k) {
+        if (std::memcmp(bytes.data() + end - k * kSlab, "QWQ4IMG1", 8) == 0) { images.push_back(end - k * kSlab); }
+    }
+    require(!images.empty(), "the dump holds state images");
+    // The SSD copy keeps the image up to its DFlash2 ring: 136 of its 184 slabs (116.5 MB of 157.6).
+    constexpr std::size_t kKept = 136;
+    std::vector<const std::byte*> slabs;
+    for (std::size_t i = 0; i < std::min<std::size_t>(images.size(), 4); ++i) {
+        for (std::size_t k = 0; k < kKept; ++k) { slabs.push_back(bytes.data() + images[i] + k * kSlab); }
+    }
+    std::vector<std::byte> stream(slabs.size() * codec_payload_bound(kSlab));
+    std::vector<std::size_t> offsets(slabs.size() + 1, 0);
+    auto start = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < slabs.size(); ++i) {
+        offsets[i + 1] = offsets[i] + encode_slab(slabs[i], kSlab, stream.data() + offsets[i]);
+    }
+    const double encode = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    const double raw    = static_cast<double>(slabs.size() * kSlab);
+    std::vector<std::byte> out(slabs.size() * kSlab);
+    const auto decode = [&](unsigned threads) {
+        const auto begin = std::chrono::steady_clock::now();
+        std::vector<std::thread> pool;
+        std::atomic<bool> ok{true};
+        for (unsigned t = 0; t < threads; ++t) {
+            pool.emplace_back([&, t] {
+                for (std::size_t i = slabs.size() * t / threads; i < slabs.size() * (t + 1) / threads; ++i) {
+                    if (!decode_slab(stream.data() + offsets[i], offsets[i + 1] - offsets[i], out.data() + i * kSlab, kSlab)) {
+                        ok = false;
+                    }
+                }
+            });
+        }
+        for (std::thread& thread : pool) { thread.join(); }
+        require(ok.load(), "the dump's payloads decode");
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    };
+    const double one = decode(1), eight = decode(8);
+    for (std::size_t i = 0; i < slabs.size(); ++i) {
+        require(std::memcmp(out.data() + i * kSlab, slabs[i], kSlab) == 0, "the dump's slabs decode exactly");
+    }
+    std::cout << "codec on " << images.size() << " dumped images (" << slabs.size() / kKept << " timed, the kept "
+              << kKept << " slabs each): " << 100.0 * (1.0 - static_cast<double>(offsets.back()) / raw)
+              << " % smaller; encode " << raw / encode / 1e9 << " GB/s (one thread); decode " << raw / one / 1e9
+              << " GB/s (one), " << raw / eight / 1e9 << " GB/s (eight)\n";
+}
+
+// The codec with a partial SSD copy (Qwen4Exp leaves out its DFlash2 ring): 16 of 17 image slabs are
+// packed into 15, and a promotion decodes them and zero-fills the 17th.
+void test_packed_partial(const std::filesystem::path& directory) {
+    std::filesystem::create_directories(directory);
+    Backend backend;
+    PrefixIndexConfig c = config(17);
+    c.ssd_image_slabs   = 16;
+    PrefixCacheIndex index(c, backend);
+    SsdTier tier(directory, 64, kSlabBytes, [&](std::uint32_t slab) { return backend.slab(slab); }, 0, true);
+    const Conversation a = publish(index, backend, 77, 2);
+    const SnapshotView view = index.snapshot(a.endpoint);
+    std::vector<std::byte> copy;
+    for (std::size_t k = 0; k < view.host_slabs.size(); ++k) {
+        fill_state(backend.slab(view.host_slabs[k]), kSlabBytes, 500U + static_cast<std::uint32_t>(k));
+        copy.insert(copy.end(), backend.slab(view.host_slabs[k]), backend.slab(view.host_slabs[k]) + kSlabBytes);
+    }
+    for (int i = 0; i < 20 && tier.counters().image_writes == 0; ++i) {
+        (void)tier.poll(index);
+        settle(tier, index);
+    }
+    require(tier.counters().image_writes == 1 && tier.counters().packed_images == 1 &&
+                tier.counters().packed_saved_bytes == kSlabBytes,
+            "a partial image was written packed, one SSD slab smaller (" + std::to_string(tier.counters().image_writes) +
+                " writes, " + std::to_string(tier.counters().packed_images) + " packed)");
+    auto image = index.reserve_host_image(false, kAny);
+    require(image.has_value(), "a second image displaces the first to the SSD");
+    for (const std::uint32_t slab : image->slabs) { std::memset(backend.slab(slab), 0xAB, kSlabBytes); }
+    index.release_host_image(std::move(*image));
+    require(index.snapshot(a.endpoint).host == CopyState::Absent, "the image is SSD-only");
+    require(tier.promote(index, a.endpoint) == SsdTier::Promotion::Pending, "a packed partial promotion starts");
+    settle(tier, index);
+    const SnapshotView back = index.snapshot(a.endpoint);
+    require(back.host == CopyState::Resident, "it landed");
+    for (std::size_t k = 0; k < 16; ++k) {
+        require(std::memcmp(backend.slab(back.host_slabs[k]), copy.data() + k * kSlabBytes, kSlabBytes) == 0,
+                "a kept slab decodes to its bytes");
+    }
+    const std::byte* omitted = backend.slab(back.host_slabs[16]);
+    require(std::all_of(omitted, omitted + kSlabBytes, [](std::byte b) { return b == std::byte{0}; }),
+            "the omitted slab holds zeros");
+    tier.drain(index);
+    index.check_invariants();
+}
+
+// The tier with the codec: state-like images are written packed (fewer SSD bytes) and read back exactly;
+// incompressible ones (the main test's pattern) still go raw through the same pipeline.
+void test_packed_tier(const std::filesystem::path& directory) {
+    std::filesystem::create_directories(directory);
+    Backend backend;
+    PrefixCacheIndex index(config(9), backend); // nine 64 KiB slabs: a packed image saves one
+    SsdTier tier(directory, 64, kSlabBytes, [&](std::uint32_t slab) { return backend.slab(slab); }, 0, true);
+    std::vector<std::vector<std::byte>> images;
+    std::vector<Conversation> conversations;
+    for (std::uint32_t seed = 1; seed <= 2; ++seed) {
+        conversations.push_back(publish(index, backend, 40 + seed, 2 + seed));
+        const SnapshotView view = index.snapshot(conversations.back().endpoint);
+        std::vector<std::byte> copy;
+        for (std::size_t k = 0; k < view.host_slabs.size(); ++k) {
+            fill_state(backend.slab(view.host_slabs[k]), kSlabBytes, 100U * seed + static_cast<std::uint32_t>(k));
+            copy.insert(copy.end(), backend.slab(view.host_slabs[k]), backend.slab(view.host_slabs[k]) + kSlabBytes);
+        }
+        images.push_back(std::move(copy));
+        (void)tier.poll(index);
+        settle(tier, index);
+    }
+    std::vector<HostImageReservation> reservations;
+    for (;;) {
+        (void)tier.poll(index);
+        settle(tier, index);
+        auto image = index.reserve_host_image(false, kAny);
+        if (!image) { break; }
+        for (const std::uint32_t slab : image->slabs) { std::memset(backend.slab(slab), 0, kSlabBytes); }
+        reservations.push_back(std::move(*image));
+    }
+    require(tier.counters().image_writes == 2 && tier.counters().packed_images == 2 &&
+                tier.counters().packed_saved_bytes == 2 * kSlabBytes,
+            "both state-like images were written packed, one SSD slab smaller each");
+    for (HostImageReservation& reservation : reservations) { index.release_host_image(std::move(reservation)); }
+    for (std::size_t c = 0; c < conversations.size(); ++c) {
+        require(tier.promote(index, conversations[c].endpoint) == SsdTier::Promotion::Pending, "a packed promotion starts");
+        settle(tier, index);
+        require(tier.promote(index, conversations[c].endpoint) == SsdTier::Promotion::Ready, "it landed");
+        const SnapshotView view = index.snapshot(conversations[c].endpoint);
+        for (std::size_t k = 0; k < view.host_slabs.size(); ++k) {
+            require(std::memcmp(backend.slab(view.host_slabs[k]), images[c].data() + k * kSlabBytes, kSlabBytes) == 0,
+                    "a packed image decodes to its bytes");
+        }
+    }
+    tier.drain(index);
+    index.check_invariants();
+}
+
+// The write budget (--ssd-context-gib-per-hour): an hour's bytes, refilled over the hour and kept across
+// restarts; everything is written while it is at least half full, then only the most valuable share
+// (2 x fill, by bytes) of the recent candidates, and nothing larger than what is left.
+void test_write_budget(const std::filesystem::path& directory) {
+    using Clock      = SsdWriteBudget::Clock;
+    const auto start = Clock::time_point{std::chrono::hours(1000)};
+    SsdWriteBudget selective(1000, directory / "selective.txt", start);
+    require(selective.available_bytes() == 1000, "a budget without a saved level starts full");
+    // Ten candidates of 50 bytes worth 1..10, all written while the bucket is at least half full.
+    for (int value = 1; value <= 10; ++value) {
+        require(selective.admit(value, 50, true, start), "at least half full: every candidate is written");
+        selective.charge(50);
+    }
+    require(selective.available_bytes() == 500, "charged");
+    selective.charge(100); // 400 left: fill 0.4, the best 80 % by bytes of the recent candidates
+    require(!selective.admit(2.0, 50, false, start), "a candidate below the best 80 % is passed over");
+    require(selective.admit(3.0, 50, false, start), "one inside it is written");
+    selective.charge(300); // 100 left: fill 0.1, the best 20 %
+    require(!selective.admit(8.0, 50, false, start) && selective.admit(9.0, 50, false, start), "the best 20 % only");
+    require(!selective.admit(100.0, 150, false, start), "nothing larger than what is left");
+    // It refills at an hour's bytes per hour, and a restart keeps the level.
+    const auto state = directory / "budget.txt";
+    SsdWriteBudget budget(1000, state, start);
+    budget.charge(900);
+    const auto later = start + std::chrono::minutes(30);
+    require(budget.admit(1.0, 50, false, later) && budget.available_bytes() == 600, "half an hour refills half the budget");
+    budget.save(later);
+    SsdWriteBudget restarted(1000, state, later + std::chrono::minutes(15));
+    require(restarted.available_bytes() == 850, "a restart keeps the level and refills from when it was saved");
+    SsdWriteBudget capped(1000, state, later + std::chrono::hours(2));
+    require(capped.available_bytes() == 1000, "the bucket holds at most an hour");
+    bool refused = false;
+    try {
+        SsdWriteBudget empty(0, state, start);
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    require(refused, "a budget needs a positive hourly size");
+}
+
 } // namespace
 
 int main() {
@@ -139,6 +378,11 @@ int main() {
     std::filesystem::create_directories(directory);
     int status = 0;
     try {
+        test_write_budget(directory);
+        test_codec();
+        if (const char* dump = std::getenv("INFERNIX_TEST_CODEC_DUMP"); dump != nullptr && *dump != '\0') { bench_codec(dump); }
+        test_packed_tier(directory / "packed");
+        test_packed_partial(directory / "partial");
         Backend backend;
         PrefixCacheIndex index(config(), backend);
         SsdTier tier(directory, 64, kSlabBytes, [&](std::uint32_t slab) { return backend.slab(slab); });

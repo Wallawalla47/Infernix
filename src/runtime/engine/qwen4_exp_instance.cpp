@@ -515,6 +515,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         program_options.prefix_host_bytes    = prefix_bytes;
         program_options.prefix_ssd_bytes     = cache.ssd_capacity_bytes;
         program_options.prefix_ssd_directory = cache.ssd_directory;
+        program_options.prefix_ssd_write_bytes_per_hour =
+            cache.ssd_write_bytes_per_hour == ContextCacheOptions::kSsdWritesUnlimited ? 0U : cache.ssd_write_bytes_per_hour;
     }
     // The SSD tier (design §19.3.7): the banks stay in the artifact; the Program pins RAM slots for
     // the experts the ledger leaves room for (less their lock overhead) and reads the rest on use.

@@ -44,7 +44,7 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
                                      const HybridHostLayout& host,
                                      std::vector<HybridRestoreLayer> layers,
                                      StartupPhaseScope* pin_progress,
-                                     const std::filesystem::path& ssd_directory)
+                                     const std::filesystem::path& ssd_directory, std::uint64_t ssd_write_bytes_per_hour)
     : config_(config), taps_(taps), text_pages_(&text_pages), backend_pages_(backend_pages),
       states_(&states), state_pool_(&state_pool), host_layout_(host), images_(config.max_snapshots),
       layers_(std::move(layers)) {
@@ -92,7 +92,8 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
     if (config.ssd_slabs != 0) {
         // Its slabs are Host slabs byte for byte, so a transfer is a plain copy (§5.7).
         ssd_ = std::make_unique<runtime::prefix_cache::SsdTier>(
-            ssd_directory, config.ssd_slabs, host.slab_bytes, [this](std::uint32_t id) { return slab(id); });
+            ssd_directory, config.ssd_slabs, host.slab_bytes, [this](std::uint32_t id) { return slab(id); },
+            ssd_write_bytes_per_hour, /*codec=*/true);
     }
     blocks_.reserve(config.max_nodes);
     index_.emplace(config_, *this);

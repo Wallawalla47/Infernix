@@ -106,6 +106,8 @@ int main() {
             const infernix::ContextCacheOptions out = normalize_engine_options(on, architecture).context_cache;
             failures += check(out.ssd_capacity_bytes == (16ULL << 30U) && out.ssd_directory.is_absolute(),
                               "the SSD tier was not kept");
+            failures += check(out.ssd_write_bytes_per_hour == infernix::ContextCacheOptions::kDefaultSsdWriteBytesPerHour,
+                              "the SSD tier's write budget did not default to 8 GiB an hour");
         }
         for (int variant = 0; variant < 4; ++variant) {
             EngineOptions bad;

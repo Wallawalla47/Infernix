@@ -671,6 +671,14 @@ struct ContextCacheOptions {
     // needs the cache and a Host tier. Every model's prefix cache supports it.
     std::uint64_t ssd_capacity_bytes = 0;
     std::filesystem::path ssd_directory;
+    // The SSD tier's write budget: at most this many bytes written in any hour, as a bucket of one hour's
+    // bytes that refills continuously and keeps its level across restarts in ssd_directory. While it is
+    // more than half full every snapshot the Host tier gives up is written; below that only those
+    // expected to save the most prefill. 0 (the default) resolves to kDefaultSsdWriteBytesPerHour;
+    // kSsdWritesUnlimited writes everything.
+    static constexpr std::uint64_t kSsdWritesUnlimited          = ~std::uint64_t{0};
+    static constexpr std::uint64_t kDefaultSsdWriteBytesPerHour = 8ULL << 30U;
+    std::uint64_t ssd_write_bytes_per_hour = 0;
 };
 
 struct ContextCostOptions {
@@ -2325,6 +2333,29 @@ struct RuntimeStats {
     std::uint64_t hybrid_ssd_snapshot_evictions   = 0;
     std::uint64_t hybrid_ssd_failures             = 0;
     double hybrid_ssd_read_bytes_per_second       = 0.0; // the last promotion of 16 MB or more
+    // The write budget (ContextCacheOptions::ssd_write_bytes_per_hour; 0: none): bytes it still allows
+    // now, the snapshots it passed over (once each, cumulative), and the write policy's own time.
+    std::uint64_t hybrid_ssd_budget_bytes_per_hour  = 0;
+    std::uint64_t hybrid_ssd_budget_available_bytes = 0;
+    std::uint64_t hybrid_ssd_declined_snapshots     = 0;
+    // Images written to the SSD as lossless codec streams, and the SSD bytes that saved (cumulative).
+    std::uint64_t hybrid_ssd_packed_images      = 0;
+    std::uint64_t hybrid_ssd_packed_saved_bytes = 0;
+    std::uint64_t hybrid_ssd_policy_nanoseconds = 0;
+    // SSD image fates by snapshot kind (tap, endpoint, output boundary, boundary), cumulative: images
+    // written and the bytes of their image and path, image reads, written images read at least once,
+    // written images superseded or dropped from the SSD before any read, and retained snapshots the
+    // Host tier evicted without an SSD copy.
+    struct HybridSsdKindStats {
+        std::uint64_t writes            = 0;
+        std::uint64_t written_bytes     = 0;
+        std::uint64_t reads             = 0;
+        std::uint64_t first_reads       = 0;
+        std::uint64_t superseded_unread = 0;
+        std::uint64_t dropped_unread    = 0;
+        std::uint64_t host_losses       = 0;
+    };
+    std::array<HybridSsdKindStats, 4> hybrid_ssd_by_kind{};
     // Idle-time prefill of finished turns (HybridPrefixCacheOptions::next_turn_prefill_quiet): passes
     // started, run to their end, yielded to a request at a unit boundary, skipped because the cache
     // already held all but a few of their tokens, and turns dropped before a pass started (a

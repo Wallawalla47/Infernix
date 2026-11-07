@@ -92,6 +92,7 @@ void ProgramImpl::create_prefix_cache() {
     config.kv_pages   = kv_pages_;
     config.ssd_bytes     = options_.prefix_ssd_bytes;
     config.ssd_directory = options_.prefix_ssd_directory;
+    config.ssd_write_bytes_per_hour = options_.prefix_ssd_write_bytes_per_hour;
     prefix_           = std::make_unique<prefix::PrefixCache>(config, *pool_, kv_geometry_, *lane_image_,
                                                             options_.prefix_host_bytes, device_.stream);
     if (mtp_) {

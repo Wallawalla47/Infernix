@@ -116,6 +116,23 @@ public:
         out.hybrid_ssd_snapshot_evictions   = ssd.snapshot_evictions;
         out.hybrid_ssd_failures             = ssd.write_failures + ssd.read_failures;
         out.hybrid_ssd_read_bytes_per_second = ssd.read_bytes_per_second;
+        out.hybrid_ssd_budget_bytes_per_hour  = ssd.budget_bytes_per_hour;
+        out.hybrid_ssd_budget_available_bytes = ssd.budget_available_bytes;
+        out.hybrid_ssd_declined_snapshots     = ssd.declined_snapshots;
+        out.hybrid_ssd_packed_images          = ssd.packed_images;
+        out.hybrid_ssd_packed_saved_bytes     = ssd.packed_saved_bytes;
+        out.hybrid_ssd_policy_nanoseconds     = ssd.policy_nanoseconds;
+        for (std::size_t kind = 0; kind < ssd.by_kind.size(); ++kind) {
+            const auto& from = ssd.by_kind[kind];
+            auto& to         = out.hybrid_ssd_by_kind[kind];
+            to.writes            = from.writes;
+            to.written_bytes     = from.written_slabs * ssd.slab_bytes;
+            to.reads             = from.reads;
+            to.first_reads       = from.first_reads;
+            to.superseded_unread = from.superseded_unread;
+            to.dropped_unread    = from.dropped_unread;
+            to.host_losses       = from.host_losses;
+        }
     }
 
     // Holds the sources of the requests waiting for admission, in admission order

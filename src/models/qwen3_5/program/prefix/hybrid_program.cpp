@@ -138,7 +138,9 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
     }
     hybrid_ = std::make_unique<HybridPrefixCache>(
         config, taps, *text_kv_pages, backend_kv_pages.get(), *state_store, *state_images, host,
-        std::move(layers), phase ? &*phase : nullptr, context_cache.ssd_directory);
+        std::move(layers), phase ? &*phase : nullptr, context_cache.ssd_directory,
+        context_cache.ssd_write_bytes_per_hour == ContextCacheOptions::kSsdWritesUnlimited ? 0U
+                                                                                       : context_cache.ssd_write_bytes_per_hour);
     if (phase) { phase->complete(host_bytes, host_bytes); }
 }
 

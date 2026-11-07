@@ -860,6 +860,23 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
         const auto delta = [&](std::uint64_t RuntimeStats::* field) {
             return monotonic_delta(previous.*field, current.*field);
         };
+        // The SSD tier's image fates by snapshot kind, over the interval.
+        const auto ssd_by_kind = [&] {
+            static constexpr std::array<const char*, 4> kKinds = {"tap", "endpoint", "output_boundary", "boundary"};
+            Json kinds = Json::object();
+            for (std::size_t k = 0; k < kKinds.size(); ++k) {
+                const auto& now  = current.hybrid_ssd_by_kind[k];
+                const auto& then = previous.hybrid_ssd_by_kind[k];
+                kinds[kKinds[k]] = Json{{"writes", monotonic_delta(then.writes, now.writes)},
+                                        {"written_bytes", monotonic_delta(then.written_bytes, now.written_bytes)},
+                                        {"reads", monotonic_delta(then.reads, now.reads)},
+                                        {"first_reads", monotonic_delta(then.first_reads, now.first_reads)},
+                                        {"superseded_unread", monotonic_delta(then.superseded_unread, now.superseded_unread)},
+                                        {"dropped_unread", monotonic_delta(then.dropped_unread, now.dropped_unread)},
+                                        {"host_losses", monotonic_delta(then.host_losses, now.host_losses)}};
+            }
+            return kinds;
+        };
         record["context_cache"]["hybrid"] =
             Json{{"device_blocks", current.hybrid_cached_blocks},
                  {"evictable_blocks", current.hybrid_evictable_blocks},
@@ -916,7 +933,14 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                              {"host_block_demotions", delta(&RuntimeStats::hybrid_ssd_host_block_demotions)},
                              {"promotions", delta(&RuntimeStats::hybrid_ssd_promotions)},
                              {"snapshot_evictions", delta(&RuntimeStats::hybrid_ssd_snapshot_evictions)},
-                             {"failures", delta(&RuntimeStats::hybrid_ssd_failures)}}},
+                             {"failures", delta(&RuntimeStats::hybrid_ssd_failures)},
+                             {"budget_bytes_per_hour", current.hybrid_ssd_budget_bytes_per_hour},
+                             {"budget_available_bytes", current.hybrid_ssd_budget_available_bytes},
+                             {"declined_snapshots", delta(&RuntimeStats::hybrid_ssd_declined_snapshots)},
+                             {"packed_images", delta(&RuntimeStats::hybrid_ssd_packed_images)},
+                             {"packed_saved_bytes", delta(&RuntimeStats::hybrid_ssd_packed_saved_bytes)},
+                             {"policy_seconds", static_cast<double>(delta(&RuntimeStats::hybrid_ssd_policy_nanoseconds)) * 1e-9},
+                             {"by_kind", ssd_by_kind()}}},
                  {"next_turn_prefill",
                   Json{{"started", delta(&RuntimeStats::next_turn_prefills_started)},
                        {"completed", delta(&RuntimeStats::next_turn_prefills_completed)},

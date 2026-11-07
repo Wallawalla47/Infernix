@@ -108,7 +108,7 @@ public:
                       qwen3_5::StateImageDevicePool& state_pool, const HybridHostLayout& host,
                       std::vector<HybridRestoreLayer> layers,
                       StartupPhaseScope* pin_progress = nullptr,
-                      const std::filesystem::path& ssd_directory = {});
+                      const std::filesystem::path& ssd_directory = {}, std::uint64_t ssd_write_bytes_per_hour = 0);
     ~HybridPrefixCache() override;
 
     HybridPrefixCache(const HybridPrefixCache&)            = delete;

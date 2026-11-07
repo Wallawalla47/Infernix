@@ -265,6 +265,8 @@ int exercise_ssd_restore(const char* artifact, infernix::SpeculativeBackend back
     }
     infernix::EngineOptions options = hybrid_options(artifact, backend, 4096, 480ULL << 20, 1);
     options.context_cache.ssd_capacity_bytes = 8ULL << 30;
+    // The write budget's level persists in the test directory: exactness and timing run without it.
+    options.context_cache.ssd_write_bytes_per_hour = infernix::ContextCacheOptions::kSsdWritesUnlimited;
     options.context_cache.ssd_directory      = directory;
     infernix::Engine engine(std::move(options));
     (void)engine.generate(engine.prepare_tokens(first), greedy(8));

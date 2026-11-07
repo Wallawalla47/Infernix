@@ -705,6 +705,9 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
                                             " is not an existing directory");
             }
             cache.ssd_directory = std::filesystem::absolute(cache.ssd_directory, ec);
+            if (cache.ssd_write_bytes_per_hour == 0) {
+                cache.ssd_write_bytes_per_hour = ContextCacheOptions::kDefaultSsdWriteBytesPerHour;
+            }
         }
     } else {
         if (cache.ssd_capacity_bytes != 0 || !cache.ssd_directory.empty()) {

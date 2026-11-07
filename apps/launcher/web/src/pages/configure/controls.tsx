@@ -267,6 +267,13 @@ export const MEMORY_CONTROLS: Control[] = [
     wide: true,
   },
   {
+    kind: "text",
+    flag: "--ssd-context-gib-per-hour",
+    label: "SSD prefix cache writes (GiB an hour)",
+    help: "Write budget: at most this many GiB written to the SSD cache in any hour (default 8). Lower trades cache hits for less SSD wear: once half an hour's budget is spent, only the snapshots most likely to save the most prefill are written. \"unlimited\" writes everything.",
+    placeholder: "8 (default)",
+  },
+  {
     kind: "number",
     flag: "--prefill-chunk",
     label: "Prefill chunk",

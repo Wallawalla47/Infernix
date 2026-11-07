@@ -55,7 +55,7 @@ other value is derived from the rest of the configuration (§14.2).
 | §7.9 next-turn prefill | implemented 2026-10-27 (`--cache-next-turn-ms`; default on for Qwen3.5, off for Qwen3.8-Flash-Next and refused on its reproducible route): host tests pass; real scenarios `next-turn` / `next-turn-reproducible` (27B) pass; Flash-Next's reproducible resume from the pass was not exact, and its reproducible route keeps no tap where a lane ends (§7.9); the agentic replay A/B is outstanding |
 | §6.2 cost model | implemented: the Engine's context-cost coefficients (prefill and Host-to-Device transfer) rank sources and value snapshots |
 | §5.5 persistence across restarts | implemented (opt-in `--prefix-cache-file`) |
-| §5.7 SSD tier | implemented 2026-11-06 (opt-in `--ssd-context-gib` with `--ssd-context-dir`), both bindings: host-only unit tests (index write-back, demotion, promotion, SSD eviction order, a randomized stress with invariant checks), `infernix_ssd_tier_test` (bytes through a real scratch file), `infernix_direct_scratch_file_test`, real scenarios `ssd-restore`/`ssd-restore-mtp` (27B) and `--ssd` (Flash-Next), timing `--ssd-scale` (§16.9) |
+| §5.7 SSD tier | implemented 2026-11-06 (opt-in `--ssd-context-gib` with `--ssd-context-dir`), both bindings; the write policy 2026-11-07 (fate counters, Qwen4Exp's ring left out, the image codec, `--ssd-context-gib-per-hour`): host-only unit tests (index write-back, demotion, promotion, SSD eviction order, partial and packed copies, a randomized stress with invariant checks), `infernix_ssd_tier_test` (bytes through a real scratch file, the codec's exactness, packed and partial copies, the write budget), `infernix_direct_scratch_file_test`, real scenarios `ssd-restore`/`ssd-restore-mtp` (27B) and `--ssd` (Flash-Next, also with DFlash2), timing `--ssd-scale` (§16.9) |
 | §12.2 in-flight prefix coalescing | implemented: requests sharing a new prefix with a lane still prefilling wait for its snapshot at the divergence instead of prefilling the prefix again |
 | §7.2–§7.3 zero-split GDN state tap and phase alignment | not implemented: an exact tap costs one prefill split (about 15 ms per turn on 27B); flexible taps avoid it, and requests resuming from an endpoint skip the opener tap (§7.1) |
 | §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
@@ -486,10 +486,11 @@ Storage and transfers:
   holds no RAM) and is removed when the process ends, a crash included (Windows deletes it on close,
   POSIX unlinks it when created). Its content does not outlive the process; `--prefix-cache-file`
   (§5.5) saves the Host tier only.
-- The file is an array of SSD slabs of the Host slab size: an SSD slab holds exactly the bytes of one
-  Host slab (a block bundle, an image part, a tail), so every transfer is a byte copy between pinned
-  Host memory and the file, and a restore through the SSD is bit-exact for every KV storage and state
-  form, the reproducible and lossless routes included. Each SSD slab id maps to one fixed offset; the
+- The file is an array of SSD slabs of the Host slab size. A block bundle or a tail moves as a byte
+  copy of its Host slab; an image as its kept slabs (all of them, or Qwen4Exp's slabs before its
+  DFlash2 ring, below), raw or as a lossless codec stream in fewer slabs (below). A restore through the
+  SSD is therefore bit-exact for every KV storage and state form, the reproducible and lossless routes
+  included. Each SSD slab id maps to one fixed offset; the
   free list hands out the lowest id first, so the file fills from its start (on Windows a write past
   the valid data length completes synchronously after zeroing any gap below it, so filling in order
   keeps those writes sequential and gap-free).
@@ -549,6 +550,52 @@ most once while the SSD keeps it (blocks are immutable):
 - A failed write leaves the entries as they were; after three failures the tier stops writing and
   keeps reading.
 
+Write policy (2026-11-06/07, the owner's request to cut SSD writes; measurements in §16.9):
+
+- The index counts, per snapshot kind, the images written with their image-and-path slabs, the image
+  reads, the written images read at least once, those superseded or dropped from the SSD before any
+  read, and the retained snapshots the Host tier evicted without an SSD copy
+  (`PrefixIndexStats::ssd_by_kind`, `RuntimeStats::hybrid_ssd_by_kind`, the `throughput` record's
+  `ssd.by_kind`). On the FP4-Local agentic replay endpoints are most of the bytes and about a third of
+  them are read back, while about half are superseded first (their conversation continued from its
+  Host or Device copy); taps are read back about once in fifty writes; shared-prefix boundaries most
+  often.
+- Qwen4Exp's SSD copies leave out the DFlash2 ring (`PrefixIndexConfig::ssd_image_slabs`: the image
+  slabs before the ring's first full slab, 136 of 184 on FP4-Local). The ring only steers drafts, so a
+  promotion zero-fills those slabs (a zeroed ring is a fresh lane's: every value finite) and the
+  restored lane drafts from a ring that refills as it prefills and decodes. On the exact route a draft
+  is accepted only when it is the token the verify column draws (Gumbel-max), so the output is the
+  same; elsewhere rejection sampling keeps the distribution. Snapshot meta stays in the index, so the
+  partial copy needs no header change.
+- An image is written as a lossless codec stream when that takes fewer SSD slabs
+  (`fp32_row_codec`, `PrefixCacheIndex::pack_ssd_write`). A state image is mostly FP32 recurrent state
+  whose sign and mantissa are incompressible (7.97 bits in the top mantissa byte) and whose exponent
+  carries about 3 bits (2.9 given its row's largest), so the lossless ceiling is about 15.6 %. Rows of
+  128 words store the row's largest exponent and a 4-bit offset per word (15 escapes to a raw exponent
+  byte), with the low 16 mantissa bits and the sign with the top 7 as planes; a row or a slab that
+  would not shrink is stored raw. A codec thread encodes a write-back's kept image slabs into a staging
+  buffer before the write is issued; one packed write runs at a time, and only while write-back has
+  slack (the Host tier's lossless room at least half its target), other write-backs going raw beside
+  it (one packed write at a time fell behind a 480 MiB Host tier's captures and lost a snapshot). A
+  packed promotion reads the stream into a staging buffer and decodes it into its Host image slabs on
+  up to eight threads before completing. Blocks and tails stay slab copies (INT8 page records carry
+  about 7.65 bits a byte).
+- The write budget (`--ssd-context-gib-per-hour N|unlimited`,
+  `ContextCacheOptions::ssd_write_bytes_per_hour`, default 8 GiB an hour, `SsdWriteBudget`): a bucket
+  of one hour's bytes that refills continuously, whose level is kept across restarts in
+  `--ssd-context-dir` (`infernix-ssd-write-budget.txt`, saved every minute and at exit), so model
+  switches do not refill it. While the bucket is at least half full every candidate is written; below
+  that, a candidate is written when its expected value is within the best (2 x fill) share, by bytes,
+  of the last 256 offered, and never when it is larger than what is left. Its expected value is its
+  GDSF value density (`(1 + hits) x seconds saved per byte`) times the share of its kind's written
+  images read back so far (one in two before any). A rule that spent at the budget's sustained rate on
+  the most valuable candidates from the start wrote less but kept fewer cache hits (the value density
+  favours early taps, which are rarely read back; §16.9). A scan the budget declined entirely is not
+  repeated until a snapshot is
+  published or the budget allows another image, and the idle Engine is not woken for it. The
+  `throughput` record reports the budget's size and level, the snapshots passed over and the write
+  policy's own time.
+
 Host eviction with an SSD tier (replacing §9.3's order):
 
 1. dead blocks (with their SSD copies);
@@ -590,10 +637,16 @@ RAM and writes:
   SSD-only snapshot its record: a 64 GiB tier of Flash-Next INT8 slabs (0.93 MB) adds about 70K
   nodes, about 30 MB.
 - A conversation turn writes at most its new blocks and the snapshots retained when the Host tier
-  needs their room, once each. The `throughput` record's `context_cache.hybrid.ssd` object and
-  `/metrics` (`ssd_context_*`) report the bytes written and read, promotions, demotions and losses.
+  needs their room, once each, within the write budget. The `throughput` record's
+  `context_cache.hybrid.ssd` object and `/metrics` (`ssd_context_*`) report the bytes written and read,
+  promotions, demotions and losses; the record also reports the fates by kind, the budget and the
+  bytes the codec saved.
+- The codec keeps at most one staging buffer of an image's kept slabs (Flash-Next FP4-Local:
+  118 MB) for reuse, allocated at the first packed write or promotion; a second one is allocated while
+  a packed write and a packed promotion overlap.
 
-Configuration: `--ssd-context-gib` and `--ssd-context-dir` go together; the tier is refused with
+Configuration: `--ssd-context-gib` and `--ssd-context-dir` go together (`--ssd-context-gib-per-hour`
+needs them); the tier is refused with
 `--no-prefix-reuse`, without a Host tier (`--host-context-mib 0`), with a directory that does not
 exist, and with a size below one snapshot image and its block (the size rounds down to whole Host
 slabs). The startup log names the directory and size.
@@ -2069,33 +2122,106 @@ Functional checks of the trial builds (Qwen3.8-27B official NVFP4, RTX 5090, gre
   `fp24` rounding changes greedy trajectories immediately; whether it degrades answers is what the
   resume-equivalence measurement has to establish.
 
-### 16.9 SSD tier (2026-11-06)
+### 16.9 SSD tier (2026-11-06/07)
 
 Built for the FP4-Local agent log of 2026-11-02/03 (§5.7). Measured on the RTX 5090 machine (PCIe 5.0
 x8 GPU link, 96 GB RAM) with two drives: a Samsung 990 PRO 2 TB (PCIe 4.0 TLC, the regular SSD) and
 an Intel Optane P5800X 400 GB.
 
-- **A 100K-token conversation** (`infernix_qwen4_exp_prefix_cache_real_test --ssd-scale`; FP4-Local,
-  INT8 KV, default route, 16,384-token chunks, Host tier 4 GiB, SSD tier 16 GiB): conversation A, then
-  B pushing A's blocks off the Device; A plus 64 tokens resumes from the Host tier; C and D push A
-  out of the Host tier; the same prompt again resumes from the SSD tier.
+- **A 100K-token conversation, like for like** (`infernix_qwen4_exp_prefix_cache_real_test
+  --ssd-scale`; FP4-Local, INT8 KV, default route, 16,384-token chunks, Host tier 4 GiB, SSD tier 16 GiB,
+  no write budget; 2026-11-07): conversation A, B pushing its blocks off the Device, A plus 64 tokens
+  (it resumes at A's last chunk-grid tap, 98,304, and leaves its own snapshot at 99,968), B2 pushing it
+  off the Device, and A1 again resumes there from the Host tier; a second conversation of the same
+  shape is pushed out of the Host tier by two more and resumes at the same position from the SSD tier
+  (a resume supersedes the snapshot it resumed from, so one conversation cannot give both).
 
-| drive | cold prefill (100K) | Host resume (98,304 reused) | SSD resume (99,968 reused) | read |
-|---|---:|---:|---:|---|
-| 990 PRO (E:) | 10.81 s | 2.24 s | **0.42 s** | 0.98 GB at 6.80 GB/s |
-| P5800X (G:) | 10.77 s | 2.23 s | **0.41 s** | 0.98 GB at 6.96 GB/s |
+| drive | cold prefill | first resume (from 98,304) | Host resume (99,968) | SSD resume (99,968) | SSD read |
+|---|---:|---:|---:|---:|---|
+| 990 PRO (E:) | 10.68 s | 2.17 s | 0.32 s | **0.47 s** | 1.43 GB at 6.94 GB/s |
+| P5800X (G:) | 10.68 s | 2.16 s | 0.24 s | **0.44 s** | 1.34 GB at 7.00 GB/s |
+| 990 PRO, codec | 10.69 s | 2.15 s | 0.23 s | **0.45 s** | 1.42 GB at 6.96 GB/s |
+| P5800X, codec | 10.67 s | 2.15 s | 0.23 s | **0.43 s** | 1.33 GB at 7.11 GB/s |
 
-  Times are to the first token. The Host resume prefills 1,760 tokens from A's snapshot, the SSD
-  resume 96 from the first resume's own, so the two resumes are not the same work; the SSD read
-  itself is 0.98 GB in about 0.14 s. The regular drive reads within 3 % of the Optane one: with eight
-  8 MiB reads in flight both run near their sequential rates. Both resumes generated the same 16
-  tokens. The run wrote 6.56 GB (10 images, 6,275 blocks): with a Host tier smaller than the
-  conversations, nearly everything the conversations leave is written once.
-- **Exactness** (exact route, byte copies at every tier): FP4-Local `--ssd` (a 300 MiB Host tier, a
-  4 GiB SSD tier): a tap resume read back from the SSD tier equals the cold run, and a turn 2 resumed
-  at turn 1's endpoint read back from it equals the lane-resident resume; Qwen3.8-27B NVFP4
-  `ssd-restore` and `ssd-restore-mtp` (a 480 MiB Host tier): the prompt-tail snapshot read back from
-  the SSD tier generates what the Device-resident engine does.
+  Times are to the first token. Reading back from the SSD costs about 0.15-0.2 s over the Host tier
+  at this point (the Host resume itself varies 0.23-0.32 s between runs), the same on both drives;
+  the codec leaves the SSD resume unchanged (decoding runs at 20 GB/s on eight threads, below). This
+  section's first version compared the first resume (2.24 s, which prefills 1,760 tokens through a
+  50.6 GiB expert stream) with the SSD resume from the later snapshot (96 tokens): not the same work.
+  The run wrote 12.13 GB (11.72 GB with the codec: blocks are most of it here).
+- **Exactness** (exact route): FP4-Local `--ssd` (a 300 MiB Host tier, a 4 GiB SSD tier): a tap resume
+  read back from the SSD tier equals the cold run, and a turn 2 resumed at turn 1's endpoint read back
+  from it equals the lane-resident resume, with and without the codec, and again with the DFlash2
+  drafter (a 420 MiB Host tier, about two and a half of its larger images), whose ring the SSD copies
+  leave out; Qwen3.8-27B NVFP4 `ssd-restore` and `ssd-restore-mtp` (a 480 MiB Host tier): the
+  prompt-tail snapshot read back from the SSD tier generates what the Device-resident engine does,
+  with and without the codec. The real tests run without a write budget (its level persists in their
+  shared directory).
+- **The agentic replay, tier on against off** (`bench/agentic_ab`, FP4-Local on the owner's launch flags
+  with `--host-context-mib 3840` in both arms, the SSD arm adding a 64 GiB tier on the 990 PRO; seed
+  42, scale 1.0, corpus `a0c806c5`, 130 requests per arm; 2026-11-06, before the write policy):
+
+| metric | no SSD tier | SSD tier | change |
+|---|---:|---:|---:|
+| average time to first token | 4.3 s (3.2-5.6) | 3.4 s (2.8-4.0) | −21.6 % |
+| median / 90th percentile | 2.93 / 9.7 s | 2.33 / 5.5 s | −20.6 / −43.2 % |
+| continuing-session turns (112), average | 4.29 s | 3.25 s | −24.3 % |
+| prompt tokens served from cache | 78.8 % | 90.8 % | +12.0 points |
+| prompt tokens prefilled | 1,142,284 | 497,279 | −56.5 % |
+| whole-prompt re-prefills, main sessions (of 75) / subagents (of 37) | 9 / 1 | 0 / 0 | |
+| output tok/s, one request decoding | 161 (156-166) | 157 (148-163) | −2.1 % |
+| decode rounds/s, one request decoding | 63.0 (59.2-65.9) | 61.2 (55.6-65.1) | −2.8 % |
+
+  Brackets are 95 % bootstrap intervals. A second run of the same build gave −26.4 % average time to
+  first token, 90.8 % from cache and one-request decode **+9.0 %** (175 tok/s): the decode rows move with
+  the run, not with write-back. The session resumed after idling took 0.98 s against 9.91 s.
+- **The write policy on the same replay** (each row one treatment run against the same no-SSD control;
+  "written" and "read" are the SSD tier's bytes; the rows from "ring left out" down are the write
+  policy's strategies, in the build that ran them):
+
+| SSD tier variant | written | read | avg / p90 TTFT | from cache | 1-request decode |
+|---|---:|---:|---:|---:|---:|
+| as first built (two runs) | 33.3 / 36.5 GB | 11.7 / 12.2 GB | 3.4 / 5.5, 3.2 / 7.2 s | 90.8 % | 157 / 175 tok/s |
+| DFlash2 ring left out (four runs) | 27.3-29.1 GB | 10.2-11.1 GB | 3.0-3.2 / 6.1-7.0 s | 90.4-90.8 % | 158-174 tok/s |
+| + half the Host tier unwritten | 24.9 GB | 11.1 GB | 3.2 / 7.0 s | 89.5 % | 158 tok/s |
+| + no taps written | 24.4 GB | 14.4 GB | 3.3 / 7.5 s | 89.9 % | 164 tok/s |
+| + image codec (two runs) | 25.7 / 26.9 GB | 10.3 / 10.4 GB | 3.6 / 7.6, 3.6 / 7.7 s | 90.7 % | 158 tok/s |
+| + budget 8 GiB an hour | 10.0 GB | 7.2 GB | 3.3 / 6.4 s | 90.4 % | 158 tok/s |
+| + budget 16 GiB an hour | 20.1 GB | 9.8 GB | 3.3 / 7.1 s | 90.4 % | 160 tok/s |
+| + budget 8 GiB an hour, rate-based (rejected) | 7.6 GB | 7.3 GB | 3.5 / 8.9 s | 89.2 % | 159 tok/s |
+| final build, no budget | 26.2 GB | 11.2 GB | 3.5 / 7.7 s | 90.8 % | 161 tok/s |
+| final build, default 8 GiB an hour | 10.0 GB | 7.3 GB | 3.3 / 7.7 s | 90.5 % | 160 tok/s |
+| no SSD tier (the control) | | | 4.3 / 9.7 s | 78.8 % | 161 tok/s |
+
+  - Fates by kind (the second first-built run): endpoints 117 written (26.5 GB), 35 read back, 55
+    superseded before any read; taps 56 written (8.9 GB), 1 read back; boundaries 7 written, 5 read
+    back; nothing lost from the Host tier unwritten.
+  - Leaving out the ring wrote about a fifth less with the same cache hits; drafting acceptance
+    (tokens per round 2.57-2.66) stayed within the first-built runs' 2.57-2.69.
+  - Half the Host tier unwritten and never writing taps each wrote about 13 % less but lost 0.7-1.1
+    points of cache hits: trades, which the budget makes with less loss. Neither was kept.
+  - The codec packed every image the replay wrote (171 and 181, 16 SSD slabs or 13.8 MB each), 5-10 %
+    fewer bytes written. The codec runs' higher time to first token is queueing, not the codec: from
+    admission to the first output both took 1.44-1.48 s against 1.42-1.50 s without the codec, while
+    their queue waits were 2.0 s against 1.6-1.7 s because each arm samples its own text (85,680 and
+    96,218 completion tokens against 77,140-81,214).
+  - The budget at 8 GiB an hour wrote about a third as much as no budget and kept nearly every hit (no
+    whole-prompt re-prefill; the session resumed after idling 2.2-2.3 s, against 0.9-1.0 s without a
+    budget and 9.9 s without the tier). With the final build 48 of its 53 images were packed (the
+    rest under pressure, raw). The rate-based rule (writing at
+    the budget's sustained rate on the most valuable candidates from the start) wrote less and lost
+    more: its value ranking wrote 13 taps and 4 endpoints, against the half-full rule's 16 and 27.
+  - Runs after about 22:40 on 2026-11-06 decode more slowly than before (a ring-only run repeated at
+    00:46 gave 158 tok/s against 170-174 earlier), so rows are compared within their period. One run
+    under a per-day budget (12 GiB, the bucket starting full) decoded at 117 tok/s (−27 %) from the
+    moment its bucket emptied; it was not reproduced (the per-hour budgets above, the policy's own
+    time measured at 0.01-3 s a run) and is not explained.
+- **The codec on real snapshots** (`infernix_ssd_tier_test` with `INFERNIX_TEST_CODEC_DUMP`, the Host
+  tier of a replay saved with `--prefix-cache-file`; FP4-Local with DFlash2, the 136 kept slabs of
+  each image): 11.9 % smaller; encoding 3.8 GB/s on one thread, decoding 4.8 GB/s on one and 20 GB/s
+  on eight (a 990 PRO reads 7 GB/s). Measured entropies: exponent 3.4 bits (2.9 given the row's
+  largest), top mantissa byte 7.97 bits; the DFlash2 ring would compress 17-22 % but is left out;
+  INT8 page records 7.65 bits a byte (zlib 4.5 %).
 - **Fixed while building** (each found by a test above): SSD jobs first held path pins, which took
   their blocks' Device copies out of the LRU, and an idle Engine refused a prompt that needed those
   pages (I/O pins replaced them); a write-back making SSD room by dropping other snapshots' backups
@@ -2103,40 +2229,15 @@ an Intel Optane P5800X 400 GB.
   write-back target, and with retries 100 ms apart, a request's endpoint was still unwritten when the
   next request's prefill displaced it (three quarters, and a retry at every poll, after landed
   captures are published); `cudaMallocHost` returned a 1 GiB Host chunk only 512-byte aligned, which
-  unbuffered I/O refuses (chunks are allocated 4 KiB-aligned).
-- **The agentic replay** (`bench/agentic_ab`, FP4-Local on the owner's launch flags with
-  `--host-context-mib 3840` in both arms, the SSD arm adding a 64 GiB tier on the 990 PRO; seed 42,
-  scale 1.0, corpus `a0c806c5`, 130 requests per arm, one run each):
-
-| metric | no SSD tier | SSD tier | change |
-|---|---:|---:|---:|
-| average time to first token | 4.3 s (3.2-5.6) | 3.4 s (2.8-4.0) | −21.6 % |
-| median / 90th percentile | 2.93 / 9.7 s | 2.33 / 5.5 s | −20.6 / −43.2 % |
-| continuing-session turns (112), average | 4.29 s | 3.25 s | −24.3 % |
-| new long prompts (6), average | 8.0 s | 7.6 s | −4.8 % |
-| prompt tokens served from cache | 78.8 % | 90.8 % | +12.0 points |
-| prompt tokens prefilled | 1,142,284 | 497,279 | −56.5 % |
-| whole-prompt re-prefills, main sessions (of 75) / subagents (of 37) | 9 / 1 | 0 / 0 | |
-| output tok/s, one request decoding | 161 (156-166) | 157 (148-163) | −2.1 % |
-| decode rounds/s, one request decoding | 63.0 (59.2-65.9) | 61.2 (55.6-65.1) | −2.8 % |
-| prefill tok/s, the two requests with no cache hit | 7,721 | 7,671 | −0.6 % |
-| workload wall time | 12.3 min | 12.8 min | +3.4 % |
-
-  Brackets are 95 % bootstrap intervals. The session resumed after idling took 0.98 s against
-  9.91 s. The decode rows are within their intervals but both lower, and write-back runs during
-  decode; they are not resolved by one run each. Subagent tool-loop turns averaged 5.17 s against
-  4.97 s although more of their prompts came from cache (91.3 against 85.0 %): their averages are
-  decided by a few queue waits (survey-1#3 29.4 s against 4.0 s, the same 1,988 tokens prefilled).
-  Each arm samples its own text (completion tokens 77,036 against 90,706), so wall time and
-  batching are not comparable between the arms. The SSD arm wrote
-  33.3 GB (159 snapshot images, 9,348 blocks) and read 11.7 GB back (36 promotions), with no
-  failures and no SSD evictions; 33.3 GB of the 64 GiB were in use at the end. From this run's and
-  the scale run's counters an image is about 164 MB and a block about 0.8 MB, so images were about
-  three quarters of the writes (an estimate).
+  unbuffered I/O refuses (chunks are allocated 4 KiB-aligned); one packed write at a time fell behind
+  a 480 MiB Host tier's captures and lost the snapshot a Qwen3.5 test restores (packing only with
+  slack, raw writes beside it); the real tests failed once the write budget's persisted level, spent
+  by an earlier test in the same directory, refused their writes (they run without a budget).
 - **Not measured here**: a Linux Engine (the POSIX path, `pread`/`pwrite` on an `O_DIRECT` file unlinked
   at creation, passes `infernix_direct_scratch_file_test`, `infernix_ssd_tier_test` and the index test
   under WSL2 Ubuntu 24.04 with g++ 13.3, `-Wall -Wextra` clean, but no Linux model run); a QLC drive
-  after its SLC cache is exhausted (writes would slow, reads are issued first).
+  after its SLC cache is exhausted (writes would slow, reads are issued first); the 122B and the
+  35B-A3B; the budget over sessions of hours (the replay is 13 minutes).
 
 ## 17. Qwen4Exp binding (Qwen3.8-Flash-Next)
 
@@ -2160,7 +2261,7 @@ rules, measurements and the build record are in the
 | Vision | A resume frontier strictly inside an item, or past its start in the block it begins in (rule 3 of §6.1), is never chosen; items ending at or before the frontier are not encoded again (the encode window is planned from the frontier); suffix M-RoPE positions come from the prompt |
 | Statistics | `RuntimeStats::hybrid_*` and the request log's `cached_prefix_tokens` / `restored_host_bytes` as in Qwen3.5 |
 | Persistence | As §5.5, own format (`prefix/persist.cpp`, `NINFQ4PC` version 1): the block table also stores each block's `mtp_next`; snapshot meta travels inside each image's header slab and is validated by the state-image layout fingerprint, which the file's geometry also records. Saved at the Engine's stop after every lane is released; loaded into the empty cache at startup |
-| SSD tier | As §5.7 (`prefix_select` promotes the source a quote chooses; a binding skips sources only on the SSD). Snapshot meta and `mtp_next` stay with their index entries, so an SSD copy is the Host slabs' bytes alone |
+| SSD tier | As §5.7 (`prefix_select` promotes the source a quote chooses; a binding skips sources only on the SSD). Snapshot meta and `mtp_next` stay with their index entries, so an SSD copy is the Host slabs' bytes alone, and it leaves out the DFlash2 ring (`ssd_image_slabs`: 136 of 184 FP4-Local image slabs; a promotion zero-fills the rest) |
 | Preemption | A pause publishes the lane's blocks and its state at the frontier to the cache, as a consistent abort does, and releases the lane (design §19.3.13); the resume binds from the deepest snapshot, without replay when it sits at the paused frontier |
 | Failure | A row with non-finite logits withdraws the request's entries (§7.8): its captures are Host-born, so the release first drains the transfer stream and reads each capture's publication (the lane keeps its capture ids until its release). A `RecoverableExecutionError` (an expert record that could not be read) still empties the whole cache, since the failed round's state is unknown for every lane |
 | Not built | Device snapshot slots, prefill CPU assist and C > 1 extras (design P7, P8) |

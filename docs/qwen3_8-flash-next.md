@@ -699,8 +699,11 @@ tokens; KV blocks are shared across requests. `infernix` (one request) runs with
   (snapshots and their blocks) in an N GiB scratch file on a local SSD and reads it back when a
   conversation returns, instead of recomputing it: with the default 4 GiB-class Host pool a long
   agent conversation (~2.4 GB at 160K tokens) is otherwise pushed out by the next one. It takes no
-  RAM beyond the cache's index, writes only when the Host pool fills, and is removed at exit
-  ([serving options](serving.md), [spec §5.7](maintainer/hybrid-prefix-cache-spec.md#57-ssd-tier-opt-in)).
+  RAM beyond the cache's index (and one staging buffer of an image, ~118 MB, for its lossless image
+  codec), writes only when the Host pool fills, at most `--ssd-context-gib-per-hour` (default 8 GiB an
+  hour), and is removed at exit. Its copies leave out the DFlash2 drafter's context (it refills after
+  a restore) ([serving options](serving.md),
+  [spec §5.7](maintainer/hybrid-prefix-cache-spec.md#57-ssd-tier-opt-in)).
 - **Exactness.** A resumed request computes what the request that left the snapshot computed; it
   may differ from an uncached run where two tokens are near ties. `--no-prefix-reuse` gives
   uncached runs.

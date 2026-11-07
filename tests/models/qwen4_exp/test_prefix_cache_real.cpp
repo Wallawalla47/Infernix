@@ -613,9 +613,20 @@ void print_ssd(const infernix::RuntimeStats& s) {
 
 // SSD tier (hybrid-prefix-cache-spec §5.7): a Host tier of about two images keeps nothing of A once
 // three pressure prompts have passed; the SSD tier keeps A's tap and turn 1's endpoint, and their
-// resumes read them back (promotions) and equal the cold run and the lane-resident resume.
-int run_ssd_tier(const char* artifact, const char* ngram) {
-    std::printf("== SSD tier (Host tier 300 MiB, SSD tier 4 GiB)\n");
+// resumes read them back (promotions) and equal the cold run and the lane-resident resume. With
+// `drafter` (INFERNIX_QWEN4_DFLASH2) the same runs under DFlash2, whose ring the SSD copies leave out:
+// a promotion zero-fills it, which may cost acceptance but never output.
+int run_ssd_tier(const char* artifact, const char* ngram, const char* drafter = nullptr) {
+    std::printf("== SSD tier (Host tier %s MiB, SSD tier 4 GiB%s)\n", drafter != nullptr ? "420" : "300",
+                drafter != nullptr ? ", DFlash2" : "");
+    const auto with_drafter = [&](infernix::EngineOptions options) {
+        if (drafter != nullptr) {
+            options.speculative.backend      = infernix::SpeculativeBackend::DFlash2;
+            options.speculative.draft_tokens = 3;
+            options.speculative.draft_model  = drafter;
+        }
+        return options;
+    };
     // The reference turn 2, resumed at turn 1's endpoint in its lane, from an Engine of its own: in the
     // SSD Engine turn 2's endpoint must be turn 1's fresh one (a re-sent turn 1 republishes an endpoint
     // the first turn 2 superseded, and superseded snapshots are never written to the SSD).
@@ -623,7 +634,7 @@ int run_ssd_tier(const char* artifact, const char* ngram) {
     Run turn1_reference, resident;
     std::vector<infernix::TokenId> t2;
     {
-        infernix::Engine reference(base_options(artifact, ngram));
+        infernix::Engine reference(with_drafter(base_options(artifact, ngram)));
         turn1_reference = generate(reference, t1, 96, true);
         t2              = t1;
         t2.insert(t2.end(), turn1_reference.tokens.begin(), turn1_reference.tokens.end());
@@ -632,9 +643,12 @@ int run_ssd_tier(const char* artifact, const char* ngram) {
         resident = generate(reference, t2, 48, true);
     }
     const std::filesystem::path directory = ssd_directory();
-    infernix::EngineOptions options       = base_options(artifact, ngram);
-    options.context_cache.host_capacity_bytes = 300ULL << 20;
+    infernix::EngineOptions options       = with_drafter(base_options(artifact, ngram));
+    // About two and a half images either way (a DFlash2 image also holds its ring: 158 against 117 MB).
+    options.context_cache.host_capacity_bytes = (drafter != nullptr ? 420ULL : 300ULL) << 20;
     options.context_cache.ssd_capacity_bytes  = 4ULL << 30;
+    // The write budget's level persists in the test directory: exactness and timing run without it.
+    options.context_cache.ssd_write_bytes_per_hour = infernix::ContextCacheOptions::kSsdWritesUnlimited;
     options.context_cache.ssd_directory       = directory;
     infernix::Engine engine(std::move(options));
     int failures = 0;
@@ -681,10 +695,12 @@ int run_ssd_tier(const char* artifact, const char* ngram) {
     return failures;
 }
 
-// The SSD tier at scale (timing, not run by default: --ssd-scale): conversation A of 100K tokens is
-// resumed from the Host tier, then, after two more conversations pushed it out of a 3 GiB Host tier,
-// from the SSD tier (INFERNIX_TEST_SSD_DIR picks the drive). Prints the time to first token of a cold
-// prefill, the Host resume and the SSD resume, and the SSD read rate; both resumes must agree.
+// The SSD tier at scale (timing, not run by default: --ssd-scale): a 100K-token conversation resumes at
+// a snapshot near its end from the Host tier, and a second conversation of the same shape resumes at
+// the same position from the SSD tier after two more pushed it out of a 4 GiB Host tier
+// (INFERNIX_TEST_SSD_DIR picks the drive). Prints the time to first token of a cold prefill, of the first
+// resume (at the chunk-grid tap, which prefills 1,760 more tokens), of the Host and the SSD resume, and
+// the SSD read rate.
 int run_ssd_scale(const char* artifact, const char* ngram) {
     constexpr std::uint32_t kContext = 100'000;
     std::printf("== SSD tier at scale (%u-token conversations, Host tier 4 GiB, SSD tier 16 GiB)\n", kContext);
@@ -698,6 +714,8 @@ int run_ssd_scale(const char* artifact, const char* ngram) {
     options.fast_path_candidates.clear();
     options.context_cache.host_capacity_bytes = 4ULL << 30;
     options.context_cache.ssd_capacity_bytes  = 16ULL << 30;
+    // The write budget's level persists in the test directory: exactness and timing run without it.
+    options.context_cache.ssd_write_bytes_per_hour = infernix::ContextCacheOptions::kSsdWritesUnlimited;
     options.context_cache.ssd_directory       = directory;
     infernix::Engine engine(std::move(options));
     const auto timed = [&](const std::vector<infernix::TokenId>& prompt, bool reuse) {
@@ -709,35 +727,50 @@ int run_ssd_scale(const char* artifact, const char* ngram) {
     std::vector<infernix::TokenId> a1      = a;
     const auto next                        = synthetic_tokens(64, 32);
     a1.insert(a1.end(), next.begin(), next.end());
+    const auto host_resume = [&](const std::vector<infernix::TokenId>& prompt, const char* label) {
+        const infernix::RuntimeStats before = engine.runtime_stats();
+        auto result                         = timed(prompt, true);
+        const infernix::RuntimeStats after  = engine.runtime_stats();
+        std::printf("        %s: %.2f GB restored from the Host tier, %llu SSD promotions\n", label,
+                    static_cast<double>(after.hybrid_host_restore_bytes - before.hybrid_host_restore_bytes) / 1e9,
+                    static_cast<unsigned long long>(after.hybrid_ssd_promotions - before.hybrid_ssd_promotions));
+        return std::make_tuple(std::get<0>(result), std::get<1>(result),
+                               after.hybrid_ssd_promotions - before.hybrid_ssd_promotions);
+    };
     const auto [first, cold_ttft] = timed(a, true);
     (void)first;
     (void)timed(synthetic_tokens(kContext, 33), true); // its blocks push A's off the Device
-    const infernix::RuntimeStats host_before = engine.runtime_stats();
-    const auto [host_run, host_ttft] = timed(a1, true);
-    const infernix::RuntimeStats host_after = engine.runtime_stats();
-    std::printf("        Host resume: %.2f GB restored from the Host tier, %llu SSD promotions\n",
-                static_cast<double>(host_after.hybrid_host_restore_bytes - host_before.hybrid_host_restore_bytes) / 1e9,
-                static_cast<unsigned long long>(host_after.hybrid_ssd_promotions - host_before.hybrid_ssd_promotions));
+    // A1 resumes at A's last chunk-grid tap and leaves its own snapshot S near its end; B2 pushes A1's
+    // pages off the Device and A1 again resumes at S from the Host tier. A resume supersedes the snapshot
+    // it resumed from, so the SSD resume at the same point runs on a second conversation of the same
+    // shape: E, F, E1 (its snapshot at the same position), C and D pushing it off the Host, E1 again.
+    const auto [tap_run, tap_ttft, tap_promotions] = host_resume(a1, "Host resume at A's tap");
+    (void)tap_promotions;
+    (void)timed(synthetic_tokens(kContext, 36), true);
+    const auto [host_run, host_ttft, host_promotions] = host_resume(a1, "Host resume at A1's snapshot");
+    std::vector<infernix::TokenId> e1 = synthetic_tokens(kContext, 37);
+    const auto e_next                 = synthetic_tokens(64, 38);
+    (void)timed(e1, true);
+    e1.insert(e1.end(), e_next.begin(), e_next.end());
+    (void)timed(synthetic_tokens(kContext, 39), true);
+    (void)host_resume(e1, "Host resume at E's tap");
     (void)timed(synthetic_tokens(kContext, 34), true);
-    (void)timed(synthetic_tokens(kContext, 35), true); // and these A's off the Host
+    (void)timed(synthetic_tokens(kContext, 35), true); // and these E's off the Host
     const infernix::RuntimeStats before = engine.runtime_stats();
-    const auto [ssd_run, ssd_ttft] = timed(a1, true);
+    const auto [ssd_run, ssd_ttft] = timed(e1, true);
     const infernix::RuntimeStats after = engine.runtime_stats();
     print_ssd(after);
     const double read_gb = static_cast<double>(after.hybrid_ssd_read_bytes - before.hybrid_ssd_read_bytes) / 1e9;
-    std::printf("        TTFT: cold %.2f s (%u tokens) | Host resume %.2f s (reused %u) | SSD resume %.2f s (reused %u, "
-                "%.2f GB read from the SSD tier, %.2f GB/s last promotion)\n",
-                cold_ttft, kContext, host_ttft, host_run.reused, ssd_ttft, ssd_run.reused, read_gb,
-                after.hybrid_ssd_read_bytes_per_second / 1e9);
-    // The second resume starts from the first one's own prompt snapshot (deeper than A's), so on the
-    // default route its decomposition, and possibly a near-tie, differ: equality is reported, not required
-    // (the --ssd scenario checks exactness on the exact route).
-    std::printf("        the SSD resume's tokens %s the Host resume's (%s)\n",
-                ssd_run.tokens == host_run.tokens ? "equal" : "differ from",
-                first_difference(ssd_run.tokens, host_run.tokens).c_str());
+    std::printf("        TTFT: cold %.2f s (%u tokens) | Host resume at A's tap %.2f s (reused %u) | Host resume %.2f s "
+                "(reused %u) | SSD resume %.2f s (reused %u, %.2f GB read from the SSD tier, %.2f GB/s last promotion)\n",
+                cold_ttft, kContext, tap_ttft, tap_run.reused, host_ttft, host_run.reused, ssd_ttft, ssd_run.reused,
+                read_gb, after.hybrid_ssd_read_bytes_per_second / 1e9);
+    // The two resumes restore snapshots at the same position of conversations of the same shape and
+    // prefill the same suffix length (the --ssd scenario checks exactness on the exact route).
     int failures = 0;
+    failures += check(host_promotions == 0, "the Host resume read nothing from the SSD tier");
     failures += check(after.hybrid_ssd_promotions > before.hybrid_ssd_promotions, "the SSD resume read from the SSD tier");
-    failures += check(ssd_run.reused >= host_run.reused, "the SSD resume reuses at least what the Host resume did");
+    failures += check(ssd_run.reused == host_run.reused, "the SSD resume reuses what the Host resume did");
     failures += check(after.hybrid_ssd_failures == 0, "no SSD transfer failed");
     return failures;
 }
@@ -762,6 +795,9 @@ int main(int argc, char** argv) {
     try {
         int failures = 0;
         if (ssd) { failures += run_ssd_tier(artifact, ngram); }
+        if (const char* drafter = std::getenv("INFERNIX_QWEN4_DFLASH2"); ssd && drafter != nullptr) {
+            failures += run_ssd_tier(artifact, ngram, drafter);
+        }
         if (ssd_scale) { failures += run_ssd_scale(artifact, ngram); }
         if (plain) { failures += run_mode(artifact, ngram, false); }
         if (mtp) { failures += run_mode(artifact, ngram, true); }

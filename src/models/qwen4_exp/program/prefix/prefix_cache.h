@@ -104,6 +104,7 @@ struct PrefixCacheConfig {
     // the directory of its scratch file. 0: none.
     std::uint64_t ssd_bytes = 0;
     std::filesystem::path ssd_directory;
+    std::uint64_t ssd_write_bytes_per_hour = 0; // 0: no write budget
 };
 
 // One admission's restore: Host pages into new pages, an image into a lane, then the events a

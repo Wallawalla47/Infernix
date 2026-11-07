@@ -82,6 +82,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--host-context-mib"},
     ServeOptionArity{"--ssd-context-gib"},
     ServeOptionArity{"--ssd-context-dir"},
+    ServeOptionArity{"--ssd-context-gib-per-hour"},
     ServeOptionArity{"--request-log-jsonl"},
     ServeOptionArity{"--request-log-max-mib"},
     ServeOptionArity{"--request-log-keep"},
@@ -517,6 +518,13 @@ std::string serve_usage_text(const char* argv0) {
            "                             the log and /metrics report the bytes written\n"
            "  --ssd-context-dir DIR      existing directory on a local SSD for that file\n"
            "                             (required with --ssd-context-gib)\n"
+           "  --ssd-context-gib-per-hour N|unlimited\n"
+           "                             the SSD tier's write budget: at most N GiB written\n"
+           "                             in any hour (default 8). Lower trades cache hits\n"
+           "                             for SSD wear: once half of an hour's budget is\n"
+           "                             spent, only the snapshots most likely to save the\n"
+           "                             most prefill are written. Kept across restarts in\n"
+           "                             --ssd-context-dir; unlimited writes everything\n"
            "  --device-snapshot-slots N  device state snapshot slots (default concurrency\n"
            "                             + 1; + 2 without a host tier). Qwen3.8-Flash-\n"
            "                             Next has none\n"
@@ -988,6 +996,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (gib > (std::uint64_t{1} << 20U)) { throw std::invalid_argument("--ssd-context-gib is out of range"); }
             options.context_cache.ssd_capacity_bytes = gib << 30U;
             cache_option_flag                        = "--ssd-context-gib";
+        } else if (arg == "--ssd-context-gib-per-hour") {
+            const std::string text = require_value("--ssd-context-gib-per-hour");
+            if (text == "unlimited") {
+                options.context_cache.ssd_write_bytes_per_hour = ContextCacheOptions::kSsdWritesUnlimited;
+            } else {
+                const std::uint64_t gib = parse_u64(text.c_str(), "ssd-context-gib-per-hour");
+                if (gib == 0 || gib > (std::uint64_t{1} << 20U)) {
+                    throw std::invalid_argument("--ssd-context-gib-per-hour must be in [1, 1048576] or unlimited");
+                }
+                options.context_cache.ssd_write_bytes_per_hour = gib << 30U;
+            }
+            cache_option_flag = "--ssd-context-gib-per-hour";
         } else if (arg == "--ssd-context-dir") {
             options.context_cache.ssd_directory = require_value("--ssd-context-dir");
             if (options.context_cache.ssd_directory.empty()) {
@@ -1257,6 +1277,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (ssd_size != !ssd.empty()) {
             throw std::invalid_argument(ssd_size ? "--ssd-context-gib needs --ssd-context-dir"
                                                  : "--ssd-context-dir needs --ssd-context-gib");
+        }
+        if (!ssd_size && options.context_cache.ssd_write_bytes_per_hour != 0) {
+            throw std::invalid_argument("--ssd-context-gib-per-hour needs --ssd-context-gib and --ssd-context-dir");
         }
         if (ssd_size) {
             if (host_context_explicit && options.context_cache.host_capacity_bytes == 0) {

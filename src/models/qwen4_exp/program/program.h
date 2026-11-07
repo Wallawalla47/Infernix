@@ -520,6 +520,7 @@ struct ProgramOptions {
     // The SSD tier below the Host tier (hybrid-prefix-cache-spec §5.7): its size and directory; 0: none.
     std::uint64_t prefix_ssd_bytes   = 0;
     std::filesystem::path prefix_ssd_directory;
+    std::uint64_t prefix_ssd_write_bytes_per_hour = 0; // 0: no write budget
     runtime::prefix_cache::TapPlannerConfig prefix_taps;
     runtime::prefix_cache::CacheCostModel prefix_cost;
     // What a cut that ends a layer walk's span costs (the next span streams the experts again), at

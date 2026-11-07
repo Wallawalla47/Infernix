@@ -1777,6 +1777,58 @@ void test_ssd_write_back_and_demotion() {
     require(back.ssd_bytes == 0 && !back.image_on_ssd_only && index.snapshot(end).ssd == CopyState::Resident,
             "the source is Host-resident again and still SSD-backed");
     require(index.begin_ssd_promotion(end).status == SsdPromotionStatus::Resident, "nothing left to promote");
+
+    // Per-kind fates: the endpoint was written once (image and path) and read once; a second read
+    // of the same copy is not a first read.
+    const SsdKindStats endpoint = index.stats().ssd_by_kind[static_cast<std::size_t>(SnapshotKind::Endpoint)];
+    require(endpoint.writes == 1 && endpoint.written_slabs == 6 && endpoint.reads == 1 && endpoint.first_reads == 1 &&
+                endpoint.superseded_unread == 0 && endpoint.dropped_unread == 0,
+            "the endpoint's write and read are counted by kind");
+    require(index.stats().ssd_by_kind[static_cast<std::size_t>(SnapshotKind::Tap)].writes == 0, "no tap was written");
+}
+
+// SSD copies may keep only the first image slabs (Qwen4Exp leaves out its DFlash2 ring): the write-back
+// and the SSD room cover those, and a promotion fills every Host image slab, zeroing the left-out ones.
+void test_ssd_partial_image() {
+    RecordingBackend backend;
+    PrefixIndexConfig config = ssd_config(16, 64);
+    config.ssd_image_slabs   = 3; // of 4
+    PrefixCacheIndex index(config, backend);
+    PrefixIndexConfig bad = config;
+    bad.ssd_image_slabs   = 5;
+    require_throws([&] { PrefixCacheIndex wrong(bad, backend); }, "an SSD copy keeps at most an image");
+    const auto a          = make_tokens(128, 310);
+    const SnapshotRef end = host_endpoint(index, backend, a); // 2 blocks + 4 image slabs
+    std::optional<SsdJob> job = index.begin_ssd_write();
+    require(job.has_value() && job->transfers.size() == 5 && index.stats().ssd_free_slabs == 59,
+            "the write-back takes both blocks and three image slabs");
+    const SnapshotView writing = index.snapshot(end);
+    require(job->transfers[4].host_slab == writing.host_slabs[2], "the image's first three slabs are written");
+    index.complete_ssd_write(*job);
+    index.check_invariants();
+    require(index.host_lossless_slabs() == 16, "the partial copy makes the whole image clean");
+
+    // Pushed off the Host, then read back: four Host image slabs, three read, one zero-filled.
+    (void)host_endpoint(index, backend, make_tokens(192, 311));
+    auto image = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+    auto more  = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+    require(image && more, "two images fit after demotions");
+    (void)index.evict_backed_device_blocks(1000);
+    require(index.snapshot(end).host == CopyState::Absent, "the endpoint is SSD-only");
+    const MatchCandidate candidate = match_one(index, a);
+    require(candidate.image_on_ssd_only && candidate.ssd_bytes == (1U << 20U) + (3U << 20U),
+            "the candidate reads three quarters of the image");
+    index.release_host_image(std::move(*image));
+    index.release_host_image(std::move(*more));
+    SsdPromotionStart start = index.begin_ssd_promotion(end);
+    require(start.job && start.job->image && start.job->transfers.size() == 4 && start.job->zero_host_slabs.size() == 1,
+            "the promotion reads the block and three image slabs and zero-fills the fourth");
+    const SnapshotView promoting = index.snapshot(end);
+    require(promoting.host_slabs.size() == 4 && start.job->zero_host_slabs[0] == promoting.host_slabs[3],
+            "the left-out slab is the image's last");
+    index.complete_ssd_promotion(*start.job);
+    index.check_invariants();
+    require(match_one(index, a).ssd_bytes == 0, "the source is Host-resident again");
 }
 
 void test_ssd_eviction_order() {
@@ -2299,6 +2351,7 @@ int main() {
         test_cost_model();
         test_random_stress();
         test_ssd_write_back_and_demotion();
+        test_ssd_partial_image();
         test_ssd_eviction_order();
         test_ssd_promotion_abort();
         test_ssd_device_slots();

@@ -29,7 +29,11 @@ PrefixCacheIndex::PrefixCacheIndex(const PrefixIndexConfig& config, PrefixIndexB
     if (config.ssd_slabs != 0 && (config.host_slabs == 0 || !config.host_blocks)) {
         throw std::invalid_argument("prefix cache SSD tier requires a Host tier holding blocks");
     }
-    if (config.ssd_slabs != 0 && config.ssd_slabs < config.image_slabs + 2U) {
+    if (config.ssd_image_slabs > config.image_slabs) {
+        throw std::invalid_argument("prefix cache SSD copies keep more slabs than an image has");
+    }
+    const std::uint32_t ssd_image = config.ssd_image_slabs == 0 ? config.image_slabs : config.ssd_image_slabs;
+    if (config.ssd_slabs != 0 && config.ssd_slabs < ssd_image + 2U) {
         throw std::invalid_argument("prefix cache SSD tier holds less than one snapshot and its block");
     }
     nodes_.resize(config.max_nodes);
@@ -155,6 +159,20 @@ std::uint32_t PrefixCacheIndex::snapshot_slab_count(const Snapshot& snapshot) co
     return config_.image_slabs + (config_.host_blocks && snapshot.tail_len != 0 ? 1U : 0U);
 }
 
+std::uint32_t PrefixCacheIndex::ssd_image_slab_count() const noexcept {
+    return config_.ssd_image_slabs == 0 ? config_.image_slabs : std::min(config_.ssd_image_slabs, config_.image_slabs);
+}
+
+std::uint32_t PrefixCacheIndex::ssd_snapshot_slab_count(const Snapshot& snapshot) const noexcept {
+    return ssd_image_slab_count() + (config_.host_blocks && snapshot.tail_len != 0 ? 1U : 0U);
+}
+
+std::size_t PrefixCacheIndex::ssd_to_host_position(std::size_t k) const noexcept {
+    // The SSD copy holds the kept image slabs, then the tail slab; the Host layout, every image slab first.
+    const std::uint32_t kept = ssd_image_slab_count();
+    return k < kept ? k : config_.image_slabs + (k - kept);
+}
+
 bool PrefixCacheIndex::tail_matches(const Snapshot& snapshot,
                                     std::span<const TokenId> prompt) const noexcept {
     const std::uint32_t begin = snapshot.frontier - snapshot.tail_len;
@@ -223,7 +241,10 @@ MatchResult PrefixCacheIndex::match(std::span<const TokenId> tokens,
             candidate.tail && !candidate.tail_on_device && snapshot.host != CopyState::Resident;
         candidate.ssd_bytes =
             static_cast<std::uint64_t>(candidate.ssd_only_blocks) * config_.block_bytes +
-            (candidate.image_on_ssd_only ? config_.image_bytes : 0ULL) +
+            (!candidate.image_on_ssd_only ? 0ULL
+             : snapshot.ssd_packed
+                 ? static_cast<std::uint64_t>(snapshot.ssd_slabs.size() - (candidate.tail ? 1U : 0U)) * config_.block_bytes
+                 : config_.image_bytes * ssd_image_slab_count() / config_.image_slabs) +
             (candidate.tail_on_ssd_only ? config_.block_bytes : 0ULL);
         result.candidates.push_back(candidate);
     };
@@ -386,6 +407,7 @@ bool PrefixCacheIndex::supersede(SnapshotRef snapshot, std::span<const TokenId> 
     }
     std::vector<std::uint32_t> dependents;
     collect_retained_dependents(snapshot.index, dependents);
+    if (entry.ssd == CopyState::Resident && !entry.ssd_read) { ++kind_stats(entry).superseded_unread; }
     entry.superseded      = true;
     entry.superseded_tick = ++tick_;
     adjust_retained(entry.anchor, -1);
@@ -1046,6 +1068,7 @@ bool PrefixCacheIndex::evict_for_slabs(std::uint32_t protect_snapshot, double cl
         chosen.host = CopyState::Absent;
         refresh_tail(victim);
     } else {
+        ++kind_stats(chosen).host_losses;
         remove_snapshot(victim);
     }
     ++counters_.host_snapshot_evictions;
@@ -1192,9 +1215,12 @@ void PrefixCacheIndex::drop_node_ssd_copy(std::uint32_t index) {
 void PrefixCacheIndex::drop_snapshot_ssd_copy(std::uint32_t index) {
     Snapshot& snapshot = snapshots_[index];
     if (snapshot.ssd != CopyState::Resident) { invariant("prefix cache drops a non-resident SSD image"); }
+    if (!snapshot.ssd_read && !snapshot.superseded) { ++kind_stats(snapshot).dropped_unread; }
     for (const std::uint32_t slab : snapshot.ssd_slabs) { free_ssd_slab(slab); }
     snapshot.ssd_slabs.clear();
-    snapshot.ssd = CopyState::Absent;
+    snapshot.ssd        = CopyState::Absent;
+    snapshot.ssd_read   = false;
+    snapshot.ssd_packed = false;
     refresh_tail(index);
 }
 
@@ -1294,7 +1320,7 @@ void PrefixCacheIndex::set_ssd_rate(double bytes_per_second) noexcept {
     if (bytes_per_second > 0.0) { config_.cost.ssd_bytes_per_second = bytes_per_second; }
 }
 
-std::optional<SsdJob> PrefixCacheIndex::begin_ssd_write() {
+std::optional<SsdJob> PrefixCacheIndex::begin_ssd_write(const std::function<bool(const SsdWriteCandidate&)>& admit) {
     if (config_.ssd_slabs == 0) { return std::nullopt; }
     // Candidates in the order the Host tier would lose them: the lowest priority first.
     std::vector<std::uint32_t> order;
@@ -1330,8 +1356,23 @@ std::optional<SsdJob> PrefixCacheIndex::begin_ssd_write() {
         }
         if (!writable) { continue; }
         std::reverse(nodes.begin(), nodes.end()); // path order
-        const Snapshot& snapshot = snapshots_[index];
-        const std::uint32_t need = static_cast<std::uint32_t>(nodes.size()) + snapshot_slab_count(snapshot);
+        Snapshot& snapshot       = snapshots_[index];
+        const std::uint32_t need = static_cast<std::uint32_t>(nodes.size()) + ssd_snapshot_slab_count(snapshot);
+        if (admit) {
+            const SsdWriteCandidate candidate{.kind        = snapshot.kind,
+                                              .hits        = snapshot.hits,
+                                              .slabs       = need,
+                                              .value       = snapshot.priority - snapshot.priority_base,
+                                              .first_offer = !snapshot.ssd_offered};
+            snapshot.ssd_offered = true;
+            if (!admit(candidate)) {
+                if (!snapshot.ssd_declined) {
+                    snapshot.ssd_declined = true;
+                    ++counters_.ssd_declined_snapshots;
+                }
+                continue;
+            }
+        }
         ++tried;
         // Checked before anything is evicted: a write that cannot fit displaces nothing.
         if (ssd_room_for(index, snapshot.priority) < need) { continue; }
@@ -1355,7 +1396,8 @@ std::optional<SsdJob> PrefixCacheIndex::begin_ssd_write() {
         written.ssd_slabs.assign(slabs.begin() + static_cast<std::ptrdiff_t>(next), slabs.end());
         written.ssd = CopyState::Filling;
         for (std::size_t k = 0; k < written.ssd_slabs.size(); ++k) {
-            job.transfers.push_back(SsdTransfer{.host_slab = written.host_slabs[k], .ssd_slab = written.ssd_slabs[k]});
+            job.transfers.push_back(
+                SsdTransfer{.host_slab = written.host_slabs[ssd_to_host_position(k)], .ssd_slab = written.ssd_slabs[k]});
         }
         io_pin_snapshot(job.snapshot.index);
         for (const std::uint32_t node : nodes) { refresh_node(node); }
@@ -1374,10 +1416,35 @@ void PrefixCacheIndex::complete_ssd_write(SsdJob& job) {
     if (job.image) {
         Snapshot& snapshot = require(job.snapshot);
         if (snapshot.ssd != CopyState::Filling) { invariant("prefix cache SSD image write not open"); }
-        snapshot.ssd = CopyState::Resident;
+        snapshot.ssd      = CopyState::Resident;
+        snapshot.ssd_read = false;
+        SsdKindStats& kind = kind_stats(snapshot);
+        ++kind.writes;
+        kind.written_slabs += job.transfers.size() + job.image_ssd_slabs.size();
+        // Superseded while it was written (begin_ssd_write takes only retained ones).
+        if (snapshot.superseded) { ++kind.superseded_unread; }
     }
     io_unpin_snapshot(job.snapshot.index);
     job = SsdJob{};
+}
+
+void PrefixCacheIndex::pack_ssd_write(SsdJob& job, std::uint32_t stream_slabs) {
+    Snapshot& snapshot       = require(job.snapshot);
+    const std::uint32_t kept = ssd_image_slab_count();
+    if (!job.image || job.packed || snapshot.ssd != CopyState::Filling || stream_slabs == 0 || stream_slabs >= kept) {
+        invariant("prefix cache packs an SSD write it cannot");
+    }
+    // The job's transfers are its blocks', its kept image slabs', then its tail's.
+    const auto image_begin = static_cast<std::ptrdiff_t>(job.nodes.size());
+    job.image_host_slabs.assign(snapshot.host_slabs.begin(), snapshot.host_slabs.begin() + kept);
+    job.image_ssd_slabs.assign(snapshot.ssd_slabs.begin(), snapshot.ssd_slabs.begin() + stream_slabs);
+    for (std::uint32_t k = stream_slabs; k < kept; ++k) { free_ssd_slab(snapshot.ssd_slabs[k]); }
+    std::vector<std::uint32_t> slabs(snapshot.ssd_slabs.begin(), snapshot.ssd_slabs.begin() + stream_slabs);
+    slabs.insert(slabs.end(), snapshot.ssd_slabs.begin() + kept, snapshot.ssd_slabs.end());
+    snapshot.ssd_slabs  = std::move(slabs);
+    snapshot.ssd_packed = true;
+    job.transfers.erase(job.transfers.begin() + image_begin, job.transfers.begin() + image_begin + kept);
+    job.packed = true;
 }
 
 void PrefixCacheIndex::abort_ssd_write(SsdJob& job) {
@@ -1394,7 +1461,8 @@ void PrefixCacheIndex::abort_ssd_write(SsdJob& job) {
         if (snapshot.ssd != CopyState::Filling) { invariant("prefix cache SSD image write not open"); }
         for (const std::uint32_t slab : snapshot.ssd_slabs) { free_ssd_slab(slab); }
         snapshot.ssd_slabs.clear();
-        snapshot.ssd = CopyState::Absent;
+        snapshot.ssd        = CopyState::Absent;
+        snapshot.ssd_packed = false;
     }
     io_unpin_snapshot(job.snapshot.index);
     job = SsdJob{};
@@ -1455,8 +1523,25 @@ SsdPromotionStart PrefixCacheIndex::begin_ssd_promotion(SnapshotRef ref) {
         Snapshot& promoted = snapshots_[ref.index];
         promoted.host_slabs.assign(slabs.begin() + static_cast<std::ptrdiff_t>(next), slabs.end());
         promoted.host = CopyState::Filling;
-        for (std::size_t k = 0; k < promoted.host_slabs.size(); ++k) {
-            job.transfers.push_back(SsdTransfer{.host_slab = promoted.host_slabs[k], .ssd_slab = promoted.ssd_slabs[k]});
+        if (promoted.ssd_packed) {
+            // The stream decodes into the kept image slabs; the tail is a slab copy.
+            const bool tail           = config_.host_blocks && promoted.tail_len != 0;
+            const std::size_t stream  = promoted.ssd_slabs.size() - (tail ? 1U : 0U);
+            job.packed                = true;
+            job.image_ssd_slabs.assign(promoted.ssd_slabs.begin(), promoted.ssd_slabs.begin() + static_cast<std::ptrdiff_t>(stream));
+            job.image_host_slabs.assign(promoted.host_slabs.begin(), promoted.host_slabs.begin() + ssd_image_slab_count());
+            if (tail) {
+                job.transfers.push_back(SsdTransfer{.host_slab = promoted.host_slabs[config_.image_slabs],
+                                                    .ssd_slab  = promoted.ssd_slabs.back()});
+            }
+        } else {
+            for (std::size_t k = 0; k < promoted.ssd_slabs.size(); ++k) {
+                job.transfers.push_back(SsdTransfer{.host_slab = promoted.host_slabs[ssd_to_host_position(k)],
+                                                    .ssd_slab  = promoted.ssd_slabs[k]});
+            }
+        }
+        for (std::uint32_t k = ssd_image_slab_count(); k < config_.image_slabs; ++k) {
+            job.zero_host_slabs.push_back(promoted.host_slabs[k]);
         }
         refresh_tail(ref.index);
     }
@@ -1476,6 +1561,10 @@ void PrefixCacheIndex::complete_ssd_promotion(SsdJob& job) {
         if (snapshot.host != CopyState::Filling) { invariant("prefix cache SSD image promotion not open"); }
         snapshot.host = CopyState::Resident;
         refresh_tail(job.snapshot.index);
+        SsdKindStats& kind = kind_stats(snapshot);
+        ++kind.reads;
+        if (!snapshot.ssd_read) { ++kind.first_reads; }
+        snapshot.ssd_read = true;
     }
     io_unpin_snapshot(job.snapshot.index);
     job = SsdJob{};
@@ -1853,6 +1942,10 @@ PublishResult PrefixCacheIndex::publish_image(NodeRef anchor, std::uint32_t fron
     snapshot.host_slabs      = std::move(host_slabs);
     snapshot.ssd_slabs.clear();
     snapshot.ssd             = CopyState::Absent;
+    snapshot.ssd_read        = false;
+    snapshot.ssd_packed      = false;
+    snapshot.ssd_offered     = false;
+    snapshot.ssd_declined    = false;
     snapshot.warm_counted    = false;
     snapshot.clean_counted   = false;
     snapshot.pins            = 0;
@@ -2083,9 +2176,14 @@ void PrefixCacheIndex::remove_snapshot(std::uint32_t index) {
         snapshot.clean_counted = false;
         host_clean_image_slabs_ -= snapshot_slab_count(snapshot);
     }
+    if (snapshot.ssd == CopyState::Resident && !snapshot.ssd_read && !snapshot.superseded) {
+        ++kind_stats(snapshot).dropped_unread;
+    }
     for (const std::uint32_t slab : snapshot.ssd_slabs) { free_ssd_slab(slab); }
     snapshot.ssd_slabs.clear();
-    snapshot.ssd = CopyState::Absent;
+    snapshot.ssd        = CopyState::Absent;
+    snapshot.ssd_read   = false;
+    snapshot.ssd_packed = false;
     unlink_snapshot(index);
     snapshot.superseded      = false;
     snapshot.superseded_tick = 0;
@@ -2413,6 +2511,10 @@ std::optional<SnapshotRef> PrefixCacheIndex::restore_host_snapshot(NodeRef ancho
     snapshot.host             = CopyState::Resident;
     snapshot.ssd_slabs.clear();
     snapshot.ssd              = CopyState::Absent;
+    snapshot.ssd_read         = false;
+    snapshot.ssd_packed       = false;
+    snapshot.ssd_offered      = false;
+    snapshot.ssd_declined     = false;
     snapshot.warm_counted     = false;
     snapshot.clean_counted    = false;
     snapshot.pins             = 0;
@@ -2631,7 +2733,9 @@ void PrefixCacheIndex::check_invariants() const {
             invariant("snapshot SSD write has no Host source");
         }
         if (snapshot.ssd != CopyState::Absent) {
-            if (snapshot.ssd_slabs.size() != snapshot_slab_count(snapshot)) {
+            if (snapshot.ssd_packed ? snapshot.ssd_slabs.size() >= ssd_snapshot_slab_count(snapshot) ||
+                                          snapshot.ssd_slabs.size() < 1U + (ssd_snapshot_slab_count(snapshot) - ssd_image_slab_count())
+                                    : snapshot.ssd_slabs.size() != ssd_snapshot_slab_count(snapshot)) {
                 invariant("snapshot SSD slab count is inconsistent");
             }
             for (const std::uint32_t slab : snapshot.ssd_slabs) {
