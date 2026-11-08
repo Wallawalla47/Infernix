@@ -13,6 +13,7 @@ add_library(infernix_core STATIC
   evictable_weight_pool.cu
   vmm_arena.cu
   device.cu
+  content_hash.cpp
   direct_read_queue.cpp
   direct_scratch_file.cpp
   dtype.cpp

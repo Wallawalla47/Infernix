@@ -187,6 +187,7 @@ struct SnapshotView {
     std::span<const std::uint32_t> host_slabs; // image slabs, then the tail slab when tail_len>0
     CopyState ssd              = CopyState::Absent;
     std::span<const std::uint32_t> ssd_slabs;  // the same layout on the SSD tier
+    bool ssd_packed    = false;                // the SSD image is a codec stream (fewer slabs)
     std::uint32_t pins = 0;
     SnapshotKind kind  = SnapshotKind::Tap;
     std::uint32_t hits = 0;
@@ -469,26 +470,30 @@ public:
     std::uint32_t withdraw(Withdrawal& withdrawal);
 
     // ---- persistence ---------------------------------------------------------------------------
-    // What a saved Host tier keeps: every Host-resident snapshot whose anchor path is Host-resident
-    // throughout, and exactly those paths, parents before children. Other Host content is dead
-    // (no snapshot can resume through it) or unreachable after a restart. Superseded snapshots are
-    // kept too (a retry or a re-sent prompt resumes from them, issue #59), after the retained ones
-    // and in supersession order, so a restore can keep their eviction order.
-    void collect_persistable(std::vector<NodeRef>& nodes,
-                             std::vector<SnapshotRef>& snapshots) const;
+    // What a saved cache keeps: every snapshot with a Host copy (with `ssd`, a kept SSD tier: or an
+    // SSD copy) whose anchor path has such copies throughout, and exactly those paths, parents
+    // before children. Other content is dead (no snapshot can resume through it) or unreachable
+    // after a restart. Superseded snapshots are kept too (a retry or a re-sent prompt resumes from
+    // them, issue #59), after the retained ones and in supersession order, so a restore can keep
+    // their eviction order.
+    void collect_persistable(std::vector<NodeRef>& nodes, std::vector<SnapshotRef>& snapshots,
+                             bool ssd = false) const;
     [[nodiscard]] BlockIdentity block_identity(NodeRef node) const;
-    // Rebuild a saved Host tier into a fresh index, parents before children and anchors before
-    // their snapshots, in the selection plan_host_restore made. Nothing is evicted to make room;
-    // absent means no slab, node or snapshot entry was free, or the entry already exists. A
-    // `superseded` snapshot comes back superseded (evicted first, oldest restored first), as it was
-    // when saved; a hit retains it again.
-    [[nodiscard]] std::optional<RestoredBlock> restore_host_block(NodeRef parent,
-                                                                  std::uint64_t lookup_hash,
-                                                                  std::span<const TokenId> tokens,
-                                                                  std::uint64_t extra);
+    // Rebuild a saved cache into a fresh index, parents before children and anchors before their
+    // snapshots: each entry Host-resident (`host`: a free slab is taken, its bytes then read into
+    // the returned slabs), at the given SSD slabs of a kept SSD tier, or both. Nothing is evicted to
+    // make room; absent means no slab, node or snapshot entry was free, an SSD slab is out of range
+    // or held twice, or the entry already exists. A `superseded` snapshot comes back superseded
+    // (evicted first, oldest restored first), as it was when saved; a hit retains it again. After
+    // the last entry with an SSD copy, finish_ssd_restore() makes every other SSD slab free.
+    [[nodiscard]] std::optional<RestoredBlock> restore_block(NodeRef parent, std::uint64_t lookup_hash,
+                                                             std::span<const TokenId> tokens, std::uint64_t extra,
+                                                             bool host, std::uint32_t ssd_slab);
     [[nodiscard]] std::optional<SnapshotRef>
-    restore_host_snapshot(NodeRef anchor, std::uint32_t frontier, std::span<const TokenId> tail,
-                          SnapshotKind kind, std::uint32_t hits, bool superseded);
+    restore_snapshot(NodeRef anchor, std::uint32_t frontier, std::span<const TokenId> tail, SnapshotKind kind,
+                     std::uint32_t hits, bool superseded, bool host, std::span<const std::uint32_t> ssd_slabs,
+                     bool ssd_packed);
+    void finish_ssd_restore();
 
     // ---- Host tier resize (RAM pressure) -------------------------------------------------------
     // Slabs [0, host_slab_limit()) are owned, reserved or free; the configured host_slabs past it are retired and
@@ -731,6 +736,8 @@ private:
     }
 
     [[nodiscard]] bool take_free_slabs(std::uint32_t count, std::vector<std::uint32_t>& out);
+    // Restore: marks SSD slabs held by restored copies; false when one is out of range or held already.
+    [[nodiscard]] bool claim_ssd_slabs(std::span<const std::uint32_t> slabs);
     // Evicts dead KV, superseded snapshots, then retained snapshots in GDSF order until `count`
     // slabs are free, but no retained snapshot with a priority above `claim`.
     [[nodiscard]] bool allocate_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
@@ -830,6 +837,7 @@ private:
     std::uint64_t host_clean_nodes_       = 0;
     std::uint64_t host_clean_image_slabs_ = 0;
     std::vector<std::uint32_t> free_ssd_slabs_; // a min-heap: the file fills from its start
+    std::vector<bool> ssd_claimed_;             // during a restore: slabs restored copies hold
 
     std::vector<std::uint32_t> free_slabs_;
     std::uint32_t host_limit_ = 0; // shrink_host / grow_host
@@ -857,6 +865,8 @@ struct SavedSnapshotShape {
     std::uint32_t slabs = 0;
     std::uint32_t hits  = 0;
     bool superseded     = false;
+    // The file holds its Host bytes (false: only an SSD copy, which takes no Host slab).
+    bool host = true;
 };
 
 struct HostRestorePlan {
@@ -873,10 +883,12 @@ struct HostRestorePlan {
 // path. Each takes its own slabs and the path blocks not yet chosen; one
 // that does not fit is passed over for later ones that may. Blocks are chosen only on a chosen
 // snapshot's path, so no restored block is dead. `block_parents` lists every saved block's parent
-// index (-1 for the root), parents first.
+// index (-1 for the root), parents first. With a kept SSD tier, `block_host` says which blocks the
+// file holds Host bytes of, and a snapshot shape's `host` the same: the others take no Host slab and
+// are never chosen (their SSD copies come back regardless).
 [[nodiscard]] HostRestorePlan plan_host_restore(std::span<const std::int32_t> block_parents,
                                                 std::span<const SavedSnapshotShape> snapshots,
-                                                std::uint64_t host_slabs,
-                                                const PrefixIndexConfig& config);
+                                                std::uint64_t host_slabs, const PrefixIndexConfig& config,
+                                                std::span<const bool> block_host = {});
 
 } // namespace infernix::runtime::prefix_cache

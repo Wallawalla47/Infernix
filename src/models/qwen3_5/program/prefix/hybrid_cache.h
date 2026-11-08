@@ -6,6 +6,7 @@
 #include "models/qwen3_5/program/storage/kv_address_space.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/state/state_image.h"
+#include "runtime/prefix_cache/persist_file.h"
 #include "runtime/prefix_cache/prefix_index.h"
 #include "runtime/prefix_cache/ssd_tier.h"
 #include "runtime/prefix_cache/tap_planner.h"
@@ -82,33 +83,18 @@ struct HybridRestoreLayer {
     std::uint32_t index = 0;
 };
 
-// Outcome of saving or loading the Host tier (--prefix-cache-file).
-struct HybridPersistResult {
-    bool ok = false;
-    // Why nothing was saved or loaded (missing file, incompatible fingerprint, I/O error).
-    std::string message;
-    std::uint64_t blocks    = 0;
-    std::uint64_t snapshots = 0;
-    std::uint64_t bytes     = 0;
-    double seconds          = 0.0;
-    // Load only: the file's entries and the Host tier bytes they all take, against this tier.
-    // A tier smaller than the file restores the snapshots it values most (plan_host_restore).
-    std::uint64_t saved_blocks        = 0;
-    std::uint64_t saved_snapshots     = 0;
-    std::uint64_t required_host_bytes = 0;
-    std::uint64_t host_bytes          = 0;
-};
-
 class HybridPrefixCache final : public runtime::prefix_cache::PrefixIndexBackend {
 public:
-    // With config.ssd_slabs, the SSD tier's scratch file is created in `ssd_directory` (§5.7).
+    // With config.ssd_slabs, the SSD tier's scratch file is created in `ssd_directory` (§5.7), or with
+    // `ssd_kept_file` (a prefix cache file's) that file is kept across restarts (§5.5).
     HybridPrefixCache(const runtime::prefix_cache::PrefixIndexConfig& config,
                       runtime::prefix_cache::TapPlannerConfig taps, LogicalKVPageStore& text_pages,
                       LogicalKVPageStore* backend_pages, StateImageStore& states,
                       qwen3_5::StateImageDevicePool& state_pool, const HybridHostLayout& host,
                       std::vector<HybridRestoreLayer> layers,
                       StartupPhaseScope* pin_progress = nullptr,
-                      const std::filesystem::path& ssd_directory = {}, std::uint64_t ssd_write_bytes_per_hour = 0);
+                      const std::filesystem::path& ssd_directory = {}, std::uint64_t ssd_write_bytes_per_hour = 0,
+                      const std::filesystem::path& ssd_kept_file = {});
     ~HybridPrefixCache() override;
 
     HybridPrefixCache(const HybridPrefixCache&)            = delete;
@@ -252,21 +238,23 @@ public:
     [[nodiscard]] std::uint64_t host_tier_shrinkable_bytes() const noexcept;
     [[nodiscard]] std::uint64_t host_tier_growable_bytes() const noexcept;
 
-    // ---- persistence (hybrid_persist.cpp) -------------------------------------------------------
+    // ---- persistence (hybrid_persist.cpp, runtime/prefix_cache/persist_file.h) ------------------
     // Writes every Host-backed snapshot and the block paths it anchors on to `path` (through a
-    // temporary file renamed into place). Requires no restore or write in flight. Once `abandoned`
-    // reports a request, at the latest after the slab being written, the temporary file is
-    // deleted and the previous file stays.
-    [[nodiscard]] HybridPersistResult save(const std::filesystem::path& path,
-                                           std::string_view fingerprint,
-                                           const CancellationView& abandoned) const;
-    // Rebuilds a saved Host tier into this empty cache when the file's fingerprint and geometry
-    // match. A mismatch or damaged file loads nothing; a smaller Host tier restores the snapshots
-    // it values most and only their paths, reading nothing else. Reading a file whose header
-    // matches publishes StartupPhase::PrefixCacheLoad to `observer`.
-    [[nodiscard]] HybridPersistResult load(const std::filesystem::path& path,
-                                           std::string_view fingerprint,
-                                           const StartupObserver& observer);
+    // temporary file renamed into place), and with a kept SSD tier the SSD-backed ones by
+    // reference (the tier is drained and flushed first). Requires no restore or write in flight.
+    // Once `abandoned` reports a request, at the latest after the slab being written, the
+    // temporary file is deleted and the previous file stays.
+    [[nodiscard]] runtime::prefix_cache::PersistResult save(const std::filesystem::path& path,
+                                                            std::string_view fingerprint,
+                                                            const CancellationView& abandoned);
+    // Rebuilds a saved cache into this empty cache when the file's fingerprint and geometry match.
+    // A mismatch or damaged file loads nothing; a smaller Host tier restores the snapshots it
+    // values most and only their paths, reading nothing else, and a kept SSD tier that reopened the
+    // previous run's file takes back its copies. Reading a file whose header matches publishes
+    // StartupPhase::PrefixCacheLoad to `observer`.
+    [[nodiscard]] runtime::prefix_cache::PersistResult load(const std::filesystem::path& path,
+                                                            std::string_view fingerprint,
+                                                            const StartupObserver& observer);
 
     // PrefixIndexBackend
     void release_device_block(std::uint32_t device_id) noexcept override;
@@ -330,6 +318,7 @@ private:
     void release(const HybridBlockPages& pages) noexcept;
     void adopt_destination(const HybridBlockPages& pages, std::uint32_t columns);
     [[nodiscard]] std::byte* slab(std::uint32_t id) const noexcept;
+    [[nodiscard]] runtime::prefix_cache::PersistBinding persist_binding();
     void add_copies(PageCopies& copies, const HybridBlockPages& pages, std::uint32_t slab_id);
     // Each returns the copy calls it issued.
     std::uint32_t enqueue_to_host(const PageCopies& copies, cudaStream_t stream) const;

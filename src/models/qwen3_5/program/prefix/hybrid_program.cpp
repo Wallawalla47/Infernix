@@ -140,7 +140,11 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
         config, taps, *text_kv_pages, backend_kv_pages.get(), *state_store, *state_images, host,
         std::move(layers), phase ? &*phase : nullptr, context_cache.ssd_directory,
         context_cache.ssd_write_bytes_per_hour == ContextCacheOptions::kSsdWritesUnlimited ? 0U
-                                                                                       : context_cache.ssd_write_bytes_per_hour);
+                                                                                       : context_cache.ssd_write_bytes_per_hour,
+        // With a prefix cache file the SSD tier's content outlives the process too (spec §5.5).
+        context_cache.ssd_capacity_bytes != 0 && !options.persistent_file.empty()
+            ? pc::kept_ssd_file(context_cache.ssd_directory, options.persistent_file)
+            : std::filesystem::path{});
     if (phase) { phase->complete(host_bytes, host_bytes); }
 }
 
@@ -150,38 +154,19 @@ void ProgramImpl::set_hybrid_cost(const pc::CacheCostModel& cost) {
     if (hybrid_) { hybrid_->set_cost(hybrid_cost_); }
 }
 
-namespace {
-
-HybridCachePersistence public_result(const HybridPersistResult& result) {
-    return HybridCachePersistence{
-        .ok                  = result.ok,
-        .message             = result.message,
-        .blocks              = result.blocks,
-        .snapshots           = result.snapshots,
-        .bytes               = result.bytes,
-        .seconds             = result.seconds,
-        .saved_blocks        = result.saved_blocks,
-        .saved_snapshots     = result.saved_snapshots,
-        .required_host_bytes = result.required_host_bytes,
-        .host_bytes          = result.host_bytes,
-    };
-}
-
-} // namespace
-
-HybridCachePersistence ProgramImpl::attach_hybrid_cache_file(const std::filesystem::path& path,
+runtime::prefix_cache::PersistResult ProgramImpl::attach_hybrid_cache_file(const std::filesystem::path& path,
                                                              std::string fingerprint,
                                                              const StartupObserver& observer) {
     if (!hybrid_) { return {.message = "the hybrid prefix cache is not enabled"}; }
     if (path.empty()) { throw std::invalid_argument("hybrid prefix cache file path is empty"); }
-    HybridCachePersistence loaded = public_result(hybrid_->load(path, fingerprint, observer));
+    runtime::prefix_cache::PersistResult loaded = hybrid_->load(path, fingerprint, observer);
     hybrid_file_                  = path;
     hybrid_fingerprint_           = std::move(fingerprint);
     hybrid_saved_writes_          = hybrid_->counters().host_write_bytes;
     return loaded;
 }
 
-std::optional<HybridCachePersistence> ProgramImpl::save_hybrid_cache_now(const CancellationView& abandoned) {
+std::optional<runtime::prefix_cache::PersistResult> ProgramImpl::save_hybrid_cache_now(const CancellationView& abandoned) {
     if (!hybrid_ || hybrid_file_.empty() || hybrid_->counters().host_write_bytes == hybrid_saved_writes_) {
         return std::nullopt;
     }
@@ -193,7 +178,7 @@ std::optional<HybridCachePersistence> ProgramImpl::save_hybrid_cache_now(const C
     // Withdrawn entries a transfer pinned until now never reach the file (spec §7.8).
     if (!hybrid_withdrawal_.empty()) { (void)hybrid_->index().withdraw(hybrid_withdrawal_); }
     const std::uint64_t written = hybrid_->counters().host_write_bytes;
-    HybridCachePersistence saved = public_result(hybrid_->save(hybrid_file_, hybrid_fingerprint_, abandoned));
+    runtime::prefix_cache::PersistResult saved = hybrid_->save(hybrid_file_, hybrid_fingerprint_, abandoned);
     if (saved.ok) {
         hybrid_saved_writes_ = written;
         ++hybrid_saves_;
@@ -216,7 +201,7 @@ void ProgramImpl::save_hybrid_cache_for_shutdown() noexcept {
         // from here, so an exit never waits for the Device work above.
         const PrefixCacheSaveControl& control = context_cache.hybrid.persistent_save;
         if (!control.begin()) {
-            hybrid_shutdown_save_ = HybridCachePersistence{.message = "abandoned before it began"};
+            hybrid_shutdown_save_ = runtime::prefix_cache::PersistResult{.message = "abandoned before it began"};
             return;
         }
 
@@ -227,13 +212,12 @@ void ProgramImpl::save_hybrid_cache_for_shutdown() noexcept {
             ~Ended() { control.end(saved); }
         } ended{control};
 
-        hybrid_shutdown_save_ = public_result(
-            hybrid_->save(hybrid_file_, hybrid_fingerprint_,
-                          CancellationView([&control] { return control.abandoned(); })));
+        hybrid_shutdown_save_ = hybrid_->save(hybrid_file_, hybrid_fingerprint_,
+                                              CancellationView([&control] { return control.abandoned(); }));
         ended.saved = hybrid_shutdown_save_->ok;
     } catch (const std::exception& error) {
-        hybrid_shutdown_save_ = HybridCachePersistence{.message = error.what()};
-    } catch (...) { hybrid_shutdown_save_ = HybridCachePersistence{.message = "unknown error"}; }
+        hybrid_shutdown_save_ = runtime::prefix_cache::PersistResult{.message = error.what()};
+    } catch (...) { hybrid_shutdown_save_ = runtime::prefix_cache::PersistResult{.message = "unknown error"}; }
 }
 
 std::uint32_t ProgramImpl::hybrid_backend_frontier(std::uint32_t frontier) const noexcept {

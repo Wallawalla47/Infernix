@@ -453,14 +453,14 @@ public:
         hybrid_coalesce_wait_seconds_ = seconds > 0.0 ? seconds : 0.0;
     }
 
-    [[nodiscard]] HybridCachePersistence attach_hybrid_cache_file(const std::filesystem::path& path,
+    [[nodiscard]] runtime::prefix_cache::PersistResult attach_hybrid_cache_file(const std::filesystem::path& path,
                                                                   std::string fingerprint,
                                                                   const StartupObserver& observer);
 
-    [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const {
+    [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> hybrid_shutdown_save() const {
         return hybrid_shutdown_save_;
     }
-    [[nodiscard]] std::optional<HybridCachePersistence> save_hybrid_cache_now(const CancellationView& abandoned);
+    [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> save_hybrid_cache_now(const CancellationView& abandoned);
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 
@@ -888,7 +888,7 @@ public:
     bool hybrid_source_pending_ = false;
     std::filesystem::path hybrid_file_;
     std::string hybrid_fingerprint_;
-    std::optional<HybridCachePersistence> hybrid_shutdown_save_;
+    std::optional<runtime::prefix_cache::PersistResult> hybrid_shutdown_save_;
 
     // ---- RAM pressure (Program::start_ram_resize): the monitor and the engine's diagnostic sink -------------------
     std::unique_ptr<runtime::expert_offload::RamMonitor> ram_;

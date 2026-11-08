@@ -23,6 +23,7 @@
 #include "runtime/contract/resources.h"
 #include "runtime/contract/timing.h"
 #include "runtime/prefix_cache/cost.h"
+#include "runtime/prefix_cache/persist_result.h"
 #include "runtime/prefix_cache/ssd_stats.h"
 #include "runtime/prefix_cache/tap_planner.h"
 
@@ -333,20 +334,6 @@ struct ProgramDevicePlan {
     }
 };
 
-// The prefix cache's Host tier saved at shutdown or loaded at startup (--prefix-cache-file).
-struct PrefixCachePersistence {
-    bool ok = false;
-    std::string message;
-    std::uint64_t blocks    = 0;
-    std::uint64_t snapshots = 0;
-    std::uint64_t bytes     = 0;
-    double seconds          = 0.0;
-    std::uint64_t saved_blocks        = 0;
-    std::uint64_t saved_snapshots     = 0;
-    std::uint64_t required_host_bytes = 0;
-    std::uint64_t host_bytes          = 0;
-};
-
 // N-gram trees: the most root-to-leaf paths (verification rows) one tree round verifies (ProgramOptions::ngram_tree_paths).
 inline constexpr std::uint32_t kNgramTreeMaximumPaths = 3;
 
@@ -540,6 +527,8 @@ struct ProgramOptions {
     std::uint64_t prefix_ssd_bytes   = 0;
     std::filesystem::path prefix_ssd_directory;
     std::uint64_t prefix_ssd_write_bytes_per_hour = 0; // 0: no write budget
+    // With --prefix-cache-file: the SSD tier's kept file, which outlives the process (§5.5); empty: none.
+    std::filesystem::path prefix_ssd_kept_file;
     runtime::prefix_cache::TapPlannerConfig prefix_taps;
     runtime::prefix_cache::CacheCostModel prefix_cost;
     // What a cut that ends a layer walk's span costs (the next span streams the experts again), at
@@ -700,15 +689,15 @@ public:
     void shutdown_cleanup() noexcept;
     // Loads the Host tier from `path` into the empty prefix cache and keeps `path` for the shutdown
     // save. `fingerprint` names everything the saved bytes depend on besides their geometry.
-    [[nodiscard]] PrefixCachePersistence attach_prefix_cache_file(const std::filesystem::path& path,
+    [[nodiscard]] runtime::prefix_cache::PersistResult attach_prefix_cache_file(const std::filesystem::path& path,
                                                                   std::string fingerprint,
                                                                   const StartupObserver& observer);
     // The shutdown save's result; absent before shutdown or without a file.
-    [[nodiscard]] std::optional<PrefixCachePersistence> prefix_shutdown_save() const;
+    [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> prefix_shutdown_save() const;
     // Between units (no unit's Device work in flight): writes the Host tier to the attached file
     // when it has been written since the last save or load (Engine periodic save,
     // HybridPrefixCacheOptions::persistent_save_interval). Absent without a file or a change.
-    [[nodiscard]] std::optional<PrefixCachePersistence> save_prefix_cache_now(const CancellationView& abandoned);
+    [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> save_prefix_cache_now(const CancellationView& abandoned);
 
     // Teacher-forced scoring of a text prompt (ProgramOptions::causal_scoring; an idle Program): the
     // log-probability of each token from first_target on given the tokens before it, with the

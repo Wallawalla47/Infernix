@@ -426,9 +426,12 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
   and expert tail skip settings, the product binary's identity — build id plus executable size
   and time, so any rebuild invalidates it — and the GPU's name, compute capability and SM count)
   and its Host geometry equal the running Engine's, and
-  its size matches its tables. The file (format 4; Qwen3.8-Flash-Next's own layout is format 2)
-  holds the header, the block table, the snapshot table (each snapshot's kind, hits and superseded
-  flag) and only then the slab bytes, so the loader chooses before it reads any slab. A Host tier
+  its size matches its tables. The file (format 5, one layout and one implementation for every
+  binding, `runtime/prefix_cache/persist_file.h`; each family supplies its file kind, its Host
+  geometry, a word per block — Qwen3.8-Flash-Next's `mtp_next` — and fixed-size meta per snapshot —
+  its state image header) holds the header, the block table, the snapshot table (each snapshot's
+  kind, hits and superseded flag) and only then the slab bytes, so the loader chooses before it
+  reads any slab. A Host tier
   that holds the whole file restores all of it, superseded snapshots coming back superseded (they
   are evicted first again, and a hit retains one as it does in a running cache). A smaller one
   restores whole snapshots, retained ones before superseded ones and each group greedily by the
@@ -441,6 +444,24 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
   with the tier the file needs, and that the save at shutdown replaces the file. Entries are rebuilt Host-only, parents before children, without evicting
   anything, and their first requests restore blocks and images through the ordinary Host restore
   path. A damaged file loads nothing.
+- **With an SSD tier (§5.7) the SSD content is kept too** (2026-11-08, candidates YK-02). The tier's
+  file is then `infernix-context-kept-<hash of the file's absolute path>.bin` in `--ssd-context-dir`,
+  opened for this process alone and kept when it ends. The tier records each slab's content hash as
+  it writes it (on its I/O threads). A save drains the tier, makes its file durable, and then saves
+  every snapshot with a Host or SSD copy whose path has such copies throughout: a Host copy's slab
+  bytes as before, an SSD copy by its slab ids and their hashes (a packed image with its flag),
+  Qwen3.8-Flash-Next's snapshot meta beside it. A load whose SSD tier reopened that file with the
+  same size takes the SSD copies back without reading them: an entry the Host plan does not take
+  (or that has no Host bytes in the file) comes back SSD-only, a planned one Host- and SSD-resident,
+  and the SSD free list becomes every slab no restored copy holds. A slab named by the previous run
+  is checked against its hash the first time a promotion reads it; one whose bytes changed — the
+  saved file names slabs that a process which ran after the save and crashed could have rewritten —
+  fails that promotion like a failed read, so its entry goes and nothing of it is used. The SSD
+  copies are not used (the log says why) when this start has no SSD tier, the file was not kept or
+  has another size. The startup log reports `prefix cache SSD tier kept` with the counts. What a
+  kept copy saves is the SSD tier's own resume, now across restarts and Launcher model switches
+  (§16.9: a 100K-token FP4-Local conversation resumed from the SSD tier in 0.43-0.47 s against a
+  10.7 s cold prefill).
 - The startup log shows the read of an accepted file as a progress phase (`loading prefix cache`,
   then `prefix cache read | bytes | time | rate`), then reports what was restored or why nothing
   was; the shutdown log reports the save.
@@ -493,8 +514,8 @@ Storage and transfers:
   whole size reserved (`FileAllocationInfo` / `posix_fallocate`, nothing written, so startup is
   instant and a drive without the space fails at once). It is opened unbuffered (no page cache, so it
   holds no RAM) and is removed when the process ends, a crash included (Windows deletes it on close,
-  POSIX unlinks it when created). Its content does not outlive the process; `--prefix-cache-file`
-  (§5.5) saves the Host tier only.
+  POSIX unlinks it when created). Its content does not outlive the process, except with
+  `--prefix-cache-file`, which keeps the file and names its content (§5.5).
 - The file is an array of SSD slabs of the Host slab size. A block bundle or a tail moves as a byte
   copy of its Host slab; an image as its kept slabs (all of them, or Qwen4Exp's slabs before its
   DFlash2 ring, below), raw or as a lossless codec stream in fewer slabs (below). A restore through the

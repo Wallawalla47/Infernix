@@ -33,7 +33,9 @@
 //
 //   SSD tier     (own Engine, hybrid-prefix-cache-spec §5.7) A 300 MiB Host tier with a 4 GiB SSD tier:
 //                after pressure prompts the tap resume and the endpoint resume read their sources back
-//                from the SSD tier and equal the cold run and the lane-resident resume.
+//                from the SSD tier and equal the cold run and the lane-resident resume. With a prefix
+//                cache file the SSD tier is kept (§5.5): after a restart turn 3 resumes at turn 2's
+//                endpoint, which only the SSD tier held, and equals the lane-resident resume.
 //   SSD scale    (--ssd-scale only: timing) A 100K-token conversation resumed from the Host tier and, once
 //                pushed out of it, from the SSD tier (INFERNIX_TEST_SSD_DIR): times to first token.
 //
@@ -52,6 +54,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -632,8 +635,8 @@ int run_ssd_tier(const char* artifact, const char* ngram, const char* drafter = 
     // SSD Engine turn 2's endpoint must be turn 1's fresh one (a re-sent turn 1 republishes an endpoint
     // the first turn 2 superseded, and superseded snapshots are never written to the SSD).
     const std::vector<infernix::TokenId> t1 = synthetic_tokens(700, 14);
-    Run turn1_reference, resident;
-    std::vector<infernix::TokenId> t2;
+    Run turn1_reference, resident, resident3;
+    std::vector<infernix::TokenId> t2, t3;
     {
         infernix::Engine reference(with_drafter(base_options(artifact, ngram)), infernix::test::engine_host());
         turn1_reference = generate(reference, t1, 96, true);
@@ -642,17 +645,36 @@ int run_ssd_tier(const char* artifact, const char* ngram, const char* drafter = 
         const auto more = synthetic_tokens(64, 15);
         t2.insert(t2.end(), more.begin(), more.end());
         resident = generate(reference, t2, 48, true);
+        // Turn 3, which the restart below resumes at turn 2's endpoint from the kept SSD tier.
+        t3 = t2;
+        t3.insert(t3.end(), resident.tokens.begin(), resident.tokens.end());
+        const auto third = synthetic_tokens(48, 16);
+        t3.insert(t3.end(), third.begin(), third.end());
+        resident3 = generate(reference, t3, 32, true);
     }
     const std::filesystem::path directory = ssd_directory();
-    infernix::EngineOptions options       = with_drafter(base_options(artifact, ngram));
-    // About two and a half images either way (a DFlash2 image also holds its ring: 158 against 117 MB).
-    options.context_cache.host_capacity_bytes = (drafter != nullptr ? 420ULL : 300ULL) << 20;
-    options.context_cache.ssd_capacity_bytes  = 4ULL << 30;
-    // The write budget's level persists in the test directory: exactness and timing run without it.
-    options.context_cache.ssd_write_bytes_per_hour = infernix::ContextCacheOptions::kSsdWritesUnlimited;
-    options.context_cache.ssd_directory       = directory;
-    infernix::Engine engine(std::move(options), infernix::test::engine_host());
+    // A prefix cache file keeps the SSD tier across the restart at the end (spec §5.5, candidates YK-02).
+    const std::filesystem::path file =
+        infernix::test::unique_temp_path(drafter != nullptr ? "infernix_qwen4_exp_ssd_dflash2.cache" : "infernix_qwen4_exp_ssd.cache");
+    std::error_code ignored;
+    std::filesystem::remove(file, ignored);
+    const auto ssd_options = [&] {
+        infernix::EngineOptions options = with_drafter(base_options(artifact, ngram));
+        // About two and a half images either way (a DFlash2 image also holds its ring: 158 against 117 MB).
+        options.context_cache.host_capacity_bytes = (drafter != nullptr ? 420ULL : 300ULL) << 20;
+        options.context_cache.ssd_capacity_bytes  = 4ULL << 30;
+        // The write budget's level persists in the test directory: exactness and timing run without it.
+        options.context_cache.ssd_write_bytes_per_hour = infernix::ContextCacheOptions::kSsdWritesUnlimited;
+        options.context_cache.ssd_directory       = directory;
+        options.context_cache.hybrid.persistent_file     = file;
+        options.context_cache.hybrid.persistent_identity = "ssd";
+        return options;
+    };
     int failures = 0;
+    Run restored;
+    std::optional<infernix::Engine> first;
+    first.emplace(ssd_options(), infernix::test::engine_host());
+    infernix::Engine& engine = *first;
     const auto pressure = [&](std::uint32_t seed) {
         for (std::uint32_t k = 0; k < 3; ++k) { (void)generate(engine, synthetic_tokens(3900, seed + k), 4, true); }
     };
@@ -685,7 +707,7 @@ int run_ssd_tier(const char* artifact, const char* ngram, const char* drafter = 
     print_ssd(engine.runtime_stats());
     pressure(200);
     const std::uint64_t promotions = engine.runtime_stats().hybrid_ssd_promotions;
-    const Run restored = generate(engine, t2, 48, true);
+    restored = generate(engine, t2, 48, true);
     print_ssd(engine.runtime_stats());
     failures += check(engine.runtime_stats().hybrid_ssd_promotions > promotions, "turn 2 was read back from the SSD tier");
     failures += check(restored.reused == endpoint, "turn 2 resumes at the endpoint " + std::to_string(endpoint) +
@@ -693,6 +715,31 @@ int run_ssd_tier(const char* artifact, const char* ngram, const char* drafter = 
     failures += check(restored.tokens == resident.tokens, "SSD-restored endpoint equals the lane-resident resume (" +
                                                               first_difference(restored.tokens, resident.tokens) + ")");
     failures += check(engine.runtime_stats().hybrid_ssd_failures == 0, "no SSD transfer failed");
+    // Turn 2's endpoint leaves the Host tier for the SSD tier; the stop saves the file.
+    pressure(300);
+    std::printf("        before the restart:\n");
+    print_ssd(engine.runtime_stats());
+    first.reset(); // the stop saves the file
+
+    // The restart: a new Engine on the same file and SSD directory takes the SSD copies back unread, and
+    // turn 3 resumes at turn 2's endpoint from them.
+    const auto endpoint2 = static_cast<std::uint32_t>(t2.size() + restored.tokens.size() - 1U);
+    infernix::Engine restarted(ssd_options(), infernix::test::engine_host());
+    const infernix::LoadSummary::PrefixCacheRestore restore = restarted.load_summary().prefix_cache;
+    std::printf("        restart: restored %llu blocks and %llu snapshots, %llu and %llu of them on the SSD tier (%s%s)\n",
+                static_cast<unsigned long long>(restore.blocks), static_cast<unsigned long long>(restore.snapshots),
+                static_cast<unsigned long long>(restore.ssd_blocks), static_cast<unsigned long long>(restore.ssd_snapshots),
+                restore.message.c_str(), restore.ssd_message.c_str());
+    failures += check(restore.restored && restore.ssd_snapshots != 0 && restore.ssd_message.empty(),
+                      "the restart takes back the SSD tier's snapshots");
+    const Run third = generate(restarted, t3, 32, true);
+    print_ssd(restarted.runtime_stats());
+    failures += check(restarted.runtime_stats().hybrid_ssd_promotions != 0, "turn 3 was read back from the kept SSD tier");
+    failures += check(third.reused == endpoint2, "turn 3 resumes at turn 2's endpoint " + std::to_string(endpoint2) +
+                                                     " after the restart (got " + std::to_string(third.reused) + ")");
+    failures += check(third.tokens == resident3.tokens, "turn 3 after the restart equals the lane-resident resume (" +
+                                                     first_difference(third.tokens, resident3.tokens) + ")");
+    failures += check(restarted.runtime_stats().hybrid_ssd_failures == 0, "no SSD transfer failed after the restart");
     return failures;
 }
 

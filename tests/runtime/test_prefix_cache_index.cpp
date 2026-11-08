@@ -661,16 +661,16 @@ void test_persistence_roundtrip() {
     };
     for (const NodeRef node : nodes) {
         const BlockIdentity identity = source.block_identity(node);
-        const auto block             = restored.restore_host_block(
-            mapped(identity.parent), identity.lookup_hash, identity.tokens, identity.extra);
+        const auto block             = restored.restore_block(mapped(identity.parent), identity.lookup_hash,
+                                                              identity.tokens, identity.extra, true, kNoId);
         require(block.has_value(), "a persisted block did not restore");
         mapping.emplace_back(node, block->node);
     }
     std::optional<SnapshotRef> restored_tap;
     for (const SnapshotRef snapshot : snapshots) {
         const SnapshotView view = source.snapshot(snapshot);
-        const auto restored_snapshot = restored.restore_host_snapshot(
-            mapped(view.anchor), view.frontier, view.tail, view.kind, view.hits, view.superseded);
+        const auto restored_snapshot = restored.restore_snapshot(mapped(view.anchor), view.frontier, view.tail,
+                                                                 view.kind, view.hits, view.superseded, true, {}, false);
         require(restored_snapshot.has_value(), "a persisted snapshot did not restore");
         if (snapshot == backed) { restored_tap = restored_snapshot; }
     }
@@ -704,12 +704,10 @@ void test_persistence_roundtrip() {
     // A full Host tier restores what fits and nothing else.
     PrefixCacheIndex tiny(small_config(1, 2), backend);
     const BlockIdentity first = source.block_identity(nodes.front());
-    require(tiny.restore_host_block(NodeRef{}, first.lookup_hash, first.tokens, first.extra)
-                .has_value(),
+    require(tiny.restore_block(NodeRef{}, first.lookup_hash, first.tokens, first.extra, true, kNoId).has_value(),
             "one slab must hold one block");
     const BlockIdentity second = source.block_identity(nodes[1]);
-    require(!tiny.restore_host_block(NodeRef{}, second.lookup_hash, second.tokens, second.extra)
-                 .has_value(),
+    require(!tiny.restore_block(NodeRef{}, second.lookup_hash, second.tokens, second.extra, true, kNoId).has_value(),
             "restoring must not evict to make room");
     tiny.check_invariants();
 }

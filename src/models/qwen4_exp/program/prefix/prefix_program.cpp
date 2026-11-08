@@ -45,19 +45,6 @@ constexpr std::size_t kFlushWords = 10; // an MR3 flush call's staging words
 // Blocks one prefetch batch copies at most (one page each; 256 pages are ~240 MB, ~9 ms of H2D).
 constexpr std::uint32_t kPrefetchBatchBlocks = 256;
 
-PrefixCachePersistence public_result(const prefix::PersistResult& result) {
-    return PrefixCachePersistence{.ok                  = result.ok,
-                                  .message             = result.message,
-                                  .blocks              = result.blocks,
-                                  .snapshots           = result.snapshots,
-                                  .bytes               = result.bytes,
-                                  .seconds             = result.seconds,
-                                  .saved_blocks        = result.saved_blocks,
-                                  .saved_snapshots     = result.saved_snapshots,
-                                  .required_host_bytes = result.required_host_bytes,
-                                  .host_bytes          = result.host_bytes};
-}
-
 } // namespace
 
 // ---- construction ------------------------------------------------------------------------------------
@@ -98,6 +85,7 @@ void ProgramImpl::create_prefix_cache() {
     config.ssd_bytes     = options_.prefix_ssd_bytes;
     config.ssd_directory = options_.prefix_ssd_directory;
     config.ssd_write_bytes_per_hour = options_.prefix_ssd_write_bytes_per_hour;
+    config.ssd_kept_file            = options_.prefix_ssd_kept_file;
     prefix_           = std::make_unique<prefix::PrefixCache>(config, *pool_, kv_geometry_, *lane_image_,
                                                             options_.prefix_host_bytes, device_.stream);
     if (mtp_) {
@@ -109,18 +97,18 @@ void ProgramImpl::create_prefix_cache() {
     }
 }
 
-PrefixCachePersistence ProgramImpl::attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
+runtime::prefix_cache::PersistResult ProgramImpl::attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
                                                              const StartupObserver& observer) {
     if (!prefix_) { return {.message = "the prefix cache is not enabled"}; }
     if (path.empty()) { throw std::invalid_argument("prefix cache file path is empty"); }
-    PrefixCachePersistence loaded = public_result(prefix_->load(path, fingerprint, observer));
+    runtime::prefix_cache::PersistResult loaded = prefix_->load(path, fingerprint, observer);
     prefix_file_                  = path;
     prefix_fingerprint_           = std::move(fingerprint);
     prefix_saved_writes_          = prefix_->counters().host_write_bytes;
     return loaded;
 }
 
-std::optional<PrefixCachePersistence> ProgramImpl::save_prefix_cache_now(const CancellationView& abandoned) {
+std::optional<runtime::prefix_cache::PersistResult> ProgramImpl::save_prefix_cache_now(const CancellationView& abandoned) {
     if (!prefix_ || prefix_file_.empty() || prefix_->counters().host_write_bytes == prefix_saved_writes_) {
         return std::nullopt;
     }
@@ -131,7 +119,7 @@ std::optional<PrefixCachePersistence> ProgramImpl::save_prefix_cache_now(const C
     // Withdrawn entries a transfer pinned until now never reach the file (hybrid-prefix-cache-spec §7.8).
     if (!prefix_withdrawal_.empty()) { (void)prefix_->index().withdraw(prefix_withdrawal_); }
     const std::uint64_t written = prefix_->counters().host_write_bytes;
-    PrefixCachePersistence saved = public_result(prefix_->save(prefix_file_, prefix_fingerprint_, abandoned));
+    runtime::prefix_cache::PersistResult saved = prefix_->save(prefix_file_, prefix_fingerprint_, abandoned);
     if (saved.ok) {
         prefix_saved_writes_ = written;
         ++prefix_saves_;
@@ -150,7 +138,7 @@ void ProgramImpl::save_prefix_cache_for_shutdown() noexcept {
         // from here, so an exit never waits for the Device work above.
         const PrefixCacheSaveControl& control = options_.prefix_save;
         if (!control.begin()) {
-            prefix_shutdown_save_ = PrefixCachePersistence{.message = "abandoned before it began"};
+            prefix_shutdown_save_ = runtime::prefix_cache::PersistResult{.message = "abandoned before it began"};
             return;
         }
         struct Ended {
@@ -158,12 +146,12 @@ void ProgramImpl::save_prefix_cache_for_shutdown() noexcept {
             bool saved = false;
             ~Ended() { control.end(saved); }
         } ended{control};
-        prefix_shutdown_save_ = public_result(
-            prefix_->save(prefix_file_, prefix_fingerprint_, CancellationView([&control] { return control.abandoned(); })));
+        prefix_shutdown_save_ =
+            prefix_->save(prefix_file_, prefix_fingerprint_, CancellationView([&control] { return control.abandoned(); }));
         ended.saved = prefix_shutdown_save_->ok;
     } catch (const std::exception& error) {
-        prefix_shutdown_save_ = PrefixCachePersistence{.message = error.what()};
-    } catch (...) { prefix_shutdown_save_ = PrefixCachePersistence{.message = "unknown error"}; }
+        prefix_shutdown_save_ = runtime::prefix_cache::PersistResult{.message = error.what()};
+    } catch (...) { prefix_shutdown_save_ = runtime::prefix_cache::PersistResult{.message = "unknown error"}; }
 }
 
 void ProgramImpl::pc_make_room(std::uint32_t pages) {

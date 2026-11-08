@@ -17,6 +17,14 @@ namespace infernix {
 // when this object is destroyed or the process ends, a crash included (Windows deletes it on close,
 // POSIX unlinks it at once). Its bytes are never made durable: it is a cache.
 //
+// With Options::kept_file the file is the one named instead, opened for this process alone, kept when
+// it closes and reused at the next start: its bytes stay (kept_content) when it already exists with
+// this size, so a prefix cache file can name slabs in it (§5.5). flush() makes the writes before it
+// durable.
+//
+// An Io may name a hash buffer: each `hash_stride` bytes of the transfer get their content_hash, of the
+// memory before a write or of the bytes read after a read, computed on the I/O thread.
+//
 // Transfers are batches of reads or of writes between the file and caller memory (4 KiB-aligned
 // offsets, sizes and addresses). Dedicated I/O threads run them: up to `read_depth` reads in flight,
 // then up to `write_depth` writes, and no write is issued while a read waits, so reads never queue
@@ -30,15 +38,21 @@ public:
         std::uint32_t read_depth  = 8;
         std::uint32_t write_depth = 2;
         std::uint32_t retries     = 2;
+        // Empty: a uniquely named scratch file in the directory, removed at the end. Otherwise this file,
+        // kept and reused (above).
+        std::filesystem::path kept_file;
     };
 
     enum class Op : std::uint8_t { Read, Write };
 
-    // One contiguous transfer: `bytes` at file `offset` from or into `memory`.
+    // One contiguous transfer: `bytes` at file `offset` from or into `memory`. With `hashes`, the I/O
+    // thread writes bytes / hash_stride content hashes there (hash_stride a positive divisor of bytes).
     struct Io {
-        std::uint64_t offset = 0;
-        std::size_t bytes    = 0;
-        std::byte* memory    = nullptr;
+        std::uint64_t offset      = 0;
+        std::size_t bytes         = 0;
+        std::byte* memory         = nullptr;
+        std::uint64_t* hashes     = nullptr;
+        std::size_t hash_stride   = 0;
     };
 
     struct Batch {
@@ -56,9 +70,10 @@ public:
         std::uint64_t nanoseconds = 0; // first issue to last completion
     };
 
-    // Creates the file (a new, uniquely named file in `directory`) and reserves `bytes` (a positive
-    // multiple of 4 KiB) for it. Throws std::system_error (a missing directory, no space, a drive that
-    // refuses unbuffered I/O) or std::invalid_argument.
+    // Creates the file (a new, uniquely named file in `directory`, or opens Options::kept_file) and
+    // reserves `bytes` (a positive multiple of 4 KiB) for it. Throws std::system_error (a missing
+    // directory, no space, a drive that refuses unbuffered I/O, a kept file another process holds) or
+    // std::invalid_argument.
     DirectScratchFile(const std::filesystem::path& directory, std::uint64_t bytes, Options options);
     DirectScratchFile(const std::filesystem::path& directory, std::uint64_t bytes)
         : DirectScratchFile(directory, bytes, Options{}) {}
@@ -70,6 +85,11 @@ public:
 
     [[nodiscard]] const std::filesystem::path& path() const noexcept;
     [[nodiscard]] std::uint64_t bytes() const noexcept;
+    // A kept file that already existed with this size: its bytes are the previous run's.
+    [[nodiscard]] bool kept_content() const noexcept;
+    // Makes every write completed before the call durable (FlushFileBuffers / fdatasync); throws
+    // std::system_error when the drive refuses.
+    void flush();
 
     // Queues a batch; throws std::invalid_argument for an empty batch, a misaligned or empty I/O, or
     // one past the end of the file.

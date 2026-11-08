@@ -4,6 +4,7 @@
 #include "runtime/contract/resources.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "runtime/prefix_cache/cost.h"
+#include "runtime/prefix_cache/persist_result.h"
 #include "runtime/prefix_cache/ssd_stats.h"
 #include <array>
 #include <chrono>
@@ -170,21 +171,6 @@ struct BindingReservation {
     std::exception_ptr refusal;
 
     explicit operator bool() const noexcept { return reserved; }
-};
-
-// Outcome of saving or restoring the hybrid prefix cache's Host tier.
-struct HybridCachePersistence {
-    bool ok = false;
-    std::string message;
-    std::uint64_t blocks    = 0;
-    std::uint64_t snapshots = 0;
-    std::uint64_t bytes     = 0;
-    double seconds          = 0.0;
-    // Load only: what the file holds and needs, against this Host tier.
-    std::uint64_t saved_blocks        = 0;
-    std::uint64_t saved_snapshots     = 0;
-    std::uint64_t required_host_bytes = 0;
-    std::uint64_t host_bytes          = 0;
 };
 
 struct HybridPrefixCacheStats {
@@ -511,14 +497,14 @@ public:
     // Restores a saved Host tier before the first request and attaches the file, so
     // shutdown_cleanup saves the tier back to it. `fingerprint` names everything the saved bytes
     // depend on; `observer` receives the file read as StartupPhase::PrefixCacheLoad.
-    [[nodiscard]] HybridCachePersistence attach_hybrid_cache_file(const std::filesystem::path& path,
+    [[nodiscard]] runtime::prefix_cache::PersistResult attach_hybrid_cache_file(const std::filesystem::path& path,
                                                                   std::string fingerprint,
                                                                   const StartupObserver& observer);
-    [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const;
+    [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> hybrid_shutdown_save() const;
     // Between units (no unit's Device work in flight): writes the Host tier to the attached file
     // when it has been written since the last save or load (Engine periodic save,
     // HybridPrefixCacheOptions::persistent_save_interval). Absent without a file or a change.
-    [[nodiscard]] std::optional<HybridCachePersistence> save_prefix_cache_now(const CancellationView& abandoned);
+    [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> save_prefix_cache_now(const CancellationView& abandoned);
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     // With offloaded experts: the VRAM expert cache's counters since startup and its size now
     // (RuntimeStats::expert_cache); nothing otherwise.

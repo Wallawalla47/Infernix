@@ -24,6 +24,7 @@
 #include "models/qwen4_exp/program/prefix/state_image.h"
 #include "infernix/types.h"
 #include "runtime/prefix_cache/prefix_index.h"
+#include "runtime/prefix_cache/persist_file.h"
 #include "runtime/prefix_cache/ssd_tier.h"
 #include "runtime/prefix_cache/tap_planner.h"
 
@@ -80,21 +81,6 @@ struct PrefixHostLayout {
 [[nodiscard]] PrefixHostLayout plan_prefix_host_layout(const KvPageGeometry& pages, const StateImageLayout& image,
                                                        std::uint64_t host_bytes);
 
-// The outcome of saving or loading the Host tier (persist.cpp).
-struct PersistResult {
-    bool ok = false;
-    std::string message; // why nothing was saved or loaded
-    std::uint64_t blocks    = 0;
-    std::uint64_t snapshots = 0;
-    std::uint64_t bytes     = 0;
-    double seconds          = 0.0;
-    // Load only: the file's entries and the Host tier bytes they all take, against this tier.
-    std::uint64_t saved_blocks        = 0;
-    std::uint64_t saved_snapshots     = 0;
-    std::uint64_t required_host_bytes = 0;
-    std::uint64_t host_bytes          = 0;
-};
-
 struct PrefixCacheConfig {
     runtime::prefix_cache::PrefixIndexConfig index; // capacities filled by the cache from the layouts
     runtime::prefix_cache::TapPlannerConfig taps;
@@ -105,6 +91,9 @@ struct PrefixCacheConfig {
     std::uint64_t ssd_bytes = 0;
     std::filesystem::path ssd_directory;
     std::uint64_t ssd_write_bytes_per_hour = 0; // 0: no write budget
+    // With a prefix cache file: the SSD tier's kept file (runtime::prefix_cache::kept_ssd_file), whose
+    // slabs the file names across restarts; empty: a scratch file that ends with the process.
+    std::filesystem::path ssd_kept_file;
 };
 
 // One admission's restore: Host pages into new pages, an image into a lane, then the events a
@@ -272,16 +261,20 @@ public:
     [[nodiscard]] std::uint64_t host_tier_shrinkable_bytes() const noexcept;
     [[nodiscard]] std::uint64_t host_tier_growable_bytes() const noexcept { return host_tier_capacity_bytes() - pinned_bytes(); }
 
-    // ---- persistence (persist.cpp) -------------------------------------------------------------
-    // Writes every Host-backed snapshot and its Host block path to `path` (through `path.tmp`,
-    // renamed when complete). Requires idle transfers. `abandoned` stops the save, deleting the
+    // ---- persistence (persist.cpp, runtime/prefix_cache/persist_file.h) -------------------------
+    // Writes every Host-backed snapshot and its block path to `path` (through `path.tmp`, renamed
+    // when complete), and with a kept SSD tier the SSD-backed ones by reference (the tier is drained
+    // and flushed first). Requires idle Host transfers. `abandoned` stops the save, deleting the
     // temporary file; the previous file stays.
-    [[nodiscard]] PersistResult save(const std::filesystem::path& path, std::string_view fingerprint,
-                                     const CancellationView& abandoned) const;
-    // Rebuilds a saved Host tier into this empty cache when the fingerprint and geometry match; a
-    // smaller tier restores the snapshots it values most. A mismatch or damaged file loads nothing.
-    [[nodiscard]] PersistResult load(const std::filesystem::path& path, std::string_view fingerprint,
-                                     const StartupObserver& observer);
+    [[nodiscard]] runtime::prefix_cache::PersistResult save(const std::filesystem::path& path,
+                                                            std::string_view fingerprint,
+                                                            const CancellationView& abandoned);
+    // Rebuilds a saved cache into this empty cache when the fingerprint and geometry match; a
+    // smaller Host tier restores the snapshots it values most, and a kept SSD tier that reopened the
+    // previous run's file takes back its copies. A mismatch or damaged file loads nothing.
+    [[nodiscard]] runtime::prefix_cache::PersistResult load(const std::filesystem::path& path,
+                                                            std::string_view fingerprint,
+                                                            const StartupObserver& observer);
 
     // PrefixIndexBackend
     void release_device_block(std::uint32_t device_id) noexcept override;
@@ -329,6 +322,7 @@ private:
 
     [[nodiscard]] std::uint32_t allocate_block_id(DeviceKVPageLease&& lease);
     [[nodiscard]] std::byte* slab(std::uint32_t id) const noexcept;
+    [[nodiscard]] runtime::prefix_cache::PersistBinding persist_binding();
     [[nodiscard]] std::uint32_t slab_group(std::uint32_t id) const noexcept { return id / host_.slabs_per_chunk; }
     [[nodiscard]] cudaEvent_t take_event();
     void recycle(cudaEvent_t event) noexcept;

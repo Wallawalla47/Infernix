@@ -414,6 +414,14 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
     } else if (load.prefix_cache.attempted) {
         impl_->logger->info("prefix cache not restored | {}", load.prefix_cache.message);
     }
+    // The SSD tier's copies come back without being read (each slab is checked at its first use).
+    if (cache.restored && (cache.ssd_snapshots != 0 || cache.ssd_blocks != 0)) {
+        impl_->logger->info("prefix cache SSD tier kept | {} snapshots | {} blocks",
+                            format_pretty_count(cache.ssd_snapshots), format_pretty_count(cache.ssd_blocks));
+    }
+    if (cache.restored && !cache.ssd_message.empty()) {
+        impl_->logger->warn("prefix cache SSD copies not used | {}", cache.ssd_message);
+    }
 }
 
 void StartupLogRenderer::chat_template_roles(infernix::ChatTemplateRoleSupport roles,

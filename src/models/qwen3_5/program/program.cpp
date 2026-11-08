@@ -363,17 +363,17 @@ void Program::set_hybrid_coalesce_wait_limit(double seconds) {
     impl_->set_hybrid_coalesce_wait_limit(seconds);
 }
 
-HybridCachePersistence Program::attach_hybrid_cache_file(const std::filesystem::path& path,
+runtime::prefix_cache::PersistResult Program::attach_hybrid_cache_file(const std::filesystem::path& path,
                                                          std::string fingerprint,
                                                          const StartupObserver& observer) {
     return impl_->attach_hybrid_cache_file(path, std::move(fingerprint), observer);
 }
 
-std::optional<HybridCachePersistence> Program::save_prefix_cache_now(const CancellationView& abandoned) {
+std::optional<runtime::prefix_cache::PersistResult> Program::save_prefix_cache_now(const CancellationView& abandoned) {
     return impl_->save_hybrid_cache_now(abandoned);
 }
 
-std::optional<HybridCachePersistence> Program::hybrid_shutdown_save() const {
+std::optional<runtime::prefix_cache::PersistResult> Program::hybrid_shutdown_save() const {
     return impl_->hybrid_shutdown_save();
 }
 

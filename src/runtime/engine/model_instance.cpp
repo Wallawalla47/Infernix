@@ -1237,7 +1237,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             static_cast<double>(options.pending_timeout_ms) / 1000.0 / 2.0);
         const std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
         if (!file.empty()) {
-            const models::qwen3_5::HybridCachePersistence loaded =
+            const runtime::prefix_cache::PersistResult loaded =
                 instance->program->attach_hybrid_cache_file(
                     file, hybrid_cache_fingerprint(options, signature, device.props),
                     options.startup_observer);
@@ -1253,6 +1253,9 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
                 .saved_snapshots     = loaded.saved_snapshots,
                 .required_host_bytes = loaded.required_host_bytes,
                 .host_bytes          = loaded.host_bytes,
+                .ssd_blocks          = loaded.ssd_blocks,
+                .ssd_snapshots       = loaded.ssd_snapshots,
+                .ssd_message         = loaded.ssd_message,
             };
         }
     }

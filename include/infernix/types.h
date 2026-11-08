@@ -2463,6 +2463,11 @@ struct LoadSummary {
         std::uint64_t saved_snapshots     = 0;
         std::uint64_t required_host_bytes = 0;
         std::uint64_t host_bytes          = 0;
+        // With an SSD tier: the restored entries whose copy came back on it (the previous run's SSD
+        // file, kept beside the prefix cache file), and why the file's SSD copies were not used.
+        std::uint64_t ssd_blocks    = 0;
+        std::uint64_t ssd_snapshots = 0;
+        std::string ssd_message;
     } prefix_cache;
 };
 

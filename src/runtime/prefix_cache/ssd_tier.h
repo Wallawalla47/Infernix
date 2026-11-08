@@ -41,6 +41,12 @@ class SsdTier;
 // write runs at a time and nothing beside it; under pressure images go raw, beside a packed write in
 // flight, so write-back keeps the raw pace. A packed promotion reads the stream into a staging buffer
 // and decodes it into the Host image slabs on the codec workers.
+//
+// With a kept file (the prefix cache file's companion, §5.5) the SSD content outlives the process: the
+// tier records each slab's content hash as it writes it (on the I/O threads), the cache's save names
+// the slabs it keeps with those hashes, and a restart reopens the file. A slab named by the previous
+// run (expect) is checked against its hash the first time a promotion reads it: one a crashed process
+// overwrote after the save fails the promotion like a failed read, so it is never used.
 class SsdTier {
 public:
     struct Counters {
@@ -56,6 +62,7 @@ public:
         std::uint64_t packed_images      = 0; // images written as codec streams
         std::uint64_t packed_saved_bytes = 0; // SSD bytes those streams saved
         std::uint64_t policy_nanoseconds = 0; // spent choosing write-backs (start_write_backs)
+        std::uint64_t kept_slab_mismatches = 0; // slabs of the previous run whose bytes no longer matched
         std::uint64_t promotions_waiting_for_room = 0; // promotions told to wait for a write-back to land
         double read_bytes_per_second     = 0.0; // the last promotion's measured rate
         double write_bytes_per_second    = 0.0; // the last write-back's
@@ -70,12 +77,13 @@ public:
     };
 
     // `host_slab(id)` is the address of Host slab `id` (4 KiB-aligned); a slab under a transfer stays
-    // put because the index keeps its entry pinned. Creates the scratch file in `directory`, and with
-    // a positive `write_bytes_per_hour` keeps the write budget's level there (SsdWriteBudget). `codec`
-    // packs images (fp32_row_codec) when that saves SSD slabs.
+    // put because the index keeps its entry pinned. Creates the scratch file in `directory` (or opens
+    // `kept_file`, kept across restarts), and with a positive `write_bytes_per_hour` keeps the write
+    // budget's level there (SsdWriteBudget). `codec` packs images (fp32_row_codec) when that saves SSD
+    // slabs.
     SsdTier(const std::filesystem::path& directory, std::uint32_t slabs, std::size_t slab_bytes,
             std::function<std::byte*(std::uint32_t)> host_slab, std::uint64_t write_bytes_per_hour = 0,
-            bool codec = false);
+            bool codec = false, const std::filesystem::path& kept_file = {});
     ~SsdTier(); // waits for the transfers and the codec work in flight
 
     SsdTier(const SsdTier&)            = delete;
@@ -83,6 +91,20 @@ public:
 
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return file_.path(); }
     [[nodiscard]] std::uint64_t capacity_bytes() const noexcept { return file_.bytes(); }
+    // A kept file: its slabs outlive the process, and kept_content says whether this start found the
+    // previous run's (an existing file of this size).
+    [[nodiscard]] bool kept() const noexcept { return kept_; }
+    [[nodiscard]] bool kept_content() const noexcept { return file_.kept_content(); }
+    // The content hash of SSD slab `slab` as last written, or as the previous run saved it (kept file
+    // only; 0 for a slab never written).
+    [[nodiscard]] std::uint64_t slab_hash(std::uint32_t slab) const noexcept {
+        return slab < slab_hash_.size() ? slab_hash_[slab] : 0U;
+    }
+    // A slab the previous run saved with `hash` (restore): its first promotion checks the bytes.
+    void expect(std::uint32_t slab, std::uint64_t hash);
+    // Makes the written slabs durable before a save names them: the tier must be drained (no transfer
+    // in flight). Throws std::system_error when the drive refuses.
+    void flush();
     [[nodiscard]] const Counters& counters() const noexcept { return counters_; }
     // The write budget (absent: every candidate is written).
     [[nodiscard]] const std::optional<SsdWriteBudget>& budget() const noexcept { return budget_; }
@@ -130,6 +152,9 @@ private:
         std::size_t stream_bytes = 0; // its encoded length
         std::atomic<std::uint32_t> parts{0};
         std::atomic<bool> failed{false};
+        // Kept file: each transferred SSD slab and its content hash (the I/O threads fill `hashes`).
+        std::vector<std::uint32_t> hash_slabs;
+        std::vector<std::uint64_t> hashes;
     };
 
     void apply(PrefixCacheIndex& index);
@@ -141,7 +166,10 @@ private:
     [[nodiscard]] std::uint64_t write_back_target(const PrefixCacheIndex& index) const noexcept;
     [[nodiscard]] bool compute_due(const PrefixCacheIndex& index) const noexcept;
     [[nodiscard]] bool budget_still_blocked(const PrefixCacheIndex& index) const noexcept;
-    [[nodiscard]] DirectScratchFile::Batch batch(std::uint64_t tag, DirectScratchFile::Op op, const Job& job) const;
+    [[nodiscard]] DirectScratchFile::Batch batch(std::uint64_t tag, DirectScratchFile::Op op, Job& job) const;
+    // A promotion's reads against the hashes the previous run saved; false when a slab differs.
+    [[nodiscard]] bool verify_kept(const Job& job);
+    void record_written(const Job& job);
     // A write-back left flight (landed, failed or refused): its accounting, and a waiting promotion's re-quote.
     void write_finished(const Job& job) noexcept;
     [[nodiscard]] Staging take_staging();
@@ -151,6 +179,11 @@ private:
     std::atomic<bool> due_{false};
     DirectScratchFile file_;
     std::size_t slab_bytes_ = 0;
+    // Kept file: every slab's content hash, and the slabs of the previous run not read back since.
+    bool kept_ = false;
+    std::vector<std::uint64_t> slab_hash_;
+    std::vector<std::uint8_t> unverified_;
+    std::uint32_t unverified_count_ = 0;
     std::function<std::byte*(std::uint32_t)> host_slab_;
     std::unordered_map<std::uint64_t, std::unique_ptr<Job>> jobs_;
     std::uint64_t next_tag_              = 1;

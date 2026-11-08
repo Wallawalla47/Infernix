@@ -6663,16 +6663,16 @@ private:
 
 public:
     // Persistence of the Host tier (--prefix-cache-file).
-    PrefixCachePersistence attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
+    runtime::prefix_cache::PersistResult attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
                                                     const StartupObserver& observer);
     void save_prefix_cache_for_shutdown() noexcept;
-    [[nodiscard]] std::optional<PrefixCachePersistence> prefix_shutdown_save() const { return prefix_shutdown_save_; }
-    [[nodiscard]] std::optional<PrefixCachePersistence> save_prefix_cache_now(const CancellationView& abandoned);
+    [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> prefix_shutdown_save() const { return prefix_shutdown_save_; }
+    [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> save_prefix_cache_now(const CancellationView& abandoned);
 
 private:
     std::filesystem::path prefix_file_;
     std::string prefix_fingerprint_;
-    std::optional<PrefixCachePersistence> prefix_shutdown_save_;
+    std::optional<runtime::prefix_cache::PersistResult> prefix_shutdown_save_;
     std::uint64_t prefix_saved_writes_ = 0; // host_write_bytes at the last save or load
     std::uint64_t prefix_saves_        = 0; // periodic saves of the attached file that succeeded
 

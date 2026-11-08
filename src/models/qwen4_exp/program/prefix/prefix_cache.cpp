@@ -112,7 +112,7 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
         // plain copy, and a snapshot's meta stays with its index entry.
         ssd_ = std::make_unique<pc::SsdTier>(config.ssd_directory, index.ssd_slabs, host_.slab_bytes,
                                              [this](std::uint32_t id) { return slab(id); }, config.ssd_write_bytes_per_hour,
-                                             /*codec=*/true);
+                                             /*codec=*/true, config.ssd_kept_file);
     }
     node_mtp_next_.assign(index.max_nodes, -1);
     snapshot_meta_.assign(index.max_snapshots, StateImageHeader{});

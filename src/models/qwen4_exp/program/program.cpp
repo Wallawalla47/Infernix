@@ -156,15 +156,15 @@ void Program::shutdown_cleanup() noexcept {
     impl_->save_prefix_cache_for_shutdown();
 }
 
-PrefixCachePersistence Program::attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
+runtime::prefix_cache::PersistResult Program::attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
                                                          const StartupObserver& observer) {
     impl_->settle_deferred();
     return impl_->attach_prefix_cache_file(path, std::move(fingerprint), observer);
 }
 
-std::optional<PrefixCachePersistence> Program::prefix_shutdown_save() const { return impl_->prefix_shutdown_save(); }
+std::optional<runtime::prefix_cache::PersistResult> Program::prefix_shutdown_save() const { return impl_->prefix_shutdown_save(); }
 
-std::optional<PrefixCachePersistence> Program::save_prefix_cache_now(const CancellationView& abandoned) {
+std::optional<runtime::prefix_cache::PersistResult> Program::save_prefix_cache_now(const CancellationView& abandoned) {
     impl_->settle_deferred();
     return impl_->save_prefix_cache_now(abandoned);
 }

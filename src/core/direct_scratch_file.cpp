@@ -1,5 +1,7 @@
 #include "core/direct_scratch_file.h"
 
+#include "core/content_hash.h"
+
 #ifdef _WIN32
 #    ifndef NOMINMAX
 #        define NOMINMAX
@@ -8,6 +10,7 @@
 #else
 #    include <cerrno>
 #    include <fcntl.h>
+#    include <sys/file.h>
 #    include <sys/stat.h>
 #    include <unistd.h>
 #endif
@@ -74,6 +77,8 @@ struct DirectScratchFile::Impl {
     Options options;
     std::filesystem::path file_path;
     std::uint64_t file_bytes = 0;
+    bool keep_file           = false; // Options::kept_file
+    bool kept                = false; // it existed with this size
 #ifdef _WIN32
     HANDLE handle = INVALID_HANDLE_VALUE;
 #else
@@ -107,7 +112,9 @@ struct DirectScratchFile::Impl {
             throw std::system_error(ec ? ec : std::make_error_code(std::errc::not_a_directory),
                                     "DirectScratchFile: " + directory.string() + " is not a directory");
         }
-        file_path = unique_name(std::filesystem::absolute(directory));
+        keep_file = !options.kept_file.empty();
+        file_path = keep_file ? std::filesystem::absolute(options.kept_file)
+                              : unique_name(std::filesystem::absolute(directory));
         open_file();
         const std::uint32_t count = options.read_depth + options.write_depth;
         try {
@@ -139,15 +146,30 @@ struct DirectScratchFile::Impl {
     // ---- platform -------------------------------------------------------------------------------
     void open_file() {
 #ifdef _WIN32
-        // No sharing, removed when the last handle closes (also at a crash: the OS closes it).
-        handle = ::CreateFileW(file_path.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW,
-                               FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_FLAG_NO_BUFFERING |
-                                   FILE_FLAG_OVERLAPPED | FILE_FLAG_DELETE_ON_CLOSE,
-                               nullptr);
+        // No sharing. A scratch file is removed when the last handle closes (also at a crash: the OS
+        // closes it); a kept file stays.
+        bool existed = false;
+        if (keep_file) {
+            handle  = ::CreateFileW(file_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
+                                    FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED,
+                                    nullptr);
+            existed = handle != INVALID_HANDLE_VALUE && ::GetLastError() == ERROR_ALREADY_EXISTS;
+        } else {
+            handle = ::CreateFileW(file_path.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW,
+                                   FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED |
+                                       FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_DELETE_ON_CLOSE,
+                                   nullptr);
+        }
         if (handle == INVALID_HANDLE_VALUE) {
             throw_win32(::GetLastError(), "DirectScratchFile: CreateFileW " + file_path.string());
         }
         try {
+            if (existed) {
+                LARGE_INTEGER size{};
+                if (::GetFileSizeEx(handle, &size) && static_cast<std::uint64_t>(size.QuadPart) == file_bytes) {
+                    kept = true;
+                }
+            }
             // Unbuffered transfers must be whole sectors; every I/O here is a multiple of 4 KiB.
             FILE_STORAGE_INFO storage{};
             if (::GetFileInformationByHandleEx(handle, FileStorageInfo, &storage, sizeof(storage)) &&
@@ -156,25 +178,27 @@ struct DirectScratchFile::Impl {
                                         "DirectScratchFile: " + file_path.string() + " has " +
                                             std::to_string(storage.LogicalBytesPerSector) + "-byte sectors");
             }
-            // Reserving the allocation fails at once when the drive lacks the space, and keeps the file
-            // in few extents. The valid data length stays 0: nothing is written to reserve it.
-            FILE_ALLOCATION_INFO allocation{};
-            allocation.AllocationSize.QuadPart = static_cast<LONGLONG>(file_bytes);
-            if (!::SetFileInformationByHandle(handle, FileAllocationInfo, &allocation, sizeof(allocation))) {
-                throw_win32(::GetLastError(), "DirectScratchFile: reserving " + std::to_string(file_bytes) +
-                                                  " bytes for " + file_path.string());
-            }
-            FILE_END_OF_FILE_INFO end{};
-            end.EndOfFile.QuadPart = static_cast<LONGLONG>(file_bytes);
-            if (!::SetFileInformationByHandle(handle, FileEndOfFileInfo, &end, sizeof(end))) {
-                throw_win32(::GetLastError(), "DirectScratchFile: sizing " + file_path.string());
+            if (!kept) {
+                // Reserving the allocation fails at once when the drive lacks the space, and keeps the file
+                // in few extents. The valid data length stays 0: nothing is written to reserve it.
+                FILE_ALLOCATION_INFO allocation{};
+                allocation.AllocationSize.QuadPart = static_cast<LONGLONG>(file_bytes);
+                if (!::SetFileInformationByHandle(handle, FileAllocationInfo, &allocation, sizeof(allocation))) {
+                    throw_win32(::GetLastError(), "DirectScratchFile: reserving " + std::to_string(file_bytes) +
+                                                      " bytes for " + file_path.string());
+                }
+                FILE_END_OF_FILE_INFO end{};
+                end.EndOfFile.QuadPart = static_cast<LONGLONG>(file_bytes);
+                if (!::SetFileInformationByHandle(handle, FileEndOfFileInfo, &end, sizeof(end))) {
+                    throw_win32(::GetLastError(), "DirectScratchFile: sizing " + file_path.string());
+                }
             }
         } catch (...) {
             close_file();
             throw;
         }
 #else
-        int flags = O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC;
+        int flags = O_RDWR | O_CREAT | O_CLOEXEC | (keep_file ? 0 : O_EXCL);
 #    ifdef O_DIRECT
         flags |= O_DIRECT;
 #    endif
@@ -183,12 +207,26 @@ struct DirectScratchFile::Impl {
         // A filesystem without direct I/O (tmpfs, some FUSE mounts) refuses O_DIRECT: the file then
         // goes through the page cache with the same alignment rules.
         if (fd < 0 && (errno == EINVAL || errno == EOPNOTSUPP)) {
-            fd = ::open(file_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+            fd = ::open(file_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | (keep_file ? 0 : O_EXCL), 0600);
         }
 #    endif
         if (fd < 0) { throw_errno(errno, "DirectScratchFile: open " + file_path.string()); }
-        // Unlinked at once: the space returns when the descriptor closes, whatever ends the process.
-        (void)::unlink(file_path.c_str());
+        if (keep_file) {
+            // For this process alone: another server on the same prefix cache file must not share it.
+            if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+                const int error = errno;
+                close_file();
+                throw_errno(error, "DirectScratchFile: " + file_path.string() + " is in use");
+            }
+            struct stat status{};
+            if (::fstat(fd, &status) == 0 && static_cast<std::uint64_t>(status.st_size) == file_bytes) {
+                kept = true;
+                return;
+            }
+        } else {
+            // Unlinked at once: the space returns when the descriptor closes, whatever ends the process.
+            (void)::unlink(file_path.c_str());
+        }
         const int reserved = ::posix_fallocate(fd, 0, static_cast<off_t>(file_bytes));
         if (reserved != 0 && reserved != EOPNOTSUPP && reserved != EINVAL) {
             const int error = reserved;
@@ -296,6 +334,7 @@ struct DirectScratchFile::Impl {
                     batch.first_issue = Clock::now();
                 }
             }
+            if (op == Op::Write) { hash(pending.io); }
             std::error_code error;
             for (std::uint32_t attempt = 0; attempt <= options.retries; ++attempt) {
 #ifdef _WIN32
@@ -309,11 +348,20 @@ struct DirectScratchFile::Impl {
 #endif
                 if (!error) { break; }
             }
+            if (op == Op::Read && !error) { hash(pending.io); }
             finish(pending, op, error);
         }
 #ifdef _WIN32
         if (event != nullptr) { ::CloseHandle(event); }
 #endif
+    }
+
+    // The content hashes an Io asks for, of its memory (before a write, after a read).
+    static void hash(const Io& io) noexcept {
+        if (io.hashes == nullptr) { return; }
+        for (std::size_t offset = 0, k = 0; offset < io.bytes; offset += io.hash_stride, ++k) {
+            io.hashes[k] = content_hash(io.memory + offset, io.hash_stride);
+        }
     }
 
     void finish(const Pending& pending, Op op, const std::error_code& error) {
@@ -353,7 +401,8 @@ struct DirectScratchFile::Impl {
         for (const Io& io : batch.ios) {
             if (io.bytes == 0 || io.bytes > kMaxIoBytes || io.bytes % kAlignment != 0 || io.offset % kAlignment != 0 ||
                 reinterpret_cast<std::uintptr_t>(io.memory) % kAlignment != 0 || io.offset > file_bytes ||
-                io.bytes > file_bytes - io.offset) {
+                io.bytes > file_bytes - io.offset ||
+                (io.hashes != nullptr && (io.hash_stride == 0 || io.bytes % io.hash_stride != 0))) {
                 throw std::invalid_argument(
                     "DirectScratchFile: transfers need 4 KiB-aligned offsets, sizes and addresses inside the file "
                     "(offset " + std::to_string(io.offset) + ", " + std::to_string(io.bytes) + " bytes, address " +
@@ -394,6 +443,18 @@ DirectScratchFile::~DirectScratchFile() = default;
 const std::filesystem::path& DirectScratchFile::path() const noexcept { return impl_->file_path; }
 
 std::uint64_t DirectScratchFile::bytes() const noexcept { return impl_->file_bytes; }
+
+bool DirectScratchFile::kept_content() const noexcept { return impl_->kept; }
+
+void DirectScratchFile::flush() {
+#ifdef _WIN32
+    if (!::FlushFileBuffers(impl_->handle)) {
+        throw_win32(::GetLastError(), "DirectScratchFile: flushing " + impl_->file_path.string());
+    }
+#else
+    if (::fdatasync(impl_->fd) != 0) { throw_errno(errno, "DirectScratchFile: flushing " + impl_->file_path.string()); }
+#endif
+}
 
 void DirectScratchFile::submit(Batch batch) { impl_->submit(std::move(batch)); }
 

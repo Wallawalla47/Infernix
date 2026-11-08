@@ -22,6 +22,7 @@
 #include "runtime/engine/engine_plan.h"
 #include "runtime/engine/expert_memory.h"
 #include "runtime/engine/model_instance.h"
+#include "runtime/prefix_cache/persist_file.h"
 
 #include <algorithm>
 #include <array>
@@ -547,6 +548,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         program_options.prefix_ssd_directory = cache.ssd_directory;
         program_options.prefix_ssd_write_bytes_per_hour =
             cache.ssd_write_bytes_per_hour == ContextCacheOptions::kSsdWritesUnlimited ? 0U : cache.ssd_write_bytes_per_hour;
+        // With a prefix cache file the SSD tier's content outlives the process too (spec §5.5).
+        if (cache.ssd_capacity_bytes != 0 && !cache.hybrid.persistent_file.empty()) {
+            program_options.prefix_ssd_kept_file =
+                runtime::prefix_cache::kept_ssd_file(cache.ssd_directory, cache.hybrid.persistent_file);
+        }
     }
     // The SSD tier (design §19.3.7): the banks stay in the artifact; the Program pins RAM slots for
     // the experts the ledger leaves room for (less their lock overhead) and reads the rest on use.
@@ -834,7 +840,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                 signature += kHex[std::to_integer<unsigned>(byte) & 15U];
             }
         }
-        const models::qwen4_exp::PrefixCachePersistence loaded = instance->program->attach_prefix_cache_file(
+        const runtime::prefix_cache::PersistResult loaded = instance->program->attach_prefix_cache_file(
             file, hybrid_cache_fingerprint(options, signature, device.props),
             options.startup_observer);
         restore = LoadSummary::PrefixCacheRestore{
@@ -849,6 +855,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
             .saved_snapshots     = loaded.saved_snapshots,
             .required_host_bytes = loaded.required_host_bytes,
             .host_bytes          = loaded.host_bytes,
+            .ssd_blocks          = loaded.ssd_blocks,
+            .ssd_snapshots       = loaded.ssd_snapshots,
+            .ssd_message         = loaded.ssd_message,
         };
     }
     program.complete();

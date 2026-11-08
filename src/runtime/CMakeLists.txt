@@ -4,6 +4,7 @@ add_library(infernix_runtime_support STATIC
   engine/kv_capacity.cpp
   engine/public_types.cpp
   prefix_cache/block_hash.cpp
+  prefix_cache/persist_file.cpp
   prefix_cache/prefix_index.cpp
   prefix_cache/ssd_tier.cpp
   prefix_cache/ssd_write_budget.cpp

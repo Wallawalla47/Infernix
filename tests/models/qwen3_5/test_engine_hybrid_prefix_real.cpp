@@ -263,16 +263,74 @@ int exercise_ssd_restore(const char* artifact, infernix::SpeculativeBackend back
         directory = infernix::test::unique_temp_path("hybrid_ssd_tier");
         std::filesystem::create_directories(directory);
     }
-    infernix::EngineOptions options = hybrid_options(artifact, backend, 4096, 480ULL << 20, 1);
-    options.context_cache.ssd_capacity_bytes = 8ULL << 30;
-    // The write budget's level persists in the test directory: exactness and timing run without it.
-    options.context_cache.ssd_write_bytes_per_hour = infernix::ContextCacheOptions::kSsdWritesUnlimited;
-    options.context_cache.ssd_directory      = directory;
-    infernix::Engine engine(std::move(options));
-    (void)engine.generate(engine.prepare_tokens(first), greedy(8));
-    for (std::uint32_t seed = 3; seed < 6; ++seed) {
-        (void)engine.generate(engine.prepare_tokens(synthetic_tokens(3900, seed)), greedy(4));
+    const auto ssd_options = [&](const std::filesystem::path& persistent) {
+        infernix::EngineOptions options = hybrid_options(artifact, backend, 4096, 480ULL << 20, 1);
+        options.context_cache.ssd_capacity_bytes = 8ULL << 30;
+        // The write budget's level persists in the test directory: exactness and timing run without it.
+        options.context_cache.ssd_write_bytes_per_hour = infernix::ContextCacheOptions::kSsdWritesUnlimited;
+        options.context_cache.ssd_directory      = directory;
+        if (!persistent.empty()) {
+            options.context_cache.hybrid.persistent_file     = persistent;
+            options.context_cache.hybrid.persistent_identity = "ssd-kept-test";
+        }
+        return options;
+    };
+    const auto pressure = [&](infernix::Engine& engine) {
+        for (std::uint32_t seed = 3; seed < 6; ++seed) {
+            (void)engine.generate(engine.prepare_tokens(synthetic_tokens(3900, seed)), greedy(4));
+        }
+    };
+    int failures = 0;
+    {
+        // A restart keeps the SSD tier with --prefix-cache-file (spec §5.5): the first prompt's snapshot, pushed
+        // to the SSD tier before the stop, comes back from the kept SSD file without being read at startup and
+        // serves the second prompt exactly.
+        const std::filesystem::path persistent = infernix::test::unique_temp_path("infernix-hybrid-ssd-kept.bin");
+        std::error_code ignored;
+        std::filesystem::remove(persistent, ignored);
+        {
+            infernix::Engine engine(ssd_options(persistent));
+            (void)engine.generate(engine.prepare_tokens(first), greedy(8));
+            pressure(engine);
+        }
+        // The restore refills the Host tier with entries the SSD does not hold yet; the promotion waits for their
+        // write-back to land (SsdTier::Promotion::Pending) rather than falling back to a cold prefill.
+        infernix::Engine restarted(ssd_options(persistent));
+        const infernix::LoadSummary::PrefixCacheRestore restore = restarted.load_summary().prefix_cache;
+        std::cout << "ssd-restore (restart): restored " << restore.blocks << " blocks and " << restore.snapshots
+                  << " snapshots, " << restore.ssd_blocks << " and " << restore.ssd_snapshots
+                  << " of them on the SSD tier (" << restore.message << restore.ssd_message << ")\n";
+        if (!restore.restored || restore.ssd_snapshots == 0 || !restore.ssd_message.empty()) {
+            std::cerr << "ssd-restore (restart): the restart did not take back the SSD tier's snapshots\n";
+            ++failures;
+        }
+        const infernix::RuntimeStats before   = restarted.runtime_stats();
+        const infernix::GenerationResult warm = restarted.generate(restarted.prepare_tokens(second), greedy(24));
+        const infernix::RuntimeStats after    = restarted.runtime_stats();
+        std::cout << "ssd-restore (restart): reused " << warm.reused_prompt_tokens << " (blocks held "
+                  << warm.cached_block_tokens << "), " << after.hybrid_ssd_promotions - before.hybrid_ssd_promotions
+                  << " SSD promotions, " << after.hybrid_ssd_failures << " SSD failures\n";
+        if (after.hybrid_ssd_promotions <= before.hybrid_ssd_promotions ||
+            warm.reused_prompt_tokens != 2 * kPrefillChunk) {
+            std::cerr << "ssd-restore (restart): the second prompt did not resume from the kept SSD tier (reused "
+                      << warm.reused_prompt_tokens << ")\n";
+            ++failures;
+        }
+        if (warm.generated_token_ids != device_tokens || after.hybrid_ssd_failures != 0) {
+            std::cerr << "ssd-restore (restart): the kept SSD restore generated other tokens or failed a transfer\n";
+            ++failures;
+        }
+        std::filesystem::remove(persistent, ignored);
     }
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        if (entry.path().filename().string().starts_with("infernix-context-kept-")) {
+            std::error_code ignored;
+            std::filesystem::remove(entry.path(), ignored);
+        }
+    }
+    infernix::Engine engine(ssd_options({}));
+    (void)engine.generate(engine.prepare_tokens(first), greedy(8));
+    pressure(engine);
     const infernix::RuntimeStats before   = engine.runtime_stats();
     const infernix::GenerationResult warm = engine.generate(engine.prepare_tokens(second), greedy(24));
     const infernix::RuntimeStats after    = engine.runtime_stats();
@@ -281,7 +339,6 @@ int exercise_ssd_restore(const char* artifact, infernix::SpeculativeBackend back
               << after.hybrid_ssd_read_bytes / 1000000 << " MB read in " << after.hybrid_ssd_promotions
               << " promotions, " << after.hybrid_ssd_host_image_demotions << " image demotions, Host snapshot evictions "
               << after.hybrid_host_snapshot_evictions << ", reused " << warm.reused_prompt_tokens << '\n';
-    int failures = 0;
     if (after.hybrid_ssd_promotions <= before.hybrid_ssd_promotions) {
         std::cerr << "ssd-restore: the second prompt did not read its source from the SSD tier\n";
         ++failures;

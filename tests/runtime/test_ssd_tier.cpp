@@ -4,6 +4,7 @@
 // the cost model, and drain/abandon settle every transfer. CPU and disk only.
 #include "test_temp_path.h"
 #include "runtime/prefix_cache/block_hash.h"
+#include "runtime/prefix_cache/persist_file.h"
 #include "runtime/prefix_cache/prefix_index.h"
 #include "runtime/prefix_cache/ssd_tier.h"
 #include "runtime/prefix_cache/fp32_row_codec.h"
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <new>
@@ -283,6 +285,112 @@ void test_packed_partial(const std::filesystem::path& directory) {
     index.check_invariants();
 }
 
+// The prefix cache file's binding for this test's Host tier and kept SSD tier.
+PersistBinding test_binding(Backend& backend, SsdTier& tier, std::uint32_t image_slabs) {
+    PersistBinding binding;
+    binding.magic       = {'T', 'E', 'S', 'T', 'P', 'C', '0', '1'};
+    binding.geometry    = {std::byte{1}, std::byte{2}, std::byte{3}};
+    binding.slab_bytes  = kSlabBytes;
+    binding.image_slabs = image_slabs;
+    binding.host_slabs  = kHostSlabs;
+    binding.slab        = [&backend](std::uint32_t id) { return backend.slab(id); };
+    binding.ssd         = &tier;
+    return binding;
+}
+
+// The only snapshot a restored index holds.
+SnapshotRef only_snapshot(const PrefixCacheIndex& index) {
+    std::vector<NodeRef> nodes;
+    std::vector<SnapshotRef> snapshots;
+    index.collect_persistable(nodes, snapshots, true);
+    require(snapshots.size() == 1, "the restored index holds one snapshot (" + std::to_string(snapshots.size()) + ")");
+    return snapshots.front();
+}
+
+// The SSD tier across a restart (§5.5, candidates YK-02): a snapshot only on the SSD is saved by reference
+// in the prefix cache file, a restart reopens the kept file and takes it back without reading it, and its
+// first promotion reads exactly the bytes the Host slabs held. A slab overwritten after the save (a crash
+// after it) fails that promotion: the entry goes and nothing of it is used.
+void test_kept_restart(const std::filesystem::path& directory) {
+    std::filesystem::create_directories(directory);
+    const std::filesystem::path kept = directory / "kept.bin";
+    const std::filesystem::path file = directory / "cache.bin";
+    const PrefixIndexConfig c        = config(17);
+    std::vector<std::byte> image;
+    std::uint32_t frontier = 0;
+    {
+        Backend backend;
+        PrefixCacheIndex index(c, backend);
+        SsdTier tier(directory, 64, kSlabBytes, [&](std::uint32_t slab) { return backend.slab(slab); }, 0, false, kept);
+        require(tier.kept() && !tier.kept_content(), "a new kept file holds no previous run");
+        const Conversation a = publish(index, backend, 91, 2);
+        const SnapshotView view = index.snapshot(a.endpoint);
+        for (const std::uint32_t slab : view.host_slabs) {
+            image.insert(image.end(), backend.slab(slab), backend.slab(slab) + kSlabBytes);
+        }
+        frontier = view.frontier;
+        for (int i = 0; i < 20 && tier.counters().image_writes == 0; ++i) {
+            (void)tier.poll(index);
+            settle(tier, index);
+        }
+        require(tier.counters().image_writes == 1, "the endpoint was written back");
+        auto displacing = index.reserve_host_image(false, kAny);
+        require(displacing.has_value(), "a second image displaces the first to the SSD");
+        index.release_host_image(std::move(*displacing));
+        require(index.snapshot(a.endpoint).host == CopyState::Absent, "the endpoint is SSD-only");
+        tier.drain(index);
+        const PersistResult saved = save_prefix_cache(index, test_binding(backend, tier, c.image_slabs), file, "fp", {});
+        require(saved.ok && saved.snapshots == 1 && saved.ssd_snapshots == 1,
+                "the SSD-only snapshot is saved by reference (" + saved.message + ")");
+    }
+    std::uint32_t first_ssd_slab = kNoId;
+    {
+        Backend backend;
+        PrefixCacheIndex index(c, backend);
+        SsdTier tier(directory, 64, kSlabBytes, [&](std::uint32_t slab) { return backend.slab(slab); }, 0, false, kept);
+        require(tier.kept_content(), "the restart finds the previous run's SSD file");
+        const PersistResult loaded = load_prefix_cache(index, test_binding(backend, tier, c.image_slabs), file, "fp", {});
+        require(loaded.ok && loaded.snapshots == 1 && loaded.ssd_snapshots == 1 && loaded.ssd_message.empty(),
+                "the SSD-only snapshot comes back (" + loaded.message + loaded.ssd_message + ")");
+        index.check_invariants();
+        const SnapshotRef snapshot = only_snapshot(index);
+        require(index.snapshot(snapshot).frontier == frontier && index.snapshot(snapshot).host == CopyState::Absent &&
+                    index.snapshot(snapshot).ssd == CopyState::Resident,
+                "it is SSD-only at its frontier");
+        first_ssd_slab = index.snapshot(snapshot).ssd_slabs[0];
+        require(tier.promote(index, snapshot) == SsdTier::Promotion::Pending, "its promotion starts");
+        settle(tier, index);
+        const SnapshotView back = index.snapshot(snapshot);
+        require(back.host == CopyState::Resident && tier.counters().kept_slab_mismatches == 0, "it landed, checked");
+        for (std::size_t k = 0; k < back.host_slabs.size(); ++k) {
+            require(std::memcmp(backend.slab(back.host_slabs[k]), image.data() + k * kSlabBytes, kSlabBytes) == 0,
+                    "a promoted slab holds the bytes saved before the restart");
+        }
+        tier.drain(index);
+    }
+    {
+        // Another process wrote over the slab after the save.
+        std::fstream damage(kept, std::ios::in | std::ios::out | std::ios::binary);
+        damage.seekp(static_cast<std::streamoff>(first_ssd_slab) * static_cast<std::streamoff>(kSlabBytes));
+        const std::vector<char> junk(4096, 'x');
+        damage.write(junk.data(), static_cast<std::streamsize>(junk.size()));
+    }
+    {
+        Backend backend;
+        PrefixCacheIndex index(c, backend);
+        SsdTier tier(directory, 64, kSlabBytes, [&](std::uint32_t slab) { return backend.slab(slab); }, 0, false, kept);
+        const PersistResult loaded = load_prefix_cache(index, test_binding(backend, tier, c.image_slabs), file, "fp", {});
+        require(loaded.ok && loaded.ssd_snapshots == 1, "the file still names the slab");
+        const SnapshotRef snapshot = only_snapshot(index);
+        require(tier.promote(index, snapshot) == SsdTier::Promotion::Pending, "its promotion starts");
+        settle(tier, index);
+        require(tier.counters().kept_slab_mismatches == 1 && tier.counters().read_failures == 1,
+                "the changed slab fails the promotion");
+        require(!index.valid(snapshot), "the snapshot whose bytes changed is gone");
+        index.check_invariants();
+    }
+}
+
 // A promotion that finds no Host room while a write-back is in flight waits for it (§5.7: the write pins
 // its entries until it lands, then they are clean and yield without loss; a restart's restored Host
 // entries are in that state): promote says Pending and counts the wait, poll reports the write's landing,
@@ -449,6 +557,7 @@ int main() {
         if (const char* dump = std::getenv("INFERNIX_TEST_CODEC_DUMP"); dump != nullptr && *dump != '\0') { bench_codec(dump); }
         test_packed_tier(directory / "packed");
         test_packed_partial(directory / "partial");
+        test_kept_restart(directory / "kept");
         test_room_wait(directory / "room");
         Backend backend;
         PrefixCacheIndex index(config(), backend);

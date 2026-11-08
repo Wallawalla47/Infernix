@@ -135,12 +135,17 @@ SsdTierStats ssd_tier_stats(const SsdTier* tier, const PrefixIndexStats& index, 
 }
 
 SsdTier::SsdTier(const std::filesystem::path& directory, std::uint32_t slabs, std::size_t slab_bytes,
-                 std::function<std::byte*(std::uint32_t)> host_slab, std::uint64_t write_bytes_per_hour, bool codec)
-    : file_(directory, static_cast<std::uint64_t>(slabs) * slab_bytes), slab_bytes_(slab_bytes),
-      host_slab_(std::move(host_slab)) {
+                 std::function<std::byte*(std::uint32_t)> host_slab, std::uint64_t write_bytes_per_hour, bool codec,
+                 const std::filesystem::path& kept_file)
+    : file_(directory, static_cast<std::uint64_t>(slabs) * slab_bytes, DirectScratchFile::Options{.kept_file = kept_file}),
+      slab_bytes_(slab_bytes), kept_(!kept_file.empty()), host_slab_(std::move(host_slab)) {
     if (slab_bytes == 0 || slab_bytes % DirectScratchFile::kAlignment != 0 || slab_bytes % kCodecRowBytes != 0 ||
         !host_slab_) {
         throw std::invalid_argument("SSD tier slabs must be positive multiples of 4 KiB with a Host address");
+    }
+    if (kept_) {
+        slab_hash_.assign(slabs, 0U);
+        unverified_.assign(slabs, 0U);
     }
     if (write_bytes_per_hour != 0) {
         budget_.emplace(write_bytes_per_hour, directory / kBudgetFile, SsdWriteBudget::Clock::now());
@@ -186,7 +191,50 @@ void SsdTier::codec_done(std::uint64_t tag) {
     if (waker_) { waker_(); }
 }
 
-DirectScratchFile::Batch SsdTier::batch(std::uint64_t tag, DirectScratchFile::Op op, const Job& job) const {
+void SsdTier::expect(std::uint32_t slab, std::uint64_t hash) {
+    if (!kept_ || slab >= slab_hash_.size()) { throw std::invalid_argument("SSD tier: no kept slab " + std::to_string(slab)); }
+    slab_hash_[slab] = hash;
+    if (unverified_[slab] == 0U) {
+        unverified_[slab] = 1U;
+        ++unverified_count_;
+    }
+}
+
+void SsdTier::flush() {
+    if (!jobs_.empty()) { throw std::logic_error("SSD tier flush requires a drained tier"); }
+    file_.flush();
+}
+
+bool SsdTier::verify_kept(const Job& job) {
+    if (job.hashes.empty()) { return true; }
+    for (std::size_t k = 0; k < job.hash_slabs.size(); ++k) {
+        const std::uint32_t slab = job.hash_slabs[k];
+        if (unverified_[slab] != 0U && job.hashes[k] != slab_hash_[slab]) {
+            ++counters_.kept_slab_mismatches;
+            return false;
+        }
+    }
+    for (const std::uint32_t slab : job.hash_slabs) {
+        if (unverified_[slab] != 0U) {
+            unverified_[slab] = 0U;
+            --unverified_count_;
+        }
+    }
+    return true;
+}
+
+void SsdTier::record_written(const Job& job) {
+    for (std::size_t k = 0; k < job.hash_slabs.size(); ++k) {
+        const std::uint32_t slab = job.hash_slabs[k];
+        slab_hash_[slab]         = job.hashes[k];
+        if (unverified_[slab] != 0U) {
+            unverified_[slab] = 0U;
+            --unverified_count_;
+        }
+    }
+}
+
+DirectScratchFile::Batch SsdTier::batch(std::uint64_t tag, DirectScratchFile::Op op, Job& job) const {
     // Slab copies (blocks, a raw image, a tail) and a packed image's stream slabs from its staging.
     struct Piece {
         std::uint64_t offset;
@@ -201,8 +249,24 @@ DirectScratchFile::Batch SsdTier::batch(std::uint64_t tag, DirectScratchFile::Op
         pieces.push_back({static_cast<std::uint64_t>(job.job.image_ssd_slabs[k]) * slab_bytes_, job.staging.get() + k * slab_bytes_});
     }
     std::sort(pieces.begin(), pieces.end(), [](const Piece& a, const Piece& b) { return a.offset < b.offset; });
+    // A kept file hashes every slab it writes, and the slabs of the previous run a read takes.
+    job.hash_slabs.clear();
+    job.hashes.clear();
+    bool hashed = false;
+    if (kept_) {
+        for (const Piece& piece : pieces) { job.hash_slabs.push_back(static_cast<std::uint32_t>(piece.offset / slab_bytes_)); }
+        hashed = op == DirectScratchFile::Op::Write ||
+                 (unverified_count_ != 0 &&
+                  std::any_of(job.hash_slabs.begin(), job.hash_slabs.end(), [&](std::uint32_t s) { return unverified_[s] != 0U; }));
+        if (hashed) {
+            job.hashes.assign(pieces.size(), 0U);
+        } else {
+            job.hash_slabs.clear();
+        }
+    }
     DirectScratchFile::Batch out{.tag = tag, .op = op, .ios = {}};
-    for (const Piece& piece : pieces) {
+    for (std::size_t k = 0; k < pieces.size(); ++k) {
+        const Piece& piece = pieces[k];
         if (!out.ios.empty()) {
             DirectScratchFile::Io& last = out.ios.back();
             // Consecutive on the SSD and in memory (one pinned chunk, or a staging buffer): one I/O.
@@ -212,7 +276,11 @@ DirectScratchFile::Batch SsdTier::batch(std::uint64_t tag, DirectScratchFile::Op
                 continue;
             }
         }
-        out.ios.push_back(DirectScratchFile::Io{.offset = piece.offset, .bytes = slab_bytes_, .memory = piece.memory});
+        out.ios.push_back(DirectScratchFile::Io{.offset      = piece.offset,
+                                                .bytes       = slab_bytes_,
+                                                .memory      = piece.memory,
+                                                .hashes      = hashed ? job.hashes.data() + k : nullptr,
+                                                .hash_stride = hashed ? slab_bytes_ : 0U});
     }
     return out;
 }
@@ -364,11 +432,13 @@ void SsdTier::apply(PrefixCacheIndex& index) {
                     index.set_ssd_rate(counters_.read_bytes_per_second);
                 }
             }
-            if (done.ok && job.job.packed) {
+            // A slab of the previous run whose bytes changed fails the promotion as a failed read does.
+            const bool ok = done.ok && verify_kept(job);
+            if (ok && job.job.packed) {
                 start_decode(done.tag, job); // lands through apply_codec
                 continue;
             }
-            land_promotion(index, job, done.ok);
+            land_promotion(index, job, ok);
         } else {
             write_finished(job);
             if (done.ok) {
@@ -378,6 +448,7 @@ void SsdTier::apply(PrefixCacheIndex& index) {
                 if (done.bytes >= kRateBatchBytes && seconds > 0.0) {
                     counters_.write_bytes_per_second = static_cast<double>(done.bytes) / seconds;
                 }
+                if (kept_) { record_written(job); }
                 index.complete_ssd_write(job.job);
             } else {
                 ++counters_.write_failures;
