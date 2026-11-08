@@ -20,8 +20,13 @@
 // - the reproducible route (fast paths off) resumes on the prefill chunk grid, and its output does not depend on
 //   the prefix cache: the resumed continuation equals the cold one, tokens and teacher-forced log-probability bits;
 // - the default route (free-cache-resume) resumes from the decode-computed endpoint the speculative request left:
-//   the teacher-forced log-probabilities of the 16 tokens past it stay within max(0.1, 4 x) of a resume from a
-//   prefill-made state in the same Engine (the stale-state failure measured 3.99).
+//   the teacher-forced log-probabilities of the 16 tokens past it stay within max(0.5, 4 x) of a resume from a
+//   prefill-made state in the same Engine (the stale-state failure measured 3.99). A decode-computed state
+//   differs from a prefill-made one by more than rounding where the two paths compute differently (the NVFP4
+//   27B's prompt path takes 4-bit activations, its decode path 16): on that artifact, ten texts on two builds
+//   either side of the attention rescale fix (fb16c255) measured 0.019-0.185 with MTP and 0.024-0.117 with
+//   DFlash2, worst single token 1.89 nats, against prefill-made 0.005-0.044 (2026-11-07). The 0.1 floor this
+//   bound had lay inside that spread: the probe's text measured 0.077 before the fix and 0.185 after it.
 namespace {
 
 void require(bool condition, const std::string& message) {
@@ -79,7 +84,7 @@ int run(const std::filesystem::path& artifact, std::string_view drafter, bool fa
         check(probe.reused > probe.start, "the continuation did not resume from the decode-computed endpoint (reused " +
                                               std::to_string(probe.reused) + " of " + std::to_string(probe.start) +
                                               " prompt tokens before the decode)");
-        const double bound = std::max(0.1, 4.0 * prefill.mean_abs_delta());
+        const double bound = std::max(0.5, 4.0 * prefill.mean_abs_delta());
         check(probe.mean_abs_delta() <= bound,
               "teacher-forced log-probabilities past the decode-computed endpoint moved by " +
                   std::to_string(probe.mean_abs_delta()) + " on average (bound " + std::to_string(bound) + ")");

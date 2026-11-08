@@ -13,10 +13,12 @@
 //
 // Arguments: drafter (dflash2, dflash or mtp; default dflash2), streams decoded at once (default 1: with 2 the
 // rows without a copy verify their neural proposal in the tree's round), KV codec (default int8). The artifact
-// (INFERNIX_TEST_ARTIFACT) must hold the drafter and verify trees (single FP8, NVFP4 or Q8 GDN input projections).
+// (INFERNIX_TEST_ARTIFACT; INFERNIX_TEST_MOE_ARTIFACT for dflash) must hold the drafter and verify trees (single
+// FP8, NVFP4 or Q8 GDN input projections).
 
 #include "infernix/engine.h"
 #include "kv_cache_storage.h"
+#include "real_test_artifact.h"
 
 #include <cmath>
 #include <cstdint>
@@ -220,13 +222,12 @@ Arm run(const infernix::EngineOptions& options, const std::vector<Tokens>& promp
 } // namespace
 
 int main(int argc, char** argv) {
-    const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
-    if (artifact == nullptr || *artifact == '\0') {
-        std::printf("skip: INFERNIX_TEST_ARTIFACT is not set\n");
-        return 77;
-    }
+    const std::string drafter = argc > 1 ? argv[1] : "dflash2";
+    // DFlash's drafter lives in the MoE artifact (the 35B-A3B), the others in the dense one.
+    const char* artifact = infernix::test::real_test_artifact(
+        drafter == "dflash" ? infernix::test::kMoeArtifactVariable : infernix::test::kDenseArtifactVariable);
+    if (artifact == nullptr) { return 77; }
     try {
-        const std::string drafter = argc > 1 ? argv[1] : "dflash2";
         const auto streams        = argc > 2 ? static_cast<std::uint32_t>(std::stoul(argv[2])) : 1U;
         const auto kv             = infernix::test::parse_kv_cache_storage(argc > 3 ? argv[3] : "int8");
         std::vector<Tokens> prompts;

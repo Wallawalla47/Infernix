@@ -1,5 +1,6 @@
 #include "infernix/engine.h"
 #include "graph_prepare_probe.h"
+#include "real_test_artifact.h"
 #include "speculative_page_boundary.h"
 
 #include <algorithm>
@@ -451,11 +452,9 @@ int run(const char* artifact) {
 }
 
 int main() {
-    const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
-    if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "skip: INFERNIX_TEST_ARTIFACT is not set\n";
-        return 77;
-    }
+    // DFlash's drafter lives in the MoE artifact (the 35B-A3B).
+    const char* artifact = infernix::test::real_test_artifact(infernix::test::kMoeArtifactVariable);
+    if (artifact == nullptr) { return 77; }
     // An artifact without the DFlash component (a DFlash2-only build, for one) fails at Engine
     // startup; report that rather than terminating on the uncaught exception.
     try {

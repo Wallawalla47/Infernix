@@ -254,9 +254,12 @@ infernix_add_test(infernix_qwen3_5_dflash_prefill_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash_prefill_real.cpp"
   LIBRARIES infernix_engine infernix_model_runtime infernix_model_loading infernix_core)
 
+# The MoE test reads INFERNIX_TEST_MOE_ARTIFACT (the 35B-A3B); its offloaded entry reads
+# INFERNIX_TEST_OFFLOADED_ARTIFACT (the 122B-A10B), so one run with both variables covers both.
 infernix_add_test(infernix_qwen3_5_moe_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_moe_real.cpp"
   LIBRARIES infernix_engine infernix_model_runtime)
+add_test(NAME infernix_qwen3_5_moe_offloaded_real_test COMMAND infernix_qwen3_5_moe_real_test offloaded)
 
 infernix_add_test(infernix_qwen3_5_dflash_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash_real.cpp"

@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/planning/startup.h"
 #include "infernix/engine.h"
 #include "graph_prepare_probe.h"
+#include "real_test_artifact.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -339,12 +340,13 @@ int exercise_maximum_configuration(const char* artifact) {
 
 } // namespace
 
-int main() {
-    const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
-    if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "skip: INFERNIX_TEST_ARTIFACT is not set\n";
-        return 77;
-    }
+// `offloaded` runs the 122B-A10B's entry (INFERNIX_TEST_OFFLOADED_ARTIFACT); without it the resident MoE
+// artifact's (INFERNIX_TEST_MOE_ARTIFACT, the 35B-A3B).
+int main(int argc, char** argv) {
+    const bool offloaded = argc > 1 && std::string(argv[1]) == "offloaded";
+    const char* artifact = infernix::test::real_test_artifact(offloaded ? infernix::test::kOffloadedArtifactVariable
+                                                                        : infernix::test::kMoeArtifactVariable);
+    if (artifact == nullptr) { return 77; }
 
     try {
         {

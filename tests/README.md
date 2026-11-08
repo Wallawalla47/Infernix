@@ -239,16 +239,23 @@ INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R infernix_qwen3_5_score_real_test --output-on-failure
 ```
 
-Run the 35B-A3B MoE route independently:
+The Qwen3.5 real tests take one artifact of each kind, so that one CTest run covers all of them
+(`tests/models/qwen3_5/real_test_artifact.h`): `INFERNIX_TEST_ARTIFACT` names a dense artifact holding MTP and
+DFlash2 (the NVFP4 27B), `INFERNIX_TEST_MOE_ARTIFACT` a MoE artifact holding DFlash (the 35B-A3B: the MoE test and
+every DFlash test), and `INFERNIX_TEST_OFFLOADED_ARTIFACT` an offloaded MoE artifact (the 122B-A10B). A test whose
+variable is not set skips.
 
 ```bash
-INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
-  ctest --test-dir build -R infernix_qwen3_5_moe_real_test --output-on-failure
+INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+INFERNIX_TEST_MOE_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
+INFERNIX_TEST_OFFLOADED_ARTIFACT=$PWD/out/ornith_122b-00001-of-00003.infernix \
+  ctest --test-dir build -L real --output-on-failure
 ```
 
-With the 122B-A10B's artifact the same test also runs its offloaded experts: the first engine in the exclusive
-RAM layout (`--expert-ram-layout exclusive`), the 262,144-token configuration in the default full layout with
-the elastic KV grown from the expert frames.
+`infernix_qwen3_5_moe_real_test` runs the 35B-A3B's MoE route; its entry
+`infernix_qwen3_5_moe_offloaded_real_test` runs the 122B-A10B's offloaded experts: the first engine in the
+exclusive RAM layout (`--expert-ram-layout exclusive`), the 262,144-token configuration in the default full layout
+with the elastic KV grown from the expert frames.
 
 The Qwen3.8-Flash-Next (`qwen4_exp`) artifact tests read `INFERNIX_QWEN4_ARTIFACT` instead (the first
 shard of a `.infernix` artifact) and, when the n-gram volume is not beside it,
@@ -322,8 +329,10 @@ The resume entries (`infernix_qwen3_5_resume_cold_real_test` and
 drafter, then compare the continuation resumed from the prefix cache with a cold run: on the
 reproducible route the tokens and the teacher-forced log-probabilities of the 16 tokens past the
 decoded text are bit-identical; on the default route, which resumes from the decode-computed
-endpoint, the mean log-probability difference stays within max(0.1, 4 x) that of a resume from a
-prefill-made state. The Qwen4Exp entry runs DFlash2 only with `INFERNIX_QWEN4_DFLASH2`.
+endpoint, the mean log-probability difference stays within max(0.5, 4 x) (Qwen3.5) or max(0.1, 4 x)
+(Qwen4Exp) that of a resume from a prefill-made state. A stale state measured 3.99; the NVFP4 27B's
+decode-computed states differ from prefill-made ones by up to 0.185 over ten texts, since its prompt path
+takes 4-bit activations and its decode path 16 (the test's comment has the measurements). The Qwen4Exp entry runs DFlash2 only with `INFERNIX_QWEN4_DFLASH2`.
 
 `infernix_qwen4_exp_startup_capture_real_test` (arguments `plain mtp dflash2`; TEMPORARY with
 `INFERNIX_TMP_STARTUP_CAPTURE`, Flash-Next design §19.3.37) runs two prompts, alone and then together, through an

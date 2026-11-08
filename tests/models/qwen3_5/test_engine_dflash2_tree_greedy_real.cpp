@@ -1,5 +1,6 @@
 #include "infernix/engine.h"
 #include "kv_cache_storage.h"
+#include "real_test_artifact.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -65,11 +66,11 @@ infernix::RequestOptions greedy(std::uint32_t outputs) {
 } // namespace
 
 int main(int argc, char** argv) {
-    const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
-    if (!artifact || !*artifact) {
-        std::cout << "skip: INFERNIX_TEST_ARTIFACT is not set\n";
-        return 77;
-    }
+    // DFlash's drafter lives in the MoE artifact (the 35B-A3B), the others in the dense one.
+    const bool dflash    = argc > 5 && std::string(argv[5]) == "dflash";
+    const char* artifact = infernix::test::real_test_artifact(dflash ? infernix::test::kMoeArtifactVariable
+                                                                     : infernix::test::kDenseArtifactVariable);
+    if (artifact == nullptr) { return 77; }
     try {
         const auto kv           = infernix::test::parse_kv_cache_storage(argc > 1 ? argv[1] : "int8");
         const std::string table = argc > 2 ? argv[2] : "16";

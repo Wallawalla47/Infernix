@@ -12,8 +12,16 @@
 #include <vector>
 
 namespace {
-// A digit ends a tokenizer word, so extending this prefix cannot merge its final token.
-const std::string kAssistantPrefix = "def transform_0(value):\n    offset = 17";
+// A digit ends a tokenizer word, so extending this prefix cannot merge its final token. A finishing
+// request publishes its decode-computed endpoint only kMinimumTapSeparation (64) or more tokens past its
+// deepest snapshot (runtime/prefix_cache/tap_planner.h), and the prompt's last one lies before this
+// prefix: the prefix holds whole functions so that a stop a few tokens into the reply lies past that.
+// (The model ends its reply after about one more function, so the stops cannot come later.)
+const std::string kAssistantPrefix = "def transform_0(value):\n    offset = 17\n    return value * 2 + offset\n\n"
+                                     "def transform_1(value):\n    offset = 18\n    return value * 3 + offset\n\n"
+                                     "def transform_2(value):\n    offset = 19\n    return value * 4 + offset\n\n"
+                                     "def transform_3(value):\n    offset = 20";
+constexpr unsigned kMinimumTapSeparation = 64;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -140,12 +148,20 @@ int main(int argc, char** argv) {
         const auto selection_end = std::min<std::size_t>(96, reference_count - 1);
         std::cout << "reference tokens=" << reference_count
                   << " finish=" << static_cast<int>(reference.finish_reason)
-                  << " stop_selection_end=" << selection_end << " exact=1" << std::endl;
+                  << " stop_selection_end=" << selection_end << " exact=1"
+                  << " content=" << std::quoted(reference.content) << std::endl;
         require(ngram == 0 || reference.speculative.ngram_accepted_tokens > 0,
                 "reference did not exercise ngram");
         for (const unsigned budget : {1U, 2U}) {
             const auto tail =
                 engine.generate(engine.prepare(prompt(source)), request(budget, true));
+            // A one-token continuation resumes at the prompt's deepest snapshot.
+            if (budget == 1U) {
+                std::cout << "prompt snapshot at " << tail.reused_prompt_tokens << " of " << prompt_tokens
+                          << " prompt tokens" << std::endl;
+                require(tail.reused_prompt_tokens + kMinimumTapSeparation <= prompt_tokens + 16,
+                        "the prompt's last snapshot lies too close to its end for a stop's endpoint to publish");
+            }
             require(tail.generated_token_ids.size() == budget &&
                         source.starts_with(kAssistantPrefix + tail.content),
                     "anchor-only tail changed the output budget or source prefix");

@@ -699,7 +699,8 @@ int test_human_and_csv_reports() {
         expect(table.find("decode eng t/s") != std::string::npos, "table engine throughput");
     failures += expect(table.find("work peak") != std::string::npos, "table workspace peak");
     failures +=
-        expect(table.find("ngram_draft_tokens=31 ngram_min_match=12 spec_min_p=default") != std::string::npos &&
+        expect(table.find("ngram_draft_tokens=31 ngram_min_match=12 ngram_tree_nodes=0 spec_min_p=default") !=
+                       std::string::npos &&
                    table.find("ngram acc/draft/round") != std::string::npos &&
                    table.find("5/5/1") != std::string::npos,
                "table separates ngram configuration and counters");
