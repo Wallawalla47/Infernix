@@ -82,6 +82,18 @@ observable BF16 cast between projection and head normalization. This complete co
 exceeds the local ring capacity, only its final live window needs storage; the context frontier
 still advances by the complete chunk.
 
+The 27B's DFlash2, whose five layers are all local, extends that across chunks (2026-11-08, candidates
+YE-01, after Ignis #506). A read of the ring at position F (the prompt end, where decoding starts, and
+every snapshot the prompt may capture: its exact taps, its flexible taps at or after their position or
+the last chunk's start, rewrite frontiers) needs only positions [F − S, F). Each text prefill pass
+projects only its columns at or after the earliest such read after the pass begins, minus S; the
+columns below it are overwritten in the ring before any read reaches them, so the ring is word for word
+the same at every read. The lane keeps where its ring's contiguous run starts (`dflash_ring_from`): a
+capture nothing planned (a coalescing sibling's tap, a lane that ends mid-prompt) whose ring is not
+whole there is passed over, so every snapshot carries a whole ring. Prompts shorter than S between
+reads project as before; Ignis measured the drafter's share of a 64K first token 220 → 75 ms (RTX
+5090, NVFP4 27B, 2,048-token chunks).
+
 ## Query block and attention masks
 
 The draft input is the target embedding of:

@@ -38,18 +38,29 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
             // it runs there: a pass on a lent workspace (offloaded experts) leaves it untouched.
             auto scope  = state.execution.work.scope();
             auto& frame = *state.execution.io.dflash_prefill;
+            // YE-01: columns below the floor (positions from text_kv_base on) are never read before a
+            // later column overwrites their ring slot.
+            std::int32_t skip = 0;
+            if (state.dflash_context_floor > static_cast<std::int64_t>(state.text_kv_base)) {
+                skip = static_cast<std::int32_t>(std::min<std::int64_t>(
+                    state.dflash_context_floor - static_cast<std::int64_t>(state.text_kv_base), features.ne[1]));
+            }
+            if (skip == features.ne[1]) { return; }
+            const std::int32_t kept   = features.ne[1] - skip;
+            const Tensor kept_columns = skip == 0 ? features : features.slice(1, skip, kept);
+            const Tensor kept_positions = skip == 0 ? positions : positions.slice(0, skip, kept);
             // Target execution and draft append use the same chunk bindings. Decode may have
             // used another compact row, or a checkpoint may have forked the destination slot.
             *state.dflash_prefill_host_ingress = {
-                .append_count           = features.ne[1],
+                .append_count           = kept,
                 .state_destination_slot = state.state_destination_slot,
                 .full_kv_table_row      = state.dflash_kv_table_row,
             };
             CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, state.dflash_prefill_host_ingress,
                                        sizeof(qwen3_5::DFlashPrefillIngress),
                                        cudaMemcpyHostToDevice, state.execution.device.stream));
-            const auto exact = static_cast<std::uint32_t>(features.ne[1]);
-            dflash_append_context(state, features, positions, frame.append_count,
+            const auto exact = static_cast<std::uint32_t>(kept);
+            dflash_append_context(state, kept_columns, kept_positions, frame.append_count,
                                   frame.state_destination_slot, frame.full_kv_table_row,
                                   {exact, exact});
             (void)rewrite_checkpoint;
@@ -780,6 +791,32 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 // one TextContext::prefill_impl takes (the chunk, cut at the split frontier).
                 execution::OffloadedCall offload_call;
                 const std::uint32_t pass_begin = staged.cursor;
+                // YE-01 (Ignis #506): a DFlash2 drafter whose layers are all local reads only the last
+                // `window` positions of its ring, at the prompt end and at every snapshot this prompt may
+                // take. The earliest such read after this pass begins bounds what the pass must project:
+                // exact taps at their position, flexible ones no earlier than their position or the
+                // last chunk's start (hybrid_after_prefill_chunk realizes them at a boundary), rewrite
+                // frontiers. A read nothing planned (a coalescing tap, a lane that ends mid-prompt) finds
+                // the ring not whole and captures nothing (dflash_ring_whole).
+                schedule_state.dflash_context_floor = -1;
+                if (const std::uint32_t window = dflash_ring_window(); window != 0 && !staged.vision) {
+                    std::uint64_t read   = staged.prompt_tokens;
+                    const auto consider = [&](std::uint64_t position) {
+                        read = std::min<std::uint64_t>(read, std::max<std::uint64_t>(position, pass_begin + 1U));
+                    };
+                    if (hybrid_taps_left()) {
+                        const std::uint32_t last_chunk =
+                            staged.prompt_tokens > prefill_chunk ? staged.prompt_tokens - prefill_chunk : 0U;
+                        for (std::size_t tap = hybrid_lane->next_tap; tap < hybrid_lane->taps.size(); ++tap) {
+                            const runtime::prefix_cache::PlannedTap& planned = hybrid_lane->taps[tap];
+                            const bool exact = planned.placement == runtime::prefix_cache::TapPlacement::Exact &&
+                                               !execution_schedule.grid_cache;
+                            consider(exact ? planned.position : std::min(planned.position, last_chunk));
+                        }
+                    }
+                    if (rewrite_split != rewrite_frontiers.end()) { consider(*rewrite_split); }
+                    schedule_state.dflash_context_floor = static_cast<std::int64_t>(read > window ? read - window : 0U);
+                }
                 if (offload) {
                     std::uint32_t expected = std::min(idle_prefill_width, remaining);
                     if (split_frontier && *split_frontier > pass_begin) {
@@ -830,6 +867,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
                 if (is_masked_draft_backend(speculative_backend)) {
                     sequence.dflash_context_frontier = staged.cursor;
+                    // The ring's contiguous run now starts where this pass began projecting.
+                    if (schedule_state.dflash_context_floor > static_cast<std::int64_t>(pass_begin)) {
+                        sequence.dflash_ring_from = static_cast<std::uint32_t>(
+                            std::min<std::int64_t>(schedule_state.dflash_context_floor, staged.cursor));
+                    }
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
 

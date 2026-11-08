@@ -243,7 +243,7 @@ void ProgramImpl::set_device_i32(Tensor& tensor, std::int32_t value) {
 
 void ProgramImpl::ordered_reset(SequenceState& state) {
     refresh_state_views(state);
-    state.text_kv_valid = state.mtp_kv_valid = state.dflash_context_frontier = 0;
+    state.text_kv_valid = state.mtp_kv_valid = state.dflash_context_frontier = state.dflash_ring_from = 0;
     work.reset();
 }
 

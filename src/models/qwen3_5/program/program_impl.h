@@ -212,6 +212,10 @@ struct SequenceState {
     std::uint32_t text_kv_valid           = 0;
     std::uint32_t mtp_kv_valid            = 0;
     std::uint32_t dflash_context_frontier = 0;
+    // The first position of the contiguous run the DFlash2 drafter's context ring holds up to
+    // dflash_context_frontier (YE-01: prefill skips positions no later read of the ring reaches). The
+    // ring is whole for a read at F when this is at most F minus its window.
+    std::uint32_t dflash_ring_from = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
     // The drafter's probability of each draft (ops::argmax_with_probability; 1 where none was
     // computed), the input of the confidence policy (MtpConfidencePolicy) and of the cut.
@@ -765,6 +769,27 @@ public:
     [[nodiscard]] PagedKVCache* backend_kv_cache() noexcept;
     [[nodiscard]] const PagedKVCache* backend_kv_cache() const noexcept;
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState&) const noexcept;
+    // YE-01: the DFlash2 drafter's context window when every drafter layer is local (the 27B's five), so
+    // a read of its ring at F needs only positions [F - window, F); 0 for any other drafter.
+    [[nodiscard]] std::uint32_t dflash_ring_window() const noexcept {
+        if (!is_masked_draft_backend(speculative_backend)) { return 0U; }
+        const auto& draft = parameters.model.config().draft;
+        if (!draft || !draft->dflash2 || draft->local_layer_count() != draft->num_hidden_layers ||
+            !draft->sliding_window) {
+            return 0U;
+        }
+        return static_cast<std::uint32_t>(*draft->sliding_window);
+    }
+    // The first position a ring whole at `frontier` holds (its window back from the frontier).
+    [[nodiscard]] std::uint32_t dflash_ring_whole_from(std::uint32_t frontier) const noexcept {
+        const std::uint32_t window = dflash_ring_window();
+        return window != 0 && frontier > window ? frontier - window : 0U;
+    }
+    // Whether the lane's ring holds every position a read at `frontier` reaches (always without YE-01's
+    // skip): a snapshot captured there carries a whole ring.
+    [[nodiscard]] bool dflash_ring_whole(const SequenceState& state, std::uint32_t frontier) const noexcept {
+        return state.dflash_ring_from <= dflash_ring_whole_from(frontier);
+    }
     [[nodiscard]] PagedKVCacheView text_kv_view(const SequenceState&) const;
     [[nodiscard]] PagedKVCacheView mtp_kv_view(const SequenceState&) const;
     [[nodiscard]] PrefillProgress wrap_prefill(std::uint32_t lane, runtime::PrefillStepResult);

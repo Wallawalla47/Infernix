@@ -1245,7 +1245,9 @@ void ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t fron
     HybridLaneState& lane         = hybrid_lanes_[sequence.lane];
     pc::PrefixCacheIndex& index   = hybrid_->index();
     HybridCacheCounters& counters = hybrid_->counters();
-    if (frontier == 0 || frontier > sequence.text_kv_valid) {
+    // A tap no prefill plan foresaw (a coalescing sibling's) may find the DFlash2 ring missing
+    // positions YE-01 skipped: a snapshot always carries a whole ring, so the tap is passed over.
+    if (frontier == 0 || frontier > sequence.text_kv_valid || !dflash_ring_whole(sequence, frontier)) {
         ++counters.taps_skipped;
         return;
     }
@@ -1497,10 +1499,12 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence,
             hybrid_publish_pending(sequence, true);
             const std::uint32_t frontier         = sequence.text_kv_valid;
             const std::uint32_t backend_frontier = hybrid_backend_frontier(frontier);
+            // A lane that ends inside a prompt whose prefill skipped drafter positions (YE-01) publishes
+            // nothing: its ring is not whole there.
             const bool backend_caught_up =
                 (!sequence.kv->backend || backend_kv_valid(sequence) >= backend_frontier) &&
                 (!is_masked_draft_backend(speculative_backend) ||
-                 sequence.dflash_context_frontier == frontier);
+                 (sequence.dflash_context_frontier == frontier && dflash_ring_whole(sequence, frontier)));
             const std::uint32_t anchor_blocks = frontier / kBlock;
             // On the reproducible route only prefill-computed state on the chunk grid is reusable: a
             // lane that ends there (a prompt cancelled between chunks, the idle-time pass yielding to

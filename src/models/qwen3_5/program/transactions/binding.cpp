@@ -184,6 +184,7 @@ void ProgramImpl::install_binding(ContextTransaction& tx) {
         state.text_kv_valid           = tx.reuse_frontier;
         state.mtp_kv_valid            = tx.backend_frontier;
         state.dflash_context_frontier = tx.reuse_frontier;
+        state.dflash_ring_from        = dflash_ring_whole_from(tx.reuse_frontier);
         // Reconstruct references into the moved durable prefill object.
         if (request.prefill && request.prefill->vision_plan &&
             !request.prefill->vision_plan->uses.empty()) {
@@ -203,6 +204,7 @@ void ProgramImpl::install_binding(ContextTransaction& tx) {
         state.text_kv_valid           = tx.reuse_frontier;
         state.mtp_kv_valid            = tx.backend_frontier;
         state.dflash_context_frontier = tx.reuse_frontier;
+        state.dflash_ring_from        = dflash_ring_whole_from(tx.reuse_frontier);
         state.tail_hidden_valid       = false;
         request.lifecycle             = Lifecycle::Prefilling;
         install_sampling(state, request, tx.base->sampling);
