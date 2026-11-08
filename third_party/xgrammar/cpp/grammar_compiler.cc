@@ -1507,6 +1507,11 @@ class GrammarCompiler::Impl {
     return result;
   }
 
+  bool HasCachedGrammar(const std::string& key) {
+    return cache_enabled_ &&
+           grammar_level_cache_.Contains(GrammarCompilerCacheKeys::PreparedGrammarKey{key});
+  }
+
   CompiledGrammar CompileJSONSchema(
       const std::string& schema,
       bool any_whitespace,
@@ -1784,5 +1789,9 @@ CompiledGrammar GrammarCompiler::CompileCachedGrammar(const std::string& key,
                                                       const std::function<Grammar()>& factory,
                                                       CompilationCacheAccess* access) {
   return pimpl_->CompileCachedGrammar(key, factory, access);
+}
+
+bool GrammarCompiler::HasCachedGrammar(const std::string& key) {
+  return pimpl_->HasCachedGrammar(key);
 }
 }  // namespace xgrammar

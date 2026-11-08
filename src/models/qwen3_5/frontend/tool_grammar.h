@@ -11,5 +11,6 @@ namespace infernix::models::qwen3_5::frontend {
 compile_tool_grammar(text::GrammarCompiler& compiler, const ToolCallOutputContract& contract,
                      std::int32_t tool_call_token, const text::ReasoningFraming& reasoning,
                      std::span<const std::int32_t> continuation,
-                     const std::optional<OutputConstraint>& body = {});
+                     const std::optional<OutputConstraint>& body = {},
+                     text::GrammarCompiler::Compile mode = text::GrammarCompiler::Compile::Now);
 } // namespace infernix::models::qwen3_5::frontend

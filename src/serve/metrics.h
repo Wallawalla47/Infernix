@@ -53,6 +53,8 @@ private:
         std::array<std::uint64_t, 3> constraint_outcomes{};
         std::array<std::uint64_t, 3> constraint_cache{};
         double constraint_prepare_seconds     = 0;
+        double constraint_compile_seconds     = 0;
+        double constraint_wait_seconds        = 0;
         double constraint_mask_seconds        = 0;
         double constraint_matcher_seconds     = 0;
         std::uint64_t constraint_positions    = 0;

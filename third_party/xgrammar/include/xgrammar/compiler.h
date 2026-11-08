@@ -94,6 +94,10 @@ class GrammarCompiler {
                                        const std::function<Grammar()>& factory,
                                        CompilationCacheAccess* access = nullptr);
 
+  // Whether CompileCachedGrammar's key has an entry, ready or in flight (false with the cache
+  // disabled). Advisory: an entry may be evicted before the next call.
+  bool HasCachedGrammar(const std::string& key);
+
   /*!
    * \brief Get the compiled grammar for a Lark grammar string.
    * \param lark_string The Lark grammar. The root rule must be named "start".

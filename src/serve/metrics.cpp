@@ -84,6 +84,8 @@ void Metrics::done(const GenerationOutcome& outcome) {
         ++requests_.constraint_outcomes[c.terminated ? 0 : c.complete ? 1 : 2];
         ++requests_.constraint_cache[static_cast<unsigned>(c.cache)];
         requests_.constraint_prepare_seconds += c.prepare_seconds;
+        requests_.constraint_compile_seconds += c.compile_seconds;
+        requests_.constraint_wait_seconds += c.wait_seconds;
         requests_.constraint_mask_seconds += c.mask_seconds;
         requests_.constraint_matcher_seconds += c.matcher_seconds;
         requests_.constraint_positions += c.mask_positions;
@@ -154,6 +156,10 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
             << requests.constraint_cache[i] << '\n';
     counter("constraint_prepare_seconds_total", requests.constraint_prepare_seconds, 0.0,
             "Observed constraint preparation work.");
+    counter("constraint_compile_seconds_total", requests.constraint_compile_seconds, 0.0,
+            "Observed grammar compiles run beside the prefill.");
+    counter("constraint_wait_seconds_total", requests.constraint_wait_seconds, 0.0,
+            "Observed time first masks waited for those compiles.");
     counter("constraint_mask_seconds_total", requests.constraint_mask_seconds, 0.0,
             "Observed CPU mask work, including lookahead rollback.");
     counter("constraint_matcher_seconds_total", requests.constraint_matcher_seconds, 0.0,

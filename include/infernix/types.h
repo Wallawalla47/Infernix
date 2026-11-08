@@ -1839,6 +1839,10 @@ struct ConstraintObservation {
     ConstraintCacheAccess cache     = ConstraintCacheAccess::Hit;
     bool timings_collected          = false;
     double prepare_seconds          = 0.0;
+    // A new grammar's token-mask compile when it ran beside the prefill (not part of prepare), and
+    // how long the request's first mask waited for it.
+    double compile_seconds          = 0.0;
+    double wait_seconds             = 0.0;
     double mask_seconds             = 0.0;
     double matcher_seconds          = 0.0;
     std::uint64_t mask_positions    = 0;

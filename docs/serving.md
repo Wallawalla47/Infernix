@@ -429,8 +429,11 @@ Constrained responses include a Infernix `constraint` observation. `branch` is `
 or `tools`; `complete` means the committed language can end, and `terminated` means it accepted EOS.
 A complete JSON value can therefore have `complete:true`, `terminated:false` and a length finish
 reason. The observation also includes `cache` (`hit`, `built`, `waited`), `mask_positions`,
-`mask_upload_bytes`, and `timings_seconds` for preparation, CPU mask work and matcher work.
-These times are parts of existing request time and can overlap GPU execution.
+`mask_upload_bytes`, and `timings_seconds` for preparation, a new grammar's compile run beside the
+prefill (`compile`) and the time the first mask waited for it (`wait`), CPU mask work and matcher work.
+These times are parts of existing request time and can overlap GPU execution. A new grammar (a cache
+miss without an assistant continuation) is built and validated during submission, so its errors
+still come back before admission; only its token-mask compile runs beside the prefill.
 Streaming sends the observation once: the Chat finish/usage chunk, the Responses terminal response
 object, or Anthropic `message_delta`. Unconstrained responses omit it.
 
@@ -2029,7 +2032,7 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_executions_total{kind}`, `infernix_execution_seconds_total{kind}`, `infernix_execution_max_seconds{kind}` | The Engine worker's execution units (`prefill` steps, `replay` steps, `control` batches, `decode` rounds), each from its call to its return: counts and wall time since startup, and the longest since the warm-up, which shows a stall the totals hide |
 | `infernix_decode_batch_rounds_total{batch}`, `infernix_decode_batch_seconds_total{batch}`, `infernix_decode_batch_max_seconds{batch}` | Decode rounds by batch size (1 to `--max-concurrency`): the cost of a batch size, and its longest round since the warm-up |
 | `infernix_constraint_requests_total{outcome}`, `infernix_constraint_cache_total{result}` | Settled constrained requests by completion state and compilation-cache access |
-| `infernix_constraint_{prepare,mask,matcher}_seconds_total`, `infernix_constraint_mask_{positions,upload_bytes}_total` | Constraint work aggregated at request settlement, including truncated/cancelled results |
+| `infernix_constraint_{prepare,compile,wait,mask,matcher}_seconds_total`, `infernix_constraint_mask_{positions,upload_bytes}_total` | Constraint work aggregated at request settlement, including truncated/cancelled results; `compile` is a new grammar's compile run beside the prefill and `wait` the time first masks waited for it |
 | `infernix_constraint_draft_wait_seconds_total` | Live draft-ready wait counted once per batch; a subset of device wait |
 | `infernix_requests_total{outcome}`, `infernix_response_failures_total` | Generation attempts entering preparation and subsequent response failures; protocol/model validation failures and token-count requests are excluded |
 | `infernix_chat_reasoning_missing_total`, `infernix_chat_reasoning_restored_total` | Chat Completions assistant tool-call messages received without reasoning, and those `--restore-tool-reasoning` restored |

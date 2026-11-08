@@ -4,6 +4,7 @@
 #include <array>
 #include <future>
 #include <iostream>
+#include <random>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -199,6 +200,129 @@ void check_draft_lookahead() {
     session->confirm();
     require(allows(mask(*session), 3), "generation failed after rejected draft lookahead");
 }
+// A deferred compile (the token masks built on a compiler worker while the request prefills) gives
+// the masks of a compile at submit, still raises every validation error at compile(), and fails a
+// session whose compile never ran (shutdown) as a dead end with its error, never a crash.
+void check_deferred_compile() {
+    using Compile = infernix::text::GrammarCompiler::Compile;
+    std::vector<std::string> vocabulary;
+    for (int byte = 0; byte < 128; ++byte) { vocabulary.emplace_back(1, static_cast<char>(byte)); }
+    for (const char* piece : {"\"a", "b\"", "{\"", "\":", "true", "null", "12", "34"}) {
+        vocabulary.emplace_back(piece);
+    }
+    const int eos = static_cast<int>(vocabulary.size());
+    vocabulary.emplace_back();
+    const std::string schema =
+        R"({"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"boolean"},)"
+        R"("c":{"type":"string","maxLength":4}},"required":["a","b"]})";
+    infernix::text::GrammarCompiler now_compiler(vocabulary, {eos}, 4 * 1024 * 1024);
+    infernix::text::GrammarCompiler deferred_compiler(vocabulary, {eos}, 4 * 1024 * 1024);
+    auto reference = now_compiler.compile(infernix::OutputConstraint::json_schema(schema), {}, {});
+    auto deferred  = deferred_compiler.compile(infernix::OutputConstraint::json_schema(schema), {},
+                                               {}, Compile::Deferred);
+    deferred->observe(true, 0.0);
+    require(deferred->observation().cache == infernix::ConstraintCacheAccess::Built,
+            "a deferred miss must report its build");
+    // Walk one path the masks allow (each step a different legal token, cycling through the
+    // allowed set), comparing every mask on the way.
+    for (int step = 0; step < 48; ++step) {
+        const auto expected = mask(*reference);
+        require(mask(*deferred) == expected, "a deferred compile changed a mask");
+        require(!deferred->pending() && deferred->failure() == nullptr,
+                "a used deferred session is still pending or failed");
+        std::vector<int> legal;
+        for (int token = 0; token < eos; ++token) {
+            if (allows(expected, token)) { legal.push_back(token); }
+        }
+        if (legal.empty()) { break; }
+        const int token = legal[static_cast<std::size_t>(step) % legal.size()];
+        reference->accept(token);
+        reference->confirm();
+        deferred->accept(token);
+        deferred->confirm();
+    }
+    require(deferred->observation().compile_seconds > 0.0, "a deferred compile's time was not observed");
+
+    // The second request of the same grammar is a hit, compiled at once.
+    auto hit = deferred_compiler.compile(infernix::OutputConstraint::json_schema(schema), {}, {},
+                                         Compile::Deferred);
+    require(!hit->pending() && hit->observation().cache == infernix::ConstraintCacheAccess::Hit,
+            "a cached grammar was compiled again");
+
+    // Validation and continuation errors still come from compile().
+    for (const auto& constraint :
+         {infernix::OutputConstraint::grammar("root ::= missing"),
+          infernix::OutputConstraint::json_schema(R"({"type":)")}) {
+        bool rejected = false;
+        try {
+            (void)deferred_compiler.compile(constraint, {}, {}, Compile::Deferred);
+        } catch (const std::exception&) { rejected = true; }
+        require(rejected, "a deferred compile accepted an invalid constraint");
+    }
+    bool rejected = false;
+    try {
+        (void)deferred_compiler.compile(infernix::OutputConstraint::grammar("root ::= \"xyz\""), {},
+                                        "xq", Compile::Deferred);
+    } catch (const std::exception&) { rejected = true; }
+    require(rejected, "a deferred compile accepted an invalid continuation");
+
+    // Concurrent first requests of one new grammar share a compile and see the same masks.
+    const std::string shared = "root ::= \"shared\" [0-9]{2,3}";
+    std::vector<std::future<std::vector<std::uint32_t>>> concurrent;
+    for (int i = 0; i < 6; ++i) {
+        concurrent.push_back(std::async(std::launch::async, [&] {
+            auto session = deferred_compiler.compile(infernix::OutputConstraint::grammar(shared),
+                                                     {}, {}, Compile::Deferred);
+            consume(*session, "shared4");
+            return mask(*session);
+        }));
+    }
+    auto expected_shared = now_compiler.compile(infernix::OutputConstraint::grammar(shared), {}, {});
+    consume(*expected_shared, "shared4");
+    for (auto& task : concurrent) {
+        require(task.get() == mask(*expected_shared), "a shared deferred compile changed a mask");
+    }
+
+    // Shutdown with compiles queued behind both workers: every session either got its grammar or
+    // fails at its first position with the compile's error.
+    // A 40K-token vocabulary makes each compile slow enough that compiles queue behind the two workers.
+    std::vector<std::string> large = vocabulary;
+    large.pop_back(); // EOS moves to the end
+    std::mt19937 random(7);
+    while (large.size() < 40000) {
+        std::string piece;
+        for (std::size_t n = 1 + random() % 6; n > 0; --n) { piece += static_cast<char>('a' + random() % 26); }
+        large.push_back(std::move(piece));
+    }
+    const int large_eos = static_cast<int>(large.size());
+    large.emplace_back();
+    std::vector<std::unique_ptr<infernix::text::GrammarSession>> orphans;
+    {
+        infernix::text::GrammarCompiler stopping(large, {large_eos}, 64 * 1024 * 1024);
+        for (int i = 0; i < 6; ++i) {
+            orphans.push_back(stopping.compile(
+                infernix::OutputConstraint::grammar("root ::= \"q" + std::to_string(i) + "\" [a-z]{1,8}"),
+                {}, {}, Compile::Deferred));
+        }
+    }
+    std::size_t unrun = 0;
+    for (std::size_t i = 0; i < orphans.size(); ++i) {
+        auto& session = *orphans[i];
+        std::vector<std::uint32_t> words(2 * session.mask_words());
+        const std::uint64_t dead = session.masks(std::array<std::int32_t, 1>{'q'}, words);
+        if (dead != 0) {
+            require(dead == 1 && session.failure() != nullptr && words[0] == 1u &&
+                        words[session.mask_words()] == 1u,
+                    "a session whose compile never ran must fail at position 0 with safe masks");
+            ++unrun;
+        } else {
+            require(session.failure() == nullptr && allows(words, 'q'),
+                    "a finished compile lost its mask at shutdown");
+        }
+    }
+    std::cout << "grammar: deferred compiles: " << unrun << " of " << orphans.size()
+              << " sessions met a compile the shutdown dropped\n";
+}
 } // namespace
 
 int main() {
@@ -207,6 +331,7 @@ int main() {
         check_counted_units();
         check_compiled_grammar_lifetime();
         check_draft_lookahead();
+        check_deferred_compile();
         std::vector<std::string> vocab;
         for (int byte = 0; byte < 256; ++byte) { vocab.emplace_back(1, static_cast<char>(byte)); }
         vocab.emplace_back();                        // EOS

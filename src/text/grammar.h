@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -52,15 +53,23 @@ public:
     virtual void discard() noexcept = 0;
 };
 
-// One immutable vocabulary/compiler per model; one transactional matcher per request.
+// One immutable vocabulary/compiler per model; one transactional matcher per request. A session
+// from a deferred compile (GrammarCompiler::Compile::Deferred) creates its matcher at first use,
+// waiting for the compile there; until the compile ends it is pending().
 class GrammarSession {
 public:
     ~GrammarSession();
     GrammarSession(GrammarSession&&) noexcept;
     GrammarSession& operator=(GrammarSession&&) noexcept;
-    // Returns one dead-end bit per position; at most 63 drafts plus the bonus position.
+    // Returns one dead-end bit per position; at most 63 drafts plus the bonus position. A deferred
+    // compile that failed leaves every position dead (bit 0 set), so the request fails at its first
+    // position with failure() as the reason, as for any dead end.
     [[nodiscard]] std::uint64_t masks(std::span<const std::int32_t> drafts,
                                       std::span<std::uint32_t> words);
+    // Whether a deferred compile is still running (masks() would wait for it).
+    [[nodiscard]] bool pending() const noexcept;
+    // A deferred compile's error, once masks() met it; null otherwise.
+    [[nodiscard]] std::exception_ptr failure() const noexcept;
     void accept(std::int32_t token);
     void accept(std::span<const std::int32_t> tokens);
     void confirm() noexcept;
@@ -79,21 +88,32 @@ private:
 
 class GrammarCompiler {
 public:
+    // Now: the call compiles (or takes the cached grammar) and returns a ready session. Deferred: on
+    // a cache miss without continuation, the call still builds and validates the grammar, so every
+    // request error is still the call's, and only the token-mask compile, the slow part, runs on
+    // one of the compiler's two workers; the session waits for it at its first use. A hit, a
+    // continuation (which must be checked against the grammar now) or a key another request is
+    // compiling take the Now path.
+    enum class Compile : std::uint8_t { Now, Deferred };
+
     // Empty entries explicitly identify forbidden/special IDs. EOS is supplied separately.
     GrammarCompiler(std::vector<std::string> vocabulary, std::vector<std::int32_t> eos,
                     std::size_t cache_bytes);
+    // Joins the workers after their running compiles; a queued compile fails its session.
     ~GrammarCompiler();
     // `continuation` is an assistant prefix the matcher accepts as bytes.
     [[nodiscard]] std::unique_ptr<GrammarSession> compile(const OutputConstraint& constraint,
                                                           const ReasoningFraming& reasoning,
-                                                          std::string_view continuation);
+                                                          std::string_view continuation,
+                                                          Compile mode = Compile::Now);
     // Model-owned composition, built only on a miss in the same bounded compiler cache. A model
     // grammar may hold token-level terminals, so its continuation is accepted as tokens, by the
     // companion (if any) as well.
     [[nodiscard]] std::unique_ptr<GrammarSession>
     compile_model(std::string_view identity, const std::function<xgrammar::Grammar()>& build,
                   const ReasoningFraming& reasoning, std::span<const std::int32_t> continuation,
-                  std::unique_ptr<GrammarStateConstraint> companion = {});
+                  std::unique_ptr<GrammarStateConstraint> companion = {},
+                  Compile mode = Compile::Now);
     // Each token's bytes (empty for special and invalid ids), shared with companions.
     [[nodiscard]] const std::shared_ptr<const std::vector<std::string>>& vocabulary() const noexcept;
     // The tokens whose bytes contain '>' (ascending): the only ones that can end a tag.

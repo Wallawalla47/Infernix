@@ -337,7 +337,7 @@ std::unique_ptr<text::GrammarSession>
 compile_tool_grammar(text::GrammarCompiler& compiler, const Contract& contract,
                      std::int32_t tool_call_token, const text::ReasoningFraming& reasoning,
                      std::span<const std::int32_t> continuation,
-                     const std::optional<OutputConstraint>& body) {
+                     const std::optional<OutputConstraint>& body, text::GrammarCompiler::Compile mode) {
     Json identity{{"qwen_tools", Json::array()},
                   {"required", contract.required},
                   {"parallel", contract.parallel},
@@ -373,6 +373,6 @@ compile_tool_grammar(text::GrammarCompiler& compiler, const Contract& contract,
     framing.withheld_token         = tool_call_token;
     return compiler.compile_model(
         identity.dump(), [&] { return build(contract, body, tool_call_token); }, framing,
-        continuation, std::move(companion));
+        continuation, std::move(companion), mode);
 }
 } // namespace infernix::models::qwen3_5::frontend

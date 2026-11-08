@@ -156,21 +156,34 @@ protocol/CLI translate the owning request
   → prepare: the Frontend renders the prompt, fixes the output phase and continuation prefix
   → submit: take an outstanding slot, prepare the OutputSession on the calling thread
   → validate the constraint type and feature combination; look up the cache by source and model framing
-  → on a miss validate the schema, convert and compile the immutable grammar
-  → create and initialize the request matcher
-  → join the existing waiting queue
+  → on a miss validate the schema and convert it to the immutable grammar (request errors end here)
+  → start the grammar's token-mask compile on a compiler worker (a hit: take the cached grammar)
+  → join the existing waiting queue; the prefill runs beside the compile
+  → the first mask creates the request matcher, waiting for the compile if it is still running
 ```
 
-Compilation happens at the existing `make_output_session` preparation boundary on the calling thread,
-outside the Engine worker, without holding the queue/execution mutex. It occupies an outstanding slot,
-released on failure. Cold compile latency counts as request preparation; a cache hit reuses the grammar
-with a new matcher. Strict tools' argument-representation analysis is request preparation and uses the
-same schema reduction as the grammar.
+Validation and conversion happen at the existing `make_output_session` preparation boundary on the
+calling thread, outside the Engine worker, without holding the queue/execution mutex, so every request
+error of a constraint still comes back from submit. The token-mask compile of a new grammar, the slow
+part (1.0-1.15 s for a new 20-tool set against 0.2 s of its 2K-token prefill, candidates §57.8), then
+runs on one of the compiler's two workers (`text::GrammarCompiler::Compile::Deferred`) while the
+request is admitted and prefilled; the request's first mask waits for it. A cache hit, an assistant
+continuation (checked against the grammar during submit) and a key another request is compiling take
+the synchronous path. Strict tools' argument-representation analysis is request preparation and uses
+the same schema reduction as the grammar.
 
-submit still builds the request synchronously and returns a handle; a cold compile may lengthen the
-call. The pending deadline is not moved by compilation: after the library call returns and before
-queueing, the deadline and Engine state are checked again. Cancelling generation uses the existing
-handle/consumer path; there is no scheduler for preemptible compile tasks.
+Where the first mask is filled decides the overlap: Qwen4Exp fills it after the prompt's forward is
+enqueued, so the compile overlaps the whole prefill; Qwen3.5 fills it before the prompt's last chunk,
+so the compile overlaps the earlier chunks only (a one-chunk prompt waits as before). A lane whose
+compile is still running yields the prefill turn while another lane has work, so the wait never holds
+another request; it then waits as it did before admission, holding its lane. A compile that fails on
+the worker (no request error is expected there: validation ran before) leaves every mask position dead,
+so the request fails at its first position with that compile's error.
+
+submit still builds the request synchronously and returns a handle. The pending deadline is not moved by
+preparation: after it returns and before queueing, the deadline and Engine state are checked again.
+Cancelling generation uses the existing handle/consumer path; a cancelled request's compile still
+completes and stays cached.
 
 The initial mask may be checked and cached while preparing. A generation request with no legal token at
 its initial position returns a request error. An empty set on a temporary speculative branch later does
@@ -217,11 +230,13 @@ compile options.
 
 One thread-safe compile cache from the library is reused. Concurrent cold compiles of the same key share
 one build; the cache lock does not cover the whole compile of different keys. Each model runs at most
-two cold compiles at once, each on its submit thread and single-threaded inside; cache hits take no cold
-slot. GBNF, JSON object, JSON Schema and regex key on kind, source text and model framing; choice uses
-the normalized literal set. Validation, conversion, framing and vocabulary compilation happen inside the
-same bounded build on a miss; a hit does not parse or convert again. Continuation bytes only initialize
-the matcher.
+two cold compiles at once, single-threaded inside: on the compiler's two workers (deferred) or on a
+submit thread (a continuation); cache hits take no cold slot. GBNF, JSON object, JSON Schema and regex
+key on kind, source text and model framing; choice uses the normalized literal set. On a deferred miss
+validation, conversion and framing run on the submit thread and only the vocabulary compilation on the
+worker; on a synchronous miss they all happen inside the same bounded build. A hit does not parse or
+convert again (the vendored compiler's `HasCachedGrammar` tells a hit or an in-flight key from a miss
+without building). Continuation bytes only initialize the matcher.
 
 The default compile-cache budget is 256 MiB, the Engine startup option `grammar_cache_bytes`. It bounds
 the compiled results the cache keeps; objects still used by requests outlive eviction, so it is not a

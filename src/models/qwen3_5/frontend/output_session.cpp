@@ -659,6 +659,14 @@ std::uint64_t OutputSession::grammar_masks(std::span<const TokenId> drafts,
     return impl_->grammar->masks(drafts, words);
 }
 
+bool OutputSession::constraint_pending() const noexcept {
+    return constrained() && impl_->grammar->pending();
+}
+
+std::exception_ptr OutputSession::constraint_failure() const noexcept {
+    return constrained() ? impl_->grammar->failure() : std::exception_ptr{};
+}
+
 void OutputSession::discard_preview() {
     if (impl_->grammar) { impl_->grammar->discard(); }
     impl_->preview_ready = false;

@@ -283,6 +283,13 @@ class ThreadSafeLRUCache {
 
   Value Get(const Key& key) { return Get(key, computer_); }
 
+  // Whether the key has an entry, ready or still being built (Infernix: the caller decides whether
+  // to build a miss's source on its own thread first). A later Get may still miss after eviction.
+  bool Contains(const Key& key) {
+    const auto lock_map = std::shared_lock{map_mutex_};
+    return cache_.GetMap().count(key) != 0;
+  }
+
   // The miss factory runs synchronously and is never retained by the cache.
   template <typename Factory>
   Value Get(const Key& key, const Factory& factory, bool* waited = nullptr) {

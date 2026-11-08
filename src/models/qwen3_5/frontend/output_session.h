@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <span>
@@ -101,8 +102,13 @@ public:
     void observe_constraint(bool timings, double prepare_seconds) noexcept;
     void constraint_uploaded(std::size_t bytes) noexcept;
     [[nodiscard]] std::optional<ConstraintObservation> constraint_observation() const;
+    // Waits for a grammar compile still running beside the prefill (GrammarCompiler::Compile).
     [[nodiscard]] std::uint64_t grammar_masks(std::span<const TokenId> drafts,
                                               std::span<std::uint32_t> words);
+    // Whether the grammar's compile is still running (grammar_masks would wait for it).
+    [[nodiscard]] bool constraint_pending() const noexcept;
+    // The grammar compile's error once grammar_masks met it (the masks then report a dead end).
+    [[nodiscard]] std::exception_ptr constraint_failure() const noexcept;
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] bool has_tool_calls() const noexcept;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;

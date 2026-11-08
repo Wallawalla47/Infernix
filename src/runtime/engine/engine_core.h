@@ -1473,9 +1473,13 @@ private:
                 const auto& request          = slots_[lane];
                 const std::uint32_t accepted = decisions[row].accepted_tokens;
                 if (failures[row] == PendingRowFailure::ConstraintDeadEnd) {
-                    complete_error(request, std::make_exception_ptr(
-                                                RequestError(RequestErrorKind::ConstraintDeadEnd,
-                                                             "grammar has no valid next token")));
+                    // A grammar whose compile beside the prefill failed reports that error.
+                    const auto compile_error = request->output.constraint_failure();
+                    complete_error(request, compile_error
+                                                ? compile_error
+                                                : std::make_exception_ptr(RequestError(
+                                                      RequestErrorKind::ConstraintDeadEnd,
+                                                      "grammar has no valid next token")));
                     remove_completed_slot(lane);
                     continue;
                 }
@@ -2182,6 +2186,27 @@ private:
             if (prefill_view[lane] && prefill_view[lane]->sequence &&
                 instance_.program->context_blocks(*prefill_view[lane]->sequence)) {
                 prefill_view[lane].reset();
+            }
+        }
+        // A lane whose grammar still compiles beside its prefill would wait for it at the mask of
+        // its prompt's last position, holding this thread. While another lane has work it yields
+        // the prefill turn instead, so that wait never stalls the others (constrained-decoding §3.2).
+        const auto has_work = [&](std::uint32_t lane) {
+            const auto& request = slots_[lane];
+            return request && request->sequence &&
+                   !request->cancelled.load(std::memory_order_acquire) &&
+                   !instance_.program->context_blocks(*request->sequence) &&
+                   !request->output.constraint_pending() &&
+                   (request->is_control_ready() || request->is_decode_ready() ||
+                    request->is_prefilling() || request->is_replaying());
+        };
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (!prefill_view[lane] || !prefill_view[lane]->output.constraint_pending()) { continue; }
+            for (std::uint32_t other = 0; other < max_concurrency_; ++other) {
+                if (other != lane && has_work(other)) {
+                    prefill_view[lane].reset();
+                    break;
+                }
             }
         }
         const auto prefill = priority && (slots_[*priority]->is_prefilling() ||

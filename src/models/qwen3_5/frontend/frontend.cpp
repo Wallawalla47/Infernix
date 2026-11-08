@@ -1277,6 +1277,9 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                    ? std::optional<std::int32_t>(impl_->markers.reasoning_close)
                                    : std::nullopt,
                 .separator   = fi::kReasoningCloseSeparator};
+            // A new grammar's token-mask compile runs beside the prefill; its errors of
+            // validation and conversion are still raised here (GrammarCompiler::Compile).
+            constexpr auto deferred = text::GrammarCompiler::Compile::Deferred;
             if (tool_constraint) {
                 for (const auto& tool : tool_contract->tools) {
                     if (tool.name.size() > output.tool_name_max_length ||
@@ -1292,10 +1295,10 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                     impl_->grammars(), *tool_contract, impl_->markers.tool_call, close,
                     tool_continuation_tokens(*impl_->tokenizer, impl_->markers.tool_call,
                                              prompt.data_->continuation_content),
-                    constraint);
+                    constraint, deferred);
             } else {
                 matcher = impl_->grammars().compile(*constraint, close,
-                                                    prompt.data_->continuation_content);
+                                                    prompt.data_->continuation_content, deferred);
             }
         } catch (const RequestError&) { throw; } catch (const std::invalid_argument& error) {
             throw RequestError(tool_constraint ? RequestErrorKind::InvalidToolConstraint

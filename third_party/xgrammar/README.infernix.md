@@ -6,13 +6,16 @@ under the Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 Infernix owns the CMake target and maintains its adaptations here, adopting upstream changes
 selectively. Cold compilation is limited to two concurrent callers per compiler; the adapter
-uses one caller thread per compile, without creating a thread pool. Python/TVM bindings, GPU kernels,
+uses one caller thread per compile (a submit thread, or one of its two compile workers), without a
+thread pool inside the library. Python/TVM bindings, GPU kernels,
 Web code, upstream tests and build machinery are excluded.
 
 Grammar string escaping preserves embedded NUL bytes, including in compilation cache keys.
 The prepared-grammar cache shares one budget and single-flight mechanism across GBNF and JSON;
 its miss factory covers validation, conversion and output framing within the cold-compile limit.
-Cache access reports hit, build or an in-flight wait to the caller without adding another cache.
+Cache access reports hit, build or an in-flight wait to the caller without adding another cache;
+`HasCachedGrammar` tells whether a key has an entry (ready or in flight) without building, so the
+adapter can validate a miss's grammar on the submit thread and compile it on a worker.
 JSON adaptations preserve literal data in cache keys, reject unsupported unions, resolve local
 JSON Pointers and carry typed errors with schema locations. String grammars constrain decoded
 Unicode values before JSON encoding; property-name exclusion also covers escaped spellings.

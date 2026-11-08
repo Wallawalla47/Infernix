@@ -164,6 +164,9 @@ int main() {
     outcome.constraint = ConstraintObservation{.complete          = true,
                                                .terminated        = false,
                                                .cache             = ConstraintCacheAccess::Built,
+                                               .timings_collected = true,
+                                               .compile_seconds   = 1.5,
+                                               .wait_seconds      = 0.25,
                                                .mask_positions    = 5,
                                                .mask_upload_bytes = 128};
     metrics.done(outcome);
@@ -175,5 +178,8 @@ int main() {
               constrained.find("infernix_constraint_mask_upload_bytes_total 128\n") !=
                   std::string::npos,
           "interrupted complete constraint lost its state or actual work");
+    check(constrained.find("infernix_constraint_compile_seconds_total 1.5\n") != std::string::npos &&
+              constrained.find("infernix_constraint_wait_seconds_total 0.25\n") != std::string::npos,
+          "a compile beside the prefill and its wait must reach the metrics");
     return failures == 0 ? 0 : 1;
 }

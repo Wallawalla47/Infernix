@@ -22,6 +22,8 @@ constraint_observation_json(const std::optional<ConstraintObservation>& observat
         {"mask_upload_bytes", value.mask_upload_bytes}};
     if (value.timings_collected)
         result["timings_seconds"] = {{"prepare", value.prepare_seconds},
+                                     {"compile", value.compile_seconds},
+                                     {"wait", value.wait_seconds},
                                      {"mask", value.mask_seconds},
                                      {"matcher", value.matcher_seconds}};
     return result;
