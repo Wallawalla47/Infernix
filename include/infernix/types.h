@@ -1767,7 +1767,8 @@ struct GenerationEngineTiming {
 
 // Request-owned scheduling observations. Restore counters count completed restorations: a
 // snapshot restore resumed from a prefix-cache snapshot at the paused frontier itself, a replay
-// restore recomputed past the deepest cached state. replayed_tokens counts tokens actually
+// restore recomputed past the deepest cached state. A request paused before its first prefill
+// chunk restores nothing and counts as neither. replayed_tokens counts tokens actually
 // recomputed, including previously generated output; these tokens are separate from initial
 // prompt prefill and delivered output. paused_ns covers pause preparation, waiting and binding
 // restoration, excluding replay computation.

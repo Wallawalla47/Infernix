@@ -1710,6 +1710,10 @@ private:
             request->model_state = progress.replaying ? EngineRequestState::Replay
                                    : control.resumed  ? request->resume_phase
                                                       : EngineRequestState::Prefill;
+            if (progress.replaying) {
+                request->replayed_tokens_at_restore = request->replayed_tokens;
+                request->restore_reused_tokens      = control.summary.reused_prompt_tokens;
+            }
             if (control.resumed) {
                 // The prefix cache may hold a snapshot at the paused frontier itself: the request
                 // then resumes from it without replay.
@@ -2972,8 +2976,16 @@ private:
                         request->replayed_tokens += progress.processed_tokens;
                         cumulative_stats_.replayed_tokens += progress.processed_tokens;
                         if (progress.complete) {
-                            ++cumulative_stats_.replay_restores;
-                            ++request->replay_restores;
+                            // Qwen3.5 binds every resume as a replay from the reused prefix: one that recomputed
+                            // nothing resumed from a snapshot at the paused frontier, or was paused before its
+                            // first prefill chunk and restored nothing.
+                            if (request->replayed_tokens > request->replayed_tokens_at_restore) {
+                                ++cumulative_stats_.replay_restores;
+                                ++request->replay_restores;
+                            } else if (request->restore_reused_tokens > 0) {
+                                ++cumulative_stats_.snapshot_restores;
+                                ++request->snapshot_restores;
+                            }
                             request->model_state = request->resume_phase;
                             observe_scheduling(request,
                                                GenerationSchedulingTransition::ReplayComplete);

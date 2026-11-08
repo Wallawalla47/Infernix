@@ -211,6 +211,11 @@ struct RequestRecord {
     std::uint64_t replay_restores          = 0;
     std::uint64_t snapshot_restores        = 0;
     std::uint64_t replayed_tokens          = 0;
+    // When a resume's replay began: replayed_tokens then, and the prefix its binding reused. A replay that
+    // recomputes nothing resumed from a snapshot at the paused frontier (a snapshot restore), or, with nothing
+    // reused, from a request paused before its first prefill chunk (no restore at all).
+    std::uint64_t replayed_tokens_at_restore = 0;
+    std::uint32_t restore_reused_tokens      = 0;
     std::uint64_t paused_ns                = 0;
     std::optional<Clock::time_point> paused_at;
     std::uint32_t computed_prompt_tokens = 0;
