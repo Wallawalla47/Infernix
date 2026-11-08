@@ -1,0 +1,21 @@
+{
+  "name": "Qwen3.8-Flash-Next NVIDIA FP4-Local (INT8 KV): Infernix default against its reproducible route, with the expert-a4-residual and screened-lm-head paths alone",
+  "certify": "E:/Infernix/.local/candidates-2026-11-08/yk05/bin/infernix-certify.exe",
+  "artifact": "D:/Infernix-staging/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-00003.infernix",
+  "text": "C:/Infernix-src/wikitext-2-raw/wiki.test.raw",
+  "context": 512,
+  "chunks": 200,
+  "work": "E:/Infernix-staging/engine-compare/fp4local-i8-c512",
+  "arms": "split",
+  "paths": ["expert-a4-residual", "screened-lm-head"],
+  "kv": "int8",
+  "logits": "bf16",
+  "twin_seeds": [1],
+  "concurrency": 1,
+  "route_args": ["--ngram-volume", "G:/ninfer/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram"],
+  "spec": ["--spec", "dflash2", "--draft-model", "D:/Infernix-staging/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix",
+           "--draft-tokens", "auto", "--lm-head-draft"],
+  "budget": 0.25,
+  "threads": 16,
+  "engines": []
+}

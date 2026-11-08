@@ -29,7 +29,8 @@ NVFP4 weights Infernix still reaches the first token 5-8× sooner and finishes t
 36 % sooner, and with its experts at 8 bits as Basalt runs them it matches or passes Basalt's decode
 too. On the IQ3_S GGUF Basalt is ahead overall (4.4 against 5.5 min); with the same 8-bit
 activations Infernix matches its first tokens, but Basalt still decodes faster. Measured quality on
-IQ3_S and the 27B, against the exact model: [Quality](#quality) (NVIDIA's NVFP4 weights not yet).
+IQ3_S, FP4-Local and the 27B, against the exact model: [Quality](#quality) (NVIDIA's NVFP4 weights not
+yet).
 
 | Infernix vs | First token | Decode | Replay: mean first token | Replay: wall time |
 |---|---|---|---|---|
@@ -209,8 +210,8 @@ sooner.
 | n-gram table (FP8 in the checkpoint) | FP8 | FP8 | FP8 | re-blocked to 8-bit |
 
 None of these engines has a lossy default that could be turned off. Quality (KL divergence against
-an exact reference) is measured on IQ3_S and the 27B in [Quality](#quality), not yet on these NVFP4
-weights.
+an exact reference) is measured on IQ3_S, FP4-Local and the 27B in [Quality](#quality), not yet on
+these NVFP4 weights.
 
 **Context length with 8-bit expert activations** (`--a8-activations`, closer to the others'
 arithmetic in decode):
@@ -444,6 +445,17 @@ Strata's and Basalt's own packs); 8-bit KV (INT8, llama.cpp Q8_0).
 | Decode | Basalt v0.2.1 (verify windows of 4) | 0.01922 | 1.20 | 0.579 | 95.29 % | +0.47 % [+0.33, +0.60] |
 | Decode | Strata v0.2.11 (route tail skip on, its default) | 0.02314 | 1.45 | 0.803 | 94.44 % | −0.00 % [−0.16, +0.14] |
 
+**Qwen3.8-Flash-Next NVIDIA FP4-Local**: NVIDIA's quantization-aware-distilled FP4 checkpoint as Infernix
+converts it (NVFP4 experts with 16-bit activations, MXFP8 dense layers); INT8 KV. Measured on 200 chunks
+(51,000 scored positions, 2026-11-08) rather than the 580 of the tables above, so its intervals are
+wider; Infernix only.
+
+| Path | Engine | Mean KLD | × rounding | KLD 99.9 % | Top-1 agreement | PPL vs reference |
+|---|---|---:|---:|---:|---:|---|
+| — | Honest rounding | 0.01475 | 1.00 | 0.526 | 95.60 % | +0.15 % [−0.03, +0.33] |
+| Prompt | Infernix | 0.01364 | 0.92 | 0.482 | 96.01 % | +0.07 % [−0.12, +0.26] |
+| Decode | Infernix (DFlash2 drafts) | 0.01323 | 0.90 | 0.457 | 96.04 % | +0.09 % [−0.07, +0.27] |
+
 - **27B prompt path**: every engine sits at 10-11× honest rounding with perplexity up about 0.7 %.
   This is the artifact's prompt path, not any one engine's: it computes with quantized activations
   (4-bit in the NVFP4 layers, 8-bit in the FP8 layers).
@@ -456,6 +468,10 @@ Strata's and Basalt's own packs); 8-bit KV (INT8, llama.cpp Q8_0).
   rounding to nearest has less error than stochastic rounding. Basalt is at 1.20× and the only IQ3_S
   engine whose perplexity rises measurably (+0.47 %); Strata is at 1.45×, with its default tail skip
   leaving out 3.9 million expert computations over the run.
+- **FP4-Local**: both paths are below honest rounding (0.90-0.92×), for the same reasons as on IQ3_S.
+  Infernix's two default speed paths on this model are within rounding: the prompt path's
+  `expert-a4-residual` adds 0.00060 mean KLD (at most 0.18× honest rounding), and the decode path's
+  screened output head adds nothing measurable.
 - **Perplexity hides noise**: rounding errors raise some tokens' probabilities and lower others about
   equally, so they cancel in perplexity. Strata's distributions are 1.45× further from the exact model
   than honest rounding's, yet its perplexity matches the reference's.
@@ -465,8 +481,9 @@ first half and generate the rest in one request with the engine's own speculativ
 text's tokens forced: a draft is accepted only when it equals the text, so every row is computed on
 the real text by the engine's decode and verify kernels. Every row's logits are rounded to BF16
 before scoring. *PPL vs reference* is the engine's perplexity as a change from the reference's on the
-same positions (reference: 7.035 on the 27B, 4.647 on IQ3_S); absolute perplexities are not quoted,
-because every engine runs the same weights and their intervals mostly measure which text was sampled.
+same positions (reference: 7.035 on the 27B, 4.647 on IQ3_S, 4.164 on FP4-Local); absolute
+perplexities are not quoted, because every engine runs the same weights and their intervals mostly
+measure which text was sampled.
 Each engine ran its latest version with its own default or recommended configuration; small patches
 only take the logits out. Strata and Basalt compute no logits on their prompt paths, so they have
 decode rows only, and Strata reads each whole chunk through its verify windows. Versions, settings,

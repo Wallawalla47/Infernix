@@ -5,7 +5,8 @@ measured with llama.cpp's KL-divergence statistics on WikiText-2. The [README](.
 summarises the results; this page gives them in full with their intervals, defines each statistic,
 records every engine's version and settings, and describes how to repeat the measurement.
 
-Measured 2026-11-05/06 on one RTX 5090 (32 GB, PCIe Gen5 x8), Core i9-13900K, 96 GB DDR5, Windows 11.
+Measured 2026-11-05/06 (FP4-Local 2026-11-08) on one RTX 5090 (32 GB, PCIe Gen5 x8), Core i9-13900K,
+96 GB DDR5, Windows 11.
 NInfer and vLLM ran in WSL2 (Ubuntu) on the same machine; every other engine ran natively on Windows.
 
 ## Results
@@ -56,6 +57,34 @@ positions is 4.6465.
 | Decode | Basalt v0.2.1 (verify windows of 4) | 0.01922 [0.01859, 0.01986] | 1.20 | 0.579 [0.522, 0.632] | 95.29 % [95.14, 95.43] | +0.47 % [+0.33, +0.60] |
 | Decode | Strata v0.2.11 (tail skip on, its default) | 0.02314 [0.02225, 0.02408] | 1.45 | 0.803 [0.725, 0.881] | 94.44 % [94.26, 94.60] | −0.00 % [−0.16, +0.14] |
 
+### Qwen3.8-Flash-Next NVIDIA FP4-Local
+
+Infernix only, on its conversion of NVIDIA's quantization-aware-distilled FP4 checkpoint
+[Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix)
+(NVIDIA's NVFP4 experts with 16-bit activations and MXFP8 dense layers, bit-exact; its n-gram volume),
+INT8 KV. The first 200 chunks only (51,000 scored positions), so the intervals are wider than the
+tables above. Besides the default route, the reproducible route (`--reproducible`: no fast paths) and
+each default fast path alone were measured. The reference's perplexity on the scored positions is
+4.1642.
+
+| Path | Engine | Mean KLD | × rounding | KLD 99.9 % | Top-1 agreement | PPL vs reference |
+|---|---|---|---:|---|---|---|
+| — | Honest rounding (noise twin, seed 1) | 0.01475 [0.01388, 0.01566] | 1.00 | 0.526 [0.465, 0.610] | 95.60 % [95.35, 95.85] | +0.15 % [−0.03, +0.33] |
+| Prompt | Infernix (`--reproducible`, BF16 KV) | 0.01310 [0.01235, 0.01387] | 0.89 | 0.401 [0.375, 0.481] | 96.00 % [95.76, 96.24] | −0.00 % [−0.20, +0.19] |
+| Prompt | Infernix (`--reproducible`) | 0.01313 [0.01238, 0.01392] | 0.89 | 0.454 [0.381, 0.519] | 95.98 % [95.74, 96.21] | −0.02 % [−0.22, +0.17] |
+| Prompt | Infernix (default) | 0.01364 [0.01283, 0.01446] | 0.92 | 0.482 [0.433, 0.539] | 96.01 % [95.75, 96.26] | +0.07 % [−0.12, +0.26] |
+| Decode | Infernix (`--reproducible`, DFlash2 drafts) | 0.01318 [0.01241, 0.01396] | 0.89 | 0.431 [0.370, 0.508] | 95.98 % [95.75, 96.21] | −0.01 % [−0.18, +0.16] |
+| Decode | Infernix (default: DFlash2 drafts) | 0.01323 [0.01248, 0.01403] | 0.90 | 0.457 [0.410, 0.514] | 96.04 % [95.78, 96.29] | +0.09 % [−0.07, +0.27] |
+
+The default route's fast paths on this model, each alone against the same route without it (paired on
+the same positions; "worst" divides the upper bound of each statistic's change by honest rounding's
+value and takes the largest):
+
+| Fast path | Path | Δ Mean KLD | Δ KLD 99.9 % | Δ Top-1 agreement | Worst / honest rounding |
+|---|---|---|---|---|---:|
+| `expert-a4-residual` | prompt | +0.00060 [+0.00025, +0.00096] | +0.012 [−0.062, +0.096] | −0.16 pt [−0.34, +0.02] | 0.18 |
+| `screened-lm-head` | decode | +0.00000 [−0.00000, +0.00000] | +0.000 [−0.000, +0.000] | +0.00 pt [+0.00, +0.00] | 0.00 |
+
 ### Observations
 
 - **27B prompt path.** All four engines sit at 10.4-11.2× honest rounding, with perplexity up
@@ -78,6 +107,10 @@ positions is 4.6465.
 - **Strata** is 1.45× honest rounding with no perplexity change. Its default route tail skip
   (`STRATA_ROUTE_TAIL_SKIP=7`: a missed expert that every token of a verify window routes at rank 7 or
   lower is not computed) skipped 3.9 million expert computations over the run.
+- **FP4-Local** sits below honest rounding on both paths (0.89-0.92×), as IQ3_S does. Its two default
+  fast paths are within rounding (at most 0.18× honest rounding), and its decode statistics are the
+  same with DFlash2 drafting as with one-token decode (to every printed digit), as exact verification
+  should leave them.
 - **Perplexity alone would hide most of this.** Strata's distributions are 1.45× further from the
   exact model than honest rounding's, yet its perplexity matches the reference's to two decimals. See
   [PPL vs reference](#ppl-vs-reference).
@@ -124,7 +157,7 @@ lead with them.
 ### Text, chunks and positions
 
 The WikiText-2 raw test set (`wiki.test.raw`), tokenised by each model's tokenizer and cut into 580
-chunks of 512 tokens. As in `llama-perplexity --kl-divergence`, each chunk is scored on its second
+chunks of 512 tokens (FP4-Local: the first 200). As in `llama-perplexity --kl-divergence`, each chunk is scored on its second
 half: the predictions of tokens 257-511 from positions 256-510, 255 per chunk, 147,900 in all. The
 reference is written as llama.cpp's `_logits_` base file (`infernix-certify reference --format
 llama-kld`), which holds the tokens and the reference's log-probabilities, so every engine reads the
@@ -156,7 +189,7 @@ prompt kernels. How each engine is forced:
 
 | Engine | Drafting | Forcing |
 |---|---|---|
-| Infernix | its default drafter (27B: the artifact's DFlash2 plus n-gram copy drafts; IQ3_S: the DFlash2 companion), automatic draft length | `infernix-certify decode`: each step's row is recorded, then the text token's logit is raised so the engine's own acceptance takes it |
+| Infernix | its default drafter (27B: the artifact's DFlash2 plus n-gram copy drafts; IQ3_S and FP4-Local: the DFlash2 companion), automatic draft length | `infernix-certify decode`: each step's row is recorded, then the text token's logit is raised so the engine's own acceptance takes it |
 | NInfer | MTP, 3 drafts | the same in its decision step (patch) |
 | vLLM | MTP, 3 drafts | a `compute_logits` hook records each row and raises the text token's logit ([`vllm_rows.py`](../tools/quality/engines/vllm_rows.py)) |
 | TensorSharp | the artifact's DFlash2, 7 drafts | a tool (patch) makes its speculative loop's own calls (draft, verify the window, commit) and accepts drafts that equal the text |
@@ -183,7 +216,7 @@ the patches only take logits out (and, for TensorSharp, compile on Windows).
 
 | Engine | Version | Platform | Settings |
 |---|---|---|---|
-| Infernix | `main` `68cb6992` with this comparison's tooling | Windows, CUDA 13.4 | default route; 27B BF16 KV; IQ3_S INT8 KV and the n-gram volume; decode `--spec dflash2 --draft-tokens auto --lm-head-draft` (27B also `--ngram-draft-tokens auto`), one request |
+| Infernix | `main` `68cb6992` with this comparison's tooling (FP4-Local: `main` `3279ceb4`) | Windows, CUDA 13.4 | default route; 27B BF16 KV; IQ3_S and FP4-Local INT8 KV and the n-gram volume; decode `--spec dflash2 --draft-tokens auto --lm-head-draft` (27B also `--ngram-draft-tokens auto`), one request |
 | NInfer | `master` `a754fcf3b` + [patch](../bench/engine_quality/patches/ninfer-a754fcf3b.patch) | WSL2, CUDA 13.4 | prompt: its CausalScoring route; decode: its Generation route, `--spec mtp --draft-tokens 3`, one request, no CUDA graphs; BF16 KV, BF16 logits |
 | vLLM | 0.33.0 (pip, torch 2.14, cu130) | WSL2 | its defaults (KV auto = BF16), `enforce_eager`, prefix caching off; decode `speculative_config={"method": "mtp", "num_speculative_tokens": 3}`, one request |
 | TensorSharp | `main` `0c45b34c` (its NInfer route is not in release v2026.10.23) + [patch](../bench/engine_quality/patches/tensorsharp-0c45b34c.patch) | Windows, .NET 10.0.403, CUDA 13.4 | its shipped `config/qwen3.8-27b-ninfer.json`: direct-CUDA backend, n_ctx 40,960, ubatch 2,048, the artifact's DFlash2 (7 drafts, pMin 0, `TS_SPEC_ADAPTIVE=0`), BF16 KV |
@@ -218,7 +251,8 @@ once. An embedding row's output is BF16 in the model, so this is the same model 
 ## Repeating the measurement
 
 1. **Weights.** Download the artifacts and checkpoints named above (the 27B `.ninfer`, Unsloth's
-   27B checkpoint for vLLM, the IQ3_S GGUF, Infernix's IQ3_S artifact with its `.ngram` volume) and
+   27B checkpoint for vLLM, the IQ3_S GGUF, Infernix's IQ3_S and FP4-Local artifacts with their
+   `.ngram` volumes, and the DFlash2 companion) and
    build Strata's and Basalt's packs of the GGUF with their own tools. Make vLLM's checkpoint:
 
    ```bash
@@ -282,7 +316,9 @@ once. An embedding row's output is BF16 in the model, so this is the same model 
    `plan` lists the steps; `run` executes the ones not yet done (`--only ID,...` selects some) and
    logs each to `WORK/logs`; `report` writes `WORK/report.md` and `report.json`. A test run on a
    few chunks: set `"chunks"` (and a separate `"work"`) in a copy of the configuration.
-   On this machine the 27B took 5.0 GPU hours (vLLM's eager decode 2.1 of them) and IQ3_S 2.7.
+   On this machine the 27B took 5.0 GPU hours (vLLM's eager decode 2.1 of them), IQ3_S 2.7 and
+   FP4-Local's 200 chunks about 1.8 (`qwen3.8-flash-next-fp4-local.json`: its `"arms": "split"` runs
+   the reproducible and default routes and each fast path alone).
 
 ## Limitations
 
