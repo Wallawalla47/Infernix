@@ -31,8 +31,10 @@ import subprocess
 
 REPO = os.environ.get("AB_CORPUS_REPO",
                       os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-# Pinned so the observations never change when the working tree does.
-CORPUS_COMMIT = os.environ.get("AB_CORPUS_COMMIT", "e48a0d28")
+# Pinned so the observations never change when the working tree does: a0c806c5 ("rename the engine to
+# Infernix", 2026-10-07), the corpus of the runs since 2026-11-06. The earlier default, e48a0d28, is no
+# longer in the repository.
+CORPUS_COMMIT = os.environ.get("AB_CORPUS_COMMIT", "a0c806c5")
 
 # Planning-only size estimate (the report uses the server's real token counts).
 # Calibrated on this corpus with the Qwen3.8 tokenizer + chat template.
@@ -57,6 +59,10 @@ def _git(*args):
 
 class Corpus:
     def __init__(self, commit=CORPUS_COMMIT):
+        if subprocess.run(["git", "-C", REPO, "cat-file", "-e", commit + "^{commit}"],
+                          capture_output=True).returncode != 0:
+            raise SystemExit("corpus commit %s is not in %s: set AB_CORPUS_COMMIT (or AB_CORPUS_REPO)"
+                             % (commit, REPO))
         self.commit = commit
         self._files = {}
         self._commits = {}

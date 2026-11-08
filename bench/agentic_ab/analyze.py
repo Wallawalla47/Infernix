@@ -321,7 +321,35 @@ def metrics(A, cold_seeds):
                 pressure["%s_%s_bytes" % (kind, d)] = pressure.get("%s_%s_bytes" % (kind, d), 0) + \
                     (t.get("bytes") or 0)
     m["pressure"] = pressure
+    m["ssd"] = ssd_totals(A["throughput"])
     return m
+
+
+# Fields of the throughput record's context_cache.hybrid.ssd that are levels at the interval's end, not deltas.
+SSD_LEVELS = ("capacity_bytes", "used_bytes", "ssd_only_snapshots", "budget_bytes_per_hour",
+              "budget_available_bytes")
+
+
+def ssd_totals(throughput):
+    """The SSD tier's interval deltas summed over the run (per snapshot kind too) and its levels at the end;
+    None when the arm ran without the tier."""
+    totals, kinds, last = {}, {}, None
+    for o in throughput:
+        s = ((o.get("context_cache") or {}).get("hybrid") or {}).get("ssd")
+        if not isinstance(s, dict):
+            continue
+        last = s
+        for k, v in s.items():
+            if k == "by_kind":
+                for kind, fields in (v or {}).items():
+                    into = kinds.setdefault(kind, {})
+                    for f, x in fields.items():
+                        into[f] = into.get(f, 0) + x
+            elif isinstance(v, (int, float)) and k not in SSD_LEVELS:
+                totals[k] = totals.get(k, 0) + v
+    if last is None:
+        return None
+    return {"totals": totals, "by_kind": kinds, "end": {k: last.get(k) for k in SSD_LEVELS}}
 
 
 # ---------------------------------------------------------------------------------------
@@ -553,6 +581,38 @@ def pressure_table(arms, ms):
     return "\n".join(L)
 
 
+def ssd_table(arms, ms):
+    gb = lambda v: "n/a" if v is None else "%.1f GB" % (v / 1e9)
+    count = lambda v: "n/a" if v is None else format(int(v), ",d")
+    rows = [("written", "totals", "write_bytes", gb), ("read back", "totals", "read_bytes", gb),
+            ("image writes", "totals", "image_writes", count), ("block writes", "totals", "block_writes", count),
+            ("promotions to the Host tier", "totals", "promotions", count),
+            ("snapshot evictions", "totals", "snapshot_evictions", count),
+            ("snapshots declined (write budget)", "totals", "declined_snapshots", count),
+            ("images packed", "totals", "packed_images", count),
+            ("bytes saved by packing", "totals", "packed_saved_bytes", gb),
+            ("failures", "totals", "failures", count),
+            ("used at the end", "end", "used_bytes", gb),
+            ("SSD-only snapshots at the end", "end", "ssd_only_snapshots", count)]
+    L = ["| SSD tier (summed over the run) | %s |" % " | ".join(SHORT[a] for a in arms),
+         "|---|" + "---|" * len(arms)]
+    for label, part, key, fmt in rows:
+        L.append("| %s | %s |" % (label, " | ".join(
+            "off" if ms[a]["ssd"] is None else fmt(ms[a]["ssd"][part].get(key)) for a in arms)))
+    kinds = sorted(set().union(*((ms[a]["ssd"] or {}).get("by_kind", {}) for a in arms)))
+    for kind in kinds:
+        cells = []
+        for a in arms:
+            k = ((ms[a]["ssd"] or {}).get("by_kind") or {}).get(kind)
+            cells.append("off" if ms[a]["ssd"] is None else "n/a" if k is None else
+                         "%d (%s) / %d / %d / %d" % (k.get("writes", 0), gb(k.get("written_bytes", 0)),
+                                                     k.get("reads", 0), k.get("superseded_unread", 0),
+                                                     k.get("dropped_unread", 0)))
+        L.append("| `%s` writes (bytes) / reads / superseded unread / dropped unread | %s |"
+                 % (kind, " | ".join(cells)))
+    return "\n".join(L)
+
+
 def per_request(A):
     L = ["| Tag | Class | Prompt | Cached | Prefilled | Path | TTFT s | Out | Stream tok/s | Finish |",
          "|---|---|---|---|---|---|---|---|---|---|"]
@@ -694,6 +754,11 @@ def main(argv):
     L.append("- Workload: %d requests per arm (seed %d, scale %.2f, corpus commit `%s`), "
              "`max_tokens: %d` on agent turns, thinking on."
              % (c["n"], cfg["seed"], cfg["scale"], cfg["corpus_commit"], cfg["agent_max_tokens"]))
+    if cfg.get("expert_state_reset"):
+        L.append("- Expert cache state at each serve's start: %s."
+                 % {"auto": "the state the run started with (`AB_EXPERT_STATE_RESET=auto`)",
+                    "off": "whatever the previous arm saved (`AB_EXPERT_STATE_RESET=off`)"}.get(
+                        cfg["expert_state_reset"], "`%s` (`AB_EXPERT_STATE_RESET`)" % cfg["expert_state_reset"]))
     exes = {"control": cfg["control_exe"], "treatment": cfg["treatment_exe"],
             "alt": cfg.get("alt_exe") or cfg["treatment_exe"]}
     for a in arms:
@@ -782,6 +847,9 @@ def main(argv):
     L.append(path_table(arms, ms) + "\n")
     L.append("## Cache pressure\n")
     L.append(pressure_table(arms, ms) + "\n")
+    if any(ms[a]["ssd"] is not None for a in arms):
+        L.append("## SSD tier\n")
+        L.append(ssd_table(arms, ms) + "\n")
     L.append("## Launch parameters\n")
     for a in arms:
         if a == "control":

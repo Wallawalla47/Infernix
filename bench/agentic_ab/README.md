@@ -61,7 +61,7 @@ its prefill speed does to the interleaving elsewhere.
 **Closed loop, identical observations.** Every observation the client sends (tool results, user
 messages, subagent reports, the post-compaction summary) is generated before the run from real
 files, diffs and history of this repository at a pinned commit (`AB_CORPUS_COMMIT`, default
-`e48a0d28`), so every arm receives byte-identical observations. The assistant turns are each
+`a0c806c5`), so every arm receives byte-identical observations. The assistant turns are each
 arm's own streamed output (reasoning, content and tool calls), fed back as an agent client does;
 that is what makes the engine's private-endpoint reuse behave as in production. Observations
 answer the model's tool calls by id whatever it asked for, so every arm sees the same token
@@ -169,9 +169,10 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 | `AB_BASALT_EXE` / `AB_BASALT_CONFIG` | none, required for a Basalt control: its `bin\basalt.exe` / its `basalt_config.json` |
 | `AB_REQUEST_TIMEOUT_S` | `1200` (per request; raise it for an engine that queues requests one at a time) |
 | `AB_TEMPERATURE` | `1.0`; `0` replays greedily (see Sampling) |
-| `AB_HOST` / `AB_PORT` | `127.0.0.1` / `8080` |
+| `AB_EXPERT_STATE_RESET` | `auto`: each serve starts from the expert cache state the run started with (Qwen3.8-Flash-Next's `<model>.expert-state`, or the arm's `--expert-state FILE`), kept in the run directory before the first serve and put back (or removed, when there was none) before every later one; `SAVED\|TARGET` copies `SAVED` over `TARGET` before every serve instead; `off` lets each arm start from what the arm before it saved |
+| `AB_HOST` / `AB_PORT` | `127.0.0.1` / `18080` (not 8080, where a server of your own may listen: the runner refuses a port in use) |
 | `AB_OUT` | `profiles\bench\agentic_ab` in this checkout |
-| `AB_CORPUS_REPO` / `AB_CORPUS_COMMIT` | this checkout / `e48a0d28` |
+| `AB_CORPUS_REPO` / `AB_CORPUS_COMMIT` | this checkout / `a0c806c5` |
 
 The launch bat's serve line may start `infernix-serve` or `ninfer-serve` (deploy folders from
 before the rename). A run is marked invalid (non-zero exit, warning in the report) if any
@@ -229,4 +230,6 @@ prompt 24K tokens under `--max-context`.
   pressure, batching and wall time, so compare seeds before attributing them to a build.
 - **Where cache hits came from** and **cache pressure** (eviction, degradation, spill and
   host/device transfer counters summed from the serve's throughput records) explain the cache
-  rows.
+  rows. With the SSD tier on (`--ssd-context-gib`), **SSD tier** sums its writes, reads, promotions,
+  evictions and write-budget refusals, and per snapshot kind what was written and what was read
+  back or superseded unread.

@@ -113,14 +113,18 @@ STRATA_PYTHON = os.environ.get("AB_STRATA_PYTHON") or (
 # Basalt: `AB_BASALT_EXE serve --config` with a copy of AB_BASALT_CONFIG (its basalt_config.json).
 BASALT_EXE = os.environ.get("AB_BASALT_EXE")
 BASALT_CONFIG = os.environ.get("AB_BASALT_CONFIG")
-# AB_EXPERT_STATE_RESET="SAVED|TARGET": before every serve arm starts, SAVED is copied over TARGET (the
-# artifact's .expert-state), so each Flash-Next arm starts from the same expert cache state whatever the
-# arm before it learned or saved.
-EXPERT_STATE_RESET = os.environ.get("AB_EXPERT_STATE_RESET", "").split("|") if os.environ.get(
-    "AB_EXPERT_STATE_RESET") else None
+# Every serve arm starts from the same expert cache state (Qwen3.8-Flash-Next's warm start), whatever the
+# arm before it learned and saved at its stop. AB_EXPERT_STATE_RESET: "auto" (default) snapshots the state
+# file each serve would load (its --expert-state FILE, else <model>.expert-state) before the first serve
+# starts, and puts it back (or removes the file, when there was none) before every later one; "SAVED|TARGET"
+# copies SAVED over TARGET before every serve instead; "off" leaves the file to the arms.
+EXPERT_STATE_RESET = os.environ.get("AB_EXPERT_STATE_RESET", "auto")
+if EXPERT_STATE_RESET not in ("auto", "off") and EXPERT_STATE_RESET.count("|") != 1:
+    raise SystemExit("AB_EXPERT_STATE_RESET must be auto, off or SAVED|TARGET: %r" % EXPERT_STATE_RESET)
 TREATMENT_LABEL = os.environ.get("AB_TREATMENT_LABEL", "")
 HOST = os.environ.get("AB_HOST", "127.0.0.1")
-PORT = int(os.environ.get("AB_PORT", "8080"))
+# Not 8080, where a server of your own usually listens: the runner refuses a port already in use.
+PORT = int(os.environ.get("AB_PORT", "18080"))
 OUT_ROOT = os.environ.get("AB_OUT", os.path.join(REPO, "profiles", "bench", "agentic_ab"))
 # Context candidates below the bat's own value, tried in order when the control cannot start.
 CTX_FALLBACKS = [200000, 180000, 170000, 160000, 150000, 140000, 131072]
@@ -294,6 +298,43 @@ def read_server_start(path):
     return None
 
 
+# Where "auto" keeps its expert-state snapshots: the run's output directory (main() sets it).
+STATE_DIR = None
+# Each expert-state file a serve loads -> its snapshot, or None when it did not exist before the first serve.
+_expert_state_snapshots = {}
+
+
+def reset_expert_state(model, flags, cwd):
+    """Gives a serve about to start in `cwd` the expert cache state the run started with (EXPERT_STATE_RESET)."""
+    if EXPERT_STATE_RESET == "off":
+        return
+    if EXPERT_STATE_RESET != "auto":
+        saved, target = EXPERT_STATE_RESET.split("|")
+        shutil.copyfile(saved, target)
+        log("expert state: %s -> %s" % (saved, target))
+        return
+    value = dict(flags).get("--expert-state")
+    if value == "off":
+        return
+    # The serve appends .expert-state to its model argument and resolves a relative path in its own cwd.
+    target = os.path.abspath(os.path.join(cwd, value or model + ".expert-state"))
+    key = os.path.normcase(target)
+    if key not in _expert_state_snapshots:
+        snapshot = None
+        if os.path.exists(target):
+            snapshot = os.path.join(STATE_DIR or cwd, "expert-state-%d.snapshot" % len(_expert_state_snapshots))
+            shutil.copyfile(target, snapshot)
+        _expert_state_snapshots[key] = snapshot
+        log("expert state: %s %s" % (target, "kept as " + snapshot if snapshot
+                                     else "absent; every serve starts without one"))
+        return
+    snapshot = _expert_state_snapshots[key]
+    if snapshot is not None:
+        shutil.copyfile(snapshot, target)
+    elif os.path.exists(target):
+        os.remove(target)
+
+
 class Serve:
     def __init__(self, exe, model, flags, request_log, serve_log, env=None):
         self.exe, self.model, self.flags = exe, model, flags
@@ -308,9 +349,7 @@ class Serve:
         wait_gpu_idle()
         if os.path.exists(self.request_log):
             os.remove(self.request_log)
-        if EXPERT_STATE_RESET:  # every serve arm starts from the same saved expert state
-            shutil.copyfile(*EXPERT_STATE_RESET)
-            log("expert state: %s -> %s" % tuple(EXPERT_STATE_RESET))
+        reset_expert_state(self.model, self.flags, os.path.dirname(self.request_log))
         args = [self.exe, self.model]
         for n, v in self.flags:
             args += [n] if v is None else [n, v]
@@ -916,7 +955,7 @@ def run_seed(seed, plan, run_dir, arms, model, flags, config, ctx):
 
 
 def main():
-    global _log_path
+    global _log_path, STATE_DIR
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--arms", default="treatment,control",
                     help="any of treatment, alt, control; they run in that order")
@@ -944,6 +983,7 @@ def main():
 
     out_dir = args.out or os.path.join(OUT_ROOT, time.strftime("%Y%m%d-%H%M%S"))
     os.makedirs(out_dir, exist_ok=True)
+    STATE_DIR = out_dir
     _log_path = os.path.join(out_dir, "runner.log")
 
     bat_model, bat_flags = parse_bat(LAUNCH_BAT)
@@ -998,7 +1038,7 @@ def main():
               "alt_label": ALT_LABEL or None, "control_label": CONTROL_LABEL or None,
               "treatment_label": TREATMENT_LABEL or None,
               "control_flags_base": ctrl_flags, "dropped_for_control": dropped,
-              "control_extra_flags": CONTROL_EXTRA_FLAGS,
+              "control_extra_flags": CONTROL_EXTRA_FLAGS, "expert_state_reset": EXPERT_STATE_RESET,
               "scale": args.scale, "agent_max_tokens": AGENT_MAX_TOKENS, "sampling": SAMPLING,
               "bat_max_context": bat_ctx, "control_kind": CONTROL_KIND,
               "strata_config": STRATA_CONFIG if CONTROL_KIND == "strata" else None,
