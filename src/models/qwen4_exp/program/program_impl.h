@@ -2179,6 +2179,10 @@ public:
         // The cached state may reach the paused frontier itself: then nothing replays.
         lane.replay = lane.state_tokens < r.target;
         lane.phase  = lane.replay ? Phase::Prefill : Phase::Decode;
+        // A replay's first prefill call waits per layer for the restore (prefix_waits); a lane that decodes at once
+        // has no such call, and its rounds (decode, verification, drafting) are graphs that wait for nothing: the
+        // compute stream waits here for the whole restore, which the lane's first round reads.
+        if (!lane.replay && lane.prefix.restore) { prefix_->order_after_restore(*lane.prefix.restore, device_.stream); }
         if (!lane.replay && lane.vision) { vision_release(lane); }
         transaction_lane_ = index;
         replaying_        = lane.replay;

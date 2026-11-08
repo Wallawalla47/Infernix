@@ -147,6 +147,13 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
                                 sequence.mtp_kv_valid + 1U == request.replay_cursor &&
                                 request.replay_cursor < sequence.ledger.size();
         if (request.replay_cursor == request.replay_target && !bridge_mtp) {
+            // The cached state reaches the frontier, so no pass runs. A prefill pass would have waited per layer
+            // for the Host restore (hybrid_take_restore_layers); a lane that decodes next has no such pass, and
+            // decode rounds wait for no restore: the compute stream waits for the whole restore now.
+            if (request.resume_lifecycle == Lifecycle::Active) {
+                const std::span<const cudaEvent_t> layers = hybrid_take_restore_layers(lane);
+                if (!layers.empty()) { CUDA_CHECK(cudaStreamWaitEvent(device.stream, layers.back(), 0)); }
+            }
             complete_replay();
             settle_unit(lane);
             return ReplayProgress{.complete = true, .timing = timing.finish()};

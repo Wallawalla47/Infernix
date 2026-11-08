@@ -1,12 +1,15 @@
 #include "models/qwen4_exp/program/prefix/prefix_cache.h"
 
 #include "core/device.h"
+#include "models/qwen4_exp/program/prefix/test_taps.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <exception>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace infernix::models::qwen4_exp::prefix {
@@ -541,6 +544,15 @@ void PrefixCache::open_restore(cudaStream_t producer) {
     CUDA_CHECK(cudaEventRecord(start, producer));
     CUDA_CHECK(cudaStreamWaitEvent(restore_stream_, start, 0));
     recycle(start);
+    // A test's delay (testing::set_restore_delay): a host function holds the copy stream, and nothing else.
+    if (const std::uint32_t delay = testing::restore_delay(); delay != 0) {
+        CUDA_CHECK(cudaLaunchHostFunc(
+            restore_stream_,
+            [](void* microseconds) {
+                std::this_thread::sleep_for(std::chrono::microseconds(reinterpret_cast<std::uintptr_t>(microseconds)));
+            },
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(delay))));
+    }
 }
 
 void PrefixCache::restore_block(pc::NodeRef node, DeviceKVPageLease&& destination) {

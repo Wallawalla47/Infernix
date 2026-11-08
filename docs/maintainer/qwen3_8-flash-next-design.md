@@ -4716,6 +4716,13 @@ binding) and `prefix/prefix_program.cpp` (the Program side).
   cache pages, a Host copy-on-write source into the lane's first private page) and its image parts;
   the MTP group holds the MTP planes and image parts. One event per group; the first call waits
   per layer (`layer_waits[0]`), by ticket, so a landed batch's recycled events are never waited on.
+  A paused request whose cached state reaches its paused frontier (§19.3.13) has no first call: it
+  decodes at once, and decode, verification and drafting rounds are graphs that wait for no event,
+  so its binding makes the compute stream wait for the whole restore (`order_after_restore`).
+  Until 2026-11-08 it did not, and a round that overtook the copies read the lane's pages and
+  state before they landed: `infernix_qwen4_exp_preemption_real_test`'s exact scenario differed
+  from the solo run in about one run in six, and in every run with its restores held 20 ms
+  (`testing::set_restore_delay`, which the test now sets).
 - **Admission.** The quote chooses with the index (lane-resident candidates' restore bytes lowered
   by the image) and checks fit as plan §7.1 (copy-on-write source per MR6). Reserve re-selects,
   **pins the selection's path and snapshot before making room** (eviction could otherwise drop

@@ -24,10 +24,16 @@
 //            resumes from the root, below the frontier the Engine had counted: it walks the prompt
 //            again, reports each token once, and equals its solo run.
 //
+// The exact and replay scenarios hold every Host restore's copies 20 ms (testing::set_restore_delay): a paused
+// request's blocks leave the Device for the other request, so its resume restores them from the Host, and a round
+// that reads them without waiting for that restore would read them before they land every time, not only when the
+// copy happens to lose the race (an exact resume decodes at once, with no prefill call to wait per layer).
+//
 //   infernix_qwen4_exp_preemption_real_test [--mtp] [--plain] [--dflash2]
 //   (default: plain and MTP, and DFlash2 when INFERNIX_QWEN4_DFLASH2 is set)
 
 #include "kv_cache_storage.h"
+#include "models/qwen4_exp/program/prefix/test_taps.h"
 #include "infernix/engine.h"
 
 #include <algorithm>
@@ -43,6 +49,16 @@ namespace {
 
 constexpr std::uint32_t kPrompt  = 1024;
 constexpr std::uint32_t kOutputs = 600;
+// What each Host restore of the paired runs is held before its copies (testing::set_restore_delay).
+constexpr std::uint32_t kRestoreDelayUs = 20'000;
+
+// The restore delay for one scope.
+struct RestoreDelay {
+    RestoreDelay() { infernix::models::qwen4_exp::testing::set_restore_delay(kRestoreDelayUs); }
+    ~RestoreDelay() { infernix::models::qwen4_exp::testing::set_restore_delay(0); }
+    RestoreDelay(const RestoreDelay&)            = delete;
+    RestoreDelay& operator=(const RestoreDelay&) = delete;
+};
 
 std::vector<infernix::TokenId> synthetic_tokens(std::size_t count, std::uint32_t seed) {
     std::vector<infernix::TokenId> tokens;
@@ -124,12 +140,17 @@ int run_mode(const char* artifact, const char* ngram, Mode mode, const char* dra
     const auto solo_b = engine.generate(engine.prepare_tokens(prompt_b), greedy(false)).generated_token_ids;
     failures += check(solo_a.size() == kOutputs && solo_b.size() == kOutputs, "solo runs generate every token");
 
+    const RestoreDelay delay;
     // exact: both publish; B (younger) is paused and restored from its own published state.
     {
+        const std::uint64_t restored = engine.runtime_stats().hybrid_host_restore_bytes;
         auto a = engine.submit(engine.prepare_tokens(prompt_a), greedy(true));
         auto b = engine.submit(engine.prepare_tokens(prompt_b), greedy(true));
         const infernix::GenerationResult ra = a.wait();
         const infernix::GenerationResult rb = b.wait();
+        const std::uint64_t restores = engine.runtime_stats().hybrid_host_restore_bytes - restored;
+        std::printf("  exact: %.1f MiB restored from the Host tier\n", static_cast<double>(restores) / (1 << 20));
+        failures += check(restores > 0, "the resumes restore from the Host tier");
         std::printf("  exact: A preemptions %llu (snapshot restores %llu, replay restores %llu), B preemptions %llu, "
                     "snapshot restores %llu, replay restores %llu\n",
                     static_cast<unsigned long long>(ra.scheduling.preemptions),

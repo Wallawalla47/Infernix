@@ -16,7 +16,12 @@
 namespace infernix::models::qwen4_exp::testing {
 namespace {
 std::atomic<std::int64_t> forced_tap_position{-1}; // -1: none
+std::atomic<std::uint32_t> restore_delay_us{0};
 } // namespace
+
+void set_restore_delay(std::uint32_t microseconds) noexcept { restore_delay_us.store(microseconds); }
+
+std::uint32_t restore_delay() noexcept { return restore_delay_us.load(); }
 
 void set_forced_tap(std::optional<std::uint32_t> position) noexcept {
     forced_tap_position.store(position ? static_cast<std::int64_t>(*position) : -1);
