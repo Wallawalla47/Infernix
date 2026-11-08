@@ -39,6 +39,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -225,6 +226,13 @@ __device__ __forceinline__ std::uint64_t global_ns() {
     std::uint64_t now;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
     return now;
+}
+
+// A word another CTA publishes with a release (a narrow down pass's per-job count), read with acquire.
+__device__ __forceinline__ std::uint32_t load_acquire_gpu(const std::uint32_t* p) {
+    std::uint32_t v;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
 }
 
 // The call's error word: layer << 16 | code (MoeExpertSource::error).

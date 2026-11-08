@@ -160,11 +160,14 @@ struct NmmaPassArgs {
     int job_base, jobs;
     std::uint16_t* h_plane;
     std::int32_t* h_emax;
-    std::uint32_t* job_ctas; // [max_jobs]: gate/up CTAs finished per job
+    std::uint32_t* job_ctas; // [max_jobs]: gate/up CTAs finished per job, then one more once its h is encoded
     bf16* outputs;
     int hidden;
     PassPhase phase;
     int narrow_max;
+    // 1: each down CTA waits for its own job's h (job_ctas reaching kNmmaGateUpCtas + 1) instead of the whole
+    // gate/up grid's PDL wait (calls of at most moe::kMaxColumns columns; launch_expert_pass_ggml).
+    int job_wait = 0;
 };
 
 // Gate/up CTA tile `bx` (intermediates 32 bx ..) of job `job`: every thread of the CTA calls it. The codebook is
@@ -271,6 +274,10 @@ __device__ __forceinline__ void gate_up_nmma_task(NmmaGateUpShared<GU>& sm, cons
     __syncthreads();
     if (last_cta == 0) { return; } // (a job belongs to one pass; the call's x encoder clears the counts)
     if (warp < count) { nmma_encode_h(h_plane, a.h_emax, first + warp, lane); }
+    // The job's h is complete: one more count, a fire-and-forget release after the barrier (cumulative over every
+    // warp's limbs and exponents), lets this job's down CTAs start without waiting for the rest of the grid.
+    __syncthreads();
+    if (threadIdx.x == 0) { asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(a.job_ctas + job) : "memory"); }
 }
 
 template <QType GU>
@@ -318,7 +325,28 @@ __device__ __forceinline__ void down_nmma_task(NmmaDownShared<D>& sm, const Nmma
     const auto row_of = [&](int r) { return down + static_cast<std::size_t>(r0 + r) * source.ggml.down_row_bytes; };
     std::uint8_t* ring = sm.ring[warp];
     if (record != nullptr) { NmmaDownRing<D>::issue_all(ring, row_of, lane); }
-    pdl::wait_for_dependencies();
+    if (a.job_wait != 0) {
+        // Only this job's h is read (and outputs written): wait for the count its last gate/up CTA releases after
+        // encoding h, as the tensor-core A16 route does (narrow_a16_mma.cuh, candidates YF-01): the gate/up grid
+        // is a serialized launch and every one of its CTAs had started before this grid launched. Bounded
+        // (offloaded_moe::kDownReadyTimeoutNs): a lost count fails the call through its error word, never hangs.
+        if (record != nullptr && threadIdx.x == 0) {
+            const std::uint32_t ready = static_cast<std::uint32_t>(kNmmaGateUpCtas) + 1U;
+            if (load_acquire_gpu(a.job_ctas + job) != ready) {
+                const std::uint64_t entered = global_ns();
+                do {
+                    if (global_ns() - entered > offloaded_moe::kDownReadyTimeoutNs) {
+                        report_error(source, offloaded_moe::kErrorDownStalled);
+                        break;
+                    }
+                    __nanosleep(64);
+                } while (load_acquire_gpu(a.job_ctas + job) != ready);
+            }
+        }
+        __syncthreads(); // thread 0's acquire reaches the other threads (record is uniform in the CTA)
+    } else {
+        pdl::wait_for_dependencies();
+    }
     if (record == nullptr) { return; }
     // The job's encoded h (its last gate/up CTA wrote each entry's limbs over its h row) and exponents.
     for (int i = static_cast<int>(threadIdx.x); i < count * (moe::wide::kA16HRowBytes / 16); i += kNmmaThreads) {
@@ -944,6 +972,9 @@ void launch_expert_pass_ggml(const bf16* x, const MoeDispatch& dispatch, const M
     args.hidden      = static_cast<int>(moe::kHidden);
     args.phase       = phase;
     args.narrow_max  = narrow_max;
+    // Decode and verify calls: each down CTA waits for its own job's h (launch_expert_pass_a16_nmma explains the
+    // cap and gives the measurements: IQ3_S struct 420.5 -> 428.6 tok/s against the grid-wide wait).
+    args.job_wait = part != PassPart::Down && columns <= moe::kMaxColumns ? 1 : 0;
     if (part != PassPart::Down) {
         CUDA_CHECK(pdl::launch_with(pdl::Dependency::Serialized,
                                     {dim3(kNmmaGateUpCtas, jobs), dim3(kNmmaThreads), sizeof(NmmaGateUpShared<GU>), stream},

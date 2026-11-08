@@ -176,9 +176,12 @@ struct Nmma16Args {
     int job_base;
     std::uint8_t* h_rows;        // [entries][kHRowBytes]: BF16 h, then the job's last gate/up CTA's limbs
     std::int32_t* h_emax;        // [entries]
-    std::uint32_t* job_ctas;     // [max_jobs]: gate/up CTAs finished per job
+    std::uint32_t* job_ctas;     // [max_jobs]: gate/up CTAs finished per job, then one more once its h is encoded
     bf16* outputs;               // [entries][hidden]
     PassPhase phase;
+    // 1: each down CTA waits for its own job's h (job_ctas reaching kGateUpCtas + 1) instead of the whole gate/up
+    // grid's PDL wait (calls of at most moe::kMaxColumns columns; launch_expert_pass_a16_nmma).
+    int job_wait = 0;
 };
 
 // A gate/up CTA's warps: KSplit warps a row group, each streaming 1 / KSplit of K through a Depth-stage ring.
@@ -331,6 +334,10 @@ __global__ void __launch_bounds__(Nmma16GateUpWarps<KSplit>::kThreads) gate_up_n
     __syncthreads();
     if (last_cta == 0) { return; } // (a job belongs to one pass; the call's prepare kernel clears the counts)
     for (int c = warp; c < count; c += W::kWarps) { nmma16_encode_h<G>(a.h_rows, a.h_emax, first + c, lane); }
+    // The job's h is complete: one more count, a fire-and-forget release after the barrier (cumulative over every
+    // warp's limbs and exponents), lets this job's down CTAs start without waiting for the rest of the grid.
+    __syncthreads();
+    if (threadIdx.x == 0) { asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(a.job_ctas + job) : "memory"); }
 }
 
 // A down CTA's shared memory: the warps' row groups, then the job's h limb rows (as many as its columns, sized at
@@ -378,7 +385,29 @@ __global__ void __launch_bounds__(kNmma16Threads) down_nmma16_kernel(Nmma16Args 
         for (int i = lane; i < S::kDownBytes / 16; i += 32) { ggml::tile::cp_async16(sm.units[warp] + 16 * i, src + 16 * i, 16); }
     }
     ggml::tile::cp_async_commit();
-    pdl::wait_for_dependencies();
+    if (a.job_wait != 0) {
+        // Only this job's h is read (and outputs written): wait for the count its last gate/up CTA releases after
+        // encoding h (candidates YF-01, after ninferpro f48f1c051a). The gate/up grid is a serialized launch, so every
+        // earlier kernel has finished, and this grid launched only once every gate/up CTA had started (each triggers
+        // at entry): the job's CTAs are running, and its other jobs' down work need not wait for them. Bounded
+        // (offloaded_moe::kDownReadyTimeoutNs): a lost count fails the call through its error word, never hangs.
+        if (record != nullptr && threadIdx.x == 0) {
+            const std::uint32_t ready = static_cast<std::uint32_t>(S::kGateUpCtas) + 1U;
+            if (load_acquire_gpu(a.job_ctas + job) != ready) {
+                const std::uint64_t entered = global_ns();
+                do {
+                    if (global_ns() - entered > offloaded_moe::kDownReadyTimeoutNs) {
+                        report_error(a.source, offloaded_moe::kErrorDownStalled);
+                        break;
+                    }
+                    __nanosleep(64);
+                } while (load_acquire_gpu(a.job_ctas + job) != ready);
+            }
+        }
+        __syncthreads(); // thread 0's acquire reaches the other threads (record is uniform in the CTA)
+    } else {
+        pdl::wait_for_dependencies();
+    }
     if (record == nullptr) { return; }
     constexpr int kChunks = S::kHRowBytes / 16;
     for (int i = static_cast<int>(threadIdx.x); i < count * kChunks; i += kNmma16Threads) {
@@ -426,8 +455,15 @@ void launch_expert_pass_a16_nmma(int columns, const MoeDispatch& dispatch, const
                                  PassPhase phase, PassPart part) {
     using G = moe::FlashNextExperts;
     using S = Nmma16Shape<G>;
-    const Nmma16Args args{layout.x_limbs, layout.x_emax, dispatch, source, top_k, job_records, flags, base,
-                          layout.h_rows, layout.h_emax, layout.job_ctas, outputs, phase};
+    Nmma16Args args{layout.x_limbs, layout.x_emax, dispatch, source, top_k, job_records, flags, base,
+                    layout.h_rows, layout.h_emax, layout.job_ctas, outputs, phase};
+    // Decode and verify calls (at most moe::kMaxColumns columns): each down CTA waits for its own job's h. ninferpro
+    // measured that wait level with the grid-wide one at 12 columns and 0.8 % slower at 18 on its dp4a kernels, so
+    // wider calls keep the PDL wait. A split call's down launch is serialized: its gate/up pass has already ended.
+    // Measured against the grid-wide wait (2026-11-08, FP4-Local, DFlash2 and n-gram auto, BF16 KV, three ABBA blocks
+    // of fresh processes, the same tokens): conv 213.6 -> 215.4 tok/s (0.6-1.1 % in each block), struct 474.8 ->
+    // 477.7 (0.4-0.8 %); the GGUF kernels' twin on IQ3_S, struct 420.5 -> 428.6 (1.5-2.1 %).
+    args.job_wait = part != PassPart::Down && columns <= moe::kMaxColumns ? 1 : 0;
     if (part != PassPart::Down) {
         // Calls of kNmma16SplitColumns columns or more split each row group's K over two warps; narrower ones keep one
         // warp a group (op bench, FP4-Local's geometry, frames, cold L2, three interleaved runs, 2026-11-03: split

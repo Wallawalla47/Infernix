@@ -10351,6 +10351,19 @@ Also measured and rejected (2026-10-10, Dense8, against the PDL pair):
   MTP −0.52 % (all pairs negative): the PDL chain already overlaps down's weight fetch with gate/up,
   and the fused grid runs down items at two CTAs per SM instead of three. (A first build lost 2 KB to
   a static `__shared__` ticket, which dropped it to one CTA per SM.)
+  **Revisited 2026-11-07 (candidates YF-01, after ninferpro `f48f1c051a`):** the two PDL grids stay, so
+  occupancy and the weight copies before the wait are unchanged; only the down CTAs' wait narrows to
+  their own job. The job's last gate/up CTA, which already found itself through `job_ctas` to encode h,
+  adds one more to that count with a release after encoding, and each down CTA of a call of at most 8
+  columns polls its job's count with acquire loads instead of `griddepcontrol.wait` (bounded:
+  `kDownReadyTimeoutNs`, then `kErrorDownStalled`). Both the tensor-core A16 route and the GGUF narrow
+  kernels take it. ninferpro measured -0.7..-1.4 % forward time on its dp4a kernels (12 columns level,
+  18 grid-wide ahead). Measured here against the grid-wide wait (2026-11-08, a temporary switch since
+  removed; three ABBA blocks of fresh processes, BF16 KV, the same tokens): FP4-Local with DFlash2 and
+  n-gram auto conv 213.6 -> 215.4 tok/s (+0.6..+1.1 % in each block), struct 474.8 -> 477.7
+  (+0.4..+0.8 %); IQ3_S (GGUF kernels) struct 420.5 -> 428.6 (+1.5..+2.1 %). IQ3_S's conv fixture is
+  not comparable: at its seeded temperature both arms' runs split into two speeds (about 145 and 185
+  tok/s, 1.7 against 2.2-2.5 tokens a round) with different generations in every process.
 - **The top-k route kernel by warp reductions** (`__reduce_max_sync` on order-preserving keys, the
   smallest id by `__reduce_min_sync`, one lane rescanning per round; same selection): plain −0.12 %,
   MTP +0.05 %, noise; the kernel's 4.3 µs is its load and launch, not the selection.
