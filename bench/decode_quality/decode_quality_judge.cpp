@@ -11,6 +11,12 @@
 // instead (every other condition the same): it isolates what decoding changes (KV format, chunking,
 // speculation, batching) but not the cost of the stored activation precision itself.
 //
+// --default-route scores on the default route, fast paths included. Neither it nor --stored-activations
+// reproduces the generator's decode: on NVIDIA's NVFP4 27B the prompt path quantizes activations to 4 bits
+// and decode keeps 16, and these references' kernels follow the sequence's length, which alone moved one
+// token's regret from under 1 nat to 19.9 (candidates YK-04, 2026-11-08). A token they rank low too is
+// therefore no evidence of a decode-state error; infernix_decode_quality_probe tests that directly.
+//
 // --report FILE also writes each build's per-segment counts as JSON (segments are independent
 // samples, which a comparison pairs between builds).
 //
@@ -20,9 +26,11 @@
 // `prompts` does (a segment's offset is then its prompt's index).
 //
 // Per build it also reports the largest regret and how many tokens' regret exceeds 1 nat: a state or
-// verification error leaves tokens far below the reference's choice, which near-ties do not.
+// verification error leaves tokens far below the reference's choice, which near-ties do not. So does a
+// route's rounding at a position where the model itself is unstable (a one-token shift of the context
+// changes its choice): there a decode can pick a confident other token.
 //
-// Usage: infernix_decode_quality_judge [--stored-activations] [--report <file.json>]
+// Usage: infernix_decode_quality_judge [--stored-activations | --default-route] [--report <file.json>]
 //                                      [--ngram-volume <file>] [--prompts] <artifact> <corpus.txt> <gen_file>...
 
 #include "infernix/engine.h"
@@ -74,13 +82,15 @@ struct SegmentScore {
 } // namespace
 
 int main(int argc, char** argv) {
-    bool stored = false, prompt_records = false;
+    bool stored = false, default_route = false, prompt_records = false;
     std::string report_path;
     std::string ngram_volume;
     while (argc > 1 && std::string(argv[1]).starts_with("--")) {
         const std::string option = argv[1];
         if (option == "--stored-activations") {
             stored = true;
+        } else if (option == "--default-route") {
+            default_route = true;
         } else if (option == "--prompts") {
             prompt_records = true;
         } else if (option == "--report" && argc > 2) {
@@ -98,9 +108,10 @@ int main(int argc, char** argv) {
         ++argv;
         --argc;
     }
-    if (argc < 4) {
-        std::cerr << "usage: infernix_decode_quality_judge [--stored-activations] [--report <file.json>] "
-                     "[--ngram-volume <file>] [--prompts] <artifact> <corpus.txt> <gen_file>...\n";
+    if (argc < 4 || (stored && default_route)) {
+        std::cerr << "usage: infernix_decode_quality_judge [--stored-activations | --default-route] "
+                     "[--report <file.json>] [--ngram-volume <file>] [--prompts] <artifact> <corpus.txt> "
+                     "<gen_file>...\n";
         return 2;
     }
     try {
@@ -122,9 +133,9 @@ int main(int argc, char** argv) {
         options.max_context     = context;
         options.prefill_chunk   = context;
         options.kv_cache        = infernix::KvCacheStorage::BFloat16;
-        options.lossless        = !stored;
-        // Neither reference runs a fast path.
-        options.fast_paths      = false;
+        options.lossless        = !stored && !default_route;
+        // Only the default-route reference runs fast paths.
+        options.fast_paths      = default_route;
         if (!ngram_volume.empty()) { options.ngram_volume_path = ngram_volume; }
         infernix::Engine engine(options);
 
@@ -234,7 +245,7 @@ int main(int argc, char** argv) {
             std::ofstream report(report_path);
             if (!report) { throw std::runtime_error("cannot write " + report_path); }
             report << std::setprecision(17) << "{\"reference\": \""
-                   << (stored ? "stored_activations" : "lossless")
+                   << (stored ? "stored_activations" : default_route ? "default_route" : "lossless")
                    << "\", \"runs\": [";
             for (std::size_t run = 0; run < runs.size(); ++run) {
                 // Generation files are paths the user chose; JSON-escape the two characters a

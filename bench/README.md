@@ -228,10 +228,30 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   they share exactly. `--report FILE` also writes each build's per-segment counts as JSON.
 - `--stored-activations` judges with the artifact's recorded activations instead (BF16 KV, one
   pass): it measures what decoding changes (KV format, chunking, speculation, batching), not the
-  cost of the stored activation precision. `--ngram-volume FILE` (judge) and `ngram-volume=FILE`
+  cost of the stored activation precision. `--default-route` judges on the default route, fast paths
+  included. Neither reproduces the generator's decode: on NVIDIA's NVFP4 27B the prompt path runs 4-bit
+  activations and decode 16-bit, and these judges' kernels follow the sequence length (one token's
+  regret moved from under 1 nat to 19.9 with the length alone). The stderr lines name each regret above
+  1 nat by segment and token; `infernix_decode_quality_probe` then tells a decode-state error from a
+  route's rounding at an unstable position (below). `--ngram-volume FILE` (judge) and `ngram-volume=FILE`
   (generator) name Qwen3.8-Flash-Next's n-gram volume when it is not `<artifact>.ngram`. The generator's `route-trace=FILE` writes
   the per-round expert routes of a model with offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) for
   `tools/expert_cache_replay/host_tier.py` and `replay.py`.
+- The probe (`infernix_decode_quality_probe`) takes flagged `<segment>:<token>` positions of a plain
+  generator output and the generator's route and KV format (`--route reproducible|default|lossless`,
+  `--kv`, `--context`). It prefills the prompt plus the first t - d generated tokens and forces the
+  rest through the decode path one step each, for several d: d = 0 is the prefill's view, d = t replays
+  the generator's decode (each forced token must be its step's most probable). A decode-state error
+  needs some number of decode steps and then persists; a fault in one step's arithmetic appears at d = 1
+  and survives a perturbed history (`--kv int8` against `bf16`); a route's rounding at an unstable
+  position flips with the split, the KV format and a one-token shift of the context (`--trim N`,
+  `--pad N`). `--show` prints the text and every earlier recurrence of the context with the token that
+  followed it; `--no-cuda-graph` decodes eagerly. Candidates YK-04 (2026-11-08, NVIDIA's NVFP4 27B,
+  plain reproducible decode) found only the last kind: the worst token (13.8 nats from lossless, a
+  confident `++` where both copy sources say `None`) appears at d = 1 on the reproducible and default
+  routes, graphs or not, and disappears with INT8 or FP8 KV and with any shift of 1-64 tokens, where
+  every route takes `None`; the lossless route is itself unsure there. The groupwise 27B's plain
+  reproducible decode matched lossless at all 2,400 tokens of the same workload.
 
 ```bat
 infernix_decode_quality_gen model.ninfer corpus.txt base.txt 32 1536 384
