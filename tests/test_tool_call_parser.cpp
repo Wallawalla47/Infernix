@@ -2374,7 +2374,7 @@ int test_quoted_call_closers() {
     return failures;
 }
 
-int main() {
+int run_tests() {
     int failures = 0;
     failures += test_constrained_call_streaming();
     failures += test_opener_token_identity();
@@ -2425,4 +2425,42 @@ int main() {
     failures += test_quoted_call_closers();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
+}
+
+// `--probe-parse` (tests/models/qwen3_5/test_response_template_oracle.py): one JSON request a line,
+// {"text": ..., "tools": {"name": ["parameter", ...]}}, every parameter a declared string so values keep
+// their text; one JSON line back: {"tool_call_response", "content", "calls": [{"name", "arguments"}]}, or
+// {"error"}.
+int probe_parse() {
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        Json response;
+        try {
+            const Json input = Json::parse(line);
+            std::vector<std::string> definitions;
+            for (const auto& [name, parameters] : input.at("tools").items()) {
+                Json properties = Json::object();
+                for (const auto& parameter : parameters) {
+                    properties[parameter.get<std::string>()] = Json{{"type", "string"}};
+                }
+                definitions.push_back(tool_definition(name, std::move(properties)));
+            }
+            const auto contract = contract_from_definitions(definitions);
+            const auto parsed   = parse(input.at("text").get<std::string>(), 64, *contract);
+            Json calls          = Json::array();
+            for (const auto& call : parsed.tool_calls) {
+                calls.push_back(Json{{"name", call.name}, {"arguments", Json::parse(call.arguments_json)}});
+            }
+            response = Json{{"tool_call_response", parsed.is_tool_call_response},
+                            {"content", parsed.content},
+                            {"calls", std::move(calls)}};
+        } catch (const std::exception& error) { response = Json{{"error", error.what()}}; }
+        std::cout << response.dump() << '\n' << std::flush;
+    }
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--probe-parse") { return probe_parse(); }
+    return run_tests();
 }

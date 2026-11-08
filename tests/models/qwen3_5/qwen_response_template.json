@@ -1,0 +1,38 @@
+{
+  "defaults": {
+    "role": "assistant"
+  },
+  "start_anchor": "<|im_start|>assistant\n",
+  "fields": {
+    "reasoning_content": {
+      "open": "<think>",
+      "close_pattern": "</think>|(?=<tool_call>)",
+      "content": "text"
+    },
+    "tool_calls": {
+      "open_pattern": "<tool_call>\\s*<function=(?P<name>[^>\\n]+)>",
+      "close_pattern": "</tool_call>|(?=<tool_call>)",
+      "repeats": true,
+      "content": "xml-inline",
+      "content_args": {
+        "tag_pattern": "<parameter=(?P<key>[^>\\n]+)>\\n?(?P<value>.*?)\\n?(?:</parameter>|(?=<parameter=)|(?=</function>))"
+      },
+      "transform": {
+        "type": "function",
+        "function": {
+          "name": "{name}",
+          "arguments": "{content}"
+        }
+      }
+    },
+    "content": {
+      "close": [
+        "<|im_end|>",
+        "<|endoftext|>"
+      ],
+      "content": "text",
+      "repeats": true,
+      "join": ""
+    }
+  }
+}

@@ -276,6 +276,12 @@ set_tests_properties(infernix_qwen3_5_tokenizer_golden_real_test PROPERTIES SKIP
 infernix_add_test(infernix_tool_call_parser_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../test_tool_call_parser.cpp"
   LIBRARIES infernix_engine infernix_model_runtime infernix::json)
+# Qwen's declarative response_template (tokenizer_config.json, 2026-11-07) as a second oracle for the
+# parser's split of canonical outputs into calls and content.
+add_test(NAME infernix_qwen3_5_response_template_oracle_test
+  COMMAND ${CMAKE_COMMAND} -E env
+    "INFERNIX_TOOL_PARSER_PROBE=$<TARGET_FILE:infernix_tool_call_parser_test>"
+    ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/test_response_template_oracle.py")
 
 infernix_add_test(infernix_qwen3_5_visual_scatter_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_visual_scatter.cpp"
