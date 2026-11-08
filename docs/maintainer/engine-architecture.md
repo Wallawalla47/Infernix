@@ -107,6 +107,14 @@ A lane is a resident request position; the StateImage slot, KV execution row and
 are independent identities. After a pause releases its lane, the request is still owned by EngineCore;
 resuming can acquire a different lane.
 
+EngineCore requires one contract of every family's Program beyond its rounds and transactions,
+`runtime::EngineProgramContract` (`src/runtime/contract/program.h`), and `static_assert`s it: maintenance
+outside rounds and its waker, the round thread's CPU placement, the prefix cache's SSD polling, idle
+write-back and resume grid, the periodic save, the expert cache's totals, and what a finished or refused
+request reports. A family without a feature implements its member as a no-op (Flash-Next's round thread
+runs unpinned; Qwen3.5's binding never refuses on its own), so a new family's Program that lacks one fails
+to compile instead of silently losing SSD polling, resizes or a periodic save.
+
 ### 2.3 HybridResourceManager
 
 The `HybridResourceManager` connects the Engine to the Program's prefix index: it asks for an admitted

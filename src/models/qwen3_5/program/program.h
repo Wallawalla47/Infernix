@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -164,6 +165,9 @@ struct BindingReservation {
     bool source_valid      = true;
     bool capacity_possible = true;
     runtime::ContextResourceUsage shortage;
+    // The Engine's contract (runtime/contract/program.h): Qwen3.5's binding never refuses a request
+    // on its own; a request no state admits fails through the Engine's capacity check.
+    std::exception_ptr refusal;
 
     explicit operator bool() const noexcept { return reserved; }
 };

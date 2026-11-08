@@ -25,6 +25,7 @@ struct RuntimeTypes {
     using DiscardResult     = qwen3_5::DiscardResult;
     using FinishResult      = qwen3_5::FinishResult;
     using AbortResult       = qwen3_5::AbortResult;
+    using BindingReservation = qwen3_5::BindingReservation;
     using Program           = qwen3_5::Program;
 };
 } // namespace infernix::models::qwen3_5

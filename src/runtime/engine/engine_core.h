@@ -7,6 +7,7 @@
 #include "core/temporary_switches.h"
 #include "infernix/types.h"
 #include "runtime/contract/execution.h"
+#include "runtime/contract/program.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/context_cache/hybrid_resource_manager.h"
@@ -60,6 +61,8 @@ class EngineCore {
 
 public:
     using ModelContract      = typename Instance::ModelContract;
+    static_assert(EngineProgramContract<ModelContract>,
+                  "the model family's Program must satisfy runtime::EngineProgramContract");
     using ExecutionUnit      = typename ModelContract::ExecutionUnit;
     using UnitKind           = typename ModelContract::ExecutionUnitKind;
     using SequenceHandle     = typename ModelContract::SequenceHandle;
@@ -140,10 +143,8 @@ public:
             try {
                 device_.bind_to_current_thread();
                 // A Program whose CPU expert team leaves a core to this round thread (the Qwen3.5-122B's
-                // offloaded experts) places it there.
-                if constexpr (kProgramPlacesEngine) {
-                    expert_offload::place_engine_thread(instance_.program->engine_thread_cpus());
-                }
+                // offloaded experts) places it there; 0 leaves it unpinned.
+                expert_offload::place_engine_thread(instance_.program->engine_thread_cpus());
                 startup.set_value();
             } catch (...) {
                 startup.set_exception(std::current_exception());
@@ -157,9 +158,7 @@ public:
             if (worker_.joinable()) { worker_.join(); }
             throw;
         }
-        if constexpr (kProgramMaintains) {
-            instance_.program->set_maintenance_waker([this] { request_maintenance(); });
-        }
+        instance_.program->set_maintenance_waker([this] { request_maintenance(); });
         // Finished turns are rendered and tokenized off the worker (hybrid-prefix-cache-spec §7.9).
         // Without the thread the Engine simply never prefills them.
         if (next_turn_quiet_.count() > 0) {
@@ -188,9 +187,7 @@ public:
 
     ~EngineCore() noexcept {
         // The Program's monitor thread must not wake an engine that is going away.
-        if constexpr (kProgramMaintains) {
-            try { instance_.program->set_maintenance_waker({}); } catch (...) {}
-        }
+        try { instance_.program->set_maintenance_waker({}); } catch (...) {}
         stop();
         {
             std::lock_guard lock(next_turn_mutex_);
@@ -202,19 +199,9 @@ public:
         if (constraint_warm_.joinable()) { constraint_warm_.join(); }
     }
 
-    // A Program that resizes resources outside rounds (Qwen4Exp's expert cache, design §19.3.7; the RAM
-    // tiers under memory pressure, --ram-resize) asks for maintain() through a waker; the idle worker
-    // runs it under the execution lock.
-    static constexpr bool kProgramMaintains = requires(typename Instance::ModelContract::Program& program) {
-        program.maintain();
-        program.set_maintenance_waker(std::function<void()>{});
-    };
-    // A Program that names the logical CPUs of the round thread (Qwen3.5's offloaded experts:
-    // runtime::expert_offload::CpuPlacement::engine, 0 for unpinned).
-    static constexpr bool kProgramPlacesEngine = requires(const typename Instance::ModelContract::Program& program) {
-        program.engine_thread_cpus();
-    };
-
+    // The Program resizes resources outside rounds (Qwen4Exp's expert cache, design §19.3.7; the RAM
+    // tiers under memory pressure, --ram-resize) by asking for maintain() through this waker; the idle
+    // worker runs it under the execution lock.
     void request_maintenance() noexcept {
         {
             std::lock_guard lock(queue_mutex_);
@@ -1198,10 +1185,8 @@ private:
             request->generation_timings = finished.timings;
             request->speculative_stats  = std::move(finished.speculative);
             request->constrained_draws  = std::move(finished.constrained_draws);
-            if constexpr (requires { finished.expert_cache; }) { request->expert_cache = finished.expert_cache; }
-            if constexpr (requires { finished.cache_created_prompt_tokens; }) {
-                request->cache_created_prompt_tokens = finished.cache_created_prompt_tokens;
-            }
+            request->expert_cache                = finished.expert_cache;
+            request->cache_created_prompt_tokens = finished.cache_created_prompt_tokens;
             request->terminal_reason.reset();
             if (request->background && reason != FinishReason::Cancelled) {
                 ++next_turn_counters_.completed;
@@ -1890,18 +1875,10 @@ private:
     // its write-back continued every cycle; a landed promotion lets the request waiting for it be
     // quoted again.
     void poll_storage() {
-        if constexpr (requires { instance_.program->hybrid_poll_storage(); }) {
-            if (instance_.program->hybrid_poll_storage()) { request_admission_check(); }
-        }
+        if (instance_.program->hybrid_poll_storage()) { request_admission_check(); }
     }
 
-    [[nodiscard]] bool source_pending() const noexcept {
-        if constexpr (requires { instance_.program->hybrid_source_pending(); }) {
-            return instance_.program->hybrid_source_pending();
-        } else {
-            return false;
-        }
-    }
+    [[nodiscard]] bool source_pending() const noexcept { return instance_.program->hybrid_source_pending(); }
 
     // Fails a waiting (fresh or paused) request that admission can never serve, alone: as a worker
     // error it would fail the whole Engine.
@@ -2019,11 +1996,9 @@ private:
                 if (!reservation) {
                     // A request no state of the Engine admits, with the Program's own error (Qwen4Exp:
                     // a Vision window its expert cache cannot lend): it fails alone, now.
-                    if constexpr (requires { reservation.refusal; }) {
-                        if (reservation.refusal) {
-                            fail_unadmittable(request, restoring, reservation.refusal);
-                            return true;
-                        }
+                    if (reservation.refusal) {
+                        fail_unadmittable(request, restoring, reservation.refusal);
+                        return true;
                     }
                     shortage = reservation.shortage;
                     note_source_wait(request, source, restoring);
@@ -2436,41 +2411,37 @@ private:
     // is not one it handles (a binding or materialization in flight) or the Program's cleanup
     // failed; the caller then fails everything, as for any other worker error.
     bool recover_locked(const std::exception_ptr& error) noexcept {
-        if constexpr (!requires { instance_.program->recover_after_failure(); }) {
-            return false;
-        } else {
-            try {
-                if (materializing_ || context_owner_) { return false; }
-                // A paused request releases its suspended state as a cancelled one does, while the
-                // Program still owns it.
-                std::uint32_t failed = 0;
-                for (auto& request : paused_) {
-                    request->suspended.reset();
-                    complete_error(request, error);
-                    ++failed;
-                }
-                paused_.clear();
-                if (!instance_.program->recover_after_failure()) { return false; }
-                admission_decision_.reset();
-                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-                    if (slots_[lane] == nullptr) { continue; }
-                    complete_error(slots_[lane], error);
-                    remove_completed_slot(lane);
-                    ++failed;
-                }
-                std::string what = "unknown error";
-                try {
-                    std::rethrow_exception(error);
-                } catch (const std::exception& e) { what = e.what(); } catch (...) {}
-                publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
-                                   "%s: failed %u running request(s); the Engine keeps serving",
-                                   what.c_str(), failed);
-                request_admission_check();
-                publish_runtime_stats();
-                return true;
-            } catch (...) {
-                return false;
+        try {
+            if (materializing_ || context_owner_) { return false; }
+            // A paused request releases its suspended state as a cancelled one does, while the
+            // Program still owns it.
+            std::uint32_t failed = 0;
+            for (auto& request : paused_) {
+                request->suspended.reset();
+                complete_error(request, error);
+                ++failed;
             }
+            paused_.clear();
+            if (!instance_.program->recover_after_failure()) { return false; }
+            admission_decision_.reset();
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (slots_[lane] == nullptr) { continue; }
+                complete_error(slots_[lane], error);
+                remove_completed_slot(lane);
+                ++failed;
+            }
+            std::string what = "unknown error";
+            try {
+                std::rethrow_exception(error);
+            } catch (const std::exception& e) { what = e.what(); } catch (...) {}
+            publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                               "%s: failed %u running request(s); the Engine keeps serving",
+                               what.c_str(), failed);
+            request_admission_check();
+            publish_runtime_stats();
+            return true;
+        } catch (...) {
+            return false;
         }
     }
 
@@ -2540,29 +2511,27 @@ private:
     // worker boundary once the interval has passed, counted from the end of the previous save. The
     // Program skips it when nothing was written since; stopping the Engine abandons it.
     void save_prefix_cache_if_due() {
-        if constexpr (requires { instance_.program->save_prefix_cache_now(CancellationView{}); }) {
-            if (prefix_save_interval_.count() == 0 || Clock::now() < next_prefix_save_) { return; }
-            const auto started = Clock::now();
-            const auto saved   = instance_.program->save_prefix_cache_now(CancellationView([this] {
-                std::lock_guard lock(queue_mutex_);
-                return stopping_;
-            }));
-            next_prefix_save_ = Clock::now() + prefix_save_interval_;
-            if (!saved) { return; }
-            const double paused = std::chrono::duration<double>(Clock::now() - started).count();
-            if (saved->ok) {
-                publish_diagnostic(diagnostics_, DiagnosticLevel::Info,
-                                   "prefix cache saved: %llu blocks and %llu snapshots (%.2f GiB) in %.1f s; "
-                                   "requests waited %.1f s",
-                                   static_cast<unsigned long long>(saved->blocks),
-                                   static_cast<unsigned long long>(saved->snapshots),
-                                   static_cast<double>(saved->bytes) / static_cast<double>(1ULL << 30),
-                                   saved->seconds, paused);
-            } else {
-                publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
-                                   "periodic prefix cache save not written (%s); the previous file is kept",
-                                   saved->message.c_str());
-            }
+        if (prefix_save_interval_.count() == 0 || Clock::now() < next_prefix_save_) { return; }
+        const auto started = Clock::now();
+        const auto saved   = instance_.program->save_prefix_cache_now(CancellationView([this] {
+            std::lock_guard lock(queue_mutex_);
+            return stopping_;
+        }));
+        next_prefix_save_ = Clock::now() + prefix_save_interval_;
+        if (!saved) { return; }
+        const double paused = std::chrono::duration<double>(Clock::now() - started).count();
+        if (saved->ok) {
+            publish_diagnostic(diagnostics_, DiagnosticLevel::Info,
+                               "prefix cache saved: %llu blocks and %llu snapshots (%.2f GiB) in %.1f s; "
+                               "requests waited %.1f s",
+                               static_cast<unsigned long long>(saved->blocks),
+                               static_cast<unsigned long long>(saved->snapshots),
+                               static_cast<double>(saved->bytes) / static_cast<double>(1ULL << 30),
+                               saved->seconds, paused);
+        } else {
+            publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
+                               "periodic prefix cache save not written (%s); the previous file is kept",
+                               saved->message.c_str());
         }
     }
 
@@ -2722,10 +2691,7 @@ private:
         const std::uint32_t prompt = request.base_plan->summary().prompt_tokens;
         std::uint32_t best         = 0;
         for (const SourceCandidate& source : sources) { best = std::max(best, source.reused_tokens); }
-        std::uint32_t grid = 1;
-        if constexpr (requires { instance_.program->hybrid_resume_grid(); }) {
-            grid = std::max<std::uint32_t>(instance_.program->hybrid_resume_grid(), 1U);
-        }
+        const std::uint32_t grid = std::max<std::uint32_t>(instance_.program->hybrid_resume_grid(), 1U);
         // The pass's last snapshot sits at its history's end (one token before its prompt's end), on
         // the grid at or before it.
         const std::uint32_t deepest = prompt == 0 ? 0U : (prompt - 1U) / grid * grid;
@@ -2815,9 +2781,7 @@ private:
                     if (start_next_turn_locked()) { continue; }
                     // The SSD tier writes back what the last requests left in the Host tier while the
                     // Engine is idle (hybrid-prefix-cache-spec §5.7); its transfers wake the worker.
-                    if constexpr (kProgramMaintains && requires { instance_.program->hybrid_storage_due(); }) {
-                        if (instance_.program->hybrid_storage_due()) { maintenance_requested_ = true; }
-                    }
+                    if (instance_.program->hybrid_storage_due()) { maintenance_requested_ = true; }
                     const std::uint64_t seen = next_turn_serial_;
                     const auto woken         = [&] {
                         return stopping_ || !pending_.empty() || maintenance_requested_ ||
@@ -2849,7 +2813,7 @@ private:
                     if (!stopping_ && pending_.empty() && maintenance_requested_) {
                         maintenance_requested_ = false;
                         lock.unlock();
-                        if constexpr (kProgramMaintains) {
+                        {
                             std::scoped_lock execution_lock(execution_mutex_);
                             try {
                                 instance_.program->maintain();

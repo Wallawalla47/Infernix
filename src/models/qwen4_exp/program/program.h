@@ -594,6 +594,9 @@ public:
     // worker, between rounds and under its execution lock. An empty waker detaches the engine.
     void set_maintenance_waker(std::function<void()> waker);
     void maintain();
+    // The Engine's round thread runs unpinned: Flash-Next's CPU expert team leaves it no core of its own
+    // (runtime/contract/program.h; Qwen3.5's offloaded experts do).
+    [[nodiscard]] std::uint64_t engine_thread_cpus() const noexcept { return 0; }
     // RAM pressure (EngineOptions::ram_resize, runtime::expert_offload::RamMonitor): starts the monitor under which
     // maintain() shrinks the prefix cache's Host tier while the OS runs short and grows it back once more than
     // `reserve_bytes` plus a step stays free.
@@ -742,6 +745,7 @@ struct RuntimeTypes {
     using DiscardResult     = qwen4_exp::DiscardResult;
     using FinishResult      = qwen4_exp::FinishResult;
     using AbortResult       = qwen4_exp::AbortResult;
+    using BindingReservation = qwen4_exp::BindingReservation;
     using Program           = qwen4_exp::Program;
 };
 

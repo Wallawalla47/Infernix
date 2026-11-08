@@ -175,12 +175,8 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.device_state_occupied_slots      = physical.occupied.state_slots;
     snapshot.device_main_kv_occupied_pages    = physical.occupied.main_kv_pages;
     snapshot.device_backend_kv_occupied_pages = physical.occupied.backend_kv_pages;
-    if constexpr (requires { resources_.populate_runtime_stats(*instance_.program, snapshot); }) {
-        resources_.populate_runtime_stats(*instance_.program, snapshot);
-    }
-    if constexpr (requires { instance_.program->expert_cache_totals(); }) {
-        snapshot.expert_cache = instance_.program->expert_cache_totals();
-    }
+    resources_.populate_runtime_stats(*instance_.program, snapshot);
+    snapshot.expert_cache = instance_.program->expert_cache_totals();
 
     {
         std::lock_guard lock(queue_mutex_);
