@@ -2258,6 +2258,12 @@ struct RuntimeStats {
     std::uint32_t replaying_requests        = 0;
     std::uint32_t materializing_requests    = 0;
     std::uint32_t terminal_pending_requests = 0;
+    // The Engine request holding the service turn (the request every unit waits on while it cannot
+    // run; 0 when no request holds it), and how long the Engine has had requests and made no
+    // progress: no unit, control row or context transaction completed (0 while it progresses or is
+    // idle). A Warning names the scheduler state once that passes 30 s.
+    std::uint64_t progress_owner_request_id = 0;
+    double no_progress_seconds              = 0.0;
     std::uint64_t preemptions               = 0;
     std::uint64_t snapshot_restores         = 0;
     std::uint64_t replay_restores           = 0;

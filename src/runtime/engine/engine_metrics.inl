@@ -190,6 +190,9 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.paused_requests                  = static_cast<std::uint32_t>(paused_.size());
     snapshot.replaying_requests               = 0;
     snapshot.materializing_requests           = materializing_.has_value() ? 1U : 0U;
+    snapshot.progress_owner_request_id        = scheduler_.progress_owner().value_or(0U);
+    snapshot.no_progress_seconds =
+        no_progress_since_ ? std::chrono::duration<double>(Clock::now() - *no_progress_since_).count() : 0.0;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         if (slots_[lane] == nullptr) { continue; }
         ++snapshot.running_requests;

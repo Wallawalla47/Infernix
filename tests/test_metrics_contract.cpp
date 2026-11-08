@@ -87,6 +87,17 @@ int main() {
     failures += check(root["totals"]["prompt_tokens"] == 3000, "totals prompt tokens");
     failures += check(root["totals"]["reused"] == 2500, "totals reused tokens");
     failures += check(root["live"]["instance_id"] == "instance-1", "live instance id");
+    failures += check(root["live"]["progress_owner"].is_null() && root["live"]["no_progress_s"] == 0.0,
+                      "no service turn and no stall read as null and 0");
+    {
+        auto stalled                            = snapshot;
+        stalled.stats.progress_owner_request_id = 17;
+        stalled.stats.no_progress_seconds       = 42.5;
+        const Json stalled_root                 = Json::parse(render_metrics_json(stalled));
+        failures += check(stalled_root["live"]["progress_owner"] == 17 &&
+                              stalled_root["live"]["no_progress_s"] == 42.5,
+                          "the service turn's owner and the stall's length");
+    }
 
     const Json row = root["requests"][0];
     failures += check(row["id"] == 41, "row id");

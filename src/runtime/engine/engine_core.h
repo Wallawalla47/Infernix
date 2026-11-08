@@ -2732,12 +2732,85 @@ private:
         return deepest < best + kNextTurnMinimumTokens;
     }
 
+    // What every request the Engine holds is doing, for the no-progress Warning.
+    [[nodiscard]] std::string describe_progress_state() const {
+        std::string out;
+        const auto owner = scheduler_.progress_owner();
+        out += owner ? "service turn: request " + std::to_string(*owner) : std::string("no service turn");
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& request = slots_[lane];
+            if (request == nullptr) { continue; }
+            const char* phase = request->terminal_reason   ? "finishing"
+                                : request->is_replaying()    ? "replay"
+                                : request->is_prefilling()   ? "prefill"
+                                : request->is_decode_ready() ? "decode"
+                                                             : "waiting";
+            out += "; lane " + std::to_string(lane) + ": request " + std::to_string(request->id) + " " + phase;
+            out += runnable_units_[lane] ? ", unit reserved" : ", no unit";
+            if (request->recovery_pending) { out += ", recovery pending"; }
+            if (request->cancelled.load(std::memory_order_acquire)) { out += ", cancelled"; }
+        }
+        if (materializing_) { out += "; materializing request " + std::to_string(materializing_->request->id); }
+        if (!paused_.empty()) {
+            out += "; paused:";
+            for (const auto& request : paused_) { out += " " + std::to_string(request->id); }
+        }
+        if (context_owner_) { out += "; context owner request " + std::to_string(context_owner_->id); }
+        if (instance_.program->has_context_transaction()) { out += "; a context transaction is open"; }
+        std::size_t queued = 0;
+        {
+            std::lock_guard lock(queue_mutex_);
+            queued = pending_.size();
+        }
+        out += "; " + std::to_string(queued) + " queued";
+        return out;
+    }
+
+    // The no-progress watch (candidates YJ-02). NInfer #434 stalled for hours with requests resident, the
+    // GPU idle and nothing logged: every unit waited on a service-turn owner that could not run. Here the
+    // worker reports once the Engine has held requests for kNoProgressWarning and completed no unit, control
+    // row or context transaction, with what each request waits on, and again when the stall ends.
+    void watch_progress(bool executed) noexcept {
+        try {
+            bool holding = !resident_empty() || !paused_.empty() || instance_.program->has_context_transaction();
+            if (!holding) {
+                std::lock_guard lock(queue_mutex_);
+                holding = !pending_.empty();
+            }
+            const auto now = Clock::now();
+            if (executed || !holding) {
+                if (no_progress_reported_) {
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Info,
+                                       "the Engine made progress again after %.0f s without any%s",
+                                       std::chrono::duration<double>(now - *no_progress_since_).count(),
+                                       executed ? "" : ": no request is left");
+                }
+                no_progress_since_.reset();
+                no_progress_reported_ = false;
+                return;
+            }
+            if (!no_progress_since_) {
+                no_progress_since_ = now;
+                return;
+            }
+            if (no_progress_reported_ || now - *no_progress_since_ < kNoProgressWarning) { return; }
+            no_progress_reported_ = true;
+            publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
+                               "no progress for %.0f s while holding requests: %s",
+                               std::chrono::duration<double>(now - *no_progress_since_).count(),
+                               describe_progress_state().c_str());
+        } catch (...) {} // a diagnostic never fails the Engine
+    }
+
     void worker_loop() noexcept {
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
                 if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
                     !instance_.program->has_context_transaction()) {
+                    // Idle: a no-progress interval ends here (watch_progress normally closes it first).
+                    no_progress_since_.reset();
+                    no_progress_reported_ = false;
                     // The idle-time pass of a finished turn starts once its quiet period has passed.
                     if (start_next_turn_locked()) { continue; }
                     // The SSD tier writes back what the last requests left in the Host tier while the
@@ -3019,6 +3092,7 @@ private:
                     update_recovery(request);
                     executed = true;
                 }
+                watch_progress(executed);
                 publish_runtime_stats();
             } catch (const RecoverableExecutionError&) {
                 auto error = std::current_exception();
@@ -3110,6 +3184,11 @@ private:
     std::optional<NextTurnCandidate> next_turn_candidate_; // queue_mutex_: prepared, not started
     std::uint64_t next_turn_serial_ = 0;                   // queue_mutex_: wakes the idle worker
     Clock::time_point worker_busy_at_{};                   // worker: the last cycle that had work
+    // worker (watch_progress): since when the Engine has held requests and completed nothing, and whether
+    // that was reported.
+    static constexpr std::chrono::seconds kNoProgressWarning{30};
+    std::optional<Clock::time_point> no_progress_since_;
+    bool no_progress_reported_ = false;
     std::shared_ptr<Request> next_turn_request_;           // worker: the pass queued, binding or resident
     NextTurnCounters next_turn_counters_;                  // worker
     std::atomic<std::uint64_t> next_turn_dropped_{0};

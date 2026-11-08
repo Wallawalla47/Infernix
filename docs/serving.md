@@ -224,6 +224,13 @@ How failures end:
 - A CUDA error other than out of memory (an illegal address, a lost device) cannot be recovered
   in-process: the server prints `CUDA_CHECK(...) failed` with the error and aborts (a non-zero
   status other than 2), without final request-log records for the requests in flight.
+- A stall, where the Engine holds requests and completes no unit, control row or context
+  transaction for 30 seconds, is a defect: the server logs one Warning, `no progress for N s
+  while holding requests: ...`, naming the request that holds the service turn and what each
+  request is doing (its lane, phase, whether it has a unit, a recovery pending, paused and queued
+  requests), and an Info line when progress resumes. Nothing is failed or restarted; the
+  `infernix_no_progress_seconds` gauge and `live.no_progress_s` in `/metrics?format=json` show the
+  same interval.
 
 The listener's port is its own: a second server cannot bind it beside a running one (Windows sets
 `SO_EXCLUSIVEADDRUSE`, which also refuses a wildcard bind beside another program's `127.0.0.1`
@@ -2006,6 +2013,7 @@ curl http://127.0.0.1:8080/metrics
 |---|---|
 | `infernix_model_info`, `infernix_max_concurrency`, `infernix_max_context_tokens` | Model/backend identity and startup limits |
 | `infernix_requests_running`, `waiting`, `paused`, `prefilling`, `decode_ready`, `replaying`, `materializing` | Current Engine gauges; prefill/decode/replay are subsets of resident requests |
+| `infernix_no_progress_seconds` | How long the Engine has held requests without completing any unit, control row or context transaction; 0 while it progresses or is idle |
 | `infernix_prompt_tokens_total`, `infernix_prompt_tokens_cached_total` | Full input and reused tokens counted once on initial binding |
 | `infernix_prefill_tokens_total`, `infernix_replayed_tokens_total` | Actual initial prefill and separate recovery recomputation |
 | `infernix_generation_tokens_total`, `infernix_decode_tokens_total` | All committed outputs, or decode/control outputs excluding the first token; include thinking and injected control tokens |
@@ -2060,7 +2068,7 @@ would make the series cardinality unbounded.
 |---|---|
 | `schema` | `infernix.telemetry/1`; additive-only within v1 |
 | `engine` | model id, architecture, weight and KV formats, speculative backend, context and concurrency limits |
-| `live` | engine phase (`idle`, `reading`, `generating`), request counts by phase, the interval prefill/decode rates, and `active`, the generation requests in flight. A rate is `null` until the throughput reporter has produced one |
+| `live` | engine phase (`idle`, `reading`, `generating`), request counts by phase, the interval prefill/decode rates, and `active`, the generation requests in flight. A rate is `null` until the throughput reporter has produced one. `progress_owner` is the Engine request id holding the service turn, the request every unit waits on while it cannot run (`null` when none holds it), and `no_progress_s` how long the Engine has held requests without completing any unit (0 while it progresses; "How failures end" under [Endpoints](#endpoints)) |
 | `totals` | monotonic counters since startup, plus terminal request counts |
 | `requests` | the last 128 settled generation requests (completed, cancelled, failed), oldest first; requests rejected before generation appear only in `totals.rejected` |
 | `session_stats` | the console statistics panel's figures as numbers, also without a terminal: `completed`, `failed`, `cancelled`, `rejected`, the model `drafter` (`null` until one drafted), `ngram_enabled`, `recent_window` (10), and two rows, `session` (every completed request) and `recent` (the last ten). Each row has `requests`, mean `ttft_s`, `prompt_tokens`, `cached_tokens` and `cache_hit_rate`, `prefill_tokens`, `prefill_s` and `prefill_tok_s`, `decode_tokens`, `decode_s`, `decode_tok_s` (aggregate) and `batch`, the model drafter's `drafted`, `accepted`, `acceptance` and `accepted_per_round`, the n-gram drafter's `ngram_drafted`, `ngram_accepted`, `ngram_acceptance` and `ngram_rounds`, the archive's `archive_drafted`, `archive_accepted` and `archive_acceptance`, and the VRAM expert cache's `expert_lookups`, `expert_hits` and `expert_hit_rate`; a ratio or rate is `null` while its denominator is zero. The [launcher](launcher.md)'s dashboard shows them |
