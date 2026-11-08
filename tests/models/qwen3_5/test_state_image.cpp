@@ -353,6 +353,9 @@ void test_packed_recurrent(q36::RecurrentHostFormat format, infernix::DeviceCont
         bits[1] = 0x3f800000U | (1U << dropped) | (1U << (dropped - 1U));    // tie, odd: up
         CUDA_CHECK(cudaMemcpy(state.data, bits.data(), state.bytes(), cudaMemcpyHostToDevice));
     }
+    // A pageable copy returns once its data is staged, before the DMA lands, and on the legacy stream,
+    // which does not order against device.stream: wait for it before the stream reads the state.
+    CUDA_CHECK(cudaDeviceSynchronize());
     pool.zero_slot(1, device.stream);
 
     const std::size_t image_bytes   = packed.layout.host.image_bytes;

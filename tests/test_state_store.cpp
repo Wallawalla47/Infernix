@@ -138,7 +138,7 @@ int main() {
 
     auto slotted_plan = plan_state(2, 10, 3, 4, 5, 6, 3);
     infernix::DeviceArena slotted_arena(slotted_plan.bytes);
-    CUDA_CHECK(cudaMemset(slotted_arena.base(), 0, slotted_arena.capacity()));
+    CUDA_CHECK(cudaMemsetAsync(slotted_arena.base(), 0, slotted_arena.capacity(), ctx.stream));
     infernix::LinearAttentionStatePool slotted({slotted_arena.base(), slotted_arena.capacity()},
                                              slotted_plan.layout);
     failures += expect_size(slotted.slot_count(), 3, "slotted.slot_count");
@@ -153,12 +153,14 @@ int main() {
     infernix::Tensor recurrent1        = slotted.recurrent_slot(0, 1);
     infernix::Tensor conv1_layer1      = slotted.conv_slot(1, 1);
     infernix::Tensor recurrent1_layer1 = slotted.recurrent_slot(1, 1);
-    CUDA_CHECK(cudaMemset(conv0.data, 0x7a, conv0.bytes()));
-    CUDA_CHECK(cudaMemset(conv1.data, 0x6b, conv1.bytes()));
-    CUDA_CHECK(cudaMemset(recurrent0.data, 0x5c, recurrent0.bytes()));
-    CUDA_CHECK(cudaMemset(recurrent1.data, 0x4d, recurrent1.bytes()));
-    CUDA_CHECK(cudaMemset(conv1_layer1.data, 0x3c, conv1_layer1.bytes()));
-    CUDA_CHECK(cudaMemset(recurrent1_layer1.data, 0x2d, recurrent1_layer1.bytes()));
+    // On ctx.stream, as the copy below: a plain cudaMemset runs on the legacy stream, which does not order
+    // against the non-blocking compute stream (ninferpro saw the copy read 0 in 20 of 120 loaded runs).
+    CUDA_CHECK(cudaMemsetAsync(conv0.data, 0x7a, conv0.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(conv1.data, 0x6b, conv1.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(recurrent0.data, 0x5c, recurrent0.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(recurrent1.data, 0x4d, recurrent1.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(conv1_layer1.data, 0x3c, conv1_layer1.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(recurrent1_layer1.data, 0x2d, recurrent1_layer1.bytes(), ctx.stream));
 
     slotted.copy_slot(1, 2, ctx.stream);
     ctx.synchronize();
