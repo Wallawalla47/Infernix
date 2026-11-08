@@ -12779,8 +12779,13 @@ least priority. Recipe C (three rotated reps): both conv 137.03 -> 138.46 tok/s 
 (+0.9 %), with the least priority 131.87 / 416.33 (nothing more). ABBA x4, the fork against the late fork: IQ3_S conv
 120.61 -> 121.27, struct 397.85 -> 399.66 (+0.5 % each); recipe A struct 299.62 -> 300.11 (+0.2 %); the FP8 import
 struct 62.76 -> 63.29 (+0.8 %). The greatest priority stays on those routes (IQ3_S's default measured it faster on
-2026-10-29, §19.3.31). Not measured: the reproducible route (the gate leaves it out; neither half changes bits) and
-`--a8-activations` outside the GGUF expert route.
+2026-10-29, §19.3.31). Not measured: `--a8-activations` outside the GGUF expert route. Since 2026-11-07 (candidates
+YK-11) the reproducible route forks too, with the same priorities: neither half changes bits, so its output is
+unchanged. Measured against the unforked route (2026-11-08, a temporary switch since removed; FP4-Local
+`--reproducible`, DFlash2 and n-gram auto, BF16 KV, three ABBA blocks of fresh processes, the same tokens): conv
+207.2 -> 209.3 tok/s (+0.7..+1.4 % in each block), struct 481.5 -> 485.4 (+0.7..+0.9 %). The reproducible ids of two
+256-token segments are byte-equal forked and unforked, with DFlash2 (its proposal head) and plain. The lossless route
+keeps its own kernels unforked.
 
 **Two decode launches (2026-11-05, candidates TM-08; same bits).** The combine-inject kernel issues a column's loads
 (the experts' outputs and weights, the shared expert, the injects and the residual streams) before any sum uses them

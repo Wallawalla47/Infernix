@@ -748,7 +748,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // pairs); recipe A struct 299.62 -> 300.11 (+0.2 %, four pairs); the FP8 import struct 62.76 -> 63.29 (+0.8 %,
     // four pairs). The greatest priority stays where the least was not measured faster (IQ3_S's default measured the
     // greatest faster on 2026-10-29).
-    if (const auto& text = instance->model->config().text; options.fast_paths && !options.a8_activations) {
+    // The reproducible route takes the same fork (candidates YK-11): it moves the shared expert's work to a side
+    // stream and changes neither half's arithmetic, so the route's bits stay. Measured against the unforked route
+    // (2026-11-08, FP4-Local --reproducible, DFlash2 and n-gram auto, BF16 KV, three ABBA blocks of fresh processes,
+    // the same tokens): conv 207.2 -> 209.3 tok/s (0.7-1.4 % in each block), struct 481.5 -> 485.4 (0.7-0.9 %); the
+    // reproducible ids byte-equal, DFlash2 and plain. The lossless route keeps its own kernels unforked.
+    if (const auto& text = instance->model->config().text; !options.lossless && !options.a8_activations) {
         program_options.shared_expert_early         = true;
         program_options.side_streams_least_priority = text.moe.a16_experts && text.expert_format == QType::NVFP4_MUL;
     }
