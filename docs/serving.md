@@ -1362,8 +1362,14 @@ block keeps its `cache_control` breakpoint, and a block the rewrite leaves empty
 breakpoint to the end of the previous block.
 
 `max_tokens` is optional for local clients and otherwise uses `--default-max-tokens`; a positive
-value is the complete output budget. `max_tokens:0` is rejected because Infernix does not expose a
-completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, and
+value is the complete output budget. `max_tokens:0` pre-warms the prefix cache, as in the Anthropic API:
+the prompt is prefilled, which publishes its `cache_control` breakpoints' snapshots as any request's
+prefill does, and the response has empty `content`, `stop_reason:"max_tokens"`, the usage with
+`cache_creation_input_tokens` and `cache_read_input_tokens`, and `output_tokens:0` (the Engine samples
+one token after the prefill, which the response leaves out). A pre-warm cannot stream, use
+`thinking.type:"enabled"` or `output_config.format`, or force a tool call (`tool_choice` `any` or `tool`):
+each is a 400. Put the breakpoint on the last block the sessions share (the system prompt or the
+tools), followed by a short placeholder user message. `temperature`, `top_p`, `top_k`, and
 `stop_sequences` enter Engine execution. A matched custom stop is returned as
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
 `model_context_window_exceeded`.

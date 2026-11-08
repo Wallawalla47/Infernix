@@ -43,6 +43,10 @@ struct AnthropicMessagesRequest {
     bool output_tokens_explicit = false;
     // `thinking.display:"omitted"` or `"updates"`: reasoning travels only inside the block signature.
     bool hide_thinking = false;
+    // `max_tokens:0`, cache pre-warming: generation.max_tokens is 1 (the Engine samples one token after the
+    // prefill that publishes the breakpoints' snapshots) and the response (make_anthropic_prewarm_response) has
+    // no content and reports no output tokens.
+    bool prewarm = false;
     std::vector<AnthropicToolSearch> tool_searches;
 };
 
@@ -146,6 +150,9 @@ std::string make_anthropic_messages_response(const AnthropicResponseIdentity& id
                                              const GenerationOutcome& totals,
                                              std::optional<std::string_view> stop_reason,
                                              bool hide_thinking = false);
+// A cache pre-warm's response (`max_tokens:0`): no content, `stop_reason:"max_tokens"`, the prompt's usage with
+// its cache reads and writes, and no output tokens (the one token the Engine sampled is left out).
+std::string make_anthropic_prewarm_response(const AnthropicResponseIdentity& identity, const GenerationOutcome& totals);
 std::string make_anthropic_count_tokens_response(int input_tokens);
 
 class AnthropicMessagesStream {

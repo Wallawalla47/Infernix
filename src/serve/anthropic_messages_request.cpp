@@ -1643,13 +1643,9 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     const std::optional<int> max_tokens = optional_int(body, "max_tokens");
     if (max_tokens) {
         result.output_tokens_explicit = true;
-        if (*max_tokens == 0) {
-            bad_request("max_tokens=0 requires a completed cache prewarm lifecycle that Infernix "
-                        "does not provide",
-                        "max_tokens", "cache_prewarm_not_supported");
-        }
         if (*max_tokens < 0) { bad_request("max_tokens must be positive", "max_tokens"); }
-        result.generation.max_tokens = *max_tokens;
+        result.prewarm               = *max_tokens == 0;
+        result.generation.max_tokens = result.prewarm ? 1 : *max_tokens; // a pre-warm samples one token (below)
     } else {
         result.generation.max_tokens = limits.default_max_tokens;
     }
@@ -1658,6 +1654,26 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
                                                limits.claude_code_prompt);
     result.hide_thinking = thinking_display_hidden(body);
     parse_generation_fields(body, result.generation);
+    if (result.prewarm) {
+        // Cache pre-warming (Anthropic's max_tokens:0): the request writes the prefix cache at its breakpoints and
+        // answers with no content. The prefill publishes the breakpoints' snapshots as for any request; the Engine
+        // then samples one token, which the response leaves out. The documented refusals apply.
+        if (result.stream) { bad_request("max_tokens=0 (cache pre-warming) cannot be streamed", "stream"); }
+        if (body.contains("thinking") && body.at("thinking").is_object() &&
+            body.at("thinking").value("type", "") == "enabled") {
+            bad_request("max_tokens=0 (cache pre-warming) cannot be combined with thinking.type 'enabled'",
+                        "thinking");
+        }
+        if (body.contains("output_config") && body.at("output_config").is_object() &&
+            body.at("output_config").contains("format") && !body.at("output_config").at("format").is_null()) {
+            bad_request("max_tokens=0 (cache pre-warming) cannot be combined with output_config.format",
+                        "output_config.format");
+        }
+        if (result.generation.tool_choice.mode == ToolChoiceMode::Required) {
+            bad_request("max_tokens=0 (cache pre-warming) cannot force a tool call (tool_choice 'any' or 'tool')",
+                        "tool_choice");
+        }
+    }
     parse_structured_outputs(body, result.generation);
     return result;
 }

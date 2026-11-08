@@ -365,6 +365,23 @@ std::string make_anthropic_messages_response(const AnthropicResponseIdentity& id
     return response.dump();
 }
 
+std::string make_anthropic_prewarm_response(const AnthropicResponseIdentity& identity,
+                                            const GenerationOutcome& totals) {
+    Json usage                     = final_usage(totals);
+    usage["output_tokens"]         = 0;
+    usage["output_tokens_details"] = Json{{"thinking_tokens", 0}};
+    OrderedJson response{{"id", identity.message_id},
+                         {"type", "message"},
+                         {"role", "assistant"},
+                         {"model", identity.model},
+                         {"content", OrderedJson::array()},
+                         {"stop_reason", "max_tokens"},
+                         {"stop_sequence", nullptr},
+                         {"usage", usage}};
+    response["timings"] = timings_json(outcome_timings(totals));
+    return response.dump();
+}
+
 std::string make_anthropic_count_tokens_response(int input_tokens) {
     return Json{{"input_tokens", input_tokens}}.dump();
 }

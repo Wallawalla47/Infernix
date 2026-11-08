@@ -276,9 +276,11 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             set_ngram_generation_header(res, state->final_outcome.ngram_archive);
             const std::vector<AnthropicResponseSegment> segments = state->segments();
             set_owned_json_content(res,
-                                   make_anthropic_messages_response(identity, segments, totals,
-                                                                    state->stop_reason,
-                                                                    request.hide_thinking),
+                                   request.prewarm
+                                       ? make_anthropic_prewarm_response(identity, totals)
+                                       : make_anthropic_messages_response(identity, segments, totals,
+                                                                          state->stop_reason,
+                                                                          request.hide_thinking),
                                    prepared.lifetime);
         } catch (const ApiException& exception) {
             const ApiError error = normalize_anthropic_error(exception.error());

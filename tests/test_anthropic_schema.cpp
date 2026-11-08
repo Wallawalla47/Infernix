@@ -13,6 +13,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <tuple>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -123,9 +124,32 @@ int test_envelope_and_field_policy() {
     const AnthropicMessagesRequest defaulted = parse(body);
     failures += check(!defaulted.output_tokens_explicit && defaulted.generation.max_tokens == 8192,
                       "omitted max_tokens did not use the server default");
-    body["max_tokens"] = 0;
-    failures += check(api_code([&] { (void)parse(body); }) == "cache_prewarm_not_supported",
-                      "max_tokens=0 was accepted as a false cache prewarm");
+    // max_tokens:0 pre-warms the cache: one token is budgeted (and left out of the response); a stream,
+    // enabled Thinking, an output format and a forced tool call are refused, as in the Anthropic API.
+    Json warm          = base_request();
+    warm["max_tokens"] = 0;
+    AnthropicMessagesRequest prewarm;
+    failures += check(api_code([&] { prewarm = parse(warm); }).empty() && prewarm.prewarm &&
+                          prewarm.output_tokens_explicit && prewarm.generation.max_tokens == 1,
+                      "max_tokens=0 was not read as a cache pre-warm of one internal token");
+    for (const auto& [field, value, param] :
+         {std::tuple{"stream", Json(true), "stream"},
+          std::tuple{"thinking", Json{{"type", "enabled"}, {"budget_tokens", 1024}}, "thinking"},
+          std::tuple{"output_config", Json{{"format", Json{{"type", "json_schema"},
+                                                           {"schema", Json{{"type", "object"}}}}}},
+                     "output_config.format"}}) {
+        Json refused   = warm;
+        refused[field] = value;
+        failures += check(api_param([&] { (void)parse(refused); }) == param,
+                          std::string("a cache pre-warm accepted ") + field);
+    }
+    {
+        Json forced           = warm;
+        forced["tools"]       = Json::array({Json{{"name", "probe"}, {"input_schema", Json{{"type", "object"}}}}});
+        forced["tool_choice"] = Json{{"type", "any"}};
+        failures += check(api_param([&] { (void)parse(forced); }) == "tool_choice",
+                          "a cache pre-warm accepted a forced tool call");
+    }
 
     body                = base_request();
     body["temperature"] = 1.01;
@@ -900,6 +924,17 @@ int test_aggregate_and_errors() {
     failures += check(Json::parse(make_anthropic_messages_response(identity, outcome))["usage"]
                                                                                          ["cache_creation_input_tokens"] == 40,
                       "cache creation usage was not clamped to the uncached input");
+    // A cache pre-warm (max_tokens:0): no content and no output tokens, whatever the one sampled token was; the
+    // prompt's cache reads and writes as for any request.
+    outcome.cache_created_prompt_tokens = 32;
+    const Json prewarmed = Json::parse(make_anthropic_prewarm_response(identity, outcome));
+    failures += check(prewarmed["content"].empty() && prewarmed["stop_reason"] == "max_tokens" &&
+                          prewarmed["stop_sequence"].is_null() && prewarmed["usage"]["output_tokens"] == 0 &&
+                          prewarmed["usage"]["output_tokens_details"]["thinking_tokens"] == 0 &&
+                          prewarmed["usage"]["cache_read_input_tokens"] == 60 &&
+                          prewarmed["usage"]["cache_creation_input_tokens"] == 32 &&
+                          prewarmed["usage"]["input_tokens"] == 8,
+                      "a cache pre-warm's response is not Anthropic's documented shape");
     outcome.cache_created_prompt_tokens.reset();
 
     outcome.prompt_tokens                   = 10;
