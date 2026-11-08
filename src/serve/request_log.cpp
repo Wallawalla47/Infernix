@@ -937,6 +937,7 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                              {"host_image_demotions", delta(&RuntimeStats::hybrid_ssd_host_image_demotions)},
                              {"host_block_demotions", delta(&RuntimeStats::hybrid_ssd_host_block_demotions)},
                              {"promotions", delta(&RuntimeStats::hybrid_ssd_promotions)},
+                             {"promotion_room_waits", delta(&RuntimeStats::hybrid_ssd_promotion_room_waits)},
                              {"snapshot_evictions", delta(&RuntimeStats::hybrid_ssd_snapshot_evictions)},
                              {"failures", delta(&RuntimeStats::hybrid_ssd_failures)},
                              {"budget_bytes_per_hour", current.hybrid_ssd_budget_bytes_per_hour},

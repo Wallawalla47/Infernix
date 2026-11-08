@@ -2319,6 +2319,8 @@ struct RuntimeStats {
     std::uint64_t hybrid_ssd_host_image_demotions = 0;
     std::uint64_t hybrid_ssd_host_block_demotions = 0;
     std::uint64_t hybrid_ssd_promotions           = 0;
+    // Times a promotion found no Host room while write-backs were in flight and waited for them to land.
+    std::uint64_t hybrid_ssd_promotion_room_waits = 0;
     std::uint64_t hybrid_ssd_snapshot_evictions   = 0;
     std::uint64_t hybrid_ssd_failures             = 0;
     double hybrid_ssd_read_bytes_per_second       = 0.0; // the last promotion of 16 MB or more

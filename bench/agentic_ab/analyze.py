@@ -587,6 +587,7 @@ def ssd_table(arms, ms):
     rows = [("written", "totals", "write_bytes", gb), ("read back", "totals", "read_bytes", gb),
             ("image writes", "totals", "image_writes", count), ("block writes", "totals", "block_writes", count),
             ("promotions to the Host tier", "totals", "promotions", count),
+            ("promotions that waited for a write-back", "totals", "promotion_room_waits", count),
             ("snapshot evictions", "totals", "snapshot_evictions", count),
             ("snapshots declined (write budget)", "totals", "declined_snapshots", count),
             ("images packed", "totals", "packed_images", count),

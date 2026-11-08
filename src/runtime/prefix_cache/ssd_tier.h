@@ -56,14 +56,17 @@ public:
         std::uint64_t packed_images      = 0; // images written as codec streams
         std::uint64_t packed_saved_bytes = 0; // SSD bytes those streams saved
         std::uint64_t policy_nanoseconds = 0; // spent choosing write-backs (start_write_backs)
+        std::uint64_t promotions_waiting_for_room = 0; // promotions told to wait for a write-back to land
         double read_bytes_per_second     = 0.0; // the last promotion's measured rate
         double write_bytes_per_second    = 0.0; // the last write-back's
     };
 
     enum class Promotion : std::uint8_t {
         Ready,       // nothing of the source is only on the SSD
-        Pending,     // reads are in flight: quote it again once poll reports a landing
-        Unavailable, // the Host tier cannot take it now
+        Pending,     // reads are in flight, or the Host tier has no room only while write-backs are in flight
+                     // (their entries are pinned until they land, then clean): quote it again once poll
+                     // reports a landing
+        Unavailable, // the Host tier cannot take it now, and no write-back would change that
     };
 
     // `host_slab(id)` is the address of Host slab `id` (4 KiB-aligned); a slab under a transfer stays
@@ -139,6 +142,8 @@ private:
     [[nodiscard]] bool compute_due(const PrefixCacheIndex& index) const noexcept;
     [[nodiscard]] bool budget_still_blocked(const PrefixCacheIndex& index) const noexcept;
     [[nodiscard]] DirectScratchFile::Batch batch(std::uint64_t tag, DirectScratchFile::Op op, const Job& job) const;
+    // A write-back left flight (landed, failed or refused): its accounting, and a waiting promotion's re-quote.
+    void write_finished(const Job& job) noexcept;
     [[nodiscard]] Staging take_staging();
     void give_staging(Staging staging) noexcept;
     void codec_done(std::uint64_t tag);
@@ -153,6 +158,9 @@ private:
     std::uint32_t writes_in_flight_      = 0;
     std::uint64_t write_slabs_in_flight_ = 0;
     bool promotion_landed_               = false;
+    // A promotion found no room while write-backs pinned Host entries: the next write landing counts as a
+    // landing for poll, so the waiting request is quoted again.
+    bool room_wanted_                    = false;
     std::chrono::steady_clock::time_point next_write_attempt_{};
     std::vector<DirectScratchFile::Completion> completions_;
     Counters counters_;

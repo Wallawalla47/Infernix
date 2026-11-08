@@ -113,6 +113,7 @@ public:
         out.hybrid_ssd_host_image_demotions = ssd.host_image_demotions;
         out.hybrid_ssd_host_block_demotions = ssd.host_block_demotions;
         out.hybrid_ssd_promotions           = ssd.promotions;
+        out.hybrid_ssd_promotion_room_waits = ssd.promotion_room_waits;
         out.hybrid_ssd_snapshot_evictions   = ssd.snapshot_evictions;
         out.hybrid_ssd_failures             = ssd.write_failures + ssd.read_failures;
         out.hybrid_ssd_read_bytes_per_second = ssd.read_bytes_per_second;

@@ -112,6 +112,7 @@ SsdTierStats ssd_tier_stats(const SsdTier* tier, const PrefixIndexStats& index, 
     out.image_writes         = counters.image_writes;
     out.block_writes         = counters.block_writes;
     out.promotions           = counters.promotions;
+    out.promotion_room_waits = counters.promotions_waiting_for_room;
     out.host_image_demotions = index.host_image_demotions;
     out.host_block_demotions = index.host_block_demotions;
     out.snapshot_evictions   = index.ssd_snapshot_evictions;
@@ -293,8 +294,7 @@ void SsdTier::issue_write(PrefixCacheIndex& index, std::uint64_t tag, Job& job) 
         index.abort_ssd_write(job.job);
         ++counters_.write_failures;
         last_error_ = error.what();
-        --writes_in_flight_;
-        write_slabs_in_flight_ -= job.host_slabs;
+        write_finished(job);
         if (job.staging) {
             give_staging(std::move(job.staging));
             packed_write_busy_ = false;
@@ -328,13 +328,22 @@ void SsdTier::apply_codec(PrefixCacheIndex& index) {
                 last_error_ = error.what();
                 ++counters_.write_failures;
                 index.abort_ssd_write(job.job);
-                --writes_in_flight_;
-                write_slabs_in_flight_ -= job.host_slabs;
+                write_finished(job);
                 give_staging(std::move(job.staging));
                 packed_write_busy_ = false;
                 jobs_.erase(tag);
             }
         }
+    }
+}
+
+void SsdTier::write_finished(const Job& job) noexcept {
+    --writes_in_flight_;
+    write_slabs_in_flight_ -= job.host_slabs;
+    if (room_wanted_) {
+        // A promotion waits for room (promote): whatever this write's outcome, it quotes again.
+        room_wanted_      = false;
+        promotion_landed_ = true;
     }
 }
 
@@ -361,8 +370,7 @@ void SsdTier::apply(PrefixCacheIndex& index) {
             }
             land_promotion(index, job, done.ok);
         } else {
-            --writes_in_flight_;
-            write_slabs_in_flight_ -= job.host_slabs;
+            write_finished(job);
             if (done.ok) {
                 counters_.write_bytes += done.bytes;
                 counters_.block_writes += job.job.nodes.size();
@@ -519,7 +527,16 @@ SsdTier::Promotion SsdTier::promote(PrefixCacheIndex& index, SnapshotRef snapsho
     }
     SsdPromotionStart start = index.begin_ssd_promotion(snapshot);
     if (start.status == SsdPromotionStatus::Resident) { return Promotion::Ready; }
-    if (start.status == SsdPromotionStatus::NoRoom) { return Promotion::Unavailable; }
+    if (start.status == SsdPromotionStatus::NoRoom) {
+        // A write-back in flight pins its Host entries until it lands, when they become clean and yield
+        // without loss (a restart refills the Host tier with entries the SSD does not hold yet): wait for it.
+        if (writes_in_flight_ != 0) {
+            room_wanted_ = true;
+            ++counters_.promotions_waiting_for_room;
+            return Promotion::Pending;
+        }
+        return Promotion::Unavailable;
+    }
     if (start.job) {
         const std::uint64_t tag = next_tag_++;
         auto entry              = std::make_unique<Job>();
@@ -570,6 +587,7 @@ void SsdTier::abandon() noexcept {
     writes_in_flight_      = 0;
     write_slabs_in_flight_ = 0;
     packed_write_busy_     = false;
+    room_wanted_           = false;
     promotion_landed_      = true; // waiting requests quote the empty cache again
     due_.store(false, std::memory_order_relaxed);
 }

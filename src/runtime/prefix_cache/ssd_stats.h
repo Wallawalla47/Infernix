@@ -32,6 +32,7 @@ struct SsdTierStats {
     std::uint64_t image_writes         = 0;
     std::uint64_t block_writes         = 0;
     std::uint64_t promotions           = 0;
+    std::uint64_t promotion_room_waits = 0; // times a promotion waited for a write-back to free Host room
     std::uint64_t host_image_demotions = 0; // Host copies given up because the SSD holds them
     std::uint64_t host_block_demotions = 0;
     std::uint64_t snapshot_evictions   = 0; // SSD-only snapshots lost

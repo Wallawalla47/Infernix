@@ -642,7 +642,12 @@ promoted before it binds:
   `hybrid_poll_storage` reports the landing. The request's source is held meanwhile (§9.6), so its
   promoted copies stay; it then binds from the Host tier as in §6.4-§6.5. A binding (`start_binding`)
   never waits: a source found only on the SSD there is stale and the Engine moves to the next.
-- When the Host tier cannot free the slabs (`NoRoom`), the quote takes the best source above the SSD.
+- When the Host tier cannot free the slabs (`NoRoom`) while write-backs are in flight, the quote waits
+  as for a read (`Promotion::Pending`): a write-back I/O-pins its Host entries until it lands, after which
+  they are clean and yield without loss, and the next write landing reports a landing to
+  `hybrid_poll_storage`. A restart needs this: the restore refills the Host tier with entries the SSD
+  does not hold yet and writes them back at once (2026-11-08: a 480 MiB Host tier refused the restored
+  SSD source otherwise). With no write-back in flight, the quote takes the best source above the SSD.
 - The SSD copies stay after a promotion (an inclusive tier): when those blocks leave the Host tier
   again nothing is written.
 - A failed read frees the Host slabs and drops the SSD copies it read (an entry left with no copy
@@ -656,8 +661,9 @@ RAM and writes:
 - A conversation turn writes at most its new blocks and the snapshots retained when the Host tier
   needs their room, once each, within the write budget. The `throughput` record's
   `context_cache.hybrid.ssd` object and `/metrics` (`ssd_context_*`) report the bytes written and read,
-  promotions, demotions and losses; the record also reports the fates by kind, the budget and the
-  bytes the codec saved.
+  promotions, the promotions' waits for write-backs to free Host room (`promotion_room_waits`),
+  demotions and losses; the record also reports the fates by kind, the budget and the bytes the codec
+  saved.
 - The codec keeps at most one staging buffer of an image's kept slabs (Flash-Next FP4-Local:
   118 MB) for reuse, allocated at the first packed write or promotion; a second one is allocated while
   a packed write and a packed promotion overlap.

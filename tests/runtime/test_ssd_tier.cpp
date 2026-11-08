@@ -283,6 +283,72 @@ void test_packed_partial(const std::filesystem::path& directory) {
     index.check_invariants();
 }
 
+// A promotion that finds no Host room while a write-back is in flight waits for it (§5.7: the write pins
+// its entries until it lands, then they are clean and yield without loss; a restart's restored Host
+// entries are in that state): promote says Pending and counts the wait, poll reports the write's landing,
+// and quoting again at each landing ends with the source Ready and its bytes. False when the write landed
+// before the quote (the promotion then simply started), so the caller tries again.
+bool room_wait_once(const std::filesystem::path& directory) {
+    std::filesystem::create_directories(directory);
+    Backend backend;
+    PrefixCacheIndex index(config(17), backend);
+    SsdTier tier(directory, 64, kSlabBytes, [&](std::uint32_t slab) { return backend.slab(slab); });
+    // a: 2 blocks + a 17-slab image, written back, then displaced to the SSD (its blocks stay, clean).
+    const Conversation a = publish(index, backend, 61, 2);
+    for (int i = 0; i < 20 && tier.counters().image_writes == 0; ++i) {
+        (void)tier.poll(index);
+        settle(tier, index);
+    }
+    require(tier.counters().image_writes == 1, "the first endpoint was written back");
+    auto displacing = index.reserve_host_image(false, kAny);
+    require(displacing.has_value(), "a second image displaces the first to the SSD");
+    index.release_host_image(std::move(*displacing));
+    require(index.snapshot(a.endpoint).host == CopyState::Absent, "the first endpoint is SSD-only");
+    // b: 19 Host-only slabs; its write-back starts (lossless room 13 < 24) and pins them. 11 slabs are
+    // free, a's image needs 17, and nothing else may yield: no room until b's write lands.
+    const Conversation b = publish(index, backend, 62, 2);
+    for (int i = 0; i < 20 && !tier.busy(); ++i) { (void)tier.poll(index); }
+    require(tier.busy(), "the second conversation's write-back is in flight");
+    const SsdTier::Promotion first = tier.promote(index, a.endpoint);
+    if (tier.counters().promotions_waiting_for_room == 0) {
+        settle(tier, index);
+        tier.drain(index);
+        return false;
+    }
+    require(first == SsdTier::Promotion::Pending, "no room while a write-back is in flight: the promotion waits");
+    bool ready = false;
+    for (int quote = 0; quote < 50 && !ready; ++quote) {
+        bool landed     = false;
+        const auto stop = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (!landed && std::chrono::steady_clock::now() < stop) {
+            landed = tier.poll(index);
+            if (!landed) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+        }
+        require(landed, "poll reports the landing the waiting promotion needs");
+        const SsdTier::Promotion again = tier.promote(index, a.endpoint);
+        require(again != SsdTier::Promotion::Unavailable, "a waiting promotion is not given up once room comes");
+        ready = again == SsdTier::Promotion::Ready;
+    }
+    require(ready, "the waiting promotion lands");
+    require(tier.counters().promotions == 1, "one promotion landed");
+    const SnapshotView image = index.snapshot(a.endpoint);
+    for (std::size_t k = 0; k < image.host_slabs.size(); ++k) {
+        require(holds(backend, image.host_slabs[k], 1000U + a.endpoint.index * 8U + static_cast<std::uint32_t>(k)),
+                "the promoted image holds its bytes");
+    }
+    require(index.snapshot(b.endpoint).ssd == CopyState::Resident, "b's write-back landed");
+    tier.drain(index);
+    index.check_invariants();
+    return true;
+}
+
+void test_room_wait(const std::filesystem::path& directory) {
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        if (room_wait_once(directory / std::to_string(attempt))) { return; }
+    }
+    require(false, "no promotion met a write-back in flight in 5 attempts (each write landed before the quote)");
+}
+
 // The tier with the codec: state-like images are written packed (fewer SSD bytes) and read back exactly;
 // incompressible ones (the main test's pattern) still go raw through the same pipeline.
 void test_packed_tier(const std::filesystem::path& directory) {
@@ -383,6 +449,7 @@ int main() {
         if (const char* dump = std::getenv("INFERNIX_TEST_CODEC_DUMP"); dump != nullptr && *dump != '\0') { bench_codec(dump); }
         test_packed_tier(directory / "packed");
         test_packed_partial(directory / "partial");
+        test_room_wait(directory / "room");
         Backend backend;
         PrefixCacheIndex index(config(), backend);
         SsdTier tier(directory, 64, kSlabBytes, [&](std::uint32_t slab) { return backend.slab(slab); });
