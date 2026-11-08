@@ -359,6 +359,10 @@ this retained benchmark. An Op-scoped Linear qualification uses this benchmark d
 not load an artifact or invoke the target, Program, Engine, or round benchmarks documented
 elsewhere in this file.
 
+Each row (and CSV line) ends with `out_fnv1a`, the FNV-1a hash of the last timed call's output: the
+activations and weights are generated from fixed seeds, so a schedule or build change that claims the same
+bits shows the same hash in both runs' rows, with no separate test.
+
 Build the benchmark and measure one exact production point:
 
 ```bash

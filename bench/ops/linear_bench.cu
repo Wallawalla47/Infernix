@@ -189,7 +189,16 @@ struct Result {
     int warmup                     = 0;
     int repeat                     = 0;
     std::uint64_t flush_bytes      = 0;
+    // FNV-1a of the last timed call's output bytes: two builds or schedules whose rows show the same hash
+    // computed the same bits (the activations and weights are generated the same way every run).
+    std::uint64_t output_fnv1a     = 0;
 };
+
+std::uint64_t fnv1a(const std::vector<std::uint8_t>& bytes) {
+    std::uint64_t hash = 0xcbf29ce484222325ULL;
+    for (const std::uint8_t byte : bytes) { hash = (hash ^ byte) * 0x100000001b3ULL; }
+    return hash;
+}
 
 struct LinearBenchWeight {
     DeviceBuffer storage;
@@ -807,6 +816,12 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt,
         result.execution   = opt.graph ? "graph" : "eager";
         result.graph_nodes = graph.nodes();
         result.graph_calls = opt.graph_calls;
+        {
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(output.bytes()));
+            CUDA_CHECK(cudaMemcpyAsync(bytes.data(), output.data, bytes.size(), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            result.output_fnv1a = fnv1a(bytes);
+        }
         if (point.t == 1) { t1_median = result.median_us; }
         if (std::isfinite(t1_median)) {
             result.t1_linear_extrapolation =
@@ -898,10 +913,10 @@ void print_header(const Options& opt) {
 
 void print_results(const std::vector<Result>& results) {
     std::printf("%-44s %5s %3s %8s %8s %6s %11s %11s %11s %10s %7s %7s %10s %11s %8s "
-                "%9s %9s %8s\n",
+                "%9s %9s %8s %16s\n",
                 "label", "qt", "pol", "N", "K", "T", "median_us", "min_us", "p95_us", "eff_GB/s",
                 "DRAM_%", "READ_%", "TFLOP/s", "TC_profile", "TC_%", "mem_%", "T1_lin_x",
-                "delta_%");
+                "delta_%", "out_fnv1a");
     for (const Result& result : results) {
         const bool have_delta = std::isfinite(result.delta_pct);
         char delta[32];
@@ -923,13 +938,14 @@ void print_results(const std::vector<Result>& results) {
             std::snprintf(tensor_peak, sizeof(tensor_peak), "-");
         }
         std::printf("%-44s %5s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %7.2f "
-                    "%7.2f %10.2f %11s %8s %9.2f %9s %8s\n",
+                    "%7.2f %10.2f %11s %8s %9.2f %9s %8s %016llx\n",
                     result.labels.c_str(), result.qtype_name, result.policy_name, result.n,
                     result.k, result.t, result.median_us, result.min_us, result.p95_us,
                     result.effective_gbs, result.dram_spec_pct, result.sustained_read_pct,
                     result.useful_tflops,
                     result.tensor_profile[0] == '\0' ? "-" : result.tensor_profile, tensor_peak,
-                    result.memory_floor_pct, t1_linear, delta);
+                    result.memory_floor_pct, t1_linear, delta,
+                    static_cast<unsigned long long>(result.output_fnv1a));
     }
 }
 
@@ -952,7 +968,7 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
            "sustained_read_gbs,sustained_read_pct,useful_tflops,tensor_profile,"
            "tensor_peak_tflops,tensor_peak_pct,memory_floor_us,memory_floor_pct,"
            "t1_linear_extrapolation,delta_pct,"
-           "warmup,repeat,flush_bytes,execution,graph_nodes,graph_calls\n";
+           "warmup,repeat,flush_bytes,execution,graph_nodes,graph_calls,output_fnv1a\n";
     for (const Result& result : results) {
         out << csv_quote(result.labels) << ',' << result.qtype_name << ',' << result.policy_name
             << ',' << result.n << ',' << result.k << ',' << result.t << ',' << result.weight_bytes
@@ -974,7 +990,9 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
         out << ',' << result.warmup << ',' << result.repeat << ',' << result.flush_bytes << ','
             << result.execution << ',';
         if (result.graph_nodes) out << result.graph_nodes;
-        out << ',' << result.graph_calls << '\n';
+        char hash[17];
+        std::snprintf(hash, sizeof(hash), "%016llx", static_cast<unsigned long long>(result.output_fnv1a));
+        out << ',' << result.graph_calls << ',' << hash << '\n';
     }
 }
 
