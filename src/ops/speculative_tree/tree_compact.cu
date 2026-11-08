@@ -4,7 +4,7 @@
 #include "core/device.h"
 #include "core/paged_kv_storage.h"
 #include "core/pdl.cuh"
-#include "infernix/types.h"
+#include "infernix/kv_format.h"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/kv_window.cuh"
 

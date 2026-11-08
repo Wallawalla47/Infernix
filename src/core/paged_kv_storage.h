@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/dtype.h"
-#include "infernix/types.h"
+#include "infernix/kv_format.h"
 
 #include <cstddef>
 #include <cstdint>

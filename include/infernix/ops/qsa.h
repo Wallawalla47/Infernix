@@ -2,7 +2,7 @@
 
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
-#include "infernix/types.h"
+#include "infernix/kv_format.h"
 
 #include <cuda_runtime.h>
 
