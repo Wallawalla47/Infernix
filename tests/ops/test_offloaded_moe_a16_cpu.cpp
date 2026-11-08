@@ -143,10 +143,17 @@ std::int64_t weight_int(const std::uint8_t* matrix, int blocks, int row, int k) 
     return static_cast<std::int64_t>(canon::e2m1_x2(code)) * canon::e4m3_scaled(unit[128 + r]);
 }
 
+void test_row_sums(const moe::ExpertShape& shape, int ncols);
+
+// The exact row sums over every row group at 3 columns, and at 6-8, which the AVX2 and AVX-VNNI kernels run as two
+// column groups a row group (rg16_row_sums_a16).
 void test_row_sums(const moe::ExpertShape& shape) {
+    for (const int ncols : {3, 6, 7, 8}) { test_row_sums(shape, ncols); }
+}
+
+void test_row_sums(const moe::ExpertShape& shape, int ncols) {
     std::mt19937 rng(3);
     const Expert e  = fixtures::random_a16_expert(rng, shape);
-    const int ncols = 3;
     const int hidden = shape.hidden, blocks = shape.gate_up_blocks(), groups = shape.gate_up_row_groups();
     const auto x    = fixtures::wide_range_activations(rng, ncols, hidden);
     std::vector<canon::A16Block> xb(static_cast<std::size_t>(ncols) * blocks);
@@ -171,7 +178,8 @@ void test_row_sums(const moe::ExpertShape& shape) {
                 if (ref != s[static_cast<std::size_t>(row) * ncols + c]) { ++bad; }
             }
         }
-        std::printf("row sums H %d %-12s %s\n", hidden, moe::cpu_isa_name(isa), bad == 0 ? "exact" : "WRONG");
+        std::printf("row sums H %d N %d %-12s %s\n", hidden, ncols, moe::cpu_isa_name(isa),
+                    bad == 0 ? "exact" : "WRONG");
         check(bad == 0, "int64 row sums equal the direct integer dot products");
     }
 }

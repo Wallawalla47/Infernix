@@ -338,10 +338,42 @@ void encode_a16_blocks(const std::uint16_t* v, int emax, int block_begin, int bl
     for (int b = block_begin; b < block_end; ++b) { out[b] = canon::a16_block(v + 16 * b, emax); }
 }
 
+// From this many columns the AVX2 / AVX-VNNI kernels run as two column groups of at most four (candidates YK-06).
+// A half's 5N live vectors exceed the 16 YMM registers from about five columns (35-95 spills at 5-8, candidates
+// §58.3): one thread, AVX-VNNI (7168560d), 6 columns took 428 us against 3 + 3 = 352, 7 took 783 against 4 + 3 = 408
+// and 8 took 719 against 4 + 4 = 465; 5 gain nothing (304 against 3 + 2 = 307). The second group re-reads the row
+// group's ~23 KB from L1/L2, so DRAM traffic is unchanged. Each column's sums are computed on their own, exact
+// integers either way, so the bits are unchanged. AVX-512 (32 registers) keeps one call: unmeasured.
+// Measured as built (2026-11-08, RTX 5090 host, infernix_cpu_rows_bench a16, one thread, same output hashes, median of
+// two runs, one call -> two groups): AVX-VNNI 6 columns 431 -> 372 us, 7: 800 -> 428, 8: 721 -> 489; AVX2 6: 676 ->
+// 606, 7: 833 -> 698, 8: 894 -> 792; 1-5 columns unchanged. Prefill, ABBA of three blocks (fresh processes, pp128 /
+// 255 / 384 / 575): the 122B's pp255 2.2-2.5 % faster in every block (328 against 320 tok/s), its other widths within
+// 0.4 %; FP4-Local within 0.4 % at every width but one block of pp128 (2.1 %, one slow grouped run).
+constexpr int kGroupedColumns = 6;
+
 void rg16_row_sums_a16(CpuIsa isa, const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end,
                        const canon::A16Block* const* acts, int ncols, std::int64_t* out, int prefetch_bytes) {
     if (ncols < 1 || ncols > kMaxColumns) { throw std::invalid_argument("offloaded_moe: ncols must be in [1, 8]"); }
     if (!cpu_isa_supported(isa)) { throw std::invalid_argument("offloaded_moe: unsupported CPU ISA"); }
+    if ((isa == CpuIsa::kAvxVnni || isa == CpuIsa::kAvx2) && ncols >= kGroupedColumns) {
+        const int first = (ncols + 1) / 2;
+        const std::array<std::array<int, 2>, 2> groups{{{0, first}, {first, ncols - first}}};
+        std::int64_t part[16 * 4];
+        for (int rg = rg_begin; rg < rg_end; ++rg) {
+            for (const auto& [begin, count] : groups) {
+                // Only the first group prefetches: the second reads what the first brought in.
+                rg16_row_sums_a16(isa, matrix, blocks, rg, rg + 1, acts + begin, count, part,
+                                  begin == 0 ? prefetch_bytes : 0);
+                for (int r = 0; r < 16; ++r) {
+                    for (int c = 0; c < count; ++c) {
+                        out[(static_cast<std::size_t>(rg - rg_begin) * 16 + r) * ncols + begin + c] =
+                            part[r * count + c];
+                    }
+                }
+            }
+        }
+        return;
+    }
     switch (isa) {
     case CpuIsa::kScalar: row_sums_scalar(matrix, blocks, rg_begin, rg_end, acts, ncols, out); return;
 #if defined(INFERNIX_MOE_X86)
