@@ -19,7 +19,6 @@
 #include "infernix/ops/rmsnorm_rope.h"
 #include "infernix/ops/sliding_window_attention.h"
 #include "infernix/ops/speculative_round.h"
-#include "infernix/ops/top_logprobs.h"
 
 #include <algorithm>
 #include <array>
@@ -168,7 +167,13 @@ void DFlash2::head_candidates(const Tensor& hidden, Tensor& ids, Tensor& scores)
         ops::projection_fp32(hidden, rows_tensor, logits, s);
     }
     const std::int32_t valid = head_ == ProposalHead::Optimized ? rows : dim(parameters_.model.resources().public_token_count);
-    ops::top_logprobs(logits, valid, ids, scores, s);
+    // The candidates' raw logits, by the multi-CTA selection (candidates YK-01): their only consumer,
+    // candidate_selector_path, takes a softmax over each position's 16 edges, which a per-column log-sum-exp
+    // shifts and does not change, so no log-probabilities are needed (top_logprobs ran one CTA a column).
+    // Measured against top_logprobs (2026-11-08, FP4-Local's BF16 text head, DFlash2 and n-gram auto, BF16 KV, three
+    // ABBA blocks of fresh processes, the same tokens): the selection 193.3 -> 40.7 us a round; conv 207.5 -> 210.4
+    // tok/s (0.9-1.8 % in each block), struct 465.3 -> 470.1 (1.0-1.1 %); the reproducible ids unchanged.
+    ops::logits_topk(logits, valid, ids, scores, work_, s);
     if (head_ == ProposalHead::Optimized) {
         Tensor flat = ids.view({kCandidates * columns});
         ops::proposal_remap_token_ids(flat, static_cast<const std::int32_t*>(head.token_ids.data), rows, s);
@@ -306,8 +311,11 @@ std::size_t DFlash2::workspace_bytes(const TextConfig& text, const DFlash2Config
         head = ops::linear_topk_workspace_capacity_bytes(config.head_rows == 131072U ? QType::Q4_G64_FP16 : kQ8,
                                                          dim(config.head_rows), dim(H), 1, dim(masks));
     } else {
+        // The FP32 logits, then either the GGUF head's decode scratch or logits_topk's selection scratch (the
+        // projection's scratch is released before the selection allocates).
         head = static_cast<std::size_t>(config.head_rows) * masks * 4 + kSlack +
-               (config.ggml_head ? ops::ggml_linear_workspace_bytes(dim(H), dim(masks)) : 0);
+               std::max(config.ggml_head ? ops::ggml_linear_workspace_bytes(dim(H), dim(masks)) : std::size_t{0},
+                        ops::logits_topk_workspace_capacity_bytes(dim(config.head_rows), 1, dim(masks)) + kSlack);
     }
     std::size_t selector = ops::candidate_selector_path_workspace_capacity_bytes(1, max_width - 1, 1, max_batch);
     for (const QType format : {kQ8, QType::BF16}) {

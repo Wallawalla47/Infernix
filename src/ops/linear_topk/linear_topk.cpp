@@ -340,4 +340,53 @@ void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_
     execute(hidden, head, &row_to_global_ids, candidate_ids, candidate_scores, workspace, stream);
 }
 
+std::size_t logits_topk_workspace_capacity_bytes(std::int32_t rows, std::int32_t min_columns, std::int32_t max_columns) {
+    if (rows < detail::kLinearTopK || min_columns < 1 || max_columns < min_columns) {
+        throw std::invalid_argument("logits_topk workspace: invalid rows or column interval");
+    }
+    // A call runs in chunks of at most kLinearTopKMaxChunkColumns columns; every chunk width up to the widest
+    // reachable one is counted (the scratch grows with the width, so the widest decides).
+    WorkspaceLayoutBuilder layout;
+    const std::int32_t widest = std::min(max_columns, detail::kLinearTopKMaxChunkColumns);
+    for (std::int32_t columns = 1; columns <= widest; ++columns) {
+        auto scope = layout.scope();
+        (void)detail::allocate_linear_topk_workspace(layout, rows, columns, detail::kLinearTopKGroupedRows);
+    }
+    return layout.peak_bytes();
+}
+
+void logits_topk(const Tensor& logits, std::int32_t valid_rows, Tensor& candidate_ids, Tensor& candidate_scores,
+                 WorkspaceArena& workspace, cudaStream_t stream) {
+    if (logits.dtype != DType::FP32 || logits.ne[1] <= 0 || logits.ne[2] != 1 || logits.ne[3] != 1 ||
+        !logits.is_contiguous() || valid_rows < detail::kLinearTopK || valid_rows > logits.ne[0]) {
+        throw std::invalid_argument("logits_topk: invalid logits or valid_rows");
+    }
+    const std::int32_t total = logits.ne[1];
+    const auto require_output = [&](const Tensor& tensor, DType dtype, const char* label) {
+        if (tensor.dtype != dtype || tensor.ne[0] != detail::kLinearTopK || tensor.ne[1] != total ||
+            tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() || !aligned_to(tensor.data, 16)) {
+            throw std::invalid_argument(std::string("logits_topk: invalid ") + label); // the merge stores float4
+        }
+    };
+    require_output(candidate_ids, DType::I32, "candidate_ids");
+    require_output(candidate_scores, DType::FP32, "candidate_scores");
+    if (overlaps(logits, candidate_ids) || overlaps(logits, candidate_scores) ||
+        overlaps(candidate_ids, candidate_scores)) {
+        throw std::invalid_argument("logits_topk: input and outputs must not overlap");
+    }
+    for (std::int32_t first = 0; first < total;) {
+        const std::int32_t columns = std::min(detail::kLinearTopKMaxChunkColumns, total - first);
+        auto scope                 = workspace.scope();
+        const auto scratch =
+            detail::allocate_linear_topk_workspace(workspace, logits.ne[0], columns, detail::kLinearTopKGroupedRows);
+        require_scratch_nonoverlap(logits, candidate_ids, candidate_scores, nullptr, scratch);
+        const Tensor x     = column_slice(logits, first, columns);
+        Tensor out_ids     = column_slice(candidate_ids, first, columns);
+        Tensor out_scores  = column_slice(candidate_scores, first, columns);
+        detail::linear_topk_logits_launch(x, valid_rows, scratch, stream);
+        detail::linear_topk_merge_launch(scratch, out_ids, out_scores, stream);
+        first += columns;
+    }
+}
+
 } // namespace infernix::ops

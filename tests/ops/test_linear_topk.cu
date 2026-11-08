@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -490,6 +491,87 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
 }
 
 } // namespace
+
+// logits_topk (candidates YK-01, the DFlash2 head without a fused head): every column's 16 largest FP32 logits of
+// rows [0, valid_rows), descending, equal values by lower row, the logits themselves as scores. Exact oracle: a host
+// sort of the same values. Values are drawn from few levels so ties are common; rows past valid_rows hold the
+// largest values and must never appear. Row counts: a small head, the 131,072-row proposal head, the full head
+// (248,077 valid of 248,320); column counts across one, several and two 128-column chunks.
+int run_logits_topk(std::int32_t rows, std::int32_t valid_rows, int columns) {
+    std::mt19937 rng(static_cast<std::uint32_t>(rows * 131 + columns));
+    std::uniform_int_distribution<int> level(-40, 40);
+    std::vector<float> host(static_cast<std::size_t>(rows) * columns);
+    for (int c = 0; c < columns; ++c) {
+        for (std::int32_t r = 0; r < rows; ++r) {
+            host[static_cast<std::size_t>(c) * rows + r] = r < valid_rows ? 0.25F * static_cast<float>(level(rng)) : 1.0e6F;
+        }
+    }
+    GuardedDeviceBuffer logits(host.size() * sizeof(float));
+    cuda_check(cudaMemcpy(logits.data(), host.data(), logits.bytes(), cudaMemcpyHostToDevice), "copy logits");
+    GuardedDeviceBuffer out_ids(static_cast<std::size_t>(kTopK) * columns * 4);
+    GuardedDeviceBuffer out_scores(static_cast<std::size_t>(kTopK) * columns * 4);
+    const std::size_t exact = ops::logits_topk_workspace_capacity_bytes(rows, columns, columns);
+    GuardedDeviceBuffer scratch(exact);
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), exact});
+    Tensor logits_tensor(logits.data(), DType::FP32, {rows, columns});
+    Tensor ids_tensor(out_ids.data(), DType::I32, {kTopK, columns});
+    Tensor scores_tensor(out_scores.data(), DType::FP32, {kTopK, columns});
+    ops::logits_topk(logits_tensor, valid_rows, ids_tensor, scores_tensor, workspace, nullptr);
+    cuda_synchronize();
+    const auto ids    = from_device<std::int32_t>(out_ids.data(), static_cast<std::size_t>(kTopK) * columns);
+    const auto scores = from_device<float>(out_scores.data(), static_cast<std::size_t>(kTopK) * columns);
+    int failures = 0;
+    std::vector<std::int32_t> order(static_cast<std::size_t>(valid_rows));
+    for (int c = 0; c < columns && failures == 0; ++c) {
+        const float* column = host.data() + static_cast<std::size_t>(c) * rows;
+        for (std::int32_t r = 0; r < valid_rows; ++r) { order[static_cast<std::size_t>(r)] = r; }
+        std::partial_sort(order.begin(), order.begin() + kTopK, order.end(), [&](std::int32_t a, std::int32_t b) {
+            return column[a] != column[b] ? column[a] > column[b] : a < b;
+        });
+        for (int k = 0; k < kTopK; ++k) {
+            const std::size_t at = static_cast<std::size_t>(c) * kTopK + k;
+            if (ids[at] != order[static_cast<std::size_t>(k)] || scores[at] != column[order[static_cast<std::size_t>(k)]]) {
+                std::cerr << "logits_topk rows " << rows << " valid " << valid_rows << " columns " << columns
+                          << ": column " << c << " rank " << k << " gave " << ids[at] << " (" << scores[at]
+                          << "), expected " << order[static_cast<std::size_t>(k)] << '\n';
+                ++failures;
+                break;
+            }
+        }
+    }
+    failures += out_ids.verify_guards("logits_topk ids tail");
+    failures += out_scores.verify_guards("logits_topk scores tail");
+    failures += scratch.verify_guards("logits_topk workspace tail");
+    if (from_device<float>(logits.data(), host.size()) != host) {
+        std::cerr << "logits_topk modified its logits\n";
+        ++failures;
+    }
+    if (workspace.used() != 0 || workspace.peak_used() > exact) {
+        std::cerr << "logits_topk workspace scope/peak failure\n";
+        ++failures;
+    }
+    std::cout << "logits_topk rows " << rows << " valid " << valid_rows << " columns " << columns << ": "
+              << (failures == 0 ? "exact" : "WRONG") << '\n';
+    return failures;
+}
+
+INFERNIX_OP_TEST(logits_topk) {
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    try {
+        int failures = 0;
+        for (const int columns : {1, 2, 7, 16, 32}) { failures += run_logits_topk(1000, 777, columns); }
+        for (const int columns : {1, 14, 129}) { failures += run_logits_topk(kShortRows, kShortRows, columns); }
+        for (const int columns : {1, 7, 56}) { failures += run_logits_topk(kFullRows, kValidRows, columns); }
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " logits_topk\n";
+        return failures == 0 ? 0 : 1;
+    } catch (const std::exception& error) {
+        std::cerr << "logits_topk: " << error.what() << '\n';
+        return 1;
+    }
+}
 
 INFERNIX_OP_TEST(linear_topk) {
     if (cuda_unavailable()) {

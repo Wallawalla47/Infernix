@@ -3986,6 +3986,22 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
     unchanged (106.1 / 106.0 µs). Cold op: proposal head at 7 columns 131.5 → 115.0 µs; 27B's at
     8 columns 237.9 → 219.4. `infernix_bench` (three reps, identical rounds and acceptance):
     greedy +0.11 %, struct −0.09 %, overlapping ranges; ~0.1 % is below what that A/B resolves.
+- **The DFlash2 head without a fused head: the same selection over its FP32 logits (adopted
+  2026-11-08, candidates YK-01).** FP4-Local, Huihui, recipes A and C, IQ3_S and the FP8 import
+  materialize the head's FP32 logits and took `ops::top_logprobs` (one CTA a column, a log-sum-exp per
+  column). TL-01 kept that form because a split log-sum-exp would change the values. The only
+  consumer, `candidate_selector_path`, softmaxes each position's 16 edges, which a per-column shift
+  leaves unchanged, so `ops::logits_topk` (one CTA per 128 rows reading every column, then the merge
+  above) returns the raw logits as scores: the same ids (exact-oracle test, ties included), drafts
+  that may differ only by FP32 rounding of the edges, outputs unchanged on the reproducible and
+  lossless routes. This covers the default route (`--lm-head-draft` off); with it, FP4-Local's
+  proposal head is fused and unaffected.
+  - **Measured** against `top_logprobs` (FP4-Local's BF16 text head, DFlash2 and n-gram auto, BF16
+    KV; a temporary switch since removed). Engine trace (struct, 1,024 tokens, 135 rounds): the
+    selection 193.3 → 40.7 µs a round (34.7 per-group pass, 3.0 select, 3.0 final). Decode, three ABBA
+    blocks of fresh processes, the same tokens and acceptance: conv 207.5 → 210.4 tok/s (0.9-1.8 % in
+    each block), struct 465.3 → 470.1 (1.0-1.1 %). The reproducible ids (two 256-token segments) are
+    byte-equal between the two selections.
 - **Few-row Q8 route for the hyper-connection down projections (adopted).**
   - **Problem.** The MTP-round profile showed the [324, 10240] and [320, 10240] projections
     (96 calls per token) on 41 eight-row CTAs at ~0.4 TB/s: 9.5 µs per call, ~0.9 ms per round,

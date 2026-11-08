@@ -67,4 +67,28 @@ void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_
                  Tensor& candidate_ids, Tensor& candidate_scores, WorkspaceArena& workspace,
                  cudaStream_t stream);
 
+/**
+ * Returns the caller-owned transient capacity logits_topk needs for every column count in the inclusive
+ * `[min_columns,max_columns]` interval over `rows` physical rows. All three are positive.
+ */
+[[nodiscard]] std::size_t logits_topk_workspace_capacity_bytes(std::int32_t rows, std::int32_t min_columns,
+                                                               std::int32_t max_columns);
+
+/**
+ * @brief The top sixteen of materialized FP32 logits per column, by linear_topk's multi-CTA selection.
+ *
+ * @details `logits` is contiguous finite FP32 `[physical_rows,U]` with `16 <= valid_rows <= physical_rows`; rows
+ * `[valid_rows,physical_rows)` never participate. `candidate_ids` is contiguous I32 `[16,U]` and `candidate_scores`
+ * contiguous FP32 `[16,U]`: per column the 16 largest logits in descending order, equal values by lower row, and
+ * the logits themselves as scores (no log-sum-exp). The ids are therefore top_logprobs' ids for the same logits;
+ * a consumer that needs only differences between one column's scores (a softmax over the candidates) reads the same
+ * values top_logprobs' log-probabilities would give it, shifted. One CTA per 128 rows reads every column, instead
+ * of one CTA per column.
+ *
+ * `logits` is preserved; both outputs are completely overwritten. Inputs, outputs and workspace must not overlap.
+ * The Op has no persistent state and performs no internal device allocation.
+ */
+void logits_topk(const Tensor& logits, std::int32_t valid_rows, Tensor& candidate_ids, Tensor& candidate_scores,
+                 WorkspaceArena& workspace, cudaStream_t stream);
+
 } // namespace infernix::ops

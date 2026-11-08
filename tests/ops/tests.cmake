@@ -174,6 +174,11 @@ infernix_add_family_op_test(infernix_lossless_kv_encode_test FAMILY lossless
 infernix_add_family_op_test(infernix_linear_topk_test FAMILY sampling
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES infernix_ops)
+# logits_topk: the multi-CTA top sixteen of materialized FP32 logits (the DFlash2 heads without a fused head)
+# against a host sort, ties and a valid-row cut included.
+infernix_add_family_op_test(infernix_logits_topk_test FAMILY sampling
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
+  LIBRARIES infernix_ops)
 
 # Screened vocabulary heads at Qwen3.8-Flash-Next's shapes (q4 proposal head, BF16 and q8 LM heads with
 # their 2-bit screens): screen scores against FP64, rescored rows against projection_fp32's bits, the
