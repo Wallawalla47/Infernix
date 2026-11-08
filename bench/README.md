@@ -512,7 +512,11 @@ the exact W4A16 wide route, or `a16x2`, expert-a4-residual), and `--bank ggml --
 exact|bf16|a8` GGUF records at Flash-Next's geometry (`bf16` takes the BF16 stage-decode tiles from 4,096 columns,
 `kGgmlStageDecodeMinColumns`, the exact tiles below it). `--staging-slots 0` (frames only) runs one pass over every
 job with no staging, the shape of a decode call's resident pass; with `--cold` and decode widths it times the narrow
-expert kernels as decode and verification find them. Each line ends with an FNV-1a hash of the call's outputs (equal
+expert kernels as decode and verification find them. `--graph` times the call as the engine replays it: captured in a
+CUDA graph (its passes' programmatic dependencies become edges, which eager launches serialize) and replayed, with the
+call's x encoding (`moe_experts_prepare`, which the engine runs beside the router) done before the timed interval.
+The CUDA event timer resolves 2.048 µs on Windows here, so decode-width comparisons read kernel spans from an `nsys`
+trace instead of the printed median. Each line ends with an FNV-1a hash of the call's outputs (equal
 hashes: bit-identical outputs across builds and runs; a line reports output values no launch wrote). `--dump
 <prefix>` writes each call's dispatch and outputs (`<prefix>_T<tokens>_<placement>.bin`, an int32 header then the
 offsets, jobs, entries and BF16 outputs) for comparing runs entry by entry, and `--fill-workspace <byte>` sets the
@@ -525,6 +529,7 @@ experts workspace to that byte before each width's calls.
 ./build/bench/infernix_offloaded_moe_wide_bench --bank ggml --formats iq3_s,iq4_nl --ggml-wide exact --tokens 512,2048,4096 --placement frames
 ./build/bench/infernix_offloaded_moe_wide_bench --bank ggml --formats iq3_s,iq4_nl --ggml-wide a8 --tokens 512,2048,4096 --placement frames
 ./build/bench/infernix_offloaded_moe_wide_bench --bank ggml --formats iq3_s,iq4_nl --ggml-wide a8 --tokens 1,2,4,8 --placement frames --staging-slots 0 --cold
+./build/bench/infernix_offloaded_moe_wide_bench --activation a16 --tokens 1,2,3,4,8 --placement frames --staging-slots 0 --cold --graph
 ```
 
 ## LinearTopK Op benchmark

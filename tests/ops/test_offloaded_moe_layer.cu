@@ -1752,10 +1752,12 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
             test_tail_skip(96, 16, 10, 8, 409); // two verify rows: past the fork route, wide experts never skipped
         }
         // W4A16 experts (§16.2.1): decode, verification, several columns per expert, many misses, and
-        // a short prompt's call. The narrow jobs of calls of at most 4,096 columns take the tensor-core narrow
-        // kernels (64 before 2026-11-03), a wider call's narrow jobs the dp4a multi-column kernels.
+        // a short prompt's call. The narrow jobs of calls of at most three columns take the row-pair kernels
+        // (design §19.3.52), of at most 4,096 the tensor-core narrow kernels (64 before 2026-11-03), a wider call's
+        // narrow jobs the dp4a multi-column kernels.
         constexpr auto kA16 = moe::ExpertActivation::kA16;
         test_layer(12, 1, 10, 41, kA16);
+        test_layer(16, 2, 10, 45, kA16); // the row-pair kernels' two-column jobs (most of 16 experts take both)
         test_layer(24, 8, 10, 43, kA16);
         test_layer(9, 5, 3, 47, kA16);
         test_layer(9, 4, 3, 53, kA16);

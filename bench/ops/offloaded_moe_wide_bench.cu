@@ -31,10 +31,12 @@
 //                                   [--repeat 10] [--seed N]
 //                                   [--columns-per-expert C] [--split-scales] [--geometry flash-next|122b]
 //                                   [--bank nvfp4|ggml] [--formats iq3_s,iq4_nl] [--ggml-wide exact|bf16|a8]
-//                                   [--staging-slots 64] [--dump <prefix>]
+//                                   [--staging-slots 64] [--graph] [--dump <prefix>]
 //
 // --staging-slots 0 (frames only) runs one pass over every job with no staging, the shape of a decode call's
-// resident pass.
+// resident pass. --graph times the call as the engine runs it: captured in a CUDA graph (its passes' programmatic
+// dependencies are captured edges; eager launches serialize every kernel) and replayed, with the call's x encoding
+// (moe_experts_prepare, which the engine runs on a side stream beside the router) done before the timed interval.
 // --columns-per-expert C routes uniformly instead (every used expert gets exactly C columns while
 // 10 T / C <= 512); --split-scales gives every expert distinct gate and up input scales, which keeps
 // experts of more than eight columns off the wide route (W4A4 only).
@@ -90,6 +92,7 @@ struct Options {
     QType ggml_down        = QType::GGML_IQ4_NL;
     bool ggml_a8           = false; // --ggml-wide a8
     int staging_slots      = kStagingSlots; // 0: one pass over every job, no staging (a decode call's resident pass)
+    bool graph             = false;         // the call captured in a CUDA graph and replayed, x prepared before it
 };
 
 // The layer under test (--geometry, --bank).
@@ -206,6 +209,8 @@ Options parse_options(int argc, char** argv) {
             if (ggml_wide != "exact" && ggml_wide != "bf16" && ggml_wide != "a8") {
                 throw std::invalid_argument("--ggml-wide takes exact, bf16 or a8");
             }
+        } else if (arg == "--graph") {
+            options.graph = true;
         } else if (arg == "--staging-slots") {
             options.staging_slots = std::stoi(value());
             if (options.staging_slots < 0 || options.staging_slots > kStagingSlots) {
@@ -448,8 +453,36 @@ void run_point(Fixture& fixture, int tokens, const Options& options, bench::L2Fl
         // A sentinel no output can hold (0xFFFF, a BF16 NaN with every payload bit set; the kernels write the
         // canonical 0x7FC0) shows entries that no launch wrote, which the hash would otherwise read uninitialized.
         bench::fill_bytes(outputs.p, 0xFF, outputs.bytes);
-        const auto timing = options.cold ? bench::measure_cold_launch(launch, *flush, stream, options.warmup, options.repeat)
-                                         : bench::measure_launch(launch, stream, options.warmup, options.repeat);
+        bench::ColdTiming timing{};
+        if (options.graph) {
+            const bool prepares = ops::moe_experts_prepares(tx, source, max_jobs, workspace.p, out);
+            const auto prepare  = [&](cudaStream_t s) {
+                if (prepares) { ops::moe_experts_prepare(tx, source, max_jobs, workspace.p, out, s); }
+            };
+            prepare(stream); // one eager call first: the launchers' one-time attribute setup is not captured
+            ops::moe_experts(tx, dispatch, source, g_geometry.top_k, max_jobs, workspace.p, out, stream, true, false, prepares);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            bench::TimedGraph graph;
+            graph.capture(stream, [&](cudaStream_t s) {
+                ops::moe_experts(tx, dispatch, source, g_geometry.top_k, max_jobs, workspace.p, out, s, true, false, prepares);
+            });
+            for (int i = 0; i < options.warmup; ++i) {
+                if (options.cold) { bench::flush_l2(*flush, stream); }
+                prepare(stream);
+                graph.launch(stream);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::vector<double> samples;
+            for (int i = 0; i < options.repeat; ++i) {
+                if (options.cold) { bench::flush_l2(*flush, stream); }
+                prepare(stream);
+                samples.push_back(graph.launch_timed(stream));
+            }
+            timing = bench::summarize_timings(std::move(samples));
+        } else {
+            timing = options.cold ? bench::measure_cold_launch(launch, *flush, stream, options.warmup, options.repeat)
+                                  : bench::measure_launch(launch, stream, options.warmup, options.repeat);
+        }
         const double tflops = g_geometry.expert_flops() * wide_entries / (timing.median_us * 1e-6) / 1e12;
         // FNV-1a of the outputs: equal hashes mean bit-identical results across kernel versions.
         std::vector<std::uint8_t> bytes(outputs.bytes);
@@ -509,10 +542,11 @@ int main(int argc, char** argv) {
             g_geometry.down    = options.ggml_down;
         }
         DeviceContext context;
-        std::printf("# gpu=%s geometry=%s bank=%s timed=moe_experts (routing and dispatch untimed%s) activation=%s narrow=%s "
+        std::printf("# gpu=%s geometry=%s bank=%s timed=moe_experts (routing and dispatch untimed%s%s) activation=%s narrow=%s "
                     "wide=%s staging_slots=%d\n",
                     context.props.name, options.geometry_122b ? "122b" : "flash-next", options.ggml ? "ggml" : "nvfp4",
-                    options.cold ? ", L2 flushed before each call" : "", options.a16 ? "a16" : "a4",
+                    options.cold ? ", L2 flushed before each call" : "",
+                    options.graph ? ", a CUDA graph replay, x prepared before it" : "", options.a16 ? "a16" : "a4",
                     options.narrow_a16 == moe::NarrowA16::kA4Residual ? "a4r"
                     : options.narrow_a16 == moe::NarrowA16::kA8 || options.ggml_a8 ? "a8"
                                                                                     : "exact",

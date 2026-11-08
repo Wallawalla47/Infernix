@@ -12828,6 +12828,91 @@ first in both reps), then 51 against none in ABBA order, four reps, 60.42 -> 62.
 The FP8 banks' prompt split keeps no share (`split_wide_keep_below`: never measured there). GGUF banks keep their
 rule (share forms at every width measured slower on IQ3_S, 2026-10-31).
 
+### 19.3.52 NVFP4 W4A16 decode calls on register-resident row pairs (2026-11-08; exact, same bits; default)
+
+**What.** The narrow jobs of decode and verification calls of at most three columns (`kA16RowsMaxColumns`) of NVFP4
+W4A16 experts at Flash-Next's geometry (NVIDIA FP4-Local at its 16-bit expert activations, Huihui FP4-Local, recipe C,
+the uncensored NVFP4) now run `ops/offloaded_sparse_moe/cuda/narrow_rows_a16.cuh` instead of §19.3.40's tensor-core
+kernels, which keep calls of 4 to 4,096 columns. They derive from ninferpro's row-pair kernels (`f4ffe290a7`,
+`0bfc3f747d`, `1b4d12c352`, `f48f1c051a`; Apache-2.0), ported onto Infernix's types and retuned:
+
+- The call's x is encoded once into `A16Act` blocks (the one-pass kernels' dp4a layout, X = lo + 256 mid + 65536 hi)
+  in the workspace's x rows, with its column exponents, and its jobs' h counts are cleared.
+- Gate/up: a CTA per (row group, job), eight warps; warp w holds the row group's blocks 20 w .. 20 w + 19 (ninferpro:
+  w, w + 8, ...), lane 8 s + i rows i and i + 8 of units s, s + 4, ... Every unit's code words and scales are loaded
+  into registers at the CTA's start (2,880 contiguous bytes in flight a warp) and kept for all of the job's columns.
+  A row's P_b is three dp4a chains wrapping to the exact int32, times `e4m3_scaled` from a shared-memory table: the
+  same int64 S as the tensor-core kernels and the CPU engine, so the same bits. Each h element is counted
+  (`red.release`) on its job.
+- Down: a CTA per four output row groups, its weights loaded before it waits on its own job's h count (acquire,
+  bounded by `kDownReadyTimeoutNs` through the call's error word) instead of the gate/up grid's PDL wait, so a job's
+  down CTAs start once that job's h is complete; each column's h is encoded under its own exponent in shared memory.
+- Three CTAs an SM (80 registers, no local memory in the SASS).
+
+**Why there.** A one-column call reads 27.6 MB of records (ten experts of 2.76 MB). The achievable DRAM read rate here
+is 1.59 TB/s (the bench's 256 MiB L2 flush takes 168.7 µs), so its floor is 17.4 µs. The tensor-core kernels took
+28.1 µs with too few bytes in flight: their gate/up kernel holds two CTAs of four warps an SM (shared memory), 1.19
+active warps a scheduler, 32 % of DRAM peak (ncu, serialized launches). The row-pair gate/up kernel keeps 5.0 active
+warps a scheduler, each with all of its loads issued at once, and stalls on memory (`lg_throttle`, long scoreboard)
+at 43 % of DRAM peak. From four columns both stream at the floor, and the MMA's n serves every column at once.
+
+**Measured** (RTX 5090 at P0, 2,400 MHz SM clock throughout; `infernix_offloaded_moe_wide_bench --activation a16
+--placement frames --staging-slots 0 --cold --graph`, a temporary switch since removed). `--graph` (new) times the
+call as the engine replays it: captured in a CUDA graph, its passes' programmatic dependencies as edges, x prepared
+before the timed interval; eager launches serialize every kernel and overstated the tensor-core kernels (T = 1: 43.6
+µs eager). The event timer quantizes at 2.048 µs here, so the times are nsys kernel spans (first gate/up start to last
+down end, median of 30 replays, forms in rotated order); the output hashes are equal at every T.
+
+| Columns | Tensor cores (µs) | Row pairs (µs) | Ratio | Floor at 1.59 TB/s |
+|---|---|---|---|---|
+| 1 | 28.1 | 21.6 | 0.77x | 17.4 |
+| 2 | 44.5 | 36.9 | 0.83x | 34.8 |
+| 3 | 52.9 | 50.8 | 0.96x | 50.4 |
+| 4 | 65.0 | 64.9 | 1.00x | 64.3 |
+| 5 | 75.1 | 74.8 | 1.00x | |
+| 6 | 91.6 | 90.3 | 0.99x | |
+| 8 | 107.9 | 108.3 | 1.00x | |
+
+From four columns the forms are level, so wider calls keep the tensor-core kernels (one kernel set where they tie).
+ninferpro's warp units (warp w taking blocks w, w + 8, ...) gave 21.7 and 37.3 µs at one and two columns, but at three
+and four tied and lost 3 % by the bench's event time (57.3 against 57.4, 71.7 against 69.7 µs); a warp's contiguous
+2,880 bytes fixed both.
+
+**Rejected** (all exact, equal hashes, all slower at one column):
+
+- The persistent producer pass in the 122B narrow ring's form (`narrow_ring_a16.cuh`), the other strategy: a cp.async
+  producer warp and four tensor-core consumer warps, three CTAs an SM, 36.9 µs (bench event time; its producers slept
+  on job readiness, 22.7 M instructions); then a TMA bulk ring (`cp.async.bulk`, mbarriers), one CTA an SM, eight
+  consumers, 46-51 µs (each down task's h made a round trip through L2 per consumer).
+- The two combined, persistent row pairs: while a CTA computes a task the next task's weights load into a second
+  register set, down tasks lagged behind their job's gate/up tasks. A task counter 31.0 µs (its fetch at a barrier),
+  static assignment 26.6, a whole round's lag 24.3, contiguous units 23.8 (two columns 39.6; level at three and four).
+  Two register sets allow two CTAs an SM, likely fewer bytes in flight than three single-set CTAs.
+- Four CTAs an SM (64 registers): 41 spilled registers, 32.8 µs by event time (the plain form 26.7 there). Eight codes
+  a word (`prmt` sign replication instead of a quad per row): 214 spilled, 58.3 µs. The gate/up CTAs prefetching
+  their job's down matrix into L2: 24.7 µs (DRAM already the limit then).
+
+The shared-memory scale table alone measured level and was kept (fewer ALU operations than decoding each scale).
+Not measured: the op at staged placements (the engine A/B below includes staged and CPU-served jobs).
+
+**Test.** `infernix_offloaded_moe_layer_test` gains a two-column call (16 experts, top-10: most jobs of two columns)
+beside its one- and three-column W4A16 calls; every placement, staging pass, CPU share and SSD-tier read against
+`expert_forward_a16`'s bits. The forms passed it at every width up to eight with the switch. The op bench's output
+hashes are the tensor-core kernels' at T = 1, 2, 3, 4, 6 and 8. FP4-Local's CLI (greedy, 320 to 400 tokens, a cold
+expert cache, so staged and CPU-served jobs too) printed the same ids as the build before this change on the
+reproducible and the default route, plain and DFlash2 auto.
+
+**End to end** (FP4-Local, `infernix_bench`, BF16 KV, the n-gram volume, every run from the same saved expert state,
+one binary with the switch, three ABBA blocks of fresh processes):
+- The conv fixture (38-token prompt, 512 tokens plain: one-column calls): 122.61 -> 124.91 tok/s, +1.6 / +2.7 / +1.4 %
+  by block, every block ahead (the first pair ran low in both arms, 114.4 / 116.6: the first processes after the
+  build).
+- The struct fixture (DFlash2 auto to 4,096 tokens): 436.84 -> 437.64 tok/s, +0.10 / +0.01 / +0.44 % by block, the same
+  534 rounds and 3,562 accepted drafts in every run. Its verification calls are mostly of seven or eight columns
+  (6.8 drafts a round), which keep the tensor-core kernels.
+- Not timed: long contexts, the reproducible route (it takes the same kernels), Huihui FP4-Local, recipe C and the
+  uncensored NVFP4 (same kernels, same bits).
+
 ---
 
 ## 20. Documentation and authority changes

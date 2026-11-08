@@ -1,9 +1,10 @@
 // The tensor-core narrow route of NVFP4 W4A16 experts (design §16.2.1's arithmetic, §19.3.40), included by
 // moe_layer.cu after the A16 narrow kernels: the jobs of at most moe::kMaxColumns columns of a call of at most
 // moe::wide::kA16NmmaCallColumns columns (decode, verification and prefill up to 4,096 columns; wider jobs keep the wide
-// route) on the exact narrow arithmetic at Qwen3.8-Flash-Next's geometry (a16_nmma_call). Every row sum
-// S = sum_b e4m3_scaled(s_b) P_b is the same int64 as the dp4a kernels' and the CPU engine's, so the outputs are
-// theirs bit for bit wherever an expert runs.
+// route) on the exact narrow arithmetic at Qwen3.8-Flash-Next's geometry (a16_nmma_call), except calls of at most
+// kA16RowsMaxColumns columns, which take the row-pair kernels (narrow_rows_a16.cuh: faster there, level from four).
+// Every row sum S = sum_b e4m3_scaled(s_b) P_b is the same int64 as the dp4a kernels' and the CPU engine's, so the
+// outputs are theirs bit for bit wherever an expert runs.
 //
 // - The call's x is encoded once (a16_nmma_prepare_kernel) into the workspace's x limb rows (a16_limbs.cuh) with its
 //   column exponents, and the jobs' gate/up CTA counts are cleared.
