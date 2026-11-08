@@ -243,6 +243,7 @@ bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, cudaStream_t pr
     if (tail != capture.tail_page.has_value() || capture.tail.size() >= pc::kBlockTokens) {
         throw std::invalid_argument("Qwen4Exp prefix cache: a capture's tail does not match its page");
     }
+    if (ssd_) { make_lossless_room(host_.image_slabs + (tail ? 1U : 0U)); }
     auto image = index_->reserve_host_image(tail, capture.claim);
     if (!image) {
         ++counters_.taps_skipped;
@@ -306,6 +307,7 @@ void PrefixCache::copy_capture_group(std::uint32_t group, std::uint32_t lane, co
 }
 
 std::optional<std::uint64_t> PrefixCache::open_staged_capture(bool tail, double claim) {
+    if (ssd_) { make_lossless_room(host_.image_slabs + (tail ? 1U : 0U)); }
     auto image = index_->reserve_host_image(tail, claim);
     if (!image) {
         ++counters_.taps_skipped;
@@ -475,6 +477,20 @@ void PrefixCache::drain() {
 bool PrefixCache::poll_ssd() {
     service_ssd();
     return std::exchange(ssd_landed_, false);
+}
+
+void PrefixCache::make_lossless_room(std::uint64_t slabs) {
+    // Landed captures and writes join the index, write-backs start for what is unwritten (the lowest
+    // value first) and land, until the reservation can displace copies the SSD holds or nothing more
+    // can be written. Without the wait a just-finished request's endpoint, published but not yet
+    // written when the next request's first capture arrived, was evicted unwritten whenever no
+    // write-back had started in between (hybrid-prefix-cache-spec §5.7). Each pass either returns or
+    // lands a transfer, and a snapshot is written once, so the loop ends.
+    while (index_->host_lossless_slabs() < slabs) {
+        service_ssd();
+        if (index_->host_lossless_slabs() >= slabs || !ssd_->busy()) { return; }
+        ssd_->drain(*index_);
+    }
 }
 
 void PrefixCache::service_ssd() {

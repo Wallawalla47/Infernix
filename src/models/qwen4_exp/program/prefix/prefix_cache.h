@@ -211,6 +211,10 @@ public:
     // the last call. service_ssd keeps the landing for the next poll_ssd (idle maintenance).
     bool poll_ssd();
     void service_ssd();
+    // Before a capture (capture or open_staged_capture) takes `slabs` Host slabs: while the Host tier
+    // cannot free them without losing unwritten content, starts the write-backs it can and waits for
+    // them to land (SSD tier only).
+    void make_lossless_room(std::uint64_t slabs);
     // Whether service_ssd would start a write-back now.
     [[nodiscard]] bool ssd_due() const noexcept { return ssd_ && ssd_->write_back_due(); }
     // Starts reading the parts of `snapshot` only on the SSD into the Host tier.

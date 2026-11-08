@@ -539,7 +539,15 @@ most once while the SSD keeps it (blocks are immutable):
   writes nothing; superseded snapshots, dead blocks and Device-only content are never written. Each
   Engine cycle first publishes landed captures and Host writes, then decides, so a request's
   snapshots are written before the next request's prefill displaces them; while the Engine is idle
-  the maintenance waker runs it (`hybrid_storage_due`).
+  the maintenance waker runs it (`hybrid_storage_due`). That order alone still lost races: on
+  Qwen3.8-Flash-Next a capture whose image the Host tier cannot hold without losing unwritten content
+  (`capture`, and a layer walk's staged capture when the walk is planned) first starts the
+  write-backs it can, lowest value first, and waits for them to land until it can displace copies
+  the SSD holds or nothing more can be written (`PrefixCache::make_lossless_room`). Before it the
+  test's 300 MiB Host tier lost the previous request's endpoint whenever no write-back started
+  between the endpoint's publication and the next request's first capture, which was the walk's
+  staged tap: on 2026-11-07 that held in every CTest run of the test and in no direct run of the same
+  build.
 - SSD transfers hold I/O pins (path-wide, like pins) on their snapshot and its path: the Host and SSD
   copies they read or write stay and the entries stay indexed, but their Device copies stay
   evictable (a path pin takes a block out of the Device LRU, and one did make an idle Engine refuse a
