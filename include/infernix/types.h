@@ -519,7 +519,8 @@ enum class DiagnosticLevel : std::uint8_t {
     Error,
 };
 
-// One runtime diagnostic from the Engine worker or its shutdown.
+// One runtime diagnostic from the Engine worker or its shutdown, or a core CUDA failure reported
+// from any thread.
 struct Diagnostic {
     DiagnosticLevel level = DiagnosticLevel::Info;
     std::string message;
@@ -527,10 +528,10 @@ struct Diagnostic {
 
 struct DiagnosticObserver {
     // Receives every diagnostic, from the worker thread, the Engine's helper threads (the startup
-    // constraint warm-up, expert offload workers) or the destructor, so it must be thread-safe; the
-    // product decides
-    // which levels to show. Without a callback, Info and above go to stderr. Callback exceptions
-    // are ignored so a logging failure cannot disturb execution.
+    // constraint warm-up, expert offload workers), the destructor, or a core CUDA failure on any
+    // thread, so it must be thread-safe; the product decides which levels to show. Without a
+    // callback, Info and above go to stderr. Callback exceptions are ignored so a logging failure
+    // cannot disturb execution.
     std::function<void(const Diagnostic& diagnostic)> callback;
 };
 

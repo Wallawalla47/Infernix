@@ -1,5 +1,7 @@
 #include "core/device.h"
 
+#include "core/cuda_diagnostics.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -9,6 +11,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -42,33 +46,83 @@ std::string cuda_error_message(const char* prefix, cudaError_t err) {
     return std::string(prefix) + ": " + cudaGetErrorName(err) + ": " + cudaGetErrorString(err);
 }
 
-void log_cuda_error(const char* op, cudaError_t err) noexcept {
-    if (err != cudaSuccess) {
-        std::fprintf(stderr, "CUDA cleanup failed during %s: %s: %s\n", op, cudaGetErrorName(err),
-                     cudaGetErrorString(err));
+std::mutex& cuda_diagnostic_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::shared_ptr<const DiagnosticObserver>& cuda_diagnostic_observer() {
+    static std::shared_ptr<const DiagnosticObserver> observer;
+    return observer;
+}
+
+void publish_cuda_diagnostic(DiagnosticLevel level, const char* text) noexcept {
+    std::shared_ptr<const DiagnosticObserver> observer;
+    {
+        std::lock_guard lock(cuda_diagnostic_mutex());
+        observer = cuda_diagnostic_observer();
     }
+    if (!observer || !observer->callback) { return; }
+    try {
+        observer->callback(Diagnostic{.level = level, .message = text});
+    } catch (...) {}
 }
 
 void destroy_stream(cudaStream_t& stream) noexcept {
     if (stream != nullptr) {
-        log_cuda_error("cudaStreamDestroy", cudaStreamDestroy(stream));
+        report_cuda_cleanup_failure("cudaStreamDestroy", cudaStreamDestroy(stream));
         stream = nullptr;
     }
 }
 
 void destroy_event(cudaEvent_t& event) noexcept {
     if (event != nullptr) {
-        log_cuda_error("cudaEventDestroy", cudaEventDestroy(event));
+        report_cuda_cleanup_failure("cudaEventDestroy", cudaEventDestroy(event));
         event = nullptr;
     }
 }
 
 } // namespace
 
+DiagnosticObserver set_cuda_diagnostic_observer(DiagnosticObserver observer) {
+    std::shared_ptr<const DiagnosticObserver> installed;
+    if (observer.callback) {
+        installed = std::make_shared<const DiagnosticObserver>(std::move(observer));
+    }
+    std::shared_ptr<const DiagnosticObserver> previous;
+    {
+        std::lock_guard lock(cuda_diagnostic_mutex());
+        previous = std::exchange(cuda_diagnostic_observer(), installed);
+    }
+    return previous ? *previous : DiagnosticObserver{};
+}
+
+void report_cuda_check_failure(const char* expr, const char* file, int line,
+                               cudaError_t err) noexcept {
+    const char* name        = cudaGetErrorName(err);
+    const char* description = cudaGetErrorString(err);
+    std::fprintf(stderr, "%s:%d: CUDA_CHECK(%s) failed: %s: %s\n", file, line, expr, name,
+                 description);
+    char record[2048];
+    std::snprintf(record, sizeof(record), "%s:%d: CUDA_CHECK(%s) failed: %s: %s", file, line, expr,
+                  name, description);
+    publish_cuda_diagnostic(DiagnosticLevel::Error, record);
+}
+
+void report_cuda_cleanup_failure(const char* op, cudaError_t err) noexcept {
+    if (err == cudaSuccess) { return; }
+    const char* name        = cudaGetErrorName(err);
+    const char* description = cudaGetErrorString(err);
+    std::fprintf(stderr, "CUDA cleanup failed during %s: %s: %s\n", op, name, description);
+    char record[1024];
+    std::snprintf(record, sizeof(record), "CUDA cleanup failed during %s: %s: %s", op, name,
+                  description);
+    publish_cuda_diagnostic(DiagnosticLevel::Warning, record);
+}
+
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     if (err == cudaSuccess) { return; }
-    std::fprintf(stderr, "%s:%d: CUDA_CHECK(%s) failed: %s: %s\n", file, line, expr,
-                 cudaGetErrorName(err), cudaGetErrorString(err));
+    report_cuda_check_failure(expr, file, line, err);
     std::abort();
 }
 
@@ -151,7 +205,7 @@ void DeviceContext::bind_to_current_thread() const {
 }
 
 void DeviceContext::bind_to_current_thread_noexcept() const noexcept {
-    log_cuda_error("cudaSetDevice", cudaSetDevice(device));
+    report_cuda_cleanup_failure("cudaSetDevice", cudaSetDevice(device));
 }
 
 int DeviceContext::compute_capability() const noexcept { return props.major * 10 + props.minor; }

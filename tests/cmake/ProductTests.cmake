@@ -8,7 +8,15 @@ infernix_add_test(infernix_prompt_input_test
 
 infernix_add_test(infernix_pretty_logging_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_pretty_logging.cpp"
-  LIBRARIES infernix_product_logging infernix_media_decode)
+  LIBRARIES infernix_product_logging infernix_media_decode infernix_core)
+
+# The abort path: the --log-file already holds the CUDA_CHECK record when the process dies.
+if(TARGET infernix_pretty_logging_test)
+  add_test(NAME infernix_cuda_failure_log_test
+    COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/../test_cuda_failure_log.py"
+            $<TARGET_FILE:infernix_pretty_logging_test>)
+  set_tests_properties(infernix_cuda_failure_log_test PROPERTIES TIMEOUT 60 LABELS "logging")
+endif()
 
 # Stable per-statistic console colouring (product/log_colour): family classification of the
 # operational line prefixes and clause-aware colouring of the pretty stats format.

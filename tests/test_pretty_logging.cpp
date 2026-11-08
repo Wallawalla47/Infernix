@@ -1,3 +1,5 @@
+#include "core/cuda_diagnostics.h"
+#include "core/device.h"
 #include "media/decode/decode.h"
 #include "product/logging/engine_diagnostics.h"
 #include "product/logging/logging.h"
@@ -113,7 +115,17 @@ std::size_t line_count(std::string_view value) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    // The end-to-end test spawns this mode: a CUDA_CHECK failure must be in the file before abort.
+    if (argc == 3 && std::string(argv[1]) == "--abort-with-log-file") {
+        infernix::product::LoggingRuntime logging(
+            {.logger_name  = "infernix-serve",
+             .color        = infernix::product::LogColorMode::Never,
+             .presentation = infernix::product::LogPresentation::Service,
+             .log_file     = argv[2]});
+        infernix::cuda_check(cudaErrorInvalidValue, "cudaInvalid()", "src/x.cu", 42);
+        return 0;
+    }
     int failures = 0;
     std::string service_output;
     {
@@ -546,6 +558,95 @@ int main() {
                               console.find("engine | detail") != std::string::npos,
                           "--log-file must keep the console's records");
     }
+    // A CUDA failure reaches --log-file through the same rail as Engine diagnostics, read here
+    // before any flush (as the abort leaves it); the bare stderr line is written first.
+    {
+        const std::filesystem::path path =
+            std::filesystem::temp_directory_path() /
+            ("infernix-cuda-log-test-" + std::to_string(port_pid()) + ".log");
+        std::filesystem::remove(path);
+        std::string file_text;
+        std::string console;
+        {
+            StderrCapture capture;
+            {
+                infernix::product::LoggingRuntime logging(
+                    {.logger_name  = "infernix-serve",
+                     .level        = infernix::product::LogLevel::Debug,
+                     .color        = infernix::product::LogColorMode::Never,
+                     .presentation = infernix::product::LogPresentation::Service,
+                     .log_file     = path.string()});
+                infernix::report_cuda_check_failure("cudaInvalid()", "src/x.cu", 42,
+                                                    cudaErrorInvalidValue);
+                infernix::report_cuda_cleanup_failure("cudaStreamDestroy", cudaErrorInvalidValue);
+                std::ifstream in(path, std::ios::binary);
+                file_text.assign(std::istreambuf_iterator<char>(in),
+                                 std::istreambuf_iterator<char>());
+            }
+            console = capture.finish();
+        }
+        std::filesystem::remove(path);
+        failures += check(
+            file_text.find(" [error] engine | src/x.cu:42: CUDA_CHECK(cudaInvalid()) failed: "
+                           "cudaErrorInvalidValue:") != std::string::npos,
+            "a CUDA_CHECK failure must reach --log-file as an error record");
+        failures += check(file_text.find(" [warning] engine | CUDA cleanup failed during "
+                                         "cudaStreamDestroy:") != std::string::npos,
+                          "a CUDA cleanup failure must reach --log-file as a warning record");
+        failures += check(console.find("src/x.cu:42: CUDA_CHECK(cudaInvalid()) failed:") !=
+                                  std::string::npos &&
+                              console.find("CUDA cleanup failed during cudaStreamDestroy:") !=
+                                  std::string::npos,
+                          "a CUDA failure must keep its bare stderr line");
+    }
+    // The bare line is level-independent: Critical filters the record, never the line.
+    {
+        const std::filesystem::path path =
+            std::filesystem::temp_directory_path() /
+            ("infernix-cuda-critical-test-" + std::to_string(port_pid()) + ".log");
+        std::filesystem::remove(path);
+        std::string file_text;
+        std::string console;
+        {
+            StderrCapture capture;
+            {
+                infernix::product::LoggingRuntime logging(
+                    {.logger_name  = "infernix-serve",
+                     .level        = infernix::product::LogLevel::Critical,
+                     .color        = infernix::product::LogColorMode::Never,
+                     .presentation = infernix::product::LogPresentation::Service,
+                     .log_file     = path.string()});
+                infernix::report_cuda_check_failure("cudaInvalid()", "src/x.cu", 42,
+                                                    cudaErrorInvalidValue);
+                std::ifstream in(path, std::ios::binary);
+                file_text.assign(std::istreambuf_iterator<char>(in),
+                                 std::istreambuf_iterator<char>());
+            }
+            console = capture.finish();
+        }
+        std::filesystem::remove(path);
+        failures += check(console.find("CUDA_CHECK(cudaInvalid()) failed:") != std::string::npos,
+                          "--log-level critical dropped the bare CUDA_CHECK line");
+        failures += check(file_text.find("engine |") == std::string::npos,
+                          "--log-level critical wrote a CUDA_CHECK record");
+    }
+    // Without a runtime the reporter writes only the current bare line.
+    {
+        std::string console;
+        {
+            StderrCapture capture;
+            infernix::report_cuda_check_failure("cudaInvalid()", "src/x.cu", 42,
+                                                cudaErrorInvalidValue);
+            console = capture.finish();
+        }
+        const std::string expected =
+            std::string("src/x.cu:42: CUDA_CHECK(cudaInvalid()) failed: cudaErrorInvalidValue: ") +
+            cudaGetErrorString(cudaErrorInvalidValue) + "\n";
+        failures += check(console == expected,
+                          "without a logging runtime a CUDA_CHECK failure must be the bare line");
+    }
+    failures += check(!infernix::set_cuda_diagnostic_observer({}).callback,
+                      "the logging runtime left its CUDA diagnostic observer installed");
     // A log file that cannot be opened (its folder is a file) leaves the console logging, with a warning.
     {
         const std::filesystem::path blocker =
