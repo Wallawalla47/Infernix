@@ -325,7 +325,15 @@ INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.infernix \
 
 INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R infernix_qwen3_5_resume_cold_real_test --output-on-failure
+
+INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R infernix_serve_shutdown_real_test --output-on-failure
 ```
+
+`infernix_qwen3_5_native_transactions_test` also pauses a request before its first prefill chunk (an empty
+replay must be granted and complete at once). `infernix_serve_shutdown_real_test` starts `infernix-serve` and
+stops it (Ctrl+Break on Windows, SIGTERM elsewhere) while a client streams: the stream must end with an error
+event, the prefix cache file must be saved and the process must exit 0 within 30 s.
 
 The invariance entry checks the exact route's request invariance with sampled decoding: each
 request alone against all four at once in reverse submission order, a warm off-grid prefix against

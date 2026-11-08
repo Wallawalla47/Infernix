@@ -105,6 +105,15 @@ endif()
 infernix_add_test(infernix_stop_control_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_stop_control.cpp"
   LIBRARIES infernix_serve)
+# The whole server stopped (Ctrl+Break, SIGTERM) while a client streams: the stream ends with an error event,
+# the prefix cache file is saved and the process exits 0 (INFERNIX_TEST_ARTIFACT: any Qwen3.5 artifact).
+if(TARGET infernix-serve)
+  add_test(NAME infernix_serve_shutdown_real_test
+    COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/../test_serve_shutdown_real.py"
+            $<TARGET_FILE:infernix-serve>)
+  set_tests_properties(infernix_serve_shutdown_real_test PROPERTIES
+    SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 900 LABELS "gpu;real")
+endif()
 
 infernix_add_test(infernix_http_error_handler_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_error_handler.cpp"

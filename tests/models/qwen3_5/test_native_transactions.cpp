@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "models/load_options.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -239,6 +240,32 @@ public:
         next_request();
     }
 
+    // A request paused after its binding and before its first prefill chunk (frontier 0). NInfer #434's
+    // server-wide stall was this case: the resume became an empty Replay its scheduler never granted, while
+    // the request kept the recovery permit, so nothing ran for hours. Here the resume's one Replay unit is
+    // reserved and completes at once with nothing processed, then the whole prompt prefills, decodes and
+    // finishes, and the stores return to their baseline.
+    void pause_before_first_prefill_chunk() {
+        auto base           = request(kPromptTokens);
+        const auto original = bind(base);
+        require(program_.start_pause(original), "a pause before the first prefill chunk was not accepted");
+        auto paused = settle();
+        require(paused.paused && paused.paused->frontier() == 0,
+                "a pause before the first prefill chunk recorded a frontier");
+        expect_empty("a pause before the first prefill chunk did not release its execution resources");
+
+        const auto resumed = bind(base, 1, &*paused.paused, qwen::ExecutionUnitKind::Prefill);
+        paused.paused.reset();
+        reserve(resumed, qwen::ExecutionUnitKind::Replay);
+        const auto replay = program_.advance_replay(resumed);
+        require(replay.complete && replay.processed_tokens == 0,
+                "an empty replay did not complete at once with nothing processed");
+        finish_prefill(resumed, kPromptTokens, false);
+        decode_and_finish(resumed);
+        expect_empty("a request resumed from frontier 0 retained physical resources");
+        next_request();
+    }
+
     void grammar_row_failure() {
         struct Masks final : runtime::TokenMaskProvider {
             void uploaded(std::size_t, std::size_t) noexcept override {}
@@ -434,24 +461,24 @@ int main(int argc, char** argv) {
                 "usage: infernix_qwen3_5_native_transactions_test [none|mtp|dflash|dflash2]");
         const auto backend = selected_backend(argc == 2 ? argv[1] : "none");
         DeviceContext device;
-        models::LoadOptions selected;
-        selected.speculative = backend;
-        auto model           = qwen::load_model(artifact, selected, device);
+        // The load options the Program checks against (an MTP Program's include its expert pool).
+        const EngineOptions options = program_options(backend);
+        auto model = qwen::load_model(artifact, models::load_options(options, models::Architecture::Qwen3_5), device);
         qwen::execution::Parameters parameters(*model);
         auto frontend = qwen::make_frontend(model->resources(),
                                             {.vision_enabled = false, .max_context = kCapacity});
-        const EngineOptions options = program_options(backend);
         auto planner = qwen::make_sequence_planner(parameters, device, options);
         auto plan    = std::move(planner).finalize(16);
         auto program = qwen::create_program(parameters, std::move(plan), device, {});
         {
             Fixture fixture(device, *program, frontend);
             fixture.replay_pause_and_resume();
+            fixture.pause_before_first_prefill_chunk();
             fixture.grammar_row_failure();
         }
         program.reset();
         replay_sampling_counts(device, parameters, frontend, options);
-        std::cout << "OK native pause, replay recovery and row failure\n";
+        std::cout << "OK native pause, a pause before the first chunk, replay recovery and row failure\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL native transactions: " << error.what() << '\n';
