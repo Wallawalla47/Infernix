@@ -3752,6 +3752,7 @@ public:
         std::string what         = code == ops::offloaded_moe::kErrorUnservedRecord ? "an SSD-only expert had no path to it"
                                    : code == ops::offloaded_moe::kErrorHostSilent   ? "the CPU expert service stopped answering"
                                    : code == ops::offloaded_moe::kErrorFetchSilent  ? "the SSD expert tier's read agent stopped answering"
+                                   : code == ops::offloaded_moe::kErrorDownStalled  ? "an expert's down pass waited past its bound for its h"
                                                                                      : "an expert record could not be read (" +
                                                                                        std::generic_category().message(static_cast<int>(code)) + ")";
         throw runtime::RecoverableExecutionError("Qwen3.8-Flash-Next layer " + std::to_string(value >> 16U) + ": " + what);

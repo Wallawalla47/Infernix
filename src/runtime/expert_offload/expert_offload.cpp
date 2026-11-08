@@ -1362,6 +1362,7 @@ void ExpertOffload::check_error(const std::string& model) {
     const std::string what   = code == moe::kErrorUnservedRecord ? "an SSD-only expert had no path to it"
                                : code == moe::kErrorHostSilent   ? "the CPU expert service stopped answering"
                                : code == moe::kErrorFetchSilent  ? "the SSD expert tier's read agent stopped answering"
+                               : code == moe::kErrorDownStalled  ? "an expert's down pass waited past its bound for its h"
                                                                  : "an expert record could not be read (" +
                                                                      std::generic_category().message(static_cast<int>(code)) + ")";
     throw RecoverableExecutionError(model + " layer " + std::to_string(value >> 16U) + ": " + what);

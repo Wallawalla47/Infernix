@@ -245,8 +245,17 @@ __global__ void __launch_bounds__(kRingThreads, kRingMinBlocksPerSm) narrow_ring
             if (t.down != 0) {
                 // The job's h is encoded once all its gate/up tasks are done (they were taken before any
                 // down task, so no CTA waits on work queued behind its own).
-                if (ctid == 0) {
-                    while (ring_load_acquire(&a.job_ready[t.job]) == 0U) { __nanosleep(128); }
+                // Bounded (offloaded_moe::kDownReadyTimeoutNs): a defect fails the call through its error
+                // word, never hangs the stream; a ready job costs one acquire load, as before.
+                if (ctid == 0 && ring_load_acquire(&a.job_ready[t.job]) == 0U) {
+                    const std::uint64_t entered = global_ns();
+                    do {
+                        if (global_ns() - entered > offloaded_moe::kDownReadyTimeoutNs) {
+                            report_error(a.source, offloaded_moe::kErrorDownStalled);
+                            break;
+                        }
+                        __nanosleep(128);
+                    } while (ring_load_acquire(&a.job_ready[t.job]) == 0U);
                 }
                 RingConsumers::sync();
             }

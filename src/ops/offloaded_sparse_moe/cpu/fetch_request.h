@@ -25,6 +25,14 @@ inline constexpr int kMaxFetch = 512; // fetch-served experts per layer call (a 
 inline constexpr std::uint32_t kErrorUnservedRecord = 0xFF01; // an SSD-only expert with no path to it
 inline constexpr std::uint32_t kErrorHostSilent     = 0xFF02; // the CPU service's heartbeat stopped during a wait
 inline constexpr std::uint32_t kErrorFetchSilent    = 0xFF03; // the fetch responder's heartbeat stopped during a wait
+inline constexpr std::uint32_t kErrorDownStalled    = 0xFF04; // a narrow down pass's job h never became ready
+
+// How long a narrow expert down pass waits for its own job's h (GPU time): the 122B's A16 ring and Flash-Next's
+// tensor-core narrow route. The h comes from gate/up work already running (taken before any down task, or a grid
+// whose every CTA had started before the down grid launched), so it is ready within microseconds; only a defect (a
+// lost ready word, a phase mismatch) reaches the bound, which fails the call through its error word instead of
+// hanging the stream until a WDDM TDR ends the process.
+inline constexpr std::uint64_t kDownReadyTimeoutNs = 2000000000ULL;
 
 // A wait gives up when the host's heartbeat has not changed for this long (GPU time). A host thread
 // that died is reported at once through its own failure (CpuMissService::failure, the tier agent's);
