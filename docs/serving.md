@@ -228,9 +228,13 @@ How failures end:
   transaction for 30 seconds, is a defect: the server logs one Warning, `no progress for N s
   while holding requests: ...`, naming the request that holds the service turn and what each
   request is doing (its lane, phase, whether it has a unit, a recovery pending, paused and queued
-  requests), and an Info line when progress resumes. Nothing is failed or restarted; the
-  `infernix_no_progress_seconds` gauge and `live.no_progress_s` in `/metrics?format=json` show the
-  same interval.
+  requests), and an Info line when progress resumes; the `infernix_no_progress_seconds` gauge and
+  `live.no_progress_s` in `/metrics?format=json` show the same interval. After two minutes the
+  Engine heals it as it does an unreadable expert record: the running and paused requests fail
+  with `the Engine made no progress for N s while holding requests` (logged as an Error with the
+  count), their state is discarded and queued requests are admitted again;
+  `infernix_no_progress_recoveries_total` and `live.no_progress_recoveries` count these. A state
+  the recovery does not handle (a binding in flight) is left as it is, with an Error line.
 
 The listener's port is its own: a second server cannot bind it beside a running one (Windows sets
 `SO_EXCLUSIVEADDRUSE`, which also refuses a wildcard bind beside another program's `127.0.0.1`
@@ -2017,6 +2021,7 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_model_info`, `infernix_max_concurrency`, `infernix_max_context_tokens` | Model/backend identity and startup limits |
 | `infernix_requests_running`, `waiting`, `paused`, `prefilling`, `decode_ready`, `replaying`, `materializing` | Current Engine gauges; prefill/decode/replay are subsets of resident requests |
 | `infernix_no_progress_seconds` | How long the Engine has held requests without completing any unit, control row or context transaction; 0 while it progresses or is idle |
+| `infernix_no_progress_recoveries_total` | Stalls healed after two minutes by failing the running and paused requests (see How failures end) |
 | `infernix_prompt_tokens_total`, `infernix_prompt_tokens_cached_total` | Full input and reused tokens counted once on initial binding |
 | `infernix_prefill_tokens_total`, `infernix_replayed_tokens_total` | Actual initial prefill and separate recovery recomputation |
 | `infernix_generation_tokens_total`, `infernix_decode_tokens_total` | All committed outputs, or decode/control outputs excluding the first token; include thinking and injected control tokens |

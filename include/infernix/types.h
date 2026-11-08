@@ -2232,6 +2232,8 @@ struct RuntimeStats {
     // idle). A Warning names the scheduler state once that passes 30 s.
     std::uint64_t progress_owner_request_id = 0;
     double no_progress_seconds              = 0.0;
+    // Stalls the Engine healed after two minutes by failing the running and paused requests (cumulative).
+    std::uint64_t no_progress_recoveries = 0;
     std::uint64_t preemptions               = 0;
     std::uint64_t snapshot_restores         = 0;
     std::uint64_t replay_restores           = 0;

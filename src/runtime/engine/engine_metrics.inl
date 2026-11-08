@@ -189,6 +189,7 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.progress_owner_request_id        = scheduler_.progress_owner().value_or(0U);
     snapshot.no_progress_seconds =
         no_progress_since_ ? std::chrono::duration<double>(Clock::now() - *no_progress_since_).count() : 0.0;
+    snapshot.no_progress_recoveries = no_progress_recoveries_;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         if (slots_[lane] == nullptr) { continue; }
         ++snapshot.running_requests;

@@ -2760,7 +2760,11 @@ private:
     // The no-progress watch (candidates YJ-02). NInfer #434 stalled for hours with requests resident, the
     // GPU idle and nothing logged: every unit waited on a service-turn owner that could not run. Here the
     // worker reports once the Engine has held requests for kNoProgressWarning and completed no unit, control
-    // row or context transaction, with what each request waits on, and again when the stall ends.
+    // row or context transaction, with what each request waits on, and again when the stall ends. Once
+    // kNoProgressRecovery has passed it heals the stall as a RecoverableExecutionError would: the running
+    // and paused requests fail with that error, the Program discards their state and the queued ones are
+    // admitted again. A state that recovery does not handle (a binding or materialization in flight) is
+    // left as it is, reported once.
     void watch_progress(bool executed) noexcept {
         try {
             bool holding = !resident_empty() || !paused_.empty() || instance_.program->has_context_transaction();
@@ -2777,20 +2781,38 @@ private:
                                        executed ? "" : ": no request is left");
                 }
                 no_progress_since_.reset();
-                no_progress_reported_ = false;
+                no_progress_reported_  = false;
+                no_progress_recovered_ = false;
                 return;
             }
             if (!no_progress_since_) {
                 no_progress_since_ = now;
                 return;
             }
-            if (no_progress_reported_ || now - *no_progress_since_ < kNoProgressWarning) { return; }
-            no_progress_reported_ = true;
-            publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
-                               "no progress for %.0f s while holding requests: %s",
-                               std::chrono::duration<double>(now - *no_progress_since_).count(),
-                               describe_progress_state().c_str());
-        } catch (...) {} // a diagnostic never fails the Engine
+            const auto stalled = now - *no_progress_since_;
+            if (!no_progress_reported_ && stalled >= kNoProgressWarning) {
+                no_progress_reported_ = true;
+                publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
+                                   "no progress for %.0f s while holding requests: %s",
+                                   std::chrono::duration<double>(stalled).count(), describe_progress_state().c_str());
+            }
+            if (no_progress_recovered_ || stalled < kNoProgressRecovery) { return; }
+            no_progress_recovered_ = true;
+            const std::string state = describe_progress_state();
+            char what[160];
+            std::snprintf(what, sizeof(what), "the Engine made no progress for %.0f s while holding requests",
+                          std::chrono::duration<double>(stalled).count());
+            if (recover_locked(std::make_exception_ptr(RecoverableExecutionError(what)))) {
+                ++no_progress_recoveries_;
+                // A new interval starts: what remains (queued requests) must progress on its own.
+                no_progress_since_.reset();
+                no_progress_reported_  = false;
+                no_progress_recovered_ = false;
+            } else {
+                publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                   "%s, and its state cannot be recovered (%s): it stays as it is", what, state.c_str());
+            }
+        } catch (...) {} // the watch never fails the Engine
     }
 
     void worker_loop() noexcept {
@@ -3176,8 +3198,13 @@ private:
     // worker (watch_progress): since when the Engine has held requests and completed nothing, and whether
     // that was reported.
     static constexpr std::chrono::seconds kNoProgressWarning{30};
+    // Every unit takes well under a second (a prefill chunk, a decode round, a context transaction), so
+    // two minutes without one completing is a stall, not slow work.
+    static constexpr std::chrono::seconds kNoProgressRecovery{120};
     std::optional<Clock::time_point> no_progress_since_;
-    bool no_progress_reported_ = false;
+    bool no_progress_reported_      = false;
+    bool no_progress_recovered_     = false;
+    std::uint64_t no_progress_recoveries_ = 0;
     std::shared_ptr<Request> next_turn_request_;           // worker: the pass queued, binding or resident
     NextTurnCounters next_turn_counters_;                  // worker
     std::atomic<std::uint64_t> next_turn_dropped_{0};

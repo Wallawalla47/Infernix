@@ -93,10 +93,12 @@ int main() {
         auto stalled                            = snapshot;
         stalled.stats.progress_owner_request_id = 17;
         stalled.stats.no_progress_seconds       = 42.5;
+        stalled.stats.no_progress_recoveries    = 2;
         const Json stalled_root                 = Json::parse(render_metrics_json(stalled));
         failures += check(stalled_root["live"]["progress_owner"] == 17 &&
-                              stalled_root["live"]["no_progress_s"] == 42.5,
-                          "the service turn's owner and the stall's length");
+                              stalled_root["live"]["no_progress_s"] == 42.5 &&
+                              stalled_root["live"]["no_progress_recoveries"] == 2,
+                          "the service turn's owner, the stall's length and the stalls healed");
     }
 
     const Json row = root["requests"][0];
