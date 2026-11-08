@@ -202,10 +202,15 @@ void ProgramImpl::mtp_flush_cell(Lane& lane, std::uint32_t index) {
 // ---- admission ---------------------------------------------------------------------------------------
 
 // Chooses the resume source for `prompt` in lane `lane`: the deepest affordable snapshot, else the
-// root, or nothing when even the root does not fit now (design §19.3.1, plan §7.1).
+// root, or nothing when even the root does not fit now (design §19.3.1, plan §7.1). A resumed request
+// (`resumed`) owns its service turn, and the Engine reclaims capacity from the other residents for its
+// binding (resource-scheduling §5.2): it takes its deepest cached state (its pause's capture when cached)
+// that the whole pool holds, whether or not it fits beside them now, so its binding reports the shortage
+// instead of replaying the ledger from a shallower state, whose prefill arithmetic would change the
+// request's output.
 std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::PreparedPromptData& prompt,
                                                                        const BasePlanImpl& base,
-                                                                       std::uint32_t lane) {
+                                                                       std::uint32_t lane, bool resumed) {
     pc::PrefixCacheIndex& index = prefix_->index();
     const auto n                = static_cast<std::uint32_t>(prompt.token_ids.size());
     const std::uint32_t E       = binding_pages(base, n);
@@ -284,7 +289,15 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
         for (std::size_t i = 0; i < match.candidates.size(); ++i) {
             if (!choice.candidate || i != *choice.candidate) { order.push_back(i); }
         }
-        const auto select = [&]() -> std::optional<PrefixSelection> {
+        // A resumed request takes its deepest state: its pause's own capture when that is cached, which
+        // leaves nothing to replay; a shallower one would replay the tokens past it with prefill arithmetic.
+        if (resumed) {
+            std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+                return match.candidates[a].frontier > match.candidates[b].frontier;
+            });
+        }
+        // `require_fit` false: the candidate is returned with its need even when it does not fit now.
+        const auto select = [&](bool require_fit = true) -> std::optional<PrefixSelection> {
         for (const std::size_t i : order) {
             const pc::MatchCandidate& c = match.candidates[i];
             PrefixSelection s;
@@ -303,7 +316,11 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
             }
             s.image_restore = !(resident && *resident == c.snapshot);
             s.existing      = frontiers;
-            if (!fits(s)) { continue; }
+            // Without require_fit, a source only the whole pool holds (the other residents' pages too).
+            if (!fits(s) && (require_fit || static_cast<std::uint64_t>(s.need) >
+                                                static_cast<std::uint64_t>(pool_->capacity_pages()) + kv_grow_pages())) {
+                continue;
+            }
             if (c.ssd_bytes != 0) {
                 // Part of it is only on the SSD tier (hybrid-prefix-cache-spec §5.7). A binding takes
                 // only what is above it (its quote promoted the source); a quote starts the read and
@@ -320,13 +337,15 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
         }
         return std::nullopt;
         };
-        if (std::optional<PrefixSelection> s = select()) { return s; }
+        // A resumed request's binding reports a shortage for its deepest state instead of taking a shallower
+        // one that fits beside the other residents now: the Engine reclaims for it or it waits.
+        if (std::optional<PrefixSelection> s = select(!resumed)) { return s; }
         if (prefix_ssd_wait_) { return std::nullopt; }
         if (!match.candidates.empty() && prefix_->transfers_pending()) {
             // Blocks pinned only by in-flight Host writes become evictable once those land: a cached
             // source is not given up for the root while a finished lane's writes land.
             prefix_->drain();
-            if (std::optional<PrefixSelection> s = select()) { return s; }
+            if (std::optional<PrefixSelection> s = select(!resumed)) { return s; }
             if (prefix_ssd_wait_) { return std::nullopt; }
         }
     }
@@ -867,12 +886,17 @@ void ProgramImpl::prefix_publish(Lane& lane, std::uint32_t frontier) {
 }
 
 // A tap or endpoint snapshot of the lane's state at its frontier F = state_tokens (Host-born).
-void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKind kind, bool hand_over_tail) {
+void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKind kind, bool hand_over_tail,
+                                 bool resume_point) {
     const std::uint32_t F = lane.state_tokens;
     const std::uint32_t k = F / kBlock;
     if (F == 0 || lane.prefix.path.size() < k) { return; }
     prefix::PrefixCache::Capture c =
         prefix_capture_at(lane, F, kind, hand_over_tail, lane.mtp_live && lane.mtp_cells == F);
+    // A paused request's frontier is its own resume point: its Host image is admitted over any retained
+    // snapshot that is not pinned (a refused capture makes the resume replay, with prefill arithmetic).
+    // The claim only admits it; its retention priority is the snapshot's own afterwards.
+    if (resume_point) { c.claim = std::numeric_limits<double>::infinity(); }
     const std::uint64_t id = c.id;
     if (prefix_->capture(index, std::move(c), device_.stream)) { prefix_captured(lane, id, F); }
 }
@@ -963,7 +987,7 @@ void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, boo
 }
 
 // Finish or a consistent abort: the M3 flush, the remaining blocks, the endpoint and write-through.
-void ProgramImpl::prefix_finish(Lane& lane, std::uint32_t index) {
+void ProgramImpl::prefix_finish(Lane& lane, std::uint32_t index, bool pausing) {
     if (!prefix_ || !lane.prefix.reuse) { return; }
     // MR3: write the pending MTP cell when its token is known, so the endpoint is final.
     if (lane.mtp_live && lane.mtp_cells + 1U == lane.state_tokens && lane.history.size() > lane.state_tokens) {
@@ -982,8 +1006,13 @@ void ProgramImpl::prefix_finish(Lane& lane, std::uint32_t index) {
         lane.prefix.resident_capture = lane.prefix.deepest == F ? lane.prefix.capture : 0;
         return;
     }
-    if (F >= lane.prefix.deepest + kBlock && full_blocks && lane.prefix.path.size() >= F / kBlock) {
-        prefix_capture(lane, index, pc::SnapshotKind::Endpoint, true);
+    // A finishing lane's endpoint less than a block past its deepest snapshot covers too little to pay for
+    // another image; a pausing lane's is its own resume point (design §19.3.13): without it the resume would
+    // replay the tokens since that snapshot with prefill arithmetic, and its output would depend on when
+    // the service turns paused it.
+    const bool far_enough = F >= lane.prefix.deepest + kBlock || (pausing && F > lane.prefix.deepest);
+    if (far_enough && full_blocks && lane.prefix.path.size() >= F / kBlock) {
+        prefix_capture(lane, index, pc::SnapshotKind::Endpoint, true, pausing);
     } else if (!full_blocks) {
         ++prefix_->counters().endpoint_skipped_mtp;
     }

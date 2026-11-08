@@ -130,8 +130,11 @@ int run_mode(const char* artifact, const char* ngram, Mode mode, const char* dra
         auto b = engine.submit(engine.prepare_tokens(prompt_b), greedy(true));
         const infernix::GenerationResult ra = a.wait();
         const infernix::GenerationResult rb = b.wait();
-        std::printf("  exact: A preemptions %llu, B preemptions %llu, snapshot restores %llu, replay restores %llu\n",
+        std::printf("  exact: A preemptions %llu (snapshot restores %llu, replay restores %llu), B preemptions %llu, "
+                    "snapshot restores %llu, replay restores %llu\n",
                     static_cast<unsigned long long>(ra.scheduling.preemptions),
+                    static_cast<unsigned long long>(ra.scheduling.snapshot_restores),
+                    static_cast<unsigned long long>(ra.scheduling.replay_restores),
                     static_cast<unsigned long long>(rb.scheduling.preemptions),
                     static_cast<unsigned long long>(rb.scheduling.snapshot_restores),
                     static_cast<unsigned long long>(rb.scheduling.replay_restores));
@@ -150,11 +153,16 @@ int run_mode(const char* artifact, const char* ngram, Mode mode, const char* dra
         const infernix::GenerationResult ra = a.wait();
         const infernix::GenerationResult rb = b.wait();
         const std::size_t kept = common_prefix(rb.generated_token_ids, solo_b);
-        std::printf("  replay: B preemptions %llu, replay restores %llu, replayed tokens %llu, tokens equal to solo %zu of %zu\n",
+        std::printf("  replay: A preemptions %llu (snapshot restores %llu, replay restores %llu); B preemptions %llu, "
+                    "replay restores %llu, replayed tokens %llu, tokens equal to solo %zu of %zu\n",
+                    static_cast<unsigned long long>(ra.scheduling.preemptions),
+                    static_cast<unsigned long long>(ra.scheduling.snapshot_restores),
+                    static_cast<unsigned long long>(ra.scheduling.replay_restores),
                     static_cast<unsigned long long>(rb.scheduling.preemptions),
                     static_cast<unsigned long long>(rb.scheduling.replay_restores),
                     static_cast<unsigned long long>(rb.scheduling.replayed_tokens), kept, rb.generated_token_ids.size());
-        failures += check(ra.generated_token_ids == solo_a, "A equals its solo run");
+        failures += check(ra.generated_token_ids == solo_a, "A equals its solo run (first difference at " +
+                                                                std::to_string(common_prefix(ra.generated_token_ids, solo_a)) + ")");
         failures += check(rb.scheduling.preemptions >= 1, "B is paused");
         failures += check(rb.scheduling.replay_restores >= 1 && rb.scheduling.replayed_tokens >= kPrompt,
                           "B resumes by replaying its ledger");

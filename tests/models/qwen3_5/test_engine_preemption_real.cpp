@@ -468,7 +468,14 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
     std::cout << label << " backend=" << backend_name << " preemptions=" << totals.preemptions
               << " snapshot_restores=" << totals.snapshot_restores
               << " replay_restores=" << totals.replay_restores
-              << " replayed_tokens=" << totals.replayed_tokens << " paused_ns=" << totals.paused_ns;
+              << " replayed_tokens=" << totals.replayed_tokens << " paused_ns=" << totals.paused_ns
+              << " first(preemptions=" << first_result->scheduling.preemptions
+              << " replay_restores=" << first_result->scheduling.replay_restores
+              << " replayed=" << first_result->scheduling.replayed_tokens << ")"
+              << " second(preemptions=" << second_result.scheduling.preemptions
+              << " replay_restores=" << second_result.scheduling.replay_restores
+              << " replayed=" << second_result.scheduling.replayed_tokens << ")"
+              << " cache_reused=" << after.hybrid_reused_tokens - before.hybrid_reused_tokens;
     if (cancel_stage != CancelStage::None) {
         std::cout << " observed_paused=" << cancellation_observed.paused_requests
                   << " observed_replaying=" << cancellation_observed.replaying_requests

@@ -353,6 +353,18 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
         hybrid_->drain();
         selected = select();
     }
+    // A resumed request owns its service turn, and the Engine reclaims capacity from the other
+    // residents for its binding (resource-scheduling §5.2): the source the cost model chose is offered
+    // even when it does not fit beside them now (its binding reports the shortage), rather than a root
+    // bind that would replay the whole ledger on every turn. Only one the whole pool holds.
+    if (!selected && maximum_frontier != UINT32_MAX && choice.candidate) {
+        const pc::MatchCandidate& candidate = match.candidates[*choice.candidate];
+        const auto usage                    = physical_usage();
+        const std::uint32_t first           = std::min(n, candidate.frontier + prefill_chunk);
+        if (kv_pages_for_frontier(first) <= usage.capacity.main_kv_pages + kv_growable_pages()) {
+            selected = candidate;
+        }
+    }
     if (selected && selected->ssd_bytes != 0) {
         // Part of the source is only on the SSD tier (§5.7): it is read into the Host tier first and
         // the request waits for it (no source; the Engine quotes it again when the read lands). The

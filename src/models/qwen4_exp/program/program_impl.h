@@ -1775,7 +1775,7 @@ public:
         const auto& data      = qwen3_5::PreparedPromptAccess::view(*b.prompt);
         std::vector<SourceCandidate> out;
         if (prefix_) {
-            std::optional<PrefixSelection> chosen = prefix_select(data, b, kNoLane);
+            std::optional<PrefixSelection> chosen = prefix_select(data, b, kNoLane, maximum_frontier != UINT32_MAX);
             // The source it chose is being read from the SSD tier (hybrid-prefix-cache-spec §5.7): no
             // source yet; the Engine quotes it again when the read lands.
             if (prefix_ssd_wait_) { return {}; }
@@ -1817,7 +1817,7 @@ public:
         std::optional<PrefixSelection> selection;
         if (prefix_) {
             if (q.prefix && q.prefix->snapshot) {
-                selection = prefix_select(data, b, index);
+                selection = prefix_select(data, b, index, resume != nullptr);
                 if (!selection || !selection->snapshot || selection->frontier != source.reused_tokens) {
                     return {}; // the quoted snapshot changed: no shortage, the Engine moves to the root source
                 }
@@ -2060,7 +2060,7 @@ public:
         if (prefix_) {
             // The pause's capture lands first, so the selection can see it.
             prefix_->drain();
-            selection = b.reuse ? prefix_select(ledger, b, index) : prefix_root(ledger, b);
+            selection = b.reuse ? prefix_select(ledger, b, index, true) : prefix_root(ledger, b);
             if (!selection) {
                 BindingReservation out;
                 out.shortage.main_kv_pages = pages > pool_->available_pages() ? pages - pool_->available_pages() : 1U;
@@ -2240,7 +2240,7 @@ public:
         saved->counted       = lane.counted_tokens;
         save_request(lane, *saved);
         // A replaying lane short of its frontier publishes what it has rebuilt so far.
-        if (!walking) { prefix_finish(lane, index); }
+        if (!walking) { prefix_finish(lane, index, true); }
         saved->capture = lane.prefix.capture;
         release(index);
         pause_.emplace(ResumeState(std::move(saved)));
@@ -6574,7 +6574,7 @@ private:
         return root;
     }
     std::optional<PrefixSelection> prefix_select(const qwen3_5::PreparedPromptData& prompt, const BasePlanImpl& base,
-                                                 std::uint32_t lane);
+                                                 std::uint32_t lane, bool resumed = false);
     void pc_make_room(std::uint32_t pages);
     // Whether a fresh prompt reusing `reuse` tokens should wait for a prefilling sibling's snapshot
     // inside their shared prefix; plans that snapshot as a boundary tap of the sibling when so.
@@ -6604,7 +6604,9 @@ private:
                          DeviceKVPageReservation& reservation, std::uint32_t pages);
     [[nodiscard]] std::uint32_t prefix_frontier(const Lane& lane, bool finishing) const noexcept;
     void prefix_publish(Lane& lane, std::uint32_t frontier);
-    void prefix_capture(Lane& lane, std::uint32_t index, runtime::prefix_cache::SnapshotKind kind, bool hand_over_tail);
+    // `resume_point`: a paused lane's frontier, admitted over any unpinned retained snapshot.
+    void prefix_capture(Lane& lane, std::uint32_t index, runtime::prefix_cache::SnapshotKind kind, bool hand_over_tail,
+                        bool resume_point = false);
     // The capture of the lane's state at frontier F (the lane's published path reaches F's anchor);
     // `mtp_written`: the MTP cell F - 1 is final.
     [[nodiscard]] prefix::PrefixCache::Capture prefix_capture_at(Lane& lane, std::uint32_t F,
@@ -6616,7 +6618,8 @@ private:
     // any was, and sets `boundary` when one is a boundary tap.
     bool prefix_take_taps(Lane& lane, std::uint32_t B, std::size_t next_call, bool& boundary);
     void prefix_after_prefill_call(Lane& lane, std::uint32_t index, bool last);
-    void prefix_finish(Lane& lane, std::uint32_t index);
+    // `pausing`: the lane is paused (start_pause), so its frontier is its resume point.
+    void prefix_finish(Lane& lane, std::uint32_t index, bool pausing = false);
     // Releases the lane's pins; a lane marked `withdraw` withdraws what it published (prefix_withdraw).
     void prefix_release(Lane& lane) noexcept;
     void prefix_withdraw(Lane& lane) noexcept;
