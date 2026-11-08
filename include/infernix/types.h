@@ -2469,6 +2469,10 @@ struct LoadSummary {
     // none wider fit. Zero when idle-wide-prefill is not selected (Qwen3.5 family only).
     std::uint32_t prefill_chunk      = 0;
     std::uint32_t idle_prefill_width = 0;
+    // Qwen3.8-Flash-Next's SSD expert tier at startup: the expert records its fill read from the artifact, and those
+    // it kept from the last Engine of the same EngineHost (no read). Both 0 without the tier.
+    std::uint64_t expert_ram_records_read = 0;
+    std::uint64_t expert_ram_records_kept = 0;
 
     // Hybrid prefix cache restored from its persistent file at startup.
     struct PrefixCacheRestore {

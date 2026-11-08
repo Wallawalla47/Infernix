@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace infernix::runtime::expert_offload::expert_cache {
@@ -177,8 +178,17 @@ public:
     // The same for a key VRAM holds (the warm start's spare slots): the slot is its shadow, so its
     // eviction from VRAM (a lend's or a decode victim's) needs no copy back (T3).
     bool prefill_shadow(std::uint32_t key, std::int32_t& slot);
-    // Whether any class has a free resident slot.
+    // The pre-fill of a reused tier (HostExpertTier over a HostSlotPool): places each (key, slot) of `kept` whose
+    // slot is a free resident slot of the key's class and whose key has no host copy and is not held, as prefill
+    // (prefill_shadow with `shadow`) would, but into that slot, whose bytes already are the key's record. Returns
+    // the keys placed, in `kept`'s order; a pair that does not qualify is skipped (prefill places its key).
+    std::vector<std::uint32_t> prefill_kept(std::span<const std::pair<std::uint32_t, std::uint32_t>> kept, bool shadow);
+    // Moves the free resident slots of `slots` behind the others in their classes' free lists, so prefill takes
+    // them last (a reused tier's slots holding records a later fill may keep).
+    void defer_free(std::span<const std::uint32_t> slots);
+    // Whether any class has a free resident slot, and how many class c has.
     [[nodiscard]] bool has_free_resident() const;
+    [[nodiscard]] std::size_t free_resident(std::uint8_t c) const { return classes_[c].free.size(); }
     // Marks `key` held outside the slots (see held); false when it has a slot copy or is held.
     bool hold(std::uint32_t key);
     // Ends key's hold (the caller gives its record back): it is SSD-only afterwards unless VRAM holds it (which the

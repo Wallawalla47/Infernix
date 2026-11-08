@@ -12,6 +12,7 @@
 
 #include "core/vram_budget.h"
 #include "runtime/expert_offload/vram_monitor.h"
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <atomic>
@@ -115,7 +116,7 @@ int main() {
         options.kv_capacity = infernix::KvCapacityPolicy::explicit_capacity(4096);
         options.kv_cache    = infernix::KvCacheStorage::Int8Group64;
         options.diagnostic_observer.callback = [&](const infernix::Diagnostic& d) { diagnostics.add(d.message); };
-        infernix::Engine engine(options);
+        infernix::Engine engine(options, infernix::test::engine_host());
 
         constexpr std::uint32_t kTokens = 700;
         const auto baseline = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;

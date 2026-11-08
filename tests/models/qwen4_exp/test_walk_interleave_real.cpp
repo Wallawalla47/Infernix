@@ -7,6 +7,7 @@
 //
 //   INFERNIX_QWEN4_ARTIFACT=out.ninfer [INFERNIX_QWEN4_NGRAM=out.ninfer.ngram] infernix_qwen4_exp_walk_interleave_real_test
 
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <atomic>
@@ -152,7 +153,7 @@ int main() {
             diagnostics.push_back(d.message);
             std::printf("  [engine] %s\n", d.message.c_str());
         };
-        infernix::Engine engine(options);
+        infernix::Engine engine(options, infernix::test::engine_host());
 
         const std::vector<infernix::TokenId> long_prompt = engine.tokenize_text(reports(260));
         std::printf("long prompt: %zu tokens\n", long_prompt.size());

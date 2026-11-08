@@ -5,6 +5,7 @@
 // expert staging passes nor the selection's presence changes an earlier position); log-probabilities are
 // valid and a repeated text is predicted well. Skips (77) without the artifact.
 
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <cmath>
@@ -32,7 +33,7 @@ int main() {
     if (const char* volume = std::getenv("INFERNIX_QWEN4_NGRAM"); volume != nullptr && *volume != '\0') {
         options.ngram_volume_path = volume;
     }
-    infernix::Engine engine(options);
+    infernix::Engine engine(options, infernix::test::engine_host());
 
     const std::string paragraph =
         "The lossless route computes each operation of the model exactly and rounds it once, so a "

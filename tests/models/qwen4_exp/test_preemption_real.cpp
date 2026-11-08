@@ -34,6 +34,7 @@
 
 #include "kv_cache_storage.h"
 #include "models/qwen4_exp/program/prefix/test_taps.h"
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <algorithm>
@@ -130,7 +131,7 @@ int run_mode(const char* artifact, const char* ngram, Mode mode, const char* dra
         options.speculative.draft_model  = drafter;
         options.fast_path_candidates.push_back(infernix::FastPath::DFlash2Pairs);
     }
-    infernix::Engine engine(options);
+    infernix::Engine engine(options, infernix::test::engine_host());
     const auto prompt_a = synthetic_tokens(kPrompt, mtp ? 11U : 1U);
     const auto prompt_b = synthetic_tokens(kPrompt, mtp ? 12U : 2U);
     int failures = 0;
@@ -214,7 +215,7 @@ int run_prompt_pause(const char* artifact, const char* ngram) {
     options.max_pending_requests = 4;
     options.fast_paths           = false;
     options.fast_path_candidates = {infernix::FastPath::Preemption};
-    infernix::Engine engine(options);
+    infernix::Engine engine(options, infernix::test::engine_host());
     const auto prompt_a = synthetic_tokens(kShort, 21U);
     const auto prompt_b = synthetic_tokens(kLong, 22U);
     const auto request  = [](std::uint32_t outputs) {

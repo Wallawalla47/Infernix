@@ -148,6 +148,25 @@ change. Each Program exclusively owns its mutable state and Device allocations; 
 Engine worker and pending device work finish first, then the Program, Frontend, Parameters and Model
 are destroyed.
 
+**EngineHost** (`include/infernix/engine.h`). A process that starts several Engines on one artifact
+(the real-model tests) can start them on one host, which keeps what a start would otherwise redo:
+Qwen3.8-Flash-Next's SSD expert tier, its page-locked RAM slots and the expert records they hold
+(`runtime/expert_offload/host_slot_pool.h`). That is a handover, not sharing: while a Program runs,
+the chunks it took are its own, and it gives them back when it ends, from its tier's destructor,
+once nothing reads or writes a slot. Each chunk carries the key whose complete record each slot
+holds by the tier's controller, which execution itself trusts. The next start's RAM plan counts the
+idle chunks as free and pinnable. Its tier takes chunks of exactly the sizes it pins, and its
+startup fill places the keys a fill without the host places, keeping a record already in a free
+slot of its class and reading the others. That knowledge ends at the first round or RAM resize.
+What the tier did not take is released before anything else is page-locked. The host also carries
+the CPU expert team's settled rates, measured on a quiet machine, for each configuration (artifact,
+workers, CPUs, arithmetic, records): a later start of the same configuration takes them instead of
+settling them again. Everything else (the Model, the RAM plan, the VRAM expert cache and its warm
+start, KV, prefix cache, the link and volume probes, graphs) is established per start as without
+the host. On Dense8 a start spends about 7 s page-locking those slots, 11 s reading 51 GiB of
+records and 4-8 s settling the CPU rates, of about 30-34 s. Qwen3.5-family artifacts start as
+without a host.
+
 Model code maintains the finite call forms, cross-Op fusion and phase relationships. For example, when
 Q/K are one Q4 parent and gate/V are one Q5 parent, the Attention projection uses two weight
 parameters; when a complete FP8/NVFP4 parent stores Q/K/gate/V, a single weight entry point is used.

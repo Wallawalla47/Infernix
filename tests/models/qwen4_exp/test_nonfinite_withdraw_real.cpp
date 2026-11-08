@@ -18,6 +18,7 @@
 
 #include "test_temp_path.h"
 #include "runtime/contract/execution.h"
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <chrono>
@@ -128,7 +129,7 @@ const std::vector<infernix::TokenId>& prompt_q() {
 
 int run_in_memory(const char* artifact, const char* ngram, std::vector<infernix::TokenId>& cold_p) {
     std::printf("== in memory\n");
-    infernix::Engine engine(base_options(artifact, ngram));
+    infernix::Engine engine(base_options(artifact, ngram), infernix::test::engine_host());
     int failures = 0;
     const std::vector<infernix::TokenId>& p = prompt_p();
     const std::vector<infernix::TokenId>& q = prompt_q();
@@ -198,7 +199,7 @@ int run_file(const char* artifact, const char* ngram, const std::vector<infernix
     };
     int failures = 0;
     {
-        infernix::Engine engine(options());
+        infernix::Engine engine(options(), infernix::test::engine_host());
         (void)generate(engine, prompt_q(), 16, true); // clean entries the file must keep
         bool saved = false;
         for (int i = 0; i < 300 && !saved; ++i) {
@@ -216,7 +217,7 @@ int run_file(const char* artifact, const char* ngram, const std::vector<infernix
     } // the stop saves the Host tier
     failures += check(std::filesystem::exists(file), "Engine 1's stop saved the Host tier");
     {
-        infernix::Engine engine(options());
+        infernix::Engine engine(options(), infernix::test::engine_host());
         const infernix::LoadSummary::PrefixCacheRestore restore = engine.load_summary().prefix_cache;
         failures += check(restore.restored && restore.snapshots > 0, "Engine 2 restores the saved snapshots");
         const Run p = generate(engine, prompt_p(), 32, true);

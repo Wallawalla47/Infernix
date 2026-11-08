@@ -42,6 +42,7 @@
 
 #include "test_temp_path.h"
 #include "kv_cache_storage.h"
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <algorithm>
@@ -171,7 +172,7 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
         options.speculative.backend      = infernix::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = 3;
     }
-    infernix::Engine engine(std::move(options));
+    infernix::Engine engine(std::move(options), infernix::test::engine_host());
     int failures = 0;
 
     // tap resume: A leaves a flexible tap at the start of its final call (1024); B shares 1,400
@@ -275,7 +276,7 @@ int run_one_context(const char* artifact, const char* ngram) {
     options.kv_capacity               = infernix::KvCapacityPolicy::explicit_capacity(4096);
     options.speculative.backend       = infernix::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 3;
-    infernix::Engine engine(std::move(options));
+    infernix::Engine engine(std::move(options), infernix::test::engine_host());
     int failures = 0;
     const std::vector<infernix::TokenId> a = synthetic_tokens(3000, 21);
     std::vector<infernix::TokenId> b(a.begin(), a.begin() + 2000);
@@ -329,7 +330,7 @@ int run_persistence(const char* artifact, const char* ngram) {
         // the Host tier stops changing, the file holds the endpoint and is not rewritten.
         infernix::EngineOptions o                       = options();
         o.context_cache.hybrid.persistent_save_interval = std::chrono::seconds(1);
-        infernix::Engine engine(o);
+        infernix::Engine engine(o, infernix::test::engine_host());
         failures += check(!engine.load_summary().prefix_cache.restored, "Engine 1 starts without a saved file");
         failures += check(!std::filesystem::exists(file), "the periodic save starts without a file");
         const infernix::GenerationResult r1 = chat_on(engine, turn1, 32);
@@ -362,7 +363,7 @@ int run_persistence(const char* artifact, const char* ngram) {
     failures += check(!size_error && saved_bytes > 0 && std::filesystem::last_write_time(file, ignored) != periodic_write,
                       "the stop saved the Host tier (" + std::to_string(size_error ? 0U : saved_bytes) + " bytes)");
     {
-        infernix::Engine engine(options());
+        infernix::Engine engine(options(), infernix::test::engine_host());
         const infernix::LoadSummary::PrefixCacheRestore restore = engine.load_summary().prefix_cache;
         std::printf("        restored %llu blocks and %llu snapshots (%s)\n",
                     static_cast<unsigned long long>(restore.blocks), static_cast<unsigned long long>(restore.snapshots),
@@ -406,7 +407,7 @@ int run_identical_burst(const char* artifact, const char* ngram) {
         options.context_cache.host_capacity_bytes = 1ULL << 30;
         options.speculative.backend               = infernix::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens          = 3;
-        infernix::Engine engine(std::move(options));
+        infernix::Engine engine(std::move(options), infernix::test::engine_host());
         infernix::PromptInput input;
         infernix::ChatMessage user;
         user.role = infernix::ChatRole::User;
@@ -465,7 +466,7 @@ int run_next_turn(const char* artifact, const char* ngram, bool reproducible) {
         refused.context_cache.hybrid.next_turn_prefill_quiet = std::chrono::milliseconds{20};
         std::string what;
         try {
-            infernix::Engine engine(std::move(refused));
+            infernix::Engine engine(std::move(refused), infernix::test::engine_host());
         } catch (const std::exception& error) { what = error.what(); }
         return check(what.find("next-turn prefill") != std::string::npos,
                      "the reproducible route refuses the next-turn prefill (" + what + ")");
@@ -477,7 +478,7 @@ int run_next_turn(const char* artifact, const char* ngram, bool reproducible) {
     options.fast_path_candidates.clear();
     options.context_cache.hybrid.next_turn_prefill_quiet = std::chrono::milliseconds{20};
     const std::uint32_t grid = reproducible ? 16U : 1U;
-    infernix::Engine engine(std::move(options));
+    infernix::Engine engine(std::move(options), infernix::test::engine_host());
     int failures = 0;
     const auto chat = [&](std::vector<infernix::ChatMessage> messages, std::uint32_t outputs, bool reuse) {
         infernix::PromptInput input;
@@ -634,7 +635,7 @@ int run_ssd_tier(const char* artifact, const char* ngram, const char* drafter = 
     Run turn1_reference, resident;
     std::vector<infernix::TokenId> t2;
     {
-        infernix::Engine reference(with_drafter(base_options(artifact, ngram)));
+        infernix::Engine reference(with_drafter(base_options(artifact, ngram)), infernix::test::engine_host());
         turn1_reference = generate(reference, t1, 96, true);
         t2              = t1;
         t2.insert(t2.end(), turn1_reference.tokens.begin(), turn1_reference.tokens.end());
@@ -650,7 +651,7 @@ int run_ssd_tier(const char* artifact, const char* ngram, const char* drafter = 
     // The write budget's level persists in the test directory: exactness and timing run without it.
     options.context_cache.ssd_write_bytes_per_hour = infernix::ContextCacheOptions::kSsdWritesUnlimited;
     options.context_cache.ssd_directory       = directory;
-    infernix::Engine engine(std::move(options));
+    infernix::Engine engine(std::move(options), infernix::test::engine_host());
     int failures = 0;
     const auto pressure = [&](std::uint32_t seed) {
         for (std::uint32_t k = 0; k < 3; ++k) { (void)generate(engine, synthetic_tokens(3900, seed + k), 4, true); }
@@ -717,7 +718,7 @@ int run_ssd_scale(const char* artifact, const char* ngram) {
     // The write budget's level persists in the test directory: exactness and timing run without it.
     options.context_cache.ssd_write_bytes_per_hour = infernix::ContextCacheOptions::kSsdWritesUnlimited;
     options.context_cache.ssd_directory       = directory;
-    infernix::Engine engine(std::move(options));
+    infernix::Engine engine(std::move(options), infernix::test::engine_host());
     const auto timed = [&](const std::vector<infernix::TokenId>& prompt, bool reuse) {
         const infernix::GenerationResult r = engine.generate(engine.prepare_tokens(prompt), greedy(16, reuse));
         const double ttft = r.first_output_timing ? r.first_output_timing->elapsed_seconds : -1.0;

@@ -15,6 +15,9 @@
 #include "runtime/engine/context_cache/hybrid_resource_manager.h"
 #include "runtime/engine/model_instance.h"
 #include "runtime/engine/qwen4_exp_instance.h"
+#include "runtime/expert_offload/host_slot_pool.h"
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <atomic>
@@ -309,7 +312,8 @@ public:
     static constexpr bool kScoring = std::is_same_v<CoreState, std::unique_ptr<ScoringCore>> ||
                                      std::is_same_v<CoreState, std::unique_ptr<Qwen4ExpScoringCore>>;
 
-    explicit Impl(EngineOptions engine_options)
+    explicit Impl(EngineOptions engine_options,
+                  std::shared_ptr<runtime::expert_offload::HostSlotPool> slot_pool = nullptr)
         : options(normalize(std::move(engine_options))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
@@ -320,7 +324,7 @@ public:
                                     options.lossless_noise_scale);
         }
         if (architecture == models::Architecture::Qwen4Exp) {
-            auto constructed  = runtime::construct_qwen4_exp(options, device);
+            auto constructed  = runtime::construct_qwen4_exp(options, device, nullptr, std::move(slot_pool));
             options           = std::move(constructed.options);
             qwen4             = std::move(constructed.instance);
             load              = std::move(constructed.load);
@@ -453,7 +457,35 @@ public:
     std::atomic<bool> stop_requested{false};
 };
 
-Engine::Engine(EngineOptions options) {
+class EngineHost::Impl {
+public:
+    // The SSD expert tier's page-locked chunks (HostExpertTier's own allocation: cudaHostAlloc, freed by
+    // cudaFreeHost), shared with every Program started on the host.
+    std::shared_ptr<runtime::expert_offload::HostSlotPool> slots =
+        std::make_shared<runtime::expert_offload::HostSlotPool>([](void* p) { (void)cudaFreeHost(p); });
+};
+
+EngineHost::EngineHost() : impl_(std::make_shared<Impl>()) {}
+EngineHost::~EngineHost()                                = default;
+EngineHost::EngineHost(EngineHost&&) noexcept            = default;
+EngineHost& EngineHost::operator=(EngineHost&&) noexcept = default;
+
+void EngineHost::release() noexcept {
+    if (impl_) { impl_->slots->release_idle(); }
+}
+
+std::uint64_t EngineHost::kept_bytes() const noexcept {
+    try {
+        return impl_ ? impl_->slots->idle_bytes() : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+namespace {
+
+// Process settings every start applies first.
+void prepare_process(const EngineOptions& options) {
     // Before any host thread starts: a throttled process runs every one of them slower.
     if (const auto refused = exempt_process_from_power_throttling()) {
         runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
@@ -476,9 +508,26 @@ Engine::Engine(EngineOptions options) {
                                         io->before);
         }
     }
+}
+
+} // namespace
+
+Engine::Engine(EngineOptions options) {
+    prepare_process(options);
     StartupObserver startup_observer = options.startup_observer;
     StartupPhaseScope startup_phase(startup_observer, StartupPhase::EngineStartup);
     impl_ = std::make_shared<Impl>(std::move(options));
+    startup_phase.complete();
+}
+
+Engine::Engine(EngineOptions options, EngineHost& host) {
+    if (!host.impl_) { throw std::logic_error("EngineHost is moved from"); }
+    prepare_process(options);
+    StartupObserver startup_observer = options.startup_observer;
+    StartupPhaseScope startup_phase(startup_observer, StartupPhase::EngineStartup);
+    // The Program shares the host's slot pool (ProgramOptions::expert_slot_pool): its tier gives the chunks back
+    // when it ends, even after the host itself is gone.
+    impl_ = std::make_shared<Impl>(std::move(options), host.impl_->slots);
     startup_phase.complete();
 }
 

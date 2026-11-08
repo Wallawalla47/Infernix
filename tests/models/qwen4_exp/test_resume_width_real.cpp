@@ -20,6 +20,7 @@
 #include "kv_cache_storage.h"
 #include "models/qwen4_exp/program/prefix/test_taps.h"
 #include "models/resume_cold_probe.h"
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <bit>
@@ -110,7 +111,7 @@ int main(int argc, char** argv) {
         for (std::size_t c = 0; c < cases.size(); ++c) {
             if (c % kCasesPerEngine == 0) {
                 holder.reset();
-                holder.emplace(engine_options(artifact, std::getenv("INFERNIX_QWEN4_NGRAM")));
+                holder.emplace(engine_options(artifact, std::getenv("INFERNIX_QWEN4_NGRAM")), infernix::test::engine_host());
             }
             infernix::Engine& engine = *holder;
             const auto [r, L] = cases[c];

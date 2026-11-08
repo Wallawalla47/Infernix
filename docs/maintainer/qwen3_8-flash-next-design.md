@@ -8168,6 +8168,43 @@ R7 and R8 implemented on `claude/fn-memory-tier` (from the integration branch, 2
   the queued loads. The allowance is 32 per decode or verification boundary, unlimited at prefill
   chunk boundaries.
 
+**A reused host** (2026-11-08, `EngineHost`, `runtime/expert_offload/host_slot_pool.h`;
+engine-architecture.md §2.5). A Dense8 serve start (release windows-2026.11.07, `--log-level
+debug`, twice, 2026-11-08) took 34.1 and 29.6 s: about 1 s to the RAM plan, 1.1 s of weights,
+2.6 s packing BF16 weights, then 7.3-7.5 s to the link probe (page-locking 59.8 GiB of slots with
+`cudaHostAlloc`, about 0.11 s/GiB; the probe itself takes milliseconds), 1.7-1.9 s for the CPU
+service, prefix cache and VRAM frames, 11.0-11.1 s for the tier's fill of 51 GiB (the VRAM warm
+start overlaps it), 4.2-8.4 s settling the CPU team's rates (two or three readings, 4 s apart) and
+0.9 s of warm-up. When several Engines start one after another in a process (the Flash-Next
+real-model tests start about 65-70 in all), a `HostSlotPool` keeps the chunks between them:
+- **Handing chunks back.** The tier pins through the pool first: chunks of exactly the size it
+  pins, with the records their slots held when they last served this artifact (the identity is
+  its artifact id). When it ends, it gives them back from its destructor, where nothing reads or
+  writes a slot, with the controller's key for each resident or shadow slot. A slot an admission
+  copy is still writing is left out, and so are lists, landings, lent slots and refill targets,
+  none of which is resident.
+- **The startup fill.** `prefill` and `prefill_shadows` first work out the keys a fill without the
+  pool places: in rank order, each class until its free slots run out. Those whose record a free
+  resident slot of their class holds take that slot unread (`HostTier::prefill_kept`); the others
+  are read into the free slots left. The slots holding kept records are taken last
+  (`HostTier::defer_free`), so a later fill can still keep theirs.
+- **When the knowledge ends.** The first round boundary and any RAM resize discard it, since a
+  round reuses slots. A fill that reads few records takes the drive rate the pool's largest fill
+  measured (`refill_within` needs it).
+- **Memory.** The RAM plan counts the idle chunks as free and pinnable, and what the tier did not
+  take is released at once, so memory ends where a start without the pool leaves it.
+- **The CPU rates.** The pool also keeps the CPU team's settled rates (§19.3.12) from a start whose
+  readings were quiet, under its configuration (artifact id, workers and their CPUs, the narrow
+  route's arithmetic, the record stride, tier or banks). A later start of the same configuration
+  takes them as they are (the startup report says "kept from an earlier Engine"), since they are
+  the machine's: readings of one machine differ by a few percent from start to start (17,915-18,958
+  experts/s settled on Dense8), so a reused rate splits as a fresh one would.
+
+`infernix_qwen4_exp_host_expert_tier_test` checks the fills against the byte oracle: kept and read
+counts, another list layout, another artifact's chunks, the first round, chunk sizes and releases.
+`infernix_qwen4_exp_engine_host_real_test` checks that the reproducible route's tokens equal those
+of an Engine without a host.
+
 ### 19.3.8 Prefill (proposed track M8, steps F0 and F1)
 
 Branch `claude/fn-prefill`. The steps are §19.3.6 item 4's F0-F6 (`strata-amendments.md`, "Prefill");

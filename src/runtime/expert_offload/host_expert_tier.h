@@ -38,6 +38,7 @@
 #include "core/direct_read_queue.h"
 #include "core/host_memory.h"
 #include "runtime/expert_offload/expert_store.h"
+#include "runtime/expert_offload/host_slot_pool.h"
 #include "runtime/expert_offload/host_tier.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 #include "ops/offloaded_sparse_moe/cpu/record_provider.h"
@@ -95,6 +96,14 @@ public:
         // OS refuses, and its release.
         std::function<void*(std::size_t)> allocate;
         std::function<void(void*)> release;
+        // Page-locked slots kept between tiers of one process (an EngineHost; HostSlotPool): each chunk is taken
+        // from the pool before `allocate` is asked, with the records its slots held when it last served
+        // `pool_identity` (the artifact's records) at the same size, and goes back to the pool, with the records its
+        // slots hold, when the tier ends. The startup fill (prefill, prefill_shadows) keeps a record already in a
+        // free slot of its class instead of reading it; that knowledge ends at the first round (begin_round) or RAM
+        // resize. A shrink still releases its chunks (`release`).
+        std::shared_ptr<HostSlotPool> pool;
+        std::string pool_identity;
         // The device's fetch channel this tier answers (owned by the caller; null: CPU demands only).
         // The ring must exceed the CPU jobs of one call plus the largest pass's fetched records.
         ops::offloaded_moe::FetchChannel* fetch = nullptr;
@@ -116,6 +125,8 @@ public:
 
     struct Stats {
         std::uint64_t demand_reads = 0, demand_failures = 0, prefill_reads = 0, admitted = 0, discarded = 0;
+        // Records the startup fill kept in a reused slot (Options::pool) instead of reading them.
+        std::uint64_t kept = 0;
         std::uint64_t copied_admissions = 0; // admissions copied into a class of smaller records
         std::uint64_t fetch_requests = 0, fetch_records = 0, fetch_from_ram = 0; // the fetch channel's
         std::uint64_t read_ns = 0; // demand reads, submit to landing, summed
@@ -346,6 +357,9 @@ private:
         std::byte* memory = nullptr;
         std::uint32_t region = 0, first = 0, slots = 0;
         std::uint64_t bytes = 0;
+        // A chunk taken from Options::pool: the record each slot held (HostSlotPool::kNoKey: none), until the
+        // constructor turns them into kept_slot_.
+        std::vector<std::int32_t> kept;
     };
     // The pinned slots: chunks released on destruction, and each region's slot addresses in order (null in a chunk
     // given back).
@@ -397,9 +411,21 @@ private:
     void submit_run(std::span<const std::pair<std::uint32_t, std::uint8_t*>> run, std::uint64_t tag);
     // Reads (key, destination) records with no round open (prefill, fill_unpinned, grow) and returns once all landed.
     void read_records(const std::vector<std::pair<std::uint32_t, std::uint8_t*>>& jobs);
-    // prefill's reads: the keys of `ranked` it places into free resident slots, with their destinations.
+    // prefill's (prefill_shadows' with `shadow`) reads: the keys of `ranked` it places into free resident slots, with
+    // their destinations. The keys a reused slot holds (kept_slot_) are placed there first, without a read.
     std::vector<std::pair<std::uint32_t, std::uint8_t*>> slot_jobs(std::span<const std::uint32_t> ranked,
-                                                                   const std::function<bool(std::uint32_t)>& skip);
+                                                                   const std::function<bool(std::uint32_t)>& skip,
+                                                                   bool shadow = false);
+    // ---- a reused pool's records (Options::pool)
+    // The controller slot of a chunk's slot j, or -1 (a bounce slot).
+    [[nodiscard]] std::int64_t controller_slot(const Chunk& chunk, std::uint32_t j) const noexcept;
+    // The key whose complete record controller slot `slot` holds now (a resident or shadow slot no admission copy
+    // writes), or HostSlotPool::kNoKey.
+    [[nodiscard]] std::int32_t record_key(std::uint32_t slot) const noexcept;
+    // The startup fill's knowledge of what reused slots hold ends (begin_round, a RAM resize).
+    void forget_kept() noexcept;
+    // Gives every pinned chunk back to Options::pool with the records its slots hold (the destructor).
+    void return_to_pool() noexcept;
     // ---- RAM resize
     // The first controller slot of a chunk shrink may give back, or -1 (the transit region; a chunk holding a bounce slot).
     [[nodiscard]] std::int64_t chunk_base(const Chunk& chunk) const noexcept;
@@ -426,6 +452,12 @@ private:
     std::vector<std::uint8_t*> slot_address_;      // the controller's slots
     std::vector<std::uint8_t*> bounce_address_;    // the bounce slots, then the stream bounce slots
     expert_cache::HostTier tier_;
+    // By key: the controller slot a reused chunk holds its record in (-1), and by controller slot that key (-1), until
+    // forget_kept; empty without a pool. A read into a slot drops its entry (drop_kept): the startup fill makes several
+    // passes, and a slot the first pass overwrote and the warm start freed again holds another key's bytes.
+    std::vector<std::int32_t> kept_slot_;
+    std::vector<std::int32_t> kept_key_;
+    void drop_kept(std::uint32_t slot) noexcept;
     // Unpinned records: key -> index (-1 none), the buffer, how many it has, the committed indices holding no record
     // (the lowest last, taken first) and those shrink decommitted.
     std::vector<std::int32_t> unpinned_of_;

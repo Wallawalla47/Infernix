@@ -19,6 +19,10 @@ namespace infernix {
 struct DeviceContext;
 }
 
+namespace infernix::runtime::expert_offload {
+class HostSlotPool;
+}
+
 namespace infernix::runtime {
 
 struct Qwen4ExpInstance {
@@ -58,7 +62,11 @@ struct ConstructedQwen4Exp {
 // compiles it, and the result is empty. A start's memory refusals become EnginePlan::fits false; anything
 // else throws as a start would (the fast paths' and --a8-activations' refusals among them, which both make
 // from the stored formats before any weight is read).
+// With `slot_pool` (an EngineHost's) the RAM plan counts its idle page-locked chunks as free and pinnable, and the
+// SSD expert tier takes them and the records they hold (ProgramOptions::expert_slot_pool); a start with every
+// expert in the model's own pinned banks releases them before the weights are read.
 [[nodiscard]] ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device,
-                                                      EnginePlan* plan = nullptr);
+                                                      EnginePlan* plan = nullptr,
+                                                      std::shared_ptr<expert_offload::HostSlotPool> slot_pool = nullptr);
 
 } // namespace infernix::runtime

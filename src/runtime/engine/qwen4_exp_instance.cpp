@@ -12,6 +12,7 @@
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/load.h"
 #include "runtime/expert_offload/expert_residency.h"
+#include "runtime/expert_offload/host_slot_pool.h"
 #include "runtime/expert_offload/memory_plan.h"
 #include "models/qwen4_exp/program/fast_paths.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
@@ -253,8 +254,11 @@ Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> sou
 
 Qwen4ExpInstance::~Qwen4ExpInstance() = default;
 
-ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device, EnginePlan* planned) {
+ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device, EnginePlan* planned,
+                                        std::shared_ptr<expert_offload::HostSlotPool> slot_pool) {
     const bool plan_only = planned != nullptr;
+    // An EngineHost's idle page-locked chunks are this start's to take: the plan counts them as free and pinnable.
+    const std::uint64_t pooled = slot_pool && !plan_only ? slot_pool->idle_bytes() : 0;
     validate(options);
     const auto start = std::chrono::steady_clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
@@ -305,6 +309,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     auto demand = expert_ram_demand(
         options, {.expert_banks = plan.pinned_expert_bytes(), .other_pinned = plan.pinned_other_bytes()}, prefix_bytes,
         vram->query());
+    if (demand.pin_room) { *demand.pin_room += pooled; }
     // The n-gram table its volume holds: the artifact's, or another volume's (any format) in its place.
     const std::filesystem::path volume = options.ngram_volume_path.empty()
                                              ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
@@ -445,8 +450,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // rest of the frames, and the fill phase's landings keep their RAM copies as those shadows; the loan and the
     // shrink evict shadowed experts first (ExpertResidency::lend), so nothing leaves both tiers. What it frees stays
     // for the n-gram table (its auto rule) and the Host tier.
-    const auto snapshot = host_memory_snapshot();
-    bool exclusive      = false;
+    auto snapshot = host_memory_snapshot();
+    snapshot.available_physical += pooled;
+    snapshot.available_commit += pooled;
+    bool exclusive = false;
     if (options.expert_ram_layout.value_or(ExpertRamLayout::Exclusive) == ExpertRamLayout::Exclusive &&
         !options.expert_ram_bytes) {
         const auto estimate = models::qwen4_exp::Program::plan_device(program_options, plan.config(), plan.public_token_count());
@@ -571,6 +578,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         program_options.expert_ram_bytes      = ram.expert_ram_bytes;
         program_options.expert_unpinned_bytes = ram.expert_unpinned_bytes;
         program_options.later_pinned_bytes    = ram.later_pinned_bytes;
+        program_options.expert_slot_pool      = slot_pool;
+    } else if (slot_pool && !plan_only) {
+        // Every expert in the model's own pinned banks: the kept chunks go before the weights are read and pinned.
+        slot_pool->release_idle();
     }
     {
         // The plan in one line, and with each choice's reason at Debug (candidates §22: compare with
@@ -863,6 +874,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // depends on the call's width.
     summary.request_invariant =
         fast.request_invariant() && options.expert_tail_skip == 0 && !options.a8_activations;
+    const models::qwen4_exp::ExpertRamFill fill = instance->program->expert_ram_fill();
+    summary.expert_ram_records_read = fill.read;
+    summary.expert_ram_records_kept = fill.kept;
 
     ModelMetadata metadata;
     metadata.model_id       = instance->model->info().name;

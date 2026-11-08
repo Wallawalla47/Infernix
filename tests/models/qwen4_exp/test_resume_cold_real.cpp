@@ -12,6 +12,7 @@
 
 #include "kv_cache_storage.h"
 #include "models/resume_cold_probe.h"
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <algorithm>
@@ -59,7 +60,7 @@ infernix::EngineOptions engine_options(const Setup& setup, std::string_view draf
 }
 
 int run(const Setup& setup, std::string_view drafter, bool fast_paths) {
-    infernix::Engine engine(engine_options(setup, drafter, fast_paths));
+    infernix::Engine engine(engine_options(setup, drafter, fast_paths), infernix::test::engine_host());
     const std::string route = fast_paths ? "default" : "reproducible";
     const auto separator    = engine.tokenize_text("\n\n");
     if (separator.empty()) { throw std::runtime_error("the tokenizer encoded no separator"); }

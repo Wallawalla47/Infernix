@@ -1410,7 +1410,16 @@ public:
                 diagnostic("SSD tier: expert record tails from " + options_.expert_stripe.string(),
                            DiagnosticLevel::Info);
             }
+            // An EngineHost's slots: the records a chunk holds are this artifact's (its id), read whole; a stripe reads
+            // the same bytes, so it shares them.
+            if (options_.expert_slot_pool) {
+                tier.pool          = options_.expert_slot_pool;
+                tier.pool_identity = pool_identity();
+            }
             tier_ = std::make_unique<HostExpertTier>(*records, std::move(tier));
+            // What the tier did not take (another size, more than it pins) is released before anything else is
+            // page-locked, so the Program ends with the memory a start without the host would hold.
+            if (options_.expert_slot_pool) { options_.expert_slot_pool->release_idle(); }
             residency_->attach_tier(tier_.get(), options_.expert_ram_exclusive);
             if (tier_->refused_slots() > 0) {
                 diagnostic("SSD expert tier: Windows refused to page-lock " + std::to_string(tier_->refused_slots()) +
@@ -1672,6 +1681,10 @@ public:
 
     const DeviceLayout& device_layout() const noexcept { return plan_; }
     const VramSizing& vram_sizing() const noexcept { return sizing_; }
+    [[nodiscard]] ExpertRamFill expert_ram_fill() const noexcept {
+        if (!tier_) { return {}; }
+        return {.read = tier_->stats().prefill_reads, .kept = tier_->stats().kept};
+    }
     // The expert cache's counters since startup and its size now (the per-request figures in
     // finish() are deltas of the same counters); nothing when the cache is off.
     [[nodiscard]] std::optional<ExpertCacheTotals> expert_cache_totals() const noexcept {
@@ -3626,17 +3639,25 @@ private:
             std::snprintf(shadow_text, sizeof(shadow_text), " and copies of the %u least-used in VRAM", shadows);
         }
         const std::uint32_t on_ssd = keys - in_ram - released - unpinned;
+        // An EngineHost's slots: the records still there from its last Engine were kept, the rest read.
+        char read[96];
+        if (tier_->stats().kept > 0) {
+            std::snprintf(read, sizeof(read), "%llu kept from the last Engine, the rest read in %.1f s",
+                          static_cast<unsigned long long>(tier_->stats().kept), seconds);
+        } else {
+            std::snprintf(read, sizeof(read), "read in %.1f s", seconds);
+        }
         char line[640];
         if (on_ssd == 0) {
             std::snprintf(line, sizeof(line),
-                          "experts in RAM: %u (read in %.1f s); with the expert cache they hold all %u experts, so none "
+                          "experts in RAM: %u (%s); with the expert cache they hold all %u experts, so none "
                           "is read from the model files",
-                          in_ram + unpinned, seconds, keys);
+                          in_ram + unpinned, read, keys);
         } else {
             std::snprintf(line, sizeof(line),
-                          "experts in RAM: %u (read in %.1f s); %u of the %u experts are read from the model files when "
+                          "experts in RAM: %u (%s); %u of the %u experts are read from the model files when "
                           "used",
-                          in_ram + unpinned, seconds, on_ssd, keys);
+                          in_ram + unpinned, read, on_ssd, keys);
         }
         diagnostic(line);
         std::snprintf(line, sizeof(line),
@@ -6713,6 +6734,17 @@ private:
     // i9-13900K at 6 workers on NVFP4 records).
     double cpu_expert_rate_ = 0.0; // 0 until measured
     double cpu_column_rate_ = 0.0;
+    // What an EngineHost's pool files this artifact's records and measurements under: "qwen4_exp:" and the artifact
+    // id in hex.
+    [[nodiscard]] std::string pool_identity() const {
+        static constexpr char kHex[] = "0123456789abcdef";
+        std::string identity = "qwen4_exp:";
+        for (const std::byte b : parameters_.model.info().artifact_id) {
+            identity += kHex[std::to_integer<unsigned>(b) >> 4U];
+            identity += kHex[std::to_integer<unsigned>(b) & 15U];
+        }
+        return identity;
+    }
     // One reading (nullopt without expert records in RAM), and the readings until they settle
     // (runtime/expert_offload/placement.h settle_cpu_rates) with their report.
     [[nodiscard]] std::optional<runtime::expert_offload::CpuRateReading> measure_cpu_rate(std::uint64_t record_stride);

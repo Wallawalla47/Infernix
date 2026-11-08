@@ -26,6 +26,7 @@
 
 #include "kv_cache_storage.h"
 #include "models/qwen4_exp/program/ngram_tree_testing.h"
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <algorithm>
@@ -220,7 +221,7 @@ Arm run(const char* artifact, const char* ngram, const char* draft_model, std::u
     }
     // Both arms take every copy, to a two-path tree's depth; the tree arm verifies every eligible tree.
     infernix::models::qwen4_exp::testing::set_ngram_policy_override(true);
-    infernix::Engine engine(options);
+    infernix::Engine engine(options, infernix::test::engine_host());
     Arm arm;
     for (const Tokens& tokens : prompts) {
         infernix::RequestOptions request;
@@ -328,7 +329,7 @@ int main() {
             options.artifact_path = artifact;
             if (ngram != nullptr) { options.ngram_volume_path = ngram; }
             options.max_context = kContext;
-            infernix::Engine engine(options);
+            infernix::Engine engine(options, infernix::test::engine_host());
             for (int variant = 0; variant < 2; ++variant) { prompts.push_back(engine.tokenize_text(prompt(variant))); }
         }
         int failures = 0;
@@ -342,7 +343,7 @@ int main() {
         }
         std::vector<const Arm*> chains{&copies_chain};
         if (with_dflash2) { chains.push_back(&*dflash2_chain); }
-        infernix::Engine reference(reference_options(artifact, ngram));
+        infernix::Engine reference(reference_options(artifact, ngram), infernix::test::engine_host());
         failures += compare("copies alone", reference, prompts, copies_tree, copies_chain, chains);
         if (with_dflash2) { failures += compare("DFlash2 7 + copies", reference, prompts, *dflash2_tree, *dflash2_chain, chains); }
         std::printf(failures == 0 ? "ngram tree real test passed\n" : "ngram tree real test: %d failure(s)\n", failures);

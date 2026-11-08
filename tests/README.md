@@ -276,6 +276,15 @@ expert frames a Vision window may be lent (the image request waits or is refused
 `media_budget_exceeded`). The hybrid prefix test's `nonfinite-withdraw` scenario
 (`INFERNIX_HYBRID_REAL_SCENARIO`) checks the withdrawal on Qwen3.5.
 
+These tests start their Engines on one `EngineHost` per process (`tests/models/qwen4_exp/engine_host.h`).
+Each start after the first takes the SSD expert tier's page-locked slots, and the expert records the
+last Engine left in them, instead of page-locking 59 GiB and reading 51 GiB again, and the CPU expert
+team's rates an earlier start of the same configuration settled (together about 22-26 s of a 30-34-s
+Dense8 start). Everything else in a start runs as without the host.
+`infernix_qwen4_exp_engine_host_real_test` checks that Engines on a reused host give the
+reproducible-route tokens of an Engine without one, and keep most of the records the last left. The
+hand-run tools (forward, score, route trace) and that test's reference Engine start without a host.
+
 Without their artifact variable, CTest marks these real Engine tests as skipped. Real-artifact targets
 carry the `real` label and `RUN_SERIAL` so CTest runs them alone. Run directly invoked GPU
 integration tests serially. `INFERNIX_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as

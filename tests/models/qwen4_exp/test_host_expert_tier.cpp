@@ -5,8 +5,9 @@
 // demands sharing a ticket, admission of hot landings at the next boundary (the victims lose their
 // host copy, the dirty set names both), ring exhaustion reusing finished slots, a failed read,
 // destruction with reads in flight, unpinned records (a refused pin chunk becoming unpinned
-// records, their startup fill, CPU demands served in place and never admitted), and a RAM resize
-// (pinned chunks and unpinned records given back and taken again, refilled from the file). CPU and disk only,
+// records, their startup fill, CPU demands served in place and never admitted), a RAM resize
+// (pinned chunks and unpinned records given back and taken again, refilled from the file), and an
+// EngineHost's slot pool (tiers keeping the records their reused chunks hold). CPU and disk only,
 // except with --fetch: the tier as the responder
 // of a fetch channel (mapped words, so a CUDA context), this thread playing the device's half of the
 // protocol (ops/offloaded_sparse_moe/cpu/fetch_request.h): records landed from RAM and read from disk,
@@ -16,10 +17,12 @@
 #include "test_temp_path.h"
 #include "runtime/expert_offload/expert_store.h"
 #include "runtime/expert_offload/host_expert_tier.h"
+#include "runtime/expert_offload/host_slot_pool.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -898,6 +901,156 @@ void test_resize_unpinned(const ExpertStore& store) {
     tier.controller().check();
 }
 
+// An EngineHost's reused slots (HostSlotPool): tiers one after another take the chunks the last gave back and keep the
+// records their slots still hold, reading only the others; every record equals the file's bytes, and the fill places
+// the keys a fill without the pool places. Another artifact's chunks are reused as memory only, a chunk of another
+// size is not taken, and what a reused chunk held is known only until the first round.
+void test_slot_pool(const ExpertStore& store) {
+    struct Calls {
+        int allocated = 0, released = 0;
+    } calls;
+    const auto allocate = [&calls](std::size_t bytes) -> void* {
+        ++calls.allocated;
+        return ::operator new(bytes, std::align_val_t{4096});
+    };
+    const auto release = [&calls](void* p) {
+        ++calls.released;
+        ::operator delete(p, std::align_val_t{4096});
+    };
+    auto pool = std::make_shared<infernix::runtime::expert_offload::HostSlotPool>(release);
+    const auto pooled = [&](std::uint32_t ring, std::string identity) {
+        auto o          = options();
+        o.ring          = ring;
+        o.allocate      = allocate;
+        o.release       = release;
+        o.pool          = pool;
+        o.pool_identity = std::move(identity);
+        return o;
+    };
+    std::vector<std::uint32_t> ranked(kKeys);
+    for (std::uint32_t k = 0; k < kKeys; ++k) { ranked[k] = k; }
+    const auto all_match = [&](const HostExpertTier& tier, std::uint32_t first, std::uint32_t last) {
+        bool ok = true;
+        for (std::uint32_t k = first; k < last; ++k) { ok = ok && matches(tier.record(k), k); }
+        return ok;
+    };
+    {
+        // The first tier reads every record and gives four chunks back; a round admits 55, 70 and 90 over three of
+        // keys 0-49, so those three leave RAM.
+        HostExpertTier tier(store, pooled(8, "A"));
+        check(calls.allocated == 4 && tier.prefill(ranked) == 50 && tier.stats().kept == 0 && tier.stats().prefill_reads == 50,
+              "pool: the first tier reads its 50 records");
+        tier.begin_round(32);
+        std::vector<std::uint32_t> statuses;
+        std::vector<bool> valid;
+        (void)serve(tier, {55, 70, 90}, statuses, valid);
+        const std::vector<std::uint32_t> hot{55, 70, 90};
+        tier.record_uses(1, hot, 50.0);
+        tier.begin_round(32);
+        check(tier.stats().admitted == 3, "pool: three landings admitted");
+        tier.end_round();
+    }
+    check(pool->idle_chunks() == 4 && pool->idle_bytes() == 64 * kRecord && calls.released == 0,
+          "pool: the tier's chunks are kept, not released");
+    {
+        // The same layout: the 47 keys of 0-49 still in RAM are kept, the three it lost are read.
+        HostExpertTier tier(store, pooled(8, "A"));
+        check(calls.allocated == 4 && pool->idle_chunks() == 0, "pool: the second tier takes the kept chunks");
+        check(tier.prefill(ranked) == 50 && tier.stats().kept == 47 && tier.stats().prefill_reads == 3,
+              "pool: 47 records kept, 3 read");
+        check(all_match(tier, 0, 50) && tier.record(55) == nullptr && tier.record(70) == nullptr,
+              "pool: the fill holds keys 0-49, each equal to the file's bytes");
+        tier.controller().check();
+    }
+    {
+        // A ring of 4 moves the controller's slots: 54 resident slots, keys 0-49 kept where they are, 50-53 read.
+        HostExpertTier tier(store, pooled(4, "A"));
+        check(tier.prefill(ranked) == 54 && tier.stats().kept == 50 && tier.stats().prefill_reads == 4 && all_match(tier, 0, 54),
+              "pool: another layout keeps the records in its resident slots");
+        tier.controller().check();
+    }
+    {
+        // The startup fill's passes (2026-11-08: a reused Dense8 host gave other tokens): the first pass reads keys
+        // 60-113 over every slot that held one of keys 0-53, the frames take 60 and 61 (their RAM copies become shadows
+        // and are released), and the refill places the keys whose records those two slots held before the first pass.
+        // Those slots now hold 60's and 61's bytes: the refill reads the keys, it keeps nothing.
+        std::vector<const std::uint8_t*> was(kKeys, nullptr);
+        {
+            HostExpertTier tier(store, pooled(4, "A"));
+            check(tier.prefill(ranked) == 54 && tier.stats().kept == 54, "pool passes: the last tier's 54 records kept");
+            for (std::uint32_t k = 0; k < 54; ++k) { was[k] = tier.record(k); }
+        }
+        HostExpertTier tier(store, pooled(4, "A"));
+        std::vector<std::uint32_t> others;
+        for (std::uint32_t k = 60; k < 114; ++k) { others.push_back(k); }
+        check(tier.prefill(others) == 54 && tier.stats().kept == 0 && all_match(tier, 60, 114),
+              "pool passes: the first pass reads 54 other keys into every slot");
+        std::vector<std::uint32_t> overwritten;
+        for (const std::uint32_t k : {60U, 61U}) {
+            for (std::uint32_t old = 0; old < 54; ++old) {
+                if (was[old] == tier.record(k)) { overwritten.push_back(old); }
+            }
+        }
+        auto& host = tier.controller();
+        for (const std::uint32_t k : {60U, 61U}) {
+            host.queued(k);
+            host.promotion_issued(k);
+            host.promotion_completed(k, true);
+        }
+        check(overwritten.size() == 2 && host.release_shadows() == 2, "pool passes: the two seeds' slots are released");
+        check(tier.prefill(overwritten) == 2 && tier.stats().kept == 0 && tier.stats().prefill_reads == 56 &&
+                  matches(tier.record(overwritten[0]), overwritten[0]) && matches(tier.record(overwritten[1]), overwritten[1]),
+              "pool passes: the refill reads the keys whose slots the first pass overwrote");
+        host.check();
+    }
+    {
+        // Another artifact's records: the chunks are reused as memory, nothing is kept.
+        HostExpertTier tier(store, pooled(8, "B"));
+        check(calls.allocated == 4 && tier.prefill(ranked) == 50 && tier.stats().kept == 0 && tier.stats().prefill_reads == 50 &&
+                  all_match(tier, 0, 50),
+              "pool: another identity reads every record into the reused chunks");
+    }
+    {
+        // Identity A again, after B wrote the chunks: nothing of A's is trusted.
+        HostExpertTier tier(store, pooled(8, "A"));
+        check(tier.prefill(ranked) == 50 && tier.stats().kept == 0 && all_match(tier, 0, 50),
+              "pool: a chunk another identity wrote holds none of A's records");
+    }
+    {
+        // The chunks now hold A's records (the last tier's), but a round begins before the fill: what they held is no
+        // longer known.
+        HostExpertTier tier(store, pooled(8, "A"));
+        tier.begin_round(32);
+        tier.end_round();
+        check(tier.prefill(ranked) == 50 && tier.stats().kept == 0 && tier.stats().prefill_reads == 50 && all_match(tier, 0, 50),
+              "pool: after the first round the fill reads everything");
+    }
+    {
+        // Chunks of another size are not taken: the tier allocates its own, and the kept ones stay idle until released.
+        auto o            = pooled(8, "A");
+        o.slots_per_chunk = 32;
+        HostExpertTier tier(store, o);
+        check(calls.allocated == 6 && pool->idle_chunks() == 4, "pool: a tier of other chunk sizes allocates its own");
+        pool->release_idle();
+        check(calls.released == 4 && pool->idle_bytes() == 0, "pool: release_idle frees the idle chunks");
+        check(tier.prefill(ranked) == 50 && tier.stats().kept == 0 && all_match(tier, 0, 50), "pool: its fill reads every record");
+    }
+    pool.reset();
+    check(calls.released == calls.allocated, "pool: every chunk allocated is released once");
+
+    // The CPU team's settled rates: a configuration's latest stands, another configuration has none, and a reading
+    // of no rate is not kept.
+    infernix::runtime::expert_offload::HostSlotPool rates([](void*) {});
+    check(!rates.cpu_rates("a"), "pool: no CPU rates before a start measures them");
+    rates.note_cpu_rates("a", {.experts = 18'000.0, .columns = 58'000.0, .note = "measured"});
+    rates.note_cpu_rates("a", {.experts = 19'000.0, .columns = 59'000.0, .note = "again"});
+    rates.note_cpu_rates("b", {.experts = 0.0, .columns = 59'000.0, .note = "none"});
+    const auto a = rates.cpu_rates("a");
+    check(a && a->experts == 19'000.0 && a->columns == 59'000.0 && a->note == "again",
+          "pool: a configuration's latest CPU rates stand");
+    check(!rates.cpu_rates("b") && !rates.cpu_rates("c"), "pool: another configuration, or a zero rate, has none");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1011,6 +1164,7 @@ int main(int argc, char** argv) {
         test_unpinned(store);
         test_resize(store);
         test_resize_unpinned(store);
+        test_slot_pool(store);
         if (argc > 1 && std::string_view(argv[1]) == "--fetch") {
             test_fetch(store);
             test_read_ahead(store);

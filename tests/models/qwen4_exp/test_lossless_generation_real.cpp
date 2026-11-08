@@ -8,6 +8,7 @@
 //    order, with another prefill chunk and resumed from the prefix cache.
 // Skips (77) without the artifact.
 
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <cstdint>
@@ -106,7 +107,7 @@ int main() {
         std::vector<infernix::TokenId> greedy;
         std::vector<std::vector<infernix::TokenId>> solo;
         {
-            infernix::Engine engine(generation_options(artifact, 1024, 2));
+            infernix::Engine engine(generation_options(artifact, 1024, 2), infernix::test::engine_host());
             for (const std::string& text :
                  {long_notes(), std::string("Write a short story about a lighthouse keeper who finds a message in a bottle.")}) {
                 tokens.push_back(engine.tokenize_text(text));
@@ -141,7 +142,7 @@ int main() {
             require_same("warm prefix", solo[0], warm.generated_token_ids);
         }
         {
-            infernix::Engine engine(generation_options(artifact, 2048, 1));
+            infernix::Engine engine(generation_options(artifact, 2048, 1), infernix::test::engine_host());
             // Sampled (temperature 1) shows any arithmetic difference greedy decoding would.
             require_same("prefill chunk 2048 (sampled)", solo[0],
                          engine.generate(engine.prepare_tokens(tokens[0]), request(false, 200)).generated_token_ids);
@@ -150,7 +151,7 @@ int main() {
             infernix::EngineOptions options = base_options(artifact);
             options.purpose                 = infernix::EnginePurpose::CausalScoring;
             options.prefill_chunk           = kContext;
-            infernix::Engine engine(options);
+            infernix::Engine engine(options, infernix::test::engine_host());
             std::vector<infernix::TokenId> sequence = tokens[0];
             sequence.insert(sequence.end(), greedy.begin(), greedy.end());
             const auto first = static_cast<std::uint32_t>(tokens[0].size());

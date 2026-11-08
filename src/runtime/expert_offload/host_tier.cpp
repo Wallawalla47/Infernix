@@ -310,6 +310,47 @@ bool HostTier::prefill(std::uint32_t key, std::int32_t& slot) {
     return true;
 }
 
+std::vector<std::uint32_t> HostTier::prefill_kept(std::span<const std::pair<std::uint32_t, std::uint32_t>> kept,
+                                                  bool shadow) {
+    std::vector<std::uint8_t> taken(slots_.size(), 0);
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> placed;
+    for (const auto& [key, slot] : kept) {
+        if (key >= slot_of_.size() || slot >= slots_.size() || taken[slot] != 0) { continue; }
+        if (host_copy(key) || held(key) || copying_[key]) { continue; }
+        const Slot& s = slots_[slot];
+        if (s.state != SlotState::kFree || s.list != SlotList::kNone || slot_class_[slot] != key_class_[key]) { continue; }
+        taken[slot] = 1;
+        placed.emplace_back(key, slot);
+    }
+    if (placed.empty()) { return {}; }
+    // A free resident slot is in its class's free list; the placed ones leave it (each list once, in its order).
+    std::size_t found = 0;
+    for (ClassState& c : classes_) {
+        const std::size_t before = c.free.size();
+        std::erase_if(c.free, [&](std::uint32_t slot) { return taken[slot] != 0; });
+        found += before - c.free.size();
+    }
+    if (found != placed.size()) { throw std::logic_error("HostTier: a kept slot is not in its class's free list"); }
+    std::vector<std::uint32_t> keys;
+    keys.reserve(placed.size());
+    for (const auto& [key, slot] : placed) {
+        set_resident(slot, key, shadow ? SlotState::kShadow : SlotState::kResident);
+        keys.push_back(key);
+    }
+    return keys;
+}
+
+void HostTier::defer_free(std::span<const std::uint32_t> slots) {
+    std::vector<std::uint8_t> deferred(slots_.size(), 0);
+    for (const std::uint32_t slot : slots) {
+        if (slot < slots_.size()) { deferred[slot] = 1; }
+    }
+    // take_free takes from the back: the deferred slots go to the front, each part in its order.
+    for (ClassState& c : classes_) {
+        (void)std::stable_partition(c.free.begin(), c.free.end(), [&](std::uint32_t slot) { return deferred[slot] != 0; });
+    }
+}
+
 bool HostTier::prefill_shadow(std::uint32_t key, std::int32_t& slot) {
     if (host_copy(key) || held(key) || copying_[key]) { return false; }
     const std::int32_t s = take_free(key_class_[key]);

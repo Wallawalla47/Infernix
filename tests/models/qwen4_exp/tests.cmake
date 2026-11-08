@@ -201,6 +201,13 @@ infernix_add_test(infernix_qwen4_exp_decide_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_decide_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# An EngineHost's reused SSD expert tier: Engines started one after another on one host keep the records the last left
+# in its slots and give the reproducible-route tokens of an Engine without a host (the other real tests start on one).
+infernix_add_test(infernix_qwen4_exp_engine_host_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_host_real.cpp"
+  LIBRARIES infernix_engine)
+set_tests_properties(infernix_qwen4_exp_engine_host_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 # Fast-path selection rules: where each path applies and which configurations qualify it, and the routes
 # --a8-activations gives each configuration.
 infernix_add_test(infernix_qwen4_exp_fast_paths_test

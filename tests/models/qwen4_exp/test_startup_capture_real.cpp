@@ -18,6 +18,7 @@
 
 #include "kv_cache_storage.h"
 #include "models/qwen4_exp/program/graph_set.h"
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <cuda_runtime.h>
@@ -130,7 +131,7 @@ Arm run_arm(const Setup& setup, std::string_view drafter, bool fast_paths, bool 
     const char* label = startup_capture ? "startup capture" : "first-use capture";
     const auto began  = std::chrono::steady_clock::now();
     {
-        infernix::Engine engine(options);
+        infernix::Engine engine(options, infernix::test::engine_host());
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
         std::printf("%s %s, %s: Engine constructed in %.2f s, %zu MiB VRAM free%s%s\n", std::string(drafter).c_str(),
                     fast_paths ? "default route" : "reproducible route", label, seconds, free_vram() >> 20,

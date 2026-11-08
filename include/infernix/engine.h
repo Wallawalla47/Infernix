@@ -68,9 +68,41 @@ private:
     friend class Engine;
 };
 
+// What a process keeps between the Engines it starts on one artifact, so a later start skips work an earlier one did:
+// Qwen3.8-Flash-Next's SSD expert tier, its page-locked RAM slots and the expert records they hold, and the CPU expert
+// team's settled rates. A later start on the host neither page-locks that memory again nor reads those records from
+// the artifact (in their place it reads only the records the slots do not hold), and a start of the same CPU
+// configuration takes those rates instead of measuring them; every other part of a start runs as without the host,
+// and an artifact of another architecture starts as without it. Engines on one host may run one after another or side by side: each
+// start takes what is idle, and an Engine gives its slots back when it ends. What the host keeps stays page-locked
+// until a start takes it, release() frees it or the host and every Engine that took from it are gone. The real-model
+// tests start their Engines on one host per process (docs/maintainer/engine-architecture.md, EngineHost).
+class EngineHost {
+public:
+    EngineHost();
+    ~EngineHost();
+    EngineHost(EngineHost&&) noexcept;
+    EngineHost& operator=(EngineHost&&) noexcept;
+    EngineHost(const EngineHost&)            = delete;
+    EngineHost& operator=(const EngineHost&) = delete;
+
+    // Frees what it keeps now (an Engine running on it keeps its slots, and gives them back when it ends).
+    void release() noexcept;
+    // Page-locked bytes it keeps now (none of an Engine's while it runs).
+    [[nodiscard]] std::uint64_t kept_bytes() const noexcept;
+
+private:
+    class Impl;
+    std::shared_ptr<Impl> impl_;
+
+    friend class Engine;
+};
+
 class Engine {
 public:
     explicit Engine(EngineOptions options);
+    // A start that takes what `host` keeps from earlier Engines and gives its own back when it ends (EngineHost).
+    Engine(EngineOptions options, EngineHost& host);
     ~Engine();
 
     // Sizes a start with `options` on this machine without loading the model (EnginePlan): the same

@@ -38,6 +38,7 @@
 // its time.
 
 #include "kv_cache_storage.h"
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <algorithm>
@@ -310,7 +311,7 @@ int tap_resume(const Setup& setup) {
     options.prefill_chunk                     = 512;
     options.context_cache.host_capacity_bytes = 2ULL << 30;
     options.fast_path_candidates              = {infernix::FastPath::FreeCacheResume};
-    infernix::Engine engine(std::move(options));
+    infernix::Engine engine(std::move(options), infernix::test::engine_host());
     // A leaves a tap at 1024; B shares 1,400 tokens, resumes at 1024 and prefills 1024..1536..1700.
     const Tokens a = synthetic_tokens(1500, 11);
     Tokens b(a.begin(), a.begin() + 1400);
@@ -351,7 +352,7 @@ int mtp(const Setup& setup, const Reference& ref, bool greedy_only, std::uint32_
     {
         std::printf("== MTP 4, one-hot drafts (one lane)\n");
         const SectionTimer timer;
-        infernix::Engine engine(engine_options(setup, Drafts::MtpOneHot, 1));
+        infernix::Engine engine(engine_options(setup, Drafts::MtpOneHot, 1), infernix::test::engine_host());
         greedy_one_hot = greedy(engine);
         if (!greedy_only) {
             const Outputs one_hot = sample(engine, ref.prompt, 1.0F, trials + 1ULL, trials, tokens, 1, true);
@@ -363,7 +364,7 @@ int mtp(const Setup& setup, const Reference& ref, bool greedy_only, std::uint32_
     {
         std::printf("== MTP 4, sampled drafts (one lane)\n");
         const SectionTimer timer;
-        infernix::Engine engine(engine_options(setup, Drafts::MtpSampled, 1));
+        infernix::Engine engine(engine_options(setup, Drafts::MtpSampled, 1), infernix::test::engine_host());
         greedy_sampled = greedy(engine);
         if (!greedy_only) {
             const Outputs drafts = sample(engine, ref.prompt, 1.0F, 2ULL * trials + 1, trials, tokens, 1, true);
@@ -390,7 +391,7 @@ int dflash2(const Setup& setup, const Reference& ref, bool greedy_only, std::uin
     {
         std::printf("== DFlash2 %u, text head\n", kDFlash2Drafts);
         const SectionTimer timer;
-        infernix::Engine engine(engine_options(setup, Drafts::DFlash2TextHead, 1));
+        infernix::Engine engine(engine_options(setup, Drafts::DFlash2TextHead, 1), infernix::test::engine_host());
         const Outputs drafted = greedy(engine);
         print_acceptance(drafted.speculative);
         for (std::size_t i = 0; i < drafted.tokens.size(); ++i) {
@@ -414,7 +415,7 @@ int dflash2(const Setup& setup, const Reference& ref, bool greedy_only, std::uin
     {
         std::printf("== DFlash2 %u, four lanes, four greedy requests in flight\n", kDFlash2Drafts);
         const SectionTimer timer;
-        infernix::Engine engine(engine_options(setup, Drafts::DFlash2TextHead, 4));
+        infernix::Engine engine(engine_options(setup, Drafts::DFlash2TextHead, 4), infernix::test::engine_host());
         std::vector<infernix::GenerationHandle> handles;
         for (int copy = 0; copy < 2; ++copy) {
             for (const char* text : kGreedyPrompts) {
@@ -438,7 +439,7 @@ int dflash2(const Setup& setup, const Reference& ref, bool greedy_only, std::uin
         infernix::EngineOptions options       = engine_options(setup, Drafts::DFlash2TextHead, 2);
         options.fast_path_candidates          = {infernix::FastPath::DFlash2Pairs};
         options.speculative.draft_tokens_auto = automatic;
-        infernix::Engine engine(std::move(options));
+        infernix::Engine engine(std::move(options), infernix::test::engine_host());
         const auto& paths = engine.load_summary().fast_paths;
         failures += check(std::find(paths.begin(), paths.end(), "dflash2-pairs") != paths.end() &&
                               !engine.load_summary().request_invariant,
@@ -469,7 +470,7 @@ int dflash2(const Setup& setup, const Reference& ref, bool greedy_only, std::uin
     }
     std::optional<infernix::Engine> proposal;
     try {
-        proposal.emplace(engine_options(setup, Drafts::DFlash2ProposalHead, 1));
+        proposal.emplace(engine_options(setup, Drafts::DFlash2ProposalHead, 1), infernix::test::engine_host());
     } catch (const std::exception& error) {
         std::printf("== DFlash2 %u with --lm-head-draft: not run (%s)\n", kDFlash2Drafts, error.what());
     }
@@ -522,7 +523,7 @@ int main(int argc, char** argv) {
             std::printf("== plain decoding (C = %u): %u requests at T 1.0 and at T 0.8, %u tokens\n", concurrency, trials,
                         tokens);
             const SectionTimer timer;
-            infernix::Engine engine(engine_options(setup, Drafts::None, greedy_only ? 1 : concurrency));
+            infernix::Engine engine(engine_options(setup, Drafts::None, greedy_only ? 1 : concurrency), infernix::test::engine_host());
             ref.greedy = greedy(engine);
             ref.prompt = engine.tokenize_text(kPrompt);
             if (!greedy_only) {

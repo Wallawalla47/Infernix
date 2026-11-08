@@ -23,6 +23,7 @@
 #include "core/cpu_topology.h"
 #include "core/host_load.h"
 #include "core/temporary_switches.h"
+#include "runtime/expert_offload/host_slot_pool.h"
 
 #include <algorithm>
 #include <chrono>
@@ -176,11 +177,36 @@ std::optional<runtime::expert_offload::CpuRateReading> ProgramImpl::measure_cpu_
     return reading;
 }
 
-// The settled rates (settle_cpu_rates) the decode miss split and the prefill CPU split take, and their report.
+// The settled rates (settle_cpu_rates) the decode miss split and the prefill CPU split take, and their report. With
+// an EngineHost's pool, a previous start's quiet rates for the same configuration stand instead (HostSlotPool::
+// cpu_rates): the same machine, artifact, team, CPUs, arithmetic and records.
 void ProgramImpl::measure_cpu_rate_settled(std::uint64_t record_stride) {
-    namespace moe               = ops::offloaded_moe;
-    const SettledCpuRates rates = settle_cpu_rates([&] { return measure_cpu_rate(record_stride); });
-    const bool measured         = !rates.readings.empty();
+    namespace moe = ops::offloaded_moe;
+    std::string pool_key;
+    std::optional<runtime::expert_offload::HostSlotPool::CpuRates> carried;
+    if (options_.expert_slot_pool) {
+        pool_key = pool_identity() + "|workers " + std::to_string(cpu_workers()) + "|cpus";
+        for (const auto cpu : placement_.cpus) { pool_key += " " + std::to_string(cpu); }
+        pool_key += "|narrow " + std::to_string(static_cast<int>(cpu_narrow_a16())) + "|ggml-a8 " +
+                    std::to_string(cpu_ggml_a8() ? 1 : 0) + "|stride " + std::to_string(record_stride) +
+                    (tier_ ? "|tier" : "|banks");
+        carried = options_.expert_slot_pool->cpu_rates(pool_key);
+    }
+    SettledCpuRates rates;
+    if (carried) {
+        rates.experts = carried->experts;
+        rates.columns = carried->columns;
+        rates.readings.push_back(carried->experts);
+        rates.note = "kept from an earlier Engine of this EngineHost, " + carried->note;
+    } else {
+        rates = settle_cpu_rates([&] { return measure_cpu_rate(record_stride); });
+        if (options_.expert_slot_pool && !rates.readings.empty() && rates.busy_share < 0.0) {
+            options_.expert_slot_pool->note_cpu_rates(pool_key, {.experts = rates.experts,
+                                                                 .columns = rates.columns,
+                                                                 .note    = rates.note + rates.readings_text()});
+        }
+    }
+    const bool measured = !rates.readings.empty();
     if (measured) {
         cpu_expert_rate_ = rates.experts;
         cpu_column_rate_ = rates.columns;

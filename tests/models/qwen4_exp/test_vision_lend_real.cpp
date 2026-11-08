@@ -18,6 +18,7 @@
 //   INFERNIX_QWEN4_ARTIFACT=out.ninfer infernix_qwen4_exp_vision_lend_real_test
 
 #include "models/qwen4_exp/program/vision_window.h"
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <chrono>
@@ -144,7 +145,7 @@ int main() {
         options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(32768);
         options.kv_cache        = infernix::KvCacheStorage::Int8Group64;
         options.fast_paths      = false; // a request's ids do not depend on the other lane
-        infernix::Engine engine(options);
+        infernix::Engine engine(options, infernix::test::engine_host());
 
         constexpr std::uint32_t kTokens = 24;
         const auto submit_image = [&] { return engine.submit(engine.prepare(image_prompt()), greedy(kTokens)); };

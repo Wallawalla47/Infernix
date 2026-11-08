@@ -229,13 +229,23 @@ HostExpertTier::Pinned HostExpertTier::pin_slots(const Plan& plan, const Options
         if (next[r] >= region.slots) { return 0; }
         const std::uint32_t here  = std::min(options.slots_per_chunk, region.slots - next[r]);
         const std::uint64_t bytes = static_cast<std::uint64_t>(here) * region.pitch;
-        auto* p = static_cast<std::byte*>(options.allocate(static_cast<std::size_t>(bytes)));
+        // A reused chunk of this size first (it stays page-locked between tiers), with the records it holds.
+        std::byte* p = nullptr;
+        std::vector<std::int32_t> kept;
+        if (options.pool) {
+            if (auto taken = options.pool->take(static_cast<std::size_t>(bytes), options.pool_identity, region.pitch)) {
+                p = static_cast<std::byte*>(taken->memory);
+                if (taken->keys.size() == here) { kept = std::move(taken->keys); }
+            }
+        }
+        if (p == nullptr) { p = static_cast<std::byte*>(options.allocate(static_cast<std::size_t>(bytes))); }
         if (p == nullptr) { return -1; }
         if (reinterpret_cast<std::uintptr_t>(p) % DirectReadQueue::kAlignment != 0) {
             options.release(p);
             throw std::runtime_error("SSD tier: expert slots must be 4 KiB-aligned");
         }
-        out.chunks.push_back({.memory = p, .region = r, .first = next[r], .slots = here, .bytes = bytes});
+        out.chunks.push_back(
+            {.memory = p, .region = r, .first = next[r], .slots = here, .bytes = bytes, .kept = std::move(kept)});
         for (std::uint32_t i = 0; i < here; ++i) {
             out.regions[r].push_back(reinterpret_cast<std::uint8_t*>(p) + static_cast<std::size_t>(i) * region.pitch);
         }
@@ -357,6 +367,28 @@ HostExpertTier::HostExpertTier(const ExpertStore& store, Options options)
         unpinned_ = std::make_unique<ResidentHostBuffer>(static_cast<std::size_t>(unpinned_count_) * store_.record_bytes());
         for (std::uint32_t i = unpinned_count_; i > 0; --i) { unpinned_free_.push_back(i - 1); }
     }
+    // Reused chunks (Options::pool): the records their slots still hold, for the startup fill. A record a resident
+    // slot of its own class holds is kept there (HostTier::prefill_kept checks the slot); those slots are taken last
+    // by the fill's other keys, so a later fill can still keep theirs.
+    std::vector<std::uint32_t> deferred;
+    for (Chunk& chunk : pinned_.chunks) {
+        for (std::uint32_t j = 0; j < chunk.kept.size(); ++j) {
+            const std::int32_t key   = chunk.kept[j];
+            const std::int64_t slot  = controller_slot(chunk, j);
+            if (key < 0 || static_cast<std::uint32_t>(key) >= keys() || slot < 0) { continue; }
+            if (kept_slot_.empty()) {
+                kept_slot_.assign(keys(), -1);
+                kept_key_.assign(slot_address_.size(), -1);
+            }
+            if (kept_slot_[static_cast<std::uint32_t>(key)] >= 0) { continue; } // a record held twice: one is enough
+            kept_slot_[static_cast<std::uint32_t>(key)] = static_cast<std::int32_t>(slot);
+            kept_key_[static_cast<std::uint32_t>(slot)] = key;
+            deferred.push_back(static_cast<std::uint32_t>(slot));
+        }
+        chunk.kept.clear();
+        chunk.kept.shrink_to_fit();
+    }
+    if (!deferred.empty()) { tier_.defer_free(deferred); }
     queue_ = std::make_unique<DirectReadQueue>(options_.io);
     for (const auto& path : store_.files()) { files_.push_back(queue_->open(path)); }
     // A layer call reads each of its experts once, so a round demands at most its layer calls'
@@ -396,6 +428,62 @@ HostExpertTier::~HostExpertTier() {
     copy_wake_.notify_all();
     for (auto& copier : copiers_) { copier.join(); }
     queue_.reset(); // cancels and waits for any read still in flight
+    // Nothing writes a slot any more: the chunks go back to the pool with what their slots hold.
+    if (options_.pool) { return_to_pool(); }
+}
+
+std::int64_t HostExpertTier::controller_slot(const Chunk& chunk, std::uint32_t j) const noexcept {
+    const std::uint32_t at = chunk.first + j;
+    if (plan_.classes.empty()) { // the one region: the controller's slots, then the bounce slots
+        return at < slot_address_.size() ? static_cast<std::int64_t>(at) : -1;
+    }
+    if (chunk.region == 0) { // the transit region: the ring and the prefetch list, then the bounce slots
+        return at < options_.ring + options_.prefetch ? static_cast<std::int64_t>(at) : -1;
+    }
+    std::int64_t base = static_cast<std::int64_t>(options_.ring) + options_.prefetch;
+    for (std::uint32_t r = 1; r < chunk.region; ++r) { base += static_cast<std::int64_t>(pinned_.regions[r].size()); }
+    return base + at;
+}
+
+std::int32_t HostExpertTier::record_key(std::uint32_t slot) const noexcept {
+    const expert_cache::SlotState state = tier_.state(slot);
+    if (state != expert_cache::SlotState::kResident && state != expert_cache::SlotState::kShadow) {
+        return HostSlotPool::kNoKey;
+    }
+    // An admission copied into a smaller class completes at finish_copies: until then its slot's bytes are not the key's.
+    for (const expert_cache::AdmissionCopy& copy : tier_.copies()) {
+        if (copy.to == slot) { return HostSlotPool::kNoKey; }
+    }
+    return static_cast<std::int32_t>(tier_.key(slot));
+}
+
+void HostExpertTier::forget_kept() noexcept {
+    kept_slot_.clear();
+    kept_slot_.shrink_to_fit();
+    kept_key_.clear();
+    kept_key_.shrink_to_fit();
+}
+
+void HostExpertTier::drop_kept(std::uint32_t slot) noexcept {
+    if (slot >= kept_key_.size() || kept_key_[slot] < 0) { return; }
+    kept_slot_[static_cast<std::uint32_t>(kept_key_[slot])] = -1;
+    kept_key_[slot]                                       = -1;
+}
+
+void HostExpertTier::return_to_pool() noexcept {
+    for (Chunk& chunk : pinned_.chunks) {
+        if (chunk.memory == nullptr) { continue; }
+        try {
+            std::vector<std::int32_t> held(chunk.slots, HostSlotPool::kNoKey);
+            for (std::uint32_t j = 0; j < chunk.slots; ++j) {
+                const std::int64_t slot = controller_slot(chunk, j);
+                if (slot >= 0) { held[j] = record_key(static_cast<std::uint32_t>(slot)); }
+            }
+            options_.pool->keep(chunk.memory, static_cast<std::size_t>(chunk.bytes), options_.pool_identity,
+                                plan_.regions[chunk.region].pitch, std::move(held));
+            chunk.memory = nullptr;
+        } catch (...) {} // the chunk is released with the others (Pinned)
+    }
 }
 
 const std::string& HostExpertTier::unpinned_lock_failure() const noexcept {
@@ -463,13 +551,41 @@ void HostExpertTier::read_records(const std::vector<std::pair<std::uint32_t, std
 }
 
 std::vector<std::pair<std::uint32_t, std::uint8_t*>> HostExpertTier::slot_jobs(std::span<const std::uint32_t> ranked,
-                                                                               const std::function<bool(std::uint32_t)>& skip) {
+                                                                               const std::function<bool(std::uint32_t)>& skip,
+                                                                               bool shadow) {
+    if (!kept_slot_.empty()) {
+        // A reused chunk's records: the keys this fill places (in `ranked` order, each class until its free slots run
+        // out, as the loop below places them) take the slots that already hold their records, unread; the loop then
+        // reads the others into the free slots left, so the fill places the same keys as one without a pool.
+        std::vector<std::size_t> room(tier_.class_count());
+        std::size_t left = 0;
+        for (std::uint32_t c = 0; c < room.size(); ++c) {
+            room[c] = tier_.free_resident(static_cast<std::uint8_t>(c));
+            left += room[c];
+        }
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> kept;
+        for (const std::uint32_t key : ranked) {
+            if (left == 0) { break; }
+            if ((skip && skip(key)) || tier_.host_copy(key) || tier_.held(key)) { continue; }
+            const std::uint8_t c = tier_.class_of(key);
+            if (room[c] == 0) { continue; }
+            --room[c];
+            --left;
+            if (kept_slot_[key] >= 0) { kept.emplace_back(key, static_cast<std::uint32_t>(kept_slot_[key])); }
+        }
+        for (const std::uint32_t key : tier_.prefill_kept(kept, shadow)) {
+            drop_kept(static_cast<std::uint32_t>(kept_slot_[key])); // the slot now holds it for this tier
+            ++stats_.kept;
+        }
+    }
     std::vector<std::pair<std::uint32_t, std::uint8_t*>> jobs;
     for (const std::uint32_t key : ranked) {
         if (!tier_.has_free_resident()) { break; }
         if (skip && skip(key)) { continue; }
         std::int32_t slot = -1;
-        if (!tier_.prefill(key, slot)) { continue; } // already has a host copy
+        const bool placed = shadow ? tier_.prefill_shadow(key, slot) : tier_.prefill(key, slot);
+        if (!placed) { continue; } // already has a host copy
+        drop_kept(static_cast<std::uint32_t>(slot)); // this read overwrites what the slot held
         jobs.emplace_back(key, const_cast<std::uint8_t*>(slot_bytes(static_cast<std::uint32_t>(slot))));
     }
     return jobs;
@@ -477,13 +593,23 @@ std::vector<std::pair<std::uint32_t, std::uint8_t*>> HostExpertTier::slot_jobs(s
 
 std::uint32_t HostExpertTier::prefill(std::span<const std::uint32_t> ranked,
                                       const std::function<bool(std::uint32_t)>& skip) {
-    const auto jobs = slot_jobs(ranked, skip);
-    if (jobs.empty()) { return 0; }
+    const std::uint64_t kept_before = stats_.kept;
+    const auto jobs                 = slot_jobs(ranked, skip);
+    const auto kept                 = static_cast<std::uint32_t>(stats_.kept - kept_before);
+    // A reused pool's fill reads few records, too few to measure the drive: the rate of the largest fill it saw.
+    if (options_.pool && read_rate_ <= 0) {
+        if (const auto rate = options_.pool->read_rate(jobs.size())) { read_rate_ = *rate; }
+    }
+    if (jobs.empty()) { return kept; }
     const auto start = std::chrono::steady_clock::now();
     read_records(jobs);
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    if (seconds > 0) { read_rate_ = static_cast<double>(jobs.size()) * static_cast<double>(store_.record_bytes()) / seconds; }
-    return static_cast<std::uint32_t>(jobs.size());
+    if (seconds > 0) {
+        const double rate = static_cast<double>(jobs.size()) * static_cast<double>(store_.record_bytes()) / seconds;
+        if (!options_.pool || !options_.pool->read_rate(jobs.size())) { read_rate_ = rate; }
+        if (options_.pool) { options_.pool->note_read_rate(rate, jobs.size()); }
+    }
+    return kept + static_cast<std::uint32_t>(jobs.size());
 }
 
 bool HostExpertTier::refill_within(double seconds) const noexcept {
@@ -493,16 +619,12 @@ bool HostExpertTier::refill_within(double seconds) const noexcept {
 }
 
 std::uint32_t HostExpertTier::prefill_shadows(std::span<const std::uint32_t> ranked) {
-    std::vector<std::pair<std::uint32_t, std::uint8_t*>> jobs;
-    for (const std::uint32_t key : ranked) {
-        if (!tier_.has_free_resident()) { break; }
-        std::int32_t slot = -1;
-        if (!tier_.prefill_shadow(key, slot)) { continue; } // already has a host copy
-        jobs.emplace_back(key, const_cast<std::uint8_t*>(slot_bytes(static_cast<std::uint32_t>(slot))));
-    }
-    if (jobs.empty()) { return 0; }
+    const std::uint64_t kept_before = stats_.kept;
+    const auto jobs                 = slot_jobs(ranked, {}, true);
+    const auto kept                 = static_cast<std::uint32_t>(stats_.kept - kept_before);
+    if (jobs.empty()) { return kept; }
     read_records(jobs);
-    return static_cast<std::uint32_t>(jobs.size());
+    return kept + static_cast<std::uint32_t>(jobs.size());
 }
 
 std::uint32_t HostExpertTier::fill_unpinned(std::span<const std::uint32_t> ranked,
@@ -578,6 +700,7 @@ std::vector<std::uint32_t> HostExpertTier::ranked_without_copy() const {
 
 std::uint64_t HostExpertTier::shrink(std::uint64_t bytes) {
     if (round_open()) { throw std::logic_error("SSD tier: a RAM shrink with a round open"); }
+    forget_kept();
     if (bytes == 0) { return 0; }
     // The last round's demands, fetches and their copies land first (a fetch's copy is a ticket in flight); then no
     // read or copy into a slot or a record is left but the stream's (into lent slots) and the refills' (shrink_order).
@@ -664,6 +787,7 @@ std::uint64_t HostExpertTier::shrink_pinned(std::uint64_t bytes) {
 
 std::uint64_t HostExpertTier::grow(std::uint64_t bytes, const std::function<bool(std::uint32_t)>& skip) {
     if (round_open()) { throw std::logic_error("SSD tier: a RAM growth with a round open"); }
+    forget_kept();
     std::uint64_t grown = 0;
     for (Chunk& chunk : pinned_.chunks) {
         if (chunk.memory != nullptr || grown + chunk.bytes > bytes) { continue; }
@@ -755,6 +879,7 @@ void HostExpertTier::drain() {
 }
 
 void HostExpertTier::begin_round(std::uint32_t allowance) {
+    forget_kept(); // rounds reuse slots: what a reused chunk held is known only before the first
     drain();
     const std::uint32_t count = std::min(ticket_count_.load(std::memory_order_acquire), ticket_capacity_);
     std::vector<expert_cache::Landing> landings;

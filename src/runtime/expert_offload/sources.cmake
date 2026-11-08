@@ -15,6 +15,7 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/expert_residency.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_stream.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/host_expert_tier.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/host_slot_pool.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/placement.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/route_trace.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/vram_monitor.cpp"

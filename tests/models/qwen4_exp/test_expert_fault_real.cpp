@@ -20,6 +20,7 @@
 //   [INFERNIX_QWEN4_DFLASH2=out.dflash2.ninfer] infernix_qwen4_exp_expert_fault_real_test
 
 #include "runtime/expert_offload/expert_offload.h"
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <cstdint>
@@ -103,7 +104,7 @@ int run(const char* artifact, const char* ngram, const char* drafter) {
             diagnostics.push_back(d.message);
             std::printf("  [engine] %s\n", d.message.c_str());
         };
-        infernix::Engine engine(options);
+        infernix::Engine engine(options, infernix::test::engine_host());
 
         constexpr std::uint32_t kTokens = 48;
         const auto baseline = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;

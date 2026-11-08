@@ -16,6 +16,7 @@
 
 #include "kv_cache_storage.h"
 #include "models/resume_cold_probe.h"
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <algorithm>
@@ -122,7 +123,7 @@ int main(int argc, char** argv) {
         for (const std::uint32_t chunk : chunks) {
             std::vector<std::string> cuts;
             std::mutex mutex;
-            infernix::Engine engine(engine_options(artifact, std::getenv("INFERNIX_QWEN4_NGRAM"), chunk, cuts, mutex));
+            infernix::Engine engine(engine_options(artifact, std::getenv("INFERNIX_QWEN4_NGRAM"), chunk, cuts, mutex), infernix::test::engine_host());
             if (!cuts.empty()) {
                 std::fprintf(stderr, "FAIL: chunk %u was cut at startup: %s\n", chunk, cuts.front().c_str());
                 return 1;

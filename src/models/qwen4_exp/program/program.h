@@ -44,6 +44,10 @@ namespace infernix {
 struct DeviceContext;
 }
 
+namespace infernix::runtime::expert_offload {
+class HostSlotPool;
+}
+
 namespace infernix::models::qwen4_exp {
 
 namespace execution {
@@ -406,6 +410,10 @@ struct ProgramOptions {
     // Pinned allocations the Program makes after the tier (the prefix cache's Host tier and an
     // allowance): when the OS refuses a slot chunk, the tier leaves this much below the limit.
     std::uint64_t later_pinned_bytes = 0;
+    // An EngineHost's page-locked expert slots (HostExpertTier::Options::pool): the tier takes its chunks and the
+    // records they hold from it, and gives them back when the Program ends; what it does not take is released once
+    // the tier is built. Null: the tier page-locks and reads everything itself.
+    std::shared_ptr<runtime::expert_offload::HostSlotPool> expert_slot_pool;
     // Speculative decoding with n-gram copy proposals (design section 11.3): at most this many
     // draft tokens per round (0 disables, at most 15), proposed only from a match of at least
     // ngram_min_match tokens (4..64) earlier in the request.
@@ -557,6 +565,12 @@ struct ProgramOptions {
     std::filesystem::path route_trace;
 };
 
+// The SSD expert tier's startup fill: records read from the artifact, and records kept in an EngineHost's slots.
+struct ExpertRamFill {
+    std::uint64_t read = 0;
+    std::uint64_t kept = 0;
+};
+
 class Program {
 public:
     Program(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options);
@@ -572,6 +586,8 @@ public:
     // The expert cache's cumulative counters and current size (RuntimeStats::expert_cache); nothing
     // without an expert cache. Engine thread, between rounds.
     [[nodiscard]] std::optional<ExpertCacheTotals> expert_cache_totals() const noexcept;
+    // The SSD expert tier's startup fill (LoadSummary::expert_ram_records_*): zeros without the tier.
+    [[nodiscard]] ExpertRamFill expert_ram_fill() const noexcept;
 
     // Expert-cache resizing outside rounds (design §19.3.7). The VRAM monitor calls the waker from
     // its own thread when the cache should resize; the engine then calls maintain() from its

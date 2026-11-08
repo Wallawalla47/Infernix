@@ -25,6 +25,7 @@
 //
 //   infernix_qwen4_exp_decide_real_test [--mtp] [--plain]   (default: both modes)
 
+#include "engine_host.h"
 #include "infernix/engine.h"
 
 #include <algorithm>
@@ -326,7 +327,7 @@ int run_mode(const char* artifact, const char* ngram, bool mtp, const std::vecto
     infernix::EngineOptions options = base_options(artifact, ngram, mtp);
     options.fast_paths = fast_paths;
     options.fast_path_candidates.insert(options.fast_path_candidates.end(), candidates.begin(), candidates.end());
-    infernix::Engine engine(options);
+    infernix::Engine engine(options, infernix::test::engine_host());
     int failures = 0;
     failures += readout(engine, !mtp && std::getenv("INFERNIX_DECIDE_DUMP") != nullptr, suffix);
     if (readout_only) { return failures; }
