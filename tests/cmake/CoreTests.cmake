@@ -140,6 +140,20 @@ if(TARGET infernix-serve)
             $<TARGET_FILE:infernix-serve> --cuobjdump "${CUDAToolkit_BIN_DIR}/cuobjdump${CMAKE_EXECUTABLE_SUFFIX}")
 endif()
 
+add_test(NAME infernix_pdl_wait_tool_test
+  COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/cuda_stack/test_check_pdl_wait.py)
+# PDL waits: no kernel may load, before its griddepcontrol.wait, from a parameter that
+# tools/cuda_stack/pdl_wait_allowlist.json does not record as reviewed (a producer's output read there is a race,
+# whether the source or the compiler put the load above the wait).
+if(TARGET infernix_ops AND TARGET infernix_core AND TARGET infernix_nvfp4_non_rdc)
+  file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/pdl_wait_objects_$<CONFIG>.txt"
+       CONTENT "$<JOIN:$<TARGET_OBJECTS:infernix_ops>;$<TARGET_OBJECTS:infernix_core>;$<TARGET_OBJECTS:infernix_nvfp4_non_rdc>,\n>\n")
+  add_test(NAME infernix_pdl_wait_check
+    COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tools/cuda_stack/check_pdl_wait.py check
+            --objects-file "${CMAKE_BINARY_DIR}/pdl_wait_objects_$<CONFIG>.txt"
+            --cuobjdump "${CUDAToolkit_BIN_DIR}/cuobjdump${CMAKE_EXECUTABLE_SUFFIX}")
+endif()
+
 add_test(NAME infernix_chat_templates_test
   COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/text/test_chat_templates.py
           $<TARGET_FILE:infernix_jinja_test>)

@@ -311,6 +311,17 @@ small-T router S1 stay serialized launches, and so does the head of the groupwis
 When a launch becomes a programmatic dependent, list its successors' pre-wait loads (the SASS audit and
 the transitive chain check of candidates XB-05) against the new upstream set.
 
+`infernix_pdl_wait_check` keeps that audit: `tools/cuda_stack/check_pdl_wait.py` reads the SASS of every CUDA
+object of `infernix_ops`, `infernix_core` and `infernix_nvfp4_non_rdc`, lists each waiting kernel's global loads
+before its first `ACQBULK` with the parameter each address traces to (`p+0x18`, `*p+0x8` for an address read
+from memory, `?` untraced), and fails on an origin `tools/cuda_stack/pdl_wait_allowlist.json` does not record.
+A new origin that is an immutable operand (weights, scales, descriptors, host-written ingress) is recorded after
+review with `python tools/cuda_stack/check_pdl_wait.py update --objects-file <build-dir>/pdl_wait_objects_Release.txt`;
+one that a producer writes is a race, fixed by reading it after the wait and dropping its `__restrict__`
+(`0e1c221d`, `0a2e3de5`). The check sees one kernel at a time: whether an allowed origin's writer is safely
+upstream still needs the chain review above, and an untraced load (`?`, 266 kernels when it was added) is
+allowed as a whole.
+
 Placing a read after the wait in the source does not keep it there: ptxas moved a non-coherent load
 (`const __restrict__`, `LDG.E.CONSTANT`) of the Flash-Next conv snapshot kernel's slot index above
 `griddepcontrol.wait` (SASS `ACQBULK`). That index is host-written ingress, which is safe, but producer output
@@ -678,7 +689,9 @@ rewritten:
    `infernix_cuda_stack_check`, which compares `cuobjdump`'s resource usage and the STL and LDL in the
    code of `infernix-serve` with `tools/cuda_stack/cuda_stack_allowlist.json` (resource usage alone has
    reported no spill for a kernel spilling inside its key-tile loop); fix the spill, or after review
-   record it with `python tools/cuda_stack/check_cuda_stack.py update BINARY`;
+   record it with `python tools/cuda_stack/check_cuda_stack.py update BINARY`; a programmatic
+   dependent's load before its PDL wait from a parameter not yet reviewed fails
+   `infernix_pdl_wait_check` (see the PDL rules above);
 9. integrate models only through semantic contract headers and explicit operands;
 10. give every source and symbol one clear build and link owner.
 
