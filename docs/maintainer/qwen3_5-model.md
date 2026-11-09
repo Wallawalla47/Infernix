@@ -253,6 +253,18 @@ activations: the official artifact's `/v1/decide` readouts then differed from Ca
 second forced NVFP4's 4-bit route at one column; linear_add's A4 tiles gave wrong sums below eight
 columns (its op test). A third, at eight columns, left the FP8 layer out and never engaged there.
 
+Where the NVFP4 MLP runs the two-term A4 residual profile (`AllowA4Residual`: verification and batched decode
+rounds of 5-96 columns, `batched-a4-residual-decode`), its input norm and both projections are one Op,
+`ops::dense_mlp_fused_rmsnorm_nvfp4` (since 2026-11-08, candidates SI-02+): the norm kernel encodes the gate/up
+projection's activation planes from its own BF16 row, the gate/up GEMM's SwiGLU epilogue encodes the down
+projection's planes from its staged BF16 product, and the down GEMM reads them. Three launches replace five
+(rmsnorm, two quantizers, two GEMMs) with the same bytes: each producer rounds to BF16 where the separate Ops stored
+BF16 and encodes it as their quantizer does. The epilogue encodes each 16-value group with four lanes (a group's
+exact divisions are its latency; one lane a group added 2.4 us to the GEMM, four add 0.8-1.7 us), the norm with one
+lane a group (320 groups over 256 lanes: two rounds, where four lanes a group take five and measured 0.45 us
+slower). The NVIDIA NVFP4 27B's MLP takes 100.7 against 105.9 us a layer in DFlash2 rounds (Nsight Systems), and
+its DFlash2 decode runs +0.26 to +0.31 % faster (INT8 KV, -p 512 -n 256, ABBA x3; 2026-11-09).
+
 MTP is a one-layer predictor conditioned on a final-normalized target hidden state h_t and the
 following token x_(t+1):
 

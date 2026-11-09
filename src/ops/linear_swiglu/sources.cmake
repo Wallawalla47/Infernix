@@ -7,6 +7,7 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_small_t.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_plan.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_dense_mlp_fused.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_swiglu_decode.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_swiglu_a16.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_swiglu_a8.cu"

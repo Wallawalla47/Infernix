@@ -147,6 +147,64 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloa
     return result;
 }
 
+// Two adjacent pairs' E2M1 codes as pack_nvfp4_e2m1x16 writes them: a's byte, then b's (the low 16 bits).
+__device__ __forceinline__ std::uint32_t pack_nvfp4_e2m1x4(float2 a, float2 b) {
+    std::uint32_t out;
+    asm("{\n"
+        ".reg .b8 b0;\n"
+        ".reg .b8 b1;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b0, %2, %1;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b1, %4, %3;\n"
+        "mov.b32 %0, {b0, b1, b0, b1};\n"
+        "}\n"
+        : "=r"(out)
+        : "f"(a.x), "f"(a.y), "f"(b.x), "f"(b.y));
+    return out & 0xFFFFU;
+}
+
+// quantize_nvfp4_terms_k16 (below) by the four lanes of a quad, the same bytes: lane q = lane & 3 holds the group's
+// elements 4q..4q+3 (`source` points at them; 8-byte aligned) and returns their two code bytes per term (bytes 2q and
+// 2q+1 of the group's eight) and every term's scale. The group's max reduces over the quad (a maximum is exact in any
+// order); each lane divides and packs its own four values, a quarter of the one-lane form's latency. `mask` names the
+// quad's lanes, which all take part.
+template <int Terms>
+__device__ __forceinline__ void quantize_nvfp4_terms_k16_quad(const __nv_bfloat16* source, float input_scale_divisor,
+                                                              unsigned mask, std::uint16_t (&codes)[Terms],
+                                                              std::uint8_t (&scales)[Terms]) {
+    const uint2 packed = load_vec<uint2>(source);
+    const float2 first = bf16x2_bits_to_float2(packed.x), second = bf16x2_bits_to_float2(packed.y);
+    float2 remainder[2] = {make_float2(__fmul_rn(first.x, input_scale_divisor), __fmul_rn(first.y, input_scale_divisor)),
+                           make_float2(__fmul_rn(second.x, input_scale_divisor),
+                                       __fmul_rn(second.y, input_scale_divisor))};
+#pragma unroll
+    for (int term = 0; term < Terms; ++term) {
+        float max_abs = 0.0F;
+#pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {
+            max_abs = fmaxf(max_abs, fabsf(remainder[pair].x));
+            max_abs = fmaxf(max_abs, fabsf(remainder[pair].y));
+        }
+        max_abs = fmaxf(max_abs, __shfl_xor_sync(mask, max_abs, 1));
+        max_abs = fmaxf(max_abs, __shfl_xor_sync(mask, max_abs, 2));
+        scales[term] = __nv_cvt_float_to_fp8(__fdiv_rn(max_abs, 6.0F), __NV_SATFINITE, __NV_E4M3);
+        codes[term]  = 0;
+        // A zero scale encodes zero; the remainder carries on to the next term unchanged.
+        if (scales[term] == 0) { continue; }
+        const float scale = decode_nvfp4_e4m3(scales[term]);
+        const std::uint32_t pair_codes =
+            pack_nvfp4_e2m1x4(make_float2(__fdiv_rn(remainder[0].x, scale), __fdiv_rn(remainder[0].y, scale)),
+                              make_float2(__fdiv_rn(remainder[1].x, scale), __fdiv_rn(remainder[1].y, scale)));
+        codes[term] = static_cast<std::uint16_t>(pair_codes);
+        if (term + 1 == Terms) { break; }
+#pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {
+            const float2 code = decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(pair_codes >> (8 * pair)));
+            remainder[pair].x = __fsub_rn(remainder[pair].x, __fmul_rn(code.x, scale));
+            remainder[pair].y = __fsub_rn(remainder[pair].y, __fmul_rn(code.y, scale));
+        }
+    }
+}
+
 // The A4 residual profile: one K16 group as a sum of NVFP4 terms. The remainder starts at the
 // divisor-scaled input x * input_scale_divisor; each term encodes it like quantize_nvfp4_k16 (an
 // E4M3 scale of max/6, E2M1 codes of value/scale), and the next term encodes what that term's

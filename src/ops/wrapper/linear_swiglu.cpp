@@ -9,6 +9,7 @@
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_plan.h"
 
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 
@@ -86,6 +87,48 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     // Qwen3.5-122B-A10B's FP8 shared expert: A16 routes, no workspace.
     if (qtype == QType::FP8_E4M3FN_ROW_F32 && gate_up_rows == 2048 && input_rows == 3072) { return 0; }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
+}
+
+bool dense_mlp_fused_rmsnorm_nvfp4_eligible(const Weight& gate_up_weight, LinearPolicy gate_up_policy,
+                                            const Weight& down_weight, LinearPolicy down_policy,
+                                            std::int32_t tokens) {
+    return tokens >= kDenseMlpFusedMinTokens && tokens <= kDenseMlpFusedMaxTokens &&
+           gate_up_policy == LinearPolicy::AllowA4Residual && down_policy == LinearPolicy::AllowA4Residual &&
+           gate_up_weight.qtype == QType::NVFP4 && gate_up_weight.layout == QuantLayout::BlockScaleK16M128x4 &&
+           gate_up_weight.n == 34816 && gate_up_weight.k == 5120 && down_weight.qtype == QType::NVFP4 &&
+           down_weight.layout == QuantLayout::BlockScaleK16M128x4 && down_weight.n == 5120 &&
+           down_weight.k == 17408;
+}
+
+std::size_t dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(std::int32_t max_tokens) {
+    if (max_tokens < 1 || max_tokens > kDenseMlpFusedMaxTokens) {
+        throw std::invalid_argument("dense_mlp_fused_rmsnorm_nvfp4 workspace: invalid token extent");
+    }
+    return detail::nvfp4_dense_mlp_fused_rmsnorm_workspace_bytes(max_tokens);
+}
+
+void dense_mlp_fused_rmsnorm_nvfp4(Tensor& residual, const Tensor& norm_weight, float eps, const Weight& gate_up_weight,
+                                   const Weight& down_weight, WorkspaceArena& ws, cudaStream_t stream) {
+    const std::int32_t tokens = residual.ne[1];
+    if (!dense_mlp_fused_rmsnorm_nvfp4_eligible(gate_up_weight, LinearPolicy::AllowA4Residual, down_weight,
+                                                LinearPolicy::AllowA4Residual, tokens)) {
+        throw std::invalid_argument("dense_mlp_fused_rmsnorm_nvfp4: unsupported projections or T");
+    }
+    if (!(eps > 0.0F) || !std::isfinite(eps)) {
+        throw std::invalid_argument("dense_mlp_fused_rmsnorm_nvfp4: eps must be positive and finite");
+    }
+    if (residual.dtype != DType::BF16 || residual.ne[0] != 5120 || residual.ne[2] != 1 || residual.ne[3] != 1 ||
+        !residual.is_contiguous() || !aligned_to(residual.data, 16)) {
+        throw std::invalid_argument("dense_mlp_fused_rmsnorm_nvfp4: residual must be contiguous BF16 [5120,T]");
+    }
+    if (norm_weight.dtype != DType::BF16 || norm_weight.ne[0] != 5120 || norm_weight.ne[1] != 1 ||
+        norm_weight.ne[2] != 1 || norm_weight.ne[3] != 1 || !norm_weight.is_contiguous() ||
+        !aligned_to(norm_weight.data, 16)) {
+        throw std::invalid_argument("dense_mlp_fused_rmsnorm_nvfp4: invalid norm weight");
+    }
+    (void)detail::validate_nvfp4_weight(gate_up_weight, "dense_mlp_fused_rmsnorm_nvfp4 gate/up");
+    (void)detail::validate_nvfp4_weight(down_weight, "dense_mlp_fused_rmsnorm_nvfp4 down");
+    detail::nvfp4_dense_mlp_fused_rmsnorm_launch(residual, norm_weight, eps, gate_up_weight, down_weight, ws, stream);
 }
 
 std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,

@@ -15,6 +15,7 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace infernix::ops::detail {
 namespace {
@@ -97,7 +98,50 @@ void launch_residual(const Tensor& x, const Weight& weight, Tensor& out, Workspa
     }
 }
 
+// The fused dense MLP's gate/up GEMM: the residual tiles above (the same per width, so the same bits) with the
+// epilogue that encodes the product as the down projection's planes instead of storing it.
+template <class Schedule>
+void launch_planes_gemm(const Weight& weight, Nvfp4A4Workspace x_planes, Nvfp4A4Workspace product_planes,
+                        float down_input_scale_divisor, std::int32_t tokens, cudaStream_t stream) {
+    using S = Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>;
+    SwiGluA4ResidualPlanesEpilogue<kNvfp4A4ResidualTerms> epilogue{};
+    epilogue.codes               = product_planes.codes;
+    epilogue.scales              = product_planes.scales;
+    epilogue.code_plane          = static_cast<std::int64_t>(product_planes.code_plane);
+    epilogue.scale_plane         = static_cast<std::int64_t>(product_planes.scale_plane);
+    epilogue.input_scale_divisor = down_input_scale_divisor;
+    epilogue.down_input_rows     = kIntermediate;
+    launch_nvfp4_a4_mma<S>(nvfp4_a4_operands(weight, x_planes, tokens, Nvfp4ScaleLayout::RowMajor),
+                           LinearBf16Output{nullptr, kIntermediate}, epilogue, stream, SwiGluTokenMajorMmaRows<S>{},
+                           pdl::Dependency::Programmatic);
+}
+
 } // namespace
+
+void nvfp4_linear_swiglu_a4_residual_planes_launch(const Weight& weight, Nvfp4A4Workspace x_planes,
+                                                   Nvfp4A4Workspace product_planes,
+                                                   float down_input_scale_divisor, std::int32_t tokens,
+                                                   cudaStream_t stream) {
+    if (x_planes.terms != kNvfp4A4ResidualTerms || product_planes.terms != kNvfp4A4ResidualTerms) {
+        throw std::invalid_argument("nvfp4 linear_swiglu A4 residual planes: unexpected activation planes");
+    }
+    constexpr int Terms = kNvfp4A4ResidualTerms;
+    if (tokens <= 16) {
+        launch_planes_gemm<ResidualM16N64<Terms>>(weight, x_planes, product_planes, down_input_scale_divisor, tokens,
+                                                  stream);
+    } else if (tokens <= 32) {
+        launch_planes_gemm<ResidualM32N64<Terms>>(weight, x_planes, product_planes, down_input_scale_divisor, tokens,
+                                                  stream);
+    } else if (tokens <= 64) {
+        launch_planes_gemm<ResidualM64N128<Terms>>(weight, x_planes, product_planes, down_input_scale_divisor, tokens,
+                                                   stream);
+    } else if (tokens <= 96) {
+        launch_planes_gemm<ResidualM96N128<Terms>>(weight, x_planes, product_planes, down_input_scale_divisor, tokens,
+                                                   stream);
+    } else {
+        throw std::invalid_argument("nvfp4 linear_swiglu A4 residual planes: at most 96 columns");
+    }
+}
 
 void nvfp4_linear_swiglu_a4_residual_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                             WorkspaceArena& workspace, cudaStream_t stream) {

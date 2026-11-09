@@ -1279,9 +1279,14 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
 
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase ph,
                            const ops::SparseMoeHints& hints, std::size_t layer) {
+    const std::int32_t width = row_width(x.ne[1]);
+    // The NVFP4 MLP's A4 residual rounds: the norm and both projections in three launches, the same bits.
+    if (fused_dense_mlp(x, weights.post_attention_norm, config_.rms_norm_eps, weights.ffn, work_, ctx_.stream,
+                        wide_residual_verification(ph, width, width))) {
+        return;
+    }
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
-    const std::int32_t width = row_width(x.ne[1]);
     // An offloaded MoE layer: decode and verification rounds (graphed) take the fork and the
     // landings; a prefill chunk the route the Program chose for it (streamed, split).
     OffloadedMoeContext offloaded;

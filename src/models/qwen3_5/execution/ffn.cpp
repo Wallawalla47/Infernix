@@ -10,6 +10,7 @@
 #include "infernix/ops/resident_moe.h"
 #include "infernix/ops/silu_mul.h"
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 #include <type_traits>
@@ -147,7 +148,30 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
                 first, last));
         }
     }
+    // fused_dense_mlp's calls in the interval (its Op allocates instead of the activation and both projections).
+    const std::int32_t fused_last = std::min(last, ops::kDenseMlpFusedMaxTokens);
+    if (!mtp && fused_last >= std::max(first, ops::kDenseMlpFusedMinTokens) &&
+        ops::dense_mlp_fused_rmsnorm_nvfp4_eligible(gu, p.gate_up.policy, down,
+                                                    residual_projection_policy(p.down, wide_verification),
+                                                    fused_last)) {
+        auto scope = layout.scope();
+        (void)layout.alloc_bytes(ops::dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(fused_last));
+    }
     return layout.peak_bytes(1);
+}
+
+bool fused_dense_mlp(Tensor& residual, const Tensor& norm_weight, float eps, const FfnParameters& parameters,
+                     WorkspaceArena& workspace, cudaStream_t stream, bool wide_verification) {
+    const auto* p = std::get_if<DenseParameters>(&parameters);
+    if (p == nullptr ||
+        !ops::dense_mlp_fused_rmsnorm_nvfp4_eligible(p->gate_up.weight, p->gate_up.policy, p->down.weight,
+                                                     residual_projection_policy(p->down, wide_verification),
+                                                     residual.ne[1])) {
+        return false;
+    }
+    ops::dense_mlp_fused_rmsnorm_nvfp4(residual, norm_weight, eps, p->gate_up.weight, p->down.weight, workspace,
+                                       stream);
+    return true;
 }
 
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,

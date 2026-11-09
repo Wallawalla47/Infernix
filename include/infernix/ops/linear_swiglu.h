@@ -106,4 +106,43 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream);
 
+// The column extent of dense_mlp_fused_rmsnorm_nvfp4.
+inline constexpr std::int32_t kDenseMlpFusedMinTokens = 5;
+inline constexpr std::int32_t kDenseMlpFusedMaxTokens = 96;
+
+/**
+ * Whether dense_mlp_fused_rmsnorm_nvfp4 serves these projections, policies and T (a host-side route
+ * predicate; it does not validate the payloads): NVFP4 BlockScaleK16M128x4 gate/up [34816,5120] and
+ * down [5120,17408], both under LinearPolicy::AllowA4Residual, T in [kDenseMlpFusedMinTokens,
+ * kDenseMlpFusedMaxTokens].
+ */
+[[nodiscard]] bool dense_mlp_fused_rmsnorm_nvfp4_eligible(const Weight& gate_up_weight, LinearPolicy gate_up_policy,
+                                                          const Weight& down_weight, LinearPolicy down_policy,
+                                                          std::int32_t tokens);
+
+// Caller-owned transient capacity of dense_mlp_fused_rmsnorm_nvfp4 for every T up to max_tokens.
+[[nodiscard]] std::size_t dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(std::int32_t max_tokens);
+
+/**
+ * Op: dense MLP with its input norm, fused (NVFP4 A4 residual activations)
+ *
+ * Math / indexing:
+ *   For every column t of residual (contiguous BF16 [5120,T]), with the Offset RMSNorm
+ *   h = rmsnorm(residual, norm_weight, eps, unit_offset = true) (norm_weight contiguous BF16 [5120]):
+ *     residual[:,t] += linear(down_weight, linear_swiglu(gate_up_weight, h)[:,t]).
+ *
+ * Numeric:
+ *   Bit for bit the composition rmsnorm() into BF16 storage, linear_swiglu() under AllowA4Residual into BF16
+ *   storage and linear_add() under AllowA4Residual, each of which meets its own Op's criterion against its FP64
+ *   oracle; the BF16 h and SwiGLU product are not materialized: the norm writes the gate/up projection's two-term
+ *   activation planes and the SwiGLU epilogue the down projection's, the bytes those Ops' quantizers write.
+ *
+ * Domain / effects:
+ *   dense_mlp_fused_rmsnorm_nvfp4_eligible(). Updates residual in place; no other output. The workspace
+ *   (dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes) overlaps no input. Three launches, capturable in a CUDA
+ *   Graph; no persistent state.
+ */
+void dense_mlp_fused_rmsnorm_nvfp4(Tensor& residual, const Tensor& norm_weight, float eps, const Weight& gate_up_weight,
+                                   const Weight& down_weight, WorkspaceArena& ws, cudaStream_t stream);
+
 } // namespace infernix::ops

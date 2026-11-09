@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "infernix/ops/linear.h"
+#include "ops/linear/nvfp4/nvfp4_a4_plan.h"
 
 #include <cuda_runtime.h>
 
@@ -35,6 +36,21 @@ void nvfp4_linear_swiglu_a4_launch(const Tensor& x, const Weight& weight, Tensor
 // AllowA4Residual: kNvfp4A4ResidualTerms NVFP4 activation planes into one accumulator.
 void nvfp4_linear_swiglu_a4_residual_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                             WorkspaceArena& workspace, cudaStream_t stream);
+// The same GEMM (5-96 columns) from the x planes already written, its SwiGLU product encoded with
+// `down_input_scale_divisor` into `product_planes` (row-major, K = 17408) instead of stored: the fused dense MLP.
+void nvfp4_linear_swiglu_a4_residual_planes_launch(const Weight& weight, Nvfp4A4Workspace x_planes,
+                                                   Nvfp4A4Workspace product_planes,
+                                                   float down_input_scale_divisor, std::int32_t tokens,
+                                                   cudaStream_t stream);
+// The fused dense MLP (linear_swiglu.h): x += down(swiglu(gate_up(offset rmsnorm(x)))) under AllowA4Residual.
+void nvfp4_dense_mlp_fused_rmsnorm_launch(Tensor& residual, const Tensor& norm_weight, float eps,
+                                          const Weight& gate_up, const Weight& down, WorkspaceArena& workspace,
+                                          cudaStream_t stream);
+[[nodiscard]] std::size_t nvfp4_dense_mlp_fused_rmsnorm_workspace_bytes(std::int32_t max_tokens);
+// The fused norm's encode alone (the op test compares it with rmsnorm + the residual quantizer).
+void launch_nvfp4_rmsnorm_a4_residual_quantize(const Tensor& residual, const Tensor& norm_weight, float eps,
+                                               float input_scale_divisor, Nvfp4A4Workspace planes,
+                                               cudaStream_t stream);
 
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                   LinearPolicy policy, WorkspaceArena& workspace,

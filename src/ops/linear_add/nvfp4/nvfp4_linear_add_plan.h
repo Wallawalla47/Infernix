@@ -45,6 +45,11 @@ void nvfp4_linear_add_a4_launch(const Tensor& x, const Weight& weight, Tensor& r
 // AllowA4Residual: the workspace's planes (two or three) into one accumulator, MMA tiles only.
 void nvfp4_linear_add_a4_residual_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                          Nvfp4A4Workspace workspace, cudaStream_t stream);
+// The same GEMM from planes already written (row-major, kNvfp4A4ResidualTerms) for `tokens` columns: the fused
+// dense MLP's down projection (its SwiGLU epilogue wrote the planes).
+void nvfp4_linear_add_a4_residual_planes_launch(const Weight& weight, Tensor& residual,
+                                                Nvfp4A4Workspace planes, std::int32_t tokens,
+                                                cudaStream_t stream);
 
 // `wide_down_tile`: LinearRoutes::WideDownTile (the batched-decode fast path's A16 tiles).
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,

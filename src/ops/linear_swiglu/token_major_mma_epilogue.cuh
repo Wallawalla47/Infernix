@@ -2,6 +2,9 @@
 
 #include "ops/common/math.cuh"
 #include "ops/linear/common/vector_output.cuh"
+#include "ops/linear/nvfp4/nvfp4_codec.cuh"
+
+#include <cstdint>
 
 namespace infernix::ops::detail {
 // Matching gate/up fragments belong to the same warp. The persistent weight
@@ -22,6 +25,17 @@ struct SwiGluTokenMajorMmaRows {
     }
 };
 
+// The TMA schedules' producer threads, which take no part in the epilogue.
+template <class S>
+struct SwiGluProducerThreads {
+    static constexpr int value = 0;
+};
+template <class S>
+    requires requires { S::kProducerThreads; }
+struct SwiGluProducerThreads<S> {
+    static constexpr int value = S::kProducerThreads;
+};
+
 struct SwiGluTokenMajorMmaEpilogue {
     __device__ __forceinline__ float apply_pair(int, int, float gate, float up) const {
         return silu(gate) * up;
@@ -30,31 +44,30 @@ struct SwiGluTokenMajorMmaEpilogue {
     template <class Schedule>
     static constexpr int kSharedBytes = Schedule::kBlockTokens * (Schedule::kBlockRows / 2 + 8) * 2;
 
-    template <class S, bool Full, class Output>
-    __device__ __forceinline__ void
-    finish_tile(Output output, unsigned char* scratch, float (&acc)[S::kMmaTokens][S::kMmaRows][4],
-                int row_begin, int token_begin, int, int token_end) const {
+    template <class S>
+    static constexpr int kProducers = SwiGluProducerThreads<S>::value;
+
+    template <class S>
+    __device__ __forceinline__ static void synchronize() {
+        constexpr int producers = kProducers<S>;
+        if constexpr (producers)
+            asm volatile("bar.sync 1, %0;" ::"r"(S::kThreads - producers) : "memory");
+        else
+            __syncthreads();
+    }
+
+    // Writes silu(gate) * up of the tile, rounded to BF16, to `scratch` as [token][row] with a row stride of
+    // kBlockRows / 2 + 8 elements, and synchronizes the consumer threads after it.
+    template <class S>
+    __device__ __forceinline__ static void stage(unsigned char* scratch,
+                                                 float (&acc)[S::kMmaTokens][S::kMmaRows][4]) {
         static_assert(S::kMmaRows % 2 == 0);
-        constexpr int rows           = S::kBlockRows / 2;
-        constexpr int stride         = rows + 8;
+        constexpr int stride         = S::kBlockRows / 2 + 8;
         constexpr int gate_fragments = S::kMmaRows / 2;
-        constexpr int producers      = [] {
-            if constexpr (requires { S::kProducerThreads; })
-                return S::kProducerThreads;
-            else
-                return 0;
-        }();
-        constexpr int threads = S::kThreads - producers;
-        const int tid = static_cast<int>(threadIdx.x) - producers, warp = tid >> 5, lane = tid & 31;
-        const auto synchronize = [] {
-            if constexpr (producers)
-                asm volatile("bar.sync 1, %0;" ::"r"(threads) : "memory");
-            else
-                __syncthreads();
-        };
+        const int tid = static_cast<int>(threadIdx.x) - kProducers<S>, warp = tid >> 5, lane = tid & 31;
         const int wt = warp / S::kWarpsRows, wr = warp % S::kWarpsRows;
         auto* final_tile = reinterpret_cast<__nv_bfloat16*>(scratch);
-        synchronize();
+        synchronize<S>();
 #pragma unroll
         for (int mt = 0; mt < S::kMmaTokens; ++mt) {
             const int token = wt * S::kWarpTokens + mt * 16 + (lane >> 2);
@@ -69,12 +82,73 @@ struct SwiGluTokenMajorMmaEpilogue {
                     __floats2bfloat162_rn(silu(gate[2]) * up[2], silu(gate[3]) * up[3]);
             }
         }
-        synchronize();
+        synchronize<S>();
+    }
+
+    template <class S, bool Full, class Output>
+    __device__ __forceinline__ void
+    finish_tile(Output output, unsigned char* scratch, float (&acc)[S::kMmaTokens][S::kMmaRows][4],
+                int row_begin, int token_begin, int, int token_end) const {
+        constexpr int rows    = S::kBlockRows / 2;
+        constexpr int stride  = rows + 8;
+        constexpr int threads = S::kThreads - kProducers<S>;
+        const int tid         = static_cast<int>(threadIdx.x) - kProducers<S>;
+        stage<S>(scratch, acc);
+        const auto* final_tile = reinterpret_cast<const __nv_bfloat16*>(scratch);
         for (int item = tid; item < S::kBlockTokens * (rows / 8); item += threads) {
             const int token = item / (rows / 8), row = (item % (rows / 8)) * 8;
             if (Full || token_begin + token < token_end)
                 linear_store_bf16_vector(output, row_begin + row, token_begin + token,
                                          load_vec<uint4>(final_tile + token * stride + row));
+        }
+    }
+};
+
+// The fused dense MLP (SI-02+): instead of storing the BF16 product, each 16-row group of a token's staged
+// product is encoded as the down projection's A4 residual planes (quantize_nvfp4_terms_k16 with the down
+// projection's activation divisor): the bytes nvfp4_a4_residual_quantize_kernel writes (row-major scales) from
+// the stored product. A CTA's product rows are 16-aligned whole groups.
+template <int Terms>
+struct SwiGluA4ResidualPlanesEpilogue : SwiGluTokenMajorMmaEpilogue {
+    std::uint8_t* codes;
+    std::uint8_t* scales;
+    std::int64_t code_plane;
+    std::int64_t scale_plane;
+    float input_scale_divisor;
+    int down_input_rows; // the product's rows (the down projection's K)
+
+    template <class S, bool Full, class Output>
+    __device__ __forceinline__ void
+    finish_tile(Output, unsigned char* scratch, float (&acc)[S::kMmaTokens][S::kMmaRows][4], int row_begin,
+                int token_begin, int, int token_end) const {
+        constexpr int rows    = S::kBlockRows / 2;
+        constexpr int stride  = rows + 8;
+        constexpr int threads = S::kThreads - kProducers<S>;
+        static_assert(rows % 16 == 0 && (stride * 2) % 16 == 0);
+        static_assert(threads % 32 == 0);
+        const int tid = static_cast<int>(threadIdx.x) - kProducers<S>;
+        stage<S>(scratch, acc);
+        const auto* final_tile = reinterpret_cast<const __nv_bfloat16*>(scratch);
+        const int groups_per_row = down_input_rows / 16;
+        // Four lanes a group (quantize_nvfp4_terms_k16_quad): lane q encodes the group's elements 4q..4q+3.
+        const int q          = tid & 3;
+        const unsigned quad  = 0xFU << (static_cast<unsigned>(threadIdx.x) & 28U);
+        for (int item = tid >> 2; item < S::kBlockTokens * (rows / 16); item += threads / 4) {
+            const int token = item / (rows / 16), local = (item % (rows / 16)) * 16;
+            const int column = token_begin + token;
+            if (!Full && column >= token_end) continue; // the same for the quad's lanes
+            std::uint16_t group_codes[Terms];
+            std::uint8_t group_scales[Terms];
+            quantize_nvfp4_terms_k16_quad<Terms>(final_tile + token * stride + local + 4 * q, input_scale_divisor, quad,
+                                                 group_codes, group_scales);
+            const int group                = (row_begin + local) / 16;
+            const std::int64_t code_offset = static_cast<std::int64_t>(column) * (down_input_rows / 2) + group * 8 + 2 * q;
+            const std::int64_t scale_offset = static_cast<std::int64_t>(column) * groups_per_row + group;
+#pragma unroll
+            for (int term = 0; term < Terms; ++term) {
+                *reinterpret_cast<std::uint16_t*>(codes + term * code_plane + code_offset) = group_codes[term];
+                if (q == 0) { scales[term * scale_plane + scale_offset] = group_scales[term]; }
+            }
         }
     }
 };

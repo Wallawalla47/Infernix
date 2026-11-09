@@ -19,6 +19,12 @@ namespace infernix::models::qwen3_5::execution {
                                               ops::LinearRoutes gate_up_routes = ops::LinearRoutes::Exact,
                                               ops::offloaded_moe::WideA16 expert_wide =
                                                   ops::offloaded_moe::WideA16::kExact);
+// residual += MLP(Offset rmsnorm(residual)) in ops::dense_mlp_fused_rmsnorm_nvfp4's three launches (SI-02+: the
+// NVFP4 A4 residual activations encoded by their producers), bit for bit rmsnorm() and then ffn() with the same
+// wide_verification, where that Op serves the dense layer's projections, policies and width; elsewhere it
+// launches nothing and returns false. ffn_workspace_bytes covers its calls.
+bool fused_dense_mlp(Tensor& residual, const Tensor& norm_weight, float eps, const FfnParameters& parameters,
+                     WorkspaceArena& workspace, cudaStream_t stream, bool wide_verification);
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, DeviceExecutionView execution,
          bool mtp = false, bool wide_verification = false,

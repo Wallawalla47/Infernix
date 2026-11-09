@@ -307,6 +307,11 @@ infernix_add_family_op_test(infernix_attn_input_proj_fused_rmsnorm_test FAMILY p
   LIBRARIES infernix_ops)
 set_tests_properties(infernix_attn_input_proj_fused_rmsnorm_test PROPERTIES SKIP_RETURN_CODE 77)
 
+infernix_add_family_op_test(infernix_dense_mlp_fused_rmsnorm_test FAMILY projection
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dense_mlp_fused_rmsnorm.cpp"
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_dense_mlp_fused_rmsnorm_test PROPERTIES SKIP_RETURN_CODE 77)
+
 infernix_add_family_op_test(infernix_gdn_input_proj_test FAMILY recurrent
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj.cpp"
   LIBRARIES infernix_ops)

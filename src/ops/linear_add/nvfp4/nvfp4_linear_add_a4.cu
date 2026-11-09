@@ -113,8 +113,14 @@ void launch_residual_terms(const Weight& weight, Tensor& residual, Nvfp4A4Worksp
 
 void nvfp4_linear_add_a4_residual_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                          Nvfp4A4Workspace workspace, cudaStream_t stream) {
-    const std::int32_t tokens = x.ne[1];
     launch_nvfp4_a4_quantize(x, weight, workspace, Nvfp4ScaleLayout::RowMajor, stream);
+    nvfp4_linear_add_a4_residual_planes_launch(weight, residual, workspace, x.ne[1], stream);
+}
+
+void nvfp4_linear_add_a4_residual_planes_launch(const Weight& weight, Tensor& residual,
+                                                Nvfp4A4Workspace planes, std::int32_t tokens,
+                                                cudaStream_t stream) {
+    Nvfp4A4Workspace& workspace = planes;
     switch (resolve_nvfp4_geometry(weight.n, weight.k)) {
     case Nvfp4GeometryId::N5120K6144:
         launch_residual_terms<Nvfp4N5120K6144>(weight, residual, workspace, tokens, stream);
