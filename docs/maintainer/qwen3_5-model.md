@@ -233,6 +233,26 @@ groupwise Qwen3.8-27B's default prefill top-1 flips were 1.53x the noise twin's 
 logits stay BF16. Ordinary decode repeats this
 schedule for one new token. CUDA Graph replay uses the same selected model implementation.
 
+A generation prompt reads the last layer's output only at each prefill window's last column: the
+head on the prompt's last window, the continuation hidden that prefix-cache snapshots and the
+zero-suffix sample keep at every pass end, and a rewrite checkpoint. So its last layer computes
+keys, values (and a GDN layer's state) over every column but the mixer's output projection and the
+MLP over the window's last few columns, and the final norm over its last one (since 2026-11-08,
+candidates YC-01; TensorFold `3d4f6aa360`). The width is twenty columns, at which every dense
+projection keeps its prompt route's activation precision: 16-bit ones (the groupwise 27B's
+`A16Only`, NVFP4 `AllowA8`, which NVFP4 runs at 16 bits at every width), NVFP4 `AllowA4` ones (the
+NVIDIA NVFP4 27B's MLP: 4-bit from 8 columns in linear_add) and row-scaled FP8 `AllowA8` ones (the
+official NVFP4 27B keeps its last layer in FP8: 8-bit from 20 columns at K = 17,408). The 4-bit
+codes use the artifact's fixed activation divisor and the 8-bit ones a per-token scale, so a
+column's codes do not depend on the others. It stays off where every column's final hidden is
+read: MTP prompt preparation, causal scoring, a drafter tapping the last layer (the 27B's DFlash2
+taps layers 5, 19, 33, 47 and 61 of 64); where a projection has a residual-term profile; and where
+the FFN is offloaded. A first version trimmed to one column, on the decode routes' 16-bit
+activations: the official artifact's `/v1/decide` readouts then differed from CausalScoring by
+0.209 logprob, past the readout real test's 0.2, and the owner kept the prompt routes' precision. A
+second forced NVFP4's 4-bit route at one column; linear_add's A4 tiles gave wrong sums below eight
+columns (its op test). A third, at eight columns, left the FP8 layer out and never engaged there.
+
 MTP is a one-layer predictor conditioned on a final-normalized target hidden state h_t and the
 following token x_(t+1):
 

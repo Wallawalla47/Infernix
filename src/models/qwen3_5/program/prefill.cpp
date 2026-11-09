@@ -101,6 +101,8 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_prefill_gpu_timer(state.prefill_gpu_timer);
+    card.set_before_first_sample(state.before_first_sample);
+    card.set_prefill_last_rows_only(state.last_rows_only);
     card.set_rope_delta(state.rope_delta);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
@@ -132,6 +134,8 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_prefill_gpu_timer(state.prefill_gpu_timer);
+    card.set_before_first_sample(state.before_first_sample);
+    card.set_prefill_last_rows_only(state.last_rows_only);
     card.set_rope_delta(state.rope_delta);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
@@ -249,16 +253,27 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
                        backend_kv_addresses->bound_row(*state.kv->backend));
     }
     grammar_dead_positions[0] = 0;
+    // The step that samples the first output token writes its sampling config (the grammar's mask, the reasoning
+    // ban) just before the sampler, behind the final pass's forward: the mask waits for a grammar still compiling
+    // (PUB-46), which then overlaps the whole prompt, its last pass included. Until 2026-11-08 the config was written
+    // before the step's passes, so a prompt of one pass (or the last pass of any) overlapped nothing.
     if (requests[lane].prefill && permit.main_frontier >= requests[lane].prefill->prompt_tokens &&
         masks && (masks->constrained(0) || masks->reasoning_ban(0).active())) {
-        auto& config       = static_cast<qwen3_5::PrefillRoundHost*>(round_host->data())->sampling;
-        config             = requests[lane].sampling_host;
-        config.mask        = fill_grammar_mask(masks, 0, {});
-        bind_reasoning_ban(masks, 0, config);
-        Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
-        CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &config, sizeof(config),
-                                   cudaMemcpyHostToDevice, device.stream));
+        prefill_first_sample_ = [this, lane, masks] {
+            auto& config       = static_cast<qwen3_5::PrefillRoundHost*>(round_host->data())->sampling;
+            config             = requests[lane].sampling_host;
+            config.mask        = fill_grammar_mask(masks, 0, {});
+            bind_reasoning_ban(masks, 0, config);
+            Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
+            CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &config, sizeof(config),
+                                       cudaMemcpyHostToDevice, device.stream));
+        };
     }
+    // The step samples once (its final pass, or the zero-suffix sample), so the hook runs at most once.
+    struct ClearHook {
+        std::function<void()>& hook;
+        ~ClearHook() { hook = nullptr; }
+    } clear_hook{prefill_first_sample_};
     auto progress = wrap_prefill(lane, advance_prefill_raw(lane, timing));
     if (!progress.complete) { settle_unit(lane); }
     return progress;
@@ -691,6 +706,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             dflash_prefill_host_ingress,
             sequence.rope_delta};
         schedule_state.prefill_gpu_timer = &prefill_gpu_timer_;
+        schedule_state.before_first_sample = &prefill_first_sample_;
+        schedule_state.last_rows_only      = true; // YC-01: a generation prompt
         // The first pass after a Host restore waits for each layer's copies (hybrid spec §6.5).
         // The chunk function takes the events itself: they are a view into the landing batch, and
         // the KV commits between chunks (the MTP bridge's among them) poll the cache, which frees
@@ -910,6 +927,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             if (!sequence.tail_hidden_valid) {
                 throw std::logic_error("zero-suffix reuse has no target tail hidden");
             }
+            if (prefill_first_sample_) { prefill_first_sample_(); }
             execution::sample_from_hidden(schedule_state, sequence.tail_hidden,
                                           checked_i32(staged.prompt_tokens, "sample position"),
                                           ops::kSamplePurposePrefill);

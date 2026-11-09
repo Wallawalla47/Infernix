@@ -172,9 +172,10 @@ continuation (checked against the grammar during submit) and a key another reque
 the synchronous path. Strict tools' argument-representation analysis is request preparation and uses
 the same schema reduction as the grammar.
 
-Where the first mask is filled decides the overlap: Qwen4Exp fills it after the prompt's forward is
-enqueued, so the compile overlaps the whole prefill; Qwen3.5 fills it before the prompt's last chunk,
-so the compile overlaps the earlier chunks only (a one-chunk prompt waits as before). A lane whose
+Where the first mask is filled decides the overlap: both families fill it once the prompt's last pass
+is enqueued, just before the sampler (Qwen3.5 through `PrefillContext::before_first_sample`, the
+zero-suffix sample too), so the compile overlaps the whole prefill. Until 2026-11-08 Qwen3.5 filled it
+before the step that reaches the prompt's end, so a short prompt (one step) overlapped nothing. A lane whose
 compile is still running yields the prefill turn while another lane has work, so the wait never holds
 another request; it then waits as it did before admission, holding its lane. A compile that fails on
 the worker (no request error is expected there: validation ran before) leaves every mask position dead,

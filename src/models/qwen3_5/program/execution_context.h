@@ -69,6 +69,13 @@ struct PrefillContext {
     std::function<std::span<const cudaEvent_t>()> take_layer_ready;
     // Offloaded experts (RoundState::offloaded_experts): this pass's route through them.
     OffloadedCall offloaded_call;
+    // The prompt's final pass calls it before sampling the first output token (TextContext::set_before_first_sample):
+    // the sampling config's grammar mask and reasoning ban, written once the pass's forward is enqueued. Null or
+    // empty: nothing to write.
+    const std::function<void()>* before_first_sample = nullptr;
+    // YC-01 (TextContext::set_prefill_last_rows_only): a generation prompt, which reads each window's final hidden
+    // at its last column only. Causal scoring and the other prompt-shaped passes leave it off.
+    bool last_rows_only = false;
 };
 
 struct OrdinaryBatchContext {

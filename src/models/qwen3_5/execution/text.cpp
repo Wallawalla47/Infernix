@@ -1098,7 +1098,14 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     ops::sigmoid_mul(gate, a, s);
 
-    ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
+    Tensor mixed = a.view({dimension(config_.attention->query_width()), T});
+    if (output_columns_ > 0) { // YC-01: only the last columns' output is read past this layer
+        Tensor columns = x.slice(1, T - output_columns_, output_columns_);
+        ops::linear_add(mixed.slice(1, T - output_columns_, output_columns_), p.output.weight, columns,
+                        residual_projection_policy(p.output, false), work_, s, ops::LinearRoutes::Exact);
+        return;
+    }
+    ops::linear_add(mixed, p.output.weight, x,
                     residual_projection_policy(
                         p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
                     work_, s,
@@ -1249,6 +1256,13 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                            dimension(config_.gdn->linear_num_value_heads), T});
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
 
+    if (output_columns_ > 0) { // YC-01: only the last columns' output is read past this layer
+        Tensor columns = x.slice(1, T - output_columns_, output_columns_);
+        ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}).slice(1, T - output_columns_, output_columns_),
+                        p.output.weight, columns, residual_projection_policy(p.output, false), work_, s,
+                        ops::LinearRoutes::Exact);
+        return;
+    }
     ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
                     residual_projection_policy(
                         p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
@@ -1295,6 +1309,15 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
         const auto& block  = text.layers[layer];
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
         const auto compact = dimension(config_.compact_layer_indices[layer]);
+        // YC-01 (prefill_impl decides the width): the last layer's mixer output projection and MLP over the last
+        // trim_last_columns_ columns only.
+        const std::int32_t kept = trim_last_columns_;
+        const bool trim = prefill && kept > 0 && layer + 1 == text.layers.size() && x.ne[1] > kept;
+        struct ResetColumns {
+            std::int32_t& columns;
+            ~ResetColumns() { columns = 0; }
+        } reset_columns{output_columns_};
+        if (trim) { output_columns_ = kept; }
         nvtx::ScopedRange layer_range(
             full ? (prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull)
                  : (prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn),
@@ -1314,13 +1337,19 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 } else {
                     gdn_mix(block, x, compact, ph);
                 }
+                output_columns_ = 0;
             }
             {
                 nvtx::ScopedRange range(prefill ? nvtx::Name::PrefillPostMixer
                                                 : nvtx::Name::VerifyPostMixer,
                                         nvtx::Category::PostMixer, layer);
                 auto scope = work_.scope();
-                mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)), layer);
+                if (trim) {
+                    Tensor columns = x.slice(1, x.ne[1] - kept, kept);
+                    mlp_tail(block, columns, ph, next_projection_hints(static_cast<int>(layer)), layer);
+                } else {
+                    mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)), layer);
+                }
             }
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
@@ -1341,6 +1370,45 @@ void TextContext::run_layers(Tensor& x, Phase ph) {
 }
 
 namespace {
+
+// YC-01's width: the trimmed columns keep the activation precision and route family the wide call gives them. At
+// twenty columns every dense projection here takes its prompt route: a 16-bit one its multi-column route; an NVFP4
+// one under AllowA8 runs 16-bit at every width, under AllowA4 (the NVIDIA NVFP4 27B's MLP) its 4-bit route (from 8
+// columns in linear_add, 5 in linear_swiglu); a row-scaled FP8 one under AllowA8 (the official NVFP4 27B keeps its
+// last layer in FP8) its 8-bit route (from 20 columns at K = 17,408 and 17 at 6,144 in linear_add, 5 in
+// linear_swiglu). The 4-bit codes use the artifact's fixed divisor and the 8-bit ones a per-token scale, so a
+// column's codes are those of the wide call. One column, the first version, ran the decode routes at 16 bits: the
+// official artifact's readouts then moved 0.209 logprob from CausalScoring's (the readout real test allows 0.2).
+// Residual-term profiles keep the wide call (width 0). Twenty columns cost 20/1024 of one layer's tail.
+constexpr std::int32_t kTrimColumns = 20;
+
+bool sixteen_bit_at_every_width(ops::LinearPolicy policy) {
+    return !ops::allows_a8(policy) && !ops::allows_residual(policy);
+}
+
+// Whether the projection keeps its prompt route's precision at kTrimColumns columns.
+bool trims_at_prompt_precision(const ops::SingleProjectionWeight& projection) {
+    if (sixteen_bit_at_every_width(projection.policy)) { return true; }
+    const QType format = projection.weight.qtype;
+    if (format == QType::NVFP4) {
+        return projection.policy == ops::LinearPolicy::AllowA8 || projection.policy == ops::LinearPolicy::AllowA4;
+    }
+    return is_fp8_row(format) && projection.policy == ops::LinearPolicy::AllowA8;
+}
+
+std::int32_t trim_columns(const BlockParameters& block) {
+    const auto* attention = std::get_if<AttentionParameters>(&block.mixer);
+    const auto* gdn       = std::get_if<GdnParameters>(&block.mixer);
+    const LinearParameters* output = attention != nullptr ? &attention->output : gdn != nullptr ? &gdn->output : nullptr;
+    if (output == nullptr || !trims_at_prompt_precision(*output)) { return 0; }
+    if (const auto* dense = std::get_if<DenseParameters>(&block.ffn)) {
+        return trims_at_prompt_precision(dense->gate_up) && trims_at_prompt_precision(dense->down) ? kTrimColumns : 0;
+    }
+    if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&block.ffn)) {
+        return sixteen_bit_at_every_width(moe->policy) ? kTrimColumns : 0;
+    }
+    return 0; // offloaded experts: their pass's route covers the whole width
+}
 
 // Diagnostic for the layer-by-layer comparison of the lossless route with the publisher's code (IQS-2 G1,
 // `python -m tools.quality.shadow.bisect`): with INFERNIX_LOSSLESS_DUMP_DIR set, every lossless prefill call
@@ -1589,8 +1657,26 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                          : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
                 lossless_final_norm(x, *final_norm_, config_, xf, s);
             } else {
+                // YC-01: past the last layer this window reads only its last column (the head, the continuation
+                // hidden, a rewrite checkpoint), so the last layer's tail runs over its last trim_columns columns
+                // (the narrowest width that keeps every projection's prompt precision), unless MTP prepares from
+                // every column, the drafter taps the last layer, or no such width exists (trim_columns 0).
+                const TextParameters& text = phase_text(Phase::Prefill, len);
+                const int last_layer       = static_cast<int>(text.layers.size()) - 1;
+                const std::int32_t kept    = prefill_last_rows_only_ && !prepare_mtp_prompt &&
+                                                  !tap.reads_layer(last_layer)
+                                              ? trim_columns(text.layers.back())
+                                              : 0;
+                const bool trim_last       = kept > 0 && len > kept;
                 if constexpr (Tap::enabled) { tap.begin(x); }
-                run_layers(x, Phase::Prefill, tap);
+                trim_last_columns_ = trim_last ? kept : 0;
+                try {
+                    run_layers(x, Phase::Prefill, tap);
+                } catch (...) {
+                    trim_last_columns_ = 0;
+                    throw;
+                }
+                trim_last_columns_ = 0;
                 if constexpr (requires { tap.capture_positions(positions, s); }) {
                     tap.capture_positions(positions, s);
                 }
@@ -1598,7 +1684,12 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 xf = prefill_hidden_.data != nullptr
                          ? matrix_window(prefill_hidden_, len)
                          : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
-                ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+                if (trim_last) {
+                    Tensor column = xf.slice(1, len - 1, 1);
+                    ops::rmsnorm(x.slice(1, len - 1, 1), *final_norm_, config_.rms_norm_eps, true, column, s);
+                } else {
+                    ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+                }
             }
             // Offloaded experts: the pass's routes reach the host for the cache update the Program
             // applies after the pass's synchronization (ProgramOffload::end_prefill_pass).
@@ -1619,6 +1710,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 // decode step, which reuses the same io_.pos).
                 ops::set_i32_scalar(io_.pos, base_i + T, s);
                 ops::set_i32_scalar(io_.rope_pos, base_i + T + rope_delta_, s);
+                // The sampling config's grammar mask, written while the pass's forward runs.
+                if (before_first_sample_ != nullptr && *before_first_sample_) { (*before_first_sample_)(); }
                 // A constrained request's first output token (descriptor column 0).
                 qwen3_5::constrain_round_logits(
                     io_, logits, nullptr,

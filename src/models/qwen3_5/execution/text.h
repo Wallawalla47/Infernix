@@ -18,6 +18,7 @@
 #include "models/qwen3_5/program/round_buffers.h"
 #include "models/qwen3_5/execution/offloaded_moe.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +39,7 @@ enum class GdnStateAction : std::uint8_t {
 
 struct NullTap {
     static constexpr bool enabled = false;
+    [[nodiscard]] static constexpr bool reads_layer(int) noexcept { return false; }
 };
 
 struct PrefillChunkResult {
@@ -63,6 +65,10 @@ struct DFlashFeatureSink {
     std::int32_t active_tokens  = 0;
 
     void begin(const Tensor& value);
+    // Whether capture_layer records this layer's output (every column of the call).
+    [[nodiscard]] bool reads_layer(int layer) const noexcept {
+        return std::find(layers.begin(), layers.end(), static_cast<std::uint32_t>(layer)) != layers.end();
+    }
     void capture_layer(int layer, const Tensor& value, cudaStream_t stream);
     void capture_positions(const Tensor& source, cudaStream_t stream);
     void consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint);
@@ -107,6 +113,22 @@ public:
     void set_rope_delta(std::int32_t delta) noexcept { rope_delta_ = delta; }
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
+
+    // Called on the prompt's final pass once its forward and head are enqueued, before its first output token is
+    // sampled: the Program writes the sampling config's grammar mask there, so a grammar still compiling
+    // (PUB-46) overlaps the final pass too. Null: the config is already in place.
+    void set_before_first_sample(const std::function<void()>* hook) noexcept { before_first_sample_ = hook; }
+
+    // YC-01: a generation prompt reads the last layer's output only at each prefill window's last column (the
+    // head on the prompt's last window; the continuation hidden, taps and rewrite checkpoints at every pass end),
+    // so its last layer runs the mixer's output projection and the MLP over the window's last twenty columns (where
+    // every dense projection keeps its prompt route's activation precision) and the final norm over the
+    // last column; keys, values and the mixer's state still
+    // cover every column. Off where every column's final hidden is read: MTP prompt preparation, causal scoring
+    // (which never sets it), a drafter tapping the last layer, the lossless route; where a projection's
+    // lower-precision profile has no such width (8-bit, residual terms); and where its FFN is offloaded (its pass's
+    // expert route is planned for the whole width).
+    void set_prefill_last_rows_only(bool on) noexcept { prefill_last_rows_only_ = on; }
 
     void set_prefill_gpu_timer(CudaEventTimer* timer) noexcept { prefill_gpu_timer_ = timer; }
 
@@ -311,6 +333,12 @@ private:
     Tensor& prefill_hidden_;
     // Borrowed from Program; every measured chunk retires before this pair is reused.
     CudaEventTimer* prefill_gpu_timer_ = nullptr;
+    const std::function<void()>* before_first_sample_ = nullptr;
+    bool prefill_last_rows_only_ = false;
+    // This window's run_layers runs its last layer's tail over this many last columns (prefill_impl); 0: all.
+    std::int32_t trim_last_columns_ = 0;
+    // The last columns the mixers' output projections write (YC-01's last layer); 0: every column.
+    std::int32_t output_columns_ = 0;
     std::uint32_t prefill_chunk_;
     ExecutionSchedule execution_schedule_;
     std::uint32_t text_kv_base_;

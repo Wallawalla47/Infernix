@@ -612,6 +612,11 @@ public:
     void bind_reasoning_ban(runtime::TokenMaskProvider*, std::size_t row, ops::SamplingConfig& config) const noexcept;
     ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider*, std::size_t row,
                                         std::span<const TokenId> drafts);
+    // A prompt step that samples the first output token of a constrained or thinking-open request: writes the
+    // lane's sampling config with its grammar mask and reasoning ban. The final pass calls it once its forward is
+    // enqueued (PrefillContext::before_first_sample), so a grammar still compiling (PUB-46) overlaps that pass;
+    // empty for other steps. Set and cleared by advance_prefill around the step.
+    std::function<void()> prefill_first_sample_;
     Tensor token_counts;
     // Per lane: the sampler's non-finite flag (ops::SamplingConfig::nonfinite), written by the
     // round's kernels through the host mapping and read once the round has synchronized.
