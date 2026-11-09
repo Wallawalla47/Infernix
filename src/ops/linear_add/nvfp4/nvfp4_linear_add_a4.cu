@@ -136,22 +136,24 @@ void nvfp4_linear_add_a4_residual_planes_launch(const Weight& weight, Tensor& re
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");
 }
 
-void nvfp4_linear_add_a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                Nvfp4A4Workspace workspace, cudaStream_t stream) {
-    const std::int32_t tokens = x.ne[1];
-    const auto layout = uses_tma(tokens) ? Nvfp4ScaleLayout::Tiled256 : Nvfp4ScaleLayout::RowMajor;
-    launch_nvfp4_a4_quantize(x, weight, workspace, layout, stream);
+Nvfp4ScaleLayout nvfp4_linear_add_a4_scale_layout(std::int32_t tokens) {
+    return uses_tma(tokens) ? Nvfp4ScaleLayout::Tiled256 : Nvfp4ScaleLayout::RowMajor;
+}
+
+void nvfp4_linear_add_a4_planes_launch(const Weight& weight, Tensor& residual, Nvfp4A4Workspace planes,
+                                       std::int32_t tokens, cudaStream_t stream) {
+    if (planes.terms != 1) { throw std::invalid_argument("nvfp4 linear_add A4: one activation plane"); }
     if (uses_tma(tokens)) {
-        launch_nvfp4_a4_tma_linear_add(nvfp4_a4_operands(weight, workspace, tokens, layout),
+        launch_nvfp4_a4_tma_linear_add(nvfp4_a4_operands(weight, planes, tokens, Nvfp4ScaleLayout::Tiled256),
                                        static_cast<__nv_bfloat16*>(residual.data), stream);
         return;
     }
     switch (resolve_nvfp4_geometry(weight.n, weight.k)) {
     case Nvfp4GeometryId::N5120K6144:
-        launch_problem<Nvfp4N5120K6144>(weight, residual, workspace, tokens, stream);
+        launch_problem<Nvfp4N5120K6144>(weight, residual, planes, tokens, stream);
         return;
     case Nvfp4GeometryId::N5120K17408:
-        launch_problem<Nvfp4N5120K17408>(weight, residual, workspace, tokens, stream);
+        launch_problem<Nvfp4N5120K17408>(weight, residual, planes, tokens, stream);
         return;
     case Nvfp4GeometryId::N14336K5120:
     case Nvfp4GeometryId::N16384K5120:
@@ -159,6 +161,13 @@ void nvfp4_linear_add_a4_launch(const Tensor& x, const Weight& weight, Tensor& r
         break;
     }
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");
+}
+
+void nvfp4_linear_add_a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                Nvfp4A4Workspace workspace, cudaStream_t stream) {
+    const std::int32_t tokens = x.ne[1];
+    launch_nvfp4_a4_quantize(x, weight, workspace, nvfp4_linear_add_a4_scale_layout(tokens), stream);
+    nvfp4_linear_add_a4_planes_launch(weight, residual, workspace, tokens, stream);
 }
 
 } // namespace infernix::ops::detail

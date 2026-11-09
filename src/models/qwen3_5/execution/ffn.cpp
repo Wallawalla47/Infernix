@@ -148,14 +148,17 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
                 first, last));
         }
     }
-    // fused_dense_mlp's calls in the interval (its Op allocates instead of the activation and both projections).
-    const std::int32_t fused_last = std::min(last, ops::kDenseMlpFusedMaxTokens);
-    if (!mtp && fused_last >= std::max(first, ops::kDenseMlpFusedMinTokens) &&
-        ops::dense_mlp_fused_rmsnorm_nvfp4_eligible(gu, p.gate_up.policy, down,
-                                                    residual_projection_policy(p.down, wide_verification),
-                                                    fused_last)) {
+    // fused_dense_mlp's calls in the interval (its Op allocates instead of the activation and both projections): the
+    // A4 residual rounds' widths, and prompt calls from kDenseMlpFusedPromptMinTokens.
+    const ops::LinearPolicy down_policy = residual_projection_policy(p.down, wide_verification);
+    const std::int32_t rounds_last = std::min(last, ops::kDenseMlpFusedMaxTokens);
+    const bool fused_rounds = rounds_last >= std::max(first, ops::kDenseMlpFusedMinTokens) &&
+                              ops::dense_mlp_fused_rmsnorm_nvfp4_eligible(gu, p.gate_up.policy, down, down_policy,
+                                                                          rounds_last);
+    const bool fused_prompt = ops::dense_mlp_fused_rmsnorm_nvfp4_eligible(gu, p.gate_up.policy, down, down_policy, last);
+    if (!mtp && (fused_rounds || fused_prompt)) {
         auto scope = layout.scope();
-        (void)layout.alloc_bytes(ops::dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(fused_last));
+        (void)layout.alloc_bytes(ops::dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(fused_prompt ? last : rounds_last));
     }
     return layout.peak_bytes(1);
 }
@@ -163,14 +166,14 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
 bool fused_dense_mlp(Tensor& residual, const Tensor& norm_weight, float eps, const FfnParameters& parameters,
                      WorkspaceArena& workspace, cudaStream_t stream, bool wide_verification) {
     const auto* p = std::get_if<DenseParameters>(&parameters);
-    if (p == nullptr ||
-        !ops::dense_mlp_fused_rmsnorm_nvfp4_eligible(p->gate_up.weight, p->gate_up.policy, p->down.weight,
-                                                     residual_projection_policy(p->down, wide_verification),
-                                                     residual.ne[1])) {
+    if (p == nullptr) { return false; }
+    const ops::LinearPolicy down_policy = residual_projection_policy(p->down, wide_verification);
+    if (!ops::dense_mlp_fused_rmsnorm_nvfp4_eligible(p->gate_up.weight, p->gate_up.policy, p->down.weight,
+                                                     down_policy, residual.ne[1])) {
         return false;
     }
-    ops::dense_mlp_fused_rmsnorm_nvfp4(residual, norm_weight, eps, p->gate_up.weight, p->down.weight, workspace,
-                                       stream);
+    ops::dense_mlp_fused_rmsnorm_nvfp4(residual, norm_weight, eps, p->gate_up.weight, p->down.weight, down_policy,
+                                       workspace, stream);
     return true;
 }
 

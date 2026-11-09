@@ -104,7 +104,7 @@ template <class Schedule>
 void launch_planes_gemm(const Weight& weight, Nvfp4A4Workspace x_planes, Nvfp4A4Workspace product_planes,
                         float down_input_scale_divisor, std::int32_t tokens, cudaStream_t stream) {
     using S = Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>;
-    SwiGluA4ResidualPlanesEpilogue<kNvfp4A4ResidualTerms> epilogue{};
+    SwiGluA4PlanesEpilogue<kNvfp4A4ResidualTerms> epilogue{};
     epilogue.codes               = product_planes.codes;
     epilogue.scales              = product_planes.scales;
     epilogue.code_plane          = static_cast<std::int64_t>(product_planes.code_plane);

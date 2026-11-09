@@ -265,6 +265,17 @@ lane a group (320 groups over 256 lanes: two rounds, where four lanes a group ta
 slower). The NVIDIA NVFP4 27B's MLP takes 100.7 against 105.9 us a layer in DFlash2 rounds (Nsight Systems), and
 its DFlash2 decode runs +0.26 to +0.31 % faster (INT8 KV, -p 512 -n 256, ABBA x3; 2026-11-09).
 
+Prompt calls of 256 columns or more where the MLP runs one-term A4 activations (`AllowA4`: both NVFP4 27B
+artifacts' prompt routes) take the same Op's prompt profile (since 2026-11-09): the norm kernel writes the gate/up
+projection's one plane with its scales in the TMA tile's 256-token tiles, the gate/up projection's TMA GEMM encodes
+its SwiGLU product as the down projection's plane (scales row-major to 512 columns, where the down projection runs
+its MMA tiles, 256-token tiles above, where it runs its TMA tile; the padding tokens' scales zeroed as the quantizer
+zeroes them), and the down projection reads it. The bytes are the separate Ops' (op test at 256-2,048 columns; greedy
+ids on the NVIDIA and official artifacts at ~2,000 and ~20,000-token prompts identical to the unfused build). Before,
+a 4,096-token prompt spent 4.6 ms in the product's quantizer and 0.8 ms in the input's (63 layers, of 309 ms of
+kernels; Nsight Systems). Prefill (INT8 KV, `infernix_bench -p N -n 1`, ABBA x3, 2026-11-09): NVIDIA NVFP4 pp1024
++0.09 to +0.24 %, pp4096 +1.15 to +1.25 %, pp16384 +1.14 to +1.21 %; official NVFP4 pp4096 +0.98 to +1.09 %.
+
 MTP is a one-layer predictor conditioned on a final-normalized target hidden state h_t and the
 following token x_(t+1):
 

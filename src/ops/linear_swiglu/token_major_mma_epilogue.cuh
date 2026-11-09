@@ -3,6 +3,7 @@
 #include "ops/common/math.cuh"
 #include "ops/linear/common/vector_output.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
+#include "ops/linear/nvfp4/nvfp4_layout.h"
 
 #include <cstdint>
 
@@ -105,17 +106,34 @@ struct SwiGluTokenMajorMmaEpilogue {
 };
 
 // The fused dense MLP (SI-02+): instead of storing the BF16 product, each 16-row group of a token's staged
-// product is encoded as the down projection's A4 residual planes (quantize_nvfp4_terms_k16 with the down
-// projection's activation divisor): the bytes nvfp4_a4_residual_quantize_kernel writes (row-major scales) from
-// the stored product. A CTA's product rows are 16-aligned whole groups.
-template <int Terms>
-struct SwiGluA4ResidualPlanesEpilogue : SwiGluTokenMajorMmaEpilogue {
+// product is encoded as the down projection's A4 activation planes (quantize_nvfp4_terms_k16 with the down
+// projection's activation divisor): the bytes nvfp4_a4_residual_quantize_kernel (Terms > 1) or
+// nvfp4_a4_quantize_kernel (Terms = 1: term 0 is quantize_nvfp4_k16) writes from the stored product, scales row-major
+// or in the TMA route's tiles (`Layout`). A CTA's product rows are 16-aligned whole groups. A tiled plane is read in
+// whole token tiles, so the tokens of a CTA's tile past the call get zero scales, as the quantizer writes them (their
+// codes are past the activation map's rows, which the TMA reads as zeroes).
+template <int Terms, Nvfp4ScaleLayout Layout = Nvfp4ScaleLayout::RowMajor>
+struct SwiGluA4PlanesEpilogue : SwiGluTokenMajorMmaEpilogue {
     std::uint8_t* codes;
     std::uint8_t* scales;
     std::int64_t code_plane;
     std::int64_t scale_plane;
     float input_scale_divisor;
     int down_input_rows; // the product's rows (the down projection's K)
+
+    // nvfp4_tiled_scale_offset's tiles for a K of `groups_per_row` groups, or the row-major offset.
+    __device__ __forceinline__ static std::int64_t scale_offset(int column, int group, int groups_per_row) {
+        if constexpr (Layout == Nvfp4ScaleLayout::RowMajor) {
+            return static_cast<std::int64_t>(column) * groups_per_row + group;
+        } else {
+            constexpr int kTileTokens = kNvfp4ScaleTileTokens<Layout>;
+            const int token_tile = column / kTileTokens, group_tile = group / kNvfp4ScaleTileGroups;
+            const std::int64_t tile = static_cast<std::int64_t>(token_tile) * (groups_per_row / kNvfp4ScaleTileGroups) + group_tile;
+            return tile * kTileTokens * kNvfp4ScaleTileGroups +
+                   static_cast<std::int64_t>(column - token_tile * kTileTokens) * kNvfp4ScaleTileGroups +
+                   (group - group_tile * kNvfp4ScaleTileGroups);
+        }
+    }
 
     template <class S, bool Full, class Output>
     __device__ __forceinline__ void
@@ -126,6 +144,8 @@ struct SwiGluA4ResidualPlanesEpilogue : SwiGluTokenMajorMmaEpilogue {
         constexpr int threads = S::kThreads - kProducers<S>;
         static_assert(rows % 16 == 0 && (stride * 2) % 16 == 0);
         static_assert(threads % 32 == 0);
+        static_assert(Layout == Nvfp4ScaleLayout::RowMajor || S::kBlockTokens % kNvfp4ScaleTileTokens<Layout> == 0,
+                      "a tiled plane's padding is written by the CTA whose token tile holds it");
         const int tid = static_cast<int>(threadIdx.x) - kProducers<S>;
         stage<S>(scratch, acc);
         const auto* final_tile = reinterpret_cast<const __nv_bfloat16*>(scratch);
@@ -136,18 +156,28 @@ struct SwiGluA4ResidualPlanesEpilogue : SwiGluTokenMajorMmaEpilogue {
         for (int item = tid >> 2; item < S::kBlockTokens * (rows / 16); item += threads / 4) {
             const int token = item / (rows / 16), local = (item % (rows / 16)) * 16;
             const int column = token_begin + token;
-            if (!Full && column >= token_end) continue; // the same for the quad's lanes
+            const int group  = (row_begin + local) / 16;
+            if (!Full && column >= token_end) { // the same for the quad's lanes
+                if constexpr (Layout != Nvfp4ScaleLayout::RowMajor) {
+                    if (q == 0) {
+#pragma unroll
+                        for (int term = 0; term < Terms; ++term) {
+                            scales[term * scale_plane + scale_offset(column, group, groups_per_row)] = 0;
+                        }
+                    }
+                }
+                continue;
+            }
             std::uint16_t group_codes[Terms];
             std::uint8_t group_scales[Terms];
             quantize_nvfp4_terms_k16_quad<Terms>(final_tile + token * stride + local + 4 * q, input_scale_divisor, quad,
                                                  group_codes, group_scales);
-            const int group                = (row_begin + local) / 16;
             const std::int64_t code_offset = static_cast<std::int64_t>(column) * (down_input_rows / 2) + group * 8 + 2 * q;
-            const std::int64_t scale_offset = static_cast<std::int64_t>(column) * groups_per_row + group;
+            const std::int64_t scale_at    = scale_offset(column, group, groups_per_row);
 #pragma unroll
             for (int term = 0; term < Terms; ++term) {
                 *reinterpret_cast<std::uint16_t*>(codes + term * code_plane + code_offset) = group_codes[term];
-                if (q == 0) { scales[term * scale_plane + scale_offset] = group_scales[term]; }
+                if (q == 0) { scales[term * scale_plane + scale_at] = group_scales[term]; }
             }
         }
     }

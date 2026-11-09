@@ -42,6 +42,13 @@ void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tens
 
 void nvfp4_linear_add_a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                 Nvfp4A4Workspace workspace, cudaStream_t stream);
+// The A4 route's activation scale layout for a call of `tokens` columns: Tiled256 where it takes the TMA tile, else
+// row-major (the MMA tiles).
+[[nodiscard]] Nvfp4ScaleLayout nvfp4_linear_add_a4_scale_layout(std::int32_t tokens);
+// The A4 GEMM from one plane already written in nvfp4_linear_add_a4_scale_layout(tokens) for `tokens` columns: the
+// fused dense MLP's prompt profile (its SwiGLU epilogue wrote the plane).
+void nvfp4_linear_add_a4_planes_launch(const Weight& weight, Tensor& residual, Nvfp4A4Workspace planes,
+                                       std::int32_t tokens, cudaStream_t stream);
 // AllowA4Residual: the workspace's planes (two or three) into one accumulator, MMA tiles only.
 void nvfp4_linear_add_a4_residual_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                          Nvfp4A4Workspace workspace, cudaStream_t stream);

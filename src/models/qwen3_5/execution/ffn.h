@@ -20,7 +20,8 @@ namespace infernix::models::qwen3_5::execution {
                                               ops::offloaded_moe::WideA16 expert_wide =
                                                   ops::offloaded_moe::WideA16::kExact);
 // residual += MLP(Offset rmsnorm(residual)) in ops::dense_mlp_fused_rmsnorm_nvfp4's three launches (SI-02+: the
-// NVFP4 A4 residual activations encoded by their producers), bit for bit rmsnorm() and then ffn() with the same
+// NVFP4 A4 residual activations of verification rounds, and the A4 activations of prompt calls of 256 columns or
+// more, encoded by their producers), bit for bit rmsnorm() and then ffn() with the same
 // wide_verification, where that Op serves the dense layer's projections, policies and width; elsewhere it
 // launches nothing and returns false. ffn_workspace_bytes covers its calls.
 bool fused_dense_mlp(Tensor& residual, const Tensor& norm_weight, float eps, const FfnParameters& parameters,
