@@ -51,6 +51,9 @@ public:
 
     [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
 
+    // False for a plan-only model (plan_model): its device weights are address ranges with no data.
+    [[nodiscard]] bool weights_resident() const noexcept { return !backing_.geometry_only(); }
+
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
         return backing_.stats();
     }

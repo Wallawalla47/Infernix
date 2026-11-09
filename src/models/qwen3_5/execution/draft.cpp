@@ -28,6 +28,7 @@
 #include "infernix/ops/rope.h"
 #include "infernix/ops/scalar.h"
 #include "infernix/ops/scatter.h"
+#include "infernix/ops/screened_head.h"
 #include "infernix/ops/sliding_window_attention.h"
 #include "infernix/ops/softmax_attention.h"
 #include "infernix/ops/speculative_round.h"
@@ -460,10 +461,17 @@ void propose_dflash2_rows(DFlashBatchContext& state, qwen3_5::DFlashDecodeState&
         Tensor scores =
             work.alloc(DType::FP32, {dimension(config.dflash2->selector_top_k), mask_columns});
         if (state.execution.proposal_head == ProposalHead::Full) {
-            ops::linear_topk(
-                hidden, state.execution.parameters.draft->output_head.weight,
-                dimension(state.execution.parameters.model.resources().public_token_count),
-                ids_flat, scores, work, stream);
+            const auto& screen = state.execution.parameters.draft_head_screen;
+            const Weight& head = state.execution.parameters.draft->output_head.weight;
+            const std::int32_t valid =
+                dimension(state.execution.parameters.model.resources().public_token_count);
+            if (screen && mask_columns <= ops::kScreenedHeadMaxColumns) {
+                // RV-41: the screened top sixteen (one request's round), the full head's otherwise.
+                ops::screened_head_topk(hidden, head, *screen, valid, ops::ScreenedHeadPolicy{}, ids_flat, scores,
+                                        work, stream);
+            } else {
+                ops::linear_topk(hidden, head, valid, ids_flat, scores, work, stream);
+            }
         } else {
             const auto& head = *state.execution.parameters.proposal;
             if (head.token_ids) {

@@ -1,7 +1,9 @@
 #include "models/qwen3_5/execution/parameters.h"
 
+#include "core/device.h"
 #include "core/weight_view.h"
 #include "infernix/ops/gdn_input_proj.h"
+#include "infernix/ops/screened_head.h"
 #include "infernix/ops/linear.h"
 #include "infernix/ops/linear_add.h"
 #include "infernix/ops/linear_swiglu.h"
@@ -377,6 +379,27 @@ Parameters::Parameters(const Model& source) : model(source), expert_scales(offlo
     if (w.draft) {
         draft = with_context(std::string(model.options().speculative_component()),
                              [&] { return prepare.draft(*w.draft); });
+        // RV-41: the full proposal head's screen, fitted once here (357.6 MB for 248,320 rows, ~11 ms). Qwen3.8-27B
+        // DFlash2 decode at one request with it, against linear_topk over the full head (same text, the reproducible
+        // route, 2026-11-09): official NVFP4 +2.9 %, NVIDIA NVFP4 +2.8 %, groupwise +3.7 % (docs/maintainer/dflash.md).
+        const Weight& head = draft->output_head.weight;
+        const auto& options = model.options();
+        const bool screened_head =
+            (head.qtype == QType::FP8_E4M3FN_ROW_BF16 || head.qtype == QType::FP8_E4M3FN_ROW_F32 ||
+             (head.qtype == QType::Q8_G32_FP16 && head.layout == QuantLayout::RowSplit)) &&
+            head.k == ops::kScreenedTopkHidden && head.n % 16 == 0;
+        if (model.config().draft && model.config().draft->dflash2 && options.proposal_head == ProposalHead::Full &&
+            !options.lossless && screened_head) {
+            if (model.weights_resident()) {
+                draft_screen      = DeviceBuffer(ops::screened_head_wide_screen_bytes(head.n));
+                draft_head_screen = ops::screened_head_wide_screen(draft_screen.p, head.n);
+                ops::screened_head_fit(head, *draft_head_screen, nullptr);
+                CUDA_CHECK(cudaStreamSynchronize(nullptr));
+            } else {
+                // A plan-only model (Engine::plan) fits nothing; its plan counts the screen's bytes.
+                planned_device_bytes += ops::screened_head_wide_screen_bytes(head.n);
+            }
+        }
     }
     if (w.proposal) {
         proposal =

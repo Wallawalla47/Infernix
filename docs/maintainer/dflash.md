@@ -191,6 +191,28 @@ For each mask hidden h_i, the selected head produces stable top-16 unary scores 
 token IDs C_i. An indexed proposal head remaps shortlist rows before codebook access. Unary top-16
 selection does not apply target penalties, temperature or top-k/top-p/min-p.
 
+Qwen3.8-27B's full head (FP8 row or q8, 248,320 x 5,120) is screened (since 2026-11-09, candidates RV-41): at load
+the engine fits a 2-bit copy of it (`ops::screened_head_fit`, 357.6 MB of VRAM, beside the KV cache's share), and a
+round of at most 16 mask columns (one request's) takes its top 16 from `ops::screened_head_topk`: every row scored by
+the copy, the rows near each column's best rescored exactly in FP32 and the 16 best kept. They are the full head's top
+16 whenever the copy selects them; otherwise a lower row stands in for a missed one, which can only change which
+drafts are proposed. On the reproducible route greedy output is unchanged (verification decides it); on the default
+route, whose verification is not invariant to the draft width, changed drafts can change greedy text, as any change
+of drafts can there. Sampled requests keep the target distribution (the drafts' own q is what the acceptance test
+reads), though their tokens may differ. A column's
+candidates depend on that column alone; on the reproducible route every row drafts alone, so each of its rounds takes
+the screen and a request's drafts never depend on the batch. Wider rounds (batched rows on the default route),
+`--lm-head-draft`'s shortlist head and the lossless route keep `linear_topk`.
+
+Measured (RTX 5090, 2026-11-09, `infernix_bench -p 512 -n 256 --spec dflash2 --draft-tokens auto`, INT8 KV, ABBA x3):
+the screen and its top 16 take 264 + 39 us a round against `linear_topk`'s 757 us. On the reproducible route, where
+both arms decode the same text, acceptance was identical and decode ran faster: official NVFP4 +2.9 %, NVIDIA NVFP4
++2.8 %, groupwise +3.7 %. On the default route the arms decode different texts (its verification is not invariant to
+the draft width), so acceptance moved both ways: NVIDIA +7.2 % (acceptance 2.05 -> 2.12), groupwise +3.9 % (1.79
+both), official -0.4 % (1.73 -> 1.66) for one prompt each. Greedy output on the reproducible route stayed identical
+at ~150, ~2,000 and ~20,000-token prompts on all three, with acceptance equal in 7 of the 9 and 1.7-2.2 % lower in
+two.
+
 Let predecessor/successor codebooks have shape `[vocab_size,R]` and the hidden projection have
 shape `[R,H]`. The current selector receives its projected hidden g_i as BF16, candidate scores as
 FP32 and codebooks as BF16. For predecessor candidate p and current candidate c:

@@ -127,6 +127,10 @@ public:
     [[nodiscard]] const StreamSource& stream_source() const noexcept { return stream_source_; }
     [[nodiscard]] std::span<const std::byte> host_bytes(ObjectHandle handle) const;
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
+    // materialize_geometry's: the device and pinned objects are address ranges with no data behind them.
+    [[nodiscard]] bool geometry_only() const noexcept {
+        return geometry_device_ != nullptr || geometry_transient_ != nullptr || geometry_pinned_ != nullptr;
+    }
 
     // Pinned host block backing HostPinned objects (e.g. the vision tower in overlay mode), at its
     // host address, so the runtime can copy the weights to device staging. Device code reads a

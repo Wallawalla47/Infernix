@@ -125,4 +125,82 @@ void screened_head_logits(const Tensor& x, const Tensor& bf16_head, const Weight
                           std::int32_t valid_rows, const ScreenedHeadPolicy& policy, Tensor& logits,
                           WorkspaceArena& workspace, cudaStream_t stream);
 
+// The width of the screened top-sixteen head (Qwen3.8-27B's hidden) and its candidates per column.
+inline constexpr std::int32_t kScreenedTopkHidden     = 5120;
+inline constexpr std::int32_t kScreenedTopkCandidates = 16;
+
+/**
+ * Device bytes of a 5,120-wide screen of `rows` rows (a positive multiple of 16): its row-split q2_g64_fp16 codes
+ * (rows x 1,280 bytes), then, 256-aligned, its binary16 scales (rows x 80).
+ */
+[[nodiscard]] std::size_t screened_head_wide_screen_bytes(std::int32_t rows);
+
+// The screen [rows, 5120] over `storage` (screened_head_wide_screen_bytes(rows) bytes, 16-byte aligned).
+[[nodiscard]] Weight screened_head_wide_screen(void* storage, std::int32_t rows);
+
+/**
+ * Op: Screened head fit (5,120 wide)
+ *
+ * Math:
+ *   For each row r and 64-weight group g of `head` (dequantized: FP8 codes times the row scale, or q8 codes times
+ *   their group scale), w the group's values and m = max |w|: the binary16 scale s of least squared error
+ *   sum (w - c s)^2, with codes c = clamp(rint(w * fl32(1 / s)), -2, 1), among the binary16 roundings of
+ *   +-m (0.300 + 0.025 i), i in [0, 28], and of the least-squares scale of the codes at s = m (the first of equal
+ *   errors wins; a zero group keeps s = 0); then the screen holds the codes c and the scale
+ *   binary16(s sqrt(|w|^2 / <w, c s>)) (s kept where the overlap is not positive or that scale is not finite):
+ *   the converter's grouped_mse_norm with fewer candidates.
+ *
+ * Domain:
+ *   head: FP8_E4M3FN_ROW_BF16 / FP8_E4M3FN_ROW_F32 [R, 5120], or row-split Q8_G32_FP16 [R, 5120]; screen:
+ *   screened_head_wide_screen over storage of the head's R rows (a multiple of 16).
+ *
+ * Effects:
+ *   Writes every code and scale of `screen`; preserves the head. One launch; deterministic.
+ */
+void screened_head_fit(const Weight& head, const Weight& screen, cudaStream_t stream);
+
+/**
+ * Caller-owned transient capacity of screened_head_topk for every column count in [1, max_columns]
+ * (max_columns <= kScreenedHeadMaxColumns) under `policy`.
+ */
+[[nodiscard]] std::size_t screened_head_topk_workspace_bytes(std::int32_t max_columns,
+                                                            const ScreenedHeadPolicy& policy = {});
+
+/**
+ * Op: Screened head top sixteen (5,120 wide)
+ *
+ * Math / indexing:
+ *   x is BF16 [5120, T]; `head` [R, 5120] and `screen` its fit (screened_head_fit). With
+ *     e[r,t] = sum_k w[r,k] x[k,t]     (w the head's dequantized rows; FP32 sums in the Op's fixed order),
+ *   s[r,t] the screen score (screened_head_top's form at K = 5120) and P_t the rows r < valid_rows the policy selects
+ *   by s[., t] (ranks = 16; the screen's g CTAs each keep their best 8 rows per column), candidate_ids[0..15, t] are
+ *   the 16 rows of P_t with the largest e[r,t], in descending order, equal values in ascending row order, and
+ *   candidate_scores[j,t] = e[candidate_ids[j,t], t].
+ *
+ * Logical shapes:
+ *   x BF16 [5120, T] with T in [1, 16]; candidate_ids I32 and candidate_scores FP32, contiguous [16, T] (rank fastest,
+ *   as ops::linear_topk); 16 <= valid_rows <= R.
+ *
+ * Supported domain:
+ *   head: FP8_E4M3FN_ROW_BF16 / FP8_E4M3FN_ROW_F32, or row-split Q8_G32_FP16, [R, 5120]; screen: its
+ *   screened_head_wide_screen. Tensors and planes 16-byte aligned.
+ *
+ * Numeric:
+ *   The candidates equal the head's exact top sixteen (linear_topk's, up to its own FP32 summation order) whenever
+ *   those rows lie in P_t. s[., t] and P_t depend on column t alone and on the device's SM count, never on T or other
+ *   columns; the scores are deterministic. A draft proposal's candidates: no logit of the model reads them.
+ *
+ * Effects:
+ *   Writes both outputs; preserves every input. Outputs overlap neither the inputs nor each other.
+ *
+ * Workspace:
+ *   screened_head_topk_workspace_bytes(T, policy).
+ *
+ * Execution:
+ *   Two launches for each T: capturable in a CUDA Graph and replayable.
+ */
+void screened_head_topk(const Tensor& x, const Weight& head, const Weight& screen, std::int32_t valid_rows,
+                        const ScreenedHeadPolicy& policy, Tensor& candidate_ids, Tensor& candidate_scores,
+                        WorkspaceArena& workspace, cudaStream_t stream);
+
 } // namespace infernix::ops

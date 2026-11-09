@@ -1052,11 +1052,14 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     for (int attempt = 0;; ++attempt) {
         if (!planning) { planning.emplace(options.startup_observer, StartupPhase::TargetFinalize); }
         const models::qwen3_5::detail::ProgramOffloadOptions* offload = offload_options ? &*offload_options : nullptr;
-        // Engine::plan reads the free memory where a start does, less the weights it did not upload.
+        // Engine::plan reads the free memory where a start does, less the weights it did not upload and the
+        // parameters' derived buffers it did not allocate (the DFlash2 drafter's head screen).
         const VramSnapshot vram_now  = open_vram_budget_source(device.device, options.vram_past_budget)->query();
         const std::size_t free_now   = free_device_bytes(vram_now);
         const std::size_t free_bytes =
-            plan_only ? planned_free_after_weights(free_now, planned_weights, planned_beside_weights) : free_now;
+            plan_only ? planned_free_after_weights(free_now, planned_weights,
+                                                   planned_beside_weights + instance->parameters.planned_device_bytes)
+                      : free_now;
         if (vram_now.has_budget) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
                                "KV sizing: %zu MiB free (cudaMemGetInfo %zu MiB; OS budget %llu MiB, %llu used)",

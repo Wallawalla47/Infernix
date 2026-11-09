@@ -263,6 +263,14 @@ public:
     std::optional<MtpParameters> mtp;
     std::optional<VisionParameters> vision;
     std::optional<DraftParameters> draft;
+    // The DFlash2 drafter's full proposal head screened (candidates RV-41): its 2-bit copy, fitted at load
+    // (ops::screened_head_fit) where the drafter's top sixteen run over the full head (not on the lossless route) and
+    // the head is a 5,120-wide FP8 row or q8 head: ops::screened_head_topk serves its calls of at most 16 columns.
+    DeviceBuffer draft_screen;
+    std::optional<Weight> draft_head_screen;
+    // A plan-only model's (Model::weights_resident false) device bytes these parameters would allocate at a start
+    // and did not (the draft screen): Engine::plan counts them beside the weights.
+    std::uint64_t planned_device_bytes = 0;
     std::optional<ProposalParameters> proposal;
     // `mtp` and the proposal head under LinearPolicy::A16ColumnInvariant, which the exact route's
     // batched draft calls run with (TextContext::mtp_forward_decode_batch, mtp_propose_batch).

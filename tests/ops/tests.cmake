@@ -188,6 +188,14 @@ infernix_add_family_op_test(infernix_screened_head_test FAMILY sampling
   LIBRARIES infernix_linear_test_support)
 set_tests_properties(infernix_screened_head_test PROPERTIES TIMEOUT 1800)
 
+# The 5,120-wide screened head (RV-41: the 27B DFlash2 drafter's proposal head): the fit's bytes against its host
+# replay, and the top sixteen against FP64 scores (planted columns exactly), column invariance and graph replay, on
+# an FP8 row and a q8 head.
+infernix_add_family_op_test(infernix_screened_head_topk_test FAMILY sampling
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_screened_head_topk.cpp"
+  LIBRARIES infernix_linear_test_support)
+set_tests_properties(infernix_screened_head_topk_test PROPERTIES TIMEOUT 1800)
+
 infernix_add_family_op_test(infernix_candidate_selector_test FAMILY sampling
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
   LIBRARIES infernix_ops)

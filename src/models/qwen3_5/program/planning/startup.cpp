@@ -29,6 +29,7 @@
 #include "infernix/ops/linear_add.h"
 #include "infernix/ops/linear_swiglu.h"
 #include "infernix/ops/sampling.h"
+#include "infernix/ops/screened_head.h"
 #include "infernix/ops/sliding_window_attention.h"
 #include "infernix/ops/softmax_attention.h"
 #include "infernix/ops/speculative_round.h"
@@ -1040,6 +1041,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     scratch(layout, ops::linear_topk_workspace_capacity_bytes(
                                         head.weight.qtype, head.weight.n, head.weight.k,
                                         mask_columns, mask_columns));
+                    // RV-41: the screened full head serves rounds of at most 16 columns.
+                    if (plan.proposal_head == ProposalHead::Full && parameters.draft_head_screen &&
+                        mask_columns <= ops::kScreenedHeadMaxColumns) {
+                        scratch(layout, ops::screened_head_topk_workspace_bytes(mask_columns));
+                    }
                     matrix(layout, DType::BF16, dimension(draft->dflash2->selector_rank),
                            mask_columns);
                     linear_scratch(layout, parameters.draft->selector->hidden_projection,
