@@ -29,7 +29,7 @@ struct ForwardFastPaths {
     // (ops::offloaded_moe::NarrowA16::kA4Residual); false keeps them exact. No effect on W4A4 experts.
     bool expert_a4_narrow = false;
     // gdn-f16-accumulate: the chunked GDN calls' arithmetic.
-    ops::GdnChunkArithmetic gdn_arithmetic = ops::GdnChunkArithmetic::Exact;
+    ops::GdnChunkArithmetic gdn_arithmetic = ops::GdnChunkArithmetic::Compensated;
     // router-mma: prefill calls of at least kRouterMmaMinColumns take the tensor-core router.
     bool router_mma = false;
     // --a8-activations (LOSSY, opt-in; not a qualified fast path; A8Routes in program/fast_paths.h): the routed

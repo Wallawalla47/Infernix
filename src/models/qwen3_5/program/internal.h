@@ -92,7 +92,7 @@ struct ExecutionSchedule {
     // ops::LinearRoutes::Q5KSplit (column-invariant where the policy is).
     bool q5_ksplit = false;
     // gdn-f16-accumulate: the chunked GDN calls' arithmetic.
-    ops::GdnChunkArithmetic gdn_arithmetic = ops::GdnChunkArithmetic::Exact;
+    ops::GdnChunkArithmetic gdn_arithmetic = ops::GdnChunkArithmetic::Compensated;
     // fp16-gdn-state: the state pool stores the GDN recurrent state as FP16 (half its traffic and
     // memory); every GDN call rounds the state it publishes once (ops::gated_delta_net).
     bool fp16_gdn_state = false;

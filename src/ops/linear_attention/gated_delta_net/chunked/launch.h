@@ -4,6 +4,7 @@
 #include "core/layout.h"
 #include "ops/common/math.h"
 #include "ops/linear_attention/gated_delta_net/common.h"
+#include "infernix/ops/gated_delta_net.h"
 
 #include <cuda_bf16.h>
 #include <cstddef>
@@ -41,7 +42,9 @@ struct alignas(256) ControlChunk {
     float mqk[kChunkSize * kChunkSize];
     float prefix[kChunkSize]; // exp(G_i)
     float suffix[kChunkSize]; // exp(G_last-G_i)
-    std::uint32_t padding[32];
+    // GdnChunkArithmetic::Compensated: each token's inverse Q norm (0..15) and K norm (16..31), which it applies
+    // after its products (its packet holds the raw Q/K); 1 without normalization. Zero under Fp16Accumulate.
+    float qk_norm[32];
 };
 
 static_assert(kChunkSize == 16);
@@ -76,15 +79,21 @@ inline WorkspaceLayout workspace_layout(int qk_heads, int value_heads, int token
     return layout;
 }
 
-// `fp16` selects GdnChunkArithmetic::Fp16Accumulate: prepare stores the Q/K packet in FP16 instead
-// of BF16 (normalized rows keep every element inside FP16's range), and the recurrence's prediction
-// K S^T, readout Q S^T and state update K^T diag(suffix) Delta take FP16 operands (S and the scaled
-// Delta rounded to FP16) with FP16 accumulation over each pair of k16 products, carried into FP32.
-// The control products (solve, mqk) keep FP32 accumulators. Both launches take the same value.
+// `arithmetic` (both launches take the same value):
+// - Compensated (candidates NQ-10, after ninferpro dbf36e6's compensated chunked route): the packet holds the raw
+//   BF16 Q/K (exact) and ControlChunk::qk_norm their inverse norms, applied in FP32 after each product (the control
+//   dot products, the prediction and readout rows, the update's Delta columns), so no Q/K element is rounded; the
+//   FP32 operands a product rounds are carried as high/low pairs: S as a TF32 pair in the prediction, both operands
+//   of the control-matrix products as TF32 pairs (hi*hi + hi*lo + lo*hi), the scaled Delta as a BF16 pair in the
+//   update. The readout Q S^T takes S rounded to BF16: its pair lowered the FP64-oracle output error only from
+//   2.37e-3 to 1.69e-3 (the state's stays 6.0e-5) and cost 0.4-0.5 % more of FP4-Local's 32K prefill (2026-11-09).
+// - Fp16Accumulate: prepare stores the normalized packet in FP16 (normalized rows keep every element inside FP16's
+//   range), and the prediction, readout and update take FP16 operands (S and the scaled Delta rounded to FP16) with
+//   FP16 accumulation over each pair of k16 products, carried into FP32. The control products keep FP32 accumulators.
 void launch_prepare(const Arguments& args, QkChunk* qk, ControlChunk* control, bool normalize_qk,
-                    cudaStream_t stream, bool fp16);
+                    cudaStream_t stream, GdnChunkArithmetic arithmetic);
 void launch_recurrence(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
-                       DeviceExecutionView execution, bool fp16);
+                       DeviceExecutionView execution, GdnChunkArithmetic arithmetic);
 int value_tile(int value_heads, int multiprocessor_count);
 
 } // namespace infernix::ops::detail::gated_delta_net::chunked

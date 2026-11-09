@@ -1560,7 +1560,7 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
             .q5_ksplit               = fast_paths.selected(FastPath::Q5KSplitMma),
             .gdn_arithmetic          = fast_paths.selected(FastPath::GdnF16Accumulate)
                                            ? ops::GdnChunkArithmetic::Fp16Accumulate
-                                           : ops::GdnChunkArithmetic::Exact,
+                                           : ops::GdnChunkArithmetic::Compensated,
             .fp16_gdn_state          = fast_paths.selected(FastPath::Fp16GdnState),
             .block_verification      = fast_paths.selected(FastPath::BlockVerification),
             .univer_trees            = fast_paths.selected(FastPath::UniverTrees),

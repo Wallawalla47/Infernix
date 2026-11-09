@@ -282,8 +282,8 @@ int main() {
                               !q::fast_path_qualified(FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, kv}),
                           "gdn-f16-accumulate is registered where it was measured faster and passed");
     }
-    failures += check(exact.gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Exact,
-                      "the exact route keeps the GDN prefill exact");
+    failures += check(exact.gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Compensated,
+                      "the exact route keeps the GDN prefill on its compensated arithmetic");
     selection.paths = {FastPath::GdnF16Accumulate};
     failures += check(q::fast_path_applies(FastPath::GdnF16Accumulate, recipe_c, options) &&
                           selection.forward().gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Fp16Accumulate,

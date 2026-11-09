@@ -714,7 +714,8 @@ normalization at matching prefill extents to measure their crossover. `--chunked
 the chunked route with pre-normalized BF16 Q/K. These prefill comparisons are independent of
 decode and ReplaySSM. Adding `--breakdown` to a chunked measurement reports isolated
 `chunked.prepare` and `chunked.recurrence` timings using the same production launchers and
-workspace layout.
+workspace layout. `--arithmetic compensated|fp16acc` selects the chunked route's arithmetic
+(`ops::GdnChunkArithmetic`; default compensated) for every prefill mode.
 
 `stage_share_pct` partitions the sum of isolated-stage medians. Each isolated stage receives its own
 cold-L2 flush, so `relative_to_e2e_pct` is informative but is not an additive partition of the

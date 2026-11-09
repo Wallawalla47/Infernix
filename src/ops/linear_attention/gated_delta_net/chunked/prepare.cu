@@ -16,11 +16,14 @@ struct PrepareShared {
     float lower[kChunkSize * kChunkSize];
 };
 
-// Fp16Packet (GdnChunkArithmetic::Fp16Accumulate): the packet's 16-bit elements hold FP16.
+// Fp16Packet (GdnChunkArithmetic::Fp16Accumulate): the packet's 16-bit elements hold the normalized Q/K in FP16.
+// Otherwise (GdnChunkArithmetic::Compensated) the packet holds the raw BF16 Q/K and ControlChunk::qk_norm their
+// inverse norms, which scale the control dot products after the MMA (the products of BF16 inputs are exact in FP32).
 template <bool Normalize, bool Fp16Packet = false>
 __global__
 __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restrict__ qk_workspace,
                                               ControlChunk* __restrict__ control_workspace) {
+    constexpr bool raw_packet = !Fp16Packet;
     __shared__ PrepareShared sm;
     const int tid = threadIdx.x, lane = tid & 31;
     const int head = blockIdx.x % args.value_heads, chunk = blockIdx.x / args.value_heads;
@@ -41,6 +44,7 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
             k[i] = __bfloat162float(kb[i]);
         }
     }
+    float q_norm = 1.0F, k_norm = 1.0F; // inverse norms (the raw packet applies them after the products)
     if constexpr (Normalize) {
         float qs = 0, ks = 0;
 #pragma unroll
@@ -51,11 +55,20 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
         qs             = warp_sum<16>(qs);
         ks             = warp_sum<16>(ks);
         const float qi = rsqrtf(qs + kNormEps), ki = rsqrtf(ks + kNormEps);
+        if constexpr (raw_packet) {
+            q_norm = qi;
+            k_norm = ki;
+        } else {
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            q[i] *= qi;
-            k[i] *= ki;
+            for (int i = 0; i < 8; ++i) {
+                q[i] *= qi;
+                k[i] *= ki;
+            }
         }
+    }
+    if ((tid & 15) == 0) {
+        sm.control.qk_norm[row]              = raw_packet ? q_norm : 0.0F;
+        sm.control.qk_norm[kChunkSize + row] = raw_packet ? k_norm : 0.0F;
     }
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -69,7 +82,6 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
             sm.qk.k[vector_index(row, col + i)] = __float2bfloat16_rn(k[i]);
         }
     }
-    if (tid < 32) sm.control.padding[tid] = 0;
     if (tid < kChunkSize) {
         const auto off = static_cast<std::int64_t>(start + tid) * args.value_heads + head;
         float g        = tid < length ? args.g[off] : 0.0F;
@@ -116,9 +128,14 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
             for (int i = 0; i < 4; ++i) {
                 const int r = lane / 4 + (i / 2) * 8;
                 const int c = n * 8 + (lane & 3) * 2 + (i & 1);
+                // A raw packet's dot products take their rows' inverse norms (K K for L, Q K for mqk).
+                float norms = 1.0F;
+                if constexpr (raw_packet) {
+                    norms = sm.control.qk_norm[(tid < 32 ? kChunkSize : 0) + r] * sm.control.qk_norm[kChunkSize + c];
+                }
                 // Do not evaluate upper-triangle exponentials: g can be strongly negative.
                 const float value =
-                    r >= c ? acc[n][i] * exp2_approx((sm.prefix[r] - sm.prefix[c]) * kLog2E) : 0.0F;
+                    r >= c ? acc[n][i] * norms * exp2_approx((sm.prefix[r] - sm.prefix[c]) * kLog2E) : 0.0F;
                 if (tid < 32)
                     sm.lower[r * kChunkSize + c] = r > c ? sm.beta[r] * value : 0.0F;
                 else
@@ -162,10 +179,10 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
 } // namespace
 
 void launch_prepare(const Arguments& args, QkChunk* qk, ControlChunk* control, bool normalize_qk,
-                    cudaStream_t stream, bool fp16) {
+                    cudaStream_t stream, GdnChunkArithmetic arithmetic) {
     const unsigned blocks = static_cast<unsigned>(static_cast<std::int64_t>(args.value_heads) *
                                                   chunk_count(args.tokens));
-    if (fp16) {
+    if (arithmetic == GdnChunkArithmetic::Fp16Accumulate) {
         if (!normalize_qk) {
             throw std::invalid_argument("gated_delta_net: FP16 Q/K packets require normalize_qk");
         }

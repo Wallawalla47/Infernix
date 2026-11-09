@@ -45,25 +45,30 @@ struct Criteria {
 };
 
 // Engineering limits for the represented public inputs, not universal forward-error
-// bounds. The chunked profile keeps the master state in FP32, uses TF32 residual products and
-// BF16 readout/update operands, and optionally materializes normalized Q/K once in BF16.
-// Output has an additional final BF16 conversion. These profile-wide regression limits retain
-// margin around the qualified error envelope and apply uniformly across head counts, sequence
-// lengths and gate values. The unchanged recurrent profile retains its limits.
+// bounds. The chunked profiles are GdnChunkArithmetic::Compensated: the packet keeps the
+// represented BF16 Q/K (normalized: each token's inverse norms applied in FP32 after the
+// products), the prediction and the control-matrix products carry their FP32 operands as TF32
+// pairs and the state update the scaled Delta as a BF16 pair, the readout takes S rounded to
+// BF16, and the master state stays FP32; the output has a final BF16 conversion. These
+// profile-wide regression limits retain margin around the qualified error envelope and apply
+// uniformly across head counts, sequence lengths and gate values (candidates NQ-10, 2026-11-09, over
+// every case here: output relative L2 at most 2.45e-3 normalized and 2.46e-3 raw, state 6.0e-5 and
+// 3.4e-6, also within those maxima for weak decay at 32,769 and 131,073 tokens; the uncompensated
+// TF32/BF16 route measured 4.44e-3 / 3.24e-3 and 3.56e-3 / 2.35e-3). The unchanged recurrent profile
+// retains its limits.
 //
 // chunked-fp16acc is GdnChunkArithmetic::Fp16Accumulate (normalized Q/K only). Every operand it
-// rounds to FP16 (Q/K, S, the scaled Delta: unit roundoff 2^-11) the chunked-normalized route
-// rounds to BF16 (2^-9) or truncates to TF32 (2^-10), and each FP16 partial sum spans 32 products
-// (two k16 MMAs before the FP32 carry) and is rounded once, so a 128-term readout or prediction
-// carries four such roundings in FP32 and the 16-token state update one per chunk. Unit Q/K rows
-// keep every packet value inside FP16's range; S and Delta follow V's magnitude, which the inputs
-// keep far below 65504. It keeps the chunked-normalized limits (measured 2026-10-16 at the 27B's
-// shapes: output relative RMS 2.08e-3 against the exact route's 3.60e-3, state 8.6e-4 against
-// 2.6e-3).
+// rounds to FP16 (Q/K, S, the scaled Delta: unit roundoff 2^-11), and each FP16 partial sum spans
+// 32 products (two k16 MMAs before the FP32 carry) and is rounded once, so a 128-term readout or
+// prediction carries four such roundings in FP32 and the 16-token state update one per chunk.
+// Unit Q/K rows keep every packet value inside FP16's range; S and Delta follow V's magnitude,
+// which the inputs keep far below 65504. It keeps its limits of 2026-10-16 (measured then at the
+// 27B's shapes: output relative RMS 2.08e-3 against the uncompensated route's 3.60e-3, state
+// 8.6e-4 against 2.6e-3; 2026-11-08 over every case: 2.25e-3 and 9.8e-4).
 constexpr std::array<Criteria, 4> kCriteria{{
     {"recurrent", {4.1e-3, 5.0e-6, 5.5e-3}, {2.7e-3, 1.0e-5, 3.9e-3}},
-    {"chunked-normalized", {6.0e-3, 5.0e-6, 8.0e-3}, {4.5e-3, 1.0e-5, 9.0e-3}},
-    {"chunked-raw", {4.5e-3, 5.0e-6, 7.0e-3}, {3.0e-3, 1.0e-5, 4.0e-3}},
+    {"chunked-normalized", {3.5e-3, 5.0e-6, 8.0e-3}, {1.2e-4, 1.0e-5, 9.0e-3}},
+    {"chunked-raw", {3.5e-3, 5.0e-6, 7.0e-3}, {1.2e-4, 1.0e-5, 4.0e-3}},
     {"chunked-fp16acc", {6.0e-3, 5.0e-6, 8.0e-3}, {4.5e-3, 1.0e-5, 9.0e-3}},
 }};
 
@@ -757,7 +762,7 @@ int batch_update_gating_case(int batch, std::uint32_t seed) {
 // above) and its state is that call's state rounded once to nearest FP16 (saturating). In place and
 // distinct states.
 int fp16_state_case(const Case& test_case, std::uint32_t seed, InputPattern pattern = InputPattern::Ordinary,
-                    ops::GdnChunkArithmetic arithmetic = ops::GdnChunkArithmetic::Exact) {
+                    ops::GdnChunkArithmetic arithmetic = ops::GdnChunkArithmetic::Compensated) {
     gdn_ref::Inputs in = make_inputs(test_case, seed, pattern);
     round_to_fp16(in.state);
     const float scale = 1.0F / std::sqrt(static_cast<float>(kStateDim));

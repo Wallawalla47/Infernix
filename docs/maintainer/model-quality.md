@@ -1828,3 +1828,20 @@ oracle predicts. Under 6.1's rule for a change to the reference route, the new r
 precise one (its Op error is lower), so the new-build rows decide: every excess estimate is at most
 zero and every criterion passes on both formats. The change stays on the exact route as a
 precision fix, and the new route is the reference.
+
+**Compensated chunked GDN (2026-11-09, candidates NQ-10, the owner's request to keep the error lower while
+keeping as much speed as possible).** The chunked GDN prefill (`ops::gated_delta_net`, calls of 16+ tokens)
+keeps the represented BF16 Q/K in its packet, with each token's inverse norms applied in FP32 after the
+products, and carries the FP32 operands its prediction, control-matrix and state-update products round as
+high/low pairs (after ninferpro `dbf36e6`'s compensated route); the readout keeps S in BF16. It is the
+reproducible route's arithmetic on every Qwen3.5-family and Flash-Next artifact and the default route's
+wherever `gdn-f16-accumulate` does not run (FP4-Local, the 35B-A3B, Dense8, recipe C). Against the Op's
+FP64 oracle over every case of its test (Q/K heads 1-96, T 16-16,385, continuations, the stress inputs, and
+weak decay at 32,769 and 131,073 tokens, which stay within the maxima): worst output relative L2 4.44e-3 →
+2.45e-3 (raw Q/K 3.24e-3 → 2.46e-3), worst state 3.56e-3 → 6.0e-5 (raw 2.35e-3 → 3.4e-6). Cost: the Op takes 1.41-1.43x the uncompensated route's time (35B and
+27B / FP4-Local heads, 4,096 and 16,384 tokens; `gdn-f16-accumulate` 0.86-0.97x); FP4-Local prefill (ABBA
+x3, INT8 KV) pp2048 and pp16384 level, pp32768 -1.03 to -1.10 % (3 of 3). Not taken: S as a BF16 pair in
+the readout too (output 1.69e-3, the state unchanged; 1.51-1.59x the Op time and pp32768 -1.41 to -1.58 %);
+without the prediction pair (state 3.4e-4, 1.25x); the raw packet and update pair alone (state 9.8e-4,
+1.07-1.12x). The model-level prefill and decode arms against the stored references and the golden
+reproducible hashes have not been run for it (owed).

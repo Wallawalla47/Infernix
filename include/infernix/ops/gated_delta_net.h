@@ -24,14 +24,14 @@ namespace infernix::ops {
                                                                    std::int32_t max_tokens);
 
 // The chunked route's arithmetic (T at or above its minimum; shorter calls run the recurrent route
-// either way). Exact is the documented route below. Fp16Accumulate (the gdn-f16-accumulate fast
-// path) requires normalize_qk: the private Q/K packet holds FP16 instead of BF16, and the chunk
+// either way). Compensated is the documented route below. Fp16Accumulate (the gdn-f16-accumulate fast
+// path) requires normalize_qk: the private Q/K packet holds the normalized Q/K in FP16, and the chunk
 // products of the state (the prediction K S^T, the readout Q S^T and the update K^T diag(suffix)
 // Delta) take FP16 operands (S and the scaled Delta rounded to FP16) and accumulate each pair of
 // k16 products (32 terms) in FP16 before adding it to an FP32 accumulator; the update's product is
 // rounded once and added to the decayed FP32 state. The control products and the master state stay
 // FP32. It runs the state products at the FP16-accumulate tensor rate.
-enum class GdnChunkArithmetic : std::uint8_t { Exact, Fp16Accumulate };
+enum class GdnChunkArithmetic : std::uint8_t { Compensated, Fp16Accumulate };
 
 /**
  * Applies the Gated DeltaNet recurrence independently for each value head h. Let
@@ -54,10 +54,14 @@ enum class GdnChunkArithmetic : std::uint8_t { Exact, Fp16Accumulate };
  * q/k are consumed as supplied. The oracle evaluates the complete recurrence and `ideal` naively
  * in FP64 from the represented inputs and FP32 initial state. The BF16 out is promoted and
  * compared directly with that result; output storage rounding belongs to the Op's numerical
- * criterion, not the oracle. The chunked route fuses normalization into preparation and stores
- * one private BF16 Q/K packet per Q/K head. FP32 control matrices and residuals feed native TF32
- * products; readout and state updates use BF16 MMA operands with FP32 accumulators. The master
- * state remains FP32 throughout. Scratch capacity is independent of normalize_qk.
+ * criterion, not the oracle. The chunked route (GdnChunkArithmetic::Compensated) stores one private
+ * packet of the represented BF16 Q/K per Q/K head and, with normalize_qk, each token's inverse norms,
+ * applied in FP32 after the products, so no Q/K element is rounded. Every product accumulates in FP32
+ * and the master state remains FP32 throughout; the FP32 operands a product rounds are carried as
+ * high/low pairs: S as a TF32 pair in the prediction K S^T, both operands of the control-matrix
+ * products as TF32 pairs (hi*hi + hi*lo + lo*hi), and the scaled Delta as a BF16 pair in the state
+ * update; the readout Q S^T takes S rounded to BF16 (its output is stored in BF16). Scratch capacity
+ * is independent of normalize_qk.
  * `execution` supplies the stream and physical SM count for launch decomposition.
  * Inputs and out do not overlap state or one another. `ws` supplies transient storage reported by
  * gated_delta_net_workspace_capacity_bytes; scratch is scoped to the call. T may be any positive
@@ -68,7 +72,7 @@ enum class GdnChunkArithmetic : std::uint8_t { Exact, Fp16Accumulate };
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
                      Tensor& ssm_state, Tensor& out, DeviceExecutionView execution,
-                     GdnChunkArithmetic arithmetic = GdnChunkArithmetic::Exact);
+                     GdnChunkArithmetic arithmetic = GdnChunkArithmetic::Compensated);
 
 /**
  * Distinct-state form of the same recurrence. `ssm_state_out` receives the final state;
@@ -79,7 +83,7 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                      DeviceExecutionView execution,
-                     GdnChunkArithmetic arithmetic = GdnChunkArithmetic::Exact);
+                     GdnChunkArithmetic arithmetic = GdnChunkArithmetic::Compensated);
 
 /**
  * One-token update for B independent state-pool slots. q/k are contiguous BF16 [128,Hqk,1,B],

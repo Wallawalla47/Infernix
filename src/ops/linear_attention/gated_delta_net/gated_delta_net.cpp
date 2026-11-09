@@ -291,8 +291,8 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                                   q.ne[2],
                                   scale,
                                   ssm_state_out.dtype == DType::FP16};
-    chunked::launch_prepare(args, qk, control, normalize_qk, execution.stream, fp16);
-    chunked::launch_recurrence(args, qk, control, execution, fp16);
+    chunked::launch_prepare(args, qk, control, normalize_qk, execution.stream, arithmetic);
+    chunked::launch_recurrence(args, qk, control, execution, arithmetic);
 }
 
 } // namespace infernix::ops

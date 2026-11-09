@@ -751,7 +751,7 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
                                                                           : 0,
             .expert_a4_narrow   = selected(FastPath::ExpertA4ResidualDecode),
             .gdn_arithmetic    = selected(FastPath::GdnF16Accumulate) ? ops::GdnChunkArithmetic::Fp16Accumulate
-                                                                       : ops::GdnChunkArithmetic::Exact,
+                                                                       : ops::GdnChunkArithmetic::Compensated,
             .router_mma        = selected(FastPath::RouterMma)};
 }
 

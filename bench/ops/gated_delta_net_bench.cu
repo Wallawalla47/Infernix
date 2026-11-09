@@ -59,6 +59,7 @@ struct Options {
     int repeat               = 100;
     std::size_t flush_bytes  = kDefaultFlushBytes;
     std::string qk_norm      = "fused";
+    ops::GdnChunkArithmetic arithmetic = ops::GdnChunkArithmetic::Compensated;
 };
 
 struct Problem {
@@ -160,6 +161,15 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--flush-mib") {
             const std::int32_t mib = parse_integer("--flush-mib", take("--flush-mib"), 1);
             options.flush_bytes    = static_cast<std::size_t>(mib) << 20;
+        } else if (arg == "--arithmetic") {
+            const std::string_view name = take("--arithmetic");
+            if (name == "fp16acc") {
+                options.arithmetic = ops::GdnChunkArithmetic::Fp16Accumulate;
+            } else if (name == "compensated") {
+                options.arithmetic = ops::GdnChunkArithmetic::Compensated;
+            } else {
+                fail("--arithmetic must be compensated or fp16acc");
+            }
         } else if (arg == "--csv") {
             options.csv = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -207,6 +217,7 @@ void print_help(const char* program) {
         "  --value-heads N    divisible value heads >= Q/K heads (default: 48)\n"
         "  --batch B          exact batch-update batch in [1,8] (default: 1)\n"
         "  --qk-norm MODE     batch-update normalization: fused or composed (default: fused)\n"
+        "  --arithmetic A     chunked arithmetic: compensated or fp16acc (default: compensated)\n"
         "\n"
         "Measurement:\n"
         "  --warmup N         cold-L2 graph warmups per case (default: 20)\n"
@@ -576,11 +587,11 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
                                                          prep_io.intermediate + rec_io.intermediate}
                                           : TrafficBytes{running_logical_bytes(problem), 0};
     auto prepare                = [&](cudaStream_t stream) {
-        chunked_detail::launch_prepare(args, qk, control, normalize, stream, /*fp16=*/false);
+        chunked_detail::launch_prepare(args, qk, control, normalize, stream, options.arithmetic);
     };
     auto recurrence = [&](cudaStream_t stream) {
         chunked_detail::launch_recurrence(args, qk, control,
-                                          {stream, execution.multiprocessor_count}, /*fp16=*/false);
+                                          {stream, execution.multiprocessor_count}, options.arithmetic);
     };
     auto pipeline = [&](cudaStream_t stream) {
         if (force_chunked) {
@@ -591,7 +602,7 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
                 q, k, v, g, beta, gated_delta_net_scale(), normalize, si, so, out, stream);
         else
             ops::gated_delta_net(q, k, v, g, beta, gated_delta_net_scale(), normalize, workspace,
-                                 si, so, out, {stream, execution.multiprocessor_count});
+                                 si, so, out, {stream, execution.multiprocessor_count}, options.arithmetic);
     };
     std::vector<BenchRow> rows;
     auto measure = [&](const char* name, TrafficBytes io, auto& body, double logical) {
