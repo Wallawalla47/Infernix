@@ -509,9 +509,10 @@ struct ProgramOptions {
     // ExpertStream::plan_ahead), so the gated stream pays up to cpu_split_columns columns on the
     // reference link (PCIe 5.0 x8, 27.5 GB/s), a limit that scales inversely with the measured link
     // (runtime::expert_offload::split_width). Dense8 prefill against the earlier route (2026-10-26, ABBA:
-    // pp1024 gated without the copy-ahead, pp2048 and pp4096 blind; the row threshold the copy-ahead uses,
-    // ExpertStream::ahead_rows): +10.2 %, +14.4 %, +8.9 %; without
-    // the copy-ahead the gated stream lost from 2,048 columns (-2.3 % / -9.6 %).
+    // pp1024 gated without the copy-ahead, pp2048 and pp4096 blind; the row threshold then ExpertStream::ahead_rows'
+    // T / 128): +10.2 %, +14.4 %, +8.9 %; without the copy-ahead the gated stream lost from 2,048 columns
+    // (-2.3 % / -9.6 %). Since 2026-11-09 the guess routes the streams normed for the next layer and the threshold is
+    // T / 64 (Forward::moe, candidates YH-02).
     bool prefill_cpu_split           = true;
     double cpu_split_expert_rate     = 21000.0;
     double cpu_split_column_rate     = 66000.0;

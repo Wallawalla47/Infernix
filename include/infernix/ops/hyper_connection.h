@@ -100,4 +100,13 @@ void hyper_connection_expand(const Tensor& x, std::int32_t streams, Tensor& resi
 void hyper_connection_stream_mean(const Tensor& residual, std::int32_t streams, Tensor& out,
                                   cudaStream_t stream);
 
+/// The mean of a mixer's normed streams without its gates: out[d,t] = bf16((sum_{s=0}^{S-1} R[s*H+d,t] r_{s,t}
+/// (1 + w[s*H+d])) / S), r_{s,t} = 1 / sqrt(mean_d R[s*H+d,t]^2 + eps) (hyper_connection_mix's grouped RMSNorm), every
+/// step in FP32, the streams summed in order and the result rounded once. Flash-Next's prefill copy-ahead routes this
+/// through the next layer's router, with that layer's MLP norm weights, to guess the experts it copies (candidates
+/// YH-02); it decides placement only. residual: contiguous BF16 [S*H, T]; norm_weight: BF16 or FP32 [S*H]; out:
+/// contiguous BF16 [H, T]; all 16-byte aligned, H a multiple of 8 up to 8192, 1 <= S <= 8, eps > 0.
+void hyper_connection_normed_stream_mean(const Tensor& residual, const Tensor& norm_weight, std::int32_t streams,
+                                         float eps, Tensor& out, cudaStream_t stream);
+
 } // namespace infernix::ops

@@ -10,6 +10,7 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -169,6 +170,78 @@ __global__ void stream_mean_kernel(const bf16* __restrict__ residual, int hidden
         for (int s = 0; s < streams; ++s) { sum += __bfloat162float(column[static_cast<std::size_t>(s) * hidden]); }
         out[static_cast<std::size_t>(t) * pitch + d] = __float2bfloat16_rn(sum / static_cast<float>(streams));
     }
+}
+
+// hyper_connection_normed_stream_mean: one CTA per column, thread v owning elements 8v..8v+7 of every stream (a
+// 16-byte load each), so the column is read once; the per-stream sums of squares reduce in warp then warp order.
+constexpr int kNormedMeanMaxStreams = 8;
+
+__device__ __forceinline__ void load8(const bf16* w, float (&out)[8]) {
+    const uint4 v = *reinterpret_cast<const uint4*>(w);
+    const bf16* e = reinterpret_cast<const bf16*>(&v);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { out[i] = __bfloat162float(e[i]); }
+}
+
+__device__ __forceinline__ void load8(const float* w, float (&out)[8]) {
+    const float4 a = reinterpret_cast<const float4*>(w)[0], b = reinterpret_cast<const float4*>(w)[1];
+    out[0] = a.x, out[1] = a.y, out[2] = a.z, out[3] = a.w, out[4] = b.x, out[5] = b.y, out[6] = b.z, out[7] = b.w;
+}
+
+template <class Norm>
+__global__ void __launch_bounds__(1024) normed_stream_mean_kernel(const bf16* __restrict__ residual,
+                                                                  const Norm* __restrict__ weight, int hidden,
+                                                                  int streams, float eps, bf16* __restrict__ out) {
+    __shared__ float partial[kNormedMeanMaxStreams][32];
+    __shared__ float inv[kNormedMeanMaxStreams];
+    const int v = threadIdx.x, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const bool active = v < hidden / 8;
+    const bf16* column = residual + static_cast<std::size_t>(blockIdx.x) * streams * hidden + static_cast<std::size_t>(v) * 8;
+    uint4 xs[kNormedMeanMaxStreams];
+#pragma unroll
+    for (int s = 0; s < kNormedMeanMaxStreams; ++s) {
+        xs[s] = make_uint4(0, 0, 0, 0);
+        if (s < streams && active) { xs[s] = *reinterpret_cast<const uint4*>(column + static_cast<std::size_t>(s) * hidden); }
+    }
+#pragma unroll
+    for (int s = 0; s < kNormedMeanMaxStreams; ++s) {
+        if (s < streams) {
+            const bf16* e = reinterpret_cast<const bf16*>(&xs[s]);
+            float sum     = 0.0F;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float x = __bfloat162float(e[i]);
+                sum += x * x;
+            }
+            for (int offset = 16; offset > 0; offset >>= 1) { sum += __shfl_xor_sync(0xFFFFFFFFU, sum, offset); }
+            if (lane == 0) { partial[s][warp] = sum; }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < streams) {
+        float total = 0.0F;
+        for (int w = 0; w < static_cast<int>(blockDim.x / 32); ++w) { total += partial[threadIdx.x][w]; }
+        inv[threadIdx.x] = rsqrtf(total / static_cast<float>(hidden) + eps);
+    }
+    __syncthreads();
+    if (!active) { return; }
+    float acc[8] = {};
+#pragma unroll
+    for (int s = 0; s < kNormedMeanMaxStreams; ++s) {
+        if (s < streams) {
+            float w[8];
+            load8(weight + static_cast<std::size_t>(s) * hidden + static_cast<std::size_t>(v) * 8, w);
+            const bf16* e = reinterpret_cast<const bf16*>(&xs[s]);
+            const float r = inv[s];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { acc[i] += __bfloat162float(e[i]) * r * (1.0F + w[i]); }
+        }
+    }
+    uint4 packed;
+    bf16* o = reinterpret_cast<bf16*>(&packed);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { o[i] = __float2bfloat16_rn(acc[i] / static_cast<float>(streams)); }
+    *reinterpret_cast<uint4*>(out + static_cast<std::size_t>(blockIdx.x) * hidden + static_cast<std::size_t>(v) * 8) = packed;
 }
 
 // The composed route's steps (private since hyper_connection_mix).
@@ -398,6 +471,33 @@ void hyper_connection_stream_mean(const Tensor& residual, std::int32_t streams, 
         static_cast<const bf16*>(residual.data), hidden, streams, columns, out.nb[1] / 2,
         static_cast<bf16*>(out.data));
     check_launch("stream mean");
+}
+
+void hyper_connection_normed_stream_mean(const Tensor& residual, const Tensor& norm_weight, std::int32_t streams,
+                                         float eps, Tensor& out, cudaStream_t stream) {
+    const auto aligned = [](const void* p) { return reinterpret_cast<std::uintptr_t>(p) % 16 == 0; };
+    require(streams > 0 && streams <= kNormedMeanMaxStreams && contiguous_2d(residual, DType::BF16) &&
+                contiguous_2d(out, DType::BF16) &&
+                (contiguous_2d(norm_weight, DType::BF16) || contiguous_2d(norm_weight, DType::FP32)),
+            "normed stream mean requires contiguous BF16 tensors, a BF16 or FP32 norm weight and 1-8 streams");
+    const int hidden = out.ne[0], columns = out.ne[1];
+    require(residual.ne[0] == static_cast<std::int64_t>(streams) * hidden && residual.ne[1] == columns && columns > 0 &&
+                norm_weight.ne[0] == residual.ne[0] && norm_weight.ne[1] == 1,
+            "normed stream mean shapes disagree");
+    require(hidden > 0 && hidden % 8 == 0 && hidden / 8 <= 1024 && eps > 0 && aligned(residual.data) &&
+                aligned(norm_weight.data) && aligned(out.data),
+            "normed stream mean needs 16-byte aligned operands, H a multiple of 8 up to 8192 and eps > 0");
+    const int threads = (hidden / 8 + 31) / 32 * 32;
+    if (norm_weight.dtype == DType::FP32) {
+        normed_stream_mean_kernel<float><<<columns, threads, 0, stream>>>(
+            static_cast<const bf16*>(residual.data), static_cast<const float*>(norm_weight.data), hidden, streams, eps,
+            static_cast<bf16*>(out.data));
+    } else {
+        normed_stream_mean_kernel<bf16><<<columns, threads, 0, stream>>>(
+            static_cast<const bf16*>(residual.data), static_cast<const bf16*>(norm_weight.data), hidden, streams, eps,
+            static_cast<bf16*>(out.data));
+    }
+    check_launch("normed stream mean");
 }
 
 } // namespace infernix::ops

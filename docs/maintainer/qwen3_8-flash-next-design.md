@@ -9287,9 +9287,10 @@ toggle; off = blind stream, on = gated + CPU split at every width up to 4,096):
 
 **Copy-ahead for the gated stream, and the width limit at 4,096 (candidates BX-09, 2026-10-26).** Item 5's
 idle link kept 2,048 columns and above on the blind stream. Now (as Basalt `31aacda` does) a gated call also
-routes each layer's MoE input through the next layer's router (the router's tensor-core form: the guess decides
-placement only) and, once the layer's experts are enqueued, copies the non-resident experts that guess gives
-more than `ExpertStream::ahead_rows` columns (the call's columns / 128, at least 8) into the start of the next
+routes a guess of the next layer's MoE input through the next layer's router (the router's tensor-core form: the
+guess decides placement only) and, once the layer's experts are enqueued, copies the non-resident experts that guess gives
+more than a row threshold (Flash-Next: the call's columns / 64 since 2026-11-09, below; the 122B:
+`ExpertStream::ahead_rows`, the call's columns / 128; at least 8 either way) into the start of the next
 layer's ring half (`ExpertStream::plan_ahead`). At the next layer's routing those experts keep their slots, the
 CPU split neither takes nor prices them (`mask_ahead`), and only the rest are copied after them. The record bytes
 read are the same, so outputs are unchanged: reproducible-route greedy ids were identical with it off and on, on
@@ -9299,6 +9300,30 @@ measured link within 5 % of the reference counts as it (`runtime::expert_offload
 from run to run. The 122B's gated stream takes the same path (`qwen3_5/execution/offloaded_moe.cpp`). Each prompt
 logs `prefill copy-ahead:` (debug) with the guess's precision (copied ahead and routed) and recall (heavy experts
 copied ahead).
+
+The guess input (since 2026-11-09, candidates YH-02, after imp #3052): the call's residual streams as this layer's
+MoE input was mixed from them, each normed with the next layer's own MLP hyper-connection norm weights and averaged
+over the streams without the mixer's gates (`ops::hyper_connection_normed_stream_mean`, one memory-bound kernel that
+reads the streams once, into the shared expert's output buffer before the shared expert writes it: no extra
+workspace). Until then the guess routed this layer's MoE input itself. The full next-layer mix (its low-rank gates as
+well) was assessed on 2026-11-07 and not built: about 0.2 ms a layer at 4,096 columns, about what it would save.
+FP4-Local, ~2,000-token prompt (greedy ids identical either way): recall 0.776 -> 0.838, precision 0.965 -> 0.978,
+experts copied after their layer's routing 2,176 -> 1,738.
+
+The better guess alone did not pay everywhere (FP4-Local prefill, INT8 KV, `infernix_bench -p N -n 1`, ABBA x3, its
+n-gram volume; 2026-11-09): pp1024 +0.5-0.8 %, pp2048 -0.4 to -0.8 %, pp4096 0 to +0.3 %, pp512 level (no gated
+copy-ahead there). At 2,048 columns it copied ~150 more experts ahead, which the CPU split then could not take: 37.85
+-> 38.21 GiB over the link a prompt, on the leg that bounds it. Copying ahead only experts of more than T / 64 columns
+fixed that and gained by itself:
+
+| FP4-Local prefill | pp1024 | pp2048 | pp4096 |
+|---|---|---|---|
+| new guess, T / 64, against the earlier guess, T / 128 | +4.4 to +4.6 % | +3.3 to +3.5 % | +0.1 to +0.2 % |
+| new guess against the earlier guess, both T / 64 | +0.7 to +0.8 % | -0.1 % | 0 to +0.2 % |
+| T / 32 against T / 64 (new guess) | +0.2 to +0.3 % | -0.2 to -0.3 % | -6.4 to -6.5 % |
+
+So Flash-Next takes the new guess with T / 64 (greedy ids identical at T / 32, T / 64 and T / 128). The 122B keeps its
+guess (the MoE input) and T / 128: not measured with either change.
 
 Measured (2026-10-26, RTX 5090 PCIe 5.0 x8, `infernix_bench -p N -r 2 --warmup 1`, INT8 KV, ABBA with a noise arm
 that read 1.000 each time; prefill tok/s against the earlier route):

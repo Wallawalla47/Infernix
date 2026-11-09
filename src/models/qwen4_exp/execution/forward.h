@@ -446,9 +446,11 @@ private:
     // columns. With inject and residual, the output is injected into the residual streams (and not
     // returned).
     // `route_skipped` (layer_moe's): the route log's leading -1 columns before the call's own.
+    // `streams`: the call's residual streams as x was mixed from them (before this MoE's inject), the copy-ahead's guess
+    // input; a gated call without them copies nothing ahead.
     Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
                const ForwardBatch* batch = nullptr, std::int32_t route_columns = -1, const Tensor* inject = nullptr,
-               Tensor* residual = nullptr, std::int32_t route_skipped = 0);
+               Tensor* residual = nullptr, std::int32_t route_skipped = 0, const Tensor* streams = nullptr);
     void wait_layer(const ForwardBatch& batch, std::size_t entry);
     void mtp_block(const MtpCall& call, Tensor& residual);
     // The dense projections' route flags for the current call: ForwardFastPaths::prefill_routes

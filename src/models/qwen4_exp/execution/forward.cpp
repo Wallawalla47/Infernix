@@ -343,7 +343,7 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
             // The combine injects its output directly unless a tap records it.
             const bool fused_inject = tap == nullptr || tap->moe_outputs == nullptr;
             ym = moe(block.moe, xm, layer, tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr,
-                     &batch, -1, fused_inject ? &inject : nullptr, fused_inject ? &residual : nullptr);
+                     &batch, -1, fused_inject ? &inject : nullptr, fused_inject ? &residual : nullptr, 0, &residual);
             if (!fused_inject) { ops::hyper_connection_inject(ym, inject, residual, s); }
         }
         if (tap != nullptr) {
@@ -480,7 +480,7 @@ void Forward::layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Te
     try {
         auto scope = work_.scope();
         Tensor ym  = moe(parameters_.layers[layer].moe, xm, layer, nullptr, &batch, route_columns, nullptr, nullptr,
-                         route_skipped);
+                         route_skipped, &residual);
         ops::hyper_connection_inject(ym, inject, residual, s);
     } catch (const std::exception& error) {
         throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
@@ -1009,7 +1009,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
 
 Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
                     const ForwardBatch* batch, std::int32_t route_columns, const Tensor* inject, Tensor* residual,
-                    std::int32_t route_skipped) {
+                    std::int32_t route_skipped, const Tensor* streams) {
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
@@ -1225,14 +1225,15 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     // A streamed prefill chunk: the layer's copied-ahead experts are read from the ring.
     ExpertStream* const streaming = streamed_chunk ? experts_.stream : nullptr;
-    // The copy-ahead (ExpertStream::plan_ahead, candidates BX-09): a gated call also routes this layer's input
-    // through the next layer's router and copies the experts that guess makes heavy while this layer ends, so the
-    // link does not wait idle for the next layer's routing. Placement only: the same record bytes are read.
+    // The copy-ahead (ExpertStream::plan_ahead, candidates BX-09): a gated call also routes a guess of the next
+    // layer's MoE input through the next layer's router and copies the experts that guess makes heavy while this layer
+    // ends, so the link does not wait idle for the next layer's routing. Placement only: the same record bytes are read.
     // A trimmed last layer (YC-01) routes only its kept columns: guessing it from the whole call would copy for nothing.
     const bool trims_next = batch != nullptr && batch->trim_last_layer && layer + 2 == config_.num_hidden_layers &&
                             last_layer_kept(T) > 0;
     const bool ahead = streaming != nullptr && streaming->gated() && batch->release_stream &&
-                       layer + 1 < config_.num_hidden_layers && !trims_next;
+                       layer + 1 < config_.num_hidden_layers && !trims_next && streams != nullptr &&
+                       streams->ne[1] == T;
     if (streaming != nullptr && streaming->gated()) {
         // A gated call (design §19.3.12): the layer's routing decides which experts the link copies
         // and which the CPU serves. The CPU takes exactly the experts the stream leaves out: every
@@ -1242,10 +1243,17 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                                    cudaMemcpyDeviceToHost, s));
         if (ahead) {
             // The route has read `logits`, so the guess reuses them. It decides placement only, so the
-            // router's tensor-core form serves every model (a gated call has at least 256 columns).
+            // router's tensor-core form serves every model (a gated call has at least 256 columns). The guess
+            // input (candidates YH-02, imp #3052): the streams normed with the next layer's own MLP norm weights and
+            // averaged without the mixer's gates, closer to that layer's MoE input than this layer's x. It lives in
+            // `shared` ([H, T]): a gated call is an eager chunk, whose shared expert writes it later on this stream,
+            // after the router has read the guess.
             const auto& next          = parameters_.layers[layer + 1].moe;
             const Tensor* next_rows[] = {&next.router, &next.shared_score};
-            ops::projection_fp32_router_mma(x, next_rows, logits, s);
+            Tensor& guess_input       = shared;
+            ops::hyper_connection_normed_stream_mean(*streams, parameters_.layers[layer + 1].mlp_hc.norm,
+                                                     dim(config_.hc.streams), config_.rms_norm_eps, guess_input, s);
+            ops::projection_fp32_router_mma(guess_input, next_rows, logits, s);
             ops::MoeRouting guess{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
                                   work_.alloc(DType::FP32, {T})};
             const DeviceSpan guess_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
@@ -1342,7 +1350,12 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         // The next layer's guessed experts follow this layer's copies on the link.
         const auto* guessed = static_cast<const std::int32_t*>(split_offsets_.data()) + E + 1;
         for (std::int32_t e = 0; e < E; ++e) { guess_columns_[static_cast<std::size_t>(e)] = guessed[e + 1] - guessed[e]; }
-        (void)streaming->plan_ahead(layer + 1, guess_columns_, ExpertStream::ahead_rows(T), 0);
+        // Flash-Next copies ahead the guessed experts of more than T / 64 columns (at least 8; the 122B keeps
+        // ExpertStream::ahead_rows' T / 128). FP4-Local prefill against T / 128 with the earlier guess (2026-11-09,
+        // ABBA x3): pp1024 +4.4-4.6 %, pp2048 +3.3-3.5 %, pp4096 +0.1-0.2 %; T / 32 lost 6.4 % at pp4096 (design
+        // §19.3.12).
+        constexpr std::int32_t kAheadDivisor = 64;
+        (void)streaming->plan_ahead(layer + 1, guess_columns_, std::max(T / kAheadDivisor, 8), 0);
     }
     if (!shared_early) {
         scan_input(x, layer, ActivationScan::Site::SharedInput);
