@@ -2870,8 +2870,32 @@ int run_row_invariant_batch_cases(DeviceExecutionView execution, KvCacheStorage 
     return failures + run_column_invariant_cases(execution, storage);
 }
 
+// One row far longer than the others on the batch-coupled partition: INT8, FP8, NVFP4 and K8V4 then share the
+// launch's split slots by the rows' windows (CausalKvPartition::proportional, YD-02), the long row taking most of
+// them, the short and empty rows at least one each; decode and verify widths, a masked row, and graph replays
+// whose live lengths move the shares.
+int run_proportional_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+    int failures = 0;
+    failures += run_batch_case(execution, kGeometries[0], storage,
+                               {1, {16384, 64, 0, 2048}, {1, 1, 1, 1}, {3, 1, 0, 2}, MappingPattern::Fragmented, 3700u});
+    BatchAttentionCase verify{8,
+                              {12288, 127, 61, 0, 4096, 17, 0, 255},
+                              {8, 8, 1, 8, 6, 8, 0, 8},
+                              {7, 0, 4, 2, 6, 1, 5, 3},
+                              MappingPattern::Fragmented,
+                              3701u,
+                              true};
+    // A graph replay runs three phases, each with its own live lengths (the long row moves).
+    verify.replay_contexts = {{12288, 127, 61, 0, 4096, 17, 0, 255},
+                              {64, 127, 9000, 0, 31, 17, 0, 255},
+                              {255, 0, 61, 12288, 17, 4096, 0, 127}};
+    failures += run_batch_case(execution, kGeometries[0], storage, verify);
+    return failures;
+}
+
 int run_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     int failures = run_row_invariant_batch_cases(execution, storage);
+    failures += run_proportional_batch_cases(execution, storage);
     failures += run_batch_case(execution, kGeometries[0], storage,
                                {16, {0}, {0}, {0}, MappingPattern::Fragmented, 1501u});
     failures += run_batch_case(execution, kGeometries[0], storage,

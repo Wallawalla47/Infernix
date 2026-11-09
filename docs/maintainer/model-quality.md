@@ -645,7 +645,12 @@ the Engine, and each acts only where the artifact can be request-invariant
   (a request's plain decode step alone in its round) run `batched-decode`'s single-column routes and
   down-projection tiles; every wider round keeps the column-invariant route, and the drafters keep
   their column-invariant copies. A step's route depends on whether another request shares its round.
-- `batch-split-attention`: decode attention sizes a row's key partition from the batch.
+- `batch-split-attention`: decode attention sizes a row's key partition from the batch. Since
+  2026-11-08 (candidates YD-02) the INT8, FP8, NVFP4 and K8V4 grouped kernels share a launch's split
+  slots between its rows in proportion to their visible keys (each live row at least one), so a long
+  row among short ones takes most of them; rows of equal length keep the earlier counts. The kernels
+  and their per-split arithmetic are the same; only how many splits a row takes changes, within the
+  range the row-invariant partition and the earlier batch target already span.
 - `adaptive-speculation`: DFlash2 tree tables and controller, and a round's longest n-gram copy,
   set every row's verify width.
 - `free-cache-resume`: prefill splits at taps and sibling boundaries, and resumes from any tap or

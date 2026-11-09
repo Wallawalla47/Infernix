@@ -77,9 +77,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int live_row_tiles = (tile_tokens * Geometry::GroupSize + 15) / 16;
     const int partial_width  = ParallelQueries ? full_width : TokenTile;
     const int partial_begin  = ParallelQueries ? column_begin : 0;
-    const int split          = static_cast<int>(blockIdx.y);
-    const int batch          = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
-    const int split_count    = static_cast<int>(gridDim.y);
+    // A proportional launch (YD-02) maps its slots to (row, split) by the rows' windows.
+    CausalRowSplit slot{(MultiBatch ? static_cast<int>(blockIdx.z) : 0), static_cast<int>(blockIdx.y), 0, (MultiBatch ? static_cast<int>(blockIdx.z) : 0) * static_cast<int>(gridDim.y)};
+    if (MultiBatch && partition.proportional != 0) {
+        int counts[kCausalProportionalMaxRows];
+        causal_proportional_counts(partition, positions, full_width, static_cast<int>(gridDim.z), logical_capacity, static_cast<int>(gridDim.y) * static_cast<int>(gridDim.z), counts);
+        if (!causal_proportional_slot(counts, (MultiBatch ? static_cast<int>(blockIdx.z) : 0) * static_cast<int>(gridDim.y) + static_cast<int>(blockIdx.y), slot)) return;
+    }
+    const int split       = slot.split;
+    const int batch       = slot.row;
     const int tid            = static_cast<int>(threadIdx.x);
     const int warp           = tid >> 5;
     const int lane           = tid & 31;
@@ -103,15 +109,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
-        partial_acc +=
-            static_cast<std::int64_t>(batch) * D * Geometry::QHeads * partial_width * split_count;
-        partial_m +=
-            static_cast<std::int64_t>(batch) * Geometry::QHeads * partial_width * split_count;
-        partial_l +=
-            static_cast<std::int64_t>(batch) * Geometry::QHeads * partial_width * split_count;
+        partial_acc += static_cast<std::int64_t>(slot.base) * D * Geometry::QHeads * partial_width;
+        partial_m += static_cast<std::int64_t>(slot.base) * Geometry::QHeads * partial_width;
+        partial_l += static_cast<std::int64_t>(slot.base) * Geometry::QHeads * partial_width;
     }
 
-    if (kv_head < 0 || kv_head >= Geometry::KVHeads || split_count <= 0) return;
+    if (kv_head < 0 || kv_head >= Geometry::KVHeads) return;
     if (valid_tokens == 0) return; // Merge owns exact zero for masked output columns.
 
     const std::int32_t first_pos = positions[0];
@@ -121,7 +124,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     // Masked tail columns repeat the last live position; no key past it is loaded.
     const int live_end           = last_pos + 1;
     const int window             = causal_row_window(row_first, full_width, logical_capacity);
-    const int active_split_count = partition.active(window);
+    const int active_split_count = MultiBatch && partition.proportional != 0 ? slot.count
+                                                                             : partition.active(window);
     if (split >= active_split_count) return;
 
     const int logical_tiles    = div_up(window, Bc);

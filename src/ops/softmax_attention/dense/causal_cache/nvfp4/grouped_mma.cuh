@@ -81,9 +81,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int tile_tokens = ParallelQueries ? min(TokenTile, full_width - column_begin) : TokenTile;
     const int live_row_tiles = (tile_tokens * Geometry::GroupSize + 15) / 16;
     const int partial_width = full_width, partial_begin = column_begin;
-    const int split       = block.split;
-    const int batch       = MultiBatch ? block.batch : 0;
-    const int split_count = block.split_count;
+    // A proportional launch (YD-02) maps its slots to (row, split) by the rows' windows.
+    CausalRowSplit slot{(MultiBatch ? block.batch : 0), block.split, 0, (MultiBatch ? block.batch : 0) * block.split_count};
+    if (MultiBatch && partition.proportional != 0) {
+        int counts[kCausalProportionalMaxRows];
+        causal_proportional_counts(partition, positions, full_width, static_cast<int>(MultiBatch ? gridDim.x : 1U), logical_capacity, block.split_count * static_cast<int>(MultiBatch ? gridDim.x : 1U), counts);
+        if (!causal_proportional_slot(counts, (MultiBatch ? block.batch : 0) * block.split_count + block.split, slot)) return;
+    }
+    const int split       = slot.split;
+    const int batch       = slot.row;
     const int tid         = static_cast<int>(threadIdx.x);
     const int warp        = tid >> 5;
     const int lane        = tid & 31;
@@ -107,12 +113,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
-        partial_acc +=
-            static_cast<std::int64_t>(batch) * D * Geometry::QHeads * partial_width * split_count;
-        partial_m +=
-            static_cast<std::int64_t>(batch) * Geometry::QHeads * partial_width * split_count;
-        partial_l +=
-            static_cast<std::int64_t>(batch) * Geometry::QHeads * partial_width * split_count;
+        partial_acc += static_cast<std::int64_t>(slot.base) * D * Geometry::QHeads * partial_width;
+        partial_m += static_cast<std::int64_t>(slot.base) * Geometry::QHeads * partial_width;
+        partial_l += static_cast<std::int64_t>(slot.base) * Geometry::QHeads * partial_width;
     }
 
     if (valid_tokens == 0) return;
@@ -120,7 +123,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     // Masked tail columns repeat the last live position; no key past it is loaded.
     const int live_end           = last_pos + 1;
     const int window             = causal_row_window(row_first, full_width, logical_capacity);
-    const int active_split_count = partition.active(window);
+    const int active_split_count = MultiBatch && partition.proportional != 0 ? slot.count
+                                                                             : partition.active(window);
     if (split >= active_split_count) return;
     const int logical_tiles = div_up(window, Bc);
     const int split_start   = (split * logical_tiles / active_split_count) * Bc;

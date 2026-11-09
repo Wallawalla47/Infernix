@@ -65,6 +65,20 @@ __launch_bounds__(256) __global__
     if constexpr (MultiBatch) {
         if (batch >= batch_size) return;
     }
+    // A proportional launch (YD-02): the row's partials start at its first slot, and it has its own count; the
+    // producer derived both from the same positions over the same capacity x batch_size slots.
+    [[maybe_unused]] std::int64_t row_base = static_cast<std::int64_t>(batch) * split_count;
+    [[maybe_unused]] int proportional_count = 0;
+    if constexpr (MultiBatch) {
+        if (partition.proportional != 0) {
+            int counts[kCausalProportionalMaxRows];
+            causal_proportional_counts(partition, positions, tokens, batch_size, visible_capacity,
+                                       split_count * batch_size, counts);
+            row_base = 0;
+            for (int r = 0; r < batch && r < kCausalProportionalMaxRows; ++r) row_base += counts[r];
+            proportional_count = batch < kCausalProportionalMaxRows ? counts[batch] : 0;
+        }
+    }
     if constexpr (MultiBatch) positions += static_cast<std::int64_t>(batch) * tokens;
     const int window  = causal_row_window(positions[0], tokens, visible_capacity);
     int output_column = token;
@@ -81,12 +95,12 @@ __launch_bounds__(256) __global__
 
 
     if constexpr (MultiBatch) {
-        partial_acc +=
-            static_cast<std::int64_t>(batch) * 256 * Geometry::QHeads * tokens * split_count;
-        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
-        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
+        partial_acc += row_base * 256 * Geometry::QHeads * tokens;
+        partial_m += row_base * Geometry::QHeads * tokens;
+        partial_l += row_base * Geometry::QHeads * tokens;
     }
-    const int active_splits = partition.active(window);
+    const int active_splits =
+        MultiBatch && partition.proportional != 0 ? proportional_count : partition.active(window);
     __shared__ float weights[256], warp_sums[8], scalars[2];
     const float head_l = causal_merge_natural_statistics<Geometry>(
         partial_m, partial_l, q_head, token, tokens, active_splits, weights, warp_sums, scalars);
