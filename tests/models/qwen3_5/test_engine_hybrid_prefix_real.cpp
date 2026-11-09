@@ -1353,25 +1353,36 @@ int exercise_next_turn_yield(infernix::Engine& engine, const std::string& name, 
     std::vector<infernix::ChatMessage> long_turn = long_history;
     long_turn.push_back(text_message(infernix::ChatRole::User, "Which bay received the most?"));
     const infernix::RuntimeStats before_long = engine.runtime_stats();
+    const auto submitted = std::chrono::steady_clock::now();
     engine.prefill_next_turn(chat(long_history));
     bool computing = false;
     for (int i = 0; i < 6000 && !computing; ++i) {
         computing = engine.runtime_stats().next_turn_prefill_tokens > before_long.next_turn_prefill_tokens;
         if (!computing) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
     }
+    // The pass's first unit, timed from the call (its render and quiet period included, so at least one unit).
+    const double first_unit = std::chrono::duration<double>(std::chrono::steady_clock::now() - submitted).count();
     const infernix::GenerationResult interrupted =
         engine.generate(engine.prepare(chat(long_turn)), request(8, true));
     const infernix::RuntimeStats after_long = engine.runtime_stats();
     const std::uint64_t reached = after_long.next_turn_prefill_tokens - before_long.next_turn_prefill_tokens;
-    std::cout << name << ": the long pass computed " << reached << " tokens before yielding; the request waited "
-              << interrupted.engine_timing.queue_wait_seconds << " s for admission and reused "
-              << interrupted.reused_prompt_tokens << " of " << interrupted.prompt.prompt_tokens << '\n';
+    std::cout << name << ": the long pass computed " << reached << " tokens before yielding (first unit "
+              << first_unit << " s); the request waited " << interrupted.engine_timing.queue_wait_seconds
+              << " s for admission and reused " << interrupted.reused_prompt_tokens << " of "
+              << interrupted.prompt.prompt_tokens << '\n';
     if (!computing || after_long.next_turn_prefills_yielded != before_long.next_turn_prefills_yielded + 1) {
         std::cerr << name << ": the long pass did not yield to the request\n";
         ++failures;
     }
-    if (interrupted.engine_timing.queue_wait_seconds > 1.0) {
-        std::cerr << name << ": the request waited more than one chunk for the pass to yield\n";
+    // A request waits at most one prefill unit (hybrid-prefix-cache-spec §7.9): the unit that began as the first
+    // ended, then admission. On an idle Engine a unit is the idle prefill width (idle-wide-prefill: 3,584 tokens), so
+    // the bound follows the pass's own first unit: twice it, as the unit waited for lies deeper in the prompt and
+    // admission follows it (2026-11-09: groupwise 27B first unit 0.91 s, wait 1.21 s; official NVFP4 27B 0.25 s and
+    // 0.31 s), and never below the second this check used to fix, which failed the groupwise artifact.
+    const double wait_bound = std::max(1.0, 2.0 * first_unit);
+    if (interrupted.engine_timing.queue_wait_seconds > wait_bound) {
+        std::cerr << name << ": the request waited " << interrupted.engine_timing.queue_wait_seconds
+                  << " s, more than one prefill unit (bound " << wait_bound << " s) for the pass to yield\n";
         ++failures;
     }
     // The yield kept the frontier the pass reached (a chunk boundary: the endpoint of its abort, or on
