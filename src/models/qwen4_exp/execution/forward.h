@@ -244,6 +244,11 @@ struct ForwardBatch {
     // its own keys); for generation, a bound on every column's position + 1, and the call runs the cache
     // form: K/V, pooled keys and tails, PLE history and GDN state through the lanes' slots and rows.
     std::int32_t lossless_keys = 0;
+    // YC-01 (candidates; a prefill chunk or forced tokens of one sequence whose final residuals only the logits of its
+    // last column read: no MTP cells, residual_out or tap): the last decoder layer's MoE runs over the call's trailing
+    // Forward::last_layer_kept(T) columns only. The other columns' final residuals keep the attention half alone and
+    // are not read; the layer's route log holds -1 for them.
+    bool trim_last_layer = false;
 };
 
 // One call of the MTP drafter (design §11.2). Cell c of a sequence pairs a residual at position c
@@ -327,8 +332,16 @@ public:
     // T, after begin_call of any of its chunks) and injects its output into `residual` (the same
     // columns), its route log holding the trailing `route_columns` columns (-1: all).
     void layer_mixer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, Tensor& xm, Tensor& inject);
+    // `route_skipped`: columns before the call's own that the route log holds as -1 (a trimmed last layer's call
+    // over the trailing columns of a wider one, ForwardBatch::trim_last_layer).
     void layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xm, const Tensor& inject,
-                   Tensor& residual, std::int32_t route_columns);
+                   Tensor& residual, std::int32_t route_columns, std::int32_t route_skipped = 0);
+    // ForwardBatch::trim_last_layer's width for a call (or a layer walk's chunk) of `columns` columns: 0 when the last
+    // layer runs whole (the lossless route, a DFlash2 target layer, the activation scan, or no column to save), else
+    // the trailing columns its MoE runs over: kRouterMmaMinColumns where the full call's router takes its MMA form
+    // (router-mma), 1 otherwise. Every MoE step acts column by column and the router keeps its form, so the kept
+    // columns' outputs are the untrimmed call's bit for bit.
+    [[nodiscard]] std::int32_t last_layer_kept(std::int32_t columns) const noexcept;
     void finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits);
     // DFlash2: when `layer` is one of the drafter's target layers, the stream mean of its completed
     // residual columns (BF16 [S*H, n]) into that tap's rows of `features` (BF16 [taps * H, n], any
@@ -432,9 +445,10 @@ private:
     // `route_columns` >= 0: a layer walk's grouped call, whose route log keeps its last that many
     // columns. With inject and residual, the output is injected into the residual streams (and not
     // returned).
+    // `route_skipped` (layer_moe's): the route log's leading -1 columns before the call's own.
     Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
                const ForwardBatch* batch = nullptr, std::int32_t route_columns = -1, const Tensor* inject = nullptr,
-               Tensor* residual = nullptr);
+               Tensor* residual = nullptr, std::int32_t route_skipped = 0);
     void wait_layer(const ForwardBatch& batch, std::size_t entry);
     void mtp_block(const MtpCall& call, Tensor& residual);
     // The dense projections' route flags for the current call: ForwardFastPaths::prefill_routes

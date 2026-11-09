@@ -2299,6 +2299,21 @@ format from the volume header's format tag (byte 62, written since 2026-10-19: 1
   per cold 4K chunk, −87 to −148 ms). Reading chunk i+1's rows while chunk i computes (gated
   prefill, S4d) is parked (§19.3.4).
 - **MTP KV for the prompt** is built in batch from the chunk residuals.
+- **The last layer's MoE over the read columns** (2026-11-08, candidates YC-01). A prefill call's or forced
+  tokens' final residuals are read only for the logits of its last column when no MTP cells take them
+  (`--spec dflash2`, `off` or n-gram: the MTP block is not bound), no causal scoring exports them and no DFlash2
+  target is the last layer (FP4-Local's companion taps layers 5, 15, 25, 35 and 45 of 48). The last layer then
+  runs its attention half and its MLP-half mix over every column (keys, values, pooled keys, GDN state and the
+  mix as before), and its MoE (router, routed and shared experts, the inject) over the call's trailing
+  `Forward::last_layer_kept` columns only: 256 where the whole call's router takes its MMA form (`router-mma`,
+  256+ columns), else one. A layer walk runs no last-layer MoE for its earlier groups and the span's last chunk's
+  trailing columns for the last (that call still releases the layer's ring half); the route log holds -1 for the
+  skipped columns, which the residency and the prompt seed skip. A gated call plans no copy-ahead for a trimmed
+  last layer. Every MoE step acts column by column (the walk's grouping relies on it) and the router keeps its
+  form, so the kept columns keep their bits: FP4-Local's greedy output was identical with and without the trim
+  at 150-, 2,000- and 17,266-token prompts (one call keeping one column, one keeping 256, and a layer walk).
+  FP4-Local prefill (INT8 KV, ABBA x3, 12 of 12 blocks ahead): pp512 +1.66 to +1.97 %, pp2048 +1.77 to
+  +1.83 %, pp16384 +0.49 to +0.63 %, pp32768 +0.68 to +0.72 %.
 
 ---
 

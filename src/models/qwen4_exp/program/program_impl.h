@@ -5318,6 +5318,10 @@ private:
         }
         // A scored prompt's calls keep their final residuals for the LM head (causal_score).
         if (scoring_) { fb.residual_out = score_residuals(score_column_, cols); }
+        // YC-01: a prefill chunk's or forced tokens' final residuals are read only at the logit column (the last) when
+        // no MTP cells or residual export take them, so the last layer's MoE runs over its trailing columns alone.
+        fb.trim_last_layer = trims_last_layer() && verify == nullptr && !decode_round && batch == 1 &&
+                             logit_columns == 1 && chunk == nullptr && fb.residual_out.data == nullptr;
         // Lossless generation runs the cache form, bounded by the call's largest position (the staged io).
         if (c_.lossless && !options_.causal_scoring) {
             const auto* positions = reinterpret_cast<const std::int32_t*>(host_io() + io_layout_.positions);
@@ -5327,6 +5331,10 @@ private:
         forward_->run(fb, logits);
         round_logits(logit_columns, device_.stream);
     }
+
+    // YC-01's trim of the last layer (ForwardBatch::trim_last_layer) where a call's final residuals are read only for
+    // its logits: not with MTP (its cells read every column) or a scored prompt (it exports them).
+    [[nodiscard]] bool trims_last_layer() const noexcept { return !mtp_ && !scoring_; }
 
     // The head's logits of `columns` columns as the Forward writes them: FP32 (logits32_), or with BF16 logits on
     // the lossless route BF16 (logits16_, each exact sum correctly rounded).

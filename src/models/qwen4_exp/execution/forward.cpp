@@ -329,12 +329,23 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
         // mixer's reads (candidates §7.3 D6) measured flat (removed 2026-10-28).
         ops::hyper_connection_inject(y, inject, residual, s);
         Tensor xm = mix(block.mlp_hc, residual, &inject);
-        // The combine injects its output directly unless a tap records it.
-        const bool fused_inject = tap == nullptr || tap->moe_outputs == nullptr;
-        Tensor ym = moe(block.moe, xm, layer,
-                        tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr, &batch, -1,
-                        fused_inject ? &inject : nullptr, fused_inject ? &residual : nullptr);
-        if (!fused_inject) { ops::hyper_connection_inject(ym, inject, residual, s); }
+        // YC-01: the last layer's MoE over the trailing columns whose final residuals are read (their logits). The
+        // mix stays whole: a layer walk mixes each chunk whole too, and its MoE then takes the same columns.
+        const std::int32_t kept =
+            tap == nullptr && batch.trim_last_layer && layer + 1 == config_.num_hidden_layers ? last_layer_kept(T) : 0;
+        Tensor ym;
+        if (kept > 0) {
+            Tensor xm_kept       = xm.slice(1, T - kept, kept);
+            Tensor inject_kept   = inject.slice(1, T - kept, kept);
+            Tensor residual_kept = residual.slice(1, T - kept, kept);
+            (void)moe(block.moe, xm_kept, layer, nullptr, &batch, -1, &inject_kept, &residual_kept, T - kept);
+        } else {
+            // The combine injects its output directly unless a tap records it.
+            const bool fused_inject = tap == nullptr || tap->moe_outputs == nullptr;
+            ym = moe(block.moe, xm, layer, tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr,
+                     &batch, -1, fused_inject ? &inject : nullptr, fused_inject ? &residual : nullptr);
+            if (!fused_inject) { ops::hyper_connection_inject(ym, inject, residual, s); }
+        }
         if (tap != nullptr) {
             const std::pair<std::vector<Tensor>*, const Tensor*> copies[] = {
                 {tap->mixer_inputs, &xa}, {tap->mixer_outputs, &y}, {tap->moe_inputs, &xm}, {tap->moe_outputs, &ym}};
@@ -464,15 +475,25 @@ void Forward::layer_mixer(std::uint32_t layer, const ForwardBatch& batch, Tensor
 }
 
 void Forward::layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xm, const Tensor& inject,
-                        Tensor& residual, std::int32_t route_columns) {
+                        Tensor& residual, std::int32_t route_columns, std::int32_t route_skipped) {
     const cudaStream_t s = device_.stream;
     try {
         auto scope = work_.scope();
-        Tensor ym  = moe(parameters_.layers[layer].moe, xm, layer, nullptr, &batch, route_columns);
+        Tensor ym  = moe(parameters_.layers[layer].moe, xm, layer, nullptr, &batch, route_columns, nullptr, nullptr,
+                         route_skipped);
         ops::hyper_connection_inject(ym, inject, residual, s);
     } catch (const std::exception& error) {
         throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
     }
+}
+
+std::int32_t Forward::last_layer_kept(std::int32_t columns) const noexcept {
+    const std::uint32_t last = config_.num_hidden_layers - 1;
+    if (config_.lossless || scan_ != nullptr || std::find(draft_taps_.begin(), draft_taps_.end(), last) != draft_taps_.end()) {
+        return 0;
+    }
+    const std::int32_t kept = fast_.router_mma && columns >= kRouterMmaMinColumns ? kRouterMmaMinColumns : 1;
+    return kept < columns ? kept : 0;
 }
 
 std::size_t Forward::moe_workspace_bytes(const TextConfig& c, std::int32_t columns,
@@ -987,7 +1008,8 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
 }
 
 Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
-                    const ForwardBatch* batch, std::int32_t route_columns, const Tensor* inject, Tensor* residual) {
+                    const ForwardBatch* batch, std::int32_t route_columns, const Tensor* inject, Tensor* residual,
+                    std::int32_t route_skipped) {
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
@@ -1000,10 +1022,15 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     std::int32_t* route_log   = nullptr;
     std::int32_t* log_tail    = nullptr;
     if (experts_.route_log != nullptr) {
-        if (static_cast<std::size_t>(K) * logged > experts_.route_stride) {
+        if (route_skipped < 0 || static_cast<std::size_t>(K) * (logged + route_skipped) > experts_.route_stride) {
             throw std::invalid_argument("Qwen4Exp MoE: route log is too small for this call");
         }
         std::int32_t* log = experts_.route_log + layer * experts_.route_stride;
+        if (route_skipped > 0) {
+            // A trimmed last layer's skipped columns route nowhere (the residency skips ids past its experts).
+            CUDA_CHECK(cudaMemsetAsync(log, 0xFF, static_cast<std::size_t>(K) * route_skipped * sizeof(std::int32_t), s));
+            log += static_cast<std::size_t>(K) * route_skipped;
+        }
         if (logged == T) {
             route_log = log;
         } else {
@@ -1201,8 +1228,11 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     // The copy-ahead (ExpertStream::plan_ahead, candidates BX-09): a gated call also routes this layer's input
     // through the next layer's router and copies the experts that guess makes heavy while this layer ends, so the
     // link does not wait idle for the next layer's routing. Placement only: the same record bytes are read.
+    // A trimmed last layer (YC-01) routes only its kept columns: guessing it from the whole call would copy for nothing.
+    const bool trims_next = batch != nullptr && batch->trim_last_layer && layer + 2 == config_.num_hidden_layers &&
+                            last_layer_kept(T) > 0;
     const bool ahead = streaming != nullptr && streaming->gated() && batch->release_stream &&
-                       layer + 1 < config_.num_hidden_layers;
+                       layer + 1 < config_.num_hidden_layers && !trims_next;
     if (streaming != nullptr && streaming->gated()) {
         // A gated call (design §19.3.12): the layer's routing decides which experts the link copies
         // and which the CPU serves. The CPU takes exactly the experts the stream leaves out: every
