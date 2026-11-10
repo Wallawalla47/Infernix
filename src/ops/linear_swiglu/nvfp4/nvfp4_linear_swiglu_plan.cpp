@@ -22,6 +22,8 @@ enum class Nvfp4LinearSwiGluRoute {
     FusedA4Residual,
 };
 
+constexpr std::int32_t kTmaFusedMinTokens = 129;
+
 Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 linear_swiglu: T must be positive"); }
     if (!valid_linear_policy(policy)) {
@@ -42,8 +44,11 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
     // This route dispatches its own fused kernel rather than a Linear shape's, so it carries its
-    // own condition; the call site below forces the matching scale layout.
-    if (tokens >= 256) { return Nvfp4LinearSwiGluRoute::TmaFusedA4; }
+    // own condition; the call site below forces the matching scale layout. From 129 columns: one
+    // partly filled 256-token TMA tile (272 CTAs) against two 128-token MMA tiles (544); the 27B's
+    // prefill takes 7-10 % less at 136-255 tokens, and 5-7 % more with the cut at 97 or 65
+    // (RTX 5090, 2026-11-10). Same bits (one K order per output).
+    if (tokens >= kTmaFusedMinTokens) { return Nvfp4LinearSwiGluRoute::TmaFusedA4; }
     return Nvfp4LinearSwiGluRoute::FusedA4;
 }
 

@@ -111,7 +111,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
 // projection's TMA tile; narrower prompt calls keep the separate Ops).
 inline constexpr std::int32_t kDenseMlpFusedMinTokens       = 5;
 inline constexpr std::int32_t kDenseMlpFusedMaxTokens       = 96;
-inline constexpr std::int32_t kDenseMlpFusedPromptMinTokens = 256;
+inline constexpr std::int32_t kDenseMlpFusedPromptMinTokens = 129;
 
 /**
  * Whether dense_mlp_fused_rmsnorm_nvfp4 serves these projections, policies and T (a host-side route

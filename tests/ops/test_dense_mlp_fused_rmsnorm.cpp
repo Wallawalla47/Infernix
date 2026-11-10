@@ -3,7 +3,7 @@
 // its domain, with the planes its fused producers write compared byte for byte with the quantizer's.
 //
 // LinearPolicy::AllowA4Residual (verification rounds, 5-96 columns): two row-major planes, every gate/up and down
-// tile, full and ragged, and two widths captured in a CUDA Graph. LinearPolicy::AllowA4 (prompt calls of 256 columns
+// tile, full and ragged, and two widths captured in a CUDA Graph. LinearPolicy::AllowA4 (prompt calls of 129 columns
 // or more): one plane, x's scales in 256-token tiles (the gate/up projection's TMA tile) and the product's in the
 // layout the down projection reads at that width (row-major MMA tiles to 512 columns, 256-token tiles above); the
 // tiled planes are compared over their padded tokens, whose scales both writers zero (the fused planes are filled
@@ -203,8 +203,8 @@ INFERNIX_OP_TEST(dense_mlp_fused_rmsnorm) {
             eligible(gate_up, kRounds, down, kRounds, 4) || eligible(gate_up, kRounds, down, kRounds, 97) ||
             eligible(down, kRounds, gate_up, kRounds, 16) || !eligible(gate_up, kRounds, down, kRounds, 5) ||
             !eligible(gate_up, kRounds, down, kRounds, 96) || eligible(gate_up, kPrompt, down, kPrompt, 96) ||
-            eligible(gate_up, kPrompt, down, kPrompt, 255) || eligible(gate_up, kPrompt, down, kRounds, 512) ||
-            eligible(gate_up, kRounds, down, kRounds, 512) || !eligible(gate_up, kPrompt, down, kPrompt, 256) ||
+            eligible(gate_up, kPrompt, down, kPrompt, 128) || eligible(gate_up, kPrompt, down, kRounds, 512) ||
+            eligible(gate_up, kRounds, down, kRounds, 512) || !eligible(gate_up, kPrompt, down, kPrompt, 129) ||
             !eligible(gate_up, kPrompt, down, kPrompt, 4096)) {
             std::cerr << "fused dense MLP eligibility mismatch\n";
             return 1;
@@ -214,9 +214,9 @@ INFERNIX_OP_TEST(dense_mlp_fused_rmsnorm) {
         for (const int tokens : {5, 7, 8, 9, 13, 16, 17, 32, 33, 48, 64, 65, 80, 96}) {
             failures += run_case(gate_up, down, tokens, kRounds);
         }
-        // The prompt profile: the down projection's row-major MMA tiles (to 512 columns) and its TMA tile, full and
-        // ragged 256-token tiles.
-        for (const int tokens : {256, 300, 512, 513, 777, 1024, 2048}) {
+        // The prompt profile: one partly filled 256-token gate/up tile (129-255 columns), the down projection's
+        // row-major MMA tiles (to 512 columns) and its TMA tile, full and ragged 256-token tiles.
+        for (const int tokens : {129, 136, 192, 193, 255, 256, 257, 300, 512, 513, 777, 1024, 2048}) {
             failures += run_case(gate_up, down, tokens, kPrompt);
         }
         failures += gate_up_parent.verify_preserved("gate/up weight");
