@@ -171,6 +171,7 @@ struct Offsets {
     std::size_t x_acts, h_acts, ring_jobs, ring_counters; // the narrow ring (ring_call)
     bool has_ring;
     bool has_nmma; // the A4 residual routes' x limbs, x_emax and job_ctas for the tensor-core narrow jobs
+    bool has_rows4; // a W4A4 call's BF16 h rows and job_ctas for the row-pair narrow kernels (kA4RowsMaxColumns)
     std::size_t end;
 };
 
@@ -229,6 +230,11 @@ Offsets offsets(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t en
     } else {
         o.h_blocks = take(e * kHBlocks * sizeof(canon::A4Block));
         o.x_plane  = take(e * kXRowBytes);
+        o.has_rows4 = shape == kFlashNextShape && a4_rows_columns(columns);
+        if (o.has_rows4) {
+            o.h_rows   = take(e * h_row);
+            o.job_ctas = take(j * sizeof(std::uint32_t));
+        }
     }
     if (ring_call(shape, activation, wide_a16, columns)) {
         o.x_acts        = take(t * static_cast<std::size_t>(shape.gate_up_blocks()) * kA16ActBytes);
@@ -623,6 +629,10 @@ ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, s
     } else {
         w.h_blocks = reinterpret_cast<canon::A4Block*>(p + o.h_blocks);
         w.x_plane  = reinterpret_cast<std::uint8_t*>(p + o.x_plane);
+        if (o.has_rows4) {
+            w.h_rows   = reinterpret_cast<std::uint8_t*>(p + o.h_rows);
+            w.job_ctas = reinterpret_cast<std::uint32_t*>(p + o.job_ctas);
+        }
     }
     if (o.has_ring) {
         w.x_acts        = reinterpret_cast<std::uint8_t*>(p + o.x_acts);

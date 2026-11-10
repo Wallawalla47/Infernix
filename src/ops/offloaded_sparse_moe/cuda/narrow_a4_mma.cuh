@@ -1,6 +1,7 @@
 // The tensor-core narrow route of NVFP4 W4A4 experts (design §16.2's arithmetic), included by moe_layer.cu after the
 // A16 tensor-core route: the jobs of a call of at most moe::kMaxColumns columns (decode and verification at one
-// lane) at Qwen3.8-Flash-Next's geometry, for banks whose experts all share their gate and up input scales
+// lane; calls of at most moe::wide::kA4RowsMaxColumns take narrow_rows_a4.cuh's row pairs where its workspace planes
+// exist) at Qwen3.8-Flash-Next's geometry, for banks whose experts all share their gate and up input scales
 // (a4_nmma_call). Every row sum S = sum_b P_b e4m3_scaled(w_b) e4m3_scaled(a_b), with P_b the block's exact sum of
 // doubled E2M1 code products, is the same int64 as the one-column kernels' (unit_sums) and the CPU engine's, so the
 // outputs are theirs bit for bit wherever an expert runs.

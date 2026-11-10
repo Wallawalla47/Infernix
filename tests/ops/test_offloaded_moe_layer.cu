@@ -1731,9 +1731,10 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
         test_layer(512, 512, 10, 29);  // a short prompt's call: ~10 columns per expert, hundreds of narrow jobs
         test_layer(512, 2048, 10, 31); // a wider call: x published from thousands of columns
         {
-            // W4A4 experts sharing their input scales: every call's narrow jobs on the tensor-core narrow kernels
-            // (one to eight columns per job, misses staged, forked and CPU-served; wider calls' wide jobs on the wide
-            // route): two-request rounds (16 columns), eight lanes (64) and a short prompt's call (512).
+            // W4A4 experts sharing their input scales: calls of one to three columns on the row-pair narrow kernels
+            // (narrow_rows_a4.cuh), wider calls' narrow jobs on the tensor-core narrow kernels (one to eight columns
+            // per job, misses staged, forked and CPU-served; wider calls' wide jobs on the wide route): two-request
+            // rounds (16 columns), eight lanes (64) and a short prompt's call (512).
             constexpr auto kA4 = moe::ExpertActivation::kA4;
             constexpr auto kNarrow = moe::NarrowA16::kExact;
             constexpr auto kWide = moe::WideA16::kExact;
@@ -1797,3 +1798,6 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
     std::printf("all offloaded_moe layer checks passed\n");
     return 0;
 }
+            test_layer(16, 2, 10, 231, kA4, kNarrow, kWide, true);
+            test_layer(9, 3, 3, 233, kA4, kNarrow, kWide, true); // several columns per expert
+            test_layer(24, 3, 10, 235, kA4, kNarrow, kWide, true);

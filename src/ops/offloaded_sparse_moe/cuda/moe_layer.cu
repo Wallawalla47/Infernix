@@ -1831,8 +1831,9 @@ void launch_expert_pass_a4r(const bf16* x, const MoeDispatch& dispatch, const Mo
 #include "ops/offloaded_sparse_moe/cuda/narrow_a4_mma.cuh"
 
 // One pass of the narrow kernels in the source's arithmetic, for a call of `columns` columns. W4A4
-// jobs take the tensor-core narrow kernels in calls of at most kMaxColumns columns of a bank whose experts share
-// their gate and up input scales (narrow_a4_mma.cuh), else the one-column kernels (one pass per column over the
+// jobs of a bank whose experts share their gate and up input scales take the row-pair kernels in calls of at most
+// kA4RowsMaxColumns columns (narrow_rows_a4.cuh) and the tensor-core narrow kernels in calls of at most kMaxColumns
+// (narrow_a4_mma.cuh), else the one-column kernels (one pass per column over the
 // staged weights); W4A16 jobs at Flash-Next's geometry the row-pair kernels in calls of at most kA16RowsMaxColumns
 // columns (narrow_rows_a16.cuh), the tensor-core narrow kernels in calls of at most kMaxColumns (narrow_a16_mma.cuh);
 // W4A16 jobs
@@ -2000,6 +2001,7 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
                                               std::int32_t* __restrict__ cpu_flags, CpuCall* __restrict__ call,
                                               CpuPlanShared& sm) {
     constexpr int kWidths = CpuPlanShared::kWidths;
+#include "ops/offloaded_sparse_moe/cuda/narrow_rows_a4.cuh"
     constexpr int kCats   = CpuPlanShared::kCats;
     constexpr int kChunks = CpuPlanShared::kChunks;
     const auto& channel   = source.cpu;
@@ -2079,6 +2081,11 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
         const int excl    = incl - total;
         const int ssd     = __shfl_sync(0xFFFFFFFFU, incl, kWidths);
         const int host    = __shfl_sync(0xFFFFFFFFU, incl, kCats) - ssd;
+    if (a4_rows_call(source, columns, layout)) {
+        launch_expert_pass_a4_rows(x, columns, dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs,
+                                   stream, phase, part);
+        return;
+    }
         const int n       = min(cap, ssd); // SSD-only, up to the cap
         const int one     = channel.one_column_divisor_device != nullptr && columns == 1 ? *channel.one_column_divisor_device
                                                                                          : channel.one_column_divisor;
@@ -2863,13 +2870,13 @@ void require_fetch_channel(const MoeExpertSource& source, std::int32_t max_jobs)
 // an NVFP4 bank's 8-bit codes, or an NVFP4 W4A16 call's x for the row-pair kernels (A16Act blocks, its jobs' h
 // counts cleared) or the tensor-core narrow kernels (x limbs, its jobs' gate/up CTA counts cleared), each encoded
 // once per call.
-// Whether prepare_x launches anything for the call (a ring, a ggml bank, an 8-bit NVFP4 call or a W4A16 narrow call
-// at Flash-Next's geometry: a16_rows_call implies a16_nmma_call).
+// Whether prepare_x launches anything for the call (a ring, a ggml bank, an 8-bit NVFP4 call, a W4A16 narrow call
+// at Flash-Next's geometry: a16_rows_call implies a16_nmma_call, or a W4A4 row-pair call: its jobs' h counts).
 bool prepares_x(const Tensor& x, const MoeExpertSource& source, const moe::wide::ExpertsWorkspace& layout) {
     const int columns   = static_cast<int>(x.ne[1]);
     const bool nvfp4_a8 = nvfp4_a8_call(source, columns);
     return (layout.x_acts != nullptr && !nvfp4_a8) || ggml_bank(source) || nvfp4_a8 || nvfp4_a8_wide_call(source, columns) ||
-           a16_nmma_call(source, columns, layout);
+           a16_nmma_call(source, columns, layout) || a4_rows_call(source, columns, layout);
 }
 
 void prepare_x(const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs,
@@ -3059,6 +3066,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         return;
     }
     // An NVFP4 W4A16 bank's call on the 8-bit route (NarrowA16::kA8): every job on the 8-bit kernels, so neither
+    } else if (a4_rows_call(source, columns, layout)) {
+        launch_prepare_a4_rows(static_cast<int>(max_jobs), layout, stream);
     // the narrow ring nor the wide route takes part. A wider call with WideA16::kA8 keeps the wide route (its
     // 8-bit grouped GEMM) for its wide jobs and the 8-bit kernels for the others.
     const bool nvfp4_a8 = nvfp4_a8_call(source, static_cast<int>(x.ne[1]));

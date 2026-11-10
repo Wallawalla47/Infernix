@@ -12309,7 +12309,8 @@ second, 2026-10-31): its narrow jobs ran the one-column kernels (§19.3.21) at e
 per column of half2 products over a staged 46 KB slice, A4(x) re-encoded per column in every CTA between six
 barriers, while the W4A16 banks had the tensor-core narrow kernels of §19.3.40.
 
-**What** (`narrow_a4_mma.cuh`, calls of at most eight columns, banks whose every expert shares its gate and up input
+**What** (`narrow_a4_mma.cuh`, calls of at most eight columns (of four to eight since 2026-11-09: narrower ones take
+§19.3.53's row pairs), banks whose every expert shares its gate and up input
 scales: `MoeExpertSource::a4_shared_input`, set at load; NVIDIA's exports always do, other banks keep the one-column
 kernels). Per 16-element block one `mma.m16n8k16` s8 product of the doubled E2M1 codes (A: the record word's rows g
 and g + 8; B: column g's codes) gives P_b exactly for up to eight columns, folded as (P_b Sw) Sa into the same int64
@@ -12952,6 +12953,38 @@ one binary with the switch, three ABBA blocks of fresh processes):
   (6.8 drafts a round), which keep the tensor-core kernels.
 - Not timed: long contexts, the reproducible route (it takes the same kernels), Huihui FP4-Local, recipe C and the
   uncensored NVFP4 (same kernels, same bits).
+
+### 19.3.53 NVFP4 W4A4 decode calls on register-resident row pairs (2026-11-09; exact, same bits; default)
+
+**What.** §19.3.52's row-pair kernels on 4-bit activations (`ops/offloaded_sparse_moe/cuda/narrow_rows_a4.cuh`,
+candidates TM-02c): the narrow jobs of calls of at most three columns (`moe::wide::kA4RowsMaxColumns`) of W4A4 banks
+whose experts share their gate and up input scales (`a4_shared_input`: Dense8, recipe A, FP4-Local under
+`--expert-a4-activations`), in place of §19.3.44's tensor-core kernels, which keep calls of 4 to 8 columns.
+- Each pass encodes its jobs' columns of x once per (job, column) with the job's input scale
+  (`encode_nmma4_kernel`, the tensor-core route's encoder and layout).
+- Gate/up: a CTA per (row group, job), its weights in registers as in §19.3.52 (loaded before the PDL wait on the
+  encode), the column's encoded row expanded in shared memory to doubled-code quads and scaled block scales; a row's
+  P_b is four dp4a products and (P_b · Sw) · Sa adds into the same int64 sums as the tensor-core kernels. Each h
+  element is stored as BF16 and counted per job.
+- Down: a CTA per four output row groups waits on its own job's count (cleared once per call in `prepare_x`), then
+  quantizes each column's h (`quantize_a4_block`, the down input scale) into shared memory.
+- The workspace of a W4A4 call of at most three columns also holds each entry's BF16 h row and the per-job counts.
+
+**Measured** (op: `infernix_offloaded_moe_wide_bench --activation a4 --graph --cold --placement frames
+--staging-slots 0`, event-timer medians, three rotations, output hashes equal to the tensor-core kernels' at every T):
+T = 1 35.4 -> 30.8 µs, T = 2 49.8 -> 45.1-47.1, T = 3 64.1 -> 61.5; T = 4 unchanged (78.5, tensor cores). Rejected:
+each gate/up CTA quantizing its job's x itself (no encode kernel; 80 CTAs a job): 34.8 / 53.3 / 69.7 µs, slower than
+the tensor-core kernels at two and three columns; the down pass waiting on the whole gate/up grid (PDL) instead of
+its job's count (no clearing, no atomics): end to end no better (below).
+
+**End to end** (Dense8, `infernix_bench`, INT8 KV, its n-gram volume, every run from the same saved expert state, base
+4d98e063 against this build, ABBA / ABCCBA blocks of fresh processes, two runs of three blocks):
+- conv (38-token prompt, 512 tokens plain: one-column calls): B/A 1.032 / 1.012 / 1.008 and 1.016 / 1.017 / 1.016 by
+  block (the first block of each run is inflated by a low first process in both arms); the PDL-wait form 1.015 /
+  1.012 in the stable blocks.
+- struct (DFlash2 companion, auto drafts, 535 rounds in every run): B/A 0.9985 / 0.9977 / 0.9972 and 0.9998 / 1.0023
+  / 1.0013: level (verification calls of seven or eight columns keep the tensor-core kernels).
+- Not timed: recipe A (same kernels, same bits), FP4-Local's `--expert-a4-activations` opt-in, long contexts.
 
 ---
 
