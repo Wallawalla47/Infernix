@@ -668,6 +668,33 @@ __global__ void __launch_bounds__(ggml::tile::kThreads)
     for (int i = threadIdx.x; i < ggml::tile::kImageBytes<F> / 16; i += blockDim.x) { dst[i] = src[i]; }
 }
 
+// The BF16 route's plane of one segment (ggml::bf16::PlaneStage images in plane_kernel's order): a
+// stage is decoded as plane_kernel decodes it and stored as the BF16 tiles' operands.
+template <QType F, bool Tiled>
+__global__ void __launch_bounds__(ggml::tile::kThreads)
+    bf16_plane_kernel(const std::uint8_t* __restrict__ weights, int rows, int row_bytes, std::uint8_t* __restrict__ plane) {
+    __shared__ ggml::tile::CodeStage cs;
+    const int tile = blockIdx.x, st = blockIdx.y, stages = gridDim.y;
+    const auto row_of = [&](int r) {
+        const int row = min(tile * ggml::tile::kTileRows + r, rows - 1);
+        if constexpr (Tiled) {
+            const int b = st * ggml::tile::kStageSlices / ggml::tile::kBlockSlices<F>;
+            return weights + static_cast<std::size_t>(row / 16) * 16 * row_bytes +
+                   static_cast<std::size_t>(row % 16 + 15 * b) * ggml_block_bytes(F);
+        } else {
+            return weights + static_cast<std::size_t>(row) * row_bytes;
+        }
+    };
+    ggml::tile::decode_stage<F>(cs, row_of, st);
+    __syncthreads();
+    auto& out = *reinterpret_cast<ggml::bf16::PlaneStage*>(
+        plane + (static_cast<std::size_t>(tile) * stages + st) * sizeof(ggml::bf16::PlaneStage));
+    constexpr ggml::bf16::Scaling S = ggml::bf16::kScaling<F>;
+    for (int i = threadIdx.x; i < ggml::tile::kStageSlices * ggml::tile::kRowGroups * 32; i += blockDim.x) {
+        ggml::bf16::plane_item<S>(cs, out, i);
+    }
+}
+
 // Wide calls: one CTA per tile of ggml::tile::kTileRows rows x kTileColumns encoded columns, its
 // stages the images of the segment's decoded plane (rows still give the scales' accumulator choice).
 // Measured at 4096 columns against tiles that decode their raw rows in the loop (2026-10-12): 15-34 %
@@ -1131,6 +1158,31 @@ void decode_plane(const GgmlSegment& s, int k, std::uint8_t* plane, cudaStream_t
     check_launch("plane");
 }
 
+void decode_bf16_plane(const GgmlSegment& s, int k, std::uint8_t* plane, cudaStream_t stream) {
+    const int slices = k / 32;
+    const dim3 grid((s.rows + ggml::tile::kTileRows - 1) / ggml::tile::kTileRows, slices / ggml::tile::kStageSlices);
+#define INFERNIX_GGML_PLANE(Q)                                                                                         \
+    case Q: {                                                                                                          \
+        const int row_bytes = static_cast<int>(k / ggml_block_elems(Q) * ggml_block_bytes(Q));                         \
+        if (s.layout == GgmlLayout::Tiles16) {                                                                         \
+            if constexpr (kTiledFormat<Q>) {                                                                           \
+                bf16_plane_kernel<Q, true><<<grid, ggml::tile::kThreads, 0, stream>>>(s.data, s.rows, row_bytes, plane); \
+                break;                                                                                                 \
+            }                                                                                                          \
+            throw std::logic_error("ggml_linear: a tiled segment's format has no tiled kernels");                      \
+        }                                                                                                              \
+        bf16_plane_kernel<Q, false><<<grid, ggml::tile::kThreads, 0, stream>>>(s.data, s.rows, row_bytes, plane);     \
+        break;                                                                                                         \
+    }
+    switch (s.format) {
+        INFERNIX_GGML_FORMATS(INFERNIX_GGML_PLANE)
+    default:
+        throw std::invalid_argument("ggml_linear: segment format is not a ggml block format");
+    }
+#undef INFERNIX_GGML_PLANE
+    check_launch("bf16 plane");
+}
+
 // Column c's sum of x over each 32-element slice (input element j at x[perm(j)]), in element order:
 // the K-quants' min term for the BF16 tiles. One CTA per column.
 __global__ void __launch_bounds__(128)
@@ -1172,8 +1224,8 @@ void launch_bf16_scaling(const GgmlSegment& s, const Bf16Input& in, int columns,
     const dim3 grid((s.rows + b::kRows - 1) / b::kRows, (columns + b::kColumns - 1) / b::kColumns);
     const b::DenseColumns cols{.x = in.x, .k = in.k, .perm = in.perm, .perm_block = in.perm_block, .xsum = in.xsum,
                                .col0 = 0, .columns = columns};
-    b::tile_kernel<S, OutF32><<<grid, b::kThreads, kShared, stream>>>(plane, tiles, s.rows, in.k / 32, cols, out, n,
-                                                                     s.out_offset, ggml::kappa_log2(s.format));
+    b::tile_kernel<S, OutF32><<<grid, b::kPlaneThreads<b::kPlaneWarpColumns<S>>, kShared, stream>>>(
+        plane, tiles, s.rows, in.k / 32, cols, out, n, s.out_offset, ggml::kappa_log2(s.format));
     check_launch("bf16 tile");
 }
 
@@ -1193,10 +1245,10 @@ void launch_bf16(const GgmlSegment& s, const Bf16Input& in, int columns, void* o
 }
 #undef INFERNIX_GGML_FORMATS
 
-// Bytes of a decoded plane of `rows` rows of K = 32 slices.
-std::size_t plane_bytes(int rows, int slices) {
+// Bytes of a decoded plane of `rows` rows of K = 32 slices whose stage images take stage_bytes.
+std::size_t plane_bytes(int rows, int slices, std::size_t stage_bytes) {
     const std::size_t tiles = static_cast<std::size_t>((rows + ggml::tile::kTileRows - 1) / ggml::tile::kTileRows);
-    return tiles * static_cast<std::size_t>(slices / ggml::tile::kStageSlices) * sizeof(ggml::tile::CodeStage);
+    return tiles * static_cast<std::size_t>(slices / ggml::tile::kStageSlices) * stage_bytes;
 }
 
 // The row slabs of a wide call's segments, each a segment of whole row tiles whose plane fits
@@ -1206,10 +1258,14 @@ struct Slab {
     std::size_t offset; // of its plane in the pass's workspace
 };
 
-std::vector<std::vector<Slab>> plan_slabs(std::span<const GgmlSegment> segments, int k) {
+// stage_bytes: a stage image of the plane's tiles; slab_tiles: slabs split at multiples of that many
+// row tiles (the BF16 tiles' CTAs take two).
+std::vector<std::vector<Slab>> plan_slabs(std::span<const GgmlSegment> segments, int k,
+                                          std::size_t stage_bytes = sizeof(ggml::tile::CodeStage), int slab_tiles = 1) {
     const int slices          = k / 32;
-    const std::size_t per_tile = plane_bytes(ggml::tile::kTileRows, slices);
-    const int max_rows = static_cast<int>(std::max<std::size_t>(kPlaneBytes / per_tile, 1)) * ggml::tile::kTileRows;
+    const std::size_t per_tile = plane_bytes(ggml::tile::kTileRows, slices, stage_bytes);
+    const int max_tiles = static_cast<int>(std::max<std::size_t>(kPlaneBytes / per_tile, static_cast<std::size_t>(slab_tiles)));
+    const int max_rows  = max_tiles / slab_tiles * slab_tiles * ggml::tile::kTileRows;
     std::vector<std::vector<Slab>> passes(1);
     std::size_t used = 0;
     for (const auto& s : segments) {
@@ -1219,7 +1275,7 @@ std::vector<std::vector<Slab>> plan_slabs(std::span<const GgmlSegment> segments,
             slab.rows        = std::min(max_rows, s.rows - r);
             slab.data        = s.data + static_cast<std::size_t>(r) * row_bytes;
             slab.out_offset  = s.out_offset + r;
-            const std::size_t bytes = plane_bytes(slab.rows, slices);
+            const std::size_t bytes = plane_bytes(slab.rows, slices, stage_bytes);
             if (used + bytes > kPlaneBytes && !passes.back().empty()) {
                 passes.emplace_back();
                 used = 0;
@@ -1235,15 +1291,15 @@ std::vector<std::vector<Slab>> plan_slabs(std::span<const GgmlSegment> segments,
 // BF16 route's).
 bool wide_call(int k, int columns) { return columns >= kTileMinColumns && (k / 32) % ggml::tile::kStageSlices == 0; }
 
-// The BF16 route of a wide call (LinearRoutes::GgmlBf16Wide): the same slabs and planes as the exact
-// route's, every column in one launch per slab, no encoding.
+// The BF16 route of a wide call (LinearRoutes::GgmlBf16Wide): slabs as the exact route's over BF16
+// planes (ggml::bf16::PlaneStage), every column in one launch per slab, no encoding.
 void linear_bf16(const Tensor& x, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs,
                  const std::int32_t* input_perm, std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream) {
     const int k = x.ne[0], columns = x.ne[1];
     require(input_perm == nullptr || perm_block % 4 == 0, "the BF16 route reads x in four-element units of the permutation");
     require(reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0, "the BF16 route reads x in 8-byte units");
     const DType dtype = outs.front()->dtype;
-    const auto passes = plan_slabs(segments, k);
+    const auto passes = plan_slabs(segments, k, sizeof(ggml::bf16::PlaneStage), ggml::bf16::kRows / ggml::tile::kTileRows);
     auto* planes      = static_cast<std::uint8_t*>(workspace.alloc(DType::U8, {static_cast<int>(kPlaneBytes)}).data);
     Bf16Input in{.x = static_cast<const std::uint16_t*>(x.data), .k = k, .perm = input_perm, .perm_block = perm_block};
     const bool min_terms = std::any_of(segments.begin(), segments.end(), [](const GgmlSegment& s) {
@@ -1256,7 +1312,7 @@ void linear_bf16(const Tensor& x, std::span<const GgmlSegment> segments, std::sp
         in.xsum = xsum;
     }
     for (const auto& pass : passes) {
-        for (const auto& slab : pass) { decode_plane(slab.segment, k, planes + slab.offset, stream); }
+        for (const auto& slab : pass) { decode_bf16_plane(slab.segment, k, planes + slab.offset, stream); }
         for (const auto& slab : pass) {
             const Tensor& out = *outs[static_cast<std::size_t>(slab.segment.output)];
             if (dtype == DType::FP32) {

@@ -759,8 +759,9 @@ __device__ __forceinline__ std::uint16_t bf16_bits(float v) { return __bfloat16_
 
 // Gate/up tiles of the pass: CTA (p, y) takes row pair p (intermediates 64 p .. 64 p + 63: its gate
 // rows, then its up rows) of the pass's tiles y, y + gridDim.y, ...
-template <QType GU>
-__global__ void __launch_bounds__(ggml::bf16::kThreads, 1)
+// T: the CTA's threads (ggml::bf16::kDecodeThreads).
+template <QType GU, int T>
+__global__ void __launch_bounds__(T, 1)
     ggml_gate_up_decode(const std::uint16_t* __restrict__ x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
                         const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ tiles,
                         const std::int32_t* __restrict__ first_tile, int jobs, std::uint16_t* __restrict__ h_plane,
@@ -775,7 +776,7 @@ __global__ void __launch_bounds__(ggml::bf16::kThreads, 1)
     const std::size_t row_bytes = source.ggml.gate_row_bytes;
     const int t1                = first_tile[jobs];
     if (static_cast<int>(blockIdx.y) >= t1) { return; }
-    sm.codebook.template load<b::kThreads>(); // published by compute_decode's first barrier
+    sm.codebook.template load<T>(); // published by compute_decode's first barrier
     for (int tile = static_cast<int>(blockIdx.y); tile < t1; tile += static_cast<int>(gridDim.y)) {
         const int job = tiles[2 * tile], col0 = tiles[2 * tile + 1];
         const int expert = dispatch.jobs[job];
@@ -790,32 +791,33 @@ __global__ void __launch_bounds__(ggml::bf16::kThreads, 1)
         const GatherColumns cols{x, static_cast<std::size_t>(moe::kHidden), dispatch.entries, first, col0, count, top_k};
         const auto run = [&](auto width) {
             constexpr int NT = decltype(width)::value;
+            constexpr int kWNT = b::kDecodeWarpTiles<NT, T>;
             b::Accumulators acc;
-            b::compute_decode<S, GU, NT>(sm, row_of, kBf16XStages, cols, acc);
+            b::compute_decode<S, GU, NT, T>(sm, row_of, kBf16XStages, cols, acc);
             // The up rows (warp row 1) through shared memory to the gate rows' threads (warp row 0).
-            if (warp >= 4) {
+            if (warp >= T / 64) {
 #pragma unroll
                 for (int mi = 0; mi < b::kMTiles; ++mi) {
 #pragma unroll
-                    for (int nt = 0; nt < NT; ++nt) {
+                    for (int nt = 0; nt < kWNT; ++nt) {
 #pragma unroll
                         for (int q = 0; q < 4; ++q) {
-                            const int r = b::out_row(warp, lane, mi, q) - ggml::tile::kTileRows;
-                            const int c = b::decode_out_column<NT>(warp, lane, nt, q);
+                            const int r = b::decode_out_row<T>(warp, lane, mi, q) - ggml::tile::kTileRows;
+                            const int c = b::decode_out_column<NT, T>(warp, lane, nt, q);
                             up[r * b::kColumns + c] = bf16_bits(ldexpf(acc.r[mi][nt][q], kappa_log2));
                         }
                     }
                 }
             }
             __syncthreads();
-            if (warp < 4) {
+            if (warp < T / 64) {
 #pragma unroll
                 for (int mi = 0; mi < b::kMTiles; ++mi) {
 #pragma unroll
-                    for (int nt = 0; nt < NT; ++nt) {
+                    for (int nt = 0; nt < kWNT; ++nt) {
 #pragma unroll
                         for (int q = 0; q < 4; ++q) {
-                            const int r = b::out_row(warp, lane, mi, q), c = b::decode_out_column<NT>(warp, lane, nt, q);
+                            const int r = b::decode_out_row<T>(warp, lane, mi, q), c = b::decode_out_column<NT, T>(warp, lane, nt, q);
                             if (col0 + c < count) {
                                 const std::uint16_t y = bf16_bits(ldexpf(acc.r[mi][nt][q], kappa_log2));
                                 h_plane[static_cast<std::size_t>(first + col0 + c) * moe::wide::kA16HRowElements +
@@ -837,8 +839,8 @@ __global__ void __launch_bounds__(ggml::bf16::kThreads, 1)
 
 // Down tiles of the pass: CTA (q, y) takes output rows 128 q .. 128 q + 127 of the pass's tiles y,
 // y + gridDim.y, ...; each entry's output column is outputs[entries[e]].
-template <QType D>
-__global__ void __launch_bounds__(ggml::bf16::kThreads, 1)
+template <QType D, int T>
+__global__ void __launch_bounds__(T, 1)
     ggml_down_decode(MoeDispatch dispatch, MoeExpertSource source, int hidden, const std::uint8_t* const* __restrict__ job_records,
                      const std::int32_t* __restrict__ tiles, const std::int32_t* __restrict__ first_tile, int jobs,
                      const std::uint16_t* __restrict__ h_plane, std::uint16_t* __restrict__ outputs, int kappa_log2) {
@@ -851,7 +853,7 @@ __global__ void __launch_bounds__(ggml::bf16::kThreads, 1)
     const std::size_t row_bytes = source.ggml.down_row_bytes;
     const int t1                = first_tile[jobs];
     if (static_cast<int>(blockIdx.y) >= t1) { return; }
-    sm.codebook.template load<b::kThreads>(); // published by compute_decode's first barrier
+    sm.codebook.template load<T>(); // published by compute_decode's first barrier
     for (int tile = static_cast<int>(blockIdx.y); tile < t1; tile += static_cast<int>(gridDim.y)) {
         const int job = tiles[2 * tile], col0 = tiles[2 * tile + 1];
         const int expert = dispatch.jobs[job];
@@ -863,16 +865,16 @@ __global__ void __launch_bounds__(ggml::bf16::kThreads, 1)
         const auto run = [&](auto width) {
             constexpr int NT = decltype(width)::value;
             b::Accumulators acc;
-            b::compute_decode<S, D, NT>(sm, row_of, kBf16HStages, cols, acc);
+            b::compute_decode<S, D, NT, T>(sm, row_of, kBf16HStages, cols, acc);
 #pragma unroll
             for (int mi = 0; mi < b::kMTiles; ++mi) {
 #pragma unroll
-                for (int nt = 0; nt < NT; ++nt) {
+                for (int nt = 0; nt < b::kDecodeWarpTiles<NT, T>; ++nt) {
 #pragma unroll
                     for (int k = 0; k < 4; ++k) {
-                        const int c = b::decode_out_column<NT>(warp, lane, nt, k);
+                        const int c = b::decode_out_column<NT, T>(warp, lane, nt, k);
                         if (col0 + c < count) {
-                            const int row = q * b::kRows + b::out_row(warp, lane, mi, k);
+                            const int row = q * b::kRows + b::decode_out_row<T>(warp, lane, mi, k);
                             outputs[static_cast<std::size_t>(dispatch.entries[first + col0 + c]) * hidden + row] =
                                 bf16_bits(ldexpf(acc.r[mi][nt][k], kappa_log2));
                         }
@@ -909,10 +911,11 @@ void launch_decode_pass_ggml(const std::uint16_t* x, const MoeDispatch& dispatch
     if (jobs > kBf16PlanThreads) { throw std::invalid_argument("offloaded_sparse_moe: a BF16 pass plans at most 512 jobs"); }
     constexpr int kGateUpShared = static_cast<int>(sizeof(b::DecodeShared<GU>));
     constexpr int kDownShared   = static_cast<int>(sizeof(b::DecodeShared<D>));
+    constexpr int kT = b::kDecodeThreads;
     static const bool configured = [] {
-        return cudaFuncSetAttribute(ggml_gate_up_decode<GU>, cudaFuncAttributeMaxDynamicSharedMemorySize, kGateUpShared) ==
-                   cudaSuccess &&
-               cudaFuncSetAttribute(ggml_down_decode<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, kDownShared) ==
+        return cudaFuncSetAttribute(ggml_gate_up_decode<GU, kT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    kGateUpShared) == cudaSuccess &&
+               cudaFuncSetAttribute(ggml_down_decode<D, kT>, cudaFuncAttributeMaxDynamicSharedMemorySize, kDownShared) ==
                    cudaSuccess;
     }();
     if (!configured) { throw std::runtime_error("offloaded_sparse_moe: the stage-decode tiles' shared memory exceeds the device's"); }
@@ -922,14 +925,14 @@ void launch_decode_pass_ggml(const std::uint16_t* x, const MoeDispatch& dispatch
     check_launch("ggml bf16 plan");
     // Grid-stride loops over the pass's tiles in 2 x SMs CTAs (two of one CTA per SM).
     const int sms = bf16_expert_sms();
-    ggml_gate_up_decode<GU><<<dim3(kBf16GateUpPairs, (2 * sms + kBf16GateUpPairs - 1) / kBf16GateUpPairs), b::kThreads,
-                              kGateUpShared, stream>>>(x, dispatch, source, top_k, job_records, layout.tiles,
-                                                       layout.pass_tiles, jobs, h_plane, ggml::kappa_log2(GU));
+    const dim3 gate_up_grid(kBf16GateUpPairs, (2 * sms + kBf16GateUpPairs - 1) / kBf16GateUpPairs);
+    const dim3 down_grid(kBf16DownTiles, (2 * sms + kBf16DownTiles - 1) / kBf16DownTiles);
+    ggml_gate_up_decode<GU, kT><<<gate_up_grid, kT, kGateUpShared, stream>>>(
+        x, dispatch, source, top_k, job_records, layout.tiles, layout.pass_tiles, jobs, h_plane, ggml::kappa_log2(GU));
     check_launch("ggml stage-decode gate/up tiles");
-    ggml_down_decode<D><<<dim3(kBf16DownTiles, (2 * sms + kBf16DownTiles - 1) / kBf16DownTiles), b::kThreads, kDownShared,
-                          stream>>>(dispatch, source, static_cast<int>(moe::kHidden), job_records, layout.tiles,
-                                    layout.pass_tiles, jobs, h_plane, reinterpret_cast<std::uint16_t*>(outputs),
-                                    ggml::kappa_log2(D));
+    ggml_down_decode<D, kT><<<down_grid, kT, kDownShared, stream>>>(
+        dispatch, source, static_cast<int>(moe::kHidden), job_records, layout.tiles, layout.pass_tiles, jobs, h_plane,
+        reinterpret_cast<std::uint16_t*>(outputs), ggml::kappa_log2(D));
     check_launch("ggml stage-decode down tiles");
 }
 

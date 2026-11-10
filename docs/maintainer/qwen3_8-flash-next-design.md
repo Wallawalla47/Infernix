@@ -11579,6 +11579,23 @@ the shared-codebook variants, `MoeGgmlTiles` and the switches `INFERNIX_TMP_IQ_S
 the exact route, just above it within the bounds of the numerics paragraph, and the stage-decode
 tiles' bits across call widths (4,096 to 16,384 columns) and staged passes.
 
+**BF16 plane and warp shapes (2026-11-10).** Both tile families ran eight warps on a CTA that owns
+its SM (73-95 KiB of shared memory), which left the SM's tensor cores short of work. The dense tiles
+now read a BF16 plane (`ggml::bf16::PlaneStage`, written once per call by `bf16_plane_kernel`: the
+`CodeStage` integers already converted to the k16 fragment pairs, with d · sub and dmin · min formed),
+so a column tile's threads only load and multiply, and run sixteen warps of 64 x 16 (thirty-two of
+64 x 8 for the half-scaled formats: `kPlaneWarpColumns`); the stage-decode expert tiles run sixteen
+warps of 64 x 16 with one decode task a warp and stage (`kDecodeThreads` = 512). The operands and the
+accumulation order are unchanged, so both keep their bits (equal output hashes at every bench point;
+greedy text identical on the IQ3_S artifact). `ggml_linear_bench --routes bf16 --cold`, eight shapes
+at 512 / 2,048 / 4,096 columns: the plane alone ±1.7 % (level: the conversions were not the bound),
+with sixteen warps -3.7 .. -8.3 % and -13.6 .. -14.6 % on the Q6_K `ssm_out`, with thirty-two -3.3 ..
+-7.2 % and -17.7 .. -19.2 %. `offloaded_moe_wide_bench --bank ggml --ggml-wide bf16 --cold --graph`,
+512 experts: experts in device frames -5.3 .. -6.5 % at 4,096 tokens and -7.5 .. -8.1 % at 16,384,
+staged experts (the call waits on the link) -0.1 .. -2.6 %. IQ3_S prefill from a cold expert cache,
+dense tiles alone: pp4096 -0.6 % (inside the runs' spread), pp16384 -1.9 %. The plane's stage images
+are 1.58x the `CodeStage` planes' bytes, so slabs split earlier (at even row tiles).
+
 **Pitfall.** With about 79 GiB of RAM free, the n-gram table's automatic residency flipped between
 runs (read from its volume, or 27.8 GiB pinned while the first test ran), costing that test 25 %;
 every arm above passes `--ngram-residency volume`. The exact `gate_up_tile_ggml` instances of the IQ
