@@ -37,7 +37,7 @@ namespace infernix::ggml::nmma {
 
 // Formats whose 4-byte code groups hold elements 4 t .. 4 t + 3 and 16 + 4 t .. 16 + 4 t + 3 (nibbles).
 template <QType F>
-inline constexpr bool kNatural = F == QType::GGML_IQ4_NL || F == QType::GGML_IQ4_XS;
+inline constexpr bool kNatural = F == QType::GGML_IQ4_NL || F == QType::GGML_IQ4_XS || F == QType::GGML_Q5_0;
 // Formats whose sub-scale covers 16 elements.
 template <QType F>
 inline constexpr bool kHalves = F == QType::GGML_IQ2_S || F == QType::GGML_IQ2_XS;
@@ -51,7 +51,7 @@ inline constexpr int kBlockBytes = static_cast<int>(ggml_block_bytes(F));
 template <QType F>
 inline constexpr bool kSupported = F == QType::GGML_IQ2_XXS || F == QType::GGML_IQ2_XS || F == QType::GGML_IQ2_S ||
                                    F == QType::GGML_IQ3_XXS || F == QType::GGML_IQ3_S || F == QType::GGML_IQ4_XS ||
-                                   F == QType::GGML_IQ4_NL || F == QType::GGML_Q2_0;
+                                   F == QType::GGML_IQ4_NL || F == QType::GGML_Q2_0 || F == QType::GGML_Q5_0;
 
 // A thread's A fragment of one step, with the sub-scales of its two slots.
 struct Step {
@@ -136,6 +136,13 @@ __device__ __forceinline__ void natural_words(const std::uint8_t* b, int sb, int
         lo  = v.x;
         hi  = v.y;
         sub = (((b[4 + sb / 2] >> (4 * (sb % 2))) & 0xF) | (((lds16(b + 2) >> (2 * sb)) & 3) << 4)) - 32;
+    } else if constexpr (F == QType::GGML_Q5_0) {
+        // The fifth bits of elements 4 t.. are at bits 4 t.. of the block's word, those of 16 + 4 t.. at 16 + 4 t...
+        const std::uint32_t fifth = lds32_a2(b + 2);
+        const int2 v = fast::q5_0_values(lds32_a2(b + 6 + 4 * t), fifth >> (4 * t), fifth >> (16 + 4 * t));
+        lo  = v.x;
+        hi  = v.y;
+        sub = 1;
     } else {
         static_assert(F == QType::GGML_IQ4_NL, "natural_words: not a nibble format");
     }
@@ -208,7 +215,7 @@ struct Rows {
     int base;
 };
 
-// Base accumulation (the one-block-per-step formats IQ4_NL and Q2_0, whose int128 term per block would cost
+// Base accumulation (the one-block-per-step formats IQ4_NL, Q5_0 and Q2_0, whose int128 term per block would cost
 // more than the step): the block term mant(d) * v * 2^(e(d) - 1) is M * v in units of 2^base with
 // M = +-mant(d) * 2^(shift - base), an int32 while shift - base <= kBaseSpan, base the row's smallest shift;
 // |v| < 2^19 for one slice of IQ4_NL (less for Q2_0), so a row's twenty terms are below 2^55.

@@ -63,6 +63,7 @@ ggml::I128 row_dot(QType q, const std::uint8_t* row, const std::int32_t* x, int 
     case QType::GGML_IQ4_XS: return ggml::row_dot<QType::GGML_IQ4_XS>(row, x, k);
     case QType::GGML_IQ4_NL: return ggml::row_dot<QType::GGML_IQ4_NL>(row, x, k);
     case QType::GGML_Q2_0: return ggml::row_dot<QType::GGML_Q2_0>(row, x, k);
+    case QType::GGML_Q5_0: return ggml::row_dot<QType::GGML_Q5_0>(row, x, k);
     default: throw std::logic_error("format");
     }
 }
@@ -281,7 +282,7 @@ void check_team_ggml(std::mt19937& rng) {
 // The expert-only formats' reference decode (ggml_exact.h chunk<F>, which the routes above are held to)
 // against ggml_block_oracle.h's transcription of llama.cpp's dequantize_row_*: every element's
 // kappa * d * sub * code equals the binary64 formula. infernix_ggml_linear_test qualifies the dense
-// formats; IQ2_XXS and IQ2_XS have no dense route, so they are qualified here.
+// formats; IQ2_XXS, IQ2_XS and Q5_0 have no dense route, so they are qualified here.
 template <QType F>
 void check_reference_decode(std::mt19937& rng) {
     constexpr int kElems = static_cast<int>(infernix::ggml_block_elems(F)), kBytes = static_cast<int>(infernix::ggml_block_bytes(F));
@@ -466,13 +467,17 @@ INFERNIX_OP_TEST(offloaded_moe_ggml_cpu) {
         std::mt19937 rng(20261011);
         check_reference_decode<QType::GGML_IQ2_XXS>(rng);
         check_reference_decode<QType::GGML_IQ2_XS>(rng);
+        check_reference_decode<QType::GGML_Q5_0>(rng);
         const std::pair<QType, QType> pairs[] = {
             {QType::GGML_IQ2_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ2_XXS, QType::GGML_Q2_0},
             {QType::GGML_IQ2_XS, QType::GGML_IQ4_NL},  {QType::GGML_IQ2_XS, QType::GGML_Q2_0},
             {QType::GGML_IQ2_S, QType::GGML_IQ4_NL},   {QType::GGML_IQ2_S, QType::GGML_Q2_0},
             {QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ3_XXS, QType::GGML_Q2_0},
             {QType::GGML_IQ3_S, QType::GGML_IQ4_NL},   {QType::GGML_IQ3_S, QType::GGML_Q2_0},
-            {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL},  {QType::GGML_IQ4_XS, QType::GGML_Q2_0}};
+            {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL},  {QType::GGML_IQ4_XS, QType::GGML_Q2_0},
+            {QType::GGML_IQ2_XXS, QType::GGML_Q5_0}, {QType::GGML_IQ2_XS, QType::GGML_Q5_0},
+            {QType::GGML_IQ2_S, QType::GGML_Q5_0}, {QType::GGML_IQ3_XXS, QType::GGML_Q5_0},
+            {QType::GGML_IQ3_S, QType::GGML_Q5_0}, {QType::GGML_IQ4_XS, QType::GGML_Q5_0}};
         for (const auto& [gu, down] : pairs) { run(gu, down, rng); }
         run(QType::FP8_E4M3FN_B128, QType::FP8_E4M3FN_B128, rng); // block-FP8 banks (cpu/fp8_expert.h)
         check_team_ggml(rng);

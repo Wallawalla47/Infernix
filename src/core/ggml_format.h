@@ -18,12 +18,18 @@ namespace infernix {
 
 [[nodiscard]] INFERNIX_GGML_FORMAT_HD constexpr bool is_ggml(QType q) noexcept {
     return (q >= QType::GGML_Q2_0 && q <= QType::GGML_IQ4_NL) || q == QType::GGML_Q8_0 || q == QType::GGML_IQ2_XXS ||
-           q == QType::GGML_IQ2_XS;
+           q == QType::GGML_IQ2_XS || q == QType::GGML_Q5_0;
 }
 
-// Formats only the expert-bank kernels decode (ops/offloaded_sparse_moe): no dense route takes them.
+// Formats only the expert-bank kernels decode (ops/offloaded_sparse_moe): no dense route takes them. IQ2_XXS and
+// IQ2_XS are gate/up formats, Q5_0 a down format (is_ggml_expert_down).
 [[nodiscard]] INFERNIX_GGML_FORMAT_HD constexpr bool is_ggml_expert_only(QType q) noexcept {
-    return q == QType::GGML_IQ2_XXS || q == QType::GGML_IQ2_XS;
+    return q == QType::GGML_IQ2_XXS || q == QType::GGML_IQ2_XS || q == QType::GGML_Q5_0;
+}
+
+// The formats a ggml expert bank's down matrices take (its layout names the one; the others are gate/up formats).
+[[nodiscard]] INFERNIX_GGML_FORMAT_HD constexpr bool is_ggml_expert_down(QType q) noexcept {
+    return q == QType::GGML_IQ4_NL || q == QType::GGML_Q2_0 || q == QType::GGML_Q5_0;
 }
 
 // Elements per block (the K-axis unit of a row).
@@ -33,6 +39,7 @@ namespace infernix {
         return 64;
     case QType::GGML_IQ4_NL:
     case QType::GGML_Q8_0:
+    case QType::GGML_Q5_0:
         return 32;
     case QType::GGML_Q4_K:
     case QType::GGML_Q5_K:
@@ -55,6 +62,8 @@ namespace infernix {
         return 18;
     case QType::GGML_IQ4_NL:
         return 18;
+    case QType::GGML_Q5_0:
+        return 22;
     case QType::GGML_Q8_0:
         return 34;
     case QType::GGML_Q4_K:
@@ -84,11 +93,13 @@ namespace infernix {
 [[nodiscard]] INFERNIX_GGML_FORMAT_HD constexpr QType ggml_expert_down_format(QuantLayout layout) noexcept {
     return layout == QuantLayout::GgmlExpertIq4Nl ? QType::GGML_IQ4_NL
            : layout == QuantLayout::GgmlExpertQ2_0 ? QType::GGML_Q2_0
+           : layout == QuantLayout::GgmlExpertQ5_0 ? QType::GGML_Q5_0
                                                     : QType::FP32;
 }
 
 [[nodiscard]] INFERNIX_GGML_FORMAT_HD constexpr bool is_ggml_expert_layout(QuantLayout layout) noexcept {
-    return layout == QuantLayout::GgmlExpertIq4Nl || layout == QuantLayout::GgmlExpertQ2_0;
+    return layout == QuantLayout::GgmlExpertIq4Nl || layout == QuantLayout::GgmlExpertQ2_0 ||
+           layout == QuantLayout::GgmlExpertQ5_0;
 }
 
 } // namespace infernix

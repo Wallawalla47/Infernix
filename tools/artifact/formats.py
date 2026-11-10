@@ -119,6 +119,7 @@ FP8_E4M3FN_ROW_F32 = Fp8RowFormat("fp8_e4m3fn_row_f32", 4)
 NVFP4_MUL = Nvfp4MulFormat("nvfp4_mul", 16)
 
 GGML_Q2_0 = GgmlFormat("ggml_q2_0", 64, 18)
+GGML_Q5_0 = GgmlFormat("ggml_q5_0", 32, 22)
 GGML_Q4_K = GgmlFormat("ggml_q4_k", 256, 144)
 GGML_Q5_K = GgmlFormat("ggml_q5_k", 256, 176)
 GGML_Q6_K = GgmlFormat("ggml_q6_k", 256, 210)
@@ -146,7 +147,7 @@ GGML_FORMATS = MappingProxyType(
     {
         item.name: item
         for item in (
-            GGML_Q2_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ2_S,
+            GGML_Q2_0, GGML_Q5_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ2_S,
             GGML_IQ3_XXS, GGML_IQ3_S, GGML_IQ4_XS, GGML_IQ4_NL,
         )
     }

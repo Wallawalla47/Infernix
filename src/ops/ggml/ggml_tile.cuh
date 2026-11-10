@@ -58,13 +58,13 @@ constexpr int kRawChunks    = 15;
 
 // Elements per block of F (the period of the int128 flush).
 template <QType F>
-inline constexpr int kBlockSlices = F == QType::GGML_IQ4_NL ? 1 : F == QType::GGML_Q2_0 ? 2 : 8;
+inline constexpr int kBlockSlices = F == QType::GGML_IQ4_NL || F == QType::GGML_Q5_0 ? 1 : F == QType::GGML_Q2_0 ? 2 : 8;
 static_assert(kUnitSlices % kStageSlices == 0);
 
 // log2 of a bound on one block's term |mant(d) * P| (with the K-quants' min term): elements x
 // |sub| x |code| x |X| (< 2^21) x mant (< 2^11). Q6_K 2^8 2^7 2^5; Q5_K 2^8 2^6 2^5 (+ the min term
 // < 2^46); Q4_K 2^8 2^6 2^4 (+ 2^46); IQ4_XS 2^8 2^5 2^7; IQ4_NL 2^5 1 2^7; IQ3_S 2^8 2^5 2^4;
-// IQ3_XXS 2^8 2^5 2^6; IQ2_S, IQ2_XS and IQ2_XXS 2^8 2^5 2^6; Q2_0 2^6 1 2^1.
+// IQ3_XXS 2^8 2^5 2^6; IQ2_S, IQ2_XS and IQ2_XXS 2^8 2^5 2^6; Q5_0 2^5 1 2^4; Q2_0 2^6 1 2^1.
 template <QType F>
 inline constexpr bool kIq2 = F == QType::GGML_IQ2_S || F == QType::GGML_IQ2_XS || F == QType::GGML_IQ2_XXS;
 template <QType F>
@@ -72,11 +72,12 @@ inline constexpr int kTermLog2 = F == QType::GGML_Q6_K || F == QType::GGML_Q5_K 
                                  : F == QType::GGML_Q4_K || F == QType::GGML_IQ3_XXS || kIq2<F>              ? 51
                                  : F == QType::GGML_IQ3_S                                                      ? 49
                                  : F == QType::GGML_IQ4_NL                                                     ? 44
+                                 : F == QType::GGML_Q5_0                                                       ? 41
                                                                                                                : 39;
 
 // Formats whose sub-scales are all 1 (the MMA sums need no scaling).
 template <QType F>
-inline constexpr bool kUnitSub = F == QType::GGML_IQ4_NL || F == QType::GGML_Q2_0;
+inline constexpr bool kUnitSub = F == QType::GGML_IQ4_NL || F == QType::GGML_Q2_0 || F == QType::GGML_Q5_0;
 
 // Formats whose sub-scale covers 16 elements: two k16 MMAs per slice, each scaled by its own.
 template <QType F>
@@ -389,6 +390,15 @@ __device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part,
             o.w[h] = fast::sub_bytes4(e, 0x01010101U);
         }
         o.d = ld16(b);
+    } else if constexpr (F == QType::GGML_Q5_0) {
+        // The word of fifth bits (bit e: element e), then IQ4_NL's nibble order: elements 0-15 the low nibbles of
+        // the 16 bytes, 16-31 the high; codes q - 16.
+        const std::uint32_t fifth = ld32(b + 2) >> (8 * part);
+        const std::uint8_t* qs    = b + 6 + 8 * (part & 1);
+        const int2 v0 = fast::q5_0_values(ld32(qs), fifth, fifth), v1 = fast::q5_0_values(ld32(qs + 4), fifth >> 4, fifth >> 4);
+        o.w[0] = part >= 2 ? v0.y : v0.x;
+        o.w[1] = part >= 2 ? v1.y : v1.x;
+        o.d    = ld16(b);
     } else if constexpr (F == QType::GGML_IQ4_NL || F == QType::GGML_IQ4_XS) {
         // Elements 0-15 of a 32-element group are the low nibbles of its 16 bytes, 16-31 the high.
         const int group = F == QType::GGML_IQ4_NL ? 0 : part / 4, p = part % 4;
@@ -912,7 +922,7 @@ __device__ __forceinline__ void compute_plane(PlaneShared& sm, RowOf row_of, con
 // and returns row_bases' accumulator mode; compute_resident then computes one tile of columns
 // against them (as compute does), any number of times. Every thread of the CTA calls both.
 // The rows' raw bytes arrive by cp.async in one batch (each row from its 16-byte aligned start, in
-// sm.b, which the K loop fills only later), then every stage decodes from shared memory (tile_chunk):
+// sm.b and sm.xsum, which the K loop fills only later), then every stage decodes from shared memory (tile_chunk):
 // one global latency per tile instead of one per stage. (Decoding each stage from global memory
 // was 12 % of the IQ4_NL down tiles' stall samples, 2026-10-14.)
 template <QType F, int Stages, int Threads = kThreads, class Stage, class RowOf>
@@ -923,7 +933,12 @@ __device__ __forceinline__ Accum decode_resident(ResidentShared<Stages, Stage>& 
     constexpr int kRowChunks  = (15 + kRowBytes + 15) / 16; // 16-byte chunks from the aligned start
     constexpr int kChunks     = kTileRows * kStageSlices * 4 / Threads; // 8-element chunks per thread and stage
     static_assert(kChunks * Threads == kTileRows * kStageSlices * 4);
-    static_assert(kTileRows * kRowChunks * 16 <= static_cast<int>(sizeof(sm.b)), "a tile's raw rows fit the limb buffers");
+    // The raw rows lie in the limb buffers and, past them, the slice sums (Q5_0's 440-byte rows take both to the
+    // byte); the K loop fills either only later.
+    using Sm = ResidentShared<Stages, Stage>;
+    static_assert(offsetof(Sm, xsum) == offsetof(Sm, b) + sizeof(sm.b), "the slice sums follow the limb buffers");
+    static_assert(kTileRows * kRowChunks * 16 <= static_cast<int>(sizeof(sm.b) + sizeof(sm.xsum)),
+                  "a tile's raw rows fit the limb and slice-sum buffers");
     auto* raw = reinterpret_cast<std::uint8_t*>(&sm.b[0][0][0][0]);
     const auto offset = [&](int r) { return static_cast<int>(reinterpret_cast<std::uintptr_t>(row_of(r)) & 15U); };
     for (int i = static_cast<int>(threadIdx.x); i < kTileRows * kRowChunks; i += Threads) {

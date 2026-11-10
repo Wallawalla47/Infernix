@@ -105,6 +105,7 @@ ggml::I128 row_dot(QType q, const std::uint8_t* row, const std::int32_t* x, int 
     case QType::GGML_IQ4_XS: return dot<QType::GGML_IQ4_XS>(row, x, k);
     case QType::GGML_IQ4_NL: return dot<QType::GGML_IQ4_NL>(row, x, k);
     case QType::GGML_Q2_0: return dot<QType::GGML_Q2_0>(row, x, k);
+    case QType::GGML_Q5_0: return dot<QType::GGML_Q5_0>(row, x, k);
     default: throw std::logic_error("format");
     }
 }
@@ -353,6 +354,7 @@ void decode_row(QType q, const std::uint8_t* row, int k, double* out) {
         case QType::GGML_IQ4_XS: c = ggml::row_chunk<QType::GGML_IQ4_XS>(row, i); break;
         case QType::GGML_IQ4_NL: c = ggml::row_chunk<QType::GGML_IQ4_NL>(row, i); break;
         case QType::GGML_Q2_0: c = ggml::row_chunk<QType::GGML_Q2_0>(row, i); break;
+        case QType::GGML_Q5_0: c = ggml::row_chunk<QType::GGML_Q5_0>(row, i); break;
         default: throw std::logic_error("format");
         }
         std::int64_t mant;
@@ -875,7 +877,10 @@ INFERNIX_OP_TEST(offloaded_moe_ggml) {
         {QType::GGML_IQ2_S, QType::GGML_IQ4_NL}, {QType::GGML_IQ2_S, QType::GGML_Q2_0},
         {QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ3_XXS, QType::GGML_Q2_0},
         {QType::GGML_IQ3_S, QType::GGML_IQ4_NL}, {QType::GGML_IQ3_S, QType::GGML_Q2_0},
-        {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL}, {QType::GGML_IQ4_XS, QType::GGML_Q2_0}};
+        {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL}, {QType::GGML_IQ4_XS, QType::GGML_Q2_0},
+        {QType::GGML_IQ2_XXS, QType::GGML_Q5_0}, {QType::GGML_IQ2_XS, QType::GGML_Q5_0},
+        {QType::GGML_IQ2_S, QType::GGML_Q5_0}, {QType::GGML_IQ3_XXS, QType::GGML_Q5_0},
+        {QType::GGML_IQ3_S, QType::GGML_Q5_0}, {QType::GGML_IQ4_XS, QType::GGML_Q5_0}};
     for (const auto& [gu, down] : pairs) {
         // 9, 40 and 300 columns: calls of the wide route (tensor-core tiles for jobs over 8 columns).
         for (const int columns : {1, 3, 9, 40, 300}) { run(gu, down, columns, rng); }

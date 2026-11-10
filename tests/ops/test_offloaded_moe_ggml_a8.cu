@@ -83,6 +83,7 @@ ggml::I128 row_dot(QType q, const std::uint8_t* row, const std::int32_t* x, int 
     case QType::GGML_IQ4_XS: return dot<QType::GGML_IQ4_XS>(row, x, k);
     case QType::GGML_IQ4_NL: return dot<QType::GGML_IQ4_NL>(row, x, k);
     case QType::GGML_Q2_0: return dot<QType::GGML_Q2_0>(row, x, k);
+    case QType::GGML_Q5_0: return dot<QType::GGML_Q5_0>(row, x, k);
     default: throw std::logic_error("format");
     }
 }
@@ -426,7 +427,10 @@ INFERNIX_OP_TEST(offloaded_moe_ggml_a8) {
         {QType::GGML_IQ2_S, QType::GGML_IQ4_NL},   {QType::GGML_IQ2_S, QType::GGML_Q2_0},
         {QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ3_XXS, QType::GGML_Q2_0},
         {QType::GGML_IQ3_S, QType::GGML_IQ4_NL},   {QType::GGML_IQ3_S, QType::GGML_Q2_0},
-        {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL},  {QType::GGML_IQ4_XS, QType::GGML_Q2_0}};
+        {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL},  {QType::GGML_IQ4_XS, QType::GGML_Q2_0},
+        {QType::GGML_IQ2_XXS, QType::GGML_Q5_0}, {QType::GGML_IQ2_XS, QType::GGML_Q5_0},
+        {QType::GGML_IQ2_S, QType::GGML_Q5_0}, {QType::GGML_IQ3_XXS, QType::GGML_Q5_0},
+        {QType::GGML_IQ3_S, QType::GGML_Q5_0}, {QType::GGML_IQ4_XS, QType::GGML_Q5_0}};
     for (const auto& [gu, down] : pairs) {
         for (const int columns : {1, 3, 9, 128}) { run(gu, down, columns, rng); }
     }

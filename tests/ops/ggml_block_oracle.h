@@ -45,6 +45,18 @@ inline void decode_block(QType q, const std::uint8_t* b, double* y) {
         }
         break;
     }
+    case QType::GGML_Q5_0: { // dequantize_row_q5_0: d, qh[4], qs[16]
+        const double d = f16(u16(b));
+        std::uint32_t qh;
+        std::memcpy(&qh, b + 2, 4);
+        for (int j = 0; j < 16; ++j) {
+            const std::uint8_t xh_0 = ((qh >> (j + 0)) << 4) & 0x10;
+            const std::uint8_t xh_1 = (qh >> (j + 12)) & 0x10;
+            y[j]      = (((b[6 + j] & 0x0F) | xh_0) - 16) * d;
+            y[j + 16] = (((b[6 + j] >> 4) | xh_1) - 16) * d;
+        }
+        break;
+    }
     case QType::GGML_IQ4_XS: {
         const double d = f16(u16(b));
         const int scales_h = u16(b + 2);

@@ -728,7 +728,8 @@ INFERNIX_OP_TEST(offloaded_moe_a8_wide) {
                                              {QType::GGML_IQ2_XXS, QType::GGML_IQ4_NL},
                                              {QType::GGML_IQ2_XS, QType::GGML_Q2_0},
                                              {QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL},
-                                             {QType::GGML_IQ4_XS, QType::GGML_Q2_0}};
+                                             {QType::GGML_IQ4_XS, QType::GGML_Q2_0},
+                                             {QType::GGML_IQ3_XXS, QType::GGML_Q5_0}, {QType::GGML_IQ4_XS, QType::GGML_Q5_0}};
     bool first_pair = true;
     for (const auto& [gu, down] : pairs) {
         Bank bank;

@@ -156,6 +156,15 @@ __device__ __forceinline__ int2 iq4nl_values(std::uint32_t q4) {
                      static_cast<int>(__byte_perm(tmp[0], tmp[1], 0x7531)));
 }
 
+// Q5_0's codes q - 16 of the eight nibbles of `q4` as signed bytes: .x the low nibbles of its four bytes, their
+// fifth bits in bits 0-3 of `low5`; .y the high nibbles, theirs in bits 0-3 of `high5` (higher bits are ignored).
+// A nibble's four shifted copies 1, 2^7, 2^14, 2^21 do not overlap, as in apply_signs4.
+__device__ __forceinline__ int2 q5_0_values(std::uint32_t q4, std::uint32_t low5, std::uint32_t high5) {
+    const std::uint32_t lo = (q4 & 0x0F0F0F0FU) | ((((low5 & 0xFU) * 0x00204081U) & 0x01010101U) << 4);
+    const std::uint32_t hi = ((q4 >> 4) & 0x0F0F0F0FU) | ((((high5 & 0xFU) * 0x00204081U) & 0x01010101U) << 4);
+    return make_int2(sub_bytes4(lo, 0x10101010U), sub_bytes4(hi, 0x10101010U));
+}
+
 // The codebooks a decode reads (F's grid; IQ3_XXS's sign table too): the device tables by __ldg
 // (DeviceCodebook) or a CTA's copy in shared memory (SharedCodebook), the same values, so a decode
 // gives the same integers from either. Formats without a table read neither.
@@ -262,6 +271,20 @@ __device__ __forceinline__ Slice slice(const std::uint8_t* row, int s, const Cod
 #pragma unroll
         for (int w = 0; w < 4; ++w) {
             const int2 v = iq4nl_values(qs[w]);
+            o.q[w]     = v.x;
+            o.q[w + 4] = v.y;
+        }
+    } else if constexpr (F == QType::GGML_Q5_0) {
+        // d, the word of fifth bits (bit e: element e), 16 bytes of low nibbles (byte j: elements j and j + 16).
+        const std::uint8_t* b = row + s * 22;
+        o.d    = static_cast<std::uint16_t>(L::u16(b));
+        o.sub0 = o.sub1 = 1;
+        const std::uint32_t fifth = u32_a2<L>(b + 2);
+        std::uint32_t qs[4];
+        ld_words_a2<4, L>(b + 6, qs);
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const int2 v = q5_0_values(qs[w], fifth >> (4 * w), fifth >> (16 + 4 * w));
             o.q[w]     = v.x;
             o.q[w + 4] = v.y;
         }
@@ -446,6 +469,17 @@ __device__ __forceinline__ Chunk chunk(const std::uint8_t* row, int s, int p, co
         // Words w < 4 are the low nibbles of bytes 4w.., words 4 + w the high nibbles.
         const int w = 2 * p % 4;
         const int2 v0 = iq4nl_values(ld_u32_a2(qs + 4 * w)), v1 = iq4nl_values(ld_u32_a2(qs + 4 * w + 4));
+        o.w0 = p >= 2 ? v0.y : v0.x;
+        o.w1 = p >= 2 ? v1.y : v1.x;
+    } else if constexpr (F == QType::GGML_Q5_0) {
+        const std::uint8_t* b = row + s * 22;
+        o.d                   = static_cast<std::uint16_t>(ld_u16(b));
+        // The chunk's elements 8p..8p+7 have their fifth bits at bits 8p.. of the word; their nibbles are the low
+        // (p < 2) or high nibbles of bytes 4w..4w+7.
+        const std::uint32_t fifth = ld_u32_a2(b + 2) >> (8 * p);
+        const int w               = 2 * p % 4;
+        const int2 v0 = q5_0_values(ld_u32_a2(b + 6 + 4 * w), fifth, fifth);
+        const int2 v1 = q5_0_values(ld_u32_a2(b + 6 + 4 * w + 4), fifth >> 4, fifth >> 4);
         o.w0 = p >= 2 ? v0.y : v0.x;
         o.w1 = p >= 2 ? v1.y : v1.x;
     } else if constexpr (F == QType::GGML_Q4_K || F == QType::GGML_Q5_K) {

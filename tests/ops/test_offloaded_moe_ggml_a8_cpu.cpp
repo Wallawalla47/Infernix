@@ -650,7 +650,10 @@ INFERNIX_OP_TEST(offloaded_moe_ggml_a8_cpu) {
             {QType::GGML_IQ2_S, QType::GGML_IQ4_NL},   {QType::GGML_IQ2_S, QType::GGML_Q2_0},
             {QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ3_XXS, QType::GGML_Q2_0},
             {QType::GGML_IQ3_S, QType::GGML_IQ4_NL},   {QType::GGML_IQ3_S, QType::GGML_Q2_0},
-            {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL},  {QType::GGML_IQ4_XS, QType::GGML_Q2_0}};
+            {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL},  {QType::GGML_IQ4_XS, QType::GGML_Q2_0},
+            {QType::GGML_IQ2_XXS, QType::GGML_Q5_0}, {QType::GGML_IQ2_XS, QType::GGML_Q5_0},
+            {QType::GGML_IQ2_S, QType::GGML_Q5_0}, {QType::GGML_IQ3_XXS, QType::GGML_Q5_0},
+            {QType::GGML_IQ3_S, QType::GGML_Q5_0}, {QType::GGML_IQ4_XS, QType::GGML_Q5_0}};
         for (const auto& [gu, down] : pairs) { run(gu, down, rng); }
         check_team(rng);
     } catch (const std::exception& error) {

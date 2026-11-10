@@ -126,6 +126,16 @@ INFERNIX_GGML_HD Chunk chunk(const std::uint8_t* b, int part) {
         const std::uint8_t* qs = b + 2 + 8 * (part & 1);
         const int shift = part >= 2 ? 4 : 0;
         for (int j = 0; j < 8; ++j) { c.code[j] = INFERNIX_GGML_TABLE(kvalues_iq4nl)[(qs[j] >> shift) & 0xF]; }
+    } else if constexpr (F == QType::GGML_Q5_0) {
+        // d, a word of fifth bits (bit e: element e), then 16 bytes of low nibbles (byte j: its low nibble
+        // element j's, its high nibble element j + 16's); codes q - 16.
+        c.d = u16_at(b);
+        const std::uint32_t qh = u32_at(b + 2);
+        const std::uint8_t* qs = b + 6 + 8 * (part & 1);
+        const int shift = part >= 2 ? 4 : 0;
+        for (int j = 0; j < 8; ++j) {
+            c.code[j] = static_cast<std::int32_t>(((qs[j] >> shift) & 0xF) | (((qh >> (8 * part + j)) & 1U) << 4)) - 16;
+        }
     } else if constexpr (F == QType::GGML_IQ4_XS) {
         c.d = u16_at(b);
         const int ib = part / 4, p = part % 4;

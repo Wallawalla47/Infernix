@@ -20,7 +20,9 @@ namespace infernix::ops::offloaded_moe {
 namespace {
 
 // Slices per block (the period of the d words).
-constexpr int block_slices(QType q) { return q == QType::GGML_IQ4_NL ? 1 : q == QType::GGML_Q2_0 ? 2 : 8; }
+constexpr int block_slices(QType q) {
+    return q == QType::GGML_IQ4_NL || q == QType::GGML_Q5_0 ? 1 : q == QType::GGML_Q2_0 ? 2 : 8;
+}
 
 // The slice's X values from its limbs.
 void limbs_to_x(const CpuLimbSlice& l, std::int32_t (&x)[32]) {
@@ -101,6 +103,17 @@ inline __m256i iq4nl_codes(const std::uint8_t* qs) {
     return _mm256_set_m128i(hi, lo);
 }
 
+// Q5_0's codes q - 16 of 16 bytes' low nibbles (elements 0-15) and high nibbles (16-31); element e's fifth bit is
+// bit e of `fifth`.
+INFERNIX_TARGET("avx2")
+inline __m256i q5_0_codes(const std::uint8_t* qs, std::uint32_t fifth) {
+    const __m128i m4      = _mm_set1_epi8(0x0F);
+    const __m128i q       = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs));
+    const __m256i nibbles = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q, 4), m4), _mm_and_si128(q, m4));
+    const __m256i high    = _mm256_and_si256(sign_mask(fifth), _mm256_set1_epi8(0x10));
+    return _mm256_sub_epi8(_mm256_or_si256(nibbles, high), _mm256_set1_epi8(16));
+}
+
 // The IQ grid entries are read by scalar loads, not vpgather (microcoded and slow on hybrid CPUs'
 // efficiency cores): scalar loads measured 0.9 % faster end to end than vpgather (RTX 5090, IQ3_S
 // artifact, MTP 4 + n-gram 7 at 4K: 202.0 against 200.2 tok/s, 2026-10-16), and gathers on P-cores only
@@ -114,6 +127,11 @@ inline Decoded decode(const std::uint8_t* row, int s) {
         o.d    = u16(b);
         o.sub0 = o.sub1 = 1;
         o.q    = iq4nl_codes(b + 2);
+    } else if constexpr (F == QType::GGML_Q5_0) {
+        const std::uint8_t* b = row + static_cast<std::size_t>(s) * 22;
+        o.d    = u16(b);
+        o.sub0 = o.sub1 = 1;
+        o.q    = q5_0_codes(b + 6, u32(b + 2));
     } else if constexpr (F == QType::GGML_IQ4_XS) {
         const std::uint8_t* b = row + static_cast<std::size_t>(s / 8) * 136;
         const int ib          = s % 8;
@@ -239,7 +257,7 @@ using x86::hsum8;
 
 // Slices per unit (one int32 accumulation), and units per block.
 template <QType F>
-inline constexpr int kUnitSlices = F == QType::GGML_IQ4_NL ? 1 : F == QType::GGML_Q2_0 ? 2 : 4;
+inline constexpr int kUnitSlices = F == QType::GGML_IQ4_NL || F == QType::GGML_Q5_0 ? 1 : F == QType::GGML_Q2_0 ? 2 : 4;
 
 
 // ------------------------------------------------------------------- AVX-512 (512-bit vectors)
@@ -448,6 +466,10 @@ inline Decoded decode_block(const std::uint8_t* b, unsigned sb) {
         o.d    = u16(b);
         o.sub0 = o.sub1 = 1;
         o.q    = iq4nl_codes(b + 2);
+    } else if constexpr (F == QType::GGML_Q5_0) {
+        o.d    = u16(b);
+        o.sub0 = o.sub1 = 1;
+        o.q    = q5_0_codes(b + 6, u32(b + 2));
     } else if constexpr (F == QType::GGML_Q2_0) {
         o = decode<F>(b, static_cast<int>(sb)); // block-relative: decode<Q2_0> indexes 18-byte blocks by s / 2
     }
@@ -643,7 +665,7 @@ bool ggml_rows(CpuIsa isa, QType format, const std::uint8_t* const* mats, int ro
     switch (format) {
 #    define INFERNIX_GGML_TILED_FORMAT(Q)                                                                                   \
     case Q:                                                                                                            \
-        if constexpr (R == 1 || (Q != QType::GGML_IQ4_NL && Q != QType::GGML_Q2_0)) { /* pairs: gate/up formats */     \
+        if constexpr (R == 1 || !is_ggml_expert_down(Q)) { /* pairs: gate/up formats */                                \
             return rows_256<Q, R>(isa, mats, row_bytes, slices, row_begin, row_end, columns, ncols, out);              \
         } else {                                                                                                       \
             return false;                                                                                              \
@@ -656,6 +678,7 @@ bool ggml_rows(CpuIsa isa, QType format, const std::uint8_t* const* mats, int ro
         INFERNIX_GGML_TILED_FORMAT(QType::GGML_IQ4_XS)
         INFERNIX_GGML_TILED_FORMAT(QType::GGML_IQ4_NL)
         INFERNIX_GGML_TILED_FORMAT(QType::GGML_Q2_0)
+        INFERNIX_GGML_TILED_FORMAT(QType::GGML_Q5_0)
 #    undef INFERNIX_GGML_TILED_FORMAT
     default: return false;
     }
@@ -687,7 +710,7 @@ constexpr int kHGroups = kGgmlHSlices / a8::kDownPartials; // 5
 
 // The formats whose sub-scales are all 1: their weights are their codes.
 template <QType F>
-inline constexpr bool kUnitSub = F == QType::GGML_IQ4_NL || F == QType::GGML_Q2_0;
+inline constexpr bool kUnitSub = F == QType::GGML_IQ4_NL || F == QType::GGML_Q2_0 || F == QType::GGML_Q5_0;
 
 // A row's BF16 output from its sum p_0 (the kernels' f32_to_bf16_rn(output_f32(p_0, kappa))).
 template <QType F>
@@ -1228,7 +1251,7 @@ bool ggml_cpu_supported(const GgmlExpertFormat& format) noexcept {
     const bool gate_up = format.gate_up == QType::GGML_IQ2_XXS || format.gate_up == QType::GGML_IQ2_XS ||
                          format.gate_up == QType::GGML_IQ2_S || format.gate_up == QType::GGML_IQ3_XXS ||
                          format.gate_up == QType::GGML_IQ3_S || format.gate_up == QType::GGML_IQ4_XS;
-    const bool down    = format.down == QType::GGML_IQ4_NL || format.down == QType::GGML_Q2_0;
+    const bool down    = is_ggml_expert_down(format.down);
     return gate_up && down &&
            format.gate_row_bytes == kHidden / ggml_block_elems(format.gate_up) * ggml_block_bytes(format.gate_up) &&
            format.down_row_bytes == kIntermediate / ggml_block_elems(format.down) * ggml_block_bytes(format.down);
@@ -1273,6 +1296,7 @@ void ggml_row_sums(CpuIsa isa, QType format, const std::uint8_t* matrix, int row
         INFERNIX_GGML_FORMAT(QType::GGML_IQ4_XS)
         INFERNIX_GGML_FORMAT(QType::GGML_IQ4_NL)
         INFERNIX_GGML_FORMAT(QType::GGML_Q2_0)
+        INFERNIX_GGML_FORMAT(QType::GGML_Q5_0)
     default:
         throw std::invalid_argument("offloaded_moe ggml: not an expert format of the CPU route");
     }
@@ -1416,6 +1440,7 @@ void ggml_a8_down(CpuIsa isa, const std::uint8_t* record, const GgmlExpertFormat
         a8_down_format<QType::GGML_IQ4_NL>(isa, down, row_bytes, h, ncols, row_begin, row_end, y);
         return;
     case QType::GGML_Q2_0: a8_down_format<QType::GGML_Q2_0>(isa, down, row_bytes, h, ncols, row_begin, row_end, y); return;
+    case QType::GGML_Q5_0: a8_down_format<QType::GGML_Q5_0>(isa, down, row_bytes, h, ncols, row_begin, row_end, y); return;
     default: throw std::invalid_argument("offloaded_moe ggml: not a down format of the 8-bit route");
     }
 }

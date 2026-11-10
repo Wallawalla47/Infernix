@@ -154,7 +154,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     }
     if (is_ggml_expert_layout(layout)) {
         const QType down = ggml_expert_down_format(layout);
-        if (!is_ggml(format) || shape.size() != 3 || format == QType::GGML_IQ4_NL || format == QType::GGML_Q2_0 ||
+        if (!is_ggml(format) || shape.size() != 3 || is_ggml_expert_down(format) || format == QType::GGML_Q8_0 ||
             shape[1] % ggml_block_elems(format) || shape[2] % ggml_block_elems(down)) {
             throw std::invalid_argument(
                 "a ggml expert bank requires an IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS [experts, hidden, intermediate] "

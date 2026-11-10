@@ -114,6 +114,40 @@ def test_plain_source_shape_must_match_up_to_unit_dimensions(tmp_path):
             plain(store, "conv", (3, 4))
 
 
+def test_q8_0_rows_take_the_row_split_padding(tmp_path):
+    """A Q8_0 matrix whose K is not whole 128-element units (Unsloth's hyper-connection up matrices,
+    K = 320) is stored with the row-split layout's zero groups, its own blocks unchanged."""
+
+    from tools.artifact.codecs.row_split import encode_row_split
+    from tools.artifact.layouts import row_split_geometry
+    from tools.convert.sources.gguf_logical import ggml_matrix
+
+    rng = np.random.default_rng(5)
+    rows, k = 6, 320
+    codes = rng.integers(-127, 128, size=(rows, k // 32, 32), dtype=np.int8)
+    scales = rng.uniform(1e-3, 1.0, size=(rows, k // 32)).astype(np.float16)
+    raw = np.concatenate([scales.view(np.uint8).reshape(rows, k // 32, 2), codes.view(np.uint8)], axis=2)
+    path = tmp_path / "q8.gguf"
+    writer = gguf.GGUFWriter(str(path), "test")
+    writer.add_tensor("w", raw.reshape(rows, k // 32 * 34), raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    with GgufStore([path]) as store:
+        source = ggml_matrix(store, "w", (rows, k))
+        words = source.read_encoded(1, 5)
+        geometry = row_split_geometry("q8_g32_fp16", (4, k))
+        assert geometry.k_pad == 384 and tuple(words.codes.shape) == (4, geometry.groups_per_row, 32)
+        assert np.array_equal(words.codes[:, :10].numpy(), codes[1:5])
+        assert np.array_equal(words.scales[:, :10].numpy(), scales[1:5])
+        assert not words.codes[:, 10:].any() and not words.scales[:, 10:].any()
+        # The exact values are the stored blocks', and the padded words encode.
+        want = codes.astype(np.float64) * scales.astype(np.float64)[..., None]
+        assert np.array_equal(source.rows(0, rows).numpy().reshape(rows, k), want.reshape(rows, k))
+        assert len(encode_row_split(words.codes, words.scales, "q8_g32_fp16", (4, k))) == geometry.payload_bytes
+
+
 def test_layout_geometry():
     g = ggml_rows_geometry("ggml_q6_k", (10240, 2560))
     assert g.row_bytes == 10 * 210 and g.payload_bytes == 10240 * 2100
@@ -130,7 +164,13 @@ def test_layout_geometry():
     assert xxs.gate_row_bytes == 10 * 66 and xxs.record_bytes == 2 * 640 * 660 + 2560 * 360
     xs = ggml_expert_geometry("ggml_expert_q2_0_v1", "ggml_iq2_xs", (512, 2560, 640))
     assert xs.gate_row_bytes == 10 * 74 and xs.down_row_bytes == 10 * 18 and xs.record_stride % 4096 == 0
-    for name in ("ggml_iq2_xxs", "ggml_iq2_xs"):
+    # Unsloth's Dynamic GGUFs store most layers' down matrices in Q5_0 (22-byte blocks of 32): down matrices only.
+    q5 = ggml_expert_geometry("ggml_expert_q5_0_v1", "ggml_iq4_xs", (512, 2560, 640))
+    assert q5.gate_row_bytes == 10 * 136 and q5.down_row_bytes == 20 * 22
+    assert q5.record_bytes == 2 * 640 * 1360 + 2560 * 440 and q5.record_stride % 4096 == 0
+    with pytest.raises(ValueError):
+        ggml_expert_geometry("ggml_expert_iq4_nl_v1", "ggml_q5_0", (512, 2560, 640))
+    for name in ("ggml_iq2_xxs", "ggml_iq2_xs", "ggml_q5_0"):
         with pytest.raises(ValueError):
             ggml_rows_geometry(name, (16, 2560))
 

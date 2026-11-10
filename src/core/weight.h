@@ -50,6 +50,9 @@ enum class QType : std::uint16_t {
     // GGUF 2-bit grid formats of the GSQ-RCO IQ3_XXS imports' routed experts (gate/up only; core/ggml_format.h).
     GGML_IQ2_XXS = 25,
     GGML_IQ2_XS  = 26,
+    // GGUF Q5_0 blocks (an FP16 scale, a word of fifth bits, 16 bytes of low nibbles; codes q - 16): the down
+    // matrices of the routed experts in Unsloth's Dynamic GGUFs (down only; core/ggml_format.h).
+    GGML_Q5_0 = 27,
 };
 
 // Whether `format` is a row-scaled FP8 format (row_scale_v1: BF16 or FP32 row multipliers).
@@ -96,6 +99,8 @@ enum class QuantLayout : std::uint16_t {
     // 528-byte units per 32-element K block (512 code bytes in m16n8k32 A-fragment order, then the 16 rows'
     // UE8M0 scales), row-group major, block ascending (tools/artifact/codecs/mxfp8_expert.py).
     Mxfp8ExpertRg16 = 13,
+    // ggml_expert_q5_0_v1: ggml_expert_{iq4_nl,q2_0}_v1's records with the down rows in Q5_0.
+    GgmlExpertQ5_0 = 14,
 };
 
 // Whether `layout` stores a matrix of GGUF blocks (ggml_rows_v1 or ggml_tiles16_v1).
@@ -106,8 +111,8 @@ enum class QuantLayout : std::uint16_t {
 // Whether `layout` stores routed-expert banks (one 4 KiB-aligned record per expert).
 [[nodiscard]] constexpr bool is_expert_bank_layout(QuantLayout layout) noexcept {
     return layout == QuantLayout::ExpertRg16 || layout == QuantLayout::GgmlExpertIq4Nl ||
-           layout == QuantLayout::GgmlExpertQ2_0 || layout == QuantLayout::Fp8ExpertB128 ||
-           layout == QuantLayout::Mxfp8ExpertRg16;
+           layout == QuantLayout::GgmlExpertQ2_0 || layout == QuantLayout::GgmlExpertQ5_0 ||
+           layout == QuantLayout::Fp8ExpertB128 || layout == QuantLayout::Mxfp8ExpertRg16;
 }
 
 struct Weight {

@@ -8,7 +8,8 @@ exact binary64 values (each term has at most 26 significant bits, so binary64 ho
 These are the converter's oracles: production kernels reproduce the components, never the values.
 
 The byte layouts and formulas are llama.cpp's (``ggml-common.h``, ``ggml-quants.c``
-``dequantize_row_*``), MIT. Q2_0 is llama.cpp #24448: blocks of 64, codes ``c - 1``.
+``dequantize_row_*``), MIT. Q2_0 is llama.cpp #24448: blocks of 64, codes ``c - 1``. Q5_0 (the down
+matrices of Unsloth's Dynamic GGUFs' routed experts): blocks of 32, codes ``q - 16``.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ class GgmlType:
 
 
 Q2_0 = GgmlType("ggml_q2_0", 42, 64, 18, 1.0)
+Q5_0 = GgmlType("ggml_q5_0", 6, 32, 22, 1.0)
 Q4_K = GgmlType("ggml_q4_k", 12, 256, 144, 1.0, has_min=True)
 Q5_K = GgmlType("ggml_q5_k", 13, 256, 176, 1.0, has_min=True)
 Q6_K = GgmlType("ggml_q6_k", 14, 256, 210, 1.0)
@@ -44,7 +46,7 @@ IQ2_S = GgmlType("ggml_iq2_s", 22, 256, 82, 0.125)
 IQ4_XS = GgmlType("ggml_iq4_xs", 23, 256, 136, 1.0)
 
 GGML_TYPES = MappingProxyType(
-    {t.name: t for t in (Q2_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS)}
+    {t.name: t for t in (Q2_0, Q5_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS)}
 )
 BY_GGML_ID = MappingProxyType({t.ggml_id: t for t in GGML_TYPES.values()})
 
@@ -167,6 +169,14 @@ def decode_terms(fmt: GgmlType, raw, n: int, k: int) -> Terms:
         qs = b[:, 2:18].astype(np.int32)
         j = np.arange(64)
         code[:] = ((qs[:, j // 4] >> (2 * (j % 4))) & 3) - 1
+    elif fmt is Q5_0:
+        # d, then a word of fifth bits (bit j for element j) and 16 bytes of low nibbles: byte j's low
+        # nibble is element j's, its high nibble element j + 16's. Codes q - 16.
+        qh = _u32(b[:, 2:6])[:, 0].astype(np.int64)
+        qs = b[:, 6:22].astype(np.int32)
+        j = np.arange(16)
+        code[:, :16] = ((qs & 0xF) | (((qh[:, None] >> j) & 1) << 4).astype(np.int32)) - 16
+        code[:, 16:] = ((qs >> 4) | (((qh[:, None] >> (j + 16)) & 1) << 4).astype(np.int32)) - 16
     elif fmt is IQ4_NL:
         qs = b[:, 2:18].astype(np.int32)
         code[:, :16] = _KVALUES[qs & 0xF]

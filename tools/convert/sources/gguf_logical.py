@@ -26,15 +26,29 @@ def ggml_matrix(store: GgufStore, name: str, shape: tuple[int, int]) -> LogicalS
     k = shape[1]
 
     if t.ggml_type == GGUF_Q8_0:
-        def encoded(begin: int, end: int) -> EncodedRows:
+        def stored(begin: int, end: int) -> EncodedRows:
             codes, scales = decode_q8_0(np.ascontiguousarray(store.raw(name, begin, end)), end - begin, k)
             if (codes == -128).any():
                 raise ValueError(f"{name}: Q8_0 code -128 has no q8_g32_fp16 encoding")
             return EncodedRows("q8_g32_fp16", torch.from_numpy(codes.copy()).reshape(end - begin, k // 32, 32),
                                torch.from_numpy(scales.copy()).view(torch.float16))
 
+        def encoded(begin: int, end: int) -> EncodedRows:
+            # The row-split layout stores K in whole 128-element units: a K between them (the hyper-connection
+            # up matrices' 320 in Unsloth's GGUFs) gets the layout's zero groups, code 0 at scale 0, as a
+            # quantized matrix's padding does.
+            rows = stored(begin, end)
+            groups = -(-k // 128) * 4
+            if groups == k // 32:
+                return rows
+            codes = torch.zeros((end - begin, groups, 32), dtype=rows.codes.dtype)
+            scales = torch.zeros((end - begin, groups), dtype=torch.float16)
+            codes[:, : k // 32] = rows.codes
+            scales[:, : k // 32] = rows.scales.reshape(end - begin, k // 32)
+            return EncodedRows("q8_g32_fp16", codes, scales)
+
         def values(begin: int, end: int) -> torch.Tensor:
-            rows = encoded(begin // k, -(-end // k))
+            rows = stored(begin // k, -(-end // k))
             v = rows.codes.to(torch.float64) * rows.scales.to(torch.float64)[..., None]
             flat = v.reshape(-1)
             start = begin - begin // k * k
