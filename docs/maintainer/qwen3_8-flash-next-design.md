@@ -10709,6 +10709,12 @@ route's bits follow the chunk grid (perplexity 4.1436 / 4.1440 / 4.1288 / 4.1441
 - The 27B chunked GDN value tile 16 instead of the heuristic's 64 at 48 value heads (giveen's survey):
   op 96.9 against 105.1 µs at 1,024 tokens and 386 against 392 at 4,096, bit-identical, but pp16384
   12,100 against 12,217 tok/s (−0.9 %, two ABBA rounds).
+  Re-tested 2026-11-10 with the stripe forced by a temporary switch (same output hash everywhere): under
+  the 27B's f16-accumulate arithmetic the op is 2 % slower at 1,024 tokens and 14 % at 3,584; under the
+  compensated arithmetic it is 8-12 % faster at 1,024-16,384 tokens (stripe 32: 2-3 % slower, 8: 11-13 %
+  slower). End to end the 27B NVFP4's prefill is 1.2 % slower at stripe 16 on the default route and
+  0.8-1.1 % slower on `--reproducible`; FP4-Local's cold-cache runs did not resolve it. The op bench
+  has the SMs the 64-wide stripes leave free to itself and the model does not, so the heuristic stays.
 
 **Adopted elsewhere:** the 35B Q8 GDN decode GEMV at four blocks per SM (giveen 310d3bf18):
 bit-identical greedy output, plain decode 397.4 → 398.6 tok/s (every four-block run ahead).
@@ -11595,6 +11601,11 @@ with sixteen warps -3.7 .. -8.3 % and -13.6 .. -14.6 % on the Q6_K `ssm_out`, wi
 staged experts (the call waits on the link) -0.1 .. -2.6 %. IQ3_S prefill from a cold expert cache,
 dense tiles alone: pp4096 -0.6 % (inside the runs' spread), pp16384 -1.9 %. The plane's stage images
 are 1.58x the `CodeStage` planes' bytes, so slabs split earlier (at even row tiles).
+
+The same re-shaping does not carry to the BF16 A16 TMA tile (`Bf16A16TmaTailMmaSchedule<128, 128, 64, 32, 3>`,
+eight consumer warps that only load and multiply): `bf16_flash_next_sweep` on gdnqkvz / qkvg / plekv /
+out6144 at 512-8,192 columns measured sixteen warps of 32 x 32 +1.4 .. +5.7 % and of 64 x 16 +2.5 ..
++5.7 % (slower at every point, 2026-11-10).
 
 **Pitfall.** With about 79 GiB of RAM free, the n-gram table's automatic residency flipped between
 runs (read from its volume, or 27.8 GiB pinned while the first test ran), costing that test 25 %;

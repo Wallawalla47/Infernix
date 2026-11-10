@@ -89,6 +89,7 @@ struct BenchRow {
     double stage_share_pct            = -1.0;
     double relative_to_e2e_pct        = -1.0;
     ColdTiming timing{};
+    std::uint64_t output_fnv = 0; // FNV-1a of the output and the final state (prefill rows' first line)
 };
 
 struct TrafficBytes {
@@ -617,6 +618,15 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
             : force_recurrent ? "forced.recurrent"
                               : "public.total",
             total_io, pipeline, running_logical_bytes(problem));
+    {
+        std::uint64_t hash = 0xcbf29ce484222325ULL;
+        for (const Tensor* tensor : {&out, &so}) {
+            std::vector<std::uint8_t> produced(tensor->bytes());
+            bench::read_back(produced.data(), tensor->data, produced.size());
+            for (const std::uint8_t byte : produced) { hash = (hash ^ byte) * 0x100000001b3ULL; }
+        }
+        rows[0].output_fnv = hash;
+    }
     if (options.breakdown && chunked) {
         measure("chunked.prepare", prep_io, prepare, 0);
         measure("chunked.recurrence", rec_io, recurrence, 0);
@@ -677,6 +687,7 @@ void print_row(const BenchRow& row, const Options& options) {
     if (row.relative_to_e2e_pct >= 0.0) {
         std::printf(" e2e_ratio=%6.2f%%", row.relative_to_e2e_pct);
     }
+    if (row.output_fnv != 0) { std::printf(" output_fnv=%016llx", static_cast<unsigned long long>(row.output_fnv)); }
     std::printf("\n  bytes logical=%7.2f MiB traffic=%7.2f MiB intermediate=%7.2f MiB"
                 " | bandwidth logical=%8.1f GB/s traffic=%8.1f GB/s"
                 "\n  %s\n",

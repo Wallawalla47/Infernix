@@ -585,6 +585,12 @@ int value_tile(int value_heads, int multiprocessor_count) {
     // Small grids need the narrowest stripe. Otherwise use fixed relative tile costs
     // to weight the SM-wave count. These are launch-heuristic weights, not measured latency.
     // Wider stripes reduce replicated packet reads but retain more state per CTA.
+    // RTX 5090, 2026-11-10 (gated_delta_net_bench, 16 / 48 heads, same output hash): the weights match
+    // Fp16Accumulate (stripe 16 +2 % at 1,024 tokens, +14 % at 3,584). Under Compensated the op alone is 8-12 %
+    // faster at stripe 16 (32: +2-3 %, 8: +11-13 %), but the 27B's prefill is 1.2 % slower with it on the
+    // default route and 0.8-1.1 % slower on --reproducible, as on 2026-10-16: the op bench has the 74 SMs the
+    // 64-wide stripes leave free to itself, the model does not. 32 value heads: stripe 16 is 9-12 % slower than
+    // 32 at the op.
     if (static_cast<std::int64_t>(value_heads) * 16 <= multiprocessor_count) return 8;
     int best               = 64;
     std::int64_t best_work = INT64_MAX;
