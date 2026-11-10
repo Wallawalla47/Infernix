@@ -113,6 +113,7 @@ struct Result {
     CacheState cache;
     Stats stats;
     std::size_t workspace_bytes;
+    std::uint64_t output_fnv;
 };
 
 const char* codec_name(CodecProfile profile) {
@@ -606,6 +607,16 @@ public:
                         destination_tensor_, workspace_, execution_.on_stream(stream));
     }
 
+    // FNV-1a of the destination's bytes (after a launch has completed on `stream`).
+    [[nodiscard]] std::uint64_t output_fnv(cudaStream_t stream) const {
+        std::vector<std::uint8_t> produced(destination_.bytes);
+        CUDA_CHECK(cudaMemcpyAsync(produced.data(), destination_.p, produced.size(), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::uint64_t hash = 0xcbf29ce484222325ULL;
+        for (const std::uint8_t byte : produced) { hash = (hash ^ byte) * 0x100000001b3ULL; }
+        return hash;
+    }
+
 private:
     BenchmarkWeights& fixture_;
     DeviceExecutionView execution_;
@@ -739,6 +750,7 @@ std::vector<Result> run_point(BenchmarkWeights& fixture, CodecProfile profile, s
     state.prepare(CacheState::Warm, stream);
     state.launch(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::uint64_t output_fnv = state.output_fnv(stream);
 
     BodyTimedGraph graph;
     if (options.execution != Execution::Eager) {
@@ -760,7 +772,7 @@ std::vector<Result> run_point(BenchmarkWeights& fixture, CodecProfile profile, s
                     : measure_eager(state, cache, stream, options.warmup, options.repeat);
             results.push_back({profile, tokens, options.distribution, options.seed,
                                pattern.unique_experts, pattern.adjacent_overlap, execution, cache,
-                               stats, state.workspace_bytes()});
+                               stats, state.workspace_bytes(), output_fnv});
         }
     }
     return results;
@@ -773,12 +785,12 @@ void print_result(const Result& result, double peak_memory_gbps) {
     const double tflops                = logical_flops(result.tokens) / seconds / 1.0e12;
     std::printf("%-6s T=%-5d %-11s U=%-3d ov=%4.1f %-12s %-4s "
                 "median=%8.3f us min=%8.3f us p95=%8.3f us "
-                "unique_weight=%7.1f GB/s (%4.1f%% peak) logical=%6.2f TFLOP/s workspace=%zu\n",
+                "unique_weight=%7.1f GB/s (%4.1f%% peak) logical=%6.2f TFLOP/s workspace=%zu output_fnv=%016llx\n",
                 codec_name(result.codec), result.tokens, distribution_name(result.distribution),
                 result.unique_experts, result.adjacent_overlap, execution_name(result.execution),
                 cache_name(result.cache), result.stats.median_us, result.stats.min_us,
                 result.stats.p95_us, useful_weight_gbps, useful_weight_percent, tflops,
-                result.workspace_bytes);
+                result.workspace_bytes, static_cast<unsigned long long>(result.output_fnv));
 }
 
 void write_csv(const std::string& path, const std::vector<Result>& results, const Options& options,

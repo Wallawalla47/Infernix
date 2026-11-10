@@ -736,14 +736,17 @@ INFERNIX_OP_TEST(sparse_moe) {
 
     // These are public-behavior cases, not route assertions. They exercise decode (T=1), the
     // Small-T supported-domain edges, each profile's first prefill T, the wide-prefill boundary,
-    // and one call crossing the 4096-token internal slice without observing any private plan.
-    constexpr std::array<std::int32_t, 34> kQ4Q5Tokens{
+    // a wide slice of the low-bit profiles (2,880 tokens), and one call crossing the 4096-token internal slice
+    // without observing any private plan.
+    constexpr std::array<std::int32_t, 35> kQ4Q5Tokens{
+        {1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,  17,  18,
+         19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 768, 2880, 4097}};
+    constexpr std::array<std::int32_t, 34> kQ4Q6Tokens{
         {1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,  17,
-         18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 768, 4097}};
-    constexpr std::array<std::int32_t, 33> kQ4Q6Tokens{
+         18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 768, 2880}};
+    constexpr std::array<std::int32_t, 33> kW8W8Tokens{
         {1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17,
          18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 768}};
-    constexpr auto kW8W8Tokens = kQ4Q6Tokens;
     constexpr std::array<std::int32_t, 7> kWideTokens{{32, 33, 46, 47, 48, 63, 64}};
     std::array<CodecProfile, 3> profiles{{
         {"sparse_moe q4+q5 a16", QType::Q4_G64_FP16, QType::Q5_G64_FP16, kQ4Q5Tokens, true},

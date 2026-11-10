@@ -20,6 +20,9 @@ inline constexpr std::int32_t kSparseMoePrefillQ4Q6Min      = 47;
 inline constexpr std::int32_t kSparseMoePrefillQ8Q8Min      = 20;
 inline constexpr std::int32_t kSparseMoePrefillWideMin      = 768;
 inline constexpr std::int32_t kSparseMoePrefillSliceMax     = 4096;
+// The smallest slice whose Q4 + Q5 / Q6 routed experts take the staging-ring plan (128-column jobs): from here
+// both trace-like and uniform routing gain (sparse_moe_prefill_kernels.cu records the measurement).
+inline constexpr std::int32_t kSparseMoePrefillRingMin      = 2880;
 inline constexpr std::int32_t kSparseMoeRouteTileTokens     = 8;
 // 257 logits padded to a 16-byte-aligned per-token stride.
 inline constexpr std::int32_t kSparseMoeRouterScoreRows = 260;

@@ -6,8 +6,12 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/rowsplit_mma.cuh"
+#include "ops/common/rowsplit_ring.cuh"
+#include "ops/linear/common/rowsplit_ring_linear.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
+#include "ops/linear/q5/q5_ring_codec.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
+#include "ops/linear/q6/q6_ring_codec.cuh"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
 #include "ops/sparse_moe/sparse_moe_route.cuh"
@@ -313,8 +317,10 @@ enum class GateUpRoute { Any, Spread, Packed };
 constexpr int kGateUpDeepJobsNum = 7;
 constexpr int kGateUpDeepJobsDen = 4;
 
+// RingTails: the job list holds 128-column jobs (the staging-ring plan below) and this kernel takes only those of at
+// most ExpertBN columns; the ring kernel takes the rest.
 template <int ExpertWarps, int ExpertBN, int Stages = kExpertStages,
-          GateUpRoute Route = GateUpRoute::Any>
+          GateUpRoute Route = GateUpRoute::Any, bool RingTails = false>
 __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gate_up_kernel(
     const __nv_bfloat16* __restrict__ x, const int* __restrict__ packed_token,
     const int* __restrict__ expert_offsets, const int* __restrict__ route_job_experts,
@@ -364,6 +370,9 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
         const int count       = expert_offsets[expert + 1] - begin;
         const int column_base = route_job_columns[route_job];
         const int cols        = count - column_base < ExpertBN ? count - column_base : ExpertBN;
+        if constexpr (RingTails) {
+            if (count - column_base > ExpertBN) { continue; }
+        }
         // A thread stages the same columns of all kHidden / kExpertBK tiles, so it resolves their
         // rows once for the whole job instead of reading the map and redoing the row multiply per
         // tile. A column past the tile is clamped onto a live one and then zero-filled.
@@ -794,7 +803,7 @@ struct Q6DownMma {
     }
 };
 
-template <class Codec, int ExpertWarps, int ExpertBN>
+template <class Codec, int ExpertWarps, int ExpertBN, bool RingTails = false>
 __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_down_kernel(
     const __nv_bfloat16* __restrict__ activation, const int* __restrict__ expert_offsets,
     const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
@@ -833,6 +842,9 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
         const int count       = expert_offsets[expert + 1] - begin;
         const int column_base = route_job_columns[route_job];
         const int cols        = count - column_base < ExpertBN ? count - column_base : ExpertBN;
+        if constexpr (RingTails) {
+            if (count - column_base > ExpertBN) { continue; }
+        }
         float acc[4][4]       = {};
 
         auto stage_scales = [&] {
@@ -969,6 +981,227 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
             }
         }
         __syncthreads();
+    }
+}
+
+// ----------------------------------------------------------------------------- staging-ring routed experts
+//
+// The wide plan's routed GEMMs on the staging ring (ops/common/rowsplit_ring.cuh): four producer warps copy a
+// job's activation columns and decode its weight codes while sixteen tensor-core warps multiply, instead of every
+// warp stopping for a decode pass and three barriers per K tile. A route job is one expert's column tile of 128
+// (the scan's job width); a work item is a job's 128-row block; a persistent CTA runs its work items in turn on
+// one ring, counting the K tiles it has carried. A ring CTA owns its SM (98 KB of shared memory), so a job of at
+// most 64 columns (an expert's tail, or an expert the prompt rarely routes to) would leave most of the SM's warps
+// idle: the 64-column kernels above run those from the same job list (RingTails), three CTAs an SM. The arithmetic
+// is the barrier-synchronised kernels': the gate/up keeps its codes unscaled and adds each K tile's partial times
+// the group's scale; the down folds the scale into the decoded BF16 weights. Same FP32 chains, so the same bits.
+//
+// Measured 2026-11-10 (RTX 5090, whole Op, graph replay, cold L2; kSparseMoePrefillRingMin comes from these):
+// against the 64-column plan, slices of 3,264 / 3,680 / 4,096 tokens take -4.8 / -3.8 / -5.6 % on trace-like
+// routing, -5.6 / -6.4 / -3.9 % on uniform routing and -7.3 / -12.1 / -9.5 % when eight experts take every token;
+// below about 2,400 tokens the two kernels in sequence each under-fill the GPU (+17 % at 768 on trace-like routing).
+// Rejected forms: the ring for every job (+26 % at 1,024 tokens), small jobs of 32 or 48 columns (+1..+8 % on
+// trace-like routing against 64), and a 128 x 64 ring tile at two CTAs an SM (-2 % at best, +12 % at 768).
+// End to end on the 35B: prefill -3.0 % at 16,384 tokens, -0.75 % at 4,096.
+
+using ExpertRingTile                       = RowSplitRingTile128;
+inline constexpr int kExpertRingScaleBytes = ExpertRingTile::BM * static_cast<int>(sizeof(std::uint16_t));
+using ExpertGateUpRing =
+    RowSplitRing<ExpertRingTile, kRowSplitRingStages, kRowSplitRingProducerWarps, kExpertRingScaleBytes>;
+using ExpertDownRing = RowSplitRing<ExpertRingTile, kRowSplitRingStages, kRowSplitRingProducerWarps>;
+static_assert(ExpertRingTile::BM == 2 * kExpertBM && ExpertRingTile::BN == 2 * kExpertBN,
+              "a ring job is two of the 64-column plan's tiles each way");
+
+// A gate/up tile's 128 rows are two warp tiles of 32 gate rows then their 32 up rows, so a thread holds both
+// halves of its SiLU(gate) * up products. Codes stay unscaled (Q4MmaDecodeAtom::decode_eight); the group's scale
+// goes to the stage's extra bytes.
+struct ExpertGateUpRingCodec {
+    const std::uint8_t* codes;
+    const std::uint8_t* scales;
+    int expert;
+    int logical0;
+
+    struct Raw {
+        uint4 codes;
+        std::uint16_t scale; // FP16 bits
+    };
+
+    __device__ __forceinline__ Raw load(int row, int k_tile, int half) const {
+        constexpr int kWarpRows = ExpertRingTile::WM;
+        const int within        = row % kWarpRows;
+        const int logical       = logical0 + (row / kWarpRows) * (kWarpRows / 2) + (within % (kWarpRows / 2));
+        const std::int64_t global =
+            static_cast<std::int64_t>(expert) * (2 * kIntermediate) + logical +
+            (within >= kWarpRows / 2 ? kIntermediate : 0);
+        const std::int64_t group = global * (kHidden / 64) + k_tile;
+        Raw raw;
+        raw.codes = load_vec<uint4>(codes + group * Q4RowSplitStorage::kCodeBytesPerGroup + half * 16);
+        raw.scale = half == 0 ? *reinterpret_cast<const std::uint16_t*>(
+                                    scales + group * Q4RowSplitStorage::kScaleBytesPerGroup)
+                              : std::uint16_t{0};
+        return raw;
+    }
+
+    __device__ __forceinline__ void decode(const Raw& raw, unsigned (&pairs)[16]) const {
+        const unsigned words[4] = {raw.codes.x, raw.codes.y, raw.codes.z, raw.codes.w};
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            unsigned out[4];
+            Q4MmaDecodeAtom::decode_eight(words[w], out);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { pairs[4 * w + i] = out[i]; }
+        }
+    }
+
+    __device__ __forceinline__ void publish(const Raw& raw, int row, int half, unsigned char* extra) const {
+        if (half == 0) { reinterpret_cast<std::uint16_t*>(extra)[row] = raw.scale; }
+    }
+};
+
+__global__ __launch_bounds__(ExpertGateUpRing::kThreads, 1) void sparse_moe_prefill_q4_gate_up_ring_kernel(
+    const __nv_bfloat16* __restrict__ x, const int* __restrict__ packed_token,
+    const int* __restrict__ expert_offsets, const int* __restrict__ route_job_experts,
+    const int* __restrict__ route_job_columns, const int* __restrict__ route_job_count,
+    const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
+    __nv_bfloat16* __restrict__ activation) {
+    using Ring = ExpertGateUpRing;
+    using Tile = ExpertRingTile;
+    constexpr int kTileLogicalRows = Tile::BM / 2; // gate rows (and up rows) of a tile
+    constexpr int kRowBlocks       = kIntermediate / kTileLogicalRows;
+    constexpr int kKTiles          = kHidden / Tile::BK;
+    constexpr int kCopies          = Tile::BN * (Tile::BK / 8) / Ring::kProducerThreads;
+    static_assert(kCopies * Ring::kProducerThreads == Tile::BN * (Tile::BK / 8) && Ring::kProducerThreads % 8 == 0,
+                  "a producer thread's copies of a K tile are the same tokens every K tile");
+    Ring::init();
+
+    const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
+    const int total_work = *route_job_count * kRowBlocks;
+    int tile0            = 0;
+    for (int work = static_cast<int>(blockIdx.x); work < total_work; work += static_cast<int>(gridDim.x)) {
+        const int route_job   = work / kRowBlocks;
+        const int row_block   = work - route_job * kRowBlocks;
+        const int expert      = route_job_experts[route_job];
+        const int logical0    = row_block * kTileLogicalRows;
+        const int begin       = expert_offsets[expert];
+        const int count       = expert_offsets[expert + 1] - begin;
+        const int column_base = route_job_columns[route_job];
+        const int cols        = count - column_base < Tile::BN ? count - column_base : Tile::BN;
+        if (cols <= kExpertBN) { continue; } // the 64-column kernel's job
+        const int first = tile0;
+        tile0 += kKTiles;
+
+        if (Ring::producer()) {
+            // Copy `ordinal` of this thread is token p / 8 + 16 * ordinal of the tile at every K tile: its row
+            // of x is resolved once per job.
+            const int p = tid - Ring::kConsumerThreads;
+            const __nv_bfloat16* row[kCopies];
+#pragma unroll
+            for (int i = 0; i < kCopies; ++i) {
+                const int token = (p + i * Ring::kProducerThreads) / (Tile::BK / 8);
+                row[i] = x + static_cast<std::int64_t>(packed_token[begin + column_base + (token < cols ? token : 0)]) *
+                                 kHidden;
+            }
+            Ring::produce_from(
+                ExpertGateUpRingCodec{codes, scales, expert, logical0},
+                [&](int ordinal, int, int k_offset) -> const __nv_bfloat16* { return row[ordinal] + k_offset; }, cols,
+                kKTiles, first);
+            continue;
+        }
+
+        const int wm = warp / Tile::WARPS_N, wn = warp % Tile::WARPS_N;
+        const bool active = wn * Tile::WN < cols;
+        float acc[Tile::MT][Tile::NT][4] = {};
+        Ring::consume_scaled(acc, kKTiles, first, active);
+        if (!active) { continue; }
+        const int gid = lane >> 2, lid = lane & 3;
+#pragma unroll
+        for (int mi = 0; mi < Tile::MT / 2; ++mi) {
+            const int row0 = logical0 + wm * (Tile::WM / 2) + mi * 16 + gid;
+#pragma unroll
+            for (int ni = 0; ni < Tile::NT; ++ni) {
+                const int local = wn * Tile::WN + ni * 8 + 2 * lid;
+                auto* out = activation + static_cast<std::int64_t>(begin + column_base + local) * kIntermediate + row0;
+                if (local < cols) {
+                    out[0] = __float2bfloat16_rn(silu(acc[mi][ni][0]) * acc[mi + Tile::MT / 2][ni][0]);
+                    out[8] = __float2bfloat16_rn(silu(acc[mi][ni][2]) * acc[mi + Tile::MT / 2][ni][2]);
+                }
+                if (local + 1 < cols) {
+                    out[kIntermediate]     = __float2bfloat16_rn(silu(acc[mi][ni][1]) * acc[mi + Tile::MT / 2][ni][1]);
+                    out[kIntermediate + 8] = __float2bfloat16_rn(silu(acc[mi][ni][3]) * acc[mi + Tile::MT / 2][ni][3]);
+                }
+            }
+        }
+    }
+}
+
+// The routed down on the ring: 128 output rows by a job's 128 columns over K = 512, weights through the Q5 / Q6
+// ring codec (the scale folded into the BF16 weights, as Q5MmaDecodeAtom / Q6MmaDecodeAtom::decode_eight).
+template <template <class> class Codec>
+__global__ __launch_bounds__(ExpertDownRing::kThreads, 1) void sparse_moe_prefill_qx_down_ring_kernel(
+    const __nv_bfloat16* __restrict__ activation, const int* __restrict__ expert_offsets,
+    const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
+    const int* __restrict__ route_job_count, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
+    __nv_bfloat16* __restrict__ output) {
+    using Ring = ExpertDownRing;
+    using Tile = ExpertRingTile;
+    constexpr int kRowBlocks = kHidden / Tile::BM;
+    constexpr int kKTiles    = kIntermediate / Tile::BK;
+    Ring::init();
+
+    const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
+    const int total_work = *route_job_count * kRowBlocks;
+    int tile0            = 0;
+    for (int work = static_cast<int>(blockIdx.x); work < total_work; work += static_cast<int>(gridDim.x)) {
+        const int route_job   = work / kRowBlocks;
+        const int row_block   = work - route_job * kRowBlocks;
+        const int expert      = route_job_experts[route_job];
+        const int row0        = row_block * Tile::BM;
+        const int begin       = expert_offsets[expert];
+        const int count       = expert_offsets[expert + 1] - begin;
+        const int column_base = route_job_columns[route_job];
+        const int cols        = count - column_base < Tile::BN ? count - column_base : Tile::BN;
+        if (cols <= kExpertBN) { continue; } // the 64-column kernel's job
+        const int first = tile0;
+        tile0 += kKTiles;
+
+        if (Ring::producer()) {
+            const auto row_of = [&](int row) -> std::int64_t {
+                return static_cast<std::int64_t>(expert) * kHidden + row0 + row;
+            };
+            const __nv_bfloat16* columns = activation + static_cast<std::int64_t>(begin + column_base) * kIntermediate;
+            Ring::produce_from(
+                Codec<decltype(row_of)>{codes, high, scales, kKTiles, kKTiles, row_of},
+                [&](int, int token, int k_offset) -> const __nv_bfloat16* {
+                    return columns + static_cast<std::int64_t>(token) * kIntermediate + k_offset;
+                },
+                cols, kKTiles, first);
+            continue;
+        }
+
+        const int wm = warp / Tile::WARPS_N, wn = warp % Tile::WARPS_N;
+        const bool active = wn * Tile::WN < cols;
+        float acc[Tile::MT][Tile::NT][4] = {};
+        Ring::consume_run(acc, kKTiles, first, active);
+        if (!active) { continue; }
+        const int gid = lane >> 2, lid = lane & 3;
+#pragma unroll
+        for (int mi = 0; mi < Tile::MT; ++mi) {
+            const int row = row0 + wm * Tile::WM + mi * 16 + gid;
+#pragma unroll
+            for (int ni = 0; ni < Tile::NT; ++ni) {
+                const int local = wn * Tile::WN + ni * 8 + 2 * lid;
+                auto* out       = output + static_cast<std::int64_t>(begin + column_base + local) * kHidden + row;
+                if (local < cols) {
+                    out[0] = __float2bfloat16_rn(acc[mi][ni][0]);
+                    out[8] = __float2bfloat16_rn(acc[mi][ni][2]);
+                }
+                if (local + 1 < cols) {
+                    out[kHidden]     = __float2bfloat16_rn(acc[mi][ni][1]);
+                    out[kHidden + 8] = __float2bfloat16_rn(acc[mi][ni][3]);
+                }
+            }
+        }
     }
 }
 
@@ -1232,7 +1465,12 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         CUDA_CHECK(cudaGetLastError());
 
         const bool wide_plan   = tokens >= kSparseMoePrefillWideMin;
-        const int route_job_bn = wide_plan ? 64 : 32;
+        const bool routed_q4_qx =
+            weights.routed_gate_up.qtype == QType::Q4_G64_FP16 &&
+            (weights.routed_down.qtype == QType::Q5_G64_FP16 || weights.routed_down.qtype == QType::Q6_G64_FP16);
+        // The staging-ring plan: 128-column jobs, the ring kernels for those above 64 columns.
+        const bool ring        = routed_q4_qx && tokens >= kSparseMoePrefillRingMin;
+        const int route_job_bn = ring ? ExpertRingTile::BN : wide_plan ? 64 : 32;
         // The scan emits one route job per nonempty column tile of an expert, so it cannot
         // emit more than one job per full tile of assignments plus one tail per expert --
         // the same bound the workspace is sized by. Each job expands into row blocks, and
@@ -1242,6 +1480,11 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         const int max_route_jobs   = assignments / route_job_bn + kExperts;
         const int routed_gate_work = max_route_jobs * (kIntermediate / (kExpertBM / 2));
         const int routed_down_work = max_route_jobs * (kHidden / kExpertBM);
+        // The ring's work items are 128-row blocks of the same jobs.
+        const int ring_gate_blocks =
+            static_cast<int>(std::min<std::int64_t>(routed_gate_work / 2, max_prefill_blocks));
+        const int ring_down_blocks =
+            static_cast<int>(std::min<std::int64_t>(routed_down_work / 2, max_prefill_blocks));
         const int routed_gate_blocks =
             static_cast<int>(std::min<std::int64_t>(routed_gate_work, max_prefill_blocks));
         const int routed_down_blocks =
@@ -1277,7 +1520,18 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
 
         const dim3 routed_gate_grid(kIntermediate / (kExpertBM / 2), kExperts);
         // Same predicate that decided whether packed_token was written above.
-        if (routed_gate_up_q4) {
+        if (ring) {
+            sparse_moe_prefill_q4_gate_up_ring_kernel
+                <<<ring_gate_blocks, ExpertGateUpRing::kThreads,
+                   rowsplit_ring_reserve<sparse_moe_prefill_q4_gate_up_ring_kernel, ExpertGateUpRing::kSharedBytes>(),
+                   stream>>>(input, packed_token, offsets, route_job_experts, route_job_columns, route_job_count,
+                             routed_gate_codes, routed_gate_scales, routed_activation);
+            CUDA_CHECK(cudaGetLastError());
+            sparse_moe_prefill_q4_gate_up_kernel<8, 64, kExpertStages, GateUpRoute::Any, true>
+                <<<routed_gate_blocks, 8 * 32, 0, stream>>>(
+                    input, packed_token, offsets, route_job_experts, route_job_columns, route_job_count,
+                    routed_gate_codes, routed_gate_scales, routed_activation);
+        } else if (routed_gate_up_q4) {
             if (wide_plan) {
                 sparse_moe_prefill_q4_gate_up_kernel<8, 64>
                     <<<routed_gate_blocks, 8 * 32, 0, stream>>>(
@@ -1322,7 +1576,19 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         const dim3 routed_down_grid(kHidden / kExpertBM, kExperts);
         switch (weights.routed_down.qtype) {
         case QType::Q5_G64_FP16:
-            if (wide_plan) {
+            if (ring) {
+                sparse_moe_prefill_qx_down_ring_kernel<Q5RingCodec>
+                    <<<ring_down_blocks, ExpertDownRing::kThreads,
+                       rowsplit_ring_reserve<sparse_moe_prefill_qx_down_ring_kernel<Q5RingCodec>,
+                                             ExpertDownRing::kSharedBytes>(),
+                       stream>>>(routed_activation, offsets, route_job_experts, route_job_columns, route_job_count,
+                                 routed_down_codes, routed_down_high, routed_down_scales, grouped_io);
+                CUDA_CHECK(cudaGetLastError());
+                sparse_moe_prefill_qx_down_kernel<Q5DownMma, 8, 64, true>
+                    <<<routed_down_blocks, 8 * 32, 0, stream>>>(
+                        routed_activation, offsets, route_job_experts, route_job_columns, route_job_count,
+                        routed_down_codes, routed_down_high, routed_down_scales, grouped_io);
+            } else if (wide_plan) {
                 sparse_moe_prefill_qx_down_kernel<Q5DownMma, 8, 64>
                     <<<routed_down_blocks, 8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
@@ -1337,7 +1603,19 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             }
             break;
         case QType::Q6_G64_FP16:
-            if (wide_plan) {
+            if (ring) {
+                sparse_moe_prefill_qx_down_ring_kernel<Q6RingCodec>
+                    <<<ring_down_blocks, ExpertDownRing::kThreads,
+                       rowsplit_ring_reserve<sparse_moe_prefill_qx_down_ring_kernel<Q6RingCodec>,
+                                             ExpertDownRing::kSharedBytes>(),
+                       stream>>>(routed_activation, offsets, route_job_experts, route_job_columns, route_job_count,
+                                 routed_down_codes, routed_down_high, routed_down_scales, grouped_io);
+                CUDA_CHECK(cudaGetLastError());
+                sparse_moe_prefill_qx_down_kernel<Q6DownMma, 8, 64, true>
+                    <<<routed_down_blocks, 8 * 32, 0, stream>>>(
+                        routed_activation, offsets, route_job_experts, route_job_columns, route_job_count,
+                        routed_down_codes, routed_down_high, routed_down_scales, grouped_io);
+            } else if (wide_plan) {
                 sparse_moe_prefill_qx_down_kernel<Q6DownMma, 8, 64>
                     <<<routed_down_blocks, 8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
