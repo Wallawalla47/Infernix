@@ -265,7 +265,7 @@ lane a group (320 groups over 256 lanes: two rounds, where four lanes a group ta
 slower). The NVIDIA NVFP4 27B's MLP takes 100.7 against 105.9 us a layer in DFlash2 rounds (Nsight Systems), and
 its DFlash2 decode runs +0.26 to +0.31 % faster (INT8 KV, -p 512 -n 256, ABBA x3; 2026-11-09).
 
-Prompt calls of 256 columns or more where the MLP runs one-term A4 activations (`AllowA4`: both NVFP4 27B
+Prompt calls of 129 columns or more (256 until 2026-11-10) where the MLP runs one-term A4 activations (`AllowA4`: both NVFP4 27B
 artifacts' prompt routes) take the same Op's prompt profile (since 2026-11-09): the norm kernel writes the gate/up
 projection's one plane with its scales in the TMA tile's 256-token tiles, the gate/up projection's TMA GEMM encodes
 its SwiGLU product as the down projection's plane (scales row-major to 512 columns, where the down projection runs
@@ -275,6 +275,35 @@ ids on the NVIDIA and official artifacts at ~2,000 and ~20,000-token prompts ide
 a 4,096-token prompt spent 4.6 ms in the product's quantizer and 0.8 ms in the input's (63 layers, of 309 ms of
 kernels; Nsight Systems). Prefill (INT8 KV, `infernix_bench -p N -n 1`, ABBA x3, 2026-11-09): NVIDIA NVFP4 pp1024
 +0.09 to +0.24 %, pp4096 +1.15 to +1.25 %, pp16384 +1.14 to +1.21 %; official NVFP4 pp4096 +0.98 to +1.09 %.
+
+Prompt widths that are not tile multiples (2026-11-10). The 27B's prefill time was a staircase: about 20 us a token
+inside a step and +5 to +7 ms where a width crossed 128, 256, 512 or 1,024 columns, because a partly filled last
+token tile ran a full tile's tensor-core work in every warp (the gate/up projection is 272 CTAs a token tile, 1.6
+waves of one CTA an SM). Three changes, official NVFP4 artifact, INT8 KV, baseline binaries against new, A B B A
+x2:
+
+- The NVFP4 A4 and FP8 A8 TMA kernels skip the tensor-core steps of 16-token fragments past the call. Their sums
+  were never stored, and each stored output keeps its K order, so no bit changes. The NVFP4 kernel has one
+  instance of its K loop per live count (`with_static_count`, `ops/common/mma.cuh`); the FP8 kernel skips only
+  warps with no live column. Two forms that lost: a run-time bound read inside the unrolled loops (the
+  accumulators left the registers: partly filled FP8 launches took 4 to 5.6 times as long), and FP8 warps with
+  some live fragments beside full ones (the 96x256 tile 17 % slower at 257-272 columns, the 192x128 tile 6 %
+  slower at 145; cause not found).
+- The fused MLP's prompt profile and the standalone gate/up's TMA route start at 129 columns: one partly filled
+  256-token tile instead of two 128-token MMA tiles (gate/up 142-153 -> 101-109 us at 129-255 columns). A cut at
+  97 or 65 columns measured 5-7 % slower at 72-120 tokens. Same bits.
+- FP8 tables: attention input at 513-576 columns on three 192x128 tiles (152-154 against 167-172 us, same bits);
+  GDN input at 257-320 on 64x256 tiles and at 385-480 on 96x256 tiles, and the K = 6144 output at 641-768 on the
+  128x256 tile. Those three replace launches that had a split-K tail, so the tail's columns take the unsplit K
+  order there: their bits change at those widths, on the default route and on `--reproducible` prefill (which
+  stays deterministic and request-invariant).
+
+Prefill: 129-255 tokens -7.0 to -9.9 %, 264-1,100 tokens -2.8 to -7.0 % (264 -3.8 %, 520 -3.7 %, 776 -6.5 %,
+1,032 -5.6 %), 40 / 72 / 104 tokens level (+0.5 / -0.5 / -0.6 %), 2,048 / 3,584 / 4,096 / 8,192 level (+0.4 / -0.1 /
+0.0 / 0.0 %); `--reproducible`: 136 -9.2 %, 264-1,032 -3.9 to -6.4 %, 4,096 -2.0 %. Decode unchanged (81.2 / 81.3
+and 72.6 / 72.6 tok/s). Greedy text against the previous build: identical at 196, 382 and 5,856 prompt tokens on
+the default route and at 196 and 382 on `--reproducible`; different at 729 tokens on both routes and at 5,856 on
+`--reproducible`, and identical there too with the three bit-changing table entries taken out.
 
 MTP is a one-layer predictor conditioned on a final-normalized target hidden state h_t and the
 following token x_(t+1):

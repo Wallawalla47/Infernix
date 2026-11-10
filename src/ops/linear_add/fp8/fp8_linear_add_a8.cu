@@ -48,8 +48,11 @@ void launch_problem(const Tensor& x, const Weight& weight, Tensor& residual,
         if (x.ne[1] <= 64) return launch.template operator()<K6144Tma32x64>();
         if (x.ne[1] <= 128) return launch.template operator()<Fp8A8T64R64K128>();
         if (x.ne[1] <= 192) return launch.template operator()<K6144Tma64x128>();
-        // The narrower row tile fills the GPU before the large-tile path reaches a full wave.
-        if (x.ne[1] <= 768) return launch.template operator()<K6144MidBulk>();
+        // The narrower row tile fills the GPU before the large-tile path reaches a full wave; from 641
+        // columns the 128x256 tile's 120 CTAs take 93.5-95.5 against 97-104 us (RTX 5090, 2026-11-10). It
+        // has no split-K tail there, where the narrower tile's 240 CTAs had one (641-768: those columns
+        // take the unsplit K order, so their bits changed).
+        if (x.ne[1] <= 640) return launch.template operator()<K6144MidBulk>();
         launch.template operator()<K6144Bulk>();
     } else {
         const int tokens = x.ne[1];
@@ -66,7 +69,7 @@ void launch_problem(const Tensor& x, const Weight& weight, Tensor& residual,
 
 std::size_t fp8_linear_add_partial_capacity_bytes(std::int32_t k, std::int32_t max_tokens) {
     if (k == 6144) {
-        if (max_tokens > 768) return K6144Bulk::kPartialBytes;
+        if (max_tokens > 640) return K6144Bulk::kPartialBytes;
         return max_tokens > 192 ? K6144MidBulk::kPartialBytes : 0;
     }
     if (max_tokens > 384) return K17408Bulk::kPartialBytes;

@@ -7,6 +7,8 @@ namespace infernix::ops::detail {
 namespace {
 using Tma64x128  = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
 using Tma192x128 = Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1>;
+using Tma64x256  = Fp8A8TmaMmaSchedule<64, 256, 128, 2, 4, 2, 1>;
+using Tma96x256  = Fp8A8TmaMmaSchedule<96, 256, 128, 3, 4, 2, 1>;
 using MidBulk = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 2, 1>, 170, 4, 8>;
 using Bulk    = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
 
@@ -51,8 +53,14 @@ void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
     if (x.ne[1] <= 64) return launch.template operator()<Fp8A8T64R128K256>();
     if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
     if (x.ne[1] <= 192) return launch.template operator()<Tma192x128>();
+    // 2026-11-10 (RTX 5090, every tile forced): five 64-token tiles of 256 rows take 109-113 against 109-119 us
+    // for the 128x256 tile with its split-K tail at 257-320 columns, and five 96-token ones 148-155 against
+    // 156-164 us for the 128x128 tile at 385-480. Neither has a split-K tail, so the columns the tail held
+    // there take the unsplit K order (their bits change at those widths).
+    if (x.ne[1] > 256 && x.ne[1] <= 320) return launch.template operator()<Tma64x256>();
+    if (x.ne[1] > 384 && x.ne[1] <= 480) return launch.template operator()<Tma96x256>();
     // Smaller output tiles leave only two full-K tiles to split near the 512-token anchor.
-    if (x.ne[1] > 384 && x.ne[1] <= 512) return launch.template operator()<MidBulk>();
+    if (x.ne[1] > 480 && x.ne[1] <= 512) return launch.template operator()<MidBulk>();
     launch.template operator()<Bulk>();
 }
 } // namespace infernix::ops::detail
