@@ -34,13 +34,16 @@ void select_a16(const Mxfp8Operands& p, Output output, cudaStream_t stream) {
     mxfp8_tma<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(p, output, stream);
 }
 
-// f16-accumulate-prefill: the exact route's TMA tiles at the same widths (not yet swept for this route).
+// f16-accumulate-prefill: tiles from linear_bench --qtype mxfp8 --routes f16 with each tile forced
+// (RTX 5090, 2026-11-10; every tile gives the same output hash). The 64x128 ring at 256 columns (77 against
+// 91 us) and at 769-1,024 where the last 128-column tile would be at most half filled (832 and 960: 2-5 %
+// less); the 128x128 tile elsewhere (896 and 1,024: 1-4 % less than the ring).
 template <class Output>
 void select_f16(const Tensor& x, const Weight& weight, Output output, F16AccumulateWorkspace scratch,
                 cudaStream_t stream) {
     const int tokens = x.ne[1];
-    if (tokens <= 768) return mxfp8_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(x, weight, output, scratch, stream);
-    if (tokens <= 1024) return mxfp8_f16acc<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(x, weight, output, scratch, stream);
+    const bool ring  = tokens <= 256 || (tokens > 768 && tokens <= 1024 && (tokens - 1) % 128 < 64);
+    if (ring) return mxfp8_f16acc<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(x, weight, output, scratch, stream);
     mxfp8_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(x, weight, output, scratch, stream);
 }
 

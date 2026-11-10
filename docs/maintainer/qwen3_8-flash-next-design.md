@@ -13086,6 +13086,30 @@ frames and 5 % fewer bytes a GPU expert reads). Not started.
 
 ---
 
+### 19.3.55 FP4-Local's f16-accumulate tiles swept; small BF16 tiles' occupancy (2026-11-10; same bits; default)
+
+The five MXFP8 f16-accumulate selectors had copied the exact route's tiles ("not yet swept for this route").
+Each tile was forced in turn (`linear_bench --qtype mxfp8 --routes f16`, RTX 5090; every tile gives the same output
+hash at every point), the choices written into the selectors, and the result measured against the previous build
+on a 64-column grid to 1,024 and a 256-column grid to 4,096:
+
+| Projection | Change | Op result |
+|---|---|---|
+| GDN input [16384,2560] | the 128x128 tile at 256 columns and, past 512, where its last tile is more than half filled (the 64x128 ring otherwise, and at 257-512) | 256 -4.2 %, 640 / 768 -7.0 / -4.8 %, 1,280-3,072 -4.0 .. -6.9 % |
+| QSA [13952,2560] | the ring at 256 columns and in the lower half of each 128 at 769-1,024 | 256 -14.7 %, 896 -3.6 % |
+| Outputs [2560,6144] | 32x128 ring to 256, 64x128 ring to 512, 128x128 to 1,024 | 256-384 -24 .. -31 %, 576-768 -4.5 .. -9.6 % |
+| Shared gate/up [1280,2560] | 32x64 ring at 256, 64x128 ring at 513-1,024, 128x128 past 3,072 | 256 -18.9 %, 576-768 -10.6 .. -15.6 %, 8,192 / 16,384 -1.5 / -1.8 % |
+| Shared down [2560,640] | the 128x128 tile past 768 columns where its last wave of 170 CTAs is at least half full, or from four waves | 832-1,024 -8.9 .. -9.1 %, 2,048-4,096 -4 .. -9 %, 8,192 / 16,384 -18.8 / -19.5 % |
+
+The first rules (the 128x128 tile at every width past the cut) lost at 704 / 832 / 960 columns on the GDN input
+(+1.6 / +4.4 / +3.3 %), 832 / 960 on QSA (+1.8 / +4.6 %) and 1,536 / 2,560 on the shared down (+6.5 / +2.0 %),
+hence the fill conditions. End to end on FP4-Local (cold expert cache, `infernix_bench`): pp2048 -0.12 %, pp8192
+-0.13 %, text identical: the prompt waits on the link, so this is an Op result.
+
+Not a gain: the small BF16 TMA tiles (r64t32, r64t64, r64t128, plain and tail forms, 37-49 KB of shared memory)
+declared at two CTAs an SM instead of the default one. `bf16_flash_next_sweep` on shgu, shdown, hcdown, hcup,
+gdnab and out6144 at 129-8,192 columns: level at every point (single timer ticks in both directions).
+
 ## 20. Documentation and authority changes
 
 When the implementation lands:

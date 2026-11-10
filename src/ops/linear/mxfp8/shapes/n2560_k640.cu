@@ -19,10 +19,19 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
     mxfp8_linear_a16_tma<Geometry, Mxfp8P2<Mxfp8TmaT64R64>>(x, weight, out, stream);
 }
 
-// f16-accumulate-prefill: the exact route's tile at the same widths (not yet swept for this route).
+// f16-accumulate-prefill: tiles from linear_bench --qtype mxfp8 --routes f16 with each tile forced
+// (RTX 5090, 2026-11-10; every tile gives the same output hash). The 128x128 tile (20 CTAs a 128 columns, one
+// an SM) takes 7-9 % less than the 64x64 one where its last wave of 170 is at least half full (832-1,024,
+// 2,048, 3,072, 4,096 columns) and 19-20 % less at 8,192-16,384 (228 against 285 us); with a thinner last wave
+// it is level or slower (1,536: +6.5 %, 2,560: +2.0 %).
 void launch_f16(const Tensor& x, const Weight& weight, Tensor& out, F16AccumulateWorkspace scratch,
                 cudaStream_t stream) {
-    mxfp8_linear_f16acc<Geometry, Mxfp8P2<Mxfp8TmaT64R64>>(x, weight, out, scratch, stream);
+    constexpr int kWaveCtas = 170;
+    const int ctas          = (Geometry::kOutputRows / 128) * ((x.ne[1] + 127) / 128);
+    const bool wide         = x.ne[1] > 768 && (ctas >= 4 * kWaveCtas || 2 * (ctas % kWaveCtas) >= kWaveCtas ||
+                                                ctas % kWaveCtas == 0);
+    if (!wide) return mxfp8_linear_f16acc<Geometry, Mxfp8P2<Mxfp8TmaT64R64>>(x, weight, out, scratch, stream);
+    mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(x, weight, out, scratch, stream);
 }
 
 // fp8-a8-pair-block32: the activation as two E4M3 terms with per-32 UE8M0 scales, the weight's own group

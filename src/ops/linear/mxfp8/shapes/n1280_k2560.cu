@@ -28,18 +28,19 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
     mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Mxfp8TmaT64R256>>(x, weight, out, stream);
 }
 
-// f16-accumulate-prefill: the exact route's TMA tiles at the same widths (not yet swept for this route;
-// the cp.async 257-384-column tile is taken over by TMA).
+// f16-accumulate-prefill: tiles from linear_bench --qtype mxfp8 --routes f16 with each tile forced
+// (RTX 5090, 2026-11-10; every tile gives the same output hash). 256 columns: the 32x64 ring 17 against
+// 21 us; 640-768: the 64x128 ring 31-33 against 38-42; past 3,072 the 128x128 tile 2 % less than 64x256.
 void launch_f16(const Tensor& x, const Weight& weight, Tensor& out, F16AccumulateWorkspace scratch,
                 cudaStream_t stream) {
     const int tokens = x.ne[1];
+    if (tokens <= 256) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Fp8A16RingT32R64S3>>(x, weight, out, scratch, stream);
     if (tokens <= 512) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT64R64>>(x, weight, out, scratch, stream);
-    if (tokens <= 768) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Fp8A16RingT32R64S3>>(x, weight, out, scratch, stream);
     if (tokens <= 1024) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(x, weight, out, scratch, stream);
     if (tokens <= 1536) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT64R64>>(x, weight, out, scratch, stream);
     if (tokens <= 2048) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(x, weight, out, scratch, stream);
     if (tokens <= 3072) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(x, weight, out, scratch, stream);
-    mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT64R256>>(x, weight, out, scratch, stream);
+    mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(x, weight, out, scratch, stream);
 }
 
 // fp8-a8-pair-block32: the activation as two E4M3 terms with per-32 UE8M0 scales, the weight's own group
