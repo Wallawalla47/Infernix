@@ -356,84 +356,98 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
     const int sfb_row       = lane >> 2;
 
     float accumulators[Schedule::kMmaTokens][Schedule::kMmaRows][4] = {};
+    // `live` of this warp's 16-token fragments hold tokens of the call. A partly filled last token
+    // tile runs no tensor-core step for the others: their sums are never stored, and every stored
+    // output keeps its own K order, so no bit changes. Each count is its own instance of the loop
+    // (27B prefill -2 .. -9 % at widths that are not tile multiples, RTX 5090, 2026-11-10).
+    const auto consume = [&](const auto live) {
 #pragma unroll 1
-    for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
-        const int stage                = k_tile % Schedule::kStages;
-        const std::uint32_t full_phase = (k_tile / Schedule::kStages) & 1U;
-        cta_mbarrier_wait(&shared.full[stage], full_phase);
+        for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
+            const int stage                = k_tile % Schedule::kStages;
+            const std::uint32_t full_phase = (k_tile / Schedule::kStages) & 1U;
+            cta_mbarrier_wait(&shared.full[stage], full_phase);
 
 #pragma unroll
-        for (int local_k64 = 0; local_k64 < Schedule::kK64PerStage; ++local_k64) {
-            unsigned a_fragments[Schedule::kTerms][Schedule::kMmaTokens][4];
-            unsigned b_fragments[Schedule::kMmaRows][2];
-            unsigned a_scales[Schedule::kTerms][Schedule::kMmaTokens];
-            unsigned b_scales[Schedule::kMmaRows];
+            for (int local_k64 = 0; local_k64 < Schedule::kK64PerStage; ++local_k64) {
+                if (!(live > 0)) { continue; }
+                unsigned a_fragments[Schedule::kTerms][Schedule::kMmaTokens][4];
+                unsigned b_fragments[Schedule::kMmaRows][2];
+                unsigned a_scales[Schedule::kTerms][Schedule::kMmaTokens];
+                unsigned b_scales[Schedule::kMmaRows];
 
 #pragma unroll
-            for (int term = 0; term < Schedule::kTerms; ++term) {
+                for (int term = 0; term < Schedule::kTerms; ++term) {
 #pragma unroll
-                for (int mma_m = 0; mma_m < Schedule::kMmaTokens; ++mma_m) {
-                    // Each plane is its own box at a multiple of the swizzle period, so the row
-                    // across planes keeps the box's swizzle phase.
-                    const int plane_row = term * Schedule::kBlockTokens +
-                                          warp_m * Schedule::kWarpTokens + mma_m * 16;
-                    const int row          = plane_row + a_row_offset;
-                    const int logical_byte = local_k64 * 32 + a_column_byte;
+                    for (int mma_m = 0; mma_m < Schedule::kMmaTokens; ++mma_m) {
+                        if (mma_m >= live) { continue; }
+                        // Each plane is its own box at a multiple of the swizzle period, so the row
+                        // across planes keeps the box's swizzle phase.
+                        const int plane_row = term * Schedule::kBlockTokens +
+                                              warp_m * Schedule::kWarpTokens + mma_m * 16;
+                        const int row          = plane_row + a_row_offset;
+                        const int logical_byte = local_k64 * 32 + a_column_byte;
+                        const int physical_byte =
+                            ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
+                        const auto* address =
+                            tensors.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
+                        ldmatrix_x4(a_fragments[term][mma_m][0], a_fragments[term][mma_m][1],
+                                    a_fragments[term][mma_m][2], a_fragments[term][mma_m][3],
+                                    smem_addr(address));
+                        const int scale_row = plane_row + sfa_row;
+                        a_scales[term][mma_m] =
+                            tensors.a_scale4[(k_tile / 2) % Schedule::kScaleSlots]
+                                            [scale_row * Schedule::kScaleWordsPerRow +
+                                             (k_tile & 1) * Schedule::kK64PerStage + local_k64];
+                    }
+                }
+
+#pragma unroll
+                for (int mma_n = 0; mma_n < Schedule::kMmaRows; ++mma_n) {
+                    constexpr int per_branch = Schedule::kMmaRows / branches;
+                    const int branch = mma_n / per_branch, fragment = mma_n % per_branch;
+                    const int pair_row =
+                        warp_n * (Schedule::kWarpRows / branches) + fragment * 8;
+                    const int row          = branch * loaded_rows + pair_row + b_row_offset;
+                    const int logical_byte = local_k64 * 32 + b_column_byte;
                     const int physical_byte =
                         ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
                     const auto* address =
-                        tensors.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
-                    ldmatrix_x4(a_fragments[term][mma_m][0], a_fragments[term][mma_m][1],
-                                a_fragments[term][mma_m][2], a_fragments[term][mma_m][3],
-                                smem_addr(address));
-                    const int scale_row = plane_row + sfa_row;
-                    a_scales[term][mma_m] =
-                        tensors.a_scale4[(k_tile / 2) % Schedule::kScaleSlots]
-                                        [scale_row * Schedule::kScaleWordsPerRow +
-                                         (k_tile & 1) * Schedule::kK64PerStage + local_k64];
+                        tensors.b_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
+                    ldmatrix_x2(b_fragments[mma_n][0], b_fragments[mma_n][1], smem_addr(address));
+                    const int scale_row = (row_begin & 127) + pair_row + sfb_row;
+                    b_scales[mma_n] =
+                        load_vec<unsigned>(tensors.b_scales[stage][branch] +
+                                           (local_k64 * 32 + (scale_row & 31)) * 16 +
+                                           (scale_row >> 5) * 4);
                 }
-            }
 
 #pragma unroll
-            for (int mma_n = 0; mma_n < Schedule::kMmaRows; ++mma_n) {
-                constexpr int per_branch = Schedule::kMmaRows / branches;
-                const int branch = mma_n / per_branch, fragment = mma_n % per_branch;
-                const int pair_row     = warp_n * (Schedule::kWarpRows / branches) + fragment * 8;
-                const int row          = branch * loaded_rows + pair_row + b_row_offset;
-                const int logical_byte = local_k64 * 32 + b_column_byte;
-                const int physical_byte =
-                    ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
-                const auto* address =
-                    tensors.b_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
-                ldmatrix_x2(b_fragments[mma_n][0], b_fragments[mma_n][1], smem_addr(address));
-                const int scale_row = (row_begin & 127) + pair_row + sfb_row;
-                b_scales[mma_n]     = load_vec<unsigned>(tensors.b_scales[stage][branch] +
-                                                         (local_k64 * 32 + (scale_row & 31)) * 16 +
-                                                         (scale_row >> 5) * 4);
-            }
-
+                for (int mma_m = 0; mma_m < Schedule::kMmaTokens; ++mma_m) {
+                    if (mma_m >= live) { continue; }
 #pragma unroll
-            for (int mma_m = 0; mma_m < Schedule::kMmaTokens; ++mma_m) {
+                    for (int mma_n = 0; mma_n < Schedule::kMmaRows; ++mma_n) {
 #pragma unroll
-                for (int mma_n = 0; mma_n < Schedule::kMmaRows; ++mma_n) {
-#pragma unroll
-                    for (int term = 0; term < Schedule::kTerms; ++term) {
-                        const unsigned(&a)[4] = a_fragments[term][mma_m];
-                        mma_nvfp4_e4m3(accumulators[mma_m][mma_n][0],
-                                       accumulators[mma_m][mma_n][1],
-                                       accumulators[mma_m][mma_n][2],
-                                       accumulators[mma_m][mma_n][3], a[0], a[1], a[2], a[3],
-                                       b_fragments[mma_n][0], b_fragments[mma_n][1],
-                                       a_scales[term][mma_m], b_scales[mma_n]);
+                        for (int term = 0; term < Schedule::kTerms; ++term) {
+                            const unsigned(&a)[4] = a_fragments[term][mma_m];
+                            mma_nvfp4_e4m3(accumulators[mma_m][mma_n][0],
+                                           accumulators[mma_m][mma_n][1],
+                                           accumulators[mma_m][mma_n][2],
+                                           accumulators[mma_m][mma_n][3], a[0], a[1], a[2], a[3],
+                                           b_fragments[mma_n][0], b_fragments[mma_n][1],
+                                           a_scales[term][mma_m], b_scales[mma_n]);
+                        }
                     }
                 }
             }
+            // Every lane's shared reads finished and ordered before the TMA refill, then the
+            // release.
+            fence_reads_before_async_refill();
+            __syncwarp();
+            if (lane == 0) { cta_mbarrier_arrive(&shared.empty[stage]); }
         }
-        // Every lane's shared reads finished and ordered before the TMA refill, then the release.
-        fence_reads_before_async_refill();
-        __syncwarp();
-        if (lane == 0) { cta_mbarrier_arrive(&shared.empty[stage]); }
-    }
+    };
+    with_static_count<Schedule::kMmaTokens>(
+        (token_count - token_begin - warp_m * Schedule::kWarpTokens + 15) / 16, consume);
 
     // The epilogue reuses the tensor pipeline's shared-memory storage. All consumer
     // warps must finish their final tensor reads before any warp starts overwriting it.

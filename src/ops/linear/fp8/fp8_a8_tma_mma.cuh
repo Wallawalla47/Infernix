@@ -202,16 +202,36 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
     const int tid  = static_cast<int>(threadIdx.x) - Schedule::kProducerThreads;
     const int warp = tid >> 5, lane = tid & 31;
     float accumulators[Schedule::kMmaTokens][Schedule::kMmaRows][4] = {};
-    for (int kt = 0; kt < tiles_k; ++kt) {
-        const int stage = kt % S;
-        cta_mbarrier_wait(full + stage, (kt / S) & 1U);
-        fp8_mma_compute_stage<Schedule>(activation + stage * BT * BK, weight + stage * BR * BK,
-                                        accumulators, warp, lane);
-        // Release only after every lane in this consumer warp has finished its shared reads,
-        // ordered before the TMA refill.
-        fence_reads_before_async_refill();
-        __syncwarp();
-        if (lane == 0) cta_mbarrier_arrive(empty + stage);
+    const auto consume = [&]<bool Live>(std::bool_constant<Live>) {
+        for (int kt = 0; kt < tiles_k; ++kt) {
+            const int stage = kt % S;
+            cta_mbarrier_wait(full + stage, (kt / S) & 1U);
+            if constexpr (Live) {
+                fp8_mma_compute_stage<Schedule>(activation + stage * BT * BK,
+                                                weight + stage * BR * BK, accumulators, warp, lane);
+            }
+            // Release only after every lane in this consumer warp has finished its shared reads,
+            // ordered before the TMA refill.
+            fence_reads_before_async_refill();
+            __syncwarp();
+            if (lane == 0) cta_mbarrier_arrive(empty + stage);
+        }
+    };
+    if constexpr (FullTokens) {
+        consume(std::true_type{});
+    } else {
+        // A partly filled last token tile: a warp whose columns all lie past the call does no
+        // tensor-core work (its sums are never stored; every stored output keeps its K order). A warp
+        // with some live columns runs whole: one instance of the loop per live count, as the NVFP4
+        // TMA kernel has, measured slower beside full warps (the 96x256 tile +17 % at 257-272 columns,
+        // the 192x128 tile +6 % at 145; RTX 5090, 2026-11-10).
+        const int tokens_left =
+            token_offset + count - token_begin - warp / Schedule::kWarpsRows * Schedule::kWarpTokens;
+        if (tokens_left > 0) {
+            consume(std::true_type{});
+        } else {
+            consume(std::false_type{});
+        }
     }
     if constexpr (SplitK) {
         if (partial >= 0) {

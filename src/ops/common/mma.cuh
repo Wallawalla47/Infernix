@@ -4,6 +4,29 @@
 
 namespace infernix::ops {
 
+// A count known at compile time that device code reads as an int, so one body serves a constant and a
+// run-time bound (the partly filled tiles' live fragment counts).
+template <int Value>
+struct StaticCount {
+    __host__ __device__ constexpr operator int() const { return Value; }
+};
+
+// body(StaticCount<n>{}) for n = min(count, Max): every count gets its own instance of the body, so a loop it
+// bounds unrolls over registers. A run-time bound inside such a loop spilled the tensor-core accumulators
+// (4-5 times the time, RTX 5090, 2026-11-10).
+template <int Max, class Body>
+__device__ __forceinline__ void with_static_count(int count, Body&& body) {
+    if constexpr (Max == 0) {
+        body(StaticCount<0>{});
+    } else {
+        if (count >= Max) {
+            body(StaticCount<Max>{});
+        } else {
+            with_static_count<Max - 1>(count, body);
+        }
+    }
+}
+
 __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned addr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r0), "=r"(r1)
