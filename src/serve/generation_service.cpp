@@ -401,6 +401,7 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     engine_options.ram_resize               = options.ram_resize;
     engine_options.expert_ram_bytes         = options.expert_ram_bytes;
     engine_options.expert_ram_layout        = options.expert_ram_layout;
+    engine_options.expert_csf               = options.expert_csf;
     engine_options.expert_pin_bytes         = options.expert_pin_bytes;
     engine_options.media_preprocess_threads = options.media_preprocess_threads;
     engine_options.startup_observer         = std::move(startup_observer);

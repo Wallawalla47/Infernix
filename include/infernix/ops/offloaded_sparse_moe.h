@@ -262,6 +262,15 @@ struct MoeExpertSource {
     // identical in each.
     const std::uint8_t* host_records = nullptr;
     const std::uint8_t* const* host_table = nullptr;
+    // An NVFP4 bank whose host records are CSF records (ops/offloaded_sparse_moe/csf_record.h; host_records, no
+    // host_table): record e's table at host_csf + e * (row groups + 1) (mapped host memory). A staged miss is
+    // expanded as it is copied (staging slot or landing), so every expert kernel reads the expanded record; the
+    // call needs staging_slots > 0 and no fetch channel. Null: the host records are expanded.
+    const std::uint32_t* host_csf = nullptr;
+    // With host_table (the SSD tier's RAM slots of this pitch; runtime/expert_offload/host_expert_tier.h): an entry with
+    // bit 0 set (csf::kTag) is a compressed record with its table in its slot's tail (csf::slot_table_offset), staged
+    // as host_csf's are; the call needs staging_slots > 0. 0: every host_table record is expanded.
+    std::uint64_t host_csf_pitch = 0;
     // Optional mapped word: a call that cannot serve an expert (an SSD-only record with no CPU job
     // and no fetch channel, a record the host could not read, or a host whose heartbeat stopped)
     // writes layer << 16 | code there (offloaded_moe::kError* or an errno); that call's outputs are
@@ -305,6 +314,11 @@ struct MoeExpertSource {
     bool a4_shared_input = false;
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
+    // With staging: the caller knows the call's misses fit the staging slots (a streamed chunk's experts evicted since
+    // the chunk began: ExpertStream::uncovered), so the call runs one pass over every job instead of passes of
+    // staging_slots jobs; a miss past the slots fails the call (kErrorUnservedRecord in the error word). For CSF host
+    // records, which cannot be read in place (zero-copy).
+    bool one_pass               = false;
     MoeCpuChannel cpu;
     MoeFetchChannel fetch; // with host_table only; needs staging_slots > 0 and max_jobs <= kMaxFetch
     // Optional overlap of staging with compute for calls of several passes (prefill chunks): the

@@ -263,8 +263,17 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
         // Every expert absent when the chunk began has a ring slot: the call stages nothing and runs as
         // one pass over every job (an expert evicted since is read in place from its host record).
         if (streaming->complete(p.layer) && source.host_table == nullptr) {
-            source.staging_slots  = 0;
-            source.overlap_stream = nullptr;
+            // CSF records cannot be read in place: the evicted ones are staged, still in one pass when they fit the
+            // slots (else the call keeps its staging passes).
+            const bool csf = source.host_csf != nullptr;
+            if (!csf || static_cast<std::int32_t>(streaming->uncovered(p.layer)) <= source.staging_slots) {
+                if (csf) {
+                    source.one_pass = true;
+                } else {
+                    source.staging_slots = 0;
+                }
+                source.overlap_stream = nullptr;
+            }
         }
     }
 

@@ -63,6 +63,7 @@ struct BenchOptions {
     std::uint64_t ram_free_bytes = infernix::kDefaultRamFreeBytes;
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
     std::optional<infernix::ExpertRamLayout> expert_ram_layout; // --expert-ram-layout (empty: the model's default)
+    bool expert_csf = false;                                    // --expert-csf
     std::optional<std::uint64_t> expert_pin_bytes; // --expert-pin-mib; empty: what the OS lets it pin
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;
@@ -206,6 +207,7 @@ struct BenchEnvironment {
     std::uint64_t ram_free_bytes = infernix::kDefaultRamFreeBytes;
     std::optional<std::uint64_t> expert_ram_bytes;
     std::optional<ExpertRamLayout> expert_ram_layout;
+    bool expert_csf = false;
     std::optional<std::uint64_t> expert_pin_bytes;
     KvCacheStorage kv_cache           = KvCacheStorage::BFloat16;
     LogitsDtype logits_dtype          = LogitsDtype::FP32;

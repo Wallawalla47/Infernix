@@ -888,6 +888,9 @@ int main() {
                               infernix::ExpertRamLayout::Exclusive &&
                           !parse({"infernix-serve", "model.ninfer"}).expert_ram_layout.has_value(),
                       "--expert-ram-layout must parse exclusive and full, unset leaving the model's default");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--expert-csf"}).expert_csf &&
+                          !parse({"infernix-serve", "model.ninfer"}).expert_csf,
+                      "--expert-csf must set CSF records, off by default");
     {
         bool rejected = false;
         try {

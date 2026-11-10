@@ -1,6 +1,7 @@
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 
 #include "core/nvtx.h"
+#include "ops/offloaded_sparse_moe/csf_record.h"
 
 #include <cuda_runtime.h>
 
@@ -96,7 +97,7 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
             (layer.ggml.valid() && shape != kFlashNextShape) ||
             (layer.ggml.valid() ? !ggml_cpu_supported(layer.ggml) || options_.activation != ExpertActivation::kA16
                                 : layer.scales == nullptr) ||
-            layer.record_stride < record) {
+            layer.record_stride < record || (layer.csf != nullptr && (layer.ggml.valid() || layer.records == nullptr))) {
             throw std::invalid_argument("CPU miss service layer is incomplete");
         }
     }
@@ -221,6 +222,17 @@ void CpuMissService::serve() {
                             .shape      = options_.shape,
                             .cpus       = options_.cpus});
         const std::size_t hidden = static_cast<std::size_t>(options_.shape.hidden);
+        const auto table_words   = static_cast<std::uint64_t>(csf::Geometry::of(options_.shape).table_words());
+        // A tiered record: an expanded one, or a tagged compressed slot whose table is in the slot's tail (false: a
+        // tagged record this service was not set up for, Options::tier_csf_pitch).
+        const auto tiered_record = [&](CpuExpertJob& job, const std::uint8_t* record) {
+            job.record = csf::untag(record);
+            job.csf    = nullptr;
+            if (!csf::tagged(record)) { return true; }
+            if (options_.tier_csf_pitch == 0) { return false; }
+            job.csf = csf::slot_table(record, static_cast<int>(table_words), options_.tier_csf_pitch);
+            return true;
+        };
         std::vector<CpuExpertJob> jobs(static_cast<std::size_t>(jobs_));
         std::vector<CpuExpertJob> ready, read;
         std::vector<std::uint32_t> tickets;
@@ -271,8 +283,17 @@ void CpuMissService::serve() {
             for (int j = 0; j < count; ++j) {
                 CpuExpertJob& job = jobs[static_cast<std::size_t>(j)];
                 const auto expert = static_cast<std::uint64_t>(r.expert[j]);
-                job.record        = r.tiered != 0 ? reinterpret_cast<const std::uint8_t*>(r.record[j])
-                                                      : layer.records + expert * layer.record_stride;
+                // A tiered request's records are the tier's (tagged when compressed); the bank's may be CSF records.
+                if (r.tiered != 0) {
+                    if (!tiered_record(job, reinterpret_cast<const std::uint8_t*>(r.record[j]))) {
+                        job.ncols = 0;
+                        status    = EINVAL;
+                        continue;
+                    }
+                } else {
+                    job.record = layer.records + expert * layer.record_stride;
+                    job.csf    = layer.csf != nullptr ? layer.csf + expert * table_words : nullptr;
+                }
                 job.ggml          = layer.ggml;
                 // The 8-bit activation route: a GGUF bank's jobs take ggml_expert.h's a8 functions (a block-FP8
                 // bank keeps its exact route), an NVFP4 bank's w4a8_expert.h's.
@@ -321,7 +342,10 @@ void CpuMissService::serve() {
                         continue;
                     }
                     CpuExpertJob job = jobs[static_cast<std::size_t>(read_jobs[i])];
-                    job.record       = record;
+                    if (!tiered_record(job, record)) {
+                        status = EINVAL;
+                        continue;
+                    }
                     read.push_back(job);
                 }
                 team.run(std::span<const CpuExpertJob>(read.data(), read.size()), {volatile_beat, &beat});

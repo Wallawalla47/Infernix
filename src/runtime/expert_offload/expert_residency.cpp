@@ -6,6 +6,7 @@
 #include "core/copy_batch.h"
 #include "core/nvtx.h"
 #include "core/temporary_switches.h"
+#include "ops/offloaded_sparse_moe/csf_expand.h"
 
 #include <algorithm>
 #include <cmath>
@@ -14,6 +15,7 @@
 #include <map>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 
 namespace infernix::runtime::expert_offload {
 namespace {
@@ -138,6 +140,11 @@ ExpertResidency::ExpertResidency(const ExpertLayout& layout, std::vector<const s
 
 ExpertResidency::~ExpertResidency() {
     if (copy_stream_ != nullptr) { (void)cudaStreamSynchronize(copy_stream_); }
+    if (expand_stream_ != nullptr) {
+        (void)cudaStreamSynchronize(expand_stream_);
+        (void)cudaStreamDestroy(expand_stream_);
+    }
+    if (copied_ != nullptr) { (void)cudaEventDestroy(copied_); }
     if (d2h_stream_ != nullptr) {
         (void)cudaStreamSynchronize(d2h_stream_);
         for (auto& demotion : demotions_) {
@@ -152,6 +159,33 @@ ExpertResidency::~ExpertResidency() {
     }
     if (table_ready_ != nullptr) { (void)cudaEventDestroy(table_ready_); }
     if (copy_stream_ != nullptr) { (void)cudaStreamDestroy(copy_stream_); }
+}
+
+void ExpertResidency::set_csf(std::vector<ops::offloaded_moe::csf::BankTables> tables,
+                              const ops::offloaded_moe::ExpertShape& shape) {
+    if (tables.size() != layers_ || !in_flight_.empty() || stats_.promotions != 0 || tier_ != nullptr ||
+        !ops::offloaded_moe::registered_shape(shape)) {
+        throw std::logic_error("expert residency: CSF banks are set once, in full mode, before any promotion");
+    }
+    csf_tables_ = std::move(tables);
+    start_expansions(shape);
+}
+
+void ExpertResidency::start_expansions(const ops::offloaded_moe::ExpertShape& shape) {
+    csf_shape_ = shape;
+    csf_words_ = static_cast<std::uint32_t>(ops::offloaded_moe::csf::Geometry::of(shape).table_words());
+    if (expand_stream_ == nullptr) {
+        // The lowest priority: a promotion's expansion yields SMs to the rounds' kernels.
+        int least = 0, greatest = 0;
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&expand_stream_, cudaStreamNonBlocking, least));
+        CUDA_CHECK(cudaEventCreateWithFlags(&copied_, cudaEventDisableTiming));
+    }
+}
+
+void ExpertResidency::sync_copies() {
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    if (expand_stream_ != nullptr) { CUDA_CHECK(cudaStreamSynchronize(expand_stream_)); }
 }
 
 const std::uint8_t* ExpertResidency::frame_base(std::uint32_t layer) const noexcept {
@@ -205,7 +239,7 @@ ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream
     }
     frames = std::min(frames, frame_limit());
     finish_demotions(compute, true); // held frames return before frames move or go
-    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    sync_copies();
     publish_landed();
     release_reservations();
     load_commands_.clear();
@@ -301,10 +335,12 @@ void ExpertResidency::attach_tier(HostExpertTier* tier, bool exclusive) {
     records_device_        = DeviceBuffer(keys * sizeof(const std::uint8_t*));
     records_host_          = PinnedHostBuffer(keys * sizeof(const std::uint8_t*));
     auto* records          = static_cast<const std::uint8_t**>(records_host_.data());
-    for (std::size_t k = 0; k < keys; ++k) { records[k] = tier_->record(static_cast<std::uint32_t>(k)); }
+    // A CSF tier's compressed slots are published tagged (csf::kTag); its promotions expand them in their frames.
+    for (std::size_t k = 0; k < keys; ++k) { records[k] = tier_->record_tagged(static_cast<std::uint32_t>(k)); }
     records_device_.copy_from_host(records_host_.data(), keys * sizeof(const std::uint8_t*));
     tier_->take_dirty(dirty_);
     dirty_.clear();
+    if (tier_->csf()) { start_expansions(*tier_->csf()); }
     queue_pinned_.assign(keys, 0);
     queue_mark_.assign(keys, 0);
     copies_in_flight_.assign(keys, 0);
@@ -361,6 +397,7 @@ void ExpertResidency::demote_or_drop(Pool& pool, const std::vector<Command>& com
             }
         }
         ++stats_.d2h_demotions;
+        tier_->mark_expanded(slot); // the frame's expanded record
         CUDA_CHECK(cudaMemcpyAsync(const_cast<std::uint8_t*>(tier_->slot_bytes(slot)),
                                    pool.base() + static_cast<std::size_t>(frame) * pool.pitch, pool.pitch,
                                    cudaMemcpyDeviceToHost, d2h_stream_));
@@ -410,6 +447,7 @@ void ExpertResidency::finish_demotions(cudaStream_t compute, bool wait) {
                     continue;
                 }
                 Pool& held = pool_of(it->key);
+                tier_->mark_expanded(it->slot); // the frame's expanded record
                 CUDA_CHECK(cudaMemcpyAsync(const_cast<std::uint8_t*>(tier_->slot_bytes(it->slot)),
                                            held.base() + static_cast<std::size_t>(it->frame) * held.pitch, held.pitch,
                                            cudaMemcpyDeviceToHost, d2h_stream_));
@@ -544,7 +582,7 @@ void ExpertResidency::tier_step(cudaStream_t compute) {
     tier_->take_dirty(dirty_);
     if (!dirty_.empty()) {
         auto* records = static_cast<const std::uint8_t**>(records_host_.data());
-        for (const std::uint32_t key : dirty_) { records[key] = tier_->record(key); }
+        for (const std::uint32_t key : dirty_) { records[key] = tier_->record_tagged(key); }
         upload_pinned(records_device_.p, records_host_.data(), records_device_.bytes, compute);
     }
 }
@@ -591,7 +629,7 @@ void ExpertResidency::before_round(cudaStream_t compute, bool landing, bool walk
         tier_->take_dirty(dirty_);
         if (!dirty_.empty()) {
             auto* records = static_cast<const std::uint8_t**>(records_host_.data());
-            for (const std::uint32_t key : dirty_) { records[key] = tier_->record(key); }
+            for (const std::uint32_t key : dirty_) { records[key] = tier_->record_tagged(key); }
             upload_pinned(records_device_.p, records_host_.data(), records_device_.bytes, compute);
         }
     }
@@ -649,7 +687,7 @@ void ExpertResidency::release_reservations() {
 }
 
 void ExpertResidency::publish_promotions() {
-    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    sync_copies();
     publish_landed();
 }
 
@@ -977,7 +1015,7 @@ std::uint32_t ExpertResidency::warm_start(const SavedState& state, std::uint32_t
     issue_loads(compute);
     stats_.promotions -= loaded; // issue_loads counted them; they are seeds, not promotions
     stats_.seeded += loaded;
-    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    sync_copies();
     publish_landed();
     if (table_dirty_) { upload_table(compute); }
     return loaded;
@@ -1061,7 +1099,7 @@ ExpertResidency::FrameLease ExpertResidency::lend(std::uint64_t bytes, cudaStrea
     if (count == 0 || count > pool_lendable(pool)) { throw std::logic_error("expert residency: cannot lend that many bytes"); }
     finish_demotions(compute, true); // a held frame must not be lent
     // The run's experts move by device copies, which need every promotion landed and published.
-    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    sync_copies();
     publish_landed();
     release_reservations();
     const std::vector<std::uint8_t> busy(pool.frames, 0);
@@ -1184,10 +1222,35 @@ void ExpertResidency::issue_loads(cudaStream_t compute) {
         stats_.unpinned_promotions += bounced.size();
         bounced.clear();
     };
+    static_assert(kLoadsPerEvent <= static_cast<std::size_t>(ops::offloaded_moe::csf::kMaxInPlaceJobs));
+    ops::offloaded_moe::csf::InPlaceJobs expansions; // a batch's CSF records, expanded in their frames
+    // The frames (pool << 32 | frame) of in-flight batches that expand CSF records, and the newest such batch's event.
+    const auto frame_id = [&](const Batch::Load& load) {
+        return static_cast<std::uint64_t>(pool_of_layer_[load.key / experts_]) << 32U | load.frame;
+    };
+    std::unordered_set<std::uint64_t> expanding;
+    cudaEvent_t newest_expanding = nullptr;
+    for (const Batch& old : in_flight_) {
+        if (!old.expands) { continue; }
+        for (const auto& load : old.loads) { expanding.insert(frame_id(load)); }
+        newest_expanding = old.done;
+    }
     for (std::size_t first = 0; first < loads.size(); first += kLoadsPerEvent) {
         Batch batch;
         batch.loads.assign(loads.begin() + static_cast<std::ptrdiff_t>(first),
                            loads.begin() + static_cast<std::ptrdiff_t>(std::min(loads.size(), first + kLoadsPerEvent)));
+        expansions.count = 0;
+        // A frame whose earlier copy is still being expanded (its key evicted and re-admitted meanwhile) takes this
+        // copy only after that expansion, which would otherwise overwrite it: the copies then wait for the newest
+        // expanding batch (expansions run in order). Rare, so the copy engine normally never waits.
+        if (newest_expanding != nullptr) {
+            const bool conflict = std::any_of(batch.loads.begin(), batch.loads.end(),
+                                              [&](const Batch::Load& load) { return expanding.contains(frame_id(load)); });
+            if (conflict) {
+                copies.flush();
+                CUDA_CHECK(cudaStreamWaitEvent(copy_stream_, newest_expanding, 0));
+            }
+        }
         for (const auto& load : batch.loads) {
             const std::uint32_t layer  = load.key / experts_;
             const std::uint32_t expert = load.key % experts_;
@@ -1223,6 +1286,22 @@ void ExpertResidency::issue_loads(cudaStream_t compute) {
                     break;
                 }
             }
+            // A CSF record (full mode: the bank's own; the tier: a compressed slot, its table in the slot's tail, which
+            // the H2D pin keeps until the batch's expansion is done): its compressed bytes, expanded in the frame below.
+            const ops::offloaded_moe::csf::BankTables* csf = csf_tables_.empty() || !csf_tables_[layer] ? nullptr
+                                                                                                           : &csf_tables_[layer];
+            if (csf != nullptr) {
+                const std::size_t at = static_cast<std::size_t>(expert) * csf_words_;
+                copies.add(destination, source, csf->host[at + csf_words_ - 1]);
+                expansions.job[expansions.count++] = {destination, csf->device + at};
+                continue;
+            }
+            if (const std::uint32_t* table = tier_ != nullptr ? tier_->record_csf(load.key) : nullptr; table != nullptr) {
+                copies.add(destination, source, table[csf_words_ - 1]);
+                expansions.job[expansions.count++] = {destination, table};
+                ++stats_.csf_promotions;
+                continue;
+            }
             copies.add(destination, source, host_strides_[layer]);
         }
         drain_bounced();
@@ -1235,7 +1314,17 @@ void ExpertResidency::issue_loads(cudaStream_t compute) {
         }
         batch.done = spare_events_.back();
         spare_events_.pop_back();
-        CUDA_CHECK(cudaEventRecord(batch.done, copy_stream_));
+        if (expansions.count > 0) {
+            CUDA_CHECK(cudaEventRecord(copied_, copy_stream_));
+            CUDA_CHECK(cudaStreamWaitEvent(expand_stream_, copied_, 0));
+            ops::offloaded_moe::csf::expand_in_place(csf_shape_, expansions, expand_stream_);
+            CUDA_CHECK(cudaEventRecord(batch.done, expand_stream_)); // after the copies too
+            batch.expands = true;
+            for (const auto& load : batch.loads) { expanding.insert(frame_id(load)); }
+            newest_expanding = batch.done;
+        } else {
+            CUDA_CHECK(cudaEventRecord(batch.done, copy_stream_));
+        }
         in_flight_.push_back(std::move(batch));
     }
 }

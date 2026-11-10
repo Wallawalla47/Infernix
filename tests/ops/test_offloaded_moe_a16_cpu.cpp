@@ -166,7 +166,7 @@ void test_row_sums(const moe::ExpertShape& shape, int ncols) {
     std::vector<std::int64_t> s(static_cast<std::size_t>(groups) * 16 * ncols);
     for (moe::CpuIsa isa : {moe::CpuIsa::kScalar, moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni}) {
         if (!moe::cpu_isa_supported(isa)) { continue; }
-        moe::rg16_row_sums_a16(isa, e.record.data(), blocks, 0, groups, xp, ncols, s.data());
+        moe::rg16_row_sums_a16(isa, {e.record.data(), blocks}, 0, groups, xp, ncols, s.data());
         int bad = 0;
         for (int row = 0; row < groups * 16; ++row) {
             for (int c = 0; c < ncols; ++c) {

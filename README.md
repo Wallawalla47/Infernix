@@ -601,7 +601,7 @@ Flash-Next keeps in RAM only the routed experts VRAM does not hold by default (`
 exclusive`); `--expert-ram-layout full` keeps a copy of every expert, 4-6 GiB more RAM on Dense8 and IQ3_S at
 the same decode and prefill speed ([guide](docs/qwen3_8-flash-next.md)). The Qwen3.5-122B-A10B keeps every
 expert in RAM by default; `--expert-ram-layout exclusive` holds 3.9 GiB less at about 1 % of decode after long
-prompts ([guide](docs/qwen3_5-122b.md)).
+prompts ([guide](docs/qwen3_5-122b.md)). `--expert-csf` keeps the offloaded NVFP4 experts' RAM copies with compressed block scales (same output): prompts 2-5 % faster, decode 0.6-2 % slower, so it is off by default.
 
 `--prefix-cache-file PATH` keeps the prefix cache across restarts (Ctrl+C twice saves it and exits).
 `infernix-serve.exe --help` lists every option; `--config FILE` reads them from a TOML file

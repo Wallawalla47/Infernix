@@ -272,6 +272,7 @@ int main(int argc, char** argv) {
         engine_options.ram_free_bytes = options.ram_free_bytes;
         engine_options.expert_ram_bytes   = options.expert_ram_bytes;
         engine_options.expert_ram_layout  = options.expert_ram_layout;
+        engine_options.expert_csf         = options.expert_csf;
         engine_options.expert_pin_bytes   = options.expert_pin_bytes;
         engine_options.vram_headroom_bytes = options.vram_headroom_bytes;
         engine_options.vram_past_budget    = options.vram_past_budget;
@@ -314,6 +315,7 @@ int main(int argc, char** argv) {
         env.ram_free_bytes               = options.ram_free_bytes;
         env.expert_ram_bytes             = options.expert_ram_bytes;
         env.expert_ram_layout            = options.expert_ram_layout;
+        env.expert_csf                   = options.expert_csf;
         env.expert_pin_bytes            = options.expert_pin_bytes;
         env.kv_cache                 = options.kv_cache;
         env.logits_dtype             = options.logits_dtype;

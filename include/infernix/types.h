@@ -868,6 +868,11 @@ struct EngineOptions {
     // does not hold (plus shadows for a prefill's loan and the KV growth), Full a copy of every expert. Empty: the
     // model's default (kExpertRamLayoutDefaults).
     std::optional<ExpertRamLayout> expert_ram_layout;
+    // Offloaded NVFP4 experts (--expert-csf; Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): the experts' host copies (the
+    // pinned banks, or the SSD tier's RAM slots) hold their block scales as CSF records, ~5 % fewer bytes for each
+    // promotion, staged miss, prefill stream copy and CPU walk; every output is the same. Prompts are faster (2-5 %,
+    // 2026-11-09), decode 0.6-2 % slower (the CPU-served misses decode the scales). Off: the records as stored.
+    bool expert_csf = false;
     // Qwen3.8-Flash-Next (--expert-pin-mib): at most this much of the experts' RAM page-locked for
     // the GPU; the rest stays in RAM unpinned and the CPU serves it. Empty: what Windows lets the
     // process page-lock (the GPU's shared memory) after every other pin; no limit elsewhere.

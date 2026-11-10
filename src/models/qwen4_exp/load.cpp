@@ -954,12 +954,13 @@ Model::Model(Config config, LoadOptions options, TextWeights weights, std::vecto
              std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
              std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
              std::optional<ExpertStore> expert_store, std::optional<artifact::MaterializedArtifact> draft_backing,
-             PackedWeights packed)
+             PackedWeights packed, CsfTables csf_tables)
     : backing_(std::move(backing)), draft_backing_(std::move(draft_backing)), packed_(std::move(packed)),
       expert_store_(std::move(expert_store)),
       config_(std::move(config)), options_(options),
       weights_(std::move(weights)), bound_(std::move(bound)), banks_(std::move(banks)),
-      resources_(std::move(resources)), info_(std::move(info)), overlay_vision_(std::move(overlay_vision)) {}
+      csf_tables_(std::move(csf_tables)), resources_(std::move(resources)), info_(std::move(info)),
+      overlay_vision_(std::move(overlay_vision)) {}
 
 Model::~Model() = default;
 
@@ -1062,6 +1063,10 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         }
         banks.push_back(std::move(bank));
     }
+    // With LoadOptions::expert_csf the pinned NVFP4 banks' records become CSF records (runtime::expert_offload::
+    // compress_banks): every reader takes their tables, so each host-to-device copy and CPU walk of a record reads ~5 %
+    // fewer bytes.
+    CsfTables csf_tables = data->options.expert_csf ? runtime::expert_offload::compress_banks(banks) : CsfTables{};
     std::optional<ExpertStore> store;
     if (streamed) {
         const auto& c = data->config.text;
@@ -1082,7 +1087,8 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                             std::move(data->weights), std::move(bound),
                                             std::move(banks), std::move(data->resources),
                                             std::move(data->info), std::move(overlay), std::move(backing),
-                                            std::move(store), std::move(draft_backing), std::move(packed)));
+                                            std::move(store), std::move(draft_backing), std::move(packed),
+                                            std::move(csf_tables)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

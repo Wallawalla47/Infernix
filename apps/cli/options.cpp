@@ -105,6 +105,7 @@ constexpr std::array kCliOptions{
     CliOption{"--expert-ram-mib"},
     CliOption{"--expert-ram-layout"},
     CliOption{"--expert-pin-mib"},
+    CliOption{"--expert-csf", false},
     CliOption{"--kv-dtype"},
     CliOption{"--logits-dtype"},
     CliOption{"--spec"},
@@ -198,7 +199,7 @@ std::string usage_text(const char* argv0) {
            "       [--a8-activations]\n"
            "       [--embedding-host]\n"
            "       [--ram-free-mib N] [--expert-ram-mib N|auto] [--expert-ram-layout exclusive|full]\n"
-           "       [--expert-pin-mib N|auto]\n"
+           "       [--expert-pin-mib N|auto] [--expert-csf]\n"
            "       [--grammar-file FILE | --json-object | --json-schema-file FILE |\n"
            "        --regex PATTERN | --choice TEXT ...]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
@@ -248,6 +249,11 @@ std::string usage_text(const char* argv0) {
            "                           RAM page-locked for the GPU; the rest stays in RAM\n"
            "                           and the CPU serves it (auto: what Windows allows,\n"
            "                           the GPU's shared memory)\n"
+           "  --expert-csf             Offloaded NVFP4 experts (Qwen3.8-Flash-Next,\n"
+           "                           Qwen3.5-122B-A10B): keep their RAM copies' block\n"
+           "                           scales compressed (CSF, ~5 % fewer bytes; same\n"
+           "                           output): prompts 2-5 % faster, decode 0.6-2 % slower\n"
+           "                           (default off)\n"
            "\n"
            "KV CACHE\n"
            "  --kv-capacity N|auto     KV-cache capacity in tokens\n"
@@ -523,6 +529,8 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--expert-ram-layout") {
             options.expert_ram_layout = parse_expert_ram_layout(value(arg));
+        } else if (arg == "--expert-csf") {
+            options.expert_csf = true;
         } else if (arg == "--expert-pin-mib") {
             const std::string text = value(arg);
             if (text == "auto") {

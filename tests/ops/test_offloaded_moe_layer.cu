@@ -4,7 +4,8 @@
 // served by the host expert engine through the CPU miss channel
 // (docs/maintainer/qwen3_8-flash-next-design.md §8.6, §10.3, §16.2), and with SSD-only experts
 // (the SSD tier, §19.3.7) read through a RecordProvider by CPU jobs or fetched through the fetch
-// channel from a host responder, including its failure paths (host status, silent host).
+// channel from a host responder, including its failure paths (host status, silent host), and with the
+// bank's CSF records (csf_record.h) expanded as every staging route copies them and read by CPU jobs.
 //
 // Oracle: the CPU engine's output of each routed (column, expert) pair of the narrow route, bit
 // for bit; the narrow route's arithmetic is exact. Every output, the wide route's included (its own
@@ -23,6 +24,7 @@
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a16_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
+#include "ops/offloaded_sparse_moe/csf_record.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -45,6 +47,7 @@
 
 namespace moe      = infernix::ops::offloaded_moe;
 namespace fixtures = infernix::test::offloaded_moe;
+namespace csf      = infernix::ops::offloaded_moe::csf;
 using infernix::DType;
 using infernix::Tensor;
 using infernix::test::cuda_check;
@@ -215,9 +218,22 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     const std::size_t stride = moe::kRecordBytes;
     std::vector<fixtures::Expert> bank;
     std::vector<moe::ExpertScales> scales;
+    const csf::Geometry geometry = csf::Geometry::of(moe::kFlashNextShape);
     for (int e = 0; e < experts; ++e) {
         bank.push_back(a16 ? fixtures::random_a16_expert(rng) : fixtures::random_expert(rng, !shared_input && e % 3 == 0));
         scales.push_back(bank.back().scales);
+        // Two of every three row groups take scale codes near a centre per row, as NVIDIA's exports have them (their
+        // CSF regions compressed); the third keeps the fixture's spread codes and extremes (raw regions).
+        for (int rg = 0; rg < geometry.rgs(); ++rg) {
+            if (rg % 3 == 1) { continue; }
+            for (int r = 0; r < 16; ++r) {
+                const int centre = 30 + static_cast<int>(rng() % 60);
+                for (int b = 0; b < geometry.blocks(rg); ++b) {
+                    bank.back().record[geometry.expanded_offset(rg) + static_cast<std::size_t>(b) * moe::kUnitBytes + 128 + r] =
+                        static_cast<std::uint8_t>(centre + static_cast<int>(rng() % 9) - 4 + (rng() % 50 == 0 ? 25 : 0));
+                }
+            }
+        }
     }
     // Pinned host bank of every record; every third expert also resident in a device frame.
     std::uint8_t* host = nullptr;
@@ -225,6 +241,24 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     for (int e = 0; e < experts; ++e) { std::memcpy(host + stride * e, bank[e].record.data(), moe::kRecordBytes); }
     std::uint8_t* host_device = nullptr;
     cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_device), host, 0), "cudaHostGetDevicePointer");
+    // The same bank of CSF records (csf_record.h: each compressed in place at the bank's stride) and its tables.
+    std::uint8_t* csf_host = nullptr;
+    std::uint32_t* csf_tables = nullptr;
+    const auto table_words = static_cast<std::size_t>(geometry.table_words());
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&csf_host), stride * experts, cudaHostAllocMapped), "cudaHostAlloc");
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&csf_tables), table_words * sizeof(std::uint32_t) * experts,
+                             cudaHostAllocMapped),
+               "cudaHostAlloc");
+    for (int e = 0; e < experts; ++e) {
+        std::memcpy(csf_host + stride * e, bank[e].record.data(), moe::kRecordBytes);
+        (void)csf::compress_record(moe::kFlashNextShape, csf_host + stride * e, csf_host + stride * e,
+                                   csf_tables + table_words * e);
+    }
+    std::uint8_t* csf_host_device = nullptr;
+    std::uint32_t* csf_tables_device = nullptr;
+    cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&csf_host_device), csf_host, 0), "cudaHostGetDevicePointer");
+    cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&csf_tables_device), csf_tables, 0),
+               "cudaHostGetDevicePointer");
     // The same records in shuffled host slots, reached through a host-pointer table (the SSD tier's
     // RAM slots, design §19.3.7 R5): every route must read identical bits through it.
     std::uint8_t* shuffled = nullptr;
@@ -322,6 +356,14 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     cuda_check(cudaMalloc(&d_out, expected.size() * sizeof(std::uint16_t)), "cudaMalloc");
     std::vector<moe::CpuMissService::Layer> layers{{.records = host, .record_stride = stride, .scales = scales.data()}};
     moe::CpuMissService service_two(layers, {.workers = 2, .max_jobs = 2, .max_columns = 64, .cpus = {}, .activation = activation, .narrow_a16 = narrow});
+    // The CSF bank's services: the CPU reads the compressed records.
+    std::vector<moe::CpuMissService::Layer> csf_layers{
+        {.records = csf_host, .record_stride = stride, .csf = csf_tables, .scales = scales.data()}};
+    moe::CpuMissService service_csf_two(csf_layers, {.workers = 2, .max_jobs = 2, .max_columns = 64, .cpus = {},
+                                                     .activation = activation, .narrow_a16 = narrow});
+    moe::CpuMissService service_csf_all(csf_layers, {.workers = 6, .max_jobs = moe::kMaxCpuJobs, .max_columns = 64,
+                                                     .pcie_divisor = 0, .cpus = {}, .activation = activation,
+                                                     .narrow_a16 = narrow});
     moe::CpuMissService service_eight(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {}, .activation = activation, .narrow_a16 = narrow});
     // The largest cap with every miss offered to the CPU, and a cap whose jobs are limited to two columns.
     moe::CpuMissService service_all(layers, {.workers = 6, .max_jobs = moe::kMaxCpuJobs, .max_columns = 64,
@@ -370,6 +412,13 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                                  .pcie_divisor = 0, .cpus = {}, .activation = activation, .narrow_a16 = narrow, .records = &copied});
     moe::CpuMissService service_ssd8(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {}, .activation = activation, .narrow_a16 = narrow,
                                               .records = &copied});
+    // The same for the tier's CSF slots: tiered requests carry tagged records, the provider's are expanded.
+    moe::CpuMissService service_tier_two(layers, {.workers = 2, .max_jobs = 2, .max_columns = 64, .cpus = {},
+                                                  .activation = activation, .narrow_a16 = narrow, .records = &copied,
+                                                  .tier_csf_pitch = stride});
+    moe::CpuMissService service_tier_ssd8(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {},
+                                                   .activation = activation, .narrow_a16 = narrow, .records = &copied,
+                                                   .tier_csf_pitch = stride});
     // The CPU's share of the misses (design §19.3.5 S3): want = min(cap, M - kept) of the misses with
     // at most max_job_columns columns, so the number served is min(want, eligible misses). The link
     // keeps M / one_column_divisor in a one-column call (when set), else (M * share) >> 8 in an assisted
@@ -407,6 +456,26 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     }
     auto* d_narrow_table = device_copy(narrow_table);
     auto* d_full_table   = device_copy(full_table);
+    // The SSD tier's CSF slots (MoeExpertSource::host_csf_pitch; HostExpertTier::Options::csf): the shuffled slots'
+    // records compressed in place with their tables in the slots' tails (csf::compress_slot), every fourth left
+    // expanded, the compressed ones' table entries tagged (csf::kTag); and with the full set's SSD-only experts.
+    std::uint8_t* tier_slots = nullptr;
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&tier_slots), stride * experts, cudaHostAllocMapped), "cudaHostAlloc");
+    std::vector<const std::uint8_t*> tier_table(experts), tier_full_table(experts);
+    int tier_compressed = 0;
+    for (int e = 0; e < experts; ++e) {
+        std::uint8_t* slot = tier_slots + stride * slot_of[e];
+        std::memcpy(slot, bank[e].record.data(), moe::kRecordBytes);
+        const bool compressed = e % 4 != 2 && csf::compress_slot(moe::kFlashNextShape, slot, stride);
+        tier_compressed += compressed ? 1 : 0;
+        std::uint8_t* mapped = nullptr;
+        cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&mapped), slot, 0), "cudaHostGetDevicePointer");
+        tier_table[e]      = compressed ? csf::tag(mapped) : mapped;
+        tier_full_table[e] = full_table[e] == nullptr ? nullptr : tier_table[e];
+    }
+    check(tier_compressed > experts / 2, "tier CSF: most slots compress");
+    auto* d_tier_table      = device_copy(tier_table);
+    auto* d_tier_full_table = device_copy(tier_full_table);
     Responder responder(host, stride);
     // The overlap route (prefill passes staged on a side stream) and its five events.
     cudaStream_t overlap_stream = nullptr;
@@ -462,6 +531,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         bool overlap  = false; // passes staged on the overlap stream
         int idle      = 0;     // calls after the service idles 60 ms; 2: wake() before each
         bool split    = false; // a forked call's misses staged in two launches (MoeExpertSource::split_stream)
+        bool csf      = false; // the bank's CSF records (MoeExpertSource::host_csf), expanded as they are staged
+        bool tier_csf = false; // with table: the tier's CSF slots (tagged entries, MoeExpertSource::host_csf_pitch)
     };
     // Which misses the CPU takes (design §19.3.5 S3): the SSD-only ones first (`ssd`: only the CPU or a fetch can
     // serve them), up to the cap, then want = min(cap - taken, M - M / divisor) of the M host-memory misses; each
@@ -569,6 +640,39 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                        .fetched = true, .split = true},
                                 Config{.slots = 64, .service = &service_ssd8, .fork = true, .land = true, .table = true,
                                        .ssd = 2, .fetched = true, .split = true},
+                                // CSF host records: serial passes (one slot, three, all), the fork, landings, the
+                                // split launches, the overlap passes, streamed records and CPU jobs on them.
+                                Config{.slots = 1, .service = nullptr, .csf = true},
+                                Config{.slots = 3, .service = nullptr, .csf = true},
+                                Config{.slots = 64, .service = nullptr, .csf = true},
+                                Config{.slots = 64, .service = nullptr, .fork = true, .csf = true},
+                                Config{.slots = 64, .service = &service_csf_two, .fork = true, .land = true, .csf = true},
+                                Config{.slots = 64, .service = nullptr, .fork = true, .split = true, .csf = true},
+                                Config{.slots = 64, .service = &service_csf_two, .fork = true, .land = true,
+                                       .split = true, .csf = true},
+                                Config{.slots = 16, .service = nullptr, .overlap = true, .csf = true},
+                                Config{.slots = 64, .service = nullptr, .streamed = true, .csf = true},
+                                Config{.slots = 3, .service = &service_csf_all, .csf = true},
+                                Config{.slots = 64, .service = &service_csf_all, .fork = true, .csf = true},
+                                // The tier's CSF slots beside expanded ones: serial passes, the fork with landings,
+                                // the split launches, the overlap passes, CPU jobs on tagged records, fetched SSD-only
+                                // records (expanded) with CPU jobs.
+                                Config{.slots = 1, .service = nullptr, .table = true, .tier_csf = true},
+                                Config{.slots = 3, .service = nullptr, .table = true, .tier_csf = true},
+                                Config{.slots = 64, .service = nullptr, .fork = true, .land = true, .table = true,
+                                       .tier_csf = true},
+                                Config{.slots = 64, .service = nullptr, .fork = true, .table = true, .split = true,
+                                       .tier_csf = true},
+                                Config{.slots = 16, .service = nullptr, .table = true, .overlap = true, .tier_csf = true},
+                                Config{.slots = 3, .service = &service_tier_two, .table = true, .tier_csf = true},
+                                Config{.slots = 64, .service = &service_tier_two, .fork = true, .table = true,
+                                       .tier_csf = true},
+                                Config{.slots = 3, .service = nullptr, .table = true, .ssd = 2, .fetched = true,
+                                       .tier_csf = true},
+                                Config{.slots = 64, .service = &service_tier_ssd8, .fork = true, .table = true, .ssd = 2,
+                                       .fetched = true, .tier_csf = true},
+                                Config{.slots = 16, .service = &service_tier_ssd8, .table = true, .ssd = 2,
+                                       .fetched = true, .overlap = true, .tier_csf = true},
                                 // An idle service answers its first request promptly (Windows: no 15.6 ms
                                 // timer-tick sleep): through its short idle wait, and at once after wake().
                                 // The first call, without the service, measures the GPU's own idle cost.
@@ -633,6 +737,14 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         if (config.overlap) {
             source.overlap_stream = overlap_stream;
             for (int i = 0; i < 5; ++i) { source.overlap_events[i] = overlap_events[i]; }
+        }
+        if (config.csf) {
+            source.host_records = csf_host_device;
+            source.host_csf     = csf_tables_device;
+        }
+        if (config.tier_csf) {
+            source.host_table     = config.ssd == 2 ? d_tier_full_table : d_tier_table;
+            source.host_csf_pitch = stride;
         }
         constexpr int kFetchLayer = 5; // names the call in its error word
         if (config.fetched) {
@@ -884,8 +996,13 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     cudaFree(d_table);
     cudaFree(d_narrow_table);
     cudaFree(d_full_table);
+    cudaFree(d_tier_table);
+    cudaFree(d_tier_full_table);
+    cudaFreeHost(tier_slots);
     cudaFreeHost(error_host);
     cudaFreeHost(shuffled);
+    cudaFreeHost(csf_host);
+    cudaFreeHost(csf_tables);
     cudaFree(d_prefetched);
     cudaFree(d_frames);
     cudaFree(d_landed);
@@ -1739,6 +1856,9 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
             constexpr auto kNarrow = moe::NarrowA16::kExact;
             constexpr auto kWide = moe::WideA16::kExact;
             test_layer(12, 1, 10, 211, kA4, kNarrow, kWide, true);
+            test_layer(16, 2, 10, 231, kA4, kNarrow, kWide, true);
+            test_layer(9, 3, 3, 233, kA4, kNarrow, kWide, true); // several columns per expert
+            test_layer(24, 3, 10, 235, kA4, kNarrow, kWide, true);
             test_layer(24, 8, 10, 213, kA4, kNarrow, kWide, true);
             test_layer(9, 5, 3, 217, kA4, kNarrow, kWide, true);
             test_layer(9, 4, 3, 219, kA4, kNarrow, kWide, true);
@@ -1798,6 +1918,3 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
     std::printf("all offloaded_moe layer checks passed\n");
     return 0;
 }
-            test_layer(16, 2, 10, 231, kA4, kNarrow, kWide, true);
-            test_layer(9, 3, 3, 233, kA4, kNarrow, kWide, true); // several columns per expert
-            test_layer(24, 3, 10, 235, kA4, kNarrow, kWide, true);

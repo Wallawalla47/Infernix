@@ -338,7 +338,8 @@ std::unique_ptr<Model> plan_model(LoadPlan&& plan) {
     return std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(parts.bound),
         std::move(data->resources), std::move(data->info), std::nullopt, std::move(backing), std::move(parts.banks),
-        std::move(parts.shared_banks), std::move(parts.shared_multipliers), std::move(parts.store)));
+        std::move(parts.shared_banks), std::move(parts.shared_multipliers), std::move(parts.store),
+        runtime::expert_offload::CsfTables{}));
 }
 
 std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
@@ -400,11 +401,17 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     }
     BoundModel parts =
         bind_model(data->config, data->options, data->weights, std::move(data->pending), backing, reader);
+    // With LoadOptions::expert_csf the pinned routed banks' records become CSF records (runtime::expert_offload::
+    // compress_banks): every reader takes their tables, so each host-to-device copy and CPU walk of a record reads ~5 %
+    // fewer bytes.
+    runtime::expert_offload::CsfTables csf_tables = data->options.expert_csf
+                                                        ? runtime::expert_offload::compress_banks(parts.banks)
+                                                        : runtime::expert_offload::CsfTables{};
     return std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(parts.bound),
         std::move(data->resources), std::move(data->info), std::move(overlay),
         std::move(backing), std::move(parts.banks), std::move(parts.shared_banks),
-        std::move(parts.shared_multipliers), std::move(parts.store)));
+        std::move(parts.shared_multipliers), std::move(parts.store), std::move(csf_tables)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

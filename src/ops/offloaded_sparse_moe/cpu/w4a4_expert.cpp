@@ -1,5 +1,7 @@
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
+#include "ops/offloaded_sparse_moe/csf_record.h"
+
 #include <array>
 #include <cstring>
 #include <stdexcept>
@@ -12,6 +14,7 @@
 #    else
 #        include <cpuid.h>
 #    endif
+#    include "ops/offloaded_sparse_moe/cpu/csf_scales.h"
 #    define INFERNIX_MOE_X86 1
 #endif
 
@@ -32,19 +35,20 @@ inline unsigned unit_code(const std::uint8_t* unit, int r, int k) {
     return r < 8 ? (byte & 15U) : (byte >> 4);
 }
 
-void row_sums_scalar(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end,
-                     const A4Block* const* acts, int ncols, std::int64_t* out) {
+void row_sums_scalar(const Rg16Matrix& m, int rg_begin, int rg_end, const A4Block* const* acts, int ncols,
+                     std::int64_t* out) {
+    csf::GroupScales g;
     for (int rg = rg_begin; rg < rg_end; ++rg) {
+        csf::group_scales(m, rg, g);
         for (int c = 0; c < ncols; ++c) {
             std::int64_t s[16] = {};
-            for (int b = 0; b < blocks; ++b) {
-                const std::uint8_t* unit =
-                    matrix + (static_cast<std::size_t>(rg) * blocks + b) * kUnitBytes;
+            for (int b = 0; b < m.blocks; ++b) {
+                const std::uint8_t* unit = g.units + static_cast<std::size_t>(b) * g.pitch;
                 const A4Block& a = acts[c][b];
                 for (int r = 0; r < 16; ++r) {
                     std::int32_t p = 0;
                     for (int k = 0; k < 16; ++k) { p += canon::e2m1_x2(unit_code(unit, r, k)) * a.c2[k]; }
-                    s[r] += static_cast<std::int64_t>(p * a.scale_scaled) * canon::e4m3_scaled(unit[128 + r]);
+                    s[r] += static_cast<std::int64_t>(p * a.scale_scaled) * canon::e4m3_scaled(g.scales[b][r]);
                 }
             }
             for (int r = 0; r < 16; ++r) { out[(static_cast<std::size_t>(rg - rg_begin) * 16 + r) * ncols + c] = s[r]; }
@@ -79,8 +83,8 @@ inline std::int32_t quad_word(const A4Block& a, int q) {
 // ----------------------------------------------------------------------------------- AVX-512
 
 INFERNIX_TARGET("avx512f,avx512bw,avx512vnni")
-inline __m512i scales16_avx512(const std::uint8_t* s) {
-    const __m512i w    = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(s)));
+inline __m512i scales16_avx512(__m128i s) {
+    const __m512i w    = _mm512_cvtepu8_epi32(s);
     const __m512i m    = _mm512_and_si512(w, _mm512_set1_epi32(7));
     const __m512i e    = _mm512_and_si512(_mm512_srli_epi32(w, 3), _mm512_set1_epi32(15));
     const __m512i norm = _mm512_sllv_epi32(_mm512_or_si512(m, _mm512_set1_epi32(8)),
@@ -89,63 +93,91 @@ inline __m512i scales16_avx512(const std::uint8_t* s) {
     return _mm512_mask_blend_epi32(sub, norm, m);
 }
 
-template <int N>
+// The row groups [rg_begin, rg_end) of a matrix, each by `body(group, out)` of the group's (compressed or raw)
+// units, `out` its rows' sums (`stride` values a row group).
+template <class Body>
+void for_groups(const Rg16Matrix& m, int rg_begin, int rg_end, std::size_t stride, std::int64_t* out, Body&& body) {
+    for (int rg = rg_begin; rg < rg_end; ++rg) { body(csf::group(m, rg), out + static_cast<std::size_t>(rg - rg_begin) * stride); }
+}
+
+// One row group (Csf: compressed units, their scales decoded once per unit for every column).
+template <int N, bool Csf>
 INFERNIX_TARGET("avx512f,avx512bw,avx512vnni")
-void row_sums_avx512(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end,
-                     const A4Block* const* acts, std::int64_t* out, int prefetch_bytes) {
+void rg_sums_avx512(const csf::Group& g, int blocks, const A4Block* const* acts, std::int64_t* out, int prefetch_bytes) {
     const __m128i lut128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kBiasedCodes.data()));
     const __m512i lut    = _mm512_broadcast_i32x4(lut128);
     const __m512i low4   = _mm512_set1_epi8(0x0F);
-    for (int rg = rg_begin; rg < rg_end; ++rg) {
-        __m512i even[N], odd[N];
-        for (int c = 0; c < N; ++c) { even[c] = odd[c] = _mm512_setzero_si512(); }
-        for (int b = 0; b < blocks; ++b) {
-            const std::uint8_t* unit = matrix + (static_cast<std::size_t>(rg) * blocks + b) * kUnitBytes;
-            prefetch_unit(unit, prefetch_bytes);
-            __m512i p[N];
-            for (int c = 0; c < N; ++c) { p[c] = _mm512_setzero_si512(); }
-            for (int q = 0; q < 4; ++q) {
-                __m512i v = _mm512_broadcast_i64x4(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(unit + 32 * q)));
-                v         = _mm512_mask_srli_epi16(v, 0xFFFF0000U, v, 4); // upper half: high nibbles
-                v         = _mm512_shuffle_epi8(lut, _mm512_and_si512(v, low4));
-                for (int c = 0; c < N; ++c) {
-                    p[c] = _mm512_dpbusd_epi32(p[c], v, _mm512_set1_epi32(quad_word(acts[c][b], q)));
-                }
-            }
-            const __m512i sw     = scales16_avx512(unit + 128);
-            const __m512i sw_odd = _mm512_srli_epi64(sw, 32);
+    constexpr std::size_t kPitch = Csf ? csf::kBodyBytes : kUnitBytes;
+    __m128i bases                = _mm_setzero_si128();
+    if constexpr (Csf) { bases = _mm_loadu_si128(reinterpret_cast<const __m128i*>(g.bases)); }
+    const std::uint8_t* escape = g.escapes;
+    __m512i even[N], odd[N];
+    for (int c = 0; c < N; ++c) { even[c] = odd[c] = _mm512_setzero_si512(); }
+    for (int b = 0; b < blocks; ++b) {
+        const std::uint8_t* unit = g.units + static_cast<std::size_t>(b) * kPitch;
+        prefetch_unit(unit, prefetch_bytes);
+        __m512i p[N];
+        for (int c = 0; c < N; ++c) { p[c] = _mm512_setzero_si512(); }
+        for (int q = 0; q < 4; ++q) {
+            __m512i v = _mm512_broadcast_i64x4(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(unit + 32 * q)));
+            v         = _mm512_mask_srli_epi16(v, 0xFFFF0000U, v, 4); // upper half: high nibbles
+            v         = _mm512_shuffle_epi8(lut, _mm512_and_si512(v, low4));
             for (int c = 0; c < N; ++c) {
-                const A4Block& a = acts[c][b];
-                const __m512i pc = _mm512_sub_epi32(p[c], _mm512_set1_epi32(kBias * a.c2_sum));
-                const __m512i pa = _mm512_mullo_epi32(pc, _mm512_set1_epi32(a.scale_scaled));
-                even[c] = _mm512_add_epi64(even[c], _mm512_mul_epi32(pa, sw));
-                odd[c]  = _mm512_add_epi64(odd[c], _mm512_mul_epi32(_mm512_srli_epi64(pa, 32), sw_odd));
+                p[c] = _mm512_dpbusd_epi32(p[c], v, _mm512_set1_epi32(quad_word(acts[c][b], q)));
             }
         }
+        __m128i s16;
+        if constexpr (Csf) {
+            { const csf::UnitScales u_ = csf::unit_scales_sse(unit, bases, escape); s16 = u_.scales; escape += u_.escapes; }
+        } else {
+            s16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(unit + 128));
+        }
+        const __m512i sw     = scales16_avx512(s16);
+        const __m512i sw_odd = _mm512_srli_epi64(sw, 32);
         for (int c = 0; c < N; ++c) {
-            alignas(64) std::int64_t e[8], o[8];
-            _mm512_store_si512(reinterpret_cast<__m512i*>(e), even[c]);
-            _mm512_store_si512(reinterpret_cast<__m512i*>(o), odd[c]);
-            for (int i = 0; i < 8; ++i) {
-                const std::size_t base = static_cast<std::size_t>(rg - rg_begin) * 16;
-                out[(base + 2 * i) * N + c]     = e[i];
-                out[(base + 2 * i + 1) * N + c] = o[i];
-            }
+            const A4Block& a = acts[c][b];
+            const __m512i pc = _mm512_sub_epi32(p[c], _mm512_set1_epi32(kBias * a.c2_sum));
+            const __m512i pa = _mm512_mullo_epi32(pc, _mm512_set1_epi32(a.scale_scaled));
+            even[c] = _mm512_add_epi64(even[c], _mm512_mul_epi32(pa, sw));
+            odd[c]  = _mm512_add_epi64(odd[c], _mm512_mul_epi32(_mm512_srli_epi64(pa, 32), sw_odd));
+        }
+    }
+    for (int c = 0; c < N; ++c) {
+        alignas(64) std::int64_t e[8], o[8];
+        _mm512_store_si512(reinterpret_cast<__m512i*>(e), even[c]);
+        _mm512_store_si512(reinterpret_cast<__m512i*>(o), odd[c]);
+        for (int i = 0; i < 8; ++i) {
+            out[(2 * i) * N + c]     = e[i];
+            out[(2 * i + 1) * N + c] = o[i];
         }
     }
 }
 
+template <int N>
+void row_sums_avx512(const Rg16Matrix& m, int rg_begin, int rg_end, const A4Block* const* acts, std::int64_t* out,
+                     int prefetch_bytes) {
+    for_groups(m, rg_begin, rg_end, 16 * N, out, [&](const csf::Group& g, std::int64_t* o) {
+        if (g.bases != nullptr) {
+            rg_sums_avx512<N, true>(g, m.blocks, acts, o, prefetch_bytes);
+        } else {
+            rg_sums_avx512<N, false>(g, m.blocks, acts, o, prefetch_bytes);
+        }
+    });
+}
+
 // ----------------------------------------------------------------------------------- AVX2
 
+// The 16 rows' multipliers of a unit's scale bytes `s` (canon::e4m3_scaled; rows 0-7 in lo, 8-15 in hi): the mantissa
+// (8 | m, or m for a subnormal code) and the exponent step (e - 1, or 0) formed on the 16 bytes at once, then a
+// widening and a variable shift per half: ~15 instructions a unit against ~20 for two eight-lane conversions.
 INFERNIX_TARGET("avx2")
-inline __m256i scales8_avx2(const std::uint8_t* s) {
-    const __m256i w    = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(s)));
-    const __m256i m    = _mm256_and_si256(w, _mm256_set1_epi32(7));
-    const __m256i e    = _mm256_and_si256(_mm256_srli_epi32(w, 3), _mm256_set1_epi32(15));
-    const __m256i norm = _mm256_sllv_epi32(_mm256_or_si256(m, _mm256_set1_epi32(8)),
-                                           _mm256_sub_epi32(e, _mm256_set1_epi32(1)));
-    const __m256i sub  = _mm256_cmpeq_epi32(e, _mm256_setzero_si256());
-    return _mm256_blendv_epi8(norm, m, sub);
+inline void scales16_avx2(__m128i s, __m256i& lo, __m256i& hi) {
+    const __m128i m    = _mm_and_si128(s, _mm_set1_epi8(7));
+    const __m128i e    = _mm_and_si128(_mm_srli_epi16(s, 3), _mm_set1_epi8(15));
+    const __m128i mant = _mm_or_si128(m, _mm_andnot_si128(_mm_cmpeq_epi8(e, _mm_setzero_si128()), _mm_set1_epi8(8)));
+    const __m128i step = _mm_subs_epu8(e, _mm_set1_epi8(1));
+    lo = _mm256_sllv_epi32(_mm256_cvtepu8_epi32(mant), _mm256_cvtepu8_epi32(step));
+    hi = _mm256_sllv_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(mant, 8)), _mm256_cvtepu8_epi32(_mm_srli_si128(step, 8)));
 }
 
 INFERNIX_TARGET("avx2")
@@ -159,71 +191,107 @@ inline __m256i dot4_avxvnni(__m256i acc, __m256i w, __m256i a) {
     return _mm256_dpbusd_avx_epi32(acc, w, a);
 }
 
-// One body, two target attributes: AVX-VNNI must not leak into the plain AVX2 variant.
-#define INFERNIX_AVX2_ROW_SUMS(NAME, DOT) \
-void NAME(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end, \
-                   const A4Block* const* acts, std::int64_t* out, int prefetch_bytes) { \
+// Scale modes of a row group: expanded units, or a compressed group's scales decoded per unit
+// (csf::unit_scales_sse).
+constexpr int kRawScales = 0, kInlineScales = 1;
+
+// One row group, one body, two target attributes: AVX-VNNI must not leak into the plain AVX2 variant.
+#define INFERNIX_AVX2_RG_SUMS(NAME, DOT) \
+void NAME(const csf::Group& g, int blocks, const A4Block* const* acts, std::int64_t* out, int prefetch_bytes) { \
     const __m128i lut128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kBiasedCodes.data())); \
     const __m256i lut    = _mm256_broadcastsi128_si256(lut128); \
     const __m256i low4   = _mm256_set1_epi8(0x0F); \
-    for (int rg = rg_begin; rg < rg_end; ++rg) { \
-        __m256i even[2][N], odd[2][N]; \
+    constexpr std::size_t kPitch = S != kRawScales ? csf::kBodyBytes : kUnitBytes; \
+    __m128i bases = _mm_setzero_si128(); \
+    if constexpr (S != kRawScales) { bases = _mm_loadu_si128(reinterpret_cast<const __m128i*>(g.bases)); } \
+    const std::uint8_t* escape = g.escapes; \
+    __m256i even[2][N], odd[2][N]; \
+    for (int h = 0; h < 2; ++h) { \
+        for (int c = 0; c < N; ++c) { even[h][c] = odd[h][c] = _mm256_setzero_si256(); } \
+    } \
+    for (int b = 0; b < blocks; ++b) { \
+        const std::uint8_t* unit = g.units + static_cast<std::size_t>(b) * kPitch; \
+        prefetch_unit(unit, prefetch_bytes); \
+        __m256i p[2][N]; \
         for (int h = 0; h < 2; ++h) { \
-            for (int c = 0; c < N; ++c) { even[h][c] = odd[h][c] = _mm256_setzero_si256(); } \
+            for (int c = 0; c < N; ++c) { p[h][c] = _mm256_setzero_si256(); } \
         } \
-        for (int b = 0; b < blocks; ++b) { \
-            const std::uint8_t* unit = matrix + (static_cast<std::size_t>(rg) * blocks + b) * kUnitBytes; \
-            prefetch_unit(unit, prefetch_bytes); \
-            __m256i p[2][N]; \
-            for (int h = 0; h < 2; ++h) { \
-                for (int c = 0; c < N; ++c) { p[h][c] = _mm256_setzero_si256(); } \
-            } \
-            for (int q = 0; q < 4; ++q) { \
-                const __m256i v  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(unit + 32 * q)); \
-                const __m256i lo = _mm256_shuffle_epi8(lut, _mm256_and_si256(v, low4)); \
-                const __m256i hi = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(v, 4), low4)); \
-                for (int c = 0; c < N; ++c) { \
-                    const __m256i a = _mm256_set1_epi32(quad_word(acts[c][b], q)); \
-                    p[0][c] = DOT(p[0][c], lo, a); \
-                    p[1][c] = DOT(p[1][c], hi, a); \
-                } \
-            } \
-            for (int h = 0; h < 2; ++h) { \
-                const __m256i sw     = scales8_avx2(unit + 128 + 8 * h); \
-                const __m256i sw_odd = _mm256_srli_epi64(sw, 32); \
-                for (int c = 0; c < N; ++c) { \
-                    const A4Block& a = acts[c][b]; \
-                    const __m256i pc = _mm256_sub_epi32(p[h][c], _mm256_set1_epi32(kBias * a.c2_sum)); \
-                    const __m256i pa = _mm256_mullo_epi32(pc, _mm256_set1_epi32(a.scale_scaled)); \
-                    even[h][c] = _mm256_add_epi64(even[h][c], _mm256_mul_epi32(pa, sw)); \
-                    odd[h][c]  = _mm256_add_epi64(odd[h][c], _mm256_mul_epi32(_mm256_srli_epi64(pa, 32), sw_odd)); \
-                } \
-            } \
-        } \
-        for (int h = 0; h < 2; ++h) { \
+        for (int q = 0; q < 4; ++q) { \
+            const __m256i v  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(unit + 32 * q)); \
+            const __m256i lo = _mm256_shuffle_epi8(lut, _mm256_and_si256(v, low4)); \
+            const __m256i hi = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(v, 4), low4)); \
             for (int c = 0; c < N; ++c) { \
-                alignas(32) std::int64_t e[4], o[4]; \
-                _mm256_store_si256(reinterpret_cast<__m256i*>(e), even[h][c]); \
-                _mm256_store_si256(reinterpret_cast<__m256i*>(o), odd[h][c]); \
-                for (int i = 0; i < 4; ++i) { \
-                    const std::size_t base = static_cast<std::size_t>(rg - rg_begin) * 16 + 8 * h; \
-                    out[(base + 2 * i) * N + c]     = e[i]; \
-                    out[(base + 2 * i + 1) * N + c] = o[i]; \
-                } \
+                const __m256i a = _mm256_set1_epi32(quad_word(acts[c][b], q)); \
+                p[0][c] = DOT(p[0][c], lo, a); \
+                p[1][c] = DOT(p[1][c], hi, a); \
+            } \
+        } \
+        __m128i s16; \
+        if constexpr (S == kInlineScales) { \
+            { const csf::UnitScales u_ = csf::unit_scales_sse(unit, bases, escape); s16 = u_.scales; escape += u_.escapes; } \
+        } else { \
+            s16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(unit + 128)); \
+        } \
+        __m256i sw_half[2]; \
+        scales16_avx2(s16, sw_half[0], sw_half[1]); \
+        for (int h = 0; h < 2; ++h) { \
+            const __m256i sw     = sw_half[h]; \
+            const __m256i sw_odd = _mm256_srli_epi64(sw, 32); \
+            for (int c = 0; c < N; ++c) { \
+                const A4Block& a = acts[c][b]; \
+                const __m256i pc = _mm256_sub_epi32(p[h][c], _mm256_set1_epi32(kBias * a.c2_sum)); \
+                const __m256i pa = _mm256_mullo_epi32(pc, _mm256_set1_epi32(a.scale_scaled)); \
+                even[h][c] = _mm256_add_epi64(even[h][c], _mm256_mul_epi32(pa, sw)); \
+                odd[h][c]  = _mm256_add_epi64(odd[h][c], _mm256_mul_epi32(_mm256_srli_epi64(pa, 32), sw_odd)); \
+            } \
+        } \
+    } \
+    for (int h = 0; h < 2; ++h) { \
+        for (int c = 0; c < N; ++c) { \
+            alignas(32) std::int64_t e[4], o[4]; \
+            _mm256_store_si256(reinterpret_cast<__m256i*>(e), even[h][c]); \
+            _mm256_store_si256(reinterpret_cast<__m256i*>(o), odd[h][c]); \
+            for (int i = 0; i < 4; ++i) { \
+                out[(8 * h + 2 * i) * N + c]     = e[i]; \
+                out[(8 * h + 2 * i + 1) * N + c] = o[i]; \
             } \
         } \
     } \
 }
 
-template <int N>
+template <int N, int S>
 INFERNIX_TARGET("avx2")
-INFERNIX_AVX2_ROW_SUMS(row_sums_avx2, dot4_avx2)
+INFERNIX_AVX2_RG_SUMS(rg_sums_avx2, dot4_avx2)
+
+template <int N, int S>
+INFERNIX_TARGET("avx2,avxvnni")
+INFERNIX_AVX2_RG_SUMS(rg_sums_avxvnni, dot4_avxvnni)
+
+#undef INFERNIX_AVX2_RG_SUMS
 
 template <int N>
-INFERNIX_TARGET("avx2,avxvnni")
-INFERNIX_AVX2_ROW_SUMS(row_sums_avxvnni, dot4_avxvnni)
+void row_sums_avx2(const Rg16Matrix& m, int rg_begin, int rg_end, const A4Block* const* acts, std::int64_t* out,
+                   int prefetch_bytes) {
+    for_groups(m, rg_begin, rg_end, 16 * N, out, [&](const csf::Group& g, std::int64_t* o) {
+        if (g.bases == nullptr) {
+            rg_sums_avx2<N, kRawScales>(g, m.blocks, acts, o, prefetch_bytes);
+        } else {
+            rg_sums_avx2<N, kInlineScales>(g, m.blocks, acts, o, prefetch_bytes);
+        }
+    });
+}
 
-#undef INFERNIX_AVX2_ROW_SUMS
+template <int N>
+void row_sums_avxvnni(const Rg16Matrix& m, int rg_begin, int rg_end, const A4Block* const* acts, std::int64_t* out,
+                      int prefetch_bytes) {
+    for_groups(m, rg_begin, rg_end, 16 * N, out, [&](const csf::Group& g, std::int64_t* o) {
+        if (g.bases == nullptr) {
+            rg_sums_avxvnni<N, kRawScales>(g, m.blocks, acts, o, prefetch_bytes);
+        } else {
+            rg_sums_avxvnni<N, kInlineScales>(g, m.blocks, acts, o, prefetch_bytes);
+        }
+    });
+}
 
 // --------------------------------------------------------------- AVX2 canonical functions
 // canonical_math.h's exp_c, silu_c, f32_to_bf16_rn, e4m3_rn_satfinite and quantize_a4_block on eight
@@ -519,25 +587,25 @@ CpuIsa best_cpu_isa() {
     return CpuIsa::kScalar;
 }
 
-void rg16_row_sums(CpuIsa isa, const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end,
-                   const canon::A4Block* const* acts, int ncols, std::int64_t* out, int prefetch_bytes) {
+void rg16_row_sums(CpuIsa isa, const Rg16Matrix& matrix, int rg_begin, int rg_end, const canon::A4Block* const* acts,
+                   int ncols, std::int64_t* out, int prefetch_bytes) {
     if (ncols < 1 || ncols > kMaxColumns) { throw std::invalid_argument("offloaded_moe: ncols must be in [1, 8]"); }
     if (!cpu_isa_supported(isa)) { throw std::invalid_argument("offloaded_moe: unsupported CPU ISA"); }
     switch (isa) {
-    case CpuIsa::kScalar: row_sums_scalar(matrix, blocks, rg_begin, rg_end, acts, ncols, out); return;
+    case CpuIsa::kScalar: row_sums_scalar(matrix, rg_begin, rg_end, acts, ncols, out); return;
 #if defined(INFERNIX_MOE_X86)
     case CpuIsa::kAvx512Vnni:
-#    define INFERNIX_CALL(n) row_sums_avx512<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
+#    define INFERNIX_CALL(n) row_sums_avx512<n>(matrix, rg_begin, rg_end, acts, out, prefetch_bytes)
         INFERNIX_MOE_DISPATCH(INFERNIX_CALL)
 #    undef INFERNIX_CALL
         return;
     case CpuIsa::kAvxVnni:
-#    define INFERNIX_CALL(n) row_sums_avxvnni<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
+#    define INFERNIX_CALL(n) row_sums_avxvnni<n>(matrix, rg_begin, rg_end, acts, out, prefetch_bytes)
         INFERNIX_MOE_DISPATCH(INFERNIX_CALL)
 #    undef INFERNIX_CALL
         return;
     case CpuIsa::kAvx2:
-#    define INFERNIX_CALL(n) row_sums_avx2<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
+#    define INFERNIX_CALL(n) row_sums_avx2<n>(matrix, rg_begin, rg_end, acts, out, prefetch_bytes)
         INFERNIX_MOE_DISPATCH(INFERNIX_CALL)
 #    undef INFERNIX_CALL
         return;
@@ -570,19 +638,20 @@ void swiglu_bf16_n(CpuIsa isa, const std::uint16_t* g, const std::uint16_t* u, i
     for (; i < n; ++i) { h[i] = canon::swiglu_bf16(g[i], u[i]); }
 }
 
-void gate_up_units(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
+void gate_up_units(CpuIsa isa, const Rg16Record& record, const ExpertScales& scales,
                    const canon::A4Block* const* x_gate, const canon::A4Block* const* x_up,
                    int ncols, int unit_begin, int unit_end, canon::A4Block* const* h_blocks,
                    int prefetch_bytes) {
     // No allocation on the miss path: one unit's sums fit on the stack.
     std::int64_t s_gate[32 * kMaxColumns];
     std::int64_t s_up[32 * kMaxColumns];
+    const Rg16Matrix matrix = gate_up_matrix(record, kFlashNextShape);
     for (int u = unit_begin; u < unit_end; ++u) {
         // Unit u is row groups 2u, 2u+1: rows 32u..32u+31, gate_i at even rows, up_i at odd rows.
-        rg16_row_sums(isa, record, kGateUpBlocks, 2 * u, 2 * u + 2, x_gate, ncols, s_gate, prefetch_bytes);
+        rg16_row_sums(isa, matrix, 2 * u, 2 * u + 2, x_gate, ncols, s_gate, prefetch_bytes);
         const std::int64_t* up_sums = s_gate;
         if (x_up != x_gate) {
-            rg16_row_sums(isa, record, kGateUpBlocks, 2 * u, 2 * u + 2, x_up, ncols, s_up, prefetch_bytes);
+            rg16_row_sums(isa, matrix, 2 * u, 2 * u + 2, x_up, ncols, s_up, prefetch_bytes);
             up_sums = s_up;
         }
         std::uint16_t g[16 * kMaxColumns], p[16 * kMaxColumns], h[16 * kMaxColumns];
@@ -599,12 +668,13 @@ void gate_up_units(CpuIsa isa, const std::uint8_t* record, const ExpertScales& s
     }
 }
 
-void down_rows(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
+void down_rows(CpuIsa isa, const Rg16Record& record, const ExpertScales& scales,
                const canon::A4Block* const* h_blocks, int ncols, int rg_begin, int rg_end,
                std::uint16_t* const* y, int prefetch_bytes) {
     std::int64_t s[16 * kMaxColumns]; // one row group at a time: no allocation on the miss path
+    const Rg16Matrix matrix = down_matrix(record, kFlashNextShape);
     for (int rg = rg_begin; rg < rg_end; ++rg) {
-        rg16_row_sums(isa, record + kGateUpBytes, kDownBlocks, rg, rg + 1, h_blocks, ncols, s, prefetch_bytes);
+        rg16_row_sums(isa, matrix, rg, rg + 1, h_blocks, ncols, s, prefetch_bytes);
         for (int r = 0; r < 16; ++r) {
             for (int c = 0; c < ncols; ++c) {
                 y[c][rg * 16 + r] = canon::a4_row_output(s[r * ncols + c], scales.alpha_down);
@@ -613,7 +683,7 @@ void down_rows(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scale
     }
 }
 
-void expert_forward(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales, int ncols,
+void expert_forward(CpuIsa isa, const Rg16Record& record, const ExpertScales& scales, int ncols,
                     const std::uint16_t* const* x, std::uint16_t* const* y, int prefetch_bytes) {
     if (ncols < 1 || ncols > kMaxColumns) { throw std::invalid_argument("offloaded_moe: ncols must be in [1, 8]"); }
     std::vector<canon::A4Block> xg(static_cast<std::size_t>(ncols) * kGateUpBlocks);

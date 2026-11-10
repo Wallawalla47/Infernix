@@ -415,6 +415,10 @@ int run_tests() {
                       "--expert-ram-layout must parse full");
     failures += check(!parse({"infernix-cli", "model.ninfer", "--prompt", "x"}).expert_ram_layout.has_value(),
                       "without --expert-ram-layout the model's default must stand");
+    failures += check(help.find("--expert-csf") != std::string::npos, "CLI help omits --expert-csf");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-csf"}).expert_csf &&
+                          !parse({"infernix-cli", "model.ninfer", "--prompt", "x"}).expert_csf,
+                      "--expert-csf must set CSF records, off by default");
     failures += check(help.find("--expert-pin-mib") != std::string::npos, "CLI help omits the expert pin control");
     failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-pin-mib", "24576"}).expert_pin_bytes ==
                               (24576ULL << 20) &&

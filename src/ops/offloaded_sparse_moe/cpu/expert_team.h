@@ -41,6 +41,7 @@ namespace infernix::ops::offloaded_moe {
 
 struct CpuExpertJob {
     const std::uint8_t* record = nullptr;
+    const std::uint32_t* csf   = nullptr; // an NVFP4 record's CSF table (csf_record.h), or null: expanded
     ExpertScales scales{};
     GgmlExpertFormat ggml{};                // a GGUF bank's record (ggml_expert.h); scales unused
     // A job of a call on the 8-bit activation route (MissRequest::a8): a GGUF job takes ggml_expert.h's a8
@@ -49,6 +50,8 @@ struct CpuExpertJob {
     int ncols = 0;                          // 1..kMaxColumns
     const std::uint16_t* x[kMaxColumns]{};  // BF16 [H] per column (H: the team's shape.hidden)
     std::uint16_t* y[kMaxColumns]{};        // BF16 [H] per column
+
+    [[nodiscard]] Rg16Record rg16() const noexcept { return {record, csf}; }
 };
 
 // A liveness word the device watches (CpuMissService's heartbeat) and its writer's counter. At

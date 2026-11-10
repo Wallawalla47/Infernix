@@ -3,8 +3,9 @@
 // router logits, moe_dispatch with the shared expert as the last job, moe_experts, moe_combine) with
 // records in device frames, read zero-copy from the pinned host bank, staged through 3 or 64 device
 // slots (serial passes) or 16 (double-buffered on an overlap stream), on the forked route, and served
-// by the host expert engine through the CPU miss channel. Calls of at most 64 columns run their narrow
-// experts on the narrow ring (each of its column variants), wider ones on the one-pass kernels.
+// by the host expert engine through the CPU miss channel; the staged and CPU-served routes also from
+// the bank's CSF records (csf_record.h). Calls of at most 64 columns run their narrow experts on the
+// narrow ring (each of its column variants), wider ones on the one-pass kernels.
 //
 // Oracles: the routing against its FP64 formula over the logits rounded once to BF16 (lower ids win
 // ties), with near-ties that FP32 and BF16 order differently; every expert output (routed and shared)
@@ -19,6 +20,7 @@
 #include "ops/offloaded_moe_fixtures.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a16_expert.h"
+#include "ops/offloaded_sparse_moe/csf_record.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -37,6 +39,7 @@
 
 namespace moe      = infernix::ops::offloaded_moe;
 namespace fixtures = infernix::test::offloaded_moe;
+namespace csf      = infernix::ops::offloaded_moe::csf;
 using infernix::DType;
 using infernix::Tensor;
 using infernix::test::cuda_check;
@@ -132,11 +135,41 @@ void run(int columns, std::mt19937& rng) {
     std::memset(host, 0, stride * kExperts);
     std::vector<fixtures::Expert> bank;
     std::vector<moe::ExpertScales> scales;
+    const csf::Geometry geometry = csf::Geometry::of(kShape);
     for (int e = 0; e < kExperts; ++e) {
         bank.push_back(fixtures::random_a16_expert(rng, kShape));
+        // Two of every three row groups take scale codes near a centre per row, as NVIDIA's exports have them (their
+        // CSF regions compressed); the third keeps the fixture's spread codes and extremes (raw regions).
+        for (int rg = 0; rg < geometry.rgs(); ++rg) {
+            if (rg % 3 == 1) { continue; }
+            for (int r = 0; r < 16; ++r) {
+                const int centre = 30 + static_cast<int>(rng() % 60);
+                for (int b = 0; b < geometry.blocks(rg); ++b) {
+                    bank.back().record[geometry.expanded_offset(rg) + static_cast<std::size_t>(b) * moe::kUnitBytes + 128 + r] =
+                        static_cast<std::uint8_t>(centre + static_cast<int>(rng() % 9) - 4 + (rng() % 50 == 0 ? 25 : 0));
+                }
+            }
+        }
         std::memcpy(host + e * stride, bank.back().record.data(), kShape.record_bytes());
         scales.push_back(bank.back().scales);
     }
+    // The same bank of CSF records (csf_record.h: compressed in place at the bank's stride) and its tables.
+    std::uint8_t* csf_host     = nullptr;
+    std::uint32_t* csf_tables  = nullptr;
+    const auto table_words     = static_cast<std::size_t>(geometry.table_words());
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&csf_host), stride * kExperts, cudaHostAllocMapped), "cudaHostAlloc");
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&csf_tables), table_words * sizeof(std::uint32_t) * kExperts,
+                             cudaHostAllocMapped),
+               "cudaHostAlloc");
+    std::memcpy(csf_host, host, stride * kExperts);
+    for (int e = 0; e < kExperts; ++e) {
+        (void)csf::compress_record(kShape, csf_host + e * stride, csf_host + e * stride, csf_tables + table_words * e);
+    }
+    std::uint8_t* csf_host_device     = nullptr;
+    std::uint32_t* csf_tables_device  = nullptr;
+    cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&csf_host_device), csf_host, 0), "cudaHostGetDevicePointer");
+    cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&csf_tables_device), csf_tables, 0),
+               "cudaHostGetDevicePointer");
     // The shared expert: its record in device memory, its multipliers after the routed experts'.
     const fixtures::Expert shared_expert = fixtures::random_a16_expert(rng, kShape);
     auto* d_shared_record = device_copy(shared_expert.record);
@@ -258,6 +291,10 @@ void run(int columns, std::mt19937& rng) {
     const std::vector<moe::CpuMissService::Layer> layers{{.records = host, .record_stride = stride, .scales = scales.data()}};
     moe::CpuMissService service(layers, {.workers = 6, .max_jobs = 8, .max_columns = 64, .pcie_divisor = 2, .cpus = {},
                                          .activation = moe::ExpertActivation::kA16, .shape = kShape});
+    const std::vector<moe::CpuMissService::Layer> csf_layers{
+        {.records = csf_host, .record_stride = stride, .csf = csf_tables, .scales = scales.data()}};
+    moe::CpuMissService csf_service(csf_layers, {.workers = 6, .max_jobs = 8, .max_columns = 64, .pcie_divisor = 2,
+                                                 .cpus = {}, .activation = moe::ExpertActivation::kA16, .shape = kShape});
 
     struct Config {
         int slots;
@@ -266,6 +303,7 @@ void run(int columns, std::mt19937& rng) {
         const char* name;
         bool overlap = false;
         bool split   = false; // a forked call's misses staged in two launches (MoeExpertSource::split_stream)
+        bool csf     = false; // the bank's CSF records (MoeExpertSource::host_csf), expanded as they are staged
     };
     const Config configs[] = {{0, false, false, "zero-copy"},
                               {3, false, false, "3 staging slots"},
@@ -275,7 +313,14 @@ void run(int columns, std::mt19937& rng) {
                               {64, true, false, "forked, split staging", false, true},
                               {64, false, true, "CPU-served misses"},
                               {64, true, true, "forked, CPU-served misses"},
-                              {64, true, true, "forked, split staging, CPU-served misses", false, true}};
+                              {64, true, true, "forked, split staging, CPU-served misses", false, true},
+                              {3, false, false, "CSF, 3 staging slots", false, false, true},
+                              {64, false, false, "CSF, 64 staging slots", false, false, true},
+                              {16, false, false, "CSF, 16 staging slots, double-buffered", true, false, true},
+                              {64, true, false, "CSF, forked", false, false, true},
+                              {64, true, false, "CSF, forked, split staging", false, true, true},
+                              {64, false, true, "CSF, CPU-served misses", false, false, true},
+                              {64, true, true, "CSF, forked, split staging, CPU-served misses", false, true, true}};
     for (const auto& config : configs) {
         if (config.fork && columns > moe::kMaxColumns) { continue; }
         if (config.cpu && columns > 64) { continue; }
@@ -307,7 +352,11 @@ void run(int columns, std::mt19937& rng) {
             source.overlap_stream = overlap_stream;
             for (int i = 0; i < 5; ++i) { source.overlap_events[i] = overlap_events[i]; }
         }
-        if (config.cpu) { source.cpu = service.channel(0); }
+        if (config.cpu) { source.cpu = (config.csf ? csf_service : service).channel(0); }
+        if (config.csf) {
+            source.host_records = csf_host_device;
+            source.host_csf     = csf_tables_device;
+        }
         Tensor tx(d_x, DType::BF16, {H, columns});
         Tensor out(d_out, DType::BF16, {H, entries});
         bool planned = false;
@@ -316,7 +365,8 @@ void run(int columns, std::mt19937& rng) {
                                                              max_jobs, d_workspace, out, nullptr,
                                                              infernix::ops::RouterLogits::kBf16, /*shared_job=*/true);
         }
-        const std::uint64_t served_before = service.served_experts();
+        const moe::CpuMissService& used     = config.csf ? csf_service : service;
+        const std::uint64_t served_before = used.served_experts();
         infernix::ops::moe_experts(tx, dispatch, source, kTopK, max_jobs, d_workspace, out, nullptr, true, planned);
         cuda_check(cudaDeviceSynchronize(), "moe_experts");
         std::vector<std::uint16_t> got(expected.size());
@@ -333,7 +383,7 @@ void run(int columns, std::mt19937& rng) {
                     got.size(), bad_shared);
         if (config.cpu) {
             std::printf(" (CPU served %llu experts)",
-                        static_cast<unsigned long long>(service.served_experts() - served_before));
+                        static_cast<unsigned long long>(used.served_experts() - served_before));
         }
         std::printf("\n");
         check(bad == 0, where + ": every routed and shared output equals the CPU engine's bits");
@@ -582,6 +632,8 @@ void run(int columns, std::mt19937& rng) {
     cudaFree(d_frame_base);
     cudaFree(d_shared_record);
     cudaFreeHost(host);
+    cudaFreeHost(csf_host);
+    cudaFreeHost(csf_tables);
     cudaStreamDestroy(fork_stream);
     cudaStreamDestroy(overlap_stream);
     cudaStreamDestroy(split_stream);

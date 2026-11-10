@@ -111,6 +111,12 @@ infernix_add_family_op_test(infernix_offloaded_moe_a4_residual_122b_test FAMILY 
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_a4_residual_122b.cu"
   LIBRARIES infernix_ops)
 set_tests_properties(infernix_offloaded_moe_a4_residual_122b_test PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
+# CSF host records (csf_record.h): compression to a well-formed table and expansion back to the record's bytes on the
+# host (also in place), on the GPU chunk by chunk (mapped host or device sources) and in place in device memory, both
+# geometries, realistic / outlier / raw / constant / mixed scales.
+infernix_add_family_op_test(infernix_offloaded_moe_csf_test FAMILY offloaded_moe
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_csf.cu"
+  LIBRARIES infernix_ops)
 # fp8_e4m3fn_row_f32 (Qwen3.5-122B-A10B): the static and per-token A8 encodings bit for bit, the attention,
 # GDN and residual projections against FP64 under A16, static and per-token A8 and the column-invariant
 # route, and the per-row FP8 shared expert's and head's column invariance.
@@ -471,6 +477,12 @@ infernix_add_family_op_test(infernix_offloaded_moe_ggml_a8_cpu_test FAMILY offlo
 # registered geometries: every ISA and width, and the worker team, bit-equal to the spec's scalar oracle; host-only.
 infernix_add_family_op_test(infernix_offloaded_moe_w4a8_cpu_test FAMILY offloaded_moe
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_w4a8_cpu.cpp"
+  LIBRARIES infernix_offloaded_moe_cpu)
+
+# The CPU routes on CSF records (csf_record.h): every route, ISA and width class, and the worker team, bit-equal to
+# the expanded record's at both registered geometries; host-only.
+infernix_add_family_op_test(infernix_offloaded_moe_csf_cpu_test FAMILY offloaded_moe
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_csf_cpu.cpp"
   LIBRARIES infernix_offloaded_moe_cpu)
 
 # The CPU worker team: any worker count gives expert_forward's bits.

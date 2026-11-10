@@ -12,13 +12,14 @@ Model::Model(Config config, LoadOptions options, ModelWeights weights,
              std::vector<runtime::expert_offload::ExpertBank> expert_banks,
              std::vector<runtime::expert_offload::ExpertBank> shared_expert_banks,
              std::vector<std::vector<float>> shared_expert_multipliers,
-             std::optional<runtime::expert_offload::ExpertStore> expert_store)
+             std::optional<runtime::expert_offload::ExpertStore> expert_store,
+             runtime::expert_offload::CsfTables csf_tables)
     : overlay_vision_(std::move(overlay_vision)), backing_(std::move(backing)),
       config_(std::move(config)), options_(options), weights_(std::move(weights)),
       bound_(std::move(bound)), resources_(std::move(resources)), info_(std::move(info)),
       expert_banks_(std::move(expert_banks)), shared_expert_banks_(std::move(shared_expert_banks)),
       shared_expert_multipliers_(std::move(shared_expert_multipliers)),
-      expert_store_(std::move(expert_store)) {}
+      expert_store_(std::move(expert_store)), csf_tables_(std::move(csf_tables)) {}
 
 Model::~Model() = default;
 

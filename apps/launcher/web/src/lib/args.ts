@@ -160,6 +160,7 @@ export function sameArgs(a: readonly string[], b: readonly string[]): boolean {
 export const KNOWN_SWITCHES: ReadonlySet<string> = new Set([
   "--any-model-name",
   "--vram-past-budget",
+  "--expert-csf",
   "--reproducible",
   "--lossless",
   "--expert-a4-activations",

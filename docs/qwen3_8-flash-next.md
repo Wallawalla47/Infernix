@@ -742,6 +742,8 @@ of life, and fails only when one has been silent for 10 s ("the CPU expert servi
 answering" or "the SSD expert tier's read agent stopped answering"); until 2026-10-17 that was 1 s,
 which RAM pressure alone could exceed (FP8 runs at the default headroom failed 8 times in 34).
 
+**Compressed expert scales (`--expert-csf`, default off).** The RAM copies of the NVFP4 routed experts keep their block scales as CSF records: per row group, 16 row bases and a 4-bit offset per block scale, with the rare scales outside a base's window stored apart. Records shrink to 0.947-0.949 of their bytes (about 3 GiB less on Dense8 and FP4-Local), every copy to VRAM and the prefill stream move the compressed bytes and expand them on the GPU, and the CPU computes on them directly; the output bits are the same. On an RTX 5090 (2026-11-09, default RAM layout): prompts of 1,024-4,096 tokens 0.8-4.3 % faster, decode 1.4-2.1 % slower on Dense8 and FP4-Local, because the CPU decodes the scales of the experts it serves.
+
 **Expert RAM layout (`--expert-ram-layout exclusive|full`, default `exclusive`).** When VRAM cannot hold
 every routed expert, `exclusive` keeps in RAM only the experts VRAM does not hold, plus copies of the ones a
 prefill borrows from VRAM and the KV cache's growth may take, and the tier serves them; `full` keeps a RAM

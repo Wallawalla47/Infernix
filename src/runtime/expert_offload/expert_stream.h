@@ -38,6 +38,8 @@
 // the device's pace while it copies.
 
 #include "core/arena.h"
+#include "ops/offloaded_sparse_moe/csf_expand.h"
+#include "ops/offloaded_sparse_moe/csf_record.h"
 
 #include <cuda_runtime.h>
 
@@ -92,6 +94,17 @@ public:
     static constexpr std::uint32_t kBounceParts = 4;
     void set_staging(Staging staging);
 
+    // Banks of CSF records (ops/offloaded_sparse_moe/csf_record.h; full mode, set before the first chunk): tables[l]
+    // is layer l's bank tables, empty for an expanded bank. Such a layer's records are copied one by one, each its
+    // compressed bytes into its slot, and expanded there (csf::expand_in_place) on a stream of the device's greatest
+    // priority, which records the layer's landing: the copy engine never waits for an expansion.
+    void set_csf(std::vector<ops::offloaded_moe::csf::BankTables> tables, const ops::offloaded_moe::ExpertShape& shape);
+    // The SSD tier's CSF slots (HostExpertTier::Options::csf; set before the first chunk): a record whose `table_of`
+    // is non-null (host memory the device reads at the same address, held with the record) is copied and expanded
+    // as a CSF bank's is.
+    using TableOf = std::function<const std::uint32_t*(std::uint32_t layer, std::uint32_t expert)>;
+    void set_tier_csf(TableOf table_of, const ops::offloaded_moe::ExpertShape& shape);
+
     // The stream that writes the ring (a writer for the lender to order after its promotions).
     [[nodiscard]] cudaStream_t stream() const noexcept { return stream_; }
     // Records per ring of `bytes`: what is left after the slot tables, an even number.
@@ -130,6 +143,9 @@ public:
     // Whether the active (ungated) chunk copies every expert of `layer` that was not resident when it
     // began: its MoE then has nothing to stage.
     [[nodiscard]] bool complete(std::uint32_t layer) const noexcept { return active_ && !gated_ && complete_[layer] != 0; }
+    // The experts of `layer` without a ring slot that are not resident now (in the residency table begin() took): a
+    // complete layer's experts evicted since the chunk began, which its MoE would stage (MoeExpertSource::one_pass).
+    [[nodiscard]] std::uint32_t uncovered(std::uint32_t layer) const noexcept;
     // Records per half of the active ring.
     [[nodiscard]] std::uint32_t half() const noexcept { return half_; }
     [[nodiscard]] bool active() const noexcept { return active_; }
@@ -213,6 +229,16 @@ private:
     bool bounce_used_[kBounceParts]    = {};
     std::vector<std::pair<std::uint8_t*, const std::uint8_t*>> staged_; // (ring slot, unpinned record)
     std::vector<std::pair<std::uint8_t*, const std::uint8_t*>> fill_;
+    // CSF banks (set_csf): per layer its tables (empty: expanded), the geometry and table words, the expansion
+    // stream and the event that orders it after a layer's copies.
+    std::vector<ops::offloaded_moe::csf::BankTables> csf_tables_;
+    TableOf tier_table_; // set_tier_csf
+    void start_expansions(const ops::offloaded_moe::ExpertShape& shape);
+    ops::offloaded_moe::ExpertShape csf_shape_{};
+    std::uint32_t csf_words_     = 0;
+    cudaStream_t expand_stream_ = nullptr;
+    cudaEvent_t copied_         = nullptr;
+    std::vector<ops::offloaded_moe::csf::InPlaceJob> expansions_; // an enqueue's records to expand
     Stats stats_;
 };
 

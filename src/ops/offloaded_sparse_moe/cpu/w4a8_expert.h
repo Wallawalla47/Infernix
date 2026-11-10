@@ -33,27 +33,27 @@ struct CpuW4A8Slice {
 // Quantizes slices [slice_begin, slice_end) of the BF16 column v (slice s: v[32 s .. 32 s + 32)) into out[s].
 void encode_a8_slices(const std::uint16_t* v, int slice_begin, int slice_end, CpuW4A8Slice* out);
 
-// The p_0 of rows of row groups [rg_begin, rg_end) of a matrix stored as row-group-major 144-byte units with
-// `blocks` (even) 16-element blocks per row, against `ncols` quantized columns acts[col] (blocks / 2 slices each),
+// The p_0 of rows of row groups [rg_begin, rg_end) of a matrix (expanded or CSF; both give the same bits) with
+// matrix.blocks (even) 16-element blocks per row, against `ncols` quantized columns acts[col] (blocks / 2 slices each),
 // with `partials` partials (a power of two, at most 16, at most blocks / 2): out[(row - 16 rg_begin) * ncols + col].
-void rg16_rows_a8(CpuIsa isa, const std::uint8_t* matrix, int blocks, int partials, int rg_begin, int rg_end,
+void rg16_rows_a8(CpuIsa isa, const Rg16Matrix& matrix, int partials, int rg_begin, int rg_end,
                   const CpuW4A8Slice* const* acts, int ncols, float* out, int prefetch_bytes = kDefaultPrefetchBytes);
 
 // Phase A for 16-intermediate units [unit_begin, unit_end) of an expert of `shape`: gate/up rows and SwiGLU.
 // `x[col]` is column col quantized (shape.hidden / 32 slices); writes h[col][16 * unit + i] in BF16. Slice t of h
 // is units 2t and 2t + 1.
-void gate_up_units_a8(CpuIsa isa, const ExpertShape& shape, const std::uint8_t* record, const ExpertScales& scales,
+void gate_up_units_a8(CpuIsa isa, const ExpertShape& shape, const Rg16Record& record, const ExpertScales& scales,
                       const CpuW4A8Slice* const* x, int ncols, int unit_begin, int unit_end, std::uint16_t* const* h,
                       int prefetch_bytes = kDefaultPrefetchBytes);
 
 // Phase B for down row groups [rg_begin, rg_end): `h[col]` is column col's h quantized (shape.intermediate / 32
 // slices); writes y[col][row] in BF16 for those rows.
-void down_rows_a8(CpuIsa isa, const ExpertShape& shape, const std::uint8_t* record, const ExpertScales& scales,
+void down_rows_a8(CpuIsa isa, const ExpertShape& shape, const Rg16Record& record, const ExpertScales& scales,
                   const CpuW4A8Slice* const* h, int ncols, int rg_begin, int rg_end, std::uint16_t* const* y,
                   int prefetch_bytes = kDefaultPrefetchBytes);
 
 // Whole expert on one thread: y[col][0..H) from x[col][0..H), both BF16, H = shape.hidden, ncols <= kMaxColumns.
-void expert_forward_a8(CpuIsa isa, const ExpertShape& shape, const std::uint8_t* record, const ExpertScales& scales,
+void expert_forward_a8(CpuIsa isa, const ExpertShape& shape, const Rg16Record& record, const ExpertScales& scales,
                        int ncols, const std::uint16_t* const* x, std::uint16_t* const* y,
                        int prefetch_bytes = kDefaultPrefetchBytes);
 

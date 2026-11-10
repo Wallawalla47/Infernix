@@ -1265,11 +1265,19 @@ public:
         std::vector<const std::uint8_t*> banks;
         std::vector<std::uint64_t> host_strides; // each bank's own record stride (a GGUF import's vary)
         std::uint64_t record_stride = 0;
+        // The pinned banks' CSF tables (runtime::expert_offload::compress_banks; empty when none is compressed):
+        // promotions and the prefill ring copy those records' compressed bytes and expand them on the device.
+        std::vector<ops::offloaded_moe::csf::BankTables> csf_banks;
         for (const auto& layer : parameters_.layers) {
             banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.device_records));
             host_strides.push_back(layer.moe.bank->planes.record_stride);
             record_stride = std::max(record_stride, layer.moe.bank->planes.record_stride);
             bank_host_bytes_ += layer.moe.bank->planes.record_stride * c_.moe.experts;
+            csf_banks.push_back(layer.moe.bank->planes.records != nullptr ? layer.moe.bank->csf
+                                                                           : ops::offloaded_moe::csf::BankTables{});
+        }
+        if (std::none_of(csf_banks.begin(), csf_banks.end(), [](const auto& t) { return static_cast<bool>(t); })) {
+            csf_banks.clear();
         }
         if (record_stride != plan_.record_stride ||
             (!c_.exact_experts && std::any_of(host_strides.begin(), host_strides.end(),
@@ -1292,6 +1300,7 @@ public:
                                 : ExpertResidency::VramPolicy::Lfru;
         residency_ = std::make_unique<ExpertResidency>(expert_layout(c_), std::move(banks), record_stride, columns_,
                                                        device_.device, host_strides, policy);
+        if (!csf_banks.empty()) { residency_->set_csf(csf_banks, parameters_.layers.front().moe.bank->shape()); }
         allocated += plan_.bytes.residency;
         if (allocated != plan_.bytes.fixed_bytes()) {
             throw std::logic_error("Qwen4Exp: the Program's device allocations differ from its device plan");
@@ -1416,6 +1425,13 @@ public:
                 tier.pool          = options_.expert_slot_pool;
                 tier.pool_identity = pool_identity();
             }
+            // --expert-csf (LoadOptions::expert_csf) with NVFP4 banks: the RAM slots hold CSF records (the fill's and the
+            // refills', compressed on the copy threads), ~5 % fewer bytes for each promotion, staged miss and CPU walk.
+            if (parameters_.model.options().expert_csf) {
+                std::vector<const runtime::expert_offload::ExpertBank*> banks;
+                for (const auto& layer : parameters_.layers) { banks.push_back(layer.moe.bank); }
+                tier.csf = runtime::expert_offload::tier_csf_shape(banks);
+            }
             tier_ = std::make_unique<HostExpertTier>(*records, std::move(tier));
             // What the tier did not take (another size, more than it pins) is released before anything else is
             // page-locked, so the Program ends with the memory a start without the host would hold.
@@ -1480,6 +1496,14 @@ public:
             expert_stream_ = std::make_unique<ExpertStream>(c_.num_hidden_layers, c_.moe.experts, record_stride,
                                                                        std::move(record_of), !tier_, std::move(hold),
                                                                        host_strides, std::move(ssd));
+            if (!csf_banks.empty()) { expert_stream_->set_csf(csf_banks, parameters_.layers.front().moe.bank->shape()); }
+            if (tier_ && tier_->csf()) {
+                expert_stream_->set_tier_csf(
+                    [tier = tier_.get()](std::uint32_t layer, std::uint32_t expert) {
+                        return tier->record_csf(tier->key(layer, expert));
+                    },
+                    *tier_->csf());
+            }
             if (tier_ && tier_->stream_bounce_slots() > 0) {
                 // Unpinned records stream through the tier's bounce slots, still two layers ahead.
                 HostExpertTier* tier = tier_.get();
@@ -1534,6 +1558,8 @@ public:
             for (const auto& layer : parameters_.layers) {
                 service_layers.push_back({.records       = reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records),
                                           .record_stride = layer.moe.bank->planes.record_stride,
+                                          .csf           = layer.moe.bank->planes.records != nullptr ? layer.moe.bank->csf.host
+                                                                                                     : nullptr,
                                           .scales        = layer.moe.bank->scales.data(),
                                           .ggml          = ggml_format(*layer.moe.bank)});
             }
@@ -1554,6 +1580,7 @@ public:
                     .ggml_a8     = cpu_ggml_a8(),
                     .nvfp4_a8    = cpu_narrow_a16() == ops::offloaded_moe::NarrowA16::kA8,
                     .records     = tier_.get(), // tier mode: SSD-only jobs read through the tier
+                    .tier_csf_pitch = tier_ && tier_->csf() ? tier_->csf_pitch() : 0,
                     // Reported when it happens; check_device_error then stops the Engine with it.
                     .on_failure  = [this](const std::string& why) {
                         diagnostic("Qwen3.8-Flash-Next: the CPU expert service stopped serving misses: " + why,
@@ -1638,6 +1665,7 @@ public:
                 experts.host_tables.push_back(residency_->record_table(l));
                 experts.fetch.push_back(fetch_channel_->channel(static_cast<int>(l)));
             }
+            experts.tier_csf_pitch = tier_->csf() ? tier_->csf_pitch() : 0;
         }
         warm_start_experts();
         // The CPU team's rates, read until they settle (cpu_rates.cpp) on the pinned banks or the SSD tier's
@@ -3670,6 +3698,7 @@ private:
                       released > 0 ? (", none of them among the " + std::to_string(released) + " in VRAM").c_str() : "",
                       shadow_text, split, seconds, on_ssd, keys);
         diagnostic(line, DiagnosticLevel::Debug);
+        if (const std::string csf = tier_->csf_summary(); !csf.empty()) { diagnostic(csf, DiagnosticLevel::Debug); }
     }
 
     // The frames' warm start from the saved state or the calibrated order; returns how many experts
@@ -6712,6 +6741,13 @@ private:
     // rescales the link-bound costs: the prefix cost's restore rate and the walk-span cost (one pass
     // of the experts over the link).
     void measure_link() {
+        {
+            std::vector<const ExpertBank*> banks;
+            for (const auto& layer : parameters_.layers) { banks.push_back(layer.moe.bank); }
+            if (const std::string csf = runtime::expert_offload::csf_summary(banks); !csf.empty()) {
+                diagnostic(csf, DiagnosticLevel::Debug);
+            }
+        }
         double rate = options_.link_bytes_per_second;
         const void* source = parameters_.layers.front().moe.bank->planes.records;
         if (source == nullptr && tier_) { source = tier_->slot_bytes(0); }

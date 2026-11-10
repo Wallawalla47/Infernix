@@ -924,6 +924,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             o.expert_unpinned_bytes = expert_ram->expert_unpinned_bytes;
             o.later_pinned_bytes    = expert_ram->later_pinned_bytes;
             o.ram_exclusive         = exclusive_experts;
+            o.expert_csf            = options.expert_csf;
             o.expert_stripe         = options.expert_stripe_path;
         } else if (!options.expert_stripe_path.empty()) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,

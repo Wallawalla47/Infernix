@@ -42,6 +42,7 @@
 #include "runtime/expert_offload/host_tier.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 #include "ops/offloaded_sparse_moe/cpu/record_provider.h"
+#include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -51,6 +52,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <thread>
@@ -121,6 +123,14 @@ public:
         // span: SSD-only records it reads ahead (stream_read) and copies to the device once per span.
         // 0 disables it.
         std::uint32_t stream = 0;
+        // CSF records (ops/offloaded_sparse_moe/csf_record.h; NVFP4 records of one size at this registered geometry):
+        // every record the startup fill (prefill, prefill_shadows, grow) and the refills read into a controller slot is
+        // compressed in place there on the copy threads, with its table in the slot's tail, before it is published;
+        // other writes (demand reads into the ring, stream reads, D2H demotions: mark_expanded) leave expanded records.
+        // Readers take tagged addresses (record_tagged, the CPU's tickets) or the slot's table (record_csf); a fetch of
+        // a resident compressed record gets an expanded copy in a ring slot. A reused pool chunk (Options::pool) keeps
+        // its slots' formats (kPoolCsf). Unpinned records stay expanded. Unset: every record as stored.
+        std::optional<ops::offloaded_moe::ExpertShape> csf;
     };
 
     struct Stats {
@@ -135,6 +145,9 @@ public:
         std::uint64_t stream_reads = 0; // records read into stream slots
         // Unpinned records served: in place to the CPU, and copied into ring slots for fetches.
         std::uint64_t unpinned_served = 0, unpinned_copies = 0;
+        // CSF (Options::csf): records compressed in their slots, records left expanded (no room for the table), and
+        // fetches of compressed residents expanded into ring slots.
+        std::uint64_t csf_compressed = 0, csf_expanded = 0, csf_fetch_expansions = 0;
     };
 
     HostExpertTier(const ExpertStore& store, Options options);
@@ -211,6 +224,24 @@ public:
         const std::uint8_t* slot = record(key);
         return slot != nullptr ? slot : unpinned_record(key);
     }
+    // ---- CSF (Options::csf)
+    [[nodiscard]] const std::optional<ops::offloaded_moe::ExpertShape>& csf() const noexcept { return options_.csf; }
+    // The slots' pitch: a tagged address's table is at untag(address) + csf::slot_table_offset(words, pitch).
+    [[nodiscard]] std::uint64_t csf_pitch() const noexcept { return csf_pitch_; }
+    // record(key) as published to a reader: tagged (csf::tag) when its slot holds a compressed record.
+    [[nodiscard]] const std::uint8_t* record_tagged(std::uint32_t key) const noexcept;
+    // key's slot's table when the slot holds a compressed record (host memory the device reads at the same address,
+    // as it reads the slot), else null.
+    [[nodiscard]] const std::uint32_t* record_csf(std::uint32_t key) const noexcept;
+    // Controller slot `slot` is about to receive an expanded record from another writer (a D2H demotion).
+    void mark_expanded(std::uint32_t slot) noexcept;
+    // Controller slots holding a compressed record now.
+    [[nodiscard]] std::uint32_t csf_slots() const noexcept;
+    // The startup log's line on the slots' CSF records (empty without Options::csf): how many slots hold one and the
+    // share of the expanded bytes they keep.
+    [[nodiscard]] std::string csf_summary() const;
+    // A pool chunk's kept key with this bit holds the key's compressed record (Options::csf; keys < kPoolCsf).
+    static constexpr std::int32_t kPoolCsf = 1 << 30;
     // The bounce slots for promotions of unpinned records (0 without unpinned records); pinned,
     // outside the controller's slots.
     [[nodiscard]] std::uint32_t bounce_slots() const noexcept { return bounce_; }
@@ -327,7 +358,10 @@ private:
         bool resident = false;       // the key was already in RAM: nothing read, nothing to admit
         bool recycled = false;       // its slot was reused for a later demand of the round
         std::int32_t fetch = -1;     // its index in the fetch request it belongs to (-1: a CPU demand)
-        const std::uint8_t* copy_from = nullptr; // a fetch of an unpinned record: copied, never admitted
+        // A fetch of an unpinned record, or of a compressed resident one (`expand`): copied (expanded) into a ring
+        // slot, never admitted.
+        const std::uint8_t* copy_from = nullptr;
+        bool expand = false;
         const std::uint8_t* bytes     = nullptr; // the record once landed (state 1)
         std::atomic<bool> done{false};
         std::atomic<std::uint32_t> state{0}; // 0 pending, 1 landed, 2 failed
@@ -378,11 +412,18 @@ private:
     // A copy into pinned memory (copy threads): a fetch's ring slot from an unpinned record, tagged
     // as a demand read, or a batch (copy_records, the admissions' copies) counting down `left`.
     struct Copy {
+        enum class Kind : std::uint8_t {
+            kCopy,     // memcpy source -> destination
+            kExpand,   // a compressed slot (source, its table in its tail) -> an expanded record at destination
+            kCompress, // the record at destination (controller slot `slot`, of `key`) compressed in place (CSF)
+        };
         std::uint8_t* destination   = nullptr;
         const std::uint8_t* source  = nullptr;
         std::uint64_t tag           = 0;
         std::uint32_t* left         = nullptr; // a batch: guarded by copy_mutex_
         std::size_t bytes           = 0;       // 0: the largest record
+        Kind kind                   = Kind::kCopy;
+        std::uint32_t slot          = 0;       // kCompress: completes into compressed_ (tag)
     };
     // Runs `copy` and reports it (copy_mutex_ not held).
     void finish_copy(const Copy& copy);
@@ -468,9 +509,33 @@ private:
     std::mutex copy_mutex_;
     std::condition_variable copy_wake_, copy_done_;
     std::deque<Copy> copies_;
+    // The CSF compressions (Copy::Kind::kCompress), taken only when copies_ is empty: a fetch's copy never waits
+    // behind a refill's compression.
+    std::deque<Copy> compressions_;
     std::vector<std::uint64_t> copied_; // tags of finished copies
+    std::vector<std::uint64_t> compressed_; // tags of finished compressions
     bool copy_stop_ = false;
     std::vector<std::thread> copiers_;
+    // CSF (Options::csf): per controller slot, 1 while it holds a compressed record (its table in its tail; set by
+    // a compression, cleared by every other writer before it writes); the table words and the slots' pitch.
+    std::unique_ptr<std::atomic<std::uint8_t>[]> slot_csf_;
+    int csf_words_            = 0;
+    std::uint64_t csf_pitch_  = 0;
+    std::atomic<std::uint64_t> csf_compressed_{0}, csf_expanded_{0}, csf_fetch_expansions_{0};
+    [[nodiscard]] bool slot_compressed(std::uint32_t slot) const noexcept {
+        return slot_csf_ && slot_csf_[slot].load(std::memory_order_acquire) != 0;
+    }
+    void clear_csf(std::uint32_t slot) noexcept {
+        if (slot_csf_) { slot_csf_[slot].store(0, std::memory_order_relaxed); }
+    }
+    // A key's compressed record (a resident or shadow slot; another slot's flag may be stale until it is written).
+    [[nodiscard]] bool holds_csf(std::uint32_t slot) const noexcept {
+        const auto state = tier_.state(slot);
+        return slot_address_[slot] != nullptr && slot_compressed(slot) &&
+               (state == expert_cache::SlotState::kResident || state == expert_cache::SlotState::kShadow);
+    }
+    // The controller slot at `address` (a resident, ring or list slot), or -1 (a bounce slot, an unpinned record).
+    [[nodiscard]] std::int64_t slot_at(const std::uint8_t* address) const noexcept;
 
     // Agent state. Guarded by mutex_: the queues of new work and the round's ring.
     mutable std::mutex mutex_;

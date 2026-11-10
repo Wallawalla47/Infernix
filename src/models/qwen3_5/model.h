@@ -76,6 +76,8 @@ public:
         return shared_expert_banks_;
     }
     [[nodiscard]] bool offloaded_experts() const noexcept { return !expert_banks_.empty(); }
+    // The pinned routed banks' CSF tables (runtime::expert_offload::compress_banks; empty: the records as stored).
+    [[nodiscard]] const runtime::expert_offload::CsfTables& csf_tables() const noexcept { return csf_tables_; }
     // With LoadOptions::stream_experts: where each routed record lies in the artifact (the SSD tier
     // reads them in place); null otherwise.
     [[nodiscard]] const runtime::expert_offload::ExpertStore* expert_store() const noexcept {
@@ -93,7 +95,8 @@ private:
           std::vector<runtime::expert_offload::ExpertBank> expert_banks,
           std::vector<runtime::expert_offload::ExpertBank> shared_expert_banks,
           std::vector<std::vector<float>> shared_expert_multipliers,
-          std::optional<runtime::expert_offload::ExpertStore> expert_store);
+          std::optional<runtime::expert_offload::ExpertStore> expert_store,
+          runtime::expert_offload::CsfTables csf_tables);
 
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
     std::optional<VisionOverlayAssets> overlay_vision_;
@@ -110,6 +113,7 @@ private:
     std::vector<std::vector<float>> shared_expert_multipliers_;
     // Owns the streamed banks' multipliers (their planes point into it).
     std::optional<runtime::expert_offload::ExpertStore> expert_store_;
+    runtime::expert_offload::CsfTables csf_tables_; // expert_banks_' CSF tables
 };
 
 } // namespace infernix::models::qwen3_5

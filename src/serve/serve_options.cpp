@@ -95,6 +95,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--expert-ram-mib"},
     ServeOptionArity{"--expert-ram-layout"},
     ServeOptionArity{"--expert-pin-mib"},
+    ServeOptionArity{"--expert-csf", false},
     ServeOptionArity{"--kv-dtype"},
     ServeOptionArity{"--logits-dtype"},
     ServeOptionArity{"--spec"},
@@ -446,6 +447,11 @@ std::string serve_usage_text(const char* argv0) {
            "                             RAM page-locked for the GPU; the rest stays in RAM\n"
            "                             and the CPU serves it (auto: what Windows allows,\n"
            "                             the GPU's shared memory)\n"
+           "  --expert-csf               Offloaded NVFP4 experts (Qwen3.8-Flash-Next,\n"
+           "                             Qwen3.5-122B-A10B): keep their RAM copies' block\n"
+           "                             scales compressed (CSF, ~5 % fewer bytes; same\n"
+           "                             output): prompts 2-5 % faster, decode 0.6-2 % slower\n"
+           "                             (default off)\n"
            "\n"
            "KV CACHE\n"
            "  --kv-capacity N|auto       KV-cache capacity in tokens (default auto, or\n"
@@ -1083,6 +1089,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         } else if (arg == "--expert-ram-layout") {
             options.expert_ram_layout = parse_expert_ram_layout(require_value("--expert-ram-layout"));
+        } else if (arg == "--expert-csf") {
+            options.expert_csf = true;
         } else if (arg == "--expert-pin-mib") {
             const std::string text = require_value("--expert-pin-mib");
             if (text == "auto") {

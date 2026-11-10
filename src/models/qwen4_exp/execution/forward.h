@@ -88,6 +88,8 @@ struct ForwardExperts {
     // experts without a CPU job are read through.
     std::vector<const std::uint8_t* const*> host_tables;
     std::vector<ops::MoeFetchChannel> fetch;
+    // The tier's CSF slots' pitch (ops::MoeExpertSource::host_csf_pitch; 0: its records are expanded).
+    std::uint64_t tier_csf_pitch = 0;
     // Mapped word a call that could not serve an expert writes (ops::MoeExpertSource::error), and the
     // token embedding and the n-gram gate their faults (kErrorTokenId, kErrorRowGateTimeout); the
     // Program checks it after each synchronization. Null: none.

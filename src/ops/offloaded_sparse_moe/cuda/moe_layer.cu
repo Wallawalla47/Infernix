@@ -28,6 +28,7 @@
 #include "ops/ggml/ggml_tile.cuh"
 #include "ops/fp8_block/fp8_exact.h"
 #include "ops/offloaded_sparse_moe/cuda/a16_limbs.cuh"
+#include "ops/offloaded_sparse_moe/cuda/csf_expand.cuh"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 #include "ops/offloaded_sparse_moe/nvfp4_a8.h"
 #include "infernix/ops/lossless_linear.h"
@@ -52,6 +53,7 @@ namespace infernix::ops {
 namespace {
 
 namespace moe = offloaded_moe;
+namespace csf = offloaded_moe::csf;
 using bf16    = __nv_bfloat16;
 
 constexpr int kThreads      = 256;
@@ -304,6 +306,122 @@ constexpr int kStageCtas  = 16;    // with 16 KiB chunks, a 256 KiB window of ho
 constexpr int kStageChunk = 16384;
 constexpr int kMaxPassJobs = 512;
 
+// A CSF record's geometry (csf_record.h) at a bank's expert geometry.
+__device__ __forceinline__ csf::Geometry csf_geometry(const moe::ExpertShape& shape) {
+    return {2 * shape.intermediate / 16, shape.hidden / 16, shape.hidden / 16, shape.intermediate / 16};
+}
+
+// The copy loop of a stage launch over CSF host records: the bank's (MoeExpertSource::host_csf; kTier false) or the
+// SSD tier's tagged slots (host_csf_pitch; kTier true: the table in the slot's tail, and .cv loads, as the host
+// rewrites its slots). The launch's chunks of every miss (csf::Geometry chunks, each chunk_units() units, so a
+// StageBytes range of whole chunks), chunk i of the concatenated misses' chunks by CTA i % gridDim.x as the expanded
+// copy keeps them adjacent. Software-pipelined so the host reads never stop: each thread loads its share of the CTA's
+// next chunk into registers (16-byte loads, all in flight at once; cp.async from host memory ran ~14x slower) as soon
+// as its share of this chunk has landed, before the CTA's barrier, and the CTA expands this chunk from shared memory
+// into the miss's destination while they fly; table words are read three chunks ahead. Measured (2026-11-09,
+// Flash-Next W4A16, 1-8 columns, against the expanded copy's time): no overlap 1.24-1.26x, the next chunk issued
+// after the barrier 1.085-1.09x.
+// Its shared memory, declared once by the stage kernel (both forms run in one launch).
+struct CsfStageShared {
+    static constexpr int kSlots = 4; // table words of the CTA's items k .. k + 3 (written at k - 1, read from k + 1 on)
+    // A chunk's bytes from its 128-byte line below to its line above (whole lines, as the expanded copy reads them).
+    static constexpr int kBufferBytes = csf::kMaxChunkBytes + 256;
+    alignas(16) std::uint8_t buffer[kBufferBytes];
+    csf::ChunkScratch scratch;
+    std::uint32_t words[kSlots][csf::kMaxChunkRgs + 1];
+};
+template <bool kTier>
+__device__ void stage_csf(const MoeDispatch& dispatch, const MoeExpertSource& source, const int* miss_jobs,
+                          std::uint8_t* const* miss_dst, int misses, const StageBytes& bytes, int end,
+                          CsfStageShared& shared_state) {
+    constexpr int kSlots       = CsfStageShared::kSlots;
+    constexpr int kBufferBytes = CsfStageShared::kBufferBytes;
+    std::uint8_t* const buffer = shared_state.buffer;
+    csf::ChunkScratch& scratch = shared_state.scratch;
+    auto& words                = shared_state.words;
+    constexpr int kPerThread = (kBufferBytes / 16 + kThreads - 1) / kThreads;
+    const csf::Geometry g    = csf_geometry(source.shape);
+    const int table_words    = g.table_words();
+    const int chunk_bytes    = g.chunk_units() * static_cast<int>(moe::kUnitBytes);
+    const int first_begin    = bytes.begin / chunk_bytes, first_count = (end - bytes.begin) / chunk_bytes;
+    const int second_begin   = bytes.begin2 / chunk_bytes;
+    const int per_miss       = first_count + (bytes.end2 - bytes.begin2) / chunk_bytes;
+    const int total          = misses * per_miss;
+    const int t              = static_cast<int>(threadIdx.x);
+    const int stride         = static_cast<int>(gridDim.x);
+    const auto chunk_of      = [&](int i) {
+        const int k = i % per_miss;
+        return k < first_count ? first_begin + k : second_begin + k - first_count;
+    };
+    // A miss's record and table (mapped host memory), and the bytes its whole-line reads stay within (records and
+    // slots start 4 KiB-aligned).
+    const auto record_of = [&](int m) -> const std::uint8_t* {
+        const int expert = dispatch.jobs[miss_jobs[m]];
+        if constexpr (kTier) {
+            return csf::untag(source.host_table[expert]);
+        } else {
+            return source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
+        }
+    };
+    const auto table_of = [&](int m) -> const std::uint32_t* {
+        if constexpr (kTier) {
+            return reinterpret_cast<const std::uint32_t*>(record_of(m) + csf::slot_table_offset(table_words, source.host_csf_pitch));
+        } else {
+            return source.host_csf + static_cast<std::size_t>(dispatch.jobs[miss_jobs[m]]) * table_words;
+        }
+    };
+    const auto bound = static_cast<std::uint32_t>(kTier ? source.host_csf_pitch : source.record_stride);
+    // Thread t <= chunk_rgs of item i's chunk reads its table word t; 0 for the other threads.
+    const auto read_word = [&](int i) -> std::uint32_t {
+        if (i >= total || t > csf::kMaxChunkRgs) { return 0; }
+        const int c = chunk_of(i);
+        if (t > g.chunk_rgs(c)) { return 0; }
+        const std::uint32_t* word = table_of(i / per_miss) + g.chunk_first_rg(c) + t;
+        return kTier ? __ldcv(word) : __ldcs(word);
+    };
+    uint4 v[kPerThread];
+    int vectors = 0;
+    // Issues item i's compressed bytes into v (not waited for), from its table words w: the whole 128-byte lines
+    // they touch, within the record's bound.
+    const auto line = [](std::uint32_t offset) { return offset & ~127U; };
+    const auto issue = [&](int i, const std::uint32_t* w) {
+        const std::uint8_t* record = record_of(i / per_miss);
+        const std::uint32_t end    = min(line(w[g.chunk_rgs(chunk_of(i))] + 127U), bound);
+        const auto* src            = reinterpret_cast<const uint4*>(record + line(w[0]));
+        vectors                    = static_cast<int>((end - line(w[0])) / 16);
+#pragma unroll
+        for (int u = 0; u < kPerThread; ++u) {
+            if (t + u * kThreads < vectors) { v[u] = kTier ? __ldcv(src + t + u * kThreads) : __ldcs(src + t + u * kThreads); }
+        }
+    };
+    int i = static_cast<int>(blockIdx.x);
+    if (i >= total) { return; }
+    if (t <= csf::kMaxChunkRgs) {
+        for (int s = 0; s < kSlots - 1; ++s) { words[s][t] = read_word(i + s * stride); }
+    }
+    __syncthreads();
+    issue(i, words[0]);
+    for (int k = 0; i < total; i += stride, ++k) {
+        const int c = chunk_of(i), m = i / per_miss;
+        auto* shared = reinterpret_cast<uint4*>(buffer);
+#pragma unroll
+        for (int u = 0; u < kPerThread; ++u) {
+            if (t + u * kThreads < vectors) { shared[t + u * kThreads] = v[u]; }
+        }
+        if (i + stride < total) { issue(i + stride, words[(k + 1) % kSlots]); }
+        const std::uint32_t ahead = read_word(i + 3 * stride);
+        __syncthreads();
+        const std::uint32_t* w = words[k % kSlots];
+        if (miss_dst[m] != nullptr) { // null: a miss past one pass's slots (the round fails)
+            csf::expand_chunk<kThreads>(g, c, w, buffer + (w[0] - line(w[0])), miss_dst[m], scratch); // ends with a barrier
+        } else {
+            __syncthreads();
+        }
+        // Item k + 3's words, published by item k + 1's barrier and read by item k + 2's issue.
+        if (t <= csf::kMaxChunkRgs) { words[(k + 3) % kSlots][t] = ahead; }
+    }
+}
+
 // Resolves the record of every job in [job_base, job_base + pass_jobs) and copies the pass's
 // non-resident records that are not CPU-served (its misses) to their destinations: the n-th miss in
 // job order lands in frame landing[n] when n < landing_slots and landing[n] >= 0 (block 0 logs
@@ -322,6 +440,7 @@ __global__ void __launch_bounds__(kThreads)
     __shared__ int warp_misses[kWarps];
     __shared__ int landed_before[offloaded_moe::kMaxLandingSlots + 1]; // landing frames among slots [0, n)
     __shared__ int misses;
+    __shared__ CsfStageShared csf_shared; // the CSF copy loops' (stage_csf)
     pdl::enter(); // a programmatic dependent of the plan on the call's own stream
     const int jobs = min(*dispatch.job_count - job_base, pass_jobs);
     if (jobs <= 0) { return; }
@@ -371,6 +490,11 @@ __global__ void __launch_bounds__(kThreads)
             } else {
                 const int slot = n - landed_before[min(n, landing_slots)];
                 destination    = source.staging_base + static_cast<std::uint64_t>(slot) * frame_pitch(source);
+                // One pass (MoeExpertSource::one_pass) whose misses exceed the slots: the round fails, nothing overruns.
+                if (slot >= source.staging_slots) {
+                    report_error(source, offloaded_moe::kErrorUnservedRecord);
+                    destination = nullptr;
+                }
             }
             miss_jobs[n] = job_base + j;
             miss_dst[n]  = destination;
@@ -383,11 +507,58 @@ __global__ void __launch_bounds__(kThreads)
         }
         __syncthreads();
     }
-    const int end          = bytes.end < 0 ? record_copy_bytes(source) : bytes.end;
+    const int end = bytes.end < 0 ? record_copy_bytes(source) : bytes.end;
+    if (source.host_csf != nullptr) {
+        stage_csf<false>(dispatch, source, miss_jobs, miss_dst, misses, bytes, end, csf_shared);
+        return; // CSF banks have no fetch channel
+    }
+    // The SSD tier's compressed slots (tagged host_table entries; MoeExpertSource::host_csf_pitch): the misses are
+    // partitioned, stably, into the expanded ones [0, expanded) (fetch-served misses among them: the host answers
+    // with ring slots) and the compressed ones, which this CTA expands first (their records wait for nothing).
+    int expanded = misses;
+    if (source.host_csf_pitch != 0 && misses > 0) {
+        constexpr int kPer = kMaxPassJobs / kThreads;
+        int job[kPer], rank[kPer];
+        std::uint8_t* dst[kPer];
+        bool compressed[kPer];
+        int before = 0; // compressed misses of the earlier rounds
+        for (int u = 0; u < kPer; ++u) {
+            const int n = u * kThreads + static_cast<int>(threadIdx.x);
+            compressed[u] = false;
+            if (n < misses) {
+                job[u]        = miss_jobs[n];
+                dst[u]        = miss_dst[n];
+                compressed[u] = fetch_index(fetch, job[u]) < 0 && csf::tagged(source.host_table[dispatch.jobs[job[u]]]);
+            }
+            const unsigned ballot = __ballot_sync(0xFFFFFFFFU, compressed[u]);
+            __syncthreads(); // the last round's counts are read
+            if (lane == 0) { warp_misses[warp] = __popc(ballot); }
+            __syncthreads();
+            rank[u] = before + __popc(ballot & ((1U << lane) - 1U));
+            for (int w = 0; w < kWarps; ++w) {
+                rank[u] += w < warp ? warp_misses[w] : 0;
+                before += warp_misses[w];
+            }
+        }
+        expanded = misses - before;
+        __syncthreads(); // every entry is read before any moves
+        for (int u = 0; u < kPer; ++u) {
+            const int n = u * kThreads + static_cast<int>(threadIdx.x);
+            if (n >= misses) { continue; }
+            const int at  = compressed[u] ? expanded + rank[u] : n - rank[u];
+            miss_jobs[at] = job[u];
+            miss_dst[at]  = dst[u];
+        }
+        __syncthreads();
+        if (expanded < misses) {
+            stage_csf<true>(dispatch, source, miss_jobs + expanded, miss_dst + expanded, misses - expanded, bytes, end,
+                            csf_shared);
+        }
+    }
     const int first_chunks = (end - bytes.begin + kStageChunk - 1) / kStageChunk;
     const int kChunks      = first_chunks + (bytes.end2 - bytes.begin2 + kStageChunk - 1) / kStageChunk;
     constexpr int kVec    = kStageChunk / 16;
-    const int total       = misses * kChunks;
+    const int total       = expanded * kChunks;
     // Tier records live in host slots the host rewrites (RAM slots, the fetch ring): .cv loads
     // discard any L2 line of an earlier occupant. The full-mode bank never changes.
     const bool mutable_host = source.host_table != nullptr;
@@ -408,7 +579,7 @@ __global__ void __launch_bounds__(kThreads)
             record = host_record(source, expert);
             if (record == nullptr && threadIdx.x == 0) { report_error(source, offloaded_moe::kErrorUnservedRecord); }
         }
-        if (record == nullptr) { continue; } // the round fails (error word); the passes compute garbage
+        if (record == nullptr || miss_dst[m] == nullptr) { continue; } // the round fails (error word)
         const auto* src = reinterpret_cast<const uint4*>(record + offset);
         auto* dst = reinterpret_cast<uint4*>(miss_dst[m] + offset);
         const int vectors = copied / 16;
@@ -1829,6 +2000,7 @@ void launch_expert_pass_a4r(const bf16* x, const MoeDispatch& dispatch, const Mo
 #include "ops/offloaded_sparse_moe/cuda/narrow_a16_mma.cuh"
 #include "ops/offloaded_sparse_moe/cuda/narrow_rows_a16.cuh"
 #include "ops/offloaded_sparse_moe/cuda/narrow_a4_mma.cuh"
+#include "ops/offloaded_sparse_moe/cuda/narrow_rows_a4.cuh"
 
 // One pass of the narrow kernels in the source's arithmetic, for a call of `columns` columns. W4A4
 // jobs of a bank whose experts share their gate and up input scales take the row-pair kernels in calls of at most
@@ -1907,6 +2079,11 @@ void launch_pass(int columns, const bf16* x, const MoeDispatch& dispatch, const 
                                                            h_plane, outputs, stream, phase, part);
             }
         });
+        return;
+    }
+    if (a4_rows_call(source, columns, layout)) {
+        launch_expert_pass_a4_rows(x, columns, dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs,
+                                   stream, phase, part);
         return;
     }
     if (a4_nmma_call(source, columns, layout)) {
@@ -2001,7 +2178,6 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
                                               std::int32_t* __restrict__ cpu_flags, CpuCall* __restrict__ call,
                                               CpuPlanShared& sm) {
     constexpr int kWidths = CpuPlanShared::kWidths;
-#include "ops/offloaded_sparse_moe/cuda/narrow_rows_a4.cuh"
     constexpr int kCats   = CpuPlanShared::kCats;
     constexpr int kChunks = CpuPlanShared::kChunks;
     const auto& channel   = source.cpu;
@@ -2081,11 +2257,6 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
         const int excl    = incl - total;
         const int ssd     = __shfl_sync(0xFFFFFFFFU, incl, kWidths);
         const int host    = __shfl_sync(0xFFFFFFFFU, incl, kCats) - ssd;
-    if (a4_rows_call(source, columns, layout)) {
-        launch_expert_pass_a4_rows(x, columns, dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs,
-                                   stream, phase, part);
-        return;
-    }
         const int n       = min(cap, ssd); // SSD-only, up to the cap
         const int one     = channel.one_column_divisor_device != nullptr && columns == 1 ? *channel.one_column_divisor_device
                                                                                          : channel.one_column_divisor;
@@ -2895,6 +3066,8 @@ void prepare_x(const Tensor& x, const MoeExpertSource& source, std::int32_t max_
         launch_prepare_a16_rows(x, static_cast<int>(max_jobs), layout, stream);
     } else if (a16_nmma_call(source, columns, layout)) {
         launch_prepare_a16_nmma(x, static_cast<int>(max_jobs), layout, stream);
+    } else if (a4_rows_call(source, columns, layout)) {
+        launch_prepare_a4_rows(static_cast<int>(max_jobs), layout, stream);
     }
 }
 
@@ -3030,6 +3203,14 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                  (ggml ? source.ggml.a8 : source.narrow_a16 == moe::NarrowA16::kA8)),
             "experts: the 8-bit wide route (WideA16::kA8) needs the bank's 8-bit narrow route (MoeGgmlBank::a8 or "
             "NarrowA16::kA8)");
+    require(source.host_csf == nullptr ||
+                (!ggml && source.host_table == nullptr && source.host_records != nullptr && source.staging_slots > 0 &&
+                 source.fetch.request == nullptr && moe::registered_shape(source.shape)),
+            "experts: CSF host records need an NVFP4 bank's pinned records, staging and no fetch channel");
+    require(source.host_csf_pitch == 0 ||
+                (!ggml && source.host_table != nullptr && source.host_csf == nullptr && source.staging_slots > 0 &&
+                 moe::registered_shape(source.shape) && source.host_csf_pitch >= moe::wide::nvfp4_record_bytes(source.shape)),
+            "experts: the SSD tier's CSF slots need an NVFP4 bank's host table and staging");
     require(source.landing_slots >= 0 && source.landing_slots <= offloaded_moe::kMaxLandingSlots &&
                 (source.landing_slots == 0 || (source.landing != nullptr && source.landed != nullptr)),
             "experts landing is incomplete");
@@ -3066,8 +3247,6 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         return;
     }
     // An NVFP4 W4A16 bank's call on the 8-bit route (NarrowA16::kA8): every job on the 8-bit kernels, so neither
-    } else if (a4_rows_call(source, columns, layout)) {
-        launch_prepare_a4_rows(static_cast<int>(max_jobs), layout, stream);
     // the narrow ring nor the wide route takes part. A wider call with WideA16::kA8 keeps the wide route (its
     // 8-bit grouped GEMM) for its wide jobs and the 8-bit kernels for the others.
     const bool nvfp4_a8 = nvfp4_a8_call(source, static_cast<int>(x.ne[1]));
@@ -3076,8 +3255,10 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     if (ggml && !a8_call(source, static_cast<int>(x.ne[1])) && x.ne[1] > moe::kMaxColumns) {
         launch_plan_ggml(dispatch, max_jobs, layout, stream);
     }
-    // Passes of at most staging_slots jobs (one pass covering every job without staging).
-    const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;
+    // Passes of at most staging_slots jobs (one pass covering every job without staging, or with one_pass).
+    const int pass_jobs = source.staging_slots > 0
+                              ? std::min(source.one_pass ? static_cast<int>(max_jobs) : source.staging_slots, kMaxPassJobs)
+                              : max_jobs;
     const int half      = source.staging_slots / 2;
     // In a call of more than eight columns, experts with more than eight take the wide route, pass
     // by pass once each pass's records are resolved; it is planned and x quantized before the passes.

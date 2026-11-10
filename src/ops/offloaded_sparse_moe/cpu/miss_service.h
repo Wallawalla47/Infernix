@@ -33,6 +33,8 @@ public:
     struct Layer {
         const std::uint8_t* records = nullptr; // pinned host bank, record_stride apart
         std::uint64_t record_stride = 0;
+        // An NVFP4 bank of CSF records (csf_record.h): record e's table at csf + e * table words; null: expanded.
+        const std::uint32_t* csf = nullptr;
         const ExpertScales* scales  = nullptr; // host [E] (NVFP4 banks)
         GgmlExpertFormat ggml{};               // a GGUF bank: its records' formats (ggml_expert.h)
     };
@@ -73,6 +75,10 @@ public:
         // heartbeat word changing while it waits for a record and as its team completes work items,
         // so the device waits as long as the request makes progress.
         RecordProvider* records = nullptr;
+        // Tiered records may be the SSD tier's compressed slots of this pitch (MoeExpertSource::host_csf_pitch): a
+        // record address with bit 0 set (csf::kTag), in a request or from `records`, has its table in its slot's
+        // tail. 0: every tiered record is expanded.
+        std::uint64_t tier_csf_pitch = 0;
         // Called once, on the service thread, when the thread stops serving, with failure()'s text
         // (the request it was serving and the exception). It must be safe to call from that
         // thread; its own exceptions are ignored.

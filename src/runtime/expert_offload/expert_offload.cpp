@@ -194,6 +194,8 @@ ExpertOffload::ExpertOffload(OffloadSetup setup, OffloadOptions options, Diagnos
     }
     residency_     = std::make_unique<ExpertResidency>(layout, std::move(banks), record_stride_, setup_.columns,
                                                        setup_.device, host_strides_);
+    // CSF banks (compress_banks): promotions copy their records' compressed bytes and expand them in the frames.
+    if (const auto csf = csf_tables(); !csf.empty()) { residency_->set_csf(csf, setup_.banks.front()->shape()); }
     std::memset(error_.data(), 0, 64);
     CUDA_CHECK(cudaStreamCreateWithPriority(&overlap_.stream, cudaStreamNonBlocking, side_stream_priority()));
     for (auto& event : overlap_.events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
@@ -316,7 +318,10 @@ void ExpertOffload::create_tier() {
         tier.io.total_depth = tier.io.demand_depth + tier.io.restore_depth + tier.io.prefetch_depth;
         diagnostic("SSD tier: expert record tails from " + options_.expert_stripe.string(), DiagnosticLevel::Info);
     }
-    tier_ = std::make_unique<HostExpertTier>(*records, std::move(tier));
+    // --expert-csf with NVFP4 banks: the RAM slots hold CSF records (the fill's and the refills', compressed on the copy
+    // threads).
+    if (options_.expert_csf) { tier.csf = tier_csf_shape(setup_.banks); }
+    tier_    = std::make_unique<HostExpertTier>(*records, std::move(tier));
     residency_->attach_tier(tier_.get(), exclusive_.slots != 0);
     if (tier_->refused_slots() > 0) {
         diagnostic("SSD expert tier: Windows refused to page-lock " + std::to_string(tier_->refused_slots()) +
@@ -384,9 +389,28 @@ const std::uint8_t* ExpertOffload::host_record(std::uint32_t layer, std::uint32_
     return tier_ ? tier_->record(tier_->key(layer, expert)) : nullptr;
 }
 
+const std::uint32_t* ExpertOffload::host_csf(std::uint32_t layer, std::uint32_t expert) const {
+    const ExpertBank& bank = *setup_.banks[layer];
+    if (bank.planes.records == nullptr) { return tier_ ? tier_->record_csf(tier_->key(layer, expert)) : nullptr; }
+    if (!bank.csf) { return nullptr; }
+    return bank.csf.host + static_cast<std::size_t>(expert) * ops::offloaded_moe::csf::Geometry::of(bank.shape()).table_words();
+}
+
+std::vector<ops::offloaded_moe::csf::BankTables> ExpertOffload::csf_tables() const {
+    std::vector<ops::offloaded_moe::csf::BankTables> out;
+    bool any = false;
+    for (const ExpertBank* bank : setup_.banks) {
+        out.push_back(bank->csf);
+        any = any || static_cast<bool>(bank->csf);
+    }
+    if (!any) { out.clear(); }
+    return out;
+}
+
 // ------------------------------------------------------------------------------------- link and CPU
 
 void ExpertOffload::measure_link() {
+    if (const std::string csf = csf_summary(setup_.banks); !csf.empty()) { diagnostic(csf, DiagnosticLevel::Debug); }
     double rate        = options_.link_bytes_per_second;
     const void* source = setup_.banks.front()->planes.records;
     if (source == nullptr && tier_) { source = tier_->slot_bytes(0); }
@@ -525,6 +549,7 @@ std::optional<CpuRateReading> ExpertOffload::measure_cpu_rate() {
                 experts[(static_cast<std::uint32_t>(round) * 131U + static_cast<std::uint32_t>(k) * 37U) % experts.size()];
             auto& job  = jobs[static_cast<std::size_t>(k)];
             job.record = host_record(layer, expert);
+            job.csf    = host_csf(layer, expert);
             job.ggml   = ggml_format(bank);
             job.a8     = options_.narrow_a16 == moe::NarrowA16::kA8 && !job.ggml.valid();
             job.scales = job.ggml.valid() ? moe::ExpertScales{} : bank.scales[expert];
@@ -704,6 +729,7 @@ void ExpertOffload::cpu_probe_detail() {
                 const ExpertBank& bank = *setup_.banks[p.layer];
                 auto& job        = jobs[static_cast<std::size_t>(k)];
                 job.record       = record_in(memory, p);
+                job.csf          = host_csf(p.layer, p.expert); // a copy keeps its record's table
                 job.ggml         = ggml_format(bank);
                 job.scales       = job.ggml.valid() ? moe::ExpertScales{} : bank.scales[p.expert];
                 job.ncols        = columns;
@@ -767,6 +793,13 @@ void ExpertOffload::create_stream() {
     }
     stream_ = std::make_unique<ExpertStream>(setup_.layout.layers, setup_.layout.experts, record_stride_, std::move(record_of),
                                              !tier_, std::move(hold), host_strides_, std::move(ssd));
+    // CSF banks: each streamed record copies its compressed bytes and expands in its ring slot.
+    if (const auto csf = csf_tables(); !csf.empty()) { stream_->set_csf(csf, setup_.banks.front()->shape()); }
+    if (tier_ && tier_->csf()) { // likewise the tier's compressed slots
+        stream_->set_tier_csf(
+            [tier = tier_.get()](std::uint32_t layer, std::uint32_t expert) { return tier->record_csf(tier->key(layer, expert)); },
+            *tier_->csf());
+    }
     if (tier_ && tier_->stream_bounce_slots() > 0) {
         // Unpinned records stream through the tier's bounce slots, still two layers ahead.
         HostExpertTier* tier = tier_.get();
@@ -797,6 +830,7 @@ void ExpertOffload::create_cpu_service() {
     for (const ExpertBank* bank : setup_.banks) {
         layers.push_back({.records       = reinterpret_cast<const std::uint8_t*>(bank->planes.records),
                           .record_stride = bank->planes.record_stride,
+                          .csf           = bank->planes.records != nullptr ? bank->csf.host : nullptr,
                           .scales        = bank->scales.data(),
                           .ggml          = ggml_format(*bank)});
     }
@@ -821,6 +855,7 @@ void ExpertOffload::create_cpu_service() {
             .nvfp4_a8           = options_.narrow_a16 == moe::NarrowA16::kA8,
             .shape              = front.shape(),
             .records            = tier_.get(), // tier mode: SSD-only jobs read through the tier
+            .tier_csf_pitch     = tier_ && tier_->csf() ? tier_->csf_pitch() : 0,
             // Reported when it happens; the next round's check_error then stops the Engine with it.
             .on_failure = [this](const std::string& why) {
                 diagnostic("the CPU expert service stopped serving misses: " + why, DiagnosticLevel::Error);
@@ -836,10 +871,12 @@ ops::MoeExpertSource ExpertOffload::source(std::uint32_t layer) const {
     s.record_stride = bank.planes.record_stride;
     s.frame_stride  = residency_->frame_pitch(layer);
     if (tier_) {
-        s.host_table = residency_->record_table(layer);
-        s.fetch      = fetch_channel_->channel(static_cast<int>(layer));
+        s.host_table     = residency_->record_table(layer);
+        s.host_csf_pitch = tier_->csf() ? tier_->csf_pitch() : 0; // compressed slots expand as they are staged
+        s.fetch          = fetch_channel_->channel(static_cast<int>(layer));
     } else {
         s.host_records = reinterpret_cast<const std::uint8_t*>(bank.planes.device_records);
+        s.host_csf     = bank.csf.device; // staged misses are expanded as they are copied
     }
     s.scales        = setup_.device_scales[layer];
     s.activation    = bank.activation;
@@ -1236,6 +1273,7 @@ void ExpertOffload::warm_start(cudaStream_t compute) {
                                              : "spread across the layers",
                   shadows, tier_->unpinned_records(), unpinned, seconds, on_ssd, keys);
     diagnostic(line, DiagnosticLevel::Debug);
+    if (const std::string csf = tier_->csf_summary(); !csf.empty()) { diagnostic(csf, DiagnosticLevel::Debug); }
 }
 
 void ExpertOffload::save_state() noexcept {

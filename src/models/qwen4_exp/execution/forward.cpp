@@ -1325,9 +1325,18 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         // since is still in its held frame or in RAM: IQ3_S's exclusive 16K prefill ran 13 passes a layer,
         // 6,500 against the full layout's 6,794 tok/s (2026-10-29).
         if (streaming->complete(layer) && (experts_.host_tables.empty() || batch->stream_whole)) {
-            source.staging_slots  = 0;
-            source.overlap_stream = nullptr;
-            source.fetch          = {}; // nothing is SSD-only: an unserved record would fail the call
+            // CSF records cannot be read in place: the evicted ones are staged, still in one pass when they fit the
+            // slots (else the call keeps its staging passes).
+            const bool csf = source.host_csf != nullptr || source.host_csf_pitch != 0;
+            if (!csf || static_cast<std::int32_t>(streaming->uncovered(layer)) <= source.staging_slots) {
+                if (csf) {
+                    source.one_pass = true;
+                } else {
+                    source.staging_slots = 0;
+                }
+                source.overlap_stream = nullptr;
+                source.fetch          = {}; // nothing is SSD-only: an unserved record would fail the call
+            }
         }
     }
     const bool planned = route_plans && ops::moe_route_dispatch_plan(logits, K, routing, dispatch, route_log, x, source,
@@ -1389,9 +1398,12 @@ ops::MoeExpertSource Forward::expert_source(const MoeParameters& p, std::uint32_
                                 .staging_slots = experts_.staging_slots,
                                 .cpu           = experts_.cpu.empty() ? ops::MoeCpuChannel{} : experts_.cpu.at(layer)};
     if (!experts_.host_tables.empty()) {
-        source.host_records = nullptr; // the banks hold no records in tier mode
-        source.host_table   = experts_.host_tables.at(layer);
+        source.host_records   = nullptr; // the banks hold no records in tier mode
+        source.host_table     = experts_.host_tables.at(layer);
+        source.host_csf_pitch = experts_.tier_csf_pitch; // compressed RAM slots: staged misses expand as they copy
         if (!experts_.fetch.empty()) { source.fetch = experts_.fetch.at(layer); }
+    } else {
+        source.host_csf = p.bank->csf.device; // the pinned bank's CSF records: staged misses expand as they copy
     }
     source.error   = experts_.error;
     source.wait_ns = experts_.wait_ns;

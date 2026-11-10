@@ -13,12 +13,16 @@
 // protocol (ops/offloaded_sparse_moe/cpu/fetch_request.h): records landed from RAM and read from disk,
 // more records than ring slots (slots reused as the "device" consumes them), the heartbeat, a request
 // failing on an unreadable record, and admission of fetched landings at the next boundary. An
-// expert stripe moves each record's tail to another file; records still land whole.
+// expert stripe moves each record's tail to another file; records still land whole. CSF slots (Options::csf, real
+// Flash-Next record geometry): the fill and the refills compress records in their slots (one that cannot hold its
+// table stays expanded), published tagged; CPU demands, admissions and copied demotions; an EngineHost's pool keeping
+// each slot's format; with --fetch, a fetch of a compressed resident landing an expanded copy.
 #include "test_temp_path.h"
 #include "runtime/expert_offload/expert_store.h"
 #include "runtime/expert_offload/host_expert_tier.h"
 #include "runtime/expert_offload/host_slot_pool.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
+#include "ops/offloaded_sparse_moe/csf_record.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1051,11 +1055,221 @@ void test_slot_pool(const ExpertStore& store) {
     check(!rates.cpu_rates("b") && !rates.cpu_rates("c"), "pool: another configuration, or a zero rate, has none");
 }
 
+// ---- CSF slots (HostExpertTier::Options::csf): Flash-Next records whose scales cluster per row as converted experts'
+// do, and one record with random scales (it does not compress enough to hold its table: it stays expanded).
+namespace csf = infernix::ops::offloaded_moe::csf;
+constexpr std::uint32_t kCsfLayers = 2, kCsfExperts = 12, kCsfKeys = kCsfLayers * kCsfExperts;
+constexpr std::uint32_t kRandomScales = 3; // the incompressible key
+
+std::vector<std::uint8_t> csf_record(std::uint32_t key) {
+    const auto& shape = infernix::ops::offloaded_moe::kFlashNextShape;
+    std::vector<std::uint8_t> record(shape.record_bytes());
+    std::uint64_t state = 0x9E3779B97F4A7C15ULL * (key + 1);
+    const auto next = [&] {
+        state ^= state << 13U;
+        state ^= state >> 7U;
+        state ^= state << 17U;
+        return state;
+    };
+    for (auto& b : record) { b = static_cast<std::uint8_t>(next()); }
+    const auto scales = [&](std::uint8_t* units, int rgs, int blocks) {
+        for (int rg = 0; rg < rgs; ++rg) {
+            int level[16];
+            for (int& l : level) { l = 0x28 + static_cast<int>(next() % 32); }
+            for (int b = 0; b < blocks; ++b) {
+                std::uint8_t* s = units + (static_cast<std::size_t>(rg) * blocks + b) * 144 + 128;
+                for (int r = 0; r < 16; ++r) {
+                    const std::uint64_t v = next();
+                    int code = level[r] + static_cast<int>(v % 9) - 4;
+                    if ((v >> 8) % 50 == 0) { code += static_cast<int>((v >> 16) % 41) - 20; } // ~2 % far
+                    s[r] = key == kRandomScales ? static_cast<std::uint8_t>(next() & 0x77U)
+                                                : static_cast<std::uint8_t>(std::clamp(code, 1, 0x76));
+                }
+            }
+        }
+    };
+    scales(record.data(), shape.gate_up_row_groups(), shape.gate_up_blocks());
+    scales(record.data() + shape.gate_up_bytes(), shape.down_row_groups(), shape.down_blocks());
+    return record;
+}
+
+// Whether a published address (tagged: a compressed slot; untagged: an expanded record) holds key's record.
+bool csf_matches(const std::uint8_t* p, const std::vector<std::uint8_t>& want, std::uint64_t pitch) {
+    if (p == nullptr) { return false; }
+    const auto& shape = infernix::ops::offloaded_moe::kFlashNextShape;
+    if (!csf::tagged(p)) { return std::memcmp(p, want.data(), want.size()) == 0; }
+    const int words = csf::Geometry::of(shape).table_words();
+    const std::uint32_t* table = csf::slot_table(p, words, pitch);
+    if (!csf::valid_table(shape, table, csf::slot_table_offset(words, pitch))) { return false; }
+    std::vector<std::uint8_t> out(want.size());
+    csf::expand_record(shape, csf::untag(p), table, out.data());
+    return out == want;
+}
+
+void test_csf(bool fetch) {
+    const auto& shape = infernix::ops::offloaded_moe::kFlashNextShape;
+    const std::uint64_t bytes = shape.record_bytes(); // 675 x 4 KiB: the slot pitch
+    const auto path = infernix::test::unique_temp_path("infernix_host_tier_csf.bin");
+    std::vector<std::vector<std::uint8_t>> want(kCsfKeys);
+    std::vector<std::vector<ExpertStore::Segment>> segments(kCsfKeys);
+    {
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        for (std::uint32_t k = 0; k < kCsfKeys; ++k) {
+            want[k] = csf_record(k);
+            file.write(reinterpret_cast<const char*>(want[k].data()), static_cast<std::streamsize>(bytes));
+            segments[k] = {{0, k * bytes, 0, static_cast<std::uint32_t>(bytes)}};
+        }
+        if (!file) { throw std::runtime_error("cannot write the CSF test file"); }
+    }
+    std::vector<std::vector<float>> multipliers(kCsfLayers, std::vector<float>(3 * kCsfExperts, 1.0F));
+    const ExpertStore store({path}, std::vector<std::uint64_t>(kCsfLayers, bytes), kCsfExperts, segments, multipliers);
+    const auto csf_options = [&](bool compressed) {
+        HostExpertTier::Options o;
+        o.slots           = 16; // ring 4 + prefetch 2 + demotion 2 + 8 resident slots
+        o.ring            = 4;
+        o.prefetch        = 2;
+        o.demotion        = 2;
+        o.half_life       = 8;
+        o.slots_per_chunk = 4;
+        o.copy_threads    = 2;
+        o.allocate = [](std::size_t n) { return ::operator new(n, std::align_val_t{4096}); };
+        o.release  = [](void* p) { ::operator delete(p, std::align_val_t{4096}); };
+        if (compressed) { o.csf = shape; }
+        return o;
+    };
+    std::vector<std::uint32_t> ranked(kCsfKeys);
+    for (std::uint32_t k = 0; k < kCsfKeys; ++k) { ranked[k] = k; }
+    const auto key_matches = [&](const HostExpertTier& tier, std::uint32_t k) {
+        return csf_matches(tier.record_tagged(k), want[k], tier.csf_pitch());
+    };
+    {
+        HostExpertTier tier(store, csf_options(true));
+        check(tier.prefill(ranked) == 8, "csf: the fill places 8 records");
+        bool all = true, tags = true;
+        for (std::uint32_t k = 0; k < 8; ++k) {
+            all  = all && key_matches(tier, k);
+            tags = tags && csf::tagged(tier.record_tagged(k)) == (k != kRandomScales) &&
+                   (tier.record_csf(k) != nullptr) == (k != kRandomScales) && tier.record(k) == csf::untag(tier.record_tagged(k));
+        }
+        check(all, "csf: every filled slot expands to its file bytes");
+        check(tags && tier.csf_slots() == 7 && tier.stats().csf_compressed == 7 && tier.stats().csf_expanded == 1,
+              "csf: 7 slots compressed, the random-scale record left expanded");
+        check(tier.csf_summary().find("CSF records in 7 RAM slots") != std::string::npos, "csf: the summary names them");
+        // CPU demands: a compressed resident (tagged), the expanded one, and an SSD-only key (read expanded).
+        tier.begin_round(32);
+        std::vector<const std::uint8_t*> got(3);
+        std::vector<std::uint32_t> status(3);
+        const std::vector<std::uint32_t> keys{1, kRandomScales, 9};
+        std::thread service([&] {
+            std::vector<std::uint32_t> tickets;
+            for (const std::uint32_t k : keys) { tickets.push_back(tier.demand(static_cast<int>(k / kCsfExperts), static_cast<int>(k % kCsfExperts))); }
+            for (std::size_t i = 0; i < keys.size(); ++i) {
+                got[i] = tier.wait(tickets[i], status[i]);
+                tier.done(tickets[i]);
+            }
+        });
+        service.join();
+        check(status == std::vector<std::uint32_t>(3, 0) && csf::tagged(got[0]) && !csf::tagged(got[1]) && !csf::tagged(got[2]) &&
+                  csf_matches(got[0], want[1], tier.csf_pitch()) && csf_matches(got[1], want[kRandomScales], tier.csf_pitch()) &&
+                  csf_matches(got[2], want[9], tier.csf_pitch()),
+              "csf: a CPU demand gets a compressed resident tagged, a read record expanded");
+        // The landing is admitted expanded.
+        const std::vector<std::uint32_t> hot{9};
+        tier.record_uses(1, hot, 50.0);
+        tier.begin_round(32);
+        check(tier.stats().admitted == 1 && !csf::tagged(tier.record_tagged(9)) && tier.record_csf(9) == nullptr && key_matches(tier, 9),
+              "csf: an admitted landing is an expanded record");
+        tier.end_round();
+        // A refill compresses its record before it lands; a D2H demotion (mark_expanded) leaves its record expanded.
+        auto& host = tier.controller();
+        for (const std::uint32_t k : {12U, 13U}) {
+            const std::vector<std::uint32_t> key{k};
+            tier.record_uses(1, key, 1000.0);
+        }
+        std::uint32_t refilled = 0, copied = 0;
+        check(host.vram_evicted(12, true, refilled) == expert_cache::VramEviction::kDemote, "csf: a demotion slot for 12");
+        const std::uint32_t id = tier.refill(12, refilled);
+        while (tier.refill_state(id) == 0) { std::this_thread::yield(); }
+        check(tier.refill_state(id) == 1, "csf: the refill lands");
+        tier.refill_release(id);
+        host.demotion_completed(12, refilled, false);
+        check(csf::tagged(tier.record_tagged(12)) && key_matches(tier, 12), "csf: the refilled record is compressed in its slot");
+        check(host.vram_evicted(13, true, copied) == expert_cache::VramEviction::kDemote, "csf: a demotion slot for 13");
+        tier.mark_expanded(copied);
+        std::memcpy(const_cast<std::uint8_t*>(tier.slot_bytes(copied)), want[13].data(), bytes); // the frame's copy
+        host.demotion_completed(13, copied, false);
+        check(!csf::tagged(tier.record_tagged(13)) && key_matches(tier, 13), "csf: a copied demotion is an expanded record");
+        host.check();
+    }
+    // An EngineHost's slots keep their records' formats: a CSF tier keeps the compressed ones as compressed, a tier
+    // without CSF keeps only the expanded ones.
+    auto pool = std::make_shared<infernix::runtime::expert_offload::HostSlotPool>([](void* p) {
+        ::operator delete(p, std::align_val_t{4096});
+    });
+    const auto pooled = [&](bool compressed) {
+        auto o          = csf_options(compressed);
+        o.pool          = pool;
+        o.pool_identity = "csf";
+        return o;
+    };
+    {
+        HostExpertTier tier(store, pooled(true));
+        check(tier.prefill(ranked) == 8 && tier.stats().kept == 0, "csf pool: the first tier reads its records");
+    }
+    {
+        HostExpertTier tier(store, pooled(true));
+        bool all = true;
+        check(tier.prefill(ranked) == 8 && tier.stats().kept == 8 && tier.stats().prefill_reads == 0,
+              "csf pool: a CSF tier keeps all 8 records");
+        for (std::uint32_t k = 0; k < 8; ++k) {
+            all = all && key_matches(tier, k) && csf::tagged(tier.record_tagged(k)) == (k != kRandomScales);
+        }
+        check(all && tier.csf_slots() == 7, "csf pool: the kept records keep their formats");
+    }
+    {
+        HostExpertTier tier(store, pooled(false));
+        bool all = true;
+        check(tier.prefill(ranked) == 8 && tier.stats().kept == 1 && tier.stats().prefill_reads == 7,
+              "csf pool: a tier without CSF keeps only the expanded record");
+        for (std::uint32_t k = 0; k < 8; ++k) { all = all && std::memcmp(tier.record(k), want[k].data(), bytes) == 0; }
+        check(all && tier.record_tagged(0) == tier.record(0), "csf pool: its records are expanded");
+    }
+    pool.reset();
+    if (fetch) {
+        // A fetch of a compressed resident lands an expanded copy in a ring slot (the device stages expanded records).
+        infernix::ops::offloaded_moe::FetchChannel channel;
+        auto o  = csf_options(true);
+        o.fetch = &channel;
+        HostExpertTier tier(store, o);
+        (void)tier.prefill(ranked);
+        tier.begin_round(32);
+        DeviceSide device{channel.channel(0)};
+        device.publish(0, {1, kRandomScales, 10});
+        std::uint32_t status = 0;
+        const std::uint8_t* a = device.wait(0, status);
+        const std::uint8_t* b = device.wait(1, status);
+        const std::uint8_t* c = device.wait(2, status);
+        check(status == 0 && a != nullptr && a != tier.record(1) && !csf::tagged(a) && csf_matches(a, want[1], tier.csf_pitch()),
+              "csf fetch: a compressed resident lands as an expanded copy");
+        check(b == tier.record(kRandomScales) && csf_matches(b, want[kRandomScales], tier.csf_pitch()) &&
+                  csf_matches(c, want[10], tier.csf_pitch()),
+              "csf fetch: an expanded resident lands in place, an SSD-only record read");
+        device.consume(3);
+        tier.end_round();
+        tier.begin_round(32);
+        check(tier.stats().csf_fetch_expansions == 1, "csf fetch: one expansion");
+        tier.end_round();
+    }
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         const Files files = make_files();
+        test_csf(argc > 1 && std::string_view(argv[1]) == "--fetch");
         std::vector<std::vector<float>> multipliers(kLayers, std::vector<float>(3 * kExperts, 1.0F));
         const ExpertStore store({files.a, files.b}, std::vector<std::uint64_t>(kLayers, kRecord), kExperts, files.records,
                                 multipliers);

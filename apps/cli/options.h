@@ -25,6 +25,7 @@ struct Options {
     std::uint64_t ram_free_bytes = kDefaultRamFreeBytes;
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
     std::optional<ExpertRamLayout> expert_ram_layout; // --expert-ram-layout (empty: the model's default)
+    bool expert_csf = false;                          // --expert-csf
     std::optional<std::uint64_t> expert_pin_bytes; // --expert-pin-mib; empty: what the OS lets it pin
     std::filesystem::path grammar_path;
     std::filesystem::path json_schema_path;

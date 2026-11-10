@@ -371,7 +371,8 @@ void test_fp64_oracle() {
     moe::quantize_a4(moe::best_cpu_isa(), x.data(), moe::kHidden, e.scales.input_gate, xq.data());
     const canon::A4Block* xp[1] = {xq.data()};
     std::vector<std::int64_t> s(static_cast<std::size_t>(moe::kGateUpRowGroups) * 16);
-    moe::rg16_row_sums(moe::best_cpu_isa(), e.record.data(), moe::kGateUpBlocks, 0, moe::kGateUpRowGroups, xp, 1, s.data());
+    moe::rg16_row_sums(moe::best_cpu_isa(), {e.record.data(), moe::kGateUpBlocks}, 0, moe::kGateUpRowGroups, xp, 1,
+                       s.data());
     int inexact = 0, checked = 0;
     for (int row = 0; row < moe::kGateUpRowGroups * 16; ++row) {
         const int rg = row / 16, r = row % 16;
@@ -400,8 +401,8 @@ void test_fp64_oracle() {
     moe::gate_up_units(moe::CpuIsa::kScalar, e.record.data(), e.scales, xp, xp, 1, 0, moe::kHBlocks, hp);
     // The down projection's int64 row sums are exact as well (its units, the quantized h).
     std::vector<std::int64_t> sd(static_cast<std::size_t>(moe::kDownRowGroups) * 16);
-    moe::rg16_row_sums(moe::best_cpu_isa(), e.record.data() + moe::kGateUpBytes, moe::kDownBlocks, 0, moe::kDownRowGroups,
-                       hp_c, 1, sd.data());
+    moe::rg16_row_sums(moe::best_cpu_isa(), {e.record.data() + moe::kGateUpBytes, moe::kDownBlocks}, 0,
+                       moe::kDownRowGroups, hp_c, 1, sd.data());
     int down_inexact = 0, down_checked = 0;
     for (int row = 0; row < moe::kHidden; ++row) {
         const int rg = row / 16, r = row % 16;

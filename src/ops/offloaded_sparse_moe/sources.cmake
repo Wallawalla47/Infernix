@@ -8,7 +8,8 @@ add_library(infernix_offloaded_moe_cpu STATIC
   "${CMAKE_CURRENT_LIST_DIR}/cpu/a4r_expert.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/cpu/ggml_expert.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/cpu/fp8_expert.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/cpu/expert_team.cpp")
+  "${CMAKE_CURRENT_LIST_DIR}/cpu/expert_team.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/csf_record.cpp")
 infernix_internal_includes(infernix_offloaded_moe_cpu)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(infernix_offloaded_moe_cpu PRIVATE -ffp-contract=off -fno-fast-math)
@@ -22,6 +23,8 @@ target_link_libraries(infernix_ops PUBLIC infernix_offloaded_moe_cpu)
 target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/narrow_expert.cu")
 # A whole MoE layer: routing, device-side dispatch, the exact expert kernels and the combine.
 target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/moe_layer.cu")
+# CSF host records' in-place expansion after copy-engine landings (csf_record.h).
+target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/csf_expand.cu")
 # The wide route: experts with more than eight columns on block-scaled tensor cores.
 target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/wide_expert.cu")
 # The canonical W4A16 dense projection of an nvfp4_rg16_v1 matrix (Qwen3.5-122B-A10B's head).

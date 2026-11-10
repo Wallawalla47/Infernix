@@ -42,6 +42,7 @@
 #include "core/device.h"
 #include "core/vmm_arena.h"
 #include "core/vram_budget.h"
+#include "ops/offloaded_sparse_moe/csf_record.h"
 #include "runtime/expert_offload/expert_cache.h"
 #include "runtime/expert_offload/memory_plan.h"
 #include "runtime/expert_offload/route_predictor.h"
@@ -89,6 +90,7 @@ public:
         std::uint64_t refill_fallbacks = 0; // SSD tier: demotions whose refill read failed, copied over the link
         std::uint64_t d2h_demotions    = 0; // SSD tier: demotions copied over the link (no refill id, or past the budget)
         std::uint64_t unpinned_promotions = 0; // SSD tier: promotions of unpinned records (bounced)
+        std::uint64_t csf_promotions      = 0; // SSD tier: promotions of compressed slots (expanded in their frames)
     };
     // Landing frames per layer and round (design §19.3.5 S4): free frames are reserved before a
     // decode or verification round, the round's forked MoE calls copy their first staged misses
@@ -121,6 +123,12 @@ public:
                     std::int32_t max_columns, int device, std::vector<std::uint64_t> host_strides = {},
                     VramPolicy policy = VramPolicy::Lfru);
     ~ExpertResidency();
+    // Banks of CSF records (ops/offloaded_sparse_moe/csf_record.h; full mode, before any promotion): tables[l] is
+    // layer l's bank tables, empty for an expanded bank. A promotion of such a record copies its compressed bytes into
+    // the frame and expands it there (csf::expand_in_place) on a low-priority stream of its own, so the copy engine
+    // never waits for the expansion; the promotion's batch completes once its expansions have. A CSF tier
+    // (HostExpertTier::Options::csf, attach_tier) promotes its compressed slots the same way, with their own tables.
+    void set_csf(std::vector<ops::offloaded_moe::csf::BankTables> tables, const ops::offloaded_moe::ExpertShape& shape);
     ExpertResidency(const ExpertResidency&)            = delete;
     ExpertResidency& operator=(const ExpertResidency&) = delete;
 
@@ -359,8 +367,20 @@ private:
 
     cudaStream_t copy_stream_ = nullptr;
     cudaEvent_t table_ready_  = nullptr;
+    // CSF banks (set_csf): per layer its tables (empty: expanded), the records' geometry and table words, and the
+    // expansion stream with the event that orders it after a batch's copies.
+    std::vector<ops::offloaded_moe::csf::BankTables> csf_tables_;
+    ops::offloaded_moe::ExpertShape csf_shape_{};
+    std::uint32_t csf_words_     = 0;
+    cudaStream_t expand_stream_ = nullptr;
+    cudaEvent_t copied_         = nullptr;
+    // The geometry and the expansion stream (set_csf, or a CSF tier's attach_tier).
+    void start_expansions(const ops::offloaded_moe::ExpertShape& shape);
+    // Waits until every promotion copy (and its expansion) has finished.
+    void sync_copies();
     struct Batch {
         cudaEvent_t done = nullptr;
+        bool expands     = false; // CSF records expanded in their frames (done recorded on the expansion stream)
         struct Load {
             std::uint32_t key, frame;
             std::uint64_t serial;

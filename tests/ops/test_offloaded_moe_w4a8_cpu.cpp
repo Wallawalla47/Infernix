@@ -319,7 +319,7 @@ void check_isa(moe::CpuIsa isa, const moe::ExpertShape& shape, const Expert& e, 
         }
         // Rows: every p_0 against the oracle's binary32 value.
         std::vector<float> p(static_cast<std::size_t>(2 * I) * ncols);
-        moe::rg16_rows_a8(isa, gate_up, H / 16, kGateUpPartials, 0, 2 * I / 16, xp, ncols, p.data());
+        moe::rg16_rows_a8(isa, {gate_up, H / 16}, kGateUpPartials, 0, 2 * I / 16, xp, ncols, p.data());
         std::size_t bad = 0;
         for (int row = 0; row < 2 * I; ++row) {
             for (int c = 0; c < ncols; ++c) {
@@ -329,7 +329,7 @@ void check_isa(moe::CpuIsa isa, const moe::ExpertShape& shape, const Expert& e, 
         }
         if (bad != 0) { fail(at + std::to_string(bad) + " gate/up p_0 differ from the oracle"); }
         p.assign(static_cast<std::size_t>(H) * ncols, 0.0F);
-        moe::rg16_rows_a8(isa, down, I / 16, kDownPartials, 0, groups, hp, ncols, p.data());
+        moe::rg16_rows_a8(isa, {down, I / 16}, kDownPartials, 0, groups, hp, ncols, p.data());
         bad = 0;
         for (int row = 0; row < H; ++row) {
             for (int c = 0; c < ncols; ++c) {

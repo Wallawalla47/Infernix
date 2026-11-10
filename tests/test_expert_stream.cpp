@@ -1,12 +1,16 @@
 // ExpertStream's gated chunks with copy-ahead (runtime/expert_offload/expert_stream.h, candidates BX-09):
 // plan_ahead fills the start of a layer's half from a guess, plan_layer keeps those slots and copies only
 // the rest after them, mask_ahead hides the copied-ahead experts from the CPU split, and every slot the
-// table names holds that expert's record bytes. The speed effect is a measurement (the copy-ahead ABBA).
+// table names holds that expert's record bytes. The speed effect is a measurement (the copy-ahead ABBA). With CSF
+// banks (set_csf), and with the SSD tier's compressed slots beside expanded ones (set_tier_csf), every slot holds its
+// expert's expanded record, in ungated and gated chunks.
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "ops/offloaded_sparse_moe/csf_record.h"
 #include "runtime/expert_offload/expert_stream.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <initializer_list>
 #include <iostream>
@@ -183,6 +187,114 @@ void ungated_refuses() {
     rig.stream.end();
 }
 
+// CSF banks (ExpertStream::set_csf), and the tier's slots (set_tier_csf: odd records compressed in their slots, even
+// ones expanded): records of Flash-Next's geometry; every slot an ungated
+// chunk (copies two layers ahead) and a gated one (copies ahead, then late) names holds its expert's expanded record,
+// bit for bit, once the layer's MoE may start.
+void csf_chunks() {
+    namespace moe = infernix::ops::offloaded_moe;
+    namespace csf = infernix::ops::offloaded_moe::csf;
+    constexpr std::uint32_t kL = 3, kE = 6;
+    const moe::ExpertShape shape = moe::kFlashNextShape;
+    const std::uint64_t stride   = shape.record_bytes();
+    const auto words             = static_cast<std::size_t>(csf::Geometry::of(shape).table_words());
+    const csf::Geometry g        = csf::Geometry::of(shape);
+    // The expanded records (scale codes near a centre per row, a few outliers) and the bank of their CSF form.
+    std::vector<std::vector<std::uint8_t>> expanded(kL * kE);
+    std::uint32_t seed = 7;
+    const auto next    = [&] { return seed = seed * 1664525U + 1013904223U; };
+    infernix::PinnedHostBuffer bank(kL * kE * stride);
+    infernix::PinnedHostBuffer tables(kL * kE * words * sizeof(std::uint32_t));
+    for (std::uint32_t r = 0; r < kL * kE; ++r) {
+        auto& rec = expanded[r];
+        rec.resize(stride);
+        for (auto& b : rec) { b = static_cast<std::uint8_t>(next() >> 24); }
+        for (int rg = 0; rg < g.rgs(); ++rg) {
+            for (int row = 0; row < 16; ++row) {
+                const int centre = 30 + static_cast<int>(next() % 60);
+                for (int b = 0; b < g.blocks(rg); ++b) {
+                    rec[g.expanded_offset(rg) + static_cast<std::size_t>(b) * moe::kUnitBytes + 128 + row] =
+                        static_cast<std::uint8_t>(centre + static_cast<int>(next() % 9) - 4 + (next() % 40 == 0 ? 25 : 0));
+                }
+            }
+        }
+        auto* at = static_cast<std::uint8_t*>(bank.data()) + r * stride;
+        std::copy(rec.begin(), rec.end(), at);
+        (void)csf::compress_record(shape, at, at, static_cast<std::uint32_t*>(tables.data()) + r * words);
+    }
+    std::uint32_t* device_tables = nullptr;
+    CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&device_tables), tables.data(), 0));
+    // The SSD tier's slots of the same records (set_tier_csf): odd records compressed in their slots, their tables in
+    // the slots' tails (csf::compress_slot), even ones expanded.
+    infernix::PinnedHostBuffer slots(kL * kE * stride);
+    std::vector<std::uint8_t> compressed(kL * kE, 0);
+    for (std::uint32_t r = 0; r < kL * kE; ++r) {
+        auto* at = static_cast<std::uint8_t*>(slots.data()) + r * stride;
+        std::copy(expanded[r].begin(), expanded[r].end(), at);
+        compressed[r] = r % 2 == 1 && csf::compress_slot(shape, at, stride) ? 1 : 0;
+    }
+    const auto slot_of = [&](std::uint32_t l, std::uint32_t e) {
+        return static_cast<const std::uint8_t*>(slots.data()) + (static_cast<std::size_t>(l) * kE + e) * stride;
+    };
+    for (const int mode : {0, 1, 2, 3}) {
+        const bool gated = mode % 2 == 1, tier = mode >= 2;
+        ExpertStream stream(kL, kE, stride, [&](std::uint32_t l, std::uint32_t e) {
+            return tier ? slot_of(l, e) : static_cast<const std::uint8_t*>(bank.data()) + (static_cast<std::size_t>(l) * kE + e) * stride;
+        }, /*one_allocation=*/!tier);
+        if (tier) {
+            stream.set_tier_csf([&](std::uint32_t l, std::uint32_t e) -> const std::uint32_t* {
+                if (compressed[l * kE + e] == 0) { return nullptr; }
+                return reinterpret_cast<const std::uint32_t*>(slot_of(l, e) + csf::slot_table_offset(static_cast<int>(words), stride));
+            }, shape);
+        } else {
+            std::vector<csf::BankTables> banks;
+            for (std::uint32_t l = 0; l < kL; ++l) {
+                banks.push_back({static_cast<const std::uint32_t*>(tables.data()) + l * kE * words, device_tables + l * kE * words});
+            }
+            stream.set_csf(banks, shape);
+        }
+        std::vector<std::int32_t> residency(kL * kE, -1);
+        residency[1] = 0; // layer 0's expert 1 is resident
+        const std::size_t table_bytes = (kL * kE * sizeof(std::int32_t) + 255) / 256 * 256;
+        infernix::DeviceBuffer ring(table_bytes + 2 * 4 * stride); // two halves of four slots
+        cudaStream_t compute = nullptr;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&compute, cudaStreamNonBlocking));
+        stream.begin({ring.p, ring.bytes}, residency.data(), compute, gated);
+        std::vector<std::uint8_t> slot(stride);
+        for (std::uint32_t l = 0; l < kL; ++l) {
+            if (gated) {
+                // Experts 2 and 3 guessed ahead; 2, 4 and 5 routed (4 and 5 copied late).
+                std::vector<std::int32_t> guess(kE, 0), columns(kE, 0);
+                guess[2] = guess[3] = 9;
+                columns[2] = columns[4] = columns[5] = 3;
+                (void)stream.plan_ahead(l, guess, 2, 0);
+                (void)stream.plan_layer(l, columns, std::vector<std::uint8_t>(kE, 0));
+            }
+            stream.before_experts(l, compute);
+            CUDA_CHECK(cudaStreamSynchronize(compute));
+            std::vector<std::int32_t> row(kE);
+            CUDA_CHECK(cudaMemcpy(row.data(), stream.slots(l), kE * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+            int named = 0;
+            for (std::uint32_t e = 0; e < kE; ++e) {
+                if (row[e] < 0) { continue; }
+                ++named;
+                CUDA_CHECK(cudaMemcpy(slot.data(), stream.base() + static_cast<std::size_t>(row[e]) * stream.pitch(), stride,
+                                      cudaMemcpyDeviceToHost));
+                check(slot == expanded[l * kE + e], std::string(gated ? "gated" : "ungated") + (tier ? " tier" : "") +
+                                                        " CSF chunk: layer " + std::to_string(l) + " expert " +
+                                                        std::to_string(e) + "'s slot does not hold its expanded record");
+            }
+            // Ungated: the half's four slots, the lowest non-resident ids; gated: two ahead and two late.
+            check(named == 4, std::string(gated ? "gated" : "ungated") + (tier ? " tier" : "") + " CSF chunk: layer " +
+                                  std::to_string(l) + " names " + std::to_string(named) + " slots, not 4");
+            stream.after_experts(l, compute);
+        }
+        stream.end();
+        CUDA_CHECK(cudaStreamSynchronize(compute));
+        CUDA_CHECK(cudaStreamDestroy(compute));
+    }
+}
+
 } // namespace
 
 int main() {
@@ -194,6 +306,7 @@ int main() {
     CUDA_CHECK(cudaSetDevice(0));
     gated_chunk();
     ungated_refuses();
+    csf_chunks();
     CUDA_CHECK(cudaDeviceSynchronize());
     std::cout << (failures == 0 ? "expert stream checks passed\n" : "expert stream checks failed\n");
     return failures == 0 ? 0 : 1;

@@ -82,6 +82,36 @@ struct ExpertShape {
     friend constexpr bool operator==(const ExpertShape&, const ExpertShape&) = default;
 };
 
+// One matrix of an `nvfp4_expert_rg16_v1` record as the CPU reads it: its row groups 0, 1, ... of `blocks` units
+// each, expanded (144-byte units from `data`, row-group-major), or of a CSF record (csf_record.h: `data` the
+// record, `csf` its table, the matrix's row groups from the record's row group `first_rg`).
+struct Rg16Matrix {
+    const std::uint8_t* data  = nullptr;
+    int blocks                = 0;
+    const std::uint32_t* csf  = nullptr;
+    int first_rg              = 0;
+};
+
+// A record as the CPU reads it: expanded (the artifact's layout; a plain pointer converts to it), or a CSF record
+// with its table.
+struct Rg16Record {
+    const std::uint8_t* data = nullptr;
+    const std::uint32_t* csf = nullptr;
+
+    constexpr Rg16Record() = default;
+    constexpr Rg16Record(const std::uint8_t* expanded) : data(expanded) {} // NOLINT(google-explicit-constructor)
+    constexpr Rg16Record(const std::uint8_t* record, const std::uint32_t* table) : data(record), csf(table) {}
+};
+
+// A record's gate/up matrix and down matrix.
+[[nodiscard]] constexpr Rg16Matrix gate_up_matrix(const Rg16Record& record, const ExpertShape& shape) {
+    return {record.data, shape.gate_up_blocks(), record.csf, 0};
+}
+[[nodiscard]] constexpr Rg16Matrix down_matrix(const Rg16Record& record, const ExpertShape& shape) {
+    return record.csf != nullptr ? Rg16Matrix{record.data, shape.down_blocks(), record.csf, shape.gate_up_row_groups()}
+                                 : Rg16Matrix{record.data + shape.gate_up_bytes(), shape.down_blocks(), nullptr, 0};
+}
+
 template <class Geometry>
 inline constexpr ExpertShape kShapeOf{Geometry::kHidden, Geometry::kIntermediate};
 inline constexpr ExpertShape kFlashNextShape    = kShapeOf<FlashNextExperts>;
@@ -161,13 +191,11 @@ const char* cpu_isa_name(CpuIsa isa);
 bool cpu_isa_supported(CpuIsa isa);
 CpuIsa best_cpu_isa();
 
-// Exact int64 row sums S[row][col] for row groups [rg_begin, rg_end) of a matrix stored as
-// row-group-major 144-byte units with `blocks` 16-element blocks per row. `acts[col]` points to
-// `blocks` quantized activation blocks of column col. `out` has (rg_end - rg_begin) * 16 rows of
-// `ncols` values.
-void rg16_row_sums(CpuIsa isa, const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end,
-                   const canon::A4Block* const* acts, int ncols, std::int64_t* out,
-                   int prefetch_bytes = kDefaultPrefetchBytes);
+// Exact int64 row sums S[row][col] for row groups [rg_begin, rg_end) of a matrix (expanded or CSF) with
+// matrix.blocks 16-element blocks per row. `acts[col]` points to matrix.blocks quantized activation blocks of
+// column col. `out` has (rg_end - rg_begin) * 16 rows of `ncols` values. Both layouts give the same sums.
+void rg16_row_sums(CpuIsa isa, const Rg16Matrix& matrix, int rg_begin, int rg_end, const canon::A4Block* const* acts,
+                   int ncols, std::int64_t* out, int prefetch_bytes = kDefaultPrefetchBytes);
 
 // Quantizes a BF16 vector of `n` (a multiple of 16) elements to A4 blocks: canon::quantize_a4_block
 // per block, eight blocks at a time in AVX2 on the vector ISAs, bit for bit.
@@ -180,18 +208,18 @@ void swiglu_bf16_n(CpuIsa isa, const std::uint16_t* g, const std::uint16_t* u, i
 // Phase A for 16-intermediate units [unit_begin, unit_end): gate/up rows, SwiGLU, and A4 of h
 // with the down input scale. `x_gate[col]` / `x_up[col]` are x quantized with the gate and up
 // input scales (the same pointers when the scales are equal). Writes h_blocks[col][unit].
-void gate_up_units(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
+void gate_up_units(CpuIsa isa, const Rg16Record& record, const ExpertScales& scales,
                    const canon::A4Block* const* x_gate, const canon::A4Block* const* x_up,
                    int ncols, int unit_begin, int unit_end, canon::A4Block* const* h_blocks,
                    int prefetch_bytes = kDefaultPrefetchBytes);
 
 // Phase B for down row groups [rg_begin, rg_end): writes y[col][row] in BF16 for those rows.
-void down_rows(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
+void down_rows(CpuIsa isa, const Rg16Record& record, const ExpertScales& scales,
                const canon::A4Block* const* h_blocks, int ncols, int rg_begin, int rg_end,
                std::uint16_t* const* y, int prefetch_bytes = kDefaultPrefetchBytes);
 
 // Whole expert on one thread: y[col][0..2560) from x[col][0..2560), both BF16.
-void expert_forward(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales, int ncols,
+void expert_forward(CpuIsa isa, const Rg16Record& record, const ExpertScales& scales, int ncols,
                     const std::uint16_t* const* x, std::uint16_t* const* y,
                     int prefetch_bytes = kDefaultPrefetchBytes);
 

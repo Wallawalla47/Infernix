@@ -2,6 +2,7 @@
 
 #include "core/copy_batch.h"
 #include "core/device.h"
+#include "ops/offloaded_sparse_moe/csf_expand.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -51,6 +52,11 @@ ExpertStream::ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uin
 
 ExpertStream::~ExpertStream() {
     if (stream_ != nullptr) { (void)cudaStreamSynchronize(stream_); }
+    if (expand_stream_ != nullptr) {
+        (void)cudaStreamSynchronize(expand_stream_);
+        (void)cudaStreamDestroy(expand_stream_);
+    }
+    if (copied_ != nullptr) { (void)cudaEventDestroy(copied_); }
     for (auto event : bounced_) {
         if (event != nullptr) { (void)cudaEventDestroy(event); }
     }
@@ -69,6 +75,35 @@ void ExpertStream::set_staging(Staging staging) {
     staging_ = std::move(staging);
     for (auto& event : bounced_) {
         if (event == nullptr && staging_.per_part > 0) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
+    }
+}
+
+void ExpertStream::set_csf(std::vector<ops::offloaded_moe::csf::BankTables> tables,
+                           const ops::offloaded_moe::ExpertShape& shape) {
+    if (active_ || tables.size() != layers_ || !ops::offloaded_moe::registered_shape(shape)) {
+        throw std::logic_error("expert stream: CSF banks are set between chunks, one per layer");
+    }
+    csf_tables_ = std::move(tables);
+    start_expansions(shape);
+}
+
+void ExpertStream::set_tier_csf(TableOf table_of, const ops::offloaded_moe::ExpertShape& shape) {
+    if (active_ || !table_of || !ops::offloaded_moe::registered_shape(shape)) {
+        throw std::logic_error("expert stream: the tier's CSF slots are set between chunks");
+    }
+    tier_table_ = std::move(table_of);
+    start_expansions(shape);
+}
+
+void ExpertStream::start_expansions(const ops::offloaded_moe::ExpertShape& shape) {
+    csf_shape_ = shape;
+    csf_words_ = static_cast<std::uint32_t>(ops::offloaded_moe::csf::Geometry::of(shape).table_words());
+    if (expand_stream_ == nullptr) {
+        // The greatest priority: a layer's MoE waits for its expansions.
+        int least = 0, greatest = 0;
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&expand_stream_, cudaStreamNonBlocking, greatest));
+        CUDA_CHECK(cudaEventCreateWithFlags(&copied_, cudaEventDisableTiming));
     }
 }
 
@@ -248,6 +283,15 @@ void ExpertStream::mask_ahead(std::uint32_t layer, std::span<std::int32_t> colum
     }
 }
 
+std::uint32_t ExpertStream::uncovered(std::uint32_t layer) const noexcept {
+    if (!active_ || residency_ == nullptr || layer >= layers_) { return 0; }
+    const auto* row            = static_cast<const std::int32_t*>(tables_host_.data()) + static_cast<std::size_t>(layer) * experts_;
+    const std::int32_t* frames = residency_ + static_cast<std::size_t>(layer) * experts_;
+    std::uint32_t n = 0;
+    for (std::uint32_t e = 0; e < experts_; ++e) { n += row[e] < 0 && frames[e] < 0 ? 1U : 0U; }
+    return n;
+}
+
 const std::int32_t* ExpertStream::slots(std::uint32_t layer) const noexcept {
     return tables_ + static_cast<std::size_t>(layer) * experts_;
 }
@@ -301,8 +345,13 @@ void ExpertStream::enqueue(std::uint32_t layer, std::uint32_t first) {
     std::size_t next_ssd = 0; // ssd_planned_[layer] is in ascending expert order, as `row`
     staged_.clear();
     // A bank whose records are narrower than the ring's slots (a GGUF import's layer) copies record by
-    // record; equal strides copy runs.
+    // record; equal strides copy runs. A CSF bank's records copy one by one, each its compressed bytes, and are
+    // expanded in their slots once copied.
     const std::uint64_t host = host_strides_.empty() ? stride_ : host_strides_[layer];
+    const ops::offloaded_moe::csf::BankTables* csf = csf_tables_.empty() || !csf_tables_[layer] ? nullptr : &csf_tables_[layer];
+    ops::offloaded_moe::csf::InPlaceJobs expansions;
+    std::vector<ops::offloaded_moe::csf::InPlaceJob>& jobs = expansions_;
+    jobs.clear();
     for (std::uint32_t e = 0; e < experts_;) {
         if (row[e] < lowest) {
             ++e;
@@ -328,8 +377,29 @@ void ExpertStream::enqueue(std::uint32_t layer, std::uint32_t first) {
             ++e;
             continue;
         }
+        // A CSF record (a bank's, or the tier's compressed slot): its compressed bytes, expanded in its ring slot.
+        const std::uint32_t* host_table   = nullptr;
+        const std::uint32_t* device_table = nullptr;
+        if (csf != nullptr) {
+            const std::size_t at = static_cast<std::size_t>(e) * csf_words_;
+            host_table           = csf->host + at;
+            device_table         = csf->device + at;
+        } else if (tier_table_) {
+            host_table = device_table = tier_table_(layer, e);
+        }
+        if (host_table != nullptr) {
+            const std::size_t bytes = host_table[csf_words_ - 1];
+            std::uint8_t* slot      = records_ + static_cast<std::size_t>(row[e]) * stride_;
+            copies.add(slot, source, bytes);
+            jobs.push_back({slot, device_table});
+            stats_.streamed += 1;
+            stats_.bytes += bytes;
+            ++stats_.copies;
+            ++e;
+            continue;
+        }
         std::uint32_t end = e + 1;
-        while (host == stride_ && one_allocation_ && end < experts_ && row[end] == row[end - 1] + 1 &&
+        while (host == stride_ && one_allocation_ && !tier_table_ && end < experts_ && row[end] == row[end - 1] + 1 &&
                record_of_(layer, end) == source + static_cast<std::size_t>(end - e) * stride_) {
             ++end;
         }
@@ -362,7 +432,20 @@ void ExpertStream::enqueue(std::uint32_t layer, std::uint32_t first) {
         CUDA_CHECK(cudaEventRecord(bounced_[h], stream_));
         bounce_used_[h] = true;
     }
-    CUDA_CHECK(cudaEventRecord(landed_[layer], stream_));
+    if (csf != nullptr || tier_table_) {
+        // Every enqueue of a CSF layer (every layer of a CSF tier) lands on the expansion stream, after its copies and
+        // any earlier enqueue's expansions of the layer (a gated chunk's copies ahead), even when it copies nothing.
+        CUDA_CHECK(cudaEventRecord(copied_, stream_));
+        CUDA_CHECK(cudaStreamWaitEvent(expand_stream_, copied_, 0));
+        for (std::size_t at = 0; at < jobs.size(); at += ops::offloaded_moe::csf::kMaxInPlaceJobs) {
+            expansions.count = static_cast<int>(std::min<std::size_t>(ops::offloaded_moe::csf::kMaxInPlaceJobs, jobs.size() - at));
+            std::copy_n(jobs.begin() + static_cast<std::ptrdiff_t>(at), expansions.count, expansions.job);
+            ops::offloaded_moe::csf::expand_in_place(csf_shape_, expansions, expand_stream_);
+        }
+        CUDA_CHECK(cudaEventRecord(landed_[layer], expand_stream_));
+    } else {
+        CUDA_CHECK(cudaEventRecord(landed_[layer], stream_));
+    }
     if (!ssd_planned_[layer].empty()) { ssd_held_.push_back(layer); } // its slots return once landed
 }
 

@@ -149,7 +149,7 @@ std::vector<float> exact_oracle(const Matrix& m, const std::vector<std::uint16_t
         std::vector<std::int64_t> s(16 * moe::kMaxColumns);
         for (int c0 = 0; c0 < columns; c0 += moe::kMaxColumns) {
             const int n = std::min(moe::kMaxColumns, columns - c0);
-            moe::rg16_row_sums_a16(moe::best_cpu_isa(), m.units.data(), m.blocks(), g, g + 1,
+            moe::rg16_row_sums_a16(moe::best_cpu_isa(), {m.units.data(), m.blocks()}, g, g + 1,
                                    &acts[static_cast<std::size_t>(c0)], n, s.data());
             for (int r = 0; r < 16; ++r) {
                 for (int c = 0; c < n; ++c) {

@@ -32,26 +32,26 @@ void encode_a4r_blocks(const std::uint16_t* v, int blocks, float row_scale, int 
 float encode_a4r(const std::uint16_t* v, int n, canon::A4Block* terms);
 
 // Exact two-term int64 row sums S[row][col] for row groups [rg_begin, rg_end) (at most two) of a matrix
-// of `blocks` blocks per row: acts[col] holds column col's terms, term-major (kA4ResidualTerms * blocks).
-// `out` has (rg_end - rg_begin) * 16 rows of `ncols` values.
-void rg16_row_sums_a4r(CpuIsa isa, const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end,
+// (expanded or CSF) of matrix.blocks blocks per row: acts[col] holds column col's terms, term-major
+// (kA4ResidualTerms * matrix.blocks). `out` has (rg_end - rg_begin) * 16 rows of `ncols` values.
+void rg16_row_sums_a4r(CpuIsa isa, const Rg16Matrix& matrix, int rg_begin, int rg_end,
                        const canon::A4Block* const* acts, int ncols, std::int64_t* out,
                        int prefetch_bytes = kDefaultPrefetchBytes);
 
 // Phase A for 16-intermediate units [unit_begin, unit_end): gate/up rows and SwiGLU. x[col] are the
 // terms of column col with row scale x_scale[col]; writes h[col][16 * unit + i] in BF16.
-void gate_up_units_a4r(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
+void gate_up_units_a4r(CpuIsa isa, const Rg16Record& record, const ExpertScales& scales,
                        const canon::A4Block* const* x, const float* x_scale, int ncols, int unit_begin, int unit_end,
                        std::uint16_t* const* h, int prefetch_bytes = kDefaultPrefetchBytes);
 
 // Phase B for down row groups [rg_begin, rg_end): h[col] are the terms of column col's h with row
 // scale h_scale[col]; writes y[col][row] in BF16 for those rows.
-void down_rows_a4r(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
+void down_rows_a4r(CpuIsa isa, const Rg16Record& record, const ExpertScales& scales,
                    const canon::A4Block* const* h, const float* h_scale, int ncols, int rg_begin, int rg_end,
                    std::uint16_t* const* y, int prefetch_bytes = kDefaultPrefetchBytes);
 
 // Whole expert on one thread: y[col][0..2560) from x[col][0..2560), both BF16.
-void expert_forward_a4r(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales, int ncols,
+void expert_forward_a4r(CpuIsa isa, const Rg16Record& record, const ExpertScales& scales, int ncols,
                         const std::uint16_t* const* x, std::uint16_t* const* y,
                         int prefetch_bytes = kDefaultPrefetchBytes);
 

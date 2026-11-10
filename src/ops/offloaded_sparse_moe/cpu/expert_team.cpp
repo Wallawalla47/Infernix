@@ -187,7 +187,7 @@ void CpuExpertTeam::work_a16(int w) {
             exps[c] = x_exp_[column(j, c)];
             hv[c]   = &hv_[column(j, c) * intermediate];
         }
-        gate_up_units_a16(isa_, shape_, job.record, job.scales, xb, exps, job.ncols, u, u + 1, hv, prefetch_bytes_);
+        gate_up_units_a16(isa_, shape_, job.rg16(), job.scales, xb, exps, job.ncols, u, u + 1, hv, prefetch_bytes_);
         beat(w);
     }
     barrier();
@@ -210,7 +210,7 @@ void CpuExpertTeam::work_a16(int w) {
         const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
         const canon::A16Block* hb[kMaxColumns];
         for (int c = 0; c < job.ncols; ++c) { hb[c] = &h16_[h_index(j, c, h_blocks)]; }
-        down_rows_a16(isa_, shape_, job.record, job.scales, hb, &h_exp_[column(j, 0)], job.ncols, rg,
+        down_rows_a16(isa_, shape_, job.rg16(), job.scales, hb, &h_exp_[column(j, 0)], job.ncols, rg,
                       rg + kRowsPerItem, job.y, prefetch_bytes_);
         beat(w);
     }
@@ -257,7 +257,7 @@ void CpuExpertTeam::work_a4r(int w) {
             scales[c] = x_scale_[column(j, c)];
             hv[c]     = &hv_[column(j, c) * kIntermediate];
         }
-        gate_up_units_a4r(isa_, job.record, job.scales, xb, scales, job.ncols, u, u + 1, hv, prefetch_bytes_);
+        gate_up_units_a4r(isa_, job.rg16(), job.scales, xb, scales, job.ncols, u, u + 1, hv, prefetch_bytes_);
         beat(w);
     }
     barrier();
@@ -279,7 +279,7 @@ void CpuExpertTeam::work_a4r(int w) {
         const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
         const canon::A4Block* hb[kMaxColumns];
         for (int c = 0; c < job.ncols; ++c) { hb[c] = h_terms(j, c); }
-        down_rows_a4r(isa_, job.record, job.scales, hb, &h_scale_[column(j, 0)], job.ncols, rg, rg + kRowsPerItem,
+        down_rows_a4r(isa_, job.rg16(), job.scales, hb, &h_scale_[column(j, 0)], job.ncols, rg, rg + kRowsPerItem,
                       job.y, prefetch_bytes_);
         beat(w);
     }
@@ -324,7 +324,7 @@ void CpuExpertTeam::work_a8(int w) {
             xs[c] = &x8_[column(j, c) * x_slices];
             hv[c] = &hv_[column(j, c) * intermediate];
         }
-        gate_up_units_a8(isa_, shape_, job.record, job.scales, xs, job.ncols, u, u + 1, hv, prefetch_bytes_);
+        gate_up_units_a8(isa_, shape_, job.rg16(), job.scales, xs, job.ncols, u, u + 1, hv, prefetch_bytes_);
         const int t = u / 2;
         if (h8_units_[static_cast<std::size_t>(j) * h_slices + t].fetch_add(1, std::memory_order_acq_rel) == 1) {
             for (int c = 0; c < job.ncols; ++c) { encode_a8_slices(hv[c], t, t + 1, &h8_[column(j, c) * h_slices]); }
@@ -340,7 +340,7 @@ void CpuExpertTeam::work_a8(int w) {
         const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
         const CpuW4A8Slice* hs[kMaxColumns];
         for (int c = 0; c < job.ncols; ++c) { hs[c] = &h8_[column(j, c) * h_slices]; }
-        down_rows_a8(isa_, shape_, job.record, job.scales, hs, job.ncols, rg, rg + kRowsPerItem, job.y,
+        down_rows_a8(isa_, shape_, job.rg16(), job.scales, hs, job.ncols, rg, rg + kRowsPerItem, job.y,
                      prefetch_bytes_);
         beat(w);
     }
@@ -523,7 +523,7 @@ void CpuExpertTeam::work(int w) {
             xu[c] = shared ? xg[c] : &x_up_[xs_index(j, c)];
             hb[c] = &h_[h_index(j, c)];
         }
-        gate_up_units(isa_, job.record, job.scales, xg, xu, job.ncols, u, u + 1, hb, prefetch_bytes_);
+        gate_up_units(isa_, job.rg16(), job.scales, xg, xu, job.ncols, u, u + 1, hb, prefetch_bytes_);
         beat(w);
     }
     barrier();
@@ -535,7 +535,7 @@ void CpuExpertTeam::work(int w) {
         const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
         const canon::A4Block* hb[kMaxColumns];
         for (int c = 0; c < job.ncols; ++c) { hb[c] = &h_[h_index(j, c)]; }
-        down_rows(isa_, job.record, job.scales, hb, job.ncols, rg, rg + kRowsPerItem, job.y, prefetch_bytes_);
+        down_rows(isa_, job.rg16(), job.scales, hb, job.ncols, rg, rg + kRowsPerItem, job.y, prefetch_bytes_);
         beat(w);
     }
 }
@@ -570,6 +570,7 @@ void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs, CpuExpertHeartbeat h
         // An 8-bit job: a GGUF pair (not block-FP8) of a team with ggml_a8, or an NVFP4 W4A16 expert of a team
         // with nvfp4_a8 (x8_ is allocated only then).
         if (job.ncols < 1 || job.ncols > kMaxColumns || !job.record || job.ggml.valid() != ggml || job.a8 != a8 ||
+            (ggml && job.csf != nullptr) ||
             (ggml && (!ggml_ || !ggml_cpu_supported(job.ggml))) ||
             (a8 && (ggml ? xa_.empty() || job.ggml.gate_up == QType::FP8_E4M3FN_B128 : x8_.empty()))) {
             throw std::invalid_argument("CpuExpertTeam: invalid job");

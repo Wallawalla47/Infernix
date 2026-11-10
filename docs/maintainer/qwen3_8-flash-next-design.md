@@ -12986,6 +12986,76 @@ its job's count (no clearing, no atomics): end to end no better (below).
   / 1.0013: level (verification calls of seven or eight columns keep the tensor-core kernels).
 - Not timed: recipe A (same kernels, same bits), FP4-Local's `--expert-a4-activations` opt-in, long contexts.
 
+### 19.3.54 CSF expert records in RAM (`--expert-csf`; 2026-11-09; same bits; opt-in)
+
+**What.** The host copies of the NVFP4 routed experts (both registered geometries: Flash-Next and the 122B) hold
+their block scales compressed (`ops/offloaded_sparse_moe/csf_record.h`). A record is its row groups in order; a
+compressed group is its 16 row bases, its escapes (unit then row order, padded to 16 bytes) and one 136-byte body a
+unit (the 128 code bytes and a 4-bit offset a row, 15 = escape); a group that would not shrink stays raw (144 bytes
+a unit). Each row's base is the lowest start of the 15-code window holding most of its codes. A record's table
+(row groups + 1 offsets) lives beside it: in a side array for the pinned banks (full mode: `compress_banks` at
+load), in the slot's tail for the SSD tier's RAM slots (compressed on the copy threads after the startup fill and
+the refills, before publication; other writes leave expanded records, and a published compressed slot's address
+carries bit 0, `csf::kTag`). Records shrink to 0.947-0.949 of their bytes (Dense8, FP4-Local, 122B: about 3 GiB).
+- Promotions and the prefill stream copy the compressed bytes and expand them in their frame or ring slot
+  (`csf::expand_in_place`, one CTA a record, descending row groups). A tier fetch of a compressed resident gets an
+  expanded copy in a ring slot.
+- The stage kernel expands staged misses as it copies them (`stage_csf`: a chunk per CTA iteration, register loads of
+  whole 128-byte lines, the next chunk issued before the barrier); a pass's misses are partitioned into expanded and
+  compressed (tagged) ones.
+- The CPU walks decode a unit's scales inline (`cpu/csf_scales.h`: offsets plus bases, escapes placed by a
+  pshufb whose control is the sum of two 16-byte table entries, the cursor stepped by a popcount); the A16 kernels
+  of six or more columns decode a row group once for both column groups.
+
+**Measured** (RTX 5090, i9-13900K, 2026-11-09, CSF off against on in one build, outputs identical, ABBA blocks):
+- Prefill (pp1024 / 2048 / 4096, cold cache): Dense8 +2.0-2.4 / +3.1-3.4 / +3.9-4.0 %, FP4-Local +0.8-2.2 / +3.0-3.2
+  / +4.0-4.3 % (default exclusive layout); 122B +4.6-5.1 / +4.4-5.0 / +1.7-3.8 %. The full layout: Dense8 +3.9-4.7 %,
+  FP4-Local +3.8-4.0 %.
+- Decode (warm, conv 512 plain / struct DFlash2 or MTP auto): FP4-Local 0.982-0.986 / 0.983-0.984 (every CSF run
+  below every expanded one, three blocks), 122B 0.992-0.995 / 0.982-0.993, Dense8 0.979-0.983 / 0.973-0.994. So the
+  option stays off by default.
+- Attribution (nsys, FP4-Local conv): the GPU side is faster (staging -11 %, its dependent expert kernels' waits
+  shorter; the in-frame expansions run on a side stream without visible contention); the GPU waits 17 % longer for
+  the CPU-served misses. Decode's CPU jobs are few per call, so their arithmetic latency counts: the scale decode
+  costs ~1.1 ns a unit (`infernix_cpu_rows_bench --csf 0|1`, one thread, in cache: W4A4 one column 66 -> 83 us a
+  gate/up matrix, eight columns 307 -> 326; A16 90 -> 112, 481 -> 525), while a DRAM-bound team is level or ahead
+  (six threads, whole experts: W4A4 one column 1.034x, A16 1.011x).
+
+**Rejected** (each measured; the inline decode stays):
+- A planar layout (code bytes 32-byte aligned, offsets apart): expanded records shifted to the bodies' 8-byte
+  alignment run at the same speed, so line-splitting loads cost nothing.
+- Escape-free formats (one 16-code window, or two 8-code windows, per row): 21 % of row groups fit (0.9945 of the
+  bytes).
+- Octave-aligned bases with each multiplier formed from its offset, escaped lanes zeroed and fixed up after the
+  loop from stored row products: escapes rise to 3.7 % (FP4-Local) and 6.3 % (Dense8) of scales, and the kernel ran
+  1.33-1.57x the expanded time (W4A4, one thread); the current bases with zeroed escapes and the same fixup
+  1.26-1.48x (the inline decode: 1.06-1.25x).
+- Keeping the decode-hot experts expanded: the experts outside VRAM share their uses widely (the top 20 % hold
+  29-32 %).
+- More decode misses on the link with CSF (Dense8 conv, link share 0.42 / 0.5): 122.5 / 115.1 against 123.4 tok/s
+  at the default split.
+- A cursor returned by value instead of advanced by reference (MSVC): the same speed (kept for clarity).
+- Scale helpers on the E-cores: four threads beside the CPU team, pinned to the efficiency cores, decoded a round's
+  compressed scales ahead into a team buffer, item by item (the down items first, then the gate/up units from the
+  last back, so they stayed off the workers' frontier), each stamped with the round; a worker read an item's scales
+  from the buffer when its stamp was the round's, else decoded them itself (same bits, no waits). Kernels reading
+  pre-decoded scales ran at the expanded speed in the op bench (one thread, DRAM records: 0.96-1.04x against inline
+  0.86-0.95x). End to end (h2: off / inline / helpers, two blocks a workload, the blocks with other processes on the
+  CPU discarded) the workers read 45-58 % of their items decoded, yet decode helpers/inline was Dense8 conv 1.000 /
+  0.987, struct 0.993 / 1.014; FP4-Local conv 1.003, struct 0.980 / 0.967 (both helper runs below both inline runs in
+  each block); the 122B conv 1.011 / 0.936, struct 0.984. No gain anywhere and a loss on the speculative workloads;
+  the first ordering (the workers' order) had the helpers racing the workers for the same items (10-17 % read
+  decoded). Removed.
+
+**Also (both record formats).** The AVX2 / AVX-VNNI kernels (W4A4, W4A16 one-pass and grouped columns, W4A8) turn a
+unit's 16 scale bytes into multipliers with byte-wide arithmetic before widening (`scales16_avx2`), about four fewer
+instructions a unit: one thread in cache, W4A4 up to 10 % faster, W4A16 one-pass 7 %, grouped columns 3 %; outputs
+identical. The two-pass W4A16 kernel keeps its per-pass conversion (storing the second half's multipliers lost 2.9 % at
+three columns).
+
+**Open.** CSF records in VRAM, with the expert kernels decoding scales as they load (about 5 % more experts in the
+frames and 5 % fewer bytes a GPU expert reads). Not started.
+
 ---
 
 ## 20. Documentation and authority changes

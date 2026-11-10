@@ -117,6 +117,7 @@ struct ServeOptions {
     bool ram_resize                        = true; // --ram-resize auto|off (infernix::EngineOptions::ram_resize)
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
     std::optional<ExpertRamLayout> expert_ram_layout; // --expert-ram-layout (empty: the model's default)
+    bool expert_csf = false;                          // --expert-csf
     std::optional<std::uint64_t> expert_pin_bytes; // --expert-pin-mib; empty: what the OS lets it pin
     std::uint32_t media_preprocess_threads = 0;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;

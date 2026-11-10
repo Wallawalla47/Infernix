@@ -31,8 +31,11 @@
 //                                   [--repeat 10] [--seed N]
 //                                   [--columns-per-expert C] [--split-scales] [--geometry flash-next|122b]
 //                                   [--bank nvfp4|ggml] [--formats iq3_s,iq4_nl] [--ggml-wide exact|bf16|a8]
-//                                   [--staging-slots 64] [--graph] [--dump <prefix>]
+//                                   [--staging-slots 64] [--graph] [--dump <prefix>] [--realistic-scales] [--csf]
 //
+// --realistic-scales gives each row's block scales codes near a centre of its own (as NVIDIA's exports have them);
+// --csf also compresses the host bank's records (csf_record.h, MoeExpertSource::host_csf: staged records are
+// expanded as they are copied), so --placement staged compares the staging of the two layouts on the same records.
 // --staging-slots 0 (frames only) runs one pass over every job with no staging, the shape of a decode call's
 // resident pass. --graph times the call as the engine runs it: captured in a CUDA graph (its passes' programmatic
 // dependencies are captured edges; eager launches serialize every kernel) and replayed, with the call's x encoding
@@ -48,6 +51,7 @@
 #include "infernix_bench_common.h"
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
+#include "ops/offloaded_sparse_moe/csf_record.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
 #include <cuda_runtime.h>
@@ -66,6 +70,7 @@
 
 using namespace infernix;
 namespace moe = infernix::ops::offloaded_moe;
+namespace csf = infernix::ops::offloaded_moe::csf;
 
 namespace {
 
@@ -93,6 +98,8 @@ struct Options {
     bool ggml_a8           = false; // --ggml-wide a8
     int staging_slots      = kStagingSlots; // 0: one pass over every job, no staging (a decode call's resident pass)
     bool graph             = false;         // the call captured in a CUDA graph and replayed, x prepared before it
+    bool realistic_scales  = false;         // each row's scale codes within a few steps of its own centre
+    bool csf               = false;         // the host bank's CSF records (MoeExpertSource::host_csf); implies the above
 };
 
 // The layer under test (--geometry, --bank).
@@ -211,6 +218,10 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--graph") {
             options.graph = true;
+        } else if (arg == "--realistic-scales") {
+            options.realistic_scales = true;
+        } else if (arg == "--csf") {
+            options.csf = options.realistic_scales = true;
         } else if (arg == "--staging-slots") {
             options.staging_slots = std::stoi(value());
             if (options.staging_slots < 0 || options.staging_slots > kStagingSlots) {
@@ -236,6 +247,9 @@ Options parse_options(int argc, char** argv) {
                            : ggml_wide == "bf16" ? moe::WideA16::kGgmlBf16
                                                  : moe::WideA16::kExact;
     }
+    if ((options.csf || options.realistic_scales) && options.ggml) {
+        throw std::invalid_argument("--csf and --realistic-scales take NVFP4 banks");
+    }
     if (options.geometry_122b && !options.a16) {
         throw std::invalid_argument("--geometry 122b registers W4A16 experts only: add --activation a16, a16x2, a16x3 or a8");
     }
@@ -245,9 +259,10 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-// Random NVFP4 codes with scale bytes in the checkpoint's usual range (E4M3 words 40-80), or random GGUF blocks
-// with finite binary16 scales of the imports' range.
-std::vector<std::uint8_t> random_records(std::mt19937& rng) {
+// Random NVFP4 codes with scale bytes in the checkpoint's usual range (E4M3 words 40-80; `realistic`: each row's
+// within four steps of its own centre in that range, one in 50 ten steps above, as NVIDIA's exports have them), or
+// random GGUF blocks with finite binary16 scales of the imports' range.
+std::vector<std::uint8_t> random_records(std::mt19937& rng, bool realistic) {
     const std::size_t stride = g_geometry.record_stride();
     std::vector<std::uint8_t> records(static_cast<std::size_t>(kDistinct) * stride, 0);
     std::uniform_int_distribution<int> byte(0, 255), scale(40, 80);
@@ -271,6 +286,20 @@ std::vector<std::uint8_t> random_records(std::mt19937& rng) {
             continue;
         }
         const std::size_t units = static_cast<std::size_t>(g_geometry.record_bytes() / moe::kUnitBytes);
+        if (realistic) {
+            const csf::Geometry g = csf::Geometry::of(g_geometry.shape);
+            for (int rg = 0; rg < g.rgs(); ++rg) {
+                for (int s = 0; s < 16; ++s) {
+                    const int centre = 44 + static_cast<int>(rng() % 33);
+                    for (int b = 0; b < g.blocks(rg); ++b) {
+                        const int code = centre + static_cast<int>(rng() % 9) - 4 + (rng() % 50 == 0 ? 10 : 0);
+                        record[g.expanded_offset(rg) + static_cast<std::size_t>(b) * moe::kUnitBytes + 128 + s] =
+                            static_cast<std::uint8_t>(code);
+                    }
+                }
+            }
+            continue;
+        }
         for (std::size_t u = 0; u < units; ++u) {
             for (int s = 0; s < 16; ++s) { record[u * moe::kUnitBytes + 128 + s] = static_cast<std::uint8_t>(scale(rng)); }
         }
@@ -321,14 +350,17 @@ struct Fixture {
     DeviceBuffer staging;
     std::uint8_t* host = nullptr;
     std::uint8_t* host_device = nullptr;
+    std::uint32_t* csf_tables = nullptr; // with --csf: the host bank's CSF tables (mapped)
+    std::uint32_t* csf_tables_device = nullptr;
     cudaStream_t overlap = nullptr;
     cudaEvent_t events[5] = {};
     bool a16 = false;
     bool ggml_a8 = false;
 
-    Fixture(std::uint32_t seed, bool a16, bool split_scales, bool ggml_a8) : a16(a16), ggml_a8(ggml_a8) {
+    Fixture(std::uint32_t seed, bool a16, bool split_scales, bool ggml_a8, bool realistic, bool csf)
+        : a16(a16), ggml_a8(ggml_a8) {
         std::mt19937 rng(seed);
-        const auto records = random_records(rng);
+        const auto records = random_records(rng, realistic);
         const std::size_t stride = g_geometry.record_stride();
         const std::size_t bank   = static_cast<std::size_t>(g_geometry.experts) * stride;
         frames_memory = DeviceBuffer(bank);
@@ -338,7 +370,26 @@ struct Fixture {
             const std::uint8_t* source = records.data() + static_cast<std::size_t>(e % kDistinct) * stride;
             std::memcpy(host + static_cast<std::size_t>(e) * stride, source, stride);
         }
-        bench::upload(frames_memory.p, host, bank);
+        bench::upload(frames_memory.p, host, bank); // the frames keep the expanded records
+        if (csf) {
+            // The distinct records compressed once, each expert's copy and table from its distinct record's.
+            const auto words = static_cast<std::size_t>(csf::Geometry::of(g_geometry.shape).table_words());
+            CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&csf_tables), words * sizeof(std::uint32_t) * g_geometry.experts,
+                                     cudaHostAllocMapped));
+            CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&csf_tables_device), csf_tables, 0));
+            std::size_t bytes = 0;
+            for (int e = 0; e < g_geometry.experts; ++e) {
+                std::uint8_t* record = host + static_cast<std::size_t>(e) * stride;
+                if (e < kDistinct) {
+                    bytes += csf::compress_record(g_geometry.shape, record, record, csf_tables + words * e);
+                } else {
+                    std::memcpy(record, host + static_cast<std::size_t>(e % kDistinct) * stride, stride);
+                    std::memcpy(csf_tables + words * e, csf_tables + words * (e % kDistinct), words * sizeof(std::uint32_t));
+                }
+            }
+            std::printf("CSF host bank: %.4f of the expanded bytes\n",
+                        static_cast<double>(bytes) / static_cast<double>(kDistinct * g_geometry.record_bytes()));
+        }
         std::vector<std::int32_t> table(g_geometry.experts), none(g_geometry.experts, -1);
         for (int e = 0; e < g_geometry.experts; ++e) { table[static_cast<std::size_t>(e)] = e; }
         frames_table  = DeviceBuffer(sizeof(std::int32_t) * g_geometry.experts);
@@ -370,6 +421,7 @@ struct Fixture {
         for (auto event : events) { cudaEventDestroy(event); }
         if (overlap != nullptr) { cudaStreamDestroy(overlap); }
         if (host != nullptr) { cudaFreeHost(host); }
+        if (csf_tables != nullptr) { cudaFreeHost(csf_tables); }
     }
 
     Fixture(const Fixture&)            = delete;
@@ -386,6 +438,7 @@ struct Fixture {
                                .staging_slots = kStagingSlots};
         s.overlap_stream = overlap;
         s.shape          = g_geometry.shape;
+        s.host_csf       = csf_tables_device;
         for (int i = 0; i < 5; ++i) { s.overlap_events[i] = events[i]; }
         if (g_geometry.ggml) {
             s.ggml = {.gate_up_format = g_geometry.gate_up,
@@ -551,7 +604,8 @@ int main(int argc, char** argv) {
                     : options.narrow_a16 == moe::NarrowA16::kA8 || options.ggml_a8 ? "a8"
                                                                                     : "exact",
                     wide_name(options.wide_a16), options.staging_slots);
-        Fixture fixture(options.seed, options.a16, options.split_scales, options.ggml_a8);
+        Fixture fixture(options.seed, options.a16, options.split_scales, options.ggml_a8, options.realistic_scales,
+                        options.csf);
         std::unique_ptr<bench::L2FlushBuffer> flush;
         if (options.cold) { flush = std::make_unique<bench::L2FlushBuffer>(256ULL << 20); }
         for (const int tokens : options.tokens) { run_point(fixture, tokens, options, flush.get(), context.stream); }

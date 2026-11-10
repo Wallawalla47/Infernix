@@ -488,6 +488,8 @@ std::string usage_text(std::string_view program) {
         << "                              (RAM holds only the experts VRAM does not)\n"
         << "                              or full (a RAM copy of every expert); default "
         << infernix::kExpertRamLayoutDefaults << "\n"
+        << "  --expert-csf                offloaded NVFP4 experts: their RAM copies' block scales compressed (CSF;\n"
+        << "                              same output; prompts faster, decode slower; default off)\n"
         << "  --expert-pin-mib <N|auto>   Qwen3.8-Flash-Next: at most this much of the experts' RAM page-locked;\n"
         << "                              the rest stays in RAM for the CPU (default auto: what Windows allows)\n"
         << "  --vram-headroom-mib <N|auto> Qwen3.8-Flash-Next: VRAM the expert cache leaves free for the\n"
@@ -675,6 +677,8 @@ BenchOptions parse_args(int argc, char** argv) {
             }
         } else if (arg == "--expert-ram-layout") {
             options.expert_ram_layout = infernix::parse_expert_ram_layout(value("--expert-ram-layout"));
+        } else if (arg == "--expert-csf") {
+            options.expert_csf = true;
         } else if (arg == "--expert-pin-mib") {
             const std::string text = value("--expert-pin-mib");
             if (text == "auto") {
@@ -1113,6 +1117,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " expert_ram_mib=" << mib_or_auto(env.expert_ram_bytes)
         << " expert_ram_layout="
         << (env.expert_ram_layout ? infernix::expert_ram_layout_name(*env.expert_ram_layout) : "default")
+        << " expert_csf=" << (env.expert_csf ? "on" : "off")
         << " expert_pin_mib=" << mib_or_auto(env.expert_pin_bytes)
         << " rope_yarn_factor=" << env.rope_yarn_factor
         << " kv_cache=" << kv_cache_name(env.kv_cache)
@@ -1275,6 +1280,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << (env.expert_ram_bytes ? std::to_string(*env.expert_ram_bytes >> 20) : "null") << ",\n"
         << "    \"expert_ram_layout\": \""
         << (env.expert_ram_layout ? infernix::expert_ram_layout_name(*env.expert_ram_layout) : "default") << "\",\n"
+        << "    \"expert_csf\": " << (env.expert_csf ? "true" : "false") << ",\n"
         << "    \"expert_pin_mib\": "
         << (env.expert_pin_bytes ? std::to_string(*env.expert_pin_bytes >> 20) : "null") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"

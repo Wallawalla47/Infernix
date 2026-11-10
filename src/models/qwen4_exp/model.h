@@ -65,6 +65,8 @@ public:
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
     [[nodiscard]] std::span<const ExpertBank> expert_banks() const noexcept { return banks_; }
+    // The pinned banks' CSF tables (runtime::expert_offload::compress_banks; empty: the records as stored).
+    [[nodiscard]] const CsfTables& csf_tables() const noexcept { return csf_tables_; }
     // With LoadOptions::stream_experts: where each record lies in the artifact (the banks then
     // hold no records, only their layout and multipliers).
     [[nodiscard]] const std::optional<ExpertStore>& expert_store() const noexcept { return expert_store_; }
@@ -93,7 +95,7 @@ private:
           std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
           std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
           std::optional<ExpertStore> expert_store, std::optional<artifact::MaterializedArtifact> draft_backing,
-          PackedWeights packed);
+          PackedWeights packed, CsfTables csf_tables);
 
     // Borrowers are declared after the backing they view, so they are destroyed first.
     artifact::MaterializedArtifact backing_;
@@ -105,6 +107,7 @@ private:
     TextWeights weights_;
     std::vector<BoundWeight> bound_;
     std::vector<ExpertBank> banks_;
+    CsfTables csf_tables_; // banks_' CSF tables
     FrontendResources resources_;
     InstanceInfo info_;
     std::optional<qwen3_5::VisionOverlayAssets> overlay_vision_;

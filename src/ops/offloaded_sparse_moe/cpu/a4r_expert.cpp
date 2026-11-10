@@ -40,7 +40,7 @@ float encode_a4r(const std::uint16_t* v, int n, canon::A4Block* terms) {
     return row_scale;
 }
 
-void rg16_row_sums_a4r(CpuIsa isa, const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end,
+void rg16_row_sums_a4r(CpuIsa isa, const Rg16Matrix& matrix, int rg_begin, int rg_end,
                        const canon::A4Block* const* acts, int ncols, std::int64_t* out, int prefetch_bytes) {
     if (ncols < 1 || ncols > kMaxColumns) { throw std::invalid_argument("offloaded_moe: ncols must be in [1, 8]"); }
     if (rg_end - rg_begin < 1 || rg_end - rg_begin > 2) {
@@ -52,9 +52,11 @@ void rg16_row_sums_a4r(CpuIsa isa, const std::uint8_t* matrix, int blocks, int r
         const int n = std::min(kColumnsPerPass, ncols - c0);
         const canon::A4Block* terms[kMaxColumns];
         for (int c = 0; c < n; ++c) {
-            for (int t = 0; t < kTerms; ++t) { terms[c * kTerms + t] = acts[c0 + c] + static_cast<std::size_t>(t) * blocks; }
+            for (int t = 0; t < kTerms; ++t) {
+                terms[c * kTerms + t] = acts[c0 + c] + static_cast<std::size_t>(t) * matrix.blocks;
+            }
         }
-        rg16_row_sums(isa, matrix, blocks, rg_begin, rg_end, terms, n * kTerms, part, prefetch_bytes);
+        rg16_row_sums(isa, matrix, rg_begin, rg_end, terms, n * kTerms, part, prefetch_bytes);
         // Exact integers: the term order of the sum changes no bit.
         for (int row = 0; row < rows; ++row) {
             for (int c = 0; c < n; ++c) {
@@ -66,13 +68,13 @@ void rg16_row_sums_a4r(CpuIsa isa, const std::uint8_t* matrix, int blocks, int r
     }
 }
 
-void gate_up_units_a4r(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
+void gate_up_units_a4r(CpuIsa isa, const Rg16Record& record, const ExpertScales& scales,
                        const canon::A4Block* const* x, const float* x_scale, int ncols, int unit_begin, int unit_end,
                        std::uint16_t* const* h, int prefetch_bytes) {
     std::int64_t s[32 * kMaxColumns]; // one unit's sums
     for (int u = unit_begin; u < unit_end; ++u) {
         // Unit u is row groups 2u, 2u+1: rows 32u..32u+31, gate_i at even rows, up_i at odd rows.
-        rg16_row_sums_a4r(isa, record, kGateUpBlocks, 2 * u, 2 * u + 2, x, ncols, s, prefetch_bytes);
+        rg16_row_sums_a4r(isa, gate_up_matrix(record, kFlashNextShape), 2 * u, 2 * u + 2, x, ncols, s, prefetch_bytes);
         for (int c = 0; c < ncols; ++c) {
             std::uint16_t g[16], p[16];
             for (int i = 0; i < 16; ++i) {
@@ -84,12 +86,12 @@ void gate_up_units_a4r(CpuIsa isa, const std::uint8_t* record, const ExpertScale
     }
 }
 
-void down_rows_a4r(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
+void down_rows_a4r(CpuIsa isa, const Rg16Record& record, const ExpertScales& scales,
                    const canon::A4Block* const* h, const float* h_scale, int ncols, int rg_begin, int rg_end,
                    std::uint16_t* const* y, int prefetch_bytes) {
     std::int64_t s[16 * kMaxColumns]; // one row group at a time
     for (int rg = rg_begin; rg < rg_end; ++rg) {
-        rg16_row_sums_a4r(isa, record + kGateUpBytes, kDownBlocks, rg, rg + 1, h, ncols, s, prefetch_bytes);
+        rg16_row_sums_a4r(isa, down_matrix(record, kFlashNextShape), rg, rg + 1, h, ncols, s, prefetch_bytes);
         for (int r = 0; r < 16; ++r) {
             for (int c = 0; c < ncols; ++c) {
                 y[c][rg * 16 + r] = canon::a4r_row_output(s[r * ncols + c], h_scale[c], scales.alpha_down);
@@ -98,7 +100,7 @@ void down_rows_a4r(CpuIsa isa, const std::uint8_t* record, const ExpertScales& s
     }
 }
 
-void expert_forward_a4r(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales, int ncols,
+void expert_forward_a4r(CpuIsa isa, const Rg16Record& record, const ExpertScales& scales, int ncols,
                         const std::uint16_t* const* x, std::uint16_t* const* y, int prefetch_bytes) {
     if (ncols < 1 || ncols > kMaxColumns) { throw std::invalid_argument("offloaded_moe: ncols must be in [1, 8]"); }
     constexpr std::size_t kXTerms = static_cast<std::size_t>(kTerms) * kGateUpBlocks;

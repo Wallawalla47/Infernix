@@ -109,6 +109,9 @@ struct OffloadOptions {
     // frames do not, and shadows for what VRAM gives back without a promotion (plan_exclusive_tier, sized at
     // start once the frames are known). A RAM budget too small for it keeps the plain SSD tier.
     bool ram_exclusive = false;
+    // The SSD tier's RAM slots hold CSF records (--expert-csf; HostExpertTier::Options::csf). The pinned banks of full
+    // mode are compressed by the load (LoadOptions::expert_csf).
+    bool expert_csf = false;
     std::filesystem::path expert_state; // the saved expert state (warm start); empty: none
     std::string expert_state_identity;
     // Without a usable saved state the warm start seeds from the model's calibrated order
@@ -405,8 +408,12 @@ private:
     void on_vram_snapshot(const VramSnapshot& snapshot);
     [[nodiscard]] double vram_seconds() const;
     void diagnostic(const std::string& text, DiagnosticLevel level = DiagnosticLevel::Info) const noexcept;
-    // A record's host address for the CPU and the rate probe: the pinned bank, or the tier's RAM copy.
+    // A record's host address for the CPU and the rate probe: the pinned bank, or the tier's RAM copy; and its CSF
+    // table when the bank's record is compressed (null: expanded).
     [[nodiscard]] const std::uint8_t* host_record(std::uint32_t layer, std::uint32_t expert) const;
+    [[nodiscard]] const std::uint32_t* host_csf(std::uint32_t layer, std::uint32_t expert) const;
+    // Every layer's bank tables (an empty vector when no bank is compressed): set_csf's argument.
+    [[nodiscard]] std::vector<ops::offloaded_moe::csf::BankTables> csf_tables() const;
 
     OffloadSetup setup_;
     OffloadOptions options_;

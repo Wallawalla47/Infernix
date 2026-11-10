@@ -34,6 +34,9 @@ struct LoadOptions {
     // and are read in place by the SSD expert tier (Flash-Next design §19.3.7) instead of being
     // pinned in host memory.
     bool stream_experts = false;
+    // EngineOptions::expert_csf: the pinned NVFP4 routed banks' records become CSF records at load
+    // (runtime/expert_offload/expert_bank.h compress_banks); the SSD tier's slots likewise (its Program).
+    bool expert_csf = false;
     // Qwen4Exp DFlash2: the companion artifact of the drafter (SpeculativeOptions::draft_model).
     std::filesystem::path draft_model;
     // Qwen4Exp: the artifact's 2-bit screens (--screen-heads), each bound when present for its consumer (an
@@ -124,6 +127,7 @@ struct LoadOptions {
             .expert_a4_activations    = options.expert_a4_activations,
             .expert_a16_activations   = architecture == Architecture::Qwen4Exp &&
                                       (options.expert_a16_activations || options.a8_activations),
+            .expert_csf               = options.expert_csf,
             .draft_model              = options.speculative.draft_model,
             // The screens are Qwen4Exp's (a Qwen3.5 Program compares these options with its loaded ones).
             .proposal_head_screen     = architecture == Architecture::Qwen4Exp &&

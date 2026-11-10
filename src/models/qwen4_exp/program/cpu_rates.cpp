@@ -104,6 +104,10 @@ std::optional<runtime::expert_offload::CpuRateReading> ProgramImpl::measure_cpu_
                 experts[(static_cast<std::uint32_t>(round) * 131U + static_cast<std::uint32_t>(k) * 37U) % experts.size()];
             auto& job  = jobs[static_cast<std::size_t>(k)];
             job.record = record_of(layer, expert);
+            // The pinned bank's CSF records take their tables, and so do the tier's compressed RAM copies.
+            job.csf    = bank.planes.records != nullptr ? bank.record(expert).csf
+                         : tier_                        ? tier_->record_csf(tier_->key(layer, expert))
+                                                        : nullptr;
             job.ggml   = ggml_format(bank);
             job.a8     = cpu_ggml_a8() || cpu_narrow_a16() == moe::NarrowA16::kA8;
             job.scales = job.ggml.valid() ? moe::ExpertScales{} : bank.scales[expert];

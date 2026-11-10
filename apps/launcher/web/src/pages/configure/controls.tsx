@@ -309,6 +309,13 @@ export const MEMORY_CONTROLS: Control[] = [
     when: offloaded,
   },
   {
+    kind: "switch",
+    flag: "--expert-csf",
+    label: "Compressed expert scales (CSF)",
+    help: "Offloaded NVFP4 experts: their RAM copies keep the block scales compressed (~5 % fewer bytes, same output): prompts 2-5 % faster, decode 0.6-2 % slower.",
+    when: offloaded,
+  },
+  {
     kind: "auto",
     flag: "--expert-ram-mib",
     label: "Expert RAM (MiB)",

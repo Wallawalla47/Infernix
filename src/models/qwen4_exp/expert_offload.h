@@ -22,6 +22,7 @@ namespace infernix::models::qwen4_exp {
 
 namespace expert_cache = runtime::expert_offload::expert_cache;
 using runtime::expert_offload::CpuSplitPolicy;
+using runtime::expert_offload::CsfTables;
 using runtime::expert_offload::display_headroom;
 using runtime::expert_offload::ExpertBank;
 using runtime::expert_offload::ExpertLayout;

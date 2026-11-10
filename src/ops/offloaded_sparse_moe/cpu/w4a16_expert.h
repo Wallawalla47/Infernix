@@ -24,30 +24,30 @@ int encode_a16(const std::uint16_t* v, int n, canon::A16Block* out);
 // Encodes blocks [block_begin, block_end) of a column whose exponent is already known.
 void encode_a16_blocks(const std::uint16_t* v, int emax, int block_begin, int block_end, canon::A16Block* out);
 
-// Exact int64 row sums S[row][col] for row groups [rg_begin, rg_end) of a matrix stored as
-// row-group-major 144-byte units with `blocks` 16-element blocks per row; `acts[col]` points to
-// `blocks` encoded blocks of column col. `out` has (rg_end - rg_begin) * 16 rows of `ncols` values.
-void rg16_row_sums_a16(CpuIsa isa, const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end,
+// Exact int64 row sums S[row][col] for row groups [rg_begin, rg_end) of a matrix (expanded or CSF) with
+// matrix.blocks 16-element blocks per row; `acts[col]` points to matrix.blocks encoded blocks of column col.
+// `out` has (rg_end - rg_begin) * 16 rows of `ncols` values. Both layouts give the same sums.
+void rg16_row_sums_a16(CpuIsa isa, const Rg16Matrix& matrix, int rg_begin, int rg_end,
                        const canon::A16Block* const* acts, int ncols, std::int64_t* out,
                        int prefetch_bytes = kDefaultPrefetchBytes);
 
 // Phase A for 16-intermediate units [unit_begin, unit_end) of an expert of `shape`: gate/up rows and
 // SwiGLU. `x[col]` is the encoded x of column col with exponent x_exp[col]; writes
 // h[col][16 * unit + i] in BF16.
-void gate_up_units_a16(CpuIsa isa, const ExpertShape& shape, const std::uint8_t* record,
+void gate_up_units_a16(CpuIsa isa, const ExpertShape& shape, const Rg16Record& record,
                        const ExpertScales& scales,
                        const canon::A16Block* const* x, const int* x_exp, int ncols, int unit_begin,
                        int unit_end, std::uint16_t* const* h, int prefetch_bytes = kDefaultPrefetchBytes);
 
 // Phase B for down row groups [rg_begin, rg_end): `h[col]` is the encoded h of column col with
 // exponent h_exp[col]; writes y[col][row] in BF16 for those rows.
-void down_rows_a16(CpuIsa isa, const ExpertShape& shape, const std::uint8_t* record,
+void down_rows_a16(CpuIsa isa, const ExpertShape& shape, const Rg16Record& record,
                    const ExpertScales& scales,
                    const canon::A16Block* const* h, const int* h_exp, int ncols, int rg_begin, int rg_end,
                    std::uint16_t* const* y, int prefetch_bytes = kDefaultPrefetchBytes);
 
 // Whole expert on one thread: y[col][0..H) from x[col][0..H), both BF16, H = shape.hidden.
-void expert_forward_a16(CpuIsa isa, const ExpertShape& shape, const std::uint8_t* record,
+void expert_forward_a16(CpuIsa isa, const ExpertShape& shape, const Rg16Record& record,
                         const ExpertScales& scales, int ncols,
                         const std::uint16_t* const* x, std::uint16_t* const* y,
                         int prefetch_bytes = kDefaultPrefetchBytes);

@@ -188,7 +188,7 @@ void test_row_sums() {
             for (const moe::CpuIsa isa : kIsas) {
                 if (!moe::cpu_isa_supported(isa)) { continue; }
                 std::vector<std::int64_t> got(want.size());
-                moe::rg16_row_sums_a4r(isa, e.record.data(), moe::kGateUpBlocks, rg, rg + 2, tp, ncols, got.data());
+                moe::rg16_row_sums_a4r(isa, {e.record.data(), moe::kGateUpBlocks}, rg, rg + 2, tp, ncols, got.data());
                 check(got == want, "E2: two-term row sums equal the direct int64 evaluation");
             }
         }

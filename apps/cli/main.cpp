@@ -396,6 +396,7 @@ int main(int argc, char** argv) {
         engine_options.ram_resize               = false; // one generation: the Engine is never idle to resize
         engine_options.expert_ram_bytes         = cli.expert_ram_bytes;
         engine_options.expert_ram_layout        = cli.expert_ram_layout;
+        engine_options.expert_csf               = cli.expert_csf;
         engine_options.expert_pin_bytes         = cli.expert_pin_bytes;
         engine_options.device                   = cli.device;
         engine_options.max_context              = cli.max_context;
