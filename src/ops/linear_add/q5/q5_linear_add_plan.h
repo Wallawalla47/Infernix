@@ -22,8 +22,8 @@ enum class Q5LinearAddScheduleId {
     SlicedR32T64W2S1,
     MmaResidualR32T32K128,
     MmaResidualR32T128,
-    MmaResidualR64T128,
-    MmaResidualR64T128Tail,
+    RingResidualT128,
+    RingResidualT128Tail,
     // Request-invariant exact route: one sliced-K reduction (four K warps, linear order) at every
     // width, so a column's bits do not depend on how many columns share the call.
     SlicedColumnInvariant,

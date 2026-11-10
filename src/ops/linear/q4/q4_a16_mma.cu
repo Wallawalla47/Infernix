@@ -1,5 +1,8 @@
 #include "ops/linear/q4/q4_instance_launch.cuh"
 
+#include "ops/linear/common/rowsplit_ring_linear.cuh"
+#include "ops/linear/q4/q4_ring_codec.cuh"
+
 namespace infernix::ops::detail {
 
 void launch_q4_a16_mma_r64_t48(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
@@ -38,9 +41,17 @@ void launch_q4_a16_mma_r64_t120(const Tensor& x, const Weight& w, Tensor& out,
     }
 }
 
-void launch_q4_a16_mma_r64_t128(const Tensor& x, const Weight& w, Tensor& out,
-                                cudaStream_t stream) {
-    launch_q4_a16_mma_instance<q4_instances::MmaR64T128K64Wr64Wt32S2A2B1>(x, w, out, stream);
+void launch_q4_a16_wide_t128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    // The wide route runs on the staging ring (ops/linear/common/rowsplit_ring_linear.cuh; 128 x 128 tiles),
+    // the same bits as the 64-row MMA tile it replaced. RTX 5090, linear_bench (CUDA graph, cold L2, A B B A,
+    // equal output hashes), 512 / 1,024 / 2,048 / 4,096 columns: [4096, 5120] -3.3 / -2.7 / -2.3 / -2.6 %;
+    // [6144, 5120] at 1,024-4,096 -3.0 / -3.4 / -2.9 % (2026-11-10).
+    const Q4LinearOperands p = q4_linear_operands(x, w);
+    validate_q4_operands(p);
+    launch_rowsplit_ring_linear<Q4RingFormat, RowSplitRingTile128, kRowSplitRingStages,
+                                kRowSplitRingProducerWarps>(
+        p.x, Q4RingFormat::Weights{p.codes, p.scales}, p.rows, p.k, p.padded_k, p.tokens,
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n}, LinearIdentityEpilogue{}, stream);
 }
 
 void launch_q4_a16_mma_r32_t32_k128_s2_a2(const Tensor& x, const Weight& w, Tensor& out,

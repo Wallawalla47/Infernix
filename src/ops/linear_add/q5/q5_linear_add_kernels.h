@@ -18,5 +18,5 @@ void q5_linear_add_sliced_invariant_launch(const Tensor&, const Weight&, Tensor&
 void q5_linear_add_ksplit_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void q5_linear_add_mma_r32_t32_k128_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void q5_linear_add_mma_r32_t128_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void q5_linear_add_mma_r64_t128_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void q5_linear_add_ring_t128_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 } // namespace infernix::ops::detail

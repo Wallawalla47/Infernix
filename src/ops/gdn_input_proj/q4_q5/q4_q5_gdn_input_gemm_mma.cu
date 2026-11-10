@@ -4,6 +4,8 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/common/rowsplit_grouped_mma.cuh"
+#include "ops/common/rowsplit_grouped_ring.cuh"
+#include "ops/linear/common/rowsplit_ring_linear.cuh"
 #include "ops/common/token_slices.h"
 
 #include <cstdint>
@@ -64,6 +66,40 @@ void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Wei
     CUDA_CHECK(cudaGetLastError());
 }
 
+// The wide route: the three jobs on the staging ring (ops/common/rowsplit_grouped_ring.cuh). A full launch reads no bounds:
+// whole token tiles and whole row tiles of every job.
+void launch_ring(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight, Tensor& qkv, Tensor& z,
+                 cudaStream_t stream) {
+    using Tile = RowSplitRingTile128;
+    using Ring = RowSplitRing<Tile, kRowSplitRingStages, kRowSplitRingProducerWarps>;
+    constexpr std::int32_t kValueRows = 6144;
+    for_each_token_slice(x.ne[1], Tile::BN, [&](std::int32_t offset, std::int32_t count) {
+        const Tensor x_slice = x.slice(1, offset, count);
+        Tensor qkv_slice     = qkv.slice(1, offset, count);
+        Tensor z_slice       = z.slice(1, offset, count);
+        const RowSplitGroupedMmaJob qk    = make_job(qk_weight, 0, qk_weight.n, qkv_slice, 0);
+        const RowSplitGroupedMmaJob value = make_job(value_z_weight, 0, kValueRows, qkv_slice, qk_weight.n);
+        const RowSplitGroupedMmaJob gate  = make_job(value_z_weight, kValueRows, kValueRows, z_slice, 0);
+        const RowSplitGroupedMmaJob empty{};
+        const dim3 grid(static_cast<unsigned>(div_up(qk.n, Tile::BM) + div_up(value.n, Tile::BM) +
+                                              div_up(gate.n, Tile::BM)),
+                        static_cast<unsigned>(div_up(count, Tile::BN)));
+        const bool full   = count % Tile::BN == 0 && qk.n % Tile::BM == 0 && kValueRows % Tile::BM == 0;
+        const auto launch = [&]<bool Full>() {
+            constexpr auto kernel =
+                rowsplit_grouped_ring_kernel<Tile, kRowSplitRingStages, kRowSplitRingProducerWarps, Full, 4>;
+            kernel<<<grid, Ring::kThreads, rowsplit_ring_reserve<kernel, Ring::kSharedBytes>(), stream>>>(
+                static_cast<const __nv_bfloat16*>(x_slice.data), qk, value, gate, empty, x.ne[0], count, x.ne[0]);
+            CUDA_CHECK(cudaGetLastError());
+        };
+        if (full) {
+            launch.template operator()<true>();
+        } else {
+            launch.template operator()<false>();
+        }
+    });
+}
+
 template <class Schedule>
 void launch_grouped(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, cudaStream_t stream) {
@@ -92,9 +128,11 @@ void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight
         launch_grouped<GemmCfg<32, 64, 64, 16, 16, 4, 1, false, true, true>>(
             x, qk_weight, value_z_weight, qkv, z, stream);
         return;
-    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128S2:
-        launch_grouped<GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>>(
-            x, qk_weight, value_z_weight, qkv, z, stream);
+    case Q4Q5GdnInputScheduleId::GroupedMixedRingC128:
+        // RTX 5090, gdn_input_proj_bench (q4q5, CUDA graph, cold L2, A B B A), against the 64-row MMA tile this
+        // route ran before: 256 columns -5.7 %, 512 -4.3 %, 896 -6.9 %, 1,024 -6.5 %, 2,048 -7.6 %, 4,096 -8.7 %
+        // (2026-11-10).
+        launch_ring(x, qk_weight, value_z_weight, qkv, z, stream);
         return;
     case Q4Q5GdnInputScheduleId::IndependentDirectFixed:
     case Q4Q5GdnInputScheduleId::ColumnInvariant:

@@ -49,8 +49,8 @@ constexpr std::array<RouteSpec, 13> kK6144Routes{{
     {{97, 128}, Q5LinearAddScheduleId::SlicedR32T32W2S2},
     {{129, 160}, Q5LinearAddScheduleId::SlicedR32T64W2S1},
     {{161, 256}, Q5LinearAddScheduleId::MmaResidualR32T128},
-    {{257, 512}, Q5LinearAddScheduleId::MmaResidualR64T128},
-    {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64T128Tail},
+    {{257, 512}, Q5LinearAddScheduleId::RingResidualT128},
+    {{513, kAnyCols}, Q5LinearAddScheduleId::RingResidualT128Tail},
 }};
 
 constexpr std::array<RouteSpec, 13> kK17408Routes{{
@@ -65,8 +65,8 @@ constexpr std::array<RouteSpec, 13> kK17408Routes{{
     {{97, 128}, Q5LinearAddScheduleId::SlicedR32T32W2S2},
     {{129, 160}, Q5LinearAddScheduleId::SlicedR32T64W2S1},
     {{161, 256}, Q5LinearAddScheduleId::MmaResidualR32T128},
-    {{257, 512}, Q5LinearAddScheduleId::MmaResidualR64T128},
-    {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64T128Tail},
+    {{257, 512}, Q5LinearAddScheduleId::RingResidualT128},
+    {{513, kAnyCols}, Q5LinearAddScheduleId::RingResidualT128Tail},
 }};
 
 template <std::size_t N>
@@ -107,13 +107,13 @@ void launch_wide_with_narrow_tail(const Tensor& x, const Weight& w, Tensor& resi
     const std::int32_t wide = (cols / kWaveCols) * kWaveCols;
     const std::int32_t tail = cols - wide;
     if (wide == 0 || tail == 0 || tail > kNarrowTailCols) {
-        q5_linear_add_mma_r64_t128_launch(x, w, residual_out, stream);
+        q5_linear_add_ring_t128_launch(x, w, residual_out, stream);
         return;
     }
 
     const Tensor x_wide = x.slice(1, 0, wide);
     Tensor out_wide     = residual_out.slice(1, 0, wide);
-    q5_linear_add_mma_r64_t128_launch(x_wide, w, out_wide, stream);
+    q5_linear_add_ring_t128_launch(x_wide, w, out_wide, stream);
 
     const Tensor x_tail = x.slice(1, wide, tail);
     Tensor out_tail     = residual_out.slice(1, wide, tail);
@@ -148,10 +148,10 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
         return "linear_add.q5.mma.r32.t32.k128.residual";
     case Q5LinearAddScheduleId::MmaResidualR32T128:
         return "linear_add.q5.mma.r32.t128.residual";
-    case Q5LinearAddScheduleId::MmaResidualR64T128:
-        return "linear_add.q5.mma.r64.t128.cta_collective_residual";
-    case Q5LinearAddScheduleId::MmaResidualR64T128Tail:
-        return "linear_add.q5.mma.r64.t128.cta_collective_residual.narrow_tail";
+    case Q5LinearAddScheduleId::RingResidualT128:
+        return "linear_add.q5.ring.t128.cta_collective_residual";
+    case Q5LinearAddScheduleId::RingResidualT128Tail:
+        return "linear_add.q5.ring.t128.cta_collective_residual.narrow_tail";
     case Q5LinearAddScheduleId::SlicedColumnInvariant:
         return "linear_add.q5.sliced.w4.linear.column_invariant.residual";
     case Q5LinearAddScheduleId::KSplitW8:
@@ -247,10 +247,10 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     case Q5LinearAddScheduleId::MmaResidualR32T128:
         q5_linear_add_mma_r32_t128_launch(x, w, residual_out, stream);
         return;
-    case Q5LinearAddScheduleId::MmaResidualR64T128:
-        q5_linear_add_mma_r64_t128_launch(x, w, residual_out, stream);
+    case Q5LinearAddScheduleId::RingResidualT128:
+        q5_linear_add_ring_t128_launch(x, w, residual_out, stream);
         return;
-    case Q5LinearAddScheduleId::MmaResidualR64T128Tail:
+    case Q5LinearAddScheduleId::RingResidualT128Tail:
         launch_wide_with_narrow_tail(x, w, residual_out, ws, stream);
         return;
     case Q5LinearAddScheduleId::SlicedColumnInvariant:

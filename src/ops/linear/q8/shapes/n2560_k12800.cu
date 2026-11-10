@@ -28,7 +28,7 @@ Q8Launch select_q8_n2560_k12800(std::int32_t tokens) {
     // to 384 columns, r64_t128 beyond: 2,048 columns 712 us against 844 for r32_t128).
     if (tokens <= 96) return launch_q8_a16_sliced<Geometry, 64, Sliced<64, 4>>;
     if (tokens <= 384) return launch_q8_a16_mma_r32_t64;
-    return launch_q8_a16_mma_r64_t128;
+    return launch_q8_a16_wide_t128;
 }
 
 } // namespace infernix::ops::detail

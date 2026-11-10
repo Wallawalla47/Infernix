@@ -37,7 +37,7 @@ void launch_q6_a16_mma_r64_t80(const Tensor& x, const Weight& weight, Tensor& ou
                                cudaStream_t stream);
 void launch_q6_a16_mma_r64_t96(const Tensor& x, const Weight& weight, Tensor& out,
                                cudaStream_t stream);
-void launch_q6_a16_mma_r64_t128(const Tensor& x, const Weight& weight, Tensor& out,
+void launch_q6_a16_wide_t128(const Tensor& x, const Weight& weight, Tensor& out,
                                 cudaStream_t stream);
 void launch_q6_a16_mma_r64_t112(const Tensor& x, const Weight& weight, Tensor& out,
                                 cudaStream_t stream);

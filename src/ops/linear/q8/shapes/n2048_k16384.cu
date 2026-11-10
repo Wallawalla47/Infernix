@@ -53,7 +53,7 @@ Q8Launch select_q8_n2048_k16384(std::int32_t tokens) {
     if (tokens <= 1680) return launch_q8_a16_mma_r128_t80;
     if (tokens <= 2016) return launch_q8_a16_mma_r64_t96;
     if (tokens <= 2112) return launch_q8_a16_mma_r96_t96;
-    return launch_q8_a16_mma_r64_t128;
+    return launch_q8_a16_wide_t128;
 }
 
 } // namespace infernix::ops::detail

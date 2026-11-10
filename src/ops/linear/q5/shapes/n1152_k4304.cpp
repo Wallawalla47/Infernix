@@ -18,6 +18,6 @@ Q5Launch select_q5_n1152_k4304(std::int32_t tokens) {
     if (tokens <= 672) return launch_q5_a16_sliced_r32_t32_w4_s1;
     if (tokens <= 1152) return launch_q5_a16_mma_r32_t128;
     if (tokens <= 1536) return launch_q5_a16_mma_r64_t96_k128_s1_a1;
-    return launch_q5_a16_mma_r64_t128;
+    return launch_q5_a16_wide_t128;
 }
 } // namespace infernix::ops::detail

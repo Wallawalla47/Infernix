@@ -18,7 +18,7 @@ void launch_q5_a16_direct_r1_t4_w2_k17408(const Tensor&, const Weight&, Tensor&,
 void launch_q5_a16_direct_r2_t4_w2_g8_b4(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q5_a16_direct_r2_t4_w4_g4_b4(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q5_a16_mma_r32_t128(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void launch_q5_a16_mma_r64_t128(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q5_a16_wide_t128(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q5_a16_mma_r64_t96_k128_s1_a1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q5_a16_sliced_r16_t16_w2_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q5_a16_sliced_r16_t16_w4_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);

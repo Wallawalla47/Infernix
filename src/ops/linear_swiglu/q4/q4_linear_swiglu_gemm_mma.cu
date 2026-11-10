@@ -2,6 +2,8 @@
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_gemm_mma.cuh"
+#include "ops/linear/common/rowsplit_ring_linear.cuh"
+#include "ops/linear_swiglu/q4/q4_linear_swiglu_gemm_ring.cuh"
 
 #include "core/device.h"
 #include "ops/common/math.h"
@@ -12,8 +14,13 @@
 namespace infernix::ops::detail {
 namespace {
 
-using GateUpC40Cfg  = GemmCfg<64, 40, 64, 64, 8, 2, 1, false, true, true>;
-using GateUpC128Cfg = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>;
+// The narrow tail's tile (the plain kernel, q4_linear_swiglu_gemm_mma.cuh).
+using GateUpC40Cfg = GemmCfg<64, 40, 64, 64, 8, 2, 1, false, true, true>;
+// The ring kernel's tile (q4_linear_swiglu_gemm_ring.cuh): the ring linears' (128 weight rows, so 64 outputs, x
+// 128 columns a CTA, sixteen MMA warps, three stages, four producer warps).
+using GateUpRingCfg = RowSplitRingTile128;
+inline constexpr int kGateUpRingStages        = kRowSplitRingStages;
+inline constexpr int kGateUpRingProducerWarps = kRowSplitRingProducerWarps;
 
 template <class Cfg, bool Full>
 void launch_folded(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -51,22 +58,56 @@ void launch_route(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     });
 }
 
-} // namespace
-
-void q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(const Tensor& x, const Weight& weight,
-                                                          Tensor& out, cudaStream_t stream) {
-    launch_route<GateUpC128Cfg>(x, weight, out, stream);
+// The ring kernel on Cfg's tile with `Stages` stages and `ProducerWarps` producer warps. A full launch reads no
+// bounds: whole column tiles, whole row tiles and no K padding.
+template <class Cfg, int Stages, int ProducerWarps>
+void launch_ring(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    using Layout    = RowSplitRing<Cfg, Stages, ProducerWarps>;
+    const bool full = (x.ne[1] % Cfg::BN) == 0 && (out.ne[0] % (Cfg::BM / 2)) == 0 &&
+                      x.ne[0] == weight.padded_shape[1];
+    for_each_token_slice(x.ne[1], Cfg::BN, [&](std::int32_t offset, std::int32_t count) {
+        const Tensor x_slice = x.slice(1, offset, count);
+        Tensor out_slice     = out.slice(1, offset, count);
+        const dim3 grid(static_cast<unsigned>(div_up(out.ne[0], Cfg::BM / 2)),
+                        static_cast<unsigned>(div_up(count, Cfg::BN)));
+        const auto launch = [&]<bool Full>() {
+            constexpr auto kernel = q4_linear_swiglu_ring_kernel<Cfg, Stages, ProducerWarps, Full>;
+            kernel<<<grid, Layout::kThreads, rowsplit_ring_reserve<kernel, Layout::kSharedBytes>(), stream>>>(
+                static_cast<const __nv_bfloat16*>(x_slice.data), static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out_slice.data),
+                out.ne[0], x.ne[0], count, weight.padded_shape[1]);
+            CUDA_CHECK(cudaGetLastError());
+        };
+        if (full) {
+            launch.template operator()<true>();
+        } else {
+            launch.template operator()<false>();
+        }
+    });
 }
 
-void q4_linear_swiglu_mma_split_half_pair_r32_c128_tail_launch(const Tensor& x,
-                                                               const Weight& weight, Tensor& out,
-                                                               cudaStream_t stream) {
-    // One 128-column folded tile is the widest block the 48 KiB static shared budget allows, so a
-    // wider extent is served by several of them in one multi-column-tile launch. A remainder of at
-    // most kNarrowTailCols columns measured cheaper on the narrow routes than a second 128-wide
+} // namespace
+
+void q4_linear_swiglu_mma_ring_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                               cudaStream_t stream) {
+    // RTX 5090, q4_linear_swiglu_bench ([34816, 5120], CUDA graph, cold L2, A B B A, the same output hashes at
+    // every width), against the 64-row plain tiles this route ran before (2026-11-10): 136 columns -10.7 %, 160
+    // -8.4 %, 225 -5.5 %, 256 -5.5 %, 400 -8.1 %, 512 -8.5 %, 768 -12.7 %, 896 -10.1 %, 1,000 -14.3 %, 1,024 -13.2 %,
+    // 1,536 -11.6 %, 2,048 -14.1 %, 3,584 -14.2 %, 4,096 -12.9 %, 8,192 -10.4 %, 16,384 -13.1 % (224-227 TFLOP/s at
+    // 1,024-2,048 against 194). A 64-row ring tile (two CTAs an SM) measured -8.0 % at 256 columns and less than
+    // this one everywhere else; the plain kernel on a 128-row tile, a one-barrier pipelined form of it and a ring
+    // whose consumers looked their weights up in a table a row all measured slower than this.
+    launch_ring<GateUpRingCfg, kGateUpRingStages, kGateUpRingProducerWarps>(x, weight, out, stream);
+}
+
+void q4_linear_swiglu_mma_ring_r64_c128_tail_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                                    cudaStream_t stream) {
+    // The ring tile is 128 columns wide, so a wider extent is served by several of them in one
+    // multi-column-tile launch. A remainder of at most kNarrowTailCols columns measured cheaper on
+    // the narrow routes (against the 64-row plain tile this route ran before) than a second 128-wide
     // tile that would be almost entirely empty, so that remainder is launched on its own; any wider
     // remainder keeps the single wide launch.
-    constexpr std::int32_t kBlockCols     = GateUpC128Cfg::BN;
+    constexpr std::int32_t kBlockCols     = GateUpRingCfg::BN;
     constexpr std::int32_t kNarrowTailCols = 40;
     constexpr std::int32_t kExactTailCols  = 24;
 
@@ -74,14 +115,14 @@ void q4_linear_swiglu_mma_split_half_pair_r32_c128_tail_launch(const Tensor& x,
     const std::int32_t blocks = tokens / kBlockCols;
     const std::int32_t tail   = tokens - blocks * kBlockCols;
     if (blocks == 0 || tail == 0 || tail > kNarrowTailCols) {
-        q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(x, weight, out, stream);
+        q4_linear_swiglu_mma_ring_r64_c128_launch(x, weight, out, stream);
         return;
     }
 
     const std::int32_t wide_cols = blocks * kBlockCols;
     const Tensor x_wide = x.slice(1, 0, wide_cols);
     Tensor out_wide     = out.slice(1, 0, wide_cols);
-    q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(x_wide, weight, out_wide, stream);
+    q4_linear_swiglu_mma_ring_r64_c128_launch(x_wide, weight, out_wide, stream);
     const Tensor x_tail = x.slice(1, wide_cols, tail);
     Tensor out_tail     = out.slice(1, wide_cols, tail);
     if (tail == 1) {

@@ -45,7 +45,7 @@ Q8Launch select_q8_n5120_k25600(std::int32_t tokens) {
     if (tokens <= 56) return launch_q8_a16_sliced<Geometry, 56, C56>;
     if (tokens <= 64) return launch_tiled<16>;
     if (tokens <= 128) return launch_tiled<32>;
-    return launch_q8_a16_mma_r64_t128;
+    return launch_q8_a16_wide_t128;
 }
 
 } // namespace infernix::ops::detail

@@ -9,11 +9,12 @@ namespace infernix::ops::detail {
 
 void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
                                        cudaStream_t stream);
-void q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(const Tensor& x, const Weight& w,
-                                                          Tensor& out, cudaStream_t stream);
-// Wide folded tiles for the leading column blocks plus a narrow route for a small remainder.
-void q4_linear_swiglu_mma_split_half_pair_r32_c128_tail_launch(const Tensor& x, const Weight& w,
-                                                               Tensor& out, cudaStream_t stream);
+// The folded gate/up ring GEMM (q4_linear_swiglu_gemm_ring.cuh): 64 output rows x 128 columns a CTA.
+void q4_linear_swiglu_mma_ring_r64_c128_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                               cudaStream_t stream);
+// Ring tiles for the leading column blocks plus a narrow route for a small remainder.
+void q4_linear_swiglu_mma_ring_r64_c128_tail_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                                    cudaStream_t stream);
 void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Tensor& out,
                                            cudaStream_t stream);
 // The same family at any width (Q4LinearSwiGluScheduleId::SmallTTiledColumnInvariant).

@@ -19,7 +19,7 @@ Q8Launch select_q8_n2560_k640(std::int32_t tokens) {
     // RTX 5090). Every MMA tile accumulates each output over K in the same order, so their bits are
     // identical (checked at every swept point); only speed differs.
     if (tokens <= 256) return launch_q8_a16_mma_r32_t64;
-    return launch_q8_a16_mma_r64_t128;
+    return launch_q8_a16_wide_t128;
 }
 
 } // namespace infernix::ops::detail

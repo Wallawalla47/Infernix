@@ -43,7 +43,8 @@ struct GemmCfg {
                   "GemmCfg: block tile must divide into warp tiles");
     static_assert(WM_ % 16 == 0 && WN_ % 8 == 0, "GemmCfg: warp tile must use m16n8 multiples");
     static_assert(WARPS >= 1 && THREADS <= 1024, "GemmCfg: invalid thread count");
-    static_assert(smem_est_bytes <= 48 * 1024, "GemmCfg: staged shared exceeds 48 KiB");
+    // A kernel whose own arrays exceed the 48 KiB of static shared memory takes them dynamically.
+    static_assert(smem_est_bytes <= 99 * 1024, "GemmCfg: staged shared exceeds a CTA's 99 KiB");
 };
 
 template <int Bytes, class Cfg>

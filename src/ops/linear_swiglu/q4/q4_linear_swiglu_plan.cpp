@@ -43,13 +43,13 @@ constexpr std::array<RouteSpec, 10> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
     {{2, 32}, Q4LinearSwiGluScheduleId::SmallTTiled},
     {{33, 128}, Q4LinearSwiGluScheduleId::Materialized},
-    {{129, 168}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128Tail},
+    {{129, 168}, Q4LinearSwiGluScheduleId::MmaRingR64C128Tail},
     {{169, 224}, Q4LinearSwiGluScheduleId::Materialized},
-    {{225, 256}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
+    {{225, 256}, Q4LinearSwiGluScheduleId::MmaRingR64C128},
     {{257, 384}, Q4LinearSwiGluScheduleId::Materialized},
-    {{385, 512}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
+    {{385, 512}, Q4LinearSwiGluScheduleId::MmaRingR64C128},
     {{513, 640}, Q4LinearSwiGluScheduleId::Materialized},
-    {{641, kAnyCols}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
+    {{641, kAnyCols}, Q4LinearSwiGluScheduleId::MmaRingR64C128},
 }};
 
 constexpr bool catalog_is_closed() noexcept {
@@ -101,10 +101,10 @@ const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) no
         return "linear_swiglu.q4.mma.small_t.tiled";
     case Q4LinearSwiGluScheduleId::Materialized:
         return "linear_swiglu.q4.materialized";
-    case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128:
-        return "linear_swiglu.q4.mma.split_half_pair.r32.c128";
-    case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128Tail:
-        return "linear_swiglu.q4.mma.split_half_pair.r32.c128.narrow_tail";
+    case Q4LinearSwiGluScheduleId::MmaRingR64C128:
+        return "linear_swiglu.q4.mma.ring.r64.c128";
+    case Q4LinearSwiGluScheduleId::MmaRingR64C128Tail:
+        return "linear_swiglu.q4.mma.ring.r64.c128.narrow_tail";
     case Q4LinearSwiGluScheduleId::W4A8:
         return "linear_swiglu.q4.w4a8.mma_s8";
     case Q4LinearSwiGluScheduleId::SmallTTiledColumnInvariant:
@@ -138,8 +138,8 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
         switch (route.schedule) {
         case Q4LinearSwiGluScheduleId::GemvPair:
         case Q4LinearSwiGluScheduleId::SmallTTiled:
-        case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128:
-        case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128Tail:
+        case Q4LinearSwiGluScheduleId::MmaRingR64C128:
+        case Q4LinearSwiGluScheduleId::MmaRingR64C128Tail:
             return plan;
         case Q4LinearSwiGluScheduleId::Materialized:
             plan.workspace_bytes = materialized_workspace_bytes(problem.gate_up_rows, problem.cols);
@@ -212,11 +212,11 @@ void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor&
                  gate_up.slice(0, problem.output_rows, problem.output_rows), out, stream);
         return;
     }
-    case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128:
-        q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(x, w, out, stream);
+    case Q4LinearSwiGluScheduleId::MmaRingR64C128:
+        q4_linear_swiglu_mma_ring_r64_c128_launch(x, w, out, stream);
         return;
-    case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128Tail:
-        q4_linear_swiglu_mma_split_half_pair_r32_c128_tail_launch(x, w, out, stream);
+    case Q4LinearSwiGluScheduleId::MmaRingR64C128Tail:
+        q4_linear_swiglu_mma_ring_r64_c128_tail_launch(x, w, out, stream);
         return;
     case Q4LinearSwiGluScheduleId::W4A8:
         q4_linear_swiglu_w4a8_launch(x, w, out, ws, stream);

@@ -241,11 +241,18 @@ int main(int argc, char** argv) {
             const std::size_t workspace_exact = ops::linear_swiglu_workspace_capacity_bytes(
                 QType::Q4_G64_FP16, kGateUpRows, kHidden, options.policy, tokens,
                 tokens, options.routes);
+            // FNV-1a of the last timed call's output: two builds or schedules that print the same hash computed
+            // the same bits (the activations and weights are generated the same way every run).
+            std::vector<std::uint8_t> produced(static_cast<std::size_t>(kOutputRows) * tokens * sizeof(std::uint16_t));
+            CUDA_CHECK(cudaMemcpyAsync(produced.data(), output.p, produced.size(), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::uint64_t output_fnv = 0xcbf29ce484222325ULL;
+            for (const std::uint8_t byte : produced) { output_fnv = (output_fnv ^ byte) * 0x100000001b3ULL; }
             std::printf("T=%-4d median=%9.3f us min=%9.3f p95=%9.3f %7.1f GB/s %7.2f TFLOP/s "
-                        "workspace_sweep=%zu workspace_exact=%zu nodes=%zu\n",
+                        "workspace_sweep=%zu workspace_exact=%zu nodes=%zu output_fnv=%016llx\n",
                         tokens, timing.median_us, timing.min_us, timing.p95_us,
                         bytes / seconds / 1.0e9, flops / seconds / 1.0e12, workspace_capacity,
-                        workspace_exact, graph.nodes());
+                        workspace_exact, graph.nodes(), static_cast<unsigned long long>(output_fnv));
             results.push_back({tokens, options.graph ? "graph" : "eager", graph.nodes(),
                                timing.median_us, timing.min_us, timing.p95_us,
                                static_cast<double>(packed.model_weight_bytes()), bytes, flops,

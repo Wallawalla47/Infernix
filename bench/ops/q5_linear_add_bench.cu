@@ -276,12 +276,21 @@ int main(int argc, char** argv) {
                 tokens);
             row.workspace_used_bytes = workspace_used;
             const double seconds     = timing.median_us * 1.0e-6;
+            // FNV-1a of one call's output from the initial residual: two builds or schedules that print the same
+            // hash computed the same bits (the activations, weights and residual are generated the same way).
+            restore(stream);
+            body(stream);
+            std::vector<std::uint8_t> produced(static_cast<std::size_t>(kRows) * tokens * sizeof(std::uint16_t));
+            CUDA_CHECK(cudaMemcpyAsync(produced.data(), residual.p, produced.size(), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::uint64_t output_fnv = 0xcbf29ce484222325ULL;
+            for (const std::uint8_t byte : produced) { output_fnv = (output_fnv ^ byte) * 0x100000001b3ULL; }
             std::printf("K=%-5d T=%-4d %-5s nodes=%zu median=%9.3f us min=%9.3f p95=%9.3f "
-                        "%7.1f GB/s %7.2f TFLOP/s workspace_exact=%zu workspace_used=%zu\n",
+                        "%7.1f GB/s %7.2f TFLOP/s workspace_exact=%zu workspace_used=%zu output_fnv=%016llx\n",
                         options.hidden, tokens, row.execution, row.graph_nodes, timing.median_us,
                         timing.min_us, timing.p95_us, row.logical_bytes / seconds / 1.0e9,
                         row.projection_flops / seconds / 1.0e12, row.workspace_exact_bytes,
-                        row.workspace_used_bytes);
+                        row.workspace_used_bytes, static_cast<unsigned long long>(output_fnv));
             rows.push_back(row);
         }
 

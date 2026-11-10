@@ -12,12 +12,12 @@ Q4Launch select_q4_n34816_k5120(std::int32_t tokens) {
     if (tokens <= 80) return launch_q4_a16_mma_r64_t80;
     if (tokens <= 96) return launch_q4_a16_mma_r64_t96;
     if (tokens <= 120) return launch_q4_a16_mma_r64_t120;
-    if (tokens <= 128) return launch_q4_a16_mma_r64_t128;
+    if (tokens <= 128) return launch_q4_a16_wide_t128;
     if (tokens <= 192) return launch_q4_a16_mma_r64_t96;
     if (tokens <= 224) return launch_q4_a16_mma_r64_t112;
     if (tokens <= 240) return launch_q4_a16_mma_r64_t120;
-    if (tokens <= 256) return launch_q4_a16_mma_r64_t128;
+    if (tokens <= 256) return launch_q4_a16_wide_t128;
     if (tokens <= 288) return launch_q4_a16_mma_r64_t96;
-    return launch_q4_a16_mma_r64_t128;
+    return launch_q4_a16_wide_t128;
 }
 } // namespace infernix::ops::detail

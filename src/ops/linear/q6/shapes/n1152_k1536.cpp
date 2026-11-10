@@ -14,7 +14,7 @@ Q6Launch select_q6_n1152_k1536(std::int32_t tokens) {
     if (tokens <= 384) return launch_q6_a16_sliced_r32_t32_w4_s2;
     // This wider capacity wins both bulk anchors; the tiled MMA wins beyond this wave interval.
     if (tokens <= 1152) return launch_q6_a16_sliced_r32_t64_w2_s1;
-    return launch_q6_a16_mma_r64_t128;
+    return launch_q6_a16_wide_t128;
 }
 
 } // namespace infernix::ops::detail

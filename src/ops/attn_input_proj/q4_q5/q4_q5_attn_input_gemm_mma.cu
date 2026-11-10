@@ -4,6 +4,8 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/common/rowsplit_grouped_mma.cuh"
+#include "ops/common/rowsplit_grouped_ring.cuh"
+#include "ops/linear/common/rowsplit_ring_linear.cuh"
 #include "ops/common/token_slices.h"
 
 #include <cstdint>
@@ -139,10 +141,32 @@ void q4_q5_attn_input_pair_r32_c64_s3_launch(const Tensor& x, const Weight& w0, 
     launch<GemmCfg<32, 64, 64, 32, 16, 3, 2, false, true, true>>(x, w0, w1, q, g, k, v, stream);
 }
 
-void q4_q5_attn_input_mixed_r64_c128_s2_launch(const Tensor& x, const Weight& w0, const Weight& w1,
-                                               Tensor& q, Tensor& g, Tensor& k, Tensor& v,
-                                               cudaStream_t stream) {
-    launch_mixed<GemmCfg<64, 128, 64, 64, 16, 2, 2, false, true, true>>(x, w0, w1, q, g, k, v,
-                                                                        stream);
+void q4_q5_attn_input_mixed_ring_c128_launch(const Tensor& x, const Weight& w0, const Weight& w1,
+                                             Tensor& q, Tensor& g, Tensor& k, Tensor& v,
+                                             cudaStream_t stream) {
+    // The four jobs on the staging ring (ops/common/rowsplit_grouped_ring.cuh). RTX 5090, attn_input_proj_bench
+    // (q4q5, CUDA graph, cold L2, A B B A), against the 64-row MMA tile this route ran before: 256 columns -4.2 %,
+    // 512 -6.4 %, 896 -6.6 %, 1,024 -5.5 %, 2,048 -6.7 %, 4,096 -6.7 % (2026-11-10).
+    using Tile = RowSplitRingTile128;
+    using Ring = RowSplitRing<Tile, kRowSplitRingStages, kRowSplitRingProducerWarps>;
+    for_each_token_slice(x.ne[1], Tile::BN, [&](int begin, int count) {
+        const Tensor xs = x.slice(1, begin, count);
+        Tensor qs = q.slice(1, begin, count), gs = g.slice(1, begin, count), ks = k.slice(1, begin, count),
+               vs = v.slice(1, begin, count);
+        const dim3 grid(14336 / Tile::BM, (count + Tile::BN - 1) / Tile::BN);
+        const auto launch = [&]<bool Full>() {
+            constexpr auto kernel =
+                rowsplit_grouped_ring_kernel<Tile, kRowSplitRingStages, kRowSplitRingProducerWarps, Full, 4>;
+            kernel<<<grid, Ring::kThreads, rowsplit_ring_reserve<kernel, Ring::kSharedBytes>(), stream>>>(
+                static_cast<const __nv_bfloat16*>(xs.data), make_job(w0, 0, 6144, qs), make_job(w0, 6144, 1024, ks),
+                make_job(w1, 0, 6144, gs), make_job(w1, 6144, 1024, vs), 5120, count, 5120);
+            CUDA_CHECK(cudaGetLastError());
+        };
+        if (count % Tile::BN == 0) {
+            launch.template operator()<true>();
+        } else {
+            launch.template operator()<false>();
+        }
+    });
 }
 } // namespace infernix::ops::detail

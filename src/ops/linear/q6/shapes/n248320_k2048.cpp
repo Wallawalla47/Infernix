@@ -15,7 +15,7 @@ Q6Launch select_q6_n248320_k2048(std::int32_t tokens) {
     if (tokens <= 80) return launch_q6_a16_mma_r64_t80;
     if (tokens <= 96) return launch_q6_a16_mma_r64_t96;
     if (tokens <= 112) return launch_q6_a16_mma_r64_t112;
-    return launch_q6_a16_mma_r64_t128;
+    return launch_q6_a16_wide_t128;
 }
 
 } // namespace infernix::ops::detail

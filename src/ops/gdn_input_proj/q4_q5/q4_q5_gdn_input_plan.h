@@ -14,7 +14,7 @@ enum class Q4Q5GdnInputScheduleId {
     IndependentDirectFixed,
     GroupedMixedMmaR32C32S2,
     GroupedMixedMmaR32C64S4,
-    GroupedMixedMmaR64C128S2,
+    GroupedMixedRingC128,
     // Request-invariant exact route: one sliced-K reduction per parent at every width.
     ColumnInvariant,
 };

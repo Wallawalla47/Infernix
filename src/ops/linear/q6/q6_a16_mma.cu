@@ -1,4 +1,7 @@
 #include "ops/linear/q6/q6_launch.h"
+
+#include "ops/linear/common/rowsplit_ring_linear.cuh"
+#include "ops/linear/q6/q6_ring_codec.cuh"
 #include "ops/linear/q6/q6_mma_launch.cuh"
 #include "ops/linear/q6/q6_instances.cuh"
 
@@ -53,10 +56,17 @@ void launch_q6_a16_mma_r64_t96(const Tensor& x, const Weight& weight, Tensor& ou
     });
 }
 
-void launch_q6_a16_mma_r64_t128(const Tensor& x, const Weight& weight, Tensor& out,
-                                cudaStream_t stream) {
+void launch_q6_a16_wide_t128(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    // The wide route runs on the staging ring (ops/linear/common/rowsplit_ring_linear.cuh; 128 x 128 tiles),
+    // the same bits as the 64-row MMA tile it replaced. RTX 5090, linear_bench (CUDA graph, cold L2, A B B A,
+    // equal output hashes), 512 / 1,024 / 2,048 / 4,096 columns: [34816, 5120] -3.9 / -4.9 / -5.0 / -5.1 %
+    // (2026-11-10).
     with_linear_output(out, weight.n, [&](auto output) {
-        launch_q6_a16_mma<q6_instances::MmaR64T128>(q6_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
+        const Q6LinearOperands p = q6_linear_operands(x, weight);
+        launch_rowsplit_ring_linear<Q6RingFormat, RowSplitRingTile128, kRowSplitRingStages,
+                                    kRowSplitRingProducerWarps>(
+            p.x, Q6RingFormat::Weights{p.codes, p.high, p.scales}, p.rows, p.k, p.padded_k, p.tokens, output,
+            LinearIdentityEpilogue{}, stream);
     });
 }
 

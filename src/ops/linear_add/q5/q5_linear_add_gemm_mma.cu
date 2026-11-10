@@ -6,7 +6,9 @@
 #include "ops/common/bf16_vector.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
+#include "ops/linear/common/rowsplit_ring_linear.cuh"
 #include "ops/linear/q5/q5_mma_launch.cuh"
+#include "ops/linear/q5/q5_ring_codec.cuh"
 
 #include <cuda_bf16.h>
 
@@ -15,6 +17,17 @@
 namespace infernix::ops::detail {
 namespace {
 
+
+// The BF16 elements of the scratch a contraction lends its tile epilogue: its own count (the staging ring's
+// stage), or the barrier-synchronised kernels' activation tile.
+template <class Schedule>
+inline constexpr int q5_tile_scratch_elements = [] {
+    if constexpr (requires { Schedule::kScratchElements; }) {
+        return static_cast<int>(Schedule::kScratchElements);
+    } else {
+        return Schedule::kBlockTokens * Schedule::kBlockK;
+    }
+}();
 
 // This Op keeps its vectorized collective finish and its BF16 projection
 // materialization. The contraction only lends scratch and fully reduced fragments.
@@ -26,7 +39,7 @@ struct Q5LinearAddTileEpilogue {
                 int token_begin, int rows, int token_end) const {
         constexpr int R = Schedule::kBlockRows;
         constexpr int T = Schedule::kBlockTokens;
-        static_assert(R <= Schedule::kBlockK && R % 8 == 0);
+        static_assert(R * T <= q5_tile_scratch_elements<Schedule> && R % 8 == 0);
         const int tid        = int(threadIdx.x);
         const int warp       = tid >> 5;
         const int lane       = tid & 31;
@@ -84,13 +97,16 @@ struct Q5LinearAddTileEpilogue {
     }
 };
 
-template <class Schedule>
-void launch_route(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
-    launch_q5_a16_mma<Schedule>(
-        q5_linear_operands(x, w),
+// The wide route: the staging ring (ops/linear/common/rowsplit_ring_linear.cuh) with this Op's tile epilogue.
+template <class Epilogue>
+void launch_ring(const Tensor& x, const Weight& w, Tensor& residual_out, Epilogue epilogue, cudaStream_t stream) {
+    const Q5LinearOperands p = q5_linear_operands(x, w);
+    validate_q5_operands(p);
+    launch_rowsplit_ring_linear<Q5RingFormat, RowSplitRingTile128, kRowSplitRingStages, kRowSplitRingProducerWarps>(
+        p.x, Q5RingFormat::Weights{p.codes, p.high, p.scales}, p.rows, p.k, p.padded_k, p.tokens,
         LinearBf16StridedOutput{static_cast<__nv_bfloat16*>(residual_out.data),
                                 std::int64_t(residual_out.nb[1] / sizeof(__nv_bfloat16)), 0},
-        Q5LinearAddTileEpilogue{}, stream);
+        epilogue, stream);
 }
 
 template <class Schedule>
@@ -112,8 +128,12 @@ void q5_linear_add_mma_r32_t128_launch(const Tensor& x, const Weight& w, Tensor&
     launch_pointwise<q5_instances::MmaR32T128>(x, w, residual, stream);
 }
 
-void q5_linear_add_mma_r64_t128_launch(const Tensor& x, const Weight& w, Tensor& residual,
-                                       cudaStream_t stream) {
-    launch_route<q5_instances::MmaR64T128>(x, w, residual, stream);
+void q5_linear_add_ring_t128_launch(const Tensor& x, const Weight& w, Tensor& residual,
+                                    cudaStream_t stream) {
+    // RTX 5090, q5_linear_add_bench (CUDA graph, cold L2, A B B A, equal output hashes), against the 64-row MMA
+    // tile this route ran before, K = 17408 / K = 6144: 384 columns -4.8 / -5.8 %, 512 -6.0 / -7.3 %, 896 -5.2 /
+    // -5.6 %, 1,024 -5.5 / -6.5 %, 2,048 -6.8 / -6.6 %, 4,096 -7.5 / -6.9 %, 8,192 -7.6 / -7.7 % (2026-11-10). The
+    // 161-256 column route (32-row tiles) measured 18-26 % slower on the ring and keeps its kernel.
+    launch_ring(x, w, residual, Q5LinearAddTileEpilogue{}, stream);
 }
 } // namespace infernix::ops::detail
