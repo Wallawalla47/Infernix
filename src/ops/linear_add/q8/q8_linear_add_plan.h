@@ -26,7 +26,7 @@ enum class Q8LinearAddScheduleId {
     MmaR48C128,
     MmaR64C96,
     MmaR64C112,
-    MmaR64C128,
+    WideC128,
     MmaR128C64,
     MmaR128C80,
     // Request-invariant exact route of [2048,4096]: one sliced-K reduction at every width.

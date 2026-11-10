@@ -23,7 +23,7 @@ constexpr std::array<RouteSpec, 4> kTargetRoutes{{
     {1, 1, Q8AttnInputScheduleId::DecodeR8Direct},
     {2, 64, Q8AttnInputScheduleId::SplitKMmaDirect},
     {65, 128, Q8AttnInputScheduleId::MmaR32C128},
-    {129, kAnyCols, Q8AttnInputScheduleId::MmaR64C128},
+    {129, kAnyCols, Q8AttnInputScheduleId::WideC128},
 }};
 
 constexpr std::array<RouteSpec, 9> kCompanionRoutes{{
@@ -32,10 +32,10 @@ constexpr std::array<RouteSpec, 9> kCompanionRoutes{{
     {97, 192, Q8AttnInputScheduleId::MmaR32C64},
     {193, 288, Q8AttnInputScheduleId::MmaR64C96},
     {289, 320, Q8AttnInputScheduleId::MmaR64C64},
-    {321, 384, Q8AttnInputScheduleId::MmaR64C128},
+    {321, 384, Q8AttnInputScheduleId::WideC128},
     {385, 448, Q8AttnInputScheduleId::MmaR128C64},
     {449, 560, Q8AttnInputScheduleId::MmaR128C80},
-    {561, kAnyCols, Q8AttnInputScheduleId::MmaR64C128},
+    {561, kAnyCols, Q8AttnInputScheduleId::WideC128},
 }};
 
 constexpr std::array<RouteSpec, 6> kDFlash2Routes{{
@@ -112,8 +112,8 @@ const char* q8_attn_input_schedule_name(Q8AttnInputScheduleId schedule) noexcept
         return "attn_input_proj.q8.mma.r64.c64";
     case Q8AttnInputScheduleId::MmaR64C96:
         return "attn_input_proj.q8.mma.r64.c96";
-    case Q8AttnInputScheduleId::MmaR64C128:
-        return "attn_input_proj.q8.mma.r64.c128";
+    case Q8AttnInputScheduleId::WideC128:
+        return "attn_input_proj.q8.wide.c128";
     case Q8AttnInputScheduleId::MmaR128C64:
         return "attn_input_proj.q8.mma.r128.c64";
     case Q8AttnInputScheduleId::MmaR128C80:
@@ -191,7 +191,7 @@ void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, co
         case Q8AttnInputScheduleId::MmaR32C128:
             q8_attn_input_n17408_mma_r32_c128_launch(x, weight, q, gate, k, v, stream);
             return;
-        case Q8AttnInputScheduleId::MmaR64C128:
+        case Q8AttnInputScheduleId::WideC128:
             q8_attn_input_n17408_mma_r64_c128_launch(x, weight, q, gate, k, v, stream);
             return;
         default:
@@ -214,8 +214,8 @@ void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, co
     case Q8AttnInputScheduleId::MmaR32C128:
         q8_attn_input_mma_r32_c128_launch(x, weight, q, gate, k, v, stream);
         return;
-    case Q8AttnInputScheduleId::MmaR64C128:
-        q8_attn_input_mma_r64_c128_launch(x, weight, q, gate, k, v, stream);
+    case Q8AttnInputScheduleId::WideC128:
+        q8_attn_input_wide_c128_launch(x, weight, q, gate, k, v, stream);
         return;
     case Q8AttnInputScheduleId::MmaR32C64:
     case Q8AttnInputScheduleId::MmaR64C64:
@@ -304,8 +304,8 @@ void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, co
     case Q8AttnInputScheduleId::MmaR128C80:
         q8_companion_attn_input_mma_r128_c80_launch(x, weight, q, k, v, stream);
         return;
-    case Q8AttnInputScheduleId::MmaR64C128:
-        q8_attn_input_mma_r64_c128_launch(x, weight, q, k, v, stream);
+    case Q8AttnInputScheduleId::WideC128:
+        q8_attn_input_wide_c128_launch(x, weight, q, k, v, stream);
         return;
     case Q8AttnInputScheduleId::DFlash2SmallT:
     case Q8AttnInputScheduleId::DFlash2MmaR32C64:

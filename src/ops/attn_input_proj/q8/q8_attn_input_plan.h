@@ -18,7 +18,7 @@ enum class Q8AttnInputScheduleId {
     MmaR32C128,
     MmaR64C64,
     MmaR64C96,
-    MmaR64C128,
+    WideC128,
     MmaR128C64,
     MmaR128C80,
     DFlash2SmallT,

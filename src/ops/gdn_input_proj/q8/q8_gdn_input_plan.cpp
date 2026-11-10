@@ -21,7 +21,7 @@ struct RouteSpec {
 constexpr std::array<RouteSpec, 3> kRoutes{{
     {1, 1, Q8GdnInputScheduleId::DecodeR8Direct},
     {2, 96, Q8GdnInputScheduleId::SplitKMmaDirect},
-    {97, kAnyCols, Q8GdnInputScheduleId::MmaR64C128},
+    {97, kAnyCols, Q8GdnInputScheduleId::WideC128},
 }};
 
 constexpr bool catalog_is_closed() {
@@ -48,8 +48,8 @@ const char* q8_gdn_input_schedule_name(Q8GdnInputScheduleId schedule) noexcept {
         return "gdn_input_proj.q8.decode.r8.direct.k2048.split2";
     case Q8GdnInputScheduleId::SplitKMmaDirect:
         return "gdn_input_proj.q8.mma.splitk.direct.k2048";
-    case Q8GdnInputScheduleId::MmaR64C128:
-        return "gdn_input_proj.q8.mma.r64.c128.split2";
+    case Q8GdnInputScheduleId::WideC128:
+        return "gdn_input_proj.q8.wide.c128";
     case Q8GdnInputScheduleId::ColumnInvariant:
         return "gdn_input_proj.q8.mma.splitk.column_invariant";
     }
@@ -111,8 +111,8 @@ void q8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, T
     case Q8GdnInputScheduleId::SplitKMmaDirect:
         q8_gdn_input_splitk_mma_launch(x, weight, qkv, z, stream);
         return;
-    case Q8GdnInputScheduleId::MmaR64C128:
-        q8_gdn_input_mma_r64_c128_launch(x, weight, qkv, z, stream);
+    case Q8GdnInputScheduleId::WideC128:
+        q8_gdn_input_wide_c128_launch(x, weight, qkv, z, stream);
         return;
     }
     throw std::logic_error("Q8 GDN input: unknown schedule");

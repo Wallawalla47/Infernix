@@ -4,7 +4,7 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
-#include "ops/linear/q8/q8_mma_launch.cuh"
+#include "ops/linear/q8/q8_wide_launch.cuh"
 
 #include <cstdint>
 
@@ -129,10 +129,13 @@ void q8_linear_add_mma_r64_c112_launch(const Tensor& x, const Weight& w, Tensor&
     launch_variant<Schedule>(x, w, residual_out, stream);
 }
 
-void q8_linear_add_mma_r64_c128_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
+void q8_linear_add_wide_c128_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                        cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>;
-    launch_variant<Schedule>(x, w, residual_out, stream);
+    launch_q8_a16_wide<Schedule>(
+        q8_linear_operands(x, w),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(residual_out.data), residual_out.ne[0]},
+        Q8AddMmaEpilogue{}, kQ8AddRingMinTokens, stream);
 }
 
 void q8_linear_add_mma_r128_c64_launch(const Tensor& x, const Weight& w, Tensor& residual_out,

@@ -60,6 +60,16 @@ void rowsplit_ring_linear_kernel(const __nv_bfloat16* __restrict__ x, typename F
         __syncthreads();
         epilogue.template finish_tile<Schedule, Full>(output, reinterpret_cast<__nv_bfloat16*>(Ring::storage()), acc,
                                                       row0, token_begin + col0, rows, token_begin + cols);
+    } else if constexpr (requires {
+                             epilogue.template finish_tile<Schedule, Full>(output, static_cast<unsigned char*>(nullptr),
+                                                                           acc, row0, token_begin + col0, rows,
+                                                                           token_begin + cols);
+                         }) {
+        // A tile epilogue that takes the whole ring as raw scratch (the Q8 residual add's FP32 tile).
+        static_assert(Ring::kSharedBytes >= BM * BN * static_cast<int>(sizeof(float)));
+        __syncthreads();
+        epilogue.template finish_tile<Schedule, Full>(output, Ring::storage(), acc, row0, token_begin + col0, rows,
+                                                      token_begin + cols);
     } else {
         const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
         const int wm = warp / Tile::WARPS_N, wn = warp % Tile::WARPS_N;

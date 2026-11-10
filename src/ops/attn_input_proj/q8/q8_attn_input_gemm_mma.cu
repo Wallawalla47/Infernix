@@ -3,7 +3,7 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
-#include "ops/linear/q8/q8_mma_launch.cuh"
+#include "ops/linear/q8/q8_wide_launch.cuh"
 
 namespace infernix::ops::detail {
 namespace {
@@ -32,14 +32,15 @@ void q8_attn_input_mma_r32_c128_launch(const Tensor& x, const Weight& weight, Te
     launch_route<Schedule, kTargetRows>(x, weight, output, stream);
 }
 
-void q8_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,
+void q8_attn_input_wide_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                        Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>;
     static_assert((4096 % Schedule::kBlockRows) == 0 && (512 % Schedule::kBlockRows) == 0);
     const TargetOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
-    launch_route<Schedule, kTargetRows>(x, weight, output, stream);
+    launch_q8_a16_wide<Schedule>(q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, kQ8InputRingMinTokens,
+                                 stream);
 }
 
 void q8_attn_input_mma_r32_c128_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
@@ -52,14 +53,15 @@ void q8_attn_input_mma_r32_c128_launch(const Tensor& x, const Weight& weight, Te
     launch_route<Schedule, kCompanionRows>(x, weight, output, stream);
 }
 
-void q8_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
+void q8_attn_input_wide_c128_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
                                        Tensor& v, cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>;
     static_assert((4096 % Schedule::kBlockRows) == 0 && (1024 % Schedule::kBlockRows) == 0);
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-    launch_route<Schedule, kCompanionRows>(x, weight, output, stream);
+    launch_q8_a16_wide<Schedule>(q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, kQ8InputRingMinTokens,
+                                 stream);
 }
 
 void q8_companion_attn_input_mma_r32_c64_launch(const Tensor& x, const Weight& weight, Tensor& q,

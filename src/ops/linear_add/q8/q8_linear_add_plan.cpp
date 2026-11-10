@@ -24,7 +24,7 @@ constexpr std::array<RouteSpec, 5> kK4096Routes{{
     {2, 48, Q8LinearAddScheduleId::SplitKMmaExactT},
     {49, 128, Q8LinearAddScheduleId::MediumSplitK},
     {129, 640, Q8LinearAddScheduleId::MmaR32C128},
-    {641, kAnyCols, Q8LinearAddScheduleId::MmaR64C128},
+    {641, kAnyCols, Q8LinearAddScheduleId::WideC128},
 }};
 
 constexpr std::array<RouteSpec, 33> kK6144Routes{{
@@ -47,20 +47,20 @@ constexpr std::array<RouteSpec, 33> kK6144Routes{{
     {785, 896, Q8LinearAddScheduleId::MmaR48C128},
     {897, 960, Q8LinearAddScheduleId::MmaR64C96},
     {961, 1023, Q8LinearAddScheduleId::MmaR64C112},
-    {1024, 1024, Q8LinearAddScheduleId::MmaR64C128},
+    {1024, 1024, Q8LinearAddScheduleId::WideC128},
     {1025, 1120, Q8LinearAddScheduleId::MmaR64C112},
-    {1121, 1280, Q8LinearAddScheduleId::MmaR64C128},
+    {1121, 1280, Q8LinearAddScheduleId::WideC128},
     {1281, 1344, Q8LinearAddScheduleId::MmaR128C64},
     {1345, 1408, Q8LinearAddScheduleId::MmaR48C128},
     {1409, 1680, Q8LinearAddScheduleId::MmaR128C80},
     {1681, 1791, Q8LinearAddScheduleId::MmaR48C128},
-    {1792, 1792, Q8LinearAddScheduleId::MmaR64C128},
+    {1792, 1792, Q8LinearAddScheduleId::WideC128},
     {1793, 1919, Q8LinearAddScheduleId::MmaR48C128},
-    {1920, 1920, Q8LinearAddScheduleId::MmaR64C128},
+    {1920, 1920, Q8LinearAddScheduleId::WideC128},
     {1921, 2016, Q8LinearAddScheduleId::MmaR64C96},
     {2017, 2047, Q8LinearAddScheduleId::MmaR64C112},
-    {2048, 2048, Q8LinearAddScheduleId::MmaR64C128},
-    {2049, kAnyCols, Q8LinearAddScheduleId::MmaR64C128},
+    {2048, 2048, Q8LinearAddScheduleId::WideC128},
+    {2049, kAnyCols, Q8LinearAddScheduleId::WideC128},
 }};
 
 constexpr std::array<RouteSpec, 2> kN5120Routes{{
@@ -101,7 +101,7 @@ std::int32_t schedule_rows(Q8LinearAddScheduleId schedule) {
         return 48;
     case Q8LinearAddScheduleId::MmaR64C96:
     case Q8LinearAddScheduleId::MmaR64C112:
-    case Q8LinearAddScheduleId::MmaR64C128:
+    case Q8LinearAddScheduleId::WideC128:
         return 64;
     case Q8LinearAddScheduleId::MmaR128C64:
     case Q8LinearAddScheduleId::MmaR128C80:
@@ -140,7 +140,7 @@ std::int32_t schedule_cols(Q8LinearAddScheduleId schedule) {
         return 112;
     case Q8LinearAddScheduleId::MmaR32C128:
     case Q8LinearAddScheduleId::MmaR48C128:
-    case Q8LinearAddScheduleId::MmaR64C128:
+    case Q8LinearAddScheduleId::WideC128:
         return 128;
     case Q8LinearAddScheduleId::SplitKMmaExactT:
     case Q8LinearAddScheduleId::SplitKMmaCapacity:
@@ -187,8 +187,8 @@ const char* q8_linear_add_schedule_name(Q8LinearAddScheduleId schedule) noexcept
         return "linear_add.q8.mma.r64.c96.residual";
     case Q8LinearAddScheduleId::MmaR64C112:
         return "linear_add.q8.mma.r64.c112.residual";
-    case Q8LinearAddScheduleId::MmaR64C128:
-        return "linear_add.q8.mma.r64.c128.k64.wr64.wc16.s2.scale_cache8.lb2";
+    case Q8LinearAddScheduleId::WideC128:
+        return "linear_add.q8.wide.c128";
     case Q8LinearAddScheduleId::MmaR128C64:
         return "linear_add.q8.mma.r128.c64.residual";
     case Q8LinearAddScheduleId::MmaR128C80:
@@ -305,8 +305,8 @@ void q8_linear_add_execute_plan(const Q8LinearAddPlan& plan, const Tensor& x, co
             case Q8LinearAddScheduleId::MmaR64C112:
                 q8_linear_add_mma_r64_c112_launch(x_slice, w, residual_slice, stream);
                 return;
-            case Q8LinearAddScheduleId::MmaR64C128:
-                q8_linear_add_mma_r64_c128_launch(x_slice, w, residual_slice, stream);
+            case Q8LinearAddScheduleId::WideC128:
+                q8_linear_add_wide_c128_launch(x_slice, w, residual_slice, stream);
                 return;
             case Q8LinearAddScheduleId::MmaR128C64:
                 q8_linear_add_mma_r128_c64_launch(x_slice, w, residual_slice, stream);
