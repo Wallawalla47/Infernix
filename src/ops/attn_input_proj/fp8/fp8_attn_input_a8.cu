@@ -8,6 +8,7 @@ namespace {
 using Tma64x128 = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
 using Tma64x256 = Fp8A8TmaMmaSchedule<64, 256, 128, 2, 4, 2, 1>;
 using Tma96x256 = Fp8A8TmaMmaSchedule<96, 256, 128, 3, 4, 2, 1>;
+using Tma192x128 = Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1>;
 using Bulk      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
 
 } // namespace
@@ -59,6 +60,9 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
     if (x.ne[1] <= 192) return launch.template operator()<Tma64x256>();
     // Three 96-token tiles give 168 CTAs: one almost-full wave through T=288.
     if (x.ne[1] <= 288) return launch.template operator()<Tma96x256>();
+    // Three 192-token tiles: 152-154 against 167-172 us for five 128-token ones (RTX 5090, 2026-11-10; no
+    // split-K tail either way, so the same bits).
+    if (x.ne[1] > 512 && x.ne[1] <= 576) return launch.template operator()<Tma192x128>();
     launch.template operator()<Bulk>();
 }
 } // namespace infernix::ops::detail
