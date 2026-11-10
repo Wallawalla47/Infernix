@@ -86,10 +86,8 @@ void launch_ring(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
     });
 }
 
-} // namespace
-
-void q4_linear_swiglu_mma_ring_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                               cudaStream_t stream) {
+// Whole and partly filled ring tiles only.
+void launch_ring_tiles(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     // RTX 5090, q4_linear_swiglu_bench ([34816, 5120], CUDA graph, cold L2, A B B A, the same output hashes at
     // every width), against the 64-row plain tiles this route ran before (2026-11-10): 136 columns -10.7 %, 160
     // -8.4 %, 225 -5.5 %, 256 -5.5 %, 400 -8.1 %, 512 -8.5 %, 768 -12.7 %, 896 -10.1 %, 1,000 -14.3 %, 1,024 -13.2 %,
@@ -100,29 +98,38 @@ void q4_linear_swiglu_mma_ring_r64_c128_launch(const Tensor& x, const Weight& we
     launch_ring<GateUpRingCfg, kGateUpRingStages, kGateUpRingProducerWarps>(x, weight, out, stream);
 }
 
-void q4_linear_swiglu_mma_ring_r64_c128_tail_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                                    cudaStream_t stream) {
-    // The ring tile is 128 columns wide, so a wider extent is served by several of them in one
-    // multi-column-tile launch. A remainder of at most kNarrowTailCols columns measured cheaper on
-    // the narrow routes (against the 64-row plain tile this route ran before) than a second 128-wide
-    // tile that would be almost entirely empty, so that remainder is launched on its own; any wider
-    // remainder keeps the single wide launch.
-    constexpr std::int32_t kBlockCols     = GateUpRingCfg::BN;
+} // namespace
+
+void q4_linear_swiglu_mma_ring_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                               cudaStream_t stream) {
+    // The ring tile is 128 columns wide and a ring CTA decodes its rows' weights however few of its columns are
+    // live, so a column tile holding a short remainder costs a whole tile: one or two more waves of the launch
+    // (272 row tiles a column tile on 170 SMs). A remainder of at most kExactTailCols columns is cheaper on the
+    // narrow routes at every width, and one of up to kNarrowTailCols is where its tile would add two waves; any
+    // other remainder stays in the ring launch. RTX 5090, q4_linear_swiglu_bench, against the ring alone
+    // (2026-11-10): remainders of 8 / 16 / 24 columns after 3 ring tiles -22.5 / -20.1 / -17.6 %, after 5 -16.0
+    // / -14.5 / -12.7 %, after 8 -11.2 / -10.2 / -9.0 %, after 16 -6.4 % (8) and -5.2 % (24), after 28 -4.4 /
+    // -3.9 / -3.6 %; remainders of 25-40 columns after 3 tiles -11.5 %, after 5 -8.5 % (two waves each), after
+    // 2, 4 and 7 tiles +0.2 .. +2.8 % (one wave: they stay in the ring launch). The narrow routes' columns do
+    // not have the ring's bits (another summation order).
+    constexpr std::int32_t kBlockCols      = GateUpRingCfg::BN;
     constexpr std::int32_t kNarrowTailCols = 40;
     constexpr std::int32_t kExactTailCols  = 24;
 
     const std::int32_t tokens = x.ne[1];
     const std::int32_t blocks = tokens / kBlockCols;
     const std::int32_t tail   = tokens - blocks * kBlockCols;
-    if (blocks == 0 || tail == 0 || tail > kNarrowTailCols) {
-        q4_linear_swiglu_mma_ring_r64_c128_launch(x, weight, out, stream);
+    const std::int64_t rows   = div_up(out.ne[0], GateUpRingCfg::BM / 2);
+    const bool two_waves      = blocks > 0 && rowsplit_ring_waves(rows * (blocks + 1)) - rowsplit_ring_waves(rows * blocks) >= 2;
+    if (blocks == 0 || tail == 0 || tail > (two_waves ? kNarrowTailCols : kExactTailCols)) {
+        launch_ring_tiles(x, weight, out, stream);
         return;
     }
 
     const std::int32_t wide_cols = blocks * kBlockCols;
     const Tensor x_wide = x.slice(1, 0, wide_cols);
     Tensor out_wide     = out.slice(1, 0, wide_cols);
-    q4_linear_swiglu_mma_ring_r64_c128_launch(x_wide, weight, out_wide, stream);
+    launch_ring_tiles(x_wide, weight, out_wide, stream);
     const Tensor x_tail = x.slice(1, wide_cols, tail);
     Tensor out_tail     = out.slice(1, wide_cols, tail);
     if (tail == 1) {

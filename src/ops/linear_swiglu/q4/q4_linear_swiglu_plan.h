@@ -16,7 +16,6 @@ enum class Q4LinearSwiGluScheduleId {
     SmallTTiled,
     Materialized,
     MmaRingR64C128,
-    MmaRingR64C128Tail,
     W4A8, // the q4-w4a8 fast path (LinearRoutes::Q4W4A8)
     // LinearPolicy::A16ColumnInvariant: the small-T sliced-K family (8 K-warps, pairwise reduction) at
     // every width, its 8-column instance for one column and 32-column slices beyond 32, so a column's

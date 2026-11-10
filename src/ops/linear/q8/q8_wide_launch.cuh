@@ -25,12 +25,7 @@ inline constexpr std::int32_t kQ8AddRingMinTokens   = 1024;
 // 4,096 columns: 512 CTAs on 170 SMs, three waves and two CTAs, +5.8 % against the MMA tile; 3,584 columns,
 // 448 CTAs, -6.5 %).
 inline bool q8_ring_fills_waves(std::int32_t rows, std::int32_t tokens) {
-    static const int sms = [] {
-        int device = 0, count = 0;
-        CUDA_CHECK(cudaGetDevice(&device));
-        CUDA_CHECK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
-        return count;
-    }();
+    const int sms = rowsplit_ring_sms();
     const int ctas = div_up(rows, RowSplitRingTile128::BM) * div_up(tokens, RowSplitRingTile128::BN);
     const int tail = ctas % sms;
     return tail == 0 || tail * 4 >= sms || ctas / sms >= 8;

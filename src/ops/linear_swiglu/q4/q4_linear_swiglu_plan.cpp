@@ -39,17 +39,21 @@ struct RouteSpec {
 
 constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
-constexpr std::array<RouteSpec, 10> kRoutes{{
+// RTX 5090, q4_linear_swiglu_bench (CUDA graph, cold L2, A B B A), the ring route against Materialized at the
+// widths that ran Materialized before (2026-11-10): 33-80 columns +55 .. +14 % and 84-92 level (Materialized
+// stays), 96 -2.8 %, 100-112 -8 .. -9 %, 120-128 -3 .. -5 %; 169-192 +9 % (stays); 193-223 -3.0 .. -4.4 %; 224
+// +0.4 % (stays: two whole 112-column tiles); 257-280 -14 .. -8 %, 281-384 -2 .. -5 %; 513-536 -13 .. -8 %,
+// 537-640 -3 .. -5 %. Materialized rounds gate and up to BF16 before SiLU(gate) * up and the fused kernels keep
+// them in FP32, so a width's bits differ between the two routes.
+constexpr std::array<RouteSpec, 8> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
     {{2, 32}, Q4LinearSwiGluScheduleId::SmallTTiled},
-    {{33, 128}, Q4LinearSwiGluScheduleId::Materialized},
-    {{129, 168}, Q4LinearSwiGluScheduleId::MmaRingR64C128Tail},
-    {{169, 224}, Q4LinearSwiGluScheduleId::Materialized},
-    {{225, 256}, Q4LinearSwiGluScheduleId::MmaRingR64C128},
-    {{257, 384}, Q4LinearSwiGluScheduleId::Materialized},
-    {{385, 512}, Q4LinearSwiGluScheduleId::MmaRingR64C128},
-    {{513, 640}, Q4LinearSwiGluScheduleId::Materialized},
-    {{641, kAnyCols}, Q4LinearSwiGluScheduleId::MmaRingR64C128},
+    {{33, 95}, Q4LinearSwiGluScheduleId::Materialized},
+    {{96, 168}, Q4LinearSwiGluScheduleId::MmaRingR64C128},
+    {{169, 192}, Q4LinearSwiGluScheduleId::Materialized},
+    {{193, 223}, Q4LinearSwiGluScheduleId::MmaRingR64C128},
+    {{224, 224}, Q4LinearSwiGluScheduleId::Materialized},
+    {{225, kAnyCols}, Q4LinearSwiGluScheduleId::MmaRingR64C128},
 }};
 
 constexpr bool catalog_is_closed() noexcept {
@@ -103,8 +107,6 @@ const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) no
         return "linear_swiglu.q4.materialized";
     case Q4LinearSwiGluScheduleId::MmaRingR64C128:
         return "linear_swiglu.q4.mma.ring.r64.c128";
-    case Q4LinearSwiGluScheduleId::MmaRingR64C128Tail:
-        return "linear_swiglu.q4.mma.ring.r64.c128.narrow_tail";
     case Q4LinearSwiGluScheduleId::W4A8:
         return "linear_swiglu.q4.w4a8.mma_s8";
     case Q4LinearSwiGluScheduleId::SmallTTiledColumnInvariant:
@@ -139,7 +141,6 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
         case Q4LinearSwiGluScheduleId::GemvPair:
         case Q4LinearSwiGluScheduleId::SmallTTiled:
         case Q4LinearSwiGluScheduleId::MmaRingR64C128:
-        case Q4LinearSwiGluScheduleId::MmaRingR64C128Tail:
             return plan;
         case Q4LinearSwiGluScheduleId::Materialized:
             plan.workspace_bytes = materialized_workspace_bytes(problem.gate_up_rows, problem.cols);
@@ -214,9 +215,6 @@ void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor&
     }
     case Q4LinearSwiGluScheduleId::MmaRingR64C128:
         q4_linear_swiglu_mma_ring_r64_c128_launch(x, w, out, stream);
-        return;
-    case Q4LinearSwiGluScheduleId::MmaRingR64C128Tail:
-        q4_linear_swiglu_mma_ring_r64_c128_tail_launch(x, w, out, stream);
         return;
     case Q4LinearSwiGluScheduleId::W4A8:
         q4_linear_swiglu_w4a8_launch(x, w, out, ws, stream);

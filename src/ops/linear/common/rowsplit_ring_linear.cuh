@@ -25,8 +25,25 @@ namespace infernix::ops::detail {
 // The tile every ring linear runs unless its own sweep says otherwise: 128 weight rows x 128 tokens a CTA, sixteen
 // MMA warps of 64 rows x 16 tokens, three stages, four producer warps (98.4 KB of shared memory: one CTA an SM).
 using RowSplitRingTile128 = GemmCfg<128, 128, 64, 64, 16, 2, 1, false, true, false>;
+// Producer warps, RTX 5090, 2026-11-10 (end to end, A B B A): two starve the ring (groupwise 27B prefill +9 ..
+// +15 %, the 35B +3 .. +4 %); eight are level on the groupwise 27B and 1.3-2.2 % slower on the 35B.
 inline constexpr int kRowSplitRingStages        = 3;
 inline constexpr int kRowSplitRingProducerWarps = 4;
+
+// The device's SM count: a ring CTA owns its SM, so a launch runs in waves of this many CTAs.
+inline int rowsplit_ring_sms() {
+    static const int sms = [] {
+        int device = 0, count = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
+        return count;
+    }();
+    return sms;
+}
+// The waves a ring launch of `ctas` CTAs takes.
+inline int rowsplit_ring_waves(std::int64_t ctas) {
+    return static_cast<int>((ctas + rowsplit_ring_sms() - 1) / rowsplit_ring_sms());
+}
 
 template <class Format, class Tile, int Stages, int ProducerWarps, bool Full, class Output, class Epilogue>
 __global__ __launch_bounds__(RowSplitRing<Tile, Stages, ProducerWarps>::kThreads, Tile::MIN_BLOCKS)

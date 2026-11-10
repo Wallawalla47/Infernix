@@ -13,10 +13,10 @@ INFERNIX_OP_TEST(linear_swiglu_q4_a16) {
     try {
         // Public numerical cases straddle each registered Q4 implementation interval. They make
         // no assertion about the private route selected for any T.
-        constexpr std::array<std::int32_t, 36> kTokenCases{
-            1,   2,   7,   8,   9,   16,  17,  24,  25,  31,   32,  33,
-            40,  41,  48,  49,  96,  128, 129, 152, 153, 168,  169, 176,
-            192, 224, 225, 256, 257, 384, 385, 512, 513, 640,  641, 1024,
+        constexpr std::array<std::int32_t, 45> kTokenCases{
+            1,   2,   7,   8,   9,   16,  17,  24,  25,  31,  32,  33,  40,  41,  48,
+            49,  95,  96,  128, 129, 152, 153, 168, 169, 176, 192, 193, 223, 224, 225,
+            256, 257, 280, 281, 296, 384, 385, 409, 424, 512, 513, 537, 640, 641, 1024,
         };
         int failures =
             run_profile("LinearSwiGLU Q4_A16",

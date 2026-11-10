@@ -66,6 +66,7 @@ struct Result {
     std::size_t graph_nodes              = 0;
     std::size_t workspace_capacity_bytes = 0;
     std::size_t workspace_peak_bytes     = 0;
+    std::uint64_t output_fnv             = 0; // FNV-1a of the four outputs (the Q4/Q5 case)
 };
 
 struct Measurement {
@@ -282,18 +283,20 @@ void report(const Result& result) {
     std::printf("entry=attn_input_proj format=%-8s policy=%-3s cache=%-4s execution=%-5s "
                 "graph_nodes=%zu T=%4d "
                 "workspace=%9zu capacity=%9zu peak=%9zu median=%9.3f us min=%9.3f us p95=%9.3f us "
-                "logical=%8.1f GB/s math=%8.2f TFLOP/s\n",
+                "logical=%8.1f GB/s math=%8.2f TFLOP/s",
                 result.format, result.policy, cache_name(result.cache),
                 result.graph_nodes ? "graph" : "eager", result.graph_nodes, result.tokens,
                 result.workspace_bytes, result.workspace_capacity_bytes,
                 result.workspace_peak_bytes, result.timing.median_us, result.timing.min_us,
                 result.timing.p95_us, gbps, tflops);
+    if (result.output_fnv != 0) { std::printf(" output_fnv=%016llx", static_cast<unsigned long long>(result.output_fnv)); }
+    std::printf("\n");
 }
 
 void append_result(std::vector<Result>& results, const char* format, const char* policy,
                    std::int32_t tokens, CacheState cache, std::size_t workspace_bytes,
                    std::uint64_t logical_bytes, double useful_flops, Measurement measurement,
-                   std::size_t capacity = 0, std::size_t peak = 0) {
+                   std::size_t capacity = 0, std::size_t peak = 0, std::uint64_t output_fnv = 0) {
     Result result{format,
                   policy,
                   tokens,
@@ -304,7 +307,8 @@ void append_result(std::vector<Result>& results, const char* format, const char*
                   measurement.timing,
                   measurement.graph_nodes,
                   capacity,
-                  peak};
+                  peak,
+                  output_fnv};
     report(result);
     results.push_back(result);
 }
@@ -355,9 +359,15 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t 
             if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
                 (options.cache == CacheMode::Warm && cache != CacheState::Warm))
                 continue;
-            append_result(results, "q4q5", policy, tokens, cache, 0, logical, flops,
-                          measure_public(launch, cache, flush, stream, options.warmup,
-                                         options.repeat, options.graph));
+            const Measurement measured =
+                measure_public(launch, cache, flush, stream, options.warmup, options.repeat, options.graph);
+            std::uint64_t hash = 0xcbf29ce484222325ULL;
+            for (const Tensor* tensor : {&tq, &tg, &tk, &tv}) {
+                std::vector<std::uint8_t> produced(tensor->bytes());
+                bench::read_back(produced.data(), tensor->data, produced.size());
+                for (const std::uint8_t byte : produced) { hash = (hash ^ byte) * 0x100000001b3ULL; }
+            }
+            append_result(results, "q4q5", policy, tokens, cache, 0, logical, flops, measured, 0, 0, hash);
         }
     }
 }
