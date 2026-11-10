@@ -645,8 +645,12 @@ __device__ __forceinline__ void store_split_activation(__nv_bfloat16* high, __nv
 // high + low to about 16 significant bits) that the Q8 down kernel consumes with two MMAs. Rounding
 // code * scale to BF16 before the MMA, or the activation to one BF16, cost about 2^-9 relative per
 // element; the decode route computes both in FP32 (NInfer 610f79e9d).
+// Three CTAs an SM (29.7 KB of shared memory each) and two for the down kernel (46.1 KB): at one CTA an SM, as
+// both were declared before, eight warps had an SM to themselves. RTX 5090, sparse_moe_bench (q4-q5, the whole MoE
+// call, CUDA graph, cold L2, A B B A, same output hash, 2026-11-10): -2.7 .. -4.6 % at 1,024-4,096 tokens, level
+// at 512; the 35B's prefill -1.6 % at 1,024 tokens, -1.7 % at 4,096.
 template <bool Routed, bool Adaptive = false>
-__global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_gate_up_kernel(
+__global__ __launch_bounds__(kExpertThreads, 3) void sparse_moe_prefill_q8_gate_up_kernel(
     const __nv_bfloat16* __restrict__ input, const int* __restrict__ expert_offsets,
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ activation, __nv_bfloat16* __restrict__ activation_low, int tokens,
@@ -1208,7 +1212,7 @@ __global__ __launch_bounds__(ExpertDownRing::kThreads, 1) void sparse_moe_prefil
 // Q8 down: the gate/up kernel's activation high and low planes, each through the exact Q8
 // arithmetic (q8_expert_tile_mma).
 template <bool Routed, bool Adaptive = false>
-__global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_down_kernel(
+__global__ __launch_bounds__(kExpertThreads, 2) void sparse_moe_prefill_q8_down_kernel(
     const __nv_bfloat16* __restrict__ input, const __nv_bfloat16* __restrict__ input_low,
     const int* __restrict__ expert_offsets,
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
