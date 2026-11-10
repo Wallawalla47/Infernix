@@ -57,6 +57,13 @@ Bf16KvCausalPlan make_bf16_kv_causal_plan(int heads, int width, int batch,
     partition.capacity = std::max(
         partition.interval_capacity(low, std::min(visible, 32767), partition.normal_target),
         partition.interval_capacity(std::max(low, 32768), visible, partition.long_target));
+    // Batch-coupled rows of different lengths share the launch's splits by their windows (the other formats'
+    // YD-02): one long row among short ones takes most of them. Equal rows keep the plain count; the
+    // row-invariant partition (the exact route) keeps each row's own. The share group is the call's batch: a
+    // column-invariant round's rows launches hold whole columns of it (causal_softmax_attention.cpp), so a column
+    // shares as its one-column call does. From three rows: two rows measured no gain (131K + 2K keys -0.4 %,
+    // 16K + 4K +3.5 %, 2 x 32K +1.2 %; RTX 5090, 24/4 heads, 2026-11-10).
+    partition.proportional = !envelope.row_invariant_partition && batch > 2 ? batch : 0;
     return {instance, partition, heads, width, batch, envelope};
 }
 

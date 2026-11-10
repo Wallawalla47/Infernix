@@ -72,6 +72,18 @@ __launch_bounds__(Schedule::kThreads) __global__
         if (batch >= batch_size) { return; }
     }
 
+    // A proportional launch: the row's partials start at its first slot and it has its own count, both derived
+    // as the producer derives them (bf16_kv_proportional_row over the same positions).
+    [[maybe_unused]] std::int64_t row_base  = static_cast<std::int64_t>(batch) * split_count;
+    [[maybe_unused]] int proportional_count = 0;
+    if constexpr (MultiBatch) {
+        if (partition.proportional != 0) {
+            int base = 0;
+            bf16_kv_proportional_row(partition, positions, Masked ? valid_columns : nullptr, tokens, batch_size,
+                                     visible_capacity, batch, base, proportional_count);
+            row_base = base;
+        }
+    }
     if constexpr (MultiBatch) { positions += batch * tokens; }
     const int live_columns = Masked ? valid_columns[batch] : tokens;
     int output_column      = token;
@@ -88,17 +100,18 @@ __launch_bounds__(Schedule::kThreads) __global__
 
 
     if constexpr (MultiBatch) {
-        const std::int64_t partial_acc_row = static_cast<std::int64_t>(batch) * Geometry::kHeadDim *
-                                             Geometry::QHeads * tokens * split_count;
-        const std::int64_t partial_stat_row =
-            static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
+        const std::int64_t partial_acc_row  = row_base * Geometry::kHeadDim * Geometry::QHeads * tokens;
+        const std::int64_t partial_stat_row = row_base * Geometry::QHeads * tokens;
         partial_acc += partial_acc_row;
         partial_m += partial_stat_row;
         partial_l += partial_stat_row;
     }
 
     const int window             = causal_row_window(positions[0], tokens, visible_capacity);
-    const int active_split_count = partition.live(window).splits;
+    const int active_split_count =
+        MultiBatch && partition.proportional != 0
+            ? Bf16KvProportionalShares::layout(partition, window, proportional_count).splits
+            : partition.live(window).splits;
 
     __shared__ float weights[Schedule::kThreads], warp_sums[Schedule::kWarps], scalars[2];
     const float head_l = bf16_kv_merge_statistics<Geometry, Schedule>(

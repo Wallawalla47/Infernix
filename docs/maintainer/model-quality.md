@@ -650,7 +650,12 @@ the Engine, and each acts only where the artifact can be request-invariant
   slots between its rows in proportion to their visible keys (each live row at least one), so a long
   row among short ones takes most of them; rows of equal length keep the earlier counts. The kernels
   and their per-split arithmetic are the same; only how many splits a row takes changes, within the
-  range the row-invariant partition and the earlier batch target already span.
+  range the row-invariant partition and the earlier batch target already span. Since 2026-11-10 the
+  BF16 grouped kernel (and so the packed `bf16p` storage's) does the same with its own partition, in
+  calls of three or more rows (two rows measured no gain): the splits the rows would run are shared
+  by their visible keys, a row never more than one split per 64 keys. A round that verifies each
+  column as a one-column call shares among that column's lanes, so a column still equals its
+  one-token decode of the same batch.
 - `adaptive-speculation`: DFlash2 tree tables and controller, and a round's longest n-gram copy,
   set every row's verify width.
 - `free-cache-resume`: prefill splits at taps and sibling boundaries, and resumes from any tap or

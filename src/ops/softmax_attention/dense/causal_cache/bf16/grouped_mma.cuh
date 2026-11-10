@@ -89,7 +89,17 @@ __launch_bounds__(Packed ? S::kThreads + 32 * kBf16pProducerWarps<S> : S::kLaunc
     const int warp_q = warp % S::kWarpsQ, warp_kv = warp / S::kWarpsQ;
     const int head  = S::kFixedWidth ? blockIdx.x : blockIdx.x % G::KVHeads;
     const int tile  = S::kFixedWidth ? 0 : blockIdx.x / G::KVHeads;
-    const int split = blockIdx.y, batch = MultiBatch ? blockIdx.z : 0;
+    // The row and split this CTA serves: grid z and y, or, on a proportional launch, the slot the rows' windows give
+    // it (bf16_kv_proportional_slot); `base` is the row's first partial slot.
+    CausalRowSplit slot{MultiBatch ? static_cast<int>(blockIdx.z) : 0, static_cast<int>(blockIdx.y), 0,
+                        (MultiBatch ? static_cast<int>(blockIdx.z) : 0) * partition.capacity};
+    if (MultiBatch && partition.proportional != 0) {
+        if (!bf16_kv_proportional_slot(partition, positions, Masked ? validity : nullptr, width,
+                                       static_cast<int>(gridDim.z), visible_capacity,
+                                       static_cast<int>(blockIdx.z * gridDim.y + blockIdx.y), slot))
+            return;
+    }
+    const int split = slot.split, batch = slot.row;
     const int row_begin = tile * M, packed_rows = width * G::GroupSize;
     const int live = Masked ? validity[batch] : width;
     q += static_cast<std::int64_t>(batch) * width * D * G::QHeads;
@@ -99,11 +109,9 @@ __launch_bounds__(Packed ? S::kThreads + 32 * kBf16pProducerWarps<S> : S::kLaunc
         input.v += static_cast<std::int64_t>(batch) * width * D * G::KVHeads;
     }
     {
-        partial.acc +=
-            static_cast<std::int64_t>(batch) * width * G::QHeads * D * partition.capacity;
-        partial.maximum +=
-            static_cast<std::int64_t>(batch) * width * G::QHeads * partition.capacity;
-        partial.sum += static_cast<std::int64_t>(batch) * width * G::QHeads * partition.capacity;
+        partial.acc += static_cast<std::int64_t>(slot.base) * width * G::QHeads * D;
+        partial.maximum += static_cast<std::int64_t>(slot.base) * width * G::QHeads;
+        partial.sum += static_cast<std::int64_t>(slot.base) * width * G::QHeads;
     }
     const auto neutral = [&]() {
         for (int i = tid; i < M * (D / 2); i += S::kThreads) {
@@ -120,7 +128,10 @@ __launch_bounds__(Packed ? S::kThreads + 32 * kBf16pProducerWarps<S> : S::kLaunc
     // Masked tail columns count toward the partition, but no key past the live ones is loaded.
     const int first = positions[0], live_end = positions[live - 1] + 1;
     const int window = causal_row_window(first, width, visible_capacity);
-    const auto work  = partition.live(window);
+    // A proportional row runs its count of slots as layout() splits them (a slot past its live splits returns).
+    const auto work = MultiBatch && partition.proportional != 0
+                          ? Bf16KvProportionalShares::layout(partition, window, slot.count)
+                          : partition.live(window);
     if (split >= work.splits) return;
     const int start     = split * work.keys_per_split;
     const int stop      = min(window, start + work.keys_per_split);

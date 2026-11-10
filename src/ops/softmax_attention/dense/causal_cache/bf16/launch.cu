@@ -203,6 +203,7 @@ void bf16_kv_cached_rows_attention(const Tensor& q, const Tensor& positions, con
                                          execution.multiprocessor_count);
     if (!plan.grouped() || q.ne[2] != 1)
         throw std::logic_error("BF16 attention: one-column rows take the grouped route");
+    // The partition stays the call batch's (its share groups are the columns' lanes); the launch holds q.ne[3] rows.
     plan.batch = q.ne[3];
     execute_grouped(q, CausalCachedInput{}, positions, scale, cache, &valid, &rows, nullptr, plan,
                     workspace, out, execution.stream);

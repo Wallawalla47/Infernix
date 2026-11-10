@@ -12,8 +12,10 @@
 // Attention: the same calls on a bf16 cache and a packed cache (physical pages in a scrambled order) on every BF16
 // route - a 700-column prompt (tiled), a 300-column prompt with the bf16-prompt-split envelope, single columns
 // (grouped decode), 4 and 64 columns (grouped), a batch of two sequences with valid columns, a verification tree, 65-96
-// query rows (the packed storage's 96-row tile) with and without a verification tree, and
-// the cached Op on its grouped, tiled and split routes - for the 24/4, 16/2 and 32/2 geometries; and past 16,384 keys
+// query rows (the packed storage's 96-row tile) with and without a verification tree,
+// the cached Op on its grouped, tiled and split routes, and four sequences of very different lengths in one decode
+// and one verification call (the split shares of Bf16KvPartition::proportional) - for the 24/4, 16/2 and 32/2
+// geometries; and past 16,384 keys
 // (the packed prompt route's second segment: suspended and resumed CTA state, with and without the prompt split; the
 // grouped producer warps over hundreds of pages; a 96-row tile whose first 64-row plan tile ends inside a split) for
 // 24/4 and 16/2. The packed outputs meet the bf16 storage's
@@ -521,6 +523,17 @@ void run_attention(int q_heads, int kv_heads, DeviceExecutionView execution) {
     cached(pair, 0, 780, 5, false, 10, g + "cached 5", execution);
     cached(pair, 0, 400, 300, false, 11, g + "cached 300", execution);
     cached(pair, 1, 100, 200, true, 12, g + "cached 200, prompt split", execution);
+    // Four table rows of very different lengths in one call: the batch-coupled partition shares the launch's splits
+    // by the rows' keys (Bf16KvPartition::proportional, calls of three or more rows), so the long row's split count
+    // differs from its own call's. A decode round, then a verification round with partly valid rows.
+    Pair four(q_heads, kv_heads, 24, 4);
+    append_attend(four, 700, {0}, {0}, {}, {}, false, 21, g + "four rows: prompt 700", execution);
+    append_attend(four, 500, {0}, {700}, {}, {}, false, 22, g + "four rows: prompt 500 more", execution);
+    append_attend(four, 300, {1}, {0}, {}, {}, false, 23, g + "four rows: prompt 300", execution);
+    append_attend(four, 40, {2}, {0}, {}, {}, false, 24, g + "four rows: 40 columns", execution);
+    append_attend(four, 1, {0, 1, 2, 3}, {1200, 300, 40, 0}, {}, {}, false, 25, g + "four rows: decode", execution);
+    append_attend(four, 8, {0, 1, 2, 3}, {1201, 301, 41, 1}, {8, 5, 1, 3}, {}, false, 26,
+                  g + "four rows: 8 columns, 8 / 5 / 1 / 3 valid", execution);
 }
 
 // Appends positions [first, first + count) of table row 0 to both caches (no attention), in calls of up to 4,096.

@@ -2870,7 +2870,8 @@ int run_row_invariant_batch_cases(DeviceExecutionView execution, KvCacheStorage 
     return failures + run_column_invariant_cases(execution, storage);
 }
 
-// One row far longer than the others on the batch-coupled partition: INT8, FP8, NVFP4 and K8V4 then share the
+// One row far longer than the others on the batch-coupled partition: BF16 (and its packed storage), INT8, FP8,
+// NVFP4 and K8V4 then share the
 // launch's split slots by the rows' windows (CausalKvPartition::proportional, YD-02), the long row taking most of
 // them, the short and empty rows at least one each; decode and verify widths, a masked row, and graph replays
 // whose live lengths move the shares.

@@ -516,8 +516,13 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             detail::causal_column_table_rows_launch(kv_table_rows, table_rows, width, batch, stream);
             detail::kv_cache_append_batch_launch(k, v, positions, valid_columns, kv_table_rows,
                                                  cache, stream);
-            for (std::int32_t first = 0; first < rows; first += kRowsPerCall) {
-                const std::int32_t count = std::min(kRowsPerCall, rows - first);
+            // BF16 (and its packed storage) shares a launch's splits among a column's lanes (Bf16KvPartition::
+            // proportional), as that column's one-column call does: its launches hold whole columns.
+            const bool whole_columns = cache.storage == KvCacheStorage::BFloat16 ||
+                                       cache.storage == KvCacheStorage::Bf16Packed;
+            const std::int32_t rows_per_call = whole_columns ? kRowsPerCall / batch * batch : kRowsPerCall;
+            for (std::int32_t first = 0; first < rows; first += rows_per_call) {
+                const std::int32_t count = std::min(rows_per_call, rows - first);
                 const Tensor call_q(static_cast<unsigned char*>(staged.q.data) + first * qb,
                                     DType::BF16, {kHeadDim, geometry.query_heads, 1, count});
                 const Tensor call_positions(static_cast<std::int32_t*>(staged.positions.data) + first,
