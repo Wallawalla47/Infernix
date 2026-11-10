@@ -104,10 +104,17 @@ def verify_q8(artifact: Artifact, binding: dict, parameter) -> bool:
         obj = artifact.object(part["object"])
         s, c = decode_row_split_codes(artifact.read_object(obj.id), obj.format, obj.shape)
         begin, end = part.get("range", (0, obj.shape[0] * obj.shape[1]))
-        codes.append(c[begin // k : end // k, : k // 32])
-        scales.append(s[begin // k : end // k, : k // 32])
-    return torch.equal(torch.cat(codes).reshape(n, k // 32, 32), expected.codes) and torch.equal(
-        torch.cat(scales).view(torch.int16), expected.scales.view(torch.int16))
+        codes.append(c[begin // k : end // k])
+        scales.append(s[begin // k : end // k])
+    # The GGUF's own blocks are the first K / 32 groups; a K that is not whole 128-element units (the
+    # hyper-connection up matrices' 320 in Unsloth's GGUFs) is followed by the layout's zero groups.
+    groups = k // 32
+    stored_codes = torch.cat(codes).reshape(n, -1, 32)
+    stored_scales = torch.cat(scales).reshape(n, -1).view(torch.int16)
+    want_scales = expected.scales.reshape(n, -1).view(torch.int16)
+    return (torch.equal(stored_codes[:, :groups], expected.codes[:, :groups])
+            and torch.equal(stored_scales[:, :groups], want_scales[:, :groups])
+            and not bool(stored_codes[:, groups:].any()) and not bool(stored_scales[:, groups:].any()))
 
 
 def main() -> int:
