@@ -41,12 +41,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     __nv_bfloat16* k_s = q_s + Br * D;                            // [Bc, D] swizzled
     __half* v_s        = reinterpret_cast<__half*>(k_s + Bc * D); // [Bc, D] swizzled
 
-    const int q_block = static_cast<int>(blockIdx.x);
-    const int q_head  = static_cast<int>(blockIdx.y);
-    const int tid     = static_cast<int>(threadIdx.x);
-    const int warp    = tid >> 5;
-    const int lane    = tid & 31;
-    const int q0      = q_block * Br;
+    // Longest-first issue order (the INT8, FP8 and MX-FP8 prompt kernels'): the first QHeads CTAs take the last
+    // row block of every head, whose rows see the most keys, so the launch's last wave holds the shortest CTAs.
+    // The same CTAs do the same work, so the same bits; a segmented launch's state stays keyed by block index.
+    const int row_blocks = static_cast<int>(gridDim.x);
+    const int linear     = static_cast<int>(blockIdx.x + blockIdx.y * gridDim.x);
+    const int q_head     = linear % Geometry::QHeads;
+    const int tid        = static_cast<int>(threadIdx.x);
+    const int warp       = tid >> 5;
+    const int lane       = tid & 31;
+    const int q0         = (row_blocks - 1 - linear / Geometry::QHeads) * Br;
     const int kv_head = q_head / Geometry::GroupSize;
     const int tokens  = metadata.valid_tokens(width);
 
