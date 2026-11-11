@@ -404,18 +404,37 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const int tid  = static_cast<int>(threadIdx.x) - Schedule::kProducerThreads;
     const int warp = tid >> 5, lane = tid & 31;
     float carry[Schedule::kMmaTokens][Schedule::kMmaRows][4] = {};
-    for (int kt = 0; kt < tiles_k; ++kt) {
-        const int stage = kt % S;
-        cta_mbarrier_wait(full + stage, (kt / S) & 1U);
-        f16acc_compute_stage<Schedule, Scales>(
-            activation + stage * Schedule::kActivationStageBytes,
-            reinterpret_cast<const std::uint8_t*>(weight + stage * Schedule::kWeightStageBytes),
-            reinterpret_cast<const std::uint8_t*>(scales + stage * Layout::kScaleStageStride), carry, warp, lane);
-        // Release only after every lane in this consumer warp has finished its shared reads; a TMA refill
-        // is an async-proxy write, so each thread first orders its generic-proxy reads before it.
-        if constexpr (kTma) { fence_reads_before_async_refill(); }
-        __syncwarp();
-        if (lane == 0) cta_mbarrier_arrive(empty + stage);
+    const auto consume = [&]<bool Live>(std::bool_constant<Live>) {
+        for (int kt = 0; kt < tiles_k; ++kt) {
+            const int stage = kt % S;
+            cta_mbarrier_wait(full + stage, (kt / S) & 1U);
+            if constexpr (Live) {
+                f16acc_compute_stage<Schedule, Scales>(
+                    activation + stage * Schedule::kActivationStageBytes,
+                    reinterpret_cast<const std::uint8_t*>(weight + stage * Schedule::kWeightStageBytes),
+                    reinterpret_cast<const std::uint8_t*>(scales + stage * Layout::kScaleStageStride), carry,
+                    warp, lane);
+            }
+            // Release only after every lane in this consumer warp has finished its shared reads; a TMA
+            // refill is an async-proxy write, so each thread first orders its generic-proxy reads
+            // before it.
+            if constexpr (kTma) { fence_reads_before_async_refill(); }
+            __syncwarp();
+            if (lane == 0) cta_mbarrier_arrive(empty + stage);
+        }
+    };
+    if constexpr (FullTokens) {
+        consume(std::true_type{});
+    } else {
+        // A partly filled last token tile: a warp whose columns all lie past the call does no
+        // tensor-core work (its sums are never stored; every stored output keeps its K order).
+        const int tokens_left =
+            token_offset + count - token_begin - warp / Schedule::kWarpsRows * Schedule::kWarpTokens;
+        if (tokens_left > 0) {
+            consume(std::true_type{});
+        } else {
+            consume(std::false_type{});
+        }
     }
     // All consumers must finish reading staged inputs before the epilogue reuses the storage.
     __syncthreads();

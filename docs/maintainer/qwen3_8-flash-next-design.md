@@ -13106,6 +13106,13 @@ The first rules (the 128x128 tile at every width past the cut) lost at 704 / 832
 hence the fill conditions. End to end on FP4-Local (cold expert cache, `infernix_bench`): pp2048 -0.12 %, pp8192
 -0.13 %, text identical: the prompt waits on the link, so this is an Op result.
 
+Partly filled last token tiles (2026-11-11): the MXFP8 A16 TMA kernel and the f16-accumulate kernel skip the
+tensor-core work of warps whose columns all lie past the call, as the FP8 A8 TMA kernel does (their sums were
+never stored; same bits). `linear_bench --qtype mxfp8` at widths that are not tile multiples, previous build
+against new: exact route QSA 392 / 520 / 776 columns -8.8 / -16.0 / -3.8 %, GDN input 392 / 648 -6.2 / -11.5 %;
+f16 route GDN input 264-776 -3.0 .. -6.8 %, QSA 520 -10.3 %, outputs 264 / 392 -7 %, shared gate/up 520 / 776
+-7 / -6 %; tile multiples level. FP4-Local end to end level (pp2056 / pp8200 within +-0.6 % over two rounds).
+
 Not a gain: the small BF16 TMA tiles (r64t32, r64t64, r64t128, plain and tail forms, 37-49 KB of shared memory)
 declared at two CTAs an SM instead of the default one. `bf16_flash_next_sweep` on shgu, shdown, hcdown, hcup,
 gdnab and out6144 at 129-8,192 columns: level at every point (single timer ticks in both directions).
