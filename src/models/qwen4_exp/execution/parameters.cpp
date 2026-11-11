@@ -381,10 +381,10 @@ Parameters::Parameters(const Model& source, bool hc_q8) : model(source) {
                               prepare.tensor(g.convolution),
                               prepare.tensor(g.norm),
                               prepare.linear({g.output})};
-            if (c.gdn.output_ggml_tiled) {
-                if (!gdn.output.is_ggml()) {
-                    throw std::invalid_argument("Qwen4Exp: a ggml-tiled GDN output projection must be GGUF blocks");
-                }
+            // GGUF block rows keep their columns in ggml's tiled value-head order and read their input through the
+            // permutation. A native output projection of a GGUF import (Q8_0 in Unsloth's dynamic quants) has its
+            // columns in Hugging Face order: the importer moves its whole 32-column blocks (value_head_columns).
+            if (c.gdn.output_ggml_tiled && gdn.output.is_ggml()) {
                 gdn.output.input_perm = static_cast<const std::int32_t*>(gdn_value_perm_.p);
                 gdn.output.perm_block = static_cast<std::int32_t>(c.gdn.value_head_dim);
             }

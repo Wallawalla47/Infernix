@@ -201,8 +201,11 @@ def test_import_inverts_the_llama_cpp_export(imported):
         matrices += 1
         codes, scales = _q8_0(truth)
         rows = parameter.source.read_encoded(0, parameter.shape[0])
-        assert rows.format == Q8 and np.array_equal(rows.codes.numpy(), codes), name
-        assert np.array_equal(rows.scales.numpy().view(np.uint16), scales.view(np.uint16)), name
+        # The GGUF's own blocks, then the row-split layout's zero groups where K is not whole 128-element units.
+        groups = codes.shape[1]
+        assert rows.format == Q8 and np.array_equal(rows.codes.numpy()[:, :groups], codes), name
+        assert np.array_equal(rows.scales.numpy().view(np.uint16)[:, :groups], scales.view(np.uint16)), name
+        assert not rows.codes[:, groups:].any() and not rows.scales[:, groups:].any(), name
         dequantized = torch.from_numpy(codes.astype(np.float64) * scales.astype(np.float64)[..., None])
         assert torch.equal(parameter.source.values().reshape(parameter.shape), dequantized.reshape(parameter.shape)), name
         # Row windows that straddle the encoded rows' boundaries read the same values.
