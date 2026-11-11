@@ -903,6 +903,8 @@ void launch_decode_pass_ggml(const std::uint16_t* x, const MoeDispatch& dispatch
     if (jobs > kBf16PlanThreads) { throw std::invalid_argument("offloaded_sparse_moe: a BF16 pass plans at most 512 jobs"); }
     constexpr int kGateUpShared = static_cast<int>(sizeof(b::DecodeShared<GU>));
     constexpr int kDownShared   = static_cast<int>(sizeof(b::DecodeShared<D>));
+    static_assert(sizeof(b::DecodeShared<GU>) <= b::kMaxSharedBytes && sizeof(b::DecodeShared<D>) <= b::kMaxSharedBytes,
+                  "the stage-decode tiles' shared memory fits a CTA");
     constexpr int kT = b::kDecodeThreads;
     static const bool configured = [] {
         return cudaFuncSetAttribute(ggml_gate_up_decode<GU, kT>, cudaFuncAttributeMaxDynamicSharedMemorySize,

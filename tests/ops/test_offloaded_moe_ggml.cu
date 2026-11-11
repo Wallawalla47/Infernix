@@ -881,7 +881,17 @@ INFERNIX_OP_TEST(offloaded_moe_ggml) {
         {QType::GGML_IQ2_XXS, QType::GGML_Q5_0}, {QType::GGML_IQ2_XS, QType::GGML_Q5_0},
         {QType::GGML_IQ2_S, QType::GGML_Q5_0}, {QType::GGML_IQ3_XXS, QType::GGML_Q5_0},
         {QType::GGML_IQ3_S, QType::GGML_Q5_0}, {QType::GGML_IQ4_XS, QType::GGML_Q5_0}};
+    // --from N: start at pair N (12: the Q5_0 down pairs alone), with unbuffered output so that an abort shows
+    // the last check that passed.
+    int from = 0;
+    if (argc > 2 && std::strcmp(argv[1], "--from") == 0) {
+        from = std::atoi(argv[2]);
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+    }
+    int index = 0;
     for (const auto& [gu, down] : pairs) {
+        if (index++ < from) { continue; }
+        try {
         // 9, 40 and 300 columns: calls of the wide route (tensor-core tiles for jobs over 8 columns).
         for (const int columns : {1, 3, 9, 40, 300}) { run(gu, down, columns, rng); }
         // The model's scale spread, the per-limb bound's limit, and spreads past it (int128).
@@ -896,6 +906,11 @@ INFERNIX_OP_TEST(offloaded_moe_ggml) {
         run_bf16(gu, down, moe::wide::kGgmlStageDecodeMinColumns + 37, rng);
         // The stage-decode tiles' bits across call widths (4,096 to 16,384 columns) and staged passes.
         run_stage_decode(gu, down, rng);
+        } catch (const std::exception& e) {
+            // A refused launch or a device fault names its pair instead of aborting the suite.
+            std::fprintf(stderr, "error: ggml experts (%d, %d): %s\n", static_cast<int>(gu), static_cast<int>(down), e.what());
+            return 1;
+        }
     }
     if (g_failures != 0) {
         std::fprintf(stderr, "%d ggml expert checks failed\n", g_failures);
