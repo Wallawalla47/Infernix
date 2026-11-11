@@ -158,11 +158,17 @@ std::string make_anthropic_count_tokens_response(int input_tokens);
 class AnthropicMessagesStream {
 public:
     // `searches` are the request's search tools: their calls stream as `server_tool_use` blocks.
+    // `claude_code_usage_compat` (--claude-code-usage-compat) reports the stream's one
+    // `message_start` usage with a provisional 0 `input_tokens` (its cache-read split stays exact);
+    // see ServeOptions. No other event changes, the terminal cumulative usage least of all.
     AnthropicMessagesStream(AnthropicResponseIdentity identity, int input_tokens,
-                            bool hide_thinking = false, std::vector<AnthropicToolSearch> searches = {});
+                            bool hide_thinking = false, std::vector<AnthropicToolSearch> searches = {},
+                            bool claude_code_usage_compat = false);
 
-    // The Engine start event is exact for normal streams. The no-argument form is reserved for an
-    // error raised before admission, so an Anthropic error event still has a valid stream prefix.
+    // The Engine start event is exact for normal streams; with the compat mode above, its
+    // `input_tokens` is the provisional 0 there too, including on this no-argument form, which is
+    // reserved for an error raised before admission, so an Anthropic error event still has a valid
+    // stream prefix.
     std::string start();
     std::string start(const infernix::GenerationStart& generation);
 
@@ -210,6 +216,8 @@ private:
     std::vector<StreamedCall> calls_; // the current generation's streamed calls
     int input_tokens_   = 0;
     bool hide_thinking_ = false;
+    // --claude-code-usage-compat: this stream's message_start carries a provisional 0 input_tokens.
+    bool claude_code_usage_compat_ = false;
     int next_index_     = 0;
     int thinking_index_ = -1;
     int text_index_     = -1;

@@ -567,6 +567,7 @@ int main() {
                                            "--no-prefix-reuse",
                                            "--vision",
                                            "--usage-chunk-choice",
+                                           "--claude-code-usage-compat",
                                            "--max-concurrency",
                                            "4",
                                            "--max-pending-requests",
@@ -603,6 +604,8 @@ int main() {
     failures += check(configured.enable_vision, "--vision did not enable Vision");
     failures += check(configured.usage_chunk_choice,
                       "--usage-chunk-choice did not reach serving options");
+    failures += check(configured.claude_code_usage_compat,
+                      "--claude-code-usage-compat did not reach serving options");
     failures += check(configured.preserve_thinking == true,
                       "--preserve-thinking did not reach serving options");
     failures +=
@@ -1416,6 +1419,26 @@ int main() {
                           std::string::npos,
                       "serve help omits --claude-code-prompt");
 
+    // --claude-code-usage-compat: an explicit opt-in for the affected Claude Code streaming usage
+    // merge. It never turns on through --claude-code-prompt or any other Claude Code option.
+    failures += check(!defaults.claude_code_usage_compat &&
+                          !parse({"infernix-serve", "model.ninfer"}).claude_code_usage_compat,
+                      "--claude-code-usage-compat must be off by default");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--claude-code-usage-compat"})
+                          .claude_code_usage_compat,
+                      "--claude-code-usage-compat did not enable the usage workaround");
+    failures += check(
+        !parse({"infernix-serve", "model.ninfer", "--claude-code-prompt", "local"})
+            .claude_code_usage_compat,
+        "--claude-code-prompt enabled the usage workaround implicitly");
+    failures += check(!parse_error({"infernix-serve", "model.ninfer",
+                                    "--claude-code-usage-compat=local"})
+                           .empty(),
+                      "--claude-code-usage-compat accepted a value");
+    failures += check(serve_usage_text("infernix-serve").find("--claude-code-usage-compat") !=
+                          std::string::npos,
+                      "serve help omits --claude-code-usage-compat");
+
     // --config FILE: options from a TOML file keyed by their long names. The command line
     // overrides the file wherever --config appears, and the file overrides the defaults.
     {
@@ -1427,14 +1450,16 @@ int main() {
                                                  "greedy = true\n"
                                                  "no-thinking = true\n"
                                                  "preserve-thinking = false\n"
-                                                 "claude-code-prompt = \"local\"\n");
+                                                 "claude-code-prompt = \"local\"\n"
+                                                 "claude-code-usage-compat = true\n");
         const ServeOptions from_file = parse({"infernix-serve", "model.ninfer", "--config", config});
         failures += check(from_file.port == 9000 && from_file.max_context == 4096 &&
                               from_file.kv_cache == infernix::KvCacheStorage::Int8Group64 &&
                               from_file.sampling_overrides.temperature == 0.7F &&
                               from_file.greedy && from_file.enable_thinking == false &&
                               !from_file.preserve_thinking.has_value() &&
-                              from_file.claude_code_prompt == ClaudeCodePrompt::Local,
+                              from_file.claude_code_prompt == ClaudeCodePrompt::Local &&
+                              from_file.claude_code_usage_compat,
                           "--config values did not reach serving options");
         failures += check(from_file.host == "127.0.0.1" && from_file.max_concurrency == 1 &&
                               from_file.prefill_chunk == 0,

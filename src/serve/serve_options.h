@@ -176,6 +176,15 @@ struct ServeOptions {
     // OpenAI-conformant empty choices array. Strict client parsers (GitHub Copilot) reject the
     // empty array as "Response contained no choices"; the extra choice is inert for other clients.
     bool usage_chunk_choice = false;
+    // --claude-code-usage-compat: Anthropic streaming only. An affected Claude Code version keeps the
+    // positive `message_start.usage.input_tokens` it saw first even when the terminal
+    // `message_delta` corrects that field to 0 (anthropics/claude-code#103901), so a prompt this
+    // request wrote into the prefix cache is counted twice. Here the start's `input_tokens` is a
+    // provisional 0 instead, and only the terminal `message_delta` carries the exact split; the
+    // start's cache-read split and the Engine's own accounting stay exact. Off by default: a client
+    // that reads the start value for early context warnings or rate limits then sees the prompt's
+    // uncached tokens only once the stream ends.
+    bool claude_code_usage_compat = false;
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;

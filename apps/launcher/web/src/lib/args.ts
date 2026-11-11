@@ -178,6 +178,7 @@ export const KNOWN_SWITCHES: ReadonlySet<string> = new Set([
   "--restore-tool-reasoning",
   "--cors",
   "--usage-chunk-choice",
+  "--claude-code-usage-compat",
   "--greedy",
   "--ngram-native-sessions",
   "--use-original-int8-prefill-kernel",

@@ -1455,7 +1455,12 @@ reusable for a later request (its deepest snapshot within the prompt); as in the
 prompt that publishes nothing, creation is `null`. Streaming emits `message_start` after Engine
 admission commits the prefix selection and before transfer/prefill output, so its cache-read split
 is already exact and creation is still `null` there; terminal cumulative usage matches the aggregate
-response.
+response. `--claude-code-usage-compat` reports that start's `input_tokens` as a provisional `0`
+instead (its cache-read split stays exact, and the terminal usage is unchanged), so a Claude Code
+version that keeps the positive start value after the terminal `message_delta` corrects it to `0`
+cannot count the prompt twice; only the terminal event then carries the uncached count. It is a
+protocol workaround for that client, not a route: it under-reports the prompt while a stream runs,
+so it is off by default and off for every other route and for the non-streaming response.
 
 Every successful Messages response also carries the llama.cpp-compatible top-level `timings`
 object described for [Chat Completions](#llamacpp-compatible-request-observations), with the same
@@ -1859,6 +1864,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--restore-tool-reasoning` | give a Chat Completions tool-call message sent back without reasoning the reasoning this server generated for it (see Chat Completions) | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
+| `--claude-code-usage-compat` | Anthropic streaming only: report a provisional `0` as `message_start`'s `input_tokens` (its cache-read split stays exact, terminal usage unchanged), so a Claude Code version that keeps the start value when the terminal `message_delta` corrects it to `0` cannot count the prompt twice (see [Anthropic Messages](#anthropic-messages)) | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
 | `--top-k N` | process-level top-k override (`0..20`; zero selects the top-20 cap) | unset |
