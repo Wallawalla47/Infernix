@@ -24,7 +24,16 @@ using M32N32K512        = Nvfp4A4MmaSchedule<32, 32, 512, 2, 2, 3, 2>;
 using M32N128           = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
 using M64N128           = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
 using M128N128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
-using M128N128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
+// 129-512 tokens, every tile forced in turn (RTX 5090, cold weights, 2026-11-10; one K order per output, so
+// the same bits). These launches are one wave, so their time is one CTA's K loop:
+//   129-176  64x64 tiles, two stages, two CTAs an SM (240 CTAs): 65-67 against 69 us for 64x128 (K=17408),
+//            30 against 32 us (K=6144)
+//   177-256  64x128 tiles (160 CTAs): 72-75 against 118-122 us for the one-stage 128x128 tile at two CTAs an
+//            SM that 193-256 took before (K=6144: 32-34 against 50)
+//   257-512  the two-stage 128x128 tile (120-160 CTAs): 100-104 against 123-130 us for the one-stage tile at
+//            257-384 (K=6144: 44-46 against 52-55)
+// Smaller tiles at three or four CTAs an SM, K blocks of 128 and the TMA tile below 513 measured slower.
+using M64N64Pair = Nvfp4A4MmaSchedule<64, 64, 256, 2, 2, 2, 2>;
 
 // This projection selects its own route, so the layout the quantizer writes below must be derived
 // from the same predicate; the two are read together at the call site for that reason. Past 512
@@ -53,10 +62,10 @@ void launch_problem(const Weight& weight, Tensor& residual, Nvfp4A4Workspace wor
         launch_gemm<Geometry, M32N64>(weight, residual, workspace, tokens, stream);
     } else if (tokens <= 128) {
         launch_gemm<Geometry, M32N128>(weight, residual, workspace, tokens, stream);
-    } else if (tokens <= 192) {
+    } else if (tokens <= 176) {
+        launch_gemm<Geometry, M64N64Pair>(weight, residual, workspace, tokens, stream);
+    } else if (tokens <= 256) {
         launch_gemm<Geometry, M64N128>(weight, residual, workspace, tokens, stream);
-    } else if (tokens <= 384) {
-        launch_gemm<Geometry, M128N128Resident>(weight, residual, workspace, tokens, stream);
     } else { // at most 512 tokens: larger calls take the TMA route
         launch_gemm<Geometry, M128N128Pipelined>(weight, residual, workspace, tokens, stream);
     }
