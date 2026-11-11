@@ -1906,12 +1906,15 @@ int test_multi_round_cache_creation() {
     two.completion_tokens           = 8;
     two.reused_prompt_tokens        = 52;
     two.cache_created_prompt_tokens = 38;
+    // The second generation found 64 tokens in cached blocks but state to resume after only 52.
+    two.cached_block_tokens = 64;
     GenerationOutcome three;
     three.text                        = "done";
     three.prompt_tokens               = 120;
     three.completion_tokens           = 6;
     three.reused_prompt_tokens        = 90;
     three.cache_created_prompt_tokens = 30;
+    three.cached_block_tokens         = 90;
     const std::vector<ServerToolRound> rounds{ServerToolRound{.outcome = one},
                                               ServerToolRound{.outcome = two}};
     const GenerationOutcome totals = combine_round_outcomes(rounds, three);
@@ -1926,6 +1929,11 @@ int test_multi_round_cache_creation() {
                           response.at("usage").at("input_tokens") == 0 &&
                           response.at("usage").at("output_tokens") == 12 + 8 + 6,
                       "three generations did not sum their cache creation into the response");
+    // The request log compares the response's cached blocks with its reuse: 12 tokens of the
+    // second generation's blocks were prefilled again.
+    failures +=
+        check(totals.reused_prompt_tokens == 52 + 90 && totals.cached_block_tokens == 64 + 90,
+              "three generations did not sum their cached block tokens");
     return failures;
 }
 

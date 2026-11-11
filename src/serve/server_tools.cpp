@@ -30,6 +30,9 @@ GenerationOutcome combine_round_outcomes(std::span<const ServerToolRound> rounds
                 total.cache_created_prompt_tokens.value_or(std::uint32_t{}) +
                 *earlier.cache_created_prompt_tokens;
         }
+        // Each generation's cached blocks are measured against its own reused prefix, so the
+        // response's re-prefilled cached blocks are the summed blocks past the summed reuse.
+        total.cached_block_tokens += earlier.cached_block_tokens;
         total.computed_prefill_tokens += earlier.computed_prefill_tokens;
         total.timings.prepare_seconds += earlier.timings.prepare_seconds;
         total.timings.vision_seconds += earlier.timings.vision_seconds;
