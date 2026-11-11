@@ -19,6 +19,15 @@ GenerationOutcome combine_round_outcomes(std::span<const ServerToolRound> rounds
                          earlier.generated_token_ids.end());
 
         total.reused_prompt_tokens += earlier.reused_prompt_tokens;
+        // Cache creation is one generation's own measurement past that generation's reused prefix
+        // (infernix::GenerationResult), so a continuation's earlier creation sits inside the later
+        // generation's reused prefix and only the sum is the response's. The optional stays unset
+        // when no generation published cache creation.
+        if (earlier.cache_created_prompt_tokens) {
+            total.cache_created_prompt_tokens =
+                total.cache_created_prompt_tokens.value_or(std::uint32_t{}) +
+                *earlier.cache_created_prompt_tokens;
+        }
         total.computed_prefill_tokens += earlier.computed_prefill_tokens;
         total.timings.prepare_seconds += earlier.timings.prepare_seconds;
         total.timings.vision_seconds += earlier.timings.vision_seconds;
