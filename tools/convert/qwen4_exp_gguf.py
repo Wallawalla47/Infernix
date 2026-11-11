@@ -32,7 +32,8 @@ from typing import Mapping
 import numpy as np
 import torch
 
-from tools.artifact.codecs.ggml import BY_GGML_ID, GGML_TYPES, require_finite_scales
+from tools.artifact.codecs.ggml import (BY_GGML_ID, GGML_TYPES, GGUF_BF16, GGUF_F16, GGUF_F32, GGUF_Q8_0,
+                                        require_finite_scales)
 from tools.artifact.layouts import ggml_expert_geometry
 from tools.flash_next.ngram import head_tables, layer_multipliers
 
@@ -41,7 +42,7 @@ from .methods import PrepareRequest, PreparedMethod
 from .model import Model, Parameter
 from .qwen3_5 import vision_config
 from .resources import load_resources
-from .sources.gguf_logical import ggml_or_plain, head_rows, permute_vector, plain
+from .sources.gguf_logical import ggml_or_plain, head_rows, permute_vector, plain, plain_as_q8
 from .sources.gguf_raw import GgufStore
 from .sources.logical import select_rows, transpose_source
 from .sources.safetensors import SafetensorsSource
@@ -185,7 +186,16 @@ class _Builder:
         self.matrix(prefix + "down", gguf_prefix + "down.weight", (rank, width), inputs=(prefix + "input",))
         self.matrix(prefix + "up", gguf_prefix + "up.weight", (width, rank), inputs=(prefix + "mix_activation",))
         if combine:
-            self.matrix(prefix + "inject", gguf_prefix + "inject.weight", (c["hc_count"], width), inputs=(prefix + "input",))
+            # The runtime reads down and inject as one matrix, so they share a parent and a format. Where the
+            # GGUF holds down as Q8_0 and inject as plain values (Unsloth's dynamic quants), inject takes down's
+            # format by the rule the engine applies to a BF16 mixer at load (plain_as_q8); down's blocks stay
+            # the GGUF's own.
+            inject, shape = gguf_prefix + "inject.weight", (c["hc_count"], width)
+            if (self.store.tensor(gguf_prefix + "down.weight").ggml_type == GGUF_Q8_0
+                    and self.store.tensor(inject).ggml_type in (GGUF_F32, GGUF_F16, GGUF_BF16)):
+                self.add(prefix + "inject", plain_as_q8(self.store, inject, shape), inputs=(prefix + "input",))
+            else:
+                self.matrix(prefix + "inject", inject, shape, inputs=(prefix + "input",))
             self.model.packing_groups.append((prefix + "down", prefix + "inject"))
 
     def gdn(self, prefix, blk):

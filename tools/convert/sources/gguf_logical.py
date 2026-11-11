@@ -102,6 +102,41 @@ def plain(store: GgufStore, name: str, shape: tuple[int, ...], *, minus_one: boo
     return LogicalSource(tuple(shape), f"{store.path}:{name}" + (" - 1" if minus_one else ""), read)
 
 
+def plain_as_q8(store: GgufStore, name: str, shape: tuple[int, int]) -> LogicalSource:
+    """An F32/F16/BF16 GGUF matrix as ``q8_g32_fp16`` rows, quantized by the engine's own rule
+    (ops::hyper_connection_repack_q8, in binary32: per 32-element group the FP16 scale fl16(max|v| / 127)
+    and the codes rint(v / scale) clamped to +-127), so it can share a parent with a Q8_0 matrix the
+    runtime reads beside it. Lossy, and the one place this importer re-quantizes a GGUF tensor; the
+    source's values are the quantized ones."""
+
+    source = plain(store, name, shape)
+    n, k = shape
+    if k % 128:
+        raise ValueError(f"{name}: q8_g32_fp16 rows need K in whole 128-element units, K is {k}")
+    cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def rows() -> tuple[torch.Tensor, torch.Tensor]:
+        if not cache:
+            v = source.values().to(torch.float32).numpy().reshape(n, k // 32, 32)
+            s16 = (np.abs(v).max(axis=2) / np.float32(127)).astype(np.float16)
+            s = s16.astype(np.float32)[..., None]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                q = np.where(s > 0, np.rint(v / s), np.float32(0))
+            codes = np.clip(q, -127, 127).astype(np.int8)
+            cache.append((torch.from_numpy(codes), torch.from_numpy(s16)))
+        return cache[0]
+
+    def encoded(begin: int, end: int) -> EncodedRows:
+        codes, scales = rows()
+        return EncodedRows("q8_g32_fp16", codes[begin:end].clone(), scales[begin:end].clone())
+
+    def values(begin: int, end: int) -> torch.Tensor:
+        codes, scales = rows()
+        return (codes.to(torch.float64) * scales.to(torch.float64)[..., None]).reshape(-1)[begin:end]
+
+    return LogicalSource(tuple(shape), f"{store.path}:{name} as q8_g32_fp16", values, encoded)
+
+
 def ggml_or_plain(store: GgufStore, name: str, shape: tuple[int, int]) -> LogicalSource:
     """A 2-D GGUF tensor: stored rows for ggml formats and Q8_0, exact values for BF16/F32/F16 (a
     BF16 binding: every value must be a BF16 value, so an F32 matrix is never rounded silently)."""
