@@ -37,11 +37,12 @@ int verify_output_range(std::string_view label, const GuardedBf16Tensor& output,
                         std::int32_t output_rows, const quantized_weight::PackedWeight& weight,
                         std::int32_t weight_row_offset, const std::vector<float>& activation,
                         std::int32_t hidden, std::int32_t tokens,
-                        const ReductionCriterion& criterion = kGdnInputProjA16Tolerance) {
-    const std::vector<double> actual =
-        gather_rows(output.values(), full_rows, output_row_offset, output_rows, tokens);
-    const std::vector<double> expected =
-        projection_oracle(weight, weight_row_offset, output_rows, activation, hidden, tokens);
+                        const ReductionCriterion& criterion = kGdnInputProjA16Tolerance,
+                        std::int32_t sample_count           = 7) {
+    const std::vector<double> actual = gather_rows(output.values(), full_rows, output_row_offset,
+                                                   output_rows, tokens, sample_count);
+    const std::vector<double> expected = projection_oracle(weight, weight_row_offset, output_rows,
+                                                           activation, hidden, tokens, sample_count);
     return compare(label, actual, expected, criterion);
 }
 
@@ -680,16 +681,23 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     failures += z.verify_guards("gdn z" + suffix);
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
     failures += z.verify_fully_written("gdn z" + suffix);
-    failures += verify_output_range_sampled("gdn query" + suffix, qkv, kQkvRows, 0, 2048,
-                                            parent.host, 0, activation, kHidden, tokens, criterion);
-    failures +=
-        verify_output_range_sampled("gdn key" + suffix, qkv, kQkvRows, 2048, 2048, parent.host,
-                                    2048, activation, kHidden, tokens, criterion);
-    failures +=
-        verify_output_range_sampled("gdn value" + suffix, qkv, kQkvRows, 4096, 6144, parent.host,
-                                    4096, activation, kHidden, tokens, criterion);
-    failures += verify_output_range_sampled("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host,
-                                            kQkvRows, activation, kHidden, tokens, criterion);
+    // The A4 criterion is a distribution-level verdict on the 4-bit activations' noise, so its sample is 31
+    // rows of every token: there the relative L2 error is 0.10 to 0.12 at every width (limit 0.16). Seven
+    // rows of seven tokens put it anywhere from 0.05 to 0.23 and fail about a third of widths, although the
+    // outputs equal the FP64 product of the weights with the values the A4 codes represent to BF16 rounding.
+    const auto verify = [&](const char* name, const GuardedBf16Tensor& output, std::int32_t full_rows,
+                            std::int32_t row_offset, std::int32_t rows, std::int32_t weight_offset) {
+        return a4 ? verify_output_range(name + suffix, output, full_rows, row_offset, rows,
+                                        parent.host, weight_offset, activation, kHidden, tokens,
+                                        criterion, kA4SampleRows)
+                  : verify_output_range_sampled(name + suffix, output, full_rows, row_offset, rows,
+                                                parent.host, weight_offset, activation, kHidden,
+                                                tokens, criterion);
+    };
+    failures += verify("gdn query", qkv, kQkvRows, 0, 2048, 0);
+    failures += verify("gdn key", qkv, kQkvRows, 2048, 2048, 2048);
+    failures += verify("gdn value", qkv, kQkvRows, 4096, 6144, 4096);
+    failures += verify("gdn z", z, kZRows, 0, kZRows, kQkvRows);
     if (workspace.peak_used() != capacity) {
         std::cerr << "gdn workspace" << suffix << ": query/execution high-water mismatch\n";
         ++failures;
@@ -717,12 +725,12 @@ int run_nvfp4() {
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
-    // 1023, 1024 and 1025 straddle this route's floor. 1024 was the narrowest width it
-    // took before; 1025 is the first ragged one it takes now, and its last M tile holds a
-    // single real token, which is the emptiest grid this route ever runs.
-    failures += run_nvfp4_case(parent, 1023, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_case(parent, 1025, ops::LinearPolicy::AllowA4);
+    // The MMA tiles' last width and the TMA route's first (128 / 129); the TMA route's token tiles full,
+    // one column over, and partly filled (130, 256, 257, 400, 512, 513, 700; 1023, 1024, 1025, whose last
+    // tile holds a single real token: the emptiest grid this route runs).
+    for (const std::int32_t tokens : {128, 129, 130, 256, 257, 400, 512, 513, 700, 1023, 1024, 1025}) {
+        failures += run_nvfp4_case(parent, tokens, ops::LinearPolicy::AllowA4);
+    }
     return failures;
 }
 
