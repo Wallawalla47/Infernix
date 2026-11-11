@@ -132,6 +132,14 @@ struct Nvfp4A4MmaSchedule {
     static_assert((kSegmentsPerRow & (kSegmentsPerRow - 1)) == 0);
 };
 
+// WeightCodePromotion: the L2 promotion of the weight-code tensor map. The prompt schedules take 128 B
+// (kNvfp4PromptWeightPromotion): with it the fused gate/up takes 91 against 99 us at 129 columns, 97 against
+// 103 at 256 and 1-2 % less from 264 to 3,584, the down and input projections 1-3 % less, and the official
+// 27B's prefill 0.2-2.8 % less at every width measured (RTX 5090, 2026-11-11). 256 B measures the same, 64 B
+// and a promotion of the activation or scale maps nothing. The residual-plane schedule of verification
+// rounds (5-96 columns) is level with it and keeps none. A load hint: no bit changes.
+inline constexpr CUtensorMapL2promotion kNvfp4PromptWeightPromotion = CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
+
 template <int BlockTokens, int Stages, int MinBlocksPerSm,
           CUtensorMapL2promotion WeightCodePromotion = CU_TENSOR_MAP_L2_PROMOTION_NONE,
           int Terms = 1>

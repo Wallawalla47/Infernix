@@ -8,7 +8,7 @@
 namespace infernix::ops::detail {
 void launch_nvfp4_linear_swiglu_a4_tma(const Nvfp4A4Operands& p, __nv_bfloat16* output,
                                        cudaStream_t stream) {
-    using S = Nvfp4ScheduleInstance<Nvfp4A4TmaMmaSchedule<256, 3, 1>, 5120>;
+    using S = Nvfp4ScheduleInstance<Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4PromptWeightPromotion>, 5120>;
     launch_nvfp4_a4_tma_mma<S>(p, LinearBf16Output{output, p.rows / 2},
                                SwiGluTokenMajorMmaEpilogue{}, stream, SwiGluTokenMajorMmaRows<S>{});
 }
@@ -16,7 +16,7 @@ void launch_nvfp4_linear_swiglu_a4_tma(const Nvfp4A4Operands& p, __nv_bfloat16* 
 void launch_nvfp4_linear_swiglu_a4_tma_planes(const Nvfp4A4Operands& p, Nvfp4A4Workspace product,
                                               float down_input_scale_divisor, Nvfp4ScaleLayout product_layout,
                                               cudaStream_t stream) {
-    using S = Nvfp4ScheduleInstance<Nvfp4A4TmaMmaSchedule<256, 3, 1>, 5120>;
+    using S = Nvfp4ScheduleInstance<Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4PromptWeightPromotion>, 5120>;
     const auto run = [&]<Nvfp4ScaleLayout Layout>(std::integral_constant<Nvfp4ScaleLayout, Layout>) {
         SwiGluA4PlanesEpilogue<1, Layout> epilogue{};
         epilogue.codes               = product.codes;
