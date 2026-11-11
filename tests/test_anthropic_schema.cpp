@@ -1843,6 +1843,92 @@ int test_tool_search_history_errors() {
     return failures;
 }
 
+// The response's cache creation is what its generations reported: their sum, with a generation that
+// reported nothing (no prefix cache, no publishing permission) absent only when none of them did.
+int test_multi_round_cache_creation() {
+    struct Pair {
+        std::optional<std::uint32_t> first;
+        std::optional<std::uint32_t> last;
+        std::optional<std::uint32_t> expect;
+    };
+
+    const std::vector<Pair> cases{
+        {40, 38, 78},
+        {40, std::nullopt, 40},
+        {std::nullopt, 38, 38},
+        {std::nullopt, std::nullopt, std::nullopt},
+        {0, std::nullopt, 0},
+        {std::nullopt, 0, 0},
+        {0, 0, 0},
+    };
+    const AnthropicResponseIdentity identity =
+        make_anthropic_response_identity("req_creation", "claude-local");
+    int failures = 0;
+    for (const Pair& pair : cases) {
+        GenerationOutcome early;
+        early.text                        = "searching";
+        early.prompt_tokens               = 40;
+        early.completion_tokens           = 12;
+        early.cache_created_prompt_tokens = pair.first;
+        GenerationOutcome last;
+        last.text                        = "done";
+        last.prompt_tokens               = 90;
+        last.completion_tokens           = 9;
+        last.reused_prompt_tokens        = 52;
+        last.cache_created_prompt_tokens = pair.last;
+        const ServerToolRound round{.outcome = early};
+        const GenerationOutcome totals = combine_round_outcomes(std::span(&round, 1), last);
+        const std::vector<AnthropicResponseSegment> segments{
+            AnthropicResponseSegment{.outcome = &early},
+            AnthropicResponseSegment{.outcome = &last}};
+        const Json response =
+            Json::parse(make_anthropic_messages_response(identity, segments, totals, std::nullopt));
+        const Json& usage = response.at("usage");
+        failures += check(totals.cache_created_prompt_tokens == pair.expect &&
+                              usage.at("cache_creation_input_tokens") ==
+                                  (pair.expect ? Json(*pair.expect) : Json(nullptr)) &&
+                              usage.at("cache_read_input_tokens") == 52 &&
+                              usage.at("input_tokens") ==
+                                  130 - 52 - (pair.expect ? static_cast<int>(*pair.expect) : 0),
+                          "a generation's cache creation did not aggregate as it was reported");
+    }
+
+    // Three generations of one response: 40 + 90 + 120 prompt tokens, 52 + 90 of them reused, so
+    // 40 + 38 + 30 written leaves nothing uncached.
+    GenerationOutcome one;
+    one.text                        = "searching";
+    one.prompt_tokens               = 40;
+    one.completion_tokens           = 12;
+    one.cache_created_prompt_tokens = 40;
+    GenerationOutcome two;
+    two.text                        = "loading";
+    two.prompt_tokens               = 90;
+    two.completion_tokens           = 8;
+    two.reused_prompt_tokens        = 52;
+    two.cache_created_prompt_tokens = 38;
+    GenerationOutcome three;
+    three.text                        = "done";
+    three.prompt_tokens               = 120;
+    three.completion_tokens           = 6;
+    three.reused_prompt_tokens        = 90;
+    three.cache_created_prompt_tokens = 30;
+    const std::vector<ServerToolRound> rounds{ServerToolRound{.outcome = one},
+                                              ServerToolRound{.outcome = two}};
+    const GenerationOutcome totals = combine_round_outcomes(rounds, three);
+    const std::vector<AnthropicResponseSegment> segments{
+        AnthropicResponseSegment{.outcome = &one}, AnthropicResponseSegment{.outcome = &two},
+        AnthropicResponseSegment{.outcome = &three}};
+    const Json response =
+        Json::parse(make_anthropic_messages_response(identity, segments, totals, std::nullopt));
+    failures += check(totals.cache_created_prompt_tokens == std::optional<std::uint32_t>(108) &&
+                          response.at("usage").at("cache_creation_input_tokens") == 108 &&
+                          response.at("usage").at("cache_read_input_tokens") == 52 + 90 &&
+                          response.at("usage").at("input_tokens") == 0 &&
+                          response.at("usage").at("output_tokens") == 12 + 8 + 6,
+                      "three generations did not sum their cache creation into the response");
+    return failures;
+}
+
 int test_tool_search_stream() {
     const AnthropicMessagesRequest request = parse(search_request_body());
     AnthropicToolSearchExecutor executor(request);
@@ -2033,6 +2119,7 @@ int main() {
     failures += test_client_tool_references();
     failures += test_tool_search_execution();
     failures += test_tool_search_round_trip();
+    failures += test_multi_round_cache_creation();
     failures += test_tool_search_history_errors();
     failures += test_tool_search_stream();
     if (failures != 0) {
