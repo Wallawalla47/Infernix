@@ -11,7 +11,9 @@ Every logical parameter the recipe imports must equal the GGUF:
 - every ggml_rows_v1 projection's rows, the stored blocks byte for byte (whole-row selections and
   the GDN value-head permutation included); a ggml_tiles16_v1 matrix's rows after untiling, and its
   last tile's padding rows zero blocks;
-- the Q8_0 tensor's codes and scales, as the identical q8_g32_fp16 words;
+- every Q8_0 tensor's codes and scales, as the identical q8_g32_fp16 words; a plain hyper-connection
+  inject stored beside a Q8_0 down (Unsloth's dynamic quants) as the words the importer's rule gives
+  for the GGUF's values (gguf_logical.plain_as_q8: the one tensor not stored as the GGUF holds it);
 - every BF16/FP32 tensor value for value (the converter's checked exact transforms applied);
 - the n-gram volume's header and its IQ4_NL rows (all of them, or a sample);
 - with the vision component (``--mmproj``), every vision tensor value for value against the mmproj,
