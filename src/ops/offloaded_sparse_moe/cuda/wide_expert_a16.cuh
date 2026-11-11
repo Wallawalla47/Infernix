@@ -147,6 +147,8 @@ __global__ __launch_bounds__(ScheduleA16::kThreads, ScheduleA16::kMinBlocksPerSm
         for (int w = static_cast<int>(blockIdx.x); w < work; w += static_cast<int>(gridDim.x)) {
             const int tile = tile_begin + w / kRowBlocks, row_block = w % kRowBlocks;
             const int job = call.tiles[2 * tile], column = call.tiles[2 * tile + 1];
+            // The stage's unserved record (kErrorUnservedRecord): the narrow passes skip it, so does this one.
+            if (call.job_records[job] == nullptr) { continue; }
             const int expert  = call.dispatch.jobs[job];
             const int first   = call.dispatch.offsets[expert] + column;
             const int columns = min(S::kBlockTokens, call.dispatch.offsets[expert + 1] - first);
@@ -222,6 +224,8 @@ __global__ __launch_bounds__(ScheduleA16::kThreads, ScheduleA16::kMinBlocksPerSm
         const int tile = tile_begin + w / kRowBlocks;
         ctx.row_block  = w % kRowBlocks;
         const int job = call.tiles[2 * tile], column = call.tiles[2 * tile + 1];
+        // The stage's unserved record (kErrorUnservedRecord): skipped in step with the producer above.
+        if (call.job_records[job] == nullptr) { continue; }
         ctx.expert      = call.dispatch.jobs[job];
         ctx.first       = call.dispatch.offsets[ctx.expert] + column;
         ctx.columns     = min(S::kBlockTokens, call.dispatch.offsets[ctx.expert + 1] - ctx.first);
