@@ -369,7 +369,6 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
 
 #pragma unroll
             for (int local_k64 = 0; local_k64 < Schedule::kK64PerStage; ++local_k64) {
-                if (!(live > 0)) { continue; }
                 unsigned a_fragments[Schedule::kTerms][Schedule::kMmaTokens][4];
                 unsigned b_fragments[Schedule::kMmaRows][2];
                 unsigned a_scales[Schedule::kTerms][Schedule::kMmaTokens];
@@ -446,8 +445,21 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
             if (lane == 0) { cta_mbarrier_arrive(&shared.empty[stage]); }
         }
     };
-    with_static_count<Schedule::kMmaTokens>(
-        (token_count - token_begin - warp_m * Schedule::kWarpTokens + 15) / 16, consume);
+    const int live_fragments =
+        (token_count - token_begin - warp_m * Schedule::kWarpTokens + 15) / 16;
+    if (live_fragments > 0) {
+        with_static_count<Schedule::kMmaTokens>(live_fragments, consume);
+    } else {
+        // No live column: the barrier protocol alone, so the producer's refills keep their pace.
+#pragma unroll 1
+        for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
+            const int stage = k_tile % Schedule::kStages;
+            cta_mbarrier_wait(&shared.full[stage], (k_tile / Schedule::kStages) & 1U);
+            fence_reads_before_async_refill();
+            __syncwarp();
+            if (lane == 0) { cta_mbarrier_arrive(&shared.empty[stage]); }
+        }
+    }
 
     // The epilogue reuses the tensor pipeline's shared-memory storage. All consumer
     // warps must finish their final tensor reads before any warp starts overwriting it.

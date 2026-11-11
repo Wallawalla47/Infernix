@@ -11,13 +11,14 @@ struct StaticCount {
     __host__ __device__ constexpr operator int() const { return Value; }
 };
 
-// body(StaticCount<n>{}) for n = min(count, Max): every count gets its own instance of the body, so a loop it
-// bounds unrolls over registers. A run-time bound inside such a loop spilled the tensor-core accumulators
-// (4-5 times the time, RTX 5090, 2026-11-10).
+// body(StaticCount<n>{}) for n = min(count, Max), count >= 1: every count gets its own instance of the body,
+// so a loop it bounds unrolls over registers. A run-time bound inside such a loop spilled the tensor-core
+// accumulators (4-5 times the time, RTX 5090, 2026-11-10). A count of zero is the caller's (an instance
+// whose loops could never run draws a "loop is not reachable" diagnostic per kernel).
 template <int Max, class Body>
 __device__ __forceinline__ void with_static_count(int count, Body&& body) {
-    if constexpr (Max == 0) {
-        body(StaticCount<0>{});
+    if constexpr (Max == 1) {
+        body(StaticCount<1>{});
     } else {
         if (count >= Max) {
             body(StaticCount<Max>{});
