@@ -13113,9 +13113,22 @@ against new: exact route QSA 392 / 520 / 776 columns -8.8 / -16.0 / -3.8 %, GDN 
 f16 route GDN input 264-776 -3.0 .. -6.8 %, QSA 520 -10.3 %, outputs 264 / 392 -7 %, shared gate/up 520 / 776
 -7 / -6 %; tile multiples level. FP4-Local end to end level (pp2056 / pp8200 within +-0.6 % over two rounds).
 
+The bf16_p12 TMA kernel (the packed BF16 weights of every route but `--lossless`) does the same from 2026-11-11
+(same bits). `bf16_p12_sweep`,
+previous build against new, A B B A x2, thirteen widths from 256 to 4,104: every width that is not a tile multiple
+is faster on all three shapes, [16384,2560] -0.6 to -3.1 % (264 columns 215.1 -> 208.4 us), [13952,2560] -0.5 to
+-1.6 %, [2560,6144] -0.9 to -2.1 %; 256 and 1,024 columns level. An Op result: not measured end to end. The same
+skip in the BF16 A16 TMA kernel was measured and not taken: `linear_bench --qtype BF16` gave [16384,2560] -9.1 %
+at 392 columns, but [1280,2560] +3.0 / +5.6 / +2.9 % at 520 / 648 / 776 and [2560,6144] +3.1 / +5.2 % at 264 / 392
+(one or two timer ticks each, all in one direction), [13952,2560] level.
+
 Not a gain: the small BF16 TMA tiles (r64t32, r64t64, r64t128, plain and tail forms, 37-49 KB of shared memory)
 declared at two CTAs an SM instead of the default one. `bf16_flash_next_sweep` on shgu, shdown, hcdown, hcup,
 gdnab and out6144 at 129-8,192 columns: level at every point (single timer ticks in both directions).
+
+Not a gain either (2026-11-11): TMA L2 promotion (128 B) requested on the MXFP8 weight tensor map, which pays on
+the NVFP4 prompt routes of the 27B. Exact and f16 routes, GDN input and outputs at 512-4,096 columns: -1.0 to
++1.1 %.
 
 ## 20. Documentation and authority changes
 

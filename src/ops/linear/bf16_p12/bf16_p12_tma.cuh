@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace infernix::ops::detail {
 
@@ -232,14 +233,31 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void bf16_p12_tma_
     const int consumer = tid - S::kProducerThreads - S::kDecodeThreads;
     const int warp = consumer / 32, lane = consumer & 31;
     float accum[S::kMmaRows][S::kMmaTokens][4] = {};
+    const auto consume = [&]<bool Live>(std::bool_constant<Live>) {
 #pragma unroll S::kConsumerKUnroll
-    for (int kt = 0; kt < tiles_k; ++kt) {
-        const int stage = kt % ST;
-        p12_wait<S::kSpin>(full + stage, (kt / ST) & 1U);
-        bf16_mma_compute_stage<S>(a + stage * BR * BK, b + stage * BT * BK, accum, warp, lane);
-        fence_reads_before_async_refill();
-        __syncwarp();
-        if (lane == 0) { cta_mbarrier_arrive(empty + stage); }
+        for (int kt = 0; kt < tiles_k; ++kt) {
+            const int stage = kt % ST;
+            p12_wait<S::kSpin>(full + stage, (kt / ST) & 1U);
+            if constexpr (Live) {
+                bf16_mma_compute_stage<S>(a + stage * BR * BK, b + stage * BT * BK, accum, warp, lane);
+            }
+            fence_reads_before_async_refill();
+            __syncwarp();
+            if (lane == 0) { cta_mbarrier_arrive(empty + stage); }
+        }
+    };
+    if constexpr (FullTokens) {
+        consume(std::true_type{});
+    } else {
+        // A partly filled last token tile: a warp whose columns all lie past the call does no tensor-core
+        // work (its sums are never stored; every stored output keeps its K order). The decode warps and the
+        // barrier protocol run unchanged.
+        const int first_token = token_begin + warp % S::kWarpsTokens * S::kWarpTokens;
+        if (first_token < token_offset + count) {
+            consume(std::true_type{});
+        } else {
+            consume(std::false_type{});
+        }
     }
     bf16_finish_mma_tile<S, FullTokens>(output, LinearIdentityEpilogue{}, storage, accum, row_begin, token_begin,
                                         rows, token_offset + count, warp, lane);
