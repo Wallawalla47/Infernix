@@ -957,7 +957,10 @@ resource errors. A body whose JSON nests arrays or objects more than 256 levels 
 parsing with HTTP 400 (`invalid_request_error`, "request body JSON nests arrays or objects deeper
 than 256 levels"). The same bound holds inside a history tool call's `arguments` string (Chat
 `tool_calls` and `function_call`, Responses `function_call` and `tool_search_call` Items), which the
-body's parse cannot see: HTTP 400 at that argument's path.
+body's parse cannot see: HTTP 400 at that argument's path. A history tool call whose arguments are
+not a JSON object (malformed JSON, or another JSON value such as `null` or an array; empty
+arguments are a call without parameters) cannot be rendered and is refused with HTTP 400
+`invalid_prompt`, naming the call.
 
 ## OpenAI prompt caching
 

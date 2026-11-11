@@ -948,6 +948,55 @@ int test_quoted_controls_in_history() {
     return failures;
 }
 
+// A history tool call's arguments reach both maintained templates as the object whose members they
+// render as parameters. A client's string that is not one, malformed JSON or another JSON value, fails
+// the render as invalid input (the serve's HTTP 400 invalid_prompt) naming the call, rather than as a
+// JSON parse or template error the serve reports as HTTP 500 (NInfer #446); empty arguments are none.
+int test_history_tool_call_arguments() {
+    const auto history = [](std::string arguments) {
+        auto assistant = chat_message(infernix::ChatRole::Assistant, "");
+        assistant.tool_calls.push_back(
+            {.id = "call_1", .name = "lookup", .arguments_json = std::move(arguments)});
+        return std::vector<fi::ChatMessage>{chat_message(infernix::ChatRole::User, "find it"),
+                                            std::move(assistant),
+                                            chat_message(infernix::ChatRole::Tool, "found")};
+    };
+    int failures = 0;
+    for (const auto& source :
+         {thinking_toggle_template_source(), reasoning_effort_template_source()}) {
+        const auto compiled = fi::CompiledChatTemplate::resolve(source);
+        // The refusal's text, "" for a render that succeeds.
+        const auto refusal = [&](const std::string& arguments) -> std::string {
+            try {
+                (void)compiled.render(history(arguments), {});
+            } catch (const std::invalid_argument& error) {
+                return error.what();
+            } catch (const std::exception&) { return "another exception"; }
+            return {};
+        };
+        const auto refused = [&](const std::string& arguments, std::string_view reason) {
+            const std::string message = refusal(arguments);
+            return message.find("history tool call 'lookup'") != std::string::npos &&
+                   message.find(reason) != std::string::npos;
+        };
+        for (const std::string arguments :
+             {R"({"key":)", R"({"key":"kumquat"} trailing)", "{'key': 1}", "{\"key\":\"\xff\"}"}) {
+            failures +=
+                check(refused(arguments, "are not valid JSON (byte "),
+                      "malformed history tool-call arguments were not refused as invalid input");
+        }
+        for (const std::string arguments : {"[1,2]", "null", R"("kumquat")", "7", "true"}) {
+            failures +=
+                check(refused(arguments, "are not a JSON object"),
+                      "non-object history tool-call arguments were not refused as invalid input");
+        }
+        const std::string rendered = compiled.render(history(R"({"key":"kumquat"})"), {}).text;
+        failures += check(refusal("").empty() && rendered.find("kumquat") != std::string::npos,
+                          "object or empty history tool-call arguments no longer render");
+    }
+    return failures;
+}
+
 int test_repeated_special_tokens_scan_linearly() {
     constexpr std::string_view token = "<|image_pad|>";
     std::string text;
@@ -4419,6 +4468,7 @@ int main() try {
     failures += test_boundary_aware_tokenization();
     failures += test_rendered_special_tokens();
     failures += test_quoted_controls_in_history();
+    failures += test_history_tool_call_arguments();
     failures += test_repeated_special_tokens_scan_linearly();
     failures += test_bounded_tokenizer_prefix();
     failures += test_context_capacity_guard();

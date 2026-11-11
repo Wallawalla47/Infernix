@@ -34,6 +34,30 @@ std::string_view role_name(ChatRole role) {
 
 bool instruction(ChatRole role) { return role == ChatRole::System || role == ChatRole::Developer; }
 
+// A history tool call's arguments as the template reads them: an object, whose members it renders
+// as the call's parameters (empty arguments are none). A client's string that is not one fails the
+// request as invalid input (HTTP 400 invalid_prompt) rather than escaping as a parse or template
+// error (NInfer #446); the model's own calls are always objects. The parsed value is converted
+// recursively, so one nested past the body's bound is refused before the parse rather than
+// overflowing the stack (the serve parsers refuse it first; candidates WF-01).
+Json history_arguments(const ToolCall& call) {
+    if (call.arguments_json.empty()) return Json::object();
+    const std::string subject = "the arguments of history tool call '" + call.name + "'";
+    if (text::json_text_nesting(call.arguments_json) > text::kMaxJsonNesting) {
+        throw std::invalid_argument(subject + " nest arrays or objects deeper than " +
+                                    std::to_string(text::kMaxJsonNesting) + " levels");
+    }
+    Json arguments;
+    try {
+        arguments = Json::parse(call.arguments_json);
+    } catch (const Json::parse_error& error) {
+        throw std::invalid_argument(subject + " are not valid JSON (byte " +
+                                    std::to_string(error.byte) + ")");
+    }
+    if (!arguments.is_object()) throw std::invalid_argument(subject + " are not a JSON object");
+    return arguments;
+}
+
 struct ContentSource {
     std::uint32_t tag = 0;
     std::vector<std::size_t> part_ends;
@@ -363,20 +387,10 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         if (!message.tool_calls.empty()) {
             value["tool_calls"] = Json::array();
             for (const auto& call : message.tool_calls) {
-                // The render converts the parsed arguments recursively: a value nested past the body's bound fails
-                // the request rather than the stack (the serve parsers refuse it first; candidates WF-01).
-                if (text::json_text_nesting(call.arguments_json) > text::kMaxJsonNesting) {
-                    throw std::invalid_argument("tool call arguments nest arrays or objects deeper than " +
-                                                std::to_string(text::kMaxJsonNesting) + " levels");
-                }
                 value["tool_calls"].push_back(
                     {{"id", call.id},
                      {"type", "function"},
-                     {"function",
-                      {{"name", call.name},
-                       {"arguments",
-                        (call.arguments_json.empty() ? Json::object()
-                                                     : Json::parse(call.arguments_json))}}}});
+                     {"function", {{"name", call.name}, {"arguments", history_arguments(call)}}}});
             }
         }
         if (!message.tool_call_id.empty()) value["tool_call_id"] = message.tool_call_id;
