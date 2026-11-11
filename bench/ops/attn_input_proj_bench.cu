@@ -66,7 +66,7 @@ struct Result {
     std::size_t graph_nodes              = 0;
     std::size_t workspace_capacity_bytes = 0;
     std::size_t workspace_peak_bytes     = 0;
-    std::uint64_t output_fnv             = 0; // FNV-1a of the four outputs (the Q4/Q5 case)
+    std::uint64_t output_fnv             = 0; // FNV-1a of the four outputs
 };
 
 struct Measurement {
@@ -423,8 +423,15 @@ void run_four_output(const Options& options, const char* format, QType qtype,
                                                     options.repeat, options.graph);
             if (workspace.used() != 0 || workspace.peak_used() > exact_workspace)
                 throw std::runtime_error("public projection exceeds its workspace query");
+            // The four outputs' FNV-1a, so two routes or two builds can be compared bit for bit.
+            std::uint64_t hash = 0xcbf29ce484222325ULL;
+            for (const Tensor* tensor : {&tq, &tg, &tk, &tv}) {
+                std::vector<std::uint8_t> produced(tensor->bytes());
+                bench::read_back(produced.data(), tensor->data, produced.size());
+                for (const std::uint8_t byte : produced) { hash = (hash ^ byte) * 0x100000001b3ULL; }
+            }
             append_result(results, format, policy_name(policy), tokens, cache, exact_workspace,
-                          logical, flops, measurement, workspace_bytes, workspace.peak_used());
+                          logical, flops, measurement, workspace_bytes, workspace.peak_used(), hash);
         }
     }
 }

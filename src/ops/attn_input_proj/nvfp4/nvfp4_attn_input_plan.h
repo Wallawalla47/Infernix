@@ -37,13 +37,19 @@ void nvfp4_attn_input_a4_launch(const Tensor& x, const Weight& weight, Tensor& q
 // Shared by the ordinary A4 launcher and the fused RMSNorm entry: the TMA cutoff and the tiled
 // activation-scale plane that route reads. The quantizer that feeds the TMA route must write the
 // same layout, so both entries derive it here.
+//
+// From 129 columns (512 until 2026-11-11), each cut and tile forced in turn (RTX 5090, cold weights): one
+// partly filled 256-token tile takes 40-46 us at 129-256 columns against 50-64 for the MMA tiles; at
+// 257-512 the 128-token tile takes 55-84 us against 66-97 (the 256-token tile 72-89: its second tile is
+// mostly empty); from 513 the 256-token tile takes 90-102 us at 513-768 against 101-125 for the 128-token
+// one, and 155 against 181 at 1,023. Same bits (one K order per output).
 [[nodiscard]] inline constexpr bool nvfp4_attn_input_tma_route(std::int32_t tokens) {
-    return tokens >= 512;
+    return tokens >= 129;
 }
 
 [[nodiscard]] inline constexpr Nvfp4ScaleLayout nvfp4_attn_input_scale_layout(std::int32_t tokens) {
     return !nvfp4_attn_input_tma_route(tokens) ? Nvfp4ScaleLayout::RowMajor
-           : tokens < 1024                     ? Nvfp4ScaleLayout::Tiled128
+           : tokens > 256 && tokens <= 512     ? Nvfp4ScaleLayout::Tiled128
                                                : Nvfp4ScaleLayout::Tiled256;
 }
 

@@ -416,6 +416,20 @@ void run_nvfp4(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t
     measure_points(options, "nvfp4", policy_name(options.nvfp4_policy), kHidden, kOutputRows,
                    parent.model_weight_bytes(), workspace_capacity, make_launch, flush, stream,
                    results);
+    if (options.profile) { return; }
+    // Both outputs' FNV-1a per width, so two routes or two builds can be compared bit for bit.
+    for (const std::int32_t tokens : options.tokens) {
+        make_launch(tokens)(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::uint64_t hash = 0xcbf29ce484222325ULL;
+        for (const auto& [buffer, rows] : {std::pair{&qkv, kQkvRows}, std::pair{&z, kZRows}}) {
+            std::vector<std::uint8_t> produced(static_cast<std::size_t>(rows) * tokens * 2);
+            bench::read_back(produced.data(), buffer->p, produced.size());
+            for (const std::uint8_t byte : produced) { hash = (hash ^ byte) * 0x100000001b3ULL; }
+        }
+        std::printf("hash format=nvfp4 policy=%s T=%d output_fnv=%016llx\n",
+                    policy_name(options.nvfp4_policy), tokens, static_cast<unsigned long long>(hash));
+    }
 }
 
 void run_fp8(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream,

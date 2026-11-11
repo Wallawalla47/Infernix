@@ -466,6 +466,10 @@ int run_nvfp4_target() {
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA8, true);
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
+    // The MMA tiles' last width, the TMA route's first, and its two tiles at their cuts (256 / 257, 512 / 513).
+    for (const std::int32_t tokens : {128, 129, 256, 257, 512, 513}) {
+        failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::AllowA4);
+    }
     // 1023, 1024 and 1025 straddle this route's floor. 1024 was the narrowest width it
     // took before; 1025 is the first ragged one it takes now, and its last M tile holds a
     // single real token, which is the emptiest grid this route ever runs.

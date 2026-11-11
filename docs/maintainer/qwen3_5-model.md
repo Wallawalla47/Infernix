@@ -322,6 +322,34 @@ for the K = 6144 FP8 output (none faster); a launch order that runs a row group'
 its full tiles (gate/up -2 to -4 % at 257-384 columns, level end to end: the partly filled tile's time is its 40
 load-and-barrier round trips, not its weights coming from memory).
 
+The NVFP4 prompt routes' weight tensor maps, and the all-NVFP4 recipe's input projections (2026-11-11). Two
+changes, both with the same bits:
+
+- The weight-code tensor maps of the prompt TMA schedules (fused gate/up, down, NVFP4 attention input and GDN
+  input) ask for L2 promotion at 128 B (`kNvfp4PromptWeightPromotion`), as the plain [34816,5120] route has since
+  2026-09-15. Fused gate/up: 129 / 192 / 256 columns -8.3 / -5.7 / -6.0 %, 264-3,584 -0.8 to -2.2 %; down 0 to
+  -2 %. 256 B measured the same and 64 B nothing; the activation-code and scale maps nothing; the residual-plane
+  schedule of verification rounds was level and stays without it. The same request on the FP8 A8 TMA maps (weight
+  or activation; 64, 128 or 256 B) measured within +-0.5 %: not taken.
+- An artifact whose attention and GDN input projections are NVFP4 (the all-NVFP4 recipe; the official, NVIDIA and
+  uncensored artifacts keep FP8 there) ran them on MMA tiles to 511 columns. Their TMA routes now start at 129.
+  GDN input: 68 -> 44-46 us at 129-192 columns, 62-64 -> 46-47 at 193-256, 90-97 -> 74-80 at 257-384, 113-119 ->
+  78-91 at 385-511. Attention input: the 256-token tile to 256 columns and from 513 (50-62 -> 40-46 us at 129-256;
+  90-102 against 101-125 us at 513-768), the 128-token tile at 257-512 (the 256-token tile is slower at 257-384:
+  72-77 against 66-68 us; at 512 itself 86.6 against 80.5). The bytes are the MMA routes':
+  `attn_input_proj_bench` and `gdn_input_proj_bench` print an FNV-1a of their outputs (`output_fnv`), equal for
+  the old and the new routes at 26 widths from 64 to 1,100.
+
+Prefill against the previous build (INT8 KV, A B B A x2, medians of four runs: about ten of the 600 runs, in both
+arms and all at 40-328 tokens, were 1.0-2.7 ms off their arm's other three). All-NVFP4 artifact (both changes): 129-255 tokens -6.3 to -11.6 %,
+264-328 -3.1 to -3.7 %, 392-511 -5.1 to -5.8 %, 520-1,100 -1.0 to -2.6 %, 2,048-8,192 -1.1 to -1.6 %, 40 / 104
++0.1 / +0.2 %; `--reproducible` (two runs): 136 -11.5 %, 200 -6.4 %, 264 -3.8 %, 392 -5.4 %, 520-4,096 -1.1 to
+-2.8 %. Official artifact (the promotion only): 129-255 -1.2 to -3.0 %, 264-511 0.0 to -0.8 %, 520-8,192 -0.7 to
+-1.6 %, 40 / 104 +0.2 / -0.1 %; `--reproducible` 136 / 200 -2.9 / -1.9 %, 264-4,096 -0.2 to -1.0 %. NVIDIA
+artifact: 129-255 -1.7 to -3.3 %, 264-8,192 0.0 to -1.0 %, 40 / 104 0.0 / -0.2 %. Decode unchanged on all three
+(99.6, 82.8, 86.1 tok/s). Greedy text equals the previous build's at four prompt lengths on each artifact and on
+`--reproducible`.
+
 MTP is a one-layer predictor conditioned on a final-normalized target hidden state h_t and the
 following token x_(t+1):
 
