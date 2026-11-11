@@ -1255,6 +1255,149 @@ int test_stream() {
     return failures;
 }
 
+struct CacheAccounting {
+    int prompt;
+    int reused;
+    std::optional<std::uint32_t> created;
+    const char* what;
+};
+
+GenerationOutcome accounted_outcome(const CacheAccounting& value) {
+    GenerationOutcome outcome           = sample_outcome();
+    outcome.prompt_tokens               = value.prompt;
+    outcome.reused_prompt_tokens        = static_cast<std::uint32_t>(value.reused);
+    outcome.cache_created_prompt_tokens = value.created;
+    return outcome;
+}
+
+// The stream of a whole answer: Engine start, Thinking, text, and the terminal events.
+std::vector<std::string> stream_answer(AnthropicMessagesStream& stream,
+                                       const infernix::GenerationStart& start,
+                                       const GenerationOutcome& outcome) {
+    std::vector<std::string> events{stream.start(start)};
+    for (std::vector<std::string> values : {stream.reasoning_delta("thought"),
+                                            stream.content_delta("answer"), stream.finish(outcome)}) {
+        events.insert(events.end(), std::make_move_iterator(values.begin()),
+                      std::make_move_iterator(values.end()));
+    }
+    return events;
+}
+
+Json first_event(const std::vector<std::string>& events, const char* type) {
+    for (const std::string& wire : events) {
+        const Json parsed = parse_event(wire);
+        if (parsed.at("type") == type) { return parsed; }
+    }
+    return Json();
+}
+
+// --claude-code-usage-compat: an affected Claude Code keeps the positive input_tokens it saw in
+// message_start after the terminal message_delta corrects that field to 0 (anthropics/claude-code
+// #103901), and then counts a prompt the request wrote into the prefix cache twice. The switch makes
+// only the start's input_tokens a provisional 0. Everything else has to stay exactly as it was: the
+// start's cache-read split is already exact, creation is still unknown there, and the terminal usage
+// is the Engine's accounting for the same outcome, byte for byte.
+int test_claude_code_usage_compat_stream() {
+    const AnthropicResponseIdentity identity =
+        make_anthropic_response_identity("req_compat", "claude-local");
+    int failures = 0;
+    for (const CacheAccounting& value :
+         {CacheAccounting{31959, 0, std::uint32_t{31959}, "cold, fully captured"},
+          CacheAccounting{32202, 32127, std::uint32_t{75}, "warm, 75 created"},
+          CacheAccounting{31959, 0, std::uint32_t{12000}, "partly captured"},
+          CacheAccounting{31959, 0, std::uint32_t{0}, "cache on, nothing captured"},
+          CacheAccounting{31959, 0, std::nullopt, "no prefix cache"},
+          CacheAccounting{31959, 31959, std::uint32_t{0}, "fully reused"},
+          CacheAccounting{0, 0, std::uint32_t{0}, "empty prompt"}}) {
+        const std::string label = std::string(" [") + value.what + "]";
+        const GenerationOutcome outcome = accounted_outcome(value);
+        const infernix::GenerationStart start{
+            .prompt = infernix::PromptSummary{
+                          .prompt_tokens = static_cast<std::uint32_t>(value.prompt)},
+            .reused_prompt_tokens = static_cast<std::uint32_t>(value.reused)};
+
+        AnthropicMessagesStream plain(identity, value.prompt);
+        AnthropicMessagesStream compat(identity, value.prompt, false, {}, true);
+        const std::vector<std::string> plain_events  = stream_answer(plain, start, outcome);
+        const std::vector<std::string> compat_events = stream_answer(compat, start, outcome);
+
+        const Json plain_message  = first_event(plain_events, "message_start").at("message");
+        const Json compat_message = first_event(compat_events, "message_start").at("message");
+        const Json plain_usage    = plain_message.at("usage");
+        const Json compat_usage   = compat_message.at("usage");
+        const Json plain_final    = first_event(plain_events, "message_delta").at("usage");
+        const Json compat_final   = first_event(compat_events, "message_delta").at("usage");
+        const Json aggregate =
+            Json::parse(make_anthropic_messages_response(identity, outcome)).at("usage");
+
+        // The event sequence is the protocol's, and only message_start's one field differs.
+        failures += check(parse_event(plain_events.front()).at("type") == "message_start" &&
+                              parse_event(compat_events.front()).at("type") == "message_start" &&
+                              parse_event(plain_events.back()).at("type") == "message_stop" &&
+                              parse_event(compat_events.back()).at("type") == "message_stop" &&
+                              plain_events.size() == compat_events.size(),
+                          ("the compat stream changed the event sequence" + label).c_str());
+        bool only_start_differs = true;
+        for (std::size_t i = 1; i < plain_events.size(); ++i) {
+            only_start_differs = only_start_differs && plain_events[i] == compat_events[i];
+        }
+        Json as_plain = compat_message;
+        as_plain["usage"]["input_tokens"] = plain_usage.at("input_tokens");
+        failures += check(only_start_differs && as_plain == plain_message,
+                          ("a field besides message_start input_tokens changed" + label).c_str());
+
+        failures += check(plain_usage.at("input_tokens") == value.prompt - value.reused &&
+                              plain_usage.at("cache_read_input_tokens") == value.reused &&
+                              plain_usage.at("cache_creation_input_tokens").is_null() &&
+                              plain_usage.at("output_tokens") == 0 &&
+                              compat_usage.at("input_tokens") == 0 &&
+                              compat_usage.at("cache_read_input_tokens") == value.reused &&
+                              compat_usage.at("cache_creation_input_tokens").is_null() &&
+                              compat_usage.at("output_tokens") == 0,
+                          ("the start usage is not the exact split without, a provisional 0 with "
+                           "the compat mode" +
+                           label)
+                              .c_str());
+
+        // Terminal accounting: unchanged, and the non-streaming response's own usage for this
+        // outcome. The three input fields sum to the prompt, a null creation counting as 0.
+        const int created =
+            plain_final.at("cache_creation_input_tokens").is_null()
+                ? 0
+                : plain_final.at("cache_creation_input_tokens").get<int>();
+        failures += check(compat_final == plain_final && plain_final == aggregate &&
+                              plain_final.at("input_tokens").get<int>() + created +
+                                      plain_final.at("cache_read_input_tokens").get<int>() ==
+                                  value.prompt,
+                          ("the terminal usage changed, left the aggregate, or no longer sums to "
+                           "the prompt" +
+                           label)
+                              .c_str());
+    }
+
+    // An error before Engine admission still starts the message (so the error event has a valid
+    // prefix) and still reports the error itself; the compat mode only withholds the count there too.
+    ApiError unavailable;
+    unavailable.status  = 503;
+    unavailable.message = "no execution lane";
+    AnthropicMessagesStream plain_error(identity, 25);
+    AnthropicMessagesStream compat_error(identity, 25, false, {}, true);
+    const Json plain_prefix  = parse_event(plain_error.start());
+    const Json compat_prefix = parse_event(compat_error.start());
+    failures +=
+        check(plain_prefix["message"]["usage"]["input_tokens"] == 25 &&
+                  plain_prefix["message"]["usage"]["cache_read_input_tokens"].is_null() &&
+                  compat_prefix["message"]["usage"]["input_tokens"] == 0 &&
+                  compat_prefix["message"]["usage"]["cache_read_input_tokens"].is_null() &&
+                  compat_prefix["message"]["usage"]["cache_creation_input_tokens"].is_null(),
+              "the compat pre-admission prefix claimed a cache split it cannot know");
+    const std::string plain_wire  = plain_error.error(unavailable);
+    const std::string compat_wire = compat_error.error(unavailable);
+    failures += check(compat_wire == plain_wire && parse_event(compat_wire).at("type") == "error",
+                      "the compat error path stopped reporting the error itself");
+    return failures;
+}
+
 int test_constrained_decoding() {
     int failures = 0;
     auto body    = base_request();
@@ -2119,6 +2262,7 @@ int main() {
     failures += test_tool_call_presentation();
     failures += test_streamed_tool_calls();
     failures += test_stream();
+    failures += test_claude_code_usage_compat_stream();
     failures += test_hidden_reasoning_signature();
     failures += test_hidden_reasoning_round_trip();
     failures += test_auto_mode_classifier_body();

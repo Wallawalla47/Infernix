@@ -146,11 +146,22 @@ Json final_usage(const GenerationOutcome& outcome) {
         {"inference_geo", nullptr}};
 }
 
-Json streaming_start_usage(int input_tokens, std::optional<int> cache_read_input_tokens) {
+// The provisional message_start usage: the cache-read split the Engine's admission already settled,
+// creation still null (which prompt tokens this request makes reusable is only known once its
+// snapshots published, after the finish), and no output yet.
+// `provisional_zero_input` is --claude-code-usage-compat: it withholds the uncached prompt count too,
+// because an affected Claude Code keeps the positive start value after the terminal message_delta
+// corrects it to 0 and then counts the prompt twice. The terminal usage is then the only event that
+// carries that count, so a stream that ends before it - on an error event or a closed transfer -
+// reports the uncached count nowhere.
+Json streaming_start_usage(int input_tokens, std::optional<int> cache_read_input_tokens,
+                           bool provisional_zero_input) {
     const int prompt = std::max(0, input_tokens);
     std::optional<int> cached;
     if (cache_read_input_tokens) { cached = std::clamp(*cache_read_input_tokens, 0, prompt); }
-    return Json{{"input_tokens", cached ? prompt - *cached : prompt},
+    // cached is clamped into the prompt, so prompt - cached is the whole uncached rest.
+    const int uncached = provisional_zero_input ? 0 : prompt - cached.value_or(0);
+    return Json{{"input_tokens", uncached},
                 {"cache_creation_input_tokens", nullptr},
                 {"cache_read_input_tokens", cached ? Json(*cached) : Json(nullptr)},
                 {"cache_creation", nullptr},
@@ -388,9 +399,10 @@ std::string make_anthropic_count_tokens_response(int input_tokens) {
 
 AnthropicMessagesStream::AnthropicMessagesStream(AnthropicResponseIdentity identity,
                                                  int input_tokens, bool hide_thinking,
-                                                 std::vector<AnthropicToolSearch> searches)
+                                                 std::vector<AnthropicToolSearch> searches,
+                                                 bool claude_code_usage_compat)
     : identity_(std::move(identity)), searches_(std::move(searches)), input_tokens_(input_tokens),
-      hide_thinking_(hide_thinking) {}
+      hide_thinking_(hide_thinking), claude_code_usage_compat_(claude_code_usage_compat) {}
 
 std::string AnthropicMessagesStream::start() { return start_with_cache(std::nullopt); }
 
@@ -416,7 +428,9 @@ std::string AnthropicMessagesStream::start_with_cache(std::optional<int> cache_r
                        {"content", Json::array()},
                        {"stop_reason", nullptr},
                        {"stop_sequence", nullptr},
-                       {"usage", streaming_start_usage(input_tokens_, cache_read_input_tokens)}};
+                       {"usage",
+                        streaming_start_usage(input_tokens_, cache_read_input_tokens,
+                                              claude_code_usage_compat_)}};
     return event("message_start", Json{{"type", "message_start"}, {"message", message}});
 }
 

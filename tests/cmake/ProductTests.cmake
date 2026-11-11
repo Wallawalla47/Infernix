@@ -137,6 +137,13 @@ infernix_add_test(infernix_http_stream_refusals_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_stream_refusals.cpp"
   LIBRARIES infernix_serve infernix_product_logging)
 
+# --claude-code-usage-compat on a streamed Messages answer, over loopback HTTP through the real route:
+# the option reaches the streaming encoder, and only message_start's input_tokens differs from the
+# same server with the flag off.
+infernix_add_test(infernix_http_anthropic_usage_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_anthropic_usage_compat.cpp"
+  LIBRARIES infernix_serve infernix_product_logging)
+
 infernix_add_test(infernix_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"
   LIBRARIES infernix_serve)

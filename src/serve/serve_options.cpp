@@ -129,6 +129,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--any-model-name", false},
     ServeOptionArity{"--cors", false},
     ServeOptionArity{"--usage-chunk-choice", false},
+    ServeOptionArity{"--claude-code-usage-compat", false},
     ServeOptionArity{"--temperature"},
     ServeOptionArity{"--top-p"},
     ServeOptionArity{"--top-k"},
@@ -699,6 +700,13 @@ std::string serve_usage_text(const char* argv0) {
            "  --cors                     send permissive CORS headers for browser UIs\n"
            "  --usage-chunk-choice       give the streamed usage chunk a zero-delta choice so\n"
            "                             strict parsers that reject choices:[] accept it\n"
+           "  --claude-code-usage-compat\n"
+           "                             Anthropic streaming: report a provisional 0 as the\n"
+           "                             message_start input_tokens (its cache-read split stays\n"
+           "                             exact), so a client that keeps the start value\n"
+           "                             when the terminal message_delta corrects it to 0 does\n"
+           "                             not count the prompt twice. Terminal usage stays\n"
+           "                             exact. Off by default; not for general clients.\n"
            "\n"
            "NOTES\n"
            "  Qwen3.5 applies --vram-headroom-mib only with --kv-capacity auto (the\n"
@@ -1217,6 +1225,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_cors = true;
         } else if (arg == "--usage-chunk-choice") {
             options.usage_chunk_choice = true;
+        } else if (arg == "--claude-code-usage-compat") {
+            options.claude_code_usage_compat = true;
         } else if (arg == "--temperature") {
             options.sampling_overrides.temperature =
                 parse_float_in(require_value("--temperature"), "temperature", 0.0f, 2.0f);
