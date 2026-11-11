@@ -508,11 +508,13 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         const int want = std::min(cap - take, misses - kept_of(channel, misses));
         return take + std::min(want, eligible);
     };
-    // Narrow SSD-only experts no CPU job takes (no service, a call wider than its columns, or past
+    // SSD-only experts no CPU job takes (no service, a call wider than its columns, or past
     // its cap): without a fetch channel nothing can serve them, so the call must set its error word.
-    const auto ssd_unserved = [&](const moe::CpuMissService* service) {
+    // `ssd` is the body's set: the narrow one for its configs, or the full one (wide experts too) for
+    // a call with no service and no fetch channel; only routed experts reach the stage.
+    const auto ssd_unserved = [&](const moe::CpuMissService* service, const std::vector<std::uint8_t>& ssd) {
         int ssd_misses = 0;
-        for (int e = 0; e < experts; ++e) { ssd_misses += ssd_narrow[e]; }
+        for (int e = 0; e < experts; ++e) { ssd_misses += ssd[e] != 0 && expert_columns[e] > 0 ? 1 : 0; }
         if (service == nullptr || columns > service->channel(0).max_columns) { return ssd_misses; }
         const auto channel = service->channel(0);
         const int cap = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
@@ -608,6 +610,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                 Config{3, &service_ssd8, false, false, false, true, true},
                                 Config{64, &service_ssd8, true, false, false, true, true},
                                 Config{3, nullptr, false, false, false, true, true},
+                                // The full SSD-only set (wide experts too) with no fetch channel: nothing serves
+                                // them, so the stage sets its error word and the wide passes skip the null records.
+                                Config{.slots = 64, .service = nullptr, .table = true, .ssd = 2},
                                 // Fetch channel: serial passes, overlap, fork, landing, with CPU jobs, failures.
                                 Config{.slots = 3, .service = nullptr, .table = true, .ssd = 2, .fetched = true},
                                 Config{.slots = 1, .service = nullptr, .table = true, .ssd = 2, .fetched = true},
@@ -832,7 +837,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                   "the CPU serves min(cap, M - M / divisor) of the eligible misses");
         }
         const std::uint32_t error = *reinterpret_cast<volatile std::uint32_t*>(error_host);
-        const int unserved        = config.ssd == 1 && !config.fetched ? ssd_unserved(config.service) : 0;
+        const int unserved        = config.ssd != 0 && !config.fetched
+                                        ? ssd_unserved(config.service, config.ssd == 1 ? ssd_narrow : ssd_full)
+                                        : 0;
         if (unserved > 0) {
             // Its outputs are undefined; the word names the layer and the staging code.
             std::printf("E=%d T=%d k=%d staging slots %2d (SSD-only experts), %d unserved: error word %#x\n", experts,

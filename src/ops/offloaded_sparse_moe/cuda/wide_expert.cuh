@@ -270,6 +270,8 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
             for (int w = static_cast<int>(blockIdx.x); w < work; w += static_cast<int>(gridDim.x)) {
                 const int tile = tile_begin + w / kRowBlocks, row_block = w % kRowBlocks;
                 const int job = call.tiles[2 * tile], column = call.tiles[2 * tile + 1];
+                // The stage's unserved record (kErrorUnservedRecord): the narrow passes skip it, so does this one.
+                if (call.job_records[job] == nullptr) { continue; }
                 const int row = call.dispatch.offsets[call.dispatch.jobs[job]] + column;
                 const std::uint8_t* matrix = call.job_records[job] + Shape::kOffset +
                                              static_cast<std::size_t>(row_block) * S::kRowGroups * Shape::kBlocks *
@@ -320,6 +322,8 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
         const int tile = tile_begin + w / kRowBlocks;
         ctx.row_block  = w % kRowBlocks;
         const int job = call.tiles[2 * tile], column = call.tiles[2 * tile + 1];
+        // The stage's unserved record (kErrorUnservedRecord): skipped in step with the producer above.
+        if (call.job_records[job] == nullptr) { continue; }
         ctx.expert    = call.dispatch.jobs[job];
         const int begin = call.dispatch.offsets[ctx.expert];
         ctx.first       = begin + column;
