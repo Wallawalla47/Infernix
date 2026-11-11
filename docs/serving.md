@@ -1461,7 +1461,11 @@ is already exact and creation is still `null` there; terminal cumulative usage m
 response. `--claude-code-usage-compat` reports that start's `input_tokens` as a provisional `0`
 instead (its cache-read split stays exact, and the terminal usage is unchanged), so a Claude Code
 version that keeps the positive start value after the terminal `message_delta` corrects it to `0`
-cannot count the prompt twice. The uncached count then travels only in that terminal event: a stream
+cannot count the prompt twice. Claude Code 2.1.309 and 2.1.322 (the latest release on 2026-11-11)
+take the terminal `input_tokens` only when it is positive
+([anthropics/claude-code#103901](https://github.com/anthropics/claude-code/issues/103901)):
+without the option they persist a prompt part written to the cache in full as both input and
+creation, with it every persisted usage sums to the prompt. The uncached count then travels only in that terminal event: a stream
 the generation breaks off with an `error` event, or a transfer the client closes before it, carries
 it nowhere, in either mode. It is a protocol workaround for that client, not a route: it
 under-reports the prompt while a stream runs, so it is off by default and off for every other route
