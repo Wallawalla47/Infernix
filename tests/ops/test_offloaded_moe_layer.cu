@@ -610,9 +610,11 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                 Config{3, &service_ssd8, false, false, false, true, true},
                                 Config{64, &service_ssd8, true, false, false, true, true},
                                 Config{3, nullptr, false, false, false, true, true},
-                                // The full SSD-only set (wide experts too) with no fetch channel: nothing serves
-                                // them, so the stage sets its error word and the wide passes skip the null records.
-                                Config{.slots = 64, .service = nullptr, .table = true, .ssd = 2},
+                                // The full SSD-only set (wide experts too) with no fetch channel, read zero-copy
+                                // as the streamed whole-layer route does: nothing serves them, so the stage sets
+                                // its error word and leaves their records null, which the wide passes skip (a
+                                // staged call gives every miss a slot, so only zero-copy reaches a null record).
+                                Config{.slots = 0, .service = nullptr, .table = true, .ssd = 2},
                                 // Fetch channel: serial passes, overlap, fork, landing, with CPU jobs, failures.
                                 Config{.slots = 3, .service = nullptr, .table = true, .ssd = 2, .fetched = true},
                                 Config{.slots = 1, .service = nullptr, .table = true, .ssd = 2, .fetched = true},
