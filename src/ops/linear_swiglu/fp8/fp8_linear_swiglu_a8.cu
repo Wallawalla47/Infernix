@@ -6,7 +6,8 @@
 namespace infernix::ops::detail {
 namespace {
 using Tma64x128 = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
-using Tma64x256 = Fp8A8TmaMmaSchedule<64, 256, 128, 2, 4, 2, 1>;
+using Tma96x256 = Fp8A8TmaMmaSchedule<96, 256, 128, 3, 4, 2, 1>;
+using Tma192x128 = Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1>;
 using Bulk      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
 } // namespace
 
@@ -54,7 +55,11 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& 
     if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R128K128>();
     if (x.ne[1] <= 64) return launch.template operator()<Fp8A8T64R128K256>();
     if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
-    if (x.ne[1] <= 192) return launch.template operator()<Tma64x256>();
+    // Two 96-token tiles of 256 rows at 129-160 columns (144-148 against 164-167 us for three 64-token ones)
+    // and one 192-token tile of 128 rows at 161-192 (151-153 against 178 us; RTX 5090, 2026-11-10). None of
+    // the three has a split-K tail: the same bits.
+    if (x.ne[1] <= 160) return launch.template operator()<Tma96x256>();
+    if (x.ne[1] <= 192) return launch.template operator()<Tma192x128>();
     launch.template operator()<Bulk>();
 }
 } // namespace infernix::ops::detail

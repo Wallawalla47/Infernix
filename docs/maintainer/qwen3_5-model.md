@@ -305,6 +305,23 @@ and 72.6 / 72.6 tok/s). Greedy text against the previous build: identical at 196
 the default route and at 196 and 382 on `--reproducible`; different at 729 tokens on both routes and at 5,856 on
 `--reproducible`, and identical there too with the three bit-changing table entries taken out.
 
+The N = 5120 down projection at 129-512 columns (2026-11-11). Its launches there are one wave (80-240 CTAs on 170
+SMs), so a call's time is one CTA's K loop of 68 tiles, and the table's one-stage 128x128 tile at two CTAs an SM
+(193-384 columns) was the slow choice: with every tile forced in turn, the 64x128 two-stage tile takes 72-75
+against 118-122 us at 193-256 columns and the 128x128 two-stage tile 100-104 against 123-130 us at 257-384 (K =
+17408; K = 6144 the same shape: 32-34 against 50, 44-46 against 52-55); a 64x64 tile at two CTAs an SM takes 65-67
+against 69 us at 129-176. Smaller tiles at three or four CTAs an SM, K blocks of 128 and the TMA tile below 513
+columns measured slower. The seven layers whose MLP is FP8 take two 96x256 tiles at 129-160 columns and one
+192x128 tile at 161-192 for the gate/up (146 against 164-167 us, 153 against 178). All of these keep the bits (one
+K order per output, no split-K tail involved); greedy text equals the previous build's at 196, ~260, 382, 729 and
+5,856 prompt tokens on both routes. Prefill against the previous build (official NVFP4 artifact, INT8 KV, A B B A
+x2): 200-255 tokens -9.7 to -10.6 %, 264-328 -4.4 to -4.9 %, 136-177 -0.2 to -2.1 %, other widths level;
+`--reproducible`: 200 -9.5 %, 264 -4.4 %. Measured and not taken: FP8 entries that would change a split-K tail
+(the FP8 MLP's gate/up at 257-288, its down at 129-240: seven layers, 0.1-0.3 % of a prefill each); small tiles
+for the K = 6144 FP8 output (none faster); a launch order that runs a row group's partly filled token tile after
+its full tiles (gate/up -2 to -4 % at 257-384 columns, level end to end: the partly filled tile's time is its 40
+load-and-barrier round trips, not its weights coming from memory).
+
 MTP is a one-layer predictor conditioned on a final-normalized target hidden state h_t and the
 following token x_(t+1):
 
