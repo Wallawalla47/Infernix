@@ -1458,9 +1458,11 @@ is already exact and creation is still `null` there; terminal cumulative usage m
 response. `--claude-code-usage-compat` reports that start's `input_tokens` as a provisional `0`
 instead (its cache-read split stays exact, and the terminal usage is unchanged), so a Claude Code
 version that keeps the positive start value after the terminal `message_delta` corrects it to `0`
-cannot count the prompt twice; only the terminal event then carries the uncached count. It is a
-protocol workaround for that client, not a route: it under-reports the prompt while a stream runs,
-so it is off by default and off for every other route and for the non-streaming response.
+cannot count the prompt twice. The uncached count then travels only in that terminal event: a stream
+the generation breaks off with an `error` event, or a transfer the client closes before it, carries
+it nowhere, in either mode. It is a protocol workaround for that client, not a route: it
+under-reports the prompt while a stream runs, so it is off by default and off for every other route
+and for the non-streaming response.
 
 Every successful Messages response also carries the llama.cpp-compatible top-level `timings`
 object described for [Chat Completions](#llamacpp-compatible-request-observations), with the same

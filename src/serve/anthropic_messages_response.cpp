@@ -151,7 +151,9 @@ Json final_usage(const GenerationOutcome& outcome) {
 // snapshots published, after the finish), and no output yet.
 // `provisional_zero_input` is --claude-code-usage-compat: it withholds the uncached prompt count too,
 // because an affected Claude Code keeps the positive start value after the terminal message_delta
-// corrects it to 0 and then counts the prompt twice. Only the terminal usage carries that count here.
+// corrects it to 0 and then counts the prompt twice. The terminal usage is then the only event that
+// carries that count, so a stream that ends before it - on an error event or a closed transfer -
+// reports the uncached count nowhere.
 Json streaming_start_usage(int input_tokens, std::optional<int> cache_read_input_tokens,
                            bool provisional_zero_input) {
     const int prompt = std::max(0, input_tokens);

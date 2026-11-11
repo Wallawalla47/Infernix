@@ -166,9 +166,10 @@ public:
                             bool claude_code_usage_compat = false);
 
     // The Engine start event is exact for normal streams; with the compat mode above, its
-    // `input_tokens` is the provisional 0 there too, including on this no-argument form, which is
-    // reserved for an error raised before admission, so an Anthropic error event still has a valid
-    // stream prefix.
+    // `input_tokens` is the provisional 0 there too, including on this no-argument form. The route
+    // that reaches it admitted the request already and then failed before the Engine's start
+    // observation, so it reports no cache-read split (a refusal before admission is a plain HTTP
+    // answer and never starts a stream); an Anthropic error event still has a valid stream prefix.
     std::string start();
     std::string start(const infernix::GenerationStart& generation);
 
