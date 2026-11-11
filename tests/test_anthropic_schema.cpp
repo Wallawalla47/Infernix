@@ -2103,17 +2103,22 @@ int test_tool_search_stream() {
 
     const AnthropicResponseIdentity identity =
         make_anthropic_response_identity("req_search_stream", "claude-local");
-    AnthropicMessagesStream stream(identity, first.prompt_tokens);
-    std::vector<std::string> events{stream.start(infernix::GenerationStart{
-        .prompt = infernix::PromptSummary{.prompt_tokens = 40}, .reused_prompt_tokens = 0})};
-    const auto append_events = [&](std::vector<std::string> values) {
-        events.insert(events.end(), std::make_move_iterator(values.begin()),
-                      std::make_move_iterator(values.end()));
+    // The response's events, with or without --claude-code-usage-compat.
+    const auto stream_events = [&](bool usage_compat) {
+        AnthropicMessagesStream stream(identity, first.prompt_tokens, false, {}, usage_compat);
+        std::vector<std::string> events{stream.start(infernix::GenerationStart{
+            .prompt = infernix::PromptSummary{.prompt_tokens = 40}, .reused_prompt_tokens = 0})};
+        const auto append_events = [&](std::vector<std::string> values) {
+            events.insert(events.end(), std::make_move_iterator(values.begin()),
+                          std::make_move_iterator(values.end()));
+        };
+        append_events(stream.reasoning_delta("I need a "));
+        append_events(stream.segment(search_segment));
+        append_events(stream.content_delta("Let me "));
+        append_events(stream.finish(final_segment, totals, std::nullopt));
+        return events;
     };
-    append_events(stream.reasoning_delta("I need a "));
-    append_events(stream.segment(search_segment));
-    append_events(stream.content_delta("Let me "));
-    append_events(stream.finish(final_segment, totals, std::nullopt));
+    const std::vector<std::string> events = stream_events(false);
 
     std::vector<std::string> blocks;
     std::vector<int> indices;
@@ -2160,6 +2165,23 @@ int test_tool_search_stream() {
                           start_usage.at("input_tokens") == 40 &&
                           start_usage.at("cache_creation_input_tokens").is_null(),
                       "the stream's terminal usage did not sum the generations");
+    // --claude-code-usage-compat on the same multi-round stream: message_start reports a
+    // provisional 0 input instead of 40 and nothing else changes, so the terminal usage is still
+    // the summed one.
+    const std::vector<std::string> compat = stream_events(true);
+    bool rest_identical                   = compat.size() == events.size();
+    for (std::size_t i = 1; rest_identical && i < events.size(); ++i) {
+        rest_identical = compat[i] == events[i];
+    }
+    Json compat_start                                = parse_event(compat.front());
+    const Json compat_start_usage                    = compat_start.at("message").at("usage");
+    compat_start["message"]["usage"]["input_tokens"] = 40;
+    failures += check(rest_identical && compat_start_usage.at("input_tokens") == 0 &&
+                          compat_start_usage.at("cache_read_input_tokens") == 0 &&
+                          compat_start_usage.at("cache_creation_input_tokens").is_null() &&
+                          compat_start == parse_event(events.front()),
+                      "the usage compat mode changed more of the multi-round stream than "
+                      "message_start's input_tokens");
 
     // A response that reached the generation limit pauses instead of claiming a tool call.
     const AnthropicResponseSegment paused{.outcome        = &first,

@@ -321,8 +321,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     try {
         auto stream  = std::make_shared<HttpGenerationStream>(std::move(prepared));
         // The compat mode reaches only this streaming encoder: the non-streaming branch and the
-        // terminal usage here are untouched, and an error before Engine admission still starts the
-        // message with its provisional usage and then reports the error event.
+        // terminal usage here are untouched, and an error after admission but before the Engine's
+        // start observation still starts the message with its provisional usage and then reports
+        // the error event.
         auto encoder = std::make_shared<AnthropicMessagesStream>(
             identity, input_tokens, request.hide_thinking, request.tool_searches,
             options_.claude_code_usage_compat);
