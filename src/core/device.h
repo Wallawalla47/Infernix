@@ -10,6 +10,12 @@ namespace infernix {
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
+// The reporter behind cuda_check and the CUDA cleanup paths: writes the bare line to stderr, then
+// publishes the same text through the observer when one is installed (core/cuda_diagnostics.h).
+void report_cuda_check_failure(const char* expr, const char* file, int line,
+                               cudaError_t err) noexcept;
+void report_cuda_cleanup_failure(const char* op, cudaError_t err) noexcept;
+
 #define CUDA_CHECK(expr) ::infernix::cuda_check((expr), #expr, __FILE__, __LINE__)
 
 // Non-owning execution facts passed to Ops whose launch policy depends on physical device

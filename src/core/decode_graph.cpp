@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <cstdio>
 #include <fstream>
 #include <mutex>
 #include <optional>
@@ -17,30 +16,24 @@
 namespace infernix {
 namespace {
 
-void log_cuda_error(const char* op, cudaError_t err) noexcept {
-    if (err != cudaSuccess) {
-        std::fprintf(stderr, "CUDA cleanup failed during %s: %s: %s\n", op, cudaGetErrorName(err),
-                     cudaGetErrorString(err));
-    }
-}
-
 void destroy_graph_exec(cudaGraphExec_t& exec) noexcept {
     if (exec != nullptr) {
-        log_cuda_error("cudaGraphExecDestroy", cudaGraphExecDestroy(exec));
+        report_cuda_cleanup_failure("cudaGraphExecDestroy", cudaGraphExecDestroy(exec));
         exec = nullptr;
     }
 }
 
 void destroy_graph(cudaGraph_t& graph) noexcept {
     if (graph != nullptr) {
-        log_cuda_error("cudaGraphDestroy", cudaGraphDestroy(graph));
+        report_cuda_cleanup_failure("cudaGraphDestroy", cudaGraphDestroy(graph));
         graph = nullptr;
     }
 }
 
 void discard_capture(cudaStream_t stream) noexcept {
     cudaGraph_t discard = nullptr;
-    log_cuda_error("cudaStreamEndCapture(discard)", cudaStreamEndCapture(stream, &discard));
+    report_cuda_cleanup_failure("cudaStreamEndCapture(discard)",
+                                cudaStreamEndCapture(stream, &discard));
     destroy_graph(discard);
 }
 
@@ -187,7 +180,8 @@ void DecodeGraphDefinition::capture_gated_chain(
             } catch (...) {
                 // The capture's graph is `target`, which the chain owns: end it without destroying it.
                 cudaGraph_t ended = nullptr;
-                log_cuda_error("cudaStreamEndCapture(discard)", cudaStreamEndCapture(stream, &ended));
+                report_cuda_cleanup_failure("cudaStreamEndCapture(discard)",
+                                            cudaStreamEndCapture(stream, &ended));
                 throw;
             }
             cudaGraph_t captured = nullptr;
@@ -203,7 +197,8 @@ void DecodeGraphDefinition::capture_gated_chain(
                 tail();
             } catch (...) {
                 cudaGraph_t ended = nullptr;
-                log_cuda_error("cudaStreamEndCapture(discard)", cudaStreamEndCapture(stream, &ended));
+                report_cuda_cleanup_failure("cudaStreamEndCapture(discard)",
+                                            cudaStreamEndCapture(stream, &ended));
                 throw;
             }
             cudaGraph_t captured = nullptr;

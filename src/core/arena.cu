@@ -1,8 +1,9 @@
 #include "core/arena.h"
 
+#include "core/device.h"
+
 #include <cuda_runtime.h>
 
-#include <cstdio>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -13,13 +14,6 @@ namespace {
 
 std::string cuda_error_message(const char* prefix, cudaError_t err) {
     return std::string(prefix) + ": " + cudaGetErrorName(err) + ": " + cudaGetErrorString(err);
-}
-
-void log_cuda_error(const char* op, cudaError_t err) noexcept {
-    if (err != cudaSuccess) {
-        std::fprintf(stderr, "CUDA cleanup failed during %s: %s: %s\n", op, cudaGetErrorName(err),
-                     cudaGetErrorString(err));
-    }
 }
 
 bool is_power_of_two(std::size_t value) { return value != 0 && (value & (value - 1)) == 0; }
@@ -39,14 +33,14 @@ std::uintptr_t align_up_addr(std::uintptr_t addr, std::size_t align) {
 
 void free_device(void*& ptr) noexcept {
     if (ptr != nullptr) {
-        log_cuda_error("cudaFree", cudaFree(ptr));
+        report_cuda_cleanup_failure("cudaFree", cudaFree(ptr));
         ptr = nullptr;
     }
 }
 
 void free_pinned(void*& ptr) noexcept {
     if (ptr != nullptr) {
-        log_cuda_error("cudaFreeHost", cudaFreeHost(ptr));
+        report_cuda_cleanup_failure("cudaFreeHost", cudaFreeHost(ptr));
         ptr = nullptr;
     }
 }

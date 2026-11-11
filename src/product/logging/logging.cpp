@@ -1,7 +1,9 @@
 #include "product/logging/logging.h"
 
+#include "core/cuda_diagnostics.h"
 #include "media/decode/decode.h"
 #include "product/log_colour/log_colour.h"
+#include "product/logging/engine_diagnostics.h"
 #include "product/logging/pretty_format.h"
 
 #include <spdlog/formatter.h>
@@ -582,9 +584,16 @@ struct LoggingRuntime::Impl {
         // A library writing to stderr directly would land inside the terminal footer, and the
         // next redraw would leave footer rows behind in the scrollback.
         previous_media_log = media::decode::set_library_log_handler(media_log_handler(logger));
+        // A CUDA_CHECK failure aborts without flushing stdio, so its record must reach the file
+        // before that; the reporter writes the bare stderr line first, then publishes here.
+        previous_cuda_diagnostics =
+            set_cuda_diagnostic_observer(engine_diagnostic_observer(logger));
     }
 
-    ~Impl() { media::decode::set_library_log_handler(std::move(previous_media_log)); }
+    ~Impl() {
+        set_cuda_diagnostic_observer(std::move(previous_cuda_diagnostics));
+        media::decode::set_library_log_handler(std::move(previous_media_log));
+    }
 
     Impl(const Impl&)            = delete;
     Impl& operator=(const Impl&) = delete;
@@ -593,6 +602,7 @@ struct LoggingRuntime::Impl {
     std::shared_ptr<TerminalProgress> progress;
     std::shared_ptr<TerminalPanel> panel;
     media::decode::LibraryLogHandler previous_media_log;
+    DiagnosticObserver previous_cuda_diagnostics;
 };
 
 LoggingRuntime::LoggingRuntime(LoggingOptions options)

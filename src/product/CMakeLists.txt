@@ -27,4 +27,6 @@ add_library(infernix_product_logging STATIC
   logging/startup_log.cpp
 )
 infernix_internal_includes(infernix_product_logging)
-target_link_libraries(infernix_product_logging PUBLIC spdlog::spdlog PRIVATE infernix_media_decode)
+target_link_libraries(infernix_product_logging
+  PUBLIC spdlog::spdlog
+  PRIVATE infernix_media_decode infernix_core)
