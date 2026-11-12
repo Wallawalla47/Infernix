@@ -27,12 +27,14 @@ inline constexpr std::uint32_t kErrorHostSilent     = 0xFF02; // the CPU service
 inline constexpr std::uint32_t kErrorFetchSilent    = 0xFF03; // the fetch responder's heartbeat stopped during a wait
 inline constexpr std::uint32_t kErrorDownStalled    = 0xFF04; // a narrow down pass's job h never became ready
 
-// How long a narrow expert down pass waits for its own job's h (GPU time): the 122B's A16 ring and Flash-Next's
-// tensor-core narrow route. The h comes from gate/up work already running (taken before any down task, or a grid
-// whose every CTA had started before the down grid launched), so it is ready within microseconds; only a defect (a
-// lost ready word, a phase mismatch) reaches the bound, which fails the call through its error word instead of
-// hanging the stream until a WDDM TDR ends the process.
-inline constexpr std::uint64_t kDownReadyTimeoutNs = 2000000000ULL;
+// How long a narrow expert down pass waits for its own job's h without progress (GPU time): the 122B's A16 ring and
+// the narrow routes' per-job waits. The h comes from gate/up work already running (taken before any down task, or a
+// grid whose every CTA had started before the down grid launched), so it is normally ready within microseconds; the
+// bound fails the call through its error word instead of hanging the stream until a WDDM TDR ends the process. It is
+// the host heartbeat's 10 s, and a counted wait restarts it at each change of its count (wait_job_count): the former
+// 2 s on elapsed time fired on 11-08 under contention (a GPU and RAM shared with another job), failing every running
+// and paused request of a healthy Engine.
+inline constexpr std::uint64_t kDownReadyTimeoutNs = 10000000000ULL; // kHeartbeatTimeoutNs (static_assert below)
 
 // A wait gives up when the host's heartbeat has not changed for this long (GPU time). A host thread
 // that died is reported at once through its own failure (CpuMissService::failure, the tier agent's);
@@ -40,6 +42,7 @@ inline constexpr std::uint64_t kDownReadyTimeoutNs = 2000000000ULL;
 // stall a live thread: under RAM pressure (Windows trimming and compressing working sets) 1 s failed
 // FP8 requests on a healthy service (2026-10-16: 8 of 34 SSD-tier runs at ~2 GiB available).
 inline constexpr std::uint64_t kHeartbeatTimeoutNs = 10000000000ULL;
+static_assert(kDownReadyTimeoutNs == kHeartbeatTimeoutNs, "the down-wait bound is the heartbeat's");
 
 struct alignas(64) FetchRequest {
     std::uint32_t sequence;

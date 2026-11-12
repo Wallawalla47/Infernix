@@ -10414,7 +10414,10 @@ Also measured and rejected (2026-10-10, Dense8, against the PDL pair):
   adds one more to that count with a release after encoding, and each down CTA of a call of at most 8
   columns polls its job's count with acquire loads instead of `griddepcontrol.wait` (bounded:
   `kDownReadyTimeoutNs`, then `kErrorDownStalled`). Both the tensor-core A16 route and the GGUF narrow
-  kernels take it. ninferpro measured -0.7..-1.4 % forward time on its dp4a kernels (12 columns level,
+  kernels take it. **The bound (2026-11-12, the fix sweep's FS-02):** 10 s without progress (`wait_job_count`:
+  each change of the count restarts it), the host heartbeat's bound; it was 2 s of elapsed time, which fired on
+  11-08 under contention and failed every request of a healthy Engine. ninferpro measured -0.7..-1.4 % forward
+  time on its dp4a kernels (12 columns level,
   18 grid-wide ahead). Measured here against the grid-wide wait (2026-11-08, a temporary switch since
   removed; three ABBA blocks of fresh processes, BF16 KV, the same tokens): FP4-Local with DFlash2 and
   n-gram auto conv 213.6 -> 215.4 tok/s (+0.6..+1.1 % in each block), struct 474.8 -> 477.7

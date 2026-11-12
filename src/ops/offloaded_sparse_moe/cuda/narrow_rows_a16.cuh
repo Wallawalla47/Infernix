@@ -213,19 +213,10 @@ __global__ void __launch_bounds__(kThreads, kRowsMinCtas) gate_up_rows_kernel(Ro
 }
 
 // A down CTA's wait for its job's h: the gate/up CTAs count every h element with a release, so acquire loads of the
-// count reaching `target` see every h store. Bounded (offloaded_moe::kDownReadyTimeoutNs): a lost count fails the call
-// through its error word and returns false (the CTA then reads no h), never hangs the stream.
+// count reaching `target` see every h store. Bounded (wait_job_count: GPU time without progress): a lost count fails
+// the call through its error word and returns false (the CTA then reads no h), never hangs the stream.
 __device__ __forceinline__ bool rows_wait_job(const MoeExpertSource& source, const std::uint32_t* count, std::uint32_t target) {
-    if (load_acquire_gpu(count) >= target) { return true; }
-    const std::uint64_t entered = global_ns();
-    do {
-        if (global_ns() - entered > offloaded_moe::kDownReadyTimeoutNs) {
-            report_error(source, offloaded_moe::kErrorDownStalled);
-            return false;
-        }
-        __nanosleep(64);
-    } while (load_acquire_gpu(count) < target);
-    return true;
+    return wait_job_count(source, count, target, true);
 }
 
 // One h row of G::kIntermediate BF16 elements encoded under its own exponent into `acts`: thread t < kIntermediate / 8

@@ -279,6 +279,10 @@ struct MoeExpertSource {
     // How long the CPU wait and the fetch poller wait on a heartbeat that stands still (GPU time)
     // before they write kErrorHostSilent / kErrorFetchSilent.
     std::uint64_t heartbeat_timeout_ns = offloaded_moe::kHeartbeatTimeoutNs;
+    // How long a narrow down pass waits for its own job's h (GPU time) before it writes kErrorDownStalled and
+    // reads none (the per-job waits of the A16 tensor-core, rows, ring and GGUF down CTAs). Tests shorten it to
+    // reach that failure path.
+    std::uint64_t down_ready_timeout_ns = offloaded_moe::kDownReadyTimeoutNs;
     // TEMPORARY (INFERNIX_TMP_REPLAY_BENCH): optional device word; each call's CPU wait adds the GPU
     // nanoseconds it waited for the host's answer (the replay bench's waits, subtracted from its
     // round time).

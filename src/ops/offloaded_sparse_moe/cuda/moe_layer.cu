@@ -244,6 +244,32 @@ __device__ __forceinline__ void report_error(const MoeExpertSource& source, std:
     *reinterpret_cast<volatile std::uint32_t*>(source.error) = (static_cast<std::uint32_t>(layer) << 16U) | (code & 0xFFFFU);
 }
 
+// A narrow down CTA's thread 0: waits until its job's count at `count` equals `ready` (reaches it with `at_least`),
+// acquiring every store the count's releases cover. The bound (MoeExpertSource::down_ready_timeout_ns) is GPU time
+// without progress: each change of the count restarts it, so a job whose gate/up CTAs are descheduled for a while (a
+// GPU shared with another process) is not failed for being slow (the fix sweep's FS-02: the former 2 s bound on
+// elapsed time fired on 11-08 under contention, and kErrorDownStalled fails every running and paused request).
+// Returns false, with kErrorDownStalled in the call's error word, once the bound passes without progress.
+__device__ inline bool wait_job_count(const MoeExpertSource& source, const std::uint32_t* count, std::uint32_t ready,
+                                      bool at_least = false) {
+    const auto done = [&](std::uint32_t v) { return at_least ? v >= ready : v == ready; };
+    std::uint32_t seen = load_acquire_gpu(count);
+    if (done(seen)) { return true; }
+    std::uint64_t entered = global_ns();
+    for (;;) {
+        __nanosleep(64);
+        const std::uint32_t now = load_acquire_gpu(count);
+        if (done(now)) { return true; }
+        if (now != seen) {
+            seen    = now;
+            entered = global_ns();
+        } else if (global_ns() - entered > source.down_ready_timeout_ns) {
+            report_error(source, offloaded_moe::kErrorDownStalled);
+            return false;
+        }
+    }
+}
+
 // The fetch index of `job` in the call's request, or -1 when the job is not fetch-served.
 __device__ __forceinline__ int fetch_index(const FetchCall* call, int job) {
     if (call == nullptr || call->pending == 0 || job < call->first || job >= call->first + call->count) { return -1; }

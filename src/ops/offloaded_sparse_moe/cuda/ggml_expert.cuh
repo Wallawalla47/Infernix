@@ -329,19 +329,9 @@ __device__ __forceinline__ void down_nmma_task(NmmaDownShared<D>& sm, const Nmma
         // Only this job's h is read (and outputs written): wait for the count its last gate/up CTA releases after
         // encoding h, as the tensor-core A16 route does (narrow_a16_mma.cuh, candidates YF-01): the gate/up grid
         // is a serialized launch and every one of its CTAs had started before this grid launched. Bounded
-        // (offloaded_moe::kDownReadyTimeoutNs): a lost count fails the call through its error word, never hangs.
+        // (MoeExpertSource::down_ready_timeout_ns): a lost count fails the call through its error word, never hangs.
         if (record != nullptr && threadIdx.x == 0) {
-            const std::uint32_t ready = static_cast<std::uint32_t>(kNmmaGateUpCtas) + 1U;
-            if (load_acquire_gpu(a.job_ctas + job) != ready) {
-                const std::uint64_t entered = global_ns();
-                do {
-                    if (global_ns() - entered > offloaded_moe::kDownReadyTimeoutNs) {
-                        report_error(source, offloaded_moe::kErrorDownStalled);
-                        break;
-                    }
-                    __nanosleep(64);
-                } while (load_acquire_gpu(a.job_ctas + job) != ready);
-            }
+            (void)wait_job_count(source, a.job_ctas + job, static_cast<std::uint32_t>(kNmmaGateUpCtas) + 1U);
         }
         __syncthreads(); // thread 0's acquire reaches the other threads (record is uniform in the CTA)
     } else {

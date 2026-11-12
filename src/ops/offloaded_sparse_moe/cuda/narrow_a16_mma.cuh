@@ -391,19 +391,9 @@ __global__ void __launch_bounds__(kNmma16Threads) down_nmma16_kernel(Nmma16Args 
         // encoding h (candidates YF-01, after ninferpro f48f1c051a). The gate/up grid is a serialized launch, so every
         // earlier kernel has finished, and this grid launched only once every gate/up CTA had started (each triggers
         // at entry): the job's CTAs are running, and its other jobs' down work need not wait for them. Bounded
-        // (offloaded_moe::kDownReadyTimeoutNs): a lost count fails the call through its error word, never hangs.
+        // (MoeExpertSource::down_ready_timeout_ns): a lost count fails the call through its error word, never hangs.
         if (record != nullptr && threadIdx.x == 0) {
-            const std::uint32_t ready = static_cast<std::uint32_t>(S::kGateUpCtas) + 1U;
-            if (load_acquire_gpu(a.job_ctas + job) != ready) {
-                const std::uint64_t entered = global_ns();
-                do {
-                    if (global_ns() - entered > offloaded_moe::kDownReadyTimeoutNs) {
-                        report_error(a.source, offloaded_moe::kErrorDownStalled);
-                        break;
-                    }
-                    __nanosleep(64);
-                } while (load_acquire_gpu(a.job_ctas + job) != ready);
-            }
+            (void)wait_job_count(a.source, a.job_ctas + job, static_cast<std::uint32_t>(S::kGateUpCtas) + 1U);
         }
         __syncthreads(); // thread 0's acquire reaches the other threads (record is uniform in the CTA)
     } else {

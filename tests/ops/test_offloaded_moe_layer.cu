@@ -55,6 +55,8 @@ using infernix::test::cuda_check;
 namespace {
 
 int g_failures = 0;
+// The zero down-wait bound configuration (Config::stall): its calls, and how many reached kErrorDownStalled.
+int g_stall_calls = 0, g_down_stalls = 0;
 
 // The idle-service latency checks (Config::idle) bound a call's time to a few milliseconds, which holds
 // only with the GPU to themselves, so CTest runs them as an entry of their own (--idle-only, run alone)
@@ -535,6 +537,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         bool split    = false; // a forked call's misses staged in two launches (MoeExpertSource::split_stream)
         bool csf      = false; // the bank's CSF records (MoeExpertSource::host_csf), expanded as they are staged
         bool tier_csf = false; // with table: the tier's CSF slots (tagged entries, MoeExpertSource::host_csf_pitch)
+        bool stall    = false; // a zero down-wait bound (MoeExpertSource::down_ready_timeout_ns; candidates ZF-01)
     };
     // Which misses the CPU takes (design §19.3.5 S3): the SSD-only ones first (`ssd`: only the CPU or a fetch can
     // serve them), up to the cap, then want = min(cap - taken, M - M / divisor) of the M host-memory misses; each
@@ -680,6 +683,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                        .fetched = true, .tier_csf = true},
                                 Config{.slots = 16, .service = &service_tier_ssd8, .table = true, .ssd = 2,
                                        .fetched = true, .overlap = true, .tier_csf = true},
+                                // A zero bound on the narrow down passes' wait for their own job's h: the
+                                // failure path (kErrorDownStalled) that only a defect reaches in use.
+                                Config{.slots = 64, .service = nullptr, .stall = true},
                                 // An idle service answers its first request promptly (Windows: no 15.6 ms
                                 // timer-tick sleep): through its short idle wait, and at once after wake().
                                 // The first call, without the service, measures the GPU's own idle cost.
@@ -763,6 +769,43 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         source.error = error_device;
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
+        if (config.stall) {
+            // A down CTA that finds its job's h not yet ready gives up at once: the call must end without a trap,
+            // with the call's error word naming kErrorDownStalled (layer 0: no CPU or fetch channel), and the next
+            // configurations' calls, on the same device, check that it stays usable. Only a captured graph overlaps a
+            // down grid with its gate/up grid (an eager launch here ran them one after the other: 0 of 328 calls
+            // reached the word), so the call is captured once and replayed (ninferpro's form). Whether a down CTA
+            // starts before its job's gate/up CTAs finish is still timing: up to eight replays, and the test requires
+            // the word over the whole run (g_down_stalls), not in every layer.
+            source.down_ready_timeout_ns = 0;
+            cuda_check(cudaDeviceSynchronize(), "the dispatch before the capture"); // a non-blocking stream follows
+            cudaStream_t capture_stream = nullptr;
+            cuda_check(cudaStreamCreateWithFlags(&capture_stream, cudaStreamNonBlocking), "cudaStreamCreate");
+            cudaGraph_t graph = nullptr;
+            cudaGraphExec_t exec = nullptr;
+            cuda_check(cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+            infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, capture_stream);
+            cuda_check(cudaStreamEndCapture(capture_stream, &graph), "end capture");
+            cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+            std::uint32_t error = 0;
+            for (int attempt = 0; attempt < 8 && error == 0; ++attempt) {
+                *reinterpret_cast<volatile std::uint32_t*>(error_host) = 0;
+                cuda_check(cudaGraphLaunch(exec, capture_stream), "graph launch");
+                check(cudaStreamSynchronize(capture_stream) == cudaSuccess,
+                      "a zero down-wait bound ends the call without a trap");
+                error = *reinterpret_cast<volatile std::uint32_t*>(error_host);
+                ++g_stall_calls;
+            }
+            cuda_check(cudaGraphExecDestroy(exec), "graph exec destroy");
+            cuda_check(cudaGraphDestroy(graph), "graph destroy");
+            cuda_check(cudaStreamDestroy(capture_stream), "stream destroy");
+            std::printf("E=%d T=%d k=%d zero down-wait bound: error word %#x\n", experts, columns, top_k, error);
+            if (error != 0) {
+                ++g_down_stalls;
+                check(error == moe::kErrorDownStalled, "a down pass past its bound sets kErrorDownStalled");
+            }
+            continue;
+        }
         if (config.idle > 0) {
             // The time 60 ms of idle adds to a call, against the same call made at once after another. The
             // GPU's own wake-up adds ~0.1 ms without the service. With it, small calls measured +0.3 to +7.3 ms
@@ -1916,6 +1959,11 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
         test_layer(9, 12, 3, 89, kA16, kTwoTerm);
         test_layer(96, 10, 10, 91, kA16, kTwoTerm);
         test_layer(512, 512, 10, 93, kA16, kTwoTerm);
+        if (g_stall_calls > 0) {
+            std::printf("zero down-wait bound: kErrorDownStalled in %d layer configurations (%d calls in all)\n",
+                        g_down_stalls, g_stall_calls);
+            check(g_down_stalls > 0, "a zero down-wait bound reaches kErrorDownStalled");
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;
