@@ -93,6 +93,12 @@ struct DeviceContext {
 // through the host mapping (pinned allocations are device-accessible under UVA) rather than by a
 // copy engine. Small per-round inputs then never queue behind bulk host-to-device transfers of
 // other streams (for example expert promotions), which share the copy engine in FIFO order.
+// The bytes are those of the source at the call, as a copy from pageable memory would take them: they are copied into
+// a pinned staging ring (allocated by the first DeviceContext) and the kernel reads that copy, so the caller may
+// rewrite its buffer as soon as this returns, whether or not the stream has reached the upload (a host a boundary
+// ahead of the device restages its tables; ZL-01). An upload larger than 16 MiB is copied from pageable memory on the
+// copy engine instead. A stream being captured records a node that reads `pinned_src` itself at each replay: the
+// caller keeps it valid and current for every replay.
 void upload_pinned(void* device_dst, const void* pinned_src, std::size_t bytes, cudaStream_t stream);
 
 // Where a kernel reports a fault instead of trapping (a bounded wait that passed its bound, an input

@@ -3824,6 +3824,18 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
   §19.3.27; prefill chunks keep the bulk copy. GPU idle time fell from 22.5 % to 10.9 % of MTP
   decode. Greedy ids are unchanged.
 
+  Its kernel read the host buffer when it ran, not when it was enqueued, and the expert residency rewrites its frame,
+  record and landing tables at every boundary without waiting (the expert stream waits for its own table). With the
+  host a boundary ahead of the device (an ungated layer walk enqueues many layers at once), a queued upload delivered
+  the next boundary's table: about one frame-table upload in 17 on FP4-Local with NVFP4 KV at 1M tokens and four lanes
+  (ZL-01, PR #62's reporter, 2026-11-12). Kernels then saw an expert in neither VRAM nor RAM (an unserved record: a
+  failed round since PR #62, a null dereference before), read frames before their copies landed (a sticky illegal
+  address within 6-9 minutes) or wrote landed records over resident experts (NaN logits until eviction). Since then
+  `upload_pinned` copies the source into a 32 MiB pinned staging ring at the call (allocated with the first
+  DeviceContext; uploads past 16 MiB take a pageable `cudaMemcpyAsync`; a captured node still reads the caller's
+  buffer at each replay), so the bytes are the caller's at the call: the same traffic then ran 557 requests in 35
+  minutes without a failure.
+
   | Workload (same flags) | Before | After |
   |---|---:|---:|
   | tg512 plain | 85.46 | **88.81** |

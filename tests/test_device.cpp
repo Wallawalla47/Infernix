@@ -55,6 +55,107 @@ int check_context(const infernix::DeviceContext& ctx, const char* label) {
     return failures;
 }
 
+void CUDART_CB hold_stream(void* flag) {
+    while (!static_cast<std::atomic<bool>*>(flag)->load()) { std::this_thread::yield(); }
+}
+
+// Fills `words` words of `p` with `seed` + index.
+void fill_words(std::uint32_t* p, std::size_t words, std::uint32_t seed) {
+    for (std::size_t i = 0; i < words; ++i) { p[i] = seed + static_cast<std::uint32_t>(i); }
+}
+
+std::size_t first_mismatch(const std::uint32_t* p, std::size_t words, std::uint32_t seed) {
+    for (std::size_t i = 0; i < words; ++i) {
+        if (p[i] != seed + static_cast<std::uint32_t>(i)) { return i; }
+    }
+    return words;
+}
+
+// upload_pinned copies its source as it is at the call. A caller that rewrites its buffer right after the call, while
+// its stream has not reached the copy yet (held here by a host function, as a host running a boundary ahead of the
+// device leaves it), still delivers the bytes it passed (ZL-01: the expert residency's frame table, re-staged for the
+// next boundary before the queued upload ran, gave kernels a later table). Also the staging ring's wrap and the
+// pageable copy of an upload too large for it.
+int check_upload_snapshot(const infernix::DeviceContext& ctx) {
+    int failures = 0;
+    // Held: one frame table (48 layers x 512 experts x 4 bytes), rewritten before the stream runs the upload.
+    constexpr std::size_t kTable = 48 * 512 * 4;
+    // Past half of the 32 MiB staging ring: the pageable copy instead.
+    constexpr std::size_t kLarge = 24ULL << 20;
+    std::uint32_t* src  = nullptr;
+    std::uint32_t* dst  = nullptr;
+    std::uint32_t* back = nullptr;
+    CUDA_CHECK(cudaMallocHost(&src, kLarge));
+    CUDA_CHECK(cudaMalloc(&dst, kLarge));
+    CUDA_CHECK(cudaMallocHost(&back, kLarge));
+    const auto held_upload = [&](std::size_t bytes, std::uint32_t seed, const char* what) {
+        const std::size_t words = bytes / 4;
+        fill_words(src, words, seed);
+        std::atomic<bool> release{false};
+        CUDA_CHECK(cudaLaunchHostFunc(ctx.stream, hold_stream, &release));
+        infernix::upload_pinned(dst, src, bytes, ctx.stream);
+        fill_words(src, words, seed ^ 0xFFFF0000U); // the next boundary's bytes
+        release.store(true);
+        CUDA_CHECK(cudaMemcpyAsync(back, dst, bytes, cudaMemcpyDeviceToHost, ctx.stream));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        if (const std::size_t at = first_mismatch(back, words, seed); at != words) {
+            std::cerr << "upload_pinned (" << what << ") delivered word " << at << " = 0x" << std::hex << back[at]
+                      << std::dec << ", rewritten after the call, not the bytes it was given\n";
+            ++failures;
+        }
+    };
+    held_upload(kTable, 0xA5000000U, "a frame table behind a held stream");
+    // Wrap: uploads of varying sizes until the ring has been reused, each source rewritten right after its call, every
+    // destination read back after each 48.
+    constexpr std::size_t kRegion = 512 * 1024;
+    constexpr int kUploads        = 96; // 96 x up to 512 KiB: half again the 32 MiB ring
+    std::vector<std::uint32_t> seeds;
+    for (int u = 0; u < kUploads; ++u) {
+        const std::size_t bytes = kRegion - static_cast<std::size_t>(u % 7) * 4096 - 16;
+        const auto seed         = static_cast<std::uint32_t>(0x10000000U + static_cast<std::uint32_t>(u) * 0x00100000U);
+        auto* at                = src + (static_cast<std::size_t>(u) % 2) * (kRegion / 4);
+        fill_words(at, bytes / 4, seed);
+        infernix::upload_pinned(dst + static_cast<std::size_t>(u % 48) * (kRegion / 4), at, bytes, ctx.stream);
+        fill_words(at, bytes / 4, ~seed);
+        seeds.push_back(seed);
+        if (u % 48 == 47) { // every destination region written once since the last check
+            CUDA_CHECK(cudaMemcpyAsync(back, dst, 48 * kRegion, cudaMemcpyDeviceToHost, ctx.stream));
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+            for (int r = 0; r < 48; ++r) {
+                const int v             = u - 47 + r;
+                const std::size_t bytes_v = kRegion - static_cast<std::size_t>(v % 7) * 4096 - 16;
+                const std::uint32_t* got  = back + static_cast<std::size_t>(r) * (kRegion / 4);
+                if (const std::size_t at_word = first_mismatch(got, bytes_v / 4, seeds[static_cast<std::size_t>(v)]);
+                    at_word != bytes_v / 4) {
+                    std::cerr << "upload_pinned upload " << v << " (staging ring reuse) differs at word " << at_word << '\n';
+                    ++failures;
+                    break;
+                }
+            }
+        }
+    }
+    // Larger than half the ring: copied from pageable memory, which cudaMemcpyAsync stages before it returns, so a
+    // rewrite after the call cannot reach it either. (Not behind a held stream: whether the driver's staging of a
+    // pageable copy waits for the stream is the driver's choice.)
+    {
+        const std::size_t words = kLarge / 4;
+        fill_words(src, words, 0x3C000000U);
+        infernix::upload_pinned(dst, src, kLarge, ctx.stream);
+        fill_words(src, words, 0xC3FF0000U);
+        CUDA_CHECK(cudaMemcpyAsync(back, dst, kLarge, cudaMemcpyDeviceToHost, ctx.stream));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        if (const std::size_t at = first_mismatch(back, words, 0x3C000000U); at != words) {
+            std::cerr << "upload_pinned (24 MiB, the pageable copy) delivered word " << at << " = 0x" << std::hex << back[at]
+                      << std::dec << ", not the bytes it was given\n";
+            ++failures;
+        }
+    }
+    CUDA_CHECK(cudaFreeHost(back));
+    CUDA_CHECK(cudaFree(dst));
+    CUDA_CHECK(cudaFreeHost(src));
+    return failures;
+}
+
 // upload_pinned_when: the copy waits for the published word, reads the data written after the
 // launch (not the poison before it), counts its waits, and a graph replay with a new expected
 // word rejects the word an earlier round left in place.
@@ -339,6 +440,7 @@ int main(int argc, char** argv) {
     failures += check_context(ctx, "ctx");
     failures += check_pinned_gate(ctx);
     failures += check_memory_exhausted(ctx);
+    failures += check_upload_snapshot(ctx);
     int* device_value = nullptr;
     int* host_value   = nullptr;
     CUDA_CHECK(cudaMalloc(&device_value, sizeof(int)));

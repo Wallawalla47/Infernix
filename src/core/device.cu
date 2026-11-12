@@ -11,6 +11,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -172,6 +174,9 @@ std::uint64_t memory_exhausted_injections() noexcept {
 }
 } // namespace testing
 
+// Allocates upload_pinned's staging ring (defined below, with the ring).
+void prepare_upload_staging();
+
 DeviceContext::DeviceContext(int device_id) : device(device_id) {
     const unsigned int sync_flags = sync_schedule_from_environment();
     int count       = 0;
@@ -211,6 +216,7 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
 
     stream          = compute;
     transfer_stream = load;
+    prepare_upload_staging(); // while the device is idle (upload_pinned's staging ring)
 }
 
 DeviceContext::~DeviceContext() {
@@ -429,18 +435,131 @@ void CudaCompletionEvent::synchronize() const {
 
 namespace {
 
+// .cv loads: host bytes at these addresses were rewritten since an earlier upload read them (the staging ring wraps,
+// and a captured node rereads its source at each replay), so no cache line of an earlier read may serve this one.
 __global__ void upload_pinned_kernel(void* __restrict__ dst, const void* __restrict__ src, std::size_t bytes) {
     const std::size_t thread = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
     const bool vectors = (reinterpret_cast<std::uintptr_t>(dst) | reinterpret_cast<std::uintptr_t>(src)) % 16 == 0;
     const std::size_t head = vectors ? bytes / 16 : 0;
     for (std::size_t i = thread; i < head; i += stride) {
-        static_cast<uint4*>(dst)[i] = static_cast<const uint4*>(src)[i];
+        static_cast<uint4*>(dst)[i] = __ldcv(static_cast<const uint4*>(src) + i);
     }
     for (std::size_t i = head * 16 + thread; i < bytes; i += stride) {
-        static_cast<unsigned char*>(dst)[i] = static_cast<const unsigned char*>(src)[i];
+        static_cast<unsigned char*>(dst)[i] = __ldcv(static_cast<const unsigned char*>(src) + i);
     }
 }
+
+// upload_pinned's staging (device.h): each eager upload's bytes are copied here at the call and the kernel reads the
+// copy, so a caller may rewrite its buffer as soon as upload_pinned returns, whether or not the stream has reached the
+// upload. A FIFO ring of pinned memory, allocated once by the first DeviceContext (allocating pinned memory waits for
+// the device, which work spinning on a host word this thread has yet to publish never lets go of); a span is reused
+// only once the event recorded after its kernel has completed, which it normally has long since: the host waits only
+// when it runs a whole ring of uploads ahead of the device. An upload larger than half the ring, or one made before
+// any DeviceContext, is copied from pageable memory instead (cudaMemcpyAsync stages a pageable source before it
+// returns), on the copy engine.
+class UploadStaging {
+public:
+    ~UploadStaging() {
+        // Process exit: the device may already be gone, so nothing is checked.
+        for (const Span& span : live_) { (void)cudaEventDestroy(span.done); }
+        for (cudaEvent_t event : spare_) { (void)cudaEventDestroy(event); }
+        if (ring_ != nullptr) { (void)cudaFreeHost(ring_); }
+    }
+
+    // Allocates the ring (DeviceContext's constructor: the device is idle then).
+    void prepare() {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (ring_ != nullptr) { return; }
+        void* ring = nullptr;
+        CUDA_CHECK(cudaHostAlloc(&ring, kRing, cudaHostAllocPortable | cudaHostAllocMapped));
+        ring_ = static_cast<std::byte*>(ring);
+    }
+
+    // Copies `bytes` of `src` into the ring, launches the copy to `dst` on `stream` from there and records its event.
+    void upload(void* dst, const void* src, std::size_t bytes, cudaStream_t stream, unsigned int blocks, unsigned int threads) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        const std::size_t span = (bytes + kAlignment - 1) / kAlignment * kAlignment;
+        if (ring_ == nullptr || span > kRing / 2) {
+            const std::vector<std::byte> copy(static_cast<const std::byte*>(src), static_cast<const std::byte*>(src) + bytes);
+            CUDA_CHECK(cudaMemcpyAsync(dst, copy.data(), bytes, cudaMemcpyHostToDevice, stream));
+            return;
+        }
+        // Relaxed: the event queries and waits are not stream work, so an upload made while this thread captures a graph
+        // on another stream neither lands in it nor invalidates it (as tma_descriptor_staging.cuh).
+        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+        CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+        try {
+            reserve(span);
+        } catch (...) {
+            (void)cudaThreadExchangeStreamCaptureMode(&mode);
+            throw;
+        }
+        CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+        std::byte* staged = ring_ + head_;
+        std::memcpy(staged, src, bytes);
+        upload_pinned_kernel<<<blocks, threads, 0, stream>>>(dst, staged, bytes);
+        CUDA_CHECK(cudaGetLastError());
+        cudaEvent_t done = take_event();
+        CUDA_CHECK(cudaEventRecord(done, stream));
+        live_.push_back(Span{head_, head_ + span, done});
+        head_ += span;
+    }
+
+private:
+    static constexpr std::size_t kAlignment = 256;
+    static constexpr std::size_t kRing      = 32ULL << 20;
+    struct Span {
+        std::size_t begin = 0, end = 0;
+        cudaEvent_t done = nullptr;
+    };
+
+    cudaEvent_t take_event() {
+        if (!spare_.empty()) {
+            cudaEvent_t event = spare_.back();
+            spare_.pop_back();
+            return event;
+        }
+        cudaEvent_t event = nullptr;
+        CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        return event;
+    }
+    void retire_front(bool wait) {
+        if (wait) { CUDA_CHECK(cudaEventSynchronize(live_.front().done)); }
+        spare_.push_back(live_.front().done);
+        live_.pop_front();
+    }
+    // Makes [head_, head_ + span) free (span <= kRing / 2): wraps to the ring's start when the span does not fit before
+    // its end, and waits for the oldest uploads whose spans it overlaps.
+    void reserve(std::size_t span) {
+        while (!live_.empty()) { // spans whose uploads have run
+            const cudaError_t status = cudaEventQuery(live_.front().done);
+            if (status == cudaErrorNotReady) { break; }
+            CUDA_CHECK(status);
+            retire_front(false);
+        }
+        if (head_ + span > kRing) { head_ = 0; }
+        const auto overlaps = [&](const Span& s) { return s.begin < head_ + span && head_ < s.end; };
+        while (std::any_of(live_.begin(), live_.end(), overlaps)) { retire_front(true); }
+    }
+
+    std::mutex mutex_;
+    std::byte* ring_  = nullptr;
+    std::size_t head_ = 0;
+    std::deque<Span> live_;
+    std::vector<cudaEvent_t> spare_;
+};
+
+UploadStaging& upload_staging() {
+    static UploadStaging staging;
+    return staging;
+}
+
+} // namespace
+
+void prepare_upload_staging() { upload_staging().prepare(); }
+
+namespace {
 
 constexpr std::size_t kGateCtaBytes = 32 * 1024;
 constexpr int kGateMaxCtas         = 16;
@@ -534,8 +653,15 @@ void upload_pinned(void* device_dst, const void* pinned_src, std::size_t bytes, 
     constexpr int kThreads = 256;
     // One 16-byte load per thread: every load of a call is in flight at once.
     const std::size_t blocks = std::min<std::size_t>((bytes / 16 + kThreads) / kThreads + 1, 64);
-    upload_pinned_kernel<<<static_cast<unsigned int>(blocks), kThreads, 0, stream>>>(device_dst, pinned_src, bytes);
-    CUDA_CHECK(cudaGetLastError());
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    if (capture == cudaStreamCaptureStatusNone) {
+        upload_staging().upload(device_dst, pinned_src, bytes, stream, static_cast<unsigned int>(blocks), kThreads);
+    } else {
+        // A captured node reads the caller's buffer at each replay (device.h).
+        upload_pinned_kernel<<<static_cast<unsigned int>(blocks), kThreads, 0, stream>>>(device_dst, pinned_src, bytes);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 } // namespace infernix
