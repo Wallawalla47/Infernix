@@ -106,13 +106,24 @@ __device__ __forceinline__ std::uint32_t pack_f16x2_sat(float lo, float hi) {
     return out;
 }
 
+// Fp16Accumulate's shared snapshot: S^T as saturated FP16 (pack_f16x2_sat), [key][value], each 16-byte chunk of
+// eight values XOR-swizzled by its row, so the eight rows one ldmatrix reads and the eight keys one store
+// instruction writes fall on distinct banks. The B fragments of the prediction and readout load with one
+// ldmatrix.x2.trans. Each element is converted once, as when the FP32 snapshot was converted at each read, so the
+// bits are the same (candidates KR-S4, 2026-11-12, RTX 5090, gated_delta_net_bench --force-chunked fp16acc, output
+// and final-state hashes equal: the op -13.2..-14.8 % at 48 value heads and -13.9..-15.0 % at 32, 1K-32K tokens).
 template <int DV>
-__device__ __forceinline__ void load_f16_b(const float* p, int k, int n, int lane, unsigned& b0,
-                                           unsigned& b1) {
-    const int t = lane & 3, col = n * 8 + lane / 4;
-    b0 = pack_f16x2_sat(p[value_index<DV>(k + 2 * t, col)], p[value_index<DV>(k + 2 * t + 1, col)]);
-    b1 =
-        pack_f16x2_sat(p[value_index<DV>(k + 2 * t + 8, col)], p[value_index<DV>(k + 2 * t + 9, col)]);
+__device__ __forceinline__ int half_snapshot_index(int key, int value) {
+    constexpr int kChunks = DV / 8;
+    const int chunk       = (value / 8) ^ ((key / (8 / kChunks)) & (kChunks - 1));
+    return key * DV + chunk * 8 + (value & 7);
+}
+
+// B fragments of keys k..k+15 at values n*8..n*8+7: lanes 0-15 address rows k..k+15 (the x2 form reads those).
+template <int DV>
+__device__ __forceinline__ void load_f16_b_snapshot(const __half* p, int k, int n, int lane, unsigned& b0,
+                                                    unsigned& b1) {
+    ldmatrix_x2_t(b0, b1, smem_addr(p + half_snapshot_index<DV>(k + (lane & 15), n * 8)));
 }
 
 // The k16 products an FP16 partial sum spans before its FP32 carry (measured 2026-10-16 against
@@ -255,8 +266,9 @@ __device__ __forceinline__ State state_to_store(float value) {
     }
 }
 
-// Fp16 selects GdnChunkArithmetic::Fp16Accumulate (launch.h); without it GdnChunkArithmetic::Compensated. State is
-// the stored state's element type (float, or __half under fp16-gdn-state).
+// Fp16 selects GdnChunkArithmetic::Fp16Accumulate (launch.h), whose shared snapshot holds FP16 pairs read by ldmatrix
+// (half_snapshot_index); without it GdnChunkArithmetic::Compensated, with an FP32 snapshot. State is the stored
+// state's element type (float, or __half under fp16-gdn-state).
 template <int DV, bool Fp16 = false, class State = float>
 __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurrence_kernel(
     Arguments args, const QkChunk* __restrict__ qk_workspace,
@@ -281,6 +293,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
     const int m_start     = NT < kWarps ? warp / NT : 0;
     const int chunks      = chunk_count(args.tokens);
     const auto state_base = static_cast<std::int64_t>(head) * kStateDim * kStateDim;
+    [[maybe_unused]] __half* const half_snapshot = reinterpret_cast<__half*>(sm.snapshot); // Fp16 only
 
     // MMA accumulators describe S^T[key,value]. External state remains [value,key].
     float state[NPW][MPW][4];
@@ -314,10 +327,17 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             for (int mi = 0; mi < MPW; ++mi) {
                 const int key = (m_start + mi * MW) * 16 + g;
                 const int col = n * 8 + t * 2;
-                store_vec(sm.snapshot + value_index<DV>(key, col),
-                          make_float2(state[ni][mi][0], state[ni][mi][1]));
-                store_vec(sm.snapshot + value_index<DV>(key + 8, col),
-                          make_float2(state[ni][mi][2], state[ni][mi][3]));
+                if constexpr (Fp16) {
+                    *reinterpret_cast<std::uint32_t*>(half_snapshot + half_snapshot_index<DV>(key, col)) =
+                        pack_f16x2_sat(state[ni][mi][0], state[ni][mi][1]);
+                    *reinterpret_cast<std::uint32_t*>(half_snapshot + half_snapshot_index<DV>(key + 8, col)) =
+                        pack_f16x2_sat(state[ni][mi][2], state[ni][mi][3]);
+                } else {
+                    store_vec(sm.snapshot + value_index<DV>(key, col),
+                              make_float2(state[ni][mi][0], state[ni][mi][1]));
+                    store_vec(sm.snapshot + value_index<DV>(key + 8, col),
+                              make_float2(state[ni][mi][2], state[ni][mi][3]));
+                }
             }
         }
         __syncthreads();
@@ -359,12 +379,9 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                     load_vector_bf16_a(qk.q, k, lane, qa);
 #pragma unroll
                     for (int ni = 0; ni < NPW; ++ni) {
-                        const int n    = warp + ni * kWarps;
-                        const float b0 = sm.snapshot[value_index<DV>(k + 2 * t, n * 8 + g)];
-                        const float b1 = sm.snapshot[value_index<DV>(k + 2 * t + 1, n * 8 + g)];
-                        const float b2 = sm.snapshot[value_index<DV>(k + 2 * t + 8, n * 8 + g)];
-                        const float b3 = sm.snapshot[value_index<DV>(k + 2 * t + 9, n * 8 + g)];
-                        const unsigned s0 = pack_f16x2_sat(b0, b1), s1 = pack_f16x2_sat(b2, b3);
+                        const int n = warp + ni * kWarps;
+                        unsigned s0, s1;
+                        load_f16_b_snapshot<DV>(half_snapshot, k, n, lane, s0, s1);
                         mma_f16_partial(prediction[ni], prediction_part[ni], k / 16, ka, s0, s1);
                         mma_f16_partial(history[ni], history_part[ni], k / 16, qa, s0, s1);
                     }
@@ -396,7 +413,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                         for (int k = 0; k < kStateDim; k += 16) {
                             unsigned af[4], b0, b1;
                             load_vector_bf16_a(qk.q, k, lane, af);
-                            load_f16_b<DV>(sm.snapshot, k, n, lane, b0, b1);
+                            load_f16_b_snapshot<DV>(half_snapshot, k, n, lane, b0, b1);
                             mma_f16_partial(history[0], part, k / 16, af, b0, b1);
                         }
                     }
@@ -407,7 +424,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                         for (int k = 0; k < kStateDim; k += 16) {
                             unsigned af[4], b0, b1;
                             load_vector_bf16_a(qk.k, k, lane, af);
-                            load_f16_b<DV>(sm.snapshot, k, n, lane, b0, b1);
+                            load_f16_b_snapshot<DV>(half_snapshot, k, n, lane, b0, b1);
                             mma_f16_partial(history[0], part, k / 16, af, b0, b1);
                         }
                     } else {

@@ -557,7 +557,10 @@ path that changes no logit (6.1), with these as the nearest timings.
 **`gdn-f16-accumulate`: FP16-accumulate chunked GDN (qualified on the 27B, 2026-10-17).** See
 `ops::GdnChunkArithmetic::Fp16Accumulate`. Op: 1.20x at the 27B's shapes, and closer to the FP64
 oracle than the exact route (output relative RMS 2.08e-3 against 3.60e-3, state 8.6e-4 against
-2.6e-3). Prefill (INT8 KV, default route against default + the path, ABBA): 27B pp4096 12,956 ->
+2.6e-3). Since 2026-11-12 (candidates KR-S4) its shared state snapshot is stored as saturated FP16 and
+read with `ldmatrix`, with the same bits (output and final-state hashes equal at 16 / 48 and 16 / 32
+heads): the op another 13.2-15.0 % faster at 1K-32K tokens; IQ3_S prefill +0.14..+0.40 % (pp4096 /
+16384 / 32768, two ABBA blocks, every block ahead). The qualification below is unaffected. Prefill (INT8 KV, default route against default + the path, ABBA): 27B pp4096 12,956 ->
 12,986 and pp16384 11,965 -> 11,994 tok/s (+0.24 %, both runs of each arm ahead); Flash-Next
 Dense8 pp16384 6,574 -> 6,564 (-0.15 %, ranges overlap), pp65536 11,186 -> 11,214 (+0.26 %), so it
 is not registered on Dense8. Exact route against exact route plus the path, pp16384, INT8 KV
