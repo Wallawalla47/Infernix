@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/device.h"
+
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -49,11 +51,12 @@ void launch_graph_gate_product(const float* values, std::int32_t stride, std::in
                                const float* threshold, cudaGraphConditionalHandle handle, cudaStream_t stream);
 
 // A CUDA Graph executable found no device memory to instantiate or upload into. The device stays
-// usable (the error is not sticky), so a caller may free memory and retry; every other CUDA error
-// of these calls aborts as CUDA_CHECK does.
-class GraphMemoryExhausted : public std::runtime_error {
+// usable (the error is not sticky), so a caller may free memory and retry (the start retries with a
+// smaller automatic KV capacity); anywhere else it is a DeviceMemoryExhausted like any other. Every
+// other CUDA error of these calls aborts as CUDA_CHECK does.
+class GraphMemoryExhausted : public DeviceMemoryExhausted {
 public:
-    using std::runtime_error::runtime_error;
+    using DeviceMemoryExhausted::DeviceMemoryExhausted;
 };
 
 class DecodeGraphDefinition {

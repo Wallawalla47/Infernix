@@ -239,6 +239,7 @@ std::string render_metrics_json(const MetricsJsonSnapshot& s) {
                                      : Json(s.stats.progress_owner_request_id)},
               {"no_progress_s", s.stats.no_progress_seconds},
               {"no_progress_recoveries", s.stats.no_progress_recoveries},
+              {"device_memory_recoveries", s.stats.device_memory_recoveries},
               {"prompt_tokens", nullptr},
               {"tok_s", number_or_null(s.rates_valid, s.decode_tokens_per_second)},
               {"tok_s_mean", number_or_null(s.rates_valid, s.decode_tokens_per_second)},

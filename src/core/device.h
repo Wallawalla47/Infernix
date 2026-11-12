@@ -5,10 +5,38 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 
 namespace infernix {
 
+// A CUDA call found no device memory (cudaErrorMemoryAllocation: an allocation, a kernel's first launch,
+// which loads its module lazily, or WDDM paging an allocation back in for a stream's work). The error is
+// not sticky: once the work already enqueued has drained (settle_after_memory_exhausted) the device is
+// usable, so the caller gives up the unit of work that needed the memory and carries on. CUDA_CHECK
+// throws it; every other CUDA error aborts the process, as a lost context cannot be recovered.
+class DeviceMemoryExhausted : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// cudaSuccess returns; cudaErrorMemoryAllocation is reported, cleared from the thread's last error and
+// thrown as DeviceMemoryExhausted; any other error is reported and aborts.
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
+
+// After a DeviceMemoryExhausted: waits for every stream's enqueued work and clears an out-of-memory
+// error that work reports (the failed call's own, or an asynchronous one). True when the device is
+// usable again; false (reported) when it reports any other error, or keeps reporting no memory.
+[[nodiscard]] bool settle_after_memory_exhausted() noexcept;
+
+namespace testing {
+// Fault injection for recovery tests: on the calling thread only, the `after`-th later CUDA_CHECK of a
+// call that succeeded throws DeviceMemoryExhausted as if the call had found no device memory (the
+// call's work stays enqueued, as a failed launch's neighbours do). 0 disarms. Other threads are never
+// affected, so a test arms the thread that runs the work it targets.
+void arm_memory_exhausted_here(std::uint64_t after) noexcept;
+// DeviceMemoryExhausted thrown by that injection so far (all threads).
+[[nodiscard]] std::uint64_t memory_exhausted_injections() noexcept;
+} // namespace testing
 
 // The reporter behind cuda_check and the CUDA cleanup paths: writes the bare line to stderr, then
 // publishes the same text through the observer when one is installed (core/cuda_diagnostics.h).

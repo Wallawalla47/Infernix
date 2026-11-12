@@ -1850,6 +1850,42 @@ public:
         return out;
     }
 
+    // How far a binding (start_binding, bind_replay) got: what a failure part-way must give back.
+    enum class BindingStage : std::uint8_t { Taking, Pinned, Activating, Activated };
+
+    // Gives back a binding that failed part-way on lane `index` (out of device memory at a slot reset or a
+    // restore copy, fix sweep FS-01): the selection's own pins before its activation, the lane and what it
+    // took (release), and, after a failed activation, whose pins lie split between the selection and the
+    // lane, the cache, emptied once no lane maps it. The lane is free again, so the Engine's recovery finds
+    // nothing half bound.
+    void abandon_binding(std::uint32_t index, const std::optional<PrefixSelection>& selection,
+                         BindingStage stage) noexcept {
+        if (stage == BindingStage::Pinned && selection) { prefix_unpin(*selection); }
+        if (stage == BindingStage::Activating) { clear_prefix_on_release_ = true; }
+        release(index);
+    }
+
+    // Runs abandon_binding when its scope ends by an exception; a normal return (a shortage, a refusal, a
+    // staged binding) gives back what it must itself.
+    class BindingFailureGuard {
+    public:
+        BindingFailureGuard(ProgramImpl& self, std::uint32_t index, const std::optional<PrefixSelection>& selection,
+                            const BindingStage& stage) noexcept
+            : self_(self), index_(index), selection_(selection), stage_(stage) {}
+        ~BindingFailureGuard() {
+            if (std::uncaught_exceptions() > exceptions_) { self_.abandon_binding(index_, selection_, stage_); }
+        }
+        BindingFailureGuard(const BindingFailureGuard&)            = delete;
+        BindingFailureGuard& operator=(const BindingFailureGuard&) = delete;
+
+    private:
+        ProgramImpl& self_;
+        std::uint32_t index_;
+        const std::optional<PrefixSelection>& selection_;
+        const BindingStage& stage_;
+        int exceptions_ = std::uncaught_exceptions();
+    };
+
     // Stages the binding of `source` on `lane`: re-selects against the cache as it is now (crediting
     // a lane-resident snapshot), reserves the prompt plus one round, lends the Vision window
     // (vision_lend) and maps the cached blocks. The Begin the Engine published names the source's
@@ -1873,6 +1909,8 @@ public:
         const BasePlanImpl& b = *base.impl_;
         const auto& data      = qwen3_5::PreparedPromptAccess::view(*b.prompt);
         std::optional<PrefixSelection> selection;
+        BindingStage stage = BindingStage::Taking;
+        const BindingFailureGuard guard(*this, index, selection, stage);
         if (prefix_) {
             if (q.prefix && q.prefix->snapshot) {
                 selection = prefix_select(data, b, index, resume != nullptr);
@@ -1883,6 +1921,7 @@ public:
                 selection = prefix_root(data, b);
             }
             prefix_pin(*selection);
+            stage = BindingStage::Pinned;
         }
         lane.history.assign(data.token_ids.begin(), data.token_ids.end());
         lane.history.reserve(lane.history.size() + q.summary.effective_output_tokens + 1);
@@ -1938,7 +1977,9 @@ public:
                 }
             }
             const std::uint64_t restored = prefix_->counters().host_restore_bytes;
+            stage = BindingStage::Activating;
             prefix_activate(lane, index, *selection, *reservation, q.pages);
+            stage = BindingStage::Activated;
             lane.prefix.cached_tokens  = selection->cached_tokens;
             lane.prefix.restored_bytes = prefix_->counters().host_restore_bytes - restored;
             lane.reservation    = std::move(*reservation);
@@ -2115,6 +2156,8 @@ public:
         const qwen3_5::PreparedPromptData ledger = ledger_prompt(prompt, r);
         const std::uint32_t pages = binding_pages(b, r.target + 1U);
         std::optional<PrefixSelection> selection;
+        BindingStage stage = BindingStage::Taking;
+        const BindingFailureGuard guard(*this, index, selection, stage);
         if (prefix_) {
             // The pause's capture lands first, so the selection can see it.
             prefix_->drain();
@@ -2130,6 +2173,7 @@ public:
                                                        call_cost())
                                   : prefix::CallPlan{};
             prefix_pin(*selection);
+            stage = BindingStage::Pinned;
         }
         lane.history       = r.history;
         lane.prompt_tokens = r.prompt_tokens;
@@ -2179,7 +2223,9 @@ public:
                 }
             }
             const std::uint64_t restored = prefix_->counters().host_restore_bytes;
+            stage = BindingStage::Activating;
             prefix_activate(lane, index, *selection, *reservation, pages);
+            stage = BindingStage::Activated;
             lane.prefix.cached_tokens  = selection->cached_tokens;
             lane.prefix.restored_bytes = prefix_->counters().host_restore_bytes - restored;
             lane.prefix.taps.clear();

@@ -202,6 +202,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
           "Seconds the Engine has held requests without completing any unit (0 while it progresses).");
     COUNTER(no_progress_recoveries, "no_progress_recoveries_total",
             "Stalls healed after two minutes by failing the running and paused requests.");
+    COUNTER(device_memory_recoveries, "device_memory_recoveries_total",
+            "Units that ran out of device memory, recovered by failing the running and paused requests.");
     COUNTER(prompt_tokens, "prompt_tokens_total",
             "Full input tokens counted once on initial binding.");
     COUNTER(reused_prompt_tokens, "prompt_tokens_cached_total",

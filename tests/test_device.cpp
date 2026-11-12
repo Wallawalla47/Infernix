@@ -221,6 +221,79 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
     return failures;
 }
 
+// Out of device memory is recoverable (fix sweep FS-01): CUDA_CHECK throws DeviceMemoryExhausted for a real
+// cudaErrorMemoryAllocation and leaves the device usable, and the test injection fires once, on the arming
+// thread only.
+int check_memory_exhausted(const infernix::DeviceContext& ctx) {
+    int failures         = 0;
+    const auto expect    = [&](bool ok, const char* what) {
+        if (!ok) {
+            ++failures;
+            std::cerr << "out of device memory: " << what << '\n';
+        }
+    };
+    const auto device_works = [&] {
+        int* value = nullptr;
+        int host   = 0;
+        CUDA_CHECK(cudaMalloc(&value, sizeof(int)));
+        CUDA_CHECK(cudaMemsetAsync(value, 0x5a, sizeof(int), ctx.stream));
+        CUDA_CHECK(cudaMemcpyAsync(&host, value, sizeof(int), cudaMemcpyDeviceToHost, ctx.stream));
+        ctx.synchronize();
+        CUDA_CHECK(cudaFree(value));
+        return host == 0x5a5a5a5a;
+    };
+    void* huge = nullptr;
+    bool thrown = false;
+    try {
+        CUDA_CHECK(cudaMalloc(&huge, std::size_t{1} << 50U));
+    } catch (const infernix::DeviceMemoryExhausted& error) {
+        thrown = std::string_view(error.what()).find("out of device memory") != std::string_view::npos;
+    }
+    expect(thrown, "a 1 PiB cudaMalloc did not throw DeviceMemoryExhausted naming the shortage");
+    expect(cudaGetLastError() == cudaSuccess, "the thread's last error was not cleared");
+    expect(infernix::settle_after_memory_exhausted(), "the device did not settle after the shortage");
+    expect(device_works(), "the device did not allocate, set and copy after the shortage");
+
+    const std::uint64_t injected = infernix::testing::memory_exhausted_injections();
+    int* word = nullptr;
+    CUDA_CHECK(cudaMalloc(&word, sizeof(int)));
+    infernix::testing::arm_memory_exhausted_here(3);
+    std::atomic<bool> other_thrown{false};
+    std::thread other([&] {
+        try {
+            CUDA_CHECK(cudaSetDevice(ctx.device));
+            for (int i = 0; i < 4; ++i) { CUDA_CHECK(cudaGetLastError()); }
+        } catch (const infernix::DeviceMemoryExhausted&) { other_thrown = true; }
+    });
+    other.join();
+    expect(!other_thrown.load(), "the injection fired on another thread");
+    int fired_at = 0;
+    for (int i = 1; i <= 4 && fired_at == 0; ++i) {
+        try {
+            CUDA_CHECK(cudaMemsetAsync(word, 0, sizeof(int), ctx.stream));
+        } catch (const infernix::DeviceMemoryExhausted& error) {
+            fired_at = std::string_view(error.what()).find("injected") != std::string_view::npos ? i : -i;
+        }
+    }
+    expect(fired_at == 3, "the injection did not fire, named, at the third check after arming");
+    expect(infernix::testing::memory_exhausted_injections() == injected + 1, "the injection was not counted once");
+    bool again = false;
+    try {
+        for (int i = 0; i < 8; ++i) { CUDA_CHECK(cudaMemsetAsync(word, 0, sizeof(int), ctx.stream)); }
+    } catch (const infernix::DeviceMemoryExhausted&) { again = true; }
+    expect(!again, "the injection fired a second time");
+    infernix::testing::arm_memory_exhausted_here(1);
+    infernix::testing::arm_memory_exhausted_here(0);
+    bool disarmed = true;
+    try {
+        CUDA_CHECK(cudaMemsetAsync(word, 0, sizeof(int), ctx.stream));
+    } catch (const infernix::DeviceMemoryExhausted&) { disarmed = false; }
+    expect(disarmed, "arming 0 did not disarm the injection");
+    ctx.synchronize();
+    CUDA_CHECK(cudaFree(word));
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -265,6 +338,7 @@ int main(int argc, char** argv) {
     }
     failures += check_context(ctx, "ctx");
     failures += check_pinned_gate(ctx);
+    failures += check_memory_exhausted(ctx);
     int* device_value = nullptr;
     int* host_value   = nullptr;
     CUDA_CHECK(cudaMalloc(&device_value, sizeof(int)));

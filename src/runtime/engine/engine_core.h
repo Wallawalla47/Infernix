@@ -2431,13 +2431,15 @@ private:
     }
 
     // A RecoverableExecutionError (an expert record that could not be read, or a resident that
-    // cannot obtain its legal unit): the requests holding lanes and the paused requests fail with
-    // it, the Program discards their state, and queued requests keep waiting. False when this state
-    // is not one it handles (a binding or materialization in flight) or the Program's cleanup
-    // failed; the caller then fails everything, as for any other worker error.
-    bool recover_locked(const std::exception_ptr& error) noexcept {
+    // cannot obtain its legal unit) or a unit out of device memory: the requests holding lanes and
+    // the paused requests fail with it, the Program discards their state, and queued requests keep
+    // waiting. With `with_binding` a binding, restore or pause in flight fails too (the Program's
+    // recovery aborts its context transaction); without it that state is not one it handles. False
+    // then, or when the Program's cleanup failed; the caller then fails everything, as for any
+    // other worker error.
+    bool recover_locked(const std::exception_ptr& error, bool with_binding = false) noexcept {
         try {
-            if (materializing_ || context_owner_) { return false; }
+            if ((materializing_ || context_owner_) && !with_binding) { return false; }
             // A paused request releases its suspended state as a cancelled one does, while the
             // Program still owns it.
             std::uint32_t failed = 0;
@@ -2449,6 +2451,15 @@ private:
             paused_.clear();
             if (!instance_.program->recover_after_failure()) { return false; }
             admission_decision_.reset();
+            if (materializing_) {
+                // In no list while it binds or restores: answered here, once its transaction is aborted.
+                const auto request = materializing_->request;
+                materializing_.reset();
+                request->suspended.reset();
+                complete_error(request, error);
+                ++failed;
+            }
+            context_owner_.reset(); // a pausing owner holds its lane: it fails with the others below
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                 if (slots_[lane] == nullptr) { continue; }
                 complete_error(slots_[lane], error);
@@ -2468,6 +2479,18 @@ private:
         } catch (...) {
             return false;
         }
+    }
+
+    // A unit that failed with a RecoverableExecutionError or ran out of device memory: recover_locked,
+    // unless this is the kMaximumUnitRecoveries-th such recovery with no successful unit since the first
+    // (docs/serving.md, "How failures end"), or recovery fails; every request then fails and the Engine
+    // stops. False when it stopped.
+    bool recover_unit_failure_locked(const std::exception_ptr& error) noexcept {
+        if (++unit_recoveries_in_a_row_ >= kMaximumUnitRecoveries || !recover_locked(error, true)) {
+            fail_all_locked(error);
+            return false;
+        }
+        return true;
     }
 
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
@@ -2902,6 +2925,12 @@ private:
             std::unique_lock execution_lock(execution_mutex_);
             bool executed   = false;
             worker_busy_at_ = Clock::now();
+            if (const std::uint64_t fault = testing::memory_fault_request().load(std::memory_order_relaxed);
+                fault != 0) [[unlikely]] {
+                // A test's out-of-memory injection (testing::request_memory_fault): armed on this thread.
+                testing::memory_fault_request().store(0, std::memory_order_relaxed);
+                ::infernix::testing::arm_memory_exhausted_here(fault == testing::kMemoryFaultDisarm ? 0 : fault);
+            }
             try {
                 save_prefix_cache_if_due();
                 set_host_work_class(HostWorkClass::Control);
@@ -3127,10 +3156,18 @@ private:
                 }
                 watch_progress(executed);
                 publish_runtime_stats();
+                if (executed) { unit_recoveries_in_a_row_ = 0; }
             } catch (const RecoverableExecutionError&) {
-                auto error = std::current_exception();
-                if (!recover_locked(error)) {
-                    fail_all_locked(error);
+                if (!recover_unit_failure_locked(std::current_exception())) { return; }
+                executed = true;
+            } catch (const DeviceMemoryExhausted& exhausted) {
+                // Not sticky: once the enqueued work has drained the device serves on. Any other error then
+                // means its context is lost, which only a restart recovers (as CUDA_CHECK aborts on one).
+                if (!settle_after_memory_exhausted()) { std::abort(); }
+                ++memory_exhausted_recoveries_;
+                const std::string what = std::string(exhausted.what()) + "; the request can be retried";
+                if (!recover_unit_failure_locked(
+                        std::make_exception_ptr(RequestError(RequestErrorKind::Unavailable, what)))) {
                     return;
                 }
                 executed = true;
@@ -3227,6 +3264,12 @@ private:
     bool no_progress_reported_      = false;
     bool no_progress_recovered_     = false;
     std::uint64_t no_progress_recoveries_ = 0;
+    // worker: units recovered (RecoverableExecutionError, out of device memory) since the last unit that
+    // succeeded; the kMaximumUnitRecoveries-th in a row stops the Engine. And the out-of-memory recoveries
+    // (cumulative, RuntimeStats::device_memory_recoveries).
+    static constexpr std::uint32_t kMaximumUnitRecoveries = 8;
+    std::uint32_t unit_recoveries_in_a_row_     = 0;
+    std::uint64_t memory_exhausted_recoveries_ = 0;
     std::shared_ptr<Request> next_turn_request_;           // worker: the pass queued, binding or resident
     NextTurnCounters next_turn_counters_;                  // worker
     std::atomic<std::uint64_t> next_turn_dropped_{0};

@@ -202,9 +202,16 @@ saturation does not make the Engine unavailable. The endpoint remains unauthenti
 
 How failures end:
 
-- An out-of-memory condition or a failed internal check during one unit of work fails the requests
-  that unit involved, logs the error with `: failed N running request(s); the Engine keeps
-  serving`, and the Engine carries on with its queue.
+- A unit of work that runs out of GPU memory, or fails an internal check (an unreadable expert
+  record), fails the running and paused requests and a request being bound, logs the error with
+  `: failed N running request(s); the Engine keeps serving`, and the Engine carries on with its
+  queue. GPU memory runs out when another program takes the VRAM the server's automatic sizing left
+  free: a kernel's first launch (CUDA loads kernels when they first run), an allocation, or the
+  driver paging the server's memory back in then finds none. Those requests end with HTTP 503
+  `service_unavailable` (an error event once their stream has started) and the message `out of
+  device memory (...); the request can be retried`; `infernix_device_memory_recoveries_total` and
+  `live.device_memory_recoveries` count these recoveries. The prefix cache keeps what earlier units
+  completed and nothing of the failed one.
 - Logits with no finite value to sample from (NaN or infinity, a numerical failure of the model's
   execution) fail only the request whose row produced them, with an HTTP 500 `internal_error`
   (an error event once its stream has started), and log `the model produced non-finite logits:
@@ -2124,6 +2131,7 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_requests_running`, `waiting`, `paused`, `prefilling`, `decode_ready`, `replaying`, `materializing` | Current Engine gauges; prefill/decode/replay are subsets of resident requests |
 | `infernix_no_progress_seconds` | How long the Engine has held requests without completing any unit, control row or context transaction; 0 while it progresses or is idle |
 | `infernix_no_progress_recoveries_total` | Stalls healed after two minutes by failing the running and paused requests (see How failures end) |
+| `infernix_device_memory_recoveries_total` | Units that ran out of GPU memory, recovered by failing the running and paused requests (see How failures end) |
 | `infernix_prompt_tokens_total`, `infernix_prompt_tokens_cached_total` | Full input and reused tokens counted once on initial binding |
 | `infernix_prefill_tokens_total`, `infernix_replayed_tokens_total` | Actual initial prefill and separate recovery recomputation |
 | `infernix_generation_tokens_total`, `infernix_decode_tokens_total` | All committed outputs, or decode/control outputs excluding the first token; include thinking and injected control tokens |

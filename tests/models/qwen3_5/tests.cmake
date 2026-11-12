@@ -135,6 +135,15 @@ set_tests_properties(
   infernix_qwen3_5_resume_cold_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
+# Recovery from a unit out of device memory (fix sweep FS-01): an injected shortage at a sweep of CUDA_CHECK
+# counts fails the request in flight, the Engine keeps serving with an intact prefix cache, a queued request
+# completes, and eight failures in a row stop the Engine (tests/memory_exhausted_recovery.h).
+infernix_add_test(infernix_qwen3_5_memory_exhausted_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_memory_exhausted_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_qwen3_5_memory_exhausted_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 1800)
+
 infernix_add_test(infernix_qwen3_5_score_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_score_real.cpp"
   LIBRARIES infernix_engine)

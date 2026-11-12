@@ -8,6 +8,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 
 #include "core/nvtx.h"
+#include "runtime/contract/execution.h"
 #include "models/qwen3_5/execution/visual_scatter.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_control.h"
@@ -1400,10 +1401,9 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
             }
-        } catch (const std::exception& error) {
-            throw std::runtime_error("text/layers/" + std::to_string(layer) +
-                                     (prefill ? " prefill" : " verify") +
-                                     " columns=" + std::to_string(x.ne[1]) + ": " + error.what());
+        } catch (const std::exception&) {
+            runtime::rethrow_with_context("text/layers/" + std::to_string(layer) + (prefill ? " prefill" : " verify") +
+                                          " columns=" + std::to_string(x.ne[1]) + ": ");
         }
     }
     // Later passes are stream-ordered behind this one.
@@ -1539,9 +1539,9 @@ void TextContext::run_lossless_layers(Tensor& x, const Tensor& rope_table, Lossl
             lossless_layer(parameters_.text.layers[layer], config_, config_.layer_types[layer], rope_table, x, work_,
                            s, cache, execution_schedule_.lossless_design, offloaded_experts_,
                            &offloaded_prefill_);
-        } catch (const std::exception& error) {
-            throw std::runtime_error("text/layers/" + std::to_string(layer) +
-                                     " lossless columns=" + std::to_string(x.ne[1]) + ": " + error.what());
+        } catch (const std::exception&) {
+            runtime::rethrow_with_context("text/layers/" + std::to_string(layer) +
+                                          " lossless columns=" + std::to_string(x.ne[1]) + ": ");
         }
         if (!dump.directory.empty()) { dump.tap("layer", x); }
     }

@@ -426,20 +426,31 @@ ends pending context and model transactions, then releases resident/paused resou
 and finally completes every response. Internal state corruption must not be interpreted as a cache
 miss.
 
-One class of execution failure is recoverable: `runtime::RecoverableExecutionError`, which a Program
-raises after a stable boundary when a unit's inputs were unavailable rather than its state corrupted
-(Qwen3.8-Flash-Next: an expert record that could not be read, or a host expert service that missed
-its heartbeat). The Engine raises it itself for the capacity contract error
+Two classes of execution failure are recoverable. `runtime::RecoverableExecutionError`, which a
+Program raises after a stable boundary when a unit's inputs were unavailable rather than its state
+corrupted (Qwen3.8-Flash-Next: an expert record that could not be read, or a host expert service that
+missed its heartbeat); the Engine raises it itself for the capacity contract error
 ([resource scheduling](resource-scheduling-and-context-cache.md) §3), which fires before the unit
-runs. The Engine fails the requests holding lanes and the paused requests with it (a paused
-request's suspended state is released first, as for a cancellation), the Program releases the
-lanes, and queued requests keep waiting. Qwen3.8-Flash-Next releases them without publishing
-anything and empties a prefix cache the failed round may have published into; Qwen3.5, whose only
-recoverable error is the Engine's own between units, releases them as `abort` does and keeps its
-cache, and refuses while a pending batch exists. If the Engine is binding or materializing at that
-moment, or the Program refuses, it fails everything instead. A service or read thread that has itself
-stopped makes every later unit fail, so the Program reports that as an ordinary (fatal) error with
-its cause. CUDA errors are never recoverable: the context state is unknown.
+runs. And `DeviceMemoryExhausted` (`core/device.h`, fix sweep FS-01): a CUDA call that found no device
+memory (`cudaErrorMemoryAllocation`: an allocation, a kernel's first launch, which loads its module
+lazily, or a synchronization the driver could not page the work in for), which `CUDA_CHECK` throws
+wherever the call is, so in the middle of a unit. That error is not sticky: the Engine first waits
+for the device's enqueued work (`settle_after_memory_exhausted`) and aborts if the device then reports
+any other error. For both, the Engine fails the requests holding lanes, the paused requests and a
+binding, restore or pause in flight (a paused request's suspended state is released first, as for a
+cancellation), the Program releases the lanes and aborts its context transaction, and queued requests
+keep waiting; an out-of-memory failure reaches its requests as `RequestErrorKind::Unavailable`.
+Qwen3.8-Flash-Next releases the lanes without publishing anything and empties a prefix cache an expert
+fault may have published into. Qwen3.5's execution paths clear a failed unit's lanes as they unwind
+(`clear_execution_failure_lanes`: pending taps dropped, no endpoint), and its recovery releases the
+others as `abort` does and keeps its cache; it refuses while a pending batch exists. The eighth such
+recovery with no successful unit since the first, or a Program that refuses, fails everything instead.
+The no-progress watch's heal (YJ-02) uses the same recovery without a binding in flight, which it
+leaves as it is. A service or read thread that has itself stopped makes every later unit fail, so the
+Program reports that as an ordinary (fatal) error with its cause. Every other CUDA error is never
+recoverable: the context state is unknown, and `CUDA_CHECK` aborts. Startup turns an out-of-memory
+error into a failed start (a CUDA Graph's, `GraphMemoryExhausted`, first retries with a smaller
+automatic KV capacity).
 
 Release and cleanup paths are `noexcept`, and a broken ownership invariant or a throw inside one of
 them (a page, extent or reference that a release finds missing, a release that a destructor or abort

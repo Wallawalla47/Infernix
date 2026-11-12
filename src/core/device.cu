@@ -120,11 +120,57 @@ void report_cuda_cleanup_failure(const char* op, cudaError_t err) noexcept {
     publish_cuda_diagnostic(DiagnosticLevel::Warning, record);
 }
 
+namespace {
+
+// testing::arm_memory_exhausted_here: this thread's countdown (0: disarmed).
+thread_local std::uint64_t t_memory_fault_countdown = 0;
+std::atomic<std::uint64_t> g_memory_fault_injections{0};
+
+[[noreturn]] void throw_memory_exhausted(const char* expr, const char* file, int line, bool injected) {
+    char what[640];
+    std::snprintf(what, sizeof(what), "out of device memory (%s:%d: %s%s)", file, line, expr,
+                  injected ? ", injected by a test" : "");
+    throw DeviceMemoryExhausted(what);
+}
+
+} // namespace
+
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
-    if (err == cudaSuccess) { return; }
+    if (err == cudaSuccess) {
+        if (t_memory_fault_countdown == 0 || --t_memory_fault_countdown != 0) { return; }
+        g_memory_fault_injections.fetch_add(1, std::memory_order_relaxed);
+        throw_memory_exhausted(expr, file, line, true);
+    }
     report_cuda_check_failure(expr, file, line, err);
+    if (err == cudaErrorMemoryAllocation) {
+        // Not sticky: the thread's last error is cleared so that the next launch check does not read it.
+        (void)cudaGetLastError();
+        throw_memory_exhausted(expr, file, line, false);
+    }
     std::abort();
 }
+
+bool settle_after_memory_exhausted() noexcept {
+    // Two passes: work enqueued before the failure may itself report the shortage once.
+    for (int pass = 0; pass < 2; ++pass) {
+        const cudaError_t err = cudaDeviceSynchronize();
+        if (err == cudaSuccess) {
+            (void)cudaGetLastError();
+            return true;
+        }
+        report_cuda_check_failure("cudaDeviceSynchronize() after an out-of-memory error", __FILE__, __LINE__, err);
+        if (err != cudaErrorMemoryAllocation) { return false; }
+        (void)cudaGetLastError();
+    }
+    return false;
+}
+
+namespace testing {
+void arm_memory_exhausted_here(std::uint64_t after) noexcept { t_memory_fault_countdown = after; }
+std::uint64_t memory_exhausted_injections() noexcept {
+    return g_memory_fault_injections.load(std::memory_order_relaxed);
+}
+} // namespace testing
 
 DeviceContext::DeviceContext(int device_id) : device(device_id) {
     const unsigned int sync_flags = sync_schedule_from_environment();

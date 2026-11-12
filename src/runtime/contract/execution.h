@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/device.h"
 #include "runtime/contract/request.h"
 #include "runtime/contract/timing.h"
 #include <atomic>
@@ -7,6 +8,7 @@
 #include <cstdint>
 #include <span>
 #include <stdexcept>
+#include <string>
 
 namespace infernix::runtime {
 
@@ -25,6 +27,21 @@ class RequestOutputError : public RecoverableExecutionError {
 public:
     using RecoverableExecutionError::RecoverableExecutionError;
 };
+
+// Inside a catch: rethrows the exception in flight with `context` before its message. The kinds the Engine
+// recovers from (DeviceMemoryExhausted, RecoverableExecutionError) keep their kind, so a layer's context never
+// turns a recoverable failure into a fatal one; any other std::exception becomes a std::runtime_error.
+[[noreturn]] inline void rethrow_with_context(const std::string& context) {
+    try {
+        throw;
+    } catch (const DeviceMemoryExhausted& error) {
+        throw DeviceMemoryExhausted(context + error.what());
+    } catch (const RecoverableExecutionError& error) {
+        throw RecoverableExecutionError(context + error.what());
+    } catch (const std::exception& error) {
+        throw std::runtime_error(context + error.what());
+    }
+}
 
 // Why one row of a pending batch cannot commit: the Engine fails that row's request alone (the
 // commit releases it as CommitDisposition::FailedReleased) and commits the other rows.
@@ -82,6 +99,18 @@ inline std::atomic<std::uint32_t>& no_progress_recovery_ms() noexcept {
 inline void set_no_progress_bounds(std::uint32_t warning_ms, std::uint32_t recovery_ms) noexcept {
     no_progress_warning_ms().store(warning_ms);
     no_progress_recovery_ms().store(recovery_ms);
+}
+
+// Out-of-memory injection for the Engine's recovery (fix sweep FS-01): the worker takes the request at its
+// next iteration and arms its own thread (infernix::testing::arm_memory_exhausted_here), so the `after`-th
+// later CUDA_CHECK of the work it runs throws DeviceMemoryExhausted. 0 disarms. Process-wide.
+inline constexpr std::uint64_t kMemoryFaultDisarm = ~std::uint64_t{0};
+inline std::atomic<std::uint64_t>& memory_fault_request() noexcept {
+    static std::atomic<std::uint64_t> request{0};
+    return request;
+}
+inline void request_memory_fault(std::uint64_t after) noexcept {
+    memory_fault_request().store(after == 0 ? kMemoryFaultDisarm : after);
 }
 } // namespace testing
 

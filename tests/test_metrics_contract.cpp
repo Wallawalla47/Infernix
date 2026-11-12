@@ -94,11 +94,14 @@ int main() {
         stalled.stats.progress_owner_request_id = 17;
         stalled.stats.no_progress_seconds       = 42.5;
         stalled.stats.no_progress_recoveries    = 2;
+        stalled.stats.device_memory_recoveries  = 3;
         const Json stalled_root                 = Json::parse(render_metrics_json(stalled));
         failures += check(stalled_root["live"]["progress_owner"] == 17 &&
                               stalled_root["live"]["no_progress_s"] == 42.5 &&
-                              stalled_root["live"]["no_progress_recoveries"] == 2,
-                          "the service turn's owner, the stall's length and the stalls healed");
+                              stalled_root["live"]["no_progress_recoveries"] == 2 &&
+                              stalled_root["live"]["device_memory_recoveries"] == 3,
+                          "the service turn's owner, the stall's length, the stalls healed and the out-of-memory "
+                          "recoveries");
     }
 
     const Json row = root["requests"][0];

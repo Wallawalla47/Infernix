@@ -28,6 +28,7 @@
 #include "infernix/ops/sigmoid_mul.h"
 #include "infernix/ops/silu_mul.h"
 #include "infernix/ops/speculative_round.h"
+#include "runtime/contract/execution.h"
 
 #include <algorithm>
 #include <array>
@@ -375,8 +376,8 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
         check_lossless_call(batch);
         try {
             lossless_layer(layer, batch, residual);
-        } catch (const std::exception& error) {
-            throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
+        } catch (const std::exception&) {
+            runtime::rethrow_with_context("qwen4_exp/layers/" + std::to_string(layer) + ": ");
         }
         return;
     }
@@ -419,8 +420,8 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
                 }
             }
         }
-    } catch (const std::exception& error) {
-        throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
+    } catch (const std::exception&) {
+        runtime::rethrow_with_context("qwen4_exp/layers/" + std::to_string(layer) + ": ");
     }
     if (batch.draft_features.data != nullptr) {
         const std::int32_t n = batch.draft_features.ne[1], T = residual.ne[1];
@@ -531,8 +532,8 @@ void Forward::layer_mixer(std::uint32_t layer, const ForwardBatch& batch, Tensor
         Tensor y  = mixer(layer, batch, xa);
         ops::hyper_connection_inject(y, inject, residual, device_.stream);
         (void)mix(block.mlp_hc, residual, &inject, &xm);
-    } catch (const std::exception& error) {
-        throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
+    } catch (const std::exception&) {
+        runtime::rethrow_with_context("qwen4_exp/layers/" + std::to_string(layer) + ": ");
     }
 }
 
@@ -545,8 +546,8 @@ void Forward::layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Te
         Tensor ym  = moe(parameters_.layers[layer].moe, xm, layer, nullptr, &batch, route_columns, nullptr, nullptr,
                          route_skipped, &residual, chunk_columns);
         ops::hyper_connection_inject(ym, inject, residual, s);
-    } catch (const std::exception& error) {
-        throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
+    } catch (const std::exception&) {
+        runtime::rethrow_with_context("qwen4_exp/layers/" + std::to_string(layer) + ": ");
     }
 }
 
@@ -1663,8 +1664,8 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
             Tensor logprob(call.draft_logprobs.data, DType::FP32, {1, T});
             ops::top_logprobs(narrow, valid, top_row, logprob, s);
         }
-    } catch (const std::exception& error) {
-        throw std::runtime_error(std::string("qwen4_exp/mtp: ") + error.what());
+    } catch (const std::exception&) {
+        runtime::rethrow_with_context("qwen4_exp/mtp: ");
     }
 }
 

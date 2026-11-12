@@ -275,6 +275,12 @@ file), and `infernix_qwen4_exp_vision_lend_real_test` (an artifact with the visi
 expert frames a Vision window may be lent (the image request waits or is refused alone with
 `media_budget_exceeded`). The hybrid prefix test's `nonfinite-withdraw` scenario
 (`INFERNIX_HYBRID_REAL_SCENARIO`) checks the withdrawal on Qwen3.5.
+`infernix_qwen4_exp_memory_exhausted_real_test` and `infernix_qwen3_5_memory_exhausted_real_test` (the
+dense `INFERNIX_TEST_ARTIFACT`) make the N-th CUDA call of the Engine's work report no device memory, over a
+sweep of N from binding through prefill into decode (`tests/memory_exhausted_recovery.h`): the request in
+flight fails with the retryable out-of-memory error, or completes with its reference tokens; the next
+request and a prefix-cached extension of the failed one return their cold tokens; a queued request
+completes; and eight failures in a row stop the Engine.
 
 These tests start their Engines on one `EngineHost` per process (`tests/models/qwen4_exp/engine_host.h`).
 Each start after the first takes the SSD expert tier's page-locked slots, and the expert records the
