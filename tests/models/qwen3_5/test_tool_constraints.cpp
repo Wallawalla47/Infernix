@@ -503,6 +503,94 @@ void unclosed_values(infernix::text::GrammarCompiler& compiled) {
     }
 }
 
+// --tool-parameter-names declared (PromptOptions::declared_parameter_names, candidates ZA-01): a non-strict
+// tool that declares parameters names only those, each once, in any order, and a raw value keeps a
+// `\n</parameter>\n<parameter=NAME>` line whose NAME the call cannot take (undeclared, or already given) as
+// its text, so an edit to a file that quotes a call keeps its content. The grammar admits each text, the
+// decoder reads it the same way whole and a byte at a time, and the open mode reads the same text as more
+// parameters.
+void declared_parameter_lines(infernix::text::GrammarCompiler& compiled) {
+    const auto allowed = [](const std::vector<std::uint32_t>& words, std::int32_t token) {
+        return (words[static_cast<std::size_t>(token) / 32] >> (token % 32) & 1U) != 0;
+    };
+    const Json source{{"type", "object"},
+                      {"properties", {{"path", {{"type", "string"}}}, {"new_string", {{"type", "string"}}}}}};
+    const auto build = [&](bool declared) {
+        const std::vector<std::string> definitions{
+            Json{{"type", "function"}, {"function", {{"name", "call"}, {"parameters", source}}}}.dump()};
+        return frontend::select_tool_call_contract(
+            frontend::build_tool_call_output_contract(definitions, {}, false, declared), infernix::ToolChoice{});
+    };
+    const auto declared = build(true);
+    const auto open     = build(false);
+    require(declared->declared_names(declared->tools.front()) && !open->declared_names(open->tools.front()),
+            "the contract did not carry the declared-names mode");
+    const auto decode = [](const std::shared_ptr<const frontend::ToolCallOutputContract>& bound, const std::string& text,
+                           bool bytewise) {
+        frontend::ToolCallOutputDecoder decoder(bound, 64);
+        if (bytewise) {
+            for (std::size_t at = 0; at < text.size(); ++at) { (void)feed(decoder, text, at, 1); }
+        } else {
+            (void)feed(decoder, text);
+        }
+        const auto terminal = decoder.finish();
+        require(terminal.tool_calls.size() == 1, "the decoder did not publish one call");
+        return Json::parse(terminal.tool_calls[0].arguments_json);
+    };
+    const std::string head  = "<tool_call>\n<function=call>\n<parameter=path>\ndocs/tools.md\n</parameter>\n";
+    const std::string close = "\n</parameter>\n</function>\n</tool_call>";
+    struct Case {
+        std::string text;
+        Json declared_arguments;
+        Json open_arguments;
+    };
+    const std::vector<Case> cases{
+        // An undeclared name in a value: the value's text (open: another parameter).
+        {head + "<parameter=new_string>\nsee\n</parameter>\n<parameter=limit>\n25" + close,
+         {{"path", "docs/tools.md"}, {"new_string", "see\n</parameter>\n<parameter=limit>\n25"}},
+         {{"path", "docs/tools.md"}, {"new_string", "see"}, {"limit", 25}}}, // undeclared: read as JSON
+        // A declared name not given yet ends the value and opens that parameter, in both modes.
+        {"<tool_call>\n<function=call>\n<parameter=path>\na.md\n</parameter>\n<parameter=new_string>\ny" + close,
+         {{"path", "a.md"}, {"new_string", "y"}},
+         {{"path", "a.md"}, {"new_string", "y"}}},
+        // Any order: new_string before path.
+        {"<tool_call>\n<function=call>\n<parameter=new_string>\ny\n</parameter>\n<parameter=path>\na.md" + close,
+         {{"new_string", "y"}, {"path", "a.md"}},
+         {{"new_string", "y"}, {"path", "a.md"}}},
+    };
+    for (const Case& item : cases) {
+        require(accepts(compiled, *declared, item.text), "the declared-names grammar refused a call");
+        require(decode(declared, item.text, false) == item.declared_arguments,
+                "the declared-names decoder did not read the value the grammar keeps");
+        require(decode(declared, item.text, true) == item.declared_arguments,
+                "the declared-names decoder read a byte at a time differently");
+        require(decode(open, item.text, false) == item.open_arguments, "the open decoder changed");
+    }
+    // A name already given, after a value: the value's text (open: the companion refuses the repeat).
+    const std::string repeated = head + "<parameter=new_string>\na\n</parameter>\n<parameter=path>\nb" + close;
+    require(accepts(compiled, *declared, repeated), "the declared-names grammar refused a repeated name as text");
+    require(decode(declared, repeated, false) ==
+                Json{{"path", "docs/tools.md"}, {"new_string", "a\n</parameter>\n<parameter=path>\nb"}},
+            "a repeated name did not stay the value's text");
+    require(!accepts(compiled, *open, repeated), "the open grammar admitted a repeated parameter name");
+    // The first parameter must be declared: only `p` (path) and `n` (new_string) may follow its opener.
+    auto matcher = frontend::compile_tool_grammar(compiled, *declared, kToolCall, {}, {});
+    std::vector<std::uint32_t> words(matcher->mask_words());
+    for (const std::int32_t token : tokens("<tool_call>\n<function=call>\n<parameter=")) {
+        require(matcher->masks({}, words) == 0 && allowed(words, token), "the grammar refused a call opener");
+        matcher->accept(token);
+        matcher->confirm();
+    }
+    require(matcher->masks({}, words) == 0 && allowed(words, 'p') && allowed(words, 'n') && !allowed(words, 'l'),
+            "the first parameter's name was not limited to the declared ones");
+    require(accepts(compiled, *open, "<tool_call>\n<function=call>\n<parameter=limit>\n25" + close),
+            "the open grammar refused an undeclared first parameter");
+    // A call that names no parameter (both optional) stays admitted.
+    const std::string empty = "<tool_call>\n<function=call>\n</function>\n</tool_call>";
+    require(accepts(compiled, *open, empty) == accepts(compiled, *declared, empty),
+            "the declared-names grammar changed whether a call may name no parameter");
+}
+
 // A parameter a declared non-strict tool does not declare counts as a schema mismatch on the constrained
 // (streamed) route, as the whole-text route counts it (candidates QA-14).
 void undeclared_parameters() {
@@ -525,6 +613,7 @@ void run() {
     calls_in_thinking(compiled);
     calls_after_closers(compiled);
     unclosed_values(compiled);
+    declared_parameter_lines(compiled);
     infernix::ToolChoice required;
     required.mode = infernix::ToolChoiceMode::Required;
     auto fixed =

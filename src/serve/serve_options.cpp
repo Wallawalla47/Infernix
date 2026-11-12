@@ -125,6 +125,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--no-thinking", false},
     ServeOptionArity{"--preserve-thinking", false},
     ServeOptionArity{"--tolerant-tool-calls", false},
+    ServeOptionArity{"--tool-parameter-names"},
     ServeOptionArity{"--restore-reasoning", false},
     ServeOptionArity{"--any-model-name", false},
     ServeOptionArity{"--cors", false},
@@ -657,6 +658,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             budget and an undeclared name, and return complete\n"
            "                             calls stranded in unclosed thinking (strict\n"
            "                             all-or-nothing by default)\n"
+           "  --tool-parameter-names M   open (default) | declared: on the constrained tool\n"
+           "                             route a non-strict tool that declares parameters\n"
+           "                             names only those, and a value keeps a quoted\n"
+           "                             <parameter=NAME> line its call cannot take\n"
            "  --restore-reasoning        give a Chat Completions assistant message sent\n"
            "                             back without its reasoning the reasoning this\n"
            "                             server generated for it (a tool call by its call\n"
@@ -1222,6 +1227,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.preserve_thinking = true;
         } else if (arg == "--tolerant-tool-calls") {
             options.tolerant_tool_calls = true;
+        } else if (arg == "--tool-parameter-names") {
+            const std::string_view value = require_value("--tool-parameter-names");
+            if (value == "open") {
+                options.tool_parameter_names = ToolParameterNames::Open;
+            } else if (value == "declared") {
+                options.tool_parameter_names = ToolParameterNames::Declared;
+            } else {
+                throw std::invalid_argument("--tool-parameter-names accepts open or declared");
+            }
         } else if (arg == "--restore-reasoning") {
             options.restore_reasoning = true;
         } else if (arg == "--any-model-name") {

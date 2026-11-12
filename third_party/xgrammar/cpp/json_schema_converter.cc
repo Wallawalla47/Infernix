@@ -3513,7 +3513,8 @@ XMLToolCallingConverter::XMLToolCallingConverter(
     RefResolver ref_resolver,
     JSONFormat json_format,
     bool any_order,
-    std::vector<std::string> excludes
+    std::vector<std::string> excludes,
+    bool quoted_parameter_lines
 )
     : JSONSchemaConverter(
           indent,
@@ -3526,7 +3527,8 @@ XMLToolCallingConverter::XMLToolCallingConverter(
       ),
       json_format_(json_format),
       nested_object_level_(0),
-      xml_wrapper_(kKeyWrapperMap.at(json_format)) {
+      xml_wrapper_(kKeyWrapperMap.at(json_format)),
+      quoted_parameter_lines_(quoted_parameter_lines && json_format == JSONFormat::kQwenXML) {
   // XML formatting can add whitespace outside a constrained raw string's rule.
   // Reject exclusions that could straddle that boundary instead of silently bypassing them.
   auto is_padding = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
@@ -3677,9 +3679,23 @@ void XMLToolCallingConverter::AddBasicRules() {
     const int32_t quoted_close = Sequence(
         {ByteString("\n</parameter>\n</function>\n</tool_call>"), RuleRef(segment)}
     );
+    // Infernix: with quoted parameter lines a raw value also holds `\n</parameter>\n<parameter=NAME>`
+    // and more text (a document quoting a call). Both readings stay open; the caller's decoder takes
+    // NAME as the next parameter only when the call may name it, and the value goes on otherwise.
+    const int32_t quoted = quoted_parameter_lines_
+                               ? Choice(
+                                     {quoted_close,
+                                      Sequence(
+                                          {ByteString("\n</parameter>\n<parameter="),
+                                           RuleRef(builder_.GetRuleId(kXMLVariableName)),
+                                           ByteString(">"),
+                                           RuleRef(segment)}
+                                      )}
+                                 )
+                               : quoted_close;
     builder_.UpdateRuleBody(
         kXMLString,
-        Sequence({RuleRef(segment), Repeat(kXMLString + "_quoted_close", quoted_close, 0, -1)})
+        Sequence({RuleRef(segment), Repeat(kXMLString + "_quoted_close", quoted, 0, -1)})
     );
   } else {
     auto string_excludes = excludes_;
@@ -4371,7 +4387,8 @@ Grammar JSONSchemaToGrammar(
     std::optional<int> max_whitespace_cnt,
     bool any_order,
     JSONFormat json_format,
-    std::vector<std::string> excludes
+    std::vector<std::string> excludes,
+    bool quoted_parameter_lines
 ) {
   picojson::value schema_value;
   std::string error = ParseJSON(schema_value, schema);
@@ -4420,7 +4437,8 @@ Grammar JSONSchemaToGrammar(
           std::move(ref_resolver),
           json_format,
           any_order,
-          std::move(excludes)
+          std::move(excludes),
+          quoted_parameter_lines
       );
       return converter.Convert(spec);
     }

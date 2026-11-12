@@ -1326,6 +1326,11 @@ struct PromptOptions {
     // Claude Code does with its MCP tools): a well-formed call to an undeclared name stays a call for
     // the client to judge instead of turning into text. The prompt does not change.
     bool open_tool_names = false;
+    // On the constrained tool route, a non-strict tool that declares parameters may name only those
+    // (each once, in any order), and a value keeps a quoted `\n</parameter>\n<parameter=NAME>` whose
+    // NAME the call cannot take as its text (infernix-serve --tool-parameter-names declared). Off: names
+    // stay open. The prompt does not change.
+    bool declared_parameter_names = false;
 };
 
 enum class PromptCacheMarkerKind : std::uint8_t {

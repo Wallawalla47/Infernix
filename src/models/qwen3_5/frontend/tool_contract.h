@@ -62,6 +62,15 @@ struct ToolCallOutputContract {
     // The client knows tools the request does not declare (PromptOptions::open_tool_names): a
     // well-formed call to an undeclared name is the client's to judge, so the parser keeps it a call.
     bool open_names  = false;
+    // PromptOptions::declared_parameter_names: on the constrained route a non-strict tool that declares
+    // parameters names only those, each once and in any order, and a raw value keeps a
+    // `\n</parameter>\n<parameter=NAME>` whose NAME the call cannot take as its text (declared_names()).
+    bool declared_parameter_names = false;
+
+    // Whether a call of `tool` names only its declared parameters (declared_parameter_names).
+    [[nodiscard]] bool declared_names(const Tool& tool) const noexcept {
+        return declared_parameter_names && !tool.strict && !tool.parameters.empty();
+    }
 };
 
 // Listed declarations come first, then deferred ones (declared but absent from the prompt's tool
@@ -69,7 +78,7 @@ struct ToolCallOutputContract {
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons,
                                 std::span<const std::string> deferred_tool_jsons = {},
-                                bool open_names = false);
+                                bool open_names = false, bool declared_parameter_names = false);
 
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
 select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& declarations,

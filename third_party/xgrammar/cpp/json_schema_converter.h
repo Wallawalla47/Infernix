@@ -579,7 +579,10 @@ Grammar JSONSchemaToGrammar(
     std::optional<int> max_whitespace_cnt = std::nullopt,
     bool any_order = false,
     JSONFormat json_format = JSONFormat::kJSON,
-    std::vector<std::string> excludes = {}
+    std::vector<std::string> excludes = {},
+    // Infernix (kQwenXML only): a raw value also reads `\n</parameter>\n<parameter=NAME>` and more
+    // text as its own, leaving the caller's decoder to decide whether NAME opens a parameter.
+    bool quoted_parameter_lines = false
 );
 
 // ==================== Public API functions (backward compatible) ====================

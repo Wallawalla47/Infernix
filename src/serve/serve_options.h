@@ -34,6 +34,9 @@ inline constexpr std::uint32_t kKeepAliveBufferSec = 10;
 // acknowledging is still cut sooner by the TCP retransmission limit (http_transport.cpp).
 inline constexpr std::uint32_t kWriteTimeoutSec = 60;
 
+// --tool-parameter-names: which parameter names a constrained non-strict tool call may write.
+enum class ToolParameterNames : std::uint8_t { Open, Declared };
+
 // Size-based rotation of the request JSONL log.
 struct RequestLogRotation {
     std::uint64_t max_bytes = 0;                      // 0 => one file that grows without bound
@@ -137,6 +140,10 @@ struct ServeOptions {
     std::optional<bool> preserve_thinking;
     // Recover complete Qwen calls with malformed wrapper/suffix output (opt-in; strict by default).
     bool tolerant_tool_calls = false;
+    // --tool-parameter-names: Open (default) lets a constrained non-strict call name any parameter;
+    // Declared limits a tool that declares parameters to those, and a value then keeps a quoted
+    // `<parameter=NAME>` line the call cannot take (infernix::PromptOptions::declared_parameter_names).
+    ToolParameterNames tool_parameter_names = ToolParameterNames::Open;
     // --restore-reasoning: a Chat Completions assistant message whose client dropped the reasoning of a
     // response this server produced gets it back (serve/reasoning_store.h): a tool-call message by its call
     // ids, an answer by its text and the conversation before it. The history then renders as generated and

@@ -638,7 +638,16 @@ While the model is thinking, the constraint refuses the `<tool_call>` token: a c
 the thinking would never run, and the turn cannot end before the thinking closes, so the model
 closes its thinking first and calls after it.
 
-Non-strict parameter names and order remain open. Their schema supplies the existing value
+With `--tool-parameter-names declared`, a non-strict tool that declares parameters names only those,
+each at most once and in any order (a tool that declares none keeps open names, and the prompt is
+unchanged). A value then also keeps a `\n</parameter>\n<parameter=NAME>` line whose NAME its call
+cannot take, one the tool does not declare or the call has already given, as its own text: an edit to
+a file that quotes a tool call keeps that quote in its value instead of ending there, while a declared
+name not given yet opens that parameter (candidates ZA-01). The grammar keeps both readings and the
+decoder applies that rule, streamed or whole. A quoted line naming a declared parameter not given yet
+still ends the value. The unconstrained routes parse as before.
+
+Without it, non-strict parameter names and order remain open. Their schema supplies the existing value
 normalization hints; it is not compiled as a strict constraint. Open objects, root unions, and
 unsupported schema assertions therefore remain usable. A root `oneOf` / `anyOf` of object variants
 (a zod or Pydantic discriminated union) supplies its variants' properties as hints too: a name takes
@@ -1951,6 +1960,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text, and (with `--end-in-thinking allow`) complete calls stranded in thinking the model never closed | off |
+| `--tool-parameter-names open\|declared` | on the constrained tool route, `declared` lets a call to a non-strict tool that declares parameters name only those (each once, in any order), and a value keeps a quoted `<parameter=NAME>` line its call cannot take as its text (see the constrained route) | `open` |
 | `--restore-reasoning` | give a Chat Completions assistant message sent back without reasoning the reasoning this server generated for it: a tool-call message by its call ids, an answer by its text and the conversation before it. Changes the prompt the model sees from the history the client sent (see Chat Completions) | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |

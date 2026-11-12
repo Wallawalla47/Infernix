@@ -93,7 +93,8 @@ class XMLToolCallingConverter : public JSONSchemaConverter {
       RefResolver ref_resolver = nullptr,
       JSONFormat json_format = JSONFormat::kQwenXML,
       bool any_order = false,
-      std::vector<std::string> excludes = {}
+      std::vector<std::string> excludes = {},
+      bool quoted_parameter_lines = false
   );
 
   /*! \brief Convert SchemaSpec to grammar with XML format for root object. Note that this function
@@ -193,6 +194,9 @@ class XMLToolCallingConverter : public JSONSchemaConverter {
   // Track if we're at the root object level
   int nested_object_level_ = 0;
   const XMLWrapper xml_wrapper_;
+  // Infernix (kQwenXML): a raw value also reads `\n</parameter>\n<parameter=NAME>` as its text, so
+  // only the caller's decoder decides whether NAME opens the next parameter.
+  const bool quoted_parameter_lines_;
 };
 
 /*!

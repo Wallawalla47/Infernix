@@ -617,6 +617,17 @@ int main() {
     } catch (const std::invalid_argument&) { tool_reasoning_name_rejected = true; }
     failures += check(tool_reasoning_name_rejected,
                       "the replaced name --restore-tool-reasoning was still accepted");
+    failures += check(defaults.tool_parameter_names == ToolParameterNames::Open &&
+                          parse({"infernix-serve", "model.ninfer", "--tool-parameter-names", "declared"})
+                                  .tool_parameter_names == ToolParameterNames::Declared &&
+                          parse({"infernix-serve", "model.ninfer", "--tool-parameter-names", "open"})
+                                  .tool_parameter_names == ToolParameterNames::Open,
+                      "--tool-parameter-names did not reach serving options, or is not open by default");
+    bool parameter_names_refused = false;
+    try {
+        (void)parse({"infernix-serve", "model.ninfer", "--tool-parameter-names", "strict"});
+    } catch (const std::invalid_argument&) { parameter_names_refused = true; }
+    failures += check(parameter_names_refused, "--tool-parameter-names accepted a value other than open or declared");
     failures +=
         check(configured.max_concurrency == 4, "--max-concurrency did not reach serving options");
     failures += check(configured.max_context == 4096 &&

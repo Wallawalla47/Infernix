@@ -183,6 +183,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         .enable_thinking           = thinking ? thinking : server.enable_thinking.value_or(true),
         .preserve_thinking         = preserve ? preserve : server.preserve_thinking,
         .chat_template_kwargs_json = kwargs.dump(),
+        .declared_parameter_names  = server.tool_parameter_names == ToolParameterNames::Declared,
     };
     if (effort) {
         const bool enables = *effort != RequestedReasoningEffort::None;
@@ -321,6 +322,7 @@ infernix::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.chat_template_kwargs_json = semantics.chat_template_kwargs_json;
     input.options.add_vision_id             = false;
     input.options.open_tool_names           = request.open_tool_names;
+    input.options.declared_parameter_names  = semantics.declared_parameter_names;
     // Listed tools render in the prompt's tool section in request order; deferred ones only join
     // the output contract, so declaring one never changes the prompt.
     for (const ToolDefinition& tool : request.tools) {

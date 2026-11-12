@@ -900,7 +900,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
     }
     const auto tool_call_output = fi::build_tool_call_output_contract(
-        options.tool_jsons, options.deferred_tool_jsons, options.open_tool_names);
+        options.tool_jsons, options.deferred_tool_jsons, options.open_tool_names, options.declared_parameter_names);
     std::vector<PromptCacheMarker> rendered_markers = cache_hints.markers;
     std::optional<std::size_t> engine_tool_marker_index;
     if (cache_hints.allow_engine_automatic_shared_prefixes && !options.tool_jsons.empty()) {

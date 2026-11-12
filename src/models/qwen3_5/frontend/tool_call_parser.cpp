@@ -1429,7 +1429,15 @@ private:
                     invalid_ = true;
                 }
             } else if (byte == kParameterOpen[1]) {
-                if (closing_) { close_value(false); } // another parameter: the value ended
+                // Another parameter: the raw value ended. When the call names only declared parameters,
+                // the name decides whether it did (decide_parameter_line).
+                if (closing_) {
+                    if (declared_) {
+                        deferred_ = true;
+                    } else {
+                        close_value(false);
+                    }
+                }
                 phase_   = Phase::ParameterOpen;
                 matched_ = 2;
             } else if (byte == kCallClose[1]) {
@@ -1442,7 +1450,7 @@ private:
         case Phase::ParameterOpen:
             if (match(kParameterOpen, byte)) {
                 phase_ = Phase::ParameterName;
-                name_.clear();
+                (deferred_ ? candidate_ : name_).clear();
             }
             return;
         case Phase::CallClose:
@@ -1456,11 +1464,15 @@ private:
             return;
         case Phase::ParameterName:
             if (byte == '>') {
-                end_parameter_name();
+                if (deferred_) {
+                    decide_parameter_line();
+                } else {
+                    end_parameter_name();
+                }
             } else if (byte == '<' || byte == '\r' || byte == '\n') {
                 invalid_ = true;
             } else {
-                name_.push_back(byte);
+                (deferred_ ? candidate_ : name_).push_back(byte);
             }
             return;
         case Phase::Value: value_byte(byte); return;
@@ -1472,8 +1484,36 @@ private:
         }
     }
 
+    // After a raw value's terminator, `\n<parameter=` and the name `candidate_` of a call that names only
+    // its declared parameters (Contract::declared_names): a name it declares and has not given opens that
+    // parameter; any other makes the whole line the value's text, as the grammar reads it too.
+    void decide_parameter_line() {
+        deferred_        = false;
+        const bool opens = find_parameter_contract(*tool_, candidate_) != nullptr &&
+                           std::find(names_.begin(), names_.end(), candidate_) == names_.end();
+        if (opens) {
+            close_value(false);
+            name_ = std::move(candidate_);
+            candidate_.clear();
+            end_parameter_name();
+            return;
+        }
+        closing_ = false;
+        held_    = 0;
+        matched_ = 0;
+        value_.append(kValueEnd);
+        value_.push_back('\n');
+        value_.append(kParameterOpen);
+        value_.append(candidate_);
+        value_.push_back('>');
+        candidate_.clear();
+        phase_ = Phase::Value;
+    }
+
     void start_call() {
         call_        = GeneratedToolCall{.name = name_, .arguments_json = {}};
+        declared_    = contract_.declared_names(*tool_);
+        deferred_    = false;
         names_.clear();
         previous_    = -1;
         first_pair_  = true;
@@ -1696,7 +1736,10 @@ private:
     std::size_t matched_ = 0;
     bool invalid_        = false;
     bool closing_        = false; // a raw value's terminator was read; the framing after it decides
-    std::string name_; // the function or parameter name being read
+    bool declared_       = false; // the call names only its declared parameters (Contract::declared_names)
+    bool deferred_       = false; // a parameter line after a raw value's terminator: its name decides
+    std::string name_;      // the function or parameter name being read
+    std::string candidate_; // a deferred parameter line's name
     const Contract::Tool* tool_           = nullptr;
     const Contract::Parameter* parameter_ = nullptr;
     std::ptrdiff_t previous_              = -1; // a strict call's last parameter index

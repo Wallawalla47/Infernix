@@ -37,7 +37,10 @@ Regex and schema patterns share character/escape normalization with explicit ful
 regex hexadecimal escapes consume exactly two digits. Product constraints reject unsupported
 escapes and anchor positions before grammar conversion.
 The Qwen converter uses canonical tool framing, preserves raw-string assertions with delimiter
-exclusion, and emits argument numbers that the protocol JSON adapters can represent.
+exclusion, and emits argument numbers that the protocol JSON adapters can represent. Its raw string
+also holds the whole call's closing lines when more value text follows them, and, with
+`JSONSchemaToGrammar`'s `quoted_parameter_lines`, a `\n</parameter>\n<parameter=NAME>` line; the
+matcher keeps both readings and Infernix's decoder decides.
 
 The CPU dependency closure includes Lark and all format converters referenced by the shared
 factories. `cpp/testing.cc` also supplies token-formatting diagnostics used by the matcher and

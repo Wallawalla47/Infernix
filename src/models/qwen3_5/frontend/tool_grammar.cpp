@@ -34,17 +34,21 @@ constexpr std::string_view kCallClose     = "</function>\n</tool_call>";
 // whole call's closing lines (the grammar's raw string rule). `calls`: the grammar's raw string reads
 // the `<tool_call>` token right after those closing lines (or after their `\n` when calls are not
 // parallel) as value text, while the decoder takes the token there only as the next call's opener,
-// so it is masked there; every tool grammar has this rule.
+// so it is masked there; every tool grammar has this rule. `declared` (Contract::declared_names): a
+// raw value's `\n</parameter>\n<parameter=NAME>` opens NAME only when the call declares it and has
+// not named it yet; any other NAME makes the line the value's text (the grammar keeps both readings).
 class ToolCallRules final : public text::GrammarStateConstraint {
 public:
+    using DeclaredNames = std::vector<std::pair<std::string, std::vector<std::string>>>;
+
     ToolCallRules(std::shared_ptr<const std::vector<std::string>> vocabulary,
                   std::shared_ptr<const std::vector<std::int32_t>> tag_ends, std::int32_t tool_call,
                   const text::ReasoningFraming& reasoning, bool combined, bool parallel, bool names,
-                  bool quotes)
+                  bool quotes, std::shared_ptr<const DeclaredNames> declared)
         : vocabulary_(std::move(vocabulary)), tag_ends_(std::move(tag_ends)), tool_call_(tool_call),
           reasoning_close_(reasoning.close_token), separator_(reasoning.separator.size()),
           body_phase_(combined ? Phase::Branch : Phase::Text), parallel_(parallel), names_rule_(names),
-          quotes_rule_(quotes) {
+          quotes_rule_(quotes), declared_(std::move(declared)) {
         cursor_.phase = reasoning_close_ ? Phase::Reasoning : body_phase_;
         committed_    = {cursor_, names_};
     }
@@ -111,6 +115,16 @@ private:
         std::uint32_t matched = 0; // bytes of the current literal matched
         std::string name;
         MarkdownCodeTracker code; // the free text's Markdown code state (`quotes`)
+        // The call's declared names when it may name only those (`declared`), else null.
+        const std::vector<std::string>* declared = nullptr;
+        bool after_value = false; // the parameter opener being read follows a raw value's terminator
+
+        // The next phase of the same call: its declared names and whether a value came before stay.
+        void enter(Phase next) {
+            phase   = next;
+            matched = 0;
+            name.clear();
+        }
     };
 
     // The current call's names: a simulation reads the committed ones and keeps its own additions.
@@ -189,17 +203,23 @@ private:
             case Phase::Branch: cursor.phase = Phase::Body; break;
             case Phase::Header:
                 if (byte == '>') {
-                    cursor.matched = 1;
+                    cursor.matched  = 1;
+                    cursor.declared = declared_names(cursor.name);
                 } else if (cursor.matched != 0) {
-                    cursor = {.phase = Phase::Parameters};
+                    cursor.enter(Phase::Parameters);
+                    cursor.after_value = false;
+                } else {
+                    cursor.name.push_back(byte);
                 }
                 break;
             case Phase::Parameters:
                 if (byte == kParameterOpen[cursor.matched]) {
-                    if (++cursor.matched == kParameterOpen.size()) { cursor = {.phase = Phase::Name}; }
+                    if (++cursor.matched == kParameterOpen.size()) { cursor.enter(Phase::Name); }
                 } else {
                     // `</`: the call's close.
-                    cursor = {.phase = Phase::CallClose, .matched = cursor.matched + 1};
+                    const std::uint32_t matched = cursor.matched + 1;
+                    cursor.enter(Phase::CallClose);
+                    cursor.matched = matched;
                 }
                 break;
             case Phase::Name:
@@ -207,15 +227,26 @@ private:
                     cursor.name.push_back(byte);
                     break;
                 }
+                if (cursor.declared != nullptr && cursor.after_value &&
+                    (std::find(cursor.declared->begin(), cursor.declared->end(), cursor.name) ==
+                         cursor.declared->end() ||
+                     names.contains(cursor.name))) {
+                    // A parameter line the call cannot take: the raw value's text, which goes on.
+                    cursor.enter(Phase::Value);
+                    break;
+                }
                 if (names_rule_ && names.contains(cursor.name)) { return false; }
                 names.added.push_back(std::move(cursor.name));
-                cursor = {.phase = Phase::ValueStart};
+                cursor.enter(Phase::ValueStart);
                 break;
-            case Phase::ValueStart: cursor = {.phase = Phase::Value}; break;
+            case Phase::ValueStart: cursor.enter(Phase::Value); break;
             case Phase::Value: value_byte(cursor, byte); break;
-            case Phase::AfterValue: cursor = {.phase = Phase::Parameters}; break;
+            case Phase::AfterValue:
+                cursor.enter(Phase::Parameters);
+                cursor.after_value = true;
+                break;
             case Phase::CallClose:
-                if (++cursor.matched == kCallClose.size()) { cursor = {.phase = Phase::AfterCall}; }
+                if (++cursor.matched == kCallClose.size()) { cursor.enter(Phase::AfterCall); }
                 break;
             case Phase::AfterCall:
                 // The `\n` before the next call's token. Other text after the call's closers is the
@@ -227,7 +258,7 @@ private:
                 }
                 {
                     const bool newline = cursor.matched != 0;
-                    cursor             = {.phase = Phase::Value};
+                    cursor.enter(Phase::Value);
                     if (newline) { value_byte(cursor, '\n'); }
                     value_byte(cursor, byte);
                 }
@@ -240,10 +271,22 @@ private:
     // A raw value's byte; `\n` occurs in its terminator only at its start.
     static void value_byte(Cursor& cursor, char byte) {
         if (byte == kValueEnd[cursor.matched]) {
-            if (++cursor.matched == kValueEnd.size()) { cursor = {.phase = Phase::AfterValue}; }
+            if (++cursor.matched == kValueEnd.size()) { cursor.enter(Phase::AfterValue); }
         } else {
             cursor.matched = byte == kValueEnd[0] ? 1 : 0;
         }
+    }
+
+    // The declared names of the tool a call header `\n<function=NAME` names, when its call may name only
+    // those; null otherwise.
+    const std::vector<std::string>* declared_names(std::string_view header) const {
+        constexpr std::string_view kFunctionOpen = "\n<function=";
+        if (!declared_ || !header.starts_with(kFunctionOpen)) { return nullptr; }
+        header.remove_prefix(kFunctionOpen.size());
+        for (const auto& [tool, names] : *declared_) {
+            if (tool == header) { return &names; }
+        }
+        return nullptr;
     }
 
     std::shared_ptr<const std::vector<std::string>> vocabulary_;
@@ -255,22 +298,34 @@ private:
     bool parallel_;
     bool names_rule_;
     bool quotes_rule_;
+    std::shared_ptr<const DeclaredNames> declared_;
     Cursor cursor_;
     std::vector<std::string> names_;
     Snapshot committed_;
 };
 
-xgrammar::Grammar arguments(const Contract::Tool& tool) {
+// A non-strict tool's parameter list when its call names only its declared parameters
+// (Contract::declared_names): each a raw string, once, in any order (the companion keeps them unique).
+std::string declared_arguments_schema(const Contract::Tool& tool) {
+    Json properties = Json::object();
+    for (const auto& parameter : tool.parameters) { properties[parameter.name] = {{"type", "string"}}; }
+    return Json{{"type", "object"}, {"properties", std::move(properties)}, {"additionalProperties", false}}.dump();
+}
+
+xgrammar::Grammar arguments(const Contract::Tool& tool, bool declared) {
     try {
         std::string source;
         if (tool.strict)
             source = text::prepare_json_schema(tool.grammar_schema_json.empty() ? tool.schema_json
                                                                                : tool.grammar_schema_json);
+        else if (declared)
+            source = declared_arguments_schema(tool);
         else
             source = R"({"type":"object","additionalProperties":{"type":"string"}})";
+        // Declared names: any order, and a raw value also reads a quoted parameter line as its text.
         return xgrammar::JSONSchemaToGrammar(
             source, false, std::nullopt, std::pair<std::string, std::string>{", ", ": "}, false,
-            std::nullopt, false, xgrammar::JSONFormat::kQwenXML, {});
+            std::nullopt, declared, xgrammar::JSONFormat::kQwenXML, {}, declared);
     } catch (const RequestError& error) {
         throw RequestError(error.kind(), "tool '" + tool.name + "': " + error.what(),
                            "/" + std::to_string(tool.declaration_index) + "/parameters" +
@@ -307,10 +362,13 @@ xgrammar::Grammar build(const Contract& contract, const std::optional<OutputCons
     std::vector<int32_t> choices;
     std::optional<int32_t> basic_arguments;
     for (const auto& tool : contract.tools) {
-        const auto body = !tool.strict && basic_arguments
-                              ? *basic_arguments
-                              : xgrammar::SubGrammarAdder::Apply(&builder, arguments(tool));
-        if (!tool.strict) basic_arguments = body;
+        // Open non-strict calls share one parameter list; a strict or declared one is the tool's own.
+        const bool declared = contract.declared_names(tool);
+        const bool shared   = !tool.strict && !declared;
+        const auto body     = shared && basic_arguments
+                                  ? *basic_arguments
+                                  : xgrammar::SubGrammarAdder::Apply(&builder, arguments(tool, declared));
+        if (shared) basic_arguments = body;
         choices.push_back(builder.AddSequence(
             {builder.AddByteString("\n<function=" + tool.name + ">\n"), builder.AddRuleRef(body),
              builder.AddByteString("</function>\n</tool_call>")}));
@@ -346,12 +404,19 @@ compile_tool_grammar(text::GrammarCompiler& compiler, const Contract& contract,
         throw RequestError(RequestErrorKind::InvalidJsonSchema,
                            "JSON constraints do not accept literal alternatives");
     if (body) identity["body"] = {{"kind", static_cast<int>(body->kind)}, {"source", body->source}};
+    // The declared parameter names of each tool whose call may name only those (Contract::declared_names).
+    auto declared = std::make_shared<std::vector<std::pair<std::string, std::vector<std::string>>>>();
     for (const auto& tool : contract.tools) {
         Json entry{{"name", tool.name}, {"strict", tool.strict}};
         if (tool.strict) {
             entry["schema"] = Json::parse(tool.schema_json);
             // Failed compilations are cached too, including their declaration error location.
             entry["source_index"] = tool.declaration_index;
+        } else if (contract.declared_names(tool)) {
+            std::vector<std::string> names;
+            for (const auto& parameter : tool.parameters) { names.push_back(parameter.name); }
+            entry["declared"] = names;
+            declared->emplace_back(tool.name, std::move(names));
         }
         identity["qwen_tools"].push_back(std::move(entry));
     }
@@ -364,7 +429,7 @@ compile_tool_grammar(text::GrammarCompiler& compiler, const Contract& contract,
     if (!contract.tools.empty()) {
         companion = std::make_unique<ToolCallRules>(compiler.vocabulary(), compiler.tag_end_tokens(), tool_call_token,
                                                     reasoning, body.has_value() && !contract.required,
-                                                    contract.parallel, names, quotes);
+                                                    contract.parallel, names, quotes, std::move(declared));
     }
     // The reasoning may not write the `<tool_call>` token: a call there never runs, and the reasoning,
     // which cannot end the turn, would go on to its budget. Its spelling in ordinary tokens stays

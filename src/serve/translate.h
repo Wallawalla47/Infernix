@@ -26,6 +26,8 @@ struct ResolvedPromptSemantics {
     std::optional<infernix::ReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;
     std::string chat_template_kwargs_json;
+    // --tool-parameter-names declared (infernix::PromptOptions::declared_parameter_names).
+    bool declared_parameter_names = false;
 };
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,

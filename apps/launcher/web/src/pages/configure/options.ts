@@ -550,6 +550,18 @@ const THINKING: FormSection = {
       help: "Recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget, and calls stranded in unclosed thinking.",
     },
     {
+      kind: "select",
+      flag: "--tool-parameter-names",
+      label: "Tool parameter names",
+      help: "declared: a constrained call to a non-strict tool that declares parameters may name only those, and a quoted <parameter=NAME> line its call cannot take stays in the value (an edit to a file that contains tool-call markup). open: any name.",
+      options: [
+        { value: "open", label: "open" },
+        { value: "declared", label: "declared" },
+      ],
+      unsetLabel: "open (default)",
+      more: true,
+    },
+    {
       kind: "number",
       flag: "--default-max-tokens",
       label: "Default output limit",
