@@ -63,7 +63,9 @@ struct Nvml {
     int (*link_width)(NvmlDevice, unsigned int*)          = nullptr;
     int (*display_active)(NvmlDevice, int*)               = nullptr; // nvmlEnableState_t: 1 a display
     int (*driver_version)(char*, unsigned int)            = nullptr;
+    // The devices in gpu_listing_order once Telemetry has read them, with each one's NVML index.
     std::vector<NvmlDevice> devices;
+    std::vector<std::uint32_t> indices;
     bool ready = false;
 
     void* symbol(const char* name) const {
@@ -111,7 +113,10 @@ struct Nvml {
         if (count(&n) != kNvmlSuccess) { return; }
         for (unsigned int i = 0; i < n; ++i) {
             NvmlDevice device = nullptr;
-            if (handle(i, &device) == kNvmlSuccess) { devices.push_back(device); }
+            if (handle(i, &device) == kNvmlSuccess) {
+                devices.push_back(device);
+                indices.push_back(i);
+            }
         }
         ready = true;
     }
@@ -539,6 +544,19 @@ Json to_json(const SystemReading& r) {
             {"server", server}};
 }
 
+std::vector<std::size_t> gpu_listing_order(const std::vector<GpuReading>& gpus) {
+    std::vector<std::size_t> order(gpus.size());
+    for (std::size_t i = 0; i < order.size(); ++i) { order[i] = i; }
+    if (order.empty()) { return order; }
+    std::size_t inference = 0;
+    for (std::size_t i = 1; i < gpus.size(); ++i) {
+        if (gpus[i].vram_total > gpus[inference].vram_total) { inference = i; }
+    }
+    std::rotate(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(inference),
+                order.begin() + static_cast<std::ptrdiff_t>(inference) + 1);
+    return order;
+}
+
 Json to_json(const SystemFacts& f) {
     Json gpus = Json::array();
     for (const auto& [index, gpu] : f.gpus) {
@@ -628,15 +646,24 @@ SystemFacts read_facts() {
 Telemetry::Telemetry(ServerProbe server, Listener listener)
     : server_(std::move(server)), listener_(std::move(listener)), sources_(std::make_unique<Sources>()) {
     facts_ = read_facts();
-    sources_->nvml.open();
-    for (std::size_t i = 0; i < sources_->nvml.devices.size(); ++i) {
-        const GpuReading gpu = sources_->nvml.read(static_cast<std::uint32_t>(i), sources_->nvml.devices[i]);
-        facts_.gpus.push_back({gpu.index, {gpu.name, gpu.vram_total}});
+    Nvml& nvml = sources_->nvml;
+    nvml.open();
+    std::vector<GpuReading> found;
+    for (std::size_t i = 0; i < nvml.devices.size(); ++i) { found.push_back(nvml.read(nvml.indices[i], nvml.devices[i])); }
+    // From here on every reading lists the inference GPU first.
+    std::vector<NvmlDevice> devices;
+    std::vector<std::uint32_t> indices;
+    for (const std::size_t i : gpu_listing_order(found)) {
+        devices.push_back(nvml.devices[i]);
+        indices.push_back(nvml.indices[i]);
+        facts_.gpus.push_back({found[i].index, {found[i].name, found[i].vram_total}});
     }
-    int active = -1;
-    if (!sources_->nvml.devices.empty() && sources_->nvml.display_active != nullptr &&
-        sources_->nvml.display_active(sources_->nvml.devices.front(), &active) == kNvmlSuccess && active >= 0) {
-        facts_.first_gpu_display = active != 0;
+    nvml.devices = std::move(devices);
+    nvml.indices = std::move(indices);
+    int active   = -1;
+    if (!nvml.devices.empty() && nvml.display_active != nullptr &&
+        nvml.display_active(nvml.devices.front(), &active) == kNvmlSuccess && active >= 0) {
+        facts_.inference_gpu_display = active != 0;
     }
     if (sources_->nvml.driver_version != nullptr) {
         char version[96] = {};
@@ -692,7 +719,7 @@ void Telemetry::run() {
         reading.cpu_temp_c      = temperature;
         reading.cpu_temp_source = source;
         for (std::size_t i = 0; i < sources_->nvml.devices.size(); ++i) {
-            reading.gpus.push_back(sources_->nvml.read(static_cast<std::uint32_t>(i), sources_->nvml.devices[i]));
+            reading.gpus.push_back(sources_->nvml.read(sources_->nvml.indices[i], sources_->nvml.devices[i]));
         }
         if (server_) {
             if (const auto probe = server_()) {

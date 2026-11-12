@@ -708,8 +708,9 @@ Args Launcher::model_default_args(const ScannedModel& model, const LibraryScan& 
     const SystemFacts facts = telemetry_->facts();
     HostFacts host;
     host.ram_total_bytes = facts.ram_total;
+    // The inference GPU: telemetry lists it first.
     if (!facts.gpus.empty()) { host.vram_total_bytes = facts.gpus.front().second.second; }
-    host.display = facts.first_gpu_display;
+    host.display = facts.inference_gpu_display;
     return default_args(scan, model, host);
 }
 
@@ -1431,7 +1432,7 @@ void Launcher::handle_load_failure(const InstanceSnapshot& snapshot, const std::
     if (const std::optional<SystemReading> reading = telemetry_->latest()) {
         facts.ram_total     = reading->ram_total;
         facts.ram_available = reading->ram_available;
-        if (!reading->gpus.empty()) {
+        if (!reading->gpus.empty()) { // the inference GPU, listed first
             facts.vram_total = reading->gpus.front().vram_total;
             facts.vram_used  = reading->gpus.front().vram_used;
         }

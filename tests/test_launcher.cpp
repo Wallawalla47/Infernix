@@ -18,6 +18,7 @@
 #include "launcher/serve_help.h"
 #include "launcher/sha256.h"
 #include "launcher/supervisor.h"
+#include "launcher/telemetry.h"
 #include "launcher/updates.h"
 #include "launcher/usage.h"
 
@@ -886,6 +887,34 @@ void test_chats() {
     std::filesystem::remove_all(dir, ignored);
 }
 
+// With a second NVIDIA card the inference GPU is the one with the most VRAM, listed first (the
+// dashboard shows the first, default launch parameters and load advice size from it); the others
+// keep NVML's order, and equals keep it too.
+void test_gpu_order() {
+    const auto gpu = [](std::uint32_t index, const char* name, std::uint64_t gib) {
+        GpuReading reading;
+        reading.index      = index;
+        reading.name       = name;
+        reading.vram_total = gib << 30U;
+        return reading;
+    };
+    check(gpu_listing_order({gpu(0, "NVIDIA GeForce RTX 3060", 12), gpu(1, "NVIDIA GeForce RTX 5090", 32)}) ==
+              std::vector<std::size_t>{1, 0},
+          "a larger second NVML device is listed first as the inference GPU");
+    check(gpu_listing_order({gpu(0, "NVIDIA GeForce RTX 5090", 32), gpu(1, "NVIDIA GeForce RTX 3060", 12)}) ==
+              std::vector<std::size_t>{0, 1},
+          "the inference GPU as NVML device 0 keeps the order");
+    check(gpu_listing_order({gpu(0, "NVIDIA T400", 2), gpu(1, "NVIDIA GeForce RTX 3060", 12),
+                             gpu(2, "NVIDIA GeForce RTX 5090", 32)}) == std::vector<std::size_t>{2, 0, 1},
+          "the other GPUs keep NVML's order behind the inference GPU");
+    check(gpu_listing_order({gpu(0, "NVIDIA GeForce RTX 5090", 32), gpu(1, "NVIDIA GeForce RTX 5090", 32)}) ==
+              std::vector<std::size_t>{0, 1},
+          "equal GPUs keep NVML's order");
+    check(gpu_listing_order({}).empty() && gpu_listing_order({gpu(0, "NVIDIA GeForce RTX 5090", 32)}) ==
+                                               std::vector<std::size_t>{0},
+          "no GPU or one GPU");
+}
+
 // /v1/models carries its page under data and again as a top-level models (Codex CLI's catalog).
 void test_models_list_body() {
     const Json page = Json::array({Json{{"id", "a"}, {"object", "model"}}, Json{{"id", "b"}, {"object", "model"}}});
@@ -901,6 +930,7 @@ void test_models_list_body() {
 }
 
 int main() {
+    test_gpu_order();
     test_models_list_body();
     test_args();
     test_blob_ids();

@@ -92,7 +92,11 @@ One page, top to bottom:
   on Windows is the CPU package sensor from HWiNFO or Core Temp when one of them runs (HWiNFO needs
   *Shared Memory Support* on), otherwise the ACPI thermal zone Windows reports, a motherboard sensor
   rather than the package; a PC that exposes neither shows no temperature. Linux reads the kernel's
-  hwmon sensors (coretemp, k10temp).
+  hwmon sensors (coretemp, k10temp). With more than one NVIDIA GPU the gauges show the inference GPU,
+  taken to be the one with the most VRAM (the first of equals in the driver's order): CUDA numbers the
+  fastest device first, so on a PC with a smaller second card `infernix-serve`'s default `--device 0`
+  is that one. The same GPU sizes the default launch parameters and the advice for a load that does
+  not fit.
 
   A dial is one arc in the accent colour, a needle and the reading. The dials with a limit turn
   amber and say **High** at the first limit, red and **Critical** at the second: CPU temperature at
