@@ -4443,7 +4443,7 @@ Where snapshots are taken and what they cost (estimated):
 
 | Checkpoint | Where | Kind | Compute | Copy | Notes |
 |---|---|---|---|---|---|
-| Generation opener | `n − ~5` (`<\|im_start\|>assistant\n<think>\n`), or the first assistant turn of a rewritten tool loop | Exact | CPU-served 5-token call, ~25-40 ms (~0.12 s GPU-staged before P0) | Tail 36 µs + image 4.5 ms, overlapping the tail call (P4) | Kept after endpoint resumes |
+| Generation opener | `n − ~5` (`<\|im_start\|>assistant\n<think>\n`), or the first assistant turn of a rewritten tool loop | Exact | With the call before it as one pair call (§19.3.56: its mixers on their own, its MoE with that call's); a CPU-served 5-token call of its own, ~25-40 ms (~0.12 s GPU-staged before P0), where no pair forms | Tail 36 µs + image 4.5 ms, overlapping the tail call (P4) | Kept after endpoint resumes |
 | Client breakpoint, `cache_control`, structural (end of tools, of the leading system block) | Anywhere | Exact | 0 if no new call, else Δ | Same | Explicit, Structural always kept; Automatic with Δ > 0.1 s become flexible |
 | Prompt tail | Start of the final call | Flexible | 0 | Image 4.5 ms | Absorbed by the opener in chat (proximity rule) |
 | Ladder `n − G·2^k`, G = max(4096, 2·chunk) | First call boundary ≥ p | Flexible | 0 | 4.5 ms + 116 MB Host each | ~log2(n/G) per cold long prompt |
@@ -4568,7 +4568,8 @@ least 256 columns cut at 65,536 tokens, and captures the taps inside a span in p
 So a cut costs a call, and a span only where it leaves a narrower call between walk-eligible ones;
 the planner charges every plan its spans (`CallCost::walk_min_columns`, `walk_max_tokens`), and
 coalescing charges a new tap the same way. A non-boundary exact tap (the generation opener, an
-automatic marker) is kept only before a CPU-served call (the opener's tail) within the split budget.
+automatic marker) is kept only before a CPU-served call (the opener's tail) within the split budget;
+that tail then runs with the call before it as one pair call where one forms (§19.3.56).
 Before a GPU-staged call it adds that call, and an automatic marker's snapshot (the conversation's
 latest turn) is one the turn's endpoint makes redundant: keeping those splits took the agentic
 replay from 84.6 % to 82.9 % of prompt tokens from cache (more snapshots than its 50 slots, so
@@ -4942,7 +4943,7 @@ M6 gate.
 | Multi-call narrow suffix route (≤ 8-column calls) | Dominated: each call re-stages its distinct experts and the CPU takes ≤ 8 misses per layer per call; 50 prompt-hot tokens as 7 narrow calls ≈ 0.6-0.7 s vs ~0.3 s for one assisted call. A single small call stays CPU-served |
 | MTP cell c at KV slot c + 1 | A QSA op change (pooled 4-blocks would straddle pages) plus requalification; the per-node next token solves it in the binding |
 | "Every prefill call leaves its last MTP cell pending" (first revision) | Withdrawn: changed cold-run drafter order for nothing; MR4 makes boundary snapshots exact |
-| Zero-split GDN state tap (Hybrid spec §7.2-7.3) | Not built: automatic exact taps are admitted only at Δ ≤ 0.1 s (the opener costs ~25-40 ms). The remaining cost is ~1.3 s once per new prefix, for an Explicit or Structural tap that splits a chunk. That does not justify a GDN kernel state tap, which is not implemented for any model |
+| Zero-split GDN state tap (Hybrid spec §7.2-7.3) | Not built: automatic exact taps are admitted only at Δ ≤ 0.1 s (the opener costs ~25-40 ms). The remaining cost is ~1.3 s once per new prefix, for an Explicit or Structural tap that splits a chunk. That does not justify a GDN kernel state tap, which is not implemented for any model. The opener's own cut no longer costs a pass where the pair call applies (§19.3.56, 2026-11-11): its tap is taken between the two chunks' mixers |
 | Review proposals | **Two spare pages per lane:** one suffices (lemma); the second served a removed early-tail D2D copy. **E1 for C = 1 greedy only:** MR5 removes the mechanism, so E1 holds at any C (E5 and the drafter risk stay C = 1 greedy). **Lane-resident pending capture as a candidate, or publishing with host = Filling:** needs a snapshot state `snapshot_valid` lacks; the bounded drain closes the gap. **Capping a resumed lane at pool − 1 pages:** silently cuts whole-extent output. **Pacing bulk D2H as primary:** D2H FIFO unverified, and `download_pinned` fixes it without delaying write-through; pacing is the fallback. **Single-kernel page copy:** `copy_page`'s ~0.1-0.3 ms per Device-COW resume is immaterial against ≥ 25 ms of suffix |
 
 #### Risks
@@ -13129,6 +13130,78 @@ gdnab and out6144 at 129-8,192 columns: level at every point (single timer ticks
 Not a gain either (2026-11-11): TMA L2 promotion (128 B) requested on the MXFP8 weight tensor map, which pays on
 the NVFP4 prompt routes of the 27B. Exact and f16 routes, GDN input and outputs at 512-4,096 columns: -1.0 to
 +1.1 %.
+
+### 19.3.56 The pair call: the generation opener's tap without a second pass (2026-11-11; default)
+
+A chat turn's suffix [F, n) is cut at the generation opener p = n - ~5 so that the next turn, whose client does
+not echo the reasoning, resumes there (§19.3.1, Checkpoints). The cut made the tail [p, n) a call of its own: 48
+layers of narrow kernels and its experts served again (FP4-Local, prefill only, cold cache: a 5-token prompt
+35.1 ms against +5 to +11 ms for five more columns of a 45- to 200-token call). The zero-split GDN tap the hybrid
+spec sketches (§7.2-§7.3 there) would remove the cut with a kernel that taps its state mid-call; this does it
+without one, the way the layer walk (§19.3.8 F4) takes taps in place.
+
+`ProgramImpl::pair_step` (`prefill_walk.cpp`) runs the prompt's last two calls as one `Forward::run_split`: per
+layer the mixer of the head chunk on its columns, the tap's copy of that layer's state group (`walk_capture`), the
+mixer of the tail chunk on its columns, then one MoE over both chunks' columns. Each mixer step runs as its
+chunk-major call runs it, so the layer's KV, GDN, PLE and QSA state at the tap and at the prompt's end are the
+cut's bit for bit. Inside the one MoE the router and the shared expert also run on each chunk on its own
+(`Forward::moe`, `chunk_columns`): their routes go by the columns they are given (a Q8 or FP8 projection is SIMT to
+8 columns and tensor-core beyond, model-quality.md 6.7; `router-mma` from 256), so each chunk gets its own call's.
+The first form ran them over both chunks, and on recipe C (FP8 dense) a restarted Engine's resume at a pair call's
+tap then left the capturing run's tokens at the 29th (X12, 2026-11-11). The routing, the routed experts and the
+combine act column by column over both chunks; where a fast path picks a routed-expert kernel by the call's width
+(`expert-a4-residual` from nine columns), the tail's columns take the wider call's, as every other prompt column
+does. With the exact kernels a repeat that resumes at a tap a pair call captured generates what the capturing run
+did (`infernix_qwen4_exp_prefix_cache_real_test` X3, X5, X12, on FP4-Local, Dense8, recipe C and IQ3_S). The
+DFlash2 ring takes the head's positions, the tap copies the drafter's group, then the ring takes the tail's, after
+the call's logits are enqueued (the drafter resets the Forward's workspace). The tail's staged inputs have a second
+small io image (`pair_io`, the io prefix of 8 columns).
+
+The expert cache sees the two calls. The route log holds every column, and `ExpertResidency::after_round` runs the
+head's columns and then the tail's as two policy rounds (`route_round`), each with the promotions its own call
+starts (`advance_prefill`: none for a wide head, the decode rate for the tail, a call the CPU serves): the LFRU's
+counts, ages and admissions, the adaptive tier's rounds and the SSD tier's clock advance as after the two calls,
+and a route trace holds two records. The first form ran one round over all the columns with the tail's budget; the
+head's misses, which outnumber and outrank the tail's, took those promotions, and the decode after the call hit
+0.2 to 0.4 points less of its routed experts on the NVFP4 artifacts (recipe C, drafting off: 92.6 against 93.0 %,
+decode 150.4 against 151.9 tok/s; 2026-11-12).
+
+A pair forms from the prompt's last two calls when the tail is 2 to 8 columns, the head at least 2 (a one-column
+call is a decode-form call), both together are below the stream boundary (a wider head walks with its tail,
+§19.3.8) and within the DFlash2 window, and the lane has no MTP drafter, Vision item, scored prompt or replay;
+otherwise the cut stays. It is part of `free-cache-resume`: without that path (the reproducible route) a prefill
+runs the cold prefill's calls on the chunk grid and no pair forms, though a prompt ending 2 to 8 tokens past a grid
+point would offer one.
+
+Served (INT8 KV, default route; six six-turn conversations with fixed assistant replies so both arms send the same
+prompts, 48 tokens generated a turn; a fresh server per pass, pair and cut passes interleaved; the server's ttft,
+medians of the per-conversation differences on the three turns that take the cut; RTX 5090, 2026-11-12, the final
+form):
+
+| Artifact | Drafting off (8 passes) | DFlash2 auto (4 passes) |
+|---|---|---|
+| FP4-Local | -11.4, -11.2, -11.0 ms (121.8 against 131.9 ms on the first) | -9.0, -5.5, -6.9 ms |
+| Dense8 | -12.3, -11.5, -11.2 ms | -11.5, -9.1, -8.0 ms |
+| Recipe C | -11.9, -10.8, -9.4 ms | -9.7, -5.0, -6.7 ms |
+| IQ3_S | -9.9, -8.6, -9.3 ms (177.2 against 185.5 ms on the first) | -2.8, -4.5, -3.6 ms |
+
+Every such conversation-turn is faster with drafting off (18 of 18 per artifact), and with DFlash2 on the NVFP4
+artifacts; on IQ3_S with DFlash2, 15 of 18. Turns without a cut are level within the passes' spread (-0.4 to
++1.8 ms; FP4-Local's second such turn +1.2 ms with DFlash2, slower in 6 of 6 conversations). Cached tokens per turn
+are the same. Decode speed is level: drafting off 142.7 against 142.9 (FP4-Local), 139.1 against 138.4 (Dense8, a
+six-pass repeat), 151.4 against 152.2 (recipe C) and 141.5 against 141.5 tok/s (IQ3_S); DFlash2 250.4 / 249.4,
+233.3 / 228.5, 248.0 / 247.1 and 300.4 / 302.2. Dense8's eight-pass run and a four-pass repeat had four pair passes
+(of six) decode 3.5 % slower from their first request on, which runs no pair call, and no cut pass (of six); the
+six-pass repeat beside a CPU monitor (no foreign load) was level. Not explained.
+
+The generated text is not the cut's on the default route. The tail's columns take the wide call's routed-expert
+kernels, the first token's logits move, and a greedy reply can leave the cut's: of 36 replies of 48 tokens, 24
+(FP4-Local), 36 (Dense8), 19 (recipe C) and 34 (IQ3_S) equal the cut's with drafting off (23, 34, 21 and 34 with
+DFlash2; two pair passes agree on all 36). The cached state after such a turn differs in its low bits too, so the
+next turns' routes differ (a route trace of recipe C: the prompt columns' expert sets equal in layers 0-1, 60 to
+70 % of them in the deep layers), and the two arms' expert-cache hit rates differ request by request with the text
+they generate (recipe C: one turn 86 against 93 %, another 5.6 points the other way; over a pass 92.8 against
+93.0 %).
 
 ## 20. Documentation and authority changes
 

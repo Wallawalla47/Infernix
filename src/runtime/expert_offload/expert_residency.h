@@ -266,8 +266,14 @@ public:
     // count as uses nor start promotions (design section 11.3). A layer's landed experts are adopted
     // first and use up its budget: max(0, per_layer_budget - landed) promotions remain. `lanes` (one
     // per row of columns / rows; empty: one row) feed the route predictor of INFERNIX_TMP_ROUTE_PROTECT.
+    // A positive `head_columns` marks a round that ran two prefill calls as one (Qwen4Exp's pair call; no
+    // `live` flags, no landing frames): the policies run the two calls' rounds. The first `head_columns`
+    // are a round with `head_budget`, the columns after them the next round with `per_layer_budget`, each
+    // with its own counts, admissions, adaptive round and tier clock, so the cache keeps what it keeps
+    // after the two calls; the evictions and loads of both are issued once.
     void after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget,
-                     std::span<const std::uint8_t> live = {}, std::span<const std::int32_t> lanes = {});
+                     std::span<const std::uint8_t> live = {}, std::span<const std::int32_t> lanes = {},
+                     std::int32_t head_columns = 0, std::size_t head_budget = 0);
     // At a prompt's end (design §19.3.27): every key with uses[key] > 0 (the prompt's tokens that
     // routed to it, [layers][experts]) gains `scale * uses[key]` of LFRU count, used now. Nothing is
     // copied: the credit ranks the decode's admissions and evictions. Loading the best credited misses at
@@ -328,6 +334,10 @@ private:
     // Tier mode: completes the demotions whose copies finished (all of them, waiting, with `wait`):
     // publishes their slots (T7), frees their frames and loads queued experts into them.
     void finish_demotions(cudaStream_t compute, bool wait);
+    // after_round's policy round over `columns` columns of the downloaded route log from `first_column`:
+    // counts, landings, the LFRU's step per layer, then the adaptive tier's round and the SSD tier's uses.
+    void route_round(std::int32_t first_column, std::int32_t columns, std::size_t per_layer_budget,
+                     std::span<const std::uint8_t> live, std::span<const std::int32_t> lanes);
     // VramPolicy::Adaptive: one round of Basalt's adaptive tier over the round's live
     // routes, each weighing `weight` (after the layers' landings; the LFRU then admits nothing).
     // It runs inline at the boundary: Basalt's planning thread (the plan applied a round later) was no faster (IQ3_S

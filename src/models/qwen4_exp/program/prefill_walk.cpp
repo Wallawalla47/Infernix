@@ -32,6 +32,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -570,6 +571,159 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     // staged misses land there anyway: 16 per layer and chunk measured slower than none for every
     // answer length (128K + 512 tokens: 23.16 -> 21.10 s; design §19.3.17).
     return prefill_progress(lane, index, begin, width, tokens, last, 0, start);
+}
+
+// ---- the pair call (design §19.3.1, the zero-split tap) ----
+//
+// A chat turn's suffix [F, n) is cut at the generation opener p = n - ~5 so that the next turn can resume
+// there. Chunk-major, the tail [p, n) is a pass of its own: 48 layers of narrow kernels and its experts
+// served again (FP4-Local: 35 ms for five tokens against 5-11 ms for five more columns of the call before
+// it, RTX 5090, 2026-11-11). A layer walk avoids that for streamed spans; these two calls are too narrow
+// to stream. The pair call runs them as one Forward::run_split: each chunk's mixer per layer on its own, as
+// its chunk-major call runs it, the tap's copy of that layer's state between them (walk_capture), and one
+// MoE over both chunks' columns.
+//
+// Bits: every mixer step and the state it leaves are the chunk-major calls', and so are the MoE's router and
+// shared expert, which run per chunk (their dense kernels change with the call's width). The routed experts
+// run over w0 + w1 columns instead of w1: where a fast path picks an expert kernel by call width
+// (expert-a4-residual from nine columns), the tail's columns take the wider call's, as every other prompt
+// column does. The pair call is part of free-cache-resume: the reproducible route runs the cold prefill's calls.
+//
+// Expert cache: the residency runs the two calls' rounds over the call's route log (ExpertResidency::after_round's
+// head): each part's counts, then its own promotions (a wide head's routes only count, the tail's misses start
+// those of a call the CPU serves), so the cache holds what it holds after the two calls. One round over all the
+// columns gave the head's misses the tail's promotions and the decode after it hit less (recipe C, plain decode:
+// 92.6 against 93.0 % of routed experts, 150.4 against 151.9 tok/s; 2026-11-12).
+
+bool ProgramImpl::pair_ready(const Lane& lane) const {
+    // Without free-cache-resume (the reproducible route) a prefill runs the cold prefill's calls and nothing else.
+    if (!options_.free_cache_resume || walk_.active || mtp_ || scoring_ || c_.lossless || lane.vision || lane.replay ||
+        lane.next_call + 2 != lane.calls.size()) {
+        return false;
+    }
+    const std::uint32_t p = lane.calls[lane.next_call], n = lane.calls[lane.next_call + 1];
+    if (n != lane.prefill_end || p <= lane.state_tokens) { return false; }
+    const std::uint32_t head = p - lane.state_tokens, tail = n - p, columns = head + tail;
+    // A one-token tail stays its own call (a sibling coalesces at a divergence there, walk_span_end), and a
+    // one-token head too (its own call is a decode-form call, not a prefill chunk); a head wide enough to stream
+    // walks with its tail; the DFlash2 ring takes the whole call's window.
+    if (head < kWalkJoinMinTokens || tail < kWalkJoinMinTokens || tail > static_cast<std::uint32_t>(kPairTailColumns) ||
+        columns >= static_cast<std::uint32_t>(stream_min_columns())) {
+        return false;
+    }
+    return !dflash2_ || columns <= plan_.dflash2_config->window;
+}
+
+PrefillProgress ProgramImpl::pair_step(Lane& lane, std::uint32_t index, Clock::time_point start) {
+    const cudaStream_t s     = device_.stream;
+    const std::int32_t begin = static_cast<std::int32_t>(lane.state_tokens);
+    const std::int32_t w0    = static_cast<std::int32_t>(lane.calls[lane.next_call]) - begin;
+    const std::int32_t w1    = static_cast<std::int32_t>(lane.calls[lane.next_call + 1] - lane.calls[lane.next_call]);
+    const std::int32_t T     = w0 + w1;
+    const std::uint32_t L    = c_.num_hidden_layers;
+    // Each call's promotions as its own call starts them (advance_prefill): one the CPU serves promotes at the
+    // decode rate, a wider one nothing. The residency runs the two rounds (prefill_progress's head).
+    const PairHead pair_head{w0, w0 <= kServedCallColumns ? decode_budget(static_cast<std::uint32_t>(w0)) : 0};
+    const std::size_t promotions = decode_budget(static_cast<std::uint32_t>(w1));
+    const nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill, static_cast<std::uint64_t>(T));
+
+    // The walk's tap bookkeeping over the two chunks (no span is active: nothing streams).
+    walk_            = LayerWalk{};
+    walk_.lane       = index;
+    walk_.first_call = lane.next_call;
+    walk_.end_call   = lane.next_call + 2;
+    walk_.begins     = {begin, begin + w0};
+    walk_.widths     = {w0, w1};
+    walk_.offsets    = {0, w0};
+    walk_plan_taps(lane);
+    // The tap's ring holds the head's positions (below), as after the head's own call.
+    walk_dflash_frontier_ = static_cast<std::uint32_t>(begin + w0);
+    const auto abandon    = [&]() noexcept {
+        for (const LayerWalk::Tap& tap : walk_.taps) {
+            if (tap.staged != 0) { prefix_->abandon_staged_capture(tap.staged); }
+        }
+        walk_ = LayerWalk{};
+    };
+    try {
+        // The tail's inputs into their own image, then the head's into the io.
+        {
+            const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
+                                               static_cast<std::uint64_t>(T));
+            stage_sequence(index, begin + w0, w1, lane.history, true);
+            std::memcpy(pair_host_.data(), io_host_.data(), io_prefix(w1));
+            stage_sequence(index, begin, w0, lane.history, true);
+        }
+        upload_pinned(pair_io_.p, pair_host_.data(), io_prefix(w1), s);
+        upload_pinned(io_device_.p, io_host_.data(), io_prefix(w0), s);
+        if (cpu_service_) { cpu_service_->wake(); }
+        settle_round(); // a deferred update precedes the next forward
+        residency_->before_round(s);
+        split_call_ = false;
+        const WideWork wide(*this, T);
+        require_tier_round();
+
+        execution::ForwardBatch head = io_batch(static_cast<std::byte*>(io_device_.p), 1, w0, 1);
+        execution::ForwardBatch tail = io_batch(static_cast<std::byte*>(pair_io_.p), 1, w1, 1);
+        // The head waits per layer for the lane's restore and any copy-out in flight; the tail for the tap's
+        // copy of that layer, enqueued by then (as a walk's later chunk does).
+        head.layer_waits = prefix_waits(lane);
+        if (walk_.taps[0].staged != 0) { tail.layer_waits[1] = prefix_->staged_events(walk_.taps[0].staged); }
+        tail.trim_last_layer = trims_last_layer();
+        Tensor features;
+        std::int32_t feature_column = 0, window = 0;
+        if (dflash2_) {
+            std::tie(feature_column, window) = dflash_call_region(T);
+            features                         = dflash_feature_columns(feature_column, window);
+        }
+        const std::int32_t from = T - window; // the window's first column of the call
+        Tensor logits           = head_logits(1);
+        // The decoder layers' groups between the chunks' mixers. The drafter's group follows the call: the
+        // drafter works in the Forward's arena, which holds the call's residuals until its logits are enqueued.
+        forward_->run_split(head, tail, logits, features, [&](std::uint32_t layer) {
+            if (layer < L) { walk_capture(0, layer); }
+        });
+        round_logits(1, s);
+        if (dflash2_ && from < w0) {
+            // The head's positions into the ring before the tap copies the drafter's group.
+            dflash2_wait_copies(lane);
+            dflash2_context(feature_column, w0 - from, begin + from, static_cast<std::int32_t>(index));
+        }
+        walk_capture(0, L);
+        if (dflash2_) {
+            // The tail's positions: the ring's update stages its positions in one pinned image, so the head's
+            // has run first; the tap's copy of the ring lands before these columns overwrite its oldest.
+            device_.synchronize();
+            if (walk_.taps[0].staged != 0) {
+                if (const auto events = prefix_->staged_events(walk_.taps[0].staged); !events.empty()) {
+                    CUDA_CHECK(cudaStreamWaitEvent(s, events.back(), 0));
+                }
+            }
+            const std::int32_t at = std::max(from, w0);
+            dflash2_context(feature_column + (at - from), T - at, begin + at, static_cast<std::int32_t>(index));
+        }
+        residency_->enqueue_route_download(s, T);
+    } catch (...) {
+        abandon();
+        throw;
+    }
+    lane.next_call += 2;
+    lane.state_tokens = static_cast<std::uint32_t>(begin + T);
+    if (dflash2_) { lane.dflash_frontier = lane.state_tokens; }
+    if (!prefilling_besides(index)) {
+        return_stream_lease();
+        return_wide_work();
+    }
+    {
+        char text[160];
+        std::snprintf(text, sizeof(text), "prefill pair call: %d + %d columns in one call, the tap at %d %s", w0, w1,
+                      begin + w0, walk_.taps[0].staged != 0 ? "captured in place" : "not captured");
+        diagnostic(text, DiagnosticLevel::Debug);
+    }
+    walk_commit_taps(lane);
+    walk_ = LayerWalk{};
+    prefix_after_prefill_call(lane, index, true);
+    ++pair_calls_;
+    return prefill_progress(lane, index, begin, T, static_cast<std::uint32_t>(T), true, promotions, start, pair_head);
 }
 
 void ProgramImpl::walk_abandon() noexcept {

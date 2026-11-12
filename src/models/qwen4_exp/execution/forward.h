@@ -21,6 +21,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -336,8 +337,11 @@ public:
     void layer_mixer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, Tensor& xm, Tensor& inject);
     // `route_skipped`: columns before the call's own that the route log holds as -1 (a trimmed last layer's call
     // over the trailing columns of a wider one, ForwardBatch::trim_last_layer).
+    // `chunk_columns` (run_split's pair call): the first chunk's columns, when xm holds two chunks; the router and
+    // the shared expert then run per chunk (moe).
     void layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xm, const Tensor& inject,
-                   Tensor& residual, std::int32_t route_columns, std::int32_t route_skipped = 0);
+                   Tensor& residual, std::int32_t route_columns, std::int32_t route_skipped = 0,
+                   std::int32_t chunk_columns = 0);
     // ForwardBatch::trim_last_layer's width for a call (or a layer walk's chunk) of `columns` columns: 0 when the last
     // layer runs whole (the lossless route, a DFlash2 target layer, the activation scan, or no column to save), else
     // the trailing columns its MoE runs over: kRouterMmaMinColumns where the full call's router takes its MMA form
@@ -345,6 +349,17 @@ public:
     // columns' outputs are the untrimmed call's bit for bit.
     [[nodiscard]] std::int32_t last_layer_kept(std::int32_t columns) const noexcept;
     void finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits);
+    // A pair call (design §19.3.1, the zero-split tap): two consecutive chunks of one lane, `head` then
+    // `tail`, as one call whose prefix tap between them costs no second pass. Per layer the mixers run
+    // chunk by chunk, each on its own columns as its chunk-major call runs it (so the layer's KV, GDN, PLE
+    // and QSA state after `head` and after `tail` are the chunk-major calls' bit for bit), `at_split(l)`
+    // between them (the tap copies layer l's state there, before `tail` overwrites it), and the MoE once
+    // over both chunks' columns. `at_split(L)` follows the head's finish. The final residuals feed the
+    // tail's logits; `draft_features` (when set: BF16 [taps * H, n]) takes the last n columns' DFlash2
+    // features, as ForwardBatch::draft_features does for run(). The route log holds every column.
+    // Both chunks are one-row prefill calls without an MTP chunk, verification records or a stream.
+    void run_split(const ForwardBatch& head, const ForwardBatch& tail, Tensor& logits, const Tensor& draft_features,
+                   const std::function<void(std::uint32_t)>& at_split);
     // DFlash2: when `layer` is one of the drafter's target layers, the stream mean of its completed
     // residual columns (BF16 [S*H, n]) into that tap's rows of `features` (BF16 [taps * H, n], any
     // column pitch); layer() applies it to ForwardBatch::draft_features, a layer walk to its spans.
@@ -452,7 +467,8 @@ private:
     // input; a gated call without them copies nothing ahead.
     Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
                const ForwardBatch* batch = nullptr, std::int32_t route_columns = -1, const Tensor* inject = nullptr,
-               Tensor* residual = nullptr, std::int32_t route_skipped = 0, const Tensor* streams = nullptr);
+               Tensor* residual = nullptr, std::int32_t route_skipped = 0, const Tensor* streams = nullptr,
+               std::int32_t chunk_columns = 0);
     void wait_layer(const ForwardBatch& batch, std::size_t entry);
     void mtp_block(const MtpCall& call, Tensor& residual);
     // The dense projections' route flags for the current call: ForwardFastPaths::prefill_routes

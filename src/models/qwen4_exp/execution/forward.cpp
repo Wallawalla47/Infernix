@@ -291,6 +291,68 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
     finish(batch, residual, &logits);
 }
 
+void Forward::run_split(const ForwardBatch& head, const ForwardBatch& tail, Tensor& logits,
+                        const Tensor& draft_features, const std::function<void(std::uint32_t)>& at_split) {
+    for (const ForwardBatch* chunk : {&head, &tail}) {
+        if (config_.lossless || chunk->batch != 1 || chunk->verify != nullptr || chunk->mtp_chunk != nullptr ||
+            chunk->stream || chunk->decode_round || chunk->residual_out.data != nullptr ||
+            chunk->draft_features.data != nullptr) {
+            throw std::invalid_argument("Qwen4Exp forward: a pair call takes two plain one-row prefill chunks");
+        }
+    }
+    // Each chunk's steps run as its own call's: eager or not by its own width (begin_call).
+    begin_call(head, nullptr);
+    const bool head_eager = eager_chunk_;
+    begin_call(tail, &logits);
+    const bool tail_eager = eager_chunk_;
+    if (!head_eager || !tail_eager) {
+        throw std::invalid_argument("Qwen4Exp forward: a pair call's chunks are prefill chunks of two or more columns");
+    }
+    const std::int32_t T0 = head.ids.ne[0], T1 = tail.ids.ne[0], T = T0 + T1;
+    const std::int32_t H = dim(config_.hidden_size), S = dim(config_.hc.streams);
+    const std::uint32_t L = config_.num_hidden_layers;
+    Tensor residual = work_.alloc(DType::BF16, {dim(config_.residual_width()), T});
+    Tensor xm       = work_.alloc(DType::BF16, {H, T});
+    Tensor inject   = work_.alloc(DType::FP32, {S, T});
+    Tensor residual_head = residual.slice(1, 0, T0), residual_tail = residual.slice(1, T0, T1);
+    Tensor xm_head = xm.slice(1, 0, T0), xm_tail = xm.slice(1, T0, T1);
+    Tensor inject_head = inject.slice(1, 0, T0), inject_tail = inject.slice(1, T0, T1);
+    eager_chunk_ = head_eager;
+    embed(head, residual_head);
+    eager_chunk_ = tail_eager;
+    embed(tail, residual_tail);
+    for (std::uint32_t l = 0; l < L; ++l) {
+        eager_chunk_ = head_eager;
+        layer_mixer(l, head, residual_head, xm_head, inject_head);
+        at_split(l);
+        eager_chunk_ = tail_eager;
+        layer_mixer(l, tail, residual_tail, xm_tail, inject_tail);
+        // One MoE over both chunks: its routing, routed experts and combine act column by column, and its router and
+        // shared expert, whose routes go by width (a Q8 projection is SIMT to 8 columns and tensor-core beyond), run
+        // on each chunk on their own, so every column has its own call's bits. The last layer's runs over the tail's
+        // trailing columns alone where the tail's own call would trim it (YC-01): no other final residual is read.
+        const std::int32_t kept = l + 1 == L && tail.trim_last_layer ? last_layer_kept(T1) : 0;
+        if (kept > 0) {
+            const Tensor xm_kept     = xm.slice(1, T - kept, kept);
+            const Tensor inject_kept = inject.slice(1, T - kept, kept);
+            Tensor residual_kept     = residual.slice(1, T - kept, kept);
+            layer_moe(l, tail, xm_kept, inject_kept, residual_kept, -1, T - kept);
+        } else {
+            layer_moe(l, tail, xm, inject, residual, -1, 0, T0);
+        }
+        if (draft_features.data != nullptr) {
+            const std::int32_t n = draft_features.ne[1];
+            if (n > T) { throw std::invalid_argument("Qwen4Exp forward: DFlash2 features exceed the pair call"); }
+            capture_draft_features(l, residual.slice(1, T - n, n), draft_features);
+        }
+    }
+    eager_chunk_ = head_eager;
+    finish(head, residual_head, nullptr);
+    at_split(L);
+    eager_chunk_ = tail_eager;
+    finish(tail, residual_tail, &logits);
+}
+
 void Forward::embed(const ForwardBatch& batch, Tensor& residual) {
     const cudaStream_t s = device_.stream;
     const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size);
@@ -475,12 +537,13 @@ void Forward::layer_mixer(std::uint32_t layer, const ForwardBatch& batch, Tensor
 }
 
 void Forward::layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xm, const Tensor& inject,
-                        Tensor& residual, std::int32_t route_columns, std::int32_t route_skipped) {
+                        Tensor& residual, std::int32_t route_columns, std::int32_t route_skipped,
+                        std::int32_t chunk_columns) {
     const cudaStream_t s = device_.stream;
     try {
         auto scope = work_.scope();
         Tensor ym  = moe(parameters_.layers[layer].moe, xm, layer, nullptr, &batch, route_columns, nullptr, nullptr,
-                         route_skipped, &residual);
+                         route_skipped, &residual, chunk_columns);
         ops::hyper_connection_inject(ym, inject, residual, s);
     } catch (const std::exception& error) {
         throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
@@ -1009,7 +1072,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
 
 Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
                     const ForwardBatch* batch, std::int32_t route_columns, const Tensor* inject, Tensor* residual,
-                    std::int32_t route_skipped, const Tensor* streams) {
+                    std::int32_t route_skipped, const Tensor* streams, std::int32_t chunk_columns) {
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
@@ -1211,11 +1274,23 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], experts_.shared_stream));
         }
     }
+    // A pair call's two chunks (`chunk_columns`, the first one's): the router and the shared expert pick their
+    // routes by the columns they are given, so each chunk's run on their own, as that chunk's own call runs them.
+    if (chunk_columns < 0 || chunk_columns >= T || (chunk_columns > 0 && !eager_chunk_)) {
+        throw std::invalid_argument("Qwen4Exp MoE: a pair call's first chunk must lie inside an eager call");
+    }
+    const std::array<std::pair<std::int32_t, std::int32_t>, 2> chunks{
+        {{0, chunk_columns > 0 ? chunk_columns : T}, {chunk_columns, chunk_columns > 0 ? T - chunk_columns : 0}}};
     const Tensor* rows[] = {&p.router, &p.shared_score};
-    if (fast_.router_mma && T >= kRouterMmaMinColumns) {
-        ops::projection_fp32_router_mma(x, rows, logits, s);
-    } else {
-        ops::projection_fp32(x, rows, logits, s);
+    for (const auto [from, n] : chunks) {
+        if (n == 0) { continue; }
+        const Tensor x_chunk = x.slice(1, from, n);
+        Tensor logits_chunk  = logits.slice(1, from, n);
+        if (fast_.router_mma && n >= kRouterMmaMinColumns) {
+            ops::projection_fp32_router_mma(x_chunk, rows, logits_chunk, s);
+        } else {
+            ops::projection_fp32(x_chunk, rows, logits_chunk, s);
+        }
     }
     if (!route_plans) { ops::moe_route_dispatch(logits, K, routing, dispatch, route_log, s); }
     if (route_tap != nullptr &&
@@ -1368,9 +1443,17 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     if (!shared_early) {
         scan_input(x, layer, ActivationScan::Site::SharedInput);
-        shared_swiglu(x, p.shared_gate_up, product, work_, shared_s, dense_routes());
+        for (const auto [from, n] : chunks) {
+            if (n == 0) { continue; }
+            Tensor product_chunk = product.slice(1, from, n);
+            shared_swiglu(x.slice(1, from, n), p.shared_gate_up, product_chunk, work_, shared_s, dense_routes());
+        }
         scan_input(product, layer, ActivationScan::Site::SharedDown);
-        project(product, p.shared_down, shared, work_, shared_s, dense_routes());
+        for (const auto [from, n] : chunks) {
+            if (n == 0) { continue; }
+            Tensor shared_chunk = shared.slice(1, from, n);
+            project(product.slice(1, from, n), p.shared_down, shared_chunk, work_, shared_s, dense_routes());
+        }
     }
     ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
     if (side) {

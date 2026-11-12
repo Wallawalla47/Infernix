@@ -254,6 +254,8 @@ struct IoLayout {
                 mtp_ids = 0, mtp_cells = 0, mtp_rope = 0, mtp_block_rope = 0, vision_columns = 0,
                 mtp_vision_columns = 0, bytes = 0;
 };
+// The widest tail chunk of a pair call (ProgramImpl::pair_step): a CPU-served call's width.
+inline constexpr std::int32_t kPairTailColumns = 8;
 
 // A request's verification rounds whose rows were read behind the n-gram gate, and those reads.
 struct GateTraffic {
@@ -343,6 +345,8 @@ struct DeviceLayout {
     // The vq2/k4v2 exact window of every KV layer and lane (prefix::KvWindowGeometry; zero otherwise).
     std::size_t window = 0;
     std::size_t logits32 = 0, logits16 = 0, token_counts = 0, work = 0, staging = 0;
+    // A pair call's tail chunk: its staged inputs' own image (the io prefix of kPairTailColumns columns).
+    std::size_t pair_io = 0;
     std::int32_t staging_slots = 0; // misses staged per pass of a layer's experts
     // The arena wide prefill calls swap in (columns above static_columns), lent from expert frames
     // while a prompt runs such calls; zero when the static arena covers every call.
@@ -694,6 +698,7 @@ public:
         if (d.io.block_rope + 12ULL * io_rows > d.io.ngram || d.io.columns + 4ULL * columns > d.io.ngram) {
             throw std::logic_error("Qwen4Exp: decode io must precede the n-gram rows");
         }
+        d.pair_io = align(d.io.ngram + row_bytes * heads * static_cast<std::size_t>(kPairTailColumns));
         // The head's FP32 logits, which the sampler, verification, constraints and the prompt readout read; with
         // BF16 logits their BF16 rounding beside them (the lossless head writes only that).
         const bool bf16_head = o.bf16_logits && c.lossless;
@@ -883,7 +888,7 @@ public:
         b.state     = d.gdn_bytes + d.ple + d.tails + d.window + d.records_bytes + d.ple_records + d.qsa_records +
                   (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0) + d.dflash_features +
                   d.dflash_ring + d.drafter_pool;
-        b.io = d.io.bytes + d.logits32 + d.logits16 + 4ULL * d.tree_io.words + 4ULL * lanes + 4ULL * lanes +
+        b.io = d.io.bytes + d.pair_io + d.logits32 + d.logits16 + 4ULL * d.tree_io.words + 4ULL * lanes + 4ULL * lanes +
                sizeof(ops::SamplingConfig) * lanes + d.token_counts + 4ULL * d.spec.words + d.mtp_ones +
                4ULL * d.mtp_io.words + 4ULL * d.dflash_io.words + kGateStatsBytes * lanes +
                (o.ngram_table && o.ngram_table->fp8_scale ? sizeof(std::uint16_t) : 0) +
@@ -1168,6 +1173,8 @@ public:
         io_layout_ = plan_.io;
         allocate(io_device_, io_layout_.bytes, allocated);
         io_host_ = PinnedHostBuffer(io_layout_.bytes);
+        allocate(pair_io_, plan_.pair_io, allocated);
+        pair_host_ = PinnedHostBuffer(plan_.pair_io);
         allocate(logits32_, plan_.logits32, allocated);
         allocate(logits16_, plan_.logits16, allocated);
         if (plan_.tree_paths != 0) {
@@ -2471,6 +2478,7 @@ public:
             walk_begin(lane, index, end);
             return walk_step(lane, index, start);
         }
+        if (pair_ready(lane)) { return pair_step(lane, index, start); }
         const std::int32_t width = static_cast<std::int32_t>(lane.calls[lane.next_call++] - lane.state_tokens);
         const bool last          = begin + width == static_cast<std::int32_t>(lane.prefill_end);
         // The lossless route's call reads only its own keys and starts from zero state: it is the whole
@@ -2541,13 +2549,21 @@ public:
         return prefill_progress(lane, index, begin, width, static_cast<std::uint32_t>(width), last, promotions, start);
     }
 
+    // A pair call's head (pair_step): its columns and the promotions its own call starts.
+    struct PairHead {
+        std::int32_t columns   = 0;
+        std::size_t promotions = 0;
+    };
+
     // A prefill call's routes into the residency: the lane's prompt uses (note_prompt_routes), then the
     // round's policies. TEMPORARY (INFERNIX_TMP_CONTINUING_PROMPT=<fraction>, candidates CF-01): a prompt
     // whose reused prefix covers at least that fraction of it is a continuing conversation turn. Its
     // calls count toward neither the cache's scores nor the prompt seed and start no promotions (every
     // column passes as not live), so the conversation's decode experts keep their ranks against the
     // turn's new tokens (a tool result, a pasted file).
-    void apply_prompt_routes(Lane& lane, std::int32_t width, std::size_t promotions) {
+    // A pair call passes its head: the residency runs the two calls' rounds (ExpertResidency::after_round), each
+    // with the promotions its own call starts.
+    void apply_prompt_routes(Lane& lane, std::int32_t width, std::size_t promotions, PairHead head = {}) {
         static const double continuing = [] {
             const auto value = temporary_switches::value("INFERNIX_TMP_CONTINUING_PROMPT");
             const double fraction = value ? std::stod(*value) : 0.0;
@@ -2564,7 +2580,7 @@ public:
             return;
         }
         note_prompt_routes(lane, width);
-        residency_->after_round(device_.stream, width, promotions, {}, staged_lane());
+        residency_->after_round(device_.stream, width, promotions, {}, staged_lane(), head.columns, head.promotions);
     }
 
     // Prompt seeding (design §19.3.27): a prefill call's per-token routes, read from the route log
@@ -2605,9 +2621,10 @@ public:
     // The progress of a prefill unit whose calls were enqueued (the last ends at `begin + width`,
     // `tokens` prompt tokens in all): for the prompt's last call the first token is sampled and the
     // pending batch returned. Non-last units have already synchronized and applied their routes.
+    // `head`: a pair call's head (apply_prompt_routes).
     PrefillProgress prefill_progress(Lane& lane, std::uint32_t index, std::int32_t begin, std::int32_t width,
                                      std::uint32_t tokens, bool last, std::size_t promotions,
-                                     Clock::time_point start) {
+                                     Clock::time_point start, PairHead head = {}) {
         PrefillProgress out;
         out.summary                 = prefill_summary(lane);
         out.processed_prompt_tokens = tokens;
@@ -2644,9 +2661,14 @@ public:
             {
                 const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                         static_cast<std::uint64_t>(width));
-                trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
-                            static_cast<std::uint32_t>(begin));
-                apply_prompt_routes(lane, width, promotions);
+                if (head.columns > 0) { // the trace holds the two calls' rounds, as the residency runs them
+                    trace_round(RouteTraceKind::PrefillChunk, 1, head.columns, static_cast<std::uint32_t>(head.columns),
+                                head.promotions, static_cast<std::uint32_t>(begin));
+                }
+                const std::int32_t rest = width - head.columns;
+                trace_round(RouteTraceKind::PrefillChunk, 1, rest, static_cast<std::uint32_t>(rest), promotions,
+                            static_cast<std::uint32_t>(begin + head.columns), {}, {}, head.columns);
+                apply_prompt_routes(lane, width, promotions, head);
                 seed_prompt_experts(lane);
                 apply_vram_target(false);
             }
@@ -3966,8 +3988,11 @@ private:
     // (ProgramOptions::route_trace); rows' lanes are `lanes`, else host_lanes_ as staged for the round.
     void trace_round(RouteTraceKind kind, std::int32_t rows, std::int32_t width, std::uint32_t tokens,
                      std::size_t budget, std::uint32_t position, std::span<const std::uint8_t> live = {},
-                     std::span<const std::int32_t> lanes = {}) {
+                     std::span<const std::int32_t> lanes = {}, std::int32_t first_column = 0) {
         if (!trace_) { return; }
+        // `first_column`: the round's first column of the route log (a pair call's tail).
+        const std::int32_t* routes =
+            residency_->route_host() + static_cast<std::size_t>(c_.moe.top_k) * static_cast<std::size_t>(first_column);
         trace_->append({.kind     = kind,
                         .rows     = static_cast<std::uint32_t>(rows),
                         .width    = static_cast<std::uint32_t>(width),
@@ -3977,7 +4002,7 @@ private:
                         .frames   = residency_->frames()},
                        lanes.empty() ? std::span<const std::int32_t>(host_lanes_.data(), static_cast<std::size_t>(rows))
                                      : lanes,
-                       live, residency_->route_host(), residency_->route_stride());
+                       live, routes, residency_->route_stride());
     }
 
     // Reports the expert cache over the finished request (and since start) as an Engine diagnostic,
@@ -7221,6 +7246,9 @@ private:
     std::array<std::uint64_t, kMaximumConcurrency> constraint_serials_{};
     std::uint64_t next_constraint_serial_ = 1;
     PinnedHostBuffer io_host_{1}, host_sampled_{1}, host_configs_{1};
+    // A pair call's tail chunk: its staged io image on the device and its pinned source (pair_step).
+    DeviceBuffer pair_io_;
+    PinnedHostBuffer pair_host_{1};
     PinnedHostBuffer penalty_host_{1};    // a lane's penalty counts, staged for upload_pinned
     PinnedHostBuffer constraint_pinned_{1}; // constraint_'s image: the staged parts, for upload_pinned
     IoLayout io_layout_;
@@ -7343,6 +7371,13 @@ private:
     std::size_t walk_span_end(const Lane& lane, std::uint32_t index);
     void walk_begin(Lane& lane, std::uint32_t index, std::size_t end);
     PrefillProgress walk_step(Lane& lane, std::uint32_t index, Clock::time_point start);
+    // The pair call (design §19.3.1, the zero-split tap): the prompt's last two calls, a call too narrow
+    // to stream and the CPU-served tail an exact tap cut off it (the generation opener's), as one
+    // Forward::run_split. The tap is captured in place as a walk's inner tap is; the tail's experts ride
+    // the head's MoE instead of a second pass. pair_ready: whether the lane's next two calls are such a pair.
+    [[nodiscard]] bool pair_ready(const Lane& lane) const;
+    PrefillProgress pair_step(Lane& lane, std::uint32_t index, Clock::time_point start);
+    std::uint64_t pair_calls_ = 0;
     [[nodiscard]] execution::ForwardBatch walk_batch(std::size_t chunk);
     [[nodiscard]] Tensor walk_residual(std::size_t first, std::size_t end);
     void walk_mixer(std::size_t chunk, std::uint32_t layer);

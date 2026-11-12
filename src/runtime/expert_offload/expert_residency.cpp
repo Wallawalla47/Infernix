@@ -733,18 +733,56 @@ void ExpertResidency::enqueue_route_download(cudaStream_t compute, std::int32_t 
 }
 
 void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget,
-                                  std::span<const std::uint8_t> live, std::span<const std::int32_t> lanes) {
+                                  std::span<const std::uint8_t> live, std::span<const std::int32_t> lanes,
+                                  std::int32_t head_columns, std::size_t head_budget) {
     const nvtx::ScopedRange range(nvtx::Name::ResidencyAfterRound, nvtx::Category::Moe);
-    const auto* routes = static_cast<const std::int32_t*>(route_host_.data());
+    if (head_columns < 0 ||
+        (head_columns > 0 && (head_columns >= columns || !live.empty() || landing_per_layer_ > 0))) {
+        throw std::invalid_argument(
+            "expert residency: a pair round's head lies inside its columns, without live flags or landing frames");
+    }
+    auto* table = static_cast<std::int32_t*>(table_host_.data());
+    for (auto& pool : pools_) { pool.commands.clear(); }
+    if (tier_ != nullptr) { tier_->end_round(); }
+    // A pair round's head is a round of its own before the rest, as after the head's own call; the boundary's
+    // evictions and loads below follow both.
+    if (head_columns > 0) { route_round(0, head_columns, head_budget, {}, lanes); }
+    route_round(head_columns, columns - head_columns, per_layer_budget, live, lanes);
+    reserved_.clear();
+    landing_per_layer_ = 0;
+    if (frozen_ || frames() == 0) { return; }
+    // Demotions that landed during the round free their held frames for this boundary's loads (the round's hits
+    // were counted above against the table it ran with).
+    if (tier_ != nullptr) { finish_demotions(compute, false); }
+    load_commands_.clear();
+    for (auto& pool : pools_) {
+        if (pool.frames == 0) { continue; }
+        if (tier_ != nullptr) { demote_or_drop(pool, pool.commands, table); } // before on_quiescent frees the victims' frames
+        pool.controller->on_quiescent(pool.commands);
+        // Evictions take effect on the compute stream before the next round; promotions copy on
+        // the copy stream once that table is in place. A demoted expert stays readable in its held frame.
+        for (const auto& command : pool.commands) {
+            if (absent_write(command) && table[command.key] >= 0 && (tier_ == nullptr || demoting_[command.key] == 0)) {
+                table[command.key] = -1;
+                table_dirty_       = true;
+            }
+        }
+        take_loads(pool.commands);
+    }
+    if (table_dirty_) { upload_table(compute); }
+    issue_loads(compute);
+    sync_queue_pins();
+}
+
+void ExpertResidency::route_round(std::int32_t first_column, std::int32_t columns, std::size_t per_layer_budget,
+                                  std::span<const std::uint8_t> live, std::span<const std::int32_t> lanes) {
+    const auto* routes = static_cast<const std::int32_t*>(route_host_.data()) +
+                         static_cast<std::size_t>(top_k_) * static_cast<std::size_t>(first_column);
     auto* table        = static_cast<std::int32_t*>(table_host_.data());
     const std::size_t used = static_cast<std::size_t>(top_k_) * static_cast<std::size_t>(columns);
     ++round_;
     if (predictor_) { predictor_->observe(routes, route_stride_, columns, lanes, live); }
-    for (auto& pool : pools_) { pool.commands.clear(); }
-    if (tier_ != nullptr) {
-        tier_->end_round();
-        uses_.clear();
-    }
+    if (tier_ != nullptr) { uses_.clear(); }
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
         Pool& pool = pools_[pool_of_layer_[layer]];
         group_.clear();
@@ -797,11 +835,7 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
         pool.controller->on_route(group_, round_, pool.commands, budget, tier_ != nullptr ? &admissible_ : nullptr,
                                   tier_ != nullptr ? &evictable_ : nullptr, predictor_ ? &guard : nullptr);
     }
-    if (frozen_) {
-        reserved_.clear();
-        landing_per_layer_ = 0;
-        return;
-    }
+    if (frozen_) { return; }
     if (adaptive_) {
         // A decode or verification round's live routes weigh 1; a prefill chunk's min(T, 16) / T (the replay's).
         std::size_t live_columns = static_cast<std::size_t>(columns);
@@ -818,30 +852,6 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
         const nvtx::ScopedRange uses_range(nvtx::Name::TierUses, nvtx::Category::Moe);
         tier_->record_uses(static_cast<double>(std::min<std::size_t>(live_columns, 16)), uses_, 1.0);
     }
-    reserved_.clear();
-    landing_per_layer_ = 0;
-    if (frames() == 0) { return; }
-    // Demotions that landed during the round free their held frames for this boundary's loads (the round's hits
-    // were counted above against the table it ran with).
-    if (tier_ != nullptr) { finish_demotions(compute, false); }
-    load_commands_.clear();
-    for (auto& pool : pools_) {
-        if (pool.frames == 0) { continue; }
-        if (tier_ != nullptr) { demote_or_drop(pool, pool.commands, table); } // before on_quiescent frees the victims' frames
-        pool.controller->on_quiescent(pool.commands);
-        // Evictions take effect on the compute stream before the next round; promotions copy on
-        // the copy stream once that table is in place. A demoted expert stays readable in its held frame.
-        for (const auto& command : pool.commands) {
-            if (absent_write(command) && table[command.key] >= 0 && (tier_ == nullptr || demoting_[command.key] == 0)) {
-                table[command.key] = -1;
-                table_dirty_       = true;
-            }
-        }
-        take_loads(pool.commands);
-    }
-    if (table_dirty_) { upload_table(compute); }
-    issue_loads(compute);
-    sync_queue_pins();
 }
 
 void ExpertResidency::adaptive_round(const std::int32_t* routes, std::size_t used, std::span<const std::uint8_t> live,

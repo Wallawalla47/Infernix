@@ -15,8 +15,8 @@
 //   X5           Chat turn 2 without turn 1's reasoning block resumes at least at turn 1's generation
 //                opener tap.
 //   X6           Sessions sharing only a system block resume at its structural tap (an exact split).
-//   X3           A repeat of a chat prompt resumes at its generation opener (an exact off-grid tap) and
-//                generates what the capturing run generated.
+//   X3           A repeat of a chat prompt resumes at its generation opener (an exact off-grid tap, taken
+//                in place by the capturing run's pair call) and generates what the capturing run generated.
 //   X12          (plain mode) Engine 1 serves two chat turns and stops, saving its Host tier to a file;
 //                Engine 2 loads the file and resumes turn 2 from it, generating what Engine 1 did.
 //                Between the turns, Engine 1's periodic save writes the file once and, with the Host
@@ -257,7 +257,10 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
                       "X6 sessions 2 and 3 resume at the shared structural frontier");
 
     // X3 split equivalence at an exact off-grid tap: session 2 again resumes at its own generation
-    // opener; the run that captured it split its prefill there, so the resume repeats its computation.
+    // opener. The run that captured it took the tap between the two chunks' mixers of a pair call (design
+    // §19.3.56) and ran the tail's routed experts with the head's; the resume runs the tail as a call of its own.
+    // With these exact kernels the two agree: the pair call's router and shared expert run per chunk, and the
+    // routed experts act column by column.
     const infernix::GenerationResult again = chat({system, user("Summarise rule 12 in one sentence.")}, 32);
     failures += check(again.reused_prompt_tokens + 16U >= s2.prompt.prompt_tokens &&
                           again.reused_prompt_tokens < s2.prompt.prompt_tokens,
