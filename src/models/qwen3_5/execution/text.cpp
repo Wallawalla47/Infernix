@@ -1002,6 +1002,10 @@ const LinearParameters* TextContext::batch_proposal_head() const noexcept {
                : proposal_head_;
 }
 
+std::int32_t TextContext::trimmed_attention_columns(std::int32_t T) const noexcept {
+    return active_sequence_batch_ == 0 && output_columns_ > 0 && output_columns_ < T ? output_columns_ : 0;
+}
+
 void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
@@ -1085,6 +1089,32 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             text_kv_layer(static_cast<std::uint32_t>(fidx)),
             execution_schedule_.verify(*active_causal_attention_envelope_),
             work_, a_batch, ctx_.execution_view());
+    } else if (const std::int32_t kept = trimmed_attention_columns(T); kept > 0) {
+        // ZC-01: past this layer only the last `kept` columns are read (YC-01's trim), so their queries are the
+        // only ones attended: every column's K and V are stored first (kv_cache_append_batch, byte-identical to
+        // the fused append), then the kept columns run as the call's tail would on its own, reading the stored
+        // keys below them. The skipped columns' attention output is never formed.
+        const std::int32_t skipped = T - kept;
+        const std::int32_t head_dim = dimension(config_.attention->head_dim);
+        const std::int32_t heads    = dimension(config_.attention->num_attention_heads);
+        const std::int32_t kv_heads = dimension(config_.attention->num_key_value_heads);
+        const Tensor positions = cache_positions.view({T});
+        ops::kv_cache_append_batch(kn.slice(2, 0, skipped).view({head_dim, kv_heads, skipped, 1}),
+                                   v.slice(2, 0, skipped).view({head_dim, kv_heads, skipped, 1}),
+                                   positions.slice(0, 0, skipped).view({skipped, 1}), kv_table_rows,
+                                   text_kv_layer(static_cast<std::uint32_t>(fidx)), s);
+        Tensor tail = a.slice(2, skipped, kept);
+        ops::causal_softmax_attention(
+            qn.slice(2, skipped, kept), kn.slice(2, skipped, kept), v.slice(2, skipped, kept),
+            positions.slice(0, skipped, kept), Tensor{}, kv_table_rows, {head_dim, heads, kv_heads},
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
+            text_kv_layer(static_cast<std::uint32_t>(fidx)),
+            execution_schedule_.apply(*active_causal_attention_envelope_), work_, tail, ctx_.execution_view());
+        ops::sigmoid_mul(gate.slice(2, skipped, kept), tail, s);
+        Tensor columns = x.slice(1, skipped, kept);
+        ops::linear_add(tail.view({dimension(config_.attention->query_width()), kept}), p.output.weight, columns,
+                        residual_projection_policy(p.output, false), work_, s, ops::LinearRoutes::Exact);
+        return;
     } else {
         ops::causal_softmax_attention(
             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
@@ -1295,6 +1325,15 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase ph,
         offloaded.experts          = offloaded_experts_;
         offloaded.call             = ph == Phase::Verify ? OffloadedCall{.graphed = true} : offloaded_prefill_;
         offloaded.next             = layer + 1 < text.layers.size() ? &text.layers[layer + 1] : nullptr;
+        // ZK-05: a trimmed last layer runs its window's last columns; the layer before it copies nothing ahead
+        // into it (its guess would cover every column).
+        if (ph == Phase::Prefill && trim_last_columns_ > 0) {
+            if (layer + 1 == text.layers.size()) {
+                offloaded.call.route_skipped = trim_route_skipped_;
+            } else if (layer + 2 == text.layers.size() && x.ne[1] > trim_last_columns_) {
+                offloaded.call.ahead_next = false;
+            }
+        }
         // A verification round's padding past each row's drafts routes no expert.
         if (ph == Phase::Verify && offloaded_experts_ != nullptr && active_valid_columns_ != nullptr && active_sequence_batch_ != 0 && width > 1) {
             offloaded.call.mask = {static_cast<const std::int32_t*>(active_valid_columns_->data), width};
@@ -1351,7 +1390,9 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto scope = work_.scope();
                 if (trim) {
                     Tensor columns = x.slice(1, x.ne[1] - kept, kept);
+                    trim_route_skipped_ = x.ne[1] - kept;
                     mlp_tail(block, columns, ph, next_projection_hints(static_cast<int>(layer)), layer);
+                    trim_route_skipped_ = 0;
                 } else {
                     mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)), layer);
                 }
@@ -1401,7 +1442,9 @@ bool trims_at_prompt_precision(const ops::SingleProjectionWeight& projection) {
     return is_fp8_row(format) && projection.policy == ops::LinearPolicy::AllowA8;
 }
 
-std::int32_t trim_columns(const BlockParameters& block) {
+// The last columns a prefill call of `columns` columns runs its last layer's tail over (0: every column).
+// `router_mma`: the offloaded experts' router takes its MMA form from kRouterMmaMinColumns columns.
+std::int32_t trim_columns(const BlockParameters& block, std::int32_t columns, bool router_mma) {
     const auto* attention = std::get_if<AttentionParameters>(&block.mixer);
     const auto* gdn       = std::get_if<GdnParameters>(&block.mixer);
     const LinearParameters* output = attention != nullptr ? &attention->output : gdn != nullptr ? &gdn->output : nullptr;
@@ -1412,7 +1455,20 @@ std::int32_t trim_columns(const BlockParameters& block) {
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&block.ffn)) {
         return sixteen_bit_at_every_width(moe->policy) ? kTrimColumns : 0;
     }
-    return 0; // offloaded experts: their pass's route covers the whole width
+    if (const auto* offloaded = std::get_if<OffloadedMoeParameters>(&block.ffn)) {
+        // ZK-05 (the 122B): the offloaded MoE over the kept columns too. The router keeps its form (its MMA form
+        // needs kRouterMmaMinColumns columns, so a call that takes it keeps that many), and a dense shared expert its
+        // prompt precision. The routed experts act column by column, but a kept column's bits follow its expert's
+        // column count where a wide route takes A4 terms (expert-a4-residual): the first token can change on the
+        // default route, as e4d12e67's trim on Flash-Next could; the reproducible route's experts are exact at
+        // every width.
+        if (offloaded->shared &&
+            !(trims_at_prompt_precision(offloaded->shared->gate_up) && trims_at_prompt_precision(offloaded->shared->down))) {
+            return 0;
+        }
+        return router_mma && columns >= kRouterMmaMinColumns ? kRouterMmaMinColumns : kTrimColumns;
+    }
+    return 0;
 }
 
 // Diagnostic for the layer-by-layer comparison of the lossless route with the publisher's code (IQS-2 G1,
@@ -1670,7 +1726,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 const int last_layer       = static_cast<int>(text.layers.size()) - 1;
                 const std::int32_t kept    = prefill_last_rows_only_ && !prepare_mtp_prompt &&
                                                   !tap.reads_layer(last_layer)
-                                              ? trim_columns(text.layers.back())
+                                              ? trim_columns(text.layers.back(), len,
+                                                             offloaded_experts_ != nullptr && offloaded_experts_->router_mma)
                                               : 0;
                 const bool trim_last       = kept > 0 && len > kept;
                 if constexpr (Tap::enabled) { tap.begin(x); }

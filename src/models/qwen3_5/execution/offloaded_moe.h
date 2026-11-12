@@ -104,6 +104,12 @@ struct OffloadedCall {
     // frames (ProgramOffload::begin_pass; prefill_text_chunk and prefill_multimodal_chunk run on it);
     // empty for a narrower call, which uses the Program's workspace.
     DeviceSpan workspace;
+    // A trimmed last layer (candidates ZK-05): the call's columns are a prefill call's last ones, and the route log's
+    // first `route_skipped` columns, which the call does not run, route nowhere (-1: the residency skips them).
+    std::int32_t route_skipped = 0;
+    // Whether a gated call copies ahead into the next layer (ExpertStream::plan_ahead): not into a trimmed last
+    // layer, whose guess would be over columns it does not run.
+    bool ahead_next = true;
 };
 
 struct OffloadedMoeContext {

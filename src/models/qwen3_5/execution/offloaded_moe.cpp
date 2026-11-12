@@ -163,10 +163,15 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
     ops::MoeDispatch dispatch = ops::carve_moe_dispatch(b.dispatch.data, E + sj, (K + sj) * T);
     std::int32_t* route_log   = nullptr;
     if (experts.route_log != nullptr) {
-        if (static_cast<std::size_t>(K) * T > experts.route_stride) {
+        if (call.route_skipped < 0 || static_cast<std::size_t>(K) * (T + call.route_skipped) > experts.route_stride) {
             throw std::invalid_argument("offloaded MoE: the route log is too small for this call");
         }
         route_log = experts.route_log + static_cast<std::size_t>(p.layer) * experts.route_stride;
+        if (call.route_skipped > 0) {
+            // A trimmed last layer's skipped columns route nowhere (ZK-05).
+            CUDA_CHECK(cudaMemsetAsync(route_log, 0xFF, static_cast<std::size_t>(K) * call.route_skipped * sizeof(std::int32_t), s));
+            route_log += static_cast<std::size_t>(K) * call.route_skipped;
+        }
     }
 
     // --expert-tail-skip acts in generation rounds only; prefill and forced tokens stay exact.
@@ -202,7 +207,7 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
     const OffloadedMoeParameters* const next =
         context.next != nullptr ? std::get_if<OffloadedMoeParameters>(&context.next->ffn) : nullptr;
     const bool ahead = streaming != nullptr && streaming->gated() && next != nullptr && call.release_stream &&
-                       T <= moe::kMaxCpuCallColumns && b.guess_dispatch.data != nullptr;
+                       call.ahead_next && T <= moe::kMaxCpuCallColumns && b.guess_dispatch.data != nullptr;
     if (streaming != nullptr) {
         ops::moe_route_dispatch(b.logits, K, routing, dispatch, route_log, s, ops::RouterLogits::kBf16, shared_job);
         if (streaming->gated()) {
@@ -284,7 +289,8 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
         const auto* guessed = static_cast<const std::int32_t*>(experts.split_offsets.data()) + E + 2;
         experts.guess_columns.resize(static_cast<std::size_t>(E));
         for (std::int32_t e = 0; e < E; ++e) { experts.guess_columns[static_cast<std::size_t>(e)] = guessed[e + 1] - guessed[e]; }
-        (void)streaming->plan_ahead(next->layer, experts.guess_columns, runtime::expert_offload::ExpertStream::ahead_rows(T), 0);
+        (void)streaming->plan_ahead(next->layer, experts.guess_columns,
+                                    runtime::expert_offload::ExpertStream::ahead_rows(T), 0);
     };
     const std::int32_t max_jobs = std::min(E, K * T) + sj;
     source.wide_a16             = experts.wide_a16;

@@ -339,6 +339,11 @@ private:
     std::int32_t trim_last_columns_ = 0;
     // The last columns the mixers' output projections write (YC-01's last layer); 0: every column.
     std::int32_t output_columns_ = 0;
+    // The columns a trimmed last layer's MLP tail skips (ZK-05: an offloaded MoE's route log pads them); 0 otherwise.
+    std::int32_t trim_route_skipped_ = 0;
+    // ZC-01: the last columns a prefill call's trimmed attention layer attends (output_columns_ when it
+    // trims fewer than T columns), or 0 to attend every column.
+    [[nodiscard]] std::int32_t trimmed_attention_columns(std::int32_t T) const noexcept;
     std::uint32_t prefill_chunk_;
     ExecutionSchedule execution_schedule_;
     std::uint32_t text_kv_base_;

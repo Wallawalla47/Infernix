@@ -238,7 +238,12 @@ head on the prompt's last window, the continuation hidden that prefix-cache snap
 zero-suffix sample keep at every pass end, and a rewrite checkpoint. So its last layer computes
 keys, values (and a GDN layer's state) over every column but the mixer's output projection and the
 MLP over the window's last few columns, and the final norm over its last one (since 2026-11-08,
-candidates YC-01; TensorFold `3d4f6aa360`). The width is twenty columns, at which every dense
+candidates YC-01; TensorFold `3d4f6aa360`). An attention last layer appends every column's keys and values to its
+cache and runs the causal attention and its output gate over the kept columns only (since 2026-11-12, candidates
+ZC-01; each kept column attends to every key before it, so its bits are the full call's): prefill of the official
+NVFP4 27B 611.3 ms trimmed against 613.8 untrimmed at 8,192 tokens (-0.41 %) and 2,871.9 against 2,910.6 ms at
+32,768 (-1.33 %), the 35B-A3B -0.56 % and -1.81 % (two ABBA blocks, RTX 5090, INT8 KV); greedy text equal on both routes.
+The width is twenty columns, at which every dense
 projection keeps its prompt route's activation precision: 16-bit ones (the groupwise 27B's
 `A16Only`, NVFP4 `AllowA8`, which NVFP4 runs at 16 bits at every width), NVFP4 `AllowA4` ones (the
 NVIDIA NVFP4 27B's MLP: 4-bit from 8 columns in linear_add) and row-scaled FP8 `AllowA8` ones (the
@@ -246,8 +251,15 @@ official NVFP4 27B keeps its last layer in FP8: 8-bit from 20 columns at K = 17,
 codes use the artifact's fixed activation divisor and the 8-bit ones a per-token scale, so a
 column's codes do not depend on the others. It stays off where every column's final hidden is
 read: MTP prompt preparation, causal scoring, a drafter tapping the last layer (the 27B's DFlash2
-taps layers 5, 19, 33, 47 and 61 of 64); where a projection has a residual-term profile; and where
-the FFN is offloaded. A first version trimmed to one column, on the decode routes' 16-bit
+taps layers 5, 19, 33, 47 and 61 of 64); and where a projection has a residual-term profile. An
+offloaded FFN (the 122B) trims too (since 2026-11-12, candidates ZK-05): its router keeps its form (the tensor-core
+router needs `kRouterMmaMinColumns`, 256, so a call that takes it keeps that many columns, else twenty), a dense shared
+expert must keep its prompt precision, the route log pads the dropped columns, and no copy-ahead runs into the
+trimmed layer. The routed experts act column by column, but where a wide route takes A4 terms
+(`expert-a4-residual`) a kept column's bits follow its expert's column count, so the first token can change on the
+default route; the reproducible route's experts are exact at every width. Ornith-1.5-122B NVFP4 prefill, trimmed
+against untrimmed (two ABBA blocks after a warm run): -1.4 % at 512 tokens, -1.7 % at 1,024, -1.5 % at 2,048, -1.6 %
+at 4,096; greedy text equal on both routes at 3,288 and 9,135 tokens. A first version trimmed to one column, on the decode routes' 16-bit
 activations: the official artifact's `/v1/decide` readouts then differed from CausalScoring by
 0.209 logprob, past the readout real test's 0.2, and the owner kept the prompt routes' precision. A
 second forced NVFP4's 4-bit route at one column; linear_add's A4 tiles gave wrong sums below eight
