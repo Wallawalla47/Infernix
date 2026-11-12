@@ -427,6 +427,15 @@ private:
     // reps, against 1.5: 1.0 struct 403.60 -> 412.57 tok/s (+2.2 %; 96.2 -> 97.6 % hits, 10.2K -> 15.5K promotions)
     // and after a 16K prompt +1.2 % (the 1.5 arm's comparable reps), 0.7 struct +1.6 %, 1.25 +1.1 %; a larger margin
     // lost (2 struct -6.0 %, 3 -17.5 %), as Basalt's -1.35 % at 3 came from a 5080 adapting every window.
+    // DECAY 0.85 and SWAPS 96 stay (candidates ZB-02, 2026-11-12; Basalt measured 12 swaps +15 % and decay 0.97 +4 % on
+    // a 16 GB card at 116-120K context). IQ3_S on the RTX 5090, every run restoring the same expert state: 12 swaps
+    // decoded 768 tokens after a 117K-token prompt 2.1 % faster (a one-off ~0.3 s; +1.4 % over 3,072 tokens) but the
+    // conv / struct fixtures about 0.9 / 0.7 % slower (fewer copies, fewer hits, more CPU-served misses). Starting a
+    // round's swaps only while fewer than N promotion loads are in flight: N = 48 lost 0.6-1.6 % on the fixtures, N = 192
+    // was level there (conv -0.2 %, struct +0.3 %) for +0.8 % after the long prompt; capping prefill rounds' swaps gave
+    // +1.1-1.4 % after it. A replay of a short-prompt route trace ranked more swaps higher at every frame count. A/Bs of
+    // these settings need a fixed --expert-state per run: each run saves the state its successor restores, which moved
+    // decode 2-4 tok/s on its own.
     struct Adaptive {
         float decay = 0.85F, floor = 1.0F, margin = 1.0F;
         std::uint32_t swaps = 96, cap = 96;
