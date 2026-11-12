@@ -1845,7 +1845,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | `on` |
 | `--log-colours on\|off` | colour the console statistics lines; never applies to file logs | `off` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
-| `--log-file PATH` | duplicate the console log records to a plain timestamped file (appended, each record written through as it is logged, so a crash leaves every earlier record in it) beside, never instead of, the console; the file carries no logger-added colour or cursor control, and records that colour their own message under `--log-colours` (the serve panels) keep those escapes; a file that cannot be opened leaves the console logging, with a warning | none |
+| `--log-file PATH` | duplicate the console log records to a plain timestamped file (appended, each record written through as it is logged, so a crash leaves every earlier record in it, including records a console that stopped taking output dropped) beside, never instead of, the console; the file carries no logger-added colour or cursor control, and records that colour their own message under `--log-colours` (the serve panels) keep those escapes; a file that cannot be opened leaves the console logging, with a warning | none |
 | `--device N` | CUDA device index | `0` |
 | `--ram-free-mib N` | physical Host RAM in MiB that everything Infernix keeps in RAM (weights, offloaded experts, the n-gram table, the prefix cache's Host tier) leaves free for other programs; startup refuses a lock that would take it, and Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger | `8192` |
 | `--ram-resize auto\|off` | `auto`: while less than 2 GiB of physical RAM is available, the RAM tiers give memory back in 1 GiB steps until 3 GiB is free, the prefix cache's Host tier first (its least valuable entries go, down to one chunk), then the offloaded experts' RAM copies when the [SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier) serves them (the `exclusive` layout, or less RAM than every expert needs; the experts given back are read from the artifact meanwhile); once more than `--ram-free-mib` (at least 3 GiB) plus 1 GiB has stayed available for 10 s they take back what stays above that, up to their startup sizes, the experts first (read again from the artifact), one piece of 1 GiB or one pinned expert chunk at a time, so a request that arrives meanwhile waits for one piece at most. Each release and each completed growth is logged. Resizes run while the Engine is idle (between requests). `off`: every tier keeps its startup size | `auto` |
@@ -1972,6 +1972,18 @@ errors are warnings, and its warnings and notices, such as swscaler's `deprecate
 notice for each full-range (JPEG-coded) video, are `debug`. A terminal may use one
 transient line during startup, but Serve throughput is always a persistent record. Redirected
 stderr contains no terminal control sequences.
+
+One writer thread does every console write (records, the transient line and the statistics
+panel), and a thread that logs only queues its record, so a stderr that stops taking output, such
+as a text selection in a legacy console window (QuickEdit pauses the console's output until the
+selection ends) or a `2>&1 |` consumer that stops reading, holds up no request. The queue holds
+about 1 MiB of records; past that the console drops `trace` and `debug` records first, then
+`info`, keeping warnings and errors longest, and once stderr takes output again one warning says
+`console | N lines not shown: stderr was not taking output`. `--log-file` still receives every
+record, written on the logging thread before the console's copy. An error record waits up to half a
+second for its console write, so the record before an abort (a failed `CUDA_CHECK`) reaches a
+working console; while the console is known stalled, errors do not wait. At exit the console gets
+up to 2 s to write what is queued.
 
 On an interactive terminal that accepts VT cursor control, and at `info` verbosity or more, Serve
 pins a session statistics panel beneath the scrolling records (`--log-stats-panel off` removes it).

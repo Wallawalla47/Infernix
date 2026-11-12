@@ -282,6 +282,9 @@ int main(int argc, char** argv) {
     logging_options.color        = options.log_colours ? infernix::product::LogColorMode::Always
                                                        : infernix::product::LogColorMode::Never;
     logging_options.log_file     = options.log_file;
+    // A stderr that stops taking output (a selection in a legacy console, a pipe nobody reads)
+    // must not stall the Engine's or the HTTP threads that log.
+    logging_options.console_queue_bytes = infernix::product::kServeConsoleQueueBytes;
     infernix::product::LoggingRuntime logging(logging_options);
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
     infernix::product::StartupLogRenderer startup_log(logging);

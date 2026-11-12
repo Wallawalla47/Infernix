@@ -18,16 +18,23 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <regex>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -113,68 +120,228 @@ std::size_t line_count(std::string_view value) {
     return static_cast<std::size_t>(std::count(value.begin(), value.end(), '\n'));
 }
 
+std::size_t count_of(std::string_view text, std::string_view needle) {
+    std::size_t count = 0;
+    for (std::size_t at = text.find(needle); at != std::string_view::npos;
+         at = text.find(needle, at + needle.size())) {
+        ++count;
+    }
+    return count;
+}
+
+// Serve's console queue while stderr takes no output (a pipe nobody reads): every thread that logs
+// keeps returning, an error record waits a bounded time once and not again while the console is
+// stalled, --log-file still gets every record, and once stderr takes output again the console
+// shows the rest with one warning counting the lines it did not show, debug lines dropped before
+// info and no warning or error dropped.
+int check_blocked_console() {
+    using Clock                     = std::chrono::steady_clock;
+    constexpr int kThreads          = 4;
+    constexpr int kLinesPerThread   = 3000; // half debug, half info: about 1.4 MB with the prefix
+    const std::string padding(64, 'x');
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() /
+        ("infernix-blocked-console-test-" + std::to_string(port_pid()) + ".log");
+    std::filesystem::remove(path);
+
+    int pipe_fds[2]{-1, -1};
+    if (port_pipe(pipe_fds) != 0) { throw std::runtime_error(std::strerror(errno)); }
+    const int saved = port_dup(STDERR_FILENO);
+    if (saved < 0 || port_dup2(pipe_fds[1], STDERR_FILENO) < 0) {
+        throw std::runtime_error(std::strerror(errno));
+    }
+    port_close(pipe_fds[1]);
+
+    std::array<Clock::duration, kThreads> slowest{};
+    Clock::duration first_error{};
+    Clock::duration second_error{};
+    std::string file_text;
+    std::string console;
+    std::thread reader;
+    {
+        auto logging = std::make_unique<infernix::product::LoggingRuntime>(
+            infernix::product::LoggingOptions{
+                .logger_name         = "infernix-serve",
+                .level               = infernix::product::LogLevel::Debug,
+                .color               = infernix::product::LogColorMode::Never,
+                .presentation        = infernix::product::LogPresentation::Service,
+                .log_file            = path.string(),
+                .console_queue_bytes = infernix::product::kServeConsoleQueueBytes});
+        {
+            const std::shared_ptr<spdlog::logger> logger = logging->logger();
+            std::atomic<int> finished{0};
+            std::vector<std::thread> threads;
+            for (int thread = 0; thread < kThreads; ++thread) {
+                threads.emplace_back([&, thread] {
+                    for (int line = 0; line < kLinesPerThread; ++line) {
+                        const Clock::time_point start = Clock::now();
+                        if (line % 2 == 0) {
+                            logger->debug("blocked console | thread {} line {} {}", thread, line,
+                                          padding);
+                        } else {
+                            logger->info("blocked console | thread {} line {} {}", thread, line,
+                                         padding);
+                        }
+                        slowest[thread] = std::max(slowest[thread], Clock::now() - start);
+                    }
+                    ++finished;
+                });
+            }
+            // Nothing reads the pipe: a thread blocked behind it never finishes, so give up loudly
+            // rather than hang (its blocked write cannot be joined).
+            const Clock::time_point deadline = Clock::now() + std::chrono::seconds(60);
+            while (finished.load() < kThreads && Clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            if (finished.load() < kThreads) {
+                (void)port_dup2(saved, STDERR_FILENO);
+                std::cerr << "a thread that logs stalled behind a stderr that takes no output\n";
+                std::_Exit(1);
+            }
+            for (std::thread& thread : threads) { thread.join(); }
+            Clock::time_point start = Clock::now();
+            logger->error("blocked console | first error");
+            first_error = Clock::now() - start;
+            start       = Clock::now();
+            logger->error("blocked console | second error");
+            second_error = Clock::now() - start;
+            logger->warn("blocked console | last warning");
+            std::ifstream in(path, std::ios::binary);
+            file_text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        // stderr takes output again.
+        reader = std::thread([&console, read_fd = pipe_fds[0]] {
+            std::array<char, 4096> buffer{};
+            for (;;) {
+                const int count = port_read(read_fd, buffer.data(), buffer.size());
+                if (count <= 0) { break; }
+                console.append(buffer.data(), static_cast<std::size_t>(count));
+            }
+        });
+        logging->flush();
+        logging.reset();
+    }
+    (void)port_dup2(saved, STDERR_FILENO);
+    port_close(saved);
+    reader.join();
+    port_close(pipe_fds[0]);
+    std::filesystem::remove(path);
+
+    const std::size_t logged = kThreads * kLinesPerThread + 3;
+    const std::string notice = "  WARN  console | ";
+    std::size_t dropped      = 0;
+    for (std::size_t at = console.find(notice); at != std::string::npos;
+         at = console.find(notice, at + notice.size())) {
+        std::string digits;
+        for (std::size_t index = at + notice.size();
+             index < console.size() && (std::isdigit(static_cast<unsigned char>(console[index])) ||
+                                        console[index] == ',');
+             ++index) {
+            if (console[index] != ',') { digits.push_back(console[index]); }
+        }
+        dropped += digits.empty() ? 0 : std::stoull(digits);
+    }
+    const std::size_t shown       = count_of(console, "blocked console |");
+    const std::size_t debug_shown = count_of(console, "DEBUG blocked console |");
+    const std::size_t info_shown  = count_of(console, "INFO  blocked console |");
+    const auto slowest_call       = *std::max_element(slowest.begin(), slowest.end());
+
+    int failures = 0;
+    failures += check(slowest_call < std::chrono::seconds(1),
+                      "a record took a second or more to log while stderr took no output");
+    failures += check(first_error < std::chrono::seconds(5),
+                      "an error record waited unboundedly for a stderr that takes no output");
+    failures += check(second_error < std::chrono::milliseconds(300),
+                      "an error record waited again for a console already known stalled");
+    failures += check(count_of(file_text, "blocked console |") == logged,
+                      "--log-file lost records while stderr took no output");
+    failures += check(dropped > 0 && console.find("lines not shown: stderr was not taking output") !=
+                                         std::string::npos,
+                      "the console did not report the lines it dropped");
+    failures += check(shown + dropped == logged,
+                      "the console's lines and its dropped count do not add up to every record");
+    failures += check(debug_shown < info_shown, "the console dropped info lines before debug ones");
+    failures += check(console.find("ERROR blocked console | first error\n") != std::string::npos &&
+                          console.find("ERROR blocked console | second error\n") !=
+                              std::string::npos &&
+                          console.find("WARN  blocked console | last warning\n") !=
+                              std::string::npos,
+                      "the console dropped a warning or an error");
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    // The end-to-end test spawns this mode: a CUDA_CHECK failure must be in the file before abort.
+    // The end-to-end test spawns this mode: a CUDA_CHECK failure must be in the file, and its record
+    // on the console behind serve's console queue, before abort.
     if (argc == 3 && std::string(argv[1]) == "--abort-with-log-file") {
         infernix::product::LoggingRuntime logging(
-            {.logger_name  = "infernix-serve",
-             .color        = infernix::product::LogColorMode::Never,
-             .presentation = infernix::product::LogPresentation::Service,
-             .log_file     = argv[2]});
+            {.logger_name         = "infernix-serve",
+             .color               = infernix::product::LogColorMode::Never,
+             .presentation        = infernix::product::LogPresentation::Service,
+             .log_file            = argv[2],
+             .console_queue_bytes = infernix::product::kServeConsoleQueueBytes});
         infernix::cuda_check(cudaErrorInvalidValue, "cudaInvalid()", "src/x.cu", 42);
         return 0;
     }
     int failures = 0;
-    std::string service_output;
-    {
-        StderrCapture capture;
+    // The direct console (the CLI) and serve's console queue write the same bytes.
+    for (const std::size_t queue_bytes :
+         {std::size_t{0}, infernix::product::kServeConsoleQueueBytes}) {
+        std::string service_output;
         {
-            infernix::product::LoggingRuntime logging(
-                {.logger_name  = "infernix-serve",
-                 .color        = infernix::product::LogColorMode::Auto,
-                 .presentation = infernix::product::LogPresentation::Service});
-            logging.logger()->info("throughput | sample");
-            logging.flush();
+            StderrCapture capture;
+            {
+                infernix::product::LoggingRuntime logging(
+                    {.logger_name         = "infernix-serve",
+                     .color               = infernix::product::LogColorMode::Auto,
+                     .presentation        = infernix::product::LogPresentation::Service,
+                     .console_queue_bytes = queue_bytes});
+                logging.logger()->info("throughput | sample");
+                logging.flush();
+            }
+            service_output = capture.finish();
         }
-        service_output = capture.finish();
-    }
-    failures += check(
-        std::regex_match(
-            service_output,
-            std::regex(
-                R"(^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}  INFO  throughput \| sample\n$)")),
-        "service pretty prefix mismatch");
-    failures += check(service_output.find("infernix-serve") == std::string::npos,
-                      "service pretty output repeated the executable name");
-    failures += check(service_output.find("\x1b[") == std::string::npos,
-                      "redirected service output contains ANSI escapes");
+        failures += check(
+            std::regex_match(
+                service_output,
+                std::regex(
+                    R"(^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}  INFO  throughput \| sample\n$)")),
+            "service pretty prefix mismatch");
+        failures += check(service_output.find("infernix-serve") == std::string::npos,
+                          "service pretty output repeated the executable name");
+        failures += check(service_output.find("\x1b[") == std::string::npos,
+                          "redirected service output contains ANSI escapes");
 
-    // Always mode on a redirected stderr must still deliver the line (plain),
-    // not drop it: the colour sink's WriteConsoleA path silently fails on a
-    // non-console handle.
-    std::string always_redirect_output;
-    {
-        StderrCapture capture;
+        // Always mode on a redirected stderr must still deliver the line (plain),
+        // not drop it: the colour sink's WriteConsoleA path silently fails on a
+        // non-console handle.
+        std::string always_redirect_output;
         {
-            infernix::product::LoggingRuntime logging(
-                {.logger_name  = "infernix-serve",
-                 .color        = infernix::product::LogColorMode::Always,
-                 .presentation = infernix::product::LogPresentation::Service});
-            logging.logger()->info("throughput | sample");
-            logging.flush();
+            StderrCapture capture;
+            {
+                infernix::product::LoggingRuntime logging(
+                    {.logger_name         = "infernix-serve",
+                     .color               = infernix::product::LogColorMode::Always,
+                     .presentation        = infernix::product::LogPresentation::Service,
+                     .console_queue_bytes = queue_bytes});
+                logging.logger()->info("throughput | sample");
+                logging.flush();
+            }
+            always_redirect_output = capture.finish();
         }
-        always_redirect_output = capture.finish();
+        failures += check(
+            std::regex_match(
+                always_redirect_output,
+                std::regex(
+                    R"(^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}  INFO  throughput \| sample\n$)")),
+            "Always mode dropped redirected service output");
+        failures += check(always_redirect_output.find("\x1b[") == std::string::npos,
+                          "redirected Always output contains ANSI escapes");
     }
-    failures += check(
-        std::regex_match(
-            always_redirect_output,
-            std::regex(
-                R"(^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}  INFO  throughput \| sample\n$)")),
-        "Always mode dropped redirected service output");
-    failures += check(always_redirect_output.find("\x1b[") == std::string::npos,
-                      "redirected Always output contains ANSI escapes");
+
+    failures += check_blocked_console();
 
     std::string startup_output;
     {
@@ -537,11 +704,12 @@ int main(int argc, char** argv) {
             StderrCapture capture;
             {
                 infernix::product::LoggingRuntime logging(
-                    {.logger_name  = "infernix-serve",
-                     .level        = infernix::product::LogLevel::Debug,
-                     .color        = infernix::product::LogColorMode::Never,
-                     .presentation = infernix::product::LogPresentation::Service,
-                     .log_file     = path.string()});
+                    {.logger_name         = "infernix-serve",
+                     .level               = infernix::product::LogLevel::Debug,
+                     .color               = infernix::product::LogColorMode::Never,
+                     .presentation        = infernix::product::LogPresentation::Service,
+                     .log_file            = path.string(),
+                     .console_queue_bytes = infernix::product::kServeConsoleQueueBytes});
                 logging.logger()->info("engine ready | sample");
                 logging.logger()->debug("engine | detail");
                 std::ifstream in(path, std::ios::binary);
@@ -571,11 +739,12 @@ int main(int argc, char** argv) {
             StderrCapture capture;
             {
                 infernix::product::LoggingRuntime logging(
-                    {.logger_name  = "infernix-serve",
-                     .level        = infernix::product::LogLevel::Debug,
-                     .color        = infernix::product::LogColorMode::Never,
-                     .presentation = infernix::product::LogPresentation::Service,
-                     .log_file     = path.string()});
+                    {.logger_name         = "infernix-serve",
+                     .level               = infernix::product::LogLevel::Debug,
+                     .color               = infernix::product::LogColorMode::Never,
+                     .presentation        = infernix::product::LogPresentation::Service,
+                     .log_file            = path.string(),
+                     .console_queue_bytes = infernix::product::kServeConsoleQueueBytes});
                 infernix::report_cuda_check_failure("cudaInvalid()", "src/x.cu", 42,
                                                     cudaErrorInvalidValue);
                 infernix::report_cuda_cleanup_failure("cudaStreamDestroy", cudaErrorInvalidValue);

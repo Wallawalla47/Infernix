@@ -33,12 +33,26 @@ enum class LogPresentation {
     Tool,
 };
 
+// The console queue infernix-serve gives its stderr writer (see LoggingOptions::console_queue_bytes).
+inline constexpr std::size_t kServeConsoleQueueBytes = std::size_t{1} << 20U;
+
 struct LoggingOptions {
     std::string logger_name;
     LogLevel level               = LogLevel::Info;
     LogColorMode color           = LogColorMode::Auto;
     LogPresentation presentation = LogPresentation::Service;
     std::string log_file; // empty => console only; else plain records are appended here beside the console
+    // 0: each record is written to stderr on the thread that logs it. Otherwise one writer thread
+    // owns every stderr write (records, progress line and panel), and a thread that logs only
+    // queues its record, so a stderr that stops taking output (a selection in a legacy console
+    // window, a pipe nobody reads) stalls no thread that logs. The queue holds about this many
+    // bytes; when it is full the oldest waiting record of the lowest level class (trace and debug,
+    // then info, then warnings and errors) is dropped, or the new record itself when its class is
+    // lower than every waiting one, and once stderr takes output again one warning says how many
+    // lines it did not show. An error record waits up to half a second for its write, and flush()
+    // up to two seconds for the queue, so a record just before an abort or an exit reaches a
+    // healthy stderr. --log-file records are written on the logging thread, before the console.
+    std::size_t console_queue_bytes = 0;
 };
 
 [[nodiscard]] LogLevel parse_log_level(std::string_view value);
@@ -115,6 +129,7 @@ public:
     [[nodiscard]] std::shared_ptr<spdlog::logger> logger() const noexcept;
     [[nodiscard]] std::shared_ptr<TerminalProgress> terminal_progress() const noexcept;
     [[nodiscard]] std::shared_ptr<TerminalPanel> terminal_panel() const noexcept;
+    // Flushes every sink; with a console queue, waits up to two seconds for it to be written.
     void flush() noexcept;
 
 private:
