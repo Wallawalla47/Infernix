@@ -5,6 +5,7 @@
 #include "runtime/contract/execution.h"
 #include "runtime/engine/generation_budget.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -142,6 +143,14 @@ struct RequestRecord {
 
     [[nodiscard]] bool is_replaying() const noexcept {
         return model_state == EngineRequestState::Replay;
+    }
+
+    // The prompt tokens this request still prefills (Scheduler::next_prefill orders by it).
+    [[nodiscard]] std::uint32_t prefill_remaining_tokens() const noexcept {
+        if (!admitted_begin) { return 0; }
+        const std::uint32_t suffix =
+            admitted_begin->prompt_tokens - std::min(admitted_begin->prompt_tokens, admitted_begin->reused_prompt_tokens);
+        return suffix > computed_prompt_tokens ? suffix - computed_prompt_tokens : 0;
     }
 
     [[nodiscard]] bool is_materializing() const noexcept {

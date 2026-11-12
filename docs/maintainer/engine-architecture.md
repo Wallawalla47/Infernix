@@ -100,7 +100,7 @@ execution units and terminal settlement, and guarantees the ordering of model co
 and user-visible events.
 
 The Scheduler owns execution membership and fairness rules: bounded bypass for fresh admission,
-prefill rotation, compact decode/control batches, preemption victims and resume opportunities. It
+prefill order, compact decode/control batches, preemption victims and resume opportunities. It
 decides using request state and submission order; paused requests wait locally for capacity events.
 
 A lane is a resident request position; the StateImage slot, KV execution row and compact batch row
@@ -286,8 +286,19 @@ cancellation, ends a service turn that has served its slice, and while a turn is
 pressure tries a complete resume of its owner if it is paused. It then acquires unit permits row by
 row for resident requests (the turn's owner first, then original ticket order), uses the remaining
 headroom to try fresh admission when no turn is held, and then executes the runnable control and decode
-work and one prefill/Replay chunk. A protected resume gets the chunk first; other prefills rotate among
-resident requests, and decode batches use the actual `B`.
+work and one prefill/Replay chunk. A protected resume gets the chunk first; decode batches use the
+actual `B`.
+
+**Prefill order.** Among the other resident prefills and Replays, the chunk goes to the least remaining
+prompt, aged (`Scheduler::next_prefill`): a lane's key is the prompt tokens it still prefills (a Replay
+counts none: it resumes a request that already had its turn) minus half the tokens other lanes
+prefilled while it waited; ties go to the rotation order after the last lane served. The lane closest to
+its first token keeps the chunk, because its key falls by each token it prefills and a waiting lane's by
+half of each, so prompts that arrive together reach their first tokens one after another (T, 2T, ... for
+equal prompts of time T, where a rotation gave them all about N x T), and a short prompt beside a long one
+goes first. A waiting lane outranks any newcomer once other lanes have prefilled twice its remaining
+prompt, which bounds its wait. Only the order of chunks changes: each request keeps its own chunk grid,
+so no output bit depends on it.
 
 The Program's `reserve_units` atomically acquires the typed incremental demand of one call set; the
 Engine calls it row by row to form the runnable subset. One row lacking resources does not stop other

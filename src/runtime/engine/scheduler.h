@@ -134,19 +134,50 @@ public:
         return membership;
     }
 
+    // The lane whose prefill or Replay unit runs next: the least remaining prompt first, aged
+    // (engine-architecture §"Prefill order"). A lane's key is the prompt tokens it still prefills (a
+    // Replay counts none: it resumes a request that already had its turn) minus half the tokens other
+    // lanes prefilled while it waited. The lane closest to its first token therefore keeps the turn
+    // (its key falls by every token it prefills, a waiting lane's by half of each), so prompts that arrive
+    // together reach their first tokens one after another instead of all together, and a short prompt
+    // beside a long one goes first; a waiting lane outranks any newcomer once others have prefilled twice
+    // its remaining prompt, which bounds its wait. Ties go to the rotation order after the last lane
+    // served. Each unit keeps the request's own chunk grid: only the order of units changes.
     template <class Slots>
     [[nodiscard]] std::optional<std::uint32_t>
     next_prefill(const Slots& slots, std::uint32_t concurrency) const noexcept {
+        std::optional<std::uint32_t> best;
+        std::int64_t best_key = 0;
         for (std::uint32_t offset = 0; offset < concurrency; ++offset) {
             const std::uint32_t lane = (prefill_cursor_ + offset) % concurrency;
             const auto& request      = slots[lane];
-            if (request && (request->is_prefilling() || request->is_replaying())) { return lane; }
+            if (!request || !(request->is_prefilling() || request->is_replaying())) { continue; }
+            const std::int64_t key = prefill_key(*request, lane);
+            if (!best || key < best_key) {
+                best     = lane;
+                best_key = key;
+            }
         }
-        return std::nullopt;
+        return best;
     }
 
-    void prefill_executed(std::uint32_t lane, std::uint32_t concurrency) noexcept {
+    // After lane `lane`'s unit prefilled or replayed `tokens`: every other lane still prefilling or
+    // replaying waited that long.
+    template <class Slots>
+    void prefill_executed(std::uint32_t lane, std::uint32_t concurrency, const Slots& slots,
+                          std::uint32_t tokens) noexcept {
         prefill_cursor_ = (lane + 1U) % concurrency;
+        for (std::uint32_t other = 0; other < concurrency; ++other) {
+            const auto& request = slots[other];
+            if (other == lane || !request || !(request->is_prefilling() || request->is_replaying())) {
+                continue;
+            }
+            if (prefill_waiter_[other] != request->id) {
+                prefill_waiter_[other] = request->id;
+                prefill_waited_[other] = 0;
+            }
+            prefill_waited_[other] += tokens;
+        }
     }
 
     // Decode share between prefill units (DecodeShare).
@@ -366,7 +397,19 @@ public:
     static constexpr std::uint64_t maximum_service_ns = 4 * service_quantum_ns;
 
 private:
+    template <class R>
+    [[nodiscard]] std::int64_t prefill_key(const R& request, std::uint32_t lane) const noexcept {
+        const std::int64_t remaining =
+            request.is_replaying() ? 0 : static_cast<std::int64_t>(request.prefill_remaining_tokens());
+        const std::uint64_t waited = prefill_waiter_[lane] == request.id ? prefill_waited_[lane] : 0;
+        return remaining - static_cast<std::int64_t>(waited / 2U);
+    }
+
     std::uint32_t prefill_cursor_      = 0;
+    // Per lane: the request that has waited for prefill units there, and the tokens other lanes
+    // prefilled meanwhile (next_prefill's ageing).
+    std::array<std::uint64_t, kMaximumConcurrency> prefill_waiter_{};
+    std::array<std::uint64_t, kMaximumConcurrency> prefill_waited_{};
     DecodeShare decode_share_;
     std::int64_t decode_owed_ns_       = 0;
     std::uint64_t decode_share_yields_ = 0;

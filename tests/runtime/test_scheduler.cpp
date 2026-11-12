@@ -44,11 +44,14 @@ struct Request {
 
     [[nodiscard]] bool is_replaying() const { return phase == Phase::Replay; }
 
+    [[nodiscard]] std::uint32_t prefill_remaining_tokens() const { return remaining; }
+
     [[nodiscard]] bool is_materializing() const { return phase == Phase::Materializing; }
 
     [[nodiscard]] bool is_model_finished() const { return phase == Phase::Finished; }
 
     std::uint64_t id                 = 0;
+    std::uint32_t remaining          = 0; // prompt tokens still to prefill
     std::uint32_t admission_bypasses = 0;
     Phase phase                      = Phase::Waiting;
     bool recovery_pending            = false;
@@ -311,24 +314,101 @@ void test_bounded_service_under_continuous_contention() {
             "continuous contention starved a request");
 }
 
-void test_prefill_replay_round_robin() {
-    Scheduler scheduler;
-    Slots slots{};
-    slots[0] = request(1, Request::Phase::Decode);
-    slots[1] = request(2, Request::Phase::Prefill);
-    slots[2] = request(3, Request::Phase::Replay);
-    slots[3] = request(4, Request::Phase::Prefill);
-    for (const std::uint32_t expected : {1U, 2U, 3U, 1U}) {
-        const auto lane = scheduler.next_prefill(slots, 4);
-        require(lane == expected, "prefill and replay did not receive rotating execution units");
-        scheduler.prefill_executed(*lane, 4);
+// Runs one prefill unit of up to `unit` tokens on the lane next_prefill picks; returns that lane.
+std::uint32_t run_unit(Scheduler& scheduler, Slots& slots, std::uint32_t concurrency, std::uint32_t unit) {
+    const auto lane = scheduler.next_prefill(slots, concurrency);
+    require(lane.has_value(), "no prefill unit was scheduled");
+    Request& r                = *slots[*lane];
+    const std::uint32_t done  = r.is_replaying() ? unit : std::min(unit, r.remaining);
+    if (!r.is_replaying()) {
+        r.remaining -= done;
+        if (r.remaining == 0) { r.phase = Request::Phase::Decode; }
     }
-    slots[1]->phase = Request::Phase::Decode;
-    slots[3]->phase = Request::Phase::Finished;
-    require(scheduler.next_prefill(slots, 4) == 2, "replay lost its turn to unready members");
-    scheduler.prefill_executed(2, 4);
-    slots[2]->phase = Request::Phase::Decode;
-    require(!scheduler.next_prefill(slots, 4), "unready prefill member was scheduled");
+    scheduler.prefill_executed(*lane, concurrency, slots, done);
+    return *lane;
+}
+
+void test_prefill_order() {
+    // Prompts that arrive together reach their first tokens one after another: the lane picked first
+    // keeps the turn to the end of its prompt (no lockstep rotation).
+    {
+        Scheduler scheduler;
+        Slots slots{};
+        for (std::uint32_t lane = 0; lane < 3; ++lane) {
+            slots[lane]            = request(lane + 1, Request::Phase::Prefill);
+            slots[lane]->remaining = 4096 * 4;
+        }
+        std::vector<std::uint32_t> order;
+        while (scheduler.next_prefill(slots, 3)) { order.push_back(run_unit(scheduler, slots, 3, 4096)); }
+        const std::vector<std::uint32_t> expected{0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2};
+        require(order == expected, "equal prompts arriving together rotated instead of finishing in turn");
+    }
+    // A short prompt beside a long one goes first, even when the long one started.
+    {
+        Scheduler scheduler;
+        Slots slots{};
+        slots[0]            = request(1, Request::Phase::Prefill);
+        slots[0]->remaining = 60000;
+        require(run_unit(scheduler, slots, 2, 4096) == 0, "the only prefilling lane was not served");
+        slots[1]            = request(2, Request::Phase::Prefill);
+        slots[1]->remaining = 2000;
+        require(run_unit(scheduler, slots, 2, 4096) == 1, "a short prompt waited behind a long one");
+        require(slots[1]->is_decode_ready() && run_unit(scheduler, slots, 2, 4096) == 0,
+                "the long prompt did not continue after the short one");
+    }
+    // A waiting lane's wait is bounded: shorter newcomers arriving on another lane overtake it only
+    // until others have prefilled twice its remaining prompt.
+    {
+        Scheduler scheduler;
+        Slots slots{};
+        slots[0]            = request(1, Request::Phase::Prefill);
+        slots[0]->remaining = 8192;
+        std::uint64_t next_id = 2;
+        std::uint32_t others  = 0;
+        bool served           = false;
+        for (int step = 0; step < 64 && !served; ++step) {
+            if (!slots[1] || !slots[1]->is_prefilling()) {
+                slots[1]            = request(next_id++, Request::Phase::Prefill);
+                slots[1]->remaining = 4096;
+            }
+            const std::uint32_t lane = run_unit(scheduler, slots, 2, 4096);
+            if (lane == 0) {
+                served = true;
+            } else {
+                others += 4096;
+            }
+        }
+        require(served && others <= 2 * 8192 + 4096, "a long prompt waited without bound behind newcomers");
+    }
+    // A Replay resumes a request that already had its turn: it precedes fresh prompts; unready lanes are
+    // never picked.
+    {
+        Scheduler scheduler;
+        Slots slots{};
+        slots[0]            = request(1, Request::Phase::Decode);
+        slots[1]            = request(2, Request::Phase::Prefill);
+        slots[1]->remaining = 100;
+        slots[2]            = request(3, Request::Phase::Replay);
+        require(scheduler.next_prefill(slots, 4) == 2, "a Replay waited behind a fresh prompt");
+        slots[2]->phase = Request::Phase::Decode;
+        require(scheduler.next_prefill(slots, 4) == 1, "a prefilling lane lost its unit to unready members");
+        slots[1]->phase = Request::Phase::Decode;
+        require(!scheduler.next_prefill(slots, 4), "an unready member was scheduled");
+    }
+    // A new request on a lane starts its own wait: the previous request's ageing is not inherited.
+    {
+        Scheduler scheduler;
+        Slots slots{};
+        slots[0]            = request(1, Request::Phase::Prefill);
+        slots[0]->remaining = 4096 * 3;
+        slots[1]            = request(2, Request::Phase::Prefill);
+        slots[1]->remaining = 4096 * 3;
+        require(run_unit(scheduler, slots, 2, 4096) == 0, "the tie did not go to the rotation order");
+        slots[1]            = request(3, Request::Phase::Prefill);
+        slots[1]->remaining = 4096 * 2 + 1;
+        require(run_unit(scheduler, slots, 2, 4096) == 0,
+                "a replacement request inherited its lane's earlier wait");
+    }
 }
 
 void test_decode_and_control_membership() {
@@ -459,7 +539,7 @@ int main() {
         test_pressure_handoff_and_fair_service();
         test_recovery_cost_has_a_bounded_service_allowance();
         test_bounded_service_under_continuous_contention();
-        test_prefill_replay_round_robin();
+        test_prefill_order();
         test_decode_and_control_membership();
         test_decode_share();
         std::cout << "ok\n";

@@ -3060,6 +3060,8 @@ private:
                 if (lane && !(shared_unit && scheduler_.prefill_yields())) {
                     const auto request = slots_[*lane];
                     set_host_work_class(HostWorkClass::Prefill);
+                    // The unit's tokens age the other prefilling lanes (Scheduler::next_prefill).
+                    const std::uint64_t tokens_before = request->computed_prompt_tokens + request->replayed_tokens;
                     if (request->is_replaying()) {
                         const auto replay_started = Clock::now();
                         const ServiceMark mark    = service_mark();
@@ -3115,7 +3117,11 @@ private:
                                 complete, remaining, decode_waiting);
                         }
                     }
-                    scheduler_.prefill_executed(*lane, max_concurrency_);
+                    const std::uint64_t unit_tokens =
+                        request->computed_prompt_tokens + request->replayed_tokens - tokens_before;
+                    scheduler_.prefill_executed(*lane, max_concurrency_, slots_,
+                                                static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                                    unit_tokens, std::numeric_limits<std::uint32_t>::max())));
                     update_recovery(request);
                     executed = true;
                 }

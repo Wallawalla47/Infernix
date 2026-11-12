@@ -29,7 +29,7 @@ history and output semantics are preserved across a pause; the device binding is
 |---|---|
 | Frontend | Template rendering, token/position/media identity, block hashes, tap hints at exact semantic boundaries |
 | Engine request record | Original ticket, input and output objects, budget, cancellation, first-time stamps, pause and recovery state |
-| Scheduler | Execution membership, fresh scans and bounded bypass, prefill/replay rotation, preemption and resume gating |
+| Scheduler | Execution membership, fresh scans and bounded bypass, prefill/replay order (least remaining, aged), preemption and resume gating |
 | `HybridResourceManager` | The Engine's connection to the Program's prefix index: admission candidates, reclaim by eviction, blocked-head prefetch, queue holds, cache statistics |
 | Native Program | Model ledger and its execution splits, backend frontiers, work-unit demand, state commit, the prefix index and its retention policy |
 | Stores inside the Program | Actual occupancy of State and KV, references, source pins, reservations and transfer destinations |
@@ -214,7 +214,8 @@ holds the real capacity across chunks, and the runtime uses `recovery_pending` t
 protection ends. Reaching the old frontier or completing the MTP bridge does not count as new
 progress; a new prefill, a generation/control commit or a terminal state ends the protection.
 
-Prefill chunk boundaries give resident requests a chance to rotate. When all lanes are occupied, a new
+Prefill chunk boundaries are where the next chunk's lane is chosen: the resident prefill with the least
+remaining prompt, aged by its wait (engine-architecture.md, "Prefill order"). When all lanes are occupied, a new
 request still has to wait for some resident to finish, be cancelled or pause under resource pressure;
 shortening chunks by itself does not let it enter earlier. A short request may therefore queue across
 several chunks of a long request, and analyzing such latency requires checking lane admission and the
