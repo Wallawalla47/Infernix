@@ -2125,10 +2125,16 @@ void Launcher::handle_models(const Request& request, Response& response, ApiCall
     Json page = Json::array();
     for (std::size_t i = begin; i < end; ++i) { page.push_back(std::move(data[i])); }
     const bool more = request.has_param("before_id") ? begin > 0 : end < data.size();
-    Json body = {{"object", "list"}, {"data", page}, {"has_more", anthropic && more}};
+    send_json(response, models_list_body(std::move(page), anthropic && more));
+}
+
+Json models_list_body(Json page, bool has_more) {
+    Json body = {{"object", "list"}, {"data", page}, {"has_more", has_more}};
     body["first_id"] = page.empty() ? Json(nullptr) : page.front()["id"];
     body["last_id"]  = page.empty() ? Json(nullptr) : page.back()["id"];
-    send_json(response, body);
+    // Codex CLI's model-catalog refresh decodes a top-level `models` (infernix-serve writes both).
+    body["models"] = std::move(page);
+    return body;
 }
 
 // ---------------------------------------------------------------------------------------------

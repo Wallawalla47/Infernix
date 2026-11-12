@@ -51,6 +51,11 @@ struct LauncherOptions {
     std::vector<std::string> restart_args;
 };
 
+// The /v1/models list body for one page of model entries: OpenAI's `object` and `data`, Anthropic's
+// `has_more`, `first_id` and `last_id`, and the same page again as a top-level `models`, the field
+// Codex CLI's model-catalog refresh reads.
+[[nodiscard]] Json models_list_body(Json page, bool has_more);
+
 class Launcher {
 public:
     explicit Launcher(LauncherOptions options);

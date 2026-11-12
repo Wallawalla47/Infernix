@@ -9,6 +9,7 @@
 #include "launcher/event_log.h"
 #include "launcher/events.h"
 #include "launcher/launch_script.h"
+#include "launcher/launcher.h"
 #include "launcher/load_advice.h"
 #include "launcher/log_buffer.h"
 #include "launcher/model_defaults.h"
@@ -885,7 +886,22 @@ void test_chats() {
     std::filesystem::remove_all(dir, ignored);
 }
 
+// /v1/models carries its page under data and again as a top-level models (Codex CLI's catalog).
+void test_models_list_body() {
+    const Json page = Json::array({Json{{"id", "a"}, {"object", "model"}}, Json{{"id", "b"}, {"object", "model"}}});
+    const Json body = models_list_body(page, true);
+    check(body["object"] == "list" && body["data"] == page && body["models"] == page,
+          "the models list carries the same entries under data and models");
+    check(body["has_more"] == true && body["first_id"] == "a" && body["last_id"] == "b",
+          "the models list keeps Anthropic's paging fields");
+    const Json empty = models_list_body(Json::array(), false);
+    check(empty["data"].empty() && empty["models"].is_array() && empty["models"].empty() &&
+              empty["first_id"].is_null() && empty["has_more"] == false,
+          "an empty models list");
+}
+
 int main() {
+    test_models_list_body();
     test_args();
     test_blob_ids();
     test_chats();

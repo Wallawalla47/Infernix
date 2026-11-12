@@ -258,7 +258,8 @@ OpenAI and Anthropic SDKs. **Endpoints**, at the top of every page, copies eithe
   other servers use so each tool finds the ones it reads:
   - the OpenAI list fields; the Anthropic ones (`type`, `display_name`, `created_at`, `has_more`,
     `first_id`, `last_id`), paged by `limit` (default 20, at most 1,000), `after_id` and `before_id`
-    when the request carries `anthropic-version`;
+    when the request carries `anthropic-version`; the list's entries again as a top-level `models`,
+    which Codex CLI's model-catalog refresh reads;
   - `name` and `description` (family, quantization, context, vision, whether it is loaded);
   - its context (`--max-context`) as `context_length`, `context_window`, `max_model_len`,
     `max_context_length`, `max_input_tokens` and `meta.n_ctx`, and the default output limit as

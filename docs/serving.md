@@ -289,6 +289,11 @@ the model behind the alias and the running instance:
 that this server was started with, not the model's native context. `n_ctx_train` reports the model's
 own trained context separately.
 
+The `GET /v1/models` list (`"object": "list"`) carries its model objects twice, under `data` (the
+OpenAI field) and under a top-level `models` with the same array: Codex CLI's model-catalog refresh
+reads `models` (reported for Codex 0.155.0-alpha), and without it falls back to guessed model
+metadata with a warning.
+
 Each model object also carries `chat_template_caps`, the chat-template capability object `llama.cpp`
 reports, with one field:
 

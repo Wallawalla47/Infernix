@@ -255,10 +255,11 @@ std::string make_models_list(const std::string& model_id, std::int64_t created,
                              std::uint32_t max_model_len, const ModelMetadata& metadata,
                              const ChatTemplateCaps& caps) {
     // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
-    const Json payload = {
-        {"object", "list"},
-        {"data", Json::array({make_model_object_json(model_id, created, max_model_len, metadata,
-                                                     caps)})}};
+    // Codex CLI's model-catalog refresh decodes a top-level `models` field and falls back to
+    // guessed metadata without it, so the same array is written under both keys.
+    const Json models = Json::array(
+        {make_model_object_json(model_id, created, max_model_len, metadata, caps)});
+    const Json payload = {{"object", "list"}, {"data", models}, {"models", models}};
     return payload.dump();
 }
 

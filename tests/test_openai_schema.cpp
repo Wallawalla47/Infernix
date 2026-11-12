@@ -1298,6 +1298,10 @@ int test_common_objects() {
     failures +=
         check(models["data"][0]["id"] == "qwen" && models["data"][0]["max_model_len"] == 240000,
               "models list advertises the configured context limit");
+    // Codex CLI reads the catalog from a top-level `models` array; OpenAI clients read `data`.
+    failures += check(models["object"] == "list" && models["data"].size() == 1 &&
+                          models.contains("models") && models["models"] == models["data"],
+                      "models list does not carry the same array under data and models");
     failures += check(models["data"][0]["chat_template_caps"] == Json{{"supports_tools", true}},
                       "models list lost the llama.cpp-compatible chat_template_caps");
     // n_ctx is the running instance's configured ceiling (max_model_len); n_ctx_train is the
