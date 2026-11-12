@@ -252,7 +252,7 @@ std::string OpenAIChatStream::prompt_progress(const infernix::PromptProgress& pr
 }
 
 void OpenAIChatStream::note_timing(const infernix::GenerationTimingObservation& timing) {
-    if (!timings_per_token_ || !started_ || !admitted_ || finished_ ||
+    if (!timings_per_token_ || !admitted_ || finished_ ||
         timing.generated_tokens == 0) {
         throw std::logic_error("invalid OpenAI Chat live-timing state");
     }
