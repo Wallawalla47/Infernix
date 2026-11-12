@@ -37,7 +37,12 @@ namespace infernix::ops {
  * edge/temperature, then draws a candidate with counter key
  * (configs[b].seed,base_positions[b]+i,kSamplePurposeDFlash2Proposal,i): the step i keeps a later
  * round's draft at the same position (a smaller step) off this uniform, which block verification's
- * outcome depends on. The selected global id is
+ * outcome depends on. A positive-temperature row with configs[b].gumbel_max (verified by equality with
+ * the target's Gumbel-max draw; sampling.h) instead takes the candidate maximizing log q + g, g the
+ * Gumbel variate of (seed, base_positions[b]+i+1, kSamplePurposeGumbel, candidate id): the key its
+ * verification column i gives that token (candidates ZH-01), so the draft equals the target's draw
+ * whenever the target's draw is the drafter's own Gumbel winner. Gumbel-max is an exact draw from q, so
+ * proposal_q is unchanged. The selected global id is
  * written to drafts[i,b] and becomes the next predecessor. The Op ignores all other
  * SamplingConfig fields and never updates token_counts.
  *
@@ -75,7 +80,11 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
  * counter key (seed, base+i-1, kSamplePurposeDFlash2Proposal, ((v+1) << 5) | j) for sibling j;
  * greedy rows take the best untaken rank. A child never exceeds depth K and a row never exceeds
  * shape.paths leaves. Since a child's priority is fixed before it is drawn, the tree's shape never
- * depends on a column's own token, which keeps recursive rejection sampling exact.
+ * depends on a column's own token, which keeps recursive rejection sampling exact. A
+ * positive-temperature row with configs[b].gumbel_max draws its main chain as candidate_selector_path's
+ * gumbel_max rows do, and node v's next child is its law's untaken rank of the highest Gumbel score at the
+ * child's verification key (seed, base+i, kSamplePurposeGumbel, candidate id) for a child at depth i: the
+ * law's Gumbel top ranks in order, a draw without replacement. Such a row builds no transport shape.
  *
  * Outputs: drafts I32 [W-1,B]; column_candidates I32 [16,W-1,B] (the lattice candidates of the
  * column's position); proposal_q FP32 [16,W-1,B] holding the full q of the column's parent (a
@@ -108,7 +117,8 @@ void candidate_selector_tree(const Tensor& candidate_ids, const Tensor& unary_sc
  * base_positions, current_extents, configs, shape, the draws, their counter keys and every output
  * are as candidate_selector_tree's. The main chain is the path walk over these edges: a greedy row
  * takes each position's lowest rank attaining its maximum score, a sampled row draws from the
- * position's law with (seed, base+i, kSamplePurposeDFlash2Proposal, i). No workspace.
+ * position's law with (seed, base+i, kSamplePurposeDFlash2Proposal, i); gumbel_max rows draw as
+ * candidate_selector_tree's do. No workspace.
  */
 void candidate_tree(const Tensor& candidate_ids, const Tensor& unary_scores,
                     const Tensor& base_positions, const Tensor& current_extents,

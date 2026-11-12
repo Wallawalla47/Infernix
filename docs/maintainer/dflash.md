@@ -290,7 +290,16 @@ sampled run under block verification was biased (a replay of the keys over four-
 most probable token's frequency from 0.600 to 0.573); its earlier A/B results ran on that form.
 
 DFlash q is one-hot; DFlash2 q is the retained conditional distribution. This preserves the
-processed target distribution for the verify path. With `--draft-tree-nodes` a DFlash2 round
+processed target distribution for the verify path.
+
+**Gumbel rows** (`SamplingConfig::gumbel_max`, the reproducible route's sampled requests) are verified by
+equality with the target's own Gumbel-max draw, keyed by (seed, the produced token's position, token). Their
+drafts are drawn with the same key (candidates ZH-01, after imp #3095): the path's draft i takes the candidate
+maximizing log q + g(seed, base + i + 1, token), and a tree node's children are its law's Gumbel top ranks in
+that order, so a draft is the target's draw whenever the target's draw is also the drafter's own Gumbel winner
+among its 16 candidates. A Gumbel-max pick is an exact draw from q, so the drafts' distribution and q are those of
+the proposal-uniform draw; only which draw is taken changes, and the output is plain sampling's text either way
+(the route's contract). With `--draft-tree-nodes` a DFlash2 round
 instead verifies a tree of proposals built from the same lattice, whose main chain is this path
 ([tree verification](tree-verification.md)). Different draft formats, shortlist heads or
 block widths can change acceptance and throughput; their logits need not match one another.
