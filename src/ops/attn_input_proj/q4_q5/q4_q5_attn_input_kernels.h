@@ -24,6 +24,9 @@ void q4_q5_attn_input_mixed_r32_c64_s3_launch(const Tensor& x, const Weight& w0,
 void q4_q5_attn_input_mixed_ring_c128_launch(const Tensor& x, const Weight& w0, const Weight& w1,
                                                Tensor& q, Tensor& g, Tensor& k, Tensor& v,
                                                cudaStream_t stream);
+// The ring tiles alone over every column (the launcher above sends a short remainder to the narrow routes).
+void q4_q5_attn_input_mixed_ring_c128_launch_tiles(const Tensor& x, const Weight& w0, const Weight& w1, Tensor& q,
+                                                   Tensor& g, Tensor& k, Tensor& v, cudaStream_t stream);
 
 void q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(const Tensor& x, const Weight& query_key_weight,
                                                     const Weight& gate_value_weight, Tensor& q,

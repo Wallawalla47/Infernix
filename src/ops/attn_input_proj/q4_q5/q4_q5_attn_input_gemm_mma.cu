@@ -143,6 +143,46 @@ void q4_q5_attn_input_mixed_ring_c128_launch(const Tensor& x, const Weight& w0, 
     // 512 -6.4 %, 896 -6.6 %, 1,024 -5.5 %, 2,048 -6.7 %, 4,096 -6.7 % (2026-11-10).
     using Tile = RowSplitRingTile128;
     using Ring = RowSplitRing<Tile, kRowSplitRingStages, kRowSplitRingProducerWarps>;
+    // ZK-11: a remainder past the last whole 128-column tile is cheaper on the narrow routes than a nearly empty ring
+    // tile when that tile adds a wave (as the Q4 gate/up ring's, q4_linear_swiglu_gemm_mma.cu, N6-2): at most
+    // kExactTailCols columns for one more wave, up to kNarrowTailCols for two. Where the extra tile shares the last
+    // wave it costs nothing, and a split there only adds the narrow call (257-280 columns split were 7-22 % slower).
+    // RTX 5090, attn_input_proj_bench (q4q5, a16, CUDA graph, cold L2, A B B A, 2026-11-12): 385-408 columns -12.5 ..
+    // -12.8 %, 513-536 -9.5 .. -10.0 %, 769-792 -7.5 .. -8.0 %, every other width of 256-792 within 0.3 %. The tail runs
+    // on the r32 routes, whose columns have the ring's bits (equal output hashes at all 22 widths); the small_t route's
+    // do not (another summation order), so it takes no tail.
+    constexpr std::int32_t kNarrowTailCols = 40;
+    constexpr std::int32_t kExactTailCols  = 24;
+    const std::int32_t tokens = x.ne[1];
+    const std::int32_t blocks = tokens / Tile::BN;
+    const std::int32_t tail   = tokens - blocks * Tile::BN;
+    const std::int64_t rows   = 14336 / Tile::BM;
+    const auto extra_waves = [&] {
+        return blocks > 0 ? rowsplit_ring_waves(rows * (blocks + 1)) - rowsplit_ring_waves(rows * blocks) : 0;
+    };
+    const std::int64_t added = tail > 0 ? extra_waves() : 0;
+    if (blocks > 0 && tail > 0 && added >= 1 && tail <= (added >= 2 ? kNarrowTailCols : kExactTailCols)) {
+        const std::int32_t wide = blocks * Tile::BN;
+        Tensor qt = q.slice(1, wide, tail), gt = g.slice(1, wide, tail), kt = k.slice(1, wide, tail),
+               vt = v.slice(1, wide, tail);
+        const Tensor xt = x.slice(1, wide, tail);
+        Tensor qw = q.slice(1, 0, wide), gw = g.slice(1, 0, wide), kw = k.slice(1, 0, wide), vw = v.slice(1, 0, wide);
+        q4_q5_attn_input_mixed_ring_c128_launch_tiles(x.slice(1, 0, wide), w0, w1, qw, gw, kw, vw, stream);
+        if (tail <= 32) {
+            q4_q5_attn_input_mixed_r32_c32_s2_launch(xt, w0, w1, qt, gt, kt, vt, stream);
+        } else {
+            q4_q5_attn_input_mixed_r32_c64_s3_launch(xt, w0, w1, qt, gt, kt, vt, stream);
+        }
+        return;
+    }
+    q4_q5_attn_input_mixed_ring_c128_launch_tiles(x, w0, w1, q, g, k, v, stream);
+}
+
+// The ring tiles over every column of x (q4_q5_attn_input_mixed_ring_c128_launch's whole-tile part).
+void q4_q5_attn_input_mixed_ring_c128_launch_tiles(const Tensor& x, const Weight& w0, const Weight& w1, Tensor& q,
+                                                   Tensor& g, Tensor& k, Tensor& v, cudaStream_t stream) {
+    using Tile = RowSplitRingTile128;
+    using Ring = RowSplitRing<Tile, kRowSplitRingStages, kRowSplitRingProducerWarps>;
     for_each_token_slice(x.ne[1], Tile::BN, [&](int begin, int count) {
         const Tensor xs = x.slice(1, begin, count);
         Tensor qs = q.slice(1, begin, count), gs = g.slice(1, begin, count), ks = k.slice(1, begin, count),
