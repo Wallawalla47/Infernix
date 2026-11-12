@@ -2,6 +2,7 @@
 
 #include "core/gpu_telemetry.h"
 #include "serve/generation_service.h"
+#include "serve/reasoning_store.h"
 #include "serve/request.h"
 
 #include <chrono>
@@ -32,6 +33,9 @@ struct RequestLogContext {
     std::optional<RequestedReasoningEffort> requested_reasoning_effort;
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
+    // Chat Completions: its assistant messages that arrived without reasoning, and those restored
+    // (serve/reasoning_store.h); unset on the other protocols.
+    std::optional<ReasoningRestore> reasoning;
     infernix::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;
     infernix::PromptPreparationStats preparation;
@@ -49,6 +53,7 @@ struct RequestLogMetadata {
     bool output_tokens_explicit            = false;
     bool preserve_thinking_semantic_change = false;
     std::string label;
+    std::optional<ReasoningRestore> reasoning; // RequestLogContext::reasoning
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a

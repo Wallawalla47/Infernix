@@ -587,6 +587,7 @@ int main() {
                                            "--log-stats-panel",
                                            "off",
                                            "--preserve-thinking",
+                                           "--restore-reasoning",
                                            "--media-cache-mib",
                                            "256",
                                            "--media-live-mib",
@@ -608,6 +609,14 @@ int main() {
                       "--claude-code-usage-compat did not reach serving options");
     failures += check(configured.preserve_thinking == true,
                       "--preserve-thinking did not reach serving options");
+    failures += check(configured.restore_reasoning && !defaults.restore_reasoning,
+                      "--restore-reasoning did not reach serving options, or is on by default");
+    bool tool_reasoning_name_rejected = false;
+    try {
+        (void)parse({"infernix-serve", "model.ninfer", "--restore-tool-reasoning"});
+    } catch (const std::invalid_argument&) { tool_reasoning_name_rejected = true; }
+    failures += check(tool_reasoning_name_rejected,
+                      "the replaced name --restore-tool-reasoning was still accepted");
     failures +=
         check(configured.max_concurrency == 4, "--max-concurrency did not reach serving options");
     failures += check(configured.max_context == 4096 &&

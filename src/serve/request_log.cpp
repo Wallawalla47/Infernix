@@ -231,6 +231,13 @@ Json overrides_json(const infernix::SamplingOverrides& overrides) {
     return result;
 }
 
+// A Chat Completions request's assistant messages by kind, as /metrics counts them; null elsewhere.
+Json reasoning_counts_json(const std::optional<ReasoningRestore>& reasoning, bool restored) {
+    if (!reasoning) { return nullptr; }
+    const ReasoningCounts& counts = restored ? reasoning->restored : reasoning->missing;
+    return Json{{"tool_call", counts.tool_calls}, {"answer", counts.answers}};
+}
+
 Json request_json(const RequestLogContext& context) {
     Json thinking_budget = nullptr;
     if (context.thinking_budget) { thinking_budget = *context.thinking_budget; }
@@ -256,6 +263,8 @@ Json request_json(const RequestLogContext& context) {
                 {"preserve_thinking",
                  context.preserve_thinking ? Json(*context.preserve_thinking) : Json(nullptr)},
                 {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
+                {"reasoning_missing", reasoning_counts_json(context.reasoning, false)},
+                {"reasoning_restored", reasoning_counts_json(context.reasoning, true)},
                 {"sampling", sampler_json(context.sampling)}};
 }
 

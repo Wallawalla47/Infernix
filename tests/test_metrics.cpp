@@ -91,6 +91,26 @@ int main() {
                   text.find("batch=\"3\"") == std::string::npos,
               "execution units by kind and decode rounds by batch size, the warm-up excluded");
     }
+    {
+        // Chat Completions assistant messages without reasoning (--restore-reasoning) accumulate across
+        // requests by kind: tool-call messages and answers.
+        Metrics chat;
+        chat.configure("m", options, memory, baseline);
+        const auto zero = chat.render(baseline, true);
+        check(zero.find("infernix_chat_reasoning_missing_total{message=\"tool_call\"} 0\n") != std::string::npos &&
+                  zero.find("infernix_chat_reasoning_missing_total{message=\"answer\"} 0\n") != std::string::npos &&
+                  zero.find("infernix_chat_reasoning_restored_total{message=\"answer\"} 0\n") != std::string::npos,
+              "the reasoning counters start at zero for both kinds");
+        chat.reasoning({.missing = {.tool_calls = 1, .answers = 2}, .restored = {.tool_calls = 0, .answers = 2}});
+        chat.reasoning({.missing = {.tool_calls = 0, .answers = 3}, .restored = {.tool_calls = 0, .answers = 0}});
+        const auto text = chat.render(baseline, true);
+        check(text.find("infernix_chat_reasoning_missing_total{message=\"tool_call\"} 1\n") != std::string::npos &&
+                  text.find("infernix_chat_reasoning_missing_total{message=\"answer\"} 5\n") != std::string::npos &&
+                  text.find("infernix_chat_reasoning_restored_total{message=\"tool_call\"} 0\n") !=
+                      std::string::npos &&
+                  text.find("infernix_chat_reasoning_restored_total{message=\"answer\"} 2\n") != std::string::npos,
+              "missing and restored reasoning reach the metrics by message kind");
+    }
     check(live.find("infernix_time_to_first_token_seconds_count 1\n") != std::string::npos &&
               live.find("infernix_requests_total{outcome=\"completed\"} 0\n") != std::string::npos,
           "TTFT must be visible before completion");

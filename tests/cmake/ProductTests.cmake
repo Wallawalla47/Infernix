@@ -137,6 +137,13 @@ infernix_add_test(infernix_http_routes_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_routes.cpp"
   LIBRARIES infernix_serve)
 
+# --restore-reasoning over loopback HTTP through the Chat Completions route: replies' reasoning is
+# remembered (aggregate and streamed), echoed answers and tool calls reach the backend with it only
+# under the option, and /metrics counts them either way.
+infernix_add_test(infernix_http_reasoning_restore_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_reasoning_restore.cpp"
+  LIBRARIES infernix_serve infernix_product_logging)
+
 # Streaming requests refused before their stream starts (queue answers, a context overflow), over
 # loopback HTTP against a refusing generation backend.
 infernix_add_test(infernix_http_stream_refusals_test

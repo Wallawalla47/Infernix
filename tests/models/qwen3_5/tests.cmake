@@ -273,6 +273,14 @@ infernix_add_test(infernix_qwen3_5_tokenizer_golden_real_test
   NEEDS_SOURCE_DIR)
 set_tests_properties(infernix_qwen3_5_tokenizer_golden_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# A reply with empty reasoning sent back as history against its generated ids (candidates ZH-03): the
+# documented id mismatch, through the real Frontend on the same INFERNIX_TEST_TOKENIZER_DIR; CPU only.
+infernix_add_test(infernix_qwen3_5_echoed_empty_reasoning_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_echoed_empty_reasoning.cpp"
+  LIBRARIES infernix_engine infernix_core
+  NEEDS_SOURCE_DIR)
+set_tests_properties(infernix_qwen3_5_echoed_empty_reasoning_test PROPERTIES SKIP_RETURN_CODE 77)
+
 infernix_add_test(infernix_tool_call_parser_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../test_tool_call_parser.cpp"
   LIBRARIES infernix_engine infernix_model_runtime infernix::json)

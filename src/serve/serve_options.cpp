@@ -125,7 +125,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--no-thinking", false},
     ServeOptionArity{"--preserve-thinking", false},
     ServeOptionArity{"--tolerant-tool-calls", false},
-    ServeOptionArity{"--restore-tool-reasoning", false},
+    ServeOptionArity{"--restore-reasoning", false},
     ServeOptionArity{"--any-model-name", false},
     ServeOptionArity{"--cors", false},
     ServeOptionArity{"--usage-chunk-choice", false},
@@ -657,10 +657,13 @@ std::string serve_usage_text(const char* argv0) {
            "                             budget and an undeclared name, and return complete\n"
            "                             calls stranded in unclosed thinking (strict\n"
            "                             all-or-nothing by default)\n"
-           "  --restore-tool-reasoning   give a Chat Completions tool-call turn sent back\n"
-           "                             without its reasoning the reasoning this server\n"
-           "                             generated for it, so a tool loop keeps its\n"
-           "                             prefix-cache match (off by default)\n"
+           "  --restore-reasoning        give a Chat Completions assistant message sent\n"
+           "                             back without its reasoning the reasoning this\n"
+           "                             server generated for it (a tool call by its call\n"
+           "                             ids, an answer by its text and the conversation\n"
+           "                             before it), so the history keeps its prefix-cache\n"
+           "                             match; changes the prompt the client sent (off by\n"
+           "                             default)\n"
            "\n"
            "NETWORKING & RESOURCES\n"
            "  --host H                   listen address (default 127.0.0.1)\n"
@@ -1219,8 +1222,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.preserve_thinking = true;
         } else if (arg == "--tolerant-tool-calls") {
             options.tolerant_tool_calls = true;
-        } else if (arg == "--restore-tool-reasoning") {
-            options.restore_tool_reasoning = true;
+        } else if (arg == "--restore-reasoning") {
+            options.restore_reasoning = true;
         } else if (arg == "--any-model-name") {
             options.any_model_name = true;
         } else if (arg == "--cors") {

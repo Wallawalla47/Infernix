@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serve/generation_service.h"
+#include "serve/reasoning_store.h"
 
 #include <array>
 #include <cstdint>
@@ -19,9 +20,9 @@ public:
     void rejected();
     void failed(bool cancelled);
     void response_failed();
-    // A Chat Completions request's tool-call turns sent without reasoning, and those restored
-    // (--restore-tool-reasoning).
-    void reasoning(std::size_t missing, std::size_t restored);
+    // A Chat Completions request's assistant messages sent without reasoning, and those restored
+    // (--restore-reasoning).
+    void reasoning(const ReasoningRestore& counts);
     [[nodiscard]] std::string render(const RuntimeStats& runtime, bool ready) const;
 
     struct RequestCounts {
@@ -48,8 +49,7 @@ private:
         std::uint64_t failed            = 0;
         std::uint64_t rejected          = 0;
         std::uint64_t response_failures = 0;
-        std::uint64_t reasoning_missing  = 0;
-        std::uint64_t reasoning_restored = 0;
+        ReasoningRestore reasoning;
         std::uint64_t tool_arguments_unwrapped = 0;
         std::array<std::uint64_t, 3> constraint_outcomes{};
         std::array<std::uint64_t, 3> constraint_cache{};

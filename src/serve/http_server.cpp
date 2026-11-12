@@ -247,8 +247,9 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
                        std::shared_ptr<product::TerminalPanel> panel)
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
                                                             options_.response_store_max_bytes),
-      operational_log_(logger), request_jsonl_(options_.request_log_jsonl, options_.artifact_path,
-                                               std::move(logger), options_.request_log_rotation) {
+      reasoning_store_(4096, 64U << 20, options_.restore_reasoning), operational_log_(logger),
+      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger),
+                     options_.request_log_rotation) {
     // Always aggregated (GET /metrics?format=json reports them); drawn only on a terminal panel.
     const bool draw_panel = options_.log_stats_panel && panel != nullptr && panel->enabled();
     console_stats_        = std::make_unique<ConsoleStatsPanel>(

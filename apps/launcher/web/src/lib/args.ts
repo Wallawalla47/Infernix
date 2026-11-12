@@ -201,7 +201,7 @@ export const KNOWN_SWITCHES: ReadonlySet<string> = new Set([
   "--no-thinking",
   "--preserve-thinking",
   "--tolerant-tool-calls",
-  "--restore-tool-reasoning",
+  "--restore-reasoning",
   "--cors",
   "--usage-chunk-choice",
   "--claude-code-usage-compat",

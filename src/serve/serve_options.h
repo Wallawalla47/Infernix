@@ -137,11 +137,11 @@ struct ServeOptions {
     std::optional<bool> preserve_thinking;
     // Recover complete Qwen calls with malformed wrapper/suffix output (opt-in; strict by default).
     bool tolerant_tool_calls = false;
-    // --restore-tool-reasoning: a Chat Completions assistant turn whose client dropped the reasoning of a
-    // tool-calling response this server produced gets it back (serve/reasoning_store.h), so a tool loop's
-    // history renders as generated and keeps its prefix-cache match. Off by default: it changes the
-    // history the client sent.
-    bool restore_tool_reasoning = false;
+    // --restore-reasoning: a Chat Completions assistant message whose client dropped the reasoning of a
+    // response this server produced gets it back (serve/reasoning_store.h): a tool-call message by its call
+    // ids, an answer by its text and the conversation before it. The history then renders as generated and
+    // keeps its prefix-cache match. Off by default: it changes the history the client sent.
+    bool restore_reasoning = false;
     // --any-model-name: the OpenAI routes serve a request whatever non-empty model name it gives (a
     // client's hard-coded or default name) and report the served model's name; off, any name but the
     // public model ID is a 404 model_not_found.

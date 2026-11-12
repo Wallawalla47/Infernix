@@ -587,9 +587,9 @@ const THINKING: FormSection = {
     },
     {
       kind: "switch",
-      flag: "--restore-tool-reasoning",
-      label: "Restore tool-call reasoning",
-      help: "Give Chat Completions tool-call messages sent back without reasoning the reasoning this server generated for them, so a tool loop keeps its prefix-cache match.",
+      flag: "--restore-reasoning",
+      label: "Restore reasoning",
+      help: "Give Chat Completions assistant messages (tool calls and answers) sent back without reasoning the reasoning this server generated for them, so the history renders as generated and keeps its prefix-cache match. Changes the prompt the model sees.",
       more: true,
     },
     {

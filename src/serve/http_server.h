@@ -158,9 +158,9 @@ private:
     // /v1/decide answer labels, computed from the loaded tokenizer when the service attaches.
     std::vector<DecideLabel> decide_labels_;
     OpenAIResponsesStore openai_responses_store_;
-    // --restore-tool-reasoning: the last 4,096 tool-calling Chat Completions responses' reasoning, at most
-    // 64 MiB of it.
-    ReasoningStore reasoning_store_{4096, 64U << 20};
+    // The reasoning of the last 4,096 Chat Completions responses that had some, at most 64 MiB of it: with
+    // --restore-reasoning to give it back, without it only which answers had reasoning, to count them.
+    ReasoningStore reasoning_store_;
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
     Metrics metrics_;

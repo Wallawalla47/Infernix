@@ -850,15 +850,30 @@ for.
 options override server defaults set with `--no-thinking` and `--preserve-thinking`. Unspecified
 thinking, effort and preservation options use the template's defaults.
 
-Many agent clients send an assistant tool-call message back without its `reasoning_content`. Within
-a tool loop the template renders that reasoning, so the history then differs from the tokens the
-model generated, and each later turn re-prefills from that message. With `--restore-tool-reasoning`,
-the server remembers the reasoning of its last 4,096 tool-calling Chat Completions responses (at most
-64 MiB) by tool-call id. An assistant message whose tool calls all belong to one remembered response,
-and which carries no reasoning of its own, renders with that response's reasoning. Messages that
-carry reasoning are left unchanged. `infernix_chat_reasoning_missing_total` counts the tool-call
-messages received without reasoning, with or without the option, and
-`infernix_chat_reasoning_restored_total` counts those restored.
+Many clients send assistant messages back without their `reasoning_content`. Where the template
+renders that reasoning (every Qwen template within a tool loop; Qwen3.8's, including
+Qwen3.8-Flash-Next's, for every earlier answer unless `preserve_thinking` is false), the history then
+differs from the tokens the model generated, and the next turn re-prefills from that message.
+`--restore-reasoning` puts it back. The server remembers the reasoning of its last 4,096 Chat
+Completions responses that had some (at most 64 MiB): a tool-calling response's by tool-call id, an
+answer's (a response without tool calls) by its text and the whole conversation it answered (the
+request's tool definitions and every message, without reasoning or tool-call ids). An assistant
+message that carries no reasoning of its own renders with the remembered reasoning when its tool calls
+all belong to one remembered response, or, without tool calls, when its text (whitespace at either end
+aside) and every message before it, with the tool definitions, are those of a remembered answer. The
+same answer after another prompt or in another conversation is not restored, and messages that carry
+reasoning are left unchanged. This changes the prompt the model sees from the history the client sent:
+the model reads its own earlier reasoning where the client left it out. With it, a conversation's
+next turn renders the reply as the [next-turn prefill](#next-turn-prefill) did.
+
+`infernix_chat_reasoning_missing_total` counts the assistant messages received without reasoning, with
+or without the option: `message="tool_call"` every tool-call message, `message="answer"` each answer
+whose response from this server had reasoning (without the option the server keeps only which answers
+had some, to count them). `infernix_chat_reasoning_restored_total` counts those restored, and the
+request log's `request_start` records both per request (`reasoning_missing`, `reasoning_restored`).
+Each request counts every such message of its history, so a conversation's answer is counted again on
+each later turn. A non-zero `answer` count without the option means a client drops reasoning the
+template would render.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. The role chunk goes out with the stream's first event (with
@@ -1929,7 +1944,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text, and (with `--end-in-thinking allow`) complete calls stranded in thinking the model never closed | off |
-| `--restore-tool-reasoning` | give a Chat Completions tool-call message sent back without reasoning the reasoning this server generated for it (see Chat Completions) | off |
+| `--restore-reasoning` | give a Chat Completions assistant message sent back without reasoning the reasoning this server generated for it: a tool-call message by its call ids, an answer by its text and the conversation before it. Changes the prompt the model sees from the history the client sent (see Chat Completions) | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--claude-code-usage-compat` | Anthropic streaming only: report a provisional `0` as `message_start`'s `input_tokens` (its cache-read split stays exact, terminal usage unchanged), so a Claude Code version that keeps the start value when the terminal `message_delta` corrects it to `0` cannot count the prompt twice (see [Anthropic Messages](#anthropic-messages)) | off |
@@ -2127,7 +2142,7 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_constraint_{prepare,compile,wait,mask,matcher}_seconds_total`, `infernix_constraint_mask_{positions,upload_bytes}_total` | Constraint work aggregated at request settlement, including truncated/cancelled results; `compile` is a new grammar's compile run beside the prefill and `wait` the time first masks waited for it |
 | `infernix_constraint_draft_wait_seconds_total` | Live draft-ready wait counted once per batch; a subset of device wait |
 | `infernix_requests_total{outcome}`, `infernix_response_failures_total` | Generation attempts entering preparation and subsequent response failures; protocol/model validation failures and token-count requests are excluded |
-| `infernix_chat_reasoning_missing_total`, `infernix_chat_reasoning_restored_total` | Chat Completions assistant tool-call messages received without reasoning, and those `--restore-tool-reasoning` restored |
+| `infernix_chat_reasoning_missing_total{message}`, `infernix_chat_reasoning_restored_total{message}` | Chat Completions assistant messages received without reasoning (`tool_call`: every tool-call message; `answer`: answers whose response from this server had reasoning), and those `--restore-reasoning` restored |
 | `infernix_tool_call_arguments_unwrapped_total` | Generated tool calls whose only parameter, an `arguments` their tool does not declare, held the whole argument object and was unwrapped (see the tool-parameter conversion above) |
 | `infernix_time_to_first_token_seconds` | Histogram updated once at the first committed token, including preparation, queueing and binding |
 | `infernix_request_duration_seconds`, `infernix_request_queue_seconds` | Histograms for settled generation outcomes, including cancellation; exceptional failures have separate counts |
@@ -2232,7 +2247,7 @@ they do not infer request behavior from process-global counter deltas.
 | Event | Contents |
 |---|---|
 | `server_start` | artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities, prompt-attention kernel and n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, unified Host context capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, redacted argv, and the `--config` file's path and redacted options (`null` without one) |
-| `request_start` | protocol, `label`, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
+| `request_start` | protocol, `label`, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape, and on Chat Completions `reasoning_missing` and `reasoning_restored` (`{"tool_call": N, "answer": N}`, as `infernix_chat_reasoning_*_total` counts them; `null` on the other protocols) |
 | `request_rejected` | parsed request shape, `label`, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `prefix_miss`, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
 | `request_scheduling` | request identity, pause/restore/recovery transitions, Engine observation time and cumulative global/request work counters |
@@ -2587,7 +2602,7 @@ grid position at or before it, so its output still equals an uncached run's).
   a layer-walk span, which a stopped pass abandons).
 - It never changes output: the next request reuses it only where its tokens are identical. A client
   that sends the reply back differently (reordered tool arguments, dropped reasoning in a template
-  that keeps it) simply misses it.
+  that keeps it, unless `--restore-reasoning` puts that back) simply misses it.
 - A history the cache already holds (the usual agent loop with a template that keeps reasoning: the
   endpoint already covers the reply) is skipped without running. Only the latest finished reply is
   prefilled; text conversations only (a request with media is not followed).

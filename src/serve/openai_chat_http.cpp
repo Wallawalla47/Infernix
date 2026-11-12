@@ -35,16 +35,19 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         write_openai_error(res, exception.error());
         return;
     }
-    // Tool-call turns sent back without their reasoning: counted, and with --restore-tool-reasoning
-    // given the reasoning this server generated for them.
-    const ReasoningRestore reasoning =
-        options_.restore_tool_reasoning
-            ? reasoning_store_.restore(request.generation.messages)
-            : ReasoningRestore{.missing = count_missing_reasoning(request.generation.messages)};
-    metrics_.reasoning(reasoning.missing, reasoning.restored);
-    const auto remember_reasoning = [this](const GenerationOutcome& outcome, const std::vector<std::string>& ids) {
-        if (options_.restore_tool_reasoning && !outcome.tool_calls.empty()) {
-            reasoning_store_.remember(ids, outcome.reasoning);
+    // Assistant messages sent back without their reasoning: counted, and with --restore-reasoning given
+    // the reasoning this server generated for them. The reply's reasoning is remembered under its tool-call
+    // ids, or as an answer to this request's conversation (a continued final message is not a new answer).
+    ConversationDigest conversation;
+    const ReasoningRestore reasoning = reasoning_store_.restore(request.generation, conversation);
+    metrics_.reasoning(reasoning);
+    const bool new_answer = request.generation.continuation == infernix::PromptContinuationMode::NewAssistantTurn;
+    const auto remember_reasoning = [this, conversation, new_answer](const GenerationOutcome& outcome,
+                                                                     const std::vector<std::string>& ids) {
+        if (!outcome.tool_calls.empty()) {
+            reasoning_store_.remember_tool_calls(ids, outcome.reasoning);
+        } else if (new_answer) {
+            reasoning_store_.remember_answer(conversation, outcome.text, outcome.reasoning);
         }
     };
 
@@ -53,7 +56,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                 .model                  = request.model,
                                 .stream                 = request.stream,
                                 .output_tokens_explicit = request.output_tokens_explicit,
-                                .label                  = request_label(req)};
+                                .label                  = request_label(req),
+                                .reasoning              = reasoning};
     PreparedRequest prepared;
     try {
         infernix::GenerationObservationOptions observation{

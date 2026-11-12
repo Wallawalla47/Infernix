@@ -115,10 +115,12 @@ void Metrics::response_failed() {
     ++requests_.response_failures;
 }
 
-void Metrics::reasoning(std::size_t missing, std::size_t restored) {
+void Metrics::reasoning(const ReasoningRestore& counts) {
     std::lock_guard lock(mutex_);
-    requests_.reasoning_missing += missing;
-    requests_.reasoning_restored += restored;
+    requests_.reasoning.missing.tool_calls += counts.missing.tool_calls;
+    requests_.reasoning.missing.answers += counts.missing.answers;
+    requests_.reasoning.restored.tool_calls += counts.restored.tool_calls;
+    requests_.reasoning.restored.answers += counts.restored.answers;
 }
 
 std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
@@ -356,10 +358,18 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     }
     counter("response_failures_total", requests.response_failures, 0U,
             "Response rendering, storage or transport failures after generation settlement.");
-    counter("chat_reasoning_missing_total", requests.reasoning_missing, 0U,
-            "Chat Completions assistant tool-call turns received without their reasoning.");
-    counter("chat_reasoning_restored_total", requests.reasoning_restored, 0U,
-            "Of those, turns given back the reasoning this server generated (--restore-tool-reasoning).");
+    // Assistant messages by kind: `tool_call` counts every tool-call message without reasoning, `answer`
+    // only answers whose response from this server had reasoning.
+    const auto by_message = [&](std::string_view name, const ReasoningCounts& counts, std::string_view help) {
+        header(name, "counter", help);
+        out << "infernix_" << name << "{message=\"tool_call\"} " << counts.tool_calls << '\n'
+            << "infernix_" << name << "{message=\"answer\"} " << counts.answers << '\n';
+    };
+    by_message("chat_reasoning_missing_total", requests.reasoning.missing,
+               "Chat Completions assistant messages received without reasoning: every tool-call message, and "
+               "answers whose response from this server had reasoning.");
+    by_message("chat_reasoning_restored_total", requests.reasoning.restored,
+               "Of those, messages given back the reasoning this server generated (--restore-reasoning).");
     counter("tool_call_arguments_unwrapped_total", requests.tool_arguments_unwrapped, 0U,
             "Generated tool calls whose only parameter, an undeclared `arguments`, held the whole argument "
             "object and was unwrapped.");

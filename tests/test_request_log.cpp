@@ -409,6 +409,21 @@ int main() {
                       "request-scoped media preparation diagnostics missing");
     failures += check(started.at("preparation_seconds").at("instruction_role_lowerings") == 2,
                       "instruction role lowering count missing from the preparation block");
+    {
+        // Chat Completions' assistant messages without reasoning, by kind, as /metrics counts them; null on a
+        // request that does not count them.
+        failures += check(started.at("request").at("reasoning_missing").is_null() &&
+                              started.at("request").at("reasoning_restored").is_null(),
+                          "a request without reasoning counts must log them as null");
+        RequestLogMetadata counted = metadata;
+        counted.reasoning = ReasoningRestore{.missing  = {.tool_calls = 1, .answers = 3},
+                                             .restored = {.tool_calls = 0, .answers = 3}};
+        const Json chat = Json::parse(format_request_start_json(
+            "serve-test", 2000, make_request_log_context(9, "openai_chat_completions", request, counted, prepared)));
+        failures += check(chat.at("request").at("reasoning_missing") == Json{{"tool_call", 1}, {"answer", 3}} &&
+                              chat.at("request").at("reasoning_restored") == Json{{"tool_call", 0}, {"answer", 3}},
+                          "the request's missing and restored reasoning counts are not in its start record");
+    }
 
     ApiError preparation_error;
     preparation_error.status             = 400;
