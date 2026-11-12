@@ -197,6 +197,12 @@ struct ExecutionSchedule {
     return phase == TextPhase::Verify && first > 16 && first <= last && last <= 64;
 }
 
+// The DFlash2 proposal rounds the screened full head serves (RV-41): its calls take at most
+// ops::kScreenedHeadMaxColumns columns, and a round of up to two such calls (a batched round of three requests
+// drafting seven tokens, or two drafting more than eight; candidates ZK-07) still reads less than the full head's
+// one. Defined in draft.cpp.
+[[nodiscard]] bool screened_proposal_columns(std::int32_t mask_columns);
+
 } // namespace infernix::models::qwen3_5
 
 namespace infernix::models::qwen3_5::detail {

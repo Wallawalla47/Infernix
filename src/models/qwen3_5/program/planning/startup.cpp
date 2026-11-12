@@ -1041,10 +1041,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     scratch(layout, ops::linear_topk_workspace_capacity_bytes(
                                         head.weight.qtype, head.weight.n, head.weight.k,
                                         mask_columns, mask_columns));
-                    // RV-41: the screened full head serves rounds of at most 16 columns.
+                    // RV-41: the screened full head serves rounds of up to two calls of at most 16 columns (ZK-07),
+                    // one call at a time.
                     if (plan.proposal_head == ProposalHead::Full && parameters.draft_head_screen &&
-                        mask_columns <= ops::kScreenedHeadMaxColumns) {
-                        scratch(layout, ops::screened_head_topk_workspace_bytes(mask_columns));
+                        screened_proposal_columns(mask_columns)) {
+                        scratch(layout, ops::screened_head_topk_workspace_bytes(
+                                            std::min(mask_columns, ops::kScreenedHeadMaxColumns)));
                     }
                     matrix(layout, DType::BF16, dimension(draft->dflash2->selector_rank),
                            mask_columns);

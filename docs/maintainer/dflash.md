@@ -201,7 +201,11 @@ route, whose verification is not invariant to the draft width, changed drafts ca
 of drafts can there. Sampled requests keep the target distribution (the drafts' own q is what the acceptance test
 reads), though their tokens may differ. A column's
 candidates depend on that column alone; on the reproducible route every row drafts alone, so each of its rounds takes
-the screen and a request's drafts never depend on the batch. Wider rounds (batched rows on the default route),
+the screen and a request's drafts never depend on the batch. A batched round on the default route of 17-32 mask
+columns (three or more requests drafting seven tokens, or two drafting more than eight) takes it in two calls of at
+most 16 columns (since 2026-11-12, candidates ZK-07), which still read less than the full head's one: serving three
+lanes, such a round's head took 559 against 894 us (-37 %, Nsight Systems kernel times). The drafts of those rounds
+change from the full head's exact top 16 to the screened one's, as narrower rounds' already are. Wider rounds,
 `--lm-head-draft`'s shortlist head and the lossless route keep `linear_topk`.
 
 Measured (RTX 5090, 2026-11-09, `infernix_bench -p 512 -n 256 --spec dflash2 --draft-tokens auto`, INT8 KV, ABBA x3):
