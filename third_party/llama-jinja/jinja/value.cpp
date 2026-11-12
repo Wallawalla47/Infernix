@@ -79,7 +79,7 @@ static value slice_value(const func_args& args) {
     const auto bounds = unicode::slice_indices(array.size(), start, stop, step);
     auto result       = mk_val<value_array>();
     for (int64_t i = bounds.start; step > 0 ? i < bounds.stop : i > bounds.stop;) {
-        if (args.ctx.checkpoint) args.ctx.checkpoint();
+        args.ctx.checkpoint();
         result->push_back(array[static_cast<size_t>(i)]);
         if ((step > 0 && i > INT64_MAX - step) || (step < 0 && i < INT64_MIN - step)) break;
         i += step;
@@ -292,7 +292,7 @@ const func_builtins& global_builtins() {
              args.ensure_vals<value_string>();
              std::string format = args.get_pos(0)->as_string().str();
              std::tm local{};
-             if (!localtime_r(&args.ctx.current_time, &local)) {
+             if (!localtime_r(&args.ctx.state().current_time, &local)) {
                  throw raised_exception("strftime_now: invalid time");
              }
              if (format.empty()) return mk_val<value_string>("");
@@ -334,7 +334,7 @@ const func_builtins& global_builtins() {
              auto out = mk_val<value_array>();
              if (step == 0) { throw raised_exception("range() step argument must not be zero"); }
              for (int64_t i = start; step > 0 ? i < stop : i > stop;) {
-                 if (args.ctx.checkpoint) args.ctx.checkpoint();
+                 args.ctx.checkpoint();
                  out->push_back(mk_val<value_int>(i));
                  if ((step > 0 && i > INT64_MAX - step) || (step < 0 && i < INT64_MIN - step))
                      break;
@@ -374,7 +374,11 @@ const func_builtins& global_builtins() {
         {"test_is_divisibleby",
          [](const func_args& args) -> value {
              args.ensure_vals<value_int, value_int>();
-             bool res = args.get_pos(0)->val_int % args.get_pos(1)->val_int == 0;
+             const int64_t divisor = args.get_pos(1)->val_int;
+             // A zero divisor is a template error, as in Jinja2, not an integer fault.
+             if (divisor == 0) throw raised_exception("divisibleby: integer modulo by zero");
+             // Every integer is divisible by -1; INT64_MIN % -1 itself overflows.
+             const bool res = divisor == -1 || args.get_pos(0)->val_int % divisor == 0;
              return mk_val<value_bool>(res);
          }},
         {"test_is_string", test_type_fn<value_string>},
@@ -643,7 +647,7 @@ const func_builtins& value_string_t::get_builtins() const {
                  }
              } else {
                  while (remaining != 0) {
-                     if (args.ctx.checkpoint) args.ctx.checkpoint();
+                     args.ctx.checkpoint();
                      const auto pos = text.find(old_str, cursor);
                      if (pos == std::string::npos) break;
                      result.append(source.cut_bytes(cursor, pos)).append(new_str);

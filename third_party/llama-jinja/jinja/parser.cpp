@@ -6,6 +6,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace jinja {
@@ -19,6 +20,9 @@ static bool is_type(const statement_ptr& ptr) {
 class parser {
     const std::vector<token>& tokens;
     size_t current = 0;
+    // Enclosing loops within the current macro or call body: loop control needs one, as in
+    // Jinja2, where a macro body is a function of its own.
+    size_t loop_depth = 0;
 
     std::string source; // for error reporting
 
@@ -146,13 +150,16 @@ private:
             expect_identifier("endfor");
             expect(token::close_statement, "Expected %}");
 
-        } else if (name == "break") {
+        } else if (name == "break" || name == "continue") {
+            if (loop_depth == 0) {
+                throw parser_exception("'" + name + "' outside loop", source,
+                                       tokens[start_pos].pos);
+            }
             expect(token::close_statement, "Expected %}");
-            result = mk_stmt<break_statement>(start_pos);
-
-        } else if (name == "continue") {
-            expect(token::close_statement, "Expected %}");
-            result = mk_stmt<continue_statement>(start_pos);
+            if (name == "break")
+                result = mk_stmt<break_statement>(start_pos);
+            else
+                result = mk_stmt<continue_statement>(start_pos);
 
         } else if (name == "call") {
             statements caller_args;
@@ -169,7 +176,9 @@ private:
             expect(token::close_statement, "Expected %}");
 
             statements body;
+            const size_t enclosing_loops = std::exchange(loop_depth, 0);
             while (!is_statement({"endcall"})) { body.push_back(parse_any()); }
+            loop_depth = enclosing_loops;
 
             expect(token::open_statement, "Expected {%");
             expect_identifier("endcall");
@@ -261,7 +270,9 @@ private:
         expect(token::close_statement, "Expected %}");
         statements body;
         // Keep going until we hit {% endmacro
+        const size_t enclosing_loops = std::exchange(loop_depth, 0);
         while (!is_statement({"endmacro"})) { body.push_back(parse_any()); }
+        loop_depth = enclosing_loops;
         return mk_stmt<macro_statement>(start_pos, std::move(name), std::move(args),
                                         std::move(body));
     }
@@ -281,6 +292,16 @@ private:
     statement_ptr parse_for_statement(size_t start_pos) {
         // e.g., `message` in `for message in messages`
         auto loop_var = parse_expression_sequence(true); // should be an identifier/tuple
+        const auto names_loop = [](const statement_ptr& target) {
+            const auto* name = dynamic_cast<const identifier*>(target.get());
+            return name && name->val == "loop";
+        };
+        const auto* targets = dynamic_cast<const tuple_literal*>(loop_var.get());
+        if (names_loop(loop_var) ||
+            (targets && std::any_of(targets->val.begin(), targets->val.end(), names_loop))) {
+            throw parser_exception("Can't assign to special loop variable in for-loop target",
+                                   source, tokens[start_pos].pos);
+        }
         if (!is_identifier("in")) throw std::runtime_error("Expected 'in'");
         ++current; // consume 'in'
 
@@ -292,8 +313,11 @@ private:
         statements alternate;
 
         // Keep going until we hit {% endfor or {% else
+        ++loop_depth;
         while (!is_statement({"endfor", "else"})) { body.push_back(parse_any()); }
+        --loop_depth;
 
+        // The else block runs outside this loop: loop control there is the enclosing loop's.
         if (is_statement({"else"})) {
             ++current; // consume {%
             ++current; // consume 'else'

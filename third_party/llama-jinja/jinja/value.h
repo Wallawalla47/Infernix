@@ -31,16 +31,33 @@ struct extract_pointee<std::shared_ptr<U>> {
     using type = U;
 };
 
-template <typename T>
-bool is_val(const value& ptr) {
-    using PointeeType = typename extract_pointee<T>::type;
-    return dynamic_cast<const PointeeType*>(ptr.get()) != nullptr;
-}
+// Every value type has one kind bit; a value's kinds() holds its type's bit and its base types'
+// bits, so is_val<T> answers what dynamic_cast to T would, without the RTTI walk.
+enum value_kind : std::uint32_t {
+    kind_int       = 1U << 0U,
+    kind_float     = 1U << 1U,
+    kind_string    = 1U << 2U,
+    kind_bool      = 1U << 3U,
+    kind_array     = 1U << 4U,
+    kind_tuple     = 1U << 5U,
+    kind_object    = 1U << 6U,
+    kind_none      = 1U << 7U,
+    kind_undefined = 1U << 8U,
+    kind_func      = 1U << 9U,
+    kind_kwarg     = 1U << 10U,
+};
+
+std::uint32_t kinds_of(const value_t* ptr) noexcept; // defined after value_t
 
 template <typename T>
 bool is_val(const value_t* ptr) {
     using PointeeType = typename extract_pointee<T>::type;
-    return dynamic_cast<const PointeeType*>(ptr) != nullptr;
+    return ptr != nullptr && (kinds_of(ptr) & PointeeType::kind) != 0;
+}
+
+template <typename T>
+bool is_val(const value& ptr) {
+    return is_val<T>(ptr.get());
 }
 
 template <typename T, typename... Args>
@@ -52,13 +69,13 @@ std::shared_ptr<typename extract_pointee<T>::type> mk_val(Args&&... args) {
 template <typename T>
 const typename extract_pointee<T>::type* cast_val(const value& ptr) {
     using PointeeType = typename extract_pointee<T>::type;
-    return dynamic_cast<const PointeeType*>(ptr.get());
+    return is_val<T>(ptr) ? static_cast<const PointeeType*>(ptr.get()) : nullptr;
 }
 
 template <typename T>
 typename extract_pointee<T>::type* cast_val(value& ptr) {
     using PointeeType = typename extract_pointee<T>::type;
-    return dynamic_cast<PointeeType*>(ptr.get());
+    return is_val<T>(ptr) ? static_cast<PointeeType*>(ptr.get()) : nullptr;
 }
 // End Helper
 
@@ -95,6 +112,9 @@ struct value_t {
     value_t()               = default;
     value_t(const value_t&) = default;
     virtual ~value_t()      = default;
+
+    // The value_kind bits of the value's type and of its base types.
+    virtual std::uint32_t kinds() const noexcept { return 0; }
 
     // Note: only for debugging and error reporting purposes
     virtual std::string type() const { return ""; }
@@ -180,6 +200,8 @@ protected:
 // utils
 //
 
+inline std::uint32_t kinds_of(const value_t* ptr) noexcept { return ptr->kinds(); }
+
 const func_builtins& global_builtins();
 
 std::string value_to_json(const value& val, int indent = -1, const std::string_view item_sep = ", ",
@@ -215,11 +237,28 @@ struct value_equality {
 //
 
 struct value_int_t : public value_t {
+    static constexpr std::uint32_t kind = kind_int;
+
     value_int_t(int64_t v) {
         val_int = v;
-        val_flt = static_cast<double>(v);
-        if (static_cast<int64_t>(val_flt) != v) { val_flt = v < 0 ? -INFINITY : INFINITY; }
+        val_flt = float_of(v);
     }
+
+    static double float_of(int64_t v) noexcept {
+        const double result = static_cast<double>(v);
+        return static_cast<int64_t>(result) != v ? (v < 0 ? -INFINITY : INFINITY) : result;
+    }
+
+    // The hash of the integer v. A float or boolean equal to an integer hashes as that integer.
+    static hasher hash_of(int64_t v) noexcept {
+        static const std::size_t type_hash = typeid(value_int_t).hash_code();
+        const double flt                   = float_of(v);
+        hasher hash;
+        hash.update(&type_hash, sizeof(type_hash)).update(&v, sizeof(v)).update(&flt, sizeof(flt));
+        return hash;
+    }
+
+    std::uint32_t kinds() const noexcept override { return kind; }
 
     virtual std::string type() const override { return "Integer"; }
 
@@ -238,9 +277,12 @@ struct value_int_t : public value_t {
     virtual bool is_hashable() const override { return true; }
 
     virtual hasher unique_hash() const noexcept override {
-        return hasher(typeid(*this))
+        static const std::size_t type_hash = typeid(value_int_t).hash_code();
+        hasher hash;
+        hash.update(&type_hash, sizeof(type_hash))
             .update(&val_int, sizeof(val_int))
             .update(&val_flt, sizeof(val_flt));
+        return hash;
     }
 protected:
     virtual bool equivalent(const value_t& other) const override {
@@ -255,13 +297,14 @@ protected:
 using value_int = std::shared_ptr<value_int_t>;
 
 struct value_float_t : public value_t {
-    value val;
+    static constexpr std::uint32_t kind = kind_float;
 
     value_float_t(double v) {
         val_flt = v;
         val_int = std::isfinite(v) ? static_cast<int64_t>(v) : 0;
-        val     = mk_val<value_int>(val_int);
     }
+
+    std::uint32_t kinds() const noexcept override { return kind; }
 
     virtual std::string type() const override { return "Float"; }
 
@@ -281,11 +324,14 @@ struct value_float_t : public value_t {
 
     virtual hasher unique_hash() const noexcept override {
         if (static_cast<double>(val_int) == val_flt) {
-            return val->unique_hash();
+            return value_int_t::hash_of(val_int);
         } else {
-            return hasher(typeid(*this))
+            static const std::size_t type_hash = typeid(value_float_t).hash_code();
+            hasher hash;
+            hash.update(&type_hash, sizeof(type_hash))
                 .update(&val_int, sizeof(val_int))
                 .update(&val_flt, sizeof(val_flt));
+            return hash;
         }
     }
 protected:
@@ -301,11 +347,17 @@ protected:
 using value_float = std::shared_ptr<value_float_t>;
 
 struct value_string_t : public value_t {
+    static constexpr std::uint32_t kind = kind_string;
+
+    std::uint32_t kinds() const noexcept override { return kind; }
+
     value_string_t() { val_str = string(); }
 
     value_string_t(const std::string& v) { val_str = string(v); }
 
     value_string_t(const string& v) { val_str = v; }
+
+    value_string_t(string&& v) { val_str = std::move(v); }
 
     virtual std::string type() const override { return "String"; }
 
@@ -318,8 +370,8 @@ struct value_string_t : public value_t {
     virtual bool is_hashable() const override { return true; }
 
     virtual hasher unique_hash() const noexcept override {
-        const auto type_hash = typeid(*this).hash_code();
-        auto hash            = hasher();
+        static const std::size_t type_hash = typeid(value_string_t).hash_code();
+        auto hash                          = hasher();
         hash.update(&type_hash, sizeof(type_hash));
         val_str.hash_update(hash);
         return hash;
@@ -327,20 +379,21 @@ struct value_string_t : public value_t {
 
 protected:
     virtual bool equivalent(const value_t& other) const override {
-        return typeid(*this) == typeid(other) && val_str.str() == other.val_str.str();
+        return typeid(*this) == typeid(other) && val_str.same_text(other.val_str);
     }
 };
 
 using value_string = std::shared_ptr<value_string_t>;
 
 struct value_bool_t : public value_t {
-    value val;
+    static constexpr std::uint32_t kind = kind_bool;
 
     value_bool_t(bool v) {
         val_int = static_cast<int64_t>(v);
         val_flt = static_cast<double>(v);
-        val     = mk_val<value_int>(val_int);
     }
+
+    std::uint32_t kinds() const noexcept override { return kind; }
 
     virtual std::string type() const override { return "Boolean"; }
 
@@ -358,7 +411,7 @@ struct value_bool_t : public value_t {
 
     virtual bool is_hashable() const override { return true; }
 
-    virtual hasher unique_hash() const noexcept override { return val->unique_hash(); }
+    virtual hasher unique_hash() const noexcept override { return value_int_t::hash_of(val_int); }
 protected:
     virtual bool equivalent(const value_t& other) const override {
         return other.is_numeric() && val_int == other.val_int && val_flt == other.val_flt;
@@ -372,6 +425,10 @@ protected:
 using value_bool = std::shared_ptr<value_bool_t>;
 
 struct value_array_t : public value_t {
+    static constexpr std::uint32_t kind = kind_array;
+
+    std::uint32_t kinds() const noexcept override { return kind; }
+
     value_array_t() = default;
 
     value_array_t(value& v) { val_arr = v->val_arr; }
@@ -478,9 +535,13 @@ protected:
 using value_array = std::shared_ptr<value_array_t>;
 
 struct value_tuple_t : public value_array_t {
+    static constexpr std::uint32_t kind = kind_tuple;
+
+    std::uint32_t kinds() const noexcept override { return kind | value_array_t::kind; }
+
     value_tuple_t(value& v) { val_arr = v->val_arr; }
 
-    value_tuple_t(std::vector<value>&& arr) { val_arr = arr; }
+    value_tuple_t(std::vector<value>&& arr) { val_arr = std::move(arr); }
 
     value_tuple_t(const std::vector<value>& arr) { val_arr = arr; }
 
@@ -497,13 +558,38 @@ struct value_tuple_t : public value_array_t {
 using value_tuple = std::shared_ptr<value_tuple_t>;
 
 struct value_object_t : public value_t {
-    std::unordered_map<value, value, value_hasher, value_equivalence> unordered;
+    using key_index = std::unordered_map<value, value, value_hasher, value_equivalence>;
+    // A small object finds a key by scanning val_obj; past kLinearKeys keys it keeps this index.
+    // Equal keys hash alike, so both find the same entry.
+    static constexpr std::size_t kLinearKeys = 8;
+    std::unique_ptr<key_index> index;
     bool has_builtins = true; // context and loop objects do not have builtins
     value_object_t()  = default;
 
+    static constexpr std::uint32_t kind = kind_object;
+
+    std::uint32_t kinds() const noexcept override { return kind; }
+
     value_object_t(value& v) {
         val_obj = v->val_obj;
-        for (const auto& pair : val_obj) { unordered[pair.first] = pair.second; }
+        if (val_obj.size() > kLinearKeys) build_index();
+    }
+
+    void build_index() {
+        index = std::make_unique<key_index>();
+        for (const auto& pair : val_obj) { (*index)[pair.first] = pair.second; }
+    }
+
+    // The value stored under an (already checked) key, or null.
+    value* find_value(const value& key) {
+        if (index) {
+            const auto found = index->find(key);
+            return found == index->end() ? nullptr : &found->second;
+        }
+        for (auto& pair : val_obj) {
+            if (*pair.first == *key) return &pair.second;
+        }
+        return nullptr;
     }
 
     value_object_t(const std::map<value, value>& obj) {
@@ -538,43 +624,55 @@ struct value_object_t : public value_t {
         return string(ss.str(), 0, true);
     }
 
-    virtual bool as_bool() const override { return !unordered.empty(); }
+    virtual bool as_bool() const override { return !val_obj.empty(); }
 
     virtual bool has_key(const value& key) override {
+        ensure_hashable_key(key);
+        return find_value(key) != nullptr;
+    }
+
+    static void ensure_hashable_key(const value& key) {
         if (!key->is_immutable() || !key->is_hashable()) {
             throw std::runtime_error("Object key of unhashable type: " + key->type());
         }
-        return unordered.find(key) != unordered.end();
     }
 
     virtual void insert(const value& key, const value& val) override {
-        bool replaced = false;
         if (is_immutable()) { throw std::runtime_error("Attempting to modify immutable type"); }
-        if (has_key(key)) {
-            // if key exists, replace value in ordered list instead of appending
-            for (auto& pair : val_obj) {
-                if (*(pair.first) == *key) {
-                    pair.second = val;
-                    replaced    = true;
-                    break;
-                }
+        ensure_hashable_key(key);
+        if (index) {
+            const auto [slot, inserted] = index->try_emplace(key, val);
+            if (inserted) {
+                val_obj.push_back({key, val});
+                return;
+            }
+            slot->second = val;
+        }
+        // the key exists: replace its value in the ordered list instead of appending
+        for (auto& pair : val_obj) {
+            if (*(pair.first) == *key) {
+                pair.second = val;
+                return;
             }
         }
-        unordered[key] = val;
-        if (!replaced) { val_obj.push_back({key, val}); }
+        val_obj.push_back({key, val});
+        if (val_obj.size() > kLinearKeys) build_index();
     }
 
     virtual value& at(const value& key, value& default_val) override {
-        if (!has_key(key)) { return default_val; }
-        return unordered.at(key);
+        ensure_hashable_key(key);
+        value* found = find_value(key);
+        return found ? *found : default_val;
     }
 
     virtual value& at(const value& key) override {
-        if (!has_key(key)) {
+        ensure_hashable_key(key);
+        value* found = find_value(key);
+        if (!found) {
             throw std::runtime_error("Key '" + key->as_string().str() +
                                      "' not found in value of type " + type());
         }
-        return unordered.at(key);
+        return *found;
     }
 
     virtual value& at(const std::string& key, value& default_val) override {
@@ -626,6 +724,10 @@ using value_object = std::shared_ptr<value_object_t>;
 //
 
 struct value_none_t : public value_t {
+    static constexpr std::uint32_t kind = kind_none;
+
+    std::uint32_t kinds() const noexcept override { return kind; }
+
     virtual std::string type() const override { return "None"; }
 
     virtual bool is_none() const override { return true; }
@@ -653,6 +755,10 @@ struct value_undefined_t : public value_t {
     std::string hint; // for debugging, to indicate where undefined came from
 
     value_undefined_t(const std::string& h = "") : hint(h) {}
+
+    static constexpr std::uint32_t kind = kind_undefined;
+
+    std::uint32_t kinds() const noexcept override { return kind; }
 
     virtual std::string type() const override {
         return hint.empty() ? "Undefined" : "Undefined (hint: '" + hint + "')";
@@ -761,6 +867,10 @@ struct value_func_t : public value_t {
     std::string name;
     value arg0; // bound "this" argument, if any
 
+    static constexpr std::uint32_t kind = kind_func;
+
+    std::uint32_t kinds() const noexcept override { return kind; }
+
     value_func_t(const std::string& name, const func_handler& func) : name(name) {
         val_func = func;
     }
@@ -811,6 +921,10 @@ struct value_kwarg_t : public value_t {
     value val;
 
     value_kwarg_t(const std::string& k, const value& v) : key(k), val(v) {}
+
+    static constexpr std::uint32_t kind = kind_kwarg;
+
+    std::uint32_t kinds() const noexcept override { return kind; }
 
     virtual std::string type() const override { return "KwArg"; }
 

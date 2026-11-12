@@ -35,6 +35,27 @@ void string::hash_update(hasher& hash) const noexcept {
     for (const auto& part : parts) hash.update(part.val.data(), part.val.size());
 }
 
+bool string::same_text(const string& other) const noexcept {
+    auto left = parts.begin(), right = other.parts.begin();
+    std::size_t left_at = 0, right_at = 0;
+    while (true) {
+        while (left != parts.end() && left_at == left->val.size()) {
+            ++left;
+            left_at = 0;
+        }
+        while (right != other.parts.end() && right_at == right->val.size()) {
+            ++right;
+            right_at = 0;
+        }
+        if (left == parts.end() || right == other.parts.end())
+            return left == parts.end() && right == other.parts.end();
+        const auto count = std::min(left->val.size() - left_at, right->val.size() - right_at);
+        if (left->val.compare(left_at, count, right->val, right_at, count) != 0) return false;
+        left_at += count;
+        right_at += count;
+    }
+}
+
 bool string::is_uppercase() const { return unicode::is_upper(str()); }
 
 bool string::is_lowercase() const { return unicode::is_lower(str()); }
@@ -71,6 +92,18 @@ string& string::append(const string& other) {
         }
         parts.push_back(part);
     }
+    return *this;
+}
+
+string& string::append_plain(std::string_view text) {
+    if (!parts.empty()) {
+        auto& last = parts.back();
+        if (!last.collapsed_source_end && !last.literal && !last.origin) {
+            last.val += text;
+            return *this;
+        }
+    }
+    parts.push_back({0, std::string(text), 0, false});
     return *this;
 }
 

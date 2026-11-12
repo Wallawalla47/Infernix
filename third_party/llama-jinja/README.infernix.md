@@ -5,6 +5,10 @@ commit [`7609846557c50f9d984719a9e1e8c5f3d02f807b`](https://github.com/ggml-org/
 `common/jinja/`, under the MIT license; see [LICENSE](LICENSE).
 
 Infernix maintains this fork for chat-template rendering and adopts upstream fixes selectively.
+Its runtime has diverged from the base: statements append to one output string, a scope links to
+the scope it was entered from instead of copying its variables, and a `for` loop reads its iterable
+element by element through one Jinja2-style `loop` object. `{% break %}` and `{% continue %}` follow
+Jinja2's loop-controls extension, including its compile-time refusal outside a loop.
 
 Unicode case data is generated from Unicode 17.0.0 `SpecialCasing.txt` and
 `DerivedCoreProperties.txt`, under [UNICODE-LICENSE](UNICODE-LICENSE):

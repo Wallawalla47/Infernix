@@ -1,8 +1,10 @@
 #include "text/jinja.h"
 
 #include <atomic>
+#include <cstdint>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -74,6 +76,137 @@ int language_semantics() {
                                "{{ value|unknown_filter }}"}) {
         try {
             (void)JinjaTemplate(source, "error-test").render(Json::object());
+            ++failures;
+        } catch (const std::invalid_argument& error) {
+            failures += check(std::string(error.what()).starts_with("error-test:"),
+                              "template error omitted its source name");
+        }
+    }
+    return failures;
+}
+
+// Loop control, lazy loops, scopes and integer tests. Every expected text and every refusal is
+// Python Jinja2 3.1.6's (plain Environment with jinja2.ext.loopcontrols), except where noted.
+int loops_and_scopes() {
+    struct Example {
+        std::string source;
+        Json input;
+        std::string expected;
+    };
+
+    const Example cases[]{
+        // Output written before a {% break %} or {% continue %} inside an if is kept.
+        {"{% for i in [1] %}A{% if true %}B{% break %}{% endif %}C{% endfor %}", Json::object(),
+         "AB"},
+        {"{% for i in [1, 2] %}A{% if true %}B{% continue %}{% endif %}C{% endfor %}",
+         Json::object(), "ABAB"},
+        {"{% for i in [1, 2] %}A{% if true %}B{% if true %}C{% break %}D{% endif %}E{% endif %}F"
+         "{% endfor %}G",
+         Json::object(), "ABCG"},
+        {"{% for i in [1, 2, 3] %}<{% if i == 2 %}x{% else %}{{ i }}{% continue %}{% endif %}>"
+         "{% endfor %}",
+         Json::object(), "<1<x><3"},
+        {"{% for i in [1, 2] %}{% for j in [1, 2, 3] %}{{ i }}{{ j }}{% if j == 2 %}!{% break %}"
+         "{% endif %}{% endfor %};{% endfor %}",
+         Json::object(), "1112!;2122!;"},
+        // An else block's loop control is the enclosing loop's.
+        {"{% for i in [1, 2] %}[{% for j in [] %}{{ j }}{% else %}e{{ i }}{% break %}{% endfor %}]"
+         "{% endfor %}",
+         Json::object(), "[e1"},
+        // Loop control inside a set or filter block leaves the loop without the block.
+        {"{% for i in [1, 2] %}A{% set x %}B{% break %}{% endset %}C{% endfor %}D", Json::object(),
+         "AD"},
+        {"{% for i in [1, 2] %}A{% filter upper %}b{% break %}{% endfilter %}C{% endfor %}D",
+         Json::object(), "AD"},
+        // The else block runs when no iteration completed its body.
+        {"{% for x in [1, 2] %}{% continue %}{% else %}E{% endfor %}", Json::object(), "E"},
+        // Elements are taken one at a time: an element after the break is never unpacked, and the
+        // loop reads its list live (length is the list's length when first asked for).
+        {"{% for a, b in [[1, 2], 3] %}{{ a }}{{ b }}{% break %}{% endfor %}", Json::object(),
+         "12"},
+        {"{% set xs = [1, 2] %}{% for x in xs %}{{ x }}{% if x == 1 %}{% set _ = xs.append(3) %}"
+         "{% endif %}{% endfor %}",
+         Json::object(), "123"},
+        {"{% set xs = [1, 2] %}{% for x in xs %}{{ x }}/{{ loop.length }}{% if x == 1 %}"
+         "{% set _ = xs.append(3) %}{% endif %};{% endfor %}",
+         Json::object(), "1/2;2/2;3/2;"},
+        {"{% set xs = [1, 2] %}{% for x in xs %}{{ x }}{{ loop.last }}{% if loop.last %}"
+         "{% set _ = xs.append(3) %}{% endif %};{% endfor %}",
+         Json::object(), "1False;2True;"},
+        // A filtered loop evaluates its condition when it reaches an element, or when a look-ahead
+        // (length, last) needs it.
+        {"{% set ns = namespace(n=0) %}{% for x in [1, 2, 3] if ns.n < 2 %}"
+         "{% set ns.n = ns.n + 1 %}{{ x }}{% endfor %}",
+         Json::object(), "12"},
+        {"{% set ns = namespace(n=0) %}{% for x in [1, 2, 3] if ns.n < 2 %}{{ loop.length }}"
+         "{% set ns.n = ns.n + 1 %}{{ x }}{% endfor %}",
+         Json::object(), "313233"},
+        {"{% set ns = namespace(n=0) %}{% for x in [1, 2, 3] if ns.n < 2 %}{{ loop.last }}"
+         "{% set ns.n = ns.n + 1 %}{{ x }}{% endfor %}",
+         Json::object(), "False1False2True3"},
+        {"{% for x in [1, 2, 3, 4] if x is even %}{{ loop.index }}/{{ loop.length }}"
+         "{{ loop.previtem }}{{ loop.nextitem }}{{ loop.last }};{% endfor %}",
+         Json::object(), "1/24False;2/22True;"},
+        {"{% for i in [1] %}{% for x in [1, 2] if loop.index == 1 %}{{ x }}{% endfor %}"
+         "{% endfor %}",
+         Json::object(), "12"},
+        {"{% for c in 'abc' %}{{ c }}{{ loop.revindex0 }}{{ loop.nextitem }}{% endfor %}",
+         Json::object(), "a2bb1cc0"},
+        {"{% for k in {'a': 1, 'b': 2} %}{{ k }}{{ loop.previtem }}{{ loop.length }}{% endfor %}",
+         Json::object(), "a2ba2"},
+        // One loop object per loop, as Jinja2's LoopContext: a stored `loop` shows its last state.
+        {"{% set n = namespace(l=none) %}{% for x in [1, 2] %}{% if loop.first %}"
+         "{% set n.l = loop %}{% endif %}{% endfor %}{{ n.l.index }}",
+         Json::object(), "2"},
+        // A macro defined in a loop reads the enclosing scopes when it runs.
+        {"{% set n = namespace(f=none) %}{% set y = 1 %}{% for x in ['c'] %}{% macro show() %}"
+         "{{ y }}{% endmacro %}{% set n.f = show %}{% endfor %}{% set y = 2 %}{{ n.f() }}",
+         Json::object(), "2"},
+        // divisibleby: every integer is divisible by -1, including INT64_MIN.
+        {"{{ -6 is divisibleby(3) }}{{ 7 is divisibleby(-2) }}{{ 0 is divisibleby(5) }}",
+         Json::object(), "TrueFalseTrue"},
+        {"{{ n is divisibleby(-1) }}{{ n is divisibleby(2) }}",
+         {{"n", std::numeric_limits<std::int64_t>::min()}},
+         "TrueTrue"},
+    };
+    int failures = 0;
+    for (const auto& item : cases) {
+        try {
+            const auto actual = JinjaTemplate(item.source, "loop-test").render(item.input).text;
+            if (actual == item.expected) continue;
+            std::cerr << "Jinja loop/scope mismatch in " << item.source
+                      << "\nexpected: " << Json(item.expected).dump()
+                      << "\nactual: " << Json(actual).dump() << '\n';
+        } catch (const std::exception& error) {
+            std::cerr << "Jinja loop/scope case failed: " << item.source << '\n'
+                      << error.what() << '\n';
+        }
+        ++failures;
+    }
+    // Jinja2 refuses these when the template compiles, reached or not.
+    for (const char* source :
+         {"A{% break %}B", "{% if false %}{% continue %}{% endif %}ok",
+          "{% macro m() %}x{% break %}{% endmacro %}{% for i in [1] %}{{ m() }}{% endfor %}",
+          "{% macro w() %}[{{ caller() }}]{% endmacro %}{% for i in [1, 2] %}{% call w() %}x"
+          "{% break %}{% endcall %}{% endfor %}",
+          "{% for loop in [1, 2] %}{{ loop }}{% endfor %}",
+          "{% for a, loop in [[1, 2]] %}{{ a }}{% endfor %}"}) {
+        try {
+            (void)JinjaTemplate(source, "compile-test");
+            std::cerr << "template compiled: " << source << '\n';
+            ++failures;
+        } catch (const std::invalid_argument& error) {
+            failures += check(std::string(error.what()).starts_with("compile-test:"),
+                              "template compile error omitted its source name");
+        }
+    }
+    // Template errors, not process faults: a zero divisor, a `loop` attribute assignment.
+    const Json zero{{"zero", 0}};
+    for (const char* source : {"{{ 1 is divisibleby(0) }}", "{{ 5 is divisibleby(zero) }}",
+                               "{% for x in [1, 2] %}{% set loop.foo = 1 %}{% endfor %}"}) {
+        try {
+            (void)JinjaTemplate(source, "error-test").render(zero);
+            std::cerr << "template rendered: " << source << '\n';
             ++failures;
         } catch (const std::invalid_argument& error) {
             failures += check(std::string(error.what()).starts_with("error-test:"),
@@ -311,8 +444,8 @@ int main(int argc, char** argv) {
         return 0;
     }
     try {
-        const int failures =
-            language_semantics() + origins_and_requests() + trim_semantics() + literal_content();
+        const int failures = language_semantics() + loops_and_scopes() + origins_and_requests() +
+                             trim_semantics() + literal_content();
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

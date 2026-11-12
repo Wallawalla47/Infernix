@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace jinja {
@@ -40,9 +41,13 @@ struct string {
     std::size_t length() const;
     std::size_t byte_size() const;
     void hash_update(hasher& hash) const noexcept;
+    // str() == other.str(), without joining either string's parts.
+    bool same_text(const string& other) const noexcept;
     bool is_uppercase() const;
     bool is_lowercase() const;
     string& append(const string& other);
+    // The same as append(string(text)): ordinary bytes without an origin.
+    string& append_plain(std::string_view text);
     string cut_bytes(std::size_t begin, std::size_t end) const;
     string slice(std::optional<std::int64_t> start, std::optional<std::int64_t> stop,
                  std::int64_t step = 1) const;

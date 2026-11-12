@@ -8,8 +8,11 @@
 #include <algorithm>
 #include <array>
 #include <initializer_list>
+#include <iterator>
 #include <map>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace infernix::models::qwen3_5::frontend {
 namespace {
@@ -247,6 +250,46 @@ bool same_prefix(const text::TemplateOutput& lhs, const text::TemplateOutput& rh
     }
 }
 
+// One boundary probe's edit of the request's own template context, undone when the probe ends: the
+// probe renders the first messages only, or one message more, without the generation prompt. The
+// edit moves the cut messages out and back, so a probe never copies the conversation.
+class ProbeContext {
+public:
+    explicit ProbeContext(Json& context)
+        : context_(context),
+          add_generation_prompt_(std::exchange(context["add_generation_prompt"], false)),
+          messages_(context["messages"].get_ref<Json::array_t&>()) {}
+    ProbeContext(const ProbeContext&)            = delete;
+    ProbeContext& operator=(const ProbeContext&) = delete;
+
+    // Restoring needs no allocation: the message list keeps its capacity.
+    ~ProbeContext() {
+        if (appended_) messages_.pop_back();
+        for (auto& message : cut_) messages_.push_back(std::move(message));
+        context_["add_generation_prompt"] = std::move(add_generation_prompt_);
+    }
+
+    void keep(std::size_t count) {
+        const auto first = messages_.begin() + static_cast<std::ptrdiff_t>(count);
+        cut_.assign(std::make_move_iterator(first), std::make_move_iterator(messages_.end()));
+        messages_.erase(first, messages_.end());
+    }
+
+    void append(Json message) {
+        messages_.push_back(std::move(message));
+        appended_ = true;
+    }
+
+    const Json& context() const noexcept { return context_; }
+
+private:
+    Json& context_;
+    Json add_generation_prompt_;
+    Json::array_t& messages_;
+    std::vector<Json> cut_;
+    bool appended_ = false;
+};
+
 bool real_user(const ChatMessage& message) {
     if (message.role != ChatRole::User) return false;
     if (message.has_media()) return true;
@@ -483,12 +526,10 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         if (count > messages.size()) return std::nullopt;
         if (const auto it = prefix_cache.find(count); it != prefix_cache.end()) return it->second;
         std::optional<std::size_t> boundary;
-        Json probe = context;
-        probe["messages"].erase(probe["messages"].begin() + static_cast<std::ptrdiff_t>(count),
-                                probe["messages"].end());
-        probe["add_generation_prompt"] = false;
+        ProbeContext probe(context);
+        probe.keep(count);
         try {
-            const auto rendered = compiled_.render(probe, execution);
+            const auto rendered = compiled_.render(probe.context(), execution);
             if (same_prefix(output, rendered, rendered.text.size()))
                 boundary = rendered.text.size();
         } catch (const RequestError&) {
@@ -584,13 +625,12 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     // the checkpoint to retain: subsequent requests still require exact token/state identity.
     bool retain_open_turn = context.value("preserve_thinking", false);
     if (first_tail_assistant && layout.messages[*first_tail_assistant].closed) {
-        Json probe = context;
-        probe["messages"].push_back({{"role", "user"}, {"content", ""}});
-        probe["add_generation_prompt"] = false;
-        auto probe_options             = execution;
-        probe_options.regions          = {};
+        ProbeContext probe(context);
+        probe.append({{"role", "user"}, {"content", ""}});
+        auto probe_options    = execution;
+        probe_options.regions = {};
         try {
-            const auto next_turn     = compiled_.render(probe, probe_options);
+            const auto next_turn     = compiled_.render(probe.context(), probe_options);
             const auto history_bytes = generation_begin.value_or(output.text.size());
             retain_open_turn         = same_prefix(next_turn, output, history_bytes);
         } catch (const RequestError&) { throw; } catch (const std::invalid_argument&) {

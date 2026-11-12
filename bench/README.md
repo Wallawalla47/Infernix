@@ -50,7 +50,7 @@ before they landed and gave different outputs from run to run at every width aft
 ## Build
 
 `CMakeLists.txt` includes explicit registrations from `ops/`, `inference/`, `decode_quality/`,
-`context_cost/` and `models/qwen3_5/`. All executables remain under `build/bench/`; the Op registration helper
+`context_cost/`, `models/qwen3_5/` and `text/`. All executables remain under `build/bench/`; the Op registration helper
 lives in `cmake/InfernixBenchmarks.cmake`.
 
 ```bash
@@ -1445,6 +1445,29 @@ closed.
 ```bash
 ./build/bench/infernix_causal_conv1d_silu_bench --legacy-stage --split --cache cold --channels 8192 --tokens 1024,8192
 ```
+
+## Chat-template render benchmark
+
+`infernix_chat_template_render_bench` (CPU only) times chat-template rendering over synthetic agent
+histories: a leading System turn, the task, then assistant turns with reasoning that call one or two
+of twelve tools, their results, and an occasional answer with a new user request, ending with a tool
+result. Each template is compiled once. Per history size it reports the median of `--repeats`
+renders (after one warm-up) of one Jinja render of the request's template context, of one whole
+`CompiledChatTemplate::render` request (the prompt render plus the boundary probes a request
+performs), of a deep copy of the context, and of a template that reads nothing (binding the context
+alone). `--dump DIR` writes every render's complete output - text, literal spans, input regions and
+boundary mappings, and for requests the message, cache and rewrite boundaries - for the timed
+requests and for twelve request variants (thinking, effort, kwargs, continuation, next-turn history,
+late System turn), so two builds can be compared byte for byte:
+
+```bash
+cmake --build build --parallel --target infernix_chat_template_render_bench
+./build/bench/infernix_chat_template_render_bench \
+  --template qwen3_8=tools/chat_templates/qwen3_8.jinja --sizes 100,300,1000,1600 --repeats 7 \
+  --dump /tmp/renders
+```
+
+Without `--template` it renders `tools/chat_templates/qwen3_6.jinja` and `qwen3_8.jinja`.
 
 ## Reports
 

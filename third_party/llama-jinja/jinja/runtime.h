@@ -4,10 +4,14 @@
 #include "value.h"
 
 #include <cassert>
+#include <cstdint>
 #include <ctime>
+#include <functional>
 #include <memory>
-#include <sstream>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace jinja {
@@ -51,74 +55,83 @@ const T* cast_stmt(const statement_ptr& ptr) {
 using visitor_pair = std::pair<std::string, std::vector<statement*>>;
 using visitor_fn   = std::function<void(bool, statement*, std::vector<visitor_pair>)>;
 
-struct context {
-    std::shared_ptr<std::string>
-        src;                  // for debugging; use shared_ptr to avoid copying on scope creation
-    std::time_t current_time; // for functions that need current time
+// One variable scope. A scope links to the scope it was entered from: a lookup walks outward to the
+// innermost binding of a name, and an assignment always binds in the scope itself, so entering a
+// scope copies nothing.
+class scope_frame {
+public:
+    explicit scope_frame(std::shared_ptr<scope_frame> parent = nullptr) noexcept
+        : parent_(std::move(parent)) {}
 
-    std::function<void()> checkpoint;
+    const std::shared_ptr<scope_frame>& parent() const noexcept { return parent_; }
 
-    visitor_fn visitor;
-
-    // src is optional, used for error reporting
-    context(std::string src = "") : src(std::make_shared<std::string>(std::move(src))) {
-        env               = mk_val<value_object>();
-        env->has_builtins = false; // context object has no builtins
-        env->insert("true", mk_val<value_bool>(true));
-        env->insert("True", mk_val<value_bool>(true));
-        env->insert("false", mk_val<value_bool>(false));
-        env->insert("False", mk_val<value_bool>(false));
-        env->insert("none", mk_val<value_none>());
-        env->insert("None", mk_val<value_none>());
-        current_time = std::time(nullptr);
-    }
-
-    ~context() = default;
-
-    // Keep macro definition scopes alive for this render. Callables refer back weakly,
-    // so an environment containing its own macro does not form an ownership cycle.
-    std::weak_ptr<value_object_t> capture_scope() {
-        captured_scopes->push_back(env);
-        return env;
-    }
-
-    std::weak_ptr<value_object_t> current_scope() const { return env; }
-
-    context(const context& caller, const std::weak_ptr<value_object_t>& lexical_scope) : context() {
-        const auto scope = lexical_scope.lock();
-        if (!scope) throw std::runtime_error("macro definition scope has expired");
-        for (const auto& pair : scope->as_ordered_object()) set_val(pair.first, pair.second);
-        current_time    = caller.current_time;
-        checkpoint      = caller.checkpoint;
-        src             = caller.src;
-        captured_scopes = caller.captured_scopes;
-    }
-
-    context(const context& parent) : context() {
-        // inherit variables (for example, when entering a new scope)
-        auto& pvar = parent.env->as_ordered_object();
-        for (const auto& pair : pvar) { set_val(pair.first, pair.second); }
-        current_time    = parent.current_time;
-        checkpoint      = parent.checkpoint;
-        src             = parent.src;
-        captured_scopes = parent.captured_scopes;
-    }
-
-    value get_val(const std::string& name) {
-        value default_val = mk_val<value_undefined>(name);
-        return env->at(name, default_val);
-    }
-
-    void set_val(const std::string& name, const value& val) { env->insert(name, val); }
-
-    void set_val(const value& name, const value& val) { env->insert(name, val); }
-
-    void print_vars() const { printf("Context Variables:\n%s\n", value_to_json(env, 2).c_str()); }
+    value* find_local(std::string_view name) noexcept;
+    void bind(std::string_view name, const value& val);
 
 private:
-    value_object env;
-    std::shared_ptr<std::vector<value_object>> captured_scopes =
-        std::make_shared<std::vector<value_object>>();
+    struct name_hash {
+        using is_transparent = void;
+        std::size_t operator()(std::string_view name) const noexcept {
+            return std::hash<std::string_view>{}(name);
+        }
+    };
+    using name_index = std::unordered_map<std::string, std::size_t, name_hash, std::equal_to<>>;
+    // Loop and macro scopes hold a few names; a scope that outgrows a short scan is indexed.
+    static constexpr std::size_t kLinearScan = 12;
+
+    std::shared_ptr<scope_frame> parent_;
+    std::vector<std::pair<std::string, value>> vars_;
+    std::unique_ptr<name_index> index_;
+};
+
+// What every scope of one render shares.
+struct render_state {
+    std::shared_ptr<const std::string> src; // for error reporting
+    std::time_t current_time = 0;           // for functions that need current time
+    std::function<void()> checkpoint;
+    visitor_fn visitor;
+    // Macro definition scopes stay alive for the render. Callables refer back weakly, so a scope
+    // that holds its own macro does not form an ownership cycle.
+    std::vector<std::shared_ptr<scope_frame>> captured_scopes;
+};
+
+struct context {
+    // A render's outermost scope. src is optional, used for error reporting.
+    explicit context(std::string src = "");
+    explicit context(std::shared_ptr<const std::string> src);
+    // A new scope inside `parent`, such as a loop's.
+    context(const context& parent);
+    // A macro or caller body: a new scope inside the scope it was defined in, run for `caller`.
+    context(const context& caller, const std::weak_ptr<scope_frame>& lexical_scope);
+    context& operator=(const context&) = delete;
+    ~context() = default;
+
+    render_state& state() const noexcept { return *state_; }
+
+    void checkpoint() const {
+        if (state_->checkpoint) state_->checkpoint();
+    }
+
+    void visitor(bool is_leaf, statement* node, std::vector<visitor_pair> children) const {
+        state_->visitor(is_leaf, node, std::move(children));
+    }
+
+    // The innermost binding of `name`, or null when no scope binds it.
+    const value* find(std::string_view name) const noexcept;
+
+    void set_val(std::string_view name, const value& val) { frame_->bind(name, val); }
+
+    std::weak_ptr<scope_frame> capture_scope() {
+        state_->captured_scopes.push_back(frame_);
+        return frame_;
+    }
+
+    std::weak_ptr<scope_frame> current_scope() const { return frame_; }
+
+private:
+    std::unique_ptr<render_state> owned_state_; // the outermost scope only
+    render_state* state_;
+    std::shared_ptr<scope_frame> frame_;
 };
 
 // utils for visiting AST nodes
@@ -127,6 +140,10 @@ static std::vector<statement*> stmts_to_ptr(const statements& stmts) {
     for (const auto& stmt : stmts) { children.push_back(stmt.get()); }
     return children;
 }
+
+// How a statement ends: normally, or at a {% break %} or {% continue %} of the enclosing loop.
+// Loop control is a result, not an exception, so the output written before it is kept.
+enum class flow : std::uint8_t { next, break_loop, continue_loop };
 
 /**
  * Base class for all nodes in the AST.
@@ -139,11 +156,19 @@ struct statement {
 
     virtual void visit(context& ctx) { ctx.visitor(true, this, {}); }
 
-    // execute_impl must be overridden by derived classes
+    // Expression position: execute_impl must be overridden by expressions and by statements
+    // that produce a value.
     virtual value execute_impl(context&) { throw_exec_error(); }
 
     // execute is the public method to execute a statement with error handling
     value execute(context&);
+
+    // Statement position: appends the statement's output to `out`. By default the output is the
+    // statement's value.
+    virtual flow render_impl(context& ctx, string& out);
+
+    // render is the public method to render a statement with error handling
+    flow render(context& ctx, string& out);
 
 private:
     [[noreturn]] void throw_exec_error() const {
@@ -181,10 +206,7 @@ struct output_statement : public statement {
 
     std::string type() const override { return "Output"; }
 
-    value execute_impl(context& ctx) override {
-        const auto result = operand->execute(ctx);
-        return mk_val<value_string>(result->as_string());
-    }
+    flow render_impl(context& ctx, string& out) override;
 };
 
 // Statements
@@ -215,7 +237,7 @@ struct if_statement : public statement {
 
     std::string type() const override { return "If"; }
 
-    value execute_impl(context& ctx) override;
+    flow render_impl(context& ctx, string& out) override;
 
     void visit(context& ctx) override {
         ctx.visitor(false, this,
@@ -227,6 +249,8 @@ struct if_statement : public statement {
 
 struct identifier;
 struct tuple_literal;
+struct slice_expression;
+struct integer_literal;
 
 /**
  * Loop over each item in a sequence
@@ -248,7 +272,7 @@ struct for_statement : public statement {
 
     std::string type() const override { return "For"; }
 
-    value execute_impl(context& ctx) override;
+    flow render_impl(context& ctx, string& out) override;
 
     void visit(context& ctx) override {
         ctx.visitor(false, this,
@@ -262,21 +286,13 @@ struct for_statement : public statement {
 struct break_statement : public statement {
     std::string type() const override { return "Break"; }
 
-    struct signal : public std::exception {
-        const char* what() const noexcept override { return "Break statement executed"; }
-    };
-
-    [[noreturn]] value execute_impl(context&) override { throw break_statement::signal(); }
+    flow render_impl(context&, string&) override { return flow::break_loop; }
 };
 
 struct continue_statement : public statement {
     std::string type() const override { return "Continue"; }
 
-    struct signal : public std::exception {
-        const char* what() const noexcept override { return "Continue statement executed"; }
-    };
-
-    [[noreturn]] value execute_impl(context&) override { throw continue_statement::signal(); }
+    flow render_impl(context&, string&) override { return flow::continue_loop; }
 };
 
 // do nothing
@@ -284,6 +300,8 @@ struct noop_statement : public statement {
     std::string type() const override { return "Noop"; }
 
     value execute_impl(context&) override { return mk_val<value_undefined>(); }
+
+    flow render_impl(context&, string&) override { return flow::next; }
 };
 
 struct set_statement : public statement {
@@ -291,15 +309,14 @@ struct set_statement : public statement {
     statement_ptr val;
     statements body;
 
-    set_statement(statement_ptr&& assignee, statement_ptr&& value, statements&& body)
-        : assignee(std::move(assignee)), val(std::move(value)), body(std::move(body)) {
-        chk_type<expression>(this->assignee);
-        chk_type<expression>(this->val);
-    }
+    // {% set name = ... %}: the name, resolved once with the program.
+    const identifier* assignee_name = nullptr;
+
+    set_statement(statement_ptr&& assignee, statement_ptr&& value, statements&& body);
 
     std::string type() const override { return "Set"; }
 
-    value execute_impl(context& ctx) override;
+    flow render_impl(context& ctx, string& out) override;
 
     void visit(context& ctx) override {
         ctx.visitor(
@@ -323,6 +340,11 @@ struct macro_statement : public statement {
 
     value execute_impl(context& ctx) override;
 
+    flow render_impl(context& ctx, string&) override {
+        (void)execute_impl(ctx);
+        return flow::next;
+    }
+
     void visit(context& ctx) override {
         ctx.visitor(
             false, this,
@@ -338,6 +360,8 @@ struct comment_statement : public statement {
     std::string type() const override { return "Comment"; }
 
     value execute_impl(context&) override { return mk_val<value_undefined>(); }
+
+    flow render_impl(context&, string&) override { return flow::next; }
 };
 
 // Expressions
@@ -353,12 +377,14 @@ struct member_expression : public expression {
     statement_ptr object;
     statement_ptr property;
     bool computed; // true if obj[expr] and false if obj.prop
+    // The property's form, resolved once with the program: obj[a:b:c], obj.0, or obj.prop with
+    // its key built once and only ever read.
+    const slice_expression* slice_property = nullptr;
+    const integer_literal* static_index    = nullptr;
+    const identifier* static_name          = nullptr;
+    value static_key;
 
-    member_expression(statement_ptr&& object, statement_ptr&& property, bool computed)
-        : object(std::move(object)), property(std::move(property)), computed(computed) {
-        chk_type<expression>(this->object);
-        chk_type<expression>(this->property);
-    }
+    member_expression(statement_ptr&& object, statement_ptr&& property, bool computed);
 
     std::string type() const override { return "MemberExpression"; }
 
@@ -431,6 +457,12 @@ struct string_literal : public expression {
     std::string type() const override { return "StringLiteral"; }
 
     value execute_impl(context&) override { return mk_val<value_string>(val); }
+
+    // Template text: ordinary bytes appended without an intermediate value.
+    flow render_impl(context&, string& out) override {
+        out.append_plain(val);
+        return flow::next;
+    }
 };
 
 struct array_literal : public expression {
@@ -459,9 +491,10 @@ struct tuple_literal : public expression {
     std::string type() const override { return "TupleLiteral"; }
 
     value execute_impl(context& ctx) override {
-        auto arr = mk_val<value_array>();
-        for (const auto& item_stmt : val) { arr->push_back(item_stmt->execute(ctx)); }
-        return mk_val<value_tuple>(std::move(arr->as_array()));
+        std::vector<value> items;
+        items.reserve(val.size());
+        for (const auto& item_stmt : val) { items.push_back(item_stmt->execute(ctx)); }
+        return mk_val<value_tuple>(std::move(items));
     }
 };
 
@@ -489,14 +522,52 @@ struct object_literal : public expression {
  * of operations being determined by the operator.
  */
 struct binary_expression : public expression {
+    enum class operation : std::uint8_t {
+        logical_and,
+        logical_or,
+        equal,
+        not_equal,
+        concat,
+        in,
+        not_in,
+        add,
+        subtract,
+        multiply,
+        divide,
+        modulo,
+        less,
+        greater,
+        greater_equal,
+        less_equal,
+        other,
+    };
+
     token op;
     statement_ptr left;
     statement_ptr right;
+    operation kind; // op, classified once with the program
 
     binary_expression(token op, statement_ptr&& left, statement_ptr&& right)
-        : op(std::move(op)), left(std::move(left)), right(std::move(right)) {
+        : op(std::move(op)), left(std::move(left)), right(std::move(right)),
+          kind(classify(this->op.value)) {
         chk_type<expression>(this->left);
         chk_type<expression>(this->right);
+    }
+
+    static operation classify(const std::string& name) {
+        static const std::pair<const char*, operation> names[] = {
+            {"and", operation::logical_and}, {"or", operation::logical_or},
+            {"==", operation::equal},        {"!=", operation::not_equal},
+            {"~", operation::concat},        {"in", operation::in},
+            {"not in", operation::not_in},   {"+", operation::add},
+            {"-", operation::subtract},      {"*", operation::multiply},
+            {"/", operation::divide},        {"%", operation::modulo},
+            {"<", operation::less},          {">", operation::greater},
+            {">=", operation::greater_equal}, {"<=", operation::less_equal}};
+        for (const auto& [text, which] : names) {
+            if (name == text) return which;
+        }
+        return operation::other;
     }
 
     std::string type() const override { return "BinaryExpression"; }
@@ -550,7 +621,7 @@ struct filter_statement : public statement {
 
     std::string type() const override { return "FilterStatement"; }
 
-    value execute_impl(context& ctx) override;
+    flow render_impl(context& ctx, string& out) override;
 
     void visit(context& ctx) override {
         ctx.visitor(false, this, {{"filter", {filter.get()}}, {"body", stmts_to_ptr(body)}});
@@ -594,12 +665,13 @@ struct test_expression : public expression {
     statement_ptr operand;
     bool negate;
     statement_ptr test;
+    // The test's name (`is name` or `is name(args)`) and builtin, resolved once with the program;
+    // an unknown or malformed test fails when the expression runs.
+    const identifier* test_name     = nullptr;
+    const call_expression* test_call = nullptr;
+    const func_handler* handler     = nullptr;
 
-    test_expression(statement_ptr&& operand, bool negate, statement_ptr&& test)
-        : operand(std::move(operand)), negate(negate), test(std::move(test)) {
-        chk_type<expression>(this->operand);
-        chk_type<identifier, call_expression>(this->test);
-    }
+    test_expression(statement_ptr&& operand, bool negate, statement_ptr&& test);
 
     std::string type() const override { return "TestExpression"; }
 
@@ -767,44 +839,13 @@ struct rethrown_exception : public std::exception {
 
 //////////////////////
 
-static void gather_string_parts_recursive(const value& val, value_string& parts) {
-    if (is_val<value_string>(val)) {
-        const auto& str_val = cast_val<value_string>(val)->val_str;
-        parts->val_str.append(str_val);
-    } else if (is_val<value_int>(val) || is_val<value_float>(val) || is_val<value_bool>(val)) {
-        std::string str_val = val->as_string().str();
-        parts->val_str.append(str_val);
-    } else if (is_val<value_array>(val)) {
-        auto items = cast_val<value_array>(val)->as_array();
-        for (const auto& item : items) { gather_string_parts_recursive(item, parts); }
-    }
-}
-
-static std::string render_string_parts(const value_string& parts) {
-    std::ostringstream oss;
-    for (const auto& part : parts->val_str.parts) { oss << part.val; }
-    return oss.str();
-}
-
 struct runtime {
     context& ctx;
 
     explicit runtime(context& ctx) : ctx(ctx) {}
 
-    value_array execute(const program& prog) {
-        value_array results = mk_val<value_array>();
-        for (const auto& stmt : prog.body) {
-            value res = stmt->execute(ctx);
-            results->push_back(std::move(res));
-        }
-        return results;
-    }
-
-    static value_string gather_string_parts(const value& val) {
-        value_string parts = mk_val<value_string>();
-        gather_string_parts_recursive(val, parts);
-        return parts;
-    }
+    // The program's output, as one string with its parts' origins.
+    string render(const program& prog);
 
     static std::string debug_dump_program(const program& prog, const std::string& src);
 };
