@@ -194,7 +194,7 @@ struct SemanticThinkingState {
     ReasoningLoopAction loop = ReasoningLoopAction::Off;
     std::string loop_partial;
     std::string loop_tail;
-    std::vector<std::uint64_t> loop_round;
+    std::vector<LoopWord> loop_round;
     std::uint32_t loop_next_check      = kLoopCheckTokens;
     bool loop_detected                 = false;
     std::uint32_t loop_thinking_tokens = 0;
@@ -467,13 +467,14 @@ public:
         }
     }
 
-    // The repeated-passage coverage of the committed thinking plus the previewed round's words.
-    [[nodiscard]] double loop_coverage(const std::vector<std::uint64_t>& round) const {
+    // The repeated-passage coverage of the committed thinking plus the previewed round's words (the
+    // digit-folded one where that alone fires the guard).
+    [[nodiscard]] double loop_coverage(const std::vector<LoopWord>& round) const {
         const std::size_t keep = kLoopHistoryWords > round.size() ? kLoopHistoryWords - round.size() : 0;
-        std::vector<std::uint64_t> words(loop_words.end() - static_cast<std::ptrdiff_t>(std::min(keep, loop_words.size())),
-                                         loop_words.end());
+        std::vector<LoopWord> words(loop_words.end() - static_cast<std::ptrdiff_t>(std::min(keep, loop_words.size())),
+                                    loop_words.end());
         words.insert(words.end(), round.begin(), round.end());
-        return repeated_passage_coverage(words);
+        return loop_passage_coverage(words);
     }
 
     // Notes where a previewed `<tool_call>` token's bytes start in its channel's stream. The token
@@ -548,7 +549,7 @@ public:
     DecoderState preview_state;
     SemanticThinkingState semantic;
     SemanticThinkingState preview_semantic;
-    std::vector<std::uint64_t> loop_words; // committed thinking words (reasoning-loop guard)
+    std::vector<LoopWord> loop_words; // committed thinking words (reasoning-loop guard)
     PrefixExecutionTracker prefix_execution;
     PrefixExecutionTracker preview_prefix_execution;
     std::optional<std::uint32_t> preview_execution_split_after;

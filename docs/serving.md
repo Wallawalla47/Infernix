@@ -797,7 +797,13 @@ penalties do not catch because every pass varies a little.
   split into words (letters, digits and non-ASCII bytes; ASCII case folded) and punctuation marks.
   The guard fires when at least 25 % of the last 2,000 words lie inside a 12-word passage that
   occurs at least three times in the last 30,000 words. A passage repeated twice (a recap) does not
-  count. The thresholds are those of Strata's measured `reasoning_loop_recovery`. It also fires when
+  count. The thresholds are those of Strata's measured `reasoning_loop_recovery`. A counting loop
+  (one line rewritten with only a number changing, such as `Checking item 7 of 40...`) repeats no
+  12-word passage when its lines are short, so the guard also reads the words with every run of
+  ASCII digits folded to one digit, and fires when at least 50 % of the last 2,000 words lie inside
+  a 12-word folded passage that occurs at least 32 times: a counting loop repeats its line once per
+  line, while thinking that walks through a numbered template with words changing from line to
+  line repeats each folded passage a few times. It also fires when
   the last 2,048 characters repeat one period of at most 64 characters, and when the thinking's tail
   holds a run-on of hyphen-joined words (ASCII letters joined by single hyphens) of 200 characters or
   more: thinking that degenerates into one `a-b-c-...` chain repeats nothing (Strata's measurement on
@@ -810,8 +816,10 @@ penalties do not catch because every pass varies a little.
   more token, it stops instead.
 - The console line and the request log (`reasoning_loop_detected`, `reasoning_loop_thinking_tokens`,
   `reasoning_loop_coverage`, and `reasoning_loop_run_on_chars`, the chain's length when a run-on fired
-  it, else 0) record each firing. It can mistake a long, deliberately repeated checklist for a loop;
-  keep it off where the thinking legitimately repeats whole passages.
+  it, else 0; the coverage is the folded one when that alone fired) record each firing. It can
+  mistake a long, deliberately repeated checklist, or a long list whose lines differ only in their
+  numbers and a word or two, for a loop; keep it off where the thinking legitimately repeats whole
+  passages or enumerates hundreds of such lines.
 
 `--end-in-thinking refuse|allow` (default `refuse`): while a reply's thinking is open, the model's end-of-turn
 tokens (`generation_config.json`'s first two stop tokens) get no probability, greedy and sampled, in decode and in

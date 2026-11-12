@@ -3094,18 +3094,29 @@ int test_tool_marker_after_quoted_marker() {
 // the thinking-close control, after which the model answers in content); varied thinking and Off
 // never fire; Conclude without room for the control and one more token stops instead.
 int test_reasoning_loop_guard(const Frontend& frontend) {
+    // Varied work: the words change from step to step, not only the numbers (a line that changes only
+    // in its numbers, over and over, is a counting loop).
+    static const char* subjects[] = {"the parser", "this branch", "the cache", "our bound", "the loop", "a tile",
+                                     "the queue", "that edge", "the schema", "each lane", "the budget"};
+    static const char* verbs[]    = {"handles", "skips", "rounds", "checks", "splits", "merges", "drops",
+                                     "keeps", "orders", "limits", "scales", "tracks", "maps"};
+    static const char* objects[]  = {"empty input", "the last token", "two columns", "a ragged width",
+                                     "every retry", "the null case", "large values", "unicode names",
+                                     "negative offsets", "the first page", "stale entries", "short reads"};
     std::string varied;
     unsigned state = 7;
     for (int s = 0; s < 260; ++s) {
         state = state * 1103515245U + 12345U;
-        varied += "step " + std::to_string(s) + " checks value " + std::to_string((state >> 8) % 9973) +
-                  " against bound " + std::to_string((state >> 4) % 811) + ". ";
+        varied += "step " + std::to_string(s) + ": " + subjects[(state >> 8) % 11] + " " + verbs[(state >> 12) % 13] +
+                  " " + objects[(state >> 16) % 12] + " against bound " + std::to_string((state >> 4) % 811) + ". ";
     }
     std::string looping = varied;
     for (int i = 0; i < 60; ++i) {
         looping += "Wait, let me double-check the case where the list is empty. Then the function returns "
                    "zero, which matches the expected output, so that case is fine. ";
     }
+    std::string counting = varied;
+    for (int i = 1; i <= 300; ++i) { counting += "Checking item " + std::to_string(i) + " of 40...\n"; }
     const std::vector<infernix::TokenId> loop_tokens   = fixture_tokenizer().encode(looping);
     const std::vector<infernix::TokenId> varied_tokens = fixture_tokenizer().encode(varied + varied);
     constexpr std::size_t kRound = 200;
@@ -3136,6 +3147,17 @@ int test_reasoning_loop_guard(const Frontend& frontend) {
                               stats.loop_coverage >= 0.25F && stats.loop_thinking_tokens >= 512 &&
                               !stats.applied && stats.loop_run_on_chars == 0,
                           "Stop did not end a looping reasoning at a check");
+    }
+    {
+        // A counting loop: one short line with only its number changing, which no exact 12-word
+        // passage repeats; the digit-folded reading fires at its own, higher coverage.
+        auto session = frontend.make_output_session(thinking_prompt(frontend), {}, {},
+                                                    infernix::ThinkingControlOptions{.loop = infernix::ReasoningLoopAction::Stop});
+        const auto decision = run(session, fixture_tokenizer().encode(counting), 1'000'000);
+        const auto stats    = session.thinking_stats();
+        failures += check(decision.finish_reason == infernix::FinishReason::OutputLimit && stats.loop_detected &&
+                              stats.loop_coverage >= 0.5F && stats.loop_run_on_chars == 0 && !stats.applied,
+                          "Stop did not end a counting loop");
     }
     {
         // Thinking that repeats nothing but degenerates into one hyphen-joined run-on (Strata #5218).

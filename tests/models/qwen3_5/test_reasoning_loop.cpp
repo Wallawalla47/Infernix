@@ -1,6 +1,7 @@
 // The reasoning-loop measure: words split across token boundaries join; a reasoning that keeps
 // rewriting the same verification passes reaches the threshold; varied work, and a short text, stay
-// below it; a passage repeated twice is not a loop.
+// below it; a passage repeated twice is not a loop; a counting loop (a line changing only in a
+// number) fires on the digit-folded reading, a numbered template with varying words does not.
 #include "models/qwen3_5/frontend/reasoning_loop.h"
 
 #include <iostream>
@@ -20,8 +21,8 @@ void expect(bool condition, const std::string& label) {
     }
 }
 
-std::vector<std::uint64_t> words_of(const std::string& text, std::size_t piece = 3) {
-    std::vector<std::uint64_t> words;
+std::vector<LoopWord> words_of(const std::string& text, std::size_t piece = 3) {
+    std::vector<LoopWord> words;
     std::string partial;
     for (std::size_t at = 0; at < text.size(); at += piece) {
         append_words(std::string_view(text).substr(at, piece), partial, words);
@@ -55,7 +56,7 @@ std::string varied(int sentences) {
 int main() {
     // Splitting: case folding, punctuation as words, a word cut by a token boundary.
     {
-        std::vector<std::uint64_t> a, b;
+        std::vector<LoopWord> a, b;
         std::string pa, pb;
         append_words("Hello, World", pa, a);
         append_words("!", pa, a);
@@ -66,7 +67,7 @@ int main() {
     // A non-word character is a word of its own even without separators, whether it arrives whole or
     // one byte per call.
     {
-        std::vector<std::uint64_t> a, b;
+        std::vector<LoopWord> a, b;
         std::string pa, pb;
         append_words("\xe2\x9a\xa1\xe2\x9a\xa1" "ab", pa, a);
         append_words(" ", pa, a);
@@ -86,7 +87,7 @@ int main() {
     }
     // A run of CJK letters is one word, as `\w+` reads it.
     {
-        std::vector<std::uint64_t> words;
+        std::vector<LoopWord> words;
         std::string partial;
         append_words("\xe4\xb8\xad\xe6\x96\x87", partial, words);
         append_words(" ", partial, words);
@@ -94,16 +95,33 @@ int main() {
     }
     // ASCII punctuation keeps one word per character.
     {
-        std::vector<std::uint64_t> words;
+        std::vector<LoopWord> words;
         std::string partial;
         append_words("?!?!?!", partial, words);
         append_words(" ", partial, words);
         expect(words.size() == 6, "punctuation per character");
     }
+    // The folded hash reads every run of ASCII digits as one digit, also across token boundaries; a
+    // word without digits hashes alike both ways.
+    {
+        const auto folded = [](const std::vector<LoopWord>& words) {
+            std::vector<std::uint64_t> hashes;
+            for (const LoopWord& word : words) { hashes.push_back(word.folded); }
+            return hashes;
+        };
+        const std::vector<LoopWord> a = words_of("Item 17 of 40, v12x3");
+        const std::vector<LoopWord> b = words_of("item 3 of 5, V0X999", 1);
+        expect(a.size() == 6 && a != b && folded(a) == folded(b), "digit runs fold");
+        const std::vector<LoopWord> plain = words_of("no digits here");
+        expect(plain.size() == 3 && plain[0].exact == plain[0].folded && plain[2].exact == plain[2].folded,
+               "a word without digits hashes alike");
+        expect(words_of("item17", 1) == words_of("item17") && words_of("item17") != words_of("item1 7"),
+               "a digit run cut by a token boundary stays one run");
+    }
     // Below a full window nothing is measured.
-    expect(repeated_passage_coverage(words_of(varied(20))) == 0.0, "short text");
+    expect(loop_passage_coverage(words_of(varied(20))) == 0.0, "short text");
     // Varied work stays low.
-    const double novel = repeated_passage_coverage(words_of(varied(400)));
+    const double novel = loop_passage_coverage(words_of(varied(400)));
     expect(novel < 0.05, "varied reasoning coverage " + std::to_string(novel));
     // The same verification pass over and over, after some real work.
     const std::string pass =
@@ -111,21 +129,66 @@ int main() {
         "the function returns zero, which matches the expected output. So that case is fine. ";
     std::string looping = varied(200);
     for (int i = 0; i < 40; ++i) { looping += pass; }
-    const double loop = repeated_passage_coverage(words_of(looping));
+    const double loop = loop_passage_coverage(words_of(looping));
     expect(loop >= kLoopCoverage, "looping coverage " + std::to_string(loop));
     // The same loop written as one unseparated run of symbols: every symbol is a word of its own, so
     // the passage repeats and the measure sees it (a byte-level split makes it a single word).
     {
         std::string symbols;
         for (int i = 0; i < 3000; ++i) { symbols += "\xe2\x9a\xa1"; }
-        const double symbol_loop = repeated_passage_coverage(words_of(varied(150) + symbols, 1));
+        const double symbol_loop = loop_passage_coverage(words_of(varied(150) + symbols, 1));
         expect(symbol_loop >= kLoopCoverage,
                "unseparated symbol loop coverage " + std::to_string(symbol_loop));
     }
     // A passage seen twice is not repeated.
     std::string twice = varied(300) + pass + varied(10) + pass + varied(150);
-    const double recap = repeated_passage_coverage(words_of(twice));
+    const double recap = loop_passage_coverage(words_of(twice));
     expect(recap < kLoopCoverage, "recap coverage " + std::to_string(recap));
+    // A counting loop after some real work: every 12-word passage of "Checking item N of 40..." holds a
+    // different number, so no exact passage repeats; folded, the line repeats once per line and the
+    // guard fires on that reading.
+    double counting = 0.0;
+    {
+        std::string text = varied(200);
+        for (int i = 1; i <= 300; ++i) { text += "Checking item " + std::to_string(i) + " of 40...\n"; }
+        const std::vector<LoopWord> words = words_of(text);
+        const double exact = repeated_passage_coverage(words, LoopWordForm::Exact, kLoopRepeats);
+        counting           = loop_passage_coverage(words);
+        expect(exact < kLoopCoverage, "a counting loop repeats no exact passage " + std::to_string(exact));
+        expect(counting >= kLoopFoldedCoverage, "counting loop coverage " + std::to_string(counting));
+    }
+    // A long numbered template whose words vary (varied(): subject, verb and object drawn per
+    // sentence) repeats each folded passage a few times: past kLoopRepeats, never kLoopFoldedRepeats.
+    {
+        const std::vector<LoopWord> words = words_of(varied(800));
+        const double three = repeated_passage_coverage(words, LoopWordForm::DigitsFolded, kLoopRepeats);
+        const double guard = loop_passage_coverage(words);
+        expect(three >= kLoopFoldedCoverage && guard < kLoopCoverage,
+               "a numbered template is no counting loop (folded at 3 repeats " + std::to_string(three) +
+                   ", guard " + std::to_string(guard) + ")");
+    }
+    // A numbered checklist of distinct items is no loop either.
+    {
+        static const char* verbs[]      = {"verify", "check",   "confirm", "test",    "measure",
+                                           "inspect", "review", "trace",   "compare", "rerun"};
+        static const char* objects[]    = {"the tokenizer",    "the scheduler",  "the KV pool",     "the sampler",
+                                           "the grammar",      "the prefix cache", "the HTTP layer",
+                                           "the stop strings", "the tool parser", "the console log",
+                                           "the request log",  "the graph cache"};
+        static const char* qualifiers[] = {"on empty input",       "under two lanes",     "after a preemption",
+                                           "with a stale prefix",  "at full context",     "with long tool calls",
+                                           "on unicode names",     "when the queue is full",
+                                           "during a model switch", "after a restart"};
+        std::string checklist = varied(100);
+        unsigned state        = 99;
+        for (int i = 1; i <= 200; ++i) {
+            state = state * 1103515245U + 12345U;
+            checklist += std::to_string(i) + ". " + verbs[(state >> 8) % 10] + " " + objects[(state >> 12) % 12] +
+                         " " + qualifiers[(state >> 16) % 10] + ".\n";
+        }
+        const double coverage = loop_passage_coverage(words_of(checklist));
+        expect(coverage < kLoopCoverage, "numbered checklist coverage " + std::to_string(coverage));
+    }
     // A loop written as one long word: a periodic tail reads as full coverage.
     {
         std::string digits;
@@ -175,7 +238,7 @@ int main() {
         }
         const std::size_t chain = longest_hyphen_chain(run_on);
         expect(chain >= kLoopRunOnChars, "run-on chain " + std::to_string(chain));
-        expect(repeated_passage_coverage(words_of(varied(200) + run_on)) < kLoopCoverage,
+        expect(loop_passage_coverage(words_of(varied(200) + run_on)) < kLoopCoverage,
                "a run-on is not repeated passages");
         expect(!periodic_tail(run_on), "a run-on is not periodic");
     }
@@ -188,6 +251,7 @@ int main() {
         expect(tail.size() <= 8U * kLoopTailChars, "tail stays bounded");
     }
     if (failures != 0) { return 1; }
-    std::cout << "OK reasoning loop (varied " << novel << ", looping " << loop << ", recap " << recap << ")\n";
+    std::cout << "OK reasoning loop (varied " << novel << ", looping " << loop << ", recap " << recap
+              << ", counting " << counting << ")\n";
     return 0;
 }

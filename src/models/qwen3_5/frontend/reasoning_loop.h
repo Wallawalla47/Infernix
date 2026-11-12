@@ -12,7 +12,13 @@
 // repeats nothing at all: thinking that degenerates into one run-on of hyphen-joined words, every
 // word new and no sentence ending (Strata #5218, Qwen3.8-Flash-Next on long agent requests: the
 // longest chain 0-56 characters in normal thinking against 203-1,569 in degenerate runs);
-// longest_hyphen_chain below measures it.
+// longest_hyphen_chain below measures it. A counting loop rewrites one line with only a number
+// changing ("checking item 7 of 40", "checking item 8 of 40": TensorSharp #338, 3 of 53 Aider turns on
+// the Qwen3.8-27B NVFP4): when the lines are short, every 12-word passage holds a different number and
+// no passage repeats, so the word measure also reads the words with each run of ASCII digits folded
+// to one digit. Folded, a numbered template with a few words varying (a table, a list of cases) also
+// repeats, a few times per passage; the loop's line repeats once per line, so on that reading a
+// passage counts from kLoopFoldedRepeats occurrences and the guard fires at kLoopFoldedCoverage.
 
 #include <cstddef>
 #include <cstdint>
@@ -29,21 +35,44 @@ inline constexpr std::uint32_t kLoopRepeats       = 3;     // occurrences that m
 inline constexpr std::size_t kLoopWindowWords     = 2000;  // the recent words whose coverage is measured
 inline constexpr std::size_t kLoopHistoryWords    = 30000; // how far back passages are counted
 inline constexpr double kLoopCoverage             = 0.25;  // coverage at which the guard fires
+// The digit-folded reading: a passage is repeated from 32 occurrences (TensorSharp closes after 32
+// such lines in a row), and the guard fires once those cover half of the last kLoopWindowWords; a
+// counting loop that keeps going soon covers nearly all of it.
+inline constexpr std::uint32_t kLoopFoldedRepeats = 32;
+inline constexpr double kLoopFoldedCoverage       = 0.5;
 inline constexpr std::size_t kLoopTailChars       = 2048;  // reasoning characters read at the end
 inline constexpr std::size_t kLoopTailPeriod      = 64;    // a period at most this long repeats
 inline constexpr std::size_t kLoopRunOnChars      = 200;   // a hyphen chain this long is a run-on
 
-// Appends the words of UTF-8 `bytes` to `words` as 64-bit hashes. A word is a run of letters, digits
-// and '_' (ASCII letters lower-cased); every other non-space character is a word of its own, so an
-// unseparated run of emoji or punctuation contributes one word per character, as it does under
-// Strata's `\w+|[^\w\s]`. A character is classified once all of its bytes have arrived, so `partial`
-// holds the bytes of a word a token boundary cut, completed by the next call.
-void append_words(std::string_view bytes, std::string& partial, std::vector<std::uint64_t>& words);
+// One word, hashed as written and with every run of ASCII digits folded to one '0' ("item17" reads
+// as "item0"); the two are equal for a word without digits.
+struct LoopWord {
+    std::uint64_t exact  = 0;
+    std::uint64_t folded = 0;
+
+    friend bool operator==(const LoopWord&, const LoopWord&) = default;
+};
+
+// Which of a LoopWord's hashes a passage measure reads.
+enum class LoopWordForm { Exact, DigitsFolded };
+
+// Appends the words of UTF-8 `bytes` to `words`. A word is a run of letters, digits and '_' (ASCII
+// letters lower-cased); every other non-space character is a word of its own, so an unseparated run
+// of emoji or punctuation contributes one word per character, as it does under Strata's
+// `\w+|[^\w\s]`. A character is classified once all of its bytes have arrived, so `partial` holds the
+// bytes of a word a token boundary cut, completed by the next call.
+void append_words(std::string_view bytes, std::string& partial, std::vector<LoopWord>& words);
 
 // The share of the last kLoopWindowWords of `words` covered by kLoopPassageWords-word passages that
-// occur at least kLoopRepeats times in `words` (the caller passes the last kLoopHistoryWords at
-// most). Zero while fewer than kLoopWindowWords words exist.
-[[nodiscard]] double repeated_passage_coverage(std::span<const std::uint64_t> words);
+// occur at least `repeats` times in `words` (the caller passes the last kLoopHistoryWords at most),
+// reading each word in `form`. Zero while fewer than kLoopWindowWords words exist.
+[[nodiscard]] double repeated_passage_coverage(std::span<const LoopWord> words, LoopWordForm form,
+                                               std::uint32_t repeats);
+
+// The guard's word measure: the Exact coverage at kLoopRepeats, or the DigitsFolded coverage at
+// kLoopFoldedRepeats when that reaches kLoopFoldedCoverage; the guard fires when the result reaches
+// kLoopCoverage.
+[[nodiscard]] double loop_passage_coverage(std::span<const LoopWord> words);
 
 // Appends `bytes` to the bounded tail of the reasoning that periodic_tail reads. It holds at least
 // kLoopTailChars characters whenever that many have been emitted.

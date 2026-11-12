@@ -68,42 +68,62 @@ bool word_codepoint(std::int32_t value) {
            text::unicode_internal::is_number(value);
 }
 
+// A word without digits: both hashes are the same.
+LoopWord plain_word(std::string_view text) {
+    const std::uint64_t hash = fnv1a(text);
+    return {.exact = hash, .folded = hash};
+}
+
 // The bytes accumulated at a word boundary are one word to the byte rule above; Strata's split can
 // make several of them. A run of word characters is one word, every other non-space character is a
 // word of its own, and whitespace separates.
 // Words are lowercased as Strata's `str.lower()` does: ASCII on arrival (append_words), every other
-// complete character by its simple lowercase mapping here.
-void flush_word(std::string& partial, std::vector<std::uint64_t>& words) {
+// complete character by its simple lowercase mapping here. Each word is also spelled with every run
+// of ASCII digits as one '0' for its folded hash.
+void flush_word(std::string& partial, std::vector<LoopWord>& words) {
     const std::string_view text = partial;
     std::string word;
+    std::string folded;
     const auto emit_word = [&] {
         if (!word.empty()) {
-            words.push_back(fnv1a(word));
+            words.push_back({.exact = fnv1a(word), .folded = fnv1a(folded)});
             word.clear();
+            folded.clear();
         }
     };
+    bool digits = false; // the folded spelling ends in a run of digits
     for (std::size_t at = 0; at < text.size();) {
         const Codepoint point = codepoint_at(text, at);
         if (!point.complete) { // cut by the last token: the bytes stand as a word of their own
             emit_word();
-            words.push_back(fnv1a(text.substr(at)));
+            words.push_back(plain_word(text.substr(at)));
             partial.clear();
             return;
         }
         if (word_codepoint(point.value)) {
             if (point.length == 1) {
-                word.push_back(text[at]);
+                const char c = text[at];
+                word.push_back(c);
+                const bool digit = c >= '0' && c <= '9';
+                if (!digit) {
+                    folded.push_back(c);
+                } else if (!digits) {
+                    folded.push_back('0');
+                }
+                digits = digit;
             } else {
-                word += text::unicode_internal::codepoint_to_utf8(
+                const std::string lower = text::unicode_internal::codepoint_to_utf8(
                     text::unicode_internal::simple_lowercase(point.value));
+                word += lower;
+                folded += lower;
+                digits = false;
             }
             at += point.length;
             continue;
         }
         emit_word();
-        if (!space_codepoint(point.value)) {
-            words.push_back(fnv1a(text.substr(at, point.length)));
-        }
+        digits = false;
+        if (!space_codepoint(point.value)) { words.push_back(plain_word(text.substr(at, point.length))); }
         at += point.length;
     }
     emit_word();
@@ -131,7 +151,7 @@ TailSpan tail_span(std::string_view text, std::size_t limit) {
 
 } // namespace
 
-void append_words(std::string_view bytes, std::string& partial, std::vector<std::uint64_t>& words) {
+void append_words(std::string_view bytes, std::string& partial, std::vector<LoopWord>& words) {
     for (const char raw : bytes) {
         const auto c = static_cast<unsigned char>(raw);
         if (word_byte(c)) {
@@ -139,13 +159,16 @@ void append_words(std::string_view bytes, std::string& partial, std::vector<std:
             continue;
         }
         if (!partial.empty()) { flush_word(partial, words); }
-        if (!space_codepoint(c)) { words.push_back(fnv1a(std::string_view(&raw, 1))); }
+        if (!space_codepoint(c)) { words.push_back(plain_word(std::string_view(&raw, 1))); }
     }
 }
 
-double repeated_passage_coverage(std::span<const std::uint64_t> words) {
+double repeated_passage_coverage(std::span<const LoopWord> words, LoopWordForm form,
+                                 std::uint32_t repeats) {
     const std::size_t n = words.size();
     if (n < kLoopWindowWords || n < kLoopPassageWords) { return 0.0; }
+    const bool folded = form == LoopWordForm::DigitsFolded;
+    const auto word   = [&](std::size_t i) { return folded ? words[i].folded : words[i].exact; };
     // Polynomial hash of every passage, rolled along the words.
     constexpr std::uint64_t kBase = 0x9E3779B97F4A7C15ULL;
     std::uint64_t top = 1; // kBase^(kLoopPassageWords - 1)
@@ -153,10 +176,10 @@ double repeated_passage_coverage(std::span<const std::uint64_t> words) {
     const std::size_t passages = n - kLoopPassageWords + 1;
     std::vector<std::uint64_t> hashes(passages);
     std::uint64_t hash = 0;
-    for (std::size_t i = 0; i < kLoopPassageWords; ++i) { hash = hash * kBase + words[i]; }
+    for (std::size_t i = 0; i < kLoopPassageWords; ++i) { hash = hash * kBase + word(i); }
     hashes[0] = hash;
     for (std::size_t i = 1; i < passages; ++i) {
-        hash      = (hash - words[i - 1] * top) * kBase + words[i + kLoopPassageWords - 1];
+        hash      = (hash - word(i - 1) * top) * kBase + word(i + kLoopPassageWords - 1);
         hashes[i] = hash;
     }
     std::unordered_map<std::uint64_t, std::uint32_t> counts;
@@ -168,7 +191,7 @@ double repeated_passage_coverage(std::span<const std::uint64_t> words) {
     std::vector<int> delta(kLoopWindowWords + 1, 0);
     const std::size_t first = window_start >= kLoopPassageWords - 1 ? window_start - (kLoopPassageWords - 1) : 0;
     for (std::size_t i = first; i < passages; ++i) {
-        if (counts[hashes[i]] < kLoopRepeats) { continue; }
+        if (counts[hashes[i]] < repeats) { continue; }
         const std::size_t begin = std::max(i, window_start) - window_start;
         const std::size_t end   = std::min(i + kLoopPassageWords, n) - window_start;
         ++delta[begin];
@@ -181,6 +204,13 @@ double repeated_passage_coverage(std::span<const std::uint64_t> words) {
         covered += depth > 0 ? 1U : 0U;
     }
     return static_cast<double>(covered) / static_cast<double>(kLoopWindowWords);
+}
+
+double loop_passage_coverage(std::span<const LoopWord> words) {
+    const double exact = repeated_passage_coverage(words, LoopWordForm::Exact, kLoopRepeats);
+    if (exact >= kLoopCoverage) { return exact; }
+    const double folded = repeated_passage_coverage(words, LoopWordForm::DigitsFolded, kLoopFoldedRepeats);
+    return folded >= kLoopFoldedCoverage ? folded : exact;
 }
 
 void append_tail(std::string_view bytes, std::string& tail) {
