@@ -2790,13 +2790,20 @@ private:
                 return;
             }
             const auto stalled = now - *no_progress_since_;
-            if (!no_progress_reported_ && stalled >= kNoProgressWarning) {
+            // A test may shorten both bounds (testing::set_no_progress_bounds).
+            const std::uint32_t warning_ms  = testing::no_progress_warning_ms().load(std::memory_order_relaxed);
+            const std::uint32_t recovery_ms = testing::no_progress_recovery_ms().load(std::memory_order_relaxed);
+            const Clock::duration warning_bound =
+                warning_ms != 0 ? Clock::duration(std::chrono::milliseconds(warning_ms)) : Clock::duration(kNoProgressWarning);
+            const Clock::duration recovery_bound = recovery_ms != 0 ? Clock::duration(std::chrono::milliseconds(recovery_ms))
+                                                                    : Clock::duration(kNoProgressRecovery);
+            if (!no_progress_reported_ && stalled >= warning_bound) {
                 no_progress_reported_ = true;
                 publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
                                    "no progress for %.0f s while holding requests: %s",
                                    std::chrono::duration<double>(stalled).count(), describe_progress_state().c_str());
             }
-            if (no_progress_recovered_ || stalled < kNoProgressRecovery) { return; }
+            if (no_progress_recovered_ || stalled < recovery_bound) { return; }
             no_progress_recovered_ = true;
             const std::string state = describe_progress_state();
             char what[160];
@@ -2954,6 +2961,15 @@ private:
                 if (instance_.program->has_context_transaction()) {
                     executed |= progress_context_transaction(boundary);
                     if (!instance_.program->has_context_transaction()) { reserve_resident_units(); }
+                }
+                if (testing::units_held().load(std::memory_order_relaxed)) {
+                    // A test's stall (testing::hold_units): requests are admitted and bound, no unit runs.
+                    finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                    watch_progress(executed);
+                    publish_runtime_stats();
+                    execution_lock.unlock();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    continue;
                 }
                 const auto cancelled = snapshot_cancellations();
                 auto controls = scheduler_.build_control_membership(slots_, max_concurrency_);

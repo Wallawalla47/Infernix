@@ -101,6 +101,14 @@ infernix_add_test(infernix_qwen4_exp_nonfinite_withdraw_real_test
 set_tests_properties(infernix_qwen4_exp_nonfinite_withdraw_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# The Engine's no-progress watch (candidates ZK-02): a test hook stalls the Engine with a request bound, the
+# watch warns and heals within its test-shortened bounds, and a request queued behind the stall completes.
+infernix_add_test(infernix_qwen4_exp_no_progress_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_no_progress_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_qwen4_exp_no_progress_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 1800)
+
 # The Vision encode window's placement and visual columns (host only).
 infernix_add_test(infernix_qwen4_exp_vision_window_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_window.cpp"

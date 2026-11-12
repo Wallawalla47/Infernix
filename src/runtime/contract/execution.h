@@ -60,6 +60,29 @@ inline void set_nonfinite_fault(std::uint32_t rows) noexcept { nonfinite_fault_r
     }
     return false;
 }
+
+// Stall injection for the Engine's no-progress watch (candidates ZK-02): while held, the worker admits and
+// binds requests but executes no unit (control, decode, prefill, Replay), as an Engine whose units wait on
+// something that never comes. Process-wide.
+inline std::atomic<bool>& units_held() noexcept {
+    static std::atomic<bool> held{false};
+    return held;
+}
+inline void hold_units(bool held) noexcept { units_held().store(held); }
+// The no-progress watch's warning and heal bounds in milliseconds (EngineCore::kNoProgressWarning,
+// kNoProgressRecovery); 0 keeps the built-in bound. Read on every check. Process-wide.
+inline std::atomic<std::uint32_t>& no_progress_warning_ms() noexcept {
+    static std::atomic<std::uint32_t> ms{0};
+    return ms;
+}
+inline std::atomic<std::uint32_t>& no_progress_recovery_ms() noexcept {
+    static std::atomic<std::uint32_t> ms{0};
+    return ms;
+}
+inline void set_no_progress_bounds(std::uint32_t warning_ms, std::uint32_t recovery_ms) noexcept {
+    no_progress_warning_ms().store(warning_ms);
+    no_progress_recovery_ms().store(recovery_ms);
+}
 } // namespace testing
 
 // Borrowed for one synchronous Program call. Engine maps compact rows to request-owned matchers.
