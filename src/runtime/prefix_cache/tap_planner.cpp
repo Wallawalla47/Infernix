@@ -20,6 +20,8 @@ struct Candidate {
     Priority priority      = Priority::Ladder;
     // Explicit and structural boundaries that later prompts share across conversations.
     bool shared = false;
+    // The generation opener, or the earlier boundary of its cluster that stands for it.
+    bool opener = false;
 };
 
 // Moves a position out of any exclusion to the exclusion start, repeatedly.
@@ -52,7 +54,7 @@ std::vector<PlannedTap> plan_taps(std::uint32_t prompt_tokens, std::uint32_t bas
                                   std::span<const TapHint> hints,
                                   std::span<const std::uint32_t> existing_frontiers,
                                   std::span<const TapExclusion> exclusions,
-                                  const TapPlannerConfig& config) {
+                                  const TapPlannerConfig& config, bool opener_near_base) {
     std::vector<PlannedTap> accepted;
     if (prompt_tokens < 2 || config.max_new_taps == 0) { return accepted; }
     const std::uint32_t last = prompt_tokens - 1U;
@@ -65,7 +67,7 @@ std::vector<PlannedTap> plan_taps(std::uint32_t prompt_tokens, std::uint32_t bas
             candidates.push_back({hint.position, Priority::Explicit, true});
             break;
         case TapHintKind::GenerationOpener:
-            candidates.push_back({hint.position, Priority::GenerationOpener});
+            candidates.push_back({hint.position, Priority::GenerationOpener, false, true});
             break;
         case TapHintKind::Structural:
             candidates.push_back({hint.position, Priority::Structural, true});
@@ -117,11 +119,16 @@ std::vector<PlannedTap> plan_taps(std::uint32_t prompt_tokens, std::uint32_t bas
         std::vector<bool> dropped(candidates.size(), false);
         std::optional<std::size_t> kept;
         for (const std::size_t index : semantic) {
-            if (kept &&
+            // A forward opener stays when its cluster's earliest boundary is at or behind the base, where
+            // it can serve nothing new.
+            const bool forward_alone = opener_near_base && candidates[index].opener && kept &&
+                                       candidates[*kept].position <= base;
+            if (kept && !forward_alone &&
                 candidates[index].position - candidates[*kept].position < kMinimumTapSeparation) {
                 dropped[index] = true;
                 // The kept snapshot serves the dropped boundary's prompts too.
                 candidates[*kept].shared = candidates[*kept].shared || candidates[index].shared;
+                candidates[*kept].opener = candidates[*kept].opener || candidates[index].opener;
             } else {
                 kept = index;
             }
@@ -151,6 +158,9 @@ std::vector<PlannedTap> plan_taps(std::uint32_t prompt_tokens, std::uint32_t bas
             std::any_of(existing_frontiers.begin(), existing_frontiers.end(), same)) {
             continue;
         }
+        // The opener moves the lineage's snapshot forward: the base and the snapshots behind it are
+        // where this prompt's next turn would otherwise resume.
+        const bool forward = opener_near_base && candidate.opener && position - base >= kMinimumForwardTokens;
         if (candidate.priority == Priority::Ladder) {
             // History taps are spaced symmetrically: each one only has to bound the loss of an
             // edit somewhere in the gap around it.
@@ -174,9 +184,12 @@ std::vector<PlannedTap> plan_taps(std::uint32_t prompt_tokens, std::uint32_t bas
                 return other <= position && position - other < kMinimumTapSeparation;
             };
             const auto covered_tap = [&](const PlannedTap& tap) { return covered(tap.position); };
+            const auto covered_existing = [&](std::uint32_t other) {
+                return !(forward && other <= base) && covered(other);
+            };
             if (std::any_of(accepted.begin(), accepted.end(), covered_tap) ||
-                std::any_of(existing_frontiers.begin(), existing_frontiers.end(), covered) ||
-                covered(base)) {
+                std::any_of(existing_frontiers.begin(), existing_frontiers.end(), covered_existing) ||
+                (!forward && covered(base))) {
                 continue;
             }
         }
@@ -186,6 +199,7 @@ std::vector<PlannedTap> plan_taps(std::uint32_t prompt_tokens, std::uint32_t bas
             .position  = position,
             .placement = flexible ? TapPlacement::Flexible : TapPlacement::Exact,
             .boundary  = candidate.shared,
+            .forward   = forward,
         });
     }
     std::sort(accepted.begin(), accepted.end(),

@@ -427,8 +427,11 @@ void ProgramImpl::walk_plan_taps(Lane& lane) {
     std::uint32_t deepest = lane.prefix.deepest;
     for (std::size_t c = 0; c + 1 < n; ++c) {
         const std::uint32_t B = lane.calls[walk_.first_call + c];
-        bool boundary         = false;
-        if (!prefix_take_taps(lane, B, walk_.first_call + c + 1, boundary) || B < deepest + kBlock) { continue; }
+        bool boundary = false, forward = false;
+        if (!prefix_take_taps(lane, B, walk_.first_call + c + 1, boundary, forward) ||
+            !prefix_tap_far_enough(deepest, B, forward)) {
+            continue;
+        }
         const bool tail   = B % kBlock != 0;
         const auto staged = prefix_->open_staged_capture(tail, prefix_->index().estimate_priority(deepest, B, tail));
         if (!staged) { continue; }

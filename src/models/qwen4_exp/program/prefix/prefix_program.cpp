@@ -234,7 +234,7 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
         // the shared tokens after the frontier again.
         const std::uint32_t branch =
             cached_tokens < n && cached_tokens >= s.frontier + kBranchTapMinTokens ? cached_tokens : 0;
-        s.plan          = plan_prefill(prompt, s.frontier, s.existing, base.reuse, branch);
+        s.plan          = plan_prefill(prompt, s.frontier, s.existing, base.reuse, branch, s.follow);
         s.cached_tokens = cached_tokens;
         return s;
     };
@@ -296,6 +296,11 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
             PrefixSelection s;
             s.snapshot = c.snapshot;
             s.frontier = c.frontier;
+            if (index.snapshot(c.snapshot).kind == pc::SnapshotKind::Endpoint) {
+                s.follow = PrefixFollow::Endpoint;
+            } else if (prefix_->meta(c.snapshot).opener) {
+                s.follow = PrefixFollow::Opener;
+            }
             s.path.assign(match.path.begin(), match.path.begin() + c.path_blocks);
             const std::uint32_t k = c.frontier / kBlock;
             s.shared              = k;
@@ -701,18 +706,24 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
     }
     // Taps for this prompt beyond the resume frontier, realized at the plan's call boundaries.
     lane.prefix.taps = s.plan.taps;
+    // A conversation that continued an endpoint, or whose behaviour is not known yet, may resume its next
+    // turn at this one's endpoint (one that continued only an opener resumes at this turn's opener).
+    lane.prefix.close_endpoint = options_.free_cache_resume && s.follow != PrefixFollow::Opener;
 }
 
 // The prompt's prefill calls from `frontier` (design §19.3.1, "Prefill integration"): with `taps`, the
 // prefix taps beyond the frontier (no tap inside a Vision item), exact ones admitted by their cost.
 prefix::CallPlan ProgramImpl::plan_prefill(const qwen3_5::PreparedPromptData& prompt, std::uint32_t frontier,
                                            std::span<const std::uint32_t> existing, bool taps,
-                                           std::uint32_t branch) const {
+                                           std::uint32_t branch, PrefixFollow follow) const {
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
     std::vector<pc::PlannedTap> planned;
     if (taps && prefix_) {
         const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
-        planned = pc::plan_taps(n, frontier, prompt.tap_hints.hints, existing, spans, prefix_->taps());
+        // Unless the conversation echoes its generated turns, the next turn resumes at this prompt's
+        // generation opener: its snapshot moves forward however close the resume frontier is (ZK-03).
+        const bool opener_forward = options_.free_cache_resume && follow != PrefixFollow::Endpoint;
+        planned = pc::plan_taps(n, frontier, prompt.tap_hints.hints, existing, spans, prefix_->taps(), opener_forward);
         // A branch tap, and a test's forced tap (testing::set_forced_tap), as exact boundaries.
         const auto exact_boundary = [&](std::uint32_t position) {
             if (position <= frontier || position >= n || prefix::inside_exclusion(position, spans)) { return; }
@@ -949,7 +960,8 @@ prefix::PrefixCache::Capture ProgramImpl::prefix_capture_at(Lane& lane, std::uin
     return c;
 }
 
-bool ProgramImpl::prefix_take_taps(Lane& lane, std::uint32_t B, std::size_t next_call, bool& boundary) {
+bool ProgramImpl::prefix_take_taps(Lane& lane, std::uint32_t B, std::size_t next_call, bool& boundary,
+                                   bool& forward) {
     if (lane.prefix.taps.empty()) { return false; }
     // A boundary inside a Vision item cannot be resumed from: its flexible taps wait for the next.
     if (prefix::inside_exclusion(B, lane.prefix.exclusions)) { return false; }
@@ -961,6 +973,7 @@ bool ProgramImpl::prefix_take_taps(Lane& lane, std::uint32_t B, std::size_t next
         if (tap.position > B && !(final_next && tap.placement == pc::TapPlacement::Flexible)) { return false; }
         due      = true;
         boundary = boundary || tap.boundary;
+        forward  = forward || tap.forward;
         return true;
     });
     return due;
@@ -973,8 +986,9 @@ void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, boo
     prefix_publish(lane, prefix_frontier(lane, false));
     if (last) { return; }
     const std::uint32_t B = lane.state_tokens;
-    bool boundary         = false;
-    if (prefix_take_taps(lane, B, lane.next_call, boundary) && B >= lane.prefix.deepest + kBlock) {
+    bool boundary = false, forward = false;
+    if (prefix_take_taps(lane, B, lane.next_call, boundary, forward) &&
+        prefix_tap_far_enough(lane.prefix.deepest, B, forward)) {
         prefix_capture(lane, index, boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap, false);
     }
 }
@@ -1000,10 +1014,12 @@ void ProgramImpl::prefix_finish(Lane& lane, std::uint32_t index, bool pausing) {
         return;
     }
     // A finishing lane's endpoint less than a block past its deepest snapshot covers too little to pay for
-    // another image; a pausing lane's is its own resume point (design §19.3.13): without it the resume would
-    // replay the tokens since that snapshot with prefill arithmetic, and its output would depend on when
-    // the service turns paused it.
-    const bool far_enough = F >= lane.prefix.deepest + kBlock || (pausing && F > lane.prefix.deepest);
+    // another image, unless the next turn may resume there (`close_endpoint`: the conversation echoes its
+    // generated turns, or has not shown yet whether it does); a pausing lane's is its own resume point
+    // (design §19.3.13): without it the resume would replay the tokens since that snapshot with prefill
+    // arithmetic, and its output would depend on when the service turns paused it.
+    const bool far_enough = F >= lane.prefix.deepest + kBlock || (pausing && F > lane.prefix.deepest) ||
+                            (lane.prefix.close_endpoint && F >= lane.prefix.deepest + pc::kMinimumForwardTokens);
     if (far_enough && full_blocks && lane.prefix.path.size() >= F / kBlock) {
         prefix_capture(lane, index, pc::SnapshotKind::Endpoint, true, pausing);
     } else if (!full_blocks) {
@@ -1072,6 +1088,7 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
     lane.prefix.deepest   = 0;
     lane.prefix.reused    = 0;
     lane.prefix.reuse     = false;
+    lane.prefix.close_endpoint = false;
 }
 
 // After a non-finite failure, once the lane's pins are released (hybrid-prefix-cache-spec §7.8):

@@ -113,9 +113,16 @@ struct BasePlanImpl {
 // or none.
 enum class PrefixCow : std::uint8_t { None, Tail, Anchor };
 
+// What a resume source shows about the conversation (design §19.3.1, "Forward snapshots"): its prompt
+// continued an endpoint (the client echoes its generated turns, so the next turn resumes after this
+// one's endpoint), continued only a generation opener (it does not: the next turn resumes at this one's
+// opener), or neither (a first turn, a shared boundary, the root).
+enum class PrefixFollow : std::uint8_t { Unknown, Endpoint, Opener };
+
 // A resume source chosen by the quote: a snapshot at `frontier` over `path`, or the root.
 struct PrefixSelection {
     std::optional<runtime::prefix_cache::SnapshotRef> snapshot;
+    PrefixFollow follow    = PrefixFollow::Unknown;
     std::vector<runtime::prefix_cache::NodeRef> path; // matched blocks up to the snapshot's anchor
     std::uint32_t frontier = 0;
     std::uint32_t shared   = 0; // leading blocks mapped from the cache
@@ -142,6 +149,9 @@ struct LanePrefix {
     // is rewritten).
     bool captured                  = false;
     std::uint64_t resident_capture = 0;               // the endpoint the slot still holds
+    // The endpoint is captured however close it lies past the deepest snapshot (PrefixFollow: the next
+    // turn may resume there).
+    bool close_endpoint = false;
     std::vector<runtime::prefix_cache::PlannedTap> taps;
     std::vector<runtime::prefix_cache::TapHint> hints;
     std::vector<runtime::prefix_cache::TapExclusion> exclusions; // Vision spans: no snapshot inside
@@ -6703,8 +6713,13 @@ private:
     // Records a capture the cache accepted as the lane's latest.
     void prefix_captured(Lane& lane, std::uint64_t id, std::uint32_t F);
     // Removes the lane's taps realized at the call boundary B before calls[next_call]; returns whether
-    // any was, and sets `boundary` when one is a boundary tap.
-    bool prefix_take_taps(Lane& lane, std::uint32_t B, std::size_t next_call, bool& boundary);
+    // any was, and sets `boundary` when one is a boundary tap and `forward` when one is a forward tap.
+    bool prefix_take_taps(Lane& lane, std::uint32_t B, std::size_t next_call, bool& boundary, bool& forward);
+    // Whether a tap realized at B is captured past the lineage's deepest snapshot at `deepest`: a block
+    // past it, or a forward tap (PlannedTap::forward) anywhere past it.
+    [[nodiscard]] static bool prefix_tap_far_enough(std::uint32_t deepest, std::uint32_t B, bool forward) noexcept {
+        return B >= deepest + runtime::prefix_cache::kBlockTokens || (forward && B > deepest);
+    }
     void prefix_after_prefill_call(Lane& lane, std::uint32_t index, bool last);
     // `pausing`: the lane is paused (start_pause), so its frontier is its resume point.
     void prefix_finish(Lane& lane, std::uint32_t index, bool pausing = false);
@@ -6747,7 +6762,8 @@ private:
     // a cached path (prefix_select).
     [[nodiscard]] prefix::CallPlan plan_prefill(const qwen3_5::PreparedPromptData& prompt, std::uint32_t frontier,
                                                 std::span<const std::uint32_t> existing, bool taps,
-                                                std::uint32_t branch = 0) const;
+                                                std::uint32_t branch = 0,
+                                                PrefixFollow follow = PrefixFollow::Unknown) const;
     // A branch tap (prefix_select) needs the prompt to share at least this many cached tokens past
     // its resume frontier: what a later prompt diverging further along re-prefills without it.
     static constexpr std::uint32_t kBranchTapMinTokens = 1024;

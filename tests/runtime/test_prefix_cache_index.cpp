@@ -2251,6 +2251,36 @@ void test_tap_planner() {
     require(!find(plan_taps(30020, 0, hints, near_opener, {}, config), 30010),
             "a tap within the minimum separation of an existing snapshot must be dropped");
 
+    // Forward snapshots (ZK-03): a conversation whose turns resume at the opener (it does not echo its
+    // generated turns) keeps the opener however close the resume base is, from kMinimumForwardTokens on.
+    const std::vector<TapHint> short_reply{{5040, TapHintKind::MessageBoundary},
+                                           {5050, TapHintKind::GenerationOpener}};
+    const std::vector<std::uint32_t> at_base{5000}, at_close_base{5040}, past_base{5000, 5030};
+    require(!find(plan_taps(5056, 5000, short_reply, at_base, {}, config), 5050),
+            "an opener less than the minimum separation past the base must be dropped by default");
+    const auto forward = plan_taps(5056, 5000, short_reply, at_base, {}, config, true);
+    require(find(forward, 5050) && find(forward, 5050)->forward &&
+                find(forward, 5050)->placement == TapPlacement::Exact && !find(forward, 5050)->boundary,
+            "a forward opener must be tapped exactly, marked forward and stay supersedable");
+    require(!find(plan_taps(5056, 5040, short_reply, at_close_base, {}, config, true), 5050),
+            "a forward opener closer than kMinimumForwardTokens to the base must be dropped");
+    require(!find(forward, 5055), "the prompt tail next to a forward opener covers nothing and must be dropped");
+    // A snapshot between the base and the opener still makes it redundant.
+    require(!find(plan_taps(5056, 5000, short_reply, past_base, {}, config, true), 5050),
+            "a forward opener near a snapshot past the base must be dropped");
+    // An earlier boundary at or behind the base does not absorb a forward opener; one past the base does
+    // and carries the forward mark.
+    const std::vector<TapHint> marked_turn{{4990, TapHintKind::Automatic}, {5050, TapHintKind::GenerationOpener}};
+    require(find(plan_taps(5056, 5000, marked_turn, at_base, {}, config, true), 5050).has_value(),
+            "a forward opener clustered with a boundary behind the base must stay");
+    const std::vector<TapHint> late_marker{{5030, TapHintKind::Automatic}, {5050, TapHintKind::GenerationOpener}};
+    const auto carried = plan_taps(5056, 5000, late_marker, at_base, {}, config, true);
+    require(find(carried, 5030) && find(carried, 5030)->forward && !find(carried, 5050),
+            "a boundary past the base that absorbs a forward opener must carry the forward mark");
+    for (const PlannedTap& tap : plan_taps(30020, 0, hints, {}, {}, config, true)) {
+        require(!tap.forward || tap.position == 30010, "only the opener may be planned forward");
+    }
+
     // Exclusions move taps to the start of the excluded span.
     const std::vector<TapExclusion> exclusions{{12000, 13000}};
     const auto excluded = plan_taps(30020, 0, hints, {}, exclusions, config);

@@ -55,12 +55,19 @@ struct PlannedTap {
     // structural boundary): its snapshot is published as SnapshotKind::Boundary, superseded only
     // while no other conversation has continued from it.
     bool boundary = false;
+    // Planned under `opener_near_base` (plan_taps): captured even when the lineage's deepest snapshot lies
+    // less than kMinimumTapSeparation before it.
+    bool forward = false;
 
     [[nodiscard]] friend bool operator==(PlannedTap, PlannedTap) noexcept = default;
 };
 
 // Two taps closer than this cover too little to pay for a second snapshot and split.
 inline constexpr std::uint32_t kMinimumTapSeparation = 64;
+// A forward snapshot (plan_taps `opener_near_base`) covers at least this many tokens: its split costs
+// about as much as one short call re-reading 10-15 tokens (Flash-Next, 2026-11-11: a pair call +10..+14 ms
+// against no split; a short call 0.9-1.8 ms a token).
+inline constexpr std::uint32_t kMinimumForwardTokens = 16;
 
 struct TapPlannerConfig {
     std::uint32_t max_new_taps   = 8;
@@ -76,11 +83,15 @@ struct TapPlannerConfig {
 // semantic boundaries (opener, structural) closer than kMinimumTapSeparation keep only the
 // earliest, and a non-Explicit, non-ladder candidate is dropped when an accepted tap, an existing
 // snapshot or the base lies at most kMinimumTapSeparation before it. Ladder taps keep
-// min_gap_tokens spacing on both sides.
+// min_gap_tokens spacing on both sides. With `opener_near_base`, the generation opener is kept however
+// close it is to the base (at least kMinimumForwardTokens past it) or to an existing snapshot at or before
+// the base: the caller's evidence is that
+// the next prompt resumes at this prompt's opener (the conversation does not echo its generated turns),
+// so the snapshot moves forward instead of leaving the next turn to recompute this one.
 [[nodiscard]] std::vector<PlannedTap> plan_taps(std::uint32_t prompt_tokens, std::uint32_t base,
                                                 std::span<const TapHint> hints,
                                                 std::span<const std::uint32_t> existing_frontiers,
                                                 std::span<const TapExclusion> exclusions,
-                                                const TapPlannerConfig& config);
+                                                const TapPlannerConfig& config, bool opener_near_base = false);
 
 } // namespace infernix::runtime::prefix_cache

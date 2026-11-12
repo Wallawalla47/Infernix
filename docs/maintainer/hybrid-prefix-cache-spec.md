@@ -941,6 +941,16 @@ Candidates, in priority order:
   generation opener is not tapped. Measured on a tool-calling agent trace (27B NVFP4, INT8 KV,
   `--preserve-thinking`), the opener split cost about 15 ms of a ~70–130 ms turn TTFT. Requests
   that resumed from a tap keep the exact opener: their client re-renders history.
+- **Forward snapshots** (`plan_taps`' `opener_near_base`, `PlannedTap::forward`; candidates ZK-03; Flash-Next only).
+  The proximity rule above left a conversation of short turns that does not echo its generated turns with a
+  snapshot only every other turn: the opener sat less than 64 tokens past the base, so the next turn recomputed
+  this one. Unless the request resumed from an endpoint, the opener (or the boundary of its cluster that stands
+  for it, when that lies past the base) is now planned however close it is to the base or to the snapshots at or
+  behind it, from `kMinimumForwardTokens` (16) past the base, and captured past the lineage's deepest snapshot.
+  The endpoint takes the mirror rule: unless the request resumed from an opener snapshot, it is captured from 16
+  tokens past the deepest snapshot. A conversation shows which of the two its next turn resumes from (an echoing
+  client from the endpoint, a re-rendering one from the opener), so each keeps one image a turn; a first turn
+  keeps both.
 - Hints are the Frontend's existing `message_boundaries` plus the structural boundaries it already
   computes.
 - At most `max_new_taps` (default 8 with a Host tier, 2 without) taps are kept per request.
