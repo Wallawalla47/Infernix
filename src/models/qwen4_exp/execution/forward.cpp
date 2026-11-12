@@ -1434,12 +1434,9 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         // The next layer's guessed experts follow this layer's copies on the link.
         const auto* guessed = static_cast<const std::int32_t*>(split_offsets_.data()) + E + 1;
         for (std::int32_t e = 0; e < E; ++e) { guess_columns_[static_cast<std::size_t>(e)] = guessed[e + 1] - guessed[e]; }
-        // Flash-Next copies ahead the guessed experts of more than T / 64 columns (at least 8; the 122B keeps
-        // ExpertStream::ahead_rows' T / 128). FP4-Local prefill against T / 128 with the earlier guess (2026-11-09,
-        // ABBA x3): pp1024 +4.4-4.6 %, pp2048 +3.3-3.5 %, pp4096 +0.1-0.2 %; T / 32 lost 6.4 % at pp4096 (design
-        // §19.3.12).
-        constexpr std::int32_t kAheadDivisor = 64;
-        (void)streaming->plan_ahead(layer + 1, guess_columns_, std::max(T / kAheadDivisor, 8), 0);
+        // Copied ahead: the guessed experts of more than ExpertStream::ahead_rows(T) columns (T / 64, at least 8;
+        // design §19.3.12).
+        (void)streaming->plan_ahead(layer + 1, guess_columns_, runtime::expert_offload::ExpertStream::ahead_rows(T), 0);
     }
     if (!shared_early) {
         scan_input(x, layer, ActivationScan::Site::SharedInput);

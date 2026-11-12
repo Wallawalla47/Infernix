@@ -133,11 +133,14 @@ public:
     // Zeroes the columns of the experts copied ahead for `layer`: they are on their way to the device, so
     // the CPU split neither takes nor prices them.
     void mask_ahead(std::uint32_t layer, std::span<std::int32_t> columns) const;
-    // plan_ahead's row threshold for a call of `columns` columns: columns / 128, at least 8. Dense8 prefill
-    // gains (2026-10-26): 2,048 columns 4 / 8 / 16 / 32 / 64 rows +10.5 / +12.7 / +14.4 / +15.0 / +14.4 %;
-    // 4,096 columns 8 / 16 / 32 rows +7.7 / +8.8 / +8.9 %; 1,024 columns 8 rows +10.2 % (the only one run).
+    // plan_ahead's row threshold for a call of `columns` columns: columns / 64, at least 8. Dense8 prefill
+    // gains of the copy-ahead (2026-10-26): 2,048 columns 4 / 8 / 16 / 32 / 64 rows +10.5 / +12.7 / +14.4 / +15.0 /
+    // +14.4 %; 4,096 columns 8 / 16 / 32 rows +7.7 / +8.8 / +8.9 %; 1,024 columns 8 rows +10.2 %. T / 64 against
+    // T / 128 (RTX 5090): FP4-Local prefill (2026-11-09, ABBA x3) pp1024 -4.4..-4.6 %, pp2048 -3.3..-3.5 %, pp4096
+    // -0.1..-0.2 % (T / 32 lost 6.4 % at pp4096); Ornith-1.5-122B prefill (2026-11-12, ABBA x2 after a warm run)
+    // pp512 level, pp1024 -2.6 %, pp2048 -0.85 %, pp4096 -0.26 % (T / 32 the same as T / 64 in one block).
     [[nodiscard]] static constexpr std::int32_t ahead_rows(std::int32_t columns) noexcept {
-        return columns / 128 > 8 ? columns / 128 : 8;
+        return columns / 64 > 8 ? columns / 64 : 8;
     }
     [[nodiscard]] bool gated() const noexcept { return gated_; }
     // Whether the active (ungated) chunk copies every expert of `layer` that was not resident when it

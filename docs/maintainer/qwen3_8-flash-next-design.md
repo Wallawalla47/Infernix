@@ -9291,8 +9291,8 @@ toggle; off = blind stream, on = gated + CPU split at every width up to 4,096):
 idle link kept 2,048 columns and above on the blind stream. Now (as Basalt `31aacda` does) a gated call also
 routes a guess of the next layer's MoE input through the next layer's router (the router's tensor-core form: the
 guess decides placement only) and, once the layer's experts are enqueued, copies the non-resident experts that guess gives
-more than a row threshold (Flash-Next: the call's columns / 64 since 2026-11-09, below; the 122B:
-`ExpertStream::ahead_rows`, the call's columns / 128; at least 8 either way) into the start of the next
+more than a row threshold (`ExpertStream::ahead_rows`: the call's columns / 64, at least 8; Flash-Next since
+2026-11-09, the 122B since 2026-11-12, below; columns / 128 before) into the start of the next
 layer's ring half (`ExpertStream::plan_ahead`). At the next layer's routing those experts keep their slots, the
 CPU split neither takes nor prices them (`mask_ahead`), and only the rest are copied after them. The record bytes
 read are the same, so outputs are unchanged: reproducible-route greedy ids were identical with it off and on, on
@@ -9325,7 +9325,10 @@ fixed that and gained by itself:
 | T / 32 against T / 64 (new guess) | +0.2 to +0.3 % | -0.2 to -0.3 % | -6.4 to -6.5 % |
 
 So Flash-Next takes the new guess with T / 64 (greedy ids identical at T / 32, T / 64 and T / 128). The 122B keeps its
-guess (the MoE input) and T / 128: not measured with either change.
+guess (the MoE input) and takes T / 64 too (candidates ZK-06, 2026-11-12; Ornith-1.5-122B NVFP4 prefill, INT8 KV,
+`infernix_bench -p N -n 1 -r 3`, two ABBA blocks after a discarded warm run, against T / 128): pp512 level (-0.04 %),
+pp1024 -2.6 %, pp2048 -0.85 %, pp4096 -0.26 %, spreads 0.6-7 ms; T / 32 measured the same as T / 64 in one block (the 122B's greedy text
+was not rechecked for this threshold).
 
 Measured (2026-10-26, RTX 5090 PCIe 5.0 x8, `infernix_bench -p N -r 2 --warmup 1`, INT8 KV, ABBA with a noise arm
 that read 1.000 each time; prefill tok/s against the earlier route):
