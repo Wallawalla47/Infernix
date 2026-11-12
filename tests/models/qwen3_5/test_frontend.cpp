@@ -3681,6 +3681,19 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
         failures += check(split == batched,
                           "generated UTF-8 recovery changed across decode-round boundaries");
     }
+    // The only generated token is a lead byte and the output limit is one token (ZD-04): the reply
+    // ends at that limit with U+FFFD for the incomplete character, in the same round.
+    {
+        auto lone_prompt  = frontend.prepare_tokens({0});
+        auto lone_session = frontend.make_output_session(lone_prompt, {});
+        const auto lone   = lone_session.preview_model(std::array<infernix::TokenId, 1>{10}, 1,
+                                                       infernix::FinishReason::OutputLimit);
+        const auto lone_output = lone_session.commit_preview();
+        failures += check(lone.accepted_tokens == 1 && lone.finished() &&
+                              lone.finish_reason == infernix::FinishReason::OutputLimit &&
+                              channel_text(lone_output, infernix::OutputChannel::Content) == replacement,
+                          "a lone lead byte at a one-token limit did not end with U+FFFD");
+    }
 
     auto repaired_stop_prompt = frontend.prepare_tokens({0});
     infernix::StopPolicy repaired_stop;

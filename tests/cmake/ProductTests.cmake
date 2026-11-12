@@ -150,6 +150,19 @@ infernix_add_test(infernix_http_anthropic_usage_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_anthropic_usage_compat.cpp"
   LIBRARIES infernix_serve infernix_product_logging)
 
+# A streamed reply whose only token is an incomplete UTF-8 character, over loopback HTTP on every
+# streaming API: its U+FFFD (or no text) and the output limit's terminal events, and the stream ends.
+infernix_add_test(infernix_http_stream_lone_token_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_stream_lone_token.cpp"
+  LIBRARIES infernix_serve infernix_product_logging)
+
+# YH-01: a client that stops reading a stream for 7 s (past cpp-httplib's 5 s default write timeout)
+# keeps it: every delta, the finish and [DONE] arrive once it reads again (one 7 s pause).
+infernix_add_test(infernix_http_stream_stall_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_stream_stall.cpp"
+  LIBRARIES infernix_serve infernix_product_logging)
+set_tests_properties(infernix_http_stream_stall_test PROPERTIES TIMEOUT 60)
+
 infernix_add_test(infernix_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"
   LIBRARIES infernix_serve)

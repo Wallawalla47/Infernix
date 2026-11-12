@@ -874,6 +874,14 @@ and reasoning-token details; choices carry `logprobs: null` when log probabiliti
 requested, and aggregate assistant messages carry `refusal: null` because refusal output is not
 supported.
 
+Generated text goes out in whole UTF-8 characters, on every API and streamed or not: a character
+whose bytes span several tokens is sent with its last byte, and a reply that ends inside one (an
+output limit between its tokens) ends with U+FFFD in place of the incomplete character, as does
+thinking a reasoning close cuts. A stream's terminal events follow the last token whatever text it
+produced: a one-token reply that is the first byte of a character sends U+FFFD, then the
+finish-reason chunk and `[DONE]` (Responses `response.incomplete`, Anthropic `message_delta` with
+`max_tokens` and `message_stop`), and the response ends.
+
 A failure after the stream has started is sent as OpenAI does: one unnamed `data:` event whose
 payload is the usual error body (`{"error": {...}}`, which OpenAI SDKs raise as an API error), then
 the connection closes without a finish-reason chunk, usage chunk or `[DONE]`. A stream's response
