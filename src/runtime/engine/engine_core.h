@@ -43,17 +43,6 @@
 
 namespace infernix::runtime {
 
-// The decode share's temporary A/B switches (DecodeShare), read once at Engine construction:
-// INFERNIX_TMP_DECODE_SHARE in [0, 1] (unset: 0) and INFERNIX_TMP_DECODE_SHARE_MIN_TOKENS
-// (unset: 0).
-[[nodiscard]] inline DecodeShare decode_share_from_environment() {
-    DecodeShare policy;
-    policy.share                = temporary_switches::number("INFERNIX_TMP_DECODE_SHARE", 0.0, 0.0, 1.0);
-    policy.min_remaining_tokens = static_cast<std::uint32_t>(temporary_switches::integer(
-        "INFERNIX_TMP_DECODE_SHARE_MIN_TOKENS", 0, 0, std::numeric_limits<std::uint32_t>::max()));
-    return policy;
-}
-
 // Requests reuse context through the Program's prefix cache, driven by HybridResourceManager
 // (docs/maintainer/hybrid-prefix-cache-spec.md).
 template <class Instance>
@@ -131,7 +120,6 @@ public:
                 .total_bytes   = options.speculative.ngram_archive_bytes});
         }
         diagnostics_ = options.diagnostic_observer;
-        scheduler_.set_decode_share(decode_share_from_environment());
         if (options.context_cache.enabled &&
             !options.context_cache.hybrid.persistent_file.empty()) {
             prefix_save_interval_ = options.context_cache.hybrid.persistent_save_interval;
@@ -2907,13 +2895,6 @@ private:
                 }
                 if (stopping_) {
                     lock.unlock();
-                    if (scheduler_.decode_share().share > 0.0) {
-                        // The A/B arm's positive control: how often prefill gave way to decode.
-                        publish_diagnostic(diagnostics_, DiagnosticLevel::Info,
-                                           "decode share: %llu prefill turns yielded",
-                                           static_cast<unsigned long long>(
-                                               scheduler_.decode_share_yields()));
-                    }
                     std::scoped_lock execution_lock(execution_mutex_);
                     fail_all_locked(
                         std::make_exception_ptr(RequestError(RequestErrorKind::Unavailable,
@@ -3017,7 +2998,6 @@ private:
                 }
                 controls = std::move(selected_control);
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                const auto decode_started = Clock::now();
                 if (!controls.empty()) {
                     set_host_work_class(HostWorkClass::Control);
                     const auto control_started = Clock::now();
@@ -3054,14 +3034,6 @@ private:
                     charge_service(mark);
                     executed = true;
                 }
-                if (controls.empty() && decode.empty()) {
-                    scheduler_.decode_work_absent();
-                } else {
-                    scheduler_.decode_work_finished(static_cast<std::uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() -
-                                                                             decode_started)
-                            .count()));
-                }
                 if (instance_.program->has_context_transaction()) {
                     set_host_work_class(HostWorkClass::Control);
                     auto progress_boundary = begin_host_phase();
@@ -3082,11 +3054,7 @@ private:
                     }
                 }
                 const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_);
-                // A protected unit (Replay, a recovering request) never gives way to the decode
-                // share; any other waits while the share still owes Control/Decode time.
-                const bool shared_unit = lane && !slots_[*lane]->is_replaying() &&
-                                         !slots_[*lane]->recovery_pending;
-                if (lane && !(shared_unit && scheduler_.prefill_yields())) {
+                if (lane) {
                     const auto request = slots_[*lane];
                     set_host_work_class(HostWorkClass::Prefill);
                     // The unit's tokens age the other prefilling lanes (Scheduler::next_prefill).
@@ -3124,27 +3092,10 @@ private:
                     } else {
                         const auto prefill_started = Clock::now();
                         const ServiceMark mark     = service_mark();
-                        const bool complete = run_prefill_step(*lane, snapshot_cancellations());
+                        (void)run_prefill_step(*lane, snapshot_cancellations());
                         charge_service(mark);
                         cumulative_stats_.execution.prefill.add(
                             elapsed_ns(prefill_started, Clock::now()));
-                        if (shared_unit) {
-                            const BeginSummary& begin = *request->admitted_begin;
-                            const std::uint32_t remaining =
-                                begin.prompt_tokens - begin.reused_prompt_tokens -
-                                request->computed_prompt_tokens;
-                            const bool decode_waiting =
-                                std::any_of(slots_.begin(), slots_.end(), [&](const auto& other) {
-                                    return other && other != request &&
-                                           (other->is_decode_ready() || other->is_control_ready());
-                                });
-                            scheduler_.prefill_unit_finished(
-                                static_cast<std::uint64_t>(
-                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                        Clock::now() - prefill_started)
-                                        .count()),
-                                complete, remaining, decode_waiting);
-                        }
                     }
                     const std::uint64_t unit_tokens =
                         request->computed_prompt_tokens + request->replayed_tokens - tokens_before;

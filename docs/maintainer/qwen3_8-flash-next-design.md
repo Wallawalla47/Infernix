@@ -4291,7 +4291,7 @@ These defaults were set on 2026-10-04, before any measurement; the user may over
 | Concurrency | Fill-phase landing (S4): every staged miss is cached while frames are free | Keep LFRU promotions within the budget |
 | Concurrency | S5 compacted grids, subject to the C = 1 no-regression gates | Fork at every width without the lists |
 | Concurrency | S4b warm start on by default from the user's own saved state; a shipped fallback profile only if the replay gate passes (§19.3.5) | Start empty, as today |
-| Concurrency | S8 decode share for Qwen4Exp at C ≥ 2, its value chosen by S8's measurement (0.5 proposed); Qwen3.5 keeps 1:1 | Today's 1:1 alternation for both |
+| Concurrency | S8 decode share for Qwen4Exp at C ≥ 2, its value chosen by S8's measurement (0.5 proposed; measured slower overall and removed 2026-11-12, 4,096-token walk steps beside decode kept instead); Qwen3.5 keeps 1:1 | Today's 1:1 alternation for both |
 
 ### 19.3.1 Prefix cache
 
@@ -6844,6 +6844,14 @@ overflow. Bit-neutral: only which CTA computes a job changes. C = 1: if items 2-
 call's launch shape changes; with item 1, n-gram W ≥ 7 rounds start forking.
 
 **S8. Decode share between prefill chunks (2026-10-04, from Strata #465; 0.5-1 day; after S1 + S2).**
+
+- **Outcome (2026-11-12).** Built behind temporary switches, measured and removed: on FP4-Local, two
+  lanes decoding beside a fresh 21K-token prompt, share 1 cost the whole set 1.6-4.0 % and the prompt's
+  TTFT 47 % (2.92 -> 4.27 s), against the owner's rule of the fastest overall first. Its walk-step
+  companion stays as the default instead: 4,096-token walk steps while another lane decodes keep the
+  set's time and the prompt's TTFT and halve the decoders' longest pause
+  ([resource scheduling](resource-scheduling-and-context-cache.md), candidates TX-12). The plan below is
+  the record of the proposal.
 
 - **Today.** `Scheduler::choose_execution` (`scheduler.h:248-255`) alternates one prefill unit with
   one decode round, and Qwen4Exp ignores `PrefillStepWidth` and the `ExecutionTiming*` argument

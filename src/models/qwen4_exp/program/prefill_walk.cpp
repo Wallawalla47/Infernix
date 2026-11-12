@@ -24,8 +24,6 @@
 
 #include "models/qwen4_exp/program/program_impl.h"
 
-#include "core/temporary_switches.h"
-
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -473,15 +471,9 @@ void ProgramImpl::walk_enqueue(std::uint32_t to_layer) {
     walk_.next_layer = std::max(walk_.next_layer, to_layer);
 }
 
-std::uint32_t ProgramImpl::walk_step_tokens_from_environment() {
-    return static_cast<std::uint32_t>(
-        temporary_switches::integer("INFERNIX_TMP_DECODE_SHARE_WALK_TOKENS", 0, 0, kWalkMaxTokens));
-}
-
-// The layers one walk step enqueues: about one call's work (walk_begin), or with the walk-step switch
-// while another lane decodes, about walk_step_tokens_ tokens' (at least one layer).
+// The layers one walk step enqueues: about one call's work (walk_begin), or while another lane decodes,
+// about kWalkStepTokensBesideDecode tokens' (at least one layer).
 std::uint32_t ProgramImpl::walk_step_layers(std::uint32_t index) const noexcept {
-    if (walk_step_tokens_ == 0) { return walk_.layers_per_step; }
     bool decoding = false;
     for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
         if (i != index && lanes_[i].phase == Phase::Decode) { decoding = true; }
@@ -489,7 +481,8 @@ std::uint32_t ProgramImpl::walk_step_layers(std::uint32_t index) const noexcept 
     if (!decoding) { return walk_.layers_per_step; }
     std::uint64_t tokens = 0;
     for (const auto w : walk_.widths) { tokens += static_cast<std::uint64_t>(w); }
-    const std::uint64_t layers = tokens == 0 ? 1 : static_cast<std::uint64_t>(c_.num_hidden_layers) * walk_step_tokens_ / tokens;
+    const std::uint64_t layers =
+        tokens == 0 ? 1 : static_cast<std::uint64_t>(c_.num_hidden_layers) * kWalkStepTokensBesideDecode / tokens;
     return static_cast<std::uint32_t>(std::clamp<std::uint64_t>(layers, 1, walk_.layers_per_step));
 }
 

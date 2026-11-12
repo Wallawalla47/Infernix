@@ -153,16 +153,26 @@ runs. A binding's first step takes it only when the free pages alone hold it (an
 block, counted as restored); Replay and recovering requests keep one chunk
 ([model quality §6.7](model-quality.md#67-fast-path-registry)).
 
-A decode share (under A/B, the temporary switches `INFERNIX_TMP_DECODE_SHARE` = s in [0, 1],
-default 0, and `INFERNIX_TMP_DECODE_SHARE_MIN_TOKENS`, default 0, logged at startup) lets other
-lanes' Control/Decode batches run for s times the wall time of each non-last ordinary prefill unit
-that leaves at least the threshold of its prompt while another lane waits to decode: the prefill
-turns of the following cycles yield until that time is spent (decode then gets s / (1 + s) of the
-wall time beside a long prompt). Replay and recovering requests never yield. Units stay whole, so
-the chunk grid and every output bit are unchanged. With Qwen3.8-Flash-Next,
-`INFERNIX_TMP_DECODE_SHARE_WALK_TOKENS` = N (default 0: off) also cuts each layer-walk step to
-about N tokens of one-call work while another lane decodes; a step boundary only changes when work
-is enqueued, not its bits.
+Each cycle runs one Control/Decode batch before its prefill turn, so a decoding lane beside a long
+prompt waits one prefill unit between rounds. Qwen3.8-Flash-Next shortens that wait without
+changing the units: while another lane decodes, each layer-walk step enqueues about 4,096 tokens
+of one-call work (`kWalkStepTokensBesideDecode`) instead of one call's; a step boundary only
+changes when work is enqueued, never a bit (candidates TX-12, measured below). A decode share,
+where prefill turns yielded until Control/Decode work had had a share of each prefill unit's wall
+time, was measured and removed (2026-11-12). The rule for both is the fastest overall first, and the
+fairer only where the whole is generally as fast. FP4-Local served, three lanes, two requests decoding
+1,500 tokens beside a fresh 21K-token prompt, ABBA with three repeats a pass:
+
+| Arm | Whole set | Prompt's TTFT | Decoders during the prefill | Decoders' longest pause |
+|---|---|---|---|---|
+| one call's work a step | 17.31 / 18.66 / 13.30 s | 2.92 s | 1.3 tok/s | 1.63 s |
+| 4,096-token steps (default) | 17.03 / 18.26 / 13.09 s | 2.90 s | 2.5 tok/s | 0.74 s |
+| decode share 1 (half the wall time) | 18.01 / 18.95 / 13.63 s | 4.27 s | 15.4 tok/s | 1.59 s |
+| both | 18.73 / 19.55 / 13.92 s | 5.28 s | 18.9 tok/s | 0.73 s |
+
+The whole set is each repeat's mean of two passes; against the baseline's later pass alone (its first
+pass ran cold) the 4,096-token steps are -0.1..+1.3 %. The decode share cost the whole set 1.6-4.0 %
+and the prompt's TTFT 47 %, so it is not kept.
 
 The fresh queue keeps FIFO tickets, and each blocked request can be successfully bypassed by at most C
 younger requests. Each scan checks the queue head and at most C following candidates; failed checks do

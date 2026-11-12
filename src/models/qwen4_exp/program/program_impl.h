@@ -1126,7 +1126,6 @@ public:
             diagnostic("sampled MTP drafts need the sparse acceptance's token domain; drafts stay one-hot",
                        DiagnosticLevel::Warning);
         }
-        walk_step_tokens_ = walk_step_tokens_from_environment();
         dflash_process_calibration_.reset();
         screened_head_ = options_.screened_lm_head;
         if (screened_head_ && !parameters_.output_head_screen) {
@@ -7415,12 +7414,15 @@ private:
     [[nodiscard]] std::uint64_t window_key() const noexcept;
     std::uint64_t walk_spans_ = 0, walk_calls_ = 0;
     std::uint64_t walk_prefetched_chunks_ = 0, prefetched_at_lease_ = 0; // chunks whose rows were prefetched
-    // Temporary switch INFERNIX_TMP_DECODE_SHARE_WALK_TOKENS (0, unset: off): while another lane
-    // decodes, a walk step enqueues about this many tokens of one-call work (layers * span tokens /
-    // L, at least one layer) instead of one call's, so the Engine's decode share interleaves with the
-    // span at finer steps. Step boundaries change only when work is enqueued, never a bit.
-    std::uint32_t walk_step_tokens_ = 0;
-    [[nodiscard]] static std::uint32_t walk_step_tokens_from_environment();
+    // While another lane decodes, a walk step enqueues about this many tokens of one-call work (layers *
+    // span tokens / L, at least one layer) instead of one call's, so decode rounds run between the steps
+    // of a long span (candidates TX-12, by the owner's rule of 2026-11-12: the fastest overall first, then
+    // the fairest). FP4-Local served, three lanes, two requests decoding 1,500 tokens beside a fresh
+    // 21K-token prompt, ABBA with three repeats a pass: the whole set's time -1.6..-2.1 % against one call's
+    // work a step (-0.1..+1.3 % against the later baseline pass alone), the prompt's TTFT level (2.90 vs
+    // 2.92 s), the decoding lanes' longest pause 1.63 -> 0.74 s. Step boundaries change only when work is
+    // enqueued, never a bit.
+    static constexpr std::uint32_t kWalkStepTokensBesideDecode = 4096;
     [[nodiscard]] std::uint32_t walk_step_layers(std::uint32_t index) const noexcept;
     static constexpr std::uint32_t kWalkMaxTokens = 65536;
     // A walk's MoE calls take up to this many columns (several chunks'): at 16,384 tokens the

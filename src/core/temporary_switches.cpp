@@ -31,12 +31,6 @@ constexpr Registration kSwitches[] = {
     // TEMPORARY: =<file> appends every instantiated CUDA graph's top-level edges and their dependency types
     // (core/decode_graph.cpp, dump_graph_edges; the PDL edge census, candidates §57). Diagnostic only.
     {"INFERNIX_TMP_GRAPH_EDGES", Scope::All, Kind::Value},
-    // The scheduler's decode share (runtime/engine/engine_core.h, decode_share_from_environment): a
-    // prefill unit's share of decode batches and the remaining tokens below which it stops. Same bits.
-    {"INFERNIX_TMP_DECODE_SHARE", Scope::All, Kind::Value},
-    {"INFERNIX_TMP_DECODE_SHARE_MIN_TOKENS", Scope::All, Kind::Value},
-    // Flash-Next's prefill walk step while another lane decodes (models/qwen4_exp/program/prefill_walk.cpp).
-    {"INFERNIX_TMP_DECODE_SHARE_WALK_TOKENS", Scope::Qwen4Exp, Kind::Value},
     // Diagnostic: the CPU team's rates on 32 records in three memories, logged at startup
     // (runtime/expert_offload/expert_offload.cpp, cpu_probe_detail; candidates §11.2 OR-08).
     {"INFERNIX_TMP_CPU_PROBE_DETAIL", Scope::All, Kind::Flag},
