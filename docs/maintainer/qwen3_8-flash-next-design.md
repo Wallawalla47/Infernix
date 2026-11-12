@@ -10418,10 +10418,16 @@ Also measured and rejected (2026-10-10, Dense8, against the PDL pair):
   adds one more to that count with a release after encoding, and each down CTA of a call of at most 8
   columns polls its job's count with acquire loads instead of `griddepcontrol.wait` (bounded:
   `kDownReadyTimeoutNs`, then `kErrorDownStalled`). Both the tensor-core A16 route and the GGUF narrow
-  kernels take it. **The bound (2026-11-12, the fix sweep's FS-02):** 10 s without progress (`wait_job_count`:
-  each change of the count restarts it), the host heartbeat's bound; it was 2 s of elapsed time, which fired on
-  11-08 under contention and failed every request of a healthy Engine. ninferpro measured -0.7..-1.4 % forward
-  time on its dp4a kernels (12 columns level,
+  kernels take it; since 2026-11-12 also the W4A4 tensor-core narrow kernels of 4-8-column calls (candidates ZK-04:
+  a count of gate/up CTAs per job, cleared by the call's prepare; calls of 1-3 columns take the row pairs, which
+  already wait per job). Op bench (a4, resident frames, CUDA graph, cold L2): 4 columns 77.9 -> 69.7 us (-10.5 %),
+  5 -6.9 %, 6 -6.0 %, 7 -3.7 %, 8 -3.5 %, equal output hashes; Dense8 served decode on `--reproducible` (7-token
+  drafts, so 8-column verify calls) level, -0.5..+0.7 % a pass pair. The block-FP8 experts' narrow calls were
+  built the same way and kept off: no bench runs that bank, and the official FP8 artifact's decode is bound by the
+  link and the SSD tier, so nothing measured them. **The bound
+  (2026-11-12, the fix sweep's FS-02):** 10 s without progress (`wait_job_count`: each change of the count
+  restarts it), the host heartbeat's bound; it was 2 s of elapsed time, which fired on 11-08 under contention and
+  failed every request of a healthy Engine. ninferpro measured -0.7..-1.4 % forward time on its dp4a kernels (12 columns level,
   18 grid-wide ahead). Measured here against the grid-wide wait (2026-11-08, a temporary switch since
   removed; three ABBA blocks of fresh processes, BF16 KV, the same tokens): FP4-Local with DFlash2 and
   n-gram auto conv 213.6 -> 215.4 tok/s (+0.6..+1.1 % in each block), struct 474.8 -> 477.7

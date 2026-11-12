@@ -3073,7 +3073,8 @@ bool prepares_x(const Tensor& x, const MoeExpertSource& source, const moe::wide:
     const int columns   = static_cast<int>(x.ne[1]);
     const bool nvfp4_a8 = nvfp4_a8_call(source, columns);
     return (layout.x_acts != nullptr && !nvfp4_a8) || ggml_bank(source) || nvfp4_a8 || nvfp4_a8_wide_call(source, columns) ||
-           a16_nmma_call(source, columns, layout) || a4_rows_call(source, columns, layout);
+           a16_nmma_call(source, columns, layout) || a4_rows_call(source, columns, layout) ||
+           (a4_nmma_call(source, columns, layout) && layout.job_ctas != nullptr);
 }
 
 void prepare_x(const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs,
@@ -3092,7 +3093,9 @@ void prepare_x(const Tensor& x, const MoeExpertSource& source, std::int32_t max_
         launch_prepare_a16_rows(x, static_cast<int>(max_jobs), layout, stream);
     } else if (a16_nmma_call(source, columns, layout)) {
         launch_prepare_a16_nmma(x, static_cast<int>(max_jobs), layout, stream);
-    } else if (a4_rows_call(source, columns, layout)) {
+    } else if (a4_rows_call(source, columns, layout) ||
+               (a4_nmma_call(source, columns, layout) && layout.job_ctas != nullptr)) {
+        // The row-pair kernels' h element counts, or the tensor-core narrow kernels' gate/up CTA counts (ZK-04).
         launch_prepare_a4_rows(static_cast<int>(max_jobs), layout, stream);
     }
 }

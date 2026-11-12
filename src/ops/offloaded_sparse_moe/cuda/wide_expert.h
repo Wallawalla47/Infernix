@@ -227,7 +227,9 @@ struct ExpertsWorkspace {
     std::int32_t* h_emax;         // [entries]: column exponent of each wide entry's h (and each narrow entry's on
                                   // a GGUF bank's tensor-core route)
     std::uint32_t* job_ctas;      // [max_jobs]: a GGUF bank's narrow gate/up CTAs finished per job (the last one
-                                  // encodes the job's h), or the NVFP4 row-pair kernels' h elements stored per job;
+                                  // encodes the job's h), or the NVFP4 row-pair kernels' h elements stored per job,
+                                  // or a W4A4 call's tensor-core narrow gate/up CTAs per job (calls of at most
+                                  // kMaxColumns columns);
                                   // cleared by the call's x encoder
     // W4A16, A4 residual (h_rows holds the BF16 h; x_emax and h_emax serve a ring call's narrow experts)
     std::uint8_t* x_terms_plane;  // [entries][x_terms_row_bytes(shape, x terms)]; the 8-bit route's A8 codes (a8_x_rows)
@@ -290,7 +292,8 @@ inline constexpr int kA16NmmaCallColumns = 4096;
 INFERNIX_WIDE_HD constexpr bool a16_nmma_columns(int columns) { return columns <= kA16NmmaCallColumns; }
 // W4A4 calls of at most kA4RowsMaxColumns columns at Flash-Next's geometry may take the row-pair narrow kernels
 // (moe_layer.cu's narrow_rows_a4.cuh), so their workspace also holds each entry's BF16 h row (h_rows) and the per-job
-// h counts (job_ctas) beside the A4 planes.
+// h counts (job_ctas) beside the A4 planes; calls of at most kMaxColumns columns hold job_ctas for the tensor-core narrow
+// kernels' per-job waits as well (candidates ZK-04).
 inline constexpr int kA4RowsMaxColumns = 3;
 INFERNIX_WIDE_HD constexpr bool a4_rows_columns(int columns) { return columns <= kA4RowsMaxColumns; }
 // `columns` is the call's T (entries = top_k * T); the activation and W4A16 wide route select the planes.

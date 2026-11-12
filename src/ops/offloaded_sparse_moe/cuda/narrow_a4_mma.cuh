@@ -108,6 +108,12 @@ struct Nmma4Args {
     // whose rows of wide entries the wide route fills in its own layout), or null: each gate/up CTA quantizes its
     // job's columns itself (calls narrower than kNmma4EncodeMinColumns).
     std::uint8_t* x_rows;
+    // [max_jobs]: gate/up CTAs that stored their h blocks, per job (the workspace's job_ctas, cleared by the call's
+    // prepare), or null.
+    std::uint32_t* job_ctas = nullptr;
+    // 1: each down CTA waits for its own job's h (job_ctas reaching kGateUpCtas) instead of the whole gate/up grid's
+    // PDL wait (decode and verify calls; candidates ZK-04, the W4A4 twin of YF-01).
+    int job_wait = 0;
 };
 
 // One 16-element block b of one column's A4(x) with the job's input scale into an x row of this route's layout:
@@ -292,6 +298,12 @@ __global__ void __launch_bounds__(kNmma4GuThreads) gate_up_nmma4_kernel(Nmma4Arg
         a.h_blocks[static_cast<std::size_t>(first + c) * G::kHBlocks + static_cast<int>(blockIdx.x) * kBlocks + blk] =
             canon::quantize_a4_block(&sm.h[c][16 * blk], scales.input_down);
     }
+    if (a.job_wait != 0) {
+        // This CTA's h blocks are stored: a fire-and-forget release after the barrier (cumulative over every thread's
+        // stores) counts it for the job's down CTAs, which start once all kGateUpCtas have counted.
+        __syncthreads();
+        if (threadIdx.x == 0) { asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(a.job_ctas + job) : "memory"); }
+    }
 }
 
 // A down CTA's shared memory: the warps' row groups, then the job's h blocks (as many columns as the call's, sized at
@@ -337,7 +349,18 @@ __global__ void __launch_bounds__(kNmma4Threads) down_nmma4_kernel(Nmma4Args a) 
         for (int i = lane; i < S::kDownBytes / 16; i += 32) { ggml::tile::cp_async16(sm.units[warp] + 16 * i, src + 16 * i, 16); }
     }
     ggml::tile::cp_async_commit();
-    pdl::wait_for_dependencies();
+    if (a.job_wait != 0) {
+        // Only this job's h is read (and outputs written): wait for its gate/up CTAs' counts, as the A16 tensor-core
+        // route does (narrow_a16_mma.cuh, candidates YF-01; here ZK-04). This grid launched only once every gate/up CTA
+        // had started (each triggers at entry), so the job's CTAs are running. Bounded
+        // (MoeExpertSource::down_ready_timeout_ns): a lost count fails the call through its error word, never hangs.
+        if (record != nullptr && threadIdx.x == 0) {
+            (void)wait_job_count(a.source, a.job_ctas + job, static_cast<std::uint32_t>(S::kGateUpCtas));
+        }
+        __syncthreads(); // thread 0's acquire reaches the other threads (record is uniform in the CTA)
+    } else {
+        pdl::wait_for_dependencies();
+    }
     if (record == nullptr) { return; }
     constexpr int kWords = static_cast<int>(sizeof(canon::A4Block)) / 4;
     static_assert(sizeof(canon::A4Block) % 4 == 0, "word copies of the h blocks");
@@ -383,8 +406,15 @@ void launch_expert_pass_a4_nmma(const bf16* x, int columns, const MoeDispatch& d
     // lost 0.4-0.6 % on every workload, encoding at every width was level (conv +0.2 %, after a 16K prompt +0.2 %,
     // struct -0.2 %); op bench: T = 1-3 0.88-0.95x the time without it, T = 4-8 level to 3 % faster.
     const bool encoded = layout.x_plane != nullptr && std::min(columns, moe::kMaxColumns) >= kNmma4EncodeMinColumns;
-    const Nmma4Args args{reinterpret_cast<const std::uint16_t*>(x), dispatch, source, top_k, job_records, flags, base,
-                         layout.h_blocks, outputs, phase, encoded ? layout.x_plane : nullptr};
+    Nmma4Args args{reinterpret_cast<const std::uint16_t*>(x), dispatch, source, top_k, job_records, flags, base,
+                   layout.h_blocks, outputs, phase, encoded ? layout.x_plane : nullptr};
+    // Each down CTA waits for its own job's h (candidates ZK-04), as the A16 tensor-core and row-pair routes do, instead
+    // of the whole gate/up grid; a split call's down launch is serialized behind its gate/up pass, so it needs no count
+    // wait. RTX 5090, offloaded_moe_wide_bench (a4, resident frames, CUDA graph, cold L2, 2026-11-12): 4 columns
+    // -10.5 %, 5 -6.9 %, 6 -6.0 %, 7 -3.7 %, 8 -3.5 %, equal output hashes; Dense8 served decode on --reproducible
+    // (7-token drafts, 8-column verify calls) level, -0.5 .. +0.7 % a pass pair.
+    args.job_ctas = layout.job_ctas;
+    args.job_wait = part != PassPart::Down && layout.job_ctas != nullptr ? 1 : 0;
     static const bool configured = [] {
         const auto set = [](auto kernel, std::size_t bytes) {
             return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)) ==
