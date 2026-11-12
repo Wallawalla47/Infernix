@@ -58,7 +58,7 @@ function snippets(
       id: "claude-code",
       label: "Claude Code",
       intro:
-        "Claude Code speaks the Anthropic Messages API. Point it at the launcher and name the model; setting the Haiku model to the same id keeps background tasks from switching models, and the context setting tells Claude Code the model's real window. With model discovery on, /model lists every launcher model (as <model id>:claude-code, the spelling Claude Code accepts).",
+        "Claude Code speaks the Anthropic Messages API. Point it at the launcher and name the model; setting the Haiku model to the same id keeps background tasks from switching models, and the context setting tells Claude Code the model's real window. With model discovery on, /model lists every launcher model (as <model id>:claude-code, the spelling Claude Code accepts). Claude Code (2.1.309 to 2.1.322 at least) counts the newly cached part of a prompt twice in its own usage figures; Claude Code usage counting, under Requests and clients in the model's configuration, corrects that.",
       blocks: [
         {
           label: "bash / zsh",

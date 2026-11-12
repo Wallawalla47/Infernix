@@ -65,8 +65,6 @@
   --primary: oklch(0.45 0.165 356);
   --primary-foreground: oklch(0.99 0.003 80);
   --primary-text: oklch(0.45 0.165 356);
-  /* The burgundy at its most contrast (gauge critical zones): darker on light. */
-  --primary-strong: oklch(0.34 0.13 356);
   --secondary: oklch(0.953 0.003 80);
   --secondary-foreground: oklch(0.25 0.006 60);
   --muted: oklch(0.953 0.003 80);
@@ -110,8 +108,6 @@
   --primary: oklch(0.56 0.18 356);
   --primary-foreground: oklch(0.99 0.003 80);
   --primary-text: oklch(0.7 0.14 356);
-  /* Lighter on dark: 8:1 on the background. */
-  --primary-strong: oklch(0.74 0.15 356);
   --secondary: oklch(0.235 0.005 50);
   --secondary-foreground: oklch(0.94 0.004 80);
   --muted: oklch(0.225 0.005 50);
@@ -229,15 +225,13 @@
   animation: infernix-indeterminate 1.5s ease-in-out infinite;
 }
 
-/* Gauges: the needle and value arc ease to each new reading; the arc glows softly in dark mode. */
+/* Gauges: the needle and the reading's arc ease to each new reading. */
 .gauge-anim {
   transition:
     transform 600ms cubic-bezier(0.22, 0.8, 0.3, 1),
     stroke-dashoffset 600ms cubic-bezier(0.22, 0.8, 0.3, 1),
+    stroke 300ms ease-out,
     opacity 300ms ease-out;
-}
-.dark .gauge-value-arc {
-  filter: drop-shadow(0 0 3px color-mix(in oklab, var(--gauge-glow, var(--primary)) 55%, transparent));
 }
 
 /* The console's resize handle. */

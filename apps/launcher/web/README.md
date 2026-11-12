@@ -19,3 +19,8 @@ Layout: `src/components/ui` holds the primitives, `src/components` the shared pi
 console, folder picker), `src/pages` one module per route, `src/lib` the API client, the live event
 store, formatting and launch-argument helpers. Charts follow the validated reference palette in
 `src/index.css` (`--series-*`, `--chart-*`, `--status-*`).
+
+The Configure form is built from one table, [`src/pages/configure/options.ts`](src/pages/configure/options.ts):
+its sections and, for each control, the `infernix-serve` option it edits. An option added to the
+server gets a control there; [`tests/test_launcher_option_coverage.py`](../../../tests/test_launcher_option_coverage.py)
+fails until it has one (or is listed as set by the launcher).

@@ -147,6 +147,31 @@ export function setFlag(
   return entriesToArgs(rest);
 }
 
+/** Every value of a repeatable flag (`--no-fast-path A --no-fast-path B`), in order. */
+export function getFlagValues(args: readonly string[], flag: string, takesValue: TakesValue): string[] {
+  const values: string[] = [];
+  for (const entry of parseEntries(args, takesValue)) {
+    if (entry.flag === flag && entry.value !== null) values.push(entry.value);
+  }
+  return values;
+}
+
+/** Writes a repeatable flag once per value, at the place of its first occurrence (else at the
+ * end); no values removes it. */
+export function setFlagValues(
+  args: readonly string[],
+  flag: string,
+  values: readonly string[],
+  takesValue: TakesValue,
+): string[] {
+  const entries = parseEntries(args, takesValue);
+  const first = entries.findIndex((entry) => entry.flag === flag);
+  const rest = entries.filter((entry) => entry.flag !== flag);
+  const added: ArgEntry[] = values.map((value) => ({ flag, value }));
+  rest.splice(first >= 0 ? Math.min(first, rest.length) : rest.length, 0, ...added);
+  return entriesToArgs(rest);
+}
+
 export function sameArgs(a: readonly string[], b: readonly string[]): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i += 1) {
@@ -164,6 +189,7 @@ export const KNOWN_SWITCHES: ReadonlySet<string> = new Set([
   "--reproducible",
   "--lossless",
   "--expert-a4-activations",
+  "--a16-activations",
   "--a8-activations",
   "--embedding-host",
   "--lm-head-draft",

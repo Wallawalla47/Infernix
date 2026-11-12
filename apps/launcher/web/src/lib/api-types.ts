@@ -598,6 +598,12 @@ export interface MetricsSnapshot {
     paused: number;
     replaying: number;
     materializing: number;
+    /** Seconds the Engine has held requests without completing anything; 0 while it progresses
+     * or is idle. It warns at 30 s and heals the stall at 120 s (the running requests fail).
+     * Absent from servers built before 2026-11. */
+    no_progress_s?: number;
+    /** Stalls healed that way since the server started. */
+    no_progress_recoveries?: number;
     tok_s: number | null;
     tok_s_mean: number | null;
     prefill_tok_s_mean: number | null;

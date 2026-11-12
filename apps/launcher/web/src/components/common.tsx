@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import type { LucideIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -171,6 +171,52 @@ export function FieldRow({
       </div>
       <div className={cn("min-w-0", stacked ? "w-full" : "sm:w-64 sm:shrink-0")}>{children}</div>
     </div>
+  );
+}
+
+/** The titles of the cards inside `container` as a row of links that stays under the page header;
+ * a click scrolls to that card. For long pages of cards (Settings). It reads the titles from the
+ * page, so a card added later is listed without being named here. */
+export function CardIndex({ container }: { container: RefObject<HTMLElement | null> }) {
+  const [titles, setTitles] = useState<string[]>([]);
+  const nav = useRef<HTMLElement>(null);
+  // After every render of the page: its cards appear once its data has loaded.
+  useEffect(() => {
+    const found = [...(container.current?.querySelectorAll<HTMLElement>('[data-slot="card-title"]') ?? [])]
+      .map((title) => title.textContent?.trim() ?? "")
+      .filter((title) => title.length > 0);
+    setTitles((old) => (old.join("\n") === found.join("\n") ? old : found));
+  });
+  if (titles.length < 4) return null;
+  const go = (index: number) => {
+    const title = container.current?.querySelectorAll<HTMLElement>('[data-slot="card-title"]')[index];
+    const card = title?.closest<HTMLElement>('[data-slot="card"]');
+    if (!card) return;
+    // Clear of the app header and of this row, whose height depends on how its entries wrap.
+    const strip = nav.current;
+    const stripBottom = strip ? (parseFloat(getComputedStyle(strip).top) || 0) + strip.offsetHeight : 0;
+    card.style.scrollMarginTop = `${stripBottom + 24}px`;
+    // At once: an animated scroll can be cut short by the page's once-a-second live updates.
+    card.scrollIntoView({ block: "start" });
+  };
+  return (
+    // One row that scrolls sideways on a phone, where wrapping would cover a sixth of the screen.
+    <nav
+      ref={nav}
+      aria-label="Sections of this page"
+      className="sticky top-14 z-20 -mx-1 flex gap-1 overflow-x-auto rounded-lg bg-background/85 px-1 py-2 backdrop-blur-md sm:flex-wrap sm:overflow-x-visible"
+    >
+      {titles.map((title, index) => (
+        <button
+          key={title}
+          type="button"
+          onClick={() => go(index)}
+          className="shrink-0 rounded-md border px-2 py-1 text-xs font-medium whitespace-nowrap text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+        >
+          {title}
+        </button>
+      ))}
+    </nav>
   );
 }
 

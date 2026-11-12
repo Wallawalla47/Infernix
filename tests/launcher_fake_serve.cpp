@@ -40,6 +40,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -535,6 +536,16 @@ void generate(const std::string& protocol, const Json& body, const std::string& 
 }
 
 void print_help() {
+    // INFERNIX_FAKE_SERVE_HELP names a text file to print instead (a real infernix-serve's --help,
+    // say), so the launcher offers that server's options while this one answers the requests.
+    if (const char* file = std::getenv("INFERNIX_FAKE_SERVE_HELP"); file != nullptr && *file != '\0') {
+        if (std::ifstream in(file, std::ios::binary); in) {
+            std::ostringstream text;
+            text << in.rdbuf();
+            std::fwrite(text.str().data(), 1, text.str().size(), stdout);
+            return;
+        }
+    }
     std::printf(
         "usage: infernix-serve ARTIFACT [options]   (the launcher's stand-in for tests)\n\n"
         "SERVER\n"

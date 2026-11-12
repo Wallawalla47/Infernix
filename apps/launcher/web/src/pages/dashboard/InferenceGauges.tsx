@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { Database, Gauge as GaugeIcon, Layers, Sparkles, Timer, Zap } from "lucide-react";
 
-import { GaugeCard, accentZones, severityZones, useGrowingMax } from "@/components/Gauge";
+import { GaugeCard, useGrowingMax } from "@/components/Gauge";
 import { Badge } from "@/components/ui/badge";
 import { useLive } from "@/lib/events";
 import { formatRateNumber, formatSeconds } from "@/lib/format";
@@ -20,7 +20,8 @@ const pctText = (value: number) => value.toFixed(1);
 const secondsText = (value: number) => (value < 10 ? value.toFixed(2) : value < 100 ? value.toFixed(1) : value.toFixed(0));
 
 /** The serving statistics as dials: rates and times over the last ten requests (the decode needle
- * follows the live rate while the server generates), with the session values beneath. */
+ * follows the live rate while the server generates), with the session values and the best or
+ * slowest of the server's kept requests beneath. */
 export function InferenceGauges() {
   const metrics = useLive((live) => live.metrics);
   const instance = useLive((live) => live.instance);
@@ -32,7 +33,6 @@ export function InferenceGauges() {
       decode: maxOf(rows.map((row) => row.decode_tok_s)),
       prefill: maxOf(rows.map((row) => row.prefill_tok_s)),
       ttft: maxOf(rows.map((row) => row.ttft_ms / 1000)),
-      hit: maxOf(rows.map((row) => (row.hit_rate === null ? null : row.hit_rate * 100))),
     }),
     [rows],
   );
@@ -64,7 +64,7 @@ export function InferenceGauges() {
             ? instance?.state === "starting"
               ? "waiting for the server to become ready"
               : "no model serving: the dials wake up with the first requests"
-            : `${stats?.recentLabel ?? "Last 10"} requests; the decode needle follows the live rate while generating`}
+            : `over the ${(stats?.recentLabel ?? "Last 10").toLowerCase()} requests`}
         </span>
         {live ? (
           <div className="ml-auto flex items-center gap-1.5">
@@ -77,7 +77,7 @@ export function InferenceGauges() {
           </div>
         ) : null}
       </div>
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-[repeat(auto-fit,minmax(170px,1fr))]">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-[repeat(auto-fill,minmax(170px,1fr))]">
         <GaugeCard
           title="Decode"
           icon={Zap}
@@ -86,14 +86,12 @@ export function InferenceGauges() {
           max={decodeMax}
           unit="tok/s"
           format={formatRateNumber}
-          zones={accentZones(decodeMax)}
-          peak={peaks.decode}
-          peakLabel="fastest request"
           aside={generating ? <Badge variant="accent">live</Badge> : null}
           sub={
             <>
-              <span>Last 10 {formatRateNumber(recent?.decode_tok_s)}</span>
+              {generating ? <span>Last 10 {formatRateNumber(recent?.decode_tok_s)}</span> : null}
               <span>Session {formatRateNumber(session?.decode_tok_s)}</span>
+              {peaks.decode !== null ? <span>best {formatRateNumber(peaks.decode)}</span> : null}
             </>
           }
         />
@@ -105,10 +103,12 @@ export function InferenceGauges() {
           max={prefillMax}
           unit="tok/s"
           format={formatRateNumber}
-          zones={accentZones(prefillMax)}
-          peak={peaks.prefill}
-          peakLabel="fastest request"
-          sub={<span>Session {formatRateNumber(session?.prefill_tok_s)}</span>}
+          sub={
+            <>
+              <span>Session {formatRateNumber(session?.prefill_tok_s)}</span>
+              {peaks.prefill !== null ? <span>best {formatRateNumber(peaks.prefill)}</span> : null}
+            </>
+          }
         />
         <GaugeCard
           title="Time to first token"
@@ -118,11 +118,12 @@ export function InferenceGauges() {
           max={ttftMax}
           unit="s"
           format={secondsText}
-          zones={severityZones(ttftMax, 2, 10)}
-          valueColor="zone"
-          peak={peaks.ttft}
-          peakLabel="slowest request"
-          sub={<span>Session {formatSeconds(session?.ttft_s)}</span>}
+          sub={
+            <>
+              <span>Session {formatSeconds(session?.ttft_s)}</span>
+              {peaks.ttft !== null ? <span>slowest {formatSeconds(peaks.ttft)}</span> : null}
+            </>
+          }
         />
         <GaugeCard
           title="Prompt cache hit"
@@ -133,9 +134,6 @@ export function InferenceGauges() {
           unit="%"
           format={pctText}
           tickFormat={(value) => String(Math.round(value))}
-          zones={accentZones(100)}
-          peak={peaks.hit}
-          peakLabel="best request"
           sub={<span>Session {session?.cache_hit_rate != null ? `${pctText(session.cache_hit_rate * 100)}%` : "—"}</span>}
         />
         {showExperts && session ? (
@@ -148,7 +146,6 @@ export function InferenceGauges() {
             unit="%"
             format={pctText}
             tickFormat={(value) => String(Math.round(value))}
-            zones={accentZones(100)}
             sub={<span>Session {session.expert_hit_rate !== null ? `${pctText(session.expert_hit_rate * 100)}%` : "—"}</span>}
           />
         ) : null}
@@ -162,7 +159,6 @@ export function InferenceGauges() {
             unit="%"
             format={pctText}
             tickFormat={(value) => String(Math.round(value))}
-            zones={accentZones(100)}
             sub={
               <>
                 <span>Session {session.acceptance !== null ? `${pctText(session.acceptance * 100)}%` : "—"}</span>

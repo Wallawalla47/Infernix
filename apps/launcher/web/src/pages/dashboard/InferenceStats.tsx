@@ -114,8 +114,31 @@ export function InferenceStats({ className }: { className?: string }) {
     });
   }
 
+  // Whole-session counts the server keeps no last-ten window for; shown once they are not zero.
+  const sessionOnly: { label: string; hint: string; value: number }[] = [
+    {
+      label: "Preemptions",
+      hint: "Requests paused under memory pressure to let others finish, then resumed from the prefix cache or by replay",
+      value: metrics.totals.preemptions,
+    },
+    {
+      label: "Replayed tokens",
+      hint: "History tokens computed again while resuming paused requests",
+      value: metrics.totals.replayed_tokens,
+    },
+    {
+      label: "Stalls healed",
+      hint: "Times the Engine made no progress for two minutes while holding requests and healed itself by failing them",
+      value: metrics.live.no_progress_recoveries ?? 0,
+    },
+  ].filter((row) => row.value > 0);
+
   const live = metrics.live;
   const busy = live.state === "generating" || live.state === "reading";
+  const held = [
+    live.paused > 0 ? `${formatInt(live.paused)} paused` : null,
+    live.replaying > 0 ? `${formatInt(live.replaying)} replaying` : null,
+  ].filter((part): part is string => part !== null);
   const outcome = [`${formatInt(stats.completed)} done`];
   if (stats.failed > 0) outcome.push(`${formatInt(stats.failed)} failed`);
   if (stats.cancelled > 0) outcome.push(`${formatInt(stats.cancelled)} cancelled`);
@@ -128,9 +151,7 @@ export function InferenceStats({ className }: { className?: string }) {
           <Gauge className="size-4 text-muted-foreground" />
           Inference statistics
         </CardTitle>
-        <CardDescription>
-          {outcome.join(" · ")} · {live.running} running, {live.waiting} waiting
-        </CardDescription>
+        <CardDescription>Requests of this run of the server: {outcome.join(" · ")}</CardDescription>
       </CardHeader>
       <CardContent className="px-0">
         <Table>
@@ -155,6 +176,19 @@ export function InferenceStats({ className }: { className?: string }) {
                 <TableCell className="pr-4 text-right font-medium tabular-nums">{row.cell(session)}</TableCell>
               </TableRow>
             ))}
+            {sessionOnly.map((row) => (
+              <TableRow key={row.label}>
+                <TableCell className="pl-4">
+                  <Hint label={row.hint} side="right">
+                    <span className="cursor-default text-muted-foreground decoration-dotted underline-offset-4 hover:underline">
+                      {row.label}
+                    </span>
+                  </Hint>
+                </TableCell>
+                <TableCell className="text-right text-muted-foreground">—</TableCell>
+                <TableCell className="pr-4 text-right font-medium tabular-nums">{formatInt(row.value)}</TableCell>
+              </TableRow>
+            ))}
             <TableRow className="hover:bg-transparent">
               <TableCell className="pl-4 text-muted-foreground">Now</TableCell>
               <TableCell colSpan={2} className="pr-4 text-right tabular-nums">
@@ -168,6 +202,7 @@ export function InferenceStats({ className }: { className?: string }) {
                 ) : (
                   <span className="text-muted-foreground">idle</span>
                 )}
+                {held.length > 0 ? <span className="ml-1.5 text-muted-foreground">· {held.join(", ")}</span> : null}
               </TableCell>
             </TableRow>
           </TableBody>

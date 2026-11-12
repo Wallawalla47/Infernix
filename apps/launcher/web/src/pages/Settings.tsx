@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowRightLeft,
@@ -28,7 +28,7 @@ import { toast } from "sonner";
 import { ApiKeysCard } from "@/components/admin/ApiKeysCard";
 import { ModelRoutesCard } from "@/components/admin/ModelRoutesCard";
 import { UpdatesCard } from "@/components/admin/UpdatesCard";
-import { FieldRow, PageHeader, SectionCardTitle } from "@/components/common";
+import { CardIndex, FieldRow, PageHeader, SectionCardTitle } from "@/components/common";
 import { CopyButton } from "@/components/CopyButton";
 import { FolderPicker } from "@/components/FolderPicker";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -175,6 +175,7 @@ export function SettingsPage() {
   const { data: library } = useLibrary();
   const serveOptions = useServeOptions();
   const { theme, setTheme } = useTheme();
+  const cards = useRef<HTMLDivElement>(null);
   const [folderPicker, setFolderPicker] = useState(false);
   const [downloadPicker, setDownloadPicker] = useState(false);
   const [logPicker, setLogPicker] = useState(false);
@@ -224,6 +225,7 @@ export function SettingsPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader title="Settings" description="Everything here persists between launcher runs." />
+      <CardIndex container={cards} />
 
       {state?.restart_required ? (
         <Alert variant="warning">
@@ -235,7 +237,7 @@ export function SettingsPage() {
         </Alert>
       ) : null}
 
-      <div className="grid gap-5 xl:grid-cols-2">
+      <div ref={cards} className="grid gap-5 xl:grid-cols-2">
         <Card className="gap-2 xl:col-span-2">
           <CardHeader>
             <CardTitle>

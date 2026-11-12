@@ -2,6 +2,8 @@ import { useMemo } from "react";
 import {
   ArrowDownToLine,
   ArrowUpFromLine,
+  ChevronDown,
+  ChevronUp,
   CircuitBoard,
   Cpu,
   HardDrive,
@@ -12,13 +14,30 @@ import {
 } from "lucide-react";
 
 import { Sparkline, type SparkPoint } from "@/components/charts";
-import { GaugeCard, accentZones, severityZones, useGrowingMax } from "@/components/Gauge";
+import { GaugeCard, gaugeTone, useGrowingMax } from "@/components/Gauge";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Hint } from "@/components/ui/tooltip";
 import type { CpuTempSource, GpuSample, SystemSample } from "@/lib/api-types";
 import { useLive } from "@/lib/events";
 import { formatByteRate, formatGiB } from "@/lib/format";
+import { useStoredFlag } from "@/lib/hooks";
 
 const GiB = 1024 ** 3;
+
+// Limits of the dials that have them: a reading at or above the first is "High", the second "Critical".
+const CPU_TEMP_LIMITS = { warnAt: 85, criticalAt: 95 };
+const GPU_TEMP_LIMITS = { warnAt: 80, criticalAt: 90 };
+// Memory is judged by what is left, not by how full it is: models with offloaded experts fill the
+// RAM on purpose. 2 GiB available is where the Engine starts giving RAM back and the launcher's
+// default floor for a load.
+const MEMORY_WARN_FREE = 4 * GiB;
+const MEMORY_CRITICAL_FREE = 2 * GiB;
+
+function memoryLimits(total: number | null): { warnAt?: number; criticalAt?: number } {
+  if (total === null || total <= MEMORY_WARN_FREE) return {};
+  return { warnAt: (1 - MEMORY_WARN_FREE / total) * 100, criticalAt: (1 - MEMORY_CRITICAL_FREE / total) * 100 };
+}
 
 const CPU_SOURCE_TEXT: Record<CpuTempSource, string> = {
   hwinfo: "CPU package sensor via HWiNFO",
@@ -66,12 +85,23 @@ function Spark({ series, label, format, domain }: { series: Series; label: strin
   return <Sparkline data={series.points} label={label} format={format} domain={domain} height={30} />;
 }
 
-/** Host and GPU readings as dials, each with its ten-minute history beneath. */
+/** The parts of a dial's sub-line that have a value, joined by a middle dot. */
+function facts(...parts: (string | null)[]): string | null {
+  const present = parts.filter((part): part is string => part !== null);
+  return present.length > 0 ? present.join(" · ") : null;
+}
+
+const SHOW_ALL_KEY = "infernix.dashboard.system-all";
+
+/** Host and GPU readings as dials, each with its ten-minute history beneath: processor, memory,
+ * GPU and VRAM use always; the temperatures, GPU power and PCIe traffic with "All gauges" (this
+ * browser remembers the choice). A temperature past its limit is named in the header either way. */
 export function SystemGauges() {
   const system = useLive((live) => live.system);
   const history = useLive((live) => live.history);
   const launcher = useLive((live) => live.launcher);
   const info = launcher?.system ?? null;
+  const [showAll, setShowAll] = useStoredFlag(SHOW_ALL_KEY, false);
 
   const series = useMemo(
     () => ({
@@ -104,6 +134,7 @@ export function SystemGauges() {
   const cpuTemp = num(system?.cpu.temp_c);
   const cpuSource = system?.cpu.temp_source ?? info?.cpu_temp_source ?? null;
   const cpuHint = cpuTemp === null || cpuSource === null ? NO_CPU_SENSOR : CPU_SOURCE_TEXT[cpuSource];
+  const gpuTemp = num(gpu?.temp_c);
 
   const ramUsed = num(system?.ram.used);
   const ramTotal = num(system?.ram.total);
@@ -116,11 +147,18 @@ export function SystemGauges() {
   const pcieGen = num(gpu?.pcie_gen);
   const pcieWidth = num(gpu?.pcie_width);
   const link = pcieGen !== null && pcieWidth !== null ? `Gen${pcieGen} x${pcieWidth}` : null;
+  const fan = num(gpu?.fan_pct);
+  const clock = num(gpu?.sm_clock_mhz);
 
   const powerMax = powerLimit !== null && powerLimit > 0 ? powerLimit : 600;
   const rxMax = useGrowingMax(series.rx.peak, 32);
   const txMax = useGrowingMax(series.tx.peak, 32);
   const server = system?.server ?? null;
+
+  // The temperature dials are among the ones "All gauges" adds: a hot reading shows in the header too.
+  const hot: string[] = [];
+  if (gaugeTone(cpuTemp, CPU_TEMP_LIMITS.warnAt, CPU_TEMP_LIMITS.criticalAt) !== "normal") hot.push(`CPU ${whole(cpuTemp ?? 0)} °C`);
+  if (gaugeTone(gpuTemp, GPU_TEMP_LIMITS.warnAt, GPU_TEMP_LIMITS.criticalAt) !== "normal") hot.push(`GPU ${whole(gpuTemp ?? 0)} °C`);
 
   return (
     <section className="flex flex-col gap-3" aria-labelledby="system-gauges">
@@ -132,8 +170,22 @@ export function SystemGauges() {
         <span className="min-w-0 truncate text-xs text-muted-foreground">
           {info ? `${info.cpu_name}${gpu ? ` · ${gpu.name ?? "GPU"}` : ""}` : "Reading the hardware…"}
         </span>
+        <div className="ml-auto flex items-center gap-1.5">
+          {hot.map((text) => (
+            <Badge key={text} variant="warning">
+              <Thermometer />
+              {text}
+            </Badge>
+          ))}
+          <Hint label={showAll ? "Show processor, memory, GPU and VRAM only" : "Also show the temperatures, GPU power and PCIe traffic"}>
+            <Button variant="ghost" size="xs" aria-expanded={showAll} onClick={() => setShowAll(!showAll)}>
+              {showAll ? <ChevronUp /> : <ChevronDown />}
+              {showAll ? "Fewer gauges" : "All gauges"}
+            </Button>
+          </Hint>
+        </div>
       </div>
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-[repeat(auto-fit,minmax(170px,1fr))]">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-[repeat(auto-fill,minmax(170px,1fr))]">
         <GaugeCard
           title="CPU"
           icon={Cpu}
@@ -141,31 +193,10 @@ export function SystemGauges() {
           max={100}
           unit="%"
           format={whole}
-          zones={accentZones(100)}
-          peak={series.cpu.peak}
-          sub={info ? <span>{`${info.cores} cores · ${info.threads} threads`}</span> : null}
-          footer={<Spark series={series.cpu} label="CPU" format={(v) => `${whole(v)}%`} domain={[0, 100]} />}
-        />
-        <GaugeCard
-          title="CPU temperature"
-          icon={Thermometer}
-          hint={cpuHint}
-          value={cpuTemp}
-          max={100}
-          unit="°C"
-          format={whole}
-          zones={severityZones(100, 80, 95)}
-          valueColor="zone"
-          peak={series.cpuTemp.peak}
-          peakLabel="hottest"
           sub={
-            <Hint label={cpuHint}>
-              <span className="cursor-default underline decoration-dotted underline-offset-4">
-                {cpuTemp === null ? "no sensor" : cpuSource === "thermal-zone" ? "motherboard zone" : "package"}
-              </span>
-            </Hint>
+            <span>{facts(cpuTemp !== null ? `${whole(cpuTemp)} °C` : null, info ? `${info.cores} cores · ${info.threads} threads` : null) ?? "—"}</span>
           }
-          footer={<Spark series={series.cpuTemp} label="CPU temperature" format={(v) => `${whole(v)} °C`} domain={[0, 100]} />}
+          footer={<Spark series={series.cpu} label="CPU" format={(v) => `${whole(v)}%`} domain={[0, 100]} />}
         />
         <GaugeCard
           title="Memory"
@@ -174,9 +205,7 @@ export function SystemGauges() {
           max={100}
           unit="%"
           format={whole}
-          zones={severityZones(100, 85, 95)}
-          valueColor="zone"
-          peak={series.ram.peak}
+          {...memoryLimits(ramTotal)}
           sub={
             <>
               <span>{ramUsed !== null && ramTotal !== null ? `${(ramUsed / GiB).toFixed(1)} of ${formatGiB(ramTotal, 0)}` : "—"}</span>
@@ -194,25 +223,8 @@ export function SystemGauges() {
               max={100}
               unit="%"
               format={whole}
-              zones={accentZones(100)}
-              peak={series.gpu.peak}
-              sub={num(gpu?.sm_clock_mhz) !== null ? <span>{`${num(gpu?.sm_clock_mhz)} MHz`}</span> : null}
+              sub={<span>{facts(gpuTemp !== null ? `${whole(gpuTemp)} °C` : null, power !== null ? `${whole(power)} W` : null) ?? "—"}</span>}
               footer={<Spark series={series.gpu} label="GPU" format={(v) => `${whole(v)}%`} domain={[0, 100]} />}
-            />
-            <GaugeCard
-              title="GPU temperature"
-              icon={Thermometer}
-              hint={num(gpu?.temp_c) === null ? "The driver reports no GPU temperature" : "GPU core sensor via NVML"}
-              value={num(gpu?.temp_c)}
-              max={100}
-              unit="°C"
-              format={whole}
-              zones={severityZones(100, 70, 85)}
-              valueColor="zone"
-              peak={series.gpuTemp.peak}
-              peakLabel="hottest"
-              sub={num(gpu?.fan_pct) !== null ? <span>{`fan ${whole(num(gpu?.fan_pct) ?? 0)}%`}</span> : null}
-              footer={<Spark series={series.gpuTemp} label="GPU temperature" format={(v) => `${whole(v)} °C`} domain={[0, 100]} />}
             />
             <GaugeCard
               title="VRAM"
@@ -221,14 +233,55 @@ export function SystemGauges() {
               max={100}
               unit="%"
               format={whole}
-              zones={accentZones(100)}
-              peak={series.vram.peak}
               sub={
                 <span>
                   {vramUsed !== null && vramTotal !== null ? `${(vramUsed / GiB).toFixed(1)} of ${formatGiB(vramTotal, 0)}` : "—"}
                 </span>
               }
               footer={<Spark series={series.vram} label="VRAM in use" format={(v) => `${whole(v)}%`} domain={[0, 100]} />}
+            />
+          </>
+        ) : null}
+        {showAll ? (
+          <GaugeCard
+            title="CPU temperature"
+            icon={Thermometer}
+            hint={cpuHint}
+            value={cpuTemp}
+            max={100}
+            unit="°C"
+            format={whole}
+            {...CPU_TEMP_LIMITS}
+            sub={
+              <>
+                <Hint label={cpuHint}>
+                  <span className="cursor-default underline decoration-dotted underline-offset-4">
+                    {cpuTemp === null ? "no sensor" : cpuSource === "thermal-zone" ? "motherboard zone" : "package"}
+                  </span>
+                </Hint>
+                {series.cpuTemp.peak !== null ? <span>peak {whole(series.cpuTemp.peak)} °C</span> : null}
+              </>
+            }
+            footer={<Spark series={series.cpuTemp} label="CPU temperature" format={(v) => `${whole(v)} °C`} domain={[0, 100]} />}
+          />
+        ) : null}
+        {showAll && showGpu ? (
+          <>
+            <GaugeCard
+              title="GPU temperature"
+              icon={Thermometer}
+              hint={gpuTemp === null ? "The driver reports no GPU temperature" : "GPU core sensor via NVML"}
+              value={gpuTemp}
+              max={100}
+              unit="°C"
+              format={whole}
+              {...GPU_TEMP_LIMITS}
+              sub={
+                <span>
+                  {facts(fan !== null ? `fan ${whole(fan)}%` : null, series.gpuTemp.peak !== null ? `peak ${whole(series.gpuTemp.peak)} °C` : null) ?? "—"}
+                </span>
+              }
+              footer={<Spark series={series.gpuTemp} label="GPU temperature" format={(v) => `${whole(v)} °C`} domain={[0, 100]} />}
             />
             <GaugeCard
               title="GPU power"
@@ -237,9 +290,11 @@ export function SystemGauges() {
               max={powerMax}
               unit="W"
               format={whole}
-              zones={accentZones(powerMax)}
-              peak={series.power.peak}
-              sub={<span>{powerLimit !== null ? `of ${whole(powerLimit)} W` : "no power limit reported"}</span>}
+              sub={
+                <span>
+                  {facts(powerLimit !== null ? `of ${whole(powerLimit)} W` : "no power limit reported", clock !== null ? `${clock} MHz` : null)}
+                </span>
+              }
               footer={<Spark series={series.power} label="GPU power" format={(v) => `${whole(v)} W`} domain={[0, powerMax]} />}
             />
             <GaugeCard
@@ -250,9 +305,7 @@ export function SystemGauges() {
               max={rxMax}
               unit="GB/s"
               format={oneDecimal}
-              zones={accentZones(rxMax)}
-              peak={series.rx.peak}
-              sub={<span>{link ?? formatByteRate(rx)}</span>}
+              sub={<span>{facts(link ?? formatByteRate(rx), series.rx.peak !== null ? `peak ${series.rx.peak.toFixed(1)}` : null)}</span>}
               footer={<Spark series={series.rx} label="Host to GPU" format={(v) => `${v.toFixed(2)} GB/s`} />}
             />
             <GaugeCard
@@ -263,9 +316,7 @@ export function SystemGauges() {
               max={txMax}
               unit="GB/s"
               format={oneDecimal}
-              zones={accentZones(txMax)}
-              peak={series.tx.peak}
-              sub={<span>{link ?? formatByteRate(tx)}</span>}
+              sub={<span>{facts(link ?? formatByteRate(tx), series.tx.peak !== null ? `peak ${series.tx.peak.toFixed(1)}` : null)}</span>}
               footer={<Spark series={series.tx} label="GPU to host" format={(v) => `${v.toFixed(2)} GB/s`} />}
             />
           </>

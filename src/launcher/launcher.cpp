@@ -1064,6 +1064,34 @@ Json Launcher::preview_json(const std::string& config_id, const ScannedModel& mo
             }
         }
     }
+    // Options infernix-serve refuses without another (the NOTES of its --help): named here, before
+    // a load fails on them.
+    const auto set = [&args](std::string_view flag) {
+        const std::optional<std::string> value = flag_value(args, flag);
+        return value ? *value != "0" : has_flag(args, flag);
+    };
+    const auto needs = [&](std::string_view flag, std::string_view other, bool other_set) {
+        if (set(flag) && !other_set) { warnings.push_back(std::string(flag) + " needs " + std::string(other)); }
+    };
+    needs("--ssd-context-gib", "--ssd-context-dir", set("--ssd-context-dir"));
+    needs("--ssd-context-dir", "--ssd-context-gib", set("--ssd-context-gib"));
+    needs("--ssd-context-gib-per-hour", "--ssd-context-gib and --ssd-context-dir",
+          set("--ssd-context-gib") && set("--ssd-context-dir"));
+    if (const std::optional<std::string> folder = flag_value(args, "--ssd-context-dir")) {
+        std::error_code error;
+        if (!std::filesystem::is_directory(utf8_path(*folder), error)) {
+            warnings.push_back("--ssd-context-dir: folder not found: " + *folder);
+        }
+    }
+    needs("--prefix-cache-save-mins",
+          "a prefix cache file (Settings, Keep each model's prefix cache, or --prefix-cache-file)",
+          has_flag(args, "--prefix-cache-file") || prefix_cache_file(config_id, args).has_value());
+    needs("--ngram-native-sessions", "--ngram-archive-mib", set("--ngram-archive-mib"));
+    needs("--request-log-max-mib", "--request-log-jsonl", set("--request-log-jsonl"));
+    needs("--request-log-keep", "--request-log-max-mib", set("--request-log-max-mib"));
+    if (flag_value(args, "--vision-offload").value_or("") == "on" && !has_flag(args, "--vision")) {
+        warnings.push_back("--vision-offload on needs --vision");
+    }
     if (model.needs_ngram_volume && !model.own_ngram_volume && !has_flag(args, "--ngram-volume")) {
         warnings.push_back(model.family_label +
                            " needs an n-gram volume (--ngram-volume): none was found in the model folders; download one "

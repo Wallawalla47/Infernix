@@ -396,6 +396,34 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
               and str(plan.get("max_context")) in (first.get("args") or []),
               "; ".join(str(s.get("title") if isinstance(s, dict) else s) for s in suggestions))
 
+    with section("Launch preview: an option given without the one it needs"):
+        # infernix-serve refuses these pairs at startup; the preview says so while the form is edited.
+        def warned(extra: list[str]) -> list[str]:
+            status, preview = call(port, "POST", f"{cfg}/preview", {"args": base + extra})
+            return preview.get("warnings", []) if status == 200 else [f"HTTP {status}"]
+
+        alone = [
+            (["--ssd-context-gib", "64"], "--ssd-context-gib needs --ssd-context-dir"),
+            (["--ssd-context-dir", str(data)], "--ssd-context-dir needs --ssd-context-gib"),
+            (["--ssd-context-gib-per-hour", "4"], "--ssd-context-gib-per-hour needs --ssd-context-gib"),
+            (["--prefix-cache-save-mins", "30"], "--prefix-cache-save-mins needs a prefix cache file"),
+            (["--ngram-native-sessions"], "--ngram-native-sessions needs --ngram-archive-mib"),
+            (["--request-log-max-mib", "8"], "--request-log-max-mib needs --request-log-jsonl"),
+            (["--request-log-keep", "2"], "--request-log-keep needs --request-log-max-mib"),
+            (["--vision-offload", "on"], "--vision-offload on needs --vision"),
+        ]
+        unnamed = [want for extra, want in alone if not any(w.startswith(want) for w in warned(extra))]
+        check("the preview names each", not unnamed, "; ".join(unnamed))
+        together = warned(["--ssd-context-gib", "64", "--ssd-context-dir", str(data), "--ssd-context-gib-per-hour", "4",
+                           "--prefix-cache-file", str(data / "prefix.cache"), "--prefix-cache-save-mins", "30",
+                           "--ngram-archive-mib", "64", "--ngram-native-sessions",
+                           "--request-log-jsonl", str(data / "requests.jsonl"), "--request-log-max-mib", "8",
+                           "--request-log-keep", "2", "--vision", "--vision-offload", "on"])
+        check("...and none of them when both are given", not any(" needs " in w for w in together), "; ".join(together))
+        absent = warned(["--ssd-context-gib", "64", "--ssd-context-dir", str(data / "no-such-folder")])
+        check("...and an SSD prefix cache folder that does not exist",
+              any(w.startswith("--ssd-context-dir: folder not found") for w in absent), "; ".join(absent))
+
     with section("Keep-alive while a model loads"):
         # Keep-alive while a model loads (the main configuration now takes 12 s to load).
         slow = base + ["--fake-load-ms", "12000"]

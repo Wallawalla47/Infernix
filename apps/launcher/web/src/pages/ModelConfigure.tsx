@@ -9,28 +9,24 @@ import { keepPreviousData, useMutation, useQuery } from "@tanstack/react-query";
 import {
   ArrowLeft,
   BookOpen,
-  Brain,
+  ChevronDown,
+  Copy,
   CopyPlus,
-  Cpu,
-  Database,
   EllipsisVertical,
-  Eye,
   FileCode,
   FileDown,
   FileInput,
-  Image as ImageIcon,
   Play,
   Plug,
   Plus,
   RotateCw,
   Save,
   Search,
-  Sparkles,
   Trash2,
   TriangleAlert,
   Undo2,
   Variable,
-  Wrench,
+  type LucideIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -44,7 +40,7 @@ import { useLoadModel } from "@/components/useModelActions";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -61,7 +57,6 @@ import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
-import { Hint } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
 import type { EnvVar, Library, ModelArtifact, ModelConfig, ServeOption } from "@/lib/api-types";
 import { argsToCommandLine, argsToText, getFlagString, hasFlag, sameArgs, setFlag, tokenize } from "@/lib/args";
@@ -81,25 +76,12 @@ import { useLive } from "@/lib/events";
 import { NGRAM_FORMAT_LABELS, formatBytes, formatContext, formatInt, quantizationLabel } from "@/lib/format";
 import { useDebounced, useLibrary, useOptionMap, useServeOptions, useSettings, useTakesValue } from "@/lib/hooks";
 import { findConfig, findModel } from "@/lib/library";
-import { baseName, cn } from "@/lib/utils";
+import { baseName, cn, copyText, readStorage, writeStorage } from "@/lib/utils";
 import { EnvEditor } from "@/pages/configure/EnvEditor";
 import { FitCard } from "@/pages/configure/FitPanel";
 import { IdleUnloadField } from "@/pages/configure/IdleUnloadField";
-import {
-  ADVANCED_CONTROLS,
-  CommitInput,
-  ControlField,
-  FORM_FLAGS,
-  MEMORY_CONTROLS,
-  NGRAM_CONTROLS,
-  SAMPLING_CONTROLS,
-  SPEC_CONTROLS,
-  THINKING_CONTROLS,
-  UNSET,
-  VISION_CONTROLS,
-  type Control,
-  type FormContext,
-} from "@/pages/configure/controls";
+import { CommitInput, ControlField, UNSET, type Control, type FormContext } from "@/pages/configure/controls";
+import { FORM_FLAGS, FORM_SECTIONS } from "@/pages/configure/options";
 
 /** The unsaved edits; the model id and name are saved on their own. */
 interface Draft {
@@ -130,49 +112,112 @@ function draftDiffers(draft: Draft, config: ModelConfig): boolean {
   );
 }
 
+const SECTIONS_KEY = "infernix.configure.sections";
+
+/** Which sections of the form are open, remembered by this browser: a section is open when the
+ * user opened it, closed when they closed it, and otherwise as it starts. */
+function useOpenSections(): {
+  isOpen: (id: string, startsOpen: boolean) => boolean;
+  setOpen: (id: string, open: boolean) => void;
+  setAll: (ids: readonly string[], open: boolean) => void;
+} {
+  const [choices, setChoices] = useState<Record<string, boolean>>(() => {
+    try {
+      const parsed: unknown = JSON.parse(readStorage(SECTIONS_KEY) ?? "{}");
+      return parsed !== null && typeof parsed === "object" ? (parsed as Record<string, boolean>) : {};
+    } catch {
+      return {};
+    }
+  });
+  const store = (next: Record<string, boolean>) => {
+    setChoices(next);
+    writeStorage(SECTIONS_KEY, JSON.stringify(next));
+  };
+  return {
+    isOpen: (id, startsOpen) => choices[id] ?? startsOpen,
+    setOpen: (id, open) => store({ ...choices, [id]: open }),
+    setAll: (ids, open) => store(Object.fromEntries(ids.map((id) => [id, open]))),
+  };
+}
+
+/** One section of the form: a header that opens and closes it (with how many of its options are
+ * set, so a closed section still says it holds settings) and its rows. */
 function Section({
   icon: Icon,
   title,
   description,
+  open,
+  onOpenChange,
+  setCount = 0,
   children,
 }: {
-  icon: typeof Cpu;
+  icon: LucideIcon;
   title: string;
   description?: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /** Options of the section the configuration sets. */
+  setCount?: number;
   children: ReactNode;
 }) {
   return (
-    <Card className="gap-1">
-      <CardHeader>
-        <CardTitle>
-          <Icon className="size-4 text-muted-foreground" />
-          {title}
-        </CardTitle>
-        {description ? <CardDescription>{description}</CardDescription> : null}
-      </CardHeader>
-      <CardContent className="divide-y">{children}</CardContent>
+    <Card className={cn("gap-1", !open && "py-0")}>
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => onOpenChange(!open)}
+        className={cn(
+          "flex w-full items-center gap-3 rounded-xl px-4 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+          open ? "pb-1" : "py-3.5",
+        )}
+      >
+        <Icon className="size-4 shrink-0 text-muted-foreground" />
+        <span className="min-w-0 flex-1">
+          <span className="block text-sm leading-tight font-semibold">{title}</span>
+          {description ? <span className="mt-0.5 block text-xs text-muted-foreground">{description}</span> : null}
+        </span>
+        {setCount > 0 ? (
+          <Badge variant="accent" className="tabular-nums">
+            {setCount} set
+          </Badge>
+        ) : null}
+        <ChevronDown className={cn("size-4 shrink-0 text-muted-foreground transition-transform", open && "rotate-180")} />
+      </button>
+      {open ? <CardContent className="divide-y">{children}</CardContent> : null}
     </Card>
   );
 }
 
-function Controls({
-  controls,
-  model,
-  form,
-  available,
-}: {
-  controls: Control[];
-  model: ModelArtifact;
-  form: FormContext;
-  available: (flag: string) => boolean;
-}) {
+/** A section's controls: the common ones, then the rest behind "More options", which is open
+ * while the configuration sets one of them. */
+function Controls({ controls, form }: { controls: Control[]; form: FormContext }) {
+  const common = controls.filter((control) => !control.more);
+  const more = controls.filter((control) => control.more);
+  const moreSet = more.filter((control) => hasFlag(form.args, control.flag, form.takesValue)).length;
+  const [showMore, setShowMore] = useState(false);
+  const expanded = showMore || moreSet > 0;
   return (
     <>
-      {controls
-        .filter((control) => (control.when ? control.when(model) : true) && available(control.flag))
-        .map((control) => (
-          <ControlField key={control.flag} control={control} form={form} />
-        ))}
+      {common.map((control) => (
+        <ControlField key={control.flag} control={control} form={form} />
+      ))}
+      {more.length > 0 ? (
+        <div className="py-1.5">
+          <Button
+            variant="ghost"
+            size="xs"
+            className="-ml-2 text-muted-foreground"
+            aria-expanded={expanded}
+            disabled={moreSet > 0}
+            onClick={() => setShowMore(!showMore)}
+          >
+            <ChevronDown className={cn("transition-transform", expanded && "rotate-180")} />
+            {expanded ? "More options" : `More options (${more.length})`}
+            {moreSet > 0 ? <span className="font-normal">· {moreSet} set</span> : null}
+          </Button>
+        </div>
+      ) : null}
+      {expanded ? more.map((control) => <ControlField key={control.flag} control={control} form={form} />) : null}
     </>
   );
 }
@@ -543,6 +588,7 @@ export function ModelConfigurePage() {
   const takesValue = useTakesValue();
   const instance = useLive((live) => live.instance);
   const { load, dialog, pending: loading } = useLoadModel();
+  const sections = useOpenSections();
 
   const model = findModel(library, id);
   const configQuery = useQuery({
@@ -658,6 +704,18 @@ export function ModelConfigurePage() {
       : null;
   const isDefault = settings?.default_model === config.id;
   const commandLine = preview.data?.command_line ?? argsToCommandLine(args);
+
+  // The sections this model and this infernix-serve have options for, with how many each sets.
+  const formSections = FORM_SECTIONS.filter((section) => (section.when ? section.when(model) : true))
+    .map((section) => {
+      const controls = section.controls.filter((control) => (control.when ? control.when(model) : true) && available(control.flag));
+      const fields = (section.fields ?? []).filter(available);
+      const flags = [...fields, ...controls.map((control) => control.flag)];
+      return { section, controls, fields, setCount: flags.filter((flag) => hasFlag(args, flag, takesValue)).length };
+    })
+    .filter((entry) => entry.controls.length + entry.fields.length > 0);
+  const sectionIds = ["serving", ...formSections.map((entry) => entry.section.id), "environment"];
+  const envCount = (draft?.env ?? []).filter((row) => row.name.trim().length > 0).length;
   const textValue = textEditing ? text : argsToText(args, takesValue);
 
   const onSave = (then?: "load" | "restart") => {
@@ -686,6 +744,11 @@ export function ModelConfigurePage() {
   const onDownload = (shell: "cmd" | "sh") => {
     if (dirty) toast.info("The script holds the saved parameters; save first to include your changes.");
     downloadScript.mutate({ id: config.id, shell });
+  };
+
+  const copyCommand = async () => {
+    if (await copyText(commandLine)) toast.success("Command copied");
+    else toast.error("Copy failed: select the command below and copy it by hand");
   };
 
   const insertOption = (option: ServeOption) => {
@@ -742,17 +805,13 @@ export function ModelConfigurePage() {
             </div>
             <div className="flex flex-col gap-2 lg:items-end">
               <div className="flex flex-wrap items-center gap-2 lg:justify-end">
-                <Button variant="outline" size="sm" onClick={() => setCreating("duplicate")}>
-                  <CopyPlus />
-                  Duplicate
-                </Button>
-                <Button variant="outline" size="sm" onClick={() => setConfirmReset(true)} disabled={reset.isPending}>
-                  <Undo2 />
-                  Restore defaults
-                </Button>
                 <Button variant="outline" size="sm" onClick={() => setHelpOpen(true)}>
                   <BookOpen />
                   All options
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => setCreating("duplicate")}>
+                  <CopyPlus />
+                  Duplicate
                 </Button>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
@@ -760,41 +819,41 @@ export function ModelConfigurePage() {
                       <EllipsisVertical />
                     </Button>
                   </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-60">
-                    <DropdownMenuItem onSelect={() => setImporting(true)}>
-                      <FileInput />
-                      Import launch script…
-                    </DropdownMenuItem>
+                  <DropdownMenuContent align="end" className="w-64">
                     <DropdownMenuItem onSelect={() => setCreating("new")}>
                       <Plus />
                       New configuration…
                     </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => setImporting(true)}>
+                      <FileInput />
+                      Import launch script…
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onSelect={() => void copyCommand()}>
+                      <Copy />
+                      Copy the command line
+                    </DropdownMenuItem>
+                    <DropdownMenuItem disabled={downloadScript.isPending} onSelect={() => onDownload("cmd")}>
+                      <FileDown />
+                      Download as .bat (Windows)
+                    </DropdownMenuItem>
+                    <DropdownMenuItem disabled={downloadScript.isPending} onSelect={() => onDownload("sh")}>
+                      <FileDown />
+                      Download as .sh
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem disabled={reset.isPending} onSelect={() => setConfirmReset(true)}>
+                      <Undo2 />
+                      Restore defaults…
+                    </DropdownMenuItem>
                     {!config.is_default ? (
-                      <>
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem variant="destructive" onSelect={() => setConfirmDelete(true)}>
-                          <Trash2 />
-                          Delete this configuration…
-                        </DropdownMenuItem>
-                      </>
+                      <DropdownMenuItem variant="destructive" onSelect={() => setConfirmDelete(true)}>
+                        <Trash2 />
+                        Delete this configuration…
+                      </DropdownMenuItem>
                     ) : null}
                   </DropdownMenuContent>
                 </DropdownMenu>
-              </div>
-              <div className="flex flex-wrap items-center gap-2 lg:justify-end">
-                <CopyButton text={commandLine} label="Copy command" variant="outline" size="sm" toastMessage="Command copied" />
-                <Hint label="This configuration's saved parameters as a Windows launch script">
-                  <Button variant="outline" size="sm" disabled={downloadScript.isPending} onClick={() => onDownload("cmd")}>
-                    <FileDown />
-                    Download .bat
-                  </Button>
-                </Hint>
-                <Hint label="This configuration's saved parameters as a shell launch script">
-                  <Button variant="outline" size="sm" disabled={downloadScript.isPending} onClick={() => onDownload("sh")}>
-                    <FileDown />
-                    Download .sh
-                  </Button>
-                </Hint>
               </div>
             </div>
           </div>
@@ -829,10 +888,26 @@ export function ModelConfigurePage() {
       ) : (
         <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(0,26rem)]">
           <div className="flex min-w-0 flex-col gap-5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs text-muted-foreground">
+                A section's badge counts the options this configuration sets in it.
+              </span>
+              <div className="flex shrink-0 items-center">
+                <Button variant="ghost" size="xs" onClick={() => sections.setAll(sectionIds, true)}>
+                  Expand all
+                </Button>
+                <Button variant="ghost" size="xs" onClick={() => sections.setAll(sectionIds, false)}>
+                  Collapse all
+                </Button>
+              </div>
+            </div>
+
             <Section
               icon={Plug}
               title="Serving"
               description="How coding tools see this configuration (its model id is the headline above) and when it unloads"
+              open={sections.isOpen("serving", true)}
+              onOpenChange={(open) => sections.setOpen("serving", open)}
             >
               <div className="flex items-center justify-between gap-3 py-2.5">
                 <div>
@@ -864,51 +939,36 @@ export function ModelConfigurePage() {
               />
             </Section>
 
-            <Section icon={Cpu} title="Context and memory">
-              {available("--max-context") ? <ContextField model={model} form={form} /> : null}
-              {available("--max-concurrency") ? <ConcurrencyField form={form} /> : null}
-              <Controls controls={MEMORY_CONTROLS} model={model} form={form} available={available} />
-            </Section>
-
-            <Section icon={Sparkles} title="Speculative decoding" description="Drafters propose tokens the model verifies; output is unchanged.">
-              {available("--spec") ? <SpecField model={model} form={form} specArg={optionMap?.get("--spec")} /> : null}
-              {model.accepts_draft_model && available("--draft-model") && library ? (
-                <DrafterField model={model} form={form} library={library} />
-              ) : null}
-              <Controls controls={SPEC_CONTROLS} model={model} form={form} available={available} />
-            </Section>
-
-            {model.needs_ngram_volume ? (
-              <Section icon={Database} title="N-gram table" description="Qwen3.8-Flash-Next's per-layer n-gram embeddings">
-                {available("--ngram-volume") && library ? <NgramVolumeField model={model} form={form} library={library} /> : null}
-                <Controls controls={NGRAM_CONTROLS} model={model} form={form} available={available} />
+            {formSections.map(({ section, controls, fields, setCount }) => (
+              <Section
+                key={section.id}
+                icon={section.icon}
+                title={section.title}
+                description={section.description}
+                setCount={setCount}
+                open={sections.isOpen(section.id, section.startsOpen ?? false)}
+                onOpenChange={(open) => sections.setOpen(section.id, open)}
+              >
+                {fields.includes("--max-context") ? <ContextField model={model} form={form} /> : null}
+                {fields.includes("--max-concurrency") ? <ConcurrencyField form={form} /> : null}
+                {fields.includes("--spec") ? <SpecField model={model} form={form} specArg={optionMap?.get("--spec")} /> : null}
+                {fields.includes("--draft-model") && model.accepts_draft_model && library ? (
+                  <DrafterField model={model} form={form} library={library} />
+                ) : null}
+                {fields.includes("--ngram-volume") && library ? <NgramVolumeField model={model} form={form} library={library} /> : null}
+                <Controls controls={controls} form={form} />
               </Section>
-            ) : null}
-
-            <Section icon={Brain} title="Thinking and tools">
-              <Controls controls={THINKING_CONTROLS} model={model} form={form} available={available} />
-            </Section>
-
-            <Section icon={Wrench} title="Sampling overrides" description="Process-wide defaults; fields a request sends still win.">
-              <Controls controls={SAMPLING_CONTROLS} model={model} form={form} available={available} />
-            </Section>
-
-            {model.has_vision ? (
-              <Section icon={ImageIcon} title="Vision">
-                <Controls controls={VISION_CONTROLS} model={model} form={form} available={available} />
-              </Section>
-            ) : null}
+            ))}
 
             <Section
               icon={Variable}
               title="Environment variables"
               description="Set for infernix-serve when this configuration starts, besides the launcher's own."
+              setCount={envCount}
+              open={sections.isOpen("environment", false)}
+              onOpenChange={(open) => sections.setOpen("environment", open)}
             >
               <EnvEditor env={draft.env} onChange={(env) => setDraft({ ...draft, env })} />
-            </Section>
-
-            <Section icon={Eye} title="Advanced" description="Numerical routes, diagnostics and approximate speed-ups">
-              <Controls controls={ADVANCED_CONTROLS} model={model} form={form} available={available} />
             </Section>
           </div>
 
@@ -961,6 +1021,9 @@ export function ModelConfigurePage() {
                 <CardHeader>
                   <CardTitle>Command</CardTitle>
                   <CardDescription>What the launcher runs{preview.isFetching ? " (updating…)" : ""}</CardDescription>
+                  <CardAction>
+                    <CopyButton text={commandLine} size="icon-sm" toastMessage="Command copied" />
+                  </CardAction>
                 </CardHeader>
                 <CardContent className="flex flex-col gap-3">
                   <pre className="max-h-56 overflow-auto rounded-lg border bg-muted/40 p-3 font-mono text-[11px] leading-5 break-all whitespace-pre-wrap">

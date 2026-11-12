@@ -77,23 +77,36 @@ One page, top to bottom:
 
 - **Status**: the loaded model, its state (idle, starting with the latest startup line, ready,
   stopping, failed with the reason), uptime, and a pending switch with the requests it waits for.
+  When the Engine holds requests and has completed nothing for 30 seconds, a warning says for how
+  long (`live.no_progress_s`; it heals itself after two minutes by failing the running requests,
+  [serving](serving.md)), and **Stalls healed** counts the times it did.
 - **Inference gauges**: speedometer dials for decode tok/s (live while generating), prefill tok/s,
   time to first token, prompt-cache hit rate, and, when the model reports them, the VRAM expert-cache
-  hit rate and drafter acceptance, each with its last-ten and session values.
-- **System gauges**: CPU use and temperature, RAM, GPU use, temperature and power, VRAM, PCIe traffic
-  (the expert and n-gram traffic of Qwen3.8-Flash-Next shows here) and the server process's memory,
-  each with a 10-minute history. Everything comes from the operating system and the NVIDIA driver; no other
-  software is needed. CPU temperature on Windows is the CPU package sensor from HWiNFO or Core Temp
-  when one of them runs (HWiNFO needs *Shared Memory Support* on), otherwise the ACPI thermal zone
-  Windows reports, a motherboard sensor rather than the package; a PC that exposes neither shows no
-  temperature. Linux reads the kernel's hwmon sensors (coretemp, k10temp).
+  hit rate and drafter acceptance. A dial reads the last ten requests; under it are the session's
+  value and the best (or, for time to first token, the slowest) of the requests the server keeps.
+- **System gauges**: CPU, RAM, GPU and VRAM use, each with a 10-minute history and, under the dial,
+  the CPU and GPU temperatures, the GPU's power and the server process's memory. **All gauges** adds
+  dials for the CPU and GPU temperature, GPU power and PCIe traffic to and from the GPU (the expert
+  and n-gram traffic of Qwen3.8-Flash-Next shows here); the browser remembers the choice. Everything
+  comes from the operating system and the NVIDIA driver; no other software is needed. CPU temperature
+  on Windows is the CPU package sensor from HWiNFO or Core Temp when one of them runs (HWiNFO needs
+  *Shared Memory Support* on), otherwise the ACPI thermal zone Windows reports, a motherboard sensor
+  rather than the package; a PC that exposes neither shows no temperature. Linux reads the kernel's
+  hwmon sensors (coretemp, k10temp).
+
+  A dial is one arc in the accent colour, a needle and the reading. The dials with a limit turn
+  amber and say **High** at the first limit, red and **Critical** at the second: CPU temperature at
+  85 and 95 °C, GPU temperature at 80 and 90 °C, and RAM when less than 4 GiB and 2 GiB are
+  available (how full it is says little: models with offloaded experts fill it on purpose). A
+  temperature past its limit is also named beside **All gauges** while its dial is not shown.
 - **Inference statistics**: the same figures as `infernix-serve`'s console panel, over the last ten
   requests and the whole session of the loaded model: requests, time to first token, prompt-cache hit
   rate, prefill and decode tok/s, mean decode batch, drafter acceptance and accepted tokens per
   round, n-gram acceptance, and the VRAM expert-cache hit rate (Qwen3.8-Flash-Next and the
   Qwen3.5-122B-A10B). They come from `session_stats` in the server's `/metrics?format=json`
   ([serving](serving.md#json-representation)); with an older `infernix-serve` the UI derives them
-  from its last 128 requests.
+  from its last 128 requests. Once they are not zero, the session's preemptions, replayed tokens and
+  healed stalls are listed too, and **Now** names paused and replaying requests.
 - **Requests**: per-request TTFT and decode speed, and the coding tools' requests as the launcher
   routed them (by pin, route, name or as the loaded model), with the client and API key and, while
   a long prompt is processed, its progress (tokens processed of the prompt, from the cache and
@@ -136,8 +149,26 @@ its option in the text, an edit to the text moves the controls, and options with
 kept. The **DFlash2 drafter** and **N-gram volume** pickers (Qwen3.8-Flash-Next) list the compatible
 files found and write `--draft-model` and `--ngram-volume`. The full command line is previewed with
 warnings (an option this `infernix-serve` does not have, a missing file, a Flash-Next model without
-a volume). Every option of the installed `infernix-serve --help` is listed in the reference drawer
-(read once per build of `infernix-serve`; a `--help` that fails is run again when next needed).
+a volume). Every option of the installed `infernix-serve --help` is listed in the reference drawer,
+**All options** (read once per build of `infernix-serve`; a `--help` that fails is run again when
+next needed).
+
+The form has a control for every option `infernix-serve` accepts, apart from the ones the launcher
+sets itself (below), in sections that open and close: **Serving**, **Context and memory**,
+**Speculative decoding**, **N-gram table** (Qwen3.8-Flash-Next), **Prefix cache** (the Host tier,
+the SSD tier, next-turn prefill), **Offloaded experts** (models that have them), **Thinking and
+tools**, **Requests and clients**, **Sampling overrides**, **Vision**, **Numerical routes and
+speed**, **Logging and diagnostics** and **Environment variables**. A section's badge counts the
+options the configuration sets in it, so a closed section still shows that it holds settings; its
+less common options are under **More options**, which stays open while one of them is set. The
+browser remembers which sections are open. A control appears only for a model it applies to and
+only when the installed `infernix-serve` lists its option.
+[`tests/test_launcher_option_coverage.py`](../tests/test_launcher_option_coverage.py) fails when an
+option of the server has no control.
+
+**⋮** beside **All options** and **Duplicate** holds the rest: a new configuration, import and
+export of a launch script, copying the command line, **Restore defaults** and deleting a named
+configuration.
 
 The **model id** is the name tools see in `/v1/models` and send back; it defaults to the artifact's
 file name without its part numbering, and any other name can be set (two configurations cannot
@@ -159,9 +190,9 @@ restored to the defaults.
 artifact become the launch parameters (the ones the launcher sets itself are dropped, and options
 this `infernix-serve` lacks are named), and its `--model-id` the model id. When the artifact is in a
 model folder (by path, else by file name), the import replaces one of that model's configurations
-or becomes a new named one; otherwise the launcher says which artifact it needs. **Export** writes the
-configuration as a `.bat` (Windows; UTF-8, with every argument quoted for cmd) or `.sh` that runs
-`infernix-serve` directly, with its model id.
+or becomes a new named one; otherwise the launcher says which artifact it needs. **Download as .bat**
+and **Download as .sh** (in the **⋮** menu) write the configuration as a `.bat` (Windows; UTF-8, with
+every argument quoted for cmd) or `.sh` that runs `infernix-serve` directly, with its model id.
 
 **Will it fit?** asks the installed `infernix-serve` to size the configuration without loading it
 (`infernix-serve --plan`): the VRAM it would take (weights, KV cache and the context it holds,
@@ -221,7 +252,7 @@ the destination becomes a model folder and is scanned. A Hugging Face token (set
 
 Point a tool at the launcher instead of at `infernix-serve`. **Connect** shows the exact addresses and
 the model list as tools see it, with snippets for Claude Code, Codex, Zed, Qwen Code, Hermes and the
-OpenAI and Anthropic SDKs.
+OpenAI and Anthropic SDKs. **Endpoints**, at the top of every page, copies either base URL.
 
 - `GET /v1/models` (also `/models`) lists the configurations not hidden, by model id, in the fields
   other servers use so each tool finds the ones it reads:
@@ -515,7 +546,10 @@ the model folders; only its header is read) and requests get plausible figures o
 the chat (thinking, prompt progress, timings) and the usage page, and **Will it fit?** gets a plan
 that fits up to 225,280 tokens of context. It crashes, locks up or stalls on request (`POST
 /fake/crash`, `/fake/hang`, `/fake/stall` on its own port) and fails or overfills its load with
-`--fake-fail-load TEXT` and `--fake-hog-mib N` in the model's parameters.
+`--fake-fail-load TEXT` and `--fake-hog-mib N` in the model's parameters. Its own `--help` lists a
+dozen options, and the Configure form shows a control only for an option the server lists: set
+`INFERNIX_FAKE_SERVE_HELP` to a text file holding a real `infernix-serve --help` and it prints that
+instead, so the form shows every control.
 [`tools/launcher/launcher_check.py`](../tools/launcher/launcher_check.py) runs a launcher against it
 and checks the features (configurations, model ids, environment, script export and import, the fit
 plan, keep-alive streams, routes and the pin, prompt progress, usage, API keys and sign-in, chats,

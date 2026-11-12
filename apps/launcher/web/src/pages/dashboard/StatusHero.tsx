@@ -39,6 +39,9 @@ function Chip({ label, value }: { label: string; value: string }) {
   );
 }
 
+/** The Engine's own warning threshold for holding requests without progress (docs/serving.md). */
+const NO_PROGRESS_WARNING_S = 30;
+
 /** Time until an idle unload: "in 14 min", "in under a minute", "in 2 h 05 min". */
 function untilUnload(ms: number): string {
   if (ms < 60_000) return "in under a minute";
@@ -76,6 +79,8 @@ export function StatusHero() {
   const defaultConfig = findConfig(library, defaultKey);
   const title = instance?.alias ?? config?.alias ?? instance?.name ?? null;
   const engine = metrics?.engine ?? null;
+  const noProgress = metrics?.live.no_progress_s ?? 0;
+  const recoveries = metrics?.live.no_progress_recoveries ?? 0;
   const active = state === "ready" || state === "starting";
   // A named configuration's name; the default one is just the model.
   const configName =
@@ -220,6 +225,21 @@ export function StatusHero() {
         </div>
       ) : null}
 
+      {state === "ready" && noProgress >= NO_PROGRESS_WARNING_S ? (
+        <div className="px-4">
+          <Alert variant="warning">
+            <TriangleAlert />
+            <AlertTitle>No progress for {Math.round(noProgress)} s</AlertTitle>
+            <AlertDescription>
+              <p>
+                The Engine holds requests and has completed nothing in that time. After two minutes it heals itself: the
+                running requests end with an error and waiting ones carry on. The console below has its report.
+              </p>
+            </AlertDescription>
+          </Alert>
+        </div>
+      ) : null}
+
       {pendingKey && instance ? (
         <div className="px-4">
           <Alert variant="info">
@@ -250,6 +270,13 @@ export function StatusHero() {
           {engine ? <Chip label="KV" value={engine.kv} /> : null}
           {engine && engine.speculative_backend && engine.speculative_backend !== "none" ? (
             <Chip label="Drafter" value={engine.speculative_backend} />
+          ) : null}
+          {state === "ready" && recoveries > 0 ? (
+            <Hint label="Times the Engine made no progress for two minutes while holding requests and healed itself by failing them (this run of the server)">
+              <span>
+                <Chip label="Stalls healed" value={String(recoveries)} />
+              </span>
+            </Hint>
           ) : null}
           {!engine && model ? <Chip label="Context" value={formatContext((config ?? model.config).context_length)} /> : null}
         </div>

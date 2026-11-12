@@ -1,11 +1,12 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { api } from "./api";
 import { makeTakesValue, type TakesValue } from "./args";
 import type { LauncherState, Library, ServeOptions, Settings } from "./api-types";
 import { useLive } from "./events";
+import { readStorage, writeStorage } from "./utils";
 
 /** The current time, refreshed every `intervalMs`. */
 export function useNow(intervalMs = 1000): number {
@@ -77,6 +78,22 @@ export function useEndpoints(): { openai: string; anthropic: string } {
     openai: launcher?.endpoints.openai ?? `${fallback}/v1`,
     anthropic: launcher?.endpoints.anthropic ?? fallback,
   };
+}
+
+/** An on/off choice this browser remembers (a section shown in full, a list expanded). */
+export function useStoredFlag(key: string, initial: boolean): [boolean, (value: boolean) => void] {
+  const [value, setValue] = useState(() => {
+    const stored = readStorage(key);
+    return stored === null ? initial : stored === "1";
+  });
+  const set = useCallback(
+    (next: boolean) => {
+      setValue(next);
+      writeStorage(key, next ? "1" : "0");
+    },
+    [key],
+  );
+  return [value, set];
 }
 
 /** Matches a min-width media query (e.g. Tailwind's md = 48rem). */

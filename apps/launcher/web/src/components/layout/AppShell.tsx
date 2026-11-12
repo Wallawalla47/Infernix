@@ -1,9 +1,11 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { NavLink, Outlet, useLocation } from "react-router";
+import { NavLink, Outlet, useLocation, useNavigate } from "react-router";
+import { toast } from "sonner";
 import {
   Boxes,
   ChartColumnBig,
   CloudDownload,
+  Copy,
   LayoutDashboard,
   Menu,
   MessageSquare,
@@ -19,7 +21,6 @@ import {
 import type { LucideIcon } from "lucide-react";
 
 import { SessionMenu } from "@/components/admin/SignIn";
-import { CopyButton } from "@/components/CopyButton";
 import { IncidentIcon, IncidentLine } from "@/components/IncidentBanner";
 import { Logo } from "@/components/Logo";
 import { StateDot } from "@/components/StateBadge";
@@ -27,9 +28,11 @@ import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from "@/components/ui/sheet";
@@ -38,7 +41,7 @@ import { useLive } from "@/lib/events";
 import { STATE_LABELS, formatTokS } from "@/lib/format";
 import { useEndpoints, useMediaQuery, useNow } from "@/lib/hooks";
 import { useTheme, type Theme } from "@/lib/theme";
-import { cn } from "@/lib/utils";
+import { cn, copyText } from "@/lib/utils";
 
 interface NavItem {
   to: string;
@@ -208,13 +211,54 @@ function ThemeMenu() {
   );
 }
 
+/** The two base URLs tools need, one click each to copy, and the way to the setup snippets. */
+function EndpointMenu() {
+  const endpoints = useEndpoints();
+  const navigate = useNavigate();
+  const copy = async (label: string, url: string) => {
+    if (await copyText(url)) toast.success(`${label} base URL copied`);
+    else toast.error("Copy failed: select the address and copy it by hand");
+  };
+  const rows = [
+    { label: "OpenAI", url: endpoints.openai },
+    { label: "Anthropic", url: endpoints.anthropic },
+  ];
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="outline" size="sm" className="hidden sm:inline-flex">
+          <Plug />
+          Endpoints
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-80">
+        <DropdownMenuLabel>Copy a base URL</DropdownMenuLabel>
+        {rows.map((row) => (
+          <DropdownMenuItem key={row.label} onSelect={() => void copy(row.label, row.url)}>
+            <Copy />
+            <span className="w-20 shrink-0">{row.label}</span>
+            <code className="min-w-0 truncate font-mono text-xs text-muted-foreground">{row.url}</code>
+          </DropdownMenuItem>
+        ))}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => navigate("/connect")}>
+          <Plug />
+          Set up a coding tool…
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/** The loaded model's state in the header, for windows whose sidebar is the icon rail or a sheet:
+ * the full sidebar's status card says the same. */
 function StatusPill() {
   const instance = useLive((live) => live.instance);
   const state = instance?.state ?? "idle";
   return (
     <NavLink
       to="/"
-      className="hidden min-w-0 items-center gap-2 rounded-full border bg-card/60 px-3 py-1 text-xs sm:flex"
+      className="hidden min-w-0 items-center gap-2 rounded-full border bg-card/60 px-3 py-1 text-xs sm:flex lg:hidden"
     >
       <StateDot state={state} />
       <span className="font-medium">{STATE_LABELS[state]}</span>
@@ -249,13 +293,17 @@ function OfflineBanner() {
 export function AppShell({ children }: { children?: ReactNode }) {
   const location = useLocation();
   const [menuOpen, setMenuOpen] = useState(false);
-  const endpoints = useEndpoints();
   const title = pageTitle(location.pathname);
   const full = useMediaQuery("(min-width: 64rem)");
 
   useEffect(() => {
     document.title = `${title} · Infernix Launcher`;
   }, [title]);
+
+  // A page opens at its top, not at the scroll position of the page before it.
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, [location.pathname]);
 
   return (
     <div className="flex min-h-dvh w-full">
@@ -279,15 +327,7 @@ export function AppShell({ children }: { children?: ReactNode }) {
           <div className="min-w-0 truncate text-sm font-semibold md:text-base">{title}</div>
           <div className="ml-auto flex min-w-0 items-center gap-2">
             <StatusPill />
-            <div className="hidden items-center gap-1 rounded-md border bg-card/60 py-0.5 pr-0.5 pl-2.5 lg:flex">
-              <span className="text-[11px] font-medium text-muted-foreground">Endpoint</span>
-              <code className="max-w-56 truncate font-mono text-xs">{endpoints.openai}</code>
-              <Hint label="Copy the OpenAI base URL">
-                <span>
-                  <CopyButton text={endpoints.openai} size="icon-xs" toastMessage="Endpoint copied" />
-                </span>
-              </Hint>
-            </div>
+            <EndpointMenu />
             <ThemeMenu />
             <SessionMenu />
           </div>

@@ -102,6 +102,12 @@ infernix_add_test(infernix_launcher_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_launcher.cpp"
   LIBRARIES infernix_launcher)
 
+# The launcher's Configure form has a control for every infernix-serve option (it reads the
+# server's option table and the form's option list; nothing is built or run).
+add_test(NAME infernix_launcher_option_coverage_test
+  COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/../test_launcher_option_coverage.py")
+set_tests_properties(infernix_launcher_option_coverage_test PROPERTIES TIMEOUT 60 LABELS "launcher")
+
 # A stand-in infernix-serve for the launcher's watchdog and web UI checks (docs/launcher.md).
 add_executable(infernix_launcher_fake_serve "${CMAKE_CURRENT_LIST_DIR}/../launcher_fake_serve.cpp")
 target_link_libraries(infernix_launcher_fake_serve PRIVATE infernix::json infernix::httplib Threads::Threads)
