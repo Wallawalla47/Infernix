@@ -394,11 +394,11 @@ the tokenizer files the golden was made from, not an artifact: `py -3.11 -I
 tests/models/qwen3_5/generate_tokenizer_golden.py <artifact> <golden.json> <dir>` writes them from any
 Qwen3.5-family artifact (and regenerates the golden), and `INFERNIX_TEST_TOKENIZER_DIR=<dir>` runs the
 test (skipped without it, and for a tokenizer.json of another size).
-`infernix_qwen3_5_echoed_empty_reasoning_test` (CPU only, the same directory) documents why a reply whose
-reasoning is empty cannot resume from its endpoint: through the real Frontend and the maintained Qwen3.8 and
-Qwen3.6 templates, the generation prompt's `<think>` "\n" plus the model's "\n" `</think>` (198, 198) render in
-the next request's history as `<think>` "\n\n" `</think>` (271), so the ids differ from the prompt's last one
-on; a reply with reasoning renders as generated.
+`infernix_qwen3_5_echoed_empty_reasoning_test` (CPU only, the same directory) checks that a reply sent back
+as history renders as the prompt's ids then the ids the model generated, so its endpoint serves the next
+turn: through the real Frontend and the maintained Qwen3.8 and Qwen3.6 templates, an empty reasoning's
+`<think>` "\n" plus the model's "\n" `</think>` stay 198 198 (one encoding of the whole text would make them
+271), a reply with reasoning and a thinking-off answer render as generated too.
 
 The agent entry checks multi-turn continuation and branching. The preemption entry exercises
 Replay recovery and cancellation while paused or replaying; `INFERNIX_PREEMPTION_REAL_SCENARIO`

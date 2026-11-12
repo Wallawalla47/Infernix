@@ -2582,7 +2582,13 @@ The prefix cache retains content-addressed KV blocks and sparse state snapshots;
 placement, Host tier and eviction are defined in the
 [hybrid prefix cache spec](maintainer/hybrid-prefix-cache-spec.md). Completed conversation endpoints
 serve direct continuations, and snapshots at the generation opener and at structural boundaries
-let a later prompt that normalizes or replaces a response recompute only the changed suffix.
+let a later prompt that normalizes or replaces a response recompute only the changed suffix. A
+reply sent back as history is encoded apart from the generation opener before it (the opener this
+request ends with, at the start of every past assistant turn that begins with it), as it was when
+generated: a reply whose reasoning is empty keeps the opener's "\n" and its own "\n" as two ids
+instead of the one "\n\n" a single encoding of the text gives, so its endpoint serves the next turn
+(candidates ZH-03). Only those ids change, never the text; a conversation that switches thinking
+on or off splits only where the opener still matches.
 
 Changing `preserve_thinking` or reasoning effort changes the rendered prompt where applicable;
 already cached exact prefixes remain usable. An appended mid-conversation system message is an

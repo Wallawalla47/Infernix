@@ -854,13 +854,18 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
 
 BoundaryEncodedText Tokenizer::encode_with_boundaries(
     std::string_view text, std::span<const std::size_t> byte_boundaries, EncodeOptions options,
-    std::span<const text::ByteSpan> literal_spans) const {
+    std::span<const text::ByteSpan> literal_spans, std::span<const std::size_t> forced_splits) const {
     std::size_t previous_end = 0;
     for (const auto span : literal_spans) {
         if (span.begin < previous_end || span.begin >= span.end || span.end > text.size())
             throw std::invalid_argument(
                 "Tokenizer literal spans must be ordered disjoint input ranges");
         previous_end = span.end;
+    }
+    for (std::size_t index = 0; index < forced_splits.size(); ++index) {
+        if (forced_splits[index] > text.size() || (index != 0 && forced_splits[index] < forced_splits[index - 1])) {
+            throw std::invalid_argument("Tokenizer forced splits must be ascending input offsets");
+        }
     }
     BoundaryEncodedText encoded;
     encoded.boundaries.resize(byte_boundaries.size());
@@ -884,7 +889,7 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
         while (end < boundaries.size() && boundaries[end].offset <= offset) { ++end; }
         return end;
     };
-    const auto append_ordinary = [&](std::size_t begin, std::size_t end) {
+    const auto append_piece = [&](std::size_t begin, std::size_t end) {
         const std::size_t request_end = boundary_end_through(end);
         const bool complete =
             append_ordinary_text(encoded, text.substr(begin, end - begin), begin,
@@ -893,6 +898,17 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
                                  bpe_merge_rules_, byte_token_ids_, options.max_tokens, scratch);
         boundary_cursor = request_end;
         return complete;
+    };
+    // An ordinary run is encoded piece by piece between the forced splits inside it.
+    std::size_t split_cursor     = 0;
+    const auto append_ordinary   = [&](std::size_t begin, std::size_t end) {
+        while (split_cursor < forced_splits.size() && forced_splits[split_cursor] <= begin) { ++split_cursor; }
+        while (split_cursor < forced_splits.size() && forced_splits[split_cursor] < end) {
+            const std::size_t split = forced_splits[split_cursor++];
+            if (!append_piece(begin, split)) { return false; }
+            begin = split;
+        }
+        return append_piece(begin, end);
     };
 
     if (!options.parse_added_tokens) {

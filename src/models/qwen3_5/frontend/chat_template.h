@@ -135,6 +135,11 @@ struct RenderedChat {
     std::vector<std::optional<std::size_t>> message_boundaries;
     // One rendered byte boundary per requested cache marker.
     std::vector<std::optional<std::size_t>> cache_boundaries;
+    // Ascending bytes where an earlier reply's generated ids began: right after this request's own
+    // generation opener, at the start of each closed assistant block that begins with that opener. The
+    // ids are encoded apart on each side (candidates ZH-03): a reply this server generated was its
+    // prompt's ids, then the model's from that byte on.
+    std::vector<std::size_t> generation_splits;
 };
 
 class CompiledChatTemplate {

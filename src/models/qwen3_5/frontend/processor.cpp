@@ -599,6 +599,7 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
     for (std::optional<std::size_t>& boundary : rendered.cache_boundaries) {
         if (boundary) { *boundary = map_boundary(*boundary, "cache boundary"); }
     }
+    for (std::size_t& split : rendered.generation_splits) { split = map_boundary(split, "generation split"); }
     rendered.media_placeholders.clear();
     rendered.text = std::move(expanded);
     return rendered;
@@ -787,7 +788,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
 
     BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
         rendered.text, byte_boundaries, EncodeOptions{.max_tokens = maximum_tokens},
-        rendered.literal_spans);
+        rendered.literal_spans, rendered.generation_splits);
     encoded.input_ids = std::move(tokenized.input_ids);
     if (encoded.input_ids.size() == maximum_tokens) { return encoded; }
     std::size_t boundary_index = 0;
@@ -952,7 +953,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             tokenizer_
                 .encode_with_boundaries(rendered.text, {},
                                         EncodeOptions{.max_tokens = encode_limit},
-                                        rendered.literal_spans)
+                                        rendered.literal_spans, rendered.generation_splits)
                 .input_ids.size();
         preliminary_tokenize_seconds =
             std::chrono::duration<double>(Clock::now() - preliminary_started).count();
@@ -963,7 +964,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                     .encode_with_boundaries(
                         rendered.text, {},
                         EncodeOptions{.max_tokens = context_recount_limit(maximum_prompt_tokens)},
-                        rendered.literal_spans)
+                        rendered.literal_spans, rendered.generation_splits)
                     .input_ids.size();
             throw ProcessorError(context_length_details(counted, maximum_prompt_tokens));
         }

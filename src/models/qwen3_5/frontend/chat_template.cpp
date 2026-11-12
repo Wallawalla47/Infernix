@@ -740,6 +740,24 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             break;
         }
     }
+    // Where each earlier reply's generated ids began (RenderedChat::generation_splits). The generation
+    // prompt is this request's opener (`<|im_start|>assistant\n<think>\n` with thinking on); a past reply
+    // that begins with it continued from the opener's last byte, so its history is encoded with a split
+    // there. An empty reasoning then keeps the opener's "\n" and the model's "\n" as the two ids they were
+    // generated as (198 198), not the one "\n\n" (271), and the reply's endpoint serves the next turn. Only
+    // the segmentation at that byte changes, never the text. A history that switched thinking modes
+    // splits only where the opener still matches.
+    if (generation_begin && !continuation && !history_only) {
+        const std::string_view opener = std::string_view(output.text).substr(*generation_begin);
+        for (const MessageLayout& block : layout.messages) {
+            if (opener.empty() || block.role != ChatRole::Assistant || !block.closed ||
+                block.end > *generation_begin || block.begin + opener.size() >= block.end ||
+                output.text.compare(block.begin, opener.size(), opener) != 0) {
+                continue;
+            }
+            result.generation_splits.push_back(block.begin + opener.size());
+        }
+    }
     result.text          = std::move(output.text);
     result.literal_spans = std::move(output.literal_spans);
     return result;

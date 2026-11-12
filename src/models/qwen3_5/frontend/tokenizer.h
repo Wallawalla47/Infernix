@@ -133,10 +133,13 @@ public:
 
     std::vector<int> encode(std::string_view text, EncodeOptions options = {}) const;
     // Literal spans suppress added-token recognition without splitting ordinary NFC/BPE runs.
+    // `forced_splits` (ascending bytes) do split them: the ordinary text on each side of one is encoded
+    // apart, as two separate encode calls would (a split inside an added token is ignored).
     BoundaryEncodedText
     encode_with_boundaries(std::string_view text, std::span<const std::size_t> byte_boundaries,
                            EncodeOptions options                         = {},
-                           std::span<const text::ByteSpan> literal_spans = {}) const;
+                           std::span<const text::ByteSpan> literal_spans = {},
+                           std::span<const std::size_t> forced_splits    = {}) const;
     // The ids' bytes joined as the artifact's decoder spells them, then validated: a sequence that
     // is invalid or incomplete throws, so a caller never sees a partial character.
     std::string decode(std::span<const int> ids, DecodeOptions options = {}) const;
