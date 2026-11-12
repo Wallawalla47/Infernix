@@ -15,10 +15,11 @@ void launch_nvfp4_linear_swiglu_a4_tma(const Nvfp4A4Operands& p, __nv_bfloat16* 
 
 void launch_nvfp4_linear_swiglu_a4_tma_planes(const Nvfp4A4Operands& p, Nvfp4A4Workspace product,
                                               float down_input_scale_divisor, Nvfp4ScaleLayout product_layout,
-                                              cudaStream_t stream) {
+                                              cudaStream_t stream, int row_major_from) {
     using S = Nvfp4ScheduleInstance<Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4PromptWeightPromotion>, 5120>;
     const auto run = [&]<Nvfp4ScaleLayout Layout>(std::integral_constant<Nvfp4ScaleLayout, Layout>) {
         SwiGluA4PlanesEpilogue<1, Layout> epilogue{};
+        epilogue.row_major_from      = row_major_from;
         epilogue.codes               = product.codes;
         epilogue.scales              = product.scales;
         epilogue.code_plane          = 0;

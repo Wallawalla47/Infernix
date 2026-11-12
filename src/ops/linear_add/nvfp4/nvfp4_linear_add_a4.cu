@@ -6,6 +6,7 @@
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_a4_tma_launch.h"
 #include "ops/linear/common/epilogue.cuh"
+#include "ops/linear/nvfp4/nvfp4_tma_tail.h"
 
 #include <stdexcept>
 
@@ -175,6 +176,19 @@ void nvfp4_linear_add_a4_planes_launch(const Weight& weight, Tensor& residual, N
 void nvfp4_linear_add_a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                 Nvfp4A4Workspace workspace, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
+    // ZK-09: the whole 256-token tiles on the TMA route, a remainder past them whose tile would add a wave on the MMA
+    // tiles (nvfp4_tma_tail).
+    if (const std::int32_t tail = nvfp4_tma_tail(tokens, static_cast<std::int32_t>(weight.n), 512);
+        tail > 0 && workspace.terms == 1) {
+        const std::int32_t wide = tokens - tail;
+        launch_nvfp4_a4_quantize(x.slice(1, 0, wide), weight, workspace, Nvfp4ScaleLayout::Tiled256, stream);
+        nvfp4_linear_add_a4_planes_launch(weight, residual, workspace, wide, stream);
+        const Nvfp4A4Workspace tail_plane = nvfp4_a4_tail_plane(workspace, weight.k, wide);
+        launch_nvfp4_a4_quantize(x.slice(1, wide, tail), weight, tail_plane, Nvfp4ScaleLayout::RowMajor, stream);
+        Tensor residual_tail = residual.slice(1, wide, tail);
+        nvfp4_linear_add_a4_planes_launch(weight, residual_tail, tail_plane, tail, stream);
+        return;
+    }
     launch_nvfp4_a4_quantize(x, weight, workspace, nvfp4_linear_add_a4_scale_layout(tokens), stream);
     nvfp4_linear_add_a4_planes_launch(weight, residual, workspace, tokens, stream);
 }

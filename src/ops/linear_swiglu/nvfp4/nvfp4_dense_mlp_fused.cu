@@ -10,6 +10,7 @@
 #include "ops/linear/nvfp4/nvfp4_operands.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a4_tma_launch.h"
+#include "ops/linear/nvfp4/nvfp4_tma_tail.h"
 
 #include <cuda_bf16.h>
 
@@ -188,8 +189,22 @@ void nvfp4_dense_mlp_fused_rmsnorm_launch(Tensor& residual, const Tensor& norm_w
     launch_nvfp4_rmsnorm_a4_quantize_tiled(residual, norm_weight, eps, gate_up.input_scale_divisor, planes.input,
                                            stream);
     const Nvfp4ScaleLayout down_layout = nvfp4_linear_add_a4_scale_layout(tokens);
+    // ZK-09: a remainder past the down projection's whole TMA tiles whose tile would add a wave runs on its MMA tiles
+    // (nvfp4_tma_tail), its product scales row-major after the whole tiles'; the gate/up projection keeps its one TMA
+    // call.
+    const std::int32_t tail =
+        down_layout == Nvfp4ScaleLayout::Tiled256 ? nvfp4_tma_tail(tokens, static_cast<std::int32_t>(down.n), 512) : 0;
+    const std::int32_t wide = tokens - tail;
     launch_nvfp4_linear_swiglu_a4_tma_planes(nvfp4_a4_operands(gate_up, planes.input, tokens, Nvfp4ScaleLayout::Tiled256),
-                                             planes.product, down.input_scale_divisor, down_layout, stream);
+                                             planes.product, down.input_scale_divisor, down_layout, stream,
+                                             tail > 0 ? wide : 0x7fffffff);
+    if (tail > 0) {
+        nvfp4_linear_add_a4_planes_launch(down, residual, planes.product, wide, stream);
+        Tensor residual_tail = residual.slice(1, wide, tail);
+        nvfp4_linear_add_a4_planes_launch(down, residual_tail, nvfp4_a4_tail_plane(planes.product, down.k, wide), tail,
+                                          stream);
+        return;
+    }
     nvfp4_linear_add_a4_planes_launch(down, residual, planes.product, tokens, stream);
 }
 

@@ -334,6 +334,19 @@ for the K = 6144 FP8 output (none faster); a launch order that runs a row group'
 its full tiles (gate/up -2 to -4 % at 257-384 columns, level end to end: the partly filled tile's time is its 40
 load-and-barrier round trips, not its weights coming from memory).
 
+The N = 5120 down and output projections' remainder past their whole TMA tiles (2026-11-12, candidates ZK-09).
+Past 512 columns both run 256-token TMA tiles, 40 CTAs a tile at one CTA an SM. A remainder of at most 64 columns
+now runs on the row-major MMA tiles instead of a partly filled TMA tile when that tile would add a wave
+(`ops/linear/nvfp4/nvfp4_tma_tail.h`, from the SM count): in the fused MLP the gate/up epilogue writes the
+remainder's product scales row-major after the whole tiles', and the standalone linear_add quantizes the two parts
+apart. Same bits (one K order per output; equal output hashes at every width, the fused chain byte-exact against the
+unfused ops). Op bench (a4, cold L2), against the padded tile: K = 17408 at 1,025-1,088 columns -12.7 to -14.6 %,
+2,049-2,112 -6.3 to -9.1 %; K = 6144 -9.4 to -11.1 % and -3.4 to -6.4 %; other widths within 0.8 %. Prefill (official
+NVFP4 artifact, INT8 KV, A B B A x2): 1,025-1,088 tokens -3.0 to -3.9 %, 2,049-2,112 -0.2 to -0.5 %, other widths
+level. Measured and not taken: the split at every remainder of up to 64 columns, which lost where the remainder's
+tile fits in the whole tiles' last wave and so costs nothing (769-832 and 1,281-1,344 columns: op +7 to +25 %,
+prefill +0.6 to +1.8 %), and the same split for the plain NVFP4 Linear's TMA routes, which no measured workload ran.
+
 The NVFP4 prompt routes' weight tensor maps, and the all-NVFP4 recipe's input projections (2026-11-11). Two
 changes, both with the same bits:
 

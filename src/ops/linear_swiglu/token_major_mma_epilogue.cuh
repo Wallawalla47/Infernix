@@ -120,12 +120,17 @@ struct SwiGluA4PlanesEpilogue : SwiGluTokenMajorMmaEpilogue {
     std::int64_t scale_plane;
     float input_scale_divisor;
     int down_input_rows; // the product's rows (the down projection's K)
+    // A tiled plane's columns from here (a whole-tile boundary) are written row-major instead, for the down
+    // projection's MMA call over the remainder past its TMA route's whole tiles (ZK-09, nvfp4_tma_tail.h); their
+    // offsets are then the row-major ones, which start where the whole tiles' tiled scales end.
+    int row_major_from = 0x7fffffff;
 
     // nvfp4_tiled_scale_offset's tiles for a K of `groups_per_row` groups, or the row-major offset.
-    __device__ __forceinline__ static std::int64_t scale_offset(int column, int group, int groups_per_row) {
+    __device__ __forceinline__ std::int64_t scale_offset(int column, int group, int groups_per_row) const {
         if constexpr (Layout == Nvfp4ScaleLayout::RowMajor) {
             return static_cast<std::int64_t>(column) * groups_per_row + group;
         } else {
+            if (column >= row_major_from) { return static_cast<std::int64_t>(column) * groups_per_row + group; }
             constexpr int kTileTokens = kNvfp4ScaleTileTokens<Layout>;
             const int token_tile = column / kTileTokens, group_tile = group / kNvfp4ScaleTileGroups;
             const std::int64_t tile = static_cast<std::int64_t>(token_tile) * (groups_per_row / kNvfp4ScaleTileGroups) + group_tile;
@@ -159,7 +164,7 @@ struct SwiGluA4PlanesEpilogue : SwiGluTokenMajorMmaEpilogue {
             const int group  = (row_begin + local) / 16;
             if (!Full && column >= token_end) { // the same for the quad's lanes
                 if constexpr (Layout != Nvfp4ScaleLayout::RowMajor) {
-                    if (q == 0) {
+                    if (q == 0 && column < row_major_from) {
 #pragma unroll
                         for (int term = 0; term < Terms; ++term) {
                             scales[term * scale_plane + scale_offset(column, group, groups_per_row)] = 0;

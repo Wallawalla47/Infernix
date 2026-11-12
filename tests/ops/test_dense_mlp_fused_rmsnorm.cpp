@@ -216,7 +216,7 @@ INFERNIX_OP_TEST(dense_mlp_fused_rmsnorm) {
         }
         // The prompt profile: one partly filled 256-token gate/up tile (129-255 columns), the down projection's
         // row-major MMA tiles (to 512 columns) and its TMA tile, full and ragged 256-token tiles.
-        for (const int tokens : {129, 136, 192, 193, 255, 256, 257, 300, 512, 513, 777, 1024, 2048}) {
+        for (const int tokens : {129, 136, 192, 193, 255, 256, 257, 300, 512, 513, 777, 1024, 1088, 2048}) {
             failures += run_case(gate_up, down, tokens, kPrompt);
         }
         failures += gate_up_parent.verify_preserved("gate/up weight");
