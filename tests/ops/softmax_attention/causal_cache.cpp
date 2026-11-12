@@ -2834,6 +2834,22 @@ int run_column_invariant_cases(DeviceExecutionView execution, KvCacheStorage sto
                 failures += run_batch_case(execution, geometry, storage, test_case);
             }
         }
+        // Three and five lanes with one long lane on the batch-coupled partition (ZK-01): an eight-row launch of
+        // the rows route then holds part of a column, so its shares follow which other rows share the launch
+        // unless each column's lanes form their own share group, as in the one-column call.
+        for (const std::vector<std::int32_t>& lanes :
+             {std::vector<std::int32_t>{40000, 1200, 900}, std::vector<std::int32_t>{1200, 40000, 900, 700, 2600}}) {
+            for (const std::int32_t width : {4, 6}) {
+                const auto batch = static_cast<std::int32_t>(lanes.size());
+                std::vector<std::int32_t> table(lanes.size());
+                for (std::int32_t row = 0; row < batch; ++row) table[row] = (row * 2 + 1) % batch;
+                BatchAttentionCase uneven{width, lanes, std::vector<std::int32_t>(lanes.size(), width), table,
+                                          MappingPattern::Fragmented, seed++};
+                uneven.row_invariant_partition = false;
+                uneven.column_invariant        = true;
+                failures += run_batch_case(execution, geometry, storage, uneven);
+            }
+        }
         // One row, every column live (the C = 1 verification round).
         BatchAttentionCase single{8, {9000}, {8}, {0}, MappingPattern::Identity, seed++};
         single.row_invariant_partition = true;

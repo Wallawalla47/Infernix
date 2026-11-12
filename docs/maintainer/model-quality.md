@@ -655,7 +655,13 @@ the Engine, and each acts only where the artifact can be request-invariant
   calls of three or more rows (two rows measured no gain): the splits the rows would run are shared
   by their visible keys, a row never more than one split per 64 keys. A round that verifies each
   column as a one-column call shares among that column's lanes, so a column still equals its
-  one-token decode of the same batch.
+  one-token decode of the same batch. In the INT8, FP8, NVFP4 and K8V4 kernels this held only while a
+  launch's eight rows were whole columns: with three or five lanes a launch's rows spanned columns and shared
+  splits across them, so a column's counts depended on its neighbours (candidates ZK-01, 2026-11-12). Their share
+  group is now the batch (a column's lanes), and the rows route's launches hold whole columns
+  (`kRowsPerCall / batch * batch` rows), as the BF16 kernel's did; the column-invariant cases at three and five
+  uneven lanes pass on all five KV formats and fail on the former grouping. Bits of those uneven three- and
+  five-lane rounds change.
 - `adaptive-speculation`: DFlash2 tree tables and controller, and a round's longest n-gram copy,
   set every row's verify width.
 - `free-cache-resume`: prefill splits at taps and sibling boundaries, and resumes from any tap or

@@ -25,7 +25,9 @@ struct CausalKvPartition {
     // per row, grid y times rows) are shared by its rows in proportion to their windows, each live row at least
     // one (causal_proportional_counts), so one long row among short ones takes most of the CTAs instead of the
     // same `target` as each short row. Rows of equal windows keep active()'s count. A row's partials then start
-    // at its first slot (the prefix of the earlier rows' counts), not at row x capacity.
+    // at its first slot (the prefix of the earlier rows' counts), not at row x capacity. The value is the share
+    // group: each run of `proportional` consecutive rows shares its own slots (a column's lanes on the rows
+    // route, whose launches hold whole columns, so a column's counts equal its one-column call's; ZK-01).
     int proportional = 0;
 
     // The plain count: the live count of any row window up to `visible` is at most this, so
@@ -84,11 +86,13 @@ __host__ __device__ inline int causal_row_window(int first_position, int width,
 }
 
 // YD-02's proportional partition: every row's live split count for a launch of `rows` rows of `width` columns
-// (row r's positions at positions[r * width]) sharing `slots` split slots. A row whose first position is negative
-// (no live work) takes none; each live row takes one, and the rest of the slots go to the live rows in proportion
-// to their windows (rounded down), each capped by CausalKvPartition::shared. The counts sum to at most `slots`, and
-// rows of equal windows keep CausalKvPartition::active's count whenever every row's share reaches it. Every CTA of
-// a launch (producer and merge alike) computes the same counts from the same positions. Returns the total.
+// (row r's positions at positions[r * width]) sharing `slots` split slots (slots / rows a row). The rows form share
+// groups of partition.proportional rows (the whole launch when that is 1 or covers it), and each group shares its
+// rows' slots: a row whose first position is negative (no live work) takes none; each live row takes one, and the
+// rest of the group's slots go to its live rows in proportion to their windows (rounded down), each capped by
+// CausalKvPartition::shared. The counts sum to at most `slots`, and rows of equal windows keep
+// CausalKvPartition::active's count whenever every row's share reaches it. Every CTA of a launch (producer and merge
+// alike) computes the same counts from the same positions. Returns the total.
 __device__ inline int causal_proportional_counts(const CausalKvPartition& partition, const std::int32_t* positions,
                                                  int width, int rows, int visible_capacity, int slots,
                                                  int (&counts)[kCausalProportionalMaxRows]) {
@@ -96,21 +100,31 @@ __device__ inline int causal_proportional_counts(const CausalKvPartition& partit
     // slots at most 8 x 256, so spare x window < 2^32 and the eight windows' sum < 2^24. Every CTA runs this before
     // its key loop; 64-bit divisions cost about a timer tick (2 us) on 4K-key rounds.
     unsigned windows[kCausalProportionalMaxRows];
-    unsigned live = 0, keys = 0;
     for (int r = 0; r < kCausalProportionalMaxRows; ++r) {
         const int first = r < rows ? positions[static_cast<std::int64_t>(r) * width] : -1;
         const int window = first >= 0 ? causal_row_window(first, width, visible_capacity) : 0;
         windows[r]       = window > 0 ? static_cast<unsigned>(window) : 0U;
-        live += windows[r] != 0U ? 1U : 0U;
-        keys += windows[r];
+        counts[r]        = 0;
     }
-    const unsigned spare = static_cast<unsigned>(slots) > live ? static_cast<unsigned>(slots) - live : 0U;
-    int total            = 0;
-    for (int r = 0; r < kCausalProportionalMaxRows; ++r) {
-        counts[r] = windows[r] != 0U
-                        ? partition.shared(static_cast<int>(windows[r]), 1 + static_cast<int>(spare * windows[r] / keys))
-                        : 0;
-        total += counts[r];
+    const int group       = partition.proportional > 1 && partition.proportional < rows ? partition.proportional : rows;
+    const unsigned per_row = rows > 0 ? static_cast<unsigned>(slots / rows) : 0U;
+    int total             = 0;
+    for (int begin = 0; begin < kCausalProportionalMaxRows; begin += group > 0 ? group : kCausalProportionalMaxRows) {
+        const int end = begin + group < kCausalProportionalMaxRows ? begin + group : kCausalProportionalMaxRows;
+        unsigned live = 0, keys = 0;
+        for (int r = begin; r < end; ++r) {
+            live += windows[r] != 0U ? 1U : 0U;
+            keys += windows[r];
+        }
+        const int in_group     = (rows < end ? rows : end) - begin;
+        const unsigned owned   = in_group > 0 ? per_row * static_cast<unsigned>(in_group) : 0U;
+        const unsigned spare   = owned > live ? owned - live : 0U;
+        for (int r = begin; r < end; ++r) {
+            counts[r] = windows[r] != 0U ? partition.shared(static_cast<int>(windows[r]),
+                                                            1 + static_cast<int>(spare * windows[r] / keys))
+                                         : 0;
+            total += counts[r];
+        }
     }
     return total;
 }

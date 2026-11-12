@@ -55,8 +55,9 @@ Fp8KvCausalPlan make_fp8_kv_causal_plan(int heads, int width, int batch,
     partition.capacity  = partition.bound(envelope.max_visible_keys);
     // Batch-coupled rows of different lengths share the launch's split slots by their windows (YD-02):
     // one long row among short ones takes most of them. Equal rows keep the plain count; the row-invariant
-    // partition (the exact route) keeps each row's own.
-    partition.proportional = !envelope.row_invariant_partition && batch > 1 ? 1 : 0;
+    // partition (the exact route) keeps each row's own. The share group is the batch (a column's lanes): the
+    // rows route's launches hold whole columns, so a column's counts are its one-column call's (ZK-01).
+    partition.proportional = !envelope.row_invariant_partition && batch > 1 ? batch : 0;
     return {family, heads, width, batch, envelope, partition};
 }
 
