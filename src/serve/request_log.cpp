@@ -91,6 +91,7 @@ Json tool_call_parse_json(const infernix::ToolCallParseDiagnostics& diagnostics)
                 {"empty_arguments_omitted", diagnostics.empty_arguments_omitted},
                 {"schema_mismatch_arguments", diagnostics.schema_mismatch_arguments},
                 {"duplicate_parameters_repaired", diagnostics.duplicate_parameters_repaired},
+                {"arguments_unwrapped", diagnostics.arguments_unwrapped},
                 {"fallback_reason",
                  infernix::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)},
                 {"tolerant_recovered", diagnostics.tolerant_recovered},

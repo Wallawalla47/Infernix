@@ -182,6 +182,17 @@ bool is_param_close_at(std::string_view text, std::size_t pos, std::size_t& tag_
     return false;
 }
 
+// The length of the longest suffix of `value` that begins the parameter closer `close` with its line break
+// (`\n</parameter>`) without completing it: what is left of the closer where the output was cut inside it, or
+// of a closer that lost its `>`. 0 when there is none.
+std::size_t closer_fragment_length(std::string_view value, std::string_view close) {
+    const std::string closer = "\n" + std::string(close);
+    for (std::size_t n = std::min(value.size(), closer.size() - 1); n != 0; --n) {
+        if (value.ends_with(std::string_view(closer).substr(0, n))) { return n; }
+    }
+    return 0;
+}
+
 // The wrapper-less openers agent harnesses drift into. They have no token of their own, so free
 // output reads them by their spelling; a constrained grammar emits only the `<tool_call>` token,
 // so constrained content that spells one of them stays content.
@@ -456,6 +467,36 @@ std::optional<std::string> parse_json_value(std::string_view value, JsonValueKin
     return std::nullopt;
 }
 
+// A letter, digit or `_`, or a byte of a non-ASCII character (a Hebrew letter, say).
+constexpr bool is_word_byte(char byte) {
+    return is_ascii_alphanumeric(byte) || byte == '_' || static_cast<unsigned char>(byte) >= 0x80U;
+}
+
+// A model writing an array or object argument sometimes leaves a quote inside one of its strings
+// unescaped: a Hebrew abbreviation (its quote between two letters) or 5"x7 (SGLang #49875: every
+// failed call of one fine-tune). A JSON quote never has a word character on both sides, so the value
+// with each such quote escaped is the one the model meant; nullopt when there is none. One linear
+// pass, applied once.
+std::optional<std::string> escape_inner_quotes(std::string_view value) {
+    std::string out;
+    bool changed = false;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == '"' && i != 0 && i + 1 < value.size() && is_word_byte(value[i - 1]) &&
+            is_word_byte(value[i + 1])) {
+            if (!changed) {
+                out.reserve(value.size() + 8);
+                out.assign(value.substr(0, i));
+                changed = true;
+            }
+            out += "\\\"";
+            continue;
+        }
+        if (changed) { out.push_back(value[i]); }
+    }
+    if (!changed) { return std::nullopt; }
+    return out;
+}
+
 NormalizedParameter normalize_declared_parameter(std::string_view encoded_value, TypeSet types,
                                                 bool nullable = false) {
     const std::string_view framed = remove_parameter_framing_newlines(encoded_value);
@@ -480,10 +521,22 @@ NormalizedParameter normalize_declared_parameter(std::string_view encoded_value,
                 .json_value  = std::move(*json)};
     }
 
+    // An array or object the type admits, refused only for quotes inside its strings (ZD-43).
+    if (admits_type(types, SchemaType::Object) || admits_type(types, SchemaType::Array)) {
+        if (const auto repaired = escape_inner_quotes(value)) {
+            if (auto json = parse_json_value(*repaired, kind);
+                json && (kind == JsonValueKind::Object || kind == JsonValueKind::Array) && admits_value(types, kind) &&
+                json_nesting(*json) <= kMaxArgumentNesting) {
+                return {.json_value = std::move(*json)};
+            }
+        }
+    }
     if (admits_type(types, SchemaType::Boolean)) {
         if (ascii_case_equal(value, "true")) { return {.json_value = "true"}; }
         if (ascii_case_equal(value, "false")) { return {.json_value = "false"}; }
     }
+    // Python's `None` where the type admits null (ZH-06), in any case as booleans are.
+    if (admits_type(types, SchemaType::Null) && ascii_case_equal(value, "none")) { return {.json_value = "null"}; }
     return {.disposition = ParameterNormalization::SchemaMismatch,
             .json_value  = encode_json_string(framed)};
 }
@@ -778,6 +831,14 @@ private:
         }
     }
 
+    // Where a parameter's value ends, and where the parse goes on after its closer.
+    struct ValueEnd {
+        std::size_t value_end = 0;
+        std::size_t resume    = 0;
+        // Tolerant: no closer ended the value (the model skipped it, or it lost its `>`).
+        bool repaired = false;
+    };
+
     FallbackReason parse_parameter(std::size_t& pos, RawToolCall& call) {
         std::size_t header_begin = 0;
         std::string_view param_close = "</parameter>";
@@ -802,20 +863,23 @@ private:
         }
         const std::string_view header = text_.substr(header_begin, tag_end - header_begin);
         const std::string_view name   = extract_name_from_tag_header(header);
-        if (name.empty()) {
+        // A name holds no line break or `<` (nor does the grammar's): such a header is an opener that lost
+        // its `>`, read up to a later tag's.
+        if (name.empty() || name.find_first_of("\r\n<") != std::string_view::npos) {
             return FallbackReason::MalformedStructure;
         }
 
         const std::size_t value_begin = tag_end + 1;
-        std::size_t value_end         = 0;
-        std::size_t close_len         = 0;
-        if (!find_parameter_close(value_begin, value_end, close_len, param_close)) {
+        const std::optional<ValueEnd> end = find_parameter_close(value_begin, param_close, call, name);
+        if (!end) {
             if (tolerant_) {
                 // Tolerant: the region ends before the closing tag, so the output budget cut the
                 // parameter value. Keep the value up to the cut (last occurrence wins, as with a
-                // complete parameter) and flag the tail; the strict parser keeps the hard
-                // structural failure.
-                const std::string_view partial = text_.substr(value_begin, text_.size() - value_begin);
+                // complete parameter), without what the cut left of its closer (ZD-42: a line break
+                // and `</param`, say), and flag the tail; the strict parser keeps the hard structural
+                // failure.
+                std::string_view partial = text_.substr(value_begin, text_.size() - value_begin);
+                partial.remove_suffix(closer_fragment_length(partial, param_close));
                 const auto existing = std::find_if(call.parameters.begin(), call.parameters.end(),
                                                    [&](const RawParameter& candidate) { return candidate.name == name; });
                 if (existing != call.parameters.end()) {
@@ -830,7 +894,8 @@ private:
             }
             return FallbackReason::MalformedStructure;
         }
-        const std::string_view value = text_.substr(value_begin, value_end - value_begin);
+        const std::string_view value = text_.substr(value_begin, end->value_end - value_begin);
+        if (end->repaired) { call.repaired = true; }
 
         const auto existing =
             std::find_if(call.parameters.begin(), call.parameters.end(),
@@ -844,7 +909,7 @@ private:
         } else {
             call.parameters.push_back(RawParameter{.name = name, .value = value});
         }
-        pos = value_end + close_len;
+        pos = end->resume;
         return FallbackReason::None;
     }
 
@@ -934,25 +999,107 @@ private:
         return strip("</function>") || strip("</invoke>") || (!bare_close_.empty() && strip(bare_close_));
     }
 
-    bool find_parameter_close(std::size_t value_begin, std::size_t& value_end,
-                              std::size_t& close_len, std::string_view required_close) const {
+    // The value of parameter `name` of `call` starts at `value_begin`; nullopt when nothing ends it.
+    std::optional<ValueEnd> find_parameter_close(std::size_t value_begin, std::string_view required_close,
+                                                 const RawToolCall& call, std::string_view name) const {
+        std::size_t value_end = 0;
+        std::size_t close_len = 0;
         if (find_balanced_parameter_close(value_begin, value_end, close_len, required_close)) {
-            return true;
+            return ValueEnd{.value_end = value_end, .resume = value_end + close_len};
         }
-        // Tolerant: a value that quotes an unmatched opener leaves the depth above one at the
-        // region end, so the call would read as cut with its own closers in the value. When the
-        // region is a whole call, the parameter ends at the first closer the grammar continues
-        // from, as it does without a quoted opener. A cut call keeps its value to the cut.
-        if (!tolerant_ || !region_ends_with_call_close()) { return false; }
-        for (std::size_t scan = value_begin; scan < text_.size(); ++scan) {
-            if (starts_with_at(text_, scan, required_close) &&
-                closes_parameter(scan + required_close.size()) && !quoted_call_close(scan, required_close)) {
-                value_end = scan;
-                close_len = required_close.size();
-                return true;
+        // A cut call keeps its value to the cut.
+        if (!tolerant_ || !region_ends_with_call_close()) { return std::nullopt; }
+        return find_unbalanced_parameter_close(value_begin, required_close, call, name);
+    }
+
+    // Tolerant: the closers in a value of a whole call (the region ends with a call's own closers) do
+    // not balance its openers. Within the call (up to its own closers, which end the call where the
+    // output ends or another call begins):
+    // - a closer the grammar continues from ends the value, as it does without a quoted opener: a value
+    //   that quotes an unmatched opener leaves the depth above one (SR-07);
+    // - in a value framed by its line break, a closer on the line of a nested opener before it closes
+    //   that inline pair, so it is value text: a file documenting the call format holds
+    //   `<parameter=limit>25</parameter>`, and the model then skips the value's own closer (Strata #5756);
+    // - after such a pair, a line holding only the opener of a parameter the tool declares and the call
+    //   has not given is the call's next parameter: the model skipped the value's closer there;
+    // - when no closer ends the value, the model skipped it (or its closer lost the `>`): the value ends
+    //   at the first later line that opens a parameter the tool declares and the call has not given,
+    //   else before the call's own closers, without a trailing closer that lost its `>`.
+    std::optional<ValueEnd> find_unbalanced_parameter_close(std::size_t value_begin, std::string_view required_close,
+                                                           const RawToolCall& call, std::string_view name) const {
+        const std::size_t first_line = starts_with_at(text_, value_begin, "\n")   ? value_begin + 1
+                                       : starts_with_at(text_, value_begin, "\r\n") ? value_begin + 2
+                                                                                    : std::string_view::npos;
+        const bool framed               = first_line != std::string_view::npos;
+        std::size_t inline_open         = 0;     // nested openers on the current line not yet closed
+        bool inline_pair                = false; // a closer closed a nested opener on its line
+        std::size_t next_parameter      = std::string_view::npos;
+        std::size_t call_close          = std::string_view::npos;
+        for (std::size_t scan = value_begin; scan < text_.size();) {
+            if (text_[scan] == '\n') {
+                inline_open = 0;
+                ++scan;
+                std::size_t tag_end = 0;
+                if (framed && scan > first_line && next_parameter == std::string_view::npos &&
+                    opens_next_parameter(scan, call, name, tag_end)) {
+                    next_parameter = scan;
+                    // The opener alone on its line, as the model frames a parameter.
+                    if (inline_pair && (starts_with_at(text_, tag_end + 1, "\n") ||
+                                        starts_with_at(text_, tag_end + 1, "\r\n"))) {
+                        break;
+                    }
+                }
+                continue;
             }
+            if (starts_with_at(text_, scan, required_close)) {
+                if (inline_open != 0) {
+                    --inline_open;
+                    inline_pair = true;
+                } else if (closes_parameter(scan + required_close.size()) && !quoted_call_close(scan, required_close)) {
+                    return ValueEnd{.value_end = scan, .resume = scan + required_close.size()};
+                }
+                scan += required_close.size();
+                continue;
+            }
+            if (text_[scan] == '<') {
+                std::size_t tag_end = 0;
+                if (framed && inline_opener_at(scan, tag_end)) {
+                    ++inline_open;
+                    scan = tag_end + 1;
+                    continue;
+                }
+                const std::size_t after = after_call_close(scan);
+                if (after != std::string_view::npos && call_boundary(after)) {
+                    call_close = scan;
+                    break;
+                }
+            }
+            ++scan;
         }
-        return false;
+        const std::size_t end = next_parameter != std::string_view::npos ? next_parameter : call_close;
+        if (end == std::string_view::npos) { return std::nullopt; }
+        std::size_t value_end = end;
+        while (value_end > value_begin && is_format_whitespace(text_[value_end - 1])) { --value_end; }
+        const std::size_t broken =
+            closer_fragment_length(text_.substr(value_begin, value_end - value_begin), required_close);
+        return ValueEnd{.value_end = broken != 0 ? value_end - broken : end, .resume = end, .repaired = true};
+    }
+
+    // A parameter opener at `pos` whose `>` is on the same line.
+    bool inline_opener_at(std::size_t pos, std::size_t& tag_end) const {
+        return is_param_open_at(text_, pos, tag_end) && text_.find('\n', pos) > tag_end;
+    }
+
+    // Whether the line at `pos` opens a parameter the call's tool declares, other than `name` and those
+    // the call has given; `tag_end` is the opener's `>`.
+    bool opens_next_parameter(std::size_t pos, const RawToolCall& call, std::string_view name,
+                              std::size_t& tag_end) const {
+        if (current_tool_ == nullptr || !inline_opener_at(pos, tag_end)) { return false; }
+        const std::size_t header_begin = pos + (starts_with_at(text_, pos, "<parameter") ? 10 : 6);
+        const std::string_view next = extract_name_from_tag_header(text_.substr(header_begin, tag_end - header_begin));
+        return !next.empty() && next != name && find_parameter_contract(*current_tool_, next) != nullptr &&
+               std::none_of(call.parameters.begin(), call.parameters.end(),
+                            [&](const RawParameter& given) { return given.name == next; });
     }
 
     bool find_balanced_parameter_close(std::size_t value_begin, std::size_t& value_end,
@@ -1001,9 +1148,31 @@ private:
     const Contract::Tool* current_tool_ = nullptr;
 };
 
+// A call whose only parameter is an `arguments` its declared tool does not declare, holding a JSON object:
+// the model wrote the tool's whole argument object as that parameter (Strata #5804, the JSON arguments
+// habit), so the object is the call's arguments. `parameter` is the contract of the parameter's name
+// (null when undeclared).
+bool undeclared_arguments(const Contract::Tool* tool, std::string_view name, const Contract::Parameter* parameter) {
+    return tool != nullptr && parameter == nullptr && name == "arguments";
+}
+
+bool holds_object(const NormalizedParameter& normalized) {
+    return normalized.disposition == ParameterNormalization::Emitted && normalized.json_value.starts_with('{');
+}
+
 GeneratedToolCall normalize_raw_tool_call(const RawToolCall& raw, const Contract& contract,
                                           ToolCallParseDiagnostics& diagnostics) {
     const Contract::Tool* tool = find_tool_contract(contract, raw.name);
+
+    if (raw.parameters.size() == 1 && tool != nullptr &&
+        undeclared_arguments(tool, raw.parameters.front().name,
+                             find_parameter_contract(*tool, raw.parameters.front().name))) {
+        NormalizedParameter only = normalize_parameter(raw.parameters.front().value, nullptr);
+        if (holds_object(only)) {
+            ++diagnostics.arguments_unwrapped;
+            return GeneratedToolCall{.name = std::string(raw.name), .arguments_json = std::move(only.json_value)};
+        }
+    }
 
     std::string arguments = "{";
     bool first            = true;
@@ -1157,7 +1326,7 @@ public:
     // The end of the output: closing lines still open close their call.
     void end() {
         if (closing_ && phase_ == Phase::Opener && !invalid_) {
-            close_value();
+            close_value(true);
             complete_call();
         }
     }
@@ -1219,7 +1388,7 @@ private:
                     continue_value(byte);
                     return;
                 }
-                close_value();
+                close_value(true);
                 complete_call(); // the `\n` already matched the next opener's
             }
             if (!calls_.empty() && !contract_.parallel) {
@@ -1260,7 +1429,7 @@ private:
                     invalid_ = true;
                 }
             } else if (byte == kParameterOpen[1]) {
-                if (closing_) { close_value(); } // another parameter: the value ended
+                if (closing_) { close_value(false); } // another parameter: the value ended
                 phase_   = Phase::ParameterOpen;
                 matched_ = 2;
             } else if (byte == kCallClose[1]) {
@@ -1310,6 +1479,7 @@ private:
         first_pair_  = true;
         omitted_     = 0;
         mismatched_  = 0;
+        unwrapped_   = false;
         deltas_.push_back(ToolCallDelta{.index = static_cast<std::uint32_t>(calls_.size()), .name = name_});
         emit("{");
     }
@@ -1320,6 +1490,7 @@ private:
         calls_.push_back(std::move(call_));
         diagnostics_.empty_arguments_omitted += omitted_;
         diagnostics_.schema_mismatch_arguments += mismatched_;
+        diagnostics_.arguments_unwrapped += unwrapped_ ? 1U : 0U;
         diagnostics_.structured_call_count = static_cast<std::uint32_t>(calls_.size());
         phase_ = Phase::Opener;
     }
@@ -1443,15 +1614,21 @@ private:
         }
     }
 
-    // The raw value whose terminator was read ends there.
-    void close_value() {
+    // The raw value whose terminator was read ends there; `last`: the call's closing lines follow it.
+    void close_value(bool last) {
         closing_ = false;
         if (mode_ == ValueMode::String) {
             flush_string(true);
             emit("\"");
         } else {
             const NormalizedParameter normalized = normalize_parameter("\n" + value_ + "\n", parameter_);
-            if (normalized.disposition == ParameterNormalization::Omitted) {
+            if (last && names_.size() == 1 && undeclared_arguments(tool_, name_, parameter_) &&
+                holds_object(normalized)) {
+                // The call's only parameter held its whole argument object: its members, after the `{`
+                // the call's arguments began with, so the steps still concatenate to its arguments.
+                unwrapped_ = true;
+                emit(std::string_view(normalized.json_value).substr(1, normalized.json_value.size() - 2));
+            } else if (normalized.disposition == ParameterNormalization::Omitted) {
                 ++omitted_;
             } else {
                 // A name the declared tool does not declare is a schema mismatch, as normalize_raw_tool_call
@@ -1528,6 +1705,7 @@ private:
     bool first_pair_         = true;
     std::uint32_t omitted_    = 0;
     std::uint32_t mismatched_ = 0;
+    bool unwrapped_           = false; // the call's lone `arguments` parameter was its argument object
     ValueMode mode_          = ValueMode::String;
     // A JSON or buffered value; a string value's bytes not yet published.
     std::string value_;
@@ -1544,29 +1722,240 @@ void MarkdownCodeTracker::feed(std::string_view text) {
     for (const char c : text) { byte(c); }
 }
 
+namespace {
+
+constexpr bool is_blank_space(char c) { return c == ' ' || c == '\t'; }
+// Bytes that leave a line blank and take no column.
+constexpr bool is_zero_width_blank(char c) { return c == '\r' || c == '\f' || c == '\v'; }
+constexpr std::uint32_t next_column(std::uint32_t column, char c) { return c == '\t' ? column / 4 * 4 + 4 : column + 1; }
+
+} // namespace
+
 void MarkdownCodeTracker::byte(char c) {
-    const auto blank = [](char b) { return b == ' ' || b == '\t' || b == '\r'; };
     if (c == '\n') {
         end_line();
         return;
     }
+    if (!structure(c)) { leaf(c); }
+}
+
+std::uint32_t MarkdownCodeTracker::levels(std::size_t containers) const noexcept {
+    std::uint32_t total = 0;
+    for (std::size_t i = 0; i < containers; ++i) {
+        const std::uint32_t add = containers_[i].quotes != 0 ? containers_[i].quotes : 1;
+        total                   = total > UINT32_MAX - add ? UINT32_MAX : total + add;
+    }
+    return total;
+}
+
+void MarkdownCodeTracker::next_container() {
+    ++entry_;
+    level_ = 0;
+    if (entry_ == depth_) { line_ = Line::Indent; }
+}
+
+bool MarkdownCodeTracker::structure(char c) {
+    if (marker_blank_) {
+        // One blank after a `>` belongs to it (a tab's first column).
+        marker_blank_ = false;
+        if (is_blank_space(c)) {
+            ++base_;
+            column_ = next_column(column_, c);
+            return true;
+        }
+    }
+    switch (line_) {
+    case Line::Prefix: {
+        const Container& open = containers_[entry_];
+        if (is_blank_space(c)) {
+            column_ = next_column(column_, c);
+            // A list item continues on a line indented to its content (the rest is the content's).
+            if (open.quotes == 0 && indent() >= open.offset) {
+                base_ += open.offset;
+                next_container();
+            }
+            return true;
+        }
+        if (is_zero_width_blank(c)) { return true; }
+        if (open.quotes != 0 && c == '>' && indent() <= 3) {
+            column_       = base_ = column_ + 1;
+            marker_blank_ = true;
+            if (++level_ == open.quotes) { next_container(); }
+            return true;
+        }
+        begin_content(c);
+        return structure(c);
+    }
+    case Line::Indent:
+        // The content's first byte may open a block quote or a list item.
+        if (is_blank_space(c) || is_zero_width_blank(c) || fence_ != '\0' || indent() > 3) { return false; }
+        if (entry_ != depth_ && !lazy_pending_) { return false; } // a lazy paragraph line
+        if (c == '>' && !lazy_pending_) {
+            note(c);
+            return open_quote();
+        }
+        if (c != '-' && c != '+' && c != '*' && !is_ascii_digit(c)) { return false; }
+        marker_        = is_ascii_digit(c) ? '0' : c;
+        marker_done_   = !is_ascii_digit(c);
+        marker_one_    = c == '1';
+        marker_digits_ = 1;
+        marker_column_ = column_;
+        marker_width_  = 1;
+        ++column_;
+        line_ = Line::Marker;
+        note(c);
+        return true;
+    case Line::Marker:
+        if (!marker_done_ && is_ascii_digit(c) && marker_digits_ < 9) {
+            ++marker_digits_;
+            ++marker_width_;
+            ++column_;
+            marker_one_ = false;
+            note(c);
+            return true;
+        }
+        if (!marker_done_ && marker_digits_ != 0 && (c == '.' || c == ')')) {
+            marker_done_ = true;
+            ++marker_width_;
+            ++column_;
+            note(c);
+            return true;
+        }
+        if (marker_done_ && (is_blank_space(c) || is_zero_width_blank(c))) {
+            if (is_blank_space(c)) { column_ = next_column(column_, c); }
+            line_ = Line::Gap;
+            return true;
+        }
+        refute_marker();
+        return false;
+    case Line::Gap:
+        if (is_blank_space(c)) {
+            column_ = next_column(column_, c);
+            return true;
+        }
+        if (is_zero_width_blank(c)) { return true; }
+        if (!open_item(false)) {
+            refute_marker();
+            return false;
+        }
+        return structure(c); // the item's content may open a container itself
+    default: return false;
+    }
+}
+
+void MarkdownCodeTracker::begin_content(char c) {
+    line_ = Line::Indent;
+    // A fence inside a container the line does not repeat ends with it.
+    if (fence_ != '\0' && fence_levels_ > levels(entry_) + level_) {
+        close_containers();
+        return;
+    }
+    // A line that would continue the paragraph keeps the containers (laziness), unless it starts a block
+    // that interrupts the paragraph; a list marker decides that itself.
+    const bool block  = indent() <= 3 && (c == '`' || c == '~' || c == '#' || c == '>');
+    const bool marker = indent() <= 3 && (c == '-' || c == '+' || c == '*' || is_ascii_digit(c));
+    if (paragraph_ && !block) {
+        lazy_pending_ = marker;
+        return;
+    }
+    close_containers();
+}
+
+void MarkdownCodeTracker::close_containers() {
+    if (level_ != 0) {
+        containers_[entry_].quotes = level_;
+        depth_                     = static_cast<std::uint8_t>(entry_ + 1);
+    } else {
+        depth_ = entry_;
+    }
+    entry_        = depth_;
+    level_        = 0;
+    lazy_pending_ = false;
+    if (fence_ != '\0' && fence_levels_ > levels(depth_)) {
+        fence_     = '\0';
+        fence_run_ = 0;
+    }
+    paragraph_ = false;
+    span_      = 0;
+}
+
+bool MarkdownCodeTracker::open_quote() {
+    if (depth_ != 0 && containers_[depth_ - 1].quotes != 0) {
+        std::uint32_t& quotes = containers_[depth_ - 1].quotes;
+        if (quotes != UINT32_MAX) { ++quotes; }
+    } else if (depth_ == kMaxContainers) {
+        return false;
+    } else {
+        containers_[depth_++] = Container{.quotes = 1, .offset = 0};
+    }
+    entry_        = depth_;
+    level_        = 0;
+    column_       = base_ = column_ + 1;
+    marker_blank_ = true;
+    paragraph_    = false;
+    span_         = 0;
+    return true;
+}
+
+// A list item interrupts a paragraph (a line that would continue one) only when it has content and,
+// ordered, starts at 1. `empty`: the marker ends its line.
+bool MarkdownCodeTracker::open_item(bool empty) {
+    if (paragraph_ && (empty || (marker_ == '0' && !marker_one_))) { return false; }
+    const std::size_t kept = lazy_pending_ ? entry_ + (level_ != 0 ? 1U : 0U) : depth_;
+    if (kept >= kMaxContainers) { return false; }
+    if (lazy_pending_) { close_containers(); }
+    const std::uint32_t gap  = column_ - (marker_column_ + marker_width_);
+    // Five or more blanks after the marker: one belongs to it, the rest start indented code.
+    const std::uint32_t used = empty || gap == 0 || gap > 4 ? 1 : gap;
+    if (items_opened_++ == 0) {
+        saved_paragraph_ = paragraph_;
+        saved_span_      = span_;
+    }
+    const std::uint32_t content = marker_column_ + marker_width_ + used;
+    containers_[depth_++]       = Container{.quotes = 0, .offset = content - base_};
+    entry_                      = depth_;
+    level_                      = 0;
+    base_                       = content;
+    paragraph_                  = false;
+    span_                       = 0;
+    line_                       = Line::Indent;
+    return true;
+}
+
+// The marker read is paragraph text; a lazy line keeps the containers it did not repeat.
+void MarkdownCodeTracker::refute_marker() {
+    lazy_pending_ = false;
+    line_         = Line::Text;
+}
+
+void MarkdownCodeTracker::note(char c) {
+    if (is_blank_space(c) || is_zero_width_blank(c)) { return; }
+    if (break_char_ == '\0' && (c == '-' || c == '*' || c == '_')) {
+        break_char_ = c;
+    } else if (c != break_char_) {
+        break_char_ = '!';
+    }
+    ++break_count_;
+}
+
+void MarkdownCodeTracker::leaf(char c) {
+    const auto blank = [](char b) { return b == ' ' || b == '\t' || b == '\r'; };
+    note(c);
     switch (line_) {
     case Line::Indent:
-        if (c == ' ') {
-            ++indent_;
-        } else if (c == '\t') {
-            indent_ = indent_ / 4 * 4 + 4;
-        } else if (c == '\r' || c == '\f' || c == '\v') {
+        if (is_blank_space(c)) {
+            column_ = next_column(column_, c);
+        } else if (is_zero_width_blank(c)) {
             // still a blank line
         } else if (fence_ != '\0') {
-            line_ = indent_ <= 3 && c == fence_ ? Line::Closer : Line::Code;
+            line_ = indent() <= 3 && c == fence_ ? Line::Closer : Line::Code;
             run_  = 1;
-        } else if (indent_ >= 4 && !paragraph_) {
+        } else if (indent() >= 4 && !paragraph_) {
             line_ = Line::Indented;
         } else {
-            line_     = indent_ <= 3 && (c == '`' || c == '~') ? Line::Run
-                        : indent_ <= 3 && c == '#'           ? Line::Hashes
-                                                             : Line::Text;
+            line_     = indent() <= 3 && (c == '`' || c == '~') ? Line::Run
+                        : indent() <= 3 && c == '#'           ? Line::Hashes
+                                                              : Line::Text;
             run_char_ = c;
             run_      = 1;
             text_byte(c);
@@ -1603,6 +1992,9 @@ void MarkdownCodeTracker::byte(char c) {
             line_ = Line::Text;
         }
         break;
+    case Line::Prefix: // structure() leaves these before content
+    case Line::Marker:
+    case Line::Gap:
     case Line::Heading:
     case Line::Text: break;
     }
@@ -1631,6 +2023,29 @@ std::uint32_t MarkdownCodeTracker::open_span() const noexcept {
 }
 
 void MarkdownCodeTracker::end_line() {
+    switch (line_) {
+    case Line::Prefix:
+        // A blank line after the prefixes it repeats: list items go on over it, a block quote it does not
+        // mark ends.
+        while (entry_ < depth_ && level_ == 0 && containers_[entry_].quotes == 0) { ++entry_; }
+        if (entry_ < depth_) { close_containers(); }
+        line_ = Line::Indent;
+        break;
+    case Line::Marker:
+        if (!marker_done_ || !open_item(true)) { refute_marker(); }
+        break;
+    case Line::Gap:
+        if (!open_item(true)) { refute_marker(); }
+        break;
+    default: break;
+    }
+    // A thematic break opens no list item: the line is the text it was before containers were read.
+    if (items_opened_ != 0 && break_char_ != '!' && break_char_ != '\0' && break_count_ >= 3) {
+        depth_     = static_cast<std::uint8_t>(depth_ - items_opened_);
+        paragraph_ = saved_paragraph_;
+        span_      = saved_span_;
+        line_      = Line::Text;
+    }
     const bool opener = (line_ == Line::Run && run_ >= 3) ||
                         (line_ == Line::Info && (run_char_ == '~' || !info_backtick_));
     if (fence_ != '\0') {
@@ -1639,10 +2054,11 @@ void MarkdownCodeTracker::end_line() {
             fence_run_ = 0;
         }
     } else if (opener) {
-        fence_     = run_char_;
-        fence_run_ = run_;
-        paragraph_ = false;
-        span_      = 0;
+        fence_        = run_char_;
+        fence_run_    = run_;
+        fence_levels_ = levels(depth_);
+        paragraph_    = false;
+        span_         = 0;
     } else if (line_ == Line::Text || line_ == Line::Run || line_ == Line::Info ||
                (line_ == Line::Hashes && run_ > 6)) {
         span_      = open_span(); // a paragraph's span continues on its next line
@@ -1652,8 +2068,16 @@ void MarkdownCodeTracker::end_line() {
         paragraph_ = false;
         span_      = 0;
     }
-    line_          = Line::Indent;
-    indent_        = 0;
+    line_          = depth_ == 0 ? Line::Indent : Line::Prefix;
+    entry_         = 0;
+    level_         = 0;
+    column_        = 0;
+    base_          = 0;
+    marker_blank_  = false;
+    lazy_pending_  = false;
+    items_opened_  = 0;
+    break_char_    = '\0';
+    break_count_   = 0;
     run_char_      = '\0';
     run_           = 0;
     info_backtick_ = false;
@@ -1662,12 +2086,19 @@ void MarkdownCodeTracker::end_line() {
 }
 
 bool MarkdownCodeTracker::in_code() const noexcept {
+    // The container structure the next byte settles first: a marker's `<`, which is no container syntax.
+    MarkdownCodeTracker next = *this;
+    (void)next.structure('<');
+    return next.leaf_in_code();
+}
+
+bool MarkdownCodeTracker::leaf_in_code() const noexcept {
     if (fence_ != '\0') { return true; } // a marker after a closing run makes it no closer
     switch (line_) {
     // A span left open on an earlier line does not reach a line's start: a streamed reader cannot know
     // that its run is never closed (CommonMark then makes it text), and a stray backtick in a preamble
     // must not turn the call on the next line into text (Strata #4923).
-    case Line::Indent: return indent_ >= 4 && !paragraph_;
+    case Line::Indent: return indent() >= 4 && !paragraph_;
     case Line::Indented: return true;
     case Line::Run: return run_ >= 3 || open_span() != 0;
     case Line::Info: return run_char_ == '~' || !info_backtick_ || open_span() != 0;

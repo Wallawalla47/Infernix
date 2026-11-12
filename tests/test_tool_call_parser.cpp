@@ -3,9 +3,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -197,8 +199,10 @@ int test_functions_in_one_wrapper() {
                               "a call in a shared wrapper lost its arguments");
         }
     }
-    const std::string broken = "<tool_call>\n<function=first>\n</function>\n<function=second>\n<parameter=x>\n1\n"
-                               "</function>\n</tool_call>";
+    // The second function's parameter opener lost its `>` (a value that only lacks its closer is
+    // recovered: test_unclosed_values).
+    const std::string broken = "<tool_call>\n<function=first>\n</function>\n<function=second>\n<parameter=x\n1\n"
+                               "</parameter>\n</function>\n</tool_call>";
     failures += check_rejected(broken, *contract, infernix::ToolCallParseFallbackReason::MalformedStructure,
                                "strict: a malformed second function in one wrapper did not fail the region");
     const auto tolerant_broken = parse(broken, 64, *contract, true);
@@ -1741,11 +1745,16 @@ int test_markdown_quoted_calls() {
     const auto free_contract = contract_from_definitions(definitions);
     const auto constrained   = fi::select_tool_call_contract(free_contract, infernix::ToolChoice{});
     const auto call          = tool_call("write", {{"path", "/tmp/a.txt"}});
-    // The call as an indented code block: every line indented four columns.
-    std::string indented = "    " + call;
-    for (std::size_t at = indented.find('\n'); at != std::string::npos; at = indented.find('\n', at + 1)) {
-        indented.insert(at + 1, "    ");
-    }
+    // The call with `prefix` before each of its lines: indented four columns (an indented code block), or
+    // inside a container (a quote's `> `, a list item's indentation).
+    const auto lines_after = [&](const std::string& prefix) {
+        std::string text = prefix + call;
+        for (std::size_t at = text.find('\n'); at != std::string::npos; at = text.find('\n', at + 1)) {
+            text.insert(at + 1, prefix);
+        }
+        return text;
+    };
+    const std::string indented = lines_after("    ");
     // (calls, content) of one output.
     using Outcome  = std::pair<std::size_t, std::string>;
     using Contract = std::shared_ptr<const fi::ToolCallOutputContract>;
@@ -1783,7 +1792,17 @@ int test_markdown_quoted_calls() {
         // line is indented, the bare `<function=...>` after the quoted token is its wrapper's text.
         "Example:\n\n" + indented + "\n\nDone.", "Example:\n\n    " + call + "\n\nDone.", "# Format\n    " + call,
         // A code span closes only on a run of its own length.
-        "Use ``a`" + call + "`` like this."};
+        "Use ``a`" + call + "`` like this.",
+        // Code inside containers: a fence in a block quote at any depth, in a quote inside a list item, or
+        // in an item whose content starts four columns in; indented code four columns past an item's
+        // content or a quote's.
+        "> Format:\n> ```xml\n" + lines_after("> ") + "\n> ```\nDone.",
+        "> > ~~~\n" + lines_after("> > ") + "\n> > ~~~",
+        ">>>>>```\n" + lines_after(">>>>>"),
+        "- Example:\n  > ```\n" + lines_after("  > ") + "\n  > ```",
+        "10. Step:\n    ```xml\n" + lines_after("    ") + "\n    ```\nDone.",
+        "- Step:\n\n      " + call,
+        "> Example:\n>\n>     " + call};
     const std::vector<std::string> real{call,
                                         "Let me do it.\n\n" + call,
                                         "Let me do it. " + call,
@@ -1800,7 +1819,21 @@ int test_markdown_quoted_calls() {
                                         // A span left open on an earlier line of the paragraph does not
                                         // reach a call at a line's start (Strata #4923).
                                         "Let me use `run_commands to check.\n" + call,
-                                        "Use `x`, then `\n   " + call};
+                                        "Use `x`, then `\n   " + call,
+                                        // A list item's continuation paragraph, four columns in after a
+                                        // blank line, is text of the item, not code.
+                                        "- Step one.\n\n    " + call,
+                                        "- Step one.\n\n    Now run it: " + call,
+                                        "1. Step:\n\n   " + call,
+                                        // A fence ends with its container; a line without the quote's `>`
+                                        // or the item's indentation continues their paragraph (laziness).
+                                        "> Quote:\n> ```\n> x\n> ```\n\n" + call,
+                                        "> ```\n> x\n" + call,
+                                        "- ```\n  x\n" + call,
+                                        "> Note:\n" + call,
+                                        "- item\n" + call,
+                                        // A thematic break is no list item.
+                                        "Text\n- - -\n" + call};
     const std::vector<std::pair<Contract, bool>> routes{{free_contract, false}, {free_contract, true}, {constrained, false}};
     for (const auto& [contract, tolerant] : routes) {
         const std::string route = contract->constrained ? " (constrained)" : tolerant ? " (tolerant)" : " (strict)";
@@ -2374,6 +2407,327 @@ int test_quoted_call_closers() {
     return failures;
 }
 
+// The terminal turn of a generated text on one route. The whole parse (free routes) and the streamed
+// decoder at widths 1, 3, 7 and whole must agree (`consistent`), and a constrained call's streamed steps
+// must concatenate to it.
+struct Turn {
+    std::vector<infernix::GeneratedToolCall> calls;
+    infernix::ToolCallParseDiagnostics diagnostics;
+    std::string content;
+    bool consistent = true;
+
+    [[nodiscard]] std::vector<Json> arguments() const {
+        std::vector<Json> out;
+        for (const auto& call : calls) { out.push_back(Json::parse(call.arguments_json)); }
+        return out;
+    }
+};
+
+enum class Route { Strict, Tolerant, Constrained };
+
+std::string route_name(Route route) {
+    return route == Route::Strict ? " (strict)" : route == Route::Tolerant ? " (tolerant)" : " (constrained)";
+}
+
+Turn turn_on(Route route, const std::shared_ptr<const fi::ToolCallOutputContract>& declarations, const std::string& text,
+             infernix::FinishReason reason = infernix::FinishReason::StopToken) {
+    const bool tolerant  = route == Route::Tolerant;
+    const auto contract  = route == Route::Constrained
+                               ? fi::select_tool_call_contract(declarations, infernix::ToolChoice{})
+                               : declarations;
+    const bool cut_short = reason == infernix::FinishReason::OutputLimit;
+    std::optional<Turn> turn;
+    const auto agree = [&](Turn next) {
+        if (!turn) {
+            turn = std::move(next);
+            return;
+        }
+        bool same = next.calls.size() == turn->calls.size() && next.diagnostics == turn->diagnostics &&
+                    next.content == turn->content && next.consistent;
+        for (std::size_t i = 0; same && i < next.calls.size(); ++i) {
+            same = next.calls[i].name == turn->calls[i].name &&
+                   next.calls[i].arguments_json == turn->calls[i].arguments_json;
+        }
+        turn->consistent = turn->consistent && same;
+    };
+    if (route != Route::Constrained) {
+        auto parsed = parse(text, 64, *contract, tolerant, cut_short);
+        agree({.calls = std::move(parsed.tool_calls), .diagnostics = parsed.diagnostics, .content = parsed.content});
+    }
+    for (const std::size_t width : {std::size_t{1}, std::size_t{3}, std::size_t{7}, text.size()}) {
+        fi::ToolCallOutputDecoder decoder(contract, 64, tolerant);
+        StreamedCalls streamed;
+        std::string visible;
+        for (std::size_t at = 0; at < text.size(); at += width) {
+            visible += feed(decoder, text, at, width);
+            streamed.take(decoder);
+        }
+        auto terminal = decoder.finish(reason);
+        streamed.take(decoder);
+        bool steps = true;
+        if (route == Route::Constrained) {
+            steps = streamed.ordered && streamed.calls.size() >= terminal.tool_calls.size();
+            for (std::size_t i = 0; steps && i < terminal.tool_calls.size(); ++i) {
+                steps = streamed.complete[i] && streamed.calls[i].arguments_json == terminal.tool_calls[i].arguments_json;
+            }
+        }
+        agree({.calls       = std::move(terminal.tool_calls),
+               .diagnostics = terminal.diagnostics,
+               .content     = visible + terminal.content,
+               .consistent  = steps});
+    }
+    return std::move(*turn);
+}
+
+// A string value that never closes (Strata #5756, strata-nvfp4 #24). The model skips the value's own
+// closer after an inline nested pair (a file that documents the call format), or its closer loses the
+// `>`. Strict: the region stays text. Tolerant: a closer on the line of a nested opener closes that pair,
+// and a value no closer ends goes on to the call's next declared parameter or its closers (without a
+// closer that lost its `>`), reported as recovered; streamed and whole agree, as does a budget stop
+// after the call's closers. A quoted unmatched opener keeps SR-07's reading.
+int test_unclosed_values() {
+    using Reason            = infernix::ToolCallParseFallbackReason;
+    const auto declarations = output_contract_for("edit_file", Json{{"path", Json{{"type", "string"}}},
+                                                                    {"old_string", Json{{"type", "string"}}},
+                                                                    {"new_string", Json{{"type", "string"}}}});
+    const std::string head  = "<tool_call>\n<function=edit_file>\n<parameter=path>\ndocs/tools.md\n</parameter>\n";
+    const std::string tail  = "</function>\n</tool_call>";
+    const std::string pair  = "<parameter=limit>25</parameter>";
+    const Json path{{"path", "docs/tools.md"}};
+    const auto with = [&](Json extra) {
+        Json arguments = path;
+        arguments.update(extra);
+        return arguments;
+    };
+    struct Case {
+        std::string label;
+        std::string text;
+        std::vector<Json> tolerant; // the tolerant calls' arguments
+        bool recovered;             // reported as tolerant_recovered
+        // The strict calls' arguments; nullopt: the strict parser returns the text.
+        std::optional<std::vector<Json>> strict;
+    };
+    const std::vector<Case> cases{
+        {"a nested pair, then the call's closers", head + "<parameter=new_string>\n" + pair + "\n" + tail,
+         {with({{"new_string", pair}})}, true, std::nullopt},
+        {"a nested pair, then the next declared parameter inline",
+         head + "<parameter=new_string>\n" + pair + "\n<parameter=old_string>x</parameter>\n" + tail,
+         {with({{"new_string", pair}, {"old_string", "x"}})}, true, std::nullopt},
+        {"a nested pair, then the next declared parameter on lines of its own",
+         head + "<parameter=new_string>\n" + pair + "\n<parameter=old_string>\nx\n</parameter>\n" + tail,
+         {with({{"new_string", pair}, {"old_string", "x"}})}, true, std::nullopt},
+        {"a nested pair and an undeclared inline pair, then the call's closers",
+         head + "<parameter=new_string>\n" + pair + "\n<parameter=other>y</parameter>\n" + tail,
+         {with({{"new_string", pair + "\n<parameter=other>y</parameter>"}})}, true, std::nullopt},
+        // Strict: the first region fails, so the second call is the turn.
+        {"a nested pair, then the call's closers and another call",
+         head + "<parameter=new_string>\n" + pair + "\n" + tail + "\n" + tool_call("edit_file", {{"path", "b.md"}}),
+         {with({{"new_string", pair}}), Json{{"path", "b.md"}}}, true, std::vector<Json>{Json{{"path", "b.md"}}}},
+        {"a nested pair closed by the value's own closer", head + "<parameter=new_string>\n" + pair + "\n</parameter>\n" + tail,
+         {with({{"new_string", pair}})}, false, std::vector<Json>{with({{"new_string", pair}})}},
+        {"a value without its closer", head + "<parameter=new_string>\nhello\n" + tail, {with({{"new_string", "hello"}})},
+         true, std::nullopt},
+        {"a closer that lost its >", "<tool_call>\n<function=edit_file>\n<parameter=path>\ndocs/tools.md\n</parameter\n" + tail,
+         {path}, true, std::nullopt},
+        // SR-07: an opener on a line of its own, or in a value written on the opener's line, is quoted.
+        {"a multi-line nested opener", head + "<parameter=new_string>\nExample:\n<parameter=limit>\n25\n</parameter>\n" + tail,
+         {with({{"new_string", "Example:\n<parameter=limit>\n25"}})}, false, std::nullopt},
+        {"an unframed value quoting an opener",
+         head + "<parameter=new_string>echo '<parameter=x>'</parameter>\n" + tail,
+         {with({{"new_string", "echo '<parameter=x>'"}})}, false, std::nullopt},
+        {"a declared opener on a line of its own, no nested pair before it",
+         head + "<parameter=new_string>\nTo set it:\n<parameter=old_string>\nand close it.\n</parameter>\n" + tail,
+         {with({{"new_string", "To set it:\n<parameter=old_string>\nand close it."}})}, false, std::nullopt},
+    };
+    int failures = 0;
+    for (const Case& c : cases) {
+        for (const auto reason : {infernix::FinishReason::StopToken, infernix::FinishReason::OutputLimit}) {
+            const std::string how = c.label + (reason == infernix::FinishReason::StopToken ? "" : ", budget stop");
+            const Turn tolerant   = turn_on(Route::Tolerant, declarations, c.text, reason);
+            failures += check(tolerant.consistent && tolerant.arguments() == c.tolerant &&
+                                  tolerant.diagnostics.fallback_reason == Reason::None &&
+                                  tolerant.diagnostics.tolerant_recovered == c.recovered,
+                              "tolerant read of " + how + " changed");
+        }
+        const Turn strict = turn_on(Route::Strict, declarations, c.text);
+        failures += check(strict.consistent && (c.strict ? strict.arguments() == *c.strict
+                                                         : strict.calls.empty() && strict.content == c.text &&
+                                                               strict.diagnostics.fallback_reason ==
+                                                                   Reason::MalformedStructure),
+                          "strict read of " + c.label + " changed");
+    }
+    // A parameter opener that lost its `>` (strata-nvfp4 #24 cases A and B) names no parameter: its header
+    // would run to a later tag's `>` across lines. The region stays text on every free route.
+    for (const std::string& text :
+         {"<tool_call>\n<function=edit_file>\n<parameter=path\ndocs/tools.md\n</parameter>\n" + tail,
+          head + "<parameter=new_string\nhello\n</parameter>\n" + tail}) {
+        for (const auto reason : {infernix::FinishReason::StopToken, infernix::FinishReason::OutputLimit}) {
+            for (const Route route : {Route::Strict, Route::Tolerant}) {
+                const Turn turn = turn_on(route, declarations, text, reason);
+                failures += check(turn.consistent && turn.calls.empty() && turn.content == text,
+                                  "a parameter opener without its > was read as a parameter" + route_name(route));
+            }
+        }
+    }
+    return failures;
+}
+
+// A value the output budget cuts inside its closer keeps no fragment of it (ZD-42), whatever byte of
+// `\n</parameter>` (or `\n</param>`) the cut follows, whole and streamed; a `<` that does not start a line
+// stays value text.
+int test_value_cut_inside_closer() {
+    using Reason            = infernix::ToolCallParseFallbackReason;
+    const auto declarations = output_contract_for("edit_file", Json{{"path", Json{{"type", "string"}}}});
+    int failures            = 0;
+    for (const std::string close : {std::string("</parameter>"), std::string("</param>")}) {
+        const std::string open   = close == "</param>" ? "<param=path>" : "<parameter=path>";
+        const std::string head   = "<tool_call>\n<function=edit_file>\n" + open + "\ndocs/tools.md";
+        const std::string closer = "\n" + close;
+        for (std::size_t n = 0; n <= closer.size(); ++n) {
+            const std::string text = head + closer.substr(0, n);
+            const Turn turn = turn_on(Route::Tolerant, declarations, text, infernix::FinishReason::OutputLimit);
+            failures += check(turn.consistent && turn.arguments() == std::vector<Json>{Json{{"path", "docs/tools.md"}}} &&
+                                  turn.diagnostics.fallback_reason == Reason::TruncatedTail &&
+                                  turn.diagnostics.tolerant_recovered,
+                              "a value cut after " + std::to_string(n) + " bytes of " + close + " kept a fragment");
+        }
+    }
+    const Turn kept = turn_on(Route::Tolerant, declarations, "<tool_call>\n<function=edit_file>\n<parameter=path>\nx <",
+                              infernix::FinishReason::OutputLimit);
+    failures += check(kept.arguments() == std::vector<Json>{Json{{"path", "x <"}}},
+                      "a cut value lost a `<` that does not start a line");
+    return failures;
+}
+
+// A call whose only parameter is an `arguments` its tool does not declare, holding a JSON object, is
+// that object (ZA-02, Strata #5804), byte for byte on every route, and counted; a declared `arguments`,
+// a value that is not an object, a second parameter or an undeclared tool keep the parameter.
+int test_lone_arguments_parameter() {
+    const auto declarations = contract_from_definitions(
+        {tool_definition("edit_file", Json{{"path", Json{{"type", "string"}}}, {"new_string", Json{{"type", "string"}}}}),
+         tool_definition("configure", Json{{"arguments", Json{{"type", "object"}}}})});
+    const std::string object = "{\"path\":\"a.md\", \"new_string\":\"x\\ny\"}";
+    struct Case {
+        std::string label;
+        std::string text;
+        std::vector<std::string> arguments; // the calls' arguments JSON, exactly
+        std::uint32_t unwrapped;
+        std::uint32_t mismatched;
+    };
+    const std::vector<Case> cases{
+        {"an undeclared lone arguments object", tool_call("edit_file", {{"arguments", object}}), {object}, 1, 0},
+        {"one with a raw line break in a string", tool_call("edit_file", {{"arguments", "{\"new_string\":\"a\nb\"}"}}),
+         {"{\"new_string\":\"a\\nb\"}"}, 1, 0},
+        {"two calls", tool_call("edit_file", {{"arguments", "{}"}}) + "\n" + tool_call("edit_file", {{"arguments", object}}),
+         {"{}", object}, 2, 0},
+        {"a declared arguments", tool_call("configure", {{"arguments", "{\"a\":1}"}}), {"{\"arguments\":{\"a\":1}}"}, 0, 0},
+        {"an array", tool_call("edit_file", {{"arguments", "[1,2]"}}), {"{\"arguments\":[1,2]}"}, 0, 1},
+        {"text", tool_call("edit_file", {{"arguments", "not json"}}), {"{\"arguments\":\"not json\"}"}, 0, 1},
+        {"a second parameter", tool_call("edit_file", {{"arguments", "{\"a\":1}"}, {"path", "b.md"}}),
+         {"{\"arguments\":{\"a\":1},\"path\":\"b.md\"}"}, 0, 1},
+    };
+    int failures = 0;
+    for (const Case& c : cases) {
+        for (const Route route : {Route::Strict, Route::Tolerant, Route::Constrained}) {
+            const Turn turn = turn_on(route, declarations, c.text);
+            bool exact      = turn.calls.size() == c.arguments.size();
+            for (std::size_t i = 0; exact && i < turn.calls.size(); ++i) {
+                exact = turn.calls[i].arguments_json == c.arguments[i];
+            }
+            failures += check(turn.consistent && exact && turn.diagnostics.arguments_unwrapped == c.unwrapped &&
+                                  turn.diagnostics.schema_mismatch_arguments == c.mismatched,
+                              "lone arguments: " + c.label + route_name(route));
+        }
+    }
+    // A tool the request does not declare (kept by tolerant mode): its parameters are unknown.
+    const Turn undeclared = turn_on(Route::Tolerant, declarations, tool_call("unknown_tool", {{"arguments", "{\"a\":1}"}}));
+    failures += check(undeclared.calls.size() == 1 && undeclared.calls[0].arguments_json == "{\"arguments\":{\"a\":1}}" &&
+                          undeclared.diagnostics.arguments_unwrapped == 0,
+                      "an undeclared tool's arguments parameter was unwrapped");
+    return failures;
+}
+
+// Python's `None` (any case, as booleans) is null where a non-string declared type admits null (ZH-06);
+// a string type keeps the text, and a type without null keeps it as a mismatched string.
+int test_python_none() {
+    const auto declarations = output_contract_for(
+        "configure", Json{{"count", Json{{"type", Json::array({"integer", "null"})}}},
+                          {"flag", Json{{"type", Json::array({"boolean", "null"})}}},
+                          {"ratio", Json{{"type", Json::array({"number", "null"})}}},
+                          {"payload", Json{{"type", Json::array({"object", "null"})}}},
+                          {"items", Json{{"anyOf", Json::array({Json{{"type", "array"}}, Json{{"type", "null"}}})}}},
+                          {"unset", Json{{"type", "null"}}},
+                          {"plain", Json{{"type", "integer"}}},
+                          {"label", Json{{"type", Json::array({"string", "null"})}}},
+                          {"name", Json{{"type", "string"}}},
+                          {"switch", Json{{"type", Json::array({"boolean", "null"})}}}});
+    const std::string text = tool_call("configure", {{"count", "None"},
+                                                     {"flag", "none"},
+                                                     {"ratio", "NONE"},
+                                                     {"payload", "None"},
+                                                     {"items", "None"},
+                                                     {"unset", "None"},
+                                                     {"plain", "None"},
+                                                     {"label", "None"},
+                                                     {"name", "None"},
+                                                     {"switch", "True"}});
+    const Json expected{{"count", nullptr},  {"flag", nullptr},   {"ratio", nullptr}, {"payload", nullptr},
+                        {"items", nullptr},  {"unset", nullptr},  {"plain", "None"},  {"label", "None"},
+                        {"name", "None"},    {"switch", true}};
+    int failures = 0;
+    for (const Route route : {Route::Strict, Route::Tolerant, Route::Constrained}) {
+        const Turn turn = turn_on(route, declarations, text);
+        failures += check(turn.consistent && turn.arguments() == std::vector<Json>{expected} &&
+                              turn.diagnostics.schema_mismatch_arguments == 1,
+                          "None was not read as null where the type admits it" + route_name(route));
+    }
+    return failures;
+}
+
+// An array or object value refused only for a quote between two word characters inside a string (a
+// Hebrew abbreviation, 5"x7) is read with it escaped (ZD-43), together with raw control bytes, on every
+// route; valid JSON keeps its text, and other quotes, a repair of a type the schema does not admit, or an
+// untyped value stay strings.
+int test_inner_quote_repair() {
+    const std::string tsadi_he = "\xd7\xa6\xd7\x94", lamed = "\xd7\x9c";
+    const auto declarations = output_contract_for(
+        "configure", Json{{"record", Json{{"type", "object"}}},
+                          {"items", Json{{"type", "array"}}},
+                          {"note", Json{{"type", Json::array({"object", "null"})}}},
+                          {"valid", Json{{"type", "object"}}},
+                          {"spaced", Json{{"type", "object"}}},
+                          {"list", Json{{"type", "array"}}},
+                          {"untyped", Json::object()},
+                          {"name", Json{{"type", "string"}}}});
+    const std::string valid = "{\"q\":\"say \\\"hi\\\"\"}";
+    const std::string text  = tool_call("configure", {{"record", "{\"unit\":\"" + tsadi_he + "\"" + lamed + "\"}"},
+                                                      {"items", "[\"5\"x7 frame\", \"ok\"]"},
+                                                      {"note", "{\"t\":\"a\"b\nc\"}"},
+                                                      {"valid", valid},
+                                                      {"spaced", "{\"a\":\"x\" y\"}"},
+                                                      {"list", "{\"a\":\"b\"c\"}"},
+                                                      {"untyped", "{\"a\":\"b\"c\"}"},
+                                                      {"name", "5\"x7"}});
+    const Json expected{{"record", Json{{"unit", tsadi_he + "\"" + lamed}}},
+                        {"items", Json::array({"5\"x7 frame", "ok"})},
+                        {"note", Json{{"t", "a\"b\nc"}}},
+                        {"valid", Json{{"q", "say \"hi\""}}},
+                        {"spaced", "{\"a\":\"x\" y\"}"},
+                        {"list", "{\"a\":\"b\"c\"}"},
+                        {"untyped", "{\"a\":\"b\"c\"}"},
+                        {"name", "5\"x7"}};
+    int failures = 0;
+    for (const Route route : {Route::Strict, Route::Tolerant, Route::Constrained}) {
+        const Turn turn = turn_on(route, declarations, text);
+        failures += check(turn.consistent && turn.arguments() == std::vector<Json>{expected} &&
+                              turn.diagnostics.schema_mismatch_arguments == 2 &&
+                              turn.calls.size() == 1 &&
+                              turn.calls[0].arguments_json.find("\"valid\":" + valid) != std::string::npos,
+                          "an unescaped inner quote was not repaired as specified" + route_name(route));
+    }
+    return failures;
+}
+
 int run_tests() {
     int failures = 0;
     failures += test_constrained_call_streaming();
@@ -2423,6 +2777,11 @@ int run_tests() {
     failures += test_open_reasoning_recovery();
     failures += test_markdown_quoted_calls();
     failures += test_quoted_call_closers();
+    failures += test_unclosed_values();
+    failures += test_value_cut_inside_closer();
+    failures += test_lone_arguments_parameter();
+    failures += test_python_none();
+    failures += test_inner_quote_repair();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

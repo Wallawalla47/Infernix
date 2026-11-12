@@ -1192,6 +1192,9 @@ struct ToolCallParseDiagnostics {
     std::uint32_t empty_arguments_omitted         = 0;
     std::uint32_t schema_mismatch_arguments       = 0;
     std::uint32_t duplicate_parameters_repaired   = 0;
+    // Calls whose only parameter, `arguments`, which their tool does not declare, held the whole argument
+    // object and was unwrapped.
+    std::uint32_t arguments_unwrapped             = 0;
     ToolCallParseFallbackReason fallback_reason   = ToolCallParseFallbackReason::None;
     // Tolerant tool-call mode turned output the strict parser rejects into structured calls.
     bool tolerant_recovered = false;

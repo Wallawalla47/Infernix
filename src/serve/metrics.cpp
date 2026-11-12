@@ -91,6 +91,7 @@ void Metrics::done(const GenerationOutcome& outcome) {
         requests_.constraint_positions += c.mask_positions;
         requests_.constraint_upload_bytes += c.mask_upload_bytes;
     }
+    requests_.tool_arguments_unwrapped += outcome.tool_call_parse.arguments_unwrapped;
     requests_.duration.observe(outcome.timings.total_seconds);
     requests_.queue.observe(outcome.engine_timing.queue_wait_seconds);
 }
@@ -359,6 +360,9 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
             "Chat Completions assistant tool-call turns received without their reasoning.");
     counter("chat_reasoning_restored_total", requests.reasoning_restored, 0U,
             "Of those, turns given back the reasoning this server generated (--restore-tool-reasoning).");
+    counter("tool_call_arguments_unwrapped_total", requests.tool_arguments_unwrapped, 0U,
+            "Generated tool calls whose only parameter, an undeclared `arguments`, held the whole argument "
+            "object and was unwrapped.");
     const auto histogram = [&](std::string_view name, const Histogram& value,
                                std::string_view help) {
         header(name, "histogram", help);

@@ -181,5 +181,14 @@ int main() {
     check(constrained.find("infernix_constraint_compile_seconds_total 1.5\n") != std::string::npos &&
               constrained.find("infernix_constraint_wait_seconds_total 0.25\n") != std::string::npos,
           "a compile beside the prefill and its wait must reach the metrics");
+    // Unwrapped `arguments` objects (ZA-02) are counted per call across settled requests.
+    check(constrained.find("infernix_tool_call_arguments_unwrapped_total 0\n") != std::string::npos,
+          "the arguments-unwrap counter must start at zero");
+    outcome.tool_call_parse.arguments_unwrapped = 2;
+    metrics.done(outcome);
+    metrics.done(outcome);
+    check(metrics.render(running, false).find("infernix_tool_call_arguments_unwrapped_total 4\n") !=
+              std::string::npos,
+          "unwrapped tool-call arguments must reach the metrics");
     return failures == 0 ? 0 : 1;
 }

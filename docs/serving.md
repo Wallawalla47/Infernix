@@ -481,10 +481,21 @@ local `$ref` (such as Pydantic's `{"$ref": "#/$defs/Status"}`), `allOf` (each br
 call. String-admitting values remain strings, including the empty string, except that the text `null`
 is the null value where `null` is admitted too. An empty block for a
 declared non-string parameter is omitted. Admitted JSON values retain their JSON type;
-case-insensitive boolean text is normalized to `true` or `false`. An array or object whose strings
-hold raw control characters (a real line break or tab inside a multi-line edit, which strict JSON
-refuses) is read with them escaped, so it keeps its JSON type. A nonempty schema mismatch remains
-a structured call: valid JSON retains its represented type and other text becomes a JSON string so
+case-insensitive boolean text is normalized to `true` or `false`, and Python's `None` (in any case)
+is the null value where a type that admits no string admits `null` (such as `["integer","null"]`). An
+array or object whose strings hold raw control characters (a real line break or tab inside a
+multi-line edit, which strict JSON refuses) is read with them escaped, so it keeps its JSON type. For
+a parameter whose type admits an array or object, a value refused because a quote inside one of its
+strings is left unescaped is read with each quote that has a word character (a letter, a digit, `_`
+or a non-ASCII character) on both sides escaped, as in a Hebrew abbreviation or `5"x7`, when that
+gives an array or object the type admits; a JSON quote never sits between two word characters, so
+valid JSON is never changed, and a quote with anything else beside it is not repaired. A call whose
+only parameter is `arguments`, which its declared tool does not declare, with a JSON object as its
+value has that object as its arguments: the model wrote the tool's whole argument object as one
+parameter. A declared `arguments`, any other value, a second parameter or a tool the request does
+not declare keep the parameter; `tool_call_parse.arguments_unwrapped` and
+`infernix_tool_call_arguments_unwrapped_total` count the unwrapped calls. A nonempty schema mismatch
+remains a structured call: valid JSON retains its represented type and other text becomes a JSON string so
 the tool consumer can report the validation error and continue the agent loop. Schemas that name no
 type this way (no type keyword, an invalid type name, a remote, missing or circular reference)
 retain untyped inference. Infernix does not apply defaults, enforce required
@@ -505,12 +516,19 @@ quoted markup before it stays ordinary content. One `<tool_call>` may hold sever
 blocks in a row before its `</tool_call>` (Qwen models sometimes write them so); each is a call, and a
 malformed one among them fails the region like any other. A marker inside Markdown code of the answer is a
 quoted example and stays content even when it is a complete call, on this route and on the
-constrained route below. Code follows CommonMark's rules without lists or block quotes: a
+constrained route below. Code follows CommonMark's rules: a
 ```` ``` ```` or `~~~` fence, from its opening line until a line of the same character at least as
 long with nothing after it; an indented code block (four or more columns of indentation after a blank
 line, a heading or the start of the answer; right after a line of text an indented line continues
-that paragraph); and a code span, closed only by a backtick run of its opening length. A marker at
-the start of a line (after at most three columns of indentation) is never inside a span opened on an
+that paragraph); and a code span, closed only by a backtick run of its opening length. Block quotes
+(`>`, at any depth) and list items (`-`, `+`, `*`, `1.`, `1)`) are containers: inside one, columns
+count from the container's content, so a fence in a quote (`` > ``` ``) or an item, and indented
+code four columns past an item's content, are code there, while a list item's paragraph continued four
+columns in after a blank line (`- Step:`, a blank line, then the call indented four columns) is the
+item's text. A line that does not repeat a quote's `>` or an item's indentation ends the container (and
+a fence inside it), unless it continues the container's paragraph. Up to eight nested containers are
+read (consecutive quotes count as one); deeper ones are text. A marker at the start of a line or of a
+container's content (after at most three columns of indentation) is never inside a span opened on an
 earlier line: a response cannot know that such a backtick run is never closed (CommonMark then makes
 it text), and a stray backtick in a sentence before the call must not turn the call into text. Only
 the text before the marker decides, so streamed and complete responses agree. A marker after a closed
@@ -521,7 +539,9 @@ By default the unconstrained parser keeps that all-or-nothing behaviour. With
 complete call, a second call is malformed, a single final call is cut by the output budget before
 its closing tags, or the closing bracket after the function name is missing: the recovered call is
 reported structurally with a `truncated_tail` diagnostic (logged at Info severity) rather than
-demoted to text, and an undeclared tool name stays structured for the consumer to judge. A final
+demoted to text, and an undeclared tool name stays structured for the consumer to judge. A value cut
+inside its closer keeps no part of it: a trailing line break and start of `</parameter>` (such as
+`\n</param`) is dropped, so a cut file write or command ends with its own last byte. A final
 call is kept cut only when the generation was cut short (the output limit, the context window, or
 a cancellation); when the model itself ended the turn inside a parameter value or before the
 function's closing tag (its end-of-turn token, or a stop string), the call may be missing input, so
@@ -537,6 +557,23 @@ ordinary markup in both modes. Inside a call, a parameter opener that lost its k
 (where the next `<parameter=NAME>` belongs, or first in the call), reads as `<parameter=NAME>` when
 the call's tool declares `NAME`; otherwise it stays text of the value it follows, and the strict
 parser keeps it as value text too. A repaired opener reports `tolerant_recovered`.
+
+When the closers in a value do not balance its openers and the output ends with a call's own closers,
+tolerant mode reads the value within its call (up to the `</function>` that ends the call where the
+output ends or another call begins). A `</parameter>` the grammar continues from ends it, so a value
+that quotes an unmatched opener, such as `echo '<parameter=x>'`, keeps it. In a value that starts with
+its line break (the model's framing), a `</parameter>` on the same line as a nested
+`<parameter=...>` before it closes that inline pair and is value text: a file that documents the call
+format holds `<parameter=limit>25</parameter>`. After such a pair, a line holding only the opener of a
+parameter the tool declares and the call has not given is the call's next parameter: the model
+skipped the value's closer before it. When no closer ends the value, the model skipped its closer,
+or the closer lost its `>`: the value ends at the first later line that opens a parameter the tool
+declares and the call has not given, else before the call's `</function>`, and a trailing
+`</parameter` without its `>` is dropped. A call read either way reports `tolerant_recovered`. Any
+other opener on a line of its own (`Example:\n<parameter=limit>\n25\n</parameter>` then `</function>`)
+is the same bytes as a quoted unmatched opener, and keeps that reading. A parameter name holds no
+line break or `<` (as the constraint's names do not), so a parameter opener that lost its `>` is not
+read as one in either mode: that region stays text.
 
 Tolerant mode also recovers calls the model wrote inside its thinking when it ends the turn with
 its stop token without closing the thinking, so no call reached the answer. Under the default
@@ -649,7 +686,8 @@ complete, then its arguments JSON in fragments, which concatenate to the argumen
 call. A string value streams as it is generated (a strict string parameter, or a non-strict one whose
 declared type admits strings); a strict JSON value streams verbatim; a value whose JSON depends on all
 of it (a nullable string, a non-strict declared non-string type, or no declared type) arrives when its
-parameter closes. A call cut by the token limit or the context keeps the fragments it streamed (its arguments
+parameter closes, and the members of a lone undeclared `arguments` object (above) when the call closes.
+A call cut by the token limit or the context keeps the fragments it streamed (its arguments
 are then incomplete JSON) and closes with the terminal status; it stays out of the aggregate response
 and of stored history. Each protocol renders the steps in its own events (below). Free tool output
 (`tool_constraints:"auto"` without a constraint that applies) still publishes its calls whole in the
@@ -2057,6 +2095,7 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_constraint_draft_wait_seconds_total` | Live draft-ready wait counted once per batch; a subset of device wait |
 | `infernix_requests_total{outcome}`, `infernix_response_failures_total` | Generation attempts entering preparation and subsequent response failures; protocol/model validation failures and token-count requests are excluded |
 | `infernix_chat_reasoning_missing_total`, `infernix_chat_reasoning_restored_total` | Chat Completions assistant tool-call messages received without reasoning, and those `--restore-tool-reasoning` restored |
+| `infernix_tool_call_arguments_unwrapped_total` | Generated tool calls whose only parameter, an `arguments` their tool does not declare, held the whole argument object and was unwrapped (see the tool-parameter conversion above) |
 | `infernix_time_to_first_token_seconds` | Histogram updated once at the first committed token, including preparation, queueing and binding |
 | `infernix_request_duration_seconds`, `infernix_request_queue_seconds` | Histograms for settled generation outcomes, including cancellation; exceptional failures have separate counts |
 
@@ -2199,17 +2238,20 @@ counts; anything else is ignored, and the request itself is unaffected.
 
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
-preserved for consumer validation, `duplicate_parameters_repaired`, and a stable fallback reason.
+preserved for consumer validation, `duplicate_parameters_repaired`, `arguments_unwrapped` (calls
+whose lone undeclared `arguments` object became their arguments), and a stable fallback reason.
 On the unconstrained route a parameter named more than once in one call keeps its last value, as in
 JSON object syntax, and counts once in `duplicate_parameters_repaired` for each repeat instead of
 demoting the call to text (a constrained call cannot repeat a name).
 Fallback reasons are `none`, `malformed_structure`, `invalid_tool_name`, `undeclared_tool`,
 `trailing_content`, and `truncated_tail`. `truncated_tail` occurs only with `--tolerant-tool-calls`:
 with a nonzero `structured_call_count` the recovered calls were returned structurally (a discarded
-suffix or a call cut at the region end), and with none the region was returned as text.
+suffix or a call cut at the region end, a cut value without any part of its closer), and with none
+the region was returned as text.
 `tolerant_recovered` is true when `--tolerant-tool-calls` turned output the strict parser rejects
-into structured calls: a recovered `truncated_tail`, or a kept call whose opener (a dropped `<` or
-keyword, a missing `>` after the name) was repaired or whose name is not a declared tool.
+into structured calls: a recovered `truncated_tail`, a kept call whose opener (a dropped `<` or
+keyword, a missing `>` after the name) was repaired or whose name is not a declared tool, or a value
+whose closer was skipped or lost its `>`.
 `recovered_from_reasoning` is true when the calls came from a turn that ended inside its thinking.
 These counters contain no tool arguments or generated text.
 

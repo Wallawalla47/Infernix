@@ -264,14 +264,21 @@ void selected_contracts(infernix::text::GrammarCompiler& compiled) {
 // spelling as content, at every chunking. A call outside code still opens, and a lookahead through
 // a quoted token finds no dead end.
 void quoted_calls(infernix::text::GrammarCompiler& compiled) {
+    // A call quoted inside a block quote's fence: every line after the quote's `> `.
+    std::string in_quote = "> " + call("a");
+    for (auto at = in_quote.find('\n'); at != std::string::npos; at = in_quote.find('\n', at + 1)) {
+        in_quote.insert(at + 1, "> ");
+    }
     const std::vector<std::string> quoted{"Format:\n```xml\n" + call("a") + "\n```\nDone.",
                                           "````markdown\n```xml\n" + call("a") + "\n```\n````\nDone.",
                                           "Use `" + call("a") + "` like this.",
-                                          "Example:\n\n    " + call("a") + "\n\nDone."};
+                                          "Example:\n\n    " + call("a") + "\n\nDone.",
+                                          "> Format:\n> ```xml\n" + in_quote + "\n> ```\nDone."};
     // A span left open by a stray backtick on an earlier line does not reach the call at a line's start
-    // (Strata #4923).
+    // (Strata #4923); a list item's continuation paragraph four columns in is the item's text, not code.
     const std::vector<std::string> real{"```\ncode\n```\n" + call("a"), "Example:\n    " + call("a"),
-                                        "Use `x` then " + call("a"), "Let me use `run_commands to check.\n" + call("a")};
+                                        "Use `x` then " + call("a"), "Let me use `run_commands to check.\n" + call("a"),
+                                        "- Step one.\n\n    " + call("a")};
     for (const bool strict : {false, true}) {
         const auto bound = contract(schema({{"type", "string"}}), strict);
         for (const std::string& text : quoted) {
@@ -444,6 +451,58 @@ void calls_after_closers(infernix::text::GrammarCompiler& compiled) {
     require(refused, "the decoder accepted a call token right after a call's closing lines");
 }
 
+// A string value that never closes (Strata #5756, strata-nvfp4 #24) on the constrained route. A parameter
+// name holds no line break, so an opener that lost its `>` cannot be generated (the grammar admits `>`
+// there). A raw value ends only at `\n</parameter>`: after an inline nested pair, or after a closer that
+// lost its `>`, the call's own closers are value text and the turn cannot end inside the value; a later
+// closer ends it, and the decoder publishes the value the grammar read.
+void unclosed_values(infernix::text::GrammarCompiler& compiled) {
+    const auto allowed = [](const std::vector<std::uint32_t>& words, std::int32_t token) {
+        return (words[static_cast<std::size_t>(token) / 32] >> (token % 32) & 1U) != 0;
+    };
+    const Json properties{{"path", {{"type", "string"}}}, {"new_string", {{"type", "string"}}}};
+    const std::string path = "<tool_call>\n<function=call>\n<parameter=path>\ndocs/tools.md\n</parameter>\n";
+    for (const bool strict : {false, true}) {
+        Json source{{"type", "object"}, {"properties", properties}};
+        if (strict) {
+            source["required"]             = Json::array({"path", "new_string"});
+            source["additionalProperties"] = false;
+        }
+        const auto bound = contract(source, strict);
+        // The mask after `text`, every token of which the grammar admits.
+        const auto mask_after = [&](const std::string& text) {
+            auto matcher = frontend::compile_tool_grammar(compiled, *bound, kToolCall, {}, {});
+            std::vector<std::uint32_t> words(matcher->mask_words());
+            for (const std::int32_t token : tokens(text)) {
+                require(matcher->masks({}, words) == 0 && allowed(words, token),
+                        "the grammar refused a token of an unclosed value's prefix");
+                matcher->accept(token);
+                matcher->confirm();
+            }
+            require(matcher->masks({}, words) == 0, "the grammar found a dead end in an unclosed value");
+            return words;
+        };
+        for (const std::string& opener : {std::string("<tool_call>\n<function=call>\n<parameter=path"),
+                                          path + "<parameter=new_string"}) {
+            const auto words = mask_after(opener);
+            require(!allowed(words, '\n') && allowed(words, '>'), "a parameter name admitted a line break");
+        }
+        for (const std::string value : {std::string("<parameter=limit>25</parameter>"), std::string("hello\n</parameter")}) {
+            const std::string open = path + "<parameter=new_string>\n" + value + "\n</function>\n</tool_call>";
+            require(!allowed(mask_after(open), kEos), "the turn could end inside an unclosed value");
+            const std::string closed = open + "\n</parameter>\n</function>\n</tool_call>";
+            require(accepts(compiled, *bound, closed), "a later closer did not end an unclosed value");
+            frontend::ToolCallOutputDecoder decoder(bound, 64);
+            (void)feed(decoder, closed);
+            const auto terminal = decoder.finish();
+            require(terminal.tool_calls.size() == 1 &&
+                        Json::parse(terminal.tool_calls[0].arguments_json) ==
+                            Json{{"path", "docs/tools.md"}, {"new_string", value + "\n</function>\n</tool_call>"}},
+                    "the decoder did not publish the value the grammar read");
+        }
+    }
+}
+
 // A parameter a declared non-strict tool does not declare counts as a schema mismatch on the constrained
 // (streamed) route, as the whole-text route counts it (candidates QA-14).
 void undeclared_parameters() {
@@ -465,6 +524,7 @@ void run() {
     quoted_closers(compiled);
     calls_in_thinking(compiled);
     calls_after_closers(compiled);
+    unclosed_values(compiled);
     infernix::ToolChoice required;
     required.mode = infernix::ToolChoiceMode::Required;
     auto fixed =

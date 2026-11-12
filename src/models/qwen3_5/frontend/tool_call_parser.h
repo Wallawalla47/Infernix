@@ -2,6 +2,7 @@
 
 #include "models/qwen3_5/frontend/tool_contract.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -29,16 +30,21 @@ struct ParsedToolCallOutput {
     ToolCallParseDiagnostics diagnostics;
 };
 
-// The Markdown code state of answer text read so far, by CommonMark's code rules without container
-// blocks (lists, block quotes): a ``` or ~~~ fence, open from its opening line (up to three columns
-// of indentation, a run of at least three, and no backtick in a backtick fence's info string) until
-// a line of the same character, at least as long, with nothing after it; an indented code block
-// (four or more columns, after a blank line, a heading or the start of the text); and a code span of
-// the current paragraph, closed only by a backtick run of its opening length (a backslash outside a
-// span makes the next backtick text). A tool-call marker inside code is a quoted example and stays
-// text; a marker at a line's start (after at most three columns of indentation) is outside any span
-// opened on an earlier line, whose run may never close. Only the text before a marker decides, so
-// streamed and whole outputs agree; the state is fixed-size, so a copy costs nothing.
+// The Markdown code state of answer text read so far, by CommonMark's code rules: a ``` or ~~~ fence,
+// open from its opening line (up to three columns of indentation, a run of at least three, and no
+// backtick in a backtick fence's info string) until a line of the same character, at least as long,
+// with nothing after it; an indented code block (four or more columns, after a blank line, a heading
+// or the start of the text); and a code span of the current paragraph, closed only by a backtick run
+// of its opening length (a backslash outside a span makes the next backtick text). Block quotes (`>`,
+// any depth) and list items (`-`, `+`, `*`, `1.`, `1)`) are containers, by CommonMark's rules for
+// them: their lines' columns count from the container's content (a fence or indented code inside a
+// quote or an item is code there), a line that does not repeat a quote's `>` or a list item's
+// indentation ends it unless it continues a paragraph (laziness), and a fence ends with its container.
+// Up to eight nested containers are read (consecutive quotes count as one); deeper ones are text. A
+// tool-call marker inside code is a quoted example and stays text; a marker at the start of a line or
+// of a container's content (after at most three columns of indentation) is outside any span opened on
+// an earlier line, whose run may never close. Only the text before a marker decides, so streamed and
+// whole outputs agree; the state is fixed-size, so a copy costs nothing.
 class MarkdownCodeTracker {
 public:
     void feed(std::string_view text);
@@ -47,29 +53,75 @@ public:
     [[nodiscard]] bool in_code() const noexcept;
 
 private:
-    // Where the current line is: its indentation, then outside a fence an indented code line, the
-    // opening run of a possible fence (and its info string), the hashes of a possible heading (and
-    // its text), or paragraph text; inside a fence a possible closing run (and the blanks after it),
-    // or code.
-    enum class Line : std::uint8_t { Indent, Indented, Run, Info, Hashes, Heading, Text, Closer, CloserTail, Code };
+    // Where the current line is: the open containers' prefixes (a quote's `>`, an item's indentation),
+    // a possible list marker and the blanks after it, the indentation of its content, then outside a
+    // fence an indented code line, the opening run of a possible fence (and its info string), the
+    // hashes of a possible heading (and its text), or paragraph text; inside a fence a possible closing
+    // run (and the blanks after it), or code.
+    enum class Line : std::uint8_t {
+        Prefix, Marker, Gap, Indent, Indented, Run, Info, Hashes, Heading, Text, Closer, CloserTail, Code
+    };
+    // An open container: `quotes` nested block quotes, or (`quotes` 0) a list item whose content starts
+    // `offset` columns after its parent's.
+    struct Container {
+        std::uint32_t quotes = 0;
+        std::uint32_t offset = 0;
+    };
+    static constexpr std::size_t kMaxContainers = 8;
 
     void byte(char c);
+    // True when `c` was container syntax (a prefix, a marker or its blanks); otherwise the line takes it
+    // as content.
+    bool structure(char c);
+    // The line's first content byte `c` does not repeat every open container.
+    void begin_content(char c);
+    bool open_quote();
+    bool open_item(bool empty);
+    void refute_marker();
+    void close_containers();
+    void next_container();
+    void leaf(char c);
+    [[nodiscard]] bool leaf_in_code() const noexcept;
+    [[nodiscard]] std::uint32_t levels(std::size_t containers) const noexcept;
+    [[nodiscard]] std::uint32_t indent() const noexcept { return column_ > base_ ? column_ - base_ : 0; }
+    // A thematic break (`- - -`, `* * *`) is no list item: the line's content bytes are noted.
+    void note(char c);
     void end_line();
     void text_byte(char c);
     // The open span once the backtick run in progress ends (0: none).
     [[nodiscard]] std::uint32_t open_span() const noexcept;
 
-    char fence_              = '\0';  // the open fence's character, '\0' when none is open
-    std::uint32_t fence_run_ = 0;     // its opening run
-    bool paragraph_          = false; // the last non-blank line was paragraph text (it takes no indented code)
-    std::uint32_t span_      = 0;     // the paragraph's open code span: its backtick run (0: none)
-    Line line_               = Line::Indent;
-    std::uint32_t indent_    = 0;     // the line's columns of leading spaces and tabs
-    char run_char_           = '\0';  // the character of the line's first run (Run, Info)
-    std::uint32_t run_       = 0;     // the length of that run, or of the hashes, or of a closing run
-    bool info_backtick_      = false; // a backtick in the info string (Info): no fence then
-    std::uint32_t ticks_     = 0;     // the backtick run in progress
-    bool escaped_            = false; // the previous byte was a backslash outside a span
+    std::array<Container, kMaxContainers> containers_{};
+    std::uint8_t depth_         = 0;     // open containers
+    char fence_                 = '\0';  // the open fence's character, '\0' when none is open
+    std::uint32_t fence_run_    = 0;     // its opening run
+    std::uint32_t fence_levels_ = 0;     // the container levels it is inside
+    bool paragraph_             = false; // the last non-blank line was paragraph text (it takes no indented code)
+    std::uint32_t span_         = 0;     // the paragraph's open code span: its backtick run (0: none)
+    // The current line.
+    Line line_                = Line::Indent;
+    std::uint8_t entry_       = 0;     // the containers it repeats so far, and `level_` quotes of the next
+    std::uint32_t level_      = 0;
+    std::uint32_t column_     = 0;     // the next byte's column
+    std::uint32_t base_       = 0;     // the column the innermost repeated container's content starts at
+    bool marker_blank_        = false; // a `>` was read: one blank after it belongs to it
+    bool lazy_pending_        = false; // a list marker decides whether the containers it did not repeat end
+    char marker_              = '\0';  // the list marker read (Marker, Gap): its bullet, or '0' when ordered
+    bool marker_done_         = false; // the marker is complete (an ordered one has its `.` or `)`)
+    bool marker_one_          = false; // an ordered marker's number is 1
+    std::uint8_t marker_digits_  = 0;
+    std::uint32_t marker_column_ = 0;
+    std::uint32_t marker_width_  = 0;
+    std::uint8_t items_opened_   = 0;     // list items the line opened, and the paragraph state before them
+    bool saved_paragraph_        = false;
+    std::uint32_t saved_span_    = 0;
+    char break_char_             = '\0';  // the content's character so far ('!': not a thematic break)
+    std::uint32_t break_count_   = 0;
+    char run_char_               = '\0';  // the character of the line's first run (Run, Info)
+    std::uint32_t run_           = 0;     // the length of that run, or of the hashes, or of a closing run
+    bool info_backtick_          = false; // a backtick in the info string (Info): no fence then
+    std::uint32_t ticks_         = 0;     // the backtick run in progress
+    bool escaped_                = false; // the previous byte was a backslash outside a span
 };
 
 // Parse Qwen's XML-like tool-call format. In tolerant mode, a complete function call is
