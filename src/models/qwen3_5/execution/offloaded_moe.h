@@ -96,6 +96,7 @@ struct OffloadedCall {
     bool streamed       = false; // a prefill chunk whose misses the expert stream copies ahead
     bool split          = false; // its gated layers give the CPU their thinnest misses
     bool release_stream = true;  // each layer's ring half is released once its experts are enqueued
+    cudaStream_t compute = nullptr; // the stream the pass runs on (a streamed pass's end orders the ring after it)
     // A verification round's live columns (rows of mask.width columns; device valid counts per row):
     // the padding past a row's drafts routes nowhere, so it adds no job, miss or prefetch (live
     // columns keep their bits). Empty for every other call.

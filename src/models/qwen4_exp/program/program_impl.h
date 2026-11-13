@@ -4810,11 +4810,11 @@ private:
         } catch (...) {
             // A failed call (an unreadable record, say) still returns the stream's slots: left
             // active, the next streamed chunk could never begin and the release would refuse.
-            if (streamed) { expert_stream_->end(); }
+            if (streamed) { expert_stream_->end(s); }
             split_call_ = false;
             throw;
         }
-        if (streamed) { expert_stream_->end(); }
+        if (streamed) { expert_stream_->end(s); }
         split_call_ = false;
         residency_->enqueue_route_download(s, batch * width);
     }

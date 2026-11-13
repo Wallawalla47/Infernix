@@ -38,6 +38,7 @@ ExpertStream::ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uin
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
     CUDA_CHECK(cudaEventCreateWithFlags(&start_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&uploaded_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&drained_, cudaEventDisableTiming));
     landed_.resize(layers_);
     consumed_.resize(layers_);
     for (std::uint32_t l = 0; l < layers_; ++l) {
@@ -57,6 +58,8 @@ ExpertStream::~ExpertStream() {
         (void)cudaStreamDestroy(expand_stream_);
     }
     if (copied_ != nullptr) { (void)cudaEventDestroy(copied_); }
+    if (expanded_ != nullptr) { (void)cudaEventDestroy(expanded_); }
+    if (drained_ != nullptr) { (void)cudaEventDestroy(drained_); }
     for (auto event : bounced_) {
         if (event != nullptr) { (void)cudaEventDestroy(event); }
     }
@@ -104,6 +107,7 @@ void ExpertStream::start_expansions(const ops::offloaded_moe::ExpertShape& shape
         CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
         CUDA_CHECK(cudaStreamCreateWithPriority(&expand_stream_, cudaStreamNonBlocking, greatest));
         CUDA_CHECK(cudaEventCreateWithFlags(&copied_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&expanded_, cudaEventDisableTiming));
     }
 }
 
@@ -449,8 +453,22 @@ void ExpertStream::enqueue(std::uint32_t layer, std::uint32_t first) {
     if (!ssd_planned_[layer].empty()) { ssd_held_.push_back(layer); } // its slots return once landed
 }
 
-void ExpertStream::end() noexcept {
+void ExpertStream::end(cudaStream_t compute) noexcept {
     active_ = false;
+    // An abandoned walk (a prompt cancelled part-way) leaves copies in flight that no layer waited for: the next
+    // layers' (after_experts enqueues layer + 2), the copy-ahead's, from RAM as well as from the SSD. The ring then
+    // goes back to the residency ordered after `compute` only, and a frame lent at once to the next prompt (its wide
+    // arena, its own ring) or refilled took a late record over its contents (PR #62, 2026-11-13: a sticky illegal
+    // address right after a cancelled 212K-token prefill and its retry). `compute` waits for both streams' tails;
+    // waits on compute are bound when they are enqueued, so they cannot wait on this.
+    try {
+        CUDA_CHECK(cudaEventRecord(drained_, stream_));
+        CUDA_CHECK(cudaStreamWaitEvent(compute, drained_, 0));
+        if (expand_stream_ != nullptr) {
+            CUDA_CHECK(cudaEventRecord(expanded_, expand_stream_));
+            CUDA_CHECK(cudaStreamWaitEvent(compute, expanded_, 0));
+        }
+    } catch (...) {}
     // Every read requested is waited for (a read in flight still writes its slot), every copy has
     // landed (the chunk's work waited for each), then the slots go back. Each slot on its own, so
     // one failed wait or release (after a failed call) does not keep the others lent.

@@ -162,9 +162,13 @@ public:
     // After the layer's experts are enqueued on `compute`: the half is free once they finish; the
     // copies of layer + 2 follow.
     void after_experts(std::uint32_t layer, cudaStream_t compute);
-    // After the chunk's last layer: `compute` is ordered after every copy (each was waited for). Gives
-    // every stream slot back once its read and copy are done.
-    void end() noexcept;
+    // After the chunk's last layer, or when its layer walk is abandoned part-way (a cancelled prompt):
+    // `compute` waits for everything the stream issued into the ring (copies, bounces, expansions, the
+    // copies of layers whose experts were never enqueued), so whatever is ordered after `compute` (the
+    // ring's return to the residency, a refill or a new lease of its frames) follows the last write. After
+    // a complete chunk compute already waited for each copy and the wait is met. Then gives every stream
+    // slot back once its read and copy are done.
+    void end(cudaStream_t compute) noexcept;
 
     struct Stats {
         std::uint64_t streamed = 0; // expert records copied
@@ -203,6 +207,8 @@ private:
     cudaStream_t stream_ = nullptr;
     cudaEvent_t start_   = nullptr;
     cudaEvent_t uploaded_ = nullptr;
+    cudaEvent_t drained_  = nullptr; // end(): the copy stream's last work, which compute waits for
+    cudaEvent_t expanded_ = nullptr; // end(): the expansion stream's last work (with expand_stream_)
     std::vector<cudaEvent_t> landed_, consumed_;
     PinnedHostBuffer tables_host_{1};
     std::int32_t* tables_     = nullptr; // device, at the ring's start

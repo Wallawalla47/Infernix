@@ -1,7 +1,8 @@
 // ExpertStream's gated chunks with copy-ahead (runtime/expert_offload/expert_stream.h, candidates BX-09):
 // plan_ahead fills the start of a layer's half from a guess, plan_layer keeps those slots and copies only
 // the rest after them, mask_ahead hides the copied-ahead experts from the CPU split, and every slot the
-// table names holds that expert's record bytes. The speed effect is a measurement (the copy-ahead ABBA). With CSF
+// table names holds that expert's record bytes. A chunk abandoned part-way orders compute after the stream's last
+// write. The speed effect is a measurement (the copy-ahead ABBA). With CSF
 // banks (set_csf), and with the SSD tier's compressed slots beside expanded ones (set_tier_csf), every slot holds its
 // expert's expanded record, in ungated and gated chunks.
 
@@ -11,11 +12,13 @@
 #include "runtime/expert_offload/expert_stream.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <initializer_list>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -158,7 +161,7 @@ void gated_chunk() {
     row = rig.table(3, ok);
     check(ok && row[15] == 8 && row[5] == -1, "layer 3's table");
     s.after_experts(3, rig.compute);
-    s.end();
+    s.end(rig.compute);
 
     // Layer 1 (rows > 2): ahead 5, 6, 12; routed 5, 6; heavy 5, 6 (ahead) and 8 (late). Layer 2 (rows > 0):
     // ahead 10, 13; routed 10; heavy 10 (ahead) and 11 (late).
@@ -184,7 +187,30 @@ void ungated_refuses() {
         rig.stream.before_experts(l, rig.compute);
         rig.stream.after_experts(l, rig.compute);
     }
-    rig.stream.end();
+    rig.stream.end(rig.compute);
+}
+
+void CUDART_CB hold_200ms(void*) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); }
+
+// A chunk abandoned part-way (a cancelled prompt's layer walk): layer 0's experts were enqueued, so layer 2's copies
+// are queued, and the later layers never run. end(compute) orders compute after everything the stream issued, so the
+// ring's return (ordered after compute) follows the last write into it: the stream's copy stream is held 200 ms,
+// then writes a flag; compute reads the flag after end() and must see it.
+void abandoned_chunk() {
+    Rig rig;
+    rig.stream.begin(rig.span(), rig.residency.data(), rig.compute, /*gated=*/false);
+    rig.stream.before_experts(0, rig.compute);
+    rig.stream.after_experts(0, rig.compute); // queues layer 2's copies
+    infernix::DeviceBuffer flag(sizeof(std::uint32_t));
+    CUDA_CHECK(cudaMemsetAsync(flag.p, 0, sizeof(std::uint32_t), rig.compute));
+    CUDA_CHECK(cudaStreamSynchronize(rig.compute));
+    CUDA_CHECK(cudaLaunchHostFunc(rig.stream.stream(), hold_200ms, nullptr));
+    CUDA_CHECK(cudaMemsetAsync(flag.p, 0x01, sizeof(std::uint32_t), rig.stream.stream()));
+    rig.stream.end(rig.compute);
+    std::uint32_t seen = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&seen, flag.p, sizeof(seen), cudaMemcpyDeviceToHost, rig.compute));
+    CUDA_CHECK(cudaStreamSynchronize(rig.compute));
+    check(seen == 0x01010101U, "work on compute after end() ran before the stream's last write (an abandoned chunk)");
 }
 
 // CSF banks (ExpertStream::set_csf), and the tier's slots (set_tier_csf: odd records compressed in their slots, even
@@ -289,7 +315,7 @@ void csf_chunks() {
                                   std::to_string(l) + " names " + std::to_string(named) + " slots, not 4");
             stream.after_experts(l, compute);
         }
-        stream.end();
+        stream.end(compute);
         CUDA_CHECK(cudaStreamSynchronize(compute));
         CUDA_CHECK(cudaStreamDestroy(compute));
     }
@@ -306,6 +332,7 @@ int main() {
     CUDA_CHECK(cudaSetDevice(0));
     gated_chunk();
     ungated_refuses();
+    abandoned_chunk();
     csf_chunks();
     CUDA_CHECK(cudaDeviceSynchronize());
     std::cout << (failures == 0 ? "expert stream checks passed\n" : "expert stream checks failed\n");

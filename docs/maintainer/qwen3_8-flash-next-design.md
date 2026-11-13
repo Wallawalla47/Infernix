@@ -9471,7 +9471,16 @@ unwritten.
   publishes nothing.
 - Inside a layer walk's span the layers are at different positions: the walk is abandoned, its
   staged tap captures are dropped (their slabs return once their copies land), and nothing past
-  the span's start is published.
+  the span's start is published. The same holds for a cancel or a failure (`walk_abandon`). The
+  abandoned span's stream still has copies queued for layers the walk never reached (the next two
+  layers, the copy-ahead), which no layer's compute waited for, so `ExpertStream::end` makes compute
+  wait for its copy and expansion streams before the ring goes back (`give_back` needs compute ordered
+  after every access). Without that wait a late record landed in frames already refilled or lent to
+  the next prompt: PR #62's reporter saw a sticky illegal address right after a cancelled
+  212K-token prefill and its retry (2026-11-13), and FP4-Local under prompts cancelled 0.3-1.5 s
+  into their prefill and retried at once, beside three multi-turn sessions, gave NaN logits for
+  every request after 22 cycles (8 minutes), then a sticky illegal address; with the wait, 117
+  cycles (40 minutes) passed with no failure.
 - The ResumeState keeps the ledger (prompt and committed output), the frontier, and the request's
   measurements and decisions (timings, speculative statistics, the drafter's acceptance policy,
   `/v1/decide` draws, cache and n-gram counters). The model state is not owned: the cache entry

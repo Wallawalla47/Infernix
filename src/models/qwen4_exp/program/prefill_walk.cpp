@@ -536,7 +536,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     lane.state_tokens = lane.calls[walk_.end_call - 1];
     lane.next_call    = walk_.end_call;
     residency_->enqueue_route_download(device_.stream, width);
-    expert_stream_->end();
+    expert_stream_->end(device_.stream);
     if (dflash2_) { dflash2_walk_context(lane, index); }
     walk_.active   = false;
     host_lanes_[0] = static_cast<std::int32_t>(index);
@@ -727,7 +727,8 @@ void ProgramImpl::walk_abandon() noexcept {
     try {
         device_.synchronize();
     } catch (...) {}
-    expert_stream_->end();
+    // The walk's copies of layers it never reached are still landing in the ring: the ring goes back after them.
+    expert_stream_->end(device_.stream);
     for (const LayerWalk::Tap& tap : walk_.taps) {
         if (tap.staged != 0) { prefix_->abandon_staged_capture(tap.staged); }
     }

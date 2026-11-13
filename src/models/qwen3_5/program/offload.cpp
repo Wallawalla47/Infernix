@@ -283,6 +283,7 @@ execution::OffloadedCall ProgramOffload::begin_pass(cudaStream_t compute, std::i
     call.streamed = engine_.lend_stream(columns, wide, /*walk_bytes=*/0, compute) ||
                     (wide > 0 && engine_.lend_stream(columns, 0, /*walk_bytes=*/0, compute));
     if (call.streamed) {
+        call.compute = compute;
         // A pass the CPU can share gates the stream on each layer's routing (Flash-Next §19.3.12).
         call.split = engine_.split_policy() != nullptr && columns <= engine_.split_columns();
         engine_.stream()->begin(engine_.ring_span(), engine_.residency().host_table(), compute, call.split);
@@ -315,7 +316,7 @@ void ProgramOffload::end_pass(cudaStream_t compute, const execution::OffloadedCa
                               std::uint32_t lane, std::int32_t columns, std::uint32_t position, bool prompt_end,
                               const std::string& model, bool continuing) {
     using Offload = runtime::expert_offload::ExpertOffload;
-    if (call.streamed) { engine_.stream()->end(); }
+    if (call.streamed) { engine_.stream()->end(compute); }
     engine_.check_error(model);
     const bool prompt            = kind == PassKind::Prompt;
     const bool silent            = prompt && continuing;
@@ -351,7 +352,7 @@ bool ProgramOffload::continuing_prompt(std::uint32_t reused, std::uint32_t promp
 }
 
 void ProgramOffload::abandon_pass(const execution::OffloadedCall& call) noexcept {
-    if (call.streamed && engine_.stream() != nullptr) { engine_.stream()->end(); }
+    if (call.streamed && engine_.stream() != nullptr) { engine_.stream()->end(call.compute); }
 }
 
 void ProgramOffload::begin_round(cudaStream_t compute, std::int32_t position) {
