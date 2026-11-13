@@ -428,15 +428,17 @@ std::string serve_usage_text(const char* argv0) {
            "  --device N                 CUDA device ordinal (default 0)\n"
            "  --ram-free-mib N           physical Host RAM in MiB that Infernix's weights,\n"
            "                             experts, n-gram table and caches leave free for\n"
-           "                             other programs (default " +
+           "                             other programs; --host-context-mib auto fills RAM\n"
+           "                             down to it (default " +
            std::to_string(kDefaultRamFreeBytes >> 20) +
            ")\n"
-           "  --ram-resize auto|off      auto (default): between requests the RAM tiers (the\n"
-           "                             prefix cache's Host tier, then offloaded experts'\n"
-           "                             RAM copies) give RAM back while less than 2 GiB is\n"
-           "                             available and take it back once --ram-free-mib\n"
-           "                             (at least 3 GiB) plus 1 GiB stays free; off keeps\n"
-           "                             their startup sizes\n"
+           "  --ram-resize auto|off      auto (default): the RAM tiers (the prefix cache's\n"
+           "                             Host tier, then offloaded experts' RAM copies)\n"
+           "                             give RAM back, also while requests run, once less\n"
+           "                             than half of --ram-free-mib (at least 2 GiB) is\n"
+           "                             available, until --ram-free-mib is, and take it\n"
+           "                             back once --ram-free-mib plus 1 GiB stays free;\n"
+           "                             off keeps their startup sizes\n"
            "  --expert-ram-mib N|auto    Offloaded experts: Host RAM in MiB for the routed\n"
            "                             experts (auto: what --ram-free-mib and the other\n"
            "                             pins leave); less than all of them need reads the\n"
@@ -499,10 +501,10 @@ std::string serve_usage_text(const char* argv0) {
            "  state snapshots. It configures itself: free VRAM becomes Device block cache\n"
            "  (--kv-capacity defaults to auto) and every option below is optional.\n"
            "  --host-context-mib N|auto  pinned Host pool in decimal MiB (whole bytes) that\n"
-           "                             KV blocks and state snapshots share (default 8192;\n"
-           "                             0 = GPU only; Qwen3.8-Flash-Next: must be positive;\n"
-           "                             auto: Qwen3.8-Flash-Next sizes it from the RAM its\n"
-           "                             experts and n-gram table leave, up to 8192)\n"
+           "                             KV blocks and state snapshots share (default auto:\n"
+           "                             all the RAM the model, its experts and n-gram table\n"
+           "                             leave beyond --ram-free-mib, at least 1024; 0 = GPU\n"
+           "                             only, Qwen3.8-Flash-Next: must be positive)\n"
            "  --prefix-cache-file PATH   restore the host tier from PATH at startup when\n"
            "                             present (written by this binary for the same\n"
            "                             artifact and KV format) and save it there on clean\n"
@@ -1011,12 +1013,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             cache_option_flag = "--cache-tap-min-gap";
         } else if (arg == "--host-context-mib") {
             const char* text = require_value("--host-context-mib");
+            // auto (the default): no size; the Engine sizes the tier once the model's RAM is planned.
             if (std::string_view(text) == "auto") {
                 options.context_cache.host_capacity_bytes.reset();
-                options.context_cache.host_capacity_auto = true;
             } else {
                 options.context_cache.host_capacity_bytes = parse_host_context_mib(text);
-                options.context_cache.host_capacity_auto  = false;
             }
             host_context_explicit = true;
             cache_option_flag     = "--host-context-mib";

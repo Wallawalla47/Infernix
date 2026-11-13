@@ -87,7 +87,7 @@ const CONTEXT: FormSection = {
       kind: "number",
       flag: "--ram-free-mib",
       label: "RAM left free (MiB)",
-      help: "Physical RAM everything Infernix keeps in RAM leaves free for other programs.",
+      help: "Physical RAM everything Infernix keeps in RAM leaves free for other programs. An automatic Host prefix cache fills RAM down to it; once other programs take half of it, RAM given back under pressure starts.",
       placeholder: "8192 (default)",
       min: 0,
     },
@@ -122,7 +122,7 @@ const CONTEXT: FormSection = {
       kind: "select",
       flag: "--ram-resize",
       label: "RAM given back under pressure",
-      help: "auto: while less than 2 GiB of RAM is available, the prefix cache's Host tier and then offloaded experts' RAM copies give memory back between requests, and take it back once RAM left free (at least 3 GiB) plus 1 GiB is available again; off keeps their startup sizes.",
+      help: "auto: once less than half of RAM left free (at least 2 GiB) is available, the prefix cache's Host tier and then offloaded experts' RAM copies give memory back, also while requests run, until RAM left free is available again, and take it back once RAM left free plus 1 GiB stays available; off keeps their startup sizes.",
       options: [
         { value: "auto", label: "auto" },
         { value: "off", label: "off" },
@@ -172,8 +172,8 @@ const PREFIX_CACHE: FormSection = {
       kind: "auto",
       flag: "--host-context-mib",
       label: "Host prefix cache (MiB)",
-      help: "Pinned RAM for the prefix cache's Host tier (KV blocks and state snapshots). Flash-Next's auto sizes it after the experts.",
-      placeholder: "8192 (default)",
+      help: "Pinned RAM for the prefix cache's Host tier (KV blocks and state snapshots). auto (the default) gives it all the RAM the model and its experts leave beyond 'RAM left free (MiB)'.",
+      placeholder: "auto (default)",
     },
     {
       kind: "number",

@@ -39,15 +39,12 @@ public:
         live.erase(id);
     }
 
-    void move_host_slab(std::uint32_t from, std::uint32_t to) noexcept override { moves.emplace_back(from, to); }
-
     std::uint32_t allocate() {
         const std::uint32_t id = next++;
         live.insert(id);
         return id;
     }
 
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> moves;
     std::vector<std::uint32_t> released;
     std::set<std::uint32_t> live;
     std::uint32_t next = 1;
@@ -1126,11 +1123,11 @@ void test_image_only_host_tier() {
     require(index.stats().host_free_slabs == 8, "the removed snapshot's image slab was leaked");
 }
 
-// Host-born snapshots (images copied straight to Host slabs) on an index without Device snapshot
-// slots: reservations, publication with and without a tail, duplicates, Device-tail eviction.
-// RAM pressure: shrink_host evicts as an allocation would until the owned slabs fit below the limit, then moves
-// those past it into free slabs below (the backend copies them); a pinned entry keeps its slabs, so the limit stays
-// above them; grow_host brings the slabs back as free ones.
+// RAM pressure while requests run: begin_host_shrink evicts as an allocation would until what is in use fits below
+// the limit and retires the slabs from the ceiling on (no allocation takes them); plan_host_moves pairs what stays past
+// it with free slabs below (the caller copies), a pinned entry included (a running sequence's path), and an entry that
+// leaves meanwhile gives its destination back at commit_host_moves; finish_host_shrink ends it once nothing past the
+// ceiling is in use. grow_host brings the slabs back as free ones.
 void test_host_tier_resize() {
     RecordingBackend backend;
     PrefixCacheIndex index(small_config(64, 0), backend);
@@ -1146,16 +1143,16 @@ void test_host_tier_resize() {
     }
     for (const auto& path : paths) {
         for (const NodeRef node : path) { backup_node(index, node); }
-        index.release_path(path); // the sequences ended: the Engine is idle
     }
+    // Five sequences ended; the last still runs, its path pinned.
+    for (std::size_t s = 0; s + 1 < paths.size(); ++s) { index.release_path(paths[s]); }
     index.check_invariants();
     require(index.stats().host_free_slabs == 64 - 36 && index.stats().host_slab_limit == 64,
             "six images and twelve blocks take 36 slabs");
     const auto owned_below = [&](std::uint32_t limit) {
         for (const auto& path : paths) {
             for (const NodeRef node : path) {
-                if (index.valid(node) && index.node(node).host == CopyState::Resident &&
-                    index.node(node).host_slab >= limit) {
+                if (index.valid(node) && index.node(node).host != CopyState::Absent && index.node(node).host_slab >= limit) {
                     return false;
                 }
             }
@@ -1168,39 +1165,77 @@ void test_host_tier_resize() {
         }
         return true;
     };
+    const std::uint32_t pinned_top = std::max(index.node(paths[5][0]).host_slab, index.node(paths[5][1]).host_slab);
+    require(pinned_top >= 20, "the running sequence's blocks lie past the cut");
+    const std::uint32_t dead_slab = index.node(paths[2][0]).host_slab; // its snapshot goes in the eviction below
 
-    require(index.shrink_host(20) == 20 && index.stats().host_slab_limit == 20, "the limit is reached");
+    require(index.begin_host_shrink(18, 4) == 20 && index.host_shrinking() && index.host_ceiling() == 20 &&
+                index.stats().host_slab_limit == 64,
+            "the ceiling is the limit rounded up to the granule; the limit stays until the shrink ends");
     index.check_invariants();
-    require(owned_below(20) && !backend.moves.empty() &&
-                std::all_of(backend.moves.begin(), backend.moves.end(),
-                            [](const auto& move) { return move.first >= 20 && move.second < 20; }),
-            "what stayed was moved below the limit");
-    require(index.stats().host_snapshot_evictions > 0 && index.stats().host_free_slabs <= 20,
-            "the shrink evicted to fit");
-    // A pinned snapshot keeps its slabs: the limit stays above them.
-    const auto kept = std::find_if(snapshots.begin(), snapshots.end(), [&](SnapshotRef s) { return index.valid(s); });
-    require(kept != snapshots.end(), "a snapshot survives the shrink");
-    const std::vector<std::uint32_t> pinned_slabs(index.snapshot(*kept).host_slabs.begin(),
-                                                  index.snapshot(*kept).host_slabs.end());
-    const std::uint32_t top = *std::max_element(pinned_slabs.begin(), pinned_slabs.end());
-    index.pin_snapshot(*kept);
-    const std::uint32_t reached = index.shrink_host(0);
+    require(index.stats().host_snapshot_evictions > 0, "the shrink evicted to fit");
+    require_throws([&] { (void)index.begin_host_shrink(8, 4); }, "one shrink at a time");
+    require_throws([&] { index.grow_host(64); }, "no growth during a shrink");
+    const std::vector<PrefixCacheIndex::HostMove> moves = index.plan_host_moves();
     index.check_invariants();
-    require(reached > top && reached < 20 && owned_below(reached) && index.valid(*kept) &&
-                std::equal(pinned_slabs.begin(), pinned_slabs.end(), index.snapshot(*kept).host_slabs.begin()),
-            "a pinned snapshot's slabs moved or were retired");
-    index.unpin_snapshot(*kept);
+    require(!moves.empty() && std::all_of(moves.begin(), moves.end(),
+                                          [](const auto& move) { return move.from >= 20 && move.to < 20; }),
+            "what stays past the ceiling is paired with free slabs below it");
+    require(index.node(paths[2][0]).host == CopyState::Absent &&
+                std::none_of(moves.begin(), moves.end(), [&](const auto& move) { return move.from == dead_slab; }),
+            "dead KV past the ceiling (its snapshot evicted) is dropped, not copied");
+    require(std::any_of(moves.begin(), moves.end(), [&](const auto& move) { return move.from == pinned_top; }),
+            "a pinned path's block moves too");
+    require(index.plan_host_moves().empty(), "a planned move is planned once");
+    // An allocation meanwhile takes only slabs below the ceiling.
+    auto during = index.reserve_host_image(false, kAny);
+    require(during.has_value() && std::all_of(during->slabs.begin(), during->slabs.end(),
+                                              [](std::uint32_t slab) { return slab < 20; }),
+            "an allocation during the shrink stays below the ceiling");
+    index.release_host_image(std::move(*during));
+    require(!index.finish_host_shrink(), "the shrink waits for its moves");
+    require(index.commit_host_moves() && index.finish_host_shrink(), "the moves commit and the shrink ends");
+    index.check_invariants();
+    require(!index.host_shrinking() && index.stats().host_slab_limit == 20 && owned_below(20) &&
+                index.valid(paths[5][1]) && index.node(paths[5][1]).host == CopyState::Resident,
+            "the limit is the ceiling and the running sequence's path is below it");
+
+    // An entry that leaves while its move is planned gives its destination back.
+    index.release_path(paths[5]);
+    require(index.begin_host_shrink(8, 4) == 8, "a second shrink");
+    const std::vector<PrefixCacheIndex::HostMove> second = index.plan_host_moves();
+    const auto moving = std::find_if(snapshots.begin(), snapshots.end(), [&](SnapshotRef snapshot) {
+        if (!index.valid(snapshot)) { return false; }
+        const auto slabs = index.snapshot(snapshot).host_slabs;
+        return std::any_of(slabs.begin(), slabs.end(), [](std::uint32_t slab) { return slab >= 8; });
+    });
+    require(!second.empty() && moving != snapshots.end(), "a snapshot past the second ceiling is planned to move");
+    (void)index.supersede(*moving);
+    auto pressure = index.reserve_host_image(false, kAny); // evicts the superseded snapshot first
+    require(pressure.has_value() && !index.valid(*moving), "the moving snapshot was evicted");
+    index.check_invariants();
+    index.release_host_image(std::move(*pressure));
+    (void)index.commit_host_moves();
+    index.check_invariants();
+    while (!index.finish_host_shrink()) {
+        require(!index.plan_host_moves().empty() || index.host_moves_pending(), "an unfinished shrink has moves left");
+        (void)index.commit_host_moves();
+    }
+    index.check_invariants();
+    require(index.stats().host_slab_limit == 8 && owned_below(8), "the second shrink ends at its ceiling");
 
     index.grow_host(64);
     index.check_invariants();
     const PrefixIndexStats grown = index.stats();
-    require(grown.host_slab_limit == 64 && grown.host_free_slabs >= 64 - reached, "grow_host frees the retired slabs");
+    require(grown.host_slab_limit == 64 && grown.host_free_slabs >= 64 - 8, "grow_host frees the retired slabs");
     auto image = index.reserve_host_image(false, kAny);
     require(image.has_value(), "a grown tier reserves again");
     index.release_host_image(std::move(*image));
     index.check_invariants();
 }
 
+// Host-born snapshots (images copied straight to Host slabs) on an index without Device snapshot
+// slots: reservations, publication with and without a tail, duplicates, Device-tail eviction.
 void test_host_born_snapshots() {
     RecordingBackend backend;
     PrefixCacheIndex index(small_config(64, 0), backend);
@@ -2127,11 +2162,21 @@ void test_ssd_random_stress() {
                     check();
                     index.release_host_image(std::move(*image));
                 }
-            } else if (op == 10 && writes.empty() && promotions.empty() && held.empty()) {
-                // A Host tier shrink and regrowth (RAM pressure) moves and demotes with the SSD tier present.
-                (void)index.shrink_host(12);
-                check();
-                index.grow_host(28);
+            } else if (op == 10) {
+                // A Host tier shrink (RAM pressure) under way among the other operations, as while requests run:
+                // it begins, plans and commits its moves (pinned paths move, I/O-pinned and filling entries wait)
+                // and ends between them; then the tier grows back.
+                if (!index.host_shrinking()) {
+                    if (index.host_slab_limit() < 28) {
+                        index.grow_host(28);
+                    } else {
+                        (void)index.begin_host_shrink(12, 4);
+                        (void)index.plan_host_moves();
+                    }
+                } else {
+                    (void)index.commit_host_moves();
+                    if (!index.finish_host_shrink()) { (void)index.plan_host_moves(); }
+                }
             }
             check();
         }
@@ -2139,6 +2184,13 @@ void test_ssd_random_stress() {
         for (SsdJob& job : promotions) { index.complete_ssd_promotion(job); }
         for (const auto& path : held) { index.release_path(path); }
         check();
+        // A shrink still under way ends once nothing is in flight.
+        for (int round = 0; index.host_shrinking(); ++round) {
+            require(round < 8, "a shrink with nothing in flight ends");
+            (void)index.commit_host_moves();
+            if (!index.finish_host_shrink()) { (void)index.plan_host_moves(); }
+            check();
+        }
         (void)index.evict_device_blocks(1000);
         check();
         // Every surviving snapshot is restorable: its image and blocks have a copy somewhere.

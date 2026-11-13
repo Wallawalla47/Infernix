@@ -23,6 +23,7 @@
 #include "core/startup.h"
 #include "models/qwen4_exp/program/prefix/state_image.h"
 #include "infernix/types.h"
+#include "runtime/prefix_cache/host_slab_store.h"
 #include "runtime/prefix_cache/prefix_index.h"
 #include "runtime/prefix_cache/persist_file.h"
 #include "runtime/prefix_cache/ssd_tier.h"
@@ -120,7 +121,7 @@ public:
     [[nodiscard]] const PrefixCacheCounters& counters() const noexcept { return counters_; }
     [[nodiscard]] const PrefixHostLayout& host_layout() const noexcept { return host_; }
     [[nodiscard]] bool host_tier() const noexcept { return host_.slabs != 0; }
-    [[nodiscard]] std::uint64_t pinned_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t pinned_bytes() const noexcept { return store_.pinned_bytes(); }
 
     // ---- blocks ------------------------------------------------------------------------------
     // Inserts a committed full block whose page is `lease`. When the index keeps it (a new node,
@@ -246,20 +247,22 @@ public:
     // Releases every reference the cache holds; the index is rebuilt empty.
     void clear() noexcept;
 
-    // ---- Host tier resize (RAM pressure, runtime::HostMemoryGovernor) --------------------------
-    // With no lane bound (the Engine idle): drains the transfers, then gives back whole chunks worth at least `bytes`
-    // (the lowest-valued entries go, the rest move below the cut), keeping image_slabs + 2 slabs. Returns the bytes
-    // released.
-    std::uint64_t shrink_host_tier(std::uint64_t bytes);
-    // Pins chunks of at most `bytes` back, up to the startup size; returns the bytes added (fewer when the OS
-    // refuses to pin one).
-    std::uint64_t grow_host_tier(std::uint64_t bytes);
-    // The startup size of the Host tier, and what shrink_host_tier could release and grow_host_tier add now.
-    [[nodiscard]] std::uint64_t host_tier_capacity_bytes() const noexcept {
-        return static_cast<std::uint64_t>(host_.slabs) * host_.slab_bytes;
+    // ---- Host tier resize (RAM pressure, --ram-resize; runtime::prefix_cache::HostSlabStore) -----------------
+    // Idle or while lanes run. Starts giving back whole chunks worth at least `bytes`, keeping image_slabs + 2 slabs:
+    // the lowest-valued entries go, the entries past the cut are copied below it on `worker`; returns the bytes it
+    // aims at (0: held entries keep every chunk in use now).
+    std::uint64_t begin_host_release(std::uint64_t bytes, HostMemoryWorker& worker);
+    // Starts page-locking chunks of at most `bytes` back on `worker`, up to the startup size; returns the bytes asked.
+    std::uint64_t begin_host_growth(std::uint64_t bytes, HostMemoryWorker& worker) {
+        return store_.begin_growth(bytes, worker);
     }
-    [[nodiscard]] std::uint64_t host_tier_shrinkable_bytes() const noexcept;
-    [[nodiscard]] std::uint64_t host_tier_growable_bytes() const noexcept { return host_tier_capacity_bytes() - pinned_bytes(); }
+    // Applies what the worker finished (never waits): a release commits its moves once no restore is in flight.
+    runtime::prefix_cache::HostSlabStore::Progress step_host_resize(HostMemoryWorker& worker);
+    [[nodiscard]] bool host_resizing() const noexcept { return store_.resizing(); }
+    // The startup size of the Host tier, and what a release could give back and a growth take back now.
+    [[nodiscard]] std::uint64_t host_tier_capacity_bytes() const noexcept { return store_.capacity_bytes(); }
+    [[nodiscard]] std::uint64_t host_tier_shrinkable_bytes() const noexcept { return store_.shrinkable_bytes(); }
+    [[nodiscard]] std::uint64_t host_tier_growable_bytes() const noexcept { return store_.growable_bytes(); }
 
     // ---- persistence (persist.cpp, runtime/prefix_cache/persist_file.h) -------------------------
     // Writes every Host-backed snapshot and its block path to `path` (through `path.tmp`, renamed
@@ -280,7 +283,6 @@ public:
     void release_device_block(std::uint32_t device_id) noexcept override;
     void release_snapshot(runtime::prefix_cache::SnapshotRef snapshot) noexcept override;
     void drop_snapshot_device_image(runtime::prefix_cache::SnapshotRef snapshot) noexcept override;
-    void move_host_slab(std::uint32_t from, std::uint32_t to) noexcept override;
 
 private:
     struct PendingCapture {
@@ -321,9 +323,9 @@ private:
     };
 
     [[nodiscard]] std::uint32_t allocate_block_id(DeviceKVPageLease&& lease);
-    [[nodiscard]] std::byte* slab(std::uint32_t id) const noexcept;
+    [[nodiscard]] std::byte* slab(std::uint32_t id) const noexcept { return store_.slab(id); }
     [[nodiscard]] runtime::prefix_cache::PersistBinding persist_binding();
-    [[nodiscard]] std::uint32_t slab_group(std::uint32_t id) const noexcept { return id / host_.slabs_per_chunk; }
+    [[nodiscard]] std::uint32_t slab_group(std::uint32_t id) const noexcept { return store_.chunk_of(id); }
     [[nodiscard]] cudaEvent_t take_event();
     void recycle(cudaEvent_t event) noexcept;
     void finish_restore(RestoreBatch& batch) noexcept;
@@ -335,7 +337,7 @@ private:
     KvPageGeometry geometry_;
     const LaneStateImage* lanes_ = nullptr;
     PrefixHostLayout host_;
-    std::vector<PinnedHostBuffer> chunks_;
+    runtime::prefix_cache::HostSlabStore store_;
     // Declared after the chunks it reads and writes: destroyed first, waiting for its transfers.
     std::unique_ptr<runtime::prefix_cache::SsdTier> ssd_;
     bool ssd_landed_ = false;

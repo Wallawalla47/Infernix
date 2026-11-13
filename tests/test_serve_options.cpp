@@ -685,16 +685,19 @@ int main() {
     failures += check(zero_host_context.context_cache.enabled &&
                           zero_host_context.context_cache.host_capacity_bytes == 0,
                       "zero Host context capacity was not retained as an explicit budget");
-    // --host-context-mib auto: no size, the automatic flag; a later number replaces it.
+    // --host-context-mib auto (the default): no size, left to the Engine's RAM plan; a later number replaces it,
+    // and a later auto replaces a number.
     const ServeOptions auto_host_context = parse({"infernix-serve", "model.ninfer", "--host-context-mib", "auto"});
-    failures += check(auto_host_context.context_cache.host_capacity_auto &&
-                          !auto_host_context.context_cache.host_capacity_bytes,
+    failures += check(!auto_host_context.context_cache.host_capacity_bytes,
                       "--host-context-mib auto must leave the size to the RAM plan");
     const ServeOptions auto_then_number =
         parse({"infernix-serve", "model.ninfer", "--host-context-mib", "auto", "--host-context-mib", "2048"});
-    failures += check(!auto_then_number.context_cache.host_capacity_auto &&
-                          auto_then_number.context_cache.host_capacity_bytes == (2048ULL << 20),
+    failures += check(auto_then_number.context_cache.host_capacity_bytes == (2048ULL << 20),
                       "a later --host-context-mib N must replace auto");
+    const ServeOptions number_then_auto =
+        parse({"infernix-serve", "model.ninfer", "--host-context-mib", "2048", "--host-context-mib", "auto"});
+    failures += check(!number_then_auto.context_cache.host_capacity_bytes,
+                      "a later --host-context-mib auto must replace a number");
     // --ram-free-mib: the RAM everything Infernix plans leaves free (8 GiB by default).
     failures += check(parse({"infernix-serve", "model.ninfer"}).ram_free_bytes == (8192ULL << 20),
                       "--ram-free-mib must default to 8 GiB");

@@ -25,9 +25,10 @@ int main() {
     int failures = 0;
 
     // The prefix cache derives every tuning value from the rest of the configuration. With the
-    // default Host tier (8 GiB) at concurrency 2 and a 2048-token chunk: one resident snapshot per
+    // default (automatic) Host tier at concurrency 2 and a 2048-token chunk: one resident snapshot per
     // lane plus one staging slot = 3, 8 taps, ladder max(4096, 2 * 2048) = 4096 and minimum gap
-    // max(1024, 2048) = 2048. The snapshot slots are the extra Device StateImages.
+    // max(1024, 2048) = 2048. The snapshot slots are the extra Device StateImages. The size stays
+    // unset here: construct_model sizes it once the model's RAM is planned.
     {
         EngineOptions options;
         options.max_concurrency                  = 2;
@@ -35,7 +36,7 @@ int main() {
         const EngineOptions normalized           = normalize_engine_options(options);
         const infernix::ContextCacheOptions& out = normalized.context_cache;
         failures +=
-            check(out.host_capacity_bytes == infernix::kDefaultHybridHostCacheBytes &&
+            check(!out.host_capacity_bytes &&
                       out.hybrid.device_snapshot_slots == 3U && out.hybrid.max_new_taps == 8U &&
                       out.hybrid.tap_ladder_tokens == 4096U &&
                       out.hybrid.tap_min_gap_tokens == 2048U,
@@ -157,19 +158,19 @@ int main() {
         failures += check(rejected, "a Host budget below one snapshot was accepted");
     }
 
-    // Qwen3.8-Flash-Next resolves its own defaults: the common 8 GiB Host tier, no Device snapshot
-    // slots (its snapshots are Host-born), the common tap budget; Qwen3.5 keeps C + 1 slots.
+    // Qwen3.8-Flash-Next resolves its own defaults: an automatic Host tier (left unset for its RAM plan),
+    // no Device snapshot slots (its snapshots are Host-born), the common tap budget; Qwen3.5 keeps C + 1
+    // slots beside its automatic Host tier.
     {
         EngineOptions options;
         options.max_concurrency = 2;
         const infernix::ContextCacheOptions qwen4 =
             normalize_engine_options(options, infernix::models::Architecture::Qwen4Exp).context_cache;
-        failures += check(qwen4.host_capacity_bytes == infernix::kDefaultHybridHostCacheBytes &&
+        failures += check(!qwen4.host_capacity_bytes &&
                               qwen4.hybrid.device_snapshot_slots == 0U && qwen4.hybrid.max_new_taps == 8U,
                           "Qwen3.8-Flash-Next prefix cache defaults are wrong");
         const infernix::ContextCacheOptions qwen35 = normalize_engine_options(options).context_cache;
-        failures += check(qwen35.host_capacity_bytes == infernix::kDefaultHybridHostCacheBytes &&
-                              qwen35.hybrid.device_snapshot_slots == 3U,
+        failures += check(!qwen35.host_capacity_bytes && qwen35.hybrid.device_snapshot_slots == 3U,
                           "Qwen3.5 prefix cache defaults changed");
         // A Qwen3.5 artifact with offloaded experts keeps one Device slot beside its Host tier (the frames
         // the others would take; candidates §22 VM-03), and the per-lane rule without a Host tier.
@@ -183,28 +184,70 @@ int main() {
             normalize_engine_options(no_tier, infernix::models::Architecture::Qwen3_5, true).context_cache;
         failures += check(device_only.hybrid.device_snapshot_slots == 4U,
                           "offloaded Qwen3.5 without a Host tier: C + 2 Device snapshot slots");
-        // --host-context-mib auto: Qwen3.8-Flash-Next keeps the size unset for its RAM plan (and still has a Host
-        // tier, so its other defaults are the tier's); Qwen3.5 takes the common default.
-        EngineOptions automatic = options;
-        automatic.context_cache.host_capacity_auto = true;
-        const infernix::ContextCacheOptions qwen4_auto =
-            normalize_engine_options(automatic, infernix::models::Architecture::Qwen4Exp).context_cache;
-        failures += check(!qwen4_auto.host_capacity_bytes && qwen4_auto.host_capacity_auto &&
-                              qwen4_auto.hybrid.max_new_taps == 8U,
-                          "Qwen3.8-Flash-Next must keep an automatic Host tier unsized for its RAM plan");
-        const infernix::ContextCacheOptions qwen35_auto = normalize_engine_options(automatic).context_cache;
-        failures += check(qwen35_auto.host_capacity_bytes == infernix::kDefaultHybridHostCacheBytes &&
-                              !qwen35_auto.host_capacity_auto,
-                          "Qwen3.5 must take the default Host tier for --host-context-mib auto");
-        // The automatic size: 0.4 of what the plan leaves beyond --ram-free-mib, in 256 MiB steps, between 1 and 8 GiB.
-        constexpr std::uint64_t kMiB = 1ULL << 20;
-        failures += check(infernix::runtime::auto_host_context_bytes(0) == 1024 * kMiB, "an automatic Host tier has a 1 GiB floor");
-        failures += check(infernix::runtime::auto_host_context_bytes(10240 * kMiB) == 4096 * kMiB,
-                          "an automatic Host tier takes 0.4 of 10 GiB left");
-        failures += check(infernix::runtime::auto_host_context_bytes(15155 * kMiB) == 5888 * kMiB,
-                          "an automatic Host tier rounds 0.4 of the RAM left down to 256 MiB");
-        failures += check(infernix::runtime::auto_host_context_bytes(40960 * kMiB) == 8192 * kMiB,
-                          "an automatic Host tier stops at 8 GiB");
+        // An explicit size is kept by every model.
+        EngineOptions sized                     = options;
+        sized.context_cache.host_capacity_bytes = 7500ULL << 20;
+        failures += check(normalize_engine_options(sized, infernix::models::Architecture::Qwen4Exp)
+                                      .context_cache.host_capacity_bytes == (7500ULL << 20) &&
+                              normalize_engine_options(sized).context_cache.host_capacity_bytes == (7500ULL << 20),
+                          "an explicit Host tier size must be kept");
+        // The automatic size (expert_memory.h): all the RAM the plan leaves beyond --ram-free-mib, the only headroom,
+        // within the commit limit and the page-lock room, less its lock overhead, in 256 MiB steps, at least 1 GiB.
+        {
+            using infernix::runtime::auto_host_context_bytes;
+            using infernix::runtime::ledger_left_bytes;
+            namespace eo = infernix::runtime::expert_offload;
+            constexpr std::uint64_t kMiB = 1ULL << 20, kGiB = 1ULL << 30;
+            // A machine like the owner's at FP4-Local's start (2026-11-12): 83.3 GiB free, a 4 GiB reserve, every
+            // one of 63.3 GiB of experts in RAM; the old rule (0.4 of what is left, up to 8 GiB) gave 4.5 GiB.
+            infernix::HostMemorySnapshot snapshot{.total_physical     = 96 * kGiB,
+                                                  .available_physical = 83 * kGiB + 300 * kMiB,
+                                                  .available_commit   = 250 * kGiB};
+            eo::HostMemoryDemand demand;
+            demand.reserve      = 4 * kGiB;
+            demand.expert_banks = 63 * kGiB + 300 * kMiB;
+            demand.other_pinned = 1400 * kMiB;
+            demand.later_pinned = 256 * kMiB;
+            demand.pageable     = 512 * kMiB;
+            demand.load_staging = 264 * kMiB;
+            const eo::HostMemoryLedger full = eo::plan_host_memory(snapshot, demand);
+            const std::uint64_t left        = ledger_left_bytes(full);
+            const std::uint64_t tier        = auto_host_context_bytes(full);
+            failures += check(left > 10 * kGiB && tier <= left && left - tier < 512 * kMiB && tier % (256 * kMiB) == 0,
+                              "an automatic Host tier takes the RAM left down to --ram-free-mib");
+            eo::HostMemoryDemand with_tier = demand;
+            with_tier.prefix_cache         = tier;
+            const eo::HostMemoryLedger planned = eo::plan_host_memory(snapshot, with_tier);
+            failures += check(planned.placement == eo::ExpertPlacement::Full && planned.expert_ram == full.expert_ram,
+                              "an automatic Host tier must not take the experts' RAM");
+            // The page-lock room: the experts pin first; the tier takes what is left of the room.
+            eo::HostMemoryDemand locked = demand;
+            locked.pin_room             = 70 * kGiB;
+            const eo::HostMemoryLedger pinned_ledger = eo::plan_host_memory(snapshot, locked);
+            const auto pin_left                      = infernix::runtime::ledger_pin_left_bytes(pinned_ledger);
+            const std::uint64_t pin_tier             = auto_host_context_bytes(pinned_ledger);
+            failures += check(pin_left && *pin_left < left && pin_tier <= *pin_left && *pin_left - pin_tier < 512 * kMiB,
+                              "an automatic Host tier stays within the page-lock room");
+            // A small page file: the commit limit binds before physical memory.
+            infernix::HostMemorySnapshot committed = snapshot;
+            committed.available_commit = full.demand.reserve + full.planned + full.expert_ram + 3 * kGiB;
+            const std::uint64_t commit_tier = auto_host_context_bytes(eo::plan_host_memory(committed, demand));
+            failures += check(commit_tier <= 3 * kGiB && commit_tier >= 2 * kGiB + 512 * kMiB,
+                              "an automatic Host tier stays within the commit limit");
+            // Nothing left: the 1 GiB floor (Qwen3.8-Flash-Next keeps its snapshots there).
+            infernix::HostMemorySnapshot small = snapshot;
+            small.available_physical           = 60 * kGiB;
+            failures += check(auto_host_context_bytes(eo::plan_host_memory(small, demand)) == kGiB,
+                              "an automatic Host tier has a 1 GiB floor");
+            // The frontend's caches the plan counts: the grammar cache, and with vision the media caches.
+            EngineOptions frontend;
+            failures += check(infernix::runtime::frontend_cache_bytes(frontend) == frontend.grammar_cache_bytes,
+                              "without vision the plan counts the grammar cache");
+            frontend.enable_vision = true;
+            failures += check(infernix::runtime::frontend_cache_bytes(frontend) ==
+                                  frontend.grammar_cache_bytes + frontend.media_cache_bytes + frontend.media_live_bytes,
+                              "with vision the plan also counts the media caches");
+        }
         // The prefill chunk defaults per model: 16,384 for Qwen3.8-Flash-Next, whose ladder keeps
         // the 4,096-token chunk's spacing (max(4096, 2 * 4096) and max(1024, 4096)), and 1,024
         // for Qwen3.5 (ladder max(4096, 2 * 1024), gap max(1024, 1024)).

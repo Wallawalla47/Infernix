@@ -104,10 +104,6 @@ public:
 
     // The snapshot keeps its host image but loses its device image copy.
     virtual void drop_snapshot_device_image(SnapshotRef /*snapshot*/) noexcept {}
-
-    // A Host tier shrink (PrefixCacheIndex::shrink_host) moves the bytes of slab `from` into the free slab `to`; no
-    // transfer reads or writes either (the caller shrinks with every transfer settled).
-    virtual void move_host_slab(std::uint32_t from, std::uint32_t to) noexcept = 0;
 };
 
 struct MatchCandidate {
@@ -266,7 +262,7 @@ struct PrefixIndexStats {
     std::uint32_t device_resident_blocks  = 0;
     std::uint32_t device_evictable_blocks = 0;
     std::uint32_t host_free_slabs         = 0;
-    std::uint32_t host_slab_limit         = 0; // slabs in service (shrink_host / grow_host)
+    std::uint32_t host_slab_limit         = 0; // slabs in service (finish_host_shrink / grow_host)
     std::uint32_t free_device_slots       = 0;
     std::uint64_t device_block_evictions  = 0;
     std::uint64_t unbacked_node_losses    = 0;
@@ -495,16 +491,42 @@ public:
                      bool ssd_packed);
     void finish_ssd_restore();
 
-    // ---- Host tier resize (RAM pressure) -------------------------------------------------------
+    // ---- Host tier resize (RAM pressure, HostSlabStore) ----------------------------------------
     // Slabs [0, host_slab_limit()) are owned, reserved or free; the configured host_slabs past it are retired and
     // hold nothing, so their memory can be released.
     [[nodiscard]] std::uint32_t host_slab_limit() const noexcept { return host_limit_; }
-    // Retires the slabs from `limit` on: evicts as an allocation would (dead KV, superseded snapshots, then the GDSF
-    // minimum, whatever its priority) until the owned and reserved slabs fit below `limit`, then moves each owned
-    // slab at or past it into a free one below it (PrefixIndexBackend::move_host_slab). Returns the limit reached:
-    // `limit`, or more when pinned, held or reserved entries keep slabs (none while the Engine is idle).
-    std::uint32_t shrink_host(std::uint32_t limit);
-    // Brings the retired slabs below `limit` (at most host_slabs) back as free ones.
+    // A shrink retires the slabs from a ceiling on while requests run and transfers fly:
+    // - begin_host_shrink evicts as an allocation would (dead KV, superseded snapshots, then the GDSF minimum of the
+    //   unheld entries, whatever its priority) until what is in use (owned and reserved) fits below `limit`, and sets
+    //   the ceiling there, or where what held entries keep in use fits, and above every slab a transfer reads or
+    //   writes now (reservations, filling copies, I/O-pinned entries), rounded up to a multiple of `granule` (the
+    //   caller's chunk); it evicts nothing when that leaves nothing to retire. From then on no slab at or past the
+    //   ceiling is taken: the free ones leave the free list and freed ones are retired. Returns the ceiling;
+    //   host_slab_limit() when nothing can be retired now.
+    // - plan_host_moves pairs each movable entry's slab past the ceiling with a free slab below it (lowest first,
+    //   evicting as an allocation would when they run short): Host-resident blocks and snapshots without an I/O pin
+    //   (an SSD job reads or writes them), pinned ones included (a sequence's mapped path; a restore batch that reads
+    //   one makes the caller wait before committing). Dead KV past the ceiling is dropped instead (allocation evicts
+    //   it first anyway). An entry an SSD job I/O-pins after begin waits until the job ends. Each is planned once; the
+    //   caller copies the bytes of `from` into `to`. Only begin_host_shrink scans every node; the rest stays
+    //   proportional to what lies past the ceiling (and the snapshots).
+    // - commit_host_moves, once the copies have landed and no restore reads a Host slab: each entry still holding a
+    //   planned `from` takes its `to` (one I/O-pinned meanwhile keeps its move for a later call), and the `to` of an
+    //   entry gone meanwhile is freed. Returns whether no move is left.
+    // - finish_host_shrink ends the shrink once no move is left and nothing past the ceiling is owned or reserved: the
+    //   limit becomes the ceiling (true); false while something still has to move or land.
+    struct HostMove {
+        std::uint32_t from = 0;
+        std::uint32_t to   = 0;
+    };
+    std::uint32_t begin_host_shrink(std::uint32_t limit, std::uint32_t granule);
+    [[nodiscard]] std::vector<HostMove> plan_host_moves();
+    bool commit_host_moves();
+    bool finish_host_shrink();
+    [[nodiscard]] bool host_shrinking() const noexcept { return ceiling_ < host_limit_; }
+    [[nodiscard]] std::uint32_t host_ceiling() const noexcept { return ceiling_; }
+    [[nodiscard]] bool host_moves_pending() const noexcept { return !host_moves_.empty(); }
+    // Brings the retired slabs below `limit` (at most host_slabs) back as free ones; not while a shrink is under way.
     void grow_host(std::uint32_t limit);
 
     // ---- SSD tier (§5.7) -------------------------------------------------------------------------
@@ -840,7 +862,26 @@ private:
     std::vector<bool> ssd_claimed_;             // during a restore: slabs restored copies hold
 
     std::vector<std::uint32_t> free_slabs_;
-    std::uint32_t host_limit_ = 0; // shrink_host / grow_host
+    std::uint32_t host_limit_ = 0; // begin/finish_host_shrink, grow_host
+    // While a shrink is under way the slabs from here on are never taken and freed ones retire (host_limit_ else).
+    std::uint32_t ceiling_ = 0;
+    // During a shrink: the slabs at or past the ceiling still owned or reserved (the shrink ends at 0; free_slab and
+    // commit_host_moves count them down), and the nodes begin_host_shrink found holding one (plan_host_moves revisits
+    // only these: no node takes a slab past the ceiling later; snapshots, far fewer, are scanned).
+    std::uint32_t past_in_use_ = 0;
+    std::vector<std::uint32_t> shrink_nodes_;
+    // A planned shrink move: the entry (a node, or a snapshot and the position in its host_slabs) holding `from`.
+    struct PendingHostMove {
+        bool snapshot          = false;
+        std::uint32_t entry    = 0;
+        std::uint32_t position = 0;
+        std::uint32_t from     = 0;
+        std::uint32_t to       = 0;
+    };
+    std::vector<PendingHostMove> host_moves_;
+    std::vector<bool> slab_moving_; // a planned move's `from`
+    // Where an entry holds a planned move's `from` (null when it no longer does).
+    [[nodiscard]] std::uint32_t* host_move_holder(const PendingHostMove& move) noexcept;
     // Slabs held by an outstanding HostImageReservation (owned by no node or snapshot).
     std::vector<bool> slab_reserved_;
     std::vector<SlotState> slot_state_;

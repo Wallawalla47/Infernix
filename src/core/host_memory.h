@@ -14,6 +14,12 @@ namespace infernix {
 // since pinned pages cannot be paged out and an oversized lock pushes other processes to swap.
 [[nodiscard]] std::uint64_t available_host_memory_bytes();
 
+// Copies `bytes` from `source` to `destination` with streaming (non-temporal) stores where the CPU has them (x86-64,
+// both pointers 16-byte aligned and `bytes` a multiple of 16; memcpy otherwise), visible to other threads on return.
+// For large background copies (the RAM tiers' moves and record fills): they then neither evict what the threads
+// serving requests keep in the caches nor read each destination line first, so they take less memory bandwidth.
+void copy_streaming(void* destination, const void* source, std::size_t bytes) noexcept;
+
 // One reading of the Host memory a startup ledger plans against.
 struct HostMemorySnapshot {
     std::uint64_t total_physical = 0;

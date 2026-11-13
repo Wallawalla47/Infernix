@@ -606,13 +606,10 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     if (cache.enabled) {
         // One pinned Host slab pool serves blocks and snapshots alike; its size is the only
         // capacity a deployment has to choose (docs/maintainer/hybrid-prefix-cache-spec.md §5.4).
-        // --host-context-mib auto: Qwen3.8-Flash-Next sizes it after its experts and n-gram table
-        // (construct_qwen4_exp). Other models take the default.
-        if (!(qwen4_exp && cache.host_capacity_auto)) {
-            cache.host_capacity_bytes = cache.host_capacity_bytes.value_or(kDefaultHybridHostCacheBytes);
-            cache.host_capacity_auto  = false;
-        }
-        const bool host_tier = cache.host_capacity_auto || *cache.host_capacity_bytes != 0;
+        // Unset (--host-context-mib auto, the default): sized once the model's RAM is planned
+        // (construct_model, construct_qwen4_exp; ContextCacheOptions::host_capacity_bytes); an automatic
+        // size is always a Host tier (at least 1 GiB).
+        const bool host_tier = !cache.host_capacity_bytes || *cache.host_capacity_bytes != 0;
         HybridPrefixCacheOptions& hybrid = cache.hybrid;
         // Whether a turn resumes from lossy Host state depends on what eviction left, so the exact
         // route's output would depend on load (model-quality 6.1).
@@ -733,7 +730,6 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             throw std::invalid_argument("prefix cache policies require the context cache to be enabled");
         }
         cache.host_capacity_bytes          = 0U;
-        cache.host_capacity_auto           = false;
         cache.hybrid.device_snapshot_slots = 0U;
         cache.hybrid.tool_call_hold        = std::chrono::milliseconds{0};
         cache.hybrid.next_turn_prefill_quiet    = std::chrono::milliseconds{0};
@@ -810,16 +806,16 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
                                         "on the lossless route");
         }
     }
+    // --host-context-mib auto (the size unset): the prefix cache's Host tier from the RAM the model's plan leaves
+    // (expert_memory.h), resolved here so the RAM plan, Engine::plan and the Program see one size.
+    const bool prefix_auto = options.context_cache.enabled && !options.context_cache.host_capacity_bytes;
     if (plan.offloaded_experts()) {
         const auto vram   = open_vram_budget_source(device.device, options.vram_past_budget);
         auto demand = expert_ram_demand(
             options, {.expert_banks = plan.pinned_expert_bytes(), .other_pinned = plan.pinned_other_bytes()},
             options.context_cache.enabled ? options.context_cache.host_capacity_bytes.value_or(0U) : 0U,
             vram->query());
-        // The frontend's caches grow to their caps after planning: the grammar cache, the n-gram
-        // archive, and with vision the decoded-media cache and its live items.
-        demand.pageable = options.grammar_cache_bytes + options.speculative.ngram_archive_bytes +
-                          (options.enable_vision ? options.media_cache_bytes + options.media_live_bytes : 0U);
+        demand.pageable = frontend_cache_bytes(options);
         // --expert-ram-layout exclusive (design §11.3; the 122B's default is full): RAM keeps only the experts the
         // frames do not, and shadows for what VRAM gives back without a promotion. The Program's engine sizes it once
         // its frames are known (ExpertOffload::plan_exclusive), so the banks load as the SSD tier's with the ledger's
@@ -827,6 +823,12 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         exclusive_experts = options.expert_ram_layout.value_or(ExpertRamLayout::Full) == ExpertRamLayout::Exclusive &&
                             !options.expert_ram_bytes;
         const HostMemorySnapshot snapshot = host_memory_snapshot();
+        if (prefix_auto) {
+            // After the experts, as Qwen3.8-Flash-Next: the ledger places them first.
+            options.context_cache.host_capacity_bytes =
+                auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
+            demand.prefix_cache = *options.context_cache.host_capacity_bytes;
+        }
         if (plan_only) {
             // A start refuses an --expert-ram-mib the ledger cannot give (plan_expert_ram).
             const auto ledger = expert_offload::plan_host_memory(snapshot, demand);
@@ -855,6 +857,18 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             tail_mirror = EvictableWeightPool::mirror_bytes(placement.device_capacity_bytes, placement.evictable_tail_bytes);
         }
         plan.set_host_reserve(options.ram_free_bytes, tail_mirror);
+        if (prefix_auto) {
+            // The weights sit in VRAM: the tier takes the RAM beside the model's pinned weights, the Program's later
+            // pins and the frontend's caches, down to --ram-free-mib, within what the process may still page-lock.
+            const auto vram = open_vram_budget_source(device.device, options.vram_past_budget);
+            auto demand =
+                expert_ram_demand(options, {.expert_banks = 0, .other_pinned = placement.pinned_capacity_bytes + tail_mirror},
+                                  0U, vram->query());
+            demand.full_margin = 0; // no experts to keep in RAM
+            demand.pageable    = frontend_cache_bytes(options);
+            options.context_cache.host_capacity_bytes =
+                auto_host_context_bytes(expert_offload::plan_host_memory(host_memory_snapshot(), demand));
+        }
     }
     // Engine::plan: the pinned block's check (materialize's), the RAM report, and the weights; then the
     // plan-only load reads the offloaded experts' scales from the artifact (streamed), as the SSD tier does.
@@ -1228,7 +1242,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     }
     if (options.ram_resize) {
         instance->program->start_ram_resize(
-            options.ram_free_bytes, [observer = options.diagnostic_observer](const std::string& text, DiagnosticLevel level) {
+            options.ram_free_bytes, prefix_auto,
+            [observer = options.diagnostic_observer](const std::string& text, DiagnosticLevel level) {
                 publish_diagnostic(observer, level, "%s", text.c_str());
             });
     }

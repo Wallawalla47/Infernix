@@ -13,10 +13,14 @@
 #include "runtime/expert_offload/memory_plan.h"
 #include "runtime/expert_offload/ram_monitor.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <deque>
+#include <future>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace infernix;
@@ -532,19 +536,26 @@ void test_nominal_and_lend() {
     require(!LendCapacity{}.lends(1), "an empty cache lends nothing");
 }
 
-// The RAM tiers' resize law (--ram-resize auto): below 2 GiB available a release in whole steps up to 3 GiB free,
-// capped by what the tiers can give; growth only after more than the growth floor (the reserve, at least 3 GiB, plus a
-// step) has held for 10 s since the last release, by what stays above it, its pieces then due one after another;
-// nothing due when the tiers have no room, which is measured again every 30 s under pressure.
+// The RAM tiers' resize law (--ram-resize auto) for the reserve R (--ram-free-mib): below the pressure point
+// max(R / 2, 2 GiB) a release in whole steps up to the relieve point max(R, pressure point + a step), capped by what
+// the tiers can give; growth only after more than the growth floor (the relieve point plus a step) has held for 10 s
+// since the last release, by what stays above it, its pieces then due one after another; between the two nothing (the
+// band that keeps ordinary swings from cycling the tiers); nothing due when the tiers have no room, which is measured
+// again every 30 s under pressure.
 void test_ram_control() {
     using infernix::runtime::expert_offload::RamControl;
     RamControl control(8 * kGiB);
+    require(control.pressure_point() == 4 * kGiB && control.relieve_point() == 8 * kGiB &&
+                control.growth_floor() == 9 * kGiB,
+            "R = 8 GiB: release below 4 GiB back to 8 GiB, grow above 9 GiB");
     control.set_room(10 * kGiB, 0);
-    require(control.observe(kGiB + kGiB / 2, 0.0) && control.decide(kGiB + kGiB / 2, 0.0).release == 2 * kGiB &&
-                control.decide(kGiB + kGiB / 2, 0.0).grow == 0,
-            "1.5 GiB available: release 2 GiB (whole steps to 3 GiB free)");
-    require(control.decide(2 * kGiB - 1, 0.0).release == 2 * kGiB, "just under 2 GiB: 1 GiB and a byte, two steps");
-    require(!control.observe(5 * kGiB, 1.0) && control.decide(5 * kGiB, 1.0).release == 0, "5 GiB: no pressure");
+    require(control.observe(3 * kGiB + kGiB / 2, 0.0) && control.decide(3 * kGiB + kGiB / 2, 0.0).release == 5 * kGiB &&
+                control.decide(3 * kGiB + kGiB / 2, 0.0).grow == 0,
+            "3.5 GiB available: release 5 GiB (whole steps to 8 GiB free)");
+    require(control.decide(4 * kGiB - 1, 0.0).release == 5 * kGiB, "just under the pressure point: 4 GiB and a byte, five steps");
+    require(!control.observe(4 * kGiB, 1.0) && control.decide(4 * kGiB, 1.0).release == 0, "at the pressure point: nothing");
+    require(!control.observe(6 * kGiB, 1.5) && control.decide(6 * kGiB, 1.5).release == 0,
+            "inside the band (below the reserve, above the pressure point): no release");
     control.set_room(kGiB, 0);
     require(control.decide(kGiB / 2, 2.0).release == kGiB, "the release stops at what the tiers can give");
     control.set_room(0, 0);
@@ -560,8 +571,8 @@ void test_ram_control() {
     require(!control.observe(12 * kGiB, 100.0) && !control.observe(12 * kGiB, 105.0),
             "growth waits while the threshold has not held for 10 s");
     require(control.observe(12 * kGiB, 110.5) && control.decide(12 * kGiB, 110.5).grow == 3 * kGiB,
-            "12 GiB available after 10 s: grow by what stays above the reserve plus a step (3 GiB)");
-    require(!control.observe(8 * kGiB + kGiB / 2, 111.0), "a dip below the reserve plus a step restarts the hold");
+            "12 GiB available after 10 s: grow by what stays above the growth floor (3 GiB)");
+    require(!control.observe(8 * kGiB + kGiB / 2, 111.0), "a dip below the growth floor restarts the hold");
     require(!control.observe(12 * kGiB, 113.0) && !control.observe(12 * kGiB, 120.0) &&
                 control.observe(12 * kGiB, 123.5),
             "the hold restarts from the dip");
@@ -573,20 +584,92 @@ void test_ram_control() {
     control.set_room(0, kGiB);
     require(control.decide(12 * kGiB, 135.0).grow == kGiB, "growth stops at the startup size");
 
-    // A reserve under 3 GiB: growth still leaves 3 GiB plus a step, or it would grow back into pressure.
+    // A 4 GiB reserve: the pressure point is its half, 2 GiB.
+    RamControl four(4 * kGiB);
+    four.set_room(8 * kGiB, 0);
+    require(four.pressure_point() == 2 * kGiB && four.relieve_point() == 4 * kGiB && four.growth_floor() == 5 * kGiB &&
+                four.decide(kGiB + kGiB / 2, 0.0).release == 3 * kGiB && four.decide(3 * kGiB, 0.0).release == 0,
+            "R = 4 GiB: release below 2 GiB (1.5: 3 GiB, back to 4.5), none at 3");
+
+    // A reserve under 4 GiB: the pressure point stays at 2 GiB (Windows stalls near 1 GiB), a release brings at least
+    // 3 GiB back and growth leaves 4 GiB.
     RamControl small(2 * kGiB);
     small.set_room(0, 8 * kGiB);
-    require(small.growth_floor() == 4 * kGiB, "growth floor: at least 3 GiB plus a step");
+    require(small.pressure_point() == 2 * kGiB && small.relieve_point() == 3 * kGiB && small.growth_floor() == 4 * kGiB,
+            "R = 2 GiB: release below 2 GiB back to 3 GiB, grow above 4 GiB");
     require(!small.observe(4 * kGiB, 0.0) && !small.observe(4 * kGiB, 20.0), "4 GiB available: nothing to grow into");
     require(!small.observe(6 * kGiB + kGiB / 2, 21.0) && small.observe(6 * kGiB + kGiB / 2, 31.0) &&
                 small.decide(6 * kGiB + kGiB / 2, 31.0).grow == 2 * kGiB,
             "6.5 GiB for 10 s: grow 2 GiB, leaving 4.5");
+
+    // A large reserve: the band scales with it.
+    const RamControl large(16 * kGiB);
+    require(large.pressure_point() == 8 * kGiB && large.relieve_point() == 16 * kGiB && large.growth_floor() == 17 * kGiB,
+            "R = 16 GiB: release below 8 GiB back to 16 GiB, grow above 17 GiB");
+}
+
+// The monitor wakes the engine when a reading finds a resize due, which due() reports until decide() takes it, and
+// every period while a resize is in flight (set_busy), within the band too; its worker runs jobs one at a time in the
+// order posted, a job's exception lands in its future, and the destructor runs what is still queued.
+void test_ram_monitor() {
+    std::atomic<std::uint64_t> available{20 * kGiB};
+    std::atomic<int> wakes{0};
+    const auto wait_for = [](const auto& done) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!done() && std::chrono::steady_clock::now() < until) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+        return done();
+    };
+    {
+        RamMonitor monitor(8 * kGiB, -1, [&] { return available.load(); }, std::chrono::milliseconds(2));
+        monitor.set_room(10 * kGiB, 0);
+        monitor.set_waker([&] { ++wakes; });
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        require(wakes.load() == 0 && !monitor.due(), "monitor: plenty available, no wake");
+        available = 3 * kGiB;
+        require(wait_for([&] { return wakes.load() > 0; }) && monitor.due(), "monitor: under the pressure point it wakes");
+        require(monitor.decide(10 * kGiB, 0).release == 5 * kGiB, "monitor: the due release");
+        // The band: once no tick still holds the old reading, decide takes what is due and nothing sets it again.
+        available = 6 * kGiB;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        require(monitor.decide(10 * kGiB, 0).release == 0, "monitor: nothing due in the band");
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        require(!monitor.due(), "monitor: decide takes the due resize, and the band sets nothing");
+        const int before = wakes.load();
+        monitor.set_busy(true);
+        require(wait_for([&] { return wakes.load() >= before + 3; }) && !monitor.due(),
+                "monitor: a resize in flight wakes it every period, nothing due");
+        monitor.set_busy(false);
+
+        std::vector<int> order;
+        std::future<void> first  = monitor.worker().post([&] { order.push_back(1); });
+        std::future<int> second  = monitor.worker().post([&] { order.push_back(2); return 7; });
+        std::future<void> failed = monitor.worker().post([] { throw std::runtime_error("refused"); });
+        require(second.get() == 7, "worker: a job's result");
+        bool threw = false;
+        try {
+            failed.get();
+        } catch (const std::runtime_error&) { threw = true; }
+        first.get();
+        require(threw && order == std::vector<int>{1, 2}, "worker: jobs run in order, an exception lands in its future");
+    }
+    std::atomic<int> ran{0};
+    {
+        HostMemoryWorker worker;
+        for (int i = 0; i < 16; ++i) {
+            (void)worker.post([&ran] {
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                ++ran;
+            });
+        }
+    }
+    require(ran.load() == 16, "worker: the destructor runs the queued jobs (a queued release does not leak)");
 }
 
 int main() {
     try {
         test_nominal_and_lend();
         test_ram_control();
+        test_ram_monitor();
         test_full_mode_boundary();
         test_reserve_applied_once();
         test_planned_terms();

@@ -11,6 +11,7 @@
 #include "runtime/expert_offload/memory_plan.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace infernix::runtime {
@@ -55,12 +56,23 @@ struct ExpertRamPlan {
 // Physical RAM a ledger leaves beyond its reserve and everything it planned, the experts included.
 [[nodiscard]] std::uint64_t ledger_left_bytes(const expert_offload::HostMemoryLedger& ledger) noexcept;
 
-// --host-context-mib auto (after Strata v0.2.6's min(8 GiB, 0.4 x (free - 2.5 GiB))): the prefix cache's Host tier
-// from the RAM a plan leaves beyond its reserve (--ram-free-mib, which takes the place of Strata's 2.5 GiB),
-// min(8 GiB, 0.4 x left) rounded down to 256 MiB, and at least kMinAutoHostContextBytes (Qwen3.8-Flash-Next keeps
-// its snapshots there, so it always has a tier).
+// The frontend's pageable caches, which grow to their caps after planning (a RAM plan's HostMemoryDemand::pageable
+// counts them): the grammar cache, the n-gram archive, and with vision the decoded-media cache and its live items.
+[[nodiscard]] std::uint64_t frontend_cache_bytes(const EngineOptions& options) noexcept;
+
+// What the process may still page-lock once a ledger's pins are in place (its other and later pins, its prefix
+// cache and its experts' pinned part, with their lock overhead); empty where the snapshot sets no limit.
+[[nodiscard]] std::optional<std::uint64_t> ledger_pin_left_bytes(const expert_offload::HostMemoryLedger& ledger) noexcept;
+
+// --host-context-mib auto (the default): the prefix cache's Host tier takes all the RAM a plan made without it leaves
+// beyond its reserve (--ram-free-mib, the only headroom: the plan counts the experts, the n-gram table, every other
+// pin, the pageable caches' caps and the process's growth), within what may still be page-locked, less the tier's
+// lock overhead, in 256 MiB steps and at least kMinAutoHostContextBytes (Qwen3.8-Flash-Next keeps its snapshots
+// there, so it always has a tier). --ram-resize auto gives part of it back while other programs need the RAM.
+// (Until 2026-11-12 Qwen3.8-Flash-Next took min(8 GiB, 0.4 x left) after Strata v0.2.6, a second margin on top of
+// --ram-free-mib, and the Qwen3.5 Programs a fixed 8 GiB.)
 inline constexpr std::uint64_t kMinAutoHostContextBytes = 1ULL << 30;
-[[nodiscard]] std::uint64_t auto_host_context_bytes(std::uint64_t left_bytes) noexcept;
+[[nodiscard]] std::uint64_t auto_host_context_bytes(const expert_offload::HostMemoryLedger& ledger) noexcept;
 
 // Plans `demand` against `snapshot`, reports the ledger (an Info summary, Debug details) and refuses
 // an --expert-ram-mib the ledger cannot give (std::runtime_error, expert_ram_refusal's message).

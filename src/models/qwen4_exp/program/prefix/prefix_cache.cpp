@@ -18,10 +18,9 @@ namespace pc = runtime::prefix_cache;
 
 namespace {
 
-// Largest single pinned allocation of the slab pool: one very large pinned allocation can fail or
-// stall under WDDM where several smaller ones succeed. A slab never crosses chunks.
-// The Host tier is pinned in chunks of this size, which is also its resize step under RAM pressure.
-constexpr std::size_t kHostChunkBytes = std::size_t{1} << 30U;
+// The Host tier is page-locked in chunks of whole slabs (HostSlabStore::kChunkBytes, also its resize step under RAM
+// pressure); a slab never crosses chunks.
+constexpr std::size_t kHostChunkBytes = pc::HostSlabStore::kChunkBytes;
 constexpr std::size_t kSlabAlignment  = 4096;
 
 std::size_t align_slab(std::size_t bytes) { return (bytes + kSlabAlignment - 1U) / kSlabAlignment * kSlabAlignment; }
@@ -91,20 +90,9 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
     if (config.device_snapshot_slots != 0) {
         throw std::invalid_argument("Qwen4Exp prefix cache: Device snapshot slots are not supported");
     }
-    const std::uint64_t total = static_cast<std::uint64_t>(host_.slabs) * host_.slab_bytes;
-    std::uint64_t pinned      = 0;
-    for (std::uint32_t first = 0; first < host_.slabs; first += host_.slabs_per_chunk) {
-        const std::uint32_t slabs = std::min(host_.slabs_per_chunk, host_.slabs - first);
-        const std::size_t bytes   = static_cast<std::size_t>(slabs) * host_.slab_bytes;
-        try {
-            chunks_.emplace_back(bytes, kSlabAlignment);
-        } catch (const std::exception& error) {
-            throw std::runtime_error("pinning the Qwen4Exp prefix cache Host tier failed after " +
-                                     std::to_string(pinned >> 20U) + " of " + std::to_string(total >> 20U) + " MiB (" +
-                                     error.what() + "); lower --host-context-mib");
-        }
-        pinned += bytes;
-    }
+    store_ = pc::HostSlabStore(host_.slab_bytes, host_.slabs, kHostChunkBytes, "Qwen4Exp prefix cache Host tier");
+    // A release keeps one snapshot and its block in service.
+    store_.set_floor_chunks((host_.image_slabs + 2U + host_.slabs_per_chunk - 1U) / host_.slabs_per_chunk);
     CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&restore_stream_, cudaStreamNonBlocking));
     if (index.ssd_slabs != 0) {
@@ -145,12 +133,6 @@ PrefixCache::~PrefixCache() {
     index_.reset();
 }
 
-std::uint64_t PrefixCache::pinned_bytes() const noexcept {
-    std::uint64_t bytes = 0;
-    for (const PinnedHostBuffer& chunk : chunks_) { bytes += chunk.size(); }
-    return bytes;
-}
-
 // ---- ids, events, slabs ----------------------------------------------------------------------------
 
 std::uint32_t PrefixCache::allocate_block_id(DeviceKVPageLease&& lease) {
@@ -170,12 +152,6 @@ DeviceKVPageHandle PrefixCache::page(std::uint32_t device_id) const {
         throw std::logic_error("Qwen4Exp prefix cache block id is not registered");
     }
     return blocks_[device_id]->handle();
-}
-
-std::byte* PrefixCache::slab(std::uint32_t id) const noexcept {
-    const std::uint32_t chunk = id / host_.slabs_per_chunk;
-    return static_cast<std::byte*>(chunks_[chunk].data()) +
-           static_cast<std::size_t>(id % host_.slabs_per_chunk) * host_.slab_bytes;
 }
 
 cudaEvent_t PrefixCache::take_event() {
@@ -704,6 +680,8 @@ void PrefixCache::clear() noexcept {
     published_.clear();
     // The new index holds no SSD slab: transfers are waited for and forgotten.
     if (ssd_) { ssd_->abandon(); }
+    // A resize's copies land first; the new index gets the slabs the Host tier holds now, not its startup size.
+    store_.abandon();
     pc::PrefixIndexConfig config = index_->config();
     index_.reset();
     blocks_.clear();
@@ -711,61 +689,25 @@ void PrefixCache::clear() noexcept {
     std::fill(node_mtp_next_.begin(), node_mtp_next_.end(), -1);
     std::fill(snapshot_meta_.begin(), snapshot_meta_.end(), StateImageHeader{});
     index_.emplace(config, *this);
+    store_.limit_index(*index_);
 }
 
 // ---- Host tier resize ----------------------------------------------------------------------------------
 
-std::uint64_t PrefixCache::host_tier_shrinkable_bytes() const noexcept {
-    const std::uint32_t floor = (host_.image_slabs + 2U + host_.slabs_per_chunk - 1U) / host_.slabs_per_chunk;
-    std::uint64_t bytes       = 0;
-    for (std::size_t i = floor; i < chunks_.size(); ++i) { bytes += chunks_[i].size(); }
-    return bytes;
+std::uint64_t PrefixCache::begin_host_release(std::uint64_t bytes, HostMemoryWorker& worker) {
+    poll(); // landed writes and captures publish first: their entries can move rather than hold the cut
+    return store_.begin_release(*index_, bytes, worker);
 }
 
-std::uint64_t PrefixCache::shrink_host_tier(std::uint64_t bytes) {
-    const std::uint32_t per_chunk = host_.slabs_per_chunk;
-    const std::uint64_t chunk     = static_cast<std::uint64_t>(per_chunk) * host_.slab_bytes;
-    const auto have               = static_cast<std::uint32_t>(chunks_.size());
-    const std::uint32_t floor     = (host_.image_slabs + 2U + per_chunk - 1U) / per_chunk;
-    const auto drop               = static_cast<std::uint32_t>(std::min<std::uint64_t>(have, (bytes + chunk - 1U) / chunk));
-    const std::uint32_t keep      = std::max(floor, have - drop);
-    if (bytes == 0 || keep >= have) { return 0; }
-    drain();
-    // An SSD transfer pins the slabs it reads or writes: settled first, so a shrink moves them freely.
-    if (ssd_) { ssd_->drain(*index_); }
-    const std::uint32_t reached = index_->shrink_host(keep * per_chunk);
-    const std::uint32_t kept    = (reached + per_chunk - 1U) / per_chunk;
-    std::uint64_t released      = 0;
-    while (chunks_.size() > kept) {
-        released += chunks_.back().size();
-        chunks_.pop_back();
-    }
-    return released;
-}
-
-std::uint64_t PrefixCache::grow_host_tier(std::uint64_t bytes) {
-    const std::uint32_t per_chunk = host_.slabs_per_chunk;
-    std::uint64_t grown           = 0;
-    while (chunks_.size() * per_chunk < host_.slabs) {
-        const auto first          = static_cast<std::uint32_t>(chunks_.size() * per_chunk);
-        const std::size_t size    = static_cast<std::size_t>(std::min(per_chunk, host_.slabs - first)) * host_.slab_bytes;
-        if (grown + size > bytes) { break; }
-        try {
-            chunks_.emplace_back(size, kSlabAlignment);
-        } catch (const std::exception&) {
-            break; // the OS refuses to pin it now
-        }
-        grown += size;
-    }
-    index_->grow_host(static_cast<std::uint32_t>(std::min<std::uint64_t>(host_.slabs, chunks_.size() * per_chunk)));
-    return grown;
+pc::HostSlabStore::Progress PrefixCache::step_host_resize(HostMemoryWorker& worker) {
+    if (!store_.resizing()) { return {}; }
+    poll(); // retires the restores that have landed
+    // A restore batch reads Host slabs from the addresses it was staged with: a move commits only once none is open
+    // or landing. Captures and writes target reserved or filling slabs, which never move.
+    return store_.step(*index_, !restore_.open && landing_.empty(), worker);
 }
 
 // ---- PrefixIndexBackend ------------------------------------------------------------------------------
-
-void PrefixCache::move_host_slab(std::uint32_t from, std::uint32_t to) noexcept {
-    std::memcpy(slab(to), slab(from), host_.slab_bytes);
-}
 
 void PrefixCache::release_device_block(std::uint32_t device_id) noexcept {
     if (device_id >= blocks_.size() || !blocks_[device_id]) { std::terminate(); }

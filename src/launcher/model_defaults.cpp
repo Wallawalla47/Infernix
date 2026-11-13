@@ -1,7 +1,6 @@
 #include "launcher/model_defaults.h"
 
 #include <algorithm>
-#include <cmath>
 
 namespace infernix::launcher {
 namespace {
@@ -98,15 +97,8 @@ Args default_args(const LibraryScan& scan, const ScannedModel& model, const Host
         }
     }
 
-    if (model.family == "qwen3.5-122b-a10b") {
-        // The experts take most of the RAM; a 4 GiB Host prefix cache leaves it to them.
-        add("--host-context-mib", "4096");
-    } else if (!model.offloaded_experts && host.ram_total_bytes >= (32ull << 30)) {
-        // Dense models leave RAM free: a larger Host tier keeps more agent sessions cached.
-        const double mib = static_cast<double>(host.ram_total_bytes) / (1 << 20) * 0.55;
-        const auto rounded = static_cast<std::uint64_t>(std::floor(mib / 1000.0) * 1000.0);
-        add("--host-context-mib", std::to_string(std::min<std::uint64_t>(rounded, 52000)));
-    }
+    // The Host prefix cache: infernix-serve's default (--host-context-mib auto) sizes it from the RAM the model
+    // leaves: most of the idle RAM for models whose weights sit in VRAM, a share of what the experts leave otherwise.
     if (model.family == "qwen3.8-27b") { add("--prefill-chunk", "4096"); }
 
     add("--preserve-thinking");

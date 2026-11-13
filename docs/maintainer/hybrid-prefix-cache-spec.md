@@ -36,9 +36,10 @@ Configuration rules:
 
 ## Status
 
-The cache configures itself: the only capacity a deployment chooses is `--host-context-mib`
-(default 8192, 0 = Device only; Qwen3.8-Flash-Next: default 4096, must be positive, §17); every
-other value is derived from the rest of the configuration (§14.2).
+The cache configures itself: the only capacity a deployment may choose is `--host-context-mib`
+(default `auto`: all the RAM the model's plan, experts and n-gram table first, leaves beyond
+`--ram-free-mib`, within the page-lock room, at least 1 GiB; 0 = Device only; Qwen3.8-Flash-Next: must
+be positive, §17); every other value is derived from the rest of the configuration (§14.2).
 
 | area | state |
 |---|---|
@@ -376,15 +377,27 @@ struct Snapshot {
   packed byte `o` lives in slab `o / slab_bytes`), and a snapshot with a tail one slab more. The
   free list is a min-heap of slab ids (the lowest goes first, so batches come out consecutive).
   There is no fragmentation and no geometry check: capacity is `free_slabs`. A nonzero budget
-  smaller than one snapshot plus one block is rejected at startup. The pool is pinned in chunks of
-  at most 1 GiB of whole slabs (one very large pinned allocation can fail or stall under WDDM),
-  which is also its resize step; a slab never crosses chunks. Under RAM pressure
-  (`--ram-resize auto`, between requests with every transfer settled) the index retires the slabs
-  past a limit (`PrefixCacheIndex::shrink_host`): it evicts in allocation order (dead KV,
-  superseded, then the GDSF minimum) until the owned and reserved slabs fit below it, moves the
-  owned slabs past it into free ones below (`move_host_slab`, a host copy), and the cache releases
-  the emptied chunks; a pinned, filling or reserved slab keeps the limit above it. `grow_host` pins
-  chunks back and returns their slabs to the free list, up to the startup size. A strided copy run
+  smaller than one snapshot plus one block is rejected at startup. Both Programs' caches keep the
+  pool in `runtime::prefix_cache::HostSlabStore`: chunks of at most 1 GiB of whole slabs (one very
+  large page-locked allocation can fail or stall under WDDM), each committed, zeroed and then
+  registered with the driver (a short driver call), which are also its resize step; a slab never
+  crosses chunks. Under RAM pressure (`--ram-resize auto`, idle or between rounds while requests
+  run) a release retires the slabs from a ceiling on without stopping anything:
+  `PrefixCacheIndex::begin_host_shrink` places the ceiling above every slab a transfer reads or
+  writes now (reservations, filling copies, I/O-pinned entries), so the release never waits for
+  one, evicts in allocation order (dead KV, superseded, then the GDSF minimum of the unheld
+  entries) until what is in use fits below it (nothing when nothing could be retired), and from
+  then on no slab at or past the ceiling is taken (freed ones retire); `plan_host_moves` drops dead
+  KV past it and pairs every other Host-resident entry past it with a free slab below, a pinned one
+  included (a running sequence's mapped path: pins keep entries indexed, and only a restore batch
+  or an SSD job reads a Host slab); the store copies the bytes with streaming stores on the RAM
+  monitor's worker thread (a hybrid CPU's slow cores); `commit_host_moves` switches the entries
+  once the copies have landed and no restore batch is staged or landing (an entry evicted meanwhile
+  gives its destination back; one an SSD job I/O-pins meanwhile waits for it); `finish_host_shrink`
+  ends the shrink once nothing past the ceiling is in use (a counter: only `begin_host_shrink`
+  scans every node), and the worker releases the chunks past it. A growth page-locks chunks on the worker and `grow_host` returns
+  their slabs to the free list at the next step, up to the startup size. A rebuilt index
+  (`clear()`) starts at the slabs page-locked then (`HostSlabStore::limit_index`). A strided copy run
   joins consecutive pages only while their slab records share a chunk and advance by one pitch no
   larger than the device's maximum copy pitch. Any two records form a candidate run, so records in
   different chunks, or gigabytes apart in one, must be split explicitly. A 52 GB Host tier
@@ -1733,7 +1746,7 @@ struct HybridPrefixCacheOptions {
 struct ContextCacheOptions {
     bool enabled;                                           // --no-prefix-reuse disables
     HybridPrefixCacheOptions hybrid;
-    std::optional<std::size_t> host_capacity_bytes;         // --host-context-mib: Host slab pool
+    std::optional<std::size_t> host_capacity_bytes;         // --host-context-mib: Host slab pool (unset: auto)
     std::uint64_t ssd_capacity_bytes;                       // --ssd-context-gib: SSD tier (§5.7), 0 = off
     std::filesystem::path ssd_directory;                    // --ssd-context-dir: its scratch file's place
 };

@@ -6,6 +6,7 @@
 #include "models/qwen3_5/program/storage/kv_address_space.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/state/state_image.h"
+#include "runtime/prefix_cache/host_slab_store.h"
 #include "runtime/prefix_cache/persist_file.h"
 #include "runtime/prefix_cache/prefix_index.h"
 #include "runtime/prefix_cache/ssd_tier.h"
@@ -114,7 +115,7 @@ public:
 
     [[nodiscard]] const HybridCacheCounters& counters() const noexcept { return counters_; }
 
-    [[nodiscard]] bool host_tier() const noexcept { return !host_chunks_.empty(); }
+    [[nodiscard]] bool host_tier() const noexcept { return !store_.empty(); }
 
     [[nodiscard]] const HybridHostLayout& host_layout() const noexcept { return host_layout_; }
 
@@ -223,20 +224,22 @@ public:
     // Releases every reference the cache holds. The index is rebuilt empty.
     void clear() noexcept;
 
-    // ---- Host tier resize (RAM pressure, runtime::HostMemoryGovernor) ---------------------------
-    // With no lane bound (the Engine idle): drains the transfers, then gives back whole chunks worth at least `bytes`
-    // (the lowest-valued entries go, the rest move below the cut), keeping one chunk and at least two images' slabs.
-    // Returns the bytes released.
-    std::uint64_t shrink_host_tier(std::uint64_t bytes);
-    // Pins chunks of at most `bytes` back, up to the startup size; returns the bytes added (fewer when the OS
-    // refuses to pin one).
-    std::uint64_t grow_host_tier(std::uint64_t bytes);
-    // The startup size of the Host tier, and what shrink_host_tier could release and grow_host_tier add now.
-    [[nodiscard]] std::uint64_t host_tier_capacity_bytes() const noexcept {
-        return static_cast<std::uint64_t>(config_.host_slabs) * host_layout_.slab_bytes;
+    // ---- Host tier resize (RAM pressure, --ram-resize; runtime::prefix_cache::HostSlabStore) ------------------
+    // Idle or while lanes run. Starts giving back whole chunks worth at least `bytes`, keeping one chunk and at least
+    // two images' slabs: the lowest-valued entries go, the entries past the cut are copied below it on `worker`;
+    // returns the bytes it aims at (0: held entries keep every chunk in use now).
+    std::uint64_t begin_host_release(std::uint64_t bytes, HostMemoryWorker& worker);
+    // Starts page-locking chunks of at most `bytes` back on `worker`, up to the startup size; returns the bytes asked.
+    std::uint64_t begin_host_growth(std::uint64_t bytes, HostMemoryWorker& worker) {
+        return store_.begin_growth(bytes, worker);
     }
-    [[nodiscard]] std::uint64_t host_tier_shrinkable_bytes() const noexcept;
-    [[nodiscard]] std::uint64_t host_tier_growable_bytes() const noexcept;
+    // Applies what the worker finished (never waits): a release commits its moves once no restore is in flight.
+    runtime::prefix_cache::HostSlabStore::Progress step_host_resize(HostMemoryWorker& worker);
+    [[nodiscard]] bool host_resizing() const noexcept { return store_.resizing(); }
+    // The startup size of the Host tier, and what a release could give back and a growth take back now.
+    [[nodiscard]] std::uint64_t host_tier_capacity_bytes() const noexcept { return store_.capacity_bytes(); }
+    [[nodiscard]] std::uint64_t host_tier_shrinkable_bytes() const noexcept { return store_.shrinkable_bytes(); }
+    [[nodiscard]] std::uint64_t host_tier_growable_bytes() const noexcept { return store_.growable_bytes(); }
 
     // ---- persistence (hybrid_persist.cpp, runtime/prefix_cache/persist_file.h) ------------------
     // Writes every Host-backed snapshot and the block paths it anchors on to `path` (through a
@@ -260,11 +263,8 @@ public:
     void release_device_block(std::uint32_t device_id) noexcept override;
     void release_snapshot(runtime::prefix_cache::SnapshotRef snapshot) noexcept override;
     void drop_snapshot_device_image(runtime::prefix_cache::SnapshotRef snapshot) noexcept override;
-    void move_host_slab(std::uint32_t from, std::uint32_t to) noexcept override;
 
 private:
-    // The chunks a shrink keeps: one, and at least two images' slabs.
-    [[nodiscard]] std::uint32_t host_floor_chunks() const noexcept;
     struct PendingWrite {
         std::vector<runtime::prefix_cache::NodeRef> nodes;
         std::optional<runtime::prefix_cache::SnapshotRef> snapshot;
@@ -317,7 +317,7 @@ private:
                 std::uint32_t backend_columns);
     void release(const HybridBlockPages& pages) noexcept;
     void adopt_destination(const HybridBlockPages& pages, std::uint32_t columns);
-    [[nodiscard]] std::byte* slab(std::uint32_t id) const noexcept;
+    [[nodiscard]] std::byte* slab(std::uint32_t id) const noexcept { return store_.slab(id); }
     [[nodiscard]] runtime::prefix_cache::PersistBinding persist_binding();
     void add_copies(PageCopies& copies, const HybridBlockPages& pages, std::uint32_t slab_id);
     // Each returns the copy calls it issued.
@@ -338,15 +338,12 @@ private:
     StateImageStore* states_                   = nullptr;
     qwen3_5::StateImageDevicePool* state_pool_ = nullptr;
     HybridHostLayout host_layout_;
-    // The Host slab pool is pinned in chunks of whole slabs: one very large pinned allocation
-    // can fail or stall on Windows (WDDM) where several smaller ones succeed. A slab never
-    // crosses chunks, and every copy record carries its chunk as its group, so a strided copy
-    // run never spans two chunks (two records of different chunks would otherwise form a run).
-    std::vector<PinnedHostBuffer> host_chunks_;
+    // The Host slab pool, page-locked in chunks of whole slabs: every copy record carries its chunk as its group, so
+    // a strided copy run never spans two chunks (two records of different chunks would otherwise form a run).
+    runtime::prefix_cache::HostSlabStore store_;
     // Declared after the chunks it reads and writes: destroyed first, waiting for its transfers.
     std::unique_ptr<runtime::prefix_cache::SsdTier> ssd_;
     bool ssd_landed_ = false;
-    std::uint32_t slabs_per_chunk_ = 0;
     cudaStream_t restore_stream_   = nullptr;
     std::vector<std::optional<HybridBlockPages>> blocks_;
     std::vector<std::uint32_t> free_blocks_;

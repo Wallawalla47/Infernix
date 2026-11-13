@@ -584,13 +584,18 @@ public:
     // worker, between rounds and under its execution lock. An empty waker detaches the engine.
     void set_maintenance_waker(std::function<void()> waker);
     void maintain();
+    // Between rounds while requests run, when a waker asked (runtime/contract/program.h): the RAM tiers' resize
+    // advances or starts (--ram-resize auto); nothing else outside rounds runs here.
+    void maintain_busy();
     // The Engine's round thread runs unpinned: Flash-Next's CPU expert team leaves it no core of its own
     // (runtime/contract/program.h; Qwen3.5's offloaded experts do).
     [[nodiscard]] std::uint64_t engine_thread_cpus() const noexcept { return 0; }
     // RAM pressure (EngineOptions::ram_resize, runtime::expert_offload::RamMonitor): starts the monitor under which
-    // maintain() shrinks the prefix cache's Host tier while the OS runs short and grows it back once more than
-    // `reserve_bytes` plus a step stays free.
-    void start_ram_resize(std::uint64_t reserve_bytes);
+    // maintain() and maintain_busy() shrink the prefix cache's Host tier and the SSD tier's RAM while the OS runs short
+    // (less than max(reserve_bytes / 2, 2 GiB) available) and grow them back once more than the reserve plus a step
+    // stays free. `trim_host_tier` (an automatic Host tier): the first maintenance after the start gives back what
+    // keeps less than the reserve available.
+    void start_ram_resize(std::uint64_t reserve_bytes, bool trim_host_tier);
     Program(const Program&)            = delete;
     Program& operator=(const Program&) = delete;
 

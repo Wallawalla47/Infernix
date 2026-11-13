@@ -707,7 +707,6 @@ std::string Launcher::config_default_alias(const std::string& config_id, const S
 Args Launcher::model_default_args(const ScannedModel& model, const LibraryScan& scan) const {
     const SystemFacts facts = telemetry_->facts();
     HostFacts host;
-    host.ram_total_bytes = facts.ram_total;
     // The inference GPU: telemetry lists it first.
     if (!facts.gpus.empty()) { host.vram_total_bytes = facts.gpus.front().second.second; }
     host.display = facts.inference_gpu_display;

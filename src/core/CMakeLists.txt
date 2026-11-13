@@ -20,6 +20,7 @@ add_library(infernix_core STATIC
   gpu_telemetry.cpp
   host_load.cpp
   host_memory.cpp
+  host_memory_worker.cpp
   host_worker_pool.cpp
   io_priority.cpp
   link_probe.cu

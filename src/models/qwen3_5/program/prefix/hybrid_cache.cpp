@@ -26,10 +26,8 @@ using runtime::prefix_cache::TapPlannerConfig;
 namespace {
 
 constexpr auto kFullPage = static_cast<std::uint32_t>(kPagedKVPageSize);
-// Largest single pinned allocation of the Host slab pool, which is also its resize step under RAM pressure.
-constexpr std::size_t kHostChunkBytes = std::size_t{1} << 30U;
-// Host chunks start on a 4 KiB boundary: the SSD tier moves their slabs with unbuffered file I/O.
-constexpr std::size_t kHostChunkAlignment = 4096;
+// The Host slab pool's page-locked chunk, also its resize step under RAM pressure (HostSlabStore::kChunkBytes).
+constexpr std::size_t kHostChunkBytes = runtime::prefix_cache::HostSlabStore::kChunkBytes;
 
 std::span<const std::byte* const> const_records(const std::vector<std::byte*>& records) noexcept {
     return {reinterpret_cast<const std::byte* const*>(records.data()), records.size()};
@@ -69,25 +67,15 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
         if (!config.host_blocks || host.slab_bytes == 0 || config.image_slabs != host.image_slabs) {
             throw std::invalid_argument("hybrid Host tier configuration is inconsistent");
         }
-        slabs_per_chunk_ = static_cast<std::uint32_t>(
-            std::max<std::size_t>(1U, kHostChunkBytes / host.slab_bytes));
-        const std::uint64_t total = static_cast<std::uint64_t>(config.host_slabs) * host.slab_bytes;
-        std::uint64_t pinned      = 0;
-        host_chunks_.reserve((config.host_slabs + slabs_per_chunk_ - 1U) / slabs_per_chunk_);
-        for (std::uint32_t first = 0; first < config.host_slabs; first += slabs_per_chunk_) {
-            const std::uint32_t slabs = std::min(slabs_per_chunk_, config.host_slabs - first);
-            const std::size_t bytes   = static_cast<std::size_t>(slabs) * host.slab_bytes;
-            try {
-                host_chunks_.emplace_back(bytes, kHostChunkAlignment);
-            } catch (const std::exception& error) {
-                throw std::runtime_error("pinning the hybrid prefix cache Host tier failed after " +
-                                         std::to_string(pinned >> 20U) + " of " +
-                                         std::to_string(total >> 20U) + " MiB (" + error.what() +
-                                         "); lower --host-context-mib");
-            }
-            pinned += bytes;
-            if (pin_progress != nullptr) { pin_progress->progress(pinned, total); }
+        std::function<void(std::uint64_t, std::uint64_t)> progress;
+        if (pin_progress != nullptr) {
+            progress = [pin_progress](std::uint64_t pinned, std::uint64_t total) { pin_progress->progress(pinned, total); };
         }
+        store_ = runtime::prefix_cache::HostSlabStore(host.slab_bytes, config.host_slabs, kHostChunkBytes,
+                                                      "hybrid prefix cache Host tier", progress);
+        // A release keeps one chunk and at least two images' slabs.
+        const std::uint32_t per_chunk = store_.slabs_per_chunk();
+        store_.set_floor_chunks(std::max(1U, (2U * host.image_slabs + per_chunk - 1U) / per_chunk));
         CUDA_CHECK(cudaStreamCreateWithFlags(&restore_stream_, cudaStreamNonBlocking));
     }
     if (config.ssd_slabs != 0) {
@@ -301,15 +289,10 @@ StateImageHandle HybridPrefixCache::image(SnapshotRef snapshot) const {
 
 // ---- transfers ---------------------------------------------------------------------------------
 
-std::byte* HybridPrefixCache::slab(std::uint32_t id) const noexcept {
-    return static_cast<std::byte*>(host_chunks_[id / slabs_per_chunk_].data()) +
-           static_cast<std::size_t>(id % slabs_per_chunk_) * host_layout_.slab_bytes;
-}
-
 void HybridPrefixCache::add_copies(PageCopies& copies, const HybridBlockPages& pages,
                                    std::uint32_t slab_id) {
     std::byte* record         = slab(slab_id);
-    const std::uint32_t chunk = slab_id / slabs_per_chunk_;
+    const std::uint32_t chunk = store_.chunk_of(slab_id);
     copies.text_pages.push_back(text_pages_->physical(pages.text));
     copies.text_records.push_back(record);
     copies.text_groups.push_back(chunk);
@@ -792,6 +775,8 @@ void HybridPrefixCache::clear() noexcept {
     landing_.clear();
     reset_restore();
     if (ssd_) { ssd_->abandon(); }
+    // A resize's copies land first; the new index gets the slabs the Host tier holds now, not its startup size.
+    store_.abandon();
     for (std::optional<HybridBlockPages>& pages : blocks_) {
         if (!pages) { continue; }
         (void)text_pages_->release_reference(pages->text, false);
@@ -809,75 +794,27 @@ void HybridPrefixCache::clear() noexcept {
     index_.reset();
     try {
         index_.emplace(config_, *this);
+        store_.limit_index(*index_);
     } catch (...) { std::terminate(); }
 }
 
-// ---- PrefixIndexBackend ------------------------------------------------------------------------
-
 // ---- Host tier resize ------------------------------------------------------------------------------
 
-std::uint32_t HybridPrefixCache::host_floor_chunks() const noexcept {
-    return std::max(1U, (2U * host_layout_.image_slabs + slabs_per_chunk_ - 1U) / slabs_per_chunk_);
+std::uint64_t HybridPrefixCache::begin_host_release(std::uint64_t bytes, HostMemoryWorker& worker) {
+    if (!host_tier()) { return 0; }
+    poll(); // landed writes publish first: their entries can move rather than hold the cut
+    return store_.begin_release(*index_, bytes, worker);
 }
 
-std::uint64_t HybridPrefixCache::host_tier_shrinkable_bytes() const noexcept {
-    std::uint64_t bytes = 0;
-    for (std::size_t i = host_floor_chunks(); i < host_chunks_.size(); ++i) { bytes += host_chunks_[i].size(); }
-    return host_chunks_.empty() ? 0 : bytes;
+runtime::prefix_cache::HostSlabStore::Progress HybridPrefixCache::step_host_resize(HostMemoryWorker& worker) {
+    if (!store_.resizing()) { return {}; }
+    poll();
+    // A restore batch (an admission's, or a prefetch) reads Host slabs from the addresses it was staged with: a move
+    // commits only once none is staged or landing. Writes target filling slabs, which never move.
+    return store_.step(*index_, !restore_.open && !restore_.submitted && landing_.empty(), worker);
 }
 
-std::uint64_t HybridPrefixCache::host_tier_growable_bytes() const noexcept {
-    std::uint64_t pinned = 0;
-    for (const PinnedHostBuffer& chunk : host_chunks_) { pinned += chunk.size(); }
-    return host_tier_capacity_bytes() - pinned;
-}
-
-std::uint64_t HybridPrefixCache::shrink_host_tier(std::uint64_t bytes) {
-    if (host_chunks_.empty()) { return 0; }
-    const std::uint32_t per_chunk = slabs_per_chunk_;
-    const std::uint64_t chunk     = static_cast<std::uint64_t>(per_chunk) * host_layout_.slab_bytes;
-    const auto have               = static_cast<std::uint32_t>(host_chunks_.size());
-    const std::uint32_t floor     = host_floor_chunks();
-    const auto drop               = static_cast<std::uint32_t>(std::min<std::uint64_t>(have, (bytes + chunk - 1U) / chunk));
-    const std::uint32_t keep      = std::max(floor, have - drop);
-    if (bytes == 0 || keep >= have) { return 0; }
-    drain();
-    // An SSD transfer pins the slabs it reads or writes: settled first, so a shrink moves them freely.
-    if (ssd_) { ssd_->drain(*index_); }
-    const std::uint32_t reached = index_->shrink_host(keep * per_chunk);
-    const std::uint32_t kept    = (reached + per_chunk - 1U) / per_chunk;
-    std::uint64_t released      = 0;
-    while (host_chunks_.size() > kept) {
-        released += host_chunks_.back().size();
-        host_chunks_.pop_back();
-    }
-    return released;
-}
-
-std::uint64_t HybridPrefixCache::grow_host_tier(std::uint64_t bytes) {
-    if (config_.host_slabs == 0) { return 0; }
-    const std::uint32_t per_chunk = slabs_per_chunk_;
-    std::uint64_t grown           = 0;
-    while (host_chunks_.size() * per_chunk < config_.host_slabs) {
-        const auto first       = static_cast<std::uint32_t>(host_chunks_.size() * per_chunk);
-        const std::size_t size = static_cast<std::size_t>(std::min(per_chunk, config_.host_slabs - first)) *
-                                 host_layout_.slab_bytes;
-        if (grown + size > bytes) { break; }
-        try {
-            host_chunks_.emplace_back(size, kHostChunkAlignment);
-        } catch (const std::exception&) {
-            break; // the OS refuses to pin it now
-        }
-        grown += size;
-    }
-    index_->grow_host(
-        static_cast<std::uint32_t>(std::min<std::uint64_t>(config_.host_slabs, host_chunks_.size() * per_chunk)));
-    return grown;
-}
-
-void HybridPrefixCache::move_host_slab(std::uint32_t from, std::uint32_t to) noexcept {
-    std::memcpy(slab(to), slab(from), host_layout_.slab_bytes);
-}
+// ---- PrefixIndexBackend ------------------------------------------------------------------------
 
 void HybridPrefixCache::release_device_block(std::uint32_t device_id) noexcept {
     if (device_id >= blocks_.size() || !blocks_[device_id]) { std::terminate(); }

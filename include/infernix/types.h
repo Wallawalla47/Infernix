@@ -33,8 +33,8 @@ inline constexpr std::uint64_t kDefaultRamFreeBytes = 8ULL << 30;
 // Prompt-attention split workspace when --prefill-split-workspace-mib is not given.
 inline constexpr std::uint32_t kDefaultPrefillSplitWorkspaceMiB = 256;
 inline constexpr std::uint32_t kMaximumPrefillSplitWorkspaceMiB = 16384;
-// Pinned Host slab pool of the hybrid prefix cache when --host-context-mib is not given, for every
-// architecture.
+// Pinned Host slab pool of a Qwen3.5 Program planned without the Engine and without a size (tests and
+// tools that build a Program directly). The Engine always resolves the size (ContextCacheOptions).
 inline constexpr std::size_t kDefaultHybridHostCacheBytes = 8ULL << 30;
 // How long the prefix cache holds a conversation's state after a reply ending in a tool call,
 // when --cache-tool-hold-secs is not given (Qwen3.5): longer than most tools take to run.
@@ -573,9 +573,8 @@ private:
 enum class HybridHostStatePrecision : std::uint8_t { Fp32, Fp24, Bf16 };
 
 // Prefix-cache tuning. Every field is optional: Engine construction derives the unset ones from
-// max_concurrency, prefill_chunk and whether a Host tier exists (host_capacity_bytes, default
-// kDefaultHybridHostCacheBytes, 0 disables it), and Engine::options() reports the effective
-// values.
+// max_concurrency, prefill_chunk and whether a Host tier exists (ContextCacheOptions::host_capacity_bytes,
+// sized automatically when unset, 0 disables it), and Engine::options() reports the effective values.
 struct HybridPrefixCacheOptions {
     // Device StateImage slots holding inactive snapshots (and tap/endpoint staging). Total Device
     // StateImage capacity is max_concurrency + device_snapshot_slots. Default: one per request
@@ -629,15 +628,12 @@ struct ContextCacheOptions {
     // root and a preempted request recovers by Replay, as it does with the cache on.
     bool enabled = true;
     HybridPrefixCacheOptions hybrid;
-    // The pinned Host slab pool that cached KV blocks and state snapshots share (default
-    // kDefaultHybridHostCacheBytes, 0 disables the Host tier; 0 when the cache is disabled). This
-    // does not bound total process RAM. Engine::options() returns the resolved capacity.
+    // The pinned Host slab pool that cached KV blocks and state snapshots share (0 disables the Host tier;
+    // 0 when the cache is disabled). This does not bound total process RAM. Unset (the default,
+    // --host-context-mib auto): the Engine gives it all the RAM the model's own plan (the experts and the n-gram
+    // table first) leaves beyond ram_free_bytes, within what the process may still page-lock, in 256 MiB steps
+    // and at least 1 GiB (runtime/engine/expert_memory.h). Engine::options() reports the resolved size.
     std::optional<std::size_t> host_capacity_bytes;
-    // --host-context-mib auto (host_capacity_bytes unset): Qwen3.8-Flash-Next sizes the Host tier after its
-    // experts and n-gram table from the RAM they leave beyond ram_free_bytes, min(8 GiB, 0.4 x left) in 256 MiB
-    // steps and at least 1 GiB (after Strata v0.2.6's rule); other models take kDefaultHybridHostCacheBytes.
-    // Engine::options() reports the resolved size in host_capacity_bytes.
-    bool host_capacity_auto = false;
     // The SSD tier below the Host tier (docs/maintainer/hybrid-prefix-cache-spec.md §5.7): a scratch
     // file of ssd_capacity_bytes (rounded down to whole Host slabs) created in ssd_directory at startup,
     // read and written unbuffered, and removed when the process ends. 0 (the default) disables it; it
@@ -856,10 +852,11 @@ struct EngineOptions {
     // that would take it, the n-gram table goes to RAM only beside it, and an automatic Host tier sizes from
     // what is left beyond it.
     std::uint64_t ram_free_bytes = kDefaultRamFreeBytes;
-    // --ram-resize auto|off: between requests the RAM tiers (the prefix cache's Host tier; the expert tier's slots
-    // and records) give memory back while less than 2 GiB of physical memory is available, and take it back in
-    // pieces, up to their startup sizes, once more than ram_free_bytes (at least 3 GiB) plus 1 GiB has stayed
-    // available for 10 s (runtime::expert_offload::RamMonitor). Off: every tier keeps its startup size.
+    // --ram-resize auto|off: the RAM tiers (the prefix cache's Host tier; the expert tier's slots and records) give
+    // memory back, while requests run as well as between them, once less than max(ram_free_bytes / 2, 2 GiB) of
+    // physical memory is available, until ram_free_bytes (at least a GiB more) is again, and take it back in pieces,
+    // up to their startup sizes, once more than that plus 1 GiB has stayed available for 10 s
+    // (runtime::expert_offload::RamMonitor). Off: every tier keeps its startup size.
     bool ram_resize = true;
     // Qwen3.8-Flash-Next (--expert-ram-mib): at most this much Host RAM for the routed experts.
     // Less than every expert needs selects the SSD tier: the experts not in RAM are read from the

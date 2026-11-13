@@ -37,6 +37,7 @@
 
 #include "core/direct_read_queue.h"
 #include "core/host_memory.h"
+#include "core/host_memory_worker.h"
 #include "runtime/expert_offload/expert_store.h"
 #include "runtime/expert_offload/host_slot_pool.h"
 #include "runtime/expert_offload/host_tier.h"
@@ -50,6 +51,7 @@
 #include <deque>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -145,6 +147,8 @@ public:
         std::uint64_t stream_reads = 0; // records read into stream slots
         // Unpinned records served: in place to the CPU, and copied into ring slots for fetches.
         std::uint64_t unpinned_served = 0, unpinned_copies = 0;
+        // Demand landings no RAM slot admitted, kept in a free unpinned record instead (record fills).
+        std::uint64_t record_fills = 0;
         // CSF (Options::csf): records compressed in their slots, records left expanded (no room for the table), and
         // fetches of compressed residents expanded into ring slots.
         std::uint64_t csf_compressed = 0, csf_expanded = 0, csf_fetch_expansions = 0;
@@ -303,30 +307,48 @@ public:
     // Whether one more refill, behind those in flight, lands within the given seconds at the rate the startup fill read the
     // artifact (true before the fill measured it).
     [[nodiscard]] bool refill_within(double seconds) const noexcept;
-    // ---- RAM resize (engine thread, no round open; the caller also guarantees that no prefill expert stream is under
-    // way and that the VRAM residency's copies have settled with no promotion of an unpinned record pending, which
-    // nothing here pins)
+    // ---- RAM resize (--ram-resize; idle or between rounds. The engine thread with no round open; the caller also
+    // guarantees that no prefill expert stream is under way, that the VRAM residency's copies have settled with no
+    // promotion of an unpinned record pending, which nothing here pins, and, for shrink, that the device has
+    // completed every kernel that may read a slot.) The memory work (releasing, page-locking, decommitting and
+    // committing) runs on `worker`, off the engine thread.
     // Gives back at least `bytes` if it can (fewer when pins, loans, refills or Options::min_slots stop it): first the
     // unpinned records, unused ones and then the lowest-ranked held keys' (HostTier::unhold; their pages decommitted),
     // then whole pinned chunks, those holding the least valuable residents first (decayed LFU): their slots are
     // retired (HostTier::retire) and the chunks released (Options::release). The transit region (records of several
     // sizes) and a chunk holding a bounce slot stay; a chunk with a pinned or lent slot, or a slot an issued refill
-    // still reads into, is passed over. Waits for the agent's demands first. Returns the bytes given back; the keys
-    // whose host copy changed are dirty (take_dirty), and the caller uploads the device's record table before the
-    // next round.
-    std::uint64_t shrink(std::uint64_t bytes);
-    // Takes back at most `bytes`, up to the startup sizes: retired chunks are allocated again (Options::allocate, until
-    // it refuses one) and their slots restored, then decommitted unpinned records are committed again (until the OS
-    // refuses); the room is filled from the artifact, before it returns, with the keys without a host copy that
-    // `skip` (when given) rejects, the best first by the decayed LFU (prefill, fill_unpinned). Returns the bytes taken
-    // back; the filled keys are dirty.
-    std::uint64_t grow(std::uint64_t bytes, const std::function<bool(std::uint32_t)>& skip = {});
-    // What shrink could give back now (every unpinned record and the chunks it would retire) and what grow could
+    // still reads into, is passed over. Waits for the agent's demands first. Returns the bytes given back (out of
+    // service now, their memory released on `worker` next); the keys whose host copy changed are dirty (take_dirty),
+    // and the caller uploads the device's record table before the next round.
+    std::uint64_t shrink(std::uint64_t bytes, HostMemoryWorker& worker);
+    // Starts taking back at most `bytes`, up to the startup sizes: retired chunks are allocated again
+    // (Options::allocate, until it refuses one), then decommitted unpinned records committed again (until the OS
+    // refuses), on `worker`. Returns the bytes asked for (0: none to take, or a growth is under way).
+    std::uint64_t begin_growth(std::uint64_t bytes, HostMemoryWorker& worker);
+    [[nodiscard]] bool growth_pending() const noexcept { return growth_.valid(); }
+    [[nodiscard]] bool growth_landed() const { return ready(growth_); }
+    // Whether the memory work of a shrink is still running on the worker (the memory is not given back yet).
+    [[nodiscard]] bool releasing();
+    // Links a landed growth: the chunks' slots come back as free resident slots and the records as free unpinned
+    // records, which rounds fill as they read experts (admissions; record fills, begin_round). Returns the bytes taken
+    // back.
+    std::uint64_t link_growth();
+    // Fills what is still free of the room a growth took back from the artifact with the keys without a host copy
+    // that `skip` (when given) rejects, the best first by the decayed LFU (prefill, fill_unpinned): once the Engine
+    // is idle, since the reads wait. Returns how many keys it read; they are dirty.
+    std::uint32_t fill_room(const std::function<bool(std::uint32_t)>& skip = {});
+    [[nodiscard]] bool room_unfilled() const noexcept { return room_unfilled_; }
+    // What shrink could give back now (every unpinned record and the chunks it would retire) and what a growth could
     // take back (the retired chunks and the decommitted records).
     [[nodiscard]] std::uint64_t shrinkable_bytes() const;
     [[nodiscard]] std::uint64_t growable_bytes() const noexcept;
     // The largest pinned chunk: the least a growth must allow to pin any retired chunk.
     [[nodiscard]] std::uint64_t largest_chunk_bytes() const noexcept;
+    // The pinned chunks shrink gave back (a growth allocates them again with Options::allocate, whose page-locking
+    // holds the driver: about 0.1 s per GiB with cudaHostAlloc, during which the round thread's launches wait), and
+    // whether the growth under way allocates any.
+    [[nodiscard]] std::uint64_t retired_chunk_bytes() const noexcept;
+    [[nodiscard]] bool growth_pins_chunks() const noexcept { return growth_.valid() && growth_pins_chunks_; }
 
     [[nodiscard]] expert_cache::HostTier& controller() noexcept { return tier_; }
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
@@ -414,6 +436,7 @@ private:
     struct Copy {
         enum class Kind : std::uint8_t {
             kCopy,     // memcpy source -> destination
+            kStream,   // the same with streaming stores (copy_streaming): a record fill, nothing waits for it
             kExpand,   // a compressed slot (source, its table in its tail) -> an expanded record at destination
             kCompress, // the record at destination (controller slot `slot`, of `key`) compressed in place (CSF)
         };
@@ -473,8 +496,37 @@ private:
     // The pinned chunks shrink may give back now (allocated, no slot an issued refill reads into), the least valuable
     // first: by the decayed-LFU values of their residents, ties to the later chunk.
     [[nodiscard]] std::vector<std::size_t> shrink_order() const;
-    std::uint64_t shrink_unpinned(std::uint64_t bytes);
-    std::uint64_t shrink_pinned(std::uint64_t bytes);
+    std::uint64_t shrink_unpinned(std::uint64_t bytes, HostMemoryWorker& worker);
+    std::uint64_t shrink_pinned(std::uint64_t bytes, HostMemoryWorker& worker);
+    // A growth's memory, made on the worker: the chunks allocated (index, memory) and how many of the records being
+    // committed again were (recommitting_, in order).
+    struct Growth {
+        std::vector<std::pair<std::size_t, std::byte*>> chunks;
+        std::uint32_t records = 0;
+    };
+    std::future<Growth> growth_;
+    std::vector<std::future<void>> releases_; // a shrink's decommits and chunk releases on the worker
+    std::vector<std::uint32_t> recommitting_;
+    bool room_unfilled_      = false;
+    bool growth_pins_chunks_ = false;
+    // ---- record fills (while rounds run): a free unpinned record takes an expert the round read from the artifact
+    // and no RAM slot admitted, copied from its ring slot by the copy threads behind every other copy, so neither
+    // the round nor the boundary waits for it; the ring slot sits out the next round meanwhile. The boundary after
+    // (settle_fills) holds the key in its record, unless a slot or another record took it first.
+    struct RecordFill {
+        std::uint32_t key = 0, record = 0;
+    };
+    // The boundary's fills: the best-ranked of `landings` (decayed LFU) still without a host copy, while free records
+    // last, at most a sixteenth of the ring and half the ring slots the round left unused (`used`: its tickets), so
+    // the next round, likely as busy, keeps the slots it needs.
+    void start_fills(std::span<const expert_cache::Landing> landings, std::uint32_t used);
+    // Waits for the fill copies still running (taking those not started) and holds their keys.
+    void settle_fills();
+    std::vector<RecordFill> fills_pending_;
+    std::vector<std::uint32_t> fill_slots_; // their ring slots, left out of the ring until settled
+    // Boundaries an unfinished batch has kept its ring slots; at kFillRounds the boundary waits for it.
+    static constexpr std::uint32_t kFillRounds = 8;
+    std::uint32_t fill_rounds_ = 0;
     // Keys without a host copy, held or in a slot, the best-ranked first (decayed LFU, ties to the lower key).
     [[nodiscard]] std::vector<std::uint32_t> ranked_without_copy() const;
     // A new ticket of this round for `key` (kNoTicket when the round has run out); resident when the
@@ -512,6 +564,9 @@ private:
     // The CSF compressions (Copy::Kind::kCompress), taken only when copies_ is empty: a fetch's copy never waits
     // behind a refill's compression.
     std::deque<Copy> compressions_;
+    // Record fills' copies, taken only when copies_ and compressions_ are empty, and how many have not finished.
+    std::deque<Copy> fills_;
+    std::uint32_t fills_left_ = 0;
     std::vector<std::uint64_t> copied_; // tags of finished copies
     std::vector<std::uint64_t> compressed_; // tags of finished compressions
     bool copy_stop_ = false;

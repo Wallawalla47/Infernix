@@ -10,6 +10,13 @@ infernix_add_test(infernix_prefix_cache_index_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_prefix_cache_index.cpp"
   LIBRARIES infernix_runtime_support)
 
+# The prefix cache's Host slab store over a real index and page-locked memory: its release and growth under RAM
+# pressure (a CUDA device; skips without one).
+infernix_add_test(infernix_host_slab_store_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_host_slab_store.cpp"
+  LIBRARIES infernix_runtime_support)
+set_tests_properties(infernix_host_slab_store_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # The prefix cache's SSD tier driver over a real index and scratch file (CPU and disk only).
 infernix_add_test(infernix_ssd_tier_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_ssd_tier.cpp"

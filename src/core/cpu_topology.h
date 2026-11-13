@@ -32,4 +32,9 @@ struct PhysicalCore {
 // mask (0 when unknown or when the change failed).
 std::uint64_t set_current_thread_cpus(std::uint64_t cpus) noexcept;
 
+// The logical CPUs of a hybrid CPU's slowest cores (its E-cores): where background threads run,
+// leaving the fast cores to the threads serving requests. 0 on a CPU of one class or without a
+// topology (set_current_thread_cpus then changes nothing).
+[[nodiscard]] std::uint64_t slow_core_cpus();
+
 } // namespace infernix

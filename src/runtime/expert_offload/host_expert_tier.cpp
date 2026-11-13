@@ -74,21 +74,9 @@ void pinned_release(void* p) { (void)cudaFreeHost(p); }
 // thread and the agent). Dense8's exclusive layout 0.986x against 0.980x with them unpinned, the tier holding every
 // expert 0.977x against 0.973x; IQ3_S unchanged (x_ab13, 2026-10-27). No change on a CPU of one class.
 void place_on_slow_cores() noexcept {
-    static const std::uint64_t slow = [] {
-        const std::vector<PhysicalCore> cores = physical_cores();
-        if (cores.empty()) { return std::uint64_t{0}; }
-        std::uint8_t lowest = 255, highest = 0;
-        for (const PhysicalCore& core : cores) {
-            lowest  = std::min(lowest, core.efficiency);
-            highest = std::max(highest, core.efficiency);
-        }
-        std::uint64_t mask = 0;
-        if (lowest != highest) {
-            for (const PhysicalCore& core : cores) { mask |= core.efficiency == lowest ? core.cpus : 0; }
-        }
-        return mask;
-    }();
-    if (slow != 0) { (void)set_current_thread_cpus(slow); }
+    try {
+        (void)set_current_thread_cpus(slow_core_cpus());
+    } catch (...) {} // no topology: unpinned
 }
 
 
@@ -445,6 +433,14 @@ HostExpertTier::~HostExpertTier() {
     copy_wake_.notify_all();
     for (auto& copier : copiers_) { copier.join(); }
     queue_.reset(); // cancels and waits for any read still in flight
+    // A growth that landed but was never linked: its chunks are released here (its job has run: the worker stops
+    // before the tier goes, or is waited for now).
+    if (growth_.valid()) {
+        try {
+            const Growth landed = growth_.get();
+            for (const auto& chunk : landed.chunks) { options_.release(chunk.second); }
+        } catch (...) {}
+    }
     // Nothing writes a slot any more: the chunks go back to the pool with what their slots hold.
     if (options_.pool) { return_to_pool(); }
 }
@@ -774,9 +770,11 @@ std::vector<std::uint32_t> HostExpertTier::ranked_without_copy() const {
     return ranked;
 }
 
-std::uint64_t HostExpertTier::shrink(std::uint64_t bytes) {
+std::uint64_t HostExpertTier::shrink(std::uint64_t bytes, HostMemoryWorker& worker) {
     if (round_open()) { throw std::logic_error("SSD tier: a RAM shrink with a round open"); }
+    if (growth_.valid()) { throw std::logic_error("SSD tier: a RAM shrink while a growth is under way"); }
     forget_kept();
+    settle_fills(); // their records and ring slots are settled before any is given back
     if (bytes == 0) { return 0; }
     // The last round's demands, fetches and their copies land first (a fetch's copy is a ticket in flight); then no
     // read or copy into a slot or a record is left but the stream's (into lent slots) and the refills' (shrink_order).
@@ -785,12 +783,12 @@ std::uint64_t HostExpertTier::shrink(std::uint64_t bytes) {
         std::lock_guard<std::mutex> lock(copy_mutex_);
         if (!copies_.empty() || !compressions_.empty()) { return 0; } // not provably quiet
     }
-    std::uint64_t released = shrink_unpinned(bytes);
-    if (released < bytes) { released += shrink_pinned(bytes - released); }
+    std::uint64_t released = shrink_unpinned(bytes, worker);
+    if (released < bytes) { released += shrink_pinned(bytes - released, worker); }
     return released;
 }
 
-std::uint64_t HostExpertTier::shrink_unpinned(std::uint64_t bytes) {
+std::uint64_t HostExpertTier::shrink_unpinned(std::uint64_t bytes, HostMemoryWorker& worker) {
     if (!unpinned_) { return 0; }
     const std::uint64_t record = store_.record_bytes();
     std::vector<std::uint32_t> given; // record indices
@@ -818,20 +816,28 @@ std::uint64_t HostExpertTier::shrink_unpinned(std::uint64_t bytes) {
             released += record;
         }
     }
-    // Neighbouring records are decommitted as one range.
+    // Neighbouring records are decommitted as one range, on the worker: nothing reads them any more (their keys left
+    // the records), and a later growth's commit of the same pages runs after it there.
     std::sort(given.begin(), given.end());
+    std::vector<std::pair<std::size_t, std::size_t>> ranges;
     for (std::size_t i = 0; i < given.size();) {
         std::size_t end = i + 1;
         while (end < given.size() && given[end] == given[end - 1] + 1) { ++end; }
-        unpinned_->decommit(static_cast<std::size_t>(given[i] * record), static_cast<std::size_t>((end - i) * record));
+        ranges.emplace_back(static_cast<std::size_t>(given[i] * record), static_cast<std::size_t>((end - i) * record));
         i = end;
+    }
+    if (!ranges.empty()) {
+        releases_.push_back(worker.post([buffer = unpinned_.get(), ranges = std::move(ranges)] {
+            for (const auto& [offset, length] : ranges) { buffer->decommit(offset, length); }
+        }));
     }
     unpinned_decommitted_.insert(unpinned_decommitted_.end(), given.begin(), given.end());
     return released;
 }
 
-std::uint64_t HostExpertTier::shrink_pinned(std::uint64_t bytes) {
+std::uint64_t HostExpertTier::shrink_pinned(std::uint64_t bytes, HostMemoryWorker& worker) {
     std::uint64_t released = 0;
+    std::vector<void*> memory;
     for (const std::size_t i : shrink_order()) {
         if (released >= bytes) { break; }
         Chunk& chunk               = pinned_.chunks[i];
@@ -841,7 +847,7 @@ std::uint64_t HostExpertTier::shrink_pinned(std::uint64_t bytes) {
         std::vector<std::uint32_t> slots(chunk.slots);
         for (std::uint32_t j = 0; j < chunk.slots; ++j) { slots[j] = first + j; }
         if (!tier_.retire(slots)) { continue; } // a pinned or lent slot, or no replacement for a list's
-        options_.release(chunk.memory);
+        memory.push_back(chunk.memory);
         chunk.memory = nullptr;
         for (std::uint32_t j = 0; j < chunk.slots; ++j) {
             slot_address_[first + j]                       = nullptr;
@@ -850,6 +856,13 @@ std::uint64_t HostExpertTier::shrink_pinned(std::uint64_t bytes) {
         pinned_.slots -= chunk.slots;
         pinned_.bytes -= chunk.bytes;
         released += chunk.bytes;
+    }
+    if (!memory.empty()) {
+        // The device has completed every kernel that read the slots (the caller's guarantee) and the next round reads
+        // the record table without them.
+        releases_.push_back(worker.post([release = options_.release, memory = std::move(memory)] {
+            for (void* p : memory) { release(p); }
+        }));
     }
     if (released > 0) {
         // The ring lost slots: the agent's copy follows (no round is open, so no ticket holds a ring slot).
@@ -861,18 +874,86 @@ std::uint64_t HostExpertTier::shrink_pinned(std::uint64_t bytes) {
     return released;
 }
 
-std::uint64_t HostExpertTier::grow(std::uint64_t bytes, const std::function<bool(std::uint32_t)>& skip) {
-    if (round_open()) { throw std::logic_error("SSD tier: a RAM growth with a round open"); }
-    forget_kept();
-    std::uint64_t grown = 0;
-    for (Chunk& chunk : pinned_.chunks) {
-        if (chunk.memory != nullptr || grown + chunk.bytes > bytes) { continue; }
-        auto* p = static_cast<std::byte*>(options_.allocate(static_cast<std::size_t>(chunk.bytes)));
-        if (p == nullptr) { break; } // the OS refuses to pin more now
-        if (reinterpret_cast<std::uintptr_t>(p) % DirectReadQueue::kAlignment != 0) {
-            options_.release(p);
-            throw std::runtime_error("SSD tier: expert slots must be 4 KiB-aligned");
+bool HostExpertTier::releasing() {
+    std::erase_if(releases_, [](std::future<void>& job) {
+        if (!ready(job)) { return false; }
+        job.get();
+        return true;
+    });
+    return !releases_.empty();
+}
+
+std::uint64_t HostExpertTier::begin_growth(std::uint64_t bytes, HostMemoryWorker& worker) {
+    if (growth_.valid()) { return 0; }
+    std::vector<std::pair<std::size_t, std::uint64_t>> chunks; // index, bytes
+    std::uint64_t asked = 0;
+    for (std::size_t i = 0; i < pinned_.chunks.size(); ++i) {
+        const Chunk& chunk = pinned_.chunks[i];
+        if (chunk.memory != nullptr || asked + chunk.bytes > bytes) { continue; }
+        chunks.emplace_back(i, chunk.bytes);
+        asked += chunk.bytes;
+    }
+    // Then the lowest decommitted records, neighbouring ones committed as one range.
+    struct Range {
+        std::size_t offset = 0, length = 0;
+        std::uint32_t records = 0;
+    };
+    std::vector<Range> ranges;
+    const std::uint64_t record = store_.record_bytes();
+    if (unpinned_ && !unpinned_decommitted_.empty() && asked < bytes) {
+        auto& gone = unpinned_decommitted_;
+        std::sort(gone.begin(), gone.end());
+        const auto take = static_cast<std::size_t>(std::min<std::uint64_t>(gone.size(), (bytes - asked) / record));
+        recommitting_.assign(gone.begin(), gone.begin() + static_cast<std::ptrdiff_t>(take));
+        gone.erase(gone.begin(), gone.begin() + static_cast<std::ptrdiff_t>(take));
+        for (std::size_t i = 0; i < take;) {
+            std::size_t end = i + 1;
+            while (end < take && recommitting_[end] == recommitting_[end - 1] + 1) { ++end; }
+            ranges.push_back({static_cast<std::size_t>(recommitting_[i] * record), static_cast<std::size_t>((end - i) * record),
+                              static_cast<std::uint32_t>(end - i)});
+            i = end;
         }
+        asked += take * record;
+    }
+    if (chunks.empty() && ranges.empty()) { return 0; }
+    growth_pins_chunks_ = !chunks.empty();
+    growth_ = worker.post([allocate = options_.allocate, release = options_.release, chunks = std::move(chunks),
+                           buffer = unpinned_.get(), ranges = std::move(ranges)] {
+        Growth out;
+        for (const auto& [index, length] : chunks) {
+            auto* p = static_cast<std::byte*>(allocate(static_cast<std::size_t>(length)));
+            if (p == nullptr) { break; } // the OS refuses to page-lock more now
+            if (reinterpret_cast<std::uintptr_t>(p) % DirectReadQueue::kAlignment != 0) {
+                release(p);
+                for (const auto& chunk : out.chunks) { release(chunk.second); } // none is linked
+                throw std::runtime_error("SSD tier: expert slots must be 4 KiB-aligned");
+            }
+            out.chunks.emplace_back(index, p);
+        }
+        for (const Range& range : ranges) {
+            if (!buffer->recommit(range.offset, range.length)) { break; } // the OS refuses to commit more now
+            out.records += range.records;
+        }
+        return out;
+    });
+    return asked;
+}
+
+std::uint64_t HostExpertTier::link_growth() {
+    if (!growth_.valid()) { return 0; }
+    if (round_open()) { throw std::logic_error("SSD tier: a RAM growth linked with a round open"); }
+    forget_kept();
+    Growth grown;
+    try {
+        grown = growth_.get();
+    } catch (...) {
+        unpinned_decommitted_.insert(unpinned_decommitted_.end(), recommitting_.begin(), recommitting_.end());
+        recommitting_.clear();
+        throw;
+    }
+    std::uint64_t linked = 0;
+    for (const auto& [index, p] : grown.chunks) {
+        Chunk& chunk              = pinned_.chunks[index];
         chunk.memory              = p;
         const std::uint64_t pitch = plan_.regions[chunk.region].pitch;
         const auto first          = static_cast<std::uint32_t>(chunk_base(chunk));
@@ -887,35 +968,32 @@ std::uint64_t HostExpertTier::grow(std::uint64_t bytes, const std::function<bool
         tier_.restore(slots);
         pinned_.slots += chunk.slots;
         pinned_.bytes += chunk.bytes;
-        grown += chunk.bytes;
+        linked += chunk.bytes;
     }
-    if (unpinned_ && !unpinned_decommitted_.empty()) {
-        // The lowest records first, neighbouring ones committed as one range, until the OS refuses.
-        const std::uint64_t record = store_.record_bytes();
-        auto& gone                 = unpinned_decommitted_;
-        std::sort(gone.begin(), gone.end());
-        const auto take = static_cast<std::size_t>(std::min<std::uint64_t>(gone.size(), (bytes - grown) / record));
-        std::size_t done = 0;
-        while (done < take) {
-            std::size_t end = done + 1;
-            while (end < take && gone[end] == gone[end - 1] + 1) { ++end; }
-            if (!unpinned_->recommit(static_cast<std::size_t>(gone[done] * record),
-                                     static_cast<std::size_t>((end - done) * record))) {
-                break;
-            }
-            done = end;
-        }
-        unpinned_free_.insert(unpinned_free_.end(), gone.begin(), gone.begin() + static_cast<std::ptrdiff_t>(done));
-        std::sort(unpinned_free_.begin(), unpinned_free_.end(), std::greater<>()); // the lowest is taken first
-        gone.erase(gone.begin(), gone.begin() + static_cast<std::ptrdiff_t>(done));
-        grown += done * record;
+    // The records committed again are free (the lowest taken first); the rest stay decommitted.
+    const auto committed = std::min<std::size_t>(grown.records, recommitting_.size());
+    unpinned_free_.insert(unpinned_free_.end(), recommitting_.begin(), recommitting_.begin() + static_cast<std::ptrdiff_t>(committed));
+    std::sort(unpinned_free_.begin(), unpinned_free_.end(), std::greater<>());
+    unpinned_decommitted_.insert(unpinned_decommitted_.end(), recommitting_.begin() + static_cast<std::ptrdiff_t>(committed),
+                                 recommitting_.end());
+    recommitting_.clear();
+    linked += committed * store_.record_bytes();
+    room_unfilled_ = room_unfilled_ || linked > 0;
+    return linked;
+}
+
+std::uint32_t HostExpertTier::fill_room(const std::function<bool(std::uint32_t)>& skip) {
+    if (!room_unfilled_) { return 0; }
+    if (round_open()) { throw std::logic_error("SSD tier: a RAM fill with a round open"); }
+    settle_fills();
+    room_unfilled_                          = false;
+    const std::vector<std::uint32_t> ranked = ranked_without_copy();
+    std::uint32_t filled                    = 0;
+    if (const auto jobs = slot_jobs(ranked, skip); !jobs.empty()) {
+        read_records(jobs);
+        filled += static_cast<std::uint32_t>(jobs.size());
     }
-    if (grown > 0) {
-        const std::vector<std::uint32_t> ranked = ranked_without_copy();
-        if (const auto jobs = slot_jobs(ranked, skip); !jobs.empty()) { read_records(jobs); }
-        (void)fill_unpinned(ranked, skip);
-    }
-    return grown;
+    return filled + fill_unpinned(ranked, skip);
 }
 
 std::uint64_t HostExpertTier::shrinkable_bytes() const {
@@ -945,6 +1023,12 @@ std::uint64_t HostExpertTier::growable_bytes() const noexcept {
     return bytes;
 }
 
+std::uint64_t HostExpertTier::retired_chunk_bytes() const noexcept {
+    std::uint64_t bytes = 0;
+    for (const Chunk& chunk : pinned_.chunks) { bytes += chunk.memory == nullptr ? chunk.bytes : 0; }
+    return bytes;
+}
+
 std::uint64_t HostExpertTier::largest_chunk_bytes() const noexcept {
     std::uint64_t bytes = 0;
     for (const Chunk& chunk : pinned_.chunks) { bytes = std::max(bytes, chunk.bytes); }
@@ -958,6 +1042,17 @@ void HostExpertTier::drain() {
 void HostExpertTier::begin_round(std::uint32_t allowance) {
     forget_kept(); // rounds reuse slots: what a reused chunk held is known only before the first
     drain();
+    // The record fills started at an earlier boundary: their keys are held now and their ring slots come back once
+    // their copies have finished (they run behind every other copy and nothing waits for them); otherwise they keep
+    // their slots another round, and only after kFillRounds boundaries does one wait for them (helping copy).
+    if (!fills_pending_.empty()) {
+        bool done = false;
+        {
+            std::lock_guard<std::mutex> lock(copy_mutex_);
+            done = fills_left_ == 0;
+        }
+        if (done || ++fill_rounds_ >= kFillRounds) { settle_fills(); }
+    }
     const std::uint32_t count = std::min(ticket_count_.load(std::memory_order_acquire), ticket_capacity_);
     std::vector<expert_cache::Landing> landings;
     for (std::uint32_t t = 0; t < count; ++t) {
@@ -985,6 +1080,7 @@ void HostExpertTier::begin_round(std::uint32_t allowance) {
         tier_.finish_copies();
         stats_.copied_admissions += batch.size();
     }
+    start_fills(landings, count); // what no slot admitted, into free unpinned records
     // The demotion list refills at every boundary (design §19.3.7 §4.8): without it the first 32
     // demotions used it up, after which every VRAM victim without a host copy was dropped to the
     // SSD and the eviction gate refused demotion-worthy victims outright (T6).
@@ -1007,13 +1103,86 @@ void HostExpertTier::begin_round(std::uint32_t allowance) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         ring_.clear();
-        for (const std::uint32_t s : tier_.ring()) { ring_.push_back({s, tier_.serial(s)}); }
+        for (const std::uint32_t s : tier_.ring()) {
+            // A record fill still copies from it: it sits this round out.
+            if (std::find(fill_slots_.begin(), fill_slots_.end(), s) != fill_slots_.end()) { continue; }
+            ring_.push_back({s, tier_.serial(s)});
+        }
         holding_.clear();
         ticket_count_.store(0, std::memory_order_release);
         ++round_;
         open_ = true;
     }
     wake_.notify_all();
+}
+
+void HostExpertTier::start_fills(std::span<const expert_cache::Landing> landings, std::uint32_t used) {
+    if (!unpinned_ || unpinned_free_.empty() || landings.empty() || used >= options_.ring || !fills_pending_.empty()) {
+        return; // one batch at a time: an unfinished one keeps its ring slots
+    }
+    std::vector<const expert_cache::Landing*> wanted;
+    for (const expert_cache::Landing& landing : landings) {
+        // Its ring slot still holds the record as read (current serial, expanded), and no slot or record holds the key.
+        if (tier_.host_copy(landing.key) || tier_.held(landing.key) || tier_.serial(landing.slot) != landing.serial ||
+            slot_compressed(landing.slot)) {
+            continue;
+        }
+        wanted.push_back(&landing);
+    }
+    std::stable_sort(wanted.begin(), wanted.end(), [&](const expert_cache::Landing* a, const expert_cache::Landing* b) {
+        return tier_.lfu().value(a->key) > tier_.lfu().value(b->key);
+    });
+    const std::size_t cap = std::min({wanted.size(), unpinned_free_.size(),
+                                      static_cast<std::size_t>(std::max<std::uint32_t>(1, options_.ring / 16)),
+                                      static_cast<std::size_t>((options_.ring - used) / 2U)});
+    if (cap == 0) { return; }
+    {
+        std::lock_guard<std::mutex> lock(copy_mutex_);
+        for (std::size_t i = 0; i < cap; ++i) {
+            const expert_cache::Landing& landing = *wanted[i];
+            const std::uint32_t record           = unpinned_free_.back();
+            unpinned_free_.pop_back();
+            fills_pending_.push_back({landing.key, record});
+            fill_slots_.push_back(landing.slot);
+            fills_.push_back({.destination = reinterpret_cast<std::uint8_t*>(unpinned_->data()) +
+                                             static_cast<std::size_t>(record) * store_.record_bytes(),
+                              .source      = slot_address_[landing.slot],
+                              .left        = &fills_left_,
+                              .bytes       = static_cast<std::size_t>(store_.record_bytes(landing.key / store_.experts())),
+                              .kind        = Copy::Kind::kStream});
+            ++fills_left_;
+        }
+    }
+    copy_wake_.notify_all();
+}
+
+void HostExpertTier::settle_fills() {
+    if (fills_pending_.empty()) { return; }
+    {
+        std::unique_lock<std::mutex> lock(copy_mutex_);
+        // Copies the threads have not started run here (normally every one finished during the round).
+        while (!fills_.empty()) {
+            const Copy copy = fills_.front();
+            fills_.pop_front();
+            lock.unlock();
+            finish_copy(copy);
+            lock.lock();
+        }
+        copy_done_.wait(lock, [&] { return fills_left_ == 0; });
+    }
+    for (const RecordFill& fill : fills_pending_) {
+        // A slot (an admission, a prefill) or another record (fill_room) may have taken the key meanwhile.
+        if (tier_.host_copy(fill.key) || !tier_.hold(fill.key)) {
+            unpinned_free_.push_back(fill.record);
+            continue;
+        }
+        unpinned_of_[fill.key] = static_cast<std::int32_t>(fill.record);
+        ++stats_.record_fills;
+    }
+    std::sort(unpinned_free_.begin(), unpinned_free_.end(), std::greater<>()); // the lowest is taken first
+    fills_pending_.clear();
+    fill_slots_.clear();
+    fill_rounds_ = 0;
 }
 
 void HostExpertTier::end_round() noexcept {
@@ -1203,6 +1372,9 @@ void HostExpertTier::finish_copy(const Copy& copy) {
     case Copy::Kind::kCopy:
         std::memcpy(copy.destination, copy.source, copy.bytes != 0 ? copy.bytes : store_.record_bytes());
         break;
+    case Copy::Kind::kStream:
+        copy_streaming(copy.destination, copy.source, copy.bytes != 0 ? copy.bytes : store_.record_bytes());
+        break;
     case Copy::Kind::kExpand:
         csf::expand_record(*options_.csf, copy.source,
                            reinterpret_cast<const std::uint32_t*>(copy.source + csf::slot_table_offset(csf_words_, csf_pitch_)),
@@ -1233,8 +1405,10 @@ void HostExpertTier::copier_main() noexcept {
         Copy copy;
         {
             std::unique_lock<std::mutex> lock(copy_mutex_);
-            copy_wake_.wait(lock, [&] { return copy_stop_ || !copies_.empty() || !compressions_.empty(); });
-            auto& queue = !copies_.empty() ? copies_ : compressions_;
+            copy_wake_.wait(lock,
+                            [&] { return copy_stop_ || !copies_.empty() || !compressions_.empty() || !fills_.empty(); });
+            // A fetch's copy first, then a refill's compression, then a record fill (nothing waits for one).
+            auto& queue = !copies_.empty() ? copies_ : !compressions_.empty() ? compressions_ : fills_;
             if (queue.empty()) { return; } // stopping
             copy = queue.front();
             queue.pop_front();

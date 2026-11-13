@@ -188,8 +188,9 @@ public:
     }
 
     // The Program resizes resources outside rounds (Qwen4Exp's expert cache, design §19.3.7; the RAM
-    // tiers under memory pressure, --ram-resize) by asking for maintain() through this waker; the idle
-    // worker runs it under the execution lock.
+    // tiers under memory pressure, --ram-resize) by asking for maintenance through this waker; the
+    // worker runs it under the execution lock, maintain() while idle and maintain_busy() before its
+    // next round while requests run.
     void request_maintenance() noexcept {
         {
             std::lock_guard lock(queue_mutex_);
@@ -2835,6 +2836,7 @@ private:
 
     void worker_loop() noexcept {
         for (;;) {
+            bool maintain_busy = false;
             {
                 std::unique_lock lock(queue_mutex_);
                 if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
@@ -2890,9 +2892,9 @@ private:
                         continue;
                     }
                 }
-                if (maintenance_requested_) {
-                    maintenance_requested_ = false; // rounds resize at their own boundaries
-                }
+                // Requests run: the Program resizes what follows its rounds at their own boundaries (the expert cache);
+                // what a waker asked for meanwhile (the RAM tiers) runs before this round (maintain_busy).
+                maintain_busy = std::exchange(maintenance_requested_, false);
                 if (stopping_) {
                     lock.unlock();
                     std::scoped_lock execution_lock(execution_mutex_);
@@ -2904,6 +2906,14 @@ private:
                 }
             }
             std::unique_lock execution_lock(execution_mutex_);
+            if (maintain_busy) {
+                try {
+                    instance_.program->maintain_busy();
+                } catch (const std::exception& error) {
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Warning, "RAM resize between rounds failed: %s",
+                                       error.what());
+                }
+            }
             bool executed   = false;
             worker_busy_at_ = Clock::now();
             if (const std::uint64_t fault = testing::memory_fault_request().load(std::memory_order_relaxed);

@@ -304,8 +304,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         planned->vram.weights_bytes = plan.device_bytes();
         planned->vram.planned_bytes = planned->vram.weights_bytes;
     }
-    // --host-context-mib auto: the prefix cache's Host tier is sized after the experts and the n-gram table.
-    const bool prefix_auto     = options.context_cache.enabled && options.context_cache.host_capacity_auto;
+    // --host-context-mib auto (the size unset, the default): the prefix cache's Host tier is sized after the experts
+    // and the n-gram table.
+    const bool prefix_auto     = options.context_cache.enabled && !options.context_cache.host_capacity_bytes;
     std::uint64_t prefix_bytes = options.context_cache.enabled && !prefix_auto ? options.context_cache.host_capacity_bytes.value() : 0;
     auto demand = expert_ram_demand(
         options, {.expert_banks = plan.pinned_expert_bytes(), .other_pinned = plan.pinned_other_bytes()}, prefix_bytes,
@@ -330,7 +331,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                "n-gram table: " + name(table.format) + " rows from " + volume.string() + " in place of the artifact's " +
                    name(own.format) + " table");
     }
-    demand.pageable = models::qwen4_exp::NgramVolume::cache_bytes(table);
+    // The n-gram row cache (a table read from its volume) and the frontend's caches grow after planning.
+    demand.pageable = models::qwen4_exp::NgramVolume::cache_bytes(table) + frontend_cache_bytes(options);
 
     models::qwen4_exp::ProgramOptions program_options;
     program_options.max_context     = options.max_context;
@@ -518,7 +520,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     bool ngram_in_ram = false;
     if (options.ngram_residency != NgramResidency::Volume) {
         auto with_table           = demand;
-        with_table.pageable       = models::qwen4_exp::NgramVolume::resident_bytes(table); // in place of the row cache
+        with_table.pageable       = models::qwen4_exp::NgramVolume::resident_bytes(table) + // in place of the row cache
+                              frontend_cache_bytes(options);
         const auto without        = expert_offload::plan_host_memory(snapshot, demand);
         const auto trial          = expert_offload::plan_host_memory(snapshot, with_table);
         const bool experts_kept   = demand.expert_cap ? trial.expert_ram >= without.expert_ram
@@ -537,9 +540,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                              : options.ngram_residency == NgramResidency::Volume
                                    ? "read from its volume"
                                    : "read from its volume (the RAM ledger keeps the experts resident first)"));
-    // --host-context-mib auto: the Host tier from what the experts and the table leave beyond --ram-free-mib.
+    // --host-context-mib auto: the Host tier takes what the experts, the table and the rest of the plan leave beyond
+    // --ram-free-mib (expert_memory.h).
     if (prefix_auto) {
-        prefix_bytes        = auto_host_context_bytes(ledger_left_bytes(expert_offload::plan_host_memory(snapshot, demand)));
+        prefix_bytes        = auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
         demand.prefix_cache = prefix_bytes;
     }
     if (cache.enabled) {
@@ -593,8 +597,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         // The plan in one line, and with each choice's reason at Debug (candidates §22: compare with
         // Basalt's and Strata's totals).
         constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
-        const double other_gib =
-            static_cast<double>(ram.ledger.planned - demand.pageable * (ngram_in_ram ? 1 : 0) - demand.prefix_cache) / kGiB;
+        const std::uint64_t table_in_ram = ngram_in_ram ? models::qwen4_exp::NgramVolume::resident_bytes(table) : 0U;
+        const double other_gib = static_cast<double>(ram.ledger.planned - table_in_ram - demand.prefix_cache) / kGiB;
         const double free_gib = static_cast<double>(ledger_left_bytes(ram.ledger) + demand.reserve) / kGiB;
         char table_text[64] = "read from its volume";
         if (ngram_in_ram) {
@@ -767,7 +771,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program =
         std::make_unique<models::qwen4_exp::Program>(instance->parameters, device, std::move(program_options));
-    if (options.ram_resize) { instance->program->start_ram_resize(options.ram_free_bytes); }
+    if (options.ram_resize) { instance->program->start_ram_resize(options.ram_free_bytes, prefix_auto); }
     const auto& sizing = instance->program->vram_sizing();
     const std::uint64_t frames_bytes =
         static_cast<std::uint64_t>(sizing.frames) * device_plan.expert_frame_bytes;

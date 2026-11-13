@@ -222,9 +222,12 @@ Defaults per family (README "Recommended settings per model"):
 |---|---|
 | all | `--max-concurrency 2 --kv-dtype int8 --preserve-thinking --tolerant-tool-calls --pending-timeout-ms 900000`, and `--spec auto --draft-tokens auto` when a drafter is available |
 | Qwen3.8-Flash-Next | `--max-context 262144 --lm-head-draft`, the best DFlash2 drafter found (`--draft-model`) and n-gram volume (`--ngram-volume`, unless `<artifact>.ngram` exists) |
-| Qwen3.8-27B | `--lm-head-draft --ngram-draft-tokens auto --prefill-chunk 4096`, `--host-context-mib` 55 % of RAM up to 52000, and the `--max-context` that fits beside the artifact in the GPU's memory (below) |
+| Qwen3.8-27B | `--lm-head-draft --ngram-draft-tokens auto --prefill-chunk 4096`, and the `--max-context` that fits beside the artifact in the GPU's memory (below) |
 | Qwen3.6-27B, Qwen3.6-35B-A3B | `--lm-head-draft` where the artifact has a proposal head; the 27B's context as for Qwen3.8-27B |
-| Qwen3.5-122B-A10B | `--max-context 262144 --host-context-mib 4096` (the experts take the RAM) |
+| Qwen3.5-122B-A10B | `--max-context 262144` |
+
+No family sets `--host-context-mib`: `infernix-serve`'s default (`auto`) gives the Host prefix cache all the RAM
+the model and its experts leave beyond `--ram-free-mib` ([serving guide](serving.md)).
 
 A 27B keeps all of its KV cache on the GPU, so its context is what the GPU holds beside the
 weights: the launcher reckons 2.03 GB plus 33,792 bytes per token of context (measured with INT8 KV,

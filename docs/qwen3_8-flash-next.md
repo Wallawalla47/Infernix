@@ -43,9 +43,10 @@ with `--expert-stripe` in the SSD tier.
   8192, today's default; MTP 4 at 4K + 512 measured 36.3-43.5, 40.4-40.9 and 39.6-39.7 (two runs
   each; how much RAM is free at startup moves it as much as the setting does). On a machine that
   runs little else, `--ram-free-mib 2048` gives that artifact its speed back. When other programs
-  later take the RAM (less than 2 GiB available), `--ram-resize auto` (the default) gives some back
-  between requests, the prefix cache's Host tier first and then the SSD tier's expert copies (those
-  experts are read from the artifact meanwhile), and takes it back once the reserve is free again
+  later take the RAM (less than half the reserve available, at least 2 GiB), `--ram-resize auto`
+  (the default) gives some back, while requests run as well as between them, the prefix cache's
+  Host tier first and then the SSD tier's expert copies (those experts are read from the artifact
+  meanwhile), and takes it back once the reserve plus 1 GiB is free again
   ([serving](serving.md#server-options)); `--ram-resize off` keeps every startup size.
 - **VRAM.** All of it: the expert cache takes what the dense weights, the KV cache, the
   workspaces and a reserve for CUDA graphs leave, less a headroom for the display and other
@@ -687,8 +688,9 @@ conversation's next turn resumes from a snapshot of the model state and prefills
 tokens; KV blocks are shared across requests. `infernix` (one request) runs without it.
 
 - **Host RAM.** Snapshots (116 MB each) and KV blocks live in one pinned Host pool,
-  `--host-context-mib` (default 8192, must be positive; it comes out of the RAM the automatic
-  `--expert-ram-mib` and `--expert-pin-mib` leave the experts). It is pinned at startup and counted in the
+  `--host-context-mib` (default `auto`: all the RAM the experts, the n-gram table and the rest of the plan
+  leave beyond `--ram-free-mib`, at least 1 GiB; a number must be positive and is set aside before the
+  experts, which then take what the automatic `--expert-ram-mib` and `--expert-pin-mib` leave). It is pinned at startup and counted in the
   RAM ledger (`prefix cache` in the ledger line that `--log-level debug` prints). `--no-prefix-reuse` turns the cache off and frees
   that RAM for the experts.
 - **Snapshots.** Each turn leaves one at the generation opener (the assistant turn's start) and one

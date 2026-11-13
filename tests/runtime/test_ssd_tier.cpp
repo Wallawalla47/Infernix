@@ -47,9 +47,6 @@ public:
     Backend() : memory(static_cast<std::byte*>(::operator new(kSlabBytes * kHostSlabs, std::align_val_t{4096}))) {}
     ~Backend() override { ::operator delete(memory, std::align_val_t{4096}); }
     void release_device_block(std::uint32_t) noexcept override {}
-    void move_host_slab(std::uint32_t from, std::uint32_t to) noexcept override {
-        std::memcpy(slab(to), slab(from), kSlabBytes);
-    }
     std::byte* slab(std::uint32_t id) const { return memory + static_cast<std::size_t>(id) * kSlabBytes; }
     std::byte* memory = nullptr;
     std::uint32_t next = 1;

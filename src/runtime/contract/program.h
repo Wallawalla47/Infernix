@@ -24,9 +24,11 @@ concept EngineProgramContract = requires(typename Types::Program& program, const
     // Recovery from a RecoverableExecutionError (or a stall, YJ-02): the Program discards the failed
     // requests' state and keeps serving; false when it could not.
     { program.recover_after_failure() } -> std::same_as<bool>;
-    // The resize of resources outside rounds: the Program asks for maintain() through the waker and the
-    // idle worker runs it under the execution lock.
+    // The resize of resources outside rounds: the Program asks for maintenance through the waker and the
+    // worker runs it under the execution lock, maintain() while idle and maintain_busy() between rounds
+    // while requests run (the RAM tiers' resize, which must not wait for an idle moment).
     program.maintain();
+    program.maintain_busy();
     program.set_maintenance_waker(std::function<void()>{});
     // The logical CPUs the round thread runs on (0: unpinned).
     { view.engine_thread_cpus() } -> std::convertible_to<std::uint64_t>;

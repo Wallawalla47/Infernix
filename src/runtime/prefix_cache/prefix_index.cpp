@@ -52,7 +52,9 @@ PrefixCacheIndex::PrefixCacheIndex(const PrefixIndexConfig& config, PrefixIndexB
     free_slabs_.resize(config.host_slabs);
     for (std::uint32_t i = 0; i < config.host_slabs; ++i) { free_slabs_[i] = i; }
     host_limit_ = config.host_slabs;
+    ceiling_    = config.host_slabs;
     slab_reserved_.assign(config.host_slabs, false);
+    slab_moving_.assign(config.host_slabs, false);
     // Ascending ids already form a min-heap.
     free_ssd_slabs_.resize(config.ssd_slabs);
     for (std::uint32_t i = 0; i < config.ssd_slabs; ++i) { free_ssd_slabs_[i] = i; }
@@ -997,6 +999,10 @@ std::uint32_t PrefixCacheIndex::evict_device_entries(std::uint32_t blocks, bool 
 // ---- host residency ---------------------------------------------------------------------------
 
 void PrefixCacheIndex::free_slab(std::uint32_t slab) {
+    if (slab >= ceiling_) { // retired by the shrink under way
+        --past_in_use_;
+        return;
+    }
     free_slabs_.push_back(slab);
     std::push_heap(free_slabs_.begin(), free_slabs_.end(), std::greater<>{});
 }
@@ -1078,7 +1084,7 @@ bool PrefixCacheIndex::evict_for_slabs(std::uint32_t protect_snapshot, double cl
 bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
                                       std::uint32_t protect_snapshot, double claim) {
     out.clear();
-    if (count > host_limit_) { return false; }
+    if (count > ceiling_) { return false; }
     while (free_slabs_.size() < count) {
         if (!evict_for_slabs(protect_snapshot, claim)) { return false; }
     }
@@ -1090,68 +1096,162 @@ bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint
     return true;
 }
 
-std::uint32_t PrefixCacheIndex::shrink_host(std::uint32_t limit) {
-    limit = std::min(limit, host_limit_);
-    while (host_limit_ - free_slabs_.size() > limit) {
-        if (!evict_for_slabs(kNoId, std::numeric_limits<double>::infinity())) { break; }
-    }
-    // The owned and reserved slabs fit below `reached`. A reservation's, a filling copy's or a pinned entry's slab
-    // stays put (a transfer may write or read it), so the limit stays above it.
-    std::uint32_t reached = std::max(limit, host_limit_ - static_cast<std::uint32_t>(free_slabs_.size()));
-    for (std::uint32_t slab = reached; slab < host_limit_; ++slab) {
-        if (slab_reserved_[slab]) { reached = slab + 1U; }
-    }
-    for (const Node& node : nodes_) {
-        if (node.occupied && node.host != CopyState::Absent &&
-            (node.host == CopyState::Filling || held(node))) {
-            reached = std::max(reached, node.host_slab + 1U);
+std::uint32_t PrefixCacheIndex::begin_host_shrink(std::uint32_t limit, std::uint32_t granule) {
+    if (host_shrinking()) { throw std::logic_error("prefix cache host shrink is already under way"); }
+    granule          = std::max(granule, 1U);
+    limit            = std::min(limit, host_limit_);
+    const auto round = [&](std::uint64_t slabs) {
+        return static_cast<std::uint32_t>(std::min<std::uint64_t>(host_limit_, (slabs + granule - 1U) / granule * granule));
+    };
+    // One pass (this may run between rounds): what no eviction frees (reservations, copies being filled, held entries:
+    // pinned, I/O-pinned or queue-held), the slabs a transfer reads or writes now (reservations, filling copies,
+    // I/O-pinned entries: the ceiling stays above them, so the shrink never waits for one), so nothing is evicted for a
+    // shrink that cannot happen, and the nodes holding a slab at or past `limit` (the ceiling never lies below it).
+    std::uint64_t kept    = 0;
+    std::uint32_t blocked = 0;
+    for (std::uint32_t slab = 0; slab < host_limit_; ++slab) {
+        if (slab_reserved_[slab]) {
+            ++kept;
+            blocked = slab + 1U;
         }
+    }
+    std::vector<std::uint32_t> past;
+    for (std::uint32_t index = 0; index < nodes_.size(); ++index) {
+        const Node& node = nodes_[index];
+        if (!node.occupied || node.host == CopyState::Absent) { continue; }
+        kept += node.host == CopyState::Filling || held(node) ? 1U : 0U;
+        if (node.host == CopyState::Filling || node.io_pins != 0) { blocked = std::max(blocked, node.host_slab + 1U); }
+        if (node.host_slab >= limit) { past.push_back(index); }
     }
     for (const Snapshot& snapshot : snapshots_) {
-        if (!snapshot.occupied || snapshot.host == CopyState::Absent ||
-            (snapshot.host != CopyState::Filling && !held(snapshot))) {
+        if (!snapshot.occupied || snapshot.host == CopyState::Absent) { continue; }
+        if (snapshot.host == CopyState::Filling || held(snapshot) || snapshot.hold != kNoHold) {
+            kept += snapshot.host_slabs.size();
+        }
+        if (snapshot.host == CopyState::Filling || snapshot.io_pins != 0) {
+            for (const std::uint32_t slab : snapshot.host_slabs) { blocked = std::max(blocked, slab + 1U); }
+        }
+    }
+    const std::uint32_t target = round(std::max<std::uint64_t>({limit, kept, blocked}));
+    if (target >= host_limit_) { return host_limit_; }
+    const auto in_use = [this] { return host_limit_ - static_cast<std::uint32_t>(free_slabs_.size()); };
+    while (in_use() > target) {
+        if (!evict_for_slabs(kNoId, std::numeric_limits<double>::infinity())) { break; }
+    }
+    const std::uint32_t ceiling = round(std::max(target, in_use()));
+    if (ceiling >= host_limit_) { return host_limit_; }
+    ceiling_                  = ceiling;
+    const std::size_t free_before = free_slabs_.size();
+    std::erase_if(free_slabs_, [this](std::uint32_t slab) { return slab >= ceiling_; });
+    std::make_heap(free_slabs_.begin(), free_slabs_.end(), std::greater<>{});
+    past_in_use_  = (host_limit_ - ceiling_) - static_cast<std::uint32_t>(free_before - free_slabs_.size());
+    shrink_nodes_ = std::move(past);
+    return ceiling_;
+}
+
+std::vector<PrefixCacheIndex::HostMove> PrefixCacheIndex::plan_host_moves() {
+    std::vector<HostMove> out;
+    if (!host_shrinking()) { return out; }
+    // Dead KV past the ceiling (no snapshot resumes through it) goes rather than moves: allocation evicts it first.
+    for (const std::uint32_t index : shrink_nodes_) {
+        const Node& node = nodes_[index];
+        if (!node.occupied || !node.in_dead || node.host != CopyState::Resident || node.host_slab < ceiling_ ||
+            held(node)) {
             continue;
         }
-        for (const std::uint32_t slab : snapshot.host_slabs) { reached = std::max(reached, slab + 1U); }
+        ++counters_.host_dead_reclaims;
+        if (node.device == CopyState::Absent) {
+            remove_subtree(index); // its subtree is dead and unpinned too
+        } else {
+            drop_node_host_copy(index);
+            if (nodes_[index].ssd == CopyState::Resident) { drop_node_ssd_copy(index); }
+        }
     }
-    // Free slabs below `reached` take the owned ones at or past it, lowest first.
-    std::vector<std::uint32_t> low;
-    for (const std::uint32_t slab : free_slabs_) {
-        if (slab < reached) { low.push_back(slab); }
-    }
-    std::sort(low.begin(), low.end());
-    std::size_t next = 0;
-    const auto move = [&](std::uint32_t& slab) {
-        if (slab < reached) { return; }
-        if (next == low.size()) { invariant("prefix cache host shrink found no free slab below its limit"); }
-        backend_->move_host_slab(slab, low[next]);
-        slab = low[next++];
+    std::erase_if(shrink_nodes_, [this](std::uint32_t index) {
+        const Node& node = nodes_[index];
+        return !node.occupied || node.host == CopyState::Absent || node.host_slab < ceiling_;
+    });
+    std::vector<PendingHostMove> wanted;
+    const auto collect = [&] {
+        wanted.clear();
+        for (const std::uint32_t index : shrink_nodes_) {
+            const Node& node = nodes_[index];
+            if (node.occupied && node.host == CopyState::Resident && node.io_pins == 0 && node.host_slab >= ceiling_ &&
+                !slab_moving_[node.host_slab]) {
+                wanted.push_back({.snapshot = false, .entry = index, .position = 0, .from = node.host_slab});
+            }
+        }
+        for (std::uint32_t index = 0; index < snapshots_.size(); ++index) {
+            const Snapshot& snapshot = snapshots_[index];
+            if (!snapshot.occupied || snapshot.host != CopyState::Resident || snapshot.io_pins != 0) { continue; }
+            for (std::uint32_t k = 0; k < snapshot.host_slabs.size(); ++k) {
+                const std::uint32_t slab = snapshot.host_slabs[k];
+                if (slab >= ceiling_ && !slab_moving_[slab]) {
+                    wanted.push_back({.snapshot = true, .entry = index, .position = k, .from = slab});
+                }
+            }
+        }
     };
-    for (Node& node : nodes_) {
-        if (node.occupied && node.host == CopyState::Resident && !held(node)) { move(node.host_slab); }
+    collect();
+    // Allocations since begin_host_shrink may have taken the room below the ceiling: they evict as theirs would.
+    while (free_slabs_.size() < wanted.size()) {
+        if (!evict_for_slabs(kNoId, std::numeric_limits<double>::infinity())) { break; }
+        collect();
     }
-    for (Snapshot& snapshot : snapshots_) {
-        if (!snapshot.occupied || snapshot.host != CopyState::Resident || held(snapshot)) { continue; }
-        for (std::uint32_t& slab : snapshot.host_slabs) { move(slab); }
+    std::vector<std::uint32_t> to;
+    for (PendingHostMove move : wanted) {
+        if (!take_free_slabs(1, to)) { break; } // the rest at a later call
+        move.to                 = to.front();
+        slab_moving_[move.from] = true;
+        host_moves_.push_back(move);
+        out.push_back({move.from, move.to});
     }
-    // The free list keeps what is below `reached` and was not taken.
-    std::vector<bool> taken(reached, false);
-    for (std::size_t i = 0; i < next; ++i) { taken[low[i]] = true; }
-    std::vector<std::uint32_t> kept;
-    kept.reserve(free_slabs_.size());
-    for (const std::uint32_t slab : free_slabs_) {
-        if (slab < reached && !taken[slab]) { kept.push_back(slab); }
+    return out;
+}
+
+std::uint32_t* PrefixCacheIndex::host_move_holder(const PendingHostMove& move) noexcept {
+    if (move.snapshot) {
+        Snapshot& snapshot = snapshots_[move.entry];
+        return snapshot.occupied && snapshot.host == CopyState::Resident && move.position < snapshot.host_slabs.size() &&
+                       snapshot.host_slabs[move.position] == move.from
+                   ? &snapshot.host_slabs[move.position]
+                   : nullptr;
     }
-    free_slabs_ = std::move(kept);
-    std::make_heap(free_slabs_.begin(), free_slabs_.end(), std::greater<>{});
-    host_limit_ = reached;
-    return reached;
+    Node& node = nodes_[move.entry];
+    return node.occupied && node.host == CopyState::Resident && node.host_slab == move.from ? &node.host_slab : nullptr;
+}
+
+bool PrefixCacheIndex::commit_host_moves() {
+    std::erase_if(host_moves_, [this](const PendingHostMove& move) {
+        if (std::uint32_t* holder = host_move_holder(move)) {
+            const std::uint32_t io_pins = move.snapshot ? snapshots_[move.entry].io_pins : nodes_[move.entry].io_pins;
+            if (io_pins != 0) { return false; } // an SSD job reads it now: a later call
+            *holder = move.to;                  // `from`, past the ceiling, is retired
+            --past_in_use_;
+        } else {
+            free_slab(move.to); // evicted or dropped meanwhile; its `from` retired then
+        }
+        slab_moving_[move.from] = false;
+        return true;
+    });
+    return host_moves_.empty();
+}
+
+bool PrefixCacheIndex::finish_host_shrink() {
+    if (!host_shrinking()) { return true; }
+    if (!host_moves_.empty() || past_in_use_ != 0) { return false; }
+    host_limit_ = ceiling_;
+    std::vector<std::uint32_t>().swap(shrink_nodes_);
+    return true;
 }
 
 void PrefixCacheIndex::grow_host(std::uint32_t limit) {
-    limit = std::min(limit, config_.host_slabs);
-    for (std::uint32_t slab = host_limit_; slab < limit; ++slab) { free_slab(slab); }
-    host_limit_ = std::max(host_limit_, limit);
+    if (host_shrinking()) { throw std::logic_error("prefix cache host growth during a shrink"); }
+    limit                     = std::min(limit, config_.host_slabs);
+    const std::uint32_t first = host_limit_;
+    host_limit_               = std::max(host_limit_, limit);
+    ceiling_                  = host_limit_;
+    for (std::uint32_t slab = first; slab < limit; ++slab) { free_slab(slab); }
 }
 
 // ---- SSD tier ----------------------------------------------------------------------------------
@@ -2859,14 +2959,33 @@ void PrefixCacheIndex::check_invariants() const {
     for (std::uint32_t slab = 0; slab < ssd_uses.size(); ++slab) {
         if (ssd_uses[slab] != 1U) { invariant("SSD slab is leaked or shared"); }
     }
-    for (const std::uint32_t slab : free_slabs_) { ++slab_uses[slab]; }
-    // Free + owned + reserved = every slab in service, each exactly once; a retired slab holds nothing.
+    for (const std::uint32_t slab : free_slabs_) {
+        if (slab >= ceiling_) { invariant("free host slab past the shrink ceiling"); }
+        ++slab_uses[slab];
+    }
+    // Free + owned + reserved + planned move destinations = every slab in service below the shrink ceiling, each
+    // exactly once; past the ceiling a slab is in use at most once (until it moves or is freed, it retires); a retired
+    // slab holds nothing.
     for (std::uint32_t slab = 0; slab < slab_reserved_.size(); ++slab) {
         if (slab_reserved_[slab]) { ++slab_uses[slab]; }
     }
-    for (std::uint32_t slab = 0; slab < slab_uses.size(); ++slab) {
-        if (slab_uses[slab] != (slab < host_limit_ ? 1U : 0U)) { invariant("host slab is leaked or shared"); }
+    std::uint32_t moving = 0;
+    for (const PendingHostMove& move : host_moves_) {
+        if (move.to >= ceiling_ || move.from < ceiling_ || !slab_moving_[move.from]) {
+            invariant("planned host move is inconsistent");
+        }
+        ++slab_uses[move.to];
     }
+    for (std::uint32_t slab = 0; slab < slab_moving_.size(); ++slab) { moving += slab_moving_[slab] ? 1U : 0U; }
+    if (moving != host_moves_.size()) { invariant("planned host moves and moving slabs differ"); }
+    if (ceiling_ > host_limit_) { invariant("host shrink ceiling past the limit"); }
+    std::uint32_t past_in_use = 0;
+    for (std::uint32_t slab = 0; slab < slab_uses.size(); ++slab) {
+        const bool ok = slab < ceiling_ ? slab_uses[slab] == 1U : slab < host_limit_ ? slab_uses[slab] <= 1U : slab_uses[slab] == 0U;
+        if (!ok) { invariant("host slab is leaked or shared"); }
+        past_in_use += slab >= ceiling_ && slab < host_limit_ && slab_uses[slab] == 1U ? 1U : 0U;
+    }
+    if (host_shrinking() && past_in_use != past_in_use_) { invariant("host slabs in use past the shrink ceiling miscounted"); }
     std::array<std::uint32_t, 2> kinds{};
     for (std::size_t list = 0; list < kLruLists; ++list) {
         std::uint32_t counted = 0;

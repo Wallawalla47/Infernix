@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -25,7 +27,36 @@
 #include <string>
 #endif
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <emmintrin.h>
+#endif
+
 namespace infernix {
+
+void copy_streaming(void* destination, const void* source, std::size_t bytes) noexcept {
+#if defined(_M_X64) || defined(__x86_64__)
+    const auto to = reinterpret_cast<std::uintptr_t>(destination), from = reinterpret_cast<std::uintptr_t>(source);
+    if (((to | from | bytes) & 15U) == 0) {
+        auto* out          = static_cast<__m128i*>(destination);
+        const auto* in     = static_cast<const __m128i*>(source);
+        const std::size_t n = bytes / 16U;
+        std::size_t i       = 0;
+        for (; i + 4U <= n; i += 4U) { // a 64-byte line per step: the write-combining buffer fills whole
+            const __m128i a = _mm_load_si128(in + i), b = _mm_load_si128(in + i + 1U);
+            const __m128i c = _mm_load_si128(in + i + 2U), d = _mm_load_si128(in + i + 3U);
+            _mm_stream_si128(out + i, a);
+            _mm_stream_si128(out + i + 1U, b);
+            _mm_stream_si128(out + i + 2U, c);
+            _mm_stream_si128(out + i + 3U, d);
+        }
+        for (; i < n; ++i) { _mm_stream_si128(out + i, _mm_load_si128(in + i)); }
+        _mm_sfence(); // the streamed stores are visible before whatever the caller publishes next
+        return;
+    }
+#endif
+    std::memcpy(destination, source, bytes);
+}
+
 namespace {
 
 std::atomic<std::size_t>& refused_registrations() {
