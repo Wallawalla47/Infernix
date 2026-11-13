@@ -21,6 +21,7 @@
 #include "launcher/telemetry.h"
 #include "launcher/updates.h"
 #include "launcher/usage.h"
+#include "launcher/util.h"
 
 #include <algorithm>
 #include <atomic>
@@ -39,6 +40,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <csignal>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -916,6 +921,88 @@ void test_gpu_order() {
 }
 
 // /v1/models carries its page under data and again as a top-level models (Codex CLI's catalog).
+#ifdef __linux__
+// Whether `pid` is a running process (a zombie, killed and not yet reaped, is not).
+bool running(pid_t pid) {
+    std::ifstream stat("/proc/" + std::to_string(pid) + "/stat");
+    std::string line;
+    if (!std::getline(stat, line)) { return false; }
+    const std::size_t close = line.rfind(')');
+    return close != std::string::npos && close + 2 < line.size() && line[close + 2] != 'Z' && line[close + 2] != 'X';
+}
+
+// --hold-child FD: the stand-in launcher of test_child_ends_with_launcher. Starts `sleep 300` from a thread that
+// then ends, writes the child's pid to FD and waits to be killed.
+int hold_child(int fd) {
+    std::unique_ptr<ChildProcess> child;
+    std::thread([&] { child = ChildProcess::start("/bin/sleep", {"300"}, {}, {}); }).join();
+    const pid_t pid = static_cast<pid_t>(child->pid());
+    if (write(fd, &pid, sizeof(pid)) != static_cast<ssize_t>(sizeof(pid))) { return 1; }
+    for (;;) { pause(); }
+}
+
+// A server ends with the launcher, even one killed by SIGKILL (Windows: the job object), and not with the
+// thread that started it (PR_SET_PDEATHSIG follows the forking thread: ChildProcess forks from one that lives as
+// long as the launcher).
+void test_child_ends_with_launcher() {
+    {
+        std::unique_ptr<ChildProcess> child;
+        std::thread([&] { child = ChildProcess::start("/bin/sleep", {"30"}, {}, {}); }).join();
+        std::this_thread::sleep_for(300ms);
+        check(!child->exit_code() && running(static_cast<pid_t>(child->pid())),
+              "a child outlives the thread that started it");
+        child->kill();
+        check(child->wait_for(5s), "a killed child ends");
+    }
+    int fds[2];
+    if (pipe(fds) != 0) {
+        check(false, "a pipe to the stand-in launcher");
+        return;
+    }
+    const pid_t launcher = fork();
+    if (launcher == 0) {
+        close(fds[0]);
+        const std::string fd = std::to_string(fds[1]);
+        execl("/proc/self/exe", "test_launcher", "--hold-child", fd.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    close(fds[1]);
+    pid_t held = -1;
+    const bool started = read(fds[0], &held, sizeof(held)) == static_cast<ssize_t>(sizeof(held)) && held > 0;
+    close(fds[0]);
+    check(started && running(held), "the stand-in launcher's child runs");
+    ::kill(launcher, SIGKILL);
+    int raw = 0;
+    waitpid(launcher, &raw, 0);
+    bool ended = !started;
+    for (int poll = 0; poll < 100 && !ended; ++poll) {
+        ended = !running(held);
+        if (!ended) { std::this_thread::sleep_for(50ms); }
+    }
+    check(started && ended, "a child ends with a launcher killed by SIGKILL");
+}
+#endif
+
+// A client body nested past kMaxJsonNesting is refused before the launcher builds a DOM it would
+// serialize or copy recursively; brackets inside strings do not count.
+void test_json_nesting() {
+    const auto nested = [](std::size_t depth) { return std::string(depth, '[') + std::string(depth, ']'); };
+    check(json_text_nesting(R"({"a":[1,{"b":"[[[{{{"}],"c":"\"]"})") == 3, "nesting counts arrays and objects, not string text");
+    check(json_text_nesting("") == 0 && json_text_nesting("\"[\"") == 0, "a scalar has no nesting");
+    const Json deepest = parse_client_json(nested(kMaxJsonNesting));
+    check(deepest.dump() == nested(kMaxJsonNesting), "a body at the bound parses and serializes");
+    bool refused = false;
+    try {
+        (void)parse_client_json(nested(kMaxJsonNesting + 1));
+    } catch (const std::invalid_argument&) { refused = true; }
+    check(refused, "a body past the bound is refused");
+    refused = false;
+    try {
+        (void)parse_client_json(R"({"a": )");
+    } catch (const Json::exception&) { refused = true; }
+    check(refused, "malformed JSON still fails as a parse error");
+}
+
 void test_models_list_body() {
     const Json page = Json::array({Json{{"id", "a"}, {"object", "model"}}, Json{{"id", "b"}, {"object", "model"}}});
     const Json body = models_list_body(page, true);
@@ -929,9 +1016,17 @@ void test_models_list_body() {
           "an empty models list");
 }
 
-int main() {
+int main(int argc, char** argv) {
+#ifdef __linux__
+    if (argc == 3 && std::string(argv[1]) == "--hold-child") { return hold_child(std::stoi(argv[2])); }
+    test_child_ends_with_launcher();
+#else
+    (void)argc;
+    (void)argv;
+#endif
     test_gpu_order();
     test_models_list_body();
+    test_json_nesting();
     test_args();
     test_blob_ids();
     test_chats();

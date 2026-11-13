@@ -3,7 +3,8 @@
 // A child process whose stdout and stderr arrive, merged, through one pipe. Windows: its own
 // process group sharing the launcher's console (so CTRL_BREAK_EVENT reaches it alone), only the
 // pipe handles inherited, and a job object that ends it if the launcher dies. POSIX: its own
-// session, stopped with SIGTERM to the group.
+// process group, stopped with SIGTERM to the group; on Linux SIGKILL when the launcher dies
+// (PR_SET_PDEATHSIG, armed from a thread that lives as long as the launcher).
 
 #include <chrono>
 #include <cstdint>

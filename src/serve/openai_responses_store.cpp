@@ -54,6 +54,18 @@ std::size_t checked_add(std::size_t left, std::size_t right, const char* label) 
 
 } // namespace
 
+OpenAIResponseContextNode::~OpenAIResponseContextNode() {
+    std::shared_ptr<const OpenAIResponseContextNode> next = std::move(parent);
+    // While this chain holds the only reference to the next ancestor, take that ancestor's parent before
+    // releasing it, so its own destructor has nothing left to release. Every node is created non-const
+    // (append_openai_response_context), so clearing its parent through the const view is defined.
+    while (next != nullptr && next.use_count() == 1) {
+        std::shared_ptr<const OpenAIResponseContextNode> after =
+            std::move(const_cast<OpenAIResponseContextNode&>(*next).parent);
+        next = std::move(after);
+    }
+}
+
 OpenAIResponseContext append_openai_response_context(OpenAIResponseContext parent,
                                                      std::vector<ChatTurn> turns) {
     auto node         = std::make_shared<OpenAIResponseContextNode>();

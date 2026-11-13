@@ -27,7 +27,7 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.4)
 endif()
 
 # --- Global settings ---------------------------------------------------------
-option(INFERNIX_BUILD_APPS "Build the Infernix CLI, server and perplexity evaluator" ON)
+option(INFERNIX_BUILD_APPS "Build the Infernix CLI, server, launcher, perplexity evaluator and certifier" ON)
 option(BUILD_TESTING "Build Infernix tests" OFF)
 option(INFERNIX_BUILD_BENCHMARKS "Build Infernix benchmarks" OFF)
 # Test builds only: every PDL wait lets its dependents launch, waits, then spins (core/pdl.cuh), so producers

@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 
-# CUDA 13.4 compiles the binaries (CMake refuses an older toolkit). They link the CUDA runtime
-# statically, so the runtime image below only sets the host-driver requirement; 13.1 keeps it low.
+# CUDA 13.4 compiles the binaries (CMake refuses an older toolkit). On Linux they link the CUDA
+# runtime as a shared library (cmake/Dependencies.cmake), which the runtime image below provides;
+# its 13.1 keeps the host-driver requirement low.
 FROM docker.io/nvidia/cuda:13.4.3-devel-ubuntu24.04 AS build
 
 ARG DEBIAN_FRONTEND=noninteractive

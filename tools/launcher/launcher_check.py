@@ -7,7 +7,8 @@ nothing in it is changed). Each group starts its own launcher with its memory an
 temporary folder (printed; removed afterwards unless --keep).
 
 features: model ids, named configurations, environment, script export and import, the fit plan,
-          keep-alive streams while a model loads (OpenAI and Anthropic, and a failed load), model
+          keep-alive streams while a model loads (OpenAI and Anthropic, a failed load, and the
+          server's error answer after the load), model
           routes and the pin, prompt progress, request labels, usage, API keys and sign-in, chats,
           and a configuration's idle unload (about four minutes).
 watchdog: crash, lock-up, stall, the restart limit, idle servers, loads that do not fit, the RAM
@@ -448,6 +449,15 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         served += "message_stop" in text
         check("an Anthropic stream gets ping events while it loads", status == 200 and "event: ping" in text and
               text.index("event: ping") < text.find("message_start") and "message_stop" in text, text[:160])
+        # The server answers a stream that waited for the load with a JSON error (it refuses compaction): the
+        # error event carries the server's message, not only its status.
+        call(port, "POST", "/launcher/api/unload", {})
+        wait_for(lambda: instance(port)["state"] == "idle", 30)
+        status, kind, headers_at, pieces = stream(port, "/v1/responses/compact",
+                                                  {"model": "fake-main", "input": "hello", "stream": True})
+        text = "".join(piece for _, piece in pieces)
+        check("a server's error answer to a stream that waited for the load keeps its message",
+              status == 200 and '"error"' in text and "compaction is not supported" in text, text[:200])
         call(port, "PUT", f"{cfg}/config", {"args": base + ["--fake-load-ms", "300", "--fake-fail-load",
                                                                "cudaMalloc failed: out of memory"]})
         call(port, "POST", "/launcher/api/unload", {})

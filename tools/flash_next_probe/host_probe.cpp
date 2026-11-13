@@ -2,12 +2,10 @@
 // DRAM read bandwidth versus worker threads, and the CPU W4A4 expert kernel's service rate per ISA,
 // column count, worker count, and cold versus cache-warm records. No GPU is needed.
 //
-// Build (from the repository root):
-//   g++ -O3 -std=c++20 -pthread -ffp-contract=off -fno-fast-math -Isrc
-//     tools/flash_next_probe/host_probe.cpp src/ops/offloaded_sparse_moe/cpu/w4a4_expert.cpp
-//     src/ops/offloaded_sparse_moe/cpu/expert_team.cpp -o build/flash_next_host_probe   (one command)
-//   ./build/flash_next_host_probe [--arena-gib 8] [--experts 256] [--seconds 0.5] [--threads 1,2,4,8]
-//                                 [--prefetch 0,1024,2048,4096,8192]
+// Build (Linux, a CMake tree configured with BUILD_TESTING=ON; tools/flash_next_probe/probes.cmake):
+//   cmake --build build --target infernix_flash_next_host_probe
+//   ./build/tests/infernix_flash_next_host_probe [--arena-gib 8] [--experts 256] [--seconds 0.5]
+//                                                [--threads 1,2,4,8] [--prefetch 0,1024,2048,4096,8192]
 //
 // Every tunable here (worker count, software prefetch distance, ISA variant) is chosen from this
 // probe's output on the target machine; numbers from other hosts only show which knobs matter.

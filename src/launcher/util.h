@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -44,6 +45,17 @@ void write_file_atomic(const std::filesystem::path& path, std::string_view conte
 
 // The directory holding the running executable.
 [[nodiscard]] std::filesystem::path executable_dir();
+
+// The deepest nesting of arrays and objects a client's JSON body may have (infernix-serve refuses deeper
+// ones too): the DOM is parsed iteratively, but serializing and copying it recurse once per level, so a
+// deeper body would overflow a worker thread's stack.
+inline constexpr std::size_t kMaxJsonNesting = 256;
+
+// The deepest array / object nesting of JSON text, outside its strings, without parsing it.
+[[nodiscard]] std::size_t json_text_nesting(std::string_view text) noexcept;
+
+// A client's JSON body; std::invalid_argument when it nests deeper than kMaxJsonNesting.
+[[nodiscard]] Json parse_client_json(const std::string& text);
 
 // JSON members with a fallback when absent or of another type.
 template <class T>

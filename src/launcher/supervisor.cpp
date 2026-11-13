@@ -136,6 +136,7 @@ void Supervisor::start(const LaunchSpec& spec) {
         state_.argv       = {path_utf8(spec.executable)};
         state_.argv.insert(state_.argv.end(), spec.args.begin(), spec.args.end());
         stop_requested_   = false;
+        stop_forced_      = false;
         metrics_          = nullptr;
     }
     if (monitor_.joinable()) { monitor_.join(); }
@@ -226,13 +227,19 @@ void Supervisor::stop(std::chrono::seconds timeout) {
     if (child_ && !child_->exit_code()) {
         notify();
         logs_.add(instance, "info", "launcher", "stopping " + alias);
+        const auto force = [this] {
+            std::lock_guard lock(mutex_);
+            stop_forced_ = true;
+        };
         if (!child_->request_stop()) {
             logs_.add(instance, "warn", "launcher", "could not send the stop signal; ending the process");
+            force();
             child_->kill();
         }
         if (!child_->wait_for(std::chrono::duration_cast<std::chrono::milliseconds>(timeout))) {
             logs_.add(instance, "warn", "launcher",
                       "infernix-serve did not stop within " + std::to_string(timeout.count()) + " s; ending it");
+            force();
             child_->kill();
             child_->wait_for(std::chrono::seconds(10));
         }
@@ -277,6 +284,7 @@ void Supervisor::monitor(std::uint32_t instance) {
             // are read after the exit is seen. Not under the lock: each line passes observe().
             child_->wait_output(std::chrono::seconds(2));
             std::string error;
+            std::string warning;
             {
                 std::lock_guard lock(mutex_);
                 const bool expected = stop_requested_;
@@ -286,6 +294,12 @@ void Supervisor::monitor(std::uint32_t instance) {
                 if (expected) {
                     state_.state = InstanceState::Idle;
                     state_.phase = "stopped";
+                    // Asked to stop, it still crashed or its engine failed on its own (while saving the
+                    // prefix cache, say): reported, though the stop goes on as one.
+                    const std::string meaning = exit_status_meaning(*code, true);
+                    if (!stop_forced_ && (*code == 2 || meaning.starts_with("crashed"))) {
+                        warning = "infernix-serve " + meaning + " while stopping";
+                    }
                 } else if (incident) {
                     error           = incident->second;
                     state_.state    = InstanceState::Failed;
@@ -313,6 +327,7 @@ void Supervisor::monitor(std::uint32_t instance) {
                 metrics_ = nullptr;
             }
             if (!error.empty()) { logs_.add(instance, "error", "launcher", error); }
+            if (!warning.empty()) { logs_.add(instance, "warn", "launcher", warning); }
             logs_.end_instance();
             notify();
             if (callbacks_.metrics) { callbacks_.metrics(Json(nullptr)); }

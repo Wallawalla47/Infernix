@@ -1410,11 +1410,6 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     layer_ready_ = {};
 }
 
-void TextContext::run_layers(Tensor& x, Phase ph) {
-    NullTap tap;
-    run_layers(x, ph, tap);
-}
-
 namespace {
 
 // YC-01's width: the trimmed columns keep the activation precision and route family the wide call gives them. At

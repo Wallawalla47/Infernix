@@ -26,13 +26,20 @@
 #include <cerrno>
 #include <csignal>
 #include <cstring>
+#include <deque>
+#include <functional>
+#include <future>
 #include <iterator>
 #include <fcntl.h>
 #include <fstream>
+#include <pthread.h>
 #include <spawn.h>
 #include <sstream>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 extern char** environ;
 #endif
 
@@ -335,6 +342,114 @@ void init_spawn_attributes(posix_spawnattr_t& attributes, bool own_group) {
     posix_spawnattr_setflags(&attributes, flags);
 }
 
+// A server must not outlive the launcher (Windows: the job object). Linux's PR_SET_PDEATHSIG kills a child when
+// the thread that forked it ends, not the process, so every ChildProcess is forked by this one thread, which lives
+// as long as the launcher: it is never joined and its state never destroyed. A launcher that dies, even by
+// SIGKILL, takes its servers with it; one started from a short-lived HTTP worker thread is not ended with it.
+class Spawner {
+public:
+    static Spawner& instance() {
+        static Spawner* const spawner = new Spawner();
+        return *spawner;
+    }
+
+    // Runs `fork_child` (a pid, or -errno) on the spawner thread and returns its result.
+    pid_t run(const std::function<pid_t()>& fork_child) {
+        std::packaged_task<pid_t()> task(fork_child);
+        std::future<pid_t> result = task.get_future();
+        {
+            std::lock_guard lock(mutex_);
+            tasks_.push_back(std::move(task));
+        }
+        cv_.notify_one();
+        return result.get();
+    }
+
+private:
+    Spawner() {
+        std::thread([this] {
+            // The launcher's sigwait thread takes SIGINT/SIGTERM/SIGHUP; this thread must never receive them.
+            sigset_t all;
+            sigfillset(&all);
+            pthread_sigmask(SIG_BLOCK, &all, nullptr);
+            for (;;) {
+                std::packaged_task<pid_t()> task;
+                {
+                    std::unique_lock lock(mutex_);
+                    cv_.wait(lock, [this] { return !tasks_.empty(); });
+                    task = std::move(tasks_.front());
+                    tasks_.pop_front();
+                }
+                task();
+            }
+        }).detach();
+    }
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::packaged_task<pid_t()>> tasks_;
+};
+
+// Forks and execs a ChildProcess on the spawner thread: stdin from /dev/null, stdout and stderr into `output`,
+// its own process group, the signal mask and the dispositions the launcher changed reset (it blocks
+// SIGINT/SIGTERM/SIGHUP for its sigwait thread and ignores SIGPIPE; a child inheriting either could not be
+// stopped with SIGTERM), and on Linux SIGKILL once the spawner thread, so the launcher, ends. The pid, or -errno
+// of the step that failed.
+pid_t fork_child(const char* path, char* const* argv, char* const* envp, const char* working_dir, int output) {
+    int status[2];
+    if (::pipe2(status, O_CLOEXEC) != 0) { return -errno; }
+    const pid_t parent = ::getpid();
+    const pid_t pid    = ::fork();
+    if (pid < 0) {
+        const int error = errno;
+        ::close(status[0]);
+        ::close(status[1]);
+        return -error;
+    }
+    if (pid == 0) {
+        // The child: async-signal-safe calls only until exec.
+        const auto fail = [&] {
+            const int error = errno;
+            (void)!::write(status[1], &error, sizeof(error));
+            ::_exit(127);
+        };
+        (void)::setpgid(0, 0);
+#ifdef __linux__
+        if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) { fail(); }
+        if (::getppid() != parent) { ::_exit(127); } // the launcher ended before the line above took effect
+#else
+        (void)parent;
+#endif
+        struct sigaction defaults {};
+        defaults.sa_handler = SIG_DFL;
+        sigemptyset(&defaults.sa_mask);
+        for (const int signal : {SIGINT, SIGTERM, SIGHUP, SIGPIPE}) { (void)::sigaction(signal, &defaults, nullptr); }
+        sigset_t none;
+        sigemptyset(&none);
+        (void)::sigprocmask(SIG_SETMASK, &none, nullptr);
+        const int input = ::open("/dev/null", O_RDONLY);
+        if (input < 0 || ::dup2(input, 0) < 0 || ::dup2(output, 1) < 0 || ::dup2(output, 2) < 0) { fail(); }
+        if (input > 2) { ::close(input); }
+        if (working_dir != nullptr && ::chdir(working_dir) != 0) { fail(); }
+        ::execve(path, argv, envp);
+        fail();
+    }
+    (void)::setpgid(pid, pid); // the child does it too: whichever runs first, `kill(-pid)` finds the group
+    ::close(status[1]);
+    int child_error = 0;
+    ssize_t got     = 0;
+    do {
+        got = ::read(status[0], &child_error, sizeof(child_error));
+    } while (got < 0 && errno == EINTR);
+    ::close(status[0]);
+    if (got == static_cast<ssize_t>(sizeof(child_error))) {
+        int raw = 0;
+        (void)::waitpid(pid, &raw, 0);
+        return -child_error;
+    }
+    return pid; // the status pipe closed on exec
+}
+
 } // namespace
 
 struct ChildProcess::Impl {
@@ -388,15 +503,6 @@ std::unique_ptr<ChildProcess> ChildProcess::start(const std::filesystem::path& e
     // this pipe open; dup2 into the child's 1 and 2 clears the flag there.
     int fds[2];
     if (::pipe2(fds, O_CLOEXEC) != 0) { throw std::runtime_error("cannot create a pipe"); }
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_adddup2(&actions, fds[1], 1);
-    posix_spawn_file_actions_adddup2(&actions, fds[1], 2);
-    posix_spawn_file_actions_addclose(&actions, fds[1]);
-    if (!working_dir.empty()) { posix_spawn_file_actions_addchdir_np(&actions, working_dir.c_str()); }
-    posix_spawnattr_t attributes;
-    init_spawn_attributes(attributes, true);
 
     std::vector<std::string> argv_storage;
     argv_storage.push_back(executable.string());
@@ -408,15 +514,16 @@ std::unique_ptr<ChildProcess> ChildProcess::start(const std::filesystem::path& e
     std::vector<char*> envp;
     for (std::string& entry : env_storage) { envp.push_back(entry.data()); }
     envp.push_back(nullptr);
-    pid_t pid       = -1;
-    const int error = posix_spawn(&pid, executable.c_str(), &actions, &attributes, argv.data(),
-                                  env_storage.empty() ? environ : envp.data());
-    posix_spawn_file_actions_destroy(&actions);
-    posix_spawnattr_destroy(&attributes);
+    const std::string path = executable.string();
+    const std::string directory = working_dir.string();
+    const pid_t pid = Spawner::instance().run([&] {
+        return fork_child(path.c_str(), argv.data(), env_storage.empty() ? environ : envp.data(),
+                          directory.empty() ? nullptr : directory.c_str(), fds[1]);
+    });
     close(fds[1]);
-    if (error != 0) {
+    if (pid < 0) {
         close(fds[0]);
-        throw std::runtime_error("cannot start " + executable.string() + ": " + std::strerror(error));
+        throw std::runtime_error("cannot start " + executable.string() + ": " + std::strerror(-pid));
     }
     auto impl  = std::make_unique<Impl>();
     impl->pid  = pid;

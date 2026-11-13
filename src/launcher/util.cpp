@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 
 #ifdef _WIN32
@@ -19,6 +20,37 @@
 #endif
 
 namespace infernix::launcher {
+
+std::size_t json_text_nesting(std::string_view text) noexcept {
+    std::size_t depth = 0, deepest = 0;
+    bool quoted = false, escaped = false;
+    for (const char c : text) {
+        if (quoted) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                quoted = false;
+            }
+        } else if (c == '"') {
+            quoted = true;
+        } else if (c == '[' || c == '{') {
+            deepest = std::max(deepest, ++depth);
+        } else if ((c == ']' || c == '}') && depth > 0) {
+            --depth;
+        }
+    }
+    return deepest;
+}
+
+Json parse_client_json(const std::string& text) {
+    if (json_text_nesting(text) > kMaxJsonNesting) {
+        throw std::invalid_argument("the JSON body nests arrays or objects deeper than " +
+                                    std::to_string(kMaxJsonNesting) + " levels");
+    }
+    return Json::parse(text);
+}
 
 std::int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(

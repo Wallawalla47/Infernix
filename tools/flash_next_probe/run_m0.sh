@@ -5,19 +5,20 @@
 #
 # CHECKPOINT_DIR is the local nvidia/Qwen3.8-Flash-Next-NVFP4 snapshot. NVME_FILE is a large file on
 # the drive that will hold the n-gram volume (the checkpoint's largest shard will do). Outputs land
-# in OUT_DIR (default profiles/m0/<host>-<date>). Set PYTHON to the Python 3.11 interpreter.
+# in OUT_DIR (default profiles/m0/<host>-<date>). Set PYTHON to the Python 3.11 interpreter, and
+# BUILD_DIR to a CMake build tree configured with BUILD_TESTING=ON (default build): the host probe is
+# its target infernix_flash_next_host_probe, linked against the whole CPU expert engine.
 set -euo pipefail
 checkpoint=${1:?checkpoint directory}
 nvme_file=${2:?large file on the target NVMe}
 out=${3:-profiles/m0/$(hostname)-$(date +%Y%m%d-%H%M)}
 python=${PYTHON:-python3}
-mkdir -p "$out" build
+build=${BUILD_DIR:-build}
+mkdir -p "$out"
 
-g++ -O3 -std=c++20 -pthread -ffp-contract=off -fno-fast-math -Isrc \
-  tools/flash_next_probe/host_probe.cpp src/ops/offloaded_sparse_moe/cpu/w4a4_expert.cpp \
-  src/ops/offloaded_sparse_moe/cpu/expert_team.cpp -o build/flash_next_host_probe
-g++ -O2 -std=c++20 -pthread tools/flash_next_probe/nvme_probe.cpp -o build/flash_next_nvme_probe
-nvcc -O3 -std=c++17 -arch=sm_120a tools/flash_next_probe/gpu_probe.cu -o build/flash_next_gpu_probe
+cmake --build "$build" --target infernix_flash_next_host_probe
+g++ -O2 -std=c++20 -pthread tools/flash_next_probe/nvme_probe.cpp -o "$build/flash_next_nvme_probe"
+nvcc -O3 -std=c++17 -arch=sm_120a tools/flash_next_probe/gpu_probe.cu -o "$build/flash_next_gpu_probe"
 
 {
   uname -a
@@ -32,11 +33,11 @@ nvcc -O3 -std=c++17 -arch=sm_120a tools/flash_next_probe/gpu_probe.cu -o build/f
 
 "$python" -m tools.flash_next.inspect_checkpoint "$checkpoint" --json "$out/source_facts.json" | tee "$out/source_facts.txt"
 "$python" -m tools.flash_next.a4_reference --json "$out/a4_vs_modelopt.json" | tee "$out/a4_vs_modelopt.txt"
-./build/flash_next_gpu_probe | tee "$out/gpu_probe.txt"
+"$build/flash_next_gpu_probe" | tee "$out/gpu_probe.txt"
 # The link trains down at idle; sample it while the probe's copies run.
-( ./build/flash_next_gpu_probe copy >/dev/null & sleep 1;
+( "$build/flash_next_gpu_probe" copy >/dev/null & sleep 1;
   nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.width.current,clocks.mem --format=csv; wait ) \
   > "$out/pcie_under_load.txt"
-./build/flash_next_host_probe | tee "$out/host_probe.txt"
-./build/flash_next_nvme_probe "$nvme_file" | tee "$out/nvme_probe.txt"
+"$build/tests/infernix_flash_next_host_probe" | tee "$out/host_probe.txt"
+"$build/flash_next_nvme_probe" "$nvme_file" | tee "$out/nvme_probe.txt"
 echo "M0 outputs in $out"

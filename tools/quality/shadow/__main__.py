@@ -42,6 +42,27 @@ def compare(engine: np.ndarray, shadow: torch.Tensor) -> dict:
     return out
 
 
+def compare_capture(sequences: list[dict], logits, rows: np.ndarray, vocab: int, whole: bool) -> list[dict]:
+    """Each sequence's captured rows against the shadow's logits. A capture that would compare nothing (no
+    sequence, a sequence without positions) or whose rows do not match its positions is refused: a gate that
+    passed on it would certify nothing. `whole`: every captured sequence is compared, so every row is used."""
+    if not sequences:
+        raise SystemExit("the capture names no sequences: nothing to compare")
+    results, offset = [], 0
+    for s, ours in zip(sequences, logits, strict=True):
+        count = len(s["positions"])
+        if count == 0:
+            raise SystemExit(f"capture sequence {s['index']} keeps no positions: nothing to compare")
+        if (offset + count) * vocab > rows.size:
+            raise SystemExit("the capture's logits hold fewer rows than its sequences' positions")
+        engine = rows[offset * vocab:(offset + count) * vocab].reshape(count, vocab)
+        offset += count
+        results.append({"index": s["index"], "id": s["id"], **compare(engine, ours)})
+    if whole and offset * vocab != rows.size:
+        raise SystemExit("the capture's logits hold more rows than its sequences' positions")
+    return results
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("capture", type=Path)
@@ -56,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
     meta = json.loads(Path(str(args.capture) + ".json").read_text(encoding="utf-8"))
     vocab = int(meta["vocab"])
     sequences = meta["sequences"][: args.sequences] if args.sequences else meta["sequences"]
+    if not sequences or not all(s["positions"] for s in sequences):
+        raise SystemExit("the capture names no sequence, or one keeps no positions: nothing to compare")
     rows = np.fromfile(Path(str(args.capture) + ".f32"), dtype="<f4")
     started = time.time()
     weights = Weights(args.artifact)
@@ -71,13 +94,8 @@ def main(argv: list[str] | None = None) -> int:
         logits = qwen4_exp.run(weights, tokens, positions, log, ngram_volume=args.ngram_volume)
     else:
         raise SystemExit(f"no shadow for {model_type!r}")
-    results, offset = [], 0
-    for s, ours in zip(sequences, logits):
-        count = len(s["positions"])
-        engine = rows[offset * vocab:(offset + count) * vocab].reshape(count, vocab)
-        offset += count
-        results.append({"index": s["index"], "id": s["id"], **compare(engine, ours)})
-    total = {k: sum(r[k] for r in results) for k in ("rows", "elements", "mismatched_rows", "mismatched_elements",
+    results = compare_capture(sequences, logits, rows, vocab, whole=len(sequences) == len(meta["sequences"]))
+    total ={k: sum(r[k] for r in results) for k in ("rows", "elements", "mismatched_rows", "mismatched_elements",
                                                      "top1_equal")}
     passed = total["mismatched_elements"] == 0
     import transformers

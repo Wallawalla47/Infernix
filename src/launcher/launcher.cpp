@@ -226,8 +226,10 @@ std::string json_body_model(const std::string& body, bool& stream, bool& parsed)
     } catch (const Json::exception&) { return {}; }
 }
 
-// A JSON object body with its `model` set.
+// A JSON object body with its `model` set. One nested past kMaxJsonNesting goes out as it came, for
+// infernix-serve to refuse with its own error: rewriting it would recurse once per level.
 std::string body_with_model(const std::string& body, const std::string& model) {
+    if (json_text_nesting(body) > kMaxJsonNesting) { return body; }
     Json value     = Json::parse(body);
     value["model"] = model;
     return value.dump();
@@ -474,7 +476,11 @@ void Launcher::serve() {
               " (memory " + path_utf8(store_.memory_file()) + ")");
     if (!is_loopback(bound_host_) && settings.api_keys.empty()) {
         event("warn", "launcher",
-              "listening on " + bound_host_ + " without an API key: anyone who can reach the port can use the models");
+              settings.allow_remote_admin
+                  ? "listening on " + bound_host_ +
+                        " with remote management and no API key: anyone who can reach the port can use the models, "
+                        "change every setting and choose the program the launcher runs"
+                  : "listening on " + bound_host_ + " without an API key: anyone who can reach the port can use the models");
     }
     if (settings.autoload) {
         std::optional<std::string> key = settings.default_model ? settings.default_model : store_.last_model();
@@ -1591,11 +1597,12 @@ void Launcher::log_api_request(const ApiCall& call, int status, std::optional<st
 
 void Launcher::log_request_body(const ApiCall& call, const std::string& request_body, int status,
                                 const std::string& response_body, bool truncated) {
-    // JSON bodies are kept as JSON; anything else (and a stream's events) as text.
+    // JSON bodies are kept as JSON; anything else (a stream's events, a body nested too deep to store as
+    // JSON) as text.
     const auto value = [](const std::string& text) {
         try {
-            return Json::parse(text);
-        } catch (const Json::exception&) { return Json(text); }
+            return parse_client_json(text);
+        } catch (const std::exception&) { return Json(text); }
     };
     const bool request_cut = request_body.size() > kBodyCaptureLimit;
     event_log_.add_request_body(
@@ -2654,7 +2661,7 @@ void Launcher::register_management_routes() {
     };
     const auto body_json = [](const Request& request) {
         if (request.body.empty()) { return Json::object(); }
-        Json value = Json::parse(request.body);
+        Json value = parse_client_json(request.body);
         if (!value.is_object()) { throw std::invalid_argument("the request body must be a JSON object"); }
         return value;
     };
@@ -3277,7 +3284,7 @@ void Launcher::register_management_routes() {
                     send_json(s, *chat);
                 }));
     server_.Put(api + R"(/chats/([A-Za-z0-9_-]{1,64}))", admin([this](const Request& q, Response& s) {
-                    send_json(s, chats_.put(q.matches[1].str(), Json::parse(q.body)));
+                    send_json(s, chats_.put(q.matches[1].str(), parse_client_json(q.body)));
                 }));
     server_.Delete(api + R"(/chats/([A-Za-z0-9_-]{1,64}))", admin([this](const Request& q, Response& s) {
                        chats_.remove(q.matches[1].str());

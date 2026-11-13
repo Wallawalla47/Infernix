@@ -55,7 +55,8 @@ CsfTables compress_banks(std::span<ExpertBank> banks) {
     std::uint64_t expanded = 0;
     for (ExpertBank& bank : banks) {
         const ExpertBankPlanes& p = bank.planes;
-        if (p.records == nullptr || p.gate_up_format != QType::NVFP4_MUL || !moe::registered_shape(bank.shape()) ||
+        if (p.records == nullptr || p.gate_up_format != QType::NVFP4_MUL || p.down_format != QType::NVFP4_MUL ||
+            !moe::registered_shape(bank.shape()) ||
             p.record_stride < bank.shape().record_bytes() || p.experts == 0) {
             continue;
         }

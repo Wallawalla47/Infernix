@@ -15,6 +15,16 @@
 
 #include "core/content_hash.h"
 
+#ifdef _WIN32
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#else
+#    include <fcntl.h>
+#    include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -72,6 +82,36 @@ private:
     std::ofstream out_;
     std::uint64_t written_ = 0;
 };
+
+// Puts a closed file's written bytes on the drive (FlushFileBuffers / fsync), so the rename that replaces
+// the previous file cannot leave a torn one after a power loss or an operating-system crash.
+void make_durable(const std::filesystem::path& path) {
+#ifdef _WIN32
+    const HANDLE handle = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) { throw std::runtime_error("cannot reopen " + path.string() + " to flush it"); }
+    const bool flushed = ::FlushFileBuffers(handle) != 0;
+    ::CloseHandle(handle);
+#else
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) { throw std::runtime_error("cannot reopen " + path.string() + " to flush it"); }
+    const bool flushed = ::fsync(fd) == 0;
+    ::close(fd);
+#endif
+    if (!flushed) { throw std::runtime_error("prefix cache file flush to the drive failed"); }
+}
+
+// POSIX: the rename itself is durable only once its directory is (Windows' rename journals it).
+void make_rename_durable([[maybe_unused]] const std::filesystem::path& path) noexcept {
+#ifndef _WIN32
+    const std::filesystem::path directory = path.has_parent_path() ? path.parent_path() : std::filesystem::path(".");
+    const int fd = ::open(directory.c_str(), O_RDONLY);
+    if (fd >= 0) {
+        (void)::fsync(fd);
+        ::close(fd);
+    }
+#endif
+}
 
 class Reader {
 public:
@@ -261,7 +301,9 @@ PersistResult save_prefix_cache(const PrefixCacheIndex& index, const PersistBind
         out.bytes = writer.written();
         // Abandoned after the last slab: the previous file still stays.
         check_abandoned();
+        make_durable(temporary);
         std::filesystem::rename(temporary, path);
+        make_rename_durable(path);
         out.blocks    = nodes.size();
         out.snapshots = snapshots.size();
     } catch (const std::exception& error) {

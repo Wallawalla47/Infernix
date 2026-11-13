@@ -533,6 +533,15 @@ void test_write_budget(const std::filesystem::path& directory) {
     require(restarted.available_bytes() == 850, "a restart keeps the level and refills from when it was saved");
     SsdWriteBudget capped(1000, state, later + std::chrono::hours(2));
     require(capped.available_bytes() == 1000, "the bucket holds at most an hour");
+    // A clock that was ahead when the level was saved, then set back: refill runs from the new time.
+    SsdWriteBudget ahead(1000, state, later - std::chrono::hours(5));
+    require(ahead.available_bytes() == 600, "a level saved in the future is kept as it was");
+    ahead.charge(600);
+    require(ahead.admit(1.0, 100, false, later - std::chrono::hours(5) + std::chrono::minutes(6)),
+            "a level saved in the future refills from now, not from its saved time");
+    ahead.save(later - std::chrono::hours(5) + std::chrono::minutes(6));
+    SsdWriteBudget back(1000, state, later - std::chrono::hours(5) + std::chrono::minutes(12));
+    require(back.available_bytes() == 200, "the save after a clock set back records the new time");
     bool refused = false;
     try {
         SsdWriteBudget empty(0, state, start);

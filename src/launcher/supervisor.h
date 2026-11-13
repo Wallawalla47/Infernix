@@ -123,6 +123,7 @@ private:
     std::unique_ptr<ChildProcess> child_;
     std::thread monitor_;
     bool stop_requested_ = false;
+    bool stop_forced_    = false; // the stop ended the process itself (no signal, or past its timeout)
     bool shutting_down_  = false;
     std::optional<std::pair<std::string, std::string>> load_verdict_; // end_load's kind and reason
     Json metrics_;

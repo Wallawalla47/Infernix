@@ -9,7 +9,10 @@ import mpmath
 import pytest
 import torch
 
+import numpy as np
+
 from tools.quality.shadow import exact
+from tools.quality.shadow.__main__ import compare_capture
 from tools.quality.shadow.tensor import Shadow, shadow
 
 F64 = torch.float64
@@ -110,6 +113,23 @@ def test_shadow_views_alias_and_inplace_rounds():
     assert s.inner[:, 1].tolist() == [1.0, 3.0]  # 1 + 2^-9 is a BF16 tie: to even
     s.index_add_(0, torch.tensor([1]), shadow(torch.full((1, 3), 2.0 ** -8), torch.bfloat16))
     assert s.inner[1].tolist() == [2.0 ** -8, 3.0 + 0.0, 2.0 ** -8]
+
+
+def test_the_gate_refuses_a_capture_that_compares_nothing():
+    vocab = 4
+    rows = np.arange(2 * vocab, dtype="<f4")
+    one = {"index": 0, "id": "a", "positions": [3, 4]}
+    shadow_rows = [torch.tensor(rows.reshape(2, vocab), dtype=torch.float64)]
+    [result] = compare_capture([one], shadow_rows, rows, vocab, whole=True)
+    assert result["rows"] == 2 and result["mismatched_elements"] == 0
+    for sequences, logits, capture in (([], [], rows),  # no sequence
+                                       ([dict(one, positions=[])], [torch.zeros(0, vocab)], rows),  # no positions
+                                       ([one], shadow_rows, rows[:vocab]),  # fewer rows than positions
+                                       ([one], shadow_rows, np.concatenate([rows, rows]))):  # rows left over
+        with pytest.raises(SystemExit):
+            compare_capture(sequences, logits, capture, vocab, whole=True)
+    # A partial comparison (--sequences) leaves the later sequences' rows unread.
+    assert compare_capture([one], shadow_rows, np.concatenate([rows, rows]), vocab, whole=False)[0]["rows"] == 2
 
 
 def test_topk_breaks_ties_toward_the_lower_index():

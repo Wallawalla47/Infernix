@@ -7,7 +7,9 @@ stops the current `infernix-serve`, starts the requested model with its saved co
 forwards the request to it, as LM Studio does.
 
 The launcher runs no inference itself. It supervises one `infernix-serve` process at a time on a
-private loopback port and relays requests and streamed answers to it.
+private loopback port and relays requests and streamed answers to it. The server never outlives
+the launcher: if the launcher ends without stopping it (a crash, a forced kill), the system ends
+the server too, on Windows and Linux, so it does not keep holding the GPU.
 
 ## Start
 

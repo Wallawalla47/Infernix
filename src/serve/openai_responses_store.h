@@ -19,6 +19,13 @@
 namespace infernix::serve {
 
 struct OpenAIResponseContextNode {
+    OpenAIResponseContextNode()                                            = default;
+    OpenAIResponseContextNode(const OpenAIResponseContextNode&)            = delete;
+    OpenAIResponseContextNode& operator=(const OpenAIResponseContextNode&) = delete;
+    // Releases the ancestors this node alone keeps alive one after another, not one stack frame per node:
+    // a previous_response_id chain can be thousands of continuations long.
+    ~OpenAIResponseContextNode();
+
     std::shared_ptr<const OpenAIResponseContextNode> parent;
     std::vector<ChatTurn> turns;
     std::size_t owned_bytes      = 0;

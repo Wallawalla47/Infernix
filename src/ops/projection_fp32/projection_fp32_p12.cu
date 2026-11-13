@@ -24,7 +24,9 @@ namespace detail {
 void projection_fp32_bf16_p12(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     if (w.qtype != QType::BF16_P12 || w.layout != QuantLayout::P12Rows || !bf16_p12_projection_fp32_supported(w.n, w.k) ||
         x.ne[0] != w.k || out.ne[0] != w.n || out.ne[1] != x.ne[1] || out.dtype != DType::FP32) {
-        throw std::invalid_argument("projection_fp32: a bf16_p12 weight [N, K] with N a multiple of 16 and K of 512");
+        throw std::invalid_argument(
+            "projection_fp32: needs a bf16_p12 weight [N, K] with N a multiple of 16 and K a multiple of 128 in "
+            "[512, 65536), x [K, T] and an FP32 out [N, T]");
     }
     constexpr std::int32_t kPass = 64;
     for (std::int32_t first = 0; first < x.ne[1]; first += kPass) {

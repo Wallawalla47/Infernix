@@ -419,8 +419,10 @@ void forward_after_load(const httplib::Request& request, httplib::Response& resp
                         bridge->cv.wait_for(lock, std::chrono::seconds(1));
                         if (!bridge->done) { return sink.is_writable(); }
                     }
-                    std::string body;
+                    // A JSON answer is held whole in `body`; anything else arrived as chunks.
+                    std::string body = std::move(bridge->body);
                     for (const std::string& chunk : bridge->chunks) { body += chunk; }
+                    bridge->body.clear();
                     bridge->chunks.clear();
                     lock.unlock();
                     const std::string event =

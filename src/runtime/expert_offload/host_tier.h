@@ -197,7 +197,8 @@ public:
     // Seeds the decayed LFU at the current time with a saved session's use counts, each capped at
     // `cap`, so the first admissions and demotions rank RAM residents by what that session used
     // instead of comparing all-zero scores (where the lowest slot, the best-ranked pre-fill, goes
-    // first). The seeds decay like any use.
+    // first). Counts the cap ties keep their uncapped order (a key's seed gains under half a use in
+    // proportion to its uncapped count). The seeds decay like any use.
     void seed_uses(std::span<const std::uint32_t> counts, std::uint32_t cap);
     // Frees every unpinned shadow slot: its key stays readable in its VRAM frame, and a later VRAM
     // eviction demotes it (T4) or drops it (T5) like any key without a host copy. Returns how many.

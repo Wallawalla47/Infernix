@@ -254,7 +254,6 @@ private:
     [[nodiscard]] std::int32_t row_width(std::int32_t columns) const noexcept {
         return active_sequence_batch_ != 0 ? active_sequence_width_ : columns;
     }
-    void run_layers(Tensor& x, Phase phase);
     // The lossless route's layers (execution/lossless.h) over x, the window form for a null cache, else
     // the cache form with each layer's KV cache and state pools filled in; each layer first waits for its
     // restored state (set_layer_ready).

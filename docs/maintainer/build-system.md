@@ -16,7 +16,7 @@ The default configuration is Release. Ninja links and archives share the single-
 
 | Cache option | Default | Scope |
 |---|---|---|
-| `INFERNIX_BUILD_APPS` | ON | CLI, HTTP server and perplexity evaluator |
+| `INFERNIX_BUILD_APPS` | ON | CLI, HTTP server, launcher, perplexity evaluator and `infernix-certify` |
 | `BUILD_TESTING` | OFF | C++ tests and registered Python interoperability tests |
 | `INFERNIX_BUILD_BENCHMARKS` | OFF | Op, model, Engine and context-cost benchmarks |
 
@@ -138,7 +138,8 @@ or justify combining shape translation units or enabling unity builds.
 
 ## Consumers and verification
 
-`apps/CMakeLists.txt` explicitly defines the three product executables. Tests and benchmarks
+`apps/CMakeLists.txt` explicitly defines the five product executables (`infernix`,
+`infernix-serve`, `infernix-launcher`, `infernix-perplexity`, `infernix-certify`). Tests and benchmarks
 include their domain registrations without creating new CMake subdirectories, preserving
 `build/tests/`, `build/bench/` and CTest working directories. The helpers are local to those
 consumers. Tests explicitly name their linked libraries; public-header and pure-host checks keep

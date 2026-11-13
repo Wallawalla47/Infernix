@@ -3,6 +3,7 @@
 // token, a stop token among the permitted tokens ends the run, an unconstrained request sharing
 // the rounds generates what it generates alone, and each step's reported distribution matches the
 // CausalScoring oracle (score_tokens over prompt + output with the step's tokens as candidates).
+// A request the Program refuses to plan on the worker fails alone, and the Engine serves on.
 // Requires INFERNIX_TEST_ARTIFACT (an artifact with a DFlash2 drafter).
 
 #include "infernix/engine.h"
@@ -134,6 +135,24 @@ int main() {
                           " did not take its most probable permitted token");
             }
             greedy_runs.push_back(greedy);
+
+            if (backend == infernix::SpeculativeBackend::None) {
+                // A request the Program refuses to plan on the worker (capture_logits beside CUDA
+                // Graphs, which this Engine uses) fails alone, and the Engine serves on.
+                infernix::TokenConstraint capture = field;
+                capture.capture_logits            = true;
+                std::string refusal;
+                try {
+                    (void)engine.generate(engine.prepare_tokens(prompt), constrained(capture, 0.0F, 1));
+                } catch (const std::invalid_argument& error) { refusal = error.what(); }
+                check(refusal.find("capture_logits") != std::string::npos,
+                      "a capture_logits request beside CUDA Graphs was not refused alone: '" + refusal + "'");
+                Run after{prompt, field,
+                          engine.generate(engine.prepare_tokens(prompt), constrained(field, 0.0F, 1))};
+                check_run(name + " after a refused plan", after);
+                check(after.result.generated_token_ids.size() == 5,
+                      "the Engine did not serve on after refusing a request's plan");
+            }
 
             for (std::uint64_t seed = 1; seed <= 3; ++seed) {
                 Run sampled{prompt, field,

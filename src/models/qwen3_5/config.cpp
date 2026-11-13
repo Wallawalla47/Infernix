@@ -2,6 +2,7 @@
 #include "models/qwen3_5/vision_config.h"
 
 #include "artifact/schema.h"
+#include "infernix/ops/context_kv_materialize.h"
 #include "infernix/ops/softmax_attention.h"
 
 #include <algorithm>
@@ -285,6 +286,16 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
             dimension(config, "selector_rank"), dimension(config, "selector_top_k")};
         if (target.hidden_size % extra.conv_group_size) {
             throw ArtifactError("DFlash2 conv group does not divide hidden width");
+        }
+        // The fused drafter (execution/draft.cpp) normalises and rotates with these constants and materialises
+        // every layer's context KV in one call over sliding-window layers: refused here, at load, rather than
+        // by the first draft on the Engine's worker.
+        if (out.rms_norm_eps != 1e-6F || out.rope_theta != 1e7F) {
+            throw ArtifactError("DFlash2: the fused drafter needs rms_norm_eps 1e-6 and rope_theta 1e7");
+        }
+        if (!ops::context_kv_materialize_layer_count(out.num_hidden_layers) ||
+            out.local_layer_count() != out.num_hidden_layers) {
+            throw ArtifactError("DFlash2: the fused drafter needs 5 or 6 layers, all sliding-window");
         }
         out.dflash2 = extra;
     }

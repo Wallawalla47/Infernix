@@ -231,6 +231,11 @@ def main() -> int:
     if not objects:
         raise SystemExit("no CUDA object files given")
     kernels = kernel_loads(objects, args.cuobjdump, args.jobs)
+    if not kernels:
+        # The engine's ops use PDL throughout: finding no wait means the wait instruction went unrecognised
+        # (another toolchain's SASS), and the check would pass having checked nothing.
+        raise SystemExit(f"no kernel in {len(objects)} objects waits on a PDL dependency: the wait was not "
+                         "recognised, so nothing was checked")
     listed = {name: found for name, found in kernels.items() if found}
     if args.command == "update":
         args.allowlist.write_text(format_allowlist(listed), encoding="utf-8")

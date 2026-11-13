@@ -1092,9 +1092,15 @@ private:
         complete_success(request, FinishReason::Cancelled);
     }
 
+    // A cancelled request holding no lane (queued, paused, or bound and not yet published). Its final
+    // output is its own: an output decoder that cannot publish it fails this request alone.
     void complete_detached_cancelled(const std::shared_ptr<Request>& request) {
         try {
             complete_cancelled(request);
+        } catch (const std::exception& error) {
+            publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                               "%s: failed 1 request; the Engine keeps serving", error.what());
+            complete_error(request, std::current_exception());
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
             complete_error(request, error);
@@ -1209,7 +1215,10 @@ private:
                 throw std::logic_error("active cancellation has no sequence binding");
             }
             (void)request->output.preview_terminal(FinishReason::Cancelled);
-            auto aborted                = instance_.program->abort(*request->sequence);
+            auto aborted = instance_.program->abort(*request->sequence);
+            if (aborted.status != ConsumeStatus::Consumed) {
+                throw std::logic_error("a cancelled request could not be released");
+            }
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
@@ -1338,10 +1347,13 @@ private:
                     continue;
                 }
                 OutputDecision decision;
+                // The output session is this request's alone and its preview is discarded below, so
+                // whatever it refuses (a grammar's refused token, an output decoder past a bound) fails
+                // this row like a cancellation, as commit_output does for the commit.
                 try {
                     decision = request->output.preview_model(
                         row_tokens, request->budget->remaining(), request->budget->limit_reason());
-                } catch (const RequestOutputError&) {
+                } catch (const std::exception&) {
                     refused[row]   = std::current_exception();
                     cancelled[row] = true;
                     request->output.discard_preview();
@@ -1888,6 +1900,27 @@ private:
         publish_runtime_stats();
     }
 
+    // Plans a waiting request at its first admission scan. A request the Program refuses to plan (its own
+    // input: a constraint these EngineOptions cannot serve, a media item its workspace cannot hold) fails
+    // alone, as an unadmittable one does: planning reads the request and no shared state, so nothing else
+    // is undone. False then. A device fault is never one request's and still fails the Engine.
+    [[nodiscard]] bool plan_or_fail(const std::shared_ptr<Request>& request, bool restoring) {
+        try {
+            ensure_base_plan(request);
+            return true;
+        } catch (const DeviceMemoryExhausted&) {
+            throw;
+        } catch (const RecoverableExecutionError&) {
+            throw;
+        } catch (const std::exception& error) {
+            publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
+                               "%s: the request cannot be planned and failed; the Engine keeps serving",
+                               error.what());
+            fail_unadmittable(request, restoring, std::current_exception());
+            return false;
+        }
+    }
+
     // `restoring`: restores the paused progress owner (Scheduler::progress_owner), pausing a
     // resident for its lane or capacity; otherwise admits a fresh request.
     bool try_admit_one(bool restoring) {
@@ -1926,7 +1959,7 @@ private:
                     if (request->admission_generation == admission_generation_) { continue; }
                     request->admission_generation = admission_generation_;
                 }
-                ensure_base_plan(request);
+                if (!plan_or_fail(request, restoring)) { return true; }
                 std::vector<SourceCandidate> sources = resources_.candidates(
                     *instance_.program, *request->base_plan,
                     restoring ? request->suspended->frontier() : UINT32_MAX);
@@ -2411,8 +2444,10 @@ private:
             const std::uint32_t lane = membership.lanes[row];
             const auto& request      = slots_[lane];
             request->budget->commit(membership.row_stride);
+            auto published = commit_output(lane, request, false);
+            if (!published) { continue; }
             auto timing = record_committed_output(request, membership.row_stride);
-            append_output(request, request->output.commit_preview(), std::move(timing), &phase);
+            append_output(request, std::move(*published), std::move(timing), &phase);
             update_recovery(request);
             request->model_state = EngineRequestState::DecodeReady;
         }
@@ -2555,6 +2590,8 @@ private:
             return stopping_;
         }));
         next_prefix_save_ = Clock::now() + prefix_save_interval_;
+        // The save is work the requests wait on, not a stall: the no-progress watch leaves it out.
+        if (no_progress_since_) { *no_progress_since_ += Clock::now() - started; }
         if (!saved) { return; }
         const double paused = std::chrono::duration<double>(Clock::now() - started).count();
         if (saved->ok) {

@@ -7,7 +7,7 @@
 // or more): one plane, x's scales in 256-token tiles (the gate/up projection's TMA tile) and the product's in the
 // layout the down projection reads at that width (row-major MMA tiles to 512 columns, 256-token tiles above); the
 // tiled planes are compared over their padded tokens, whose scales both writers zero (the fused planes are filled
-// with 0xA5 first).
+// with 0xA5 first). Three widths also repeat under a side stream's traffic (verify_repeatable).
 #include "ops/op_family.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -155,6 +155,22 @@ int run_case(const Weight& gate_up, const Weight& down, int tokens, ops::LinearP
     failures += compare_bytes("norm weight preserved" + suffix, gain_buffer.p, to_device(gain_bits).p,
                               gain_buffer.bytes);
 
+    // Repeated calls under a side stream's traffic give the same bits (its cp.async and TMA pipelines; op-development.md,
+    // "Repeat and compare"): a round width, the down projection's first TMA width and a ragged wide prompt call. Each
+    // run restores the in-place residual first.
+    if (tokens == 33 || tokens == 513 || tokens == 4160) {
+        DeviceBuffer pristine = to_device(residual_bits);
+        failures += verify_repeatable(
+            "repeat" + suffix, 4, nullptr,
+            [&] {
+                cuda_check(cudaMemcpyAsync(fused_io.p, pristine.p, fused_io.bytes, cudaMemcpyDeviceToDevice, nullptr),
+                           "restore the residual");
+                ops::dense_mlp_fused_rmsnorm_nvfp4(fused, gain, kEps, gate_up, down, policy, fused_workspace, nullptr);
+            },
+            {OutputRegion{fused_io.p, fused_io.bytes}});
+        failures += compare_bytes("repeat residual" + suffix, reference_io.p, fused_io.p, reference_io.bytes);
+    }
+
     // Captured in a CUDA Graph (the decode graphs' programmatic launches), from the same input again.
     if (!prompt && (tokens == 16 || tokens == 33)) {
         DeviceBuffer graph_io = to_device(residual_bits);
@@ -215,8 +231,9 @@ INFERNIX_OP_TEST(dense_mlp_fused_rmsnorm) {
             failures += run_case(gate_up, down, tokens, kRounds);
         }
         // The prompt profile: one partly filled 256-token gate/up tile (129-255 columns), the down projection's
-        // row-major MMA tiles (to 512 columns) and its TMA tile, full and ragged 256-token tiles.
-        for (const int tokens : {129, 136, 192, 193, 255, 256, 257, 300, 512, 513, 777, 1024, 1088, 2048}) {
+        // row-major MMA tiles (to 512 columns) and its TMA tile, full and ragged 256-token tiles, up to the idle-wide
+        // prefill's 4,096-column calls (and one ragged past them).
+        for (const int tokens : {129, 136, 192, 193, 255, 256, 257, 300, 512, 513, 777, 1024, 1088, 2048, 4096, 4160}) {
             failures += run_case(gate_up, down, tokens, kPrompt);
         }
         failures += gate_up_parent.verify_preserved("gate/up weight");

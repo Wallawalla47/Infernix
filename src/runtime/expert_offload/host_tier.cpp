@@ -378,9 +378,15 @@ bool HostTier::unhold(std::uint32_t key) {
 
 void HostTier::seed_uses(std::span<const std::uint32_t> counts, std::uint32_t cap) {
     if (counts.size() != config_.num_keys) { throw std::invalid_argument("HostTier: the seed counts have another key count"); }
+    // The cap ties most of a calibrated order (16 holds 497 of every 512 Flash-Next experts a layer, 241 of 256 on
+    // the 122B), and tied values fall to the slot order, which the warm start's refills scramble. The uncapped count
+    // breaks the tie by under half a use, so a better-ranked key leaves RAM later, as LfruPolicy::rank_seeds orders
+    // the VRAM seeds; one real use still outranks it.
+    const double most = counts.empty() ? 0.0 : static_cast<double>(*std::max_element(counts.begin(), counts.end()));
     for (std::uint32_t key = 0; key < config_.num_keys; ++key) {
         if (counts[key] != 0) {
-            lfu_.use(key, static_cast<double>(std::min(counts[key], cap)));
+            lfu_.use(key, static_cast<double>(std::min(counts[key], cap)) +
+                              0.5 * static_cast<double>(counts[key]) / (most + 1.0));
             rerank_shadow(key);
         }
     }

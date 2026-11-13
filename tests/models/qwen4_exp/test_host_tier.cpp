@@ -430,8 +430,21 @@ void test_warm_fill() {
     for (std::uint32_t k = 0; k < 8; ++k) { counts[k] = 8 - k; }
     counts[50] = 100; // capped
     tier.seed_uses(counts, 16);
-    check(tier.lfu().score(50) == 16.0 && tier.lfu().score(0) == 8.0 && tier.lfu().score(60) == 0.0,
-          "seeds are capped counts at the current time");
+    // A seed is its capped count plus under half a use in proportion to its uncapped count (the largest, 100).
+    check(tier.lfu().score(50) == 16.0 + 0.5 * 100.0 / 101.0 && tier.lfu().score(0) == 8.0 + 0.5 * 8.0 / 101.0 &&
+              tier.lfu().score(60) == 0.0,
+          "seeds are capped counts at the current time, ranked within a capped value");
+    {
+        // A calibrated order ties its best keys at the cap; their uncapped counts still rank them, and one real use
+        // outranks any such tie-break.
+        HostTier ranked(small_config());
+        std::vector<std::uint32_t> calibrated(100, 0);
+        for (std::uint32_t k = 0; k < 4; ++k) { calibrated[k] = 40 - k; } // all above the cap
+        ranked.seed_uses(calibrated, 16);
+        check(ranked.lfu().score(0) > ranked.lfu().score(1) && ranked.lfu().score(1) > ranked.lfu().score(3) &&
+                  ranked.lfu().score(0) < 16.5 && ranked.lfu().score(3) > 16.0,
+              "keys the cap ties keep their calibrated order, by under half a use");
+    }
     for (std::uint32_t k = 0; k < 8; ++k) {
         std::int32_t slot = -1;
         check(tier.prefill(k, slot), "prefill");

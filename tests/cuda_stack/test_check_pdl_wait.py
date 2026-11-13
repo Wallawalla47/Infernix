@@ -1,6 +1,7 @@
 """check_pdl_wait: a load before a kernel's PDL wait is traced to the parameter its address comes from (through
 index arithmetic, LEA, a constant-bank addend and an address read from memory), a kernel without a wait is not
-listed, an origin missing from the allow-list fails, and the written allow-list reads back unchanged."""
+listed, an origin missing from the allow-list fails, the written allow-list reads back unchanged, and objects
+in which no kernel waits fail rather than pass having checked nothing."""
 
 import json
 import sys
@@ -58,6 +59,14 @@ def main() -> int:
     # Kernels are keyed by stable names: nvcc's per-file id in an internal-linkage name does not reach the key.
     static = "__nv_static_46__6fa03c6b_24_ggml_encode_producers_cu_9cd89126__ZN8infernix3ops4kernEv"
     assert list(tool.parse_listing(listing({static: ["ACQBULK"]}))) == [tool.stable_name(static)]
+    # Objects in which no kernel waits (the wait instruction not recognised) fail: nothing would be checked.
+    tool.kernel_loads = lambda objects, cuobjdump, jobs: {}
+    sys.argv = ["check_pdl_wait.py", "check", "ops.cu.obj"]
+    try:
+        tool.main()
+        raise AssertionError("objects without a waiting kernel must fail the check")
+    except SystemExit as stop:
+        assert "nothing was checked" in str(stop.code), stop.code
     print("check_pdl_wait tool checks passed")
     return 0
 

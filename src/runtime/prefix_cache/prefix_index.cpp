@@ -1477,7 +1477,9 @@ std::optional<SsdJob> PrefixCacheIndex::begin_ssd_write(const std::function<bool
         // Checked before anything is evicted: a write that cannot fit displaces nothing.
         if (ssd_room_for(index, snapshot.priority) < need) { continue; }
         std::vector<std::uint32_t> slabs;
-        if (!allocate_ssd_slabs(need, slabs, index, snapshot.priority)) { return std::nullopt; }
+        // The room check can pass and the allocation still fail: each SSD eviction re-values the victim's retained
+        // dependents, which may rise above this claim. What it freed stays free for the next candidate.
+        if (!allocate_ssd_slabs(need, slabs, index, snapshot.priority)) { continue; }
         // The SSD eviction above removes only other snapshots, which never take a block of this path
         // with them (the path stays live), so the candidate and its blocks are as checked.
         SsdJob job;

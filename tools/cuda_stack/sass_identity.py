@@ -62,6 +62,10 @@ def main() -> int:
     args = parser.parse_args()
 
     before, after = kernels(args.before, args.cuobjdump), kernels(args.after, args.cuobjdump)
+    if not before or not after:
+        # An empty listing (not a CUDA binary, or a cuobjdump that printed nothing) compares nothing.
+        empty = [str(path) for path, found in ((args.before, before), (args.after, after)) if not found]
+        raise SystemExit(f"no kernels found in {', '.join(empty)}: nothing to compare")
     removed = sorted(set(before) - set(after))
     added = sorted(set(after) - set(before))
     changed = sorted(k for k in set(before) & set(after) if digest(before[k]) != digest(after[k]))

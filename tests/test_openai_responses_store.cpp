@@ -82,6 +82,26 @@ int test_lru_and_delete() {
     return failures;
 }
 
+// A previous_response_id chain far deeper than a thread's stack could release one node per frame is released
+// without overflowing it, and an ancestor another context still holds survives with its own history.
+int test_deep_chain_release() {
+    constexpr std::size_t kDepth = 200'000;
+    OpenAIResponseContext kept;
+    OpenAIResponseContext tail;
+    for (std::size_t index = 0; index < kDepth; ++index) {
+        tail = append_openai_response_context(std::move(tail), {text_turn(infernix::ChatRole::User, "t")});
+        if (index == kDepth / 2) { kept = tail; }
+    }
+    int failures = 0;
+    failures += check(tail->cumulative_turns == kDepth, "the deep chain holds every turn");
+    tail.reset();
+    failures += check(kept != nullptr && kept->cumulative_turns == kDepth / 2 + 1 &&
+                          flatten_openai_response_context(kept).size() == kDepth / 2 + 1,
+                      "an ancestor another context holds keeps its whole history");
+    kept.reset();
+    return failures;
+}
+
 int test_oversized_record() {
     OpenAIResponsesStore store(4, 256);
     StoredOpenAIResponse large =
@@ -104,6 +124,7 @@ int main() {
     int failures = 0;
     failures += test_context_dag();
     failures += test_lru_and_delete();
+    failures += test_deep_chain_release();
     failures += test_oversized_record();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

@@ -23,7 +23,8 @@ SsdWriteBudget::SsdWriteBudget(std::uint64_t bytes_per_hour, std::filesystem::pa
     : bytes_per_hour_(bytes_per_hour), level_(static_cast<double>(bytes_per_hour)), last_(now),
       state_file_(std::move(state_file)) {
     if (bytes_per_hour == 0) { throw std::invalid_argument("an SSD write budget needs a positive hourly size"); }
-    // A saved level refills from the time it was saved; a missing or unreadable file starts full.
+    // A saved level refills from the time it was saved; a missing or unreadable file starts full. A time
+    // after `now` (the clock was ahead when it was saved) refills from `now`.
     std::ifstream in(state_file_);
     std::string tag;
     double level           = 0.0;
@@ -40,7 +41,8 @@ void SsdWriteBudget::refill(Clock::time_point now) noexcept {
     if (seconds > 0.0) {
         level_ = std::min(static_cast<double>(bytes_per_hour_), level_ + seconds * static_cast<double>(bytes_per_hour_) / kHourSeconds);
     }
-    last_ = std::max(last_, now);
+    // A clock set back refills from its new time rather than waiting for it to pass the old one.
+    last_ = now;
 }
 
 double SsdWriteBudget::threshold(double share) const {
@@ -82,7 +84,7 @@ void SsdWriteBudget::save(Clock::time_point now) const noexcept {
         if (seconds > 0.0) {
             level = std::min(static_cast<double>(bytes_per_hour_), level + seconds * static_cast<double>(bytes_per_hour_) / kHourSeconds);
         }
-        const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(std::max(now, last_).time_since_epoch()).count();
+        const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
         std::filesystem::path temporary = state_file_;
         temporary += ".tmp";
         {
