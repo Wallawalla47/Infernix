@@ -486,6 +486,12 @@ struct ResumeStateImpl {
     GateTraffic gate;
 };
 
+// A pair call's head (pair_step): its columns and the promotions its own call starts.
+struct PairHead {
+    std::int32_t columns   = 0;
+    std::size_t promotions = 0;
+};
+
 class ProgramImpl {
 public:
     enum class Phase : std::uint8_t { Free, Prefill, Decode, Finishable };
@@ -2603,12 +2609,6 @@ public:
 
         return prefill_progress(lane, index, begin, width, static_cast<std::uint32_t>(width), last, promotions, start);
     }
-
-    // A pair call's head (pair_step): its columns and the promotions its own call starts.
-    struct PairHead {
-        std::int32_t columns   = 0;
-        std::size_t promotions = 0;
-    };
 
     // A prefill call's routes into the residency: the lane's prompt uses (note_prompt_routes), then the
     // round's policies. TEMPORARY (INFERNIX_TMP_CONTINUING_PROMPT=<fraction>, candidates CF-01): a prompt
