@@ -7,6 +7,7 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/launcher/embed_gather.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gdn_gating.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gelu.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/launcher/kernel_images.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/l2norm.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/layer_norm.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/mtp_pack.cu"

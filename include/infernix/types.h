@@ -27,9 +27,11 @@ inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
 // Physical Host memory Infernix leaves free for the OS and other programs after its weights, experts,
-// n-gram table and caches, when --ram-free-mib is not given (8 GiB since 2026-10-26: with 2 GiB a desktop paged
-// once Qwen3.8-Flash-Next's experts and n-gram table took the rest; Basalt's RAM-low guard sits at ~8.3 GiB).
-inline constexpr std::uint64_t kDefaultRamFreeBytes = 8ULL << 30;
+// n-gram table and caches, when --ram-free-mib is not given: 4 GiB since 2026-11-13 (the owner's choice, once the RAM
+// plans counted the CUDA kernel images, 4.5 GiB they had missed, so that the 8 GiB reserve of before actually stayed
+// free); 8 GiB from 2026-10-26 (with 2 GiB a desktop paged once Qwen3.8-Flash-Next's experts and n-gram table took the
+// rest, which the missed images made 2.4-3.8 GiB less than planned).
+inline constexpr std::uint64_t kDefaultRamFreeBytes = 4ULL << 30;
 // Prompt-attention split workspace when --prefill-split-workspace-mib is not given.
 inline constexpr std::uint32_t kDefaultPrefillSplitWorkspaceMiB = 256;
 inline constexpr std::uint32_t kMaximumPrefillSplitWorkspaceMiB = 16384;
@@ -2039,6 +2041,53 @@ struct ExpertCacheMemorySummary {
     std::uint64_t kv_backed_bytes   = 0;
 };
 
+// The memory a Program holds now, by category (RuntimeStats::memory; serving.md, the JSON telemetry's `memory`).
+// Each figure is what is allocated (reserved, which is what the OS counts as used); the `*_used` figures are the
+// occupied share inside a part. The parts of one kind never overlap. The CUDA context, the driver's own allocations
+// and buffers no part names are not counted: the process's own usage less the parts.
+struct MemoryUsage {
+    struct Device {
+        std::uint64_t weights       = 0; // the model's device weights, the drafter's excepted
+        std::uint64_t drafter       = 0; // a separate drafter's weights, and the drafters' columns, rings and pools
+        std::uint64_t experts       = 0; // the VRAM expert cache's frames that hold experts
+        std::uint32_t expert_frames = 0;
+        std::uint64_t kv            = 0; // the KV cache's backed pages and tables, less `prefix`'s pages
+        std::uint64_t kv_used       = 0; // of them, pages holding requests' tokens
+        std::uint64_t state         = 0; // recurrent (GDN) state, per-request rows and records, call inputs and outputs
+        std::uint64_t prefix        = 0; // the prefix cache's device snapshots and the KV pages only it holds
+        std::uint64_t workspace     = 0; // activation workspace, with frames the expert cache lends to prefill and vision
+        std::uint64_t cuda_graphs   = 0; // CUDA Graph executables (measured when they were prepared)
+        std::uint64_t staging       = 0; // copy staging and tables (expert misses, the expert cache's tables)
+    } device;
+    struct Host {
+        std::uint64_t experts        = 0; // expert records in RAM
+        std::uint64_t expert_records = 0;
+        std::uint64_t prefix         = 0; // the prefix cache's Host tier
+        std::uint64_t prefix_used    = 0; // of it, slabs holding entries
+        std::uint64_t weights        = 0; // weights kept in RAM (pinned mirrors and escapes, the embedding, a vision tower)
+        std::uint64_t ngram          = 0; // the n-gram table in RAM, or its row cache
+        std::uint64_t staging        = 0; // pinned staging buffers
+    } host;
+    struct Ssd {
+        std::uint64_t prefix         = 0; // the prefix cache's SSD tier file
+        std::uint64_t prefix_used    = 0;
+        std::uint64_t experts        = 0; // expert records read from the artifact on use (not in RAM)
+        std::uint64_t expert_records = 0;
+    } ssd;
+    std::uint64_t vram_headroom = 0; // device memory the Engine keeps free for the display and other programs
+};
+
+// One reading of the Engine's device memory (Engine::device_memory): the card's total and free bytes (cudaMemGetInfo;
+// under a Windows video-memory budget past it, or with several devices, the budget less this process's use) and,
+// where the OS reports them (Windows WDDM, WSL2), this process's own use of the device's memory and of the system
+// memory it page-locked for the device.
+struct DeviceMemoryReading {
+    std::uint64_t total_bytes = 0;
+    std::uint64_t free_bytes  = 0;
+    std::optional<std::uint64_t> process_bytes;
+    std::optional<std::uint64_t> process_pinned_bytes;
+};
+
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
@@ -2273,6 +2322,9 @@ struct RuntimeStats {
     // The VRAM expert cache of an offloaded-expert model (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B);
     // absent otherwise.
     std::optional<ExpertCacheTotals> expert_cache;
+
+    // What the Program holds now, by category (MemoryUsage).
+    MemoryUsage memory;
 
     // The prefix cache; zero when it is disabled. Block and snapshot gauges are absolute; the
     // rest are cumulative event counters.

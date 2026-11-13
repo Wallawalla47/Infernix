@@ -372,6 +372,8 @@ std::string HttpServer::metrics_json_body() const {
     snapshot.max_context         = engine.max_context;
     snapshot.max_concurrency     = engine.max_concurrency;
     snapshot.stats               = service_->runtime_stats();
+    snapshot.device_memory       = service_->device_memory();
+    snapshot.host_memory         = host_memory_snapshot();
     snapshot.counts              = {.completed = counts.completed,
                                     .cancelled = counts.cancelled,
                                     .failed    = counts.failed,

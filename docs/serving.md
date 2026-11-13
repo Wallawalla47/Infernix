@@ -150,8 +150,9 @@ What is exact and what is estimated (`estimated` is always `true`):
   `--a8-activations` that does not apply, so `fits` is the start's own decision (the plan compiles
   the chat template as the start's frontend does); its Program then re-plans with the fast paths
   selected, so its actual frames can differ slightly from `expert_frames`. Both families'
-  `expert_frames` leave off the 64 MiB chunk per further record-size pool a start keeps free (a GGUF
-  import's layers have up to seven).
+  `expert_frames` leave off the 64 MiB chunk per record-size pool a start keeps free (a GGUF import's
+  layers have up to seven). A start reads the CUDA kernel images (about 4.5 GiB of RAM) before its RAM
+  ledger, which then sees them used; the plan, which launches no kernel, counts them as process growth.
 - The Qwen3.5 family's capacity is resolved against the free VRAM read where a start reads it
   (under Windows with a DXGI budget, at most the budget less the process's usage, which can be GiBs
   below the driver's free figure; a KV sized past it would be demoted to system memory), less
@@ -1902,8 +1903,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--log-file PATH` | duplicate the console log records to a plain timestamped file (appended, each record written through as it is logged, so a crash leaves every earlier record in it, including records a console that stopped taking output dropped) beside, never instead of, the console; the file carries no logger-added colour or cursor control, and records that colour their own message under `--log-colours` (the serve panels) keep those escapes; a file that cannot be opened leaves the console logging, with a warning | none |
 | `--device N` | CUDA device index | `0` |
-| `--ram-free-mib N` | physical Host RAM in MiB that everything Infernix keeps in RAM (weights, offloaded experts, the n-gram table, the prefix cache's Host tier) leaves free for other programs; startup refuses a lock that would take it, and Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger | `8192` |
-| `--ram-resize auto\|off` | `auto`: the RAM tiers follow the RAM other programs need, while requests run as well as between them. With R = `--ram-free-mib`, once less than max(R / 2, 2 GiB) of physical RAM is available they give memory back in whole 1 GiB steps until R (at least 1 GiB above that point) is available again: the prefix cache's Host tier first (its least valuable entries go; the rest, a running request's cached blocks included, are copied below the cut; down to one chunk), then the offloaded experts' RAM copies when the [SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier) serves them (the `exclusive` layout, or less RAM than every expert needs; the experts given back are read from the artifact meanwhile). Once more than R plus 1 GiB has stayed available for 10 s they take back what stays above that, up to their startup sizes, one piece of 1 GiB or one pinned expert chunk at a time, the experts first: rounds refill their slots and records with the experts they read from the artifact (a record by a background copy of what a round read and no slot took), and what is still empty once the Engine is idle is read from the artifact then. Between the two thresholds (R = 8 GiB: 4 to 9 GiB available) nothing changes, so ordinary swings of other programs do not cycle the tiers. The copies, page-locking and releases run on a thread of their own (a hybrid CPU's slow cores); a round waits only for the bookkeeping between rounds, the driver's own stall of 1-3 ms per 64 MiB chunk the Host tier locks or unlocks, and, for the experts, the round in flight before a release and about 0.1 s per GiB of expert chunk locked again (while requests run, one chunk at most every 2 s). Each release and each completed growth is logged. `off`: every tier keeps its startup size | `auto` |
+| `--ram-free-mib N` | physical Host RAM in MiB that everything Infernix keeps in RAM (weights, offloaded experts, the n-gram table, the prefix cache's Host tier) leaves free for other programs; startup refuses a lock that would take it, and Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger | `4096` |
+| `--ram-resize auto\|off` | `auto`: the RAM tiers follow the RAM other programs need, while requests run as well as between them. With R = `--ram-free-mib`, once less than max(R / 2, 2 GiB) of physical RAM is available they give memory back in whole 1 GiB steps until R (at least 1 GiB above that point) is available again: the prefix cache's Host tier first (its least valuable entries go; the rest, a running request's cached blocks included, are copied below the cut; down to one chunk), then the offloaded experts' RAM copies when the [SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier) serves them (the `exclusive` layout, or less RAM than every expert needs; the experts given back are read from the artifact meanwhile). Once more than R plus 1 GiB has stayed available for 10 s they take back what stays above that, up to their startup sizes, one piece of 1 GiB or one pinned expert chunk at a time, the experts first: rounds refill their slots and records with the experts they read from the artifact (a record by a background copy of what a round read and no slot took), and what is still empty once the Engine is idle is read from the artifact then. Between the two thresholds (R = 4 GiB, the default: 2 to 5 GiB available) nothing changes, so ordinary swings of other programs do not cycle the tiers. The copies, page-locking and releases run on a thread of their own (a hybrid CPU's slow cores); a round waits only for the bookkeeping between rounds, the driver's own stall of 1-3 ms per 64 MiB chunk the Host tier locks or unlocks, and, for the experts, the round in flight before a release and about 0.1 s per GiB of expert chunk locked again (while requests run, one chunk at most every 2 s). Each release and each completed growth is logged. `off`: every tier keeps its startup size | `auto` |
 | `--expert-ram-mib N\|auto` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB on Flash-Next, 60.75 GiB on the 122B) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |
 | `--expert-ram-layout exclusive\|full` | Qwen3.8-Flash-Next and the Qwen3.5-122B-A10B, when VRAM cannot hold every routed expert: `exclusive` keeps in RAM only the experts VRAM does not hold (plus copies of the ones a prefill borrows and the KV may take), `full` keeps a RAM copy of every expert whenever RAM allows. Same output bits either way. Flash-Next: `full` takes 4-6 GiB more RAM for the Dense8 and IQ3_S experts at 16K on an RTX 5090, at the same decode speed. 122B: `exclusive` holds 56.9 instead of 60.8 GiB of experts and decodes about 1 % slower after a 32K prompt (equal at short ones), prefill 0.4 % slower. Ignored with `--expert-ram-mib N` | `exclusive` (Flash-Next), `full` (122B) |
 | `--expert-csf` | Qwen3.8-Flash-Next and the Qwen3.5-122B-A10B, NVFP4 experts offloaded to RAM: their RAM copies (the pinned banks, or the SSD tier's slots) keep the block scales compressed (CSF: 4-bit offsets from per-row bases, ~5 % fewer bytes, about 3 GiB on Flash-Next), so each copy to VRAM and each CPU walk reads less. Same output bits. Measured on an RTX 5090 (2026-11-09): prompts 2-5 % faster on Dense8, FP4-Local and the 122B, decode 0.6-2 % slower (the CPU decodes the scales of the experts it computes) | off |
@@ -2192,7 +2193,7 @@ An unknown `format` is a `400`, never a silent fallback.
 curl 'http://127.0.0.1:8080/metrics?format=json'
 ```
 
-The document carries `schema`, `time`, `engine`, `live`, `totals`, `requests` and `session_stats`. It exists because
+The document carries `schema`, `time`, `engine`, `live`, `totals`, `requests`, `memory` and `session_stats`. It exists because
 the text exposition cannot carry per-request records: a request id or a per-row timing in a label
 would make the series cardinality unbounded.
 
@@ -2203,6 +2204,7 @@ would make the series cardinality unbounded.
 | `live` | engine phase (`idle`, `reading`, `generating`), request counts by phase, the interval prefill/decode rates, and `active`, the generation requests in flight. A rate is `null` until the throughput reporter has produced one. `progress_owner` is the Engine request id holding the service turn, the request every unit waits on while it cannot run (`null` when none holds it), and `no_progress_s` how long the Engine has held requests without completing any unit (0 while it progresses; "How failures end" under [Endpoints](#endpoints)) |
 | `totals` | monotonic counters since startup, plus terminal request counts |
 | `requests` | the last 128 settled generation requests (completed, cancelled, failed), oldest first; requests rejected before generation appear only in `totals.rejected` |
+| `memory` | what the server holds now on the GPU (`device`), in RAM (`host`) and, with an SSD tier, on the SSD (`ssd`, otherwise `null`), by part; below |
 | `session_stats` | the console statistics panel's figures as numbers, also without a terminal: `completed`, `failed`, `cancelled`, `rejected`, the model `drafter` (`null` until one drafted), `ngram_enabled`, `recent_window` (10), and two rows, `session` (every completed request) and `recent` (the last ten). Each row has `requests`, mean `ttft_s`, `prompt_tokens`, `cached_tokens` and `cache_hit_rate`, `prefill_tokens`, `prefill_s` and `prefill_tok_s`, `decode_tokens`, `decode_s`, `decode_tok_s` (aggregate) and `batch`, the model drafter's `drafted`, `accepted`, `acceptance` and `accepted_per_round`, the n-gram drafter's `ngram_drafted`, `ngram_accepted`, `ngram_acceptance` and `ngram_rounds`, the archive's `archive_drafted`, `archive_accepted` and `archive_acceptance`, and the VRAM expert cache's `expert_lookups`, `expert_hits` and `expert_hit_rate`; a ratio or rate is `null` while its denominator is zero. The [launcher](launcher.md)'s dashboard shows them |
 
 Each request row carries its id, completion time in Unix seconds, `label` (the request's
@@ -2233,6 +2235,33 @@ entry is:
 The figures come from the Engine's progress observations, published at admission, after each
 prefill unit and at each committed output, and taken by the request's own thread within about 10 ms;
 a poll reads them without touching the Engine. A request rejected before submission never appears.
+
+`memory` has three members. `device` carries the card's `total_bytes` and `free_bytes` (all processes),
+`process_bytes`, this server's own use of the card as the OS counts it (Windows and WSL2; `null` elsewhere), which
+includes the CUDA context and driver allocations no part names, and `headroom_bytes`, what the server keeps free for
+the display and other programs. `host` carries the RAM's `total_bytes` and `available_bytes` and `process_bytes`, the
+server's resident memory (`null` if unknown), which includes what no part names, mostly the CUDA driver's copy of the
+server's GPU code (about 4 GiB, read at startup). On Windows the process's committed memory also counts its VRAM (the
+driver's backing store), so it is not shown. `ssd` is `null` unless the server uses an SSD tier. Each member has
+`parts`, what the server holds by category, listed only when the part holds memory; parts never overlap. A part's
+`bytes` is what is allocated (reserved), which is what the OS counts as used; `used_bytes`, where given, is the
+occupied share (KV pages holding requests' tokens, prefix-cache space holding entries) and `count` the experts held.
+
+| Part | `device` | `host` | `ssd` |
+|---|---|---|---|
+| `weights` | the model's weights, the drafter's excepted | weights kept in RAM (pinned objects, the token embedding, packed-weight escapes) | |
+| `drafter` | the speculative drafter's weights (MTP, DFlash, DFlash2), its columns, rings and pools, and DFlash2's proposal-head screen | | |
+| `experts` | the VRAM expert cache's frames that hold experts (`count`: frames) | expert records in RAM (`count`: records) | records read from the artifact on use (`count`) |
+| `kv_cache` | the KV cache's backed pages and tables, less `prefix_cache`'s | | |
+| `state` | recurrent (GDN) state, per-request rows and records, round inputs and outputs | | |
+| `prefix_cache` | Device snapshot slots and the KV pages only the prefix cache holds | the Host tier | the SSD tier's file |
+| `workspace` | the activation workspace, with the frames the expert cache lends a prompt while lent | | |
+| `cuda_graphs` | CUDA Graph executables, as measured when they were prepared | | |
+| `staging` | expert-miss staging and the expert cache's tables | the pinned upload ring and the Program's pinned buffers | |
+| `ngram` | | Qwen3.8-Flash-Next's n-gram table in RAM, or its row cache | |
+
+The [launcher](launcher.md)'s dashboard draws `memory` as one bar per member, with the server's unnamed use
+(`process_bytes` less the parts) and other processes' use beside the parts.
 
 The route follows the server's API-key authentication. The document contains no prompt, completion,
 tool argument, key, or client address, and no header value but the client's own request label

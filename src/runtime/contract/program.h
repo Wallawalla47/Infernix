@@ -42,6 +42,8 @@ concept EngineProgramContract = requires(typename Types::Program& program, const
     program.save_prefix_cache_now(CancellationView{});
     // The expert cache's cumulative counters (RuntimeStats::expert_cache; empty without one).
     { view.expert_cache_totals() } -> std::convertible_to<std::optional<ExpertCacheTotals>>;
+    // What the Program holds now, by category (RuntimeStats::memory): read with every stats publication, so cheap.
+    { view.memory_usage() } -> std::same_as<MemoryUsage>;
     // A finished request's expert cache counters and the prompt tokens its snapshots made reusable.
     { finished.expert_cache } -> std::convertible_to<std::optional<ExpertCacheStats>>;
     { finished.cache_created_prompt_tokens } -> std::convertible_to<std::optional<std::uint32_t>>;

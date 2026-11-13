@@ -240,15 +240,19 @@ std::uint64_t maximum_main_page_groups(std::uint32_t concurrency, std::uint32_t 
 
 // Device memory the driver takes for CUDA Graph decode executables. Every topology class of a
 // graph family is instantiated as one executable per batch size, uploaded and launched once at
-// startup, so graph memory scales with the executable count. Measured on an RTX 5090 (CUDA 13.4,
-// Qwen3.8-27B NVFP4, as the drop in free Device memory after startup against --no-cuda-graph at
-// the same KV capacity): 2.2-2.9 MiB per executable for no speculation, MTP, DFlash2 and DFlash2
-// with n-gram drafting (16 MiB for DFlash2 at max concurrency 1, 274 MiB for DFlash2 with n-gram
-// at 8), rising to 4.1 MiB only where MTP verifies a 15-wide n-gram window at batch 4-8 (198 MiB
-// at max concurrency 8, the tightest case against this allowance). The allowance keeps 4 MiB per
-// executable plus a fixed 64 MiB for driver and module state.
-constexpr std::size_t kGraphExecutableAllowance = 4ULL * kMiB;
-constexpr std::size_t kGraphDriverAllowance     = 64ULL * kMiB;
+// startup, so graph memory scales with the executable count. Measured on an RTX 5090 (driver 621.01,
+// CUDA 13.4, Qwen3.8-27B NVFP4, INT8 KV, 2026-11-13: the drop in free Device memory over graph
+// preparation, which matched the process's use against --no-cuda-graph net of the KV the allowance
+// displaced, 38 against 42 MiB for DFlash2 at max concurrency 2): 1.0-1.5 MiB per executable, the
+// driver's own share within the 2 MiB granularity, for no speculation (2-4 MiB at max concurrency
+// 1-2), MTP (2-10 MiB at 1-4), DFlash2 (28, 42 and 74 MiB at 1, 2 and 4), DFlash2 with n-gram
+// drafting (72 MiB at 2) and MTP verifying a 15-wide n-gram window (182 MiB for 136 executables at
+// 4). The 2026-09-26 calibration measured 2.2-4.1 MiB on the graphs of then, and the 4 MiB and
+// 64 MiB it kept left 66-426 MiB of these configurations free above the headroom, KV capacity
+// automatic sizing never used. The allowance keeps 2 MiB per executable (a third above the largest
+// measured) plus 16 MiB; serve warns at startup when the graphs took more.
+constexpr std::size_t kGraphExecutableAllowance = 2ULL * kMiB;
+constexpr std::size_t kGraphDriverAllowance     = 16ULL * kMiB;
 
 // Number of executables one family instantiates for one batch size: one per topology class.
 std::uint32_t graph_topology_classes(const std::vector<GraphExecutionProfile>& profiles) {
@@ -318,6 +322,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         out.text_kv_region_bytes = text_pages.finish(kArenaAlign, "elastic text KV pages");
         out.text_kv_base_pages   = std::min(physical_pages, page_count(kElasticKvBaseTokens));
     }
+    out.kv_bytes = builder.finish();
     qwen3_5::StateImageSpec state_image_spec{
         .linear =
             {
@@ -366,7 +371,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             .kv_heads = dimension(config.attention->num_key_value_heads),
         };
     }
-    out.state_images = qwen3_5::plan_state_image_device_pool(builder, state_image_spec);
+    out.state_images      = qwen3_5::plan_state_image_device_pool(builder, state_image_spec);
+    out.state_image_bytes = builder.finish() - out.kv_bytes;
     if (plan.speculative_backend != SpeculativeBackend::None) {
         // A layer's records hold the widest round's columns (verify_column_capacity), as the verify
         // logits do: rows of draft_window + 1 columns, enough of them for every family's width times the
@@ -386,6 +392,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             });
     }
     {
+        const std::size_t before = builder.finish();
         const auto* draft =
             parameters.model.config().draft ? &*parameters.model.config().draft : nullptr;
         if (plan.features.masked_draft()) {
@@ -439,6 +446,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                   static_cast<std::int32_t>(plan.max_concurrency)},
                 "DFlash pending target features");
         }
+        out.drafter_bytes = builder.finish() - before;
     }
 
     out.round = qwen3_5::begin_round_state_layout(

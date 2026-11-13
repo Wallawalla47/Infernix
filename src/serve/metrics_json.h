@@ -6,6 +6,7 @@
 // constants) except a request's label, the client's own X-Infernix-Request-Label (printable ASCII,
 // at most 128 bytes; request_label); no request text is copied into them.
 
+#include "core/host_memory.h"
 #include "serve/console_stats.h"
 #include "serve/generation_service.h"
 #include "serve/request_events.h"
@@ -124,6 +125,10 @@ struct MetricsJsonSnapshot {
     std::uint32_t max_context     = 0;
     std::uint32_t max_concurrency = 0;
     infernix::RuntimeStats stats{};
+    // `memory`: the parts are stats.memory; the device's and the host's totals and this process's use are these
+    // readings (GenerationBackend::device_memory, host_memory_snapshot), taken with the snapshot.
+    infernix::DeviceMemoryReading device_memory{};
+    HostMemorySnapshot host_memory{};
     MetricsJsonCounts counts{};
     double decode_tokens_per_second  = 0.0;
     double prefill_tokens_per_second = 0.0;

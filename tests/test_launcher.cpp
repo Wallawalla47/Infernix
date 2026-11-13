@@ -588,7 +588,7 @@ void test_load_advice() {
         "ram", offloaded, {"--max-context", "262144", "--host-context-mib", "8192"}, "free RAM fell", facts);
     check(std::any_of(ram.begin(), ram.end(),
                       [](const LoadSuggestion& s) {
-                          return s.args && flag_value(*s.args, "--ram-free-mib") == "16384" &&
+                          return s.args && flag_value(*s.args, "--ram-free-mib") == "12288" &&
                                  flag_value(*s.args, "--expert-ram-mib") == "auto";
                       }),
           "more RAM left free with automatic expert sizing");

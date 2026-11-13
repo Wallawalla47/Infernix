@@ -698,10 +698,10 @@ int main() {
         parse({"infernix-serve", "model.ninfer", "--host-context-mib", "2048", "--host-context-mib", "auto"});
     failures += check(!number_then_auto.context_cache.host_capacity_bytes,
                       "a later --host-context-mib auto must replace a number");
-    // --ram-free-mib: the RAM everything Infernix plans leaves free (8 GiB by default).
-    failures += check(parse({"infernix-serve", "model.ninfer"}).ram_free_bytes == (8192ULL << 20),
-                      "--ram-free-mib must default to 8 GiB");
-    failures += check(parse({"infernix-serve", "model.ninfer", "--ram-free-mib", "4096"}).ram_free_bytes == (4096ULL << 20),
+    // --ram-free-mib: the RAM everything Infernix plans leaves free (4 GiB by default).
+    failures += check(parse({"infernix-serve", "model.ninfer"}).ram_free_bytes == (4096ULL << 20),
+                      "--ram-free-mib must default to 4 GiB");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--ram-free-mib", "6144"}).ram_free_bytes == (6144ULL << 20),
                       "--ram-free-mib must set the RAM left free");
     // --ram-resize: the RAM tiers follow memory pressure unless it is off.
     failures += check(parse({"infernix-serve", "model.ninfer"}).ram_resize &&

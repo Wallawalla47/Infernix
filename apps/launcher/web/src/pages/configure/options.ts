@@ -88,7 +88,7 @@ const CONTEXT: FormSection = {
       flag: "--ram-free-mib",
       label: "RAM left free (MiB)",
       help: "Physical RAM everything Infernix keeps in RAM leaves free for other programs. An automatic Host prefix cache fills RAM down to it; once other programs take half of it, RAM given back under pressure starts.",
-      placeholder: "8192 (default)",
+      placeholder: "4096 (default)",
       min: 0,
     },
     {

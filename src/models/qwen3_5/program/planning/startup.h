@@ -199,6 +199,12 @@ struct PersistentLayout {
     std::optional<TensorLayout> grammar_masks;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
+    // Of `bytes`, by use (ProgramImpl::memory_usage): the decoder's KV pages and tables, the StateImage pool (one slot
+    // per lane, then the prefix cache's Device snapshot slots) and the DFlash drafter's KV pages and features; the
+    // rest holds replay records, round inputs and outputs and sampling state.
+    std::size_t kv_bytes          = 0;
+    std::size_t state_image_bytes = 0;
+    std::size_t drafter_bytes     = 0;
     // Elastic text KV (offloaded experts; Qwen3.5-122B design §11.1): the text KV page planes in their
     // own region of text_kv_region_bytes, reserved as virtual memory, its pages [0, text_kv_base_pages)
     // backed at startup and the rest taken from the expert frames as requests need them (ProgramImpl::

@@ -18,7 +18,7 @@ import { errorMessage } from "@/lib/api";
 import type { UsageRow } from "@/lib/api-types";
 import { formatCount, formatInt, formatRatio, formatTokS } from "@/lib/format";
 import { useNow } from "@/lib/hooks";
-import { useTheme } from "@/lib/theme";
+import { OTHER_COLOR, useCategoricalPalette } from "@/lib/palette";
 import { cn } from "@/lib/utils";
 
 type Preset = "7" | "30" | "90" | "month";
@@ -36,14 +36,6 @@ const METRICS: Record<Metric, { label: string; description: string; of: (row: Us
   prompt: { label: "Prompt", description: "Prompt tokens (cached included)", of: (row) => row.prompt_tokens },
   output: { label: "Output", description: "Output tokens", of: (row) => row.output_tokens },
 };
-
-// The validated categorical palette in its fixed order: slots 1-3 are the theme's series tokens,
-// 4-8 the same palette's further hues stepped per theme. A ninth model folds into "Other".
-const PALETTE: Record<"light" | "dark", string[]> = {
-  light: ["var(--series-1)", "var(--series-2)", "var(--series-3)", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"],
-  dark: ["var(--series-1)", "var(--series-2)", "var(--series-3)", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"],
-};
-const OTHER_COLOR = "var(--chart-muted)";
 
 function rangeOf(preset: Preset, today: string): DayRange {
   const date = parseDay(today);
@@ -130,8 +122,8 @@ interface Series {
 }
 
 /** The chart's series: every model while they fit the palette, else the seven largest and
- * "Other". Colours follow the models in name order, so a model keeps its colour when the metric
- * changes. Returned in stack order, largest at the bottom. */
+ * "Other" (a ninth model folds into it). Colours follow the models in name order, so a model
+ * keeps its colour when the metric changes. Returned in stack order, largest at the bottom. */
 function seriesOf(models: readonly Group[], palette: readonly string[]): Series[] {
   const kept = models.length > palette.length ? models.slice(0, palette.length - 1) : models.slice();
   const folded = models.slice(kept.length);
@@ -192,9 +184,9 @@ function DayTooltip({ active, payload, label, series }: RechartsTooltipProps & {
 }
 
 function TokensChart({ range, rows, models }: { range: DayRange; rows: readonly UsageRow[]; models: readonly Group[] }) {
-  const { resolved } = useTheme();
+  const palette = useCategoricalPalette();
   const [metric, setMetric] = useState<Metric>("total");
-  const series = useMemo(() => seriesOf(models, PALETTE[resolved]), [models, resolved]);
+  const series = useMemo(() => seriesOf(models, palette), [models, palette]);
 
   const data = useMemo(() => {
     const keyOf = new Map<string, string>();
@@ -385,7 +377,7 @@ export function UsagePage() {
   const today = localDay(new Date(now));
   const range = useMemo(() => rangeOf(preset, today), [preset, today]);
   const usage = useUsage(range);
-  const { resolved } = useTheme();
+  const palette = useCategoricalPalette();
 
   const rows = useMemo(() => usage.data?.rows ?? [], [usage.data]);
   const totals = useMemo(() => {
@@ -401,9 +393,9 @@ export function UsagePage() {
   const clients = useMemo(() => groupBy(rows, (row) => row.client, (row) => row.client), [rows]);
   const modelColors = useMemo(() => {
     const colors = new Map<string, string>();
-    for (const spec of seriesOf(models, PALETTE[resolved])) for (const id of spec.ids) colors.set(id, spec.color);
+    for (const spec of seriesOf(models, palette)) for (const id of spec.ids) colors.set(id, spec.color);
     return colors;
-  }, [models, resolved]);
+  }, [models, palette]);
 
   const perDay = totals.requests / Math.max(1, daysBetween(range).length);
   const failedShare = totals.requests > 0 ? totals.failed / totals.requests : null;

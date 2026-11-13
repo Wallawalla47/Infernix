@@ -104,16 +104,17 @@ int main() {
     // ---- what a start keeps off its expert frames, which the plan's frames leave off too ----
     {
         constexpr std::uint64_t kChunk = 64ULL << 20;
-        // A GGUF import's layers of three record sizes: three pools, two chunks of slack in average frames.
+        // A GGUF import's layers of three record sizes: three pools, three chunks of slack in average frames.
         const std::uint64_t strides[] = {6'291'456, 5'242'880, 6'291'456, 4'194'304, 5'242'880};
         failures += check(expert_offload::frame_pools(strides) == 3, "one pool per distinct record stride");
-        // 128 MiB in frames of their mean stride (5,452,596 bytes): 24 whole frames.
-        failures += check(expert_offload::pool_slack_frames(3, kChunk, 5'452'596) == 24,
-                          "one chunk of slack per pool beyond the first, in average frames");
+        // 192 MiB in frames of their mean stride (5,452,596 bytes): 36 whole frames.
+        failures += check(expert_offload::pool_slack_frames(3, kChunk, 5'452'596) == 36,
+                          "one chunk of slack per pool, in average frames");
+        // One record size: one pool, whose last chunk still rounds up (64 MiB in 7 MiB frames: 9).
         const std::uint64_t nvfp4[] = {7'340'032, 7'340'032, 7'340'032};
         failures += check(expert_offload::frame_pools(nvfp4) == 1 &&
-                              expert_offload::pool_slack_frames(1, kChunk, 7'340'032) == 0,
-                          "one record size: one pool and no slack");
+                              expert_offload::pool_slack_frames(1, kChunk, 7'340'032) == 9,
+                          "one record size: one pool and its chunk of slack");
         failures += check(expert_offload::pool_slack_frames(3, kChunk, 0) == 0, "no frame size: no slack");
     }
 

@@ -1,11 +1,14 @@
 #include "infernix/engine.h"
 
 #include "core/device.h"
+#include "core/host_memory.h"
 #include "core/nvtx.h"
 #include "core/io_priority.h"
 #include "core/power_throttling.h"
 #include "core/startup.h"
 #include "core/temporary_switches.h"
+#include "core/vram_budget.h"
+#include "infernix/ops/kernel_images.h"
 #include "infernix/ops/lossless_ops.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
@@ -26,6 +29,8 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -46,7 +51,8 @@ namespace {
 constexpr std::size_t kStackBytes         = 256;
 constexpr std::size_t kLosslessStackBytes = 1536;
 
-DeviceContext initialize_device(const EngineOptions& options) {
+// `start`: a start (not Engine::plan) also loads the kernel images now (load_kernel_images).
+DeviceContext initialize_device(const EngineOptions& options, bool start) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
     DeviceContext device(options.device);
     // Every kernel is built for sm_120a alone: another GPU is refused by name here, before the artifact is read, rather
@@ -61,6 +67,18 @@ DeviceContext initialize_device(const EngineOptions& options) {
     device.bind_to_current_thread();
     if (const cudaError_t err = cudaDeviceSetLimit(cudaLimitStackSize, stack); err != cudaSuccess) {
         throw std::runtime_error(std::string("cudaDeviceSetLimit(cudaLimitStackSize) failed: ") + cudaGetErrorString(err));
+    }
+    if (start) {
+        // The first kernel launch reads the kernel images into RAM (ops/kernel_images.h). Launched here, before the RAM plans read
+        // the host's free memory, they see it used: a launch after them left Qwen3.8-Flash-Next and the 122B 2.4-3.8 GiB
+        // short of the RAM their plans left free, and an automatic Host prefix tier pinned that RAM while Windows moved
+        // the images to the page file (2026-11-13). The start pays the load's time here instead of at that launch.
+        const std::uint64_t before = host_memory_snapshot().process_resident;
+        ops::load_kernel_images();
+        const std::uint64_t after = host_memory_snapshot().process_resident;
+        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
+                                    "CUDA kernel images: %llu MiB of RAM, read at the first kernel launch",
+                                    static_cast<unsigned long long>((after > before ? after - before : 0) >> 20));
     }
     phase.complete();
     return device;
@@ -315,7 +333,7 @@ public:
     explicit Impl(EngineOptions engine_options,
                   std::shared_ptr<runtime::expert_offload::HostSlotPool> slot_pool = nullptr)
         : options(normalize(std::move(engine_options))),
-          device(initialize_device(options)) {
+          device(initialize_device(options, true)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         // The lossless ops' rounding mode is process-wide device state: every lossless Engine sets it, so
         // a noise twin never leaks into a later lossless run.
@@ -455,6 +473,9 @@ public:
     ModelSamplingDefaults sampling_defaults;
     Core core;
     std::atomic<bool> stop_requested{false};
+    // device_memory(): its own source, opened at the first reading.
+    std::mutex vram_mutex;
+    std::unique_ptr<VramBudgetSource> vram_source;
 };
 
 class EngineHost::Impl {
@@ -536,7 +557,7 @@ EnginePlan Engine::plan(EngineOptions engine_options) {
     EngineOptions options             = normalize_options(std::move(engine_options), architecture);
     // The start's CUDA context and stack reserve come first there too, so the free memory the plan
     // reads is the free memory a start would read.
-    DeviceContext device = initialize_device(options);
+    DeviceContext device = initialize_device(options, false);
     EnginePlan plan;
     if (architecture == models::Architecture::Qwen4Exp) {
         (void)runtime::construct_qwen4_exp(options, device, &plan);
@@ -805,6 +826,26 @@ MemorySummary Engine::memory_summary() const {
             }
         },
         impl_->core);
+}
+
+DeviceMemoryReading Engine::device_memory() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::lock_guard lock(impl_->vram_mutex);
+    // The calling thread (an HTTP worker) reads the Engine's device.
+    if (cudaSetDevice(impl_->options.device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return {};
+    }
+    if (impl_->vram_source == nullptr) {
+        impl_->vram_source = open_vram_budget_source(impl_->options.device, impl_->options.vram_past_budget);
+    }
+    const VramSnapshot reading = impl_->vram_source->query();
+    DeviceMemoryReading out;
+    out.total_bytes = reading.device_total;
+    out.free_bytes  = reading.device_free;
+    if (reading.has_budget) { out.process_bytes = reading.local_usage; }
+    if (reading.shared_system != 0) { out.process_pinned_bytes = reading.nonlocal_usage; }
+    return out;
 }
 
 MediaCacheSummary Engine::media_cache_summary() const {

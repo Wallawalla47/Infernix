@@ -1219,7 +1219,7 @@ without `preemption`).
   runs through routes qualified at that width, so the path changes no kernel arithmetic and is
   decided by speed (6.1 item 3). Copy (n-gram) rounds keep their widths and propose at N.
 - **Cost:** one Forward/Finish graph pair per extra (K, batch size): K < N for one row, K in 1..3
-  for every batch size (about +4 MiB of graph allowance each).
+  for every batch size (+2 MiB of graph allowance each; 1.0-1.5 MiB measured 2026-11-13).
 - **Speed** (2026-10-18, RTX 5090, INT8 KV, `infernix_bench` tg512 on the bench corpus at
   concurrency 1, 2 and 4 on the default route, two runs per setting; `infernix` sampled text, math,
   story and code at seeds 7 and 43, 1,024 tokens; tok/s):
@@ -1285,7 +1285,7 @@ without `preemption`).
   run. Automatic DFlash2 trees resolve to chains beside it (below).
 - **Cost:** a one-row round's proposal and verification are two graphs with a host wait between;
   one proposal graph per drafter profile for the batch sizes that split, one verify/finish pair per
-  width and batch size it serves (about 2.5 MiB of graph allowance each).
+  width and batch size it serves (2 MiB of graph allowance each; 1.0-1.5 MiB measured 2026-11-13).
 - **Correctness:** greedy streams against the target's own greedy choice at every position
   (`infernix_qwen3_5_dflash{2,}_block*_greedy_real_test`, six prompts of 160 tokens): NVFP4 27B
   one request 17 of 960 positions disagree (worst margin 0.50 nats; fixed chains 3.0-3.3 % on this

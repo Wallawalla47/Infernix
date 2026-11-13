@@ -216,9 +216,9 @@ int test_cli_contract() {
         failures += expect(off.expert_state_path.empty() && off.expert_state_off, "--expert-state off: an empty cache");
         failures += expect(file.expert_state_path == "s.expert-state" && !file.expert_state_off, "--expert-state FILE");
     }
-    // --ram-free-mib: 8 GiB by default.
-    failures += expect(parse_for_test({"infernix_bench", "--weights", "model.ninfer"}).ram_free_bytes == (8192ULL << 20),
-                       "--ram-free-mib defaults to 8 GiB");
+    // --ram-free-mib: 4 GiB by default.
+    failures += expect(parse_for_test({"infernix_bench", "--weights", "model.ninfer"}).ram_free_bytes == (4096ULL << 20),
+                       "--ram-free-mib defaults to 4 GiB");
     // --a8-activations: off by default, a flag without a value.
     failures += expect(!parse_for_test({"infernix_bench", "--weights", "model.ninfer"}).a8_activations &&
                            parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--a8-activations"}).a8_activations,
@@ -550,7 +550,7 @@ int test_report_contract() {
                        "report preserves runtime YaRN factor");
     failures += expect(report.at("schema_version") == 26, "report schema v26");
     failures += expect(report.at("config").at("expert_state") == "calibrated" &&
-                           report.at("config").at("ram_free_mib") == 8192,
+                           report.at("config").at("ram_free_mib") == 4096,
                        "report records the expert seed and the RAM kept free");
     failures += expect(report.at("machine").at("pcie_generation").is_null() &&
                            report.at("machine").at("h2d_gbps").is_null() &&

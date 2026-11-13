@@ -182,6 +182,8 @@ public:
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] ModelMetadata model_metadata() const;
     [[nodiscard]] MemorySummary memory_summary() const;
+    // The device's memory now (the serving telemetry's `memory.device`): any thread, cheap enough to poll each second.
+    [[nodiscard]] DeviceMemoryReading device_memory() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     // Which instruction positions the active chat template renders; prompt preparation lowers an

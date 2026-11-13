@@ -138,6 +138,19 @@ HostMemorySnapshot host_memory_snapshot() {
     return out;
 }
 
+#ifdef _WIN32
+namespace {
+
+// The process's working set now (0 if unknown): a working-set maximum set below it trims the working set to it.
+SIZE_T current_working_set() noexcept {
+    PROCESS_MEMORY_COUNTERS counters{};
+    counters.cb = sizeof(counters);
+    return ::GetProcessMemoryInfo(::GetCurrentProcess(), &counters, sizeof(counters)) ? counters.WorkingSetSize : 0;
+}
+
+} // namespace
+#endif
+
 std::string reserve_process_working_set(std::uint64_t bytes) {
 #ifdef _WIN32
     SIZE_T minimum = 0, maximum = 0;
@@ -148,9 +161,12 @@ std::string reserve_process_working_set(std::uint64_t bytes) {
     const auto wanted = static_cast<SIZE_T>(bytes);
     // Only the minimum is hard; the maximum stays soft so the process may grow past it. Windows
     // rejects a hard minimum equal to the maximum (ERROR_INVALID_PARAMETER), so the maximum is
-    // kept above it.
+    // kept above it, and above the working set now: a lower maximum, soft or not, trims the working set
+    // to it at once (the CUDA kernel images, read into RAM before the RAM plan calls this, went to the
+    // page file: 4.6 GiB of a 5.3 GiB working set beyond its pins, 2026-11-13).
     constexpr SIZE_T kMaximumAbove = SIZE_T{64} << 20;
-    if (!::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), wanted, std::max(maximum, wanted + kMaximumAbove),
+    const SIZE_T new_maximum = std::max({maximum, wanted + kMaximumAbove, current_working_set() + kMaximumAbove});
+    if (!::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), wanted, new_maximum,
                                       QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
         return "Windows error " + std::to_string(::GetLastError());
     }
@@ -281,7 +297,9 @@ std::string lock_resident(std::byte* at, std::size_t bytes, std::size_t& raised)
     }
     const SIZE_T grow   = bytes + (raised == 0 ? kWorkingSetSlack : 0);
     const SIZE_T wanted = minimum + grow;
-    if (!::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), wanted, std::max(maximum, wanted + kWorkingSetSlack),
+    // Above the working set now as well, so raising the minimum trims nothing (reserve_process_working_set).
+    const SIZE_T new_maximum = std::max({maximum, wanted + kWorkingSetSlack, current_working_set() + kWorkingSetSlack});
+    if (!::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), wanted, new_maximum,
                                       QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
         return "Windows error " + std::to_string(::GetLastError()) + " raising the working set";
     }

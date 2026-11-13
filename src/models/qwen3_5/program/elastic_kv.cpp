@@ -92,7 +92,9 @@ void ProgramImpl::shrink_kv(bool evict) {
     if (pool.backed_pages() <= kv_base_pages) { return; }
     if (evict && hybrid_) {
         // The idle cache's device blocks that have host copies go first (a later match restores them),
-        // so an ended conversation gives its memory back to the frames.
+        // so an ended conversation gives its memory back to the frames. The Host writes a lane's release
+        // started pin their blocks until poll sees them land, and nothing else polls while the engine idles.
+        hybrid_->poll();
         runtime::prefix_cache::PrefixCacheIndex& index = hybrid_->index();
         for (std::uint32_t budget = pool.backed_pages() - kv_base_pages;
              budget != 0 && !pool.can_back(kv_base_pages) && index.evict_backed_device_blocks(1) != 0; --budget) {}

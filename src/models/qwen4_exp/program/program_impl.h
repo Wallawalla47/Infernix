@@ -895,9 +895,10 @@ public:
         b.kv_max    = d.kv;
         b.workspace = d.work;
         b.staging   = d.staging;
-        b.state     = d.gdn_bytes + d.ple + d.tails + d.window + d.records_bytes + d.ple_records + d.qsa_records +
-                  (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0) + d.dflash_features +
-                  d.dflash_ring + d.drafter_pool;
+        const std::uint64_t drafter_state = (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0) +
+                                            d.dflash_features + d.dflash_ring + d.drafter_pool;
+        b.state   = d.gdn_bytes + d.ple + d.tails + d.window + d.records_bytes + d.ple_records + d.qsa_records + drafter_state;
+        b.drafter = drafter_state + d.mtp_ones + 4ULL * d.mtp_io.words + 4ULL * d.dflash_io.words;
         b.io = d.io.bytes + d.pair_io + d.logits32 + d.logits16 + 4ULL * d.tree_io.words + 4ULL * lanes + 4ULL * lanes +
                sizeof(ops::SamplingConfig) * lanes + d.token_counts + 4ULL * d.spec.words + d.mtp_ones +
                4ULL * d.mtp_io.words + 4ULL * d.dflash_io.words + kGateStatsBytes * lanes +
@@ -1624,10 +1625,11 @@ public:
         // executables and the display headroom leave (design §19.3.7). Its frames are the one
         // elastic allocation: a chunk the driver places in system memory (another program took
         // memory since the reading) is given back and the cache stops growing there.
+        std::optional<std::uint64_t> free_after_frames; // the debug line before the graphs' capture
         if (options_.expert_cache) {
             const VramDemand demand = expert_frame_demand(residency_->frame_bytes());
             sizing_                 = size_expert_frames(vram_->query(), demand);
-            // Each pool maps whole chunks: one chunk of slack per pool beyond the first (Engine::plan's too).
+            // Each pool maps whole chunks: one chunk of slack per pool (Engine::plan's too).
             const std::uint32_t slack =
                 pool_slack_frames(residency_->pools(), ExpertResidency::kChunkBytes, residency_->frame_bytes());
             sizing_.frames = sizing_.frames > slack ? sizing_.frames - slack : 0U;
@@ -1642,6 +1644,7 @@ public:
                                                      std::to_string(sizing_.frames) + " frames", DiagnosticLevel::Warning);
             }
             sizing_.frames = grown.frames;
+            free_after_frames = vram_->query().device_free;
             start_vram_monitor(demand);
             const std::uint32_t nominal = size_expert_frames(nominal_snapshot(sizing_.snapshot), demand).frames;
             const std::uint64_t lends   = fit_wide_work_to_cache(grown.frames, nominal > slack ? nominal - slack : 0U);
@@ -1718,6 +1721,14 @@ public:
         forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
                                                         std::move(experts), dim(options_.max_context), options_.fast_paths);
         if (dflash2_) { create_dflash2_drafter(); }
+        if (free_after_frames) {
+            // What startup takes from the device after the frames' sizing, before the graphs (the sizing planned for
+            // the graphs' reserve and the headroom only).
+            device_.synchronize();
+            diagnostic("VRAM after the expert frames: " + std::to_string(*free_after_frames >> 20) + " MiB free; " +
+                           std::to_string(vram_->query().device_free >> 20) + " MiB before the CUDA graphs' capture",
+                       DiagnosticLevel::Debug);
+        }
         capture_graph_set();
         device_.synchronize();
         report_lane_cost(lanes, residency_->frame_bytes());
@@ -3266,6 +3277,13 @@ public:
         out.kv_cache                = options_.kv_cache;
         out.kv_payload_bytes        = kv_vmm_ ? kv_vmm_->mapped_bytes() : kv_backing_.bytes;
         out.workspace_logical_peak_bytes = work_capacity_;
+        const std::uint64_t weights = parameters_.model.device_weight_bytes();
+        out.weights                 = ArenaMemorySummary{weights, weights, weights};
+        out.workspace               = ArenaMemorySummary{work_capacity_, work_capacity_, work_capacity_};
+        // The graphs' share of the frames' sizing reserve, and what their startup capture took (serve warns when it
+        // took more).
+        out.cuda_graph_allowance_bytes = sizing_.reserve;
+        out.cuda_graph_measured_bytes  = graph_set_.bytes > 0 ? static_cast<std::size_t>(graph_set_.bytes) : 0;
         if (residency_) {
             // As the 122B's ExpertOffload::memory_summary reports its cache; the cache only resizes
             // under the VRAM monitor, so without it the startup frames are today's.
@@ -3287,9 +3305,75 @@ public:
         return out;
     }
 
+    // RuntimeStats::memory (the prefix cache's Host and SSD tiers are the Engine's to fill).
+    MemoryUsage memory_usage() const noexcept {
+        MemoryUsage out;
+        const auto& model           = parameters_.model;
+        const std::uint64_t draft   = model.draft_device_bytes();
+        out.device.weights          = model.device_weight_bytes() - draft;
+        out.device.drafter          = draft + plan_.bytes.drafter;
+        out.device.state            = plan_.bytes.state + plan_.bytes.io - plan_.bytes.drafter;
+        out.device.workspace        = work_capacity_;
+        out.device.staging          = plan_.bytes.staging + plan_.bytes.residency;
+        out.device.cuda_graphs      = graph_set_.bytes > 0 ? static_cast<std::uint64_t>(graph_set_.bytes) : 0;
+        out.device.kv               = kv_vmm_ ? kv_vmm_->mapped_bytes() : kv_backing_.bytes;
+        if (const std::uint32_t backed = kv_vmm_ ? pool_->backed_pages() : pool_->capacity_pages(); backed != 0) {
+            // The pages only the prefix cache holds are its part (each page's share of the pool with its tables).
+            const std::uint64_t page      = out.device.kv / backed;
+            const std::uint32_t allocated = std::min(pool_->allocated_pages(), backed);
+            const std::uint32_t cached    = prefix_ ? std::min(prefix_->index().device_evictable_blocks(), allocated) : 0;
+            out.device.prefix  = page * cached;
+            out.device.kv     -= out.device.prefix;
+            out.device.kv_used = page * (allocated - cached);
+        }
+        if (residency_) {
+            // Frames lent to a prompt's wide arena, its stream ring or a vision window are workspace while lent.
+            const std::uint64_t lent  = std::min<std::uint64_t>(residency_->stats().lent_frames, residency_->frames());
+            const std::uint64_t pools = residency_->pool_bytes();
+            const std::uint64_t lent_bytes = std::min(pools, lent * residency_->frame_bytes());
+            out.device.experts       = pools - lent_bytes;
+            out.device.expert_frames = residency_->frames() - static_cast<std::uint32_t>(lent);
+            out.device.workspace += lent_bytes;
+            const std::uint64_t keys = static_cast<std::uint64_t>(c_.num_hidden_layers) * c_.moe.experts;
+            if (tier_) {
+                // The pinned slots and the committed unpinned records; the keys they hold (a slot's resident or shadow,
+                // a record's) are disjoint. The rest are read from the artifact on the SSD (at the largest record).
+                const std::uint64_t record = tier_->record_bytes();
+                out.host.experts           = tier_->pinned_bytes() + static_cast<std::uint64_t>(tier_->unpinned_committed()) * record;
+                const std::uint64_t held =
+                    std::min<std::uint64_t>(keys, tier_->controller().resident_count() + tier_->unpinned_held());
+                out.host.expert_records = held;
+                out.ssd.expert_records  = keys - held;
+                out.ssd.experts         = out.ssd.expert_records * record;
+            } else {
+                out.host.experts        = bank_host_bytes_;
+                out.host.expert_records = keys;
+            }
+        }
+        // The banks' records are among the model's host objects when every expert is loaded into RAM.
+        const std::uint64_t host_weights = model.host_weight_bytes();
+        out.host.weights = tier_ || !residency_ ? host_weights : host_weights - std::min(host_weights, bank_host_bytes_);
+        out.host.ngram   = volume_.resident() ? NgramVolume::resident_bytes(volume_.table()) : NgramVolume::cache_bytes(volume_.table());
+        out.host.staging = kUploadStagingRingBytes + pinned_buffer_bytes();
+        out.vram_headroom = sizing_.headroom; // the frames' sizing kept it free
+        return out;
+    }
+
     std::uint64_t revision() const noexcept { return revision_; }
 
 private:
+    // The Program's own pinned host buffers (memory_usage's staging).
+    std::uint64_t pinned_buffer_bytes() const noexcept {
+        std::uint64_t bytes = 0;
+        for (const PinnedHostBuffer* buffer :
+             {&score_host_, &nonfinite_flags_, &unpackable_flags_, &grammar_host_, &io_host_, &host_sampled_, &host_configs_,
+              &pair_host_, &penalty_host_, &constraint_pinned_, &tree_host_, &device_error_, &walk_host_, &mtp_host_,
+              &dflash_host_, &spec_host_, &gate_host_, &commit_gate_host_, &flush_host_}) {
+            bytes += buffer->size();
+        }
+        return bytes;
+    }
+
     // Promotions per layer call (design section 19.2): one per decode round measured fastest; a
     // promotion moves as many PCIe bytes as serving the expert once zero-copy.
     static constexpr std::size_t kDecodePromotionsPerLayer  = 1;
@@ -4156,8 +4240,14 @@ private:
             const auto promoted = s.promotions - at_admission.promotions;
             const auto landed   = s.landed - at_admission.landed;
             const auto cpu      = cpu_service_ ? cpu_service_->served_experts() - lane.cpu_served_at_admission : 0;
+            // The free memory the frames are sized against: past the OS budget (--vram-past-budget) the driver's own
+            // reading is 0.
             std::size_t free_vram = 0, total_vram = 0;
-            if (cudaMemGetInfo(&free_vram, &total_vram) != cudaSuccess) { free_vram = 0; }
+            if (vram_) {
+                free_vram = static_cast<std::size_t>(vram_->query().device_free);
+            } else if (cudaMemGetInfo(&free_vram, &total_vram) != cudaSuccess) {
+                free_vram = 0;
+            }
             // The process's RAM beside the plan (candidates §22 RAM comparison: the engines' totals were only derived).
             const HostMemorySnapshot ram = host_memory_snapshot();
             constexpr double kGiB        = 1024.0 * 1024.0 * 1024.0;
@@ -7214,9 +7304,21 @@ private:
     void shrink_kv(bool evict = false) {
         if (!kv_vmm_ || pool_->backed_pages() <= plan_.kv_base_pages) { return; }
         if (evict && prefix_) {
+            // The Host writes a lane's release started pin their blocks until poll sees them land, and nothing polls
+            // while the engine idles: without this the blocks of the last conversation stayed pinned, the shrink
+            // released nothing and the pool kept them (with the frames they took) until the next admission.
+            prefix_->poll();
             runtime::prefix_cache::PrefixCacheIndex& index = prefix_->index();
+            std::uint32_t evicted = 0;
             for (std::uint32_t budget = pool_->backed_pages() - plan_.kv_base_pages;
-                 budget != 0 && !pool_->can_back(plan_.kv_base_pages) && index.evict_backed_device_blocks(1) != 0; --budget) {}
+                 budget != 0 && !pool_->can_back(plan_.kv_base_pages) && index.evict_backed_device_blocks(1) != 0; --budget) {
+                ++evicted;
+            }
+            diagnostic("idle KV shrink: " + std::to_string(evicted) + " cached blocks with Host copies released; " +
+                           std::to_string(pool_->allocated_pages()) + " of " + std::to_string(pool_->backed_pages()) +
+                           " backed pages in use, " + std::to_string(index.device_evictable_blocks()) +
+                           " of them cached blocks without Host copies",
+                       DiagnosticLevel::Debug);
         }
         // Down in growth steps, the last one to the base (Qwen3.5's elastic_kv.cpp: a pool grown to a capacity
         // off the step grid stopped above the base when a page below the base was in use, and then woke the

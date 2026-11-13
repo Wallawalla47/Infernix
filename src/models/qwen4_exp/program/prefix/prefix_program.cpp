@@ -766,7 +766,7 @@ HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
     out.snapshots               = index.snapshots;
     out.device_resident_blocks  = index.device_resident_blocks;
     out.device_evictable_blocks = index.device_evictable_blocks;
-    out.host_slabs              = prefix_->host_layout().slabs;
+    out.host_slabs              = index.host_slab_limit; // in service now: a RAM release or growth moves it
     out.host_free_slabs         = index.host_free_slabs;
     out.host_slab_bytes         = prefix_->host_layout().slab_bytes;
     out.snapshot_hits           = index.snapshot_hits;

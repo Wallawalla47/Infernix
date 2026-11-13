@@ -30,6 +30,7 @@ const ProgramDevicePlan& Program::device_plan() const noexcept { return impl_->d
 const VramSizing& Program::vram_sizing() const noexcept { return impl_->vram_sizing(); }
 ExpertRamFill Program::expert_ram_fill() const noexcept { return impl_->expert_ram_fill(); }
 std::optional<ExpertCacheTotals> Program::expert_cache_totals() const noexcept { return impl_->expert_cache_totals(); }
+MemoryUsage Program::memory_usage() const noexcept { return impl_->memory_usage(); }
 
 void Program::set_maintenance_waker(std::function<void()> waker) { impl_->set_maintenance_waker(std::move(waker)); }
 

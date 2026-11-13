@@ -100,6 +100,8 @@ struct DeviceContext {
 // copy engine instead. A stream being captured records a node that reads `pinned_src` itself at each replay: the
 // caller keeps it valid and current for every replay.
 void upload_pinned(void* device_dst, const void* pinned_src, std::size_t bytes, cudaStream_t stream);
+// The process's pinned staging ring of upload_pinned (one per process, allocated by the first DeviceContext).
+inline constexpr std::size_t kUploadStagingRingBytes = 32ULL << 20;
 
 // Where a kernel reports a fault instead of trapping (a bounded wait that passed its bound, an input
 // outside its domain): it stores `value` into the mapped pinned `word` and lets its stream drain,

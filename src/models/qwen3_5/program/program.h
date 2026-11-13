@@ -178,7 +178,7 @@ struct HybridPrefixCacheStats {
     std::uint32_t snapshots                  = 0;
     std::uint32_t device_resident_blocks     = 0;
     std::uint32_t device_evictable_blocks    = 0;
-    std::uint32_t host_slabs                 = 0;
+    std::uint32_t host_slabs                 = 0; // Host-tier slabs in service now (a RAM release or growth moves it)
     std::uint32_t host_free_slabs            = 0;
     std::uint64_t host_slab_bytes            = 0;
     std::uint32_t free_device_snapshot_slots = 0;
@@ -515,6 +515,10 @@ public:
     // With offloaded experts: the VRAM expert cache's counters since startup and its size now
     // (RuntimeStats::expert_cache); nothing otherwise.
     [[nodiscard]] std::optional<ExpertCacheTotals> expert_cache_totals() const noexcept;
+    // What the device, host and SSD hold now, by use, and with offloaded experts the headroom their frames' sizing
+    // kept free (RuntimeStats::memory; the prefix cache's Host and SSD tiers, and otherwise the headroom, are the
+    // Engine's to fill). Engine thread, between units; with every stats publication, so O(1).
+    [[nodiscard]] MemoryUsage memory_usage() const noexcept;
     void reset_memory_peaks() noexcept;
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept;

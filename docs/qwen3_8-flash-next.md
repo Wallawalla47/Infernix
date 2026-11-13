@@ -26,10 +26,13 @@ with `--expert-stripe` in the SSD tier.
   x8 link halves their bandwidth. Check with
   `nvidia-smi --query-gpu=pcie.link.width.current --format=csv`.
 - **RAM.** About 96 GB for full speed. A run pins ~64.5 GiB. At startup a RAM ledger plans every
-  allocation (experts, n-gram table, prefix cache) and keeps `--ram-free-mib` (default 8192; 2048
-  before 2026-10-26, when a desktop paged once the experts and the n-gram table took the rest) free
-  for other programs; with the defaults about 75.3 GiB must be available, and 83.3 GiB for
-  `infernix-serve` with its prefix cache (see [Prefix cache](#prefix-cache)). With less, the [SSD expert tier](#ssd-expert-tier) keeps the
+  allocation (experts, n-gram table, prefix cache) and keeps `--ram-free-mib` (default 4096 since
+  2026-11-13, when the ledger started counting the 4.5 GiB of CUDA kernel code Infernix reads at
+  startup, which had left less free than planned; 8192 from 2026-10-26; 2048 before, when a desktop
+  paged once the experts and the n-gram table took the rest) free for other programs; with the
+  defaults about 76.7 GiB must be available when it starts, the kernel code included, with the
+  smallest prefix cache, which takes whatever the experts leave beyond the reserve (see
+  [Prefix cache](#prefix-cache)). With less, the [SSD expert tier](#ssd-expert-tier) keeps the
   experts that fit in RAM and reads the others from the artifact; the ledger line names every term.
   Windows lets the GPU page-lock RAM only up to its *shared GPU memory* (Task Manager → Performance
   → GPU; often half of RAM). Experts past that limit stay in RAM unpinned and the CPU serves them
@@ -40,7 +43,7 @@ with `--expert-stripe` in the SSD tier.
   they page, and Windows may stall Infernix's own threads for a moment: rounds wait up to 10 s for
   its CPU expert service and SSD reads before they fail): with the FP8 artifact on a 96 GB machine
   (2026-10-17, one run each), plain tg512 measured 43.8 tok/s at 2048, 38.3 at 5120 and 35.6 at
-  8192, today's default; MTP 4 at 4K + 512 measured 36.3-43.5, 40.4-40.9 and 39.6-39.7 (two runs
+  8192, the default from 2026-10-26 to 2026-11-13; MTP 4 at 4K + 512 measured 36.3-43.5, 40.4-40.9 and 39.6-39.7 (two runs
   each; how much RAM is free at startup moves it as much as the setting does). On a machine that
   runs little else, `--ram-free-mib 2048` gives that artifact its speed back. When other programs
   later take the RAM (less than half the reserve available, at least 2 GiB), `--ram-resize auto`
@@ -831,16 +834,19 @@ and whether the GPU drives a display (DXGI outputs, then NVML). The expert cache
 
 `min(free - fixed - headroom, budget - fixed - 64 MiB) - reserve`
 
-where `fixed` is the dense weights plus the KV cache, workspaces and staging, `reserve` is
-max(256 MiB, 128 MiB + 4 MiB per CUDA graph the engine may capture, counting at most 32), and
-`headroom` is `--vram-headroom-mib`: by default 512 MiB when the GPU drives a display (or cannot
-tell) and 256 MiB when it does not. The console shows a one-line summary (`VRAM: model …, KV cache
-…, expert cache …`); `--log-level debug` adds the full ledger, for example:
+where `fixed` is the dense weights plus the KV cache, workspaces and staging, `reserve` is 128 MiB
+for the CUDA graphs the engine captures later (the elastic KV cache below gives frames back when they
+take more), and `headroom` is `--vram-headroom-mib`: by default 512 MiB when the GPU drives a display
+(or cannot tell) and 256 MiB when it does not. The frames are mapped in 64 MiB chunks, so the count leaves out
+one chunk's worth per frame size. The console shows a one-line summary (`VRAM: model …, KV cache …, expert
+cache …`); `--log-level debug` adds the full ledger, for example (FP4-Local with `--vram-headroom-mib 128`
+and `--vram-past-budget`):
 
 ```text
-VRAM ledger: 32607 MiB card, no display, 547 in use before loading; dense weights 4198 MiB, KV 1024,
-workspace 1236, expert staging 169, state and io 310, expert tables 7; reserve 256 (20 graphs);
-headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
+VRAM ledger: 32579 MiB card, no display, 758 in use before loading (640 MiB past the OS budget); dense weights
+6302 MiB, KV 168 (grows to 6721 from the expert cache), workspace 324, expert staging 168, state and io 395,
+expert tables 30; reserve 128 (70 graphs); headroom 128 (set); expert frames 9124 (23.49 GiB); 203 free after
+startup
 ```
 
 - **Before reading the weights**, the engine checks that the fixed allocations fit; if they do not,
@@ -860,7 +866,7 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
   back 30 s after the memory is released. Decode is slower while the cache is smaller, and a
   warning is logged if it falls below a quarter of its startup size.
 - **The KV cache is elastic.**
-  - Startup backs only its first 32K tokens; the ledger shows `KV 482 (grows to 3360 from the
+  - Startup backs only its first 4,096 tokens; the ledger shows `KV 168 (grows to 6721 from the
     expert cache)`.
   - A request that needs more KV takes the memory from the expert cache when it is admitted, and
     gives it back when it ends.

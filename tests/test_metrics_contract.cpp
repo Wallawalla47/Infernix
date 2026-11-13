@@ -306,5 +306,62 @@ int main() {
         failures += check(live.rows(t0).empty(), "every request ended");
     }
 
+    // memory: what the server holds on the device, in RAM and on the SSD, by part, with the totals the launcher's
+    // dashboard shows them against.
+    {
+        const Json& memory = root["memory"];
+        failures += check(memory["device"]["total_bytes"].is_null() && memory["device"]["process_bytes"].is_null() &&
+                              memory["device"]["parts"].empty() && memory["host"]["parts"].empty() &&
+                              memory["ssd"].is_null(),
+                          "memory without readings: null totals, no parts, no SSD tier");
+
+        MetricsJsonSnapshot held = snapshot;
+        auto& m                  = held.stats.memory;
+        m.device.weights         = 6000;
+        m.device.experts         = 24000;
+        m.device.expert_frames   = 87;
+        m.device.kv              = 1700;
+        m.device.kv_used         = 400;
+        m.device.cuda_graphs     = 140;
+        m.host.experts           = 69000;
+        m.host.expert_records    = 2400;
+        m.host.prefix            = 9900;
+        m.host.prefix_used       = 20000; // more than the part: clamped to it
+        m.host.ngram             = 1000;
+        m.ssd.prefix             = 50000;
+        m.ssd.prefix_used        = 12000;
+        m.ssd.experts            = 3000;
+        m.ssd.expert_records     = 100;
+        m.vram_headroom          = 256;
+        held.device_memory       = {.total_bytes = 34000, .free_bytes = 230, .process_bytes = 33000};
+        held.host_memory         = {.total_physical = 102000, .available_physical = 7000, .process_resident = 85000};
+        const Json full          = Json::parse(render_metrics_json(held))["memory"];
+        const Json& device       = full["device"];
+        failures += check(device["total_bytes"] == 34000 && device["free_bytes"] == 230 && device["process_bytes"] == 33000 &&
+                              device["headroom_bytes"] == 256,
+                          "memory.device totals");
+        std::vector<std::string> keys;
+        for (const Json& part : device["parts"]) { keys.push_back(part["key"].get<std::string>()); }
+        failures += check(keys == std::vector<std::string>{"weights", "experts", "kv_cache", "cuda_graphs"},
+                          "memory.device lists the parts that hold memory, in order");
+        failures += check(device["parts"][1]["count"] == 87 && device["parts"][2]["used_bytes"] == 400 &&
+                              !device["parts"][0].contains("used_bytes") && !device["parts"][0].contains("count"),
+                          "memory.device experts' frames and the KV cache's used pages");
+        const Json& host = full["host"];
+        failures += check(host["total_bytes"] == 102000 && host["available_bytes"] == 7000 && host["process_bytes"] == 85000 &&
+                              host["parts"].size() == 3 && host["parts"][0]["key"] == "experts" &&
+                              host["parts"][0]["count"] == 2400 && host["parts"][1]["key"] == "prefix_cache" &&
+                              host["parts"][1]["used_bytes"] == 9900 && host["parts"][2]["key"] == "ngram",
+                          "memory.host totals and parts (used clamped to the part)");
+        const Json& ssd = full["ssd"];
+        failures += check(ssd["parts"].size() == 2 && ssd["parts"][0]["key"] == "prefix_cache" &&
+                              ssd["parts"][0]["bytes"] == 50000 && ssd["parts"][0]["used_bytes"] == 12000 &&
+                              ssd["parts"][1]["key"] == "experts" && ssd["parts"][1]["count"] == 100,
+                          "memory.ssd: the prefix cache's tier and the experts read from the artifact");
+
+        m.ssd = {};
+        failures += check(Json::parse(render_metrics_json(held))["memory"]["ssd"].is_null(), "no SSD tier: ssd is null");
+    }
+
     return failures == 0 ? 0 : 1;
 }

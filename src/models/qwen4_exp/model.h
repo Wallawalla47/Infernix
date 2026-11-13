@@ -46,8 +46,8 @@ struct PackedWeights {
     std::uint64_t source_bytes = 0; // the BF16 bytes they replace
     std::uint64_t escapes      = 0;
     double seconds             = 0; // packing's wall time
-    // Of which: counts (with the CUDA module load of the process's first kernel launch, ~2.4 s, which a load without
-    // packing pays later), the block's allocation, packing, freeing the BF16 copies.
+    // Of which: counts, the block's allocation, packing, freeing the BF16 copies. (The CUDA module load of the
+    // process's first kernel launch, ~2.4 s, is a start's CUDA initialization: load_kernel_images.)
     double phase_seconds[4] = {};
 };
 
@@ -79,8 +79,18 @@ public:
     // The device bytes the dense weights hold once loaded: the artifact's device arena, the packed block and the
     // DFlash2 companion's arena.
     [[nodiscard]] std::uint64_t device_weight_bytes() const noexcept {
-        return backing_.stats().device_capacity_bytes + packed_.storage.bytes +
-               (draft_backing_ ? draft_backing_->stats().device_capacity_bytes : 0);
+        return backing_.stats().device_capacity_bytes + packed_.storage.bytes + draft_device_bytes();
+    }
+    // Of device_weight_bytes, the DFlash2 companion's arena.
+    [[nodiscard]] std::uint64_t draft_device_bytes() const noexcept {
+        return draft_backing_ ? draft_backing_->stats().device_capacity_bytes : 0;
+    }
+    // The weights' host memory: the artifact's and the companion's pinned and retained host objects (the expert banks'
+    // records among them when every expert is loaded into RAM) and the packed objects kept in pinned host memory.
+    [[nodiscard]] std::uint64_t host_weight_bytes() const noexcept {
+        std::uint64_t bytes = backing_.stats().pinned_bytes + backing_.stats().retained_host_bytes + packed_.host_bytes;
+        if (draft_backing_) { bytes += draft_backing_->stats().pinned_bytes + draft_backing_->stats().retained_host_bytes; }
+        return bytes;
     }
     // With vision offload: the pinned tower and its staging layout (no evictable pool: the encode
     // window borrows device memory from the expert cache, design §19.3.2).

@@ -159,6 +159,9 @@ public:
     [[nodiscard]] virtual infernix::ModelMetadata model_metadata() const = 0;
     [[nodiscard]] virtual infernix::MemorySummary memory_summary() const = 0;
     [[nodiscard]] virtual infernix::RuntimeStats runtime_stats() const = 0;
+    // One reading of the device's memory and of this process's use of it (infernix::Engine::device_memory); none
+    // for a backend without a device.
+    [[nodiscard]] virtual infernix::DeviceMemoryReading device_memory() const { return {}; }
     virtual void reset_execution_maxima() noexcept = 0;
     [[nodiscard]] virtual bool is_available() const = 0;
     // An Engine-wide execution failure, as opposed to an orderly stop.
@@ -228,6 +231,10 @@ public:
 
     [[nodiscard]] infernix::RuntimeStats runtime_stats() const override {
         return engine_->runtime_stats();
+    }
+
+    [[nodiscard]] infernix::DeviceMemoryReading device_memory() const override {
+        return engine_->device_memory();
     }
 
     void reset_execution_maxima() noexcept override { engine_->reset_execution_maxima(); }

@@ -508,7 +508,7 @@ public:
 
 private:
     static constexpr std::size_t kAlignment = 256;
-    static constexpr std::size_t kRing      = 32ULL << 20;
+    static constexpr std::size_t kRing      = kUploadStagingRingBytes;
     struct Span {
         std::size_t begin = 0, end = 0;
         cudaEvent_t done = nullptr;

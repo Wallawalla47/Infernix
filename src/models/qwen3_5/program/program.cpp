@@ -470,6 +470,7 @@ std::optional<runtime::prefix_cache::PersistResult> Program::hybrid_shutdown_sav
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->physical_usage(); }
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
+MemoryUsage Program::memory_usage() const noexcept { return impl_->memory_usage(); }
 std::optional<ExpertCacheTotals> Program::expert_cache_totals() const noexcept {
     if (!impl_->offload) { return std::nullopt; }
     return impl_->offload->engine().totals();

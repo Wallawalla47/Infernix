@@ -1,8 +1,9 @@
 // A stand-in infernix-serve for the launcher's own checks (docs/launcher.md, "Web UI development"):
-// it answers the routes the launcher uses (/health, /metrics?format=json with live progress and
-// labelled request rows, the OpenAI and Anthropic generation routes with thinking, prompt progress
-// and llama-server timings, --help, --plan) with plausible, slowly varying figures, logs in the
-// server's record format, and misbehaves on request so the watchdog can be exercised without a GPU:
+// it answers the routes the launcher uses (/health, /metrics?format=json with live progress,
+// labelled request rows and the memory breakdown, the OpenAI and Anthropic generation routes with
+// thinking, prompt progress and llama-server timings, --help, --plan) with plausible, slowly varying
+// figures, logs in the server's record format, and misbehaves on request so the watchdog can be
+// exercised without a GPU:
 //
 //   POST /fake/crash?code=N   exit at once with status N (default: an access violation)
 //   POST /fake/hang           stop answering anything (the process stays alive)
@@ -10,7 +11,8 @@
 //   --fake-load-ms N          take N ms to "load" (/health answers 503 meanwhile)
 //   --fake-fail-load TEXT     fail the load with TEXT as its fatal record (exit status 1)
 //   --fake-hog-mib N          while loading, take and touch N MiB of RAM (the RAM-floor check)
-//   --fake-experts            report an expert cache (offloaded-expert models)
+//   --fake-experts            report an expert cache, expert memory and an SSD tier (offloaded-expert models)
+//   --fake-no-memory          report no memory breakdown (a server older than it)
 //   --plan FILE               write a plan (fits up to --max-context 225280) and exit
 //   INFERNIX_FAKE_PROBE=TEXT  logged at startup (a configuration's environment reaches the server)
 //   INFERNIX_FAKE_BIND_FAIL_ONCE=FILE  refuse the port once, as infernix-serve does when another
@@ -120,6 +122,7 @@ struct State {
     bool hung    = false;
     bool stalled = false;
     bool experts = false;
+    bool memory  = true; // --fake-no-memory: an older server without the memory breakdown
     std::uint64_t next_id        = 1;
     std::uint64_t completed      = 0;
     std::uint64_t prefill_tokens = 0;
@@ -185,6 +188,70 @@ Json stats_row(const std::deque<Sample>& samples, std::size_t last) {
             {"expert_hit_rate", ratio(static_cast<double>(sum.hits), static_cast<double>(sum.lookups))}};
 }
 
+// The `memory` object (docs/serving.md, JSON representation) of a 32 GiB card and 96 GiB of RAM,
+// with the plan's figures: dense, or (--fake-experts) Flash-Next-like with a VRAM expert cache,
+// expert records in RAM, an n-gram table and an SSD tier. The KV cache fills with the running
+// requests' tokens and the prefix cache with what the requests computed. Called under the lock.
+Json memory_json() {
+    constexpr std::uint64_t kMiB = 1ull << 20;
+    constexpr std::uint64_t kGiB = 1ull << 30;
+    const auto part = [](const char* key, std::uint64_t bytes) { return Json{{"key", key}, {"bytes", bytes}}; };
+    const auto filled = [](const char* key, std::uint64_t bytes, std::uint64_t used) {
+        return Json{{"key", key}, {"bytes", bytes}, {"used_bytes", std::min(used, bytes)}};
+    };
+    const auto experts = [](std::uint64_t count, std::uint64_t each) {
+        return Json{{"key", "experts"}, {"bytes", count * each}, {"count", count}};
+    };
+    const auto sum = [](const Json& parts) {
+        std::uint64_t bytes = 0;
+        for (const Json& p : parts) { bytes += p["bytes"].get<std::uint64_t>(); }
+        return bytes;
+    };
+    std::uint64_t held = 0; // tokens the running requests hold, in 256-token KV page groups
+    for (const auto& [id, request] : g_state.active) { held += (request.processed + request.output + 255) / 256 * 256; }
+    const std::uint64_t computed = g_state.prefill_tokens + g_state.output_tokens;
+
+    const std::uint64_t total = 32 * kGiB;
+    std::uint64_t headroom = 0, others = 0, ram_others = 0;
+    Json device = Json::array(), host = Json::array(), ssd = nullptr;
+    if (g_state.experts) {
+        headroom = 256 * kMiB;
+        others   = 512 * kMiB;
+        device   = {part("weights", 6608125952ull), part("drafter", 775946240ull), experts(8729, 2763828),
+                    filled("kv_cache", 170 * kMiB, held * 8192), part("state", 680 * kMiB), part("prefix_cache", 0),
+                    part("workspace", 356 * kMiB), part("cuda_graphs", 136 * kMiB), part("staging", 210 * kMiB)};
+        ram_others = 14 * kGiB;
+        host       = {part("weights", 910 * kMiB), experts(23808, 2815313), filled("prefix_cache", 4 * kGiB, computed * 24576),
+                      part("ngram", kGiB), part("staging", 288 * kMiB)};
+        ssd = {{"parts", Json::array({filled("prefix_cache", 50 * kGiB, 12 * kGiB + computed * 49152), experts(768, 2815313)})}};
+    } else {
+        headroom = kGiB;
+        others   = 1229 * kMiB;
+        device   = {part("weights", static_cast<std::uint64_t>(21.4 * static_cast<double>(kGiB))), part("drafter", 740 * kMiB),
+                    filled("kv_cache", 2 * kGiB, held * 32768), part("state", 680 * kMiB),
+                    filled("prefix_cache", 256 * kMiB, g_state.completed * 24 * kMiB), part("workspace", 1500000000ull),
+                    part("cuda_graphs", 530000000ull), part("staging", 64 * kMiB)};
+        ram_others = 18 * kGiB;
+        host       = {part("weights", 910 * kMiB), filled("prefix_cache", 4 * kGiB, computed * 24576), part("staging", 288 * kMiB)};
+    }
+    // The process holds a little more than its parts: the CUDA context, the driver, heaps.
+    const std::uint64_t vram_process = sum(device) + 330 * kMiB;
+    const std::uint64_t ram_process  = sum(host) + 1100 * kMiB;
+    const std::uint64_t ram_total    = 96 * kGiB;
+    return {{"device",
+             {{"total_bytes", total},
+              {"process_bytes", vram_process},
+              {"free_bytes", total - std::min(total, vram_process + others)},
+              {"headroom_bytes", headroom},
+              {"parts", device}}},
+            {"host",
+             {{"total_bytes", ram_total},
+              {"available_bytes", ram_total - std::min(ram_total, ram_process + ram_others)},
+              {"process_bytes", ram_process},
+              {"parts", host}}},
+            {"ssd", ssd}};
+}
+
 Json metrics_json() {
     std::lock_guard lock(g_state.mutex);
     const Json recent = stats_row(g_state.samples, 10);
@@ -221,7 +288,7 @@ Json metrics_json() {
                                              : Json(nullptr)}});
     }
     const std::uint64_t running = g_state.active.size();
-    return {{"schema", 1},
+    Json snapshot = {{"schema", 1},
             {"time", unix_now()},
             {"engine",
              {{"name", "infernix"},
@@ -270,6 +337,8 @@ Json metrics_json() {
               {"rejected", 0},
               {"session", stats_row(g_state.samples, g_state.samples.size())},
               {"recent", recent}}}};
+    if (g_state.memory) { snapshot["memory"] = memory_json(); }
+    return snapshot;
 }
 
 std::string sse(const std::string& event, const Json& data) {
@@ -570,7 +639,8 @@ void print_help() {
         "  --fake-load-ms N           loading time\n"
         "  --fake-fail-load TEXT      fail the load\n"
         "  --fake-hog-mib N           take RAM while loading\n"
-        "  --fake-experts             report an expert cache\n");
+        "  --fake-experts             report an expert cache, expert memory and an SSD tier\n"
+        "  --fake-no-memory           report no memory breakdown, as an older server\n");
 }
 
 // --plan: a plan that fits up to 225,280 tokens of context (2.03 GB + 33,792 bytes per token
@@ -613,7 +683,7 @@ int write_plan(const std::string& file, std::uint64_t context) {
         {"ram",
          {{"total_bytes", static_cast<std::uint64_t>(96.0 * kGiB)},
           {"available_bytes", static_cast<std::uint64_t>(80.0 * kGiB)},
-          {"ram_free_bytes", 8192ull << 20},
+          {"ram_free_bytes", 4096ull << 20},
           {"experts_bytes", nullptr},
           {"pinned_bytes", 4096ull << 20},
           {"host_context_bytes", 4096ull << 20},
@@ -674,6 +744,8 @@ int main(int argc, char** argv) {
             hog_mib = std::atoi(value().c_str());
         } else if (arg == "--fake-experts") {
             g_state.experts = true;
+        } else if (arg == "--fake-no-memory") {
+            g_state.memory = false;
         }
     }
     if (!plan_file.empty()) { return write_plan(plan_file, context); }

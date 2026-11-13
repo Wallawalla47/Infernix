@@ -10,7 +10,7 @@ namespace {
 
 constexpr std::uint64_t kStep          = 4096;  // contexts are suggested in whole 4,096-token steps
 constexpr std::uint64_t kMinContext    = 8192;
-constexpr std::uint64_t kDefaultRamFree = 8192; // MiB; infernix-serve's --ram-free-mib default
+constexpr std::uint64_t kDefaultRamFree = 4096; // MiB; infernix-serve's --ram-free-mib default
 constexpr double kGiB                  = 1024.0 * 1024.0 * 1024.0;
 
 std::string gib(double bytes) {

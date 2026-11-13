@@ -351,6 +351,15 @@ public:
     [[nodiscard]] bool growth_pins_chunks() const noexcept { return growth_.valid() && growth_pins_chunks_; }
 
     [[nodiscard]] expert_cache::HostTier& controller() noexcept { return tier_; }
+    [[nodiscard]] const expert_cache::HostTier& controller() const noexcept { return tier_; }
+    // Of unpinned_records: those committed now (a RAM shrink decommits some; a growth under way commits them again)
+    // and, of these, those holding a key.
+    [[nodiscard]] std::uint32_t unpinned_committed() const noexcept {
+        return unpinned_count_ - static_cast<std::uint32_t>(unpinned_decommitted_.size() + recommitting_.size());
+    }
+    [[nodiscard]] std::uint32_t unpinned_held() const noexcept {
+        return unpinned_committed() - static_cast<std::uint32_t>(unpinned_free_.size());
+    }
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
     // A controller slot's bytes (null while retired).
     [[nodiscard]] const std::uint8_t* slot_bytes(std::uint32_t slot) const noexcept;

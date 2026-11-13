@@ -241,6 +241,7 @@ public:
     [[nodiscard]] ExpertResidency& residency() noexcept { return *residency_; }
     [[nodiscard]] const ExpertResidency& residency() const noexcept { return *residency_; }
     [[nodiscard]] HostExpertTier* tier() noexcept { return tier_.get(); }
+    [[nodiscard]] const HostExpertTier* tier() const noexcept { return tier_.get(); }
     [[nodiscard]] ExpertStream* stream() noexcept { return stream_.get(); }
     [[nodiscard]] ops::offloaded_moe::CpuMissService* cpu_service() noexcept { return cpu_service_.get(); }
     // The cache's counters since startup and its size now (RuntimeStats::expert_cache).
@@ -250,6 +251,10 @@ public:
     [[nodiscard]] std::uint32_t frames() const noexcept { return residency_->frames(); }
     // The memory summary's expert-cache facts (MemorySummary::expert_cache).
     [[nodiscard]] ExpertCacheMemorySummary memory_summary() const noexcept;
+    // Adds the expert cache's parts to `out` (RuntimeStats::memory): its frames that hold experts (frames lent to a
+    // prompt's wide pass or stream are workspace while lent), its miss staging, the records in RAM and, with the SSD
+    // tier, those read from the artifact, and the headroom its sizing kept free. Engine thread; O(1).
+    void add_memory_usage(MemoryUsage& out) const noexcept;
 
     // ---- round hooks ----
     // Before a round's calls: wakes the CPU service and opens the residency's round (landing for

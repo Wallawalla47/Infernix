@@ -182,8 +182,9 @@ struct VramSizing {
 // one stride share a pool, ExpertResidency), so an NVFP4 or block-FP8 artifact has one.
 [[nodiscard]] std::size_t frame_pools(std::span<const std::uint64_t> strides);
 // The frames a start keeps off size_expert_frames' count before it backs them: every pool maps whole
-// chunks of `chunk_bytes`, so one chunk per pool beyond the first, in frames of `frame_bytes`
-// (ExpertResidency::frame_bytes, the average frame). Engine::plan takes the same off its frames.
+// chunks of `chunk_bytes`, so one chunk per pool, in frames of `frame_bytes` (ExpertResidency::frame_bytes,
+// the average frame). Engine::plan takes the same off its frames. (Without the first pool's chunk the last
+// chunk's rounding came out of the headroom: 47 MiB of FP4-Local's 128, 2026-11-13.)
 [[nodiscard]] std::uint32_t pool_slack_frames(std::size_t pools, std::uint64_t chunk_bytes,
                                               std::uint64_t frame_bytes) noexcept;
 // What an expert cache lends one run (a prefill pass's workspace): the most frames one pool lends with no

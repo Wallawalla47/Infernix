@@ -7561,7 +7561,13 @@ measured results are under "Status" at the end of this section.
   Core host-memory snapshot (Windows `ullAvailPhys`, commit, `PrivateUsage`; Linux `MemAvailable`
   under the cgroup limit) and the pin room below. Planned: embedding 1.18 GiB, vision tower and
   media reserve, the prefix Host tier, n-gram row cache 0.16 GiB, Program buffers, load staging
-  0.26 GiB, 1.0 GiB of process growth until RM7 measures it, and 0.25 % lock overhead. The experts
+  0.26 GiB, 1.0 GiB of process growth until RM7 measures it, and 0.25 % lock overhead. The CUDA kernel
+  images (4.5 GiB of RAM: the Ops module's code, which the driver reads at the module's first kernel launch) are
+  read before the snapshot: a start launches an empty Ops kernel at CUDA initialization
+  (`ops::load_kernel_images`), and `Engine::plan`, which launches none, counts them as process growth. (Read after
+  the snapshot until 2026-11-13, they left the deploy FP4-Local configuration 7.0 GiB free where its plan said 9.8.)
+  The hard minimum working set keeps its soft maximum above the working set, since a lower maximum trims the
+  working set at once (it sent the images to the page file). The experts
   take what is left of available RAM and of the commit limit; `--expert-ram-mib N` caps it (to keep
   RAM for other programs or simulate a smaller machine). The ledger then splits the experts' RAM:
   `expert_pinned = min(expert RAM, pin room − other pins)` (`--expert-pin-mib N` lowers it) and
@@ -12433,9 +12439,10 @@ weights; code 15 escapes), and each row's escapes (zeros, subnormals, exponents 
 a transient device arena (`Binder::mark_device_transient`), are counted and packed into one Model-owned block, the
 bound views move to the packed parents and the transient arena is freed before the expert frames are sized:
 3,697 MiB become 2,777 MiB and the 919 MiB freed hold 349 more expert frames (8,608 against 8,259 at 20K context).
-Load cost: the 48 count and pack passes take 29 ms of GPU time; the loader's log line also counts the CUDA module
+Load cost: the 48 count and pack passes take 29 ms of GPU time; the loader's log line also counted the CUDA module
 load of the process's first kernel launch (~2.4 s), which a load without packing pays later in its startup:
-end-to-end loads differed by 0.0-0.15 s within each of the two load-time modes seen (29 and 33.5 s).
+end-to-end loads differed by 0.0-0.15 s within each of the two load-time modes seen (29 and 33.5 s). (Since
+2026-11-13 a start pays that load at CUDA initialization, `ops::load_kernel_images`, before the RAM ledger.)
 
 **Routes** (`ops/linear/bf16_p12`, one selector a shape; every route decodes a weight to its BF16 bits):
 - the skinny GEMV (T = 1-8): the BF16 skinny kernel's order, so its bits are the BF16 skinny route's, which is the

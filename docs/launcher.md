@@ -105,6 +105,17 @@ One page, top to bottom:
   85 and 95 °C, GPU temperature at 80 and 90 °C, and RAM when less than 4 GiB and 2 GiB are
   available (how full it is says little: models with offloaded experts fill it on purpose). A
   temperature past its limit is also named beside **All gauges** while its dial is not shown.
+- **Memory**: what the loaded `infernix-serve` holds, as one bar for VRAM and one for RAM: its
+  parts (model weights, the drafter, experts with their count, the KV cache, model state, the prefix
+  cache, workspace, CUDA graphs, staging, the n-gram table), then **Infernix other** (its memory no
+  part names: the CUDA context, the driver, heaps), **Other processes** and **Free**, beside which
+  VRAM shows what the server keeps free for the display (its headroom). The KV cache and the prefix
+  cache are drawn faint, with the share holding tokens or entries solid. While the server uses an SSD
+  tier (an SSD prefix cache, or experts read from the artifact on the SSD), each part on the SSD is
+  listed with its size. A part keeps its colour in every bar; hovering one gives its exact size and
+  what it is. The parts come from `memory` in the server's `/metrics?format=json`
+  ([serving](serving.md#json-representation)) and other programs' VRAM from the NVIDIA driver; an
+  older `infernix-serve` reports no parts, and the panel says so.
 - **Inference statistics**: the same figures as `infernix-serve`'s console panel, over the last ten
   requests and the whole session of the loaded model: requests, time to first token, prompt-cache hit
   rate, prefill and decode tok/s, mean decode batch, drafter acceptance and accepted tokens per
@@ -556,12 +567,15 @@ the model folders; only its header is read) and requests get plausible figures o
 the chat (thinking, prompt progress, timings) and the usage page, and **Will it fit?** gets a plan
 that fits up to 225,280 tokens of context. It crashes, locks up or stalls on request (`POST
 /fake/crash`, `/fake/hang`, `/fake/stall` on its own port) and fails or overfills its load with
-`--fake-fail-load TEXT` and `--fake-hog-mib N` in the model's parameters. Its own `--help` lists a
+`--fake-fail-load TEXT` and `--fake-hog-mib N` in the model's parameters; `--fake-experts` there
+makes it an offloaded-expert model (an expert cache, experts in RAM and an SSD tier on the
+dashboard's **Memory**) and `--fake-no-memory` a server too old to report its memory. Its own
+`--help` lists a
 dozen options, and the Configure form shows a control only for an option the server lists: set
 `INFERNIX_FAKE_SERVE_HELP` to a text file holding a real `infernix-serve --help` and it prints that
 instead, so the form shows every control.
 [`tools/launcher/launcher_check.py`](../tools/launcher/launcher_check.py) runs a launcher against it
-and checks the features (configurations, model ids, environment, script export and import, the fit
-plan, keep-alive streams, routes and the pin, prompt progress, usage, API keys and sign-in, chats,
-idle unload) and the watchdog, the event log and the request log, and, on Windows, that a launcher
+and checks the features (configurations, model ids, environment, the memory breakdown, script export
+and import, the fit plan, keep-alive streams, routes and the pin, prompt progress, usage, API keys
+and sign-in, chats, idle unload) and the watchdog, the event log and the request log, and, on Windows, that a launcher
 started on a console without a window still stops its server in order.

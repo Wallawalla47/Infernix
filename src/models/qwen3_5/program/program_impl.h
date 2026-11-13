@@ -466,6 +466,8 @@ public:
     }
     [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> save_hybrid_cache_now(const CancellationView& abandoned);
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    // RuntimeStats::memory (Program::memory_usage).
+    [[nodiscard]] MemoryUsage memory_usage() const noexcept;
     void reset_memory_peaks() noexcept;
 
     const execution::Parameters& parameters;
@@ -539,6 +541,12 @@ public:
     const bool use_cuda_graph;
     const bool causal_scoring;
     const std::size_t kv_payload_bytes;
+    // The persistent arena's parts by use (PersistentLayout::kv_bytes, state_image_bytes, drafter_bytes).
+    const std::size_t persistent_kv_bytes;
+    const std::size_t persistent_state_image_bytes;
+    const std::size_t persistent_drafter_bytes;
+    // The device bytes of the speculative drafter's own weights (MTP's or DFlash's), within the weights' arena.
+    const std::uint64_t drafter_weight_bytes;
     const std::size_t graph_allowance_bytes;
     // Free Device memory CUDA Graph preparation consumed at startup (instantiate, upload and one
     // launch of every executable), for comparison with graph_allowance_bytes.

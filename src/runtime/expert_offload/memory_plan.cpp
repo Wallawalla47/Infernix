@@ -187,8 +187,8 @@ std::size_t frame_pools(std::span<const std::uint64_t> strides) {
 }
 
 std::uint32_t pool_slack_frames(std::size_t pools, std::uint64_t chunk_bytes, std::uint64_t frame_bytes) noexcept {
-    if (pools < 2 || frame_bytes == 0) { return 0; }
-    return static_cast<std::uint32_t>((pools - 1) * chunk_bytes / frame_bytes);
+    if (pools == 0 || frame_bytes == 0) { return 0; }
+    return static_cast<std::uint32_t>(pools * chunk_bytes / frame_bytes);
 }
 
 LendCapacity lend_capacity(std::span<const std::uint64_t> strides, std::uint32_t experts, std::uint32_t frames) {

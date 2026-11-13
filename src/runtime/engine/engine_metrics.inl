@@ -177,6 +177,15 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.device_backend_kv_occupied_pages = physical.occupied.backend_kv_pages;
     resources_.populate_runtime_stats(*instance_.program, snapshot);
     snapshot.expert_cache = instance_.program->expert_cache_totals();
+    snapshot.memory       = instance_.program->memory_usage();
+    snapshot.memory.host.prefix      = snapshot.hybrid_host_capacity_bytes;
+    snapshot.memory.host.prefix_used = snapshot.hybrid_host_used_bytes;
+    snapshot.memory.ssd.prefix       = snapshot.hybrid_ssd_capacity_bytes;
+    snapshot.memory.ssd.prefix_used  = snapshot.hybrid_ssd_used_bytes;
+    // An expert cache's sizing kept its own headroom free (the Program reports it); otherwise automatic KV capacity's.
+    if (snapshot.memory.vram_headroom == 0) {
+        snapshot.memory.vram_headroom = instance_.kv_capacity_resolution.automatic_headroom_bytes;
+    }
 
     {
         std::lock_guard lock(queue_mutex_);

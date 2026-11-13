@@ -35,6 +35,65 @@ Json rate(std::uint64_t tokens, double seconds) {
 }
 
 // One panel row as numbers: the same sums and the same ratios the console prints.
+// One `memory` part: listed when it holds memory (or, with `count`, experts).
+void add_part(Json& parts, const char* key, std::uint64_t bytes, std::optional<std::uint64_t> used = std::nullopt,
+              std::optional<std::uint64_t> count = std::nullopt) {
+    if (bytes == 0 && count.value_or(0) == 0) { return; }
+    Json part{{"key", key}, {"bytes", bytes}};
+    if (used) { part["used_bytes"] = std::min(*used, bytes); }
+    if (count) { part["count"] = *count; }
+    parts.push_back(std::move(part));
+}
+
+Json bytes_or_null(std::uint64_t bytes) { return bytes != 0 ? Json(bytes) : Json(nullptr); }
+
+// `memory` (docs/serving.md): what the server holds on the device, in RAM and on the SSD, by part, with the totals the
+// parts are shown against.
+Json memory_json(const MetricsJsonSnapshot& s) {
+    const infernix::MemoryUsage& m = s.stats.memory;
+    Json device_parts              = Json::array();
+    add_part(device_parts, "weights", m.device.weights);
+    add_part(device_parts, "drafter", m.device.drafter);
+    add_part(device_parts, "experts", m.device.experts, std::nullopt,
+             m.device.experts != 0 ? std::optional<std::uint64_t>(m.device.expert_frames) : std::nullopt);
+    add_part(device_parts, "kv_cache", m.device.kv, m.device.kv_used);
+    add_part(device_parts, "state", m.device.state);
+    add_part(device_parts, "prefix_cache", m.device.prefix);
+    add_part(device_parts, "workspace", m.device.workspace);
+    add_part(device_parts, "cuda_graphs", m.device.cuda_graphs);
+    add_part(device_parts, "staging", m.device.staging);
+    Json host_parts = Json::array();
+    add_part(host_parts, "experts", m.host.experts, std::nullopt,
+             m.host.expert_records != 0 ? std::optional<std::uint64_t>(m.host.expert_records) : std::nullopt);
+    add_part(host_parts, "prefix_cache", m.host.prefix, m.host.prefix_used);
+    add_part(host_parts, "weights", m.host.weights);
+    add_part(host_parts, "ngram", m.host.ngram);
+    add_part(host_parts, "staging", m.host.staging);
+    const infernix::DeviceMemoryReading& d = s.device_memory;
+    const HostMemorySnapshot& h            = s.host_memory;
+    Json out{
+        {"device",
+         Json{{"total_bytes", bytes_or_null(d.total_bytes)},
+              {"process_bytes", d.process_bytes ? Json(*d.process_bytes) : Json(nullptr)},
+              {"free_bytes", d.total_bytes != 0 ? Json(d.free_bytes) : Json(nullptr)},
+              {"headroom_bytes", m.vram_headroom},
+              {"parts", std::move(device_parts)}}},
+        {"host",
+         Json{{"total_bytes", bytes_or_null(h.total_physical)},
+              {"available_bytes", h.total_physical != 0 ? Json(h.available_physical) : Json(nullptr)},
+              {"process_bytes", bytes_or_null(h.process_resident)},
+              {"parts", std::move(host_parts)}}},
+        {"ssd", nullptr},
+    };
+    if (m.ssd.prefix != 0 || m.ssd.expert_records != 0) {
+        Json ssd_parts = Json::array();
+        add_part(ssd_parts, "prefix_cache", m.ssd.prefix, m.ssd.prefix_used);
+        add_part(ssd_parts, "experts", m.ssd.experts, std::nullopt, m.ssd.expert_records);
+        out["ssd"] = Json{{"parts", std::move(ssd_parts)}};
+    }
+    return out;
+}
+
 Json stats_row(const ConsoleStatsTotals& totals) {
     const ConsoleRequestSample& s = totals.sum;
     return Json{
@@ -265,6 +324,7 @@ std::string render_metrics_json(const MetricsJsonSnapshot& s) {
               {"prompt_ms", nullptr},
               {"decode_ms", nullptr}}},
         {"requests", std::move(requests)},
+        {"memory", memory_json(s)},
     };
     if (s.session_stats) { root["session_stats"] = session_stats_json(*s.session_stats); }
     return root.dump() + '\n';

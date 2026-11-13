@@ -1,6 +1,7 @@
 #include "runtime/engine/expert_memory.h"
 
 #include "core/host_memory.h"
+#include "infernix/ops/kernel_images.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -38,6 +39,9 @@ expert_offload::HostMemoryDemand expert_ram_demand(const EngineOptions& options,
     // The prefix cache pins its whole Host tier at startup, beside the experts.
     demand.prefix_cache = prefix_cache_bytes;
     demand.load_staging = kLoadStagingBytes;
+    // A start has read the kernel images into RAM before planning (load_kernel_images); Engine::plan has not, and
+    // counts them as the process's growth.
+    demand.process_growth = expert_offload::kLedgerGiB + ops::kernel_images_pending_bytes();
     demand.expert_cap   = options.expert_ram_bytes;
     // Windows page-locks memory for the GPU only up to the adapter's shared system memory; the
     // experts past that stay in RAM unpinned (the SSD tier's unpinned records).

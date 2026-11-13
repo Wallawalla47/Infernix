@@ -922,7 +922,7 @@ void ExpertOffload::size_frames(cudaStream_t compute) {
     if (!options_.expert_cache) { return; }
     const VramDemand demand = frame_demand(residency_->frame_bytes());
     sizing_                 = size_expert_frames(vram_->query(), demand);
-    // Each pool maps whole chunks: one chunk of slack per pool beyond the first.
+    // Each pool maps whole chunks: one chunk of slack per pool.
     const std::uint32_t slack = pool_slack_frames(residency_->pools(), ExpertResidency::kChunkBytes, residency_->frame_bytes());
     sizing_.frames            = sizing_.frames > slack ? sizing_.frames - slack : 0U;
     const auto grown = residency_->resize(sizing_.frames, compute, *vram_);
@@ -1005,6 +1005,33 @@ ExpertCacheMemorySummary ExpertOffload::memory_summary() const noexcept {
         for (const std::uint64_t stride : host_strides_) { out.host_ram_bytes += stride * setup_.layout.experts; }
     }
     return out;
+}
+
+void ExpertOffload::add_memory_usage(MemoryUsage& out) const noexcept {
+    const std::uint64_t lent       = std::min<std::uint64_t>(residency_->stats().lent_frames, residency_->frames());
+    const std::uint64_t pools      = residency_->pool_bytes();
+    const std::uint64_t lent_bytes = std::min(pools, lent * residency_->frame_bytes());
+    out.device.experts += pools - lent_bytes;
+    out.device.expert_frames += residency_->frames() - static_cast<std::uint32_t>(lent);
+    out.device.workspace += lent_bytes;
+    // The miss staging, the residency's frame tables and route logs, plain decode's divisor word (fixed_bytes' terms).
+    out.device.staging += staging_.bytes + ExpertResidency::table_bytes(setup_.layout, setup_.columns) + divisor_word_.bytes;
+    const std::uint64_t keys = static_cast<std::uint64_t>(setup_.layout.layers) * setup_.layout.experts;
+    if (tier_) {
+        // The pinned slots and the committed unpinned records; the keys they hold (a slot's resident or shadow, a
+        // record's) are disjoint. The rest are read from the artifact on the SSD (at the largest record).
+        const std::uint64_t record = tier_->record_bytes();
+        out.host.experts += tier_->pinned_bytes() + static_cast<std::uint64_t>(tier_->unpinned_committed()) * record;
+        const std::uint64_t held = std::min<std::uint64_t>(keys, tier_->controller().resident_count() + tier_->unpinned_held());
+        out.host.expert_records += held;
+        out.ssd.expert_records += keys - held;
+        out.ssd.experts += (keys - held) * record;
+    } else {
+        for (const std::uint64_t stride : host_strides_) { out.host.experts += stride * setup_.layout.experts; }
+        out.host.expert_records += keys;
+    }
+    out.host.staging += divisor_host_.size() + error_.size();
+    out.vram_headroom = sizing_.headroom; // the frames' sizing kept it free
 }
 
 // The monitor thread: wakes an idle engine when the cache should resize; without an elastic pool,

@@ -1650,7 +1650,7 @@ HybridPrefixCacheStats ProgramImpl::hybrid_stats() const noexcept {
     out.snapshots                       = index.snapshots;
     out.device_resident_blocks          = index.device_resident_blocks;
     out.device_evictable_blocks         = index.device_evictable_blocks;
-    out.host_slabs                      = config.host_slabs;
+    out.host_slabs                      = index.host_slab_limit; // in service now: a RAM release or growth moves it
     out.host_free_slabs                 = index.host_free_slabs;
     out.host_slab_bytes                 = hybrid_->host_layout().slab_bytes;
     out.free_device_snapshot_slots      = index.free_device_slots;

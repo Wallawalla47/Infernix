@@ -629,6 +629,57 @@ export interface MetricsSnapshot {
   requests: MetricsRequestRow[];
   /** Absent from servers built before the launcher; the UI then derives rows from `requests`. */
   session_stats?: SessionStats;
+  /** What the server holds in VRAM, RAM and on the SSD, by part. Absent from servers built before
+   * 2026-11-13 (docs/serving.md, JSON representation). */
+  memory?: MemoryBreakdown;
+}
+
+/** A closed vocabulary; a newer server's unknown key is shown under its raw name. */
+export type MemoryPartKey =
+  | "weights"
+  | "drafter"
+  | "experts"
+  | "kv_cache"
+  | "state"
+  | "prefix_cache"
+  | "workspace"
+  | "cuda_graphs"
+  | "staging"
+  | "ngram";
+
+/** One category of what the server holds in a pool. Parts never overlap. */
+export interface MemoryPart {
+  key: MemoryPartKey | (string & {});
+  /** Allocated (reserved): what the operating system counts as used. */
+  bytes: number;
+  /** The occupied share inside the part (KV pages holding tokens, prefix-cache slabs holding
+   * entries); at most `bytes`. */
+  used_bytes?: number;
+  /** Experts held. */
+  count?: number;
+}
+
+export interface MemoryBreakdown {
+  /** The GPU the server runs on. */
+  device: {
+    total_bytes: number;
+    /** Free on the device now, all processes counted. */
+    free_bytes: number;
+    /** What the server keeps free for the display and other programs. */
+    headroom_bytes: number;
+    /** The server's own VRAM use as the OS counts it; null where the platform reports none. */
+    process_bytes: number | null;
+    parts: MemoryPart[];
+  };
+  host: {
+    total_bytes: number;
+    available_bytes: number;
+    /** The server's resident memory (working set / RSS); null if unknown. */
+    process_bytes: number | null;
+    parts: MemoryPart[];
+  };
+  /** Present only while the server uses an SSD tier (prefix cache, or experts read from the SSD). */
+  ssd: { parts: MemoryPart[] } | null;
 }
 
 // ---------------------------------------------------------------------------------------------

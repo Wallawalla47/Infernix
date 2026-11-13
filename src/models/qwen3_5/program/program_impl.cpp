@@ -17,7 +17,10 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -33,6 +36,29 @@ std::optional<SpillGuard> begun_spill_guard(VramBudgetSource* source) {
     std::optional<SpillGuard> guard(std::in_place, *source);
     guard->begin();
     return guard;
+}
+
+// The device bytes of the speculative drafter's own weights, bound as `<component>/...` (MTP's or DFlash's), each
+// parent once; the weights it shares with the target (the embedding, the output head) are the target's.
+std::uint64_t drafter_device_weight_bytes(const Model& model) {
+    const std::string_view component = model.options().speculative_component();
+    if (component.empty()) { return 0; }
+    const std::string prefix = std::string(component) + "/";
+    std::unordered_set<const WeightParent*> parents;
+    std::uint64_t bytes = 0;
+    for (const BoundWeight& weight : model.weight_data()) {
+        if (!weight.name.starts_with(prefix)) { continue; }
+        for (const WeightRegion& part : weight.view.parts) {
+            if (part.parent == nullptr || part.parent->data == nullptr || !parents.insert(part.parent).second) { continue; }
+            cudaPointerAttributes attributes{};
+            if (cudaPointerGetAttributes(&attributes, part.parent->data) != cudaSuccess) {
+                (void)cudaGetLastError();
+                continue;
+            }
+            if (attributes.type == cudaMemoryTypeDevice) { bytes += part.parent->geometry.bytes; }
+        }
+    }
+    return bytes;
 }
 
 } // namespace
@@ -65,6 +91,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      persistent_kv_bytes(plan.persistent.kv_bytes), persistent_state_image_bytes(plan.persistent.state_image_bytes),
+      persistent_drafter_bytes(plan.persistent.drafter_bytes),
+      drafter_weight_bytes(drafter_device_weight_bytes(parameters_in.model)),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       // Every Program checks its fixed allocations against the driver's sysmem fallback (VR-04): a
       // resident model's KV and arenas are as exposed to it as an offloaded one's.
@@ -759,6 +788,48 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
             out.expert_cache->kv_capacity_pages = pool.capacity_pages();
             out.expert_cache->kv_backed_bytes   = kv_vmm->mapped_bytes();
         }
+    }
+    return out;
+}
+
+MemoryUsage ProgramImpl::memory_usage() const noexcept {
+    MemoryUsage out;
+    const auto& storage = parameters.model.storage_stats();
+    out.device.weights  = storage.device_capacity_bytes - std::min<std::uint64_t>(storage.device_capacity_bytes, drafter_weight_bytes);
+    // With the drafter's proposal-head screen (DFlash2, Parameters::draft_screen: 357.6 MB at 248,320 rows).
+    out.device.drafter  = drafter_weight_bytes + persistent_drafter_bytes + parameters.draft_screen.bytes;
+    // The KV: the decoder's pages and tables (and an elastic pool's mapped pages), less the pages only the prefix
+    // cache holds (each page's share of the KV), which are its part.
+    out.device.kv = persistent_kv_bytes + (kv_vmm ? kv_vmm->mapped_bytes() : 0);
+    const DeviceKVPagePool& pool = decoder->text_kv.page_pool();
+    if (const std::uint32_t backed = pool.backed_pages(); backed != 0) {
+        const std::uint64_t page      = out.device.kv / backed;
+        const std::uint32_t allocated = std::min(pool.allocated_pages(), backed);
+        const std::uint32_t cached    = hybrid_ ? std::min(hybrid_->index().device_evictable_blocks(), allocated) : 0;
+        out.device.prefix  = page * cached;
+        out.device.kv     -= out.device.prefix;
+        out.device.kv_used = page * (allocated - cached);
+    }
+    // The StateImage pool: a slot per lane (state), then the prefix cache's Device snapshot slots (its part).
+    const std::uint64_t snapshot_slots = context_cache.hybrid.device_snapshot_slots.value_or(0);
+    const std::uint64_t slots          = max_concurrency + snapshot_slots;
+    const std::uint64_t snapshots      = slots != 0 ? persistent_state_image_bytes * snapshot_slots / slots : 0;
+    out.device.prefix += snapshots;
+    out.device.state       = persistent.capacity() - persistent_kv_bytes - persistent_drafter_bytes - snapshots;
+    out.device.workspace   = workspace_storage.capacity();
+    out.device.cuda_graphs = graph_measured_bytes;
+    if (offload) {
+        offload->add_memory_usage(out);
+        out.device.staging += parameters.expert_scales.bytes; // the offloaded layers' expert scales
+    }
+    // The routed banks' records are among the pinned objects when every expert is loaded into RAM.
+    const std::uint64_t host_weights = storage.pinned_bytes + storage.retained_host_bytes;
+    const bool banks_pinned          = offload && offload->engine().tier() == nullptr;
+    out.host.weights = host_weights - (banks_pinned ? std::min(host_weights, out.host.experts) : 0);
+    out.host.staging = kUploadStagingRingBytes;
+    for (const std::optional<PinnedHostBuffer>* buffer : {&grammar_masks_host, &unpackable_flags, &round_host, &score_logprobs_host,
+                                                          &ordinary_host, &mtp_host, &dflash_host}) {
+        if (buffer->has_value()) { out.host.staging += (*buffer)->size(); }
     }
     return out;
 }

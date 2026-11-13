@@ -103,6 +103,13 @@ public:
     [[nodiscard]] const runtime::expert_offload::ExpertOffload& engine() const noexcept { return engine_; }
     // Valid after start(); every pointer in it is stable for the Program's life.
     [[nodiscard]] execution::OffloadedExperts& experts() noexcept { return experts_; }
+    // Adds the engine's parts (ExpertOffload::add_memory_usage) and this Program's own: the MTP drafter's expert pool
+    // and a wide pass's buffers allocated outside the frames (RuntimeStats::memory). O(1).
+    void add_memory_usage(MemoryUsage& out) const noexcept {
+        engine_.add_memory_usage(out);
+        out.device.drafter += drafter_pool_memory_.bytes;
+        out.device.workspace += wide_fallback_.bytes;
+    }
 
     // ---- an eager pass of a lane's tokens through the text layers (Flash-Next design §19.3.8,
     // §19.3.12; Qwen3.5-122B design §10): a prompt's (prefill, replay) or forced tokens' ----
