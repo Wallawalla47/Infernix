@@ -2618,7 +2618,7 @@ public:
     // turn's new tokens (a tool result, a pasted file).
     // A pair call passes its head: the residency runs the two calls' rounds (ExpertResidency::after_round), each
     // with the promotions its own call starts.
-    void apply_prompt_routes(Lane& lane, std::int32_t width, std::size_t promotions, PairHead head = {}) {
+    void apply_prompt_routes(Lane& lane, std::int32_t width, std::size_t promotions, PairHead head = {0, 0}) {
         static const double continuing = [] {
             const auto value = temporary_switches::value("INFERNIX_TMP_CONTINUING_PROMPT");
             const double fraction = value ? std::stod(*value) : 0.0;
@@ -2679,7 +2679,7 @@ public:
     // `head`: a pair call's head (apply_prompt_routes).
     PrefillProgress prefill_progress(Lane& lane, std::uint32_t index, std::int32_t begin, std::int32_t width,
                                      std::uint32_t tokens, bool last, std::size_t promotions,
-                                     Clock::time_point start, PairHead head = {}) {
+                                     Clock::time_point start, PairHead head = {0, 0}) {
         PrefillProgress out;
         out.summary                 = prefill_summary(lane);
         out.processed_prompt_tokens = tokens;
