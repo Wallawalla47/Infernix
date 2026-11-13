@@ -189,15 +189,23 @@ DxcoreAdapter::~DxcoreAdapter() {
     if (library_ != nullptr) { ::dlclose(library_); }
 }
 
-bool DxcoreAdapter::nonlocal_usage(std::uint64_t& usage) const {
-    const BudgetQuery query{0, SegmentGroup::NonLocal};
+namespace {
+
+bool segment_usage(void* adapter, SegmentGroup group, std::uint64_t& usage) {
+    const BudgetQuery query{0, group};
     Budget budget{};
-    if (!succeeded(static_cast<Adapter*>(adapter_)->query_state(State::AdapterMemoryBudget, sizeof(query), &query,
-                                                                  sizeof(budget), &budget))) {
+    if (!succeeded(static_cast<Adapter*>(adapter)->query_state(State::AdapterMemoryBudget, sizeof(query), &query,
+                                                                 sizeof(budget), &budget))) {
         return false;
     }
     usage = budget.usage;
     return true;
 }
+
+} // namespace
+
+bool DxcoreAdapter::nonlocal_usage(std::uint64_t& usage) const { return segment_usage(adapter_, SegmentGroup::NonLocal, usage); }
+
+bool DxcoreAdapter::local_usage(std::uint64_t& usage) const { return segment_usage(adapter_, SegmentGroup::Local, usage); }
 
 } // namespace infernix

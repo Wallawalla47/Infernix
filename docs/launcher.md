@@ -114,8 +114,9 @@ One page, top to bottom:
   tier (an SSD prefix cache, or experts read from the artifact on the SSD), each part on the SSD is
   listed with its size. A part keeps its colour in every bar; hovering one gives its exact size and
   what it is. The parts come from `memory` in the server's `/metrics?format=json`
-  ([serving](serving.md#json-representation)) and other programs' VRAM from the NVIDIA driver; an
-  older `infernix-serve` reports no parts, and the panel says so.
+  ([serving](serving.md#json-representation)), as do the free VRAM and RAM the other programs' share
+  follows from (the server's own readings, which its headroom and reserve are kept against); an older
+  `infernix-serve` reports no parts, and the panel says so. Under WSL2 RAM is the Linux VM's.
 - **Inference statistics**: the same figures as `infernix-serve`'s console panel, over the last ten
   requests and the whole session of the loaded model: requests, time to first token, prompt-cache hit
   rate, prefill and decode tok/s, mean decode batch, drafter acceptance and accepted tokens per

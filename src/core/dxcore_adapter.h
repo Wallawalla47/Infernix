@@ -26,6 +26,8 @@ public:
     // This process's non-local (system memory) usage, which counts every page-locked byte; false
     // when the query fails.
     [[nodiscard]] bool nonlocal_usage(std::uint64_t& usage) const;
+    // This process's local (device memory) usage, as DXGI's LOCAL CurrentUsage on Windows; false when the query fails.
+    [[nodiscard]] bool local_usage(std::uint64_t& usage) const;
 
 private:
     DxcoreAdapter() = default;

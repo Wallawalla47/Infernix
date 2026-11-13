@@ -177,9 +177,10 @@ public:
         if (adapter_ != nullptr) {
             DXGI_QUERY_VIDEO_MEMORY_INFO info{};
             if (SUCCEEDED(adapter_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
-                out.has_budget   = true;
-                out.local_budget = info.Budget;
-                out.local_usage  = info.CurrentUsage;
+                out.has_budget      = true;
+                out.has_local_usage = true;
+                out.local_budget    = info.Budget;
+                out.local_usage     = info.CurrentUsage;
                 // Free memory as cudaMemGetInfo derives it on one visible device (budget less
                 // usage), from the wider budget past it. With several CUDA devices visible,
                 // cudaMemGetInfo fell below the budget less usage and stopped following allocations
@@ -201,10 +202,14 @@ public:
             out.outputs = outputs_;
         }
 #else
-        std::uint64_t nonlocal = 0;
+        std::uint64_t nonlocal = 0, local = 0;
         if (dxcore_ != nullptr && dxcore_->nonlocal_usage(nonlocal)) {
             out.shared_system  = dxcore_->shared_system();
             out.nonlocal_usage = nonlocal;
+        }
+        if (dxcore_ != nullptr && dxcore_->local_usage(local)) {
+            out.has_local_usage = true;
+            out.local_usage     = local;
         }
 #endif
         const int active = nvml_->display_active();

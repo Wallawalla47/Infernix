@@ -46,6 +46,34 @@ std::string av_error(int code) {
     throw Error(ErrorKind::InvalidInput, std::move(message));
 }
 
+// Animated WebP's codec id (AV_CODEC_ID_WEBP_ANIM, FFmpeg 8: libavcodec 62+), looked up by its descriptor's name:
+// the libavcodec 60 the build accepts (Ubuntu 24.04's FFmpeg 6.1) has no such id. AV_CODEC_ID_NONE there.
+AVCodecID webp_anim_id() {
+    static const AVCodecID id = [] {
+        const AVCodecDescriptor* descriptor = avcodec_descriptor_get_by_name("webp_anim");
+        return descriptor != nullptr ? descriptor->id : AV_CODEC_ID_NONE;
+    }();
+    return id;
+}
+
+// Whether `id` is WebP's, still or animated.
+bool webp_codec(AVCodecID id) { return id == AV_CODEC_ID_WEBP || (webp_anim_id() != AV_CODEC_ID_NONE && id == webp_anim_id()); }
+
+// An extended WebP whose VP8X header sets the animation flag (RIFF, size, "WEBP", "VP8X", size, flags).
+bool is_animated_webp(std::span<const std::uint8_t> bytes) {
+    return bytes.size() >= 21 && std::memcmp(bytes.data(), "RIFF", 4) == 0 && std::memcmp(bytes.data() + 8, "WEBPVP8X", 8) == 0 &&
+           (bytes[20] & 0x02) != 0;
+}
+
+// FFmpeg before 8 skips an animated WebP's frames and reports invalid data: say what it lacks instead.
+void refuse_unsupported_animated_webp(std::span<const std::uint8_t> bytes) {
+    if (!is_animated_webp(bytes) || animated_webp_supported()) { return; }
+    const unsigned version = avcodec_version();
+    throw_invalid_media("animated WebP needs FFmpeg 8 (libavcodec 62 or newer) to decode; this build has libavcodec " +
+                        std::to_string(version >> 16) + "." + std::to_string((version >> 8) & 0xffU) +
+                        " (a still WebP, PNG, JPEG or GIF works)");
+}
+
 void validate_input(std::span<const std::uint8_t> bytes, const Policy& policy) {
     if (policy.max_bytes == 0) { throw std::invalid_argument("media byte limit must be positive"); }
     if (bytes.empty()) { throw_invalid_media("media bytes are empty"); }
@@ -401,7 +429,7 @@ public:
                            (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
         const std::size_t pixels = static_cast<std::size_t>(width) * height;
         const bool lossy_webp =
-            (codec_->codec_id == AV_CODEC_ID_WEBP || codec_->codec_id == AV_CODEC_ID_WEBP_ANIM) &&
+            webp_codec(codec_->codec_id) &&
             (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVA420P);
         if (lossy_webp) {
             out.rgb.resize(pixels * 3);
@@ -740,9 +768,15 @@ void forward_library_log(void* context, int level, const char* format, std::va_l
 
 } // namespace
 
+bool animated_webp_supported() noexcept {
+    const AVCodecID id = webp_anim_id();
+    return id != AV_CODEC_ID_NONE && avcodec_find_decoder(id) != nullptr;
+}
+
 ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
+    refuse_unsupported_animated_webp(bytes);
 #ifdef INFERNIX_MEDIA_NATIVE_PNG
     if (is_png(bytes)) {
         return png_image_info(bytes, policy.max_decoded_pixels);
@@ -791,6 +825,7 @@ VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& polic
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
+    refuse_unsupported_animated_webp(bytes);
     // Some FFmpeg builds (the Windows vcpkg tree) ship without the png decoder; the
     // native path decodes png directly so those builds accept png images too.
 #ifdef INFERNIX_MEDIA_NATIVE_PNG

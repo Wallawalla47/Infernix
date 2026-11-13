@@ -27,6 +27,9 @@ struct VramSnapshot {
     bool has_budget            = false;
     std::uint64_t local_budget = 0;
     std::uint64_t local_usage  = 0;
+    // Whether local_usage is this process's device-memory use: with has_budget on Windows, and under WSL2 through
+    // DXCore's budget query of the local segment, which only reports it (no WSL2 sizing reads a budget).
+    bool has_local_usage = false;
     DisplayState display       = DisplayState::Unknown;
     int outputs                = -1; // DXGI outputs of the adapter; -1 unknown
     // A source opened past the budget: the bytes added to the OS budget (already included in

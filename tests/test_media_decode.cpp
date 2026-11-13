@@ -187,9 +187,28 @@ void test_webp_gif_references() {
     for (const auto& fixture : webp_gif_fixtures::cases) {
         const auto encoded  = decode_base64(fixture.encoded);
         const auto expected = decode_base64(fixture.rgb);
+        const std::string name(fixture.name);
+        if (name.starts_with("webp animated") && !infernix::media::decode::animated_webp_supported()) {
+            // FFmpeg before 8 (Ubuntu 24.04's 6.1) cannot decode it: both calls refuse it, naming what it needs.
+            for (const bool inspect : {true, false}) {
+                try {
+                    if (inspect) {
+                        (void)infernix::media::decode::inspect_image(encoded, {});
+                    } else {
+                        (void)infernix::media::decode::decode_image(encoded, {});
+                    }
+                    failures += " " + name + " (decoded without an animated WebP decoder)";
+                } catch (const infernix::media::decode::Error& error) {
+                    if (error.kind() != infernix::media::decode::ErrorKind::InvalidInput ||
+                        std::string_view(error.what()).find("FFmpeg 8") == std::string_view::npos) {
+                        failures += " " + name + " (refused as: " + error.what() + ")";
+                    }
+                }
+            }
+            continue;
+        }
         const auto info     = infernix::media::decode::inspect_image(encoded, {});
         const auto image    = infernix::media::decode::decode_image(encoded, {});
-        const std::string name(fixture.name);
         if (info.width != fixture.width || info.height != fixture.height || image.width != fixture.width ||
             image.height != fixture.height || image.rgb.size() != expected.size()) {
             throw std::runtime_error(name + ": geometry mismatch");

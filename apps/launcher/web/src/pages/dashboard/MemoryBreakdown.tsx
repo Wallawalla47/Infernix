@@ -190,10 +190,14 @@ function poolView(
   };
 }
 
-/** Device memory in use: the driver's reading (NVML) for the same card when the launcher has one,
- * else what the server sees free. */
+/** Device memory in use: the card's total less what the server sees free (the reading it keeps its headroom
+ * against), else the driver's reading (NVML) for the same card. NVML's used figure leaves out memory the driver
+ * holds: under WSL2 about 650 MiB less than CUDA's, which then showed as free. */
 function deviceUsed(device: Memory["device"], gpu: GpuSample | null): number {
   const total = bytesOf(device.total_bytes);
+  if (total > 0 && typeof device.free_bytes === "number" && Number.isFinite(device.free_bytes)) {
+    return Math.max(0, total - bytesOf(device.free_bytes));
+  }
   const sameCard = gpu !== null && bytesOf(gpu.vram_total) > 0 && Math.abs(gpu.vram_total - total) <= total * 0.05;
   if (sameCard && typeof gpu.vram_used === "number" && Number.isFinite(gpu.vram_used)) return Math.min(Math.max(0, gpu.vram_used), total);
   return Math.max(0, total - bytesOf(device.free_bytes));

@@ -77,6 +77,9 @@ VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& polic
                         double target_fps, int min_frames, int max_frames);
 
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy);
+// Whether this build's FFmpeg decodes animated WebP (FFmpeg 8: libavcodec 62+). Without it inspect_image and
+// decode_image refuse an animated WebP as InvalidInput with a message naming the version it needs.
+[[nodiscard]] bool animated_webp_supported() noexcept;
 Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, double target_fps,
                    int min_frames, int max_frames);
 

@@ -628,6 +628,11 @@ cmake --build build -j
 The server is `build/apps/infernix-serve`, with the same options, and the launcher
 `build/apps/infernix-launcher`. Under WSL2 use the Windows NVIDIA
 driver (install none inside WSL) and copy models into the Linux filesystem; `/mnt/` reads are slow.
+Ubuntu 24.04's FFmpeg (6.1) decodes every image format but animated WebP, which needs FFmpeg 8; an
+animated WebP sent to such a build is refused with a message saying so. Under WSL2 Infernix plans RAM
+against the Linux VM's memory (`.wslconfig`'s `memory=`), which Windows cannot see it use: an
+automatic Host prefix cache fills the VM down to `--ram-free-mib` (on a 96 GB machine with an 88 GiB VM,
+the 27B pinned 75 GiB), so keep the VM's limit below what Windows can spare or set `--host-context-mib`.
 
 The [`Dockerfile`](Dockerfile) builds the same server in a CUDA 13.4 image for Docker or Podman, with
 the NVIDIA Container Toolkit installed on the host. Mount the folder that holds the model and

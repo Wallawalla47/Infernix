@@ -843,7 +843,7 @@ DeviceMemoryReading Engine::device_memory() const {
     DeviceMemoryReading out;
     out.total_bytes = reading.device_total;
     out.free_bytes  = reading.device_free;
-    if (reading.has_budget) { out.process_bytes = reading.local_usage; }
+    if (reading.has_local_usage) { out.process_bytes = reading.local_usage; }
     if (reading.shared_system != 0) { out.process_pinned_bytes = reading.nonlocal_usage; }
     return out;
 }
