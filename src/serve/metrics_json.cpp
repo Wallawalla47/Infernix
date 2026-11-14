@@ -71,6 +71,16 @@ Json memory_json(const MetricsJsonSnapshot& s) {
     add_part(host_parts, "staging", m.host.staging);
     const infernix::DeviceMemoryReading& d = s.device_memory;
     const HostMemorySnapshot& h            = s.host_memory;
+    std::uint64_t host_process             = h.process_resident;
+#ifdef _WIN32
+    // Windows leaves memory the driver page-locked (cudaHostAlloc: the prefix cache's Host tier) out of the working
+    // set, and counts the process's VRAM in its private commit (the driver's backing store): what the process holds
+    // in RAM is the commit less the VRAM, at least the working set (a 27B with a 72.5 GiB Host tier, 2026-11-14:
+    // working set 6.35 GiB, commit 108.91 less VRAM 30.71 = 78.2 GiB, its 72.6 GiB of page-locked memory and 5.6 more).
+    if (d.process_bytes && h.process_private > *d.process_bytes) {
+        host_process = std::max(host_process, h.process_private - *d.process_bytes);
+    }
+#endif
     Json out{
         {"device",
          Json{{"total_bytes", bytes_or_null(d.total_bytes)},
@@ -81,7 +91,7 @@ Json memory_json(const MetricsJsonSnapshot& s) {
         {"host",
          Json{{"total_bytes", bytes_or_null(h.total_physical)},
               {"available_bytes", h.total_physical != 0 ? Json(h.available_physical) : Json(nullptr)},
-              {"process_bytes", bytes_or_null(h.process_resident)},
+              {"process_bytes", bytes_or_null(host_process)},
               {"parts", std::move(host_parts)}}},
         {"ssd", nullptr},
     };

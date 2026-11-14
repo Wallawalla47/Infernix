@@ -611,7 +611,11 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
         logger_->info("{}", note->message);
     }
 
-    if (cache.enabled) {
+    if (cache.enabled && cache.host_growth_capacity_bytes) {
+        logger_->info("prefix cache | on | {} in RAM, up to {} as RAM frees",
+                      product::format_pretty_bytes(*cache.host_capacity_bytes),
+                      product::format_pretty_bytes(*cache.host_growth_capacity_bytes));
+    } else if (cache.enabled) {
         logger_->info("prefix cache | on | {} in RAM", product::format_pretty_bytes(*cache.host_capacity_bytes));
     } else {
         logger_->info("prefix cache | off");

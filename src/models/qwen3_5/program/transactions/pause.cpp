@@ -1,6 +1,8 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "core/device.h"
 
+#include <array>
+#include <cstdint>
 #include <stdexcept>
 
 namespace infernix::models::qwen3_5::detail {
@@ -26,6 +28,8 @@ bool ProgramImpl::start_pause(SequenceHandle handle, runtime::ExecutionTiming* o
         control.prefill->vision.reset();
     }
     if (control.replay) { control.replay->vision.reset(); }
+    // Before the replay's lifecycle is unwound below: the snapshot is taken at the state's own frontier.
+    hybrid_publish_pause(state, control);
     auto saved      = std::make_unique<ResumeStateImpl>();
     saved->frontier = control.lifecycle == Lifecycle::Prefilling  ? control.prefill->cursor
                       : control.lifecycle == Lifecycle::Replaying ? control.replay_target
@@ -34,8 +38,9 @@ bool ProgramImpl::start_pause(SequenceHandle handle, runtime::ExecutionTiming* o
         control.lifecycle = control.resume_lifecycle;
         control.replay.reset();
     }
-    // The lane's committed blocks stay in the prefix cache; the resume binding restores the
-    // deepest cached state up to the frontier and replays the rest of the ledger.
+    // The lane's committed blocks stay in the prefix cache, with its pause snapshot where one was
+    // published; the resume binding restores the deepest cached state up to the frontier and
+    // replays the rest of the ledger.
     hybrid_release_lane(state.lane);
     release_sequence_kv(state);
     release_sequence_state(state);
@@ -53,6 +58,32 @@ bool ProgramImpl::start_pause(SequenceHandle handle, runtime::ExecutionTiming* o
     tx.paused.emplace(ResumeState(std::move(saved)));
     context_transaction_.emplace(std::move(tx));
     return true;
+}
+
+void ProgramImpl::hybrid_publish_pause(SequenceState& sequence, const RequestControl& request) {
+    if (!hybrid_ || !sequence.kv || sequence.lane >= max_concurrency) { return; }
+    const std::uint32_t frontier = sequence.text_kv_valid;
+    const bool consistent =
+        (request.lifecycle == Lifecycle::Active && frontier == sequence.execution_frontier) ||
+        (request.lifecycle == Lifecycle::Prefilling && request.prefill && frontier == request.prefill->cursor) ||
+        (request.lifecycle == Lifecycle::Replaying && frontier == request.replay_cursor);
+    if (!consistent || frontier == 0) { return; }
+    if (is_masked_draft_backend(speculative_backend) && sequence.dflash_context_frontier < frontier) {
+        // Decode leaves the round's accepted tokens out of the drafter's context until the next round; a snapshot
+        // carries a whole ring. A drafter with its own paged KV would need pages mapped here, under the pressure
+        // that is pausing the lane: it replays instead.
+        const std::uint32_t lag = frontier - sequence.dflash_context_frontier;
+        if (backend_kv_cache() != nullptr || lag > draft_window + 1U) { return; }
+        const std::array<std::uint32_t, 1> lanes{sequence.lane};
+        const std::array<std::uint32_t, 1> starts{sequence.dflash_context_frontier};
+        const std::array<std::uint32_t, 1> counts{lag};
+        enqueue_dflash_context_append(lanes, starts, counts);
+        device.synchronize();
+        sequence.dflash_context_frontier = frontier;
+        commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+        work.reset();
+    }
+    (void)hybrid_publish_endpoint(sequence, true, true);
 }
 
 ResumeState ProgramImpl::complete_pause(ContextTransaction& tx) {

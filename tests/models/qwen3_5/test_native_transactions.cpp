@@ -85,7 +85,7 @@ public:
     bind(const qwen::RequestBasePlan& base, std::uint32_t lane = 0,
          qwen::ResumeState* resume           = nullptr,
          qwen::ExecutionUnitKind resume_kind = qwen::ExecutionUnitKind::Decode) {
-        const auto sources = program_.hybrid_sources(base, UINT32_MAX);
+        const auto sources = program_.hybrid_sources(base, nullptr);
         require(sources.size() == 1 && sources.front().reused_tokens == 0,
                 "a Program without a prefix cache quoted more than a root start");
         require(static_cast<bool>(program_.start_binding(
@@ -345,7 +345,7 @@ void replay_sampling_counts(DeviceContext& device, const qwen::execution::Parame
         throw std::runtime_error("sampling-count recovery transaction did not complete");
     };
     const auto bind = [&](std::uint32_t lane, qwen::ResumeState* resume) {
-        const auto sources = program.hybrid_sources(base, UINT32_MAX);
+        const auto sources = program.hybrid_sources(base, nullptr);
         require(sources.size() == 1 &&
                     static_cast<bool>(program.start_binding(base, {lane}, sources.front(), resume,
                                                             qwen::ExecutionUnitKind::Decode, 1)),

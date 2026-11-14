@@ -249,7 +249,8 @@ public:
     public:
         virtual ~Concept() = default;
         virtual GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) = 0;
-        virtual void await_admission(const CancellationView& cancellation) = 0;
+        virtual bool await_admission(const CancellationView& cancellation,
+                                     std::chrono::steady_clock::time_point until) = 0;
     };
 
     template <class Submission>
@@ -262,8 +263,9 @@ public:
             return submission_.wait(sink, cancellation);
         }
 
-        void await_admission(const CancellationView& cancellation) override {
-            submission_.await_admission(cancellation);
+        bool await_admission(const CancellationView& cancellation,
+                             std::chrono::steady_clock::time_point until) override {
+            return submission_.await_admission(cancellation, until);
         }
 
     private:
@@ -281,7 +283,9 @@ public:
         return state_->wait(sink, cancellation);
     }
 
-    void await_admission(const CancellationView& cancellation) { state_->await_admission(cancellation); }
+    bool await_admission(const CancellationView& cancellation, std::chrono::steady_clock::time_point until) {
+        return state_->await_admission(cancellation, until);
+    }
 
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept {
         return sampling_;
@@ -312,9 +316,10 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
     return impl->wait(sink, cancellation);
 }
 
-void GenerationHandle::await_admission(const CancellationView& cancellation) {
+bool GenerationHandle::await_admission(const CancellationView& cancellation,
+                                       std::chrono::steady_clock::time_point until) {
     if (impl_ == nullptr) { throw std::logic_error("GenerationHandle is empty"); }
-    impl_->await_admission(cancellation);
+    return impl_->await_admission(cancellation, until);
 }
 
 class Engine::Impl {
@@ -747,7 +752,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             }
 
             // Answered on submit: no queue, so no admission to wait for.
-            void await_admission(const CancellationView&) const noexcept {}
+            bool await_admission(const CancellationView&, std::chrono::steady_clock::time_point) const noexcept {
+                return true;
+            }
         } immediate{.consumer_mode = consumer_mode};
 
         immediate.result.prompt                     = prompt_summary;

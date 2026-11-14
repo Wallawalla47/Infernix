@@ -87,12 +87,14 @@ struct HybridRestoreLayer {
 class HybridPrefixCache final : public runtime::prefix_cache::PrefixIndexBackend {
 public:
     // With config.ssd_slabs, the SSD tier's scratch file is created in `ssd_directory` (§5.7), or with
-    // `ssd_kept_file` (a prefix cache file's) that file is kept across restarts (§5.5).
+    // `ssd_kept_file` (a prefix cache file's) that file is kept across restarts (§5.5). Of config.host_slabs, the
+    // chunks holding the first `locked_slabs` are page-locked and served at the start; a growth (--ram-resize auto)
+    // locks the rest once RAM frees.
     HybridPrefixCache(const runtime::prefix_cache::PrefixIndexConfig& config,
                       runtime::prefix_cache::TapPlannerConfig taps, LogicalKVPageStore& text_pages,
                       LogicalKVPageStore* backend_pages, StateImageStore& states,
                       qwen3_5::StateImageDevicePool& state_pool, const HybridHostLayout& host,
-                      std::vector<HybridRestoreLayer> layers,
+                      std::uint32_t locked_slabs, std::vector<HybridRestoreLayer> layers,
                       StartupPhaseScope* pin_progress = nullptr,
                       const std::filesystem::path& ssd_directory = {}, std::uint64_t ssd_write_bytes_per_hour = 0,
                       const std::filesystem::path& ssd_kept_file = {});
@@ -148,9 +150,11 @@ public:
 
     // ---- Host write-through (§9.3) --------------------------------------------------------------
     // Copies a Device-resident snapshot (image and tail) to Host slabs. Returns false when there is
-    // no Host tier or no slabs could be freed. The snapshot is pinned until the copy completes.
+    // no Host tier or no slabs could be freed (none of a retained snapshot valued above `claim`, the
+    // snapshot's own priority when absent). The snapshot is pinned until the copy completes.
     bool start_snapshot_host_write(runtime::prefix_cache::SnapshotRef snapshot,
-                                   cudaStream_t producer, cudaStream_t transfer);
+                                   cudaStream_t producer, cudaStream_t transfer,
+                                   std::optional<double> claim = std::nullopt);
     // Copies every Device-only node of `nodes` to a Host slab in one batch. Nodes are pinned until
     // the copy completes. Stops early when the Host tier cannot free a slab.
     void start_block_host_writes(std::span<const runtime::prefix_cache::NodeRef> nodes,
@@ -163,6 +167,13 @@ public:
     // for the copies is the right answer, not a blocked admission or a truncated lease.
     [[nodiscard]] bool transfers_pending() const noexcept {
         return !pending_.empty() || !landing_.empty();
+    }
+    // Device blocks those pins hold now (an upper bound on what drain() can make evictable).
+    [[nodiscard]] std::uint32_t transfer_pinned_blocks() const noexcept {
+        std::size_t blocks = 0;
+        for (const PendingWrite& write : pending_) { blocks += write.nodes.size(); }
+        for (const RestoreBatch& batch : landing_) { blocks += batch.nodes.size(); }
+        return static_cast<std::uint32_t>(blocks);
     }
 
     // Waits for every Host write and landing restore and publishes them.
@@ -229,15 +240,15 @@ public:
     // two images' slabs: the lowest-valued entries go, the entries past the cut are copied below it on `worker`;
     // returns the bytes it aims at (0: held entries keep every chunk in use now).
     std::uint64_t begin_host_release(std::uint64_t bytes, HostMemoryWorker& worker);
-    // Starts page-locking chunks of at most `bytes` back on `worker`, up to the startup size; returns the bytes asked.
+    // Starts page-locking chunks of at most `bytes` on `worker`, up to the tier's slabs; returns the bytes asked.
     std::uint64_t begin_host_growth(std::uint64_t bytes, HostMemoryWorker& worker) {
         return store_.begin_growth(bytes, worker);
     }
     // Applies what the worker finished (never waits): a release commits its moves once no restore is in flight.
     runtime::prefix_cache::HostSlabStore::Progress step_host_resize(HostMemoryWorker& worker);
     [[nodiscard]] bool host_resizing() const noexcept { return store_.resizing(); }
-    // The startup size of the Host tier, and what a release could give back and a growth take back now.
-    [[nodiscard]] std::uint64_t host_tier_capacity_bytes() const noexcept { return store_.capacity_bytes(); }
+    // What the Host tier holds page-locked, and what a release could give back and a growth take now.
+    [[nodiscard]] std::uint64_t host_tier_pinned_bytes() const noexcept { return store_.pinned_bytes(); }
     [[nodiscard]] std::uint64_t host_tier_shrinkable_bytes() const noexcept { return store_.shrinkable_bytes(); }
     [[nodiscard]] std::uint64_t host_tier_growable_bytes() const noexcept { return store_.growable_bytes(); }
 

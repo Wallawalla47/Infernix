@@ -278,7 +278,7 @@ public:
             return owner->wait_for_request(std::exchange(request_, nullptr), sink, cancellation);
         }
 
-        void await_admission(const CancellationView& cancellation) {
+        bool await_admission(const CancellationView& cancellation, Clock::time_point until) {
             if (owner_ == nullptr || request_ == nullptr) {
                 throw std::logic_error("concurrent submission is empty");
             }
@@ -286,7 +286,7 @@ public:
                 throw std::invalid_argument(
                     "await_admission requires a stream-consumed submission");
             }
-            owner_->await_request_admission(request_, cancellation);
+            return owner_->await_request_admission(request_, cancellation, until);
         }
 
     private:
@@ -683,13 +683,14 @@ private:
     }
 
     // wait_for_request's first step, read only: until the request crosses the admission boundary
-    // that publishes its GenerationStart, or is answered before it. Nothing is consumed, so
-    // wait_for_request still delivers the start and every later event. An error answered before
-    // admission is rethrown (the later wait rethrows it again); a request answered without
-    // admission and without an error (cancelled in the queue) returns. A cancellation marks the
-    // request and keeps waiting for the worker's answer, as the wait loop does.
-    void await_request_admission(const std::shared_ptr<Request>& request,
-                                 const CancellationView& cancellation) {
+    // that publishes its GenerationStart, or is answered before it, or `until` passes while it is
+    // still queued (false). Nothing is consumed, so wait_for_request still delivers the start and
+    // every later event. An error answered before admission is rethrown (the later wait rethrows it
+    // again); a request answered without admission and without an error (cancelled in the queue)
+    // returns true. A cancellation marks the request and keeps waiting for the worker's answer, as
+    // the wait loop does.
+    bool await_request_admission(const std::shared_ptr<Request>& request,
+                                 const CancellationView& cancellation, Clock::time_point until) {
         for (;;) {
             std::exception_ptr error;
             bool settled = false;
@@ -705,7 +706,7 @@ private:
             }
             if (settled) {
                 if (error != nullptr) { std::rethrow_exception(error); }
-                return;
+                return true;
             }
             bool cancel = false;
             try {
@@ -715,6 +716,8 @@ private:
                 request->cancelled.store(true, std::memory_order_release);
                 request_admission_check();
                 queue_cv_.notify_one();
+            } else if (Clock::now() >= until) {
+                return false; // still queued: the caller's wait() takes it from here
             }
         }
     }
@@ -1866,14 +1869,16 @@ private:
         }
         std::vector<std::uint64_t> ids;
         std::vector<const typename ModelContract::RequestBasePlan*> bases;
+        std::vector<const typename ModelContract::ResumeState*> resumes;
         for (const auto& request : queue) {
             if (!request->base_plan || request->cancelled.load(std::memory_order_acquire)) {
                 continue;
             }
             ids.push_back(request->id);
             bases.push_back(&*request->base_plan);
+            resumes.push_back(request->suspended ? &*request->suspended : nullptr);
         }
-        resources_.hold_queue(*instance_.program, ids, bases);
+        resources_.hold_queue(*instance_.program, ids, bases, resumes);
     }
 
     // The prefix cache's SSD tier (hybrid-prefix-cache-spec §5.7): landed transfers are applied and
@@ -1961,8 +1966,7 @@ private:
                 }
                 if (!plan_or_fail(request, restoring)) { return true; }
                 std::vector<SourceCandidate> sources = resources_.candidates(
-                    *instance_.program, *request->base_plan,
-                    restoring ? request->suspended->frontier() : UINT32_MAX);
+                    *instance_.program, *request->base_plan, restoring ? &*request->suspended : nullptr);
                 if (sources.empty() && source_pending()) {
                     // Its source is being read from the SSD tier (hybrid-prefix-cache-spec §5.7): it
                     // waits for that read, whose landing starts a new scan (poll_storage).
@@ -2028,7 +2032,11 @@ private:
                     }
                     shortage = reservation.shortage;
                     note_source_wait(request, source, restoring);
-                    if (reclaim(shortage, restoring)) {
+                    // A shortage the cache cannot cover (the other residents hold the pages) evicts nothing
+                    // from it: that would take the request's own cached history, to restore it again. A
+                    // resumed request pauses a resident for its turn; a fresh one waits for their release.
+                    if (reservation.reclaim_cache ? reclaim(shortage, restoring)
+                                                  : restoring && pause_reclaim_victim()) {
                         if (instance_.program->has_context_transaction()) { return true; }
                         continue;
                     }
@@ -2925,6 +2933,9 @@ private:
                                 publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
                                                    "VRAM or RAM resize outside rounds failed: %s", error.what());
                             }
+                            // A resize changes the tiers' sizes: an idle server's metrics show them now, not
+                            // at its next request.
+                            publish_runtime_stats();
                         }
                         continue;
                     }

@@ -87,6 +87,10 @@ struct PrefixCacheConfig {
     runtime::prefix_cache::TapPlannerConfig taps;
     std::uint32_t kv_pages             = 0; // Device page groups of the pool
     std::uint32_t device_snapshot_slots = 0;
+    // An automatic Host tier's growth room (--host-context-mib auto with --ram-resize auto): the tier is sized to this
+    // and page-locks its startup size (host_bytes); RAM freed later grows it towards this. 0 (or below host_bytes):
+    // the startup size is the most.
+    std::uint64_t host_ceiling_bytes = 0;
     // The SSD tier (hybrid-prefix-cache-spec §5.7): its size, rounded down to whole Host slabs, and
     // the directory of its scratch file. 0: none.
     std::uint64_t ssd_bytes = 0;
@@ -252,15 +256,15 @@ public:
     // the lowest-valued entries go, the entries past the cut are copied below it on `worker`; returns the bytes it
     // aims at (0: held entries keep every chunk in use now).
     std::uint64_t begin_host_release(std::uint64_t bytes, HostMemoryWorker& worker);
-    // Starts page-locking chunks of at most `bytes` back on `worker`, up to the startup size; returns the bytes asked.
+    // Starts page-locking chunks of at most `bytes` on `worker`, up to the tier's slabs (an automatic tier's growth
+    // room included: PrefixCacheConfig::host_ceiling_bytes); returns the bytes asked.
     std::uint64_t begin_host_growth(std::uint64_t bytes, HostMemoryWorker& worker) {
         return store_.begin_growth(bytes, worker);
     }
     // Applies what the worker finished (never waits): a release commits its moves once no restore is in flight.
     runtime::prefix_cache::HostSlabStore::Progress step_host_resize(HostMemoryWorker& worker);
     [[nodiscard]] bool host_resizing() const noexcept { return store_.resizing(); }
-    // The startup size of the Host tier, and what a release could give back and a growth take back now.
-    [[nodiscard]] std::uint64_t host_tier_capacity_bytes() const noexcept { return store_.capacity_bytes(); }
+    // What a release could give back and a growth take now (pinned_bytes: what the Host tier holds page-locked).
     [[nodiscard]] std::uint64_t host_tier_shrinkable_bytes() const noexcept { return store_.shrinkable_bytes(); }
     [[nodiscard]] std::uint64_t host_tier_growable_bytes() const noexcept { return store_.growable_bytes(); }
 

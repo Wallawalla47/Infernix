@@ -16,22 +16,23 @@ enum class ReclaimProgress : std::uint8_t { Blocked, Changed, Transferring };
 
 // Engine-side driver of the prefix cache (docs/maintainer/hybrid-prefix-cache-spec.md §8).
 // Retention policy lives in the Program's prefix index: sources are quotes of its block tree and
-// reclamation evicts its cached Device blocks. A paused request keeps nothing: it recovers from
-// whatever the tree then holds, by Replay past it.
+// reclamation evicts its cached Device blocks. A pause publishes the lane's state at its frontier;
+// the paused request resumes from the deepest state the tree then holds on its ledger (that
+// snapshot, while it is cached), by Replay past it.
 template <class Model>
 class HybridResourceManager {
 public:
     using Program = typename Model::Program;
     using Base    = typename Model::RequestBasePlan;
     using Source  = typename Model::SourceCandidate;
+    using Resume  = typename Model::ResumeState;
 
     // The tree's quotes in preference order (its chosen path, then a root start; a root start
-    // alone without a prefix cache). A resumed request's source never passes
-    // `maximum_frontier`. Empty while a prefilling sibling is about to publish the snapshot this
-    // request should resume from.
-    [[nodiscard]] std::vector<Source> candidates(Program& program, const Base& base,
-                                                 std::uint32_t maximum_frontier) {
-        return program.hybrid_sources(base, maximum_frontier);
+    // alone without a prefix cache). A paused request (`resume`) is quoted over its ledger, never
+    // past its paused frontier. Empty while a prefilling sibling is about to publish the snapshot
+    // this request should resume from.
+    [[nodiscard]] std::vector<Source> candidates(Program& program, const Base& base, const Resume* resume) {
+        return program.hybrid_sources(base, resume);
     }
 
     [[nodiscard]] ReclaimProgress reclaim(Program& program, ContextResourceUsage shortage) {
@@ -137,17 +138,17 @@ public:
     }
 
     // Holds the sources of the requests waiting for admission, in admission order
-    // (hybrid-prefix-cache-spec §9.6). `ids` names `queue`'s requests; matching walks every
-    // queued prompt's path, so the holds are recomputed only when the queue or the tree's
-    // snapshots changed.
+    // (hybrid-prefix-cache-spec §9.6). `ids` names `queue`'s requests and `resumes` their paused
+    // states (null for a fresh request); matching walks every queued prompt's path, so the holds
+    // are recomputed only when the queue or the tree's snapshots changed.
     void hold_queue(Program& program, std::span<const std::uint64_t> ids,
-                    std::span<const Base* const> queue) {
+                    std::span<const Base* const> queue, std::span<const Resume* const> resumes) {
         const std::uint64_t epoch = program.hybrid_cache_epoch();
         if (hold_valid_ && epoch == hold_epoch_ && !program.hybrid_holds_stale() &&
             std::equal(ids.begin(), ids.end(), hold_ids_.begin(), hold_ids_.end())) {
             return;
         }
-        program.hybrid_hold_queue(queue);
+        program.hybrid_hold_queue(queue, resumes);
         hold_ids_.assign(ids.begin(), ids.end());
         hold_epoch_ = epoch;
         hold_valid_ = true;

@@ -53,12 +53,14 @@ public:
     GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});
 
     // Blocks until the Engine admits this handle's request (the boundary that publishes its
-    // GenerationStart) or answers it before admission, consuming nothing: wait() still delivers every
-    // event. An error answered before admission (a queue timeout, an orderly stop) is rethrown here as
-    // wait() would rethrow it, so a streaming route can answer with a plain HTTP status before it
-    // commits a response; a request settled without admission and without an error (cancelled while
-    // queued) returns, and wait() gives its answer. Valid on a stream-consumed handle only.
-    void await_admission(const CancellationView& cancellation = {});
+    // GenerationStart) or answers it before admission, or until `until`, consuming nothing: wait() still
+    // delivers every event. Whether the request settled (false: still queued at `until`). An error
+    // answered before admission (a queue timeout, an orderly stop) is rethrown here as wait() would
+    // rethrow it, so a streaming route can answer with a plain HTTP status before it commits a
+    // response; a request settled without admission and without an error (cancelled while queued)
+    // returns true, and wait() gives its answer. Valid on a stream-consumed handle only.
+    bool await_admission(const CancellationView& cancellation                   = {},
+                         std::chrono::steady_clock::time_point until = std::chrono::steady_clock::time_point::max());
 
 private:
     class Impl;

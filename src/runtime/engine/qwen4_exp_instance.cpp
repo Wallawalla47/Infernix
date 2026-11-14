@@ -542,12 +542,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                    : "read from its volume (the RAM ledger keeps the experts resident first)"));
     // --host-context-mib auto: the Host tier takes what the experts, the table and the rest of the plan leave beyond
     // --ram-free-mib (expert_memory.h).
+    // With --ram-resize auto it may grow later, into RAM other programs free.
+    std::uint64_t prefix_growth = 0;
     if (prefix_auto) {
-        prefix_bytes        = auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
+        prefix_bytes = auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
+        if (options.ram_resize) { prefix_growth = auto_host_context_ceiling_bytes(snapshot, demand, prefix_bytes); }
         demand.prefix_cache = prefix_bytes;
     }
     if (cache.enabled) {
         program_options.prefix_host_bytes    = prefix_bytes;
+        program_options.prefix_host_growth_bytes = prefix_growth;
         program_options.prefix_ssd_bytes     = cache.ssd_capacity_bytes;
         program_options.prefix_ssd_directory = cache.ssd_directory;
         program_options.prefix_ssd_write_bytes_per_hour =
@@ -906,6 +910,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
 
     EngineOptions resolved = options;
     if (prefix_auto) { resolved.context_cache.host_capacity_bytes = prefix_bytes; }
+    resolved.context_cache.host_growth_capacity_bytes.reset();
+    if (prefix_growth > prefix_bytes) { resolved.context_cache.host_growth_capacity_bytes = prefix_growth; }
     return {std::move(instance), std::move(summary), std::move(metadata), std::move(resolved)};
 }
 

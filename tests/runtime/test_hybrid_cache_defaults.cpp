@@ -239,6 +239,33 @@ int main() {
             small.available_physical           = 60 * kGiB;
             failures += check(auto_host_context_bytes(eo::plan_host_memory(small, demand)) == kGiB,
                               "an automatic Host tier has a 1 GiB floor");
+            // Its growth limit (--ram-resize auto): the size the start would have planned with the RAM other programs
+            // hold free (the experts still first), within the page-lock room; never below the startup size.
+            {
+                using infernix::runtime::auto_host_context_ceiling_bytes;
+                // 30 GiB held by others: 96 total, 60 available, 6 resident in this process.
+                infernix::HostMemorySnapshot busy = small;
+                busy.process_resident             = 6 * kGiB;
+                const std::uint64_t startup = auto_host_context_bytes(eo::plan_host_memory(busy, demand));
+                infernix::HostMemorySnapshot freed = busy;
+                freed.available_physical += 30 * kGiB;
+                freed.available_commit += 30 * kGiB;
+                const std::uint64_t as_if = auto_host_context_bytes(eo::plan_host_memory(freed, demand));
+                const std::uint64_t grown = auto_host_context_ceiling_bytes(busy, demand, startup);
+                failures += check(startup == kGiB && as_if > 10 * kGiB && grown == as_if,
+                                  "an automatic Host tier may grow into the RAM other programs hold");
+                failures += check(eo::plan_host_memory(freed, demand).placement == eo::ExpertPlacement::Full,
+                                  "the growth limit leaves the experts their RAM");
+                failures += check(auto_host_context_ceiling_bytes(busy, locked, startup) <= *pin_left,
+                                  "the growth limit stays within the page-lock room");
+                // Nothing held by others (all of it this process's or free): no growth past the start.
+                infernix::HostMemorySnapshot alone = busy;
+                alone.process_resident             = 36 * kGiB;
+                failures += check(auto_host_context_ceiling_bytes(alone, demand, startup) == startup,
+                                  "with no RAM held by others the startup size is the most");
+                failures += check(auto_host_context_ceiling_bytes(busy, demand, 40 * kGiB) == 40 * kGiB,
+                                  "the growth limit is never below the startup size");
+            }
             // The frontend's caches the plan counts: the grammar cache, and with vision the media caches.
             EngineOptions frontend;
             failures += check(infernix::runtime::frontend_cache_bytes(frontend) == frontend.grammar_cache_bytes,

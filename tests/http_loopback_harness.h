@@ -66,7 +66,9 @@ public:
 
     int count_prompt_tokens(const GenerationRequest&, std::function<bool()>) const override { return 8; }
 
-    void admit(PreparedRequest&, std::function<bool()>) const override {}
+    bool admit(PreparedRequest&, std::function<bool()>, std::chrono::steady_clock::time_point) const override {
+        return true;
+    }
 
     void stop() noexcept override {}
 

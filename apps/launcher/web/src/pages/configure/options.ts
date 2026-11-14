@@ -84,6 +84,12 @@ const CONTEXT: FormSection = {
       placeholder: "auto (default)",
     },
     {
+      kind: "switch",
+      flag: "--vram-past-budget",
+      label: "Use VRAM past the Windows budget",
+      help: "Windows only. Windows keeps part of the GPU's memory out of each program's VRAM budget (~0.6 GiB on an RTX 5090) though it runs at full speed. On: startup sizing uses it too, for the expert cache with offloaded experts, else for the KV cache (KV capacity auto: more context and prefix cache in VRAM). If another program then needs VRAM, Windows may move that part to system memory: an expert cache shrinks, while KV there is slower until the VRAM frees.",
+    },
+    {
       kind: "number",
       flag: "--ram-free-mib",
       label: "RAM left free (MiB)",
@@ -122,7 +128,7 @@ const CONTEXT: FormSection = {
       kind: "select",
       flag: "--ram-resize",
       label: "RAM given back under pressure",
-      help: "auto: once less than half of RAM left free (at least 2 GiB) is available, the prefix cache's Host tier and then offloaded experts' RAM copies give memory back, also while requests run, until RAM left free is available again, and take it back once RAM left free plus 1 GiB stays available; off keeps their startup sizes.",
+      help: "auto: once less than half of RAM left free (at least 2 GiB) is available, the prefix cache's Host tier and then offloaded experts' RAM copies give memory back, also while requests run, until RAM left free is available again, and take it back once RAM left free plus 1 GiB stays available (an automatic Host prefix cache also grows past its startup size into RAM other programs free); off keeps their startup sizes.",
       options: [
         { value: "auto", label: "auto" },
         { value: "off", label: "off" },
@@ -329,12 +335,6 @@ const EXPERTS: FormSection = {
         { value: "full", label: "full" },
       ],
       unsetLabel: "Default for the model",
-    },
-    {
-      kind: "switch",
-      flag: "--vram-past-budget",
-      label: "Use VRAM past the Windows budget",
-      help: "On Windows: also size the expert cache into the ~0.6 GiB the per-process budget withholds (~240 more cached experts). It may move to system memory if another program needs VRAM.",
     },
     {
       kind: "switch",

@@ -145,6 +145,9 @@ struct BindingReservation {
     bool source_valid      = true;
     bool capacity_possible = true;
     runtime::ContextResourceUsage shortage;
+    // False when evicting cached Device pages cannot cover the shortage (always true here: the
+    // Engine reclaims from the cache first).
+    bool reclaim_cache = true;
     // With capacity_possible false: why no state of the Engine admits the request, a RequestError
     // the Engine fails it with at once (a Vision window the expert cache cannot lend with every
     // other lane idle and this request's context reserved).
@@ -522,9 +525,11 @@ struct ProgramOptions {
     // layer's non-resident experts ahead by DMA into frames lent for the prompt.
     bool prefill_stream              = true;
     // Prefix cache (design §19.3.1): requests resume from and publish to a shared block tree with
-    // Host-born state snapshots in a pinned slab pool of prefix_host_bytes.
+    // Host-born state snapshots in a pinned slab pool of prefix_host_bytes, which RAM freed after the start grows up to
+    // prefix_host_growth_bytes (an automatic tier with --ram-resize auto; 0: none).
     bool prefix_cache                = false;
     std::uint64_t prefix_host_bytes  = 0;
+    std::uint64_t prefix_host_growth_bytes = 0;
     // The SSD tier below the Host tier (hybrid-prefix-cache-spec §5.7): its size and directory; 0: none.
     std::uint64_t prefix_ssd_bytes   = 0;
     std::filesystem::path prefix_ssd_directory;
@@ -608,9 +613,10 @@ public:
 
     // ---- admission: hybrid_sources quotes, start_binding stages, poll_context activates ----
     // The prefix cache's quotes in preference order: its chosen path and snapshot, then a root start
-    // (a root start only, without a prefix cache).
+    // (a root start only, without a prefix cache). A paused request's (`resume`) never passes its
+    // paused frontier; its binding chooses again over its ledger (bind_replay).
     [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base,
-                                                              std::uint32_t maximum_frontier);
+                                                              const ResumeState* resume);
     // Reserves the KV pages of the request's prompt plus one round on `lane`, and the frames of its
     // Vision window, and stages its prefix restore; a shortage reports the pages missing (none for
     // a window that waits for frames), a window that cannot fit even so a refusal. With `resume`,
@@ -632,8 +638,11 @@ public:
     // The Device pages a prefetch could fill now (free plus Host-backed cached).
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     // Holds the snapshot each queued request would resume from now, in admission order
-    // (hybrid-prefix-cache-spec §9.6); an empty queue releases every hold.
-    void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);
+    // (hybrid-prefix-cache-spec §9.6); an empty queue releases every hold. `resumes` names each
+    // paused request's state (null for a fresh one): one paused after its first token holds the
+    // deepest source of its ledger, its pause's capture while that is cached.
+    void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue,
+                           std::span<const ResumeState* const> resumes);
     // No tool-call holds (HybridPrefixCacheOptions::tool_call_hold is zero for this architecture
     // and normalize_engine_options refuses another value), so the queue holds go stale only with
     // the queue or the snapshots.

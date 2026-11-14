@@ -166,6 +166,10 @@ struct BindingReservation {
     bool source_valid      = true;
     bool capacity_possible = true;
     runtime::ContextResourceUsage shortage;
+    // False when evicting cached Device blocks cannot cover the shortage (the other residents hold
+    // the pages): the Engine then reclaims nothing from the cache, which would evict the request's
+    // own cached history for nothing, and pauses a resident for a resumed request or defers a fresh one.
+    bool reclaim_cache = true;
     // The Engine's contract (runtime/contract/program.h): Qwen3.5's binding never refuses a request
     // on its own; a request no state admits fails through the Engine's capacity check.
     std::exception_ptr refusal;
@@ -460,10 +464,11 @@ public:
     // context transaction: hybrid_sources() quotes, start_binding() stages and poll_context()
     // activates.
     // The quoted sources for a request in preference order: the chosen cached path, if any, then
-    // a root start. A resumed request's source never passes `maximum_frontier`. Empty while a
-    // prefilling sibling is about to publish the snapshot this request should resume from.
+    // a root start. A paused request (`resume`) is matched over its whole ledger and takes its
+    // deepest source, never past its paused frontier. Empty while a prefilling sibling is about to
+    // publish the snapshot this request should resume from.
     [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base,
-                                                              std::uint32_t maximum_frontier);
+                                                              const ResumeState* resume);
     // Evicts unpinned cached Device blocks, and the Device copies of cached snapshot images, until
     // the shortage is covered or nothing evictable remains. Returns whether anything was freed.
     [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);
@@ -474,8 +479,10 @@ public:
     // Device pages a prefetch could fill now: free ones and host-backed cached ones.
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     // Holds the snapshot each queued request would resume from now, in admission order
-    // (hybrid-prefix-cache-spec §9.6); an empty queue releases every hold.
-    void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);
+    // (hybrid-prefix-cache-spec §9.6); an empty queue releases every hold. `resumes` names each
+    // paused request's state (null for a fresh one), whose source is held over its ledger.
+    void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue,
+                           std::span<const ResumeState* const> resumes);
     // Tool-call hold: what the request finished last resumes its next turn from is held after
     // every queued request's source until `deadline`.
     void hybrid_hold_continuation(std::chrono::steady_clock::time_point deadline);

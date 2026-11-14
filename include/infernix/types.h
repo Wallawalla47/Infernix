@@ -636,6 +636,10 @@ struct ContextCacheOptions {
     // table first) leaves beyond ram_free_bytes, within what the process may still page-lock, in 256 MiB steps
     // and at least 1 GiB (runtime/engine/expert_memory.h). Engine::options() reports the resolved size.
     std::optional<std::size_t> host_capacity_bytes;
+    // Resolved by the Engine, a caller's value ignored: an automatic Host tier with ram_resize page-locks
+    // host_capacity_bytes at the start and may grow to this once other programs free RAM (the RAM other programs
+    // held at the start, within what the process may page-lock; expert_memory.h). Empty: the start's size is the most.
+    std::optional<std::size_t> host_growth_capacity_bytes;
     // The SSD tier below the Host tier (docs/maintainer/hybrid-prefix-cache-spec.md §5.7): a scratch
     // file of ssd_capacity_bytes (rounded down to whole Host slabs) created in ssd_directory at startup,
     // read and written unbuffered, and removed when the process ends. 0 (the default) disables it; it
@@ -736,9 +740,11 @@ struct EngineOptions {
     // (expert_offload::display_headroom). Qwen3.5: what --kv-capacity auto leaves after the KV cache
     // (requires it). Offloaded experts: what the expert cache leaves once every fixed allocation is made.
     std::optional<std::size_t> vram_headroom_bytes;
-    // Qwen3.8-Flash-Next on Windows: also size the expert cache into the physical VRAM the OS
-    // budget withholds (~0.6 GiB on an RTX 5090), measured at startup (--vram-past-budget). That
-    // memory may be moved to system memory when another program needs VRAM.
+    // Windows: also size into the physical VRAM the OS budget withholds (~0.6 GiB on an RTX 5090),
+    // measured at startup (--vram-past-budget): the expert cache with offloaded experts, else the KV
+    // pool of --kv-capacity auto (every startup reading, the Program's spill check and the reported
+    // free VRAM count it). That memory may be moved to system memory when another program needs
+    // VRAM: an expert cache shrinks then, a KV pool stays (slower until the VRAM frees).
     bool vram_past_budget = false;
     // Qwen3.8-Flash-Next, approximate (--expert-tail-skip R, 1..9; 0 off): in decode and verification
     // rounds, a routed expert not resident in VRAM that every token of the round routes at top-10
@@ -857,8 +863,9 @@ struct EngineOptions {
     // --ram-resize auto|off: the RAM tiers (the prefix cache's Host tier; the expert tier's slots and records) give
     // memory back, while requests run as well as between them, once less than max(ram_free_bytes / 2, 2 GiB) of
     // physical memory is available, until ram_free_bytes (at least a GiB more) is again, and take it back in pieces,
-    // up to their startup sizes, once more than that plus 1 GiB has stayed available for 10 s
-    // (runtime::expert_offload::RamMonitor). Off: every tier keeps its startup size.
+    // up to their startup sizes (an automatic Host tier up to ContextCacheOptions::host_growth_capacity_bytes), once
+    // more than that plus 1 GiB has stayed available for 10 s (runtime::expert_offload::RamMonitor). Off: every tier
+    // keeps its startup size.
     bool ram_resize = true;
     // Qwen3.8-Flash-Next (--expert-ram-mib): at most this much Host RAM for the routed experts.
     // Less than every expert needs selects the SSD tier: the experts not in RAM are read from the

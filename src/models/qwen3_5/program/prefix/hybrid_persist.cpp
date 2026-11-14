@@ -35,7 +35,7 @@ pc::PersistBinding HybridPrefixCache::persist_binding() {
     append(binding.geometry, static_cast<std::uint32_t>(host_layout_.image_slabs));
     binding.slab_bytes  = host_layout_.slab_bytes;
     binding.image_slabs = host_layout_.image_slabs;
-    binding.host_slabs  = config_.host_slabs;
+    binding.host_slabs  = index_->host_slab_limit(); // in service now: a load fills no more
     binding.slab        = [this](std::uint32_t id) { return slab(id); };
     binding.ssd         = ssd_ && ssd_->kept() ? ssd_.get() : nullptr;
     return binding;

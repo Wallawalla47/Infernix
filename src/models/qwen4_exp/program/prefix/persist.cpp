@@ -37,7 +37,7 @@ pc::PersistBinding PrefixCache::persist_binding() {
     append(binding.geometry, static_cast<std::uint32_t>(host_.image_slabs));
     binding.slab_bytes  = host_.slab_bytes;
     binding.image_slabs = host_.image_slabs;
-    binding.host_slabs  = host_.slabs;
+    binding.host_slabs  = index_->host_slab_limit(); // in service now: a load fills no more
     binding.slab        = [this](std::uint32_t id) { return slab(id); };
     binding.block_word  = [this](pc::NodeRef node) { return node_mtp_next_[node.index]; };
     binding.set_block_word = [this](pc::NodeRef node, std::int32_t word) { node_mtp_next_[node.index] = word; };

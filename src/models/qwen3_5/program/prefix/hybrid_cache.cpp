@@ -39,7 +39,7 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
                                      LogicalKVPageStore& text_pages,
                                      LogicalKVPageStore* backend_pages, StateImageStore& states,
                                      qwen3_5::StateImageDevicePool& state_pool,
-                                     const HybridHostLayout& host,
+                                     const HybridHostLayout& host, std::uint32_t locked_slabs,
                                      std::vector<HybridRestoreLayer> layers,
                                      StartupPhaseScope* pin_progress,
                                      const std::filesystem::path& ssd_directory, std::uint64_t ssd_write_bytes_per_hour,
@@ -71,7 +71,7 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
         if (pin_progress != nullptr) {
             progress = [pin_progress](std::uint64_t pinned, std::uint64_t total) { pin_progress->progress(pinned, total); };
         }
-        store_ = runtime::prefix_cache::HostSlabStore(host.slab_bytes, config.host_slabs, kHostChunkBytes,
+        store_ = runtime::prefix_cache::HostSlabStore(host.slab_bytes, config.host_slabs, locked_slabs, kHostChunkBytes,
                                                       "hybrid prefix cache Host tier", progress);
         // A release keeps one chunk and at least two images' slabs.
         const std::uint32_t per_chunk = store_.slabs_per_chunk();
@@ -86,6 +86,7 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
     }
     blocks_.reserve(config.max_nodes);
     index_.emplace(config_, *this);
+    if (config.host_slabs != 0) { store_.limit_index(*index_); } // only the locked slabs serve until a growth
 }
 
 bool HybridPrefixCache::poll_ssd() {
@@ -359,7 +360,7 @@ void HybridPrefixCache::order_after(cudaStream_t producer, cudaStream_t consumer
 // ---- Host write-through ------------------------------------------------------------------------
 
 bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStream_t producer,
-                                                  cudaStream_t transfer) {
+                                                  cudaStream_t transfer, std::optional<double> claim) {
     if (!host_tier() || !index_->valid(snapshot) || !images_[snapshot.index].valid()) {
         return false;
     }
@@ -371,7 +372,7 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStre
         }
     }
     index_->pin_snapshot(snapshot);
-    if (!index_->begin_snapshot_host_fill(snapshot)) {
+    if (!index_->begin_snapshot_host_fill(snapshot, claim)) {
         // It stays Device-only: its slot is then its last copy (spec §9.2).
         index_->unpin_snapshot(snapshot);
         ++counters_.host_image_write_refusals;

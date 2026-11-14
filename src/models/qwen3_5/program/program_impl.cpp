@@ -96,9 +96,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       drafter_weight_bytes(drafter_device_weight_bytes(parameters_in.model)),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       // Every Program checks its fixed allocations against the driver's sysmem fallback (VR-04): a
-      // resident model's KV and arenas are as exposed to it as an offloaded one's.
-      spill_source(open_vram_budget_source(
-          device_in.device, offload_options != nullptr && offload_options->engine.vram_past_budget)),
+      // resident model's KV and arenas are as exposed to it as an offloaded one's. Past the budget
+      // (--vram-past-budget) its free memory counts the allowance the KV was sized in.
+      spill_source(open_vram_budget_source(device_in.device, plan.vram_past_budget)),
       spill_guard(begun_spill_guard(spill_source.get())), persistent(plan.persistent.bytes),
       workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
@@ -437,7 +437,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     if (use_cuda_graph) {
         StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
-        const std::size_t free_before = device.free_bytes();
+        // Past the OS budget (--vram-past-budget) cudaMemGetInfo stops at the budget: the budget source reads both
+        // sides of the graphs' allocations.
+        const auto graph_vram         = open_vram_budget_source(device.device, plan.vram_past_budget);
+        const std::size_t free_before = graph_vram->query().device_free;
         // Offloaded experts: each executable's warm launch runs the MoE (its CPU-served misses and
         // landings included), so a round is open; an expert the warm launches could not serve fails
         // the startup.
@@ -445,7 +448,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         prepare_graphs();
         device.synchronize();
         if (offload) { offload->engine().check_error(parameters.model.info().name + " (graph preparation)"); }
-        const std::size_t free_after = device.free_bytes();
+        const std::size_t free_after = graph_vram->query().device_free;
         graph_measured_bytes         = free_before > free_after ? free_before - free_after : 0;
         graph_phase.complete();
     }

@@ -62,7 +62,7 @@ be positive, §17); every other value is derived from the rest of the configurat
 | §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
 | §6.3 persistent backfill proof | not issued: a blocked FIFO head is never overtaken (a proof with a growth reserve was tried and reverted, §16.3) |
 | §12 optional features other than 12.1 and 12.2, §13.2 Op qualification | not implemented |
-| §5.6 Host state precision, §9.7 tool-call holds | implemented 2026-10-12 with branch-point taps and pause snapshots, measured by agentic A/B (§16.8); tool-call holds on by default (30 s) since 2026-10-13, packed Host state an option (default `fp32`), branch-point taps and pause snapshots removed. An Op test for the state codec, a state-image test, option tests and a `cache-replay` preemption real scenario |
+| §5.6 Host state precision, §9.7 tool-call holds | implemented 2026-10-12 with branch-point taps and pause snapshots, measured by agentic A/B (§16.8); tool-call holds on by default (30 s) since 2026-10-13, packed Host state an option (default `fp32`), branch-point taps and pause snapshots removed; pause snapshots back since 2026-11-14 with ledger resumes (§16.10). An Op test for the state codec, a state-image test, option tests and a `cache-replay` preemption real scenario |
 | §13.3 real-artifact scenarios | `infernix_qwen3_5_hybrid_prefix_real_test`: Host vs Device restore exactness (with and without MTP), generation-opener and system-block reuse, Device-only mode, protocol cache hints, Vision, persistence across a restart, cancellation mid-prefill (with and without DFlash2); `INFERNIX_HYBRID_KV_DTYPE` runs them for every KV storage (bf16, int8, fp8, nvfp4, k8v4 pass). `infernix_qwen3_5_prefix_real_test`, `infernix_ngram_concurrent_real` and the other real tests run on the cache as well |
 
 ## 0. Summary
@@ -396,7 +396,11 @@ struct Snapshot {
   gives its destination back; one an SSD job I/O-pins meanwhile waits for it); `finish_host_shrink`
   ends the shrink once nothing past the ceiling is in use (a counter: only `begin_host_shrink`
   scans every node), and the worker releases the chunks past it. A growth page-locks chunks on the worker and `grow_host` returns
-  their slabs to the free list at the next step, up to the startup size. A rebuilt index
+  their slabs to the free list at the next step, up to the tier's configured slabs. An automatic
+  tier (`--host-context-mib auto` with `--ram-resize auto`) is configured for the RAM other
+  programs held at startup as well (`auto_host_context_ceiling_bytes`): it page-locks its startup
+  size, the index serves only those slabs (`limit_index` on the fresh index), and growth takes the
+  rest as that RAM frees; a prefix cache file loads into the slabs in service. A rebuilt index
   (`clear()`) starts at the slabs page-locked then (`HostSlabStore::limit_index`). A strided copy run
   joins consecutive pages only while their slab records share a chunk and advance by one pitch no
   larger than the device's maximum copy pitch. Any two records form a candidate run, so records in
@@ -749,6 +753,12 @@ restore_seconds = (host_path_bytes + host_image_bytes + host_tail_bytes) / measu
 plus `B·S + S(S+1)/2` attention pairs, keyed by `prefill_signature`). Pick the minimum. Ties
 favour fewer transferred bytes. This is O(1) and deterministic, and the cost model only ranks
 feasible choices.
+
+A paused request takes its deepest candidate instead, over its whole ledger (§16.10). A source that
+fits beside the residents now (§6.3) replaces the choice only when it leaves at most a prefill chunk
+of the chosen source's cached history to compute again (a paused request: none); otherwise the choice
+is offered and its binding waits for room (§8.2), since recomputing restorable history needs the same
+pages within a few units.
 
 ### 6.3 Capacity
 
@@ -1219,11 +1229,12 @@ struct SourceCandidate {                    // the binding source shared with ch
     PrefixReusePath reuse_path;             // HybridEndpoint | HybridSnapshot for a hybrid hit
 };
 [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan&,
-                                                          std::uint32_t maximum_frontier); // §6.1-6.3
+                                                          const ResumeState* resume);      // §6.1-6.3
 [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);                // §9.5
 [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan&);       // §6.6
 [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
-void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);                   // §9.6
+void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue,
+                       std::span<const ResumeState* const> resumes);                     // §9.6
 [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;                         // §9.6
 void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel&);                       // §6.2
 void set_hybrid_coalesce_wait_limit(double seconds);                                     // §12.2
@@ -1248,10 +1259,16 @@ policy lives:
 - `candidates` returns the Program's hybrid sources; empty while a prefilling sibling is about to
   publish the snapshot the request should resume from (§12.2), which leaves the request queued.
 - `reclaim` evicts cached Device blocks (`hybrid_reclaim`); when nothing is evictable it reports
-  `Blocked`, and the Engine pauses a younger request.
-- A paused request recovers by Replay, from the deepest source the tree then holds; a pause
-  publishes nothing beyond the blocks and snapshots the lane already committed. An MTP lane's
-  Replay bridges its drafter from the snapshot's continuation hidden, which every image holds.
+  `Blocked`, and the Engine pauses a younger request. A binding whose shortage evicting the cache
+  cannot cover while another lane holds KV says so (`BindingReservation::reclaim_cache` false): the
+  Engine then evicts nothing for it, pausing a resident for a resumed request and deferring a fresh
+  one, and the binding itself makes no room (it would evict the cache, the waiting request's own
+  prefetched path among it, and wait for every transfer on each admission pass).
+- A pause publishes the lane's state at its committed frontier as the request's resume point (§16.10),
+  whenever that state is consistent and its DFlash2 ring whole; the paused request is quoted over its
+  whole ledger (`hybrid_sources` with its `ResumeState`), takes its deepest source and recovers by
+  Replay past it, which is nothing when its pause snapshot is still cached. An MTP lane's Replay
+  bridges its drafter from the snapshot's continuation hidden, which every image holds.
 - While the FIFO head waits, the Engine asks for a prefetch of its Host-only path (§6.6).
 - After each admission pass the Engine passes the queue to `hold_queue`, which recomputes the
   Program's queue holds when the queue or the snapshot epoch changed (§9.6).
@@ -1380,8 +1397,12 @@ C(s)  = prefill_seconds(base=F_a, tokens=F_s−F_a) − restore_seconds(image)  
 Z(s)  = image_bytes + tail_bytes + exclusive_path_bytes(s)
         exclusive_path_bytes: host bytes of the nodes on path(s) below which s is the only
         retained snapshot
-F(s)  = 1 + hits(s)                             // hits since publication
+F(s)  = 1 + hits(s)                             // admissions resumed from s since publication
 ```
+
+- A paused request's resume is the request admitted before, recovering: it refreshes `s`'s recency
+  and retains it again when superseded, but adds no hit and leaves `L_s` as it was, so a source one
+  request replays from again and again does not outrank the snapshots of conversations that move on.
 
 - Each snapshot records its nearest snapshot above it on its path (`ancestor`) and the snapshots
   that record it (`dependents`); a new snapshot between them takes over the dependents below it,
@@ -1454,8 +1475,8 @@ Holds use the queue as the eviction policy's lookahead:
   admission or a unit reservation.
 - A held snapshot that is removed anyway (its path lost its last copy) counts as
   `held_snapshot_losses`; Device copies of held entries evicted count as `held_device_evictions`.
-- A paused request (Qwen3.5; Qwen3.8-Flash-Next never pauses) recovers by Replay from what the
-  tree holds, so its source is held like a queued request's, ahead of them.
+- A paused request's source is held like a queued request's, ahead of them, and matched over its
+  whole ledger, so the hold keeps its pause snapshot (§16.10) cached until it resumes.
 
 Holds cannot make room that does not exist: with more queued context than the cache holds, the
 requests at the back of the queue still lose theirs. They change who loses it, from every waiting
@@ -2308,6 +2329,69 @@ an Intel Optane P5800X 400 GB.
   under WSL2 Ubuntu 24.04 with g++ 13.3, `-Wall -Wextra` clean, but no Linux model run); a QLC drive
   after its SLC cache is exhausted (writes would slow, reads are issued first); the 122B and the
   35B-A3B; the budget over sessions of hours (the replay is 13 minutes).
+
+### 16.10 Pause snapshots, ledger resumes and source choice under KV pressure (2026-11-14)
+
+A production session on the 27B (official NVIDIA NVFP4, DFlash2, INT8 KV, four lanes,
+`--max-context 230000 --kv-capacity auto`, a 72.5 GiB Host tier) served two agent conversations of
+about 185K and 75K tokens, which do not fit the 239K-token pool together. Its counters: 399
+preemptions, 12.8 M replayed tokens (3,543 s of Replay execution), 95.5 % of prompt tokens in cached
+blocks but 69 % resumed, and continuing turns up to 142 s to the first token. The Host tier was not
+the cause: four mechanisms were.
+
+1. A pause published nothing (pause snapshots were removed in §16.8, when the A/B workload paused
+   too rarely to show a gain). Under pressure the service turns (resource-scheduling §5.1) pause a
+   resident every 1-4 s, and each resume replayed the request's whole generation, or the whole prompt
+   prefilled so far, from the deepest snapshot published before.
+2. A resume was matched over the prompt only, so no snapshot of generated tokens could serve it, and
+   its binding planned no taps over the rest of the prompt, so a prefill paused twice replayed from the
+   same tap twice. Each resume also counted as a GDSF hit on its source.
+3. Source choice took the first candidate that fitted beside the residents now. With the other
+   conversation resident, the deep source's Host-only blocks did not fit, so a fresh request took a
+   source 65-71K tokens short of its cached history and prefilled the difference (needing the same
+   pages within a few units, and preempting the other conversation for them).
+4. A binding that could not fit evicted every evictable cached block (the waiting request's own
+   prefetched path among them) and waited for every transfer before failing, on every admission pass,
+   and the Engine's reclaim then evicted the resuming request's own path, 90 blocks per attempt.
+
+The changes: a pause publishes the lane's state at its committed frontier as the request's resume
+point (Qwen3.5 now as Qwen3.8-Flash-Next, §17), taken however close it lies to the lane's deepest
+snapshot, with its Device slot and Host image admitted over any snapshot that is not pinned or held
+(a DFlash2 drafter first takes the last round's accepted tokens; a prefill whose ring is not whole
+there, YE-01, publishes nothing). A paused request is quoted and held over its whole ledger (the
+Engine passes its `ResumeState` to `hybrid_sources` and `hybrid_hold_queue`), takes its deepest
+source, and its resumed prefill plans taps past its paused frontier; its hits add no GDSF frequency
+(§9.3). A source that fits now replaces the cost model's choice only within a prefill chunk of it
+(§6.2). A binding that evicting the cache cannot make room for while another lane holds KV makes no
+room and reports `reclaim_cache` false, so the Engine pauses a resident for a resume and defers a
+fresh request (§8.2); a binding over blocks the head's prefetch is landing waits for the prefetch.
+Three more defects surfaced on the way and are fixed: draining every transfer whenever no source
+fitted (the head's prefetch among them, halving the residents' decode rate); binding a root start
+when the prefetch had marked the source's path Filling; and aborting a binding with a staged Host
+restore (an Engine stopping during a resume's restore) released the restore's destination pages
+while its prefix fork still pinned them as sources, which terminated the process: the forks now go
+first (the preemption real test's combined scenarios aborted in 3 of 6 runs before, 0 of 11 after).
+
+Measurements, RTX 5090, same artifact and launch flags, one run each:
+
+| workload | arm | continuing-turn TTFT mean / median / max | prompt tokens resumed | preemptions | replayed tokens | wall |
+|---|---|---|---|---|---|---|
+| two concurrent agent conversations (`.local` driver: 186K and 96K-token histories, six tool-loop turns each, thinking on, the owner's flags) | before | 20.0 / 1.0 / 72.3 s | 87.4 % of continuing prompts | 12 | 347 K | 219 s |
+| | after | 2.9 / 1.3 / 18.3 s | 98.9 % | 2 (1 resumed from its pause snapshot) | 21.5 K (a cold 186K prefill paused once) | 59 s |
+| `bench/agentic_ab`, seed 42, scale 1, `--kv-capacity 160000 --host-context-mib 16000` (§16.3) | before | all requests 2.81 / 0.36 / 89.1 s, p90 5.18 | 81.7 % (16 requests resumed short of their cached blocks, 396 K tokens) | 38 | 980 K | 14.8 min |
+| | after | all requests 1.18 / 0.34 / 20.6 s, p90 3.31 | 88.0 % (8 requests, 9.3 K tokens) | 3 (all from pause snapshots) | 0 | 11.1 min |
+
+The remaining 18.3 s two-conversation turn waited behind the other conversation's cold 186K prefill,
+and the replay is sampled, so the arms generated different conversations; neither A/B was repeated.
+Unfavourable or unexplained: the agentic replay's `unbacked_node_losses` rose from 0 to 13 (Device-only
+blocks evicted without a Host copy; not traced), and a fresh request now waits for a resident's release
+where it used to start from a shallower source at once, which can delay a request whose shallower
+source would have needed only a short prefill (the one-chunk allowance bounds that case). Checks: the
+index tests (a resume point displaces an unheld valuable snapshot but not a held one; resume hits add
+no frequency), the Qwen3.5 preemption real test on all scenarios with backends none, MTP and DFlash2
+(`cache-replay`: every resume from its pause snapshot, 0 replayed tokens; `cache-fairness`: 0 replayed
+against 4,420-5,188 without the cache), the native-transaction, prefix and hybrid-prefix real tests,
+and the Qwen3.8-Flash-Next prefix-cache and preemption real tests.
 
 ## 17. Qwen4Exp binding (Qwen3.8-Flash-Next)
 

@@ -11,16 +11,17 @@
 
 namespace infernix::runtime::prefix_cache {
 
-HostSlabStore::HostSlabStore(std::size_t slab_bytes, std::uint32_t slabs, std::size_t chunk_bytes, std::string_view tier,
-                             const std::function<void(std::uint64_t, std::uint64_t)>& progress)
+HostSlabStore::HostSlabStore(std::size_t slab_bytes, std::uint32_t slabs, std::uint32_t locked, std::size_t chunk_bytes,
+                             std::string_view tier, const std::function<void(std::uint64_t, std::uint64_t)>& progress)
     : slab_bytes_(slab_bytes), slabs_(slabs),
       per_chunk_(static_cast<std::uint32_t>(std::max<std::size_t>(1U, slab_bytes == 0 ? 1U : chunk_bytes / slab_bytes))) {
     if (slabs == 0) { return; }
     if (slab_bytes == 0 || slab_bytes % 4096U != 0) {
         throw std::invalid_argument("prefix cache Host slabs must be a positive multiple of 4 KiB");
     }
-    const std::uint64_t total = capacity_bytes();
-    const std::uint32_t count = (slabs + per_chunk_ - 1U) / per_chunk_;
+    // Whole chunks: the last one locked may hold slabs past `locked`.
+    const std::uint32_t count = (std::min(locked, slabs) + per_chunk_ - 1U) / per_chunk_;
+    const std::uint64_t total = std::min<std::uint64_t>(slabs, static_cast<std::uint64_t>(count) * per_chunk_) * slab_bytes;
     std::uint64_t pinned      = 0;
     const auto failure        = [&](const std::exception& error) {
         return std::runtime_error("pinning the " + std::string(tier) + " failed after " + std::to_string(pinned >> 20U) +

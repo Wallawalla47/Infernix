@@ -438,11 +438,15 @@ public:
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
 
     [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base,
-                                                              std::uint32_t maximum_frontier);
+                                                              const ResumeState* resume);
     [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);
     [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
-    void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);
+    void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue,
+                           std::span<const ResumeState* const> resumes);
+    // A paused request's ledger: its prompt and generated tokens (through the next input when it was
+    // paused while generating).
+    [[nodiscard]] static std::span<const TokenId> resume_ledger(const ResumeState& resume) noexcept;
     // Holds what the last finished request's next turn resumes from until `deadline`, after every
     // queued request's source (a tool-call hold).
     void hybrid_hold_continuation(std::chrono::steady_clock::time_point deadline);
@@ -706,7 +710,8 @@ public:
         struct HybridBinding {
             std::shared_ptr<const HybridQuoteImpl> quote;
             std::vector<runtime::prefix_cache::NodeRef> path;
-            std::vector<std::uint64_t> extras;
+            // The lookup hash of the path's last block (a paused request's may lie past the prompt).
+            std::uint64_t path_hash = runtime::prefix_cache::kRootLookupHash;
             bool snapshot_pinned = false;
             bool state_restored  = false;
             // This binding opened the cache's staged restore batch.
@@ -1041,9 +1046,18 @@ public:
                             std::optional<std::uint32_t>* created = nullptr) noexcept;
     // The publication of hybrid_finish_lane without the release: returns the snapshot now at the
     // lane's committed frontier (created or an identical existing one), invalid when none was
-    // published, for a tool-call hold.
+    // published, for a tool-call hold. `pausing`: the snapshot is the paused request's own resume
+    // point (hybrid_publish_pause), taken however close it lies to the lane's deepest snapshot, and
+    // its Host image is admitted over any retained snapshot that is not pinned or held.
     [[nodiscard]] runtime::prefix_cache::SnapshotRef
-    hybrid_publish_endpoint(SequenceState& sequence, bool endpoint) noexcept;
+    hybrid_publish_endpoint(SequenceState& sequence, bool endpoint, bool pausing = false) noexcept;
+    // A pause's publication (start_pause): where the lane's state is consistent at its committed frontier (a
+    // prefill or replay unit's end, a committed decode round), that state becomes a snapshot there, so the resume
+    // binding restores it instead of replaying the ledger from the deepest snapshot published before (a request
+    // paused again and again replayed its whole generation, or the whole prompt, each time). A DFlash2 drafter's
+    // context first takes the last round's accepted tokens, as the next round would. A prefill whose drafter ring
+    // is not whole at the frontier (YE-01 skips what no planned read reaches) publishes nothing there.
+    void hybrid_publish_pause(SequenceState& sequence, const RequestControl& request);
     // Drops the lane's index pins and pending taps. Safe on any lane state. A lane marked
     // `withdraw` writes nothing through and withdraws what it published (hybrid_withdraw).
     void hybrid_release_lane(std::uint32_t lane) noexcept;

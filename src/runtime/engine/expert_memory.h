@@ -73,6 +73,14 @@ struct ExpertRamPlan {
 // --ram-free-mib, and the Qwen3.5 Programs a fixed 8 GiB.)
 inline constexpr std::uint64_t kMinAutoHostContextBytes = 1ULL << 30;
 [[nodiscard]] std::uint64_t auto_host_context_bytes(const expert_offload::HostMemoryLedger& ledger) noexcept;
+// With --ram-resize auto, the most an automatic Host tier may grow to after the start (it page-locks `startup` then,
+// and grows once RAM stays free, RamControl): auto_host_context_bytes for `demand` (planned without the tier, as at
+// the start) as if the RAM other programs hold now were free, so the experts keep their place ahead of it, still
+// within what the process may page-lock; never below `startup`. The tier's index is sized for it (a few bytes per
+// slab); no RAM is taken until a growth.
+[[nodiscard]] std::uint64_t auto_host_context_ceiling_bytes(HostMemorySnapshot snapshot,
+                                                            const expert_offload::HostMemoryDemand& demand,
+                                                            std::uint64_t startup) noexcept;
 
 // Plans `demand` against `snapshot`, reports the ledger (an Info summary, Debug details) and refuses
 // an --expert-ram-mib the ledger cannot give (std::runtime_error, expert_ram_refusal's message).

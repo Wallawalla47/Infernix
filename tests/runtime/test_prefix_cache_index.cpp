@@ -954,6 +954,69 @@ void test_host_write_admission() {
     index.check_invariants();
 }
 
+// A paused request's resume point is admitted with an infinite claim: it displaces a retained Host
+// snapshot worth more than itself, but never a held one (the source of a request waiting to resume).
+void test_resume_point_admission() {
+    for (const bool held : {false, true}) {
+        RecordingBackend backend;
+        PrefixCacheIndex index(small_config(4, 4), backend); // one tail-less image
+        const auto a      = make_tokens(64 * 8, 56);
+        const auto path_a = insert_sequence(index, backend, a);
+        const SnapshotRef valuable = publish_at(index, backend, path_a, a, 64 * 8, SnapshotKind::Boundary);
+        backup_snapshot(index, valuable);
+        if (held) { index.set_queue_holds(std::span<const SnapshotRef>(&valuable, 1)); }
+        const auto b             = make_tokens(64 * 1, 57);
+        const auto path_b        = insert_sequence(index, backend, b);
+        const SnapshotRef paused = publish_tap(index, path_b[0]);
+        index.pin_snapshot(paused);
+        require(!index.begin_snapshot_host_fill(paused), "its own priority does not displace the valuable snapshot");
+        const bool admitted = index.begin_snapshot_host_fill(paused, std::numeric_limits<double>::infinity());
+        require(admitted == !held, held ? "a held snapshot must keep its Host copy against any claim"
+                                        : "a resume point must displace an unheld retained snapshot");
+        if (admitted) {
+            index.complete_snapshot_host_fill(paused);
+            require(!index.valid(valuable) || index.snapshot(valuable).host == CopyState::Absent,
+                    "the displaced snapshot gives up its Host copy");
+        }
+        index.unpin_snapshot(paused);
+        index.set_queue_holds({});
+        index.release_path(path_a);
+        index.release_path(path_b);
+        index.check_invariants();
+    }
+}
+
+// A paused request's resumes (note_hit counted false) add no GDSF frequency: a source a request
+// replays from again and again keeps its value, and a new snapshot of the same value displaces it,
+// while as many admissions would have kept it (§9.3). Either kind retains a superseded snapshot again.
+void test_resume_hits_add_no_frequency() {
+    for (const bool counted : {false, true}) {
+        RecordingBackend backend;
+        PrefixCacheIndex index(small_config(4, 4), backend); // one tail-less image
+        const auto a      = make_tokens(64 * 8, 58);
+        const auto path_a = insert_sequence(index, backend, a);
+        const SnapshotRef source = publish_at(index, backend, path_a, a, 64 * 8, SnapshotKind::Boundary);
+        backup_snapshot(index, source);
+        require(index.supersede(source), "the source must be superseded");
+        index.note_hit(source, counted);
+        require(!index.snapshot(source).superseded, "a hit of either kind must retain the source again");
+        for (int hit = 0; hit < 3; ++hit) { index.note_hit(source, counted); }
+        require(index.snapshot(source).hits == (counted ? 4U : 0U), "only admissions count as hits");
+        const auto c      = make_tokens(64 * 8, 59);
+        const auto path_c = insert_sequence(index, backend, c);
+        const SnapshotRef next = publish_at(index, backend, path_c, c, 64 * 8, SnapshotKind::Boundary);
+        index.pin_snapshot(next);
+        const bool admitted = index.begin_snapshot_host_fill(next);
+        require(admitted == !counted, counted ? "a source admissions hit four times outranks a new snapshot"
+                                              : "a source only resumes hit must not outrank a new snapshot");
+        if (admitted) { index.complete_snapshot_host_fill(next); }
+        index.unpin_snapshot(next);
+        index.release_path(path_a);
+        index.release_path(path_c);
+        index.check_invariants();
+    }
+}
+
 // A boundary no other conversation continued from is just its lineage's snapshot: superseded
 // when the lineage moves past it, and retained again by a later hit.
 void test_unshared_boundary() {
@@ -2447,6 +2510,8 @@ int main() {
         test_unbacked_slot_kept_beside_backed_owner();
         test_unsupersede_restores_retention();
         test_host_write_admission();
+        test_resume_point_admission();
+        test_resume_hits_add_no_frequency();
         test_unshared_boundary();
         test_passed_endpoints();
         test_host_only_reattach();

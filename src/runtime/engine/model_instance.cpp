@@ -809,6 +809,14 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     // --host-context-mib auto (the size unset): the prefix cache's Host tier from the RAM the model's plan leaves
     // (expert_memory.h), resolved here so the RAM plan, Engine::plan and the Program see one size.
     const bool prefix_auto = options.context_cache.enabled && !options.context_cache.host_capacity_bytes;
+    // With --ram-resize auto an automatic tier may grow later, into RAM other programs free.
+    options.context_cache.host_growth_capacity_bytes.reset();
+    const auto set_growth = [&](const HostMemorySnapshot& snapshot, const expert_offload::HostMemoryDemand& demand) {
+        if (!options.ram_resize) { return; }
+        const std::uint64_t startup = *options.context_cache.host_capacity_bytes;
+        const std::uint64_t growth  = auto_host_context_ceiling_bytes(snapshot, demand, startup);
+        if (growth > startup) { options.context_cache.host_growth_capacity_bytes = growth; }
+    };
     if (plan.offloaded_experts()) {
         const auto vram   = open_vram_budget_source(device.device, options.vram_past_budget);
         auto demand = expert_ram_demand(
@@ -827,6 +835,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             // After the experts, as Qwen3.8-Flash-Next: the ledger places them first.
             options.context_cache.host_capacity_bytes =
                 auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
+            set_growth(snapshot, demand);
             demand.prefix_cache = *options.context_cache.host_capacity_bytes;
         }
         if (plan_only) {
@@ -866,8 +875,10 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
                                   0U, vram->query());
             demand.full_margin = 0; // no experts to keep in RAM
             demand.pageable    = frontend_cache_bytes(options);
+            const HostMemorySnapshot snapshot = host_memory_snapshot();
             options.context_cache.host_capacity_bytes =
-                auto_host_context_bytes(expert_offload::plan_host_memory(host_memory_snapshot(), demand));
+                auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
+            set_growth(snapshot, demand);
         }
     }
     // Engine::plan: the pinned block's check (materialize's), the RAM report, and the weights; then the
@@ -1212,6 +1223,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             return {};
         }
         options.context_cache.host_capacity_bytes = sequence.host_capacity_bytes();
+        if (sequence.host_capacity_bytes() == 0) { options.context_cache.host_growth_capacity_bytes.reset(); }
         // Automatic tree widths on a target that cannot verify trees resolve to chain verification.
         options.speculative.draft_tree_auto = sequence.draft_tree_auto();
         instance->kv_capacity_resolution    = resolution;

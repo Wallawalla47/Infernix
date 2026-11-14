@@ -190,12 +190,14 @@ public:
                                   std::function<bool()> is_cancelled = {}) = 0;
 
     // A streaming route calls it before committing its response: blocks until the Engine admits the
-    // request, so that the queue's own answers (a queue timeout, an orderly stop) still reach the
-    // client as a plain HTTP status, as on the non-streaming routes; after admission only
-    // mid-generation failures remain, which belong in the stream. Throws the ApiException run()
-    // would; a request cancelled while queued returns, and run() gives its answer.
-    virtual void admit(PreparedRequest& prepared,
-                       std::function<bool()> is_cancelled = {}) const = 0;
+    // request or `until` passes, so that the queue's own answers in that time (a queue timeout, an
+    // orderly stop) still reach the client as a plain HTTP status, as on the non-streaming routes.
+    // Whether the request settled; false: still queued, and the route commits its stream anyway
+    // (kStreamAdmissionGrace), whose heartbeats keep the client while run() waits for admission. Throws
+    // the ApiException run() would; a request cancelled while queued returns true, and run() gives
+    // its answer.
+    virtual bool admit(PreparedRequest& prepared, std::function<bool()> is_cancelled,
+                       std::chrono::steady_clock::time_point until) const = 0;
 
     // Begins the Engine's orderly stop: running and queued generations fail as Unavailable.
     virtual void stop() noexcept = 0;
@@ -274,8 +276,8 @@ public:
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
                           std::function<bool()> is_cancelled = {}) override;
 
-    void admit(PreparedRequest& prepared,
-               std::function<bool()> is_cancelled = {}) const override;
+    bool admit(PreparedRequest& prepared, std::function<bool()> is_cancelled,
+               std::chrono::steady_clock::time_point until) const override;
 
     void warmup();
 

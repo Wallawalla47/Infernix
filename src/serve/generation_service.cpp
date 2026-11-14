@@ -641,11 +641,12 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     }
 }
 
-void GenerationService::admit(PreparedRequest& prepared, std::function<bool()> is_cancelled) const {
+bool GenerationService::admit(PreparedRequest& prepared, std::function<bool()> is_cancelled,
+                              std::chrono::steady_clock::time_point until) const {
     infernix::CancellationView cancellation;
     if (is_cancelled) { cancellation = infernix::CancellationView(std::move(is_cancelled)); }
     try {
-        prepared.generation.await_admission(cancellation);
+        return prepared.generation.await_admission(cancellation, until);
     } catch (const infernix::RequestError& exception) {
         throw_request_error(exception, prepared.constraint_param, prepared.tool_schema_params,
                             queue_retry_after_seconds());

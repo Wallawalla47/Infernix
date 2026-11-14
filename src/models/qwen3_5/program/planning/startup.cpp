@@ -1393,6 +1393,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->use_cuda_graph       = inputs.use_cuda_graph;
     impl->causal_scoring       = inputs.causal_scoring;
     impl->device               = inputs.device;
+    impl->vram_past_budget     = inputs.vram_past_budget;
     impl->multiprocessor_count = inputs.multiprocessor_count;
     impl->context_cache        = inputs.context_cache;
     impl->kv_storage           = inputs.kv_storage;
@@ -1420,6 +1421,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         (void)hybrid_host_slabs(host, *impl->context_cache.host_capacity_bytes);
     } else {
         impl->context_cache.host_capacity_bytes = 0U;
+        impl->context_cache.host_growth_capacity_bytes.reset();
     }
     impl->workspace = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
@@ -1821,6 +1823,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .use_cuda_graph       = options.use_cuda_graph,
         .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
         .device               = options.device,
+        .vram_past_budget     = options.vram_past_budget,
         .multiprocessor_count = device.multiprocessor_count(),
         .context_cache        = options.context_cache,
     };

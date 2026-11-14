@@ -394,7 +394,7 @@ void detail::ProgramImpl::report_ram(bool release, std::uint64_t available, std:
         std::snprintf(text, sizeof(text), "RAM pressure: %.1f GiB available; gave back %.1f GiB (prefix cache %.1f, experts %.1f)",
                       left, total, in_prefix, in_experts);
     } else {
-        std::snprintf(text, sizeof(text), "RAM free again: took back %.1f GiB (prefix cache %.1f, experts %.1f); %.1f GiB available",
+        std::snprintf(text, sizeof(text), "RAM free: took %.1f GiB (prefix cache %.1f, experts %.1f); %.1f GiB available",
                       total, in_prefix, in_experts, left);
     }
     ram_diagnostic_(text, DiagnosticLevel::Info);
@@ -404,9 +404,8 @@ std::uint64_t Program::engine_thread_cpus() const noexcept {
     return impl_->offload ? impl_->offload->engine().engine_cpus() : 0U;
 }
 
-std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base,
-                                                     std::uint32_t maximum_frontier) {
-    return impl_->hybrid_sources(base, maximum_frontier);
+std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base, const ResumeState* resume) {
+    return impl_->hybrid_sources(base, resume);
 }
 
 bool Program::hybrid_reclaim(runtime::ContextResourceUsage shortage) {
@@ -421,8 +420,9 @@ std::uint32_t Program::hybrid_prefetch_room() const noexcept {
     return impl_->hybrid_prefetch_room();
 }
 
-void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) {
-    impl_->hybrid_hold_queue(queue);
+void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue,
+                                std::span<const ResumeState* const> resumes) {
+    impl_->hybrid_hold_queue(queue, resumes);
 }
 
 void Program::hybrid_hold_continuation(std::chrono::steady_clock::time_point deadline) {

@@ -60,8 +60,8 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::Re
     return impl_->plan_request(std::move(prompt), options);
 }
 
-std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base, std::uint32_t maximum_frontier) {
-    return impl_->hybrid_sources(base, maximum_frontier);
+std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base, const ResumeState* resume) {
+    return impl_->hybrid_sources(base, resume ? resume->frontier() : UINT32_MAX);
 }
 
 BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane,
@@ -89,7 +89,10 @@ std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& bas
     return impl_->hybrid_prefetch(base);
 }
 std::uint32_t Program::hybrid_prefetch_room() const noexcept { return impl_->hybrid_prefetch_room(); }
-void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) { impl_->hybrid_hold_queue(queue); }
+void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue,
+                                std::span<const ResumeState* const> resumes) {
+    impl_->hybrid_hold_queue(queue, resumes);
+}
 std::uint64_t Program::hybrid_cache_epoch() const noexcept { return impl_->hybrid_cache_epoch(); }
 
 bool Program::hybrid_poll_storage() { return impl_->hybrid_poll_storage(); }

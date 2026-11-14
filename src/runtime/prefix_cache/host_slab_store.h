@@ -13,8 +13,9 @@
 //   copied below it on the HostMemoryWorker with streaming stores (copy_streaming: no cache lines evicted from the
 //   threads serving requests), the index switches them once the copies have landed and no restore reads a Host
 //   slab, and once nothing past the ceiling is in use its chunks are released on the worker.
-// - A growth page-locks chunks on the worker, up to the startup size, and links them (their slabs freed into the
-//   index) at the next step.
+// - A growth page-locks chunks on the worker, up to the tier's `slabs` (an automatic tier starts with part of them
+//   locked: what the start left; the rest is room to grow into RAM freed later), and links them (their slabs freed
+//   into the index) at the next step.
 // The engine thread never waits for a copy, a pin or a release: it starts them and step() applies what has landed
 // (the worker wakes the engine after each job).
 
@@ -42,11 +43,12 @@ public:
     static constexpr std::size_t kChunkBytes = std::size_t{64} << 20U;
 
     HostSlabStore() = default; // no Host tier
-    // Page-locks `slabs` slabs of `slab_bytes` (a multiple of 4 KiB: the SSD tier moves slabs with unbuffered I/O) in
-    // chunks of at most `chunk_bytes`; `tier` names the tier in the error a refused chunk throws, and `progress` sees
-    // the bytes locked so far and the total.
-    HostSlabStore(std::size_t slab_bytes, std::uint32_t slabs, std::size_t chunk_bytes, std::string_view tier,
-                  const std::function<void(std::uint64_t, std::uint64_t)>& progress = {});
+    // A tier of `slabs` slabs of `slab_bytes` (a multiple of 4 KiB: the SSD tier moves slabs with unbuffered I/O) in
+    // chunks of at most `chunk_bytes`, of which the chunks holding the first `locked` slabs are page-locked now (the
+    // rest a growth may lock later; limit_index then gives a fresh index only the locked ones); `tier` names the tier
+    // in the error a refused chunk throws, and `progress` sees the bytes locked so far and the total.
+    HostSlabStore(std::size_t slab_bytes, std::uint32_t slabs, std::uint32_t locked, std::size_t chunk_bytes,
+                  std::string_view tier, const std::function<void(std::uint64_t, std::uint64_t)>& progress = {});
     // Waits for the worker's jobs on its memory.
     ~HostSlabStore();
     HostSlabStore(const HostSlabStore&)            = delete;
@@ -63,7 +65,7 @@ public:
     [[nodiscard]] std::size_t slab_bytes() const noexcept { return slab_bytes_; }
     [[nodiscard]] std::uint32_t slabs() const noexcept { return slabs_; }
     [[nodiscard]] bool empty() const noexcept { return slabs_ == 0; }
-    // The startup size, and what is page-locked now.
+    // The most the tier may hold (`slabs`), and what is page-locked now.
     [[nodiscard]] std::uint64_t capacity_bytes() const noexcept { return static_cast<std::uint64_t>(slabs_) * slab_bytes_; }
     [[nodiscard]] std::uint64_t pinned_bytes() const noexcept;
     // The slabs the locked chunks hold: the index's limit outside a resize.
@@ -81,7 +83,7 @@ public:
     // Starts giving back whole chunks worth at least `bytes`, keeping the floor (fewer when held entries keep the
     // slabs in use); returns the bytes it aims at (0: none can go now).
     std::uint64_t begin_release(PrefixCacheIndex& index, std::uint64_t bytes, HostMemoryWorker& worker);
-    // Starts page-locking chunks worth at most `bytes` back, up to the startup size; returns the bytes asked for.
+    // Starts page-locking chunks worth at most `bytes`, up to the tier's slabs; returns the bytes asked for.
     std::uint64_t begin_growth(std::uint64_t bytes, HostMemoryWorker& worker);
     struct Progress {
         std::uint64_t released = 0; // chunks the worker released, counted when it has

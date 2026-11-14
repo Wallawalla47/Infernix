@@ -361,6 +361,17 @@ int main() {
 
         m.ssd = {};
         failures += check(Json::parse(render_metrics_json(held))["memory"]["ssd"].is_null(), "no SSD tier: ssd is null");
+
+#ifdef _WIN32
+        // Windows: a working set without the driver's page-locked memory; the commit less the VRAM is what RAM holds.
+        held.host_memory.process_resident = 6000;
+        held.host_memory.process_private  = 111000;
+        failures += check(Json::parse(render_metrics_json(held))["memory"]["host"]["process_bytes"] == 78000,
+                          "memory.host process_bytes: the private commit less the VRAM, over a smaller working set");
+        held.host_memory.process_private = 30000; // below the VRAM: the working set
+        failures += check(Json::parse(render_metrics_json(held))["memory"]["host"]["process_bytes"] == 6000,
+                          "memory.host process_bytes: the working set when the commit is not above the VRAM");
+#endif
     }
 
     return failures == 0 ? 0 : 1;

@@ -81,6 +81,17 @@ std::uint64_t auto_host_context_bytes(const expert_offload::HostMemoryLedger& le
     return std::max(kMinAutoHostContextBytes, bytes / kStep * kStep);
 }
 
+std::uint64_t auto_host_context_ceiling_bytes(HostMemorySnapshot snapshot, const expert_offload::HostMemoryDemand& demand,
+                                              std::uint64_t startup) noexcept {
+    // What the rest of the system holds beyond this process: other programs, and the OS's own share, which never comes
+    // free (the growth stops at the RAM actually available; this only bounds it).
+    const std::uint64_t held   = snapshot.available_physical + snapshot.process_resident;
+    const std::uint64_t others = snapshot.total_physical > held ? snapshot.total_physical - held : 0;
+    snapshot.available_physical += others;
+    snapshot.available_commit += others;
+    return std::max(startup, auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand)));
+}
+
 ExpertRamPlan plan_expert_ram(const EngineOptions& options, const expert_offload::HostMemoryDemand& demand,
                               const HostMemorySnapshot& snapshot, bool always_tier) {
     ExpertRamPlan out;

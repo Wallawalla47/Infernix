@@ -287,12 +287,14 @@ AdmissionChoice PrefixCacheIndex::choose(const MatchResult& match,
     return best;
 }
 
-void PrefixCacheIndex::note_hit(SnapshotRef snapshot) {
+void PrefixCacheIndex::note_hit(SnapshotRef snapshot, bool counted) {
     Snapshot& entry = require(snapshot);
-    ++entry.hits;
     ++counters_.snapshot_hits;
     entry.last_hit_tick = ++tick_;
-    entry.priority_base = inflation_;
+    if (counted) {
+        ++entry.hits;
+        entry.priority_base = inflation_;
+    }
     if (!entry.superseded) {
         update_priority(snapshot.index);
         return;
@@ -1740,7 +1742,7 @@ void PrefixCacheIndex::abort_host_fill(NodeRef ref) {
     refresh_node(ref.index);
 }
 
-bool PrefixCacheIndex::begin_snapshot_host_fill(SnapshotRef ref) {
+bool PrefixCacheIndex::begin_snapshot_host_fill(SnapshotRef ref, std::optional<double> claim) {
     Snapshot& snapshot = require(ref);
     if (snapshot.host != CopyState::Absent || snapshot.pins == 0) {
         invariant("prefix cache snapshot host fill requires a pinned device-only snapshot");
@@ -1750,7 +1752,7 @@ bool PrefixCacheIndex::begin_snapshot_host_fill(SnapshotRef ref) {
     std::vector<std::uint32_t> slabs;
     // The image goes to the Host only if it is worth what it displaces; otherwise it stays
     // Device-only.
-    if (!allocate_slabs(count, slabs, ref.index, snapshot.priority)) { return false; }
+    if (!allocate_slabs(count, slabs, ref.index, claim.value_or(snapshot.priority))) { return false; }
     Snapshot& filled  = snapshots_[ref.index];
     filled.host_slabs = std::move(slabs);
     filled.host       = CopyState::Filling;

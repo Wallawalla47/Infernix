@@ -75,7 +75,45 @@ PrefixReusePath reuse_path_for(pc::SnapshotKind kind) noexcept {
                                               : PrefixReusePath::HybridSnapshot;
 }
 
+// The lookup keys of the history a source is matched over: a fresh request's prompt, or a paused
+// request's whole ledger (its generated tokens through the next input), whose blocks past the prompt
+// chain their hashes from the prompt's and carry its trailing Vision key, as hybrid_publish_blocks
+// published them.
+struct HistoryKeys {
+    std::span<const TokenId> tokens;
+    std::vector<std::uint64_t> hashes;
+    std::vector<std::uint64_t> extras;
+};
+
+HistoryKeys history_keys(const PreparedPromptData& prompt, std::span<const TokenId> ledger,
+                         std::uint64_t trailing_extra) {
+    const std::size_t prompt_tokens = prompt.token_ids.size();
+    if (prompt.block_hashes.size() != prompt_tokens / kBlock) {
+        throw std::logic_error("prepared prompt carries no hybrid block keys");
+    }
+    HistoryKeys out;
+    out.tokens = prompt.token_ids;
+    out.hashes.assign(prompt.block_hashes.begin(), prompt.block_hashes.end());
+    out.extras.assign(prompt.block_extras.begin(), prompt.block_extras.end());
+    if (ledger.size() <= prompt_tokens) { return out; }
+    if (!std::equal(prompt.token_ids.begin(), prompt.token_ids.end(), ledger.begin())) {
+        throw std::logic_error("a paused ledger does not extend its prompt");
+    }
+    out.tokens = ledger;
+    if (trailing_extra != 0 && out.extras.empty()) { out.extras.assign(out.hashes.size(), 0ULL); }
+    for (std::size_t block = out.hashes.size(); block < ledger.size() / kBlock; ++block) {
+        const std::uint64_t previous = block == 0 ? pc::kRootLookupHash : out.hashes[block - 1U];
+        out.hashes.push_back(pc::block_lookup_hash(previous, ledger.subspan(block * kBlock, kBlock), trailing_extra));
+        if (!out.extras.empty()) { out.extras.push_back(trailing_extra); }
+    }
+    return out;
+}
+
 } // namespace
+
+std::span<const TokenId> ProgramImpl::resume_ledger(const ResumeState& resume) noexcept {
+    return resume.impl_->sequence.ledger;
+}
 
 // ---- construction ------------------------------------------------------------------------------
 
@@ -86,8 +124,13 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
         backend_kv_pages ? &backend_kv_pages->physical_pool().geometry() : nullptr;
     const HybridHostLayout host = plan_hybrid_host_layout(text_pool.geometry(), backend_geometry,
                                                           state_images->host_layout().image_bytes);
+    // An automatic tier with --ram-resize auto is sized for the RAM other programs may free later and page-locks its
+    // startup size; the index serves the locked slabs until a growth links more (HostSlabStore).
+    const std::uint64_t startup_bytes = context_cache.host_capacity_bytes.value_or(0U);
+    const std::uint32_t locked        = hybrid_host_slabs(host, startup_bytes);
+    const std::uint64_t growth_bytes  = context_cache.host_growth_capacity_bytes.value_or(0U);
     const std::uint32_t slabs =
-        hybrid_host_slabs(host, context_cache.host_capacity_bytes.value_or(0U));
+        locked != 0 && growth_bytes > startup_bytes ? std::max(locked, hybrid_host_slabs(host, growth_bytes)) : locked;
     const HybridPrefixCacheOptions& options = context_cache.hybrid;
     const std::uint32_t device_slots        = options.device_snapshot_slots.value_or(0U);
     if (device_slots == 0 || !options.max_new_taps || !options.tap_ladder_tokens ||
@@ -121,7 +164,7 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
         .ladder_tokens  = *options.tap_ladder_tokens,
         .min_gap_tokens = *options.tap_min_gap_tokens,
     };
-    const std::uint64_t host_bytes = static_cast<std::uint64_t>(slabs) * host.slab_bytes;
+    const std::uint64_t host_bytes = static_cast<std::uint64_t>(locked) * host.slab_bytes;
     std::optional<StartupPhaseScope> phase;
     if (host_bytes != 0) {
         phase.emplace(observer, StartupPhase::HostContextPin, StartupProgressUnit::Bytes,
@@ -137,7 +180,7 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
                                .index     = text.compact_layer_indices[layer]});
     }
     hybrid_ = std::make_unique<HybridPrefixCache>(
-        config, taps, *text_kv_pages, backend_kv_pages.get(), *state_store, *state_images, host,
+        config, taps, *text_kv_pages, backend_kv_pages.get(), *state_store, *state_images, host, locked,
         std::move(layers), phase ? &*phase : nullptr, context_cache.ssd_directory,
         context_cache.ssd_write_bytes_per_hour == ContextCacheOptions::kSsdWritesUnlimited ? 0U
                                                                                        : context_cache.ssd_write_bytes_per_hour,
@@ -145,7 +188,10 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
         context_cache.ssd_capacity_bytes != 0 && !options.persistent_file.empty()
             ? pc::kept_ssd_file(context_cache.ssd_directory, options.persistent_file)
             : std::filesystem::path{});
-    if (phase) { phase->complete(host_bytes, host_bytes); }
+    if (phase) {
+        const std::uint64_t pinned = hybrid_->host_tier_pinned_bytes(); // whole chunks
+        phase->complete(pinned, pinned);
+    }
 }
 
 void ProgramImpl::set_hybrid_cost(const pc::CacheCostModel& cost) {
@@ -228,7 +274,7 @@ std::uint32_t ProgramImpl::hybrid_backend_frontier(std::uint32_t frontier) const
 // ---- admission ---------------------------------------------------------------------------------
 
 std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& base,
-                                                         std::uint32_t maximum_frontier) {
+                                                         const ResumeState* resume) {
     if (base.impl_ == nullptr || !base.impl_->prompt) {
         throw std::logic_error("admission requires a prepared prompt");
     }
@@ -236,10 +282,11 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
     hybrid_source_pending_           = false;
     const RequestBasePlanImpl& plan  = *base.impl_;
     const PreparedPromptData& prompt = *plan.prompt;
-    const auto n                     = static_cast<std::uint32_t>(prompt.token_ids.size());
-    if (n == 0 || n != plan.summary.prompt_tokens) {
+    if (prompt.token_ids.empty() || prompt.token_ids.size() != plan.summary.prompt_tokens) {
         throw std::logic_error("hybrid admission prompt does not match its base plan");
     }
+    // A resumed request's source never passes the frontier it replays to.
+    const std::uint32_t maximum_frontier = resume ? resume->frontier() : UINT32_MAX;
     const auto source = [](std::shared_ptr<HybridQuoteImpl> quote, PrefixReusePath path) {
         SourceCandidate candidate;
         candidate.reused_tokens       = quote->reuse_frontier;
@@ -256,11 +303,23 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
 
     pc::PrefixCacheIndex& index = hybrid_->index();
     const bool backend_pool     = backend_kv_pages != nullptr;
+    // Preparation computed the prompt's lookup keys once; every quote of this prompt reads them. A
+    // paused request's are its whole ledger's: its own pause snapshot lies past the prompt when it was
+    // paused while generating.
+    const std::vector<VisionTokenRange> ranges =
+        prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
+    const HistoryKeys keys = history_keys(prompt, resume ? resume_ledger(*resume) : std::span<const TokenId>{},
+                                          all_vision_key(ranges));
+    // The history a source leaves at least one token of: the prompt to prefill, or a paused
+    // request's ledger through its next input.
+    const auto n = static_cast<std::uint32_t>(keys.tokens.size());
     // Device pages a source needs beyond what the pools have free plus the cache can give up:
     // the restored blocks and tail, the private tail copy and the first unit's growth. Entries
     // this source pins stop being evictable: its unpinned Device-resident path blocks and the
     // snapshot's Device-resident tail.
-    const auto fits = [&](const pc::MatchCandidate& candidate, std::span<const pc::NodeRef> path) {
+    // `pinned_room`: blocks only in-flight transfers pin, counted as evictable (they are once drained).
+    const auto fits = [&](const pc::MatchCandidate& candidate, std::span<const pc::NodeRef> path,
+                          std::uint64_t pinned_room = 0) {
         const std::uint32_t frontier = candidate.frontier;
         const std::uint32_t restored =
             candidate.host_only_blocks + (candidate.tail && !candidate.tail_on_device ? 1U : 0U);
@@ -273,7 +332,7 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
             index.snapshot(candidate.snapshot).pins == 0) {
             ++evictable_on_path;
         }
-        const std::uint64_t evictable = index.device_evictable_blocks() - evictable_on_path;
+        const std::uint64_t evictable = index.device_evictable_blocks() - evictable_on_path + pinned_room;
         const std::uint32_t first     = std::min(n, frontier + prefill_chunk);
         const auto need               = [&](std::uint32_t reuse) {
             return static_cast<std::uint64_t>(kv_pages_for_frontier(first)) - reuse / kBlock +
@@ -287,12 +346,7 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
                                     backend_kv_pages->physical_pool().available_pages() + evictable;
     };
 
-    // Preparation computed the lookup keys once; every quote of this prompt reads them.
-    if (prompt.block_hashes.size() != prompt.token_ids.size() / kBlock) {
-        throw std::logic_error("prepared prompt carries no hybrid block keys");
-    }
-    pc::MatchResult match =
-        index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+    pc::MatchResult match = index.match(keys.tokens, keys.hashes, keys.extras, n);
     const auto filling = [](const pc::MatchResult& result) {
         return std::any_of(
             result.candidates.begin(), result.candidates.end(),
@@ -302,47 +356,66 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
         // A prefetch (§6.6) is copying blocks this prompt resumes over: they land within a
         // batch's copy time, and skipping them would pick a shallower source.
         hybrid_->settle_prefetch();
-        match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+        match = index.match(keys.tokens, keys.hashes, keys.extras, n);
     }
     const auto cached          = static_cast<std::uint32_t>(match.path.size()) * kBlock;
     root->cached_prefix_tokens = cached;
-    const std::vector<VisionTokenRange> ranges =
-        prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
-    // A source keeps at least one prompt token to prefill, and a resumed request's source never
-    // passes the frontier it replays to.
+    // A source keeps at least one token to compute, and a resumed request's source never passes
+    // the frontier it replays to.
     std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
         return candidate.filling_blocks != 0 || candidate.frontier >= n ||
                candidate.frontier > maximum_frontier || inside_vision(candidate.frontier, ranges);
     });
     const pc::AdmissionChoice choice = index.choose(match, n);
     std::vector<std::size_t> order;
-    if (choice.candidate) { order.push_back(*choice.candidate); }
-    for (std::size_t i = 0; i < match.candidates.size(); ++i) {
-        if (!choice.candidate || i != *choice.candidate) { order.push_back(i); }
+    if (resume) {
+        // A resumed request takes its deepest state, its pause's own snapshot when that is cached: every
+        // token above it would be replayed (as Flash-Next's resume, §17).
+        for (std::size_t i = 0; i < match.candidates.size(); ++i) { order.push_back(i); }
+        std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+            return match.candidates[a].frontier > match.candidates[b].frontier;
+        });
+    } else {
+        if (choice.candidate) { order.push_back(*choice.candidate); }
+        for (std::size_t i = 0; i < match.candidates.size(); ++i) {
+            if (!choice.candidate || i != *choice.candidate) { order.push_back(i); }
+        }
     }
-    const auto select = [&]() -> std::optional<pc::MatchCandidate> {
+    // A source that fits beside the residents now is taken only when it leaves at most a prefill chunk
+    // of the preferred source's cached history to compute again (a resumed request: none). That history
+    // needs the same pages within the request's first units, and recomputing it costs far more than
+    // restoring it (2026-11-14: two agent conversations that did not fit the KV pool together took
+    // sources 65K and 71K tokens short of their cached history this way, 63-94 s to the first token,
+    // with 75 GiB of Host tier mostly free).
+    const std::uint32_t preferred = order.empty() ? 0U : match.candidates[order.front()].frontier;
+    const auto select = [&](std::uint64_t pinned_room) -> std::optional<pc::MatchCandidate> {
         for (const std::size_t i : order) {
             const pc::MatchCandidate& candidate = match.candidates[i];
-            if (fits(candidate,
-                     std::span<const pc::NodeRef>(match.path.data(), candidate.path_blocks))) {
+            const bool close = resume ? candidate.frontier == preferred
+                                      : candidate.frontier + prefill_chunk >= preferred;
+            if (close && fits(candidate, std::span<const pc::NodeRef>(match.path.data(), candidate.path_blocks),
+                              pinned_room)) {
                 return candidate;
             }
         }
         return std::nullopt;
     };
-    std::optional<pc::MatchCandidate> selected = select();
-    if (!selected && !match.candidates.empty() && hybrid_->transfers_pending()) {
-        // Blocks pinned only by their in-flight Host writes become evictable once those land:
-        // a cached source is not given up for a root bind while a finished lane's writes land.
+    std::optional<pc::MatchCandidate> selected = select(0U);
+    // Blocks pinned only by in-flight transfers (a finished lane's Host writes) become evictable once those
+    // land: a cached source is not given up for a root bind while they land. Waited for only when that
+    // makes a source fit; a request waiting for the residents' pages would otherwise wait for every copy
+    // (its own prefetch among them) on each admission pass, stalling the residents' decode.
+    if (!selected && hybrid_->transfers_pending() && select(hybrid_->transfer_pinned_blocks())) {
         hybrid_->drain();
-        selected = select();
+        selected = select(0U);
     }
-    // A resumed request owns its service turn, and the Engine reclaims capacity from the other
-    // residents for its binding (resource-scheduling §5.2): the source the cost model chose is offered
-    // even when it does not fit beside them now (its binding reports the shortage), rather than a root
-    // bind that would replay the whole ledger on every turn. Only one the whole pool holds.
-    if (!selected && maximum_frontier != UINT32_MAX && choice.candidate) {
-        const pc::MatchCandidate& candidate = match.candidates[*choice.candidate];
+    // Otherwise the preferred source is offered even when it does not fit beside the residents now:
+    // its binding reports the shortage, and the Engine reclaims cached blocks for it or defers it
+    // until capacity frees (a resumed request owns its service turn, and the Engine reclaims from
+    // the other residents for it: resource-scheduling §5.2), rather than a root or shallow bind that
+    // would recompute the history. Only one the whole pool holds.
+    if (!selected && !order.empty()) {
+        const pc::MatchCandidate& candidate = match.candidates[order.front()];
         const auto usage                    = physical_usage();
         const std::uint32_t first           = std::min(n, candidate.frontier + prefill_chunk);
         if (kv_pages_for_frontier(first) <= usage.capacity.main_kv_pages + kv_growable_pages()) {
@@ -367,13 +440,12 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
             for (std::size_t i = 0; i < match.candidates.size(); ++i) {
                 if (!fallback.candidate || i != *fallback.candidate) { order.push_back(i); }
             }
-            selected = select();
+            selected = select(0U);
         }
         // Ready: it landed meanwhile; the binding validates the source as it stands.
     }
     // Coalescing only defers a fresh request; a resumed one replays from what exists.
-    if (maximum_frontier == UINT32_MAX &&
-        hybrid_await_sibling(prompt, selected ? selected->frontier : 0U)) {
+    if (!resume && hybrid_await_sibling(prompt, selected ? selected->frontier : 0U)) {
         return {};
     }
     std::vector<SourceCandidate> out;
@@ -485,30 +557,45 @@ std::uint32_t ProgramImpl::hybrid_prefetch_room() const noexcept {
 }
 
 // The snapshot each queued request would resume from now, as hybrid_sources would choose it, is
-// held in admission order (§9.6). A block landing for another admission does not change what the
+// held in admission order (§9.6): a paused request's over its whole ledger, so its pause snapshot
+// stays cached until it resumes. A block landing for another admission does not change what the
 // request needs, so filling candidates stay eligible.
-void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) {
+void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue,
+                                    std::span<const ResumeState* const> resumes) {
     if (!hybrid_) { return; }
+    if (resumes.size() != queue.size()) { throw std::logic_error("queue holds need one resume entry per request"); }
     pc::PrefixCacheIndex& index = hybrid_->index();
     std::vector<pc::SnapshotRef> holds;
-    for (const RequestBasePlan* base : context_cache.hybrid.queue_holds
-                                           ? queue
-                                           : std::span<const RequestBasePlan* const>{}) {
+    const std::size_t queued = context_cache.hybrid.queue_holds ? queue.size() : 0U;
+    for (std::size_t entry = 0; entry < queued; ++entry) {
         if (holds.size() == pc::kMaxQueueHolds) { break; }
+        const RequestBasePlan* base = queue[entry];
+        const ResumeState* resume   = resumes[entry];
         if (base == nullptr || base->impl_ == nullptr || !base->impl_->prompt ||
             !base->impl_->allow_prefix_reuse || !base->impl_->prompt->identity.reusable) {
             continue;
         }
         const PreparedPromptData& prompt = *base->impl_->prompt;
-        const auto n                     = static_cast<std::uint32_t>(prompt.token_ids.size());
-        if (n == 0 || prompt.block_hashes.size() != prompt.token_ids.size() / kBlock) { continue; }
-        pc::MatchResult match =
-            index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+        if (prompt.token_ids.empty() || prompt.block_hashes.size() != prompt.token_ids.size() / kBlock) { continue; }
         const std::vector<VisionTokenRange> ranges =
             prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
+        const HistoryKeys keys = history_keys(prompt, resume ? resume_ledger(*resume) : std::span<const TokenId>{},
+                                              all_vision_key(ranges));
+        const auto n                   = static_cast<std::uint32_t>(keys.tokens.size());
+        const std::uint32_t maximum    = resume ? resume->frontier() : UINT32_MAX;
+        pc::MatchResult match          = index.match(keys.tokens, keys.hashes, keys.extras, n);
         std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
-            return candidate.frontier >= n || inside_vision(candidate.frontier, ranges);
+            return candidate.frontier >= n || candidate.frontier > maximum || inside_vision(candidate.frontier, ranges);
         });
+        if (resume) {
+            // hybrid_sources' choice for a resume: the deepest.
+            const auto deepest = std::max_element(match.candidates.begin(), match.candidates.end(),
+                                                  [](const pc::MatchCandidate& a, const pc::MatchCandidate& b) {
+                                                      return a.frontier < b.frontier;
+                                                  });
+            if (deepest != match.candidates.end()) { holds.push_back(deepest->snapshot); }
+            continue;
+        }
         const pc::AdmissionChoice choice = index.choose(match, n);
         if (choice.candidate) { holds.push_back(match.candidates[*choice.candidate].snapshot); }
     }
@@ -706,29 +793,45 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
     if (hybrid_) { hybrid_->poll(); }
     const PreparedPromptData& prompt = *base.impl_->prompt;
     const HybridQuoteImpl& quote     = *candidate.hybrid;
-    const auto n                     = static_cast<std::uint32_t>(prompt.token_ids.size());
     const std::uint32_t reuse        = quote.reuse_frontier;
     const std::uint32_t full         = reuse / kBlock;
     const std::uint32_t tail         = reuse % kBlock;
+    // A paused request resumes over its whole ledger (hybrid_sources).
+    const std::span<const TokenId> history =
+        resume && resume_ledger(*resume).size() > prompt.token_ids.size() ? resume_ledger(*resume)
+                                                                         : std::span<const TokenId>(prompt.token_ids);
+    const auto n = static_cast<std::uint32_t>(history.size());
     if (reuse >= n || (resume && reuse > resume->frontier())) { return {.source_valid = false}; }
     pc::PrefixCacheIndex* const cache = hybrid_ ? &hybrid_->index() : nullptr;
 
     // The quote may have gone stale since it was made; the Engine then tries its next source.
     std::vector<pc::NodeRef> path;
     pc::SnapshotView snapshot;
+    std::uint64_t path_hash = pc::kRootLookupHash;
     if (reuse != 0) {
         if (!cache->valid(quote.snapshot)) { return {.source_valid = false}; }
         snapshot = cache->snapshot(quote.snapshot);
-        if (prompt.block_hashes.size() != prompt.token_ids.size() / kBlock) {
-            throw std::logic_error("prepared prompt carries no hybrid block keys");
+        const HistoryKeys keys = history_keys(
+            prompt, history, all_vision_key(prompt.vision_items.empty() ? std::vector<VisionTokenRange>{}
+                                                                         : vision_ranges(prompt)));
+        pc::MatchResult match = cache->match(keys.tokens, keys.hashes, keys.extras, n);
+        const auto filling = [&] {
+            return std::any_of(match.path.begin(), match.path.begin() + std::min<std::size_t>(full, match.path.size()),
+                               [&](pc::NodeRef node) { return cache->node(node).device == pc::CopyState::Filling; });
+        };
+        if (hybrid_->prefetch_landing() && filling()) {
+            // The blocked head's prefetch (§6.6) is copying blocks this source stands on while it
+            // waited for room: they land within a batch's copy time, and a stale source here would
+            // send the request to a root start.
+            hybrid_->settle_prefetch();
+            match = cache->match(keys.tokens, keys.hashes, keys.extras, n);
         }
-        const pc::MatchResult match =
-            cache->match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
         if (snapshot.frontier != reuse || match.path.size() < full ||
             (full != 0 ? !(snapshot.anchor == match.path[full - 1U]) : snapshot.anchor.valid())) {
             return {.source_valid = false};
         }
         path.assign(match.path.begin(), match.path.begin() + full);
+        if (full != 0) { path_hash = keys.hashes[full - 1U]; }
         for (const pc::NodeRef node : path) {
             const pc::NodeView view = cache->node(node);
             if (view.device != pc::CopyState::Absent && view.device != pc::CopyState::Resident) {
@@ -755,6 +858,7 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
     transaction.backend_frontier = backend_kv_cache() ? hybrid_backend_frontier(reuse) : 0U;
     auto& binding                = transaction.hybrid.emplace();
     binding.quote                = candidate.hybrid;
+    binding.path_hash            = path_hash;
     plan_binding_units(transaction, base, resume, resume_kind, resume_tokens);
     // The Begin summary names the hybrid path the Engine admitted (initialize_prefill knows only
     // the legacy Checkpoint/Root pair).
@@ -792,7 +896,31 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
     };
     try {
         runtime::ContextResourceUsage shortage;
-        if (!hybrid_make_room(text_need, backend_need)) {
+        // A binding the pools cannot hold even with every cached Device block evicted and every transfer
+        // landed makes no room: it would evict the cache's Device copies (a waiting request's prefetched
+        // blocks among them) and wait for the copies, on every admission pass while it waits.
+        // While another lane holds KV, a binding the pools cannot hold even with every evictable cached
+        // Device block evicted and every transfer landed makes no room: it would evict the cache's Device
+        // copies (a waiting request's prefetched blocks among them) and wait for the copies on every
+        // admission pass, and the Engine's reclaim would then evict the request's own cached history for
+        // nothing. Without another lane every cached block can go, so the binding makes room as before.
+        bool lane_resident = false;
+        for (std::uint32_t other = 0; other < max_concurrency; ++other) {
+            lane_resident = lane_resident || (other != lane && sequences[other].kv);
+        }
+        const std::uint64_t cache_room =
+            cache != nullptr ? static_cast<std::uint64_t>(cache->device_evictable_blocks()) +
+                                   hybrid_->transfer_pinned_blocks()
+                             : 0U;
+        const auto reachable = [&](const DeviceKVPagePool& pool, std::uint32_t need, std::uint64_t growth) {
+            return static_cast<std::uint64_t>(need) <=
+                   static_cast<std::uint64_t>(pool.available_pages()) + cache_room + growth;
+        };
+        const bool possible =
+            !lane_resident ||
+            (reachable(text_kv_pages->physical_pool(), text_need, kv_growable_pages()) &&
+             (!backend_kv_pages || reachable(backend_kv_pages->physical_pool(), backend_need, 0U)));
+        if (!possible || !hybrid_make_room(text_need, backend_need)) {
             const auto missing = [](std::uint32_t need, std::uint32_t available) {
                 return need > available ? need - available : 0U;
             };
@@ -810,7 +938,7 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
             const bool capacity_possible =
                 text_need <= usage.capacity.main_kv_pages &&
                 (!backend_kv_pages || backend_need <= usage.capacity.backend_kv_pages);
-            return {.capacity_possible = capacity_possible, .shortage = shortage};
+            return {.capacity_possible = capacity_possible, .shortage = shortage, .reclaim_cache = possible};
         }
         transaction.reserved_state = state_store->reserve_destination();
         if (!transaction.reserved_state) {
@@ -928,14 +1056,18 @@ void ProgramImpl::abort_hybrid_binding(ContextTransaction& tx) noexcept {
     if (!hybrid_ || !tx.hybrid) { return; }
     auto& hb = *tx.hybrid;
     try {
+        // The forks first: they pin their shared pages as sources, among them the restore's
+        // destinations, and the cache cannot drop a source-pinned page's last reference (2026-11-14:
+        // an Engine stopping during a resume's Host restore terminated here). A fork's own tail page
+        // is no restore destination.
+        hb.text_fork.reset();
+        hb.backend_fork.reset();
         // A submitted restore may still be writing the reserved state slot and the destination
         // pages; it returns every destination once its copies are done.
         if (hb.restore_staged) {
             hybrid_->abort_restore();
             hb.restore_staged = false;
         }
-        hb.text_fork.reset();
-        hb.backend_fork.reset();
         pc::PrefixCacheIndex& index = hybrid_->index();
         if (hb.snapshot_pinned && index.valid(hb.quote->snapshot)) {
             index.unpin_snapshot(hb.quote->snapshot);
@@ -1026,8 +1158,13 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     for (const VisionTokenRange& range : ranges) {
         exclusions.push_back(pc::media_exclusion(range.begin, range.end));
     }
+    // A paused prefill plans its taps over the prompt it has still to prefill: its Replay up to the
+    // paused frontier publishes blocks only, and a request paused again within the prompt resumes from
+    // its pause snapshot or the taps past it. A paused generation has no prompt left.
+    const std::uint32_t paused_at =
+        tx.resume ? std::max(reuse, tx.resume->frontier()) : reuse;
     std::vector<pc::PlannedTap> taps;
-    if (publish && !tx.resume) {
+    if (publish && paused_at < n) {
         // A request that resumed from a previous generation's endpoint proves its client echoes
         // generated turns token for token (agent loops, preserved reasoning): its own endpoint
         // will serve the next turn, so the generation opener is not worth the prefill split an
@@ -1039,10 +1176,10 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
                 return hint.kind == pc::TapHintKind::GenerationOpener;
             });
         }
-        const std::array<std::uint32_t, 1> existing{reuse};
-        taps = pc::plan_taps(n, reuse, hints,
-                             reuse != 0 ? std::span<const std::uint32_t>(existing)
-                                        : std::span<const std::uint32_t>(),
+        const std::array<std::uint32_t, 1> existing{paused_at};
+        taps = pc::plan_taps(n, paused_at, hints,
+                             paused_at != 0 ? std::span<const std::uint32_t>(existing)
+                                            : std::span<const std::uint32_t>(),
                              exclusions, hybrid_->taps());
     }
     const std::uint32_t full    = reuse / kBlock;
@@ -1054,7 +1191,7 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     lane_state.path.swap(hb.path);
     lane_state.active           = true;
     lane_state.publish          = publish;
-    lane_state.path_hash        = full == 0 ? pc::kRootLookupHash : prompt.block_hashes[full - 1U];
+    lane_state.path_hash        = full == 0 ? pc::kRootLookupHash : hb.path_hash;
     lane_state.trailing_extra   = all_vision_key(ranges);
     lane_state.deepest_snapshot = reuse;
     lane_state.prompt_tokens    = n;
@@ -1071,7 +1208,8 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     HybridCacheCounters& counters = hybrid_->counters();
     ++counters.admissions;
     if (reuse != 0) {
-        index.note_hit(quote.snapshot);
+        // A resume is the request admitted before, recovering: no GDSF frequency.
+        index.note_hit(quote.snapshot, tx.resume == nullptr);
         ++counters.snapshot_hits;
         counters.reused_tokens += reuse;
         index.unpin_snapshot(quote.snapshot);
@@ -1488,8 +1626,8 @@ void ProgramImpl::hybrid_finish_lane(SequenceState& sequence, bool endpoint,
     hybrid_release_lane(sequence.lane);
 }
 
-pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence,
-                                                     bool endpoint) noexcept {
+pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence, bool endpoint,
+                                                     bool pausing) noexcept {
     pc::SnapshotRef out;
     if (!hybrid_ || sequence.lane >= max_concurrency) { return out; }
     HybridLaneState& lane_state = hybrid_lanes_[sequence.lane];
@@ -1513,11 +1651,16 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence,
             const bool grid_state = execution_schedule.grid_cache &&
                                     frontier <= lane_state.prompt_tokens &&
                                     frontier % prefill_chunk == 0;
-            const pc::SnapshotKind kind =
-                execution_schedule.grid_cache ? pc::SnapshotKind::Tap : pc::SnapshotKind::Endpoint;
+            // Inside the prompt (a pause during prefill) the state is a tap's; past it, a generation's endpoint.
+            const pc::SnapshotKind kind = execution_schedule.grid_cache || frontier <= lane_state.prompt_tokens
+                                              ? pc::SnapshotKind::Tap
+                                              : pc::SnapshotKind::Endpoint;
+            // A pausing lane's snapshot is its resume point: without it the resume replays the tokens since
+            // the deepest snapshot, however few.
+            const bool far_enough = pausing ? frontier > lane_state.deepest_snapshot
+                                            : frontier >= lane_state.deepest_snapshot + pc::kMinimumTapSeparation;
             if (endpoint && (!execution_schedule.grid_cache || grid_state) && backend_caught_up &&
-                frontier != 0 &&
-                frontier >= lane_state.deepest_snapshot + pc::kMinimumTapSeparation &&
+                frontier != 0 && far_enough &&
                 frontier <= sequence.ledger.size() && lane_state.path.size() >= anchor_blocks &&
                 sequence.state.read == sequence.state.write &&
                 state_store->role(sequence.state.write) == StateImageRole::ActiveMutable) {
@@ -1531,9 +1674,11 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence,
                     hybrid_undo_supersession(lane_state, superseded);
                     ++hybrid_->counters().endpoints_skipped;
                 };
-                const std::optional<std::uint32_t> slot =
-                    index.acquire_device_slot(index.estimate_priority(
-                        lane_state.deepest_snapshot, frontier, frontier % kBlock != 0));
+                // A pause's resume point takes a slot over any Device-only snapshot that is not pinned or
+                // held, as its Host image is admitted below.
+                const std::optional<std::uint32_t> slot = index.acquire_device_slot(
+                    pausing ? std::numeric_limits<double>::infinity()
+                            : index.estimate_priority(lane_state.deepest_snapshot, frontier, frontier % kBlock != 0));
                 if (!slot) { skipped(); }
                 if (slot) {
                     try {
@@ -1589,8 +1734,13 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence,
                             // Superseded first, so the Host write below can take its slabs.
                             (void)hybrid_supersede_resume(lane_state, lane_state.deepest_snapshot,
                                                           sequence.ledger);
+                            // A pause's resume point goes to the Host over any retained snapshot that is
+                            // not pinned or held (a refused image would be lost with its Device slot, and
+                            // the resume would replay); its retention priority is its own afterwards.
                             (void)hybrid_->start_snapshot_host_write(
-                                published.snapshot, device.stream, device.transfer_stream);
+                                published.snapshot, device.stream, device.transfer_stream,
+                                pausing ? std::optional<double>(std::numeric_limits<double>::infinity())
+                                        : std::nullopt);
                         } else {
                             state_store->thaw(image);
                         }

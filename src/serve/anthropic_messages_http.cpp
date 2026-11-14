@@ -298,11 +298,14 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         return;
     }
 
-    // The event stream cannot be taken back once committed: wait for the Engine's admission of the
-    // first generation, so the queue's own answers are a plain HTTP status here as on the
-    // non-streaming branch (a later round's failure, after a server tool, belongs in the stream).
+    // The event stream cannot be taken back once committed: wait up to kStreamAdmissionGrace for the
+    // Engine's admission of the first generation, so the queue's prompt answers are a plain HTTP status
+    // here as on the non-streaming branch. A request still queued then starts its stream: pings keep
+    // the client while it waits, and a later queue timeout is the stream's error event, as a later
+    // round's failure (after a server tool) is.
     try {
-        service_->admit(prepared, [&req] { return client_disconnected(req); });
+        (void)service_->admit(prepared, [&req] { return client_disconnected(req); },
+                              std::chrono::steady_clock::now() + kStreamAdmissionGrace);
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());
         lifecycle->failure(make_generation_request_failure(error));

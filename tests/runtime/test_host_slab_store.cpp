@@ -2,7 +2,8 @@
 // memory, as both Programs' caches drive it under RAM pressure (--ram-resize auto): a release while a sequence still
 // runs copies what lies past the ceiling below it on the worker with every byte kept, a pinned path included; its
 // moves wait while a restore may read a Host slab; the chunks past the ceiling are given back. A growth page-locks
-// chunks again and links them, and a rebuilt index gets the slabs page-locked now (limit_index). Needs a CUDA device
+// chunks again and links them, and a rebuilt index gets the slabs page-locked now (limit_index). An automatic tier
+// sized for growth starts with part of its slabs locked and served, and grows into the rest. Needs a CUDA device
 // (exit 77 without one).
 
 #include "core/host_memory_worker.h"
@@ -12,6 +13,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -115,7 +117,7 @@ pc::HostSlabStore::Progress step_until(pc::HostSlabStore& store, pc::PrefixCache
 
 void test_release_and_growth(int device) {
     infernix::HostMemoryWorker worker(device);
-    pc::HostSlabStore store(kSlab, kSlabs, kChunk, "test Host tier");
+    pc::HostSlabStore store(kSlab, kSlabs, kSlabs, kChunk, "test Host tier");
     store.set_floor_chunks(1);
     require(store.slabs_per_chunk() == kPerChunk && store.pinned_bytes() == kSlabs * kSlab &&
                 store.pinned_slabs() == kSlabs && store.shrinkable_bytes() == 3 * kChunk && store.growable_bytes() == 0,
@@ -218,6 +220,49 @@ void test_release_and_growth(int device) {
     fresh.check_invariants();
 }
 
+// An automatic tier sized for growth: the start locks part of it (whole chunks), the index serves only that part, and
+// a growth takes the rest, never past the tier's slabs.
+void test_growth_past_start(int device) {
+    infernix::HostMemoryWorker worker(device);
+    pc::HostSlabStore store(kSlab, kSlabs, kPerChunk + 1U, kChunk, "test Host tier");
+    require(store.capacity_bytes() == kSlabs * kSlab && store.pinned_slabs() == 2 * kPerChunk &&
+                store.pinned_bytes() == 2 * kChunk && store.growable_bytes() == 2 * kChunk,
+            "a start locks the whole chunks holding its share");
+    Backend backend;
+    pc::PrefixCacheIndex index(config(), backend);
+    store.limit_index(index);
+    require(index.host_slab_limit() == 2 * kPerChunk && !index.host_shrinking(), "the index serves the locked slabs");
+    std::vector<pc::HostImageReservation> held;
+    while (auto image = index.reserve_host_image(false, kAny)) {
+        for (const std::uint32_t slab : image->slabs) {
+            require(slab < 2 * kPerChunk, "reservations stay inside the locked chunks");
+            std::memset(store.slab(slab), 0x3C, kSlab);
+        }
+        held.push_back(std::move(*image));
+    }
+    require(held.size() == 2 * kPerChunk / 4U, "the locked slabs fill");
+    for (auto& image : held) { index.release_host_image(std::move(image)); }
+    held.clear();
+
+    require(store.begin_growth(8 * kChunk, worker) == 2 * kChunk, "a growth stops at the tier's slabs");
+    const pc::HostSlabStore::Progress grown =
+        step_until(store, index, true, worker, [](const auto& total) { return total.growth_done; });
+    require(grown.grown == 2 * kChunk && !grown.refused && store.pinned_slabs() == kSlabs &&
+                index.host_slab_limit() == kSlabs && store.growable_bytes() == 0,
+            "the growth links the rest");
+    std::uint32_t top = 0;
+    while (auto image = index.reserve_host_image(false, kAny)) {
+        for (const std::uint32_t slab : image->slabs) {
+            top = std::max(top, slab);
+            std::memset(store.slab(slab), 0x5A, kSlab);
+        }
+        held.push_back(std::move(*image));
+    }
+    require(held.size() == kSlabs / 4U && top == kSlabs - 1U, "the grown tier fills to its slabs");
+    for (auto& image : held) { index.release_host_image(std::move(image)); }
+    index.check_invariants();
+}
+
 } // namespace
 
 int main() {
@@ -228,6 +273,7 @@ int main() {
     }
     try {
         test_release_and_growth(0);
+        test_growth_past_start(0);
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

@@ -44,15 +44,19 @@ PrefixHostLayout plan_prefix_host_layout(const KvPageGeometry& pages, const Stat
 PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool, const KvPageGeometry& pages,
                          const LaneStateImage& lanes, std::uint64_t host_bytes, cudaStream_t compute)
     : taps_(config.taps), pool_(&pool), geometry_(pages), lanes_(&lanes),
-      host_(plan_prefix_host_layout(pages, lanes.layout(), host_bytes)), compute_(compute) {
+      host_(plan_prefix_host_layout(pages, lanes.layout(), std::max(host_bytes, config.host_ceiling_bytes))),
+      compute_(compute) {
     if (pool.plane_count() != pages.geometry.planes.size()) {
         throw std::invalid_argument("Qwen4Exp prefix cache: the page geometry does not match the pool");
     }
-    if (host_.slabs == 0) {
+    // The slabs page-locked at the start; the rest of host_.slabs is growth room.
+    const auto locked =
+        static_cast<std::uint32_t>(std::min<std::uint64_t>(host_.slabs, host_bytes / std::max<std::size_t>(host_.slab_bytes, 1U)));
+    if (locked == 0) {
         // Host-born snapshots are the only snapshot source: without a Host tier there is no cache.
         throw std::invalid_argument("Qwen4Exp prefix cache needs a Host tier (--host-context-mib)");
     }
-    if (host_.slabs < host_.image_slabs + 2U) {
+    if (locked < host_.image_slabs + 2U) {
         const std::uint64_t mib = (static_cast<std::uint64_t>(host_.image_slabs + 2U) * host_.slab_bytes + (1U << 20U) - 1U) >> 20U;
         throw std::invalid_argument("--host-context-mib is too small for the Qwen4Exp prefix cache: one snapshot needs " +
                                     std::to_string(mib) + " MiB");
@@ -90,7 +94,7 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
     if (config.device_snapshot_slots != 0) {
         throw std::invalid_argument("Qwen4Exp prefix cache: Device snapshot slots are not supported");
     }
-    store_ = pc::HostSlabStore(host_.slab_bytes, host_.slabs, kHostChunkBytes, "Qwen4Exp prefix cache Host tier");
+    store_ = pc::HostSlabStore(host_.slab_bytes, host_.slabs, locked, kHostChunkBytes, "Qwen4Exp prefix cache Host tier");
     // A release keeps one snapshot and its block in service.
     store_.set_floor_chunks((host_.image_slabs + 2U + host_.slabs_per_chunk - 1U) / host_.slabs_per_chunk);
     CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_, cudaStreamNonBlocking));
@@ -106,6 +110,7 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
     snapshot_meta_.assign(index.max_snapshots, StateImageHeader{});
     blocks_.reserve(index.max_nodes);
     index_.emplace(index, *this);
+    store_.limit_index(*index_); // only the locked slabs serve until a growth links more
 }
 
 PrefixCache::~PrefixCache() {

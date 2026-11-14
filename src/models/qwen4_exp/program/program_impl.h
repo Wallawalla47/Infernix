@@ -1996,7 +1996,7 @@ public:
             }
             const std::uint64_t restored = prefix_->counters().host_restore_bytes;
             stage = BindingStage::Activating;
-            prefix_activate(lane, index, *selection, *reservation, q.pages);
+            prefix_activate(lane, index, *selection, *reservation, q.pages, resume != nullptr);
             stage = BindingStage::Activated;
             lane.prefix.cached_tokens  = selection->cached_tokens;
             lane.prefix.restored_bytes = prefix_->counters().host_restore_bytes - restored;
@@ -2242,7 +2242,7 @@ public:
             }
             const std::uint64_t restored = prefix_->counters().host_restore_bytes;
             stage = BindingStage::Activating;
-            prefix_activate(lane, index, *selection, *reservation, pages);
+            prefix_activate(lane, index, *selection, *reservation, pages, true);
             stage = BindingStage::Activated;
             lane.prefix.cached_tokens  = selection->cached_tokens;
             lane.prefix.restored_bytes = prefix_->counters().host_restore_bytes - restored;
@@ -3738,7 +3738,7 @@ public:
                           total, in_prefix, in_experts);
         } else {
             std::snprintf(text, sizeof(text),
-                          "RAM free again: took back %.1f GiB (prefix cache %.1f, experts %.1f); %.1f GiB available",
+                          "RAM free: took %.1f GiB (prefix cache %.1f, experts %.1f); %.1f GiB available",
                           total, in_prefix, in_experts, left);
         }
         diagnostic(text, DiagnosticLevel::Info);
@@ -6910,7 +6910,8 @@ private:
 public:
     std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
-    void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);
+    void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue,
+                           std::span<const ResumeState* const> resumes);
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
     // Without free cache resume a request resumes only from prefill state on the prefill-chunk grid.
     [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept { return resume_grid(); }
@@ -6922,8 +6923,9 @@ public:
 private:
     void prefix_pin(const PrefixSelection& selection);
     void prefix_unpin(const PrefixSelection& selection) noexcept;
+    // `resumed`: a paused request's binding, whose hit adds no GDSF frequency (PrefixCacheIndex::note_hit).
     void prefix_activate(Lane& lane, std::uint32_t index, const PrefixSelection& selection,
-                         DeviceKVPageReservation& reservation, std::uint32_t pages);
+                         DeviceKVPageReservation& reservation, std::uint32_t pages, bool resumed);
     [[nodiscard]] std::uint32_t prefix_frontier(const Lane& lane, bool finishing) const noexcept;
     void prefix_publish(Lane& lane, std::uint32_t frontier);
     // `resume_point`: a paused lane's frontier, admitted over any unpinned retained snapshot.

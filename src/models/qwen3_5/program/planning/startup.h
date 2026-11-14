@@ -281,6 +281,8 @@ struct SequencePlanningInputs {
     bool use_cuda_graph               = true;
     bool causal_scoring               = false;
     int device                        = 0;
+    // --vram-past-budget: the Program checks its allocations against the budget plus the allowance its KV was sized in.
+    bool vram_past_budget             = false;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
     // Offloaded experts: the offload engine's staging and tables (ProgramOffload::fixed_bytes), allocated
@@ -316,6 +318,8 @@ struct SequencePlanImpl {
     bool use_cuda_graph               = true;
     bool causal_scoring               = false;
     int device                        = 0;
+    // --vram-past-budget: the Program checks its allocations against the budget plus the allowance its KV was sized in.
+    bool vram_past_budget             = false;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
     PersistentLayout persistent;

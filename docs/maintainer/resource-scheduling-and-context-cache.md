@@ -252,21 +252,37 @@ execution state; the blocks and snapshots the lane already published stay in the
 The resume binds like an admission, from the deepest cached state on the request's committed
 history (often its own prefix), then recomputes to the pause frontier and resumes the original phase.
 Replay splits prefill at every split the ledger recorded, so its GDN decomposition and therefore its
-state match the original execution exactly. A Qwen3.8-Flash-Next pause also publishes the lane's
-state at its frontier to the cache, so its resume normally finds a snapshot at the paused frontier
-itself and continues without recomputation (counted as a snapshot restore). That capture is the
-paused request's resume point, not a cache tap: it is taken however close the frontier lies to the
-lane's last snapshot, and its Host image is admitted over any unpinned retained snapshot.
+state match the original execution exactly. A pause also publishes the lane's state at its frontier
+to the cache (both families; on Qwen3.5 since 2026-11-14), so its resume normally finds a snapshot at
+the paused frontier itself and continues without recomputation (counted as a snapshot restore). That
+capture is the paused request's resume point, not a cache tap: it is taken however close the frontier
+lies to the lane's last snapshot, its Host image is admitted over any retained snapshot that is not
+pinned or held, and the paused request's queue hold keeps it cached until the resume. The resume is
+matched over the request's whole ledger, so a snapshot of generated tokens serves it. A Qwen3.5 lane
+whose DFlash2 drafter ring is not whole at the frontier (YE-01: a prefill skips drafter positions no
+planned read reaches) publishes nothing there and replays from its deepest snapshot; its resumed
+prefill plans taps over the prompt it has still to prefill, so a second pause resumes past the first.
 
 A resume happens during its owner's turn, usually while another resident still holds most of the
 pool. Its source is therefore not limited to what fits beside the other residents at that moment: a
-resumed request offers the deepest cached state the whole pool holds (Qwen3.8-Flash-Next: its pause's
-capture when cached; Qwen3.5: the source the cost model chose), and its binding reports the shortage,
-which the turn's reclaim covers by pausing the other resident (or the resume waits). Taking a
-shallower state that happened to fit would replay the tokens past it on every turn, and on
-Qwen3.8-Flash-Next with prefill arithmetic, so the request's output would depend on when the turns
-paused it (2026-11-07: the preemption tests' DFlash2-pairs replay on Dense8, and Qwen3.5's
-cache-replay, which reused its prompt snapshot once in five resumes).
+resumed request offers its deepest cached state the whole pool holds (its pause's capture when
+cached), and its binding reports the shortage, which the turn covers by pausing the other resident
+(or the resume waits). When evicting cached blocks cannot cover that shortage, the binding says so
+(`BindingReservation::reclaim_cache` false) and the Engine pauses the resident without evicting the
+cache first, which would only have evicted the resumed request's own history (2026-11-14: a resume
+evicted 1,500 of its own blocks, 90 per attempt, before the pause). Taking a shallower state that
+happened to fit would replay the tokens past it on every turn, and on Qwen3.8-Flash-Next with prefill
+arithmetic, so the request's output would depend on when the turns paused it (2026-11-07: the
+preemption tests' DFlash2-pairs replay on Dense8, and Qwen3.5's cache-replay, which reused its prompt
+snapshot once in five resumes).
+
+A fresh Qwen3.5 request follows the same rule for the history it shares with the cache: it takes a
+source that fits beside the residents now only when that source leaves at most a prefill chunk of the
+preferred source's cached history to compute again. Otherwise it offers the preferred source, which
+waits for the residents' release while evicting cached blocks cannot make room; recomputing restorable
+history needs the same pages within a few units and costs far more than the restore (2026-11-14: two
+agent conversations that did not fit the pool together took sources 65K and 71K tokens short of their
+history this way).
 
 Replay does not republish old output, does not charge the budget again and does not resample historical
 tokens. Penalty counts are restored from committed output and actually counted forced control; the RNG

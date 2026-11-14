@@ -20,7 +20,8 @@
 #include <vector>
 
 // The streaming routes answer a request refused before its stream starts over real HTTP, against a
-// generation backend that refuses at preparation or at admission and never generates.
+// generation backend that refuses at preparation, at admission or after the admission grace (still
+// queued) and never generates.
 namespace {
 
 using Json = nlohmann::json;
@@ -38,7 +39,9 @@ int check(bool condition, const std::string& message) {
 
 class RefusingBackend final : public GenerationBackend {
 public:
-    enum class Stage { Prepare, Admission };
+    // Queued: the request is still queued when the route's admission grace ends, and the queue answers
+    // later, in run().
+    enum class Stage { Prepare, Admission, Queued };
 
     // The next requests fail with `error` at `stage`, as GenerationService throws it there.
     void refuse(Stage stage, ApiError error) {
@@ -79,10 +82,13 @@ public:
         return request.tools.empty() ? 10 : 20;
     }
     GenerationOutcome run(PreparedRequest&, const StreamSink*, std::function<bool()>) override {
+        refuse_at(Stage::Queued);
         throw std::logic_error("a refused request ran");
     }
-    void admit(PreparedRequest&, std::function<bool()>) const override {
+    bool admit(PreparedRequest&, std::function<bool()>, std::chrono::steady_clock::time_point) const override {
         refuse_at(Stage::Admission);
+        std::lock_guard lock(mutex_);
+        return stage_ != Stage::Queued;
     }
     void stop() noexcept override {}
 
@@ -182,6 +188,59 @@ int test_admission_refusals(RefusingBackend& backend, httplib::Client& client) {
     return failures;
 }
 
+// A request still queued when its admission grace ends (kStreamAdmissionGrace) has its stream started, so
+// a client that gives up on a silent connection keeps it; the queue's later answer is the protocol's
+// in-stream error: Chat's unnamed error data event, Anthropic's message_start then error event, a
+// Response's created, in_progress, then failed.
+int test_queued_streams(RefusingBackend& backend, httplib::Client& client) {
+    int failures = 0;
+    const ApiError queue_timeout = request_error_to_api_error(
+        infernix::RequestError(infernix::RequestErrorKind::QueueTimeout,
+                               "inference request expired while waiting for admission"),
+        "structured_outputs.grammar", {}, kRetryAfter);
+    backend.refuse(RefusingBackend::Stage::Queued, queue_timeout);
+    for (const Route& route : streaming_routes()) {
+        const std::string what       = std::string(route.name) + " queued past the grace";
+        const httplib::Result result = client.Post(route.path, route.body.dump(), "application/json");
+        failures += check(static_cast<bool>(result), what + ": no HTTP answer");
+        if (!result) { continue; }
+        failures += check(result->status == 200 && event_stream(result), what + ": no event stream");
+        if (std::string_view(route.path) == "/v1/chat/completions") {
+            // OpenAI's form: one unnamed data event carrying the error body, then the connection closes.
+            const std::string& body = result->body;
+            const bool one_error    = body.starts_with("data: ") && body.ends_with("\n\n") &&
+                                   body.find("\n\n") == body.size() - 2;
+            const Json error = one_error ? Json::parse(body.substr(6), nullptr, false) : Json(nullptr);
+            failures += check(error.is_object() && error.contains("error") &&
+                                  error.at("error").value("code", "") == queue_timeout.code,
+                              what + ": not one error data event: " + body);
+            continue;
+        }
+        std::vector<Json> events;
+        try {
+            events = sse_events(result->body);
+        } catch (const std::exception& error) {
+            failures += check(false, what + ": " + error.what());
+            continue;
+        }
+        const std::vector<std::string> types =
+            route.anthropic ? std::vector<std::string>{"message_start", "error"}
+                            : std::vector<std::string>{"response.created", "response.in_progress", "response.failed"};
+        bool sequence = events.size() == types.size();
+        for (std::size_t index = 0; sequence && index < events.size(); ++index) {
+            sequence = events[index].at("type") == types[index];
+        }
+        failures += check(sequence, what + ": events out of sequence: " + result->body);
+        if (!sequence) { continue; }
+        const Json& last = events.back();
+        failures += check(route.anthropic ? last.at("error").contains("type") &&
+                                                last.at("error").value("message", "") == queue_timeout.message
+                                          : last.at("response").at("error").value("code", "") == queue_timeout.code,
+                          what + ": the stream's error lost the queue timeout: " + last.dump());
+    }
+    return failures;
+}
+
 // A prompt over the context limit is refused at preparation. A streamed Response answers inside its
 // event stream (HTTP 200: created, in_progress, then failed carrying context_length_exceeded and the
 // message), the one form Codex compacts on; a non-streamed Response and the other routes keep the
@@ -271,6 +330,7 @@ int main() try {
 
     int failures = 0;
     failures += test_admission_refusals(backend, client);
+    failures += test_queued_streams(backend, client);
     failures += test_context_overflow(backend, client);
 
     server.stop();

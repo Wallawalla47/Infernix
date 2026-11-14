@@ -5,7 +5,8 @@
 // once it is free, while requests run as well as between them. With the reserve R (--ram-free-mib) the tiers release
 // once less than the pressure point max(R / 2, 2 GiB) is available (Windows stalls once about 1 GiB is left), in whole
 // steps until the relieve point max(R, pressure point + a step) is available again, and grow back, up to their startup
-// sizes, only after more than the growth floor (the relieve point plus a step) has stayed available for
+// sizes (an automatic Host tier further, into the RAM other programs held at the start: HostSlabStore), only after
+// more than the growth floor (the relieve point plus a step) has stayed available for
 // kGrowHoldSeconds since the last release; growth then goes on in pieces while it stays due. The band between the
 // pressure point and the growth floor (R = 8 GiB: 4 to 9 GiB) keeps a desktop's ordinary swings from cycling the
 // tiers between releases and growths.

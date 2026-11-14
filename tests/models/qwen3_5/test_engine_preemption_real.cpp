@@ -512,13 +512,15 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
                     "replay cancellation lost work performed before cancellation");
         }
     } else if (prefix_cache) {
-        // Each resume bound from the prompt's own tap at 128 and replayed only past it; an MTP
+        // Each pause published the lane's state at its frontier (a pause snapshot, past the prompt
+        // while generating), and its resume bound from it over the ledger: nothing replayed. An MTP
         // lane bridges its drafter from the snapshot's continuation hidden.
-        require(totals.replay_restores == totals.preemptions,
-                "growth pressure did not restore every affected request");
+        require(totals.snapshot_restores == totals.preemptions && totals.replay_restores == 0 &&
+                    totals.replayed_tokens == 0,
+                "a resume did not bind from its own pause snapshot");
         require(after.hybrid_reused_tokens - before.hybrid_reused_tokens >=
-                    std::uint64_t{128} * totals.preemptions,
-                "a resume did not bind from the request's own prompt snapshot");
+                    std::uint64_t{kPromptTokens + 1} * totals.preemptions,
+                "a resume did not bind past its prompt");
     } else {
         require(totals.snapshot_restores == 0 && totals.replay_restores != 0 &&
                     totals.replayed_tokens > kPromptTokens,

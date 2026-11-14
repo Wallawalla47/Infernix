@@ -86,6 +86,7 @@ void ProgramImpl::create_prefix_cache() {
     config.ssd_directory = options_.prefix_ssd_directory;
     config.ssd_write_bytes_per_hour = options_.prefix_ssd_write_bytes_per_hour;
     config.ssd_kept_file            = options_.prefix_ssd_kept_file;
+    config.host_ceiling_bytes       = options_.prefix_host_growth_bytes;
     prefix_           = std::make_unique<prefix::PrefixCache>(config, *pool_, kv_geometry_, *lane_image_,
                                                             options_.prefix_host_bytes, device_.stream);
     if (mtp_) {
@@ -431,20 +432,42 @@ std::uint32_t ProgramImpl::hybrid_prefetch_room() const noexcept {
 }
 
 // The snapshot each queued request would resume from now, as prefix_select would choose it, is
-// held in admission order (hybrid-prefix-cache-spec §9.6). A block landing for another admission
-// does not change what the request needs, so filling candidates stay eligible.
-void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) {
+// held in admission order (hybrid-prefix-cache-spec §9.6): a request paused after its first token
+// over its ledger, as bind_replay chooses (the deepest state up to its paused frontier), so its
+// pause's capture stays cached until it resumes. A block landing for another admission does not
+// change what the request needs, so filling candidates stay eligible.
+void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue,
+                                    std::span<const ResumeState* const> resumes) {
     if (!prefix_) { return; }
+    if (resumes.size() != queue.size()) { throw std::logic_error("queue holds need one resume entry per request"); }
     pc::PrefixCacheIndex& index = prefix_->index();
     std::vector<pc::SnapshotRef> holds;
-    for (const RequestBasePlan* base : queue) {
+    for (std::size_t entry = 0; entry < queue.size(); ++entry) {
         if (holds.size() == pc::kMaxQueueHolds) { break; }
+        const RequestBasePlan* base = queue[entry];
         if (base == nullptr || base->impl_ == nullptr || !base->impl_->reuse || !base->impl_->prompt) { continue; }
         const auto& prompt = qwen3_5::PreparedPromptAccess::view(*base->impl_->prompt);
-        const auto n       = static_cast<std::uint32_t>(prompt.token_ids.size());
-        if (n <= 1 || prompt.block_hashes.size() != n / kBlock) { continue; }
-        pc::MatchResult match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+        if (prompt.token_ids.size() <= 1 || prompt.block_hashes.size() != prompt.token_ids.size() / kBlock) { continue; }
+        const ResumeStateImpl* resume = resumes[entry] ? resumes[entry]->impl_.get() : nullptr;
         const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
+        if (resume && resume->generated) {
+            const qwen3_5::PreparedPromptData ledger = ledger_prompt(prompt, *resume);
+            const auto n          = static_cast<std::uint32_t>(ledger.token_ids.size());
+            pc::MatchResult match = index.match(ledger.token_ids, ledger.block_hashes, ledger.block_extras, n);
+            std::optional<pc::SnapshotRef> deepest;
+            std::uint32_t frontier = 0;
+            for (const pc::MatchCandidate& c : match.candidates) {
+                if (c.frontier <= resume->target && c.frontier >= frontier &&
+                    !prefix::inside_exclusion(c.frontier, spans)) {
+                    deepest  = c.snapshot;
+                    frontier = c.frontier;
+                }
+            }
+            if (deepest) { holds.push_back(*deepest); }
+            continue;
+        }
+        const auto n          = static_cast<std::uint32_t>(prompt.token_ids.size());
+        pc::MatchResult match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
         std::erase_if(match.candidates,
                       [&](const pc::MatchCandidate& c) { return prefix::inside_exclusion(c.frontier, spans); });
         const pc::AdmissionChoice choice = index.choose(match, n);
@@ -612,7 +635,7 @@ void ProgramImpl::prefix_unpin(const PrefixSelection& s) noexcept {
 // Activates a pinned selection in a lane whose pages are reserved: maps shared pages, stages
 // restores and copy-on-write sources, and sets the lane's frontier and MTP state (plan §7.2).
 void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixSelection& s,
-                                  DeviceKVPageReservation& reservation, std::uint32_t pages) {
+                                  DeviceKVPageReservation& reservation, std::uint32_t pages, bool resumed) {
     pc::PrefixCacheIndex& cache = prefix_->index();
     const cudaStream_t stream   = device_.stream;
     // A copy-out of this lane's previous state must land before anything overwrites the slot.
@@ -662,7 +685,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
             cache.release_path(to_anchor);
             if (k > 1) { cache.acquire_path(to_anchor.first(k - 1)); }
         }
-        cache.note_hit(*s.snapshot);
+        cache.note_hit(*s.snapshot, !resumed);
         cache.unpin_snapshot(*s.snapshot); // the restore batch holds its own pin while it lands
         lane.prefix.resume  = s.snapshot;
         lane.prefix.deepest = s.frontier;

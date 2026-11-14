@@ -131,12 +131,14 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         return;
     }
 
-    // The SSE response cannot be taken back once committed: wait for the Engine's admission first,
-    // so the queue's own answers (a queue timeout, an orderly stop) are a plain HTTP status here as
-    // on the non-streaming branch; after it only mid-generation failures remain, which belong in
-    // the stream.
+    // The SSE response cannot be taken back once committed: wait up to kStreamAdmissionGrace for the
+    // Engine's admission, so the queue's prompt answers (a queue timeout, an orderly stop) are a plain
+    // HTTP status here as on the non-streaming branch. A request still queued then starts its stream:
+    // SSE comments keep the client while it waits, and a later queue answer is the stream's error
+    // event, as a mid-generation failure is.
     try {
-        service_->admit(prepared, [&req] { return client_disconnected(req); });
+        (void)service_->admit(prepared, [&req] { return client_disconnected(req); },
+                              std::chrono::steady_clock::now() + kStreamAdmissionGrace);
     } catch (const ApiException& exception) {
         lifecycle->failure(make_generation_request_failure(exception.error()));
         write_openai_error(res, exception.error());

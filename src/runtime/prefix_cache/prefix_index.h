@@ -316,8 +316,11 @@ public:
     [[nodiscard]] AdmissionChoice choose(const MatchResult& match,
                                          std::uint32_t prompt_tokens) const;
     // Records a hit on the snapshot selected for an admission. A hit on a superseded snapshot
-    // shows it still serves requests: it is retained again until its new lineage moves on.
-    void note_hit(SnapshotRef snapshot);
+    // shows it still serves requests: it is retained again until its new lineage moves on. A
+    // paused request's resume (`counted` false) is the request admitted before, recovering: it
+    // refreshes recency and retention but adds no GDSF frequency, so a source a request replays
+    // from again and again does not outrank the snapshots of the conversations still moving on.
+    void note_hit(SnapshotRef snapshot, bool counted = true);
     // A lineage that resumed from `snapshot`, or captured it as a tap, has published a deeper
     // snapshot on the same path, so its next request resumes from that one: `snapshot` now serves
     // only requests that diverge before it. Superseded snapshots are evicted before every retained
@@ -403,8 +406,10 @@ public:
     [[nodiscard]] std::optional<std::uint32_t> begin_host_fill(NodeRef node);
     void complete_host_fill(NodeRef node);
     void abort_host_fill(NodeRef node);
-    // Allocates image slabs (+1 tail slab) for a pinned snapshot. Absent when they cannot be freed.
-    [[nodiscard]] bool begin_snapshot_host_fill(SnapshotRef snapshot);
+    // Allocates image slabs (+1 tail slab) for a pinned snapshot, evicting no retained snapshot valued
+    // above `claim` (the snapshot's own priority when absent). False when they cannot be freed.
+    [[nodiscard]] bool begin_snapshot_host_fill(SnapshotRef snapshot,
+                                                std::optional<double> claim = std::nullopt);
     void complete_snapshot_host_fill(SnapshotRef snapshot);
     void abort_snapshot_host_fill(SnapshotRef snapshot);
     // A pinned host-backed snapshot whose tail lost its Device copy receives `device_id` being
