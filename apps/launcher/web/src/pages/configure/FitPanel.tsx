@@ -132,7 +132,9 @@ function PlanResult({
   }
 
   const currentContext = getFlagString(args, "--max-context", takesValue);
-  const contextShown = currentContext.length > 0 ? Number(currentContext) : 8192;
+  // auto takes the largest context that fits, so the plan's answer is the one in use.
+  const contextAuto = currentContext === "auto";
+  const contextShown = contextAuto ? plan.max_context : currentContext.length > 0 ? Number(currentContext) : 8192;
 
   return (
     <div className="flex flex-col gap-4">
@@ -167,7 +169,7 @@ function PlanResult({
               ) : (
                 <Badge variant="accent">
                   <Check />
-                  in use
+                  {contextAuto ? "auto" : "in use"}
                 </Badge>
               )}
             </div>

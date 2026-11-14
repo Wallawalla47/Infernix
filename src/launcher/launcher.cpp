@@ -711,12 +711,21 @@ std::string Launcher::config_default_alias(const std::string& config_id, const S
 }
 
 Args Launcher::model_default_args(const ScannedModel& model, const LibraryScan& scan) const {
-    const SystemFacts facts = telemetry_->facts();
-    HostFacts host;
-    // The inference GPU: telemetry lists it first.
-    if (!facts.gpus.empty()) { host.vram_total_bytes = facts.gpus.front().second.second; }
-    host.display = facts.inference_gpu_display;
-    return default_args(scan, model, host);
+    return default_args(scan, model);
+}
+
+std::uint64_t Launcher::advertised_context(const std::string& config_id, const ScannedModel& model,
+                                           const Args& args) const {
+    if (!context_auto(args)) { return context_length(args); }
+    const InstanceSnapshot instance = supervisor_->snapshot();
+    if (instance.model_key == config_id && instance.state == InstanceState::Ready) {
+        const Json metrics = supervisor_->metrics();
+        if (metrics.is_object() && metrics.contains("engine") && metrics["engine"].is_object()) {
+            const Json& resolved = metrics["engine"].value("max_context", Json());
+            if (resolved.is_number_unsigned() && resolved.get<std::uint64_t>() > 0) { return resolved.get<std::uint64_t>(); }
+        }
+    }
+    return model.native_context != 0 ? std::min<std::uint64_t>(model.native_context, 262144) : 8192;
 }
 
 std::string Launcher::effective_alias(const std::string& config_id, const ScannedModel& model,
@@ -749,7 +758,8 @@ Json Launcher::model_config_json(const std::string& config_id, const ScannedMode
             {"env", env},
             {"idle_unload_min", stored && stored->idle_unload_min ? Json(*stored->idle_unload_min) : Json(nullptr)},
             {"customized", named || args != defaults || alias != def_alias || !env.empty()},
-            {"context_length", context_length(args)},
+            {"context_length", advertised_context(config_id, model, args)},
+            {"context_auto", context_auto(args)},
             {"vision", model.has_vision && has_flag(args, "--vision")},
             {"updated_at", stored && stored->updated_at ? Json(*stored->updated_at) : Json(nullptr)}};
 }
@@ -1019,7 +1029,7 @@ Json Launcher::fit_plan_json(const std::string& config_id, const ScannedModel& m
         }
         // The plan's own largest context comes first when it is smaller than asked, in place of the
         // estimate from the refusal's figures.
-        if (out["max_context"].is_number_unsigned() && out["max_context"].get<std::uint64_t>() < context_length(args) &&
+        if (!context_auto(args) && out["max_context"].is_number_unsigned() && out["max_context"].get<std::uint64_t>() < context_length(args) &&
             out["max_context"].get<std::uint64_t>() > 0) {
             const std::uint64_t fit_tokens = out["max_context"].get<std::uint64_t>();
             Args fitted = args;
@@ -2000,7 +2010,7 @@ bool Launcher::client_authorized(const Request& request, Response& response, boo
 Json Launcher::model_entry(const std::string& config_id, const ScannedModel& model, const LibraryScan& scan,
                            bool claude_code) const {
     const Args args                 = effective_args(config_id, model, scan);
-    const std::uint64_t context     = context_length(args);
+    const std::uint64_t context     = advertised_context(config_id, model, args);
     const std::uint64_t max_output  = default_output_tokens(args, context);
     const InstanceSnapshot instance = supervisor_->snapshot();
     std::string state               = "not-loaded";
@@ -2149,7 +2159,7 @@ Json models_list_body(Json page, bool has_more) {
 
 Json Launcher::props_json(const std::string& config_id, const ScannedModel& model, const Args& args,
                           const std::string& alias) const {
-    const std::uint64_t context     = context_length(args);
+    const std::uint64_t context     = advertised_context(config_id, model, args);
     const InstanceSnapshot instance = supervisor_->snapshot();
     const bool loaded               = instance.model_key == config_id && instance.state == InstanceState::Ready;
     int slots                       = 1; // infernix-serve's --max-concurrency default

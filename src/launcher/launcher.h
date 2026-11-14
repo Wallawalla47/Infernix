@@ -112,6 +112,11 @@ private:
                                       const LibraryScan& scan) const;
     [[nodiscard]] EnvVars effective_env(const std::string& config_id) const;
     [[nodiscard]] Args model_default_args(const ScannedModel& model, const LibraryScan& scan) const;
+    // The context a configuration serves: its --max-context, or with --max-context auto the context the
+    // loaded server resolved (its /metrics engine.max_context) and, before it loads, the model's own
+    // (at most 262,144 tokens, what auto reaches with enough VRAM).
+    [[nodiscard]] std::uint64_t advertised_context(const std::string& config_id, const ScannedModel& model,
+                                                   const Args& args) const;
     // The configuration using this model id, if any.
     [[nodiscard]] std::optional<std::string> alias_owner(const std::string& alias) const;
     // POST /scripts/import: the script's server commands, matched to the library.

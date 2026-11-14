@@ -238,19 +238,36 @@ function FieldShell({ label, flag, help, children }: { label: string; flag: stri
 
 function ContextField({ model, form }: { model: ModelArtifact; form: FormContext }) {
   const raw = getFlagString(form.args, "--max-context", form.takesValue);
-  const value = raw.length > 0 ? Number(raw) : 8192;
+  // auto: the server sizes the context at startup to the largest the KV cache holds (models whose
+  // experts stay in VRAM; offloaded experts share the VRAM with their cache, which it would starve).
+  const auto = raw === "auto";
+  const value = auto ? Number.NaN : raw.length > 0 ? Number(raw) : 8192;
   const yarn = getFlagString(form.args, "--rope-yarn-factor", form.takesValue);
   const factor = yarn.length > 0 ? Number(yarn) : 1;
   const ceiling = model.native_context * (Number.isFinite(factor) ? factor : 1);
-  const set = (next: number | null) =>
+  const set = (next: number | "auto" | null) =>
     form.setArgs(setFlag(form.args, "--max-context", next === null ? null : String(next), form.takesValue));
   return (
     <FieldShell
       label="Context length"
       flag="--max-context"
-      help={`Tokens per request (prompt and output). Native ${formatInt(model.native_context)}; without the flag the server uses 8,192.`}
+      help={`Tokens per request (prompt and output). Native ${formatInt(model.native_context)}; without the flag the server uses 8,192.${
+        model.offloaded_experts ? "" : " Auto sizes it at startup to the largest the KV cache holds beside the weights."
+      }`}
     >
       <div className="flex flex-wrap items-center gap-1.5">
+        {model.offloaded_experts ? null : (
+          <button
+            type="button"
+            onClick={() => set("auto")}
+            className={cn(
+              "rounded-md border px-2 py-1 text-xs font-medium transition-colors",
+              auto ? "border-primary/50 bg-primary/10 text-foreground" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            Auto
+          </button>
+        )}
         {CONTEXT_PRESETS.map((preset) => (
           <button
             key={preset}
@@ -268,13 +285,19 @@ function ContextField({ model, form }: { model: ModelArtifact; form: FormContext
         <CommitInput
           type="number"
           className="h-8 w-32"
-          value={raw}
-          placeholder="8192"
+          value={auto ? "" : raw}
+          placeholder={auto ? "auto" : "8192"}
           min={1024}
           ariaLabel="Context length"
-          onCommit={(text) => set(text.length > 0 ? Number(text) : null)}
+          onCommit={(text) => set(text.length > 0 ? Number(text) : auto ? "auto" : null)}
         />
       </div>
+      {auto && model.offloaded_experts ? (
+        <div className="flex items-center gap-1.5 text-xs text-warning">
+          <TriangleAlert className="size-3.5" />
+          Offloaded experts share the VRAM with their expert cache: the server refuses auto here; set a length.
+        </div>
+      ) : null}
       {value > ceiling ? (
         <div className="flex items-center gap-1.5 text-xs text-warning">
           <TriangleAlert className="size-3.5" />

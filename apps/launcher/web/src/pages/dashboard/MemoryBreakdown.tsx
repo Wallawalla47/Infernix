@@ -28,10 +28,14 @@ interface KeySpec {
   what: Partial<Record<Pool, string>>;
 }
 
-// The contract's keys in its order (the bars' order). Ten keys share eight hues: the slots were
-// chosen so that neighbours in realistic bars (with or without a drafter, experts, device prefix
-// slots, CUDA graphs) stay apart for normal and colour-blind vision in both themes; staging and the
-// n-gram table, the two smallest and rarest, reuse the hue of workspace and of the drafter, striped.
+// The bars' order: the contract's keys, but with the KV cache beside the prefix cache. The two trade
+// pages with every request (the prefix cache gives up what a growing KV cache takes), so beside each
+// other only their shared boundary moves and the other parts keep their places. Ten keys share eight
+// hues: the slots were chosen so that neighbours in realistic bars (with or without a drafter,
+// experts, device prefix slots, CUDA graphs) stay apart for normal and colour-blind vision in both
+// themes (model state and the KV cache swapped hues when they swapped places, so the bar's run of
+// colours is the validated one); staging and the n-gram table, the two smallest and rarest, reuse
+// the hue of workspace and of the drafter, striped.
 const KEYS: Record<MemoryPartKey, KeySpec> = {
   weights: {
     label: "Model weights",
@@ -51,12 +55,12 @@ const KEYS: Record<MemoryPartKey, KeySpec> = {
       ssd: "Experts read from the artifact on the SSD instead of being held in RAM.",
     },
   },
+  state: { label: "Model state", slot: 4, what: { device: "Recurrent (GDN) state, per-request rows and input/output buffers." } },
   kv_cache: {
     label: "KV cache",
-    slot: 4,
+    slot: 6,
     what: { device: "The attention KV cache's pages; the solid share holds tokens now, the faint rest is free for more." },
   },
-  state: { label: "Model state", slot: 6, what: { device: "Recurrent (GDN) state, per-request rows and input/output buffers." } },
   prefix_cache: {
     label: "Prefix cache",
     slot: 7,

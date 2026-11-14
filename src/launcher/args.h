@@ -36,8 +36,10 @@ void remove_flag(Args& args, std::string_view flag, const TakesValue& takes_valu
 // Removes the managed flags from `args`; returns the names removed.
 std::vector<std::string> strip_managed_flags(Args& args, const TakesValue& takes_value = {});
 
-// Effective --max-context (infernix-serve's default 8192 when absent or unreadable).
+// Effective --max-context (infernix-serve's default 8192 when absent or unreadable); 0 for
+// --max-context auto, which the server sizes at startup (Launcher::advertised_context).
 [[nodiscard]] std::uint64_t context_length(const Args& args);
+[[nodiscard]] bool context_auto(const Args& args);
 
 // One argument quoted for the host shell (cmd/PowerShell on Windows, POSIX sh elsewhere), for
 // display.

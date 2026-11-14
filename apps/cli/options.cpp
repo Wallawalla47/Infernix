@@ -223,7 +223,10 @@ std::string usage_text(const char* argv0) {
            "                           line override the file\n"
            "\n"
            "CONTEXT\n"
-           "  --max-context N          max context tokens (default 2048)\n"
+           "  --max-context N|auto     max context tokens (default 2048); auto sizes it at\n"
+           "                           startup to the largest the KV cache holds beside the\n"
+           "                           weights (Qwen3.5-family models whose experts stay in\n"
+           "                           VRAM)\n"
            "  --rope-yarn-factor F     startup-fixed YaRN, finite [1,4] (default 1);\n"
            "                           extends allowed ceiling only, not --max-context\n"
            "  --prefill-chunk N        prefill chunk size in tokens, multiple of 128\n"
@@ -485,7 +488,9 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--rope-yarn-factor") {
             options.rope_yarn_factor = parse_float(value(arg), "rope-yarn-factor", 1.0F, 4.0F);
         } else if (arg == "--max-context") {
-            options.max_context = parse_u32(value(arg), "max-context");
+            const char* context      = value(arg);
+            options.max_context_auto = std::string_view(context) == "auto";
+            if (!options.max_context_auto) { options.max_context = parse_u32(context, "max-context"); }
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
@@ -697,7 +702,9 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("select only one of --grammar-file, --json-object, "
                                     "--json-schema-file, --regex or --choice");
     if (!kv_capacity_explicit) {
-        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+        // An automatic context takes the KV pool it sizes.
+        options.kv_capacity = options.max_context_auto ? KvCapacityPolicy::automatic()
+                                                       : KvCapacityPolicy::explicit_capacity(options.max_context);
     }
 
     const bool has_prompt   = !options.prompt.empty();
@@ -711,7 +718,7 @@ Options parse_options(int argc, char** argv) {
     if (options.prefill_split_workspace_mib > kMaximumPrefillSplitWorkspaceMiB) {
         throw std::invalid_argument("--prefill-split-workspace-mib must be in [0,16384]");
     }
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    if (!options.max_context_auto && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }

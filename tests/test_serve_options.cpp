@@ -93,6 +93,26 @@ int main() {
                       "--max-pending-requests 1024 refused");
     failures += check(!parse_error({"infernix-serve", "model.ninfer", "--max-pending-requests", "1025"}).empty(),
                       "--max-pending-requests past 1024 accepted");
+    // --max-context auto: the Engine sizes the context at startup (make_engine_options carries it); the KV
+    // capacity defaults to automatic even without the prefix cache, and an explicit one is the search's ceiling.
+    {
+        const ServeOptions sized = parse({"infernix-serve", "model.ninfer", "--max-context", "auto"});
+        const infernix::EngineOptions engine = make_engine_options(sized);
+        failures += check(sized.max_context_auto && engine.max_context_auto &&
+                              sized.kv_capacity.mode == infernix::KvCapacityMode::Automatic,
+                          "--max-context auto does not reach the Engine with an automatic KV capacity");
+        const ServeOptions uncached =
+            parse({"infernix-serve", "model.ninfer", "--max-context", "auto", "--no-prefix-reuse"});
+        failures += check(uncached.kv_capacity.mode == infernix::KvCapacityMode::Automatic,
+                          "--max-context auto without the prefix cache did not size the KV pool automatically");
+        const ServeOptions bounded =
+            parse({"infernix-serve", "model.ninfer", "--max-context", "auto", "--kv-capacity", "4096"});
+        failures += check(bounded.max_context_auto && bounded.kv_capacity.explicit_tokens == 4096,
+                          "--max-context auto refused an explicit KV capacity below its starting point");
+        failures += check(!parse({"infernix-serve", "model.ninfer"}).max_context_auto &&
+                              !parse_error({"infernix-serve", "model.ninfer", "--max-context", "automatic"}).empty(),
+                          "--max-context accepted a word other than auto");
+    }
     // --plan FILE: the start's options as given, plus where the plan goes; the Engine's options are the
     // start's (make_engine_options), so the plan sizes that start.
     {

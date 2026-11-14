@@ -159,8 +159,11 @@ export interface ModelConfig {
   idle_unload_min: number | null;
   /** args, env or alias differ from the defaults (named configurations: always true). */
   customized: boolean;
-  /** Effective --max-context (8192 when absent). */
+  /** Effective --max-context (8192 when absent); with --max-context auto, the loaded server's resolved
+   * context, or the model's own before it loads. */
   context_length: number;
+  /** --max-context auto: the server sizes the context at startup. */
+  context_auto: boolean;
   /** The artifact has a vision tower and these parameters enable it (--vision): images can be sent. */
   vision: boolean;
   updated_at: UnixMs | null;

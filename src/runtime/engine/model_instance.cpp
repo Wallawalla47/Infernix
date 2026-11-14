@@ -58,6 +58,19 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
+    // An automatic context takes all the VRAM the KV pool may have: offloaded experts size their cache from what
+    // the fixed allocations leave, so it would starve the expert cache.
+    if (options.max_context_auto) {
+        if (architecture != models::Architecture::Qwen3_5 || offloaded_experts) {
+            throw std::invalid_argument(
+                "--max-context auto sizes one request to the whole KV cache, which offloaded experts share the VRAM "
+                "with (their expert cache would shrink to nothing): give --max-context N (infernix-serve --plan "
+                "reports the largest that fits)");
+        }
+        if (options.purpose != EnginePurpose::Generation) {
+            throw std::invalid_argument("--max-context auto sizes a generation server: causal scoring takes N");
+        }
+    }
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit:
         if (options.kv_capacity.explicit_tokens == 0) {
@@ -345,7 +358,8 @@ void plan_qwen3_5_context(EnginePlan& plan, const EngineOptions& options,
                              std::max(1.0, static_cast<double>(options.rope_yarn_factor));
     const auto upper       = static_cast<std::uint32_t>(
         std::min(positions, static_cast<double>(std::numeric_limits<std::int32_t>::max())));
-    const bool kv_follows = options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    // An automatic context's starting point is no capacity to follow.
+    const bool kv_follows = !options.max_context_auto && options.kv_capacity.mode == KvCapacityMode::Explicit &&
                             options.kv_capacity.explicit_tokens == options.max_context;
     plan.max_context = largest_fitting_context(upper, options.max_context, [&](std::uint32_t context) {
         EngineOptions trial = options;
@@ -737,23 +751,35 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     return options;
 }
 
+namespace {
+
+models::qwen3_5::Frontend instance_frontend(const models::qwen3_5::Model& model, const EngineOptions& options) {
+    return models::qwen3_5::make_frontend(
+        model.resources(),
+        {.chat_template_path       = options.chat_template_path,
+         .grammar_cache_bytes      = options.grammar_cache_bytes,
+         .architecture             = model.config().text.architecture,
+         .vision_enabled           = options.enable_vision,
+         .max_context              = options.max_context,
+         .media_cache_bytes        = options.media_cache_bytes,
+         .media_live_bytes         = options.media_live_bytes,
+         .media_preprocess_threads = options.media_preprocess_threads,
+         .vision_max_merged_tokens = options.vision_max_merged_tokens,
+         .ngram_sources_enabled    = options.speculative.ngram_draft_tokens != 0,
+         .ngram_archive_enabled    = options.speculative.ngram_archive_bytes != 0});
+}
+
+} // namespace
+
 ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                              const EngineOptions& options)
-    : model(std::move(source)), parameters(*model),
-      frontend(models::qwen3_5::make_frontend(
-          model->resources(),
-          {.chat_template_path       = options.chat_template_path,
-           .grammar_cache_bytes      = options.grammar_cache_bytes,
-           .architecture             = model->config().text.architecture,
-           .vision_enabled           = options.enable_vision,
-           .max_context              = options.max_context,
-           .media_cache_bytes        = options.media_cache_bytes,
-           .media_live_bytes         = options.media_live_bytes,
-           .media_preprocess_threads = options.media_preprocess_threads,
-           .vision_max_merged_tokens = options.vision_max_merged_tokens,
-           .ngram_sources_enabled    = options.speculative.ngram_draft_tokens != 0,
-           .ngram_archive_enabled    = options.speculative.ngram_archive_bytes != 0})),
+    : model(std::move(source)), parameters(*model), frontend(instance_frontend(*model, options)),
       capacity(options.max_context) {}
+
+void ModelInstance::resize_context(const EngineOptions& options) {
+    frontend = instance_frontend(*model, options);
+    capacity = options.max_context;
+}
 
 ModelInstance::~ModelInstance() = default;
 
@@ -1149,6 +1175,23 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             }
             return std::pair{std::move(sequence), resolution};
         };
+        // --max-context auto: the largest context whose smallest reservation resolves here (Engine::plan's
+        // answer), so one request may fill the KV pool; every attempt resolves it again, as a retry's larger
+        // headroom leaves fewer pages. The frontend and the Engine's capacity take it.
+        if (options.max_context_auto) {
+            EnginePlan probe;
+            plan_qwen3_5_context(probe, options, instance->parameters, device, offload, free_bytes, headroom);
+            if (!probe.max_context) {
+                throw std::runtime_error("--max-context auto: no context fits beside the weights in the free VRAM");
+            }
+            if (*probe.max_context != options.max_context) {
+                options.max_context = *probe.max_context;
+                instance->resize_context(options);
+            }
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "--max-context auto: %u tokens, the largest context the KV cache holds here",
+                               options.max_context);
+        }
         auto planned_sequence = plan_sequence(options);
         if (!planned_sequence) {
             plan_qwen3_5_context(*planned, options, instance->parameters, device, offload, free_bytes, headroom);

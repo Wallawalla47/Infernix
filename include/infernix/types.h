@@ -731,6 +731,12 @@ struct EngineOptions {
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
+    // --max-context auto: the Engine raises max_context at startup to the largest context whose smallest
+    // reservation resolves beside the weights (as Engine::plan reports it), bounded by the model's positions,
+    // so one request may fill the KV pool. Qwen3.5-family generation whose experts stay in VRAM (offloaded
+    // experts and Qwen3.8-Flash-Next share the VRAM with their expert cache, which it would starve).
+    // max_context is the search's starting point; options() then report the resolved value.
+    bool max_context_auto              = false;
     // Startup-fixed runtime YaRN override, finite [1,4]; 1 preserves native RoPE.
     // Extends only the allowed ceiling, never max_context itself or artifact metadata.
     float rope_yarn_factor             = 1.0F;

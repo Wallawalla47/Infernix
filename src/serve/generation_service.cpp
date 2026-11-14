@@ -365,6 +365,7 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     engine_options.route_trace_path        = options.route_trace;
     engine_options.device                   = options.device;
     engine_options.max_context              = options.max_context;
+    engine_options.max_context_auto         = options.max_context_auto;
     engine_options.rope_yarn_factor          = options.rope_yarn_factor;
     engine_options.kv_capacity              = options.kv_capacity;
     engine_options.vram_headroom_bytes      = options.vram_headroom_bytes;

@@ -106,8 +106,10 @@ One page, top to bottom:
   available (how full it is says little: models with offloaded experts fill it on purpose). A
   temperature past its limit is also named beside **All gauges** while its dial is not shown.
 - **Memory**: what the loaded `infernix-serve` holds, as one bar for VRAM and one for RAM: its
-  parts (model weights, the drafter, experts with their count, the KV cache, model state, the prefix
-  cache, workspace, CUDA graphs, staging, the n-gram table), then **Infernix other** (its memory no
+  parts (model weights, the drafter, experts with their count, model state, the KV cache, the prefix
+  cache, workspace, CUDA graphs, staging, the n-gram table; the KV cache and the prefix cache side by
+  side, since they trade pages with every request, so only their shared boundary moves), then
+  **Infernix other** (its memory no
   part names: the CUDA context, the driver, heaps), **Other processes** and **Free**, beside which
   VRAM shows what the server keeps free for the display (its headroom). The KV cache and the prefix
   cache are drawn faint, with the share holding tokens or entries solid. While the server uses an SSD
@@ -236,7 +238,7 @@ Defaults per family (README "Recommended settings per model"):
 |---|---|
 | all | `--max-concurrency 2 --kv-dtype int8 --preserve-thinking --tolerant-tool-calls --pending-timeout-ms 900000`, and `--spec auto --draft-tokens auto` when a drafter is available |
 | Qwen3.8-Flash-Next | `--max-context 262144 --lm-head-draft`, the best DFlash2 drafter found (`--draft-model`) and n-gram volume (`--ngram-volume`, unless `<artifact>.ngram` exists) |
-| Qwen3.8-27B | `--lm-head-draft --ngram-draft-tokens auto --prefill-chunk 4096`, and the `--max-context` that fits beside the artifact in the GPU's memory (below) |
+| Qwen3.8-27B | `--lm-head-draft --ngram-draft-tokens auto --prefill-chunk 4096 --max-context auto` (the context the GPU's memory holds beside the artifact, below) |
 | Qwen3.6-27B, Qwen3.6-35B-A3B | `--lm-head-draft` where the artifact has a proposal head; the 27B's context as for Qwen3.8-27B |
 | Qwen3.5-122B-A10B | `--max-context 262144` |
 
@@ -244,12 +246,12 @@ No family sets `--host-context-mib`: `infernix-serve`'s default (`auto`) gives t
 the model and its experts leave beyond `--ram-free-mib` ([serving guide](serving.md)).
 
 A 27B keeps all of its KV cache on the GPU, so its context is what the GPU holds beside the
-weights: the launcher reckons 2.03 GB plus 33,792 bytes per token of context (measured with INT8 KV,
-two requests and both draft kinds), the Engine's automatic headroom (256 MiB when NVML reports no
-display on the GPU, else 1 GiB) and 1 GB for the CUDA context and the display, rounded down to
-4,096 tokens and at most 240,000. On a 32 GB RTX 5090 that is 208,896 headless and 188,416 with a
-display for the 23.7 GB official NVFP4 artifact, and 240,000 for artifacts of up to 22.7 GB headless
-(21.9 GB with a display). Raise it with `--vram-headroom-mib 0` when nothing else uses the GPU.
+weights: the launcher sets `--max-context auto`, and the server sizes the context at startup to the
+largest its KV cache holds beside the weights and the automatic headroom (256 MiB when NVML reports no
+display on the GPU, else 1 GiB). Raise it with `--vram-headroom-mib 0` when nothing else uses the
+GPU. Before the model loads, the launcher reports the model's own context for such a configuration
+(at most 262,144 tokens); once it is loaded, the one the server resolved. **Context length**'s
+**Auto** sets it for any model whose experts stay in VRAM; the plan reports what it resolves to.
 
 The launcher sets `--host`, `--port`, `--model-id` (the model id), `--any-model-name`,
 `--log-stats-panel off` and `--log-colours off` itself; they are removed from saved parameters.
@@ -282,7 +284,8 @@ OpenAI and Anthropic SDKs. **Endpoints**, at the top of every page, copies eithe
     when the request carries `anthropic-version`; the list's entries again as a top-level `models`,
     which Codex CLI's model-catalog refresh reads;
   - `name` and `description` (family, quantization, context, vision, whether it is loaded);
-  - its context (`--max-context`) as `context_length`, `context_window`, `max_model_len`,
+  - its context (`--max-context`; with `auto`, the loaded server's, else the model's own) as
+    `context_length`, `context_window`, `max_model_len`,
     `max_context_length`, `max_input_tokens` and `meta.n_ctx`, and the default output limit as
     `max_tokens`;
   - whether it is loaded, as `state` (`loaded`, `loading`, `not-loaded`; LM Studio's) and

@@ -107,10 +107,13 @@ std::vector<std::string> strip_managed_flags(Args& args, const TakesValue& takes
     return removed;
 }
 
+bool context_auto(const Args& args) { return flag_value(args, "--max-context") == "auto"; }
+
 std::uint64_t context_length(const Args& args) {
     constexpr std::uint64_t kServeDefault = 8192;
     const std::optional<std::string> value = flag_value(args, "--max-context");
     if (!value) { return kServeDefault; }
+    if (*value == "auto") { return 0; }
     std::uint64_t parsed = 0;
     const auto [end, error] = std::from_chars(value->data(), value->data() + value->size(), parsed);
     if (error != std::errc{} || end != value->data() + value->size() || parsed == 0) {

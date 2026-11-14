@@ -626,7 +626,7 @@ void print_help() {
         "  --log-colours on|off       coloured console\n"
         "  --plan FILE                write the sizing plan to FILE and exit\n"
         "MODEL & CONTEXT\n"
-        "  --max-context N            max context tokens per request (default 8192)\n"
+        "  --max-context N|auto       max context tokens per request (default 8192)\n"
         "  --max-concurrency N        max concurrent sequences, 1-8 (default 1)\n"
         "  --kv-dtype T               KV storage\n"
         "  --vram-headroom-mib N|auto VRAM left free\n"
@@ -645,16 +645,18 @@ void print_help() {
 
 // --plan: a plan that fits up to 225,280 tokens of context (2.03 GB + 33,792 bytes per token
 // beside 21.4 GiB of weights on a 32 GiB card), the shape infernix-serve writes.
+// `context` 0: --max-context auto, which takes the largest that fits.
 int write_plan(const std::string& file, std::uint64_t context) {
     constexpr double kGiB          = 1024.0 * 1024.0 * 1024.0;
     const std::uint64_t total      = static_cast<std::uint64_t>(32.0 * kGiB);
     const std::uint64_t free_bytes = static_cast<std::uint64_t>(31.4 * kGiB);
     const std::uint64_t weights    = static_cast<std::uint64_t>(21.4 * kGiB);
     const std::uint64_t headroom   = 1ull << 30;
+    const std::uint64_t max_context = (free_bytes - weights - headroom - 2030000000ull) / 33792ull / 4096 * 4096;
+    if (context == 0) { context = max_context; }
     const std::uint64_t minimum    = 2030000000ull + context * 33792ull;
     const std::uint64_t planned    = weights + minimum + headroom;
     const bool fits                = planned <= free_bytes;
-    const std::uint64_t max_context = (free_bytes - weights - headroom - 2030000000ull) / 33792ull / 4096 * 4096;
     const Json plan = {
         {"schema", 1},
         {"fits", fits},
@@ -733,7 +735,8 @@ int main(int argc, char** argv) {
         } else if (arg == "--model-id") {
             g_state.model = value();
         } else if (arg == "--max-context") {
-            context = std::strtoull(value().c_str(), nullptr, 10);
+            const std::string text = value();
+            context                = text == "auto" ? 0 : std::strtoull(text.c_str(), nullptr, 10);
         } else if (arg == "--plan") {
             plan_file = value();
         } else if (arg == "--fake-load-ms") {

@@ -54,10 +54,13 @@ struct ModelInstance {
     const models::qwen3_5::execution::Parameters parameters;
     models::qwen3_5::Frontend frontend;
     KvCapacityResolution kv_capacity_resolution;
-    const std::uint32_t capacity;
+    std::uint32_t capacity;
     std::unique_ptr<models::qwen3_5::Program> program;
 
     ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options);
+    // --max-context auto resolved its context at startup (before the Program exists): the frontend and the
+    // capacity take it.
+    void resize_context(const EngineOptions& options);
     ~ModelInstance();
     ModelInstance(const ModelInstance&)            = delete;
     ModelInstance& operator=(const ModelInstance&) = delete;

@@ -78,6 +78,9 @@ void test_args() {
     check(flag_value({"--draft-tokens=auto"}, "--draft-tokens") == "auto", "flag_value reads --flag=value");
     check(context_length({"--max-context", "240000"}) == 240000, "context_length reads --max-context");
     check(context_length({}) == 8192, "context_length falls back to infernix-serve's default");
+    check(context_length({"--max-context", "auto"}) == 0 && context_auto({"--max-context", "auto"}) &&
+              !context_auto({"--max-context", "240000"}) && !context_auto({}),
+          "--max-context auto is the server's to size");
 
     Args managed = {"--port", "9000", "--any-model-name", "--kv-dtype", "int8", "--model-id", "x", "--host", "0.0.0.0"};
     const std::vector<std::string> removed = strip_managed_flags(managed);
@@ -355,7 +358,7 @@ void test_library() {
     ScannedNgramVolume volume = *iq4;
     volume.path               = "Z:/volumes/iq4.ngram";
     scan.ngram_volumes.push_back(volume);
-    const Args args = default_args(scan, model, HostFacts{});
+    const Args args = default_args(scan, model);
     check(contains(args, {"--max-context", "262144"}), "Flash-Next default context");
     check(contains(args, {"--spec", "auto"}) && contains(args, {"--draft-tokens", "auto"}), "drafter chosen by the Engine");
     check(has_flag(args, "--lm-head-draft"), "proposal head used");
@@ -374,27 +377,13 @@ void test_library() {
     dense.has_proposal = true;
     dense.family       = "qwen3.8-27b";
     dense.bytes        = 23719715844; // neroued/Qwen3.8-27B-nvfp4-NInfer
-    const HostFacts rtx5090{32607ull << 20};
-    const Args dense_args = default_args(scan, dense, rtx5090);
+    const Args dense_args = default_args(scan, dense);
     check(contains(dense_args, {"--ngram-draft-tokens", "auto"}) && contains(dense_args, {"--prefill-chunk", "4096"}),
           "Qwen3.8-27B defaults follow the README's recommended settings");
     check(!has_flag(dense_args, "--host-context-mib"), "the Engine sizes every model's Host tier (auto)");
     check(!has_flag(dense_args, "--draft-model"), "bundled drafters take no --draft-model");
-    // On a 32 GB RTX 5090 this artifact started with at most ~196,000 tokens beside the Engine's
-    // 1 GiB headroom (240,000 failed): the default stays inside that, with room for other programs.
-    const std::uint64_t fit = fitting_27b_context(dense, rtx5090);
-    check(fit >= 180000 && fit <= 196000 && contains(dense_args, {"--max-context", std::to_string(fit)}),
-          "the 27B context fits beside the weights on a 32 GB GPU");
-    ScannedModel small = dense;
-    small.bytes        = 20437521664;
-    check(fitting_27b_context(small, rtx5090) == 240000, "a smaller artifact gets the full 240,000");
-    check(fitting_27b_context(dense, HostFacts{0}) == 188416, "an unknown GPU gets the 32 GB value");
-    check(fitting_27b_context(dense, HostFacts{24ull << 30}) == 32768, "a too-small GPU gets the floor");
-    // The Engine's automatic headroom follows the display (VM-07 b): 256 MiB headless, 1 GiB with a
-    // display or when NVML cannot tell (the case above).
-    check(fitting_27b_context(dense, HostFacts{32607ull << 20, false}) == 208896 &&
-              fitting_27b_context(dense, HostFacts{32607ull << 20, true}) == 188416,
-          "the 27B context does not follow the GPU's display");
+    // Every KV page stays on the GPU: the server sizes the context to what its KV cache holds.
+    check(contains(dense_args, {"--max-context", "auto"}), "the 27B context is the server's to size");
 }
 
 void test_router() {

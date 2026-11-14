@@ -14,26 +14,6 @@ std::string stem_of(const ScannedModel& model) {
 
 } // namespace
 
-std::uint64_t fitting_27b_context(const ScannedModel& model, const HostFacts& host) {
-    // Measured on the official NVFP4 artifact (RTX 5090 32 GB, INT8 KV, two lanes, DFlash2 and
-    // n-gram drafts; 2026-10-31): the Engine's minimum reservation is 2.03 GB plus 33,792 bytes per
-    // context token, and about 0.74 GB beside the file's bytes went to the CUDA context, workspaces
-    // and the display (1 GB is assumed, leaving room for other programs). The Engine's automatic
-    // headroom is 256 MiB on a GPU without a display and 1 GiB with one (or when NVML cannot tell).
-    // A file's unloaded parts (vision without --vision) make this lower than what fits, never higher.
-    constexpr std::uint64_t kUnknownGpu = 188416;
-    constexpr double kPerToken          = 33792.0;
-    constexpr double kFixed             = 2.03e9;
-    constexpr double kBeside            = 1.0e9;
-    constexpr std::uint64_t kStep       = 4096;
-    if (host.vram_total_bytes == 0) { return kUnknownGpu; }
-    const double headroom = host.display == false ? 268435456.0 : 1073741824.0;
-    const double budget =
-        static_cast<double>(host.vram_total_bytes) - static_cast<double>(model.bytes) - kBeside - headroom - kFixed;
-    const auto tokens = budget <= 0.0 ? 0 : static_cast<std::uint64_t>(budget / kPerToken) / kStep * kStep;
-    return std::clamp<std::uint64_t>(tokens, 32768, 240000);
-}
-
 const ScannedDrafter* best_drafter(const LibraryScan& scan, const ScannedModel& model) {
     const ScannedDrafter* best = nullptr;
     for (const ScannedDrafter& drafter : scan.drafters) {
@@ -61,7 +41,7 @@ const ScannedNgramVolume* best_ngram_volume(const LibraryScan& scan, const Scann
     return best;
 }
 
-Args default_args(const LibraryScan& scan, const ScannedModel& model, const HostFacts& host) {
+Args default_args(const LibraryScan& scan, const ScannedModel& model) {
     Args args;
     const auto add = [&](std::string_view flag, std::string_view value = {}) {
         args.emplace_back(flag);
@@ -72,7 +52,10 @@ Args default_args(const LibraryScan& scan, const ScannedModel& model, const Host
     if (model.family == "qwen3.8-flash-next") {
         add("--max-context", "262144");
     } else if (model.family == "qwen3.8-27b" || model.family == "qwen3.6-27b") {
-        add("--max-context", std::to_string(fitting_27b_context(model, host)));
+        // Every KV page stays on the GPU: infernix-serve sizes the context at startup to the largest the KV
+        // cache holds beside the weights and the headroom (2026-11-14, a headless 32 GB RTX 5090 with the 22 GB
+        // NVIDIA NVFP4 artifact, INT8 KV, two lanes, DFlash2: 256,896 tokens, the whole KV pool).
+        add("--max-context", "auto");
     } else if (model.native_context != 0) {
         add("--max-context", std::to_string(std::min<std::uint64_t>(model.native_context, 262144)));
     }
