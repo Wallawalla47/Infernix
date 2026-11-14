@@ -54,6 +54,7 @@ struct HybridCacheCounters {
     std::uint64_t taps_created        = 0;
     std::uint64_t taps_skipped        = 0;
     std::uint64_t taps_skipped_no_slot = 0; // of taps_skipped: no Device snapshot slot
+    std::uint64_t taps_retried        = 0; // flexible taps taken a boundary later after a skip for room
     std::uint64_t endpoints_created   = 0;
     // Endpoints that passed their gates but were not published (no Device snapshot slot, a full
     // snapshot table, or a failure while publishing).
@@ -167,13 +168,6 @@ public:
     // for the copies is the right answer, not a blocked admission or a truncated lease.
     [[nodiscard]] bool transfers_pending() const noexcept {
         return !pending_.empty() || !landing_.empty();
-    }
-    // Device blocks those pins hold now (an upper bound on what drain() can make evictable).
-    [[nodiscard]] std::uint32_t transfer_pinned_blocks() const noexcept {
-        std::size_t blocks = 0;
-        for (const PendingWrite& write : pending_) { blocks += write.nodes.size(); }
-        for (const RestoreBatch& batch : landing_) { blocks += batch.nodes.size(); }
-        return static_cast<std::uint32_t>(blocks);
     }
 
     // Waits for every Host write and landing restore and publishes them.

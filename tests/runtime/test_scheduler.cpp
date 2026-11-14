@@ -259,6 +259,20 @@ void test_pressure_handoff_and_fair_service() {
     slots[3] = request(40, Request::Phase::Materializing);
     require(scheduler.preemption_victim(slots, 4) == 1, "a binding destination was chosen as a victim");
     slots[3].reset();
+    // A pause that leaves the lane's state cached at its frontier is preferred over the youngest one
+    // whose pause would recompute (a Qwen3.5 prefill without a whole DFlash2 ring); equals stay youngest.
+    slots[3] = request(40, Request::Phase::Prefill);
+    const std::array<std::uint32_t, 4> replays{0U, 0U, 0U, 4096U};
+    const auto cost = [&](std::uint32_t lane) { return replays[lane]; };
+    require(scheduler.preemption_victim(slots, 4, {}, cost) == 1,
+            "a pause that replays was chosen over one that resumes from its own snapshot");
+    const std::array<std::uint32_t, 4> uneven{512U, 1024U, 0U, 1024U};
+    require(scheduler.preemption_victim(slots, 4, {}, [&](std::uint32_t lane) { return uneven[lane]; }) == 0,
+            "the cheaper of two replaying pauses was not chosen");
+    const std::array<std::uint32_t, 4> equal{7U, 7U, 7U, 7U};
+    require(scheduler.preemption_victim(slots, 4, {}, [&](std::uint32_t lane) { return equal[lane]; }) == 3,
+            "equal pause costs did not keep the youngest victim");
+    slots[3].reset();
     // Arbitrarily many resource polls and Replay boundaries cannot consume c's turn.
     for (int i = 0; i < 100; ++i) {
         require(!scheduler.advance_service(true, true) && scheduler.progress_owner() == c->id,

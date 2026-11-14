@@ -639,6 +639,91 @@ void fairness(const std::filesystem::path& artifact, infernix::SpeculativeBacken
             "pressure recovery did not reopen admission");
 }
 
+// Two greedy conversations whose contexts do not fit the KV pool together (each fits alone), run turn
+// by turn side by side with the prefix cache on (2026-11-14: two agent conversations on the 27B paused
+// each other every service turn and replayed 12.8M tokens). Each turn sends back the previous prompt
+// and its output with a short new message. Criteria, fixed before measuring:
+// - pressure engaged: the turns paused each other at least once;
+// - every later turn resumes from at least its previous turn's whole context (prompt and output) less
+//   one block: neither the pauses nor the other conversation cost it its cached history;
+// - Replay recomputes no more than one prefill chunk per pause on a backend whose pause publishes the
+//   lane's state at its frontier (none, MTP); a DFlash2 prefill pause whose ring YE-01 left incomplete
+//   replays from its deepest snapshot, so it is reported, not bounded.
+void conversations(const std::filesystem::path& artifact, infernix::SpeculativeBackend selected,
+                   std::string_view backend_name) {
+    constexpr std::uint32_t kPool      = 4096;
+    constexpr std::uint32_t kSystem    = 1024;
+    constexpr std::uint32_t kFirstUser = 256;
+    constexpr std::uint32_t kNextUser  = 64;
+    constexpr std::uint32_t kReply     = 384;
+    constexpr std::uint32_t kTurns     = 3;
+    auto options        = engine_options(artifact, selected, true);
+    options.max_context = kPool;
+    options.kv_capacity = infernix::KvCapacityPolicy::explicit_capacity(kPool);
+    // The service turns' own pacing; the 64-token ladder of engine_options would tap every block.
+    options.context_cache.hybrid.tap_ladder_tokens  = {};
+    options.context_cache.hybrid.tap_min_gap_tokens = {};
+    infernix::Engine engine(options);
+    const auto before = engine.runtime_stats();
+
+    std::array<std::vector<infernix::TokenId>, 2> history;
+    for (std::size_t row = 0; row < 2; ++row) {
+        history[row].resize(kSystem + kFirstUser);
+        for (std::size_t at = 0; at < history[row].size(); ++at) {
+            history[row][at] = static_cast<infernix::TokenId>(1000 + 50 * row + (at * 7919U) % 40000U);
+        }
+    }
+    std::array<std::uint32_t, 2> previous_context{};
+    std::uint64_t worst_shortfall = 0;
+    for (std::uint32_t turn = 0; turn < kTurns; ++turn) {
+        std::array<infernix::GenerationHandle, 2> handles;
+        for (std::size_t row = 0; row < 2; ++row) {
+            if (turn != 0) {
+                for (std::uint32_t at = 0; at < kNextUser; ++at) {
+                    history[row].push_back(static_cast<infernix::TokenId>(2000 + 97 * turn + 13 * row + at));
+                }
+            }
+            handles[row] = engine.submit(engine.prepare_tokens(history[row]), request(kReply, true),
+                                         infernix::OutputConsumerMode::Aggregate);
+        }
+        for (std::size_t row = 0; row < 2; ++row) {
+            const infernix::GenerationResult result = handles[row].wait();
+            require(result.generated_token_ids.size() == kReply, "a conversation turn ended early");
+            std::cout << "conversations backend=" << backend_name << " turn=" << turn << " row=" << row
+                      << " prompt=" << history[row].size() << " reused=" << result.reused_prompt_tokens
+                      << " computed=" << result.computed_prefill_tokens
+                      << " preemptions=" << result.scheduling.preemptions
+                      << " snapshot_restores=" << result.scheduling.snapshot_restores
+                      << " replay_restores=" << result.scheduling.replay_restores
+                      << " replayed=" << result.scheduling.replayed_tokens << '\n';
+            if (turn != 0) {
+                const std::uint32_t floor = previous_context[row] - 63U;
+                if (result.reused_prompt_tokens < floor) {
+                    worst_shortfall = std::max<std::uint64_t>(worst_shortfall, floor - result.reused_prompt_tokens);
+                }
+            }
+            history[row].insert(history[row].end(), result.generated_token_ids.begin(),
+                                result.generated_token_ids.end());
+            previous_context[row] = static_cast<std::uint32_t>(history[row].size());
+        }
+    }
+    (void)engine.memory_summary(); // the completed worker boundary
+    const auto after                 = engine.runtime_stats();
+    const std::uint64_t preemptions  = after.preemptions - before.preemptions;
+    const std::uint64_t replayed     = after.replayed_tokens - before.replayed_tokens;
+    const std::uint64_t direct       = after.snapshot_restores - before.snapshot_restores;
+    const std::uint64_t replay_count = after.replay_restores - before.replay_restores;
+    std::cout << "conversations backend=" << backend_name << " preemptions=" << preemptions
+              << " snapshot_restores=" << direct << " replay_restores=" << replay_count
+              << " replayed_tokens=" << replayed << " worst_reuse_shortfall=" << worst_shortfall << '\n';
+    require(preemptions != 0, "the two conversations never paused each other: the pool did not press");
+    require(worst_shortfall == 0, "a later turn lost its previous turn's cached context");
+    if (selected != infernix::SpeculativeBackend::DFlash2) {
+        require(replayed <= preemptions * options.prefill_chunk, "Replay recomputed more than a chunk per pause");
+    }
+    settled(after, true);
+}
+
 } // namespace
 
 int main() {
@@ -656,9 +741,9 @@ int main() {
         const auto scenario     = setting("INFERNIX_PREEMPTION_REAL_SCENARIO", "all");
         require(scenario == "all" || scenario == "replay" || scenario == "cancel-paused" ||
                     scenario == "cancel-replay" || scenario == "cache-replay" || scenario == "fairness" ||
-                    scenario == "cache-fairness",
+                    scenario == "cache-fairness" || scenario == "conversations",
                 "INFERNIX_PREEMPTION_REAL_SCENARIO must be all, replay, cancel-paused, "
-                "cancel-replay, cache-replay, fairness or cache-fairness");
+                "cancel-replay, cache-replay, fairness, cache-fairness or conversations");
         if (scenario == "all" || scenario == "replay") { exercise(artifact, selected, backend_name); }
         if (scenario == "all" || scenario == "cancel-paused") {
             exercise(artifact, selected, backend_name, CancelStage::Paused);
@@ -675,6 +760,10 @@ int main() {
         if ((scenario == "all" && setting("INFERNIX_TEST_CONSTRAINT", "none") == "none") ||
             scenario == "cache-fairness") {
             fairness(artifact, selected, backend_name, true);
+        }
+        if ((scenario == "all" && setting("INFERNIX_TEST_CONSTRAINT", "none") == "none") ||
+            scenario == "conversations") {
+            conversations(artifact, selected, backend_name);
         }
     } catch (const std::exception& error) {
         std::cerr << "real Engine preemption test failed: " << error.what() << '\n';

@@ -879,6 +879,22 @@ RuntimeStats Engine::runtime_stats() const {
         impl_->core);
 }
 
+RequestMonitor Engine::request_monitor() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& core) -> RequestMonitor {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (requires { core->request_monitor(); }) {
+                return core->request_monitor();
+            } else {
+                return {}; // a scoring Engine holds no generation requests
+            }
+        },
+        impl_->core);
+}
+
 bool Engine::is_available() const {
     if (impl_ == nullptr) { return false; }
     return std::visit(

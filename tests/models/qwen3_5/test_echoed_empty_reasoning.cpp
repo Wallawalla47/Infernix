@@ -18,6 +18,7 @@
 // CPU only. Skipped (77) without the directory, or for a tokenizer whose "\n" and "\n\n" are not 198 and 271.
 
 #include "models/qwen3_5/frontend/frontend.h"
+#include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 
@@ -108,6 +109,22 @@ std::vector<TokenId> prompt_ids(const q::Frontend& frontend, infernix::PromptInp
     return {ids.begin(), ids.end()};
 }
 
+// Where the history's earlier replies' generated ids begin (PreparedPromptData::reply_frontiers).
+std::vector<std::uint32_t> reply_frontiers(const q::Frontend& frontend, infernix::PromptInput input) {
+    const q::PreparedPrompt prepared = frontend.prepare(std::move(input));
+    return q::PreparedPromptAccess::view(prepared).reply_frontiers;
+}
+
+// The latest reply's generated ids begin where its generation prompt ended.
+void check_latest_frontier(const std::string& what, const q::Frontend& frontend, const infernix::PromptInput& echoed,
+                           std::size_t prompt_ids) {
+    const std::vector<std::uint32_t> frontiers = reply_frontiers(frontend, echoed);
+    check(!frontiers.empty() && frontiers.back() == prompt_ids,
+          what + ": the latest reply frontier is " +
+              (frontiers.empty() ? std::string("absent") : std::to_string(frontiers.back())) + ", not " +
+              std::to_string(prompt_ids));
+}
+
 std::vector<TokenId> concat(std::vector<TokenId> head, std::span<const TokenId> tail) {
     head.insert(head.end(), tail.begin(), tail.end());
     return head;
@@ -153,6 +170,25 @@ void empty_reasoning_case(const std::string& what, const q::Frontend& frontend, 
     check(frontend.detokenize(expected) ==
               frontend.detokenize(std::span(history).first(std::min(history.size(), expected.size()))),
           what + ": the history's text differs from the generated text");
+    check_latest_frontier(what, frontend, echoed, prompt.size());
+}
+
+// A reasoning closed at once: the model writes `</think>` straight after the prompt's `<think>` "\n", and
+// the template echoes it as `<think>\n\n</think>`, one "\n" more than generated, so the history departs
+// from the reply's endpoint at the prompt's end. That is the latest reply frontier, where the hybrid cache's
+// prompt-end tap (taken for a reply whose first id is the prompt's prompt_end_tap_token) stands.
+void closed_at_once_case(const std::string& what, const q::Frontend& frontend, const Ids& ids,
+                         const infernix::PromptInput& opener, const std::vector<TokenId>& generated_tail,
+                         const infernix::PromptInput& echoed) {
+    const std::vector<TokenId> prompt    = prompt_ids(frontend, opener);
+    const std::vector<TokenId> generated = concat({ids.think_close}, generated_tail);
+    const std::vector<TokenId> expected  = concat(prompt, generated);
+    const std::vector<TokenId> history   = prompt_ids(frontend, echoed);
+    const std::size_t at                 = first_difference(expected, history);
+    std::cout << what << ": prompt " << prompt.size() << " ids; first difference at id " << at << '\n';
+    check(at == prompt.size(), what + ": the history departs from the generated ids at id " + std::to_string(at) +
+                                   ", not at the prompt's end " + std::to_string(prompt.size()));
+    check_latest_frontier(what, frontend, echoed, prompt.size());
 }
 
 } // namespace
@@ -207,6 +243,11 @@ int main() {
             const std::vector<TokenId> tail = concat(concat({kDoubleNewline}, frontend.tokenize_text(answer)),
                                                      std::vector<TokenId>{ids.im_end});
             empty_reasoning_case("qwen3_8 answer", frontend, ids, opener, tail, echoed);
+            closed_at_once_case("qwen3_8 answer closed at once", frontend, ids, opener, tail, echoed);
+            // The prompt opens the reasoning, so a reply whose first id is </think> is marked as not echoed.
+            const q::PreparedPrompt prepared = frontend.prepare(opener);
+            const auto mark                  = q::PreparedPromptAccess::view(prepared).prompt_end_tap_token;
+            check(mark && *mark == ids.think_close, "a prompt opening the reasoning does not mark </think> as unechoed");
         }
 
         // 2. The control: a reply with reasoning, its ids the tokenizer's own segmentation of each part,
@@ -231,6 +272,7 @@ int main() {
                       << expected.size() << " generated-and-prompt ids\n";
             check(at == expected.size(), "the control reply does not render as generated (first difference at id " +
                                              std::to_string(at) + ")");
+            check_latest_frontier("qwen3_8 control", frontend, echoed, prompt.size());
         }
 
         // 2b. Thinking off: the opener is `<think>\n\n</think>\n\n` (its "\n\n" one id, as the template wrote
@@ -252,6 +294,10 @@ int main() {
                       << " generated-and-prompt ids\n";
             check(at == expected.size(), "a thinking-off answer does not render as generated (first difference at id " +
                                              std::to_string(at) + ")");
+            check_latest_frontier("qwen3_8 thinking off", frontend, echoed, prompt.size());
+            const q::PreparedPrompt prepared = frontend.prepare(opener);
+            check(!q::PreparedPromptAccess::view(prepared).prompt_end_tap_token,
+                  "a thinking-off prompt marks an unechoed first id");
         }
 
         // 3. Qwen3.8, a tool call with empty reasoning inside a tool loop, with preserve_thinking false: the

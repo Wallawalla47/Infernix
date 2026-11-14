@@ -154,6 +154,8 @@ struct ProcessedInput {
     std::vector<std::uint32_t> rewrite_execution_frontiers;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
+    // Token frontiers where earlier replies' generated ids begin (RenderedChat::generation_splits).
+    std::vector<std::uint32_t> reply_frontiers;
     PreprocessStats stats;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
@@ -174,6 +176,8 @@ struct EncodedChat {
     std::vector<std::uint32_t> rewrite_execution_frontiers;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
+    // Token frontiers where earlier replies' generated ids begin (RenderedChat::generation_splits).
+    std::vector<std::uint32_t> reply_frontiers;
 };
 
 EncodedChat

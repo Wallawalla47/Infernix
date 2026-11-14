@@ -954,6 +954,98 @@ void test_host_write_admission() {
     index.check_invariants();
 }
 
+// A transfer holds only the Device copy it reads or writes: its node's ancestors stay indexed (and an
+// unbacked one keeps its Device copy, its eviction would remove the subtree), but a backed ancestor's
+// Device copy stays evictable, as under a retained node or a pinned snapshot. The Device copies only
+// transfers hold are counted as room once they land.
+void test_transfer_pins_hold_only_their_block() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 2), backend);
+    const auto tokens = make_tokens(64 * 4, 90);
+    const auto path   = insert_sequence(index, backend, tokens);
+    const SnapshotRef tap = publish_at(index, backend, path, tokens, 64 * 4, SnapshotKind::Tap);
+    for (std::size_t b = 0; b < 3; ++b) { backup_node(index, path[b]); }
+    index.release_path(path);
+    index.check_invariants();
+    require(index.device_evictable_blocks() == 4 && index.device_transfer_held_blocks() == 0,
+            "an unpinned path is evictable");
+    // The deepest block's Host write (pin_node then the fill).
+    index.pin_node(path[3]);
+    require(index.begin_host_fill(path[3]).has_value(), "no slab for the deepest block");
+    index.check_invariants();
+    for (std::size_t b = 0; b < 3; ++b) {
+        require(index.node(path[b]).evictable, "a backed ancestor of a written block must stay evictable");
+    }
+    require(!index.node(path[3]).evictable && index.node(path[3]).transfer_held &&
+                index.device_transfer_held_blocks() == 1 && index.device_evictable_blocks() == 3,
+            "the written block's Device copy is held by its transfer alone");
+    require(index.evict_device_blocks(3) == 3, "the ancestors' Device copies must be evictable");
+    for (std::size_t b = 0; b < 3; ++b) {
+        require(index.valid(path[b]) && index.node(path[b]).host == CopyState::Resident &&
+                    index.node(path[b]).device == CopyState::Absent,
+                "an evicted ancestor keeps its node and Host copy");
+    }
+    index.complete_host_fill(path[3]);
+    index.unpin_node(path[3]);
+    index.check_invariants();
+    require(index.node(path[3]).evictable && index.device_transfer_held_blocks() == 0,
+            "a landed write releases its block");
+    // A pinned snapshot and a retained node keep their backed path's Device copies evictable.
+    index.pin_snapshot(tap);
+    index.retain_node(path[3]);
+    require(index.node(path[3]).evictable, "a retained backed node stays evictable");
+    index.unretain_node(path[3]);
+    index.unpin_snapshot(tap);
+    index.check_invariants();
+
+    // Unbacked ancestors of a transfer keep their Device copies: evicting one would remove the subtree.
+    const auto other      = make_tokens(64 * 3, 91);
+    const auto other_path = insert_sequence(index, backend, other);
+    (void)publish_at(index, backend, other_path, other, 64 * 3, SnapshotKind::Tap);
+    index.release_path(other_path);
+    index.pin_node(other_path[2]);
+    index.check_invariants();
+    require(!index.node(other_path[0]).evictable && !index.node(other_path[1]).evictable,
+            "an unbacked ancestor of a transfer must keep its Device copy");
+    index.unpin_node(other_path[2]);
+    index.retain_node(other_path[1]);
+    require(!index.node(other_path[1]).evictable && !index.node(other_path[0]).evictable,
+            "a retained unbacked node and its ancestors keep their Device copies");
+    index.unretain_node(other_path[1]);
+    index.check_invariants();
+    require(index.node(other_path[0]).evictable, "released, the unbacked path is evictable again");
+}
+
+// An allocation evicts only when what its order may take covers it: a resume point (an infinite claim)
+// against a Host tier of held snapshots and one unheld one too small for it fails and keeps the unheld
+// one, instead of evicting it for nothing (the order used to evict every unheld victim first).
+void test_infeasible_allocation_evicts_nothing() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(12, 4), backend); // three tail-less images fill the Host tier
+    std::vector<SnapshotRef> images;
+    std::vector<std::vector<NodeRef>> paths;
+    for (std::uint32_t seed = 0; seed < 3; ++seed) {
+        const auto tokens = make_tokens(64 * 2, 100 + seed);
+        paths.push_back(insert_sequence(index, backend, tokens));
+        images.push_back(publish_at(index, backend, paths.back(), tokens, 64 * 2, SnapshotKind::Tap));
+        backup_snapshot(index, images.back());
+    }
+    index.set_queue_holds(std::span<const SnapshotRef>(images.data(), 2));
+    const auto tokens       = make_tokens(64 * 2 + 10, 110);
+    const auto path         = insert_sequence(index, backend, tokens);
+    const SnapshotRef tailed = publish_at(index, backend, path, tokens, 64 * 2 + 10, SnapshotKind::Endpoint);
+    index.pin_snapshot(tailed);
+    require(!index.begin_snapshot_host_fill(tailed, std::numeric_limits<double>::infinity()),
+            "five slabs cannot come from one unheld four-slab image");
+    index.unpin_snapshot(tailed);
+    require(index.valid(images[2]) && index.snapshot(images[2]).host == CopyState::Resident,
+            "an allocation that cannot complete must evict nothing");
+    index.set_queue_holds({});
+    for (const auto& p : paths) { index.release_path(p); }
+    index.release_path(path);
+    index.check_invariants();
+}
+
 // A paused request's resume point is admitted with an infinite claim: it displaces a retained Host
 // snapshot worth more than itself, but never a held one (the source of a request waiting to resume).
 void test_resume_point_admission() {
@@ -1184,6 +1276,124 @@ void test_image_only_host_tier() {
     }
     require(!index.valid(endpoint.snapshot), "a snapshot without its tail KV must be removed");
     require(index.stats().host_free_slabs == 8, "the removed snapshot's image slab was leaked");
+}
+
+// Operation counts (after NInfer #402's complexity blowup): a Host allocation takes dead blocks from
+// their list without scanning the snapshot table; a snapshot eviction scans it once; and a feasibility
+// check walks each lineage node at most once, however deep the lineage's snapshots lie.
+void test_host_eviction_operation_counts() {
+    {
+        RecordingBackend backend;
+        PrefixCacheIndex index(small_config(16, 2), backend);
+        const auto old_path = insert_sequence(index, backend, make_tokens(64 * 16, 900));
+        for (const NodeRef node : old_path) { backup_node(index, node); }
+        index.release_path(old_path);
+        const PrefixIndexOperations before = index.operations();
+        const std::uint64_t reclaims       = index.stats().host_dead_reclaims;
+        const auto fresh                   = insert_sequence(index, backend, make_tokens(64 * 16, 901));
+        for (const NodeRef node : fresh) { backup_node(index, node); }
+        const PrefixIndexOperations after = index.operations();
+        require(index.stats().host_dead_reclaims - reclaims == 16, "sixteen dead blocks yield their slabs");
+        require(after.victim_scans == before.victim_scans && after.room_scans == before.room_scans &&
+                    after.snapshot_visits == before.snapshot_visits,
+                "evicting dead blocks scanned the snapshot table");
+        index.release_path(fresh);
+        index.check_invariants();
+    }
+    {
+        constexpr double kAny = std::numeric_limits<double>::infinity();
+        RecordingBackend backend;
+        PrefixIndexConfig config = small_config(64 * 4, 1);
+        config.max_nodes         = 1024;
+        config.max_snapshots     = 64;
+        PrefixCacheIndex index(config, backend);
+        const auto tokens = make_tokens(64 * 512, 902);
+        const auto path   = insert_sequence(index, backend, tokens);
+        // 64 Host-only snapshots, one every eight blocks of one 512-block lineage, the deepest first in the table.
+        for (std::uint32_t depth = 512; depth >= 8; depth -= 8) {
+            auto image = index.reserve_host_image(false, kAny);
+            require(image.has_value(), "the Host tier holds 64 images");
+            require(index.publish_host_snapshot(path[depth - 1U], depth * 64U, {}, std::nullopt, std::move(*image),
+                                                SnapshotKind::Tap)
+                        .created,
+                    "a Host-only snapshot is created");
+        }
+        require(index.stats().host_free_slabs == 0, "the Host tier is full");
+        // A tailed image takes five slabs, one more than any snapshot frees: the check counts two snapshots
+        // and the blocks the first leaves dead, walking up from its anchor only as far as the next snapshot.
+        const PrefixIndexOperations before = index.operations();
+        const std::uint64_t evictions      = index.stats().host_snapshot_evictions;
+        auto tailed                        = index.reserve_host_image(true, kAny);
+        require(tailed.has_value(), "two snapshots make room for a tailed image");
+        const PrefixIndexOperations after = index.operations();
+        const std::uint64_t evicted       = index.stats().host_snapshot_evictions - evictions;
+        require(evicted == 2, "a tailed image displaces two four-slab images");
+        require(after.room_scans - before.room_scans == 1, "one feasibility check per allocation");
+        require(after.room_node_visits - before.room_node_visits >= 1 &&
+                    after.room_node_visits - before.room_node_visits <= 8 + 1,
+                "the feasibility check walked past the next snapshot of the lineage (or not at all)");
+        require(after.victim_scans - before.victim_scans == evicted, "one victim scan per snapshot evicted");
+        require(after.snapshot_visits - before.snapshot_visits <= (1 + evicted) * config.max_snapshots,
+                "victim selection examined more than one table pass per eviction");
+        index.release_host_image(std::move(*tailed));
+        index.release_path(path);
+        index.check_invariants();
+    }
+}
+
+// NInfer #394's trap: a Host tier full of unrelated requests' snapshots, then a chat of short turns over a
+// 5,120-token system prompt. Each turn ends with an endpoint, which alone keeps the turn's few tokens and is
+// valued low (GDSF), so its Host write is refused; the next turn must still resume from it rather than fall
+// back to the system prompt's tap.
+void test_short_turns_over_a_full_host_tier() {
+    RecordingBackend backend;
+    PrefixIndexConfig config = small_config(64, 2); // 16 images
+    config.max_nodes         = 2048;
+    config.max_snapshots     = 64;
+    PrefixCacheIndex index(config, backend);
+    constexpr double kAny = std::numeric_limits<double>::infinity();
+    for (std::uint32_t other = 0; other < 16; ++other) {
+        const auto path = insert_sequence(index, backend, make_tokens(64 * 32, 1000 + other));
+        auto image      = index.reserve_host_image(false, kAny);
+        require(image.has_value(), "the unrelated requests fill the Host tier");
+        (void)index.publish_host_snapshot(path.back(), 64 * 32, {}, std::nullopt, std::move(*image),
+                                          SnapshotKind::Endpoint);
+        index.release_path(path);
+    }
+    require(index.stats().host_free_slabs == 0, "the Host tier is full");
+
+    std::vector<TokenId> history = make_tokens(64 * 80, 2000); // the system prompt
+    const auto system_path       = insert_sequence(index, backend, history);
+    const SnapshotRef system_tap = publish_at(index, backend, system_path, history, 64 * 80, SnapshotKind::Boundary);
+    index.release_path(system_path);
+    SnapshotRef previous;
+    std::uint32_t previous_end = 64 * 80;
+    for (std::uint32_t turn = 0; turn < 8; ++turn) {
+        // The user's message, then the reply; the next request sends both back.
+        const auto user = make_tokens(40, 3000 + turn);
+        history.insert(history.end(), user.begin(), user.end());
+        const auto hashes      = block_lookup_hashes(history, {});
+        const MatchResult seen = index.match(history, hashes, {}, static_cast<std::uint32_t>(history.size()));
+        require(!seen.candidates.empty() && seen.candidates.front().frontier >= previous_end,
+                "turn " + std::to_string(turn) + " resumed from " +
+                    std::to_string(seen.candidates.empty() ? 0U : seen.candidates.front().frontier) +
+                    ", not from the previous turn's end " + std::to_string(previous_end));
+        const auto reply = make_tokens(100, 4000 + turn);
+        history.insert(history.end(), reply.begin(), reply.end());
+        const auto path         = insert_sequence(index, backend, history);
+        const auto end          = static_cast<std::uint32_t>(history.size());
+        const SnapshotRef ended = publish_at(index, backend, path, history, end, SnapshotKind::Endpoint);
+        index.pin_snapshot(ended);
+        if (index.begin_snapshot_host_fill(ended)) { index.complete_snapshot_host_fill(ended); }
+        index.unpin_snapshot(ended);
+        // The lineage moved past its previous endpoint (hybrid_supersede_resume).
+        if (previous.valid() && index.valid(previous)) { (void)index.supersede(previous); }
+        index.release_path(path);
+        index.check_invariants();
+        previous     = ended;
+        previous_end = end;
+    }
+    (void)system_tap; // it may have yielded its Device slot to an endpoint: no turn needed it
 }
 
 // RAM pressure while requests run: begin_host_shrink evicts as an allocation would until what is in use fits below
@@ -1492,9 +1702,10 @@ void test_queue_holds() {
         require(first && index.valid(snaps[0]) && !index.valid(snaps[1]),
                 "an unheld snapshot yields before a held one");
         index.check_invariants();
-        // The 4 freed slabs went to `first`; b's 2 dead blocks remain, then only the held endpoint.
+        // The 4 freed slabs went to `first`; b's 2 dead blocks remain, then only the held endpoint: two
+        // slabs cannot hold a four-slab image, so nothing is evicted for it (host_room_possible).
         require(!index.reserve_host_image(false, kAny).has_value() && index.valid(snaps[0]) &&
-                    index.stats().held_host_refusals == 1 && index.stats().host_dead_reclaims == 2,
+                    index.stats().held_host_refusals == 1 && index.stats().host_dead_reclaims == 0,
                 "a write is refused rather than evict a held snapshot");
         index.check_invariants();
         index.set_queue_holds({});
@@ -2510,6 +2721,10 @@ int main() {
         test_unbacked_slot_kept_beside_backed_owner();
         test_unsupersede_restores_retention();
         test_host_write_admission();
+        test_transfer_pins_hold_only_their_block();
+        test_infeasible_allocation_evicts_nothing();
+        test_host_eviction_operation_counts();
+        test_short_turns_over_a_full_host_tier();
         test_resume_point_admission();
         test_resume_hits_add_no_frequency();
         test_unshared_boundary();

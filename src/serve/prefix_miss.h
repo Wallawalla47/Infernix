@@ -1,7 +1,8 @@
 #pragma once
 
 // Prefix-reuse miss record (candidates CF-08): explains a large re-prefill by comparing the prompt
-// with the contexts (prompt and output) of the last requests. Kept only with the request log.
+// with the contexts (prompt and output) of the last requests. Its kind shows in the `req#N done`
+// line; the request JSONL records it whole.
 
 #include "infernix/types.h"
 

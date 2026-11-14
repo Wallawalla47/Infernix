@@ -131,14 +131,15 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         return;
     }
 
-    // The SSE response cannot be taken back once committed: wait up to kStreamAdmissionGrace for the
-    // Engine's admission, so the queue's prompt answers (a queue timeout, an orderly stop) are a plain
-    // HTTP status here as on the non-streaming branch. A request still queued then starts its stream:
-    // SSE comments keep the client while it waits, and a later queue answer is the stream's error
-    // event, as a mid-generation failure is.
+    // The SSE response cannot be taken back once committed: wait for the Engine's admission, so the
+    // queue's answers (a queue timeout, an orderly stop) are a plain HTTP status here as on the
+    // non-streaming branch. Unlike Messages and Responses, Chat Completions has no error event clients
+    // agree on: a queue timeout as one `data:` error frame after a 200 is recorded by some clients
+    // (LiteLLM 1.98, raw HTTP) as a successful empty reply and retried at once (NInfer #420), so this
+    // route does not start its stream early (kStreamAdmissionGrace).
     try {
         (void)service_->admit(prepared, [&req] { return client_disconnected(req); },
-                              std::chrono::steady_clock::now() + kStreamAdmissionGrace);
+                              std::chrono::steady_clock::time_point::max());
     } catch (const ApiException& exception) {
         lifecycle->failure(make_generation_request_failure(exception.error()));
         write_openai_error(res, exception.error());

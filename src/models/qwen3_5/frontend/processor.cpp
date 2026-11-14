@@ -768,7 +768,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     byte_boundaries.reserve((rendered.rewrite_checkpoint ? 2U : 0U) +
                             rendered.rewrite_execution_boundaries.size() +
                             rendered.message_boundaries.size() + rendered.cache_boundaries.size() +
-                            rendered.media_token_runs.size() * 2U);
+                            rendered.media_token_runs.size() * 2U + rendered.generation_splits.size());
     if (rendered.rewrite_checkpoint) {
         byte_boundaries.push_back(rendered.rewrite_checkpoint->offset);
         byte_boundaries.push_back(rendered.rewrite_checkpoint->recovery_offset);
@@ -785,6 +785,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         byte_boundaries.push_back(run.bytes.begin);
         byte_boundaries.push_back(run.bytes.end);
     }
+    byte_boundaries.insert(byte_boundaries.end(), rendered.generation_splits.begin(), rendered.generation_splits.end());
 
     BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
         rendered.text, byte_boundaries, EncodeOptions{.max_tokens = maximum_tokens},
@@ -868,6 +869,14 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
             .item_index  = run.item_index,
             .frame_index = run.frame_index,
         });
+    }
+    // The tokenizer splits at each of them, so each is an exact frontier.
+    encoded.reply_frontiers.reserve(rendered.generation_splits.size());
+    for (std::size_t remaining = rendered.generation_splits.size(); remaining != 0; --remaining) {
+        const TokenBoundaryResult& result = tokenized.boundaries.at(boundary_index++);
+        if (result.exact_frontier) {
+            encoded.reply_frontiers.push_back(to_frontier(*result.exact_frontier, "reply frontier"));
+        }
     }
     if (boundary_index != tokenized.boundaries.size()) {
         throw std::logic_error("rendered token boundary result count changed during encoding");
@@ -1106,6 +1115,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     output.rewrite_execution_frontiers = std::move(encoded.rewrite_execution_frontiers);
     output.message_boundaries          = std::move(encoded.message_boundaries);
     output.cache_boundaries            = std::move(encoded.cache_boundaries);
+    output.reply_frontiers             = std::move(encoded.reply_frontiers);
     stats.prompt_tokens                = output.input_ids.size();
     enforce_media_resource_limits(stats, options_);
 

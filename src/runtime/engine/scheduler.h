@@ -313,16 +313,26 @@ public:
         begin_admission_scan();
     }
 
-    // The resident a pressure turn pauses for its owner: the youngest one that is not the owner,
-    // not binding, not finished and not protecting a Native recovery, outside `excluded` (lanes
-    // that could not pause). None without a turn.
-    template <class Slots>
+    // Every pause costs the same (tests and callers without a Program).
+    struct UniformPauseCost {
+        [[nodiscard]] constexpr std::uint32_t operator()(std::uint32_t) const noexcept { return 0; }
+    };
+
+    // The resident a pressure turn pauses for its owner, among those that are not the owner, not
+    // binding, not finished and not protecting a Native recovery, outside `excluded` (lanes that
+    // could not pause): the one whose pause costs the fewest tokens to recompute on resume
+    // (`replay(lane)`, the Program's pause_replay_tokens: none where the pause publishes the lane's
+    // state at its frontier, from the deepest snapshot where it cannot, as a Qwen3.5 prefill whose
+    // DFlash2 ring is not whole), the youngest among equals. None without a turn.
+    template <class Slots, class Replay = UniformPauseCost>
     [[nodiscard]] std::optional<std::uint32_t>
     preemption_victim(const Slots& slots, std::uint32_t concurrency,
-                      std::span<const std::uint32_t> excluded = {}) const noexcept {
+                      std::span<const std::uint32_t> excluded = {},
+                      const Replay& replay = {}) const noexcept {
         const auto owner = progress_owner();
         if (!owner) { return std::nullopt; }
-        std::optional<std::uint32_t> youngest;
+        std::optional<std::uint32_t> chosen;
+        std::uint32_t chosen_cost = 0;
         for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
             const auto& request = slots[lane];
             if (!request || request->id == *owner || request->is_materializing() ||
@@ -330,9 +340,14 @@ public:
                 std::find(excluded.begin(), excluded.end(), lane) != excluded.end()) {
                 continue;
             }
-            if (!youngest || request->id > slots[*youngest]->id) { youngest = lane; }
+            const std::uint32_t cost = replay(lane);
+            if (!chosen || cost < chosen_cost ||
+                (cost == chosen_cost && request->id > slots[*chosen]->id)) {
+                chosen      = lane;
+                chosen_cost = cost;
+            }
         }
-        return youngest;
+        return chosen;
     }
 
     // A turn grants at least one second of useful execution; an expensive restore earns up to

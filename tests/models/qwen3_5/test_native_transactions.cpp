@@ -29,6 +29,11 @@ constexpr std::uint32_t kCapacity      = 512;
 constexpr std::uint32_t kChunk         = 128;
 constexpr std::uint32_t kPromptTokens  = 384;
 constexpr std::uint32_t kPauseFrontier = 256;
+// The cached lifecycle's long prompt: past the 27B DFlash2 drafter's ring window, paused far from any
+// planned read.
+constexpr std::uint32_t kLongContext = 8192;
+constexpr std::uint32_t kLongPrompt  = 6144;
+constexpr std::uint32_t kLongPause   = 3072;
 
 void require(bool condition, std::string_view message) {
     if (!condition) { throw std::runtime_error(std::string(message)); }
@@ -440,6 +445,292 @@ void replay_sampling_counts(DeviceContext& device, const qwen::execution::Parame
             "sampling-count fixture leaked typed resources");
 }
 
+// The prefix cache's pause lifecycle (resource-scheduling §5.2-5.3), on a Device-only cache:
+// - pause_replay_tokens, which a pressure turn uses to choose its victim, names the tokens the resume
+//   recomputes: a pause that publishes the lane's state at its frontier resumes from it and replays
+//   nothing, one that cannot replays from the deepest snapshot (decode and prefill pauses);
+// - a resume binding cancelled while its restore is staged releases everything it took, leaves the
+//   index consistent, and the paused request still resumes from the same source;
+// - shutdown cleanup during a staged resume binding (an Engine stop) leaves no pin behind.
+// Pins are checked through the index: with no lane bound, every Device-resident block is evictable.
+void cached_pause_lifecycle(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                            EngineOptions options) {
+    const qwen::Frontend frontend =
+        qwen::make_frontend(parameters.model.resources(), {.vision_enabled = false, .max_context = kLongContext});
+    options.max_context                                = kLongContext;
+    options.kv_capacity                                = KvCapacityPolicy::explicit_capacity(2 * kLongContext);
+    options.context_cache.enabled                      = true;
+    options.context_cache.hybrid.device_snapshot_slots = 4;
+    options.context_cache.hybrid.max_new_taps          = 2;
+    options.context_cache.hybrid.tap_ladder_tokens     = 4096;
+    options.context_cache.hybrid.tap_min_gap_tokens    = 1024;
+    // Main KV pages: two long lanes and the cached blocks of finished requests.
+    auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
+    auto plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), 3 * kLongContext / 64U);
+    qwen::detail::ProgramImpl program(parameters, *plan, device, {});
+    require(program.hybrid_ != nullptr, "the cached fixture built no prefix cache");
+    auto& index = program.hybrid_->index();
+
+    const auto prompt_ids = [](TokenId first, std::uint32_t tokens) {
+        std::vector<TokenId> ids(tokens, 198);
+        for (std::size_t at = 0; at < ids.size(); at += 7) { ids[at] = first + static_cast<TokenId>(at % 97); }
+        return ids;
+    };
+    // `unechoed`: the prompt's PreparedPromptData::prompt_end_tap_token, as the Frontend sets it for a prompt that
+    // opens the reasoning.
+    const auto request_of = [&](std::vector<TokenId> ids, std::optional<TokenId> unechoed = std::nullopt,
+                                bool reuse = true) {
+        runtime::ResolvedExecutionOptions execution;
+        execution.requested_output_tokens = 16;
+        execution.allow_prefix_reuse      = reuse;
+        qwen::PreparedPromptData data = qwen::PreparedPromptAccess::take(frontend.prepare_tokens(std::move(ids)));
+        data.prompt_end_tap_token     = unechoed;
+        return program.plan_request(std::move(data), execution);
+    };
+    const auto request = [&](TokenId first, std::uint32_t tokens = kPromptTokens) {
+        return request_of(prompt_ids(first, tokens));
+    };
+    const auto settle = [&](runtime::CancellationFlagView cancellation = {}) {
+        for (unsigned step = 0; step < 8; ++step) {
+            device.synchronize();
+            auto progress = program.poll_context(cancellation);
+            if (progress.complete) { return progress; }
+        }
+        throw std::runtime_error("cached fixture transaction did not complete");
+    };
+    struct Bound {
+        qwen::SequenceHandle sequence;
+        std::uint32_t reused = 0;
+    };
+    const auto start = [&](const qwen::RequestBasePlan& base, std::uint32_t lane, qwen::ResumeState* resume,
+                           qwen::ExecutionUnitKind kind) {
+        const auto sources = program.hybrid_sources(base, resume);
+        require(!sources.empty(), "the cached fixture quoted no source");
+        require(static_cast<bool>(program.start_binding(base, {lane}, sources.front(), resume, kind,
+                                                        kind == qwen::ExecutionUnitKind::Prefill ? 0U : 1U)),
+                "the cached fixture could not reserve its first unit");
+        return sources.front().reused_tokens;
+    };
+    const auto bind = [&](const qwen::RequestBasePlan& base, std::uint32_t lane, qwen::ResumeState* resume,
+                          qwen::ExecutionUnitKind kind) {
+        const std::uint32_t reused = start(base, lane, resume, kind);
+        auto progress              = settle();
+        require(progress.published && progress.sequence, "the cached fixture did not publish a lane");
+        return Bound{*progress.sequence, reused};
+    };
+    const auto reserve = [&](qwen::SequenceHandle sequence, qwen::ExecutionUnitKind kind, std::uint32_t tokens = 0) {
+        const std::array<qwen::ExecutionUnit, 1> units{{{sequence, kind, tokens}}};
+        require(static_cast<bool>(program.reserve_units(units)), "the cached fixture could not reserve a unit");
+    };
+    // Prefills `tokens` more prompt tokens; reaching the prompt's end commits its first output token.
+    const auto prefill = [&](qwen::SequenceHandle sequence, std::uint32_t tokens) {
+        std::uint32_t processed = 0;
+        while (processed < tokens) {
+            reserve(sequence, qwen::ExecutionUnitKind::Prefill);
+            auto step = program.advance_prefill(sequence, nullptr, nullptr);
+            require(step.processed_prompt_tokens != 0, "cached prefill made no progress");
+            processed += step.processed_prompt_tokens;
+            if (step.complete) {
+                const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+                (void)program.commit(std::move(*step.pending), accepted, runtime::CommitObservation::AllRows, nullptr);
+            }
+        }
+        require(processed == tokens, "cached prefill crossed its frontier");
+    };
+    const auto decode = [&](qwen::SequenceHandle sequence, bool terminal) {
+        reserve(sequence, qwen::ExecutionUnitKind::Decode, 1);
+        const std::array<qwen::SequenceHandle, 1> members{sequence};
+        const std::array<runtime::RoundBudget, 1> budgets{{{.generated_tokens_remaining = 1}}};
+        auto pending = program.decode(members, budgets, nullptr, nullptr);
+        const std::array<runtime::CommitDecision, 1> decision{{{.accepted_tokens = 1, .terminal = terminal}}};
+        (void)program.commit(std::move(pending), decision, runtime::CommitObservation::AllRows, nullptr);
+    };
+    const auto replay = [&](qwen::SequenceHandle sequence) {
+        std::uint32_t replayed = 0;
+        for (unsigned step = 0; step < kLongPrompt / kChunk + 4; ++step) {
+            reserve(sequence, qwen::ExecutionUnitKind::Replay);
+            const auto progress = program.advance_replay(sequence, nullptr);
+            replayed += progress.processed_tokens;
+            if (progress.complete) { return replayed; }
+        }
+        throw std::runtime_error("cached replay did not complete");
+    };
+    const auto unpinned = [&](std::string_view label) {
+        device.synchronize();
+        index.check_invariants();
+        const std::uint32_t pinned = index.device_pinned_nodes();
+        require(pinned == 0, std::string(label) + ": " + std::to_string(pinned) + " of " +
+                                 std::to_string(index.stats().device_resident_blocks) +
+                                 " Device blocks stayed pinned with no lane bound");
+    };
+    // Pauses the request bound on lane 0 and resumes it on lane 1; the prediction must name what the
+    // resume recomputes.
+    const auto pause_and_resume = [&](const qwen::RequestBasePlan& base, Bound bound, qwen::ExecutionUnitKind kind,
+                                      std::string_view label) {
+        const std::uint32_t predicted = program.pause_replay_tokens(bound.sequence);
+        require(program.start_pause(bound.sequence, nullptr), std::string(label) + ": pause refused");
+        auto paused = settle();
+        require(paused.paused.has_value(), std::string(label) + ": pause lost its request");
+        const std::uint32_t frontier = paused.paused->frontier();
+        unpinned(std::string(label) + " paused");
+        const Bound resumed = bind(base, 1, &*paused.paused, kind);
+        paused.paused.reset();
+        const std::uint32_t replayed = replay(resumed.sequence);
+        std::cout << label << ": paused at " << frontier << ", predicted " << predicted << " to replay, resumed from "
+                  << resumed.reused << ", replayed " << replayed << '\n';
+        require(resumed.reused + predicted == frontier && replayed == predicted,
+                std::string(label) + ": pause_replay_tokens predicted " + std::to_string(predicted) +
+                    " tokens, the resume reused " + std::to_string(resumed.reused) + " of " +
+                    std::to_string(frontier) + " and replayed " + std::to_string(replayed));
+        return resumed;
+    };
+
+    // A decode pause.
+    {
+        const auto base = request(1000);
+        Bound bound     = bind(base, 0, nullptr, qwen::ExecutionUnitKind::Prefill);
+        prefill(bound.sequence, kPromptTokens);
+        for (int round = 0; round < 3; ++round) { decode(bound.sequence, false); }
+        const Bound resumed = pause_and_resume(base, bound, qwen::ExecutionUnitKind::Decode, "decode pause");
+        decode(resumed.sequence, true);
+        require(program.finish(resumed.sequence).status == runtime::ConsumeStatus::Consumed,
+                "the resumed request did not finish");
+        unpinned("decode pause finished");
+    }
+    // A prefill pause on the chunk grid.
+    {
+        const auto base = request(2000);
+        Bound bound     = bind(base, 0, nullptr, qwen::ExecutionUnitKind::Prefill);
+        prefill(bound.sequence, kPauseFrontier);
+        const Bound resumed = pause_and_resume(base, bound, qwen::ExecutionUnitKind::Prefill, "prefill pause");
+        prefill(resumed.sequence, kPromptTokens - kPauseFrontier);
+        decode(resumed.sequence, true);
+        require(program.finish(resumed.sequence).status == runtime::ConsumeStatus::Consumed,
+                "the resumed prefill did not finish");
+        unpinned("prefill pause finished");
+    }
+    // A prefill pause far into a prompt longer than the DFlash2 drafter's ring window: with that drafter,
+    // YE-01 skipped the positions no planned read reaches, so the pause publishes nothing and the resume
+    // replays from the deepest snapshot; the prediction must say so (other backends publish there).
+    {
+        const auto base = request(5000, kLongPrompt);
+        Bound bound     = bind(base, 0, nullptr, qwen::ExecutionUnitKind::Prefill);
+        prefill(bound.sequence, kLongPause);
+        const Bound resumed = pause_and_resume(base, bound, qwen::ExecutionUnitKind::Prefill, "long prefill pause");
+        prefill(resumed.sequence, kLongPrompt - kLongPause);
+        decode(resumed.sequence, true);
+        require(program.finish(resumed.sequence).status == runtime::ConsumeStatus::Consumed,
+                "the resumed long prefill did not finish");
+        unpinned("long prefill pause finished");
+    }
+    // A flexible tap skipped for lack of room stays planned and is taken at the next chunk boundary (after NInfer):
+    // with every Device snapshot slot held, the long prompt's first planned tap is skipped; once the slots return,
+    // the next boundary takes it, a chunk deeper (with DFlash2 its ring is whole there: the tap stayed a planned
+    // read for YE-01), counting one skip and one retry, and a prompt departing just past it resumes there.
+    {
+        const auto ids  = prompt_ids(9000, kLongPrompt);
+        const auto base = request_of(ids);
+        const Bound bound = bind(base, 0, nullptr, qwen::ExecutionUnitKind::Prefill);
+        std::vector<std::uint32_t> held;
+        while (const auto slot = index.acquire_device_slot()) { held.push_back(*slot); }
+        require(!held.empty(), "tap retry: no Device snapshot slot to hold");
+        const auto before    = program.hybrid_stats();
+        std::uint32_t cursor = 0;
+        bool skipped         = false;
+        while (!skipped && cursor + 2U * kChunk < kLongPrompt) {
+            prefill(bound.sequence, kChunk);
+            cursor += kChunk;
+            skipped = program.hybrid_stats().taps_skipped_no_slot > before.taps_skipped_no_slot;
+        }
+        require(skipped, "tap retry: no planned tap was skipped with every slot held");
+        for (const std::uint32_t slot : held) { index.release_device_slot(slot); }
+        prefill(bound.sequence, kChunk);
+        cursor += kChunk;
+        const auto after = program.hybrid_stats();
+        std::cout << "tap retry: skipped at " << cursor - kChunk << ", retried at " << cursor << ": skipped "
+                  << after.taps_skipped_no_slot - before.taps_skipped_no_slot << ", retried "
+                  << after.taps_retried - before.taps_retried << '\n';
+        require(after.taps_retried == before.taps_retried + 1 &&
+                    after.taps_skipped_no_slot == before.taps_skipped_no_slot + 1,
+                "tap retry: the skipped tap was not taken at the next boundary once, with one skip counted");
+        prefill(bound.sequence, kLongPrompt - cursor);
+        decode(bound.sequence, true);
+        require(program.finish(bound.sequence).status == runtime::ConsumeStatus::Consumed,
+                "tap retry: the request did not finish");
+        std::vector<TokenId> departed(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(cursor) + 32);
+        departed.insert(departed.end(), 40, 201);
+        const auto sources = program.hybrid_sources(request_of(departed), nullptr);
+        const std::uint32_t resumed = sources.empty() ? 0U : sources.front().reused_tokens;
+        std::cout << "tap retry: a prompt departing at " << cursor + 32 << " resumes from " << resumed << '\n';
+        require(resumed == cursor, "tap retry: the retried tap does not serve a prompt departing past it");
+        unpinned("tap retry");
+    }
+    // A reply the template will not echo (its first id is the prompt's prompt_end_tap_token: a reasoning closed at
+    // once) leaves a tap at the prompt's end, taken as its first token commits; a next prompt departing there
+    // resumes from it. The first token is learned from the same prompt with the cache off, then marked.
+    // The control marks an id the reply does not start with: no tap, so the departing prompt resumes short of the end.
+    for (const bool control : {false, true}) {
+        const auto ids = prompt_ids(control ? 7000 : 6000, kPromptTokens);
+        TokenId first  = 0;
+        {
+            const auto probe = request_of(ids, std::nullopt, false);
+            const Bound bound = bind(probe, 0, nullptr, qwen::ExecutionUnitKind::Prefill);
+            prefill(bound.sequence, kPromptTokens);
+            first = program.sequences[0].ledger.at(kPromptTokens);
+            require(program.abort(bound.sequence).status == runtime::ConsumeStatus::Consumed,
+                    "the probe request could not abort");
+        }
+        const TokenId other = first == 198 ? 199 : 198;
+        const auto marked   = request_of(ids, control ? other : first);
+        const Bound bound   = bind(marked, 0, nullptr, qwen::ExecutionUnitKind::Prefill);
+        prefill(bound.sequence, kPromptTokens);
+        require(program.sequences[0].ledger.at(kPromptTokens) == first, "the marked request's first id changed");
+        for (int round = 0; round < 2; ++round) { decode(bound.sequence, round == 1); }
+        require(program.finish(bound.sequence).status == runtime::ConsumeStatus::Consumed,
+                "the marked request did not finish");
+        auto departed = ids;
+        departed.push_back(other); // the echo's extra id where the reply began
+        departed.insert(departed.end(), 40, 200);
+        const auto next              = request_of(departed);
+        const auto sources           = program.hybrid_sources(next, nullptr);
+        const std::uint32_t resumed  = sources.empty() ? 0U : sources.front().reused_tokens;
+        std::cout << "prompt-end tap" << (control ? " (control)" : "") << ": first id " << first
+                  << ", the departing prompt resumes from " << resumed << " of " << kPromptTokens << '\n';
+        require(control ? resumed < kPromptTokens : resumed == kPromptTokens,
+                control ? "a reply the template echoes left a snapshot at its prompt's end"
+                        : "a reply the template does not echo left no snapshot at its prompt's end");
+        unpinned("prompt-end tap");
+    }
+    // A resume binding cancelled while its restore is staged, then the same resume again; then shutdown
+    // cleanup with a resume binding staged.
+    {
+        const auto base = request(3000);
+        Bound bound     = bind(base, 0, nullptr, qwen::ExecutionUnitKind::Prefill);
+        prefill(bound.sequence, kPauseFrontier);
+        require(program.start_pause(bound.sequence, nullptr), "cancel fixture: pause refused");
+        auto paused = settle();
+        require(paused.paused.has_value(), "cancel fixture: pause lost its request");
+        const std::uint32_t staged = start(base, 1, &*paused.paused, qwen::ExecutionUnitKind::Prefill);
+        const std::atomic<bool> cancelled{true};
+        const auto aborted = settle(runtime::CancellationFlagView{&cancelled});
+        require(aborted.complete && !aborted.published && !program.has_context_transaction(),
+                "a cancelled resume binding published or stayed open");
+        unpinned("resume binding cancelled");
+        const Bound again = bind(base, 1, &*paused.paused, qwen::ExecutionUnitKind::Prefill);
+        require(again.reused == staged, "the paused request lost its source to a cancelled binding");
+        (void)replay(again.sequence);
+        require(program.abort(again.sequence).status == runtime::ConsumeStatus::Consumed,
+                "the resumed request could not abort");
+        unpinned("resumed after a cancelled binding");
+
+        (void)start(base, 0, &*paused.paused, qwen::ExecutionUnitKind::Prefill);
+        program.shutdown_cleanup();
+        require(!program.has_context_transaction(), "shutdown cleanup left a binding open");
+        unpinned("shutdown cleanup during a staged resume");
+        paused.paused.reset();
+    }
+}
+
 SpeculativeBackend selected_backend(std::string_view name) {
     if (name == "none") { return SpeculativeBackend::None; }
     if (name == "mtp") { return SpeculativeBackend::Mtp; }
@@ -477,8 +768,12 @@ int main(int argc, char** argv) {
             fixture.grammar_row_failure();
         }
         program.reset();
+        std::cout << "pause, replay and row failure: OK\n";
         replay_sampling_counts(device, parameters, frontend, options);
-        std::cout << "OK native pause, a pause before the first chunk, replay recovery and row failure\n";
+        std::cout << "replay sampling counts: OK\n";
+        cached_pause_lifecycle(device, parameters, options);
+        std::cout << "OK native pause, a pause before the first chunk, replay recovery, row failure and the cached "
+                     "pause lifecycle\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL native transactions: " << error.what() << '\n';

@@ -306,6 +306,68 @@ int main() {
         failures += check(live.rows(t0).empty(), "every request ended");
     }
 
+    // GET /monitor: the Engine's view of each request it holds, joined with the server's request by
+    // Engine id (an Engine idle-time prefill, or a request not admitted yet, has no server id).
+    {
+        using Clock = LiveRequests::Clock;
+        const Clock::time_point t0 = Clock::now();
+        LiveRequests live;
+        live.begin(21, "agent-a", "anthropic_messages", 70000, t0);
+        live.begin(22, "", "openai_chat_completions", 900, t0);
+        live.progress(21, {.engine_request_id = 104, .prompt_tokens = 70000, .reused_prompt_tokens = 65536});
+        infernix::RequestMonitor monitor;
+        monitor.progress_owner_request_id = 104;
+        monitor.no_progress_seconds       = 0.5;
+        monitor.queued_not_listed         = 3;
+        monitor.requests.push_back({.engine_request_id      = 104,
+                                    .phase                  = infernix::RequestMonitorPhase::Replay,
+                                    .lane                   = 1U,
+                                    .progress_owner         = true,
+                                    .recovery_pending       = true,
+                                    .recovery_route         = infernix::GenerationRecoveryRoute::Replay,
+                                    .prompt_tokens          = 70000,
+                                    .reused_prompt_tokens   = 65536,
+                                    .computed_prompt_tokens = 4464,
+                                    .output_tokens          = 812,
+                                    .preemptions            = 2,
+                                    .snapshot_restores      = 1,
+                                    .replay_restores        = 1,
+                                    .replayed_tokens        = 2048,
+                                    .age_seconds            = 30.0,
+                                    .paused_seconds         = 4.0,
+                                    .since_progress_seconds = 0.25});
+        monitor.requests.push_back({.engine_request_id = 105, .phase = infernix::RequestMonitorPhase::Paused,
+                                    .background = true, .prompt_tokens = 4000});
+        monitor.requests.push_back({.engine_request_id = 106, .phase = infernix::RequestMonitorPhase::Queued});
+        const Json body = Json::parse(render_monitor_json(monitor, live.rows(t0), 1234.5));
+        failures += check(body["schema"] == "infernix.monitor/1" && body["time"] == 1234.5 &&
+                              body["progress_owner"] == 104 && body["no_progress_s"] == 0.5 &&
+                              body["queued_not_listed"] == 3 && body["requests"].size() == 3,
+                          "monitor header fields");
+        const Json& owner = body["requests"][0];
+        failures += check(owner["engine_id"] == 104 && owner["id"] == 21 && owner["label"] == "agent-a" &&
+                              owner["protocol"] == "anthropic_messages" && owner["phase"] == "replay" &&
+                              owner["lane"] == 1 && owner["progress_owner"] == true &&
+                              owner["recovery_pending"] == true && owner["recovery_route"] == "replay" &&
+                              owner["prompt_tokens"] == 70000 && owner["reused_tokens"] == 65536 &&
+                              owner["computed_prompt_tokens"] == 4464 && owner["output_tokens"] == 812 &&
+                              owner["preemptions"] == 2 && owner["snapshot_restores"] == 1 &&
+                              owner["replay_restores"] == 1 && owner["replayed_tokens"] == 2048 &&
+                              owner["age_s"] == 30.0 && owner["paused_s"] == 4.0 && owner["since_progress_s"] == 0.25,
+                          "a monitored request joined with its server request");
+        const Json& background = body["requests"][1];
+        failures += check(background["id"].is_null() && background["label"].is_null() &&
+                              background["protocol"].is_null() && background["phase"] == "paused" &&
+                              background["background"] == true && background["lane"].is_null() &&
+                              background["since_progress_s"].is_null() && background["recovery_route"] == "none",
+                          "an Engine-only request has no server identity");
+        failures += check(body["requests"][2]["phase"] == "queued" && body["requests"][2]["id"].is_null(),
+                          "a queued request's Engine id joins no server request before admission");
+        infernix::RequestMonitor idle;
+        failures += check(Json::parse(render_monitor_json(idle, {}, 1.0))["progress_owner"].is_null(),
+                          "no service turn renders null");
+    }
+
     // memory: what the server holds on the device, in RAM and on the SSD, by part, with the totals the launcher's
     // dashboard shows them against.
     {

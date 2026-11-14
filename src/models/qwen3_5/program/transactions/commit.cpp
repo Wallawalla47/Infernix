@@ -482,6 +482,9 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
 
         for (std::size_t row = 0; row < row_count; ++row) {
             if (!discarded[row]) { settle_unit(lanes[row]); }
+            if (!discarded[row] && pending_kinds[row] == PendingKind::Begin) {
+                hybrid_after_begin(sequences[lanes[row]]);
+            }
         }
         // A round's commit is part of its execution: its span joins its rows' decode time (the prefill's for the
         // prefill's first token), as the decode and prefill calls charge theirs.

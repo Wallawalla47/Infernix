@@ -31,11 +31,12 @@ public:
     explicit ResponseRenderFailure(const std::string& message) : std::runtime_error(message) {}
 };
 
-// How long a streaming route waits for the Engine's admission before it commits its response anyway.
-// Within it the queue's own answers (a queue timeout, an orderly stop) are a plain HTTP status. A
-// request still queued then gets its headers and the stream's heartbeats while it waits, so a client
-// that gives up on a silent connection (one agent client closed every request queued for 120 s,
-// 2026-11-14) keeps it; the queue's later answers arrive in the stream.
+// How long the Messages and Responses streaming routes wait for the Engine's admission before they
+// commit their response anyway. Within it the queue's own answers (a queue timeout, an orderly stop)
+// are a plain HTTP status. A request still queued then gets its headers and the stream's heartbeats
+// while it waits, so a client that gives up on a silent connection (one agent client closed every
+// request queued for 120 s, 2026-11-14) keeps it; the queue's later answers arrive as the protocol's
+// own error event. Chat Completions waits for admission instead (openai_chat_http.cpp).
 inline constexpr std::chrono::seconds kStreamAdmissionGrace{5};
 
 struct HttpGenerationStream {

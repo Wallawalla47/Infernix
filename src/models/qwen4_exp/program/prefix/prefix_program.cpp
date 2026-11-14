@@ -6,6 +6,7 @@
 #include "models/qwen4_exp/program/prefix/test_taps.h"
 #include "models/qwen3_5/program/prefix/block_keys.h"
 #include "runtime/prefix_cache/block_hash.h"
+#include "runtime/prefix_cache/source_policy.h"
 
 #include <algorithm>
 #include <atomic>
@@ -215,7 +216,7 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
         const std::uint32_t k = s.frontier / kBlock;
         for (std::uint32_t b = 0; b < k; ++b) {
             const pc::NodeView view = index.node(s.path[b]);
-            if (view.pins == 0 && view.device == pc::CopyState::Resident) { ++evictable_on_path; }
+            if (view.evictable) { ++evictable_on_path; }
             if (b < s.shared && view.device != pc::CopyState::Resident) { ++host_only; }
         }
         if (s.cow == PrefixCow::Tail) {
@@ -278,22 +279,22 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
         const pc::AdmissionChoice choice = index.choose(match, n);
         std::vector<std::uint32_t> frontiers;
         for (const pc::MatchCandidate& c : match.candidates) { frontiers.push_back(c.frontier); }
-        std::vector<std::size_t> order;
-        if (choice.candidate) { order.push_back(*choice.candidate); }
-        for (std::size_t i = 0; i < match.candidates.size(); ++i) {
-            if (!choice.candidate || i != *choice.candidate) { order.push_back(i); }
-        }
-        // A resumed request takes its deepest state: its pause's own capture when that is cached, which
-        // leaves nothing to replay; a shallower one would replay the tokens past it with prefill arithmetic.
-        if (resumed) {
-            std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
-                return match.candidates[a].frontier > match.candidates[b].frontier;
-            });
-        }
+        // The shared rules (runtime/prefix_cache/source_policy.h): a resumed request takes its deepest state,
+        // its pause's own capture when that is cached, which leaves nothing to replay (a shallower one would
+        // replay the tokens past it with prefill arithmetic); a fresh one the cost model's choice, and a
+        // source that fits now in its place only within a prefill chunk of it.
+        const std::vector<std::size_t> order = pc::source_order(match, choice.candidate, resumed);
+        const std::uint32_t preferred = order.empty() ? 0U : match.candidates[order.front()].frontier;
         // `require_fit` false: the candidate is returned with its need even when it does not fit now.
-        const auto select = [&](bool require_fit = true) -> std::optional<PrefixSelection> {
+        // `only_preferred`: the first candidate alone.
+        const auto select = [&](bool require_fit = true, bool only_preferred = false) -> std::optional<PrefixSelection> {
         for (const std::size_t i : order) {
             const pc::MatchCandidate& c = match.candidates[i];
+            if (only_preferred && i != order.front()) { break; }
+            if (require_fit && !resumed &&
+                !pc::may_stand_in(c.frontier, preferred, false, static_cast<std::uint32_t>(chunk_))) {
+                continue;
+            }
             PrefixSelection s;
             s.snapshot = c.snapshot;
             s.frontier = c.frontier;
@@ -345,6 +346,13 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
             // source is not given up for the root while a finished lane's writes land.
             prefix_->drain();
             if (std::optional<PrefixSelection> s = select(!resumed)) { return s; }
+            if (prefix_ssd_wait_) { return std::nullopt; }
+        }
+        // A fresh request whose preferred source does not fit beside the residents now offers it anyway when
+        // the whole pool holds it: its binding reports the shortage and waits for their release, rather than
+        // a shallow or root start that would recompute restorable history.
+        if (!resumed) {
+            if (std::optional<PrefixSelection> s = select(false, true)) { return s; }
             if (prefix_ssd_wait_) { return std::nullopt; }
         }
     }
@@ -454,16 +462,12 @@ void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queu
             const qwen3_5::PreparedPromptData ledger = ledger_prompt(prompt, *resume);
             const auto n          = static_cast<std::uint32_t>(ledger.token_ids.size());
             pc::MatchResult match = index.match(ledger.token_ids, ledger.block_hashes, ledger.block_extras, n);
-            std::optional<pc::SnapshotRef> deepest;
-            std::uint32_t frontier = 0;
-            for (const pc::MatchCandidate& c : match.candidates) {
-                if (c.frontier <= resume->target && c.frontier >= frontier &&
-                    !prefix::inside_exclusion(c.frontier, spans)) {
-                    deepest  = c.snapshot;
-                    frontier = c.frontier;
-                }
-            }
-            if (deepest) { holds.push_back(*deepest); }
+            std::erase_if(match.candidates, [&](const pc::MatchCandidate& c) {
+                return c.frontier > resume->target || prefix::inside_exclusion(c.frontier, spans);
+            });
+            // bind_replay's choice (source_policy.h): the deepest.
+            const std::vector<std::size_t> order = pc::source_order(match, std::nullopt, true);
+            if (!order.empty()) { holds.push_back(match.candidates[order.front()].snapshot); }
             continue;
         }
         const auto n          = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -854,14 +858,8 @@ qwen3_5::PreparedPromptData ProgramImpl::ledger_prompt(const qwen3_5::PreparedPr
             out.positions[axis * n + token] = static_cast<std::int32_t>(static_cast<std::int64_t>(token) + prompt.rope_delta);
         }
     }
-    const std::uint64_t trailing = prefix_trailing_extra(prompt);
-    const bool extras            = !prompt.block_extras.empty();
-    for (std::size_t b = out.block_hashes.size(); b < n / kBlock; ++b) {
-        const std::uint64_t previous = b == 0 ? pc::kRootLookupHash : out.block_hashes[b - 1];
-        const std::span<const TokenId> tokens(out.token_ids.data() + b * kBlock, kBlock);
-        out.block_hashes.push_back(pc::block_lookup_hash(previous, tokens, trailing));
-        if (extras) { out.block_extras.push_back(trailing); }
-    }
+    // Chained over the output blocks as prefix_publish chains them (source_policy.h).
+    pc::extend_history_keys(out.token_ids, out.block_hashes, out.block_extras, prefix_trailing_extra(prompt));
     out.tap_hints.hints.clear();
     return out;
 }
@@ -923,7 +921,7 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
     // A paused request's frontier is its own resume point: its Host image is admitted over any retained
     // snapshot that is not pinned (a refused capture makes the resume replay, with prefill arithmetic).
     // The claim only admits it; its retention priority is the snapshot's own afterwards.
-    if (resume_point) { c.claim = std::numeric_limits<double>::infinity(); }
+    if (resume_point) { c.claim = pc::kResumePointClaim; }
     const std::uint64_t id = c.id;
     if (prefix_->capture(index, std::move(c), device_.stream)) { prefix_captured(lane, id, F); }
 }

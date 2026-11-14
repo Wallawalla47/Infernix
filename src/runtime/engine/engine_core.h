@@ -419,6 +419,11 @@ public:
         return published_stats_;
     }
 
+    [[nodiscard]] RequestMonitor request_monitor() const {
+        std::lock_guard lock(stats_mutex_);
+        return published_monitor_;
+    }
+
     [[nodiscard]] bool is_available() const {
         std::lock_guard lock(queue_mutex_);
         return !stopping_ && !failed_;
@@ -854,6 +859,7 @@ private:
         if (!request->observation.progress || !request->admitted_begin) { return; }
         const BeginSummary& begin = *request->admitted_begin;
         const GenerationProgressObservation observation{
+            .engine_request_id       = request->id,
             .prompt_tokens           = begin.prompt_tokens,
             .reused_prompt_tokens    = begin.reused_prompt_tokens,
             .processed_prompt_tokens = begin.reused_prompt_tokens + request->computed_prompt_tokens,
@@ -1462,11 +1468,15 @@ private:
         if (decode_round) {
             ++cumulative_stats_.decode_rounds;
             cumulative_stats_.decode_row_rounds += row_count;
+            const auto committed_at = Clock::now();
             for (std::size_t row = 0; row < row_count; ++row) {
                 if (!cancelled[row]) {
                     cumulative_stats_.committed_decode_tokens += decisions[row].accepted_tokens;
                     slots_[lane_indices[row]]->committed_decode_tokens +=
                         decisions[row].accepted_tokens;
+                    if (decisions[row].accepted_tokens != 0) {
+                        slots_[lane_indices[row]]->last_progress = committed_at;
+                    }
                 }
             }
         }
@@ -1586,6 +1596,7 @@ private:
             throw std::logic_error("completed prefill did not reach the admitted prompt frontier");
         }
         if (progress.processed_prompt_tokens != 0) {
+            request->last_progress = Clock::now();
             publish_prompt_progress(request);
             publish_progress_observation(request);
         }
@@ -1791,10 +1802,19 @@ private:
         return allow_pause && pause_reclaim_victim();
     }
 
+    // The tokens a pause of the resident on `lane` would recompute on its resume (the Program's
+    // prediction), so a pressure turn pauses the resident whose resume restores its own state.
+    [[nodiscard]] auto pause_cost() const noexcept {
+        return [this](std::uint32_t lane) noexcept -> std::uint32_t {
+            const auto& request = slots_[lane];
+            return request && request->sequence ? instance_.program->pause_replay_tokens(*request->sequence) : 0U;
+        };
+    }
+
     // Pauses the progress owner's victim, the next one when a resident cannot pause now.
     bool pause_reclaim_victim() {
         std::vector<std::uint32_t> skipped;
-        while (const auto victim = scheduler_.preemption_victim(slots_, max_concurrency_, skipped)) {
+        while (const auto victim = scheduler_.preemption_victim(slots_, max_concurrency_, skipped, pause_cost())) {
             if (pause_resident(*victim)) { return true; }
             if (instance_.program->has_context_transaction()) { return false; }
             skipped.push_back(*victim);
@@ -1926,6 +1946,45 @@ private:
         }
     }
 
+    // The admission trace (Debug): the sources the Program offered the request, in its order with the
+    // one tried marked `*`, and what became of it. A line repeats only when it changes, so a request
+    // waiting across scans logs its wait once.
+    void trace_admission(Request& request, const AdmissionDecision& decision, const std::string& outcome) {
+        const auto path_name = [](PrefixReusePath path) {
+            switch (path) {
+            case PrefixReusePath::HybridEndpoint: return "endpoint";
+            case PrefixReusePath::HybridSnapshot: return "snapshot";
+            case PrefixReusePath::Root: break;
+            }
+            return "root";
+        };
+        std::string line = "admission req " + std::to_string(request.id) +
+                           (decision.restoring ? " resume" : " fresh") + ", prompt " +
+                           std::to_string(request.base_plan ? request.base_plan->summary().prompt_tokens : 0U) +
+                           ": sources";
+        for (std::size_t index = 0; index < decision.sources.size(); ++index) {
+            const SourceCandidate& source = decision.sources[index];
+            line += index == 0 ? " " : ", ";
+            if (index == decision.current) { line += '*'; }
+            line += std::to_string(source.reused_tokens);
+            line += ' ';
+            line += path_name(source.reused_tokens != 0 ? source.reuse_path : PrefixReusePath::Root);
+        }
+        if (!decision.sources.empty() && decision.sources.front().cached_block_tokens != 0) {
+            line += " (cached blocks " + std::to_string(decision.sources.front().cached_block_tokens) + ')';
+        }
+        line += "; " + outcome;
+        if (line == request.admission_trace) { return; }
+        request.admission_trace = line;
+        publish_diagnostic(diagnostics_, DiagnosticLevel::Debug, "%s", line.c_str());
+    }
+
+    [[nodiscard]] static std::string shortage_text(const ContextResourceUsage& shortage) {
+        return "short state " + std::to_string(shortage.state_slots) + ", main KV " +
+               std::to_string(shortage.main_kv_pages) + ", backend KV " + std::to_string(shortage.backend_kv_pages) +
+               " pages";
+    }
+
     // `restoring`: restores the paused progress owner (Scheduler::progress_owner), pausing a
     // resident for its lane or capacity; otherwise admits a fresh request.
     bool try_admit_one(bool restoring) {
@@ -1939,7 +1998,7 @@ private:
         if (restoring && suspended == paused_.end()) { return false; }
         if (!lane && !restoring) { prefetch_blocked_head(); }
         if (!lane && restoring) {
-            if (const auto victim = scheduler_.preemption_victim(slots_, max_concurrency_)) {
+            if (const auto victim = scheduler_.preemption_victim(slots_, max_concurrency_, {}, pause_cost())) {
                 return pause_resident(*victim);
             }
             return false;
@@ -1999,6 +2058,7 @@ private:
             while (decision.current < decision.sources.size()) {
                 const SourceCandidate& source = decision.sources[decision.current];
                 if (!lane) {
+                    trace_admission(*request, decision, "waits for a lane");
                     note_source_wait(request, source, restoring);
                     deferred = true;
                     break;
@@ -2017,6 +2077,7 @@ private:
                                     request->output.pending_control_tokens().size())
                                   : 1U);
                 if (!reservation && !reservation.source_valid) {
+                    trace_admission(*request, decision, "source no longer valid, next");
                     if (!restoring) {
                         request->admission.fallback_reason = AdmissionFallbackReason::SourceInvalid;
                     }
@@ -2027,6 +2088,7 @@ private:
                     // A request no state of the Engine admits, with the Program's own error (Qwen4Exp:
                     // a Vision window its expert cache cannot lend): it fails alone, now.
                     if (reservation.refusal) {
+                        trace_admission(*request, decision, "refused by the Program");
                         fail_unadmittable(request, restoring, reservation.refusal);
                         return true;
                     }
@@ -2035,8 +2097,13 @@ private:
                     // A shortage the cache cannot cover (the other residents hold the pages) evicts nothing
                     // from it: that would take the request's own cached history, to restore it again. A
                     // resumed request pauses a resident for its turn; a fresh one waits for their release.
+                    const std::string short_by = shortage_text(shortage);
                     if (reservation.reclaim_cache ? reclaim(shortage, restoring)
                                                   : restoring && pause_reclaim_victim()) {
+                        trace_admission(*request, decision,
+                                        short_by + (reservation.reclaim_cache
+                                                        ? ", reclaimed from the cache or a pause"
+                                                        : ", the cache cannot cover it: paused a resident"));
                         if (instance_.program->has_context_transaction()) { return true; }
                         continue;
                     }
@@ -2044,9 +2111,14 @@ private:
                     // initial allocation is not a reason to discard this source.
                     if (reservation.capacity_possible &&
                         (!resident_empty() || (!restoring && !paused_.empty()))) {
+                        trace_admission(*request, decision, short_by + ", waits for the residents' release");
                         deferred = true;
                         break;
                     }
+                    trace_admission(*request, decision,
+                                    short_by + (reservation.capacity_possible
+                                                    ? ", nothing resident to release it: next source"
+                                                    : ", beyond the pool: next source"));
                     if (!restoring) {
                         request->admission.fallback_reason =
                             reservation.capacity_possible ? AdmissionFallbackReason::IsolatedCapacity
@@ -2055,6 +2127,7 @@ private:
                     ++decision.current;
                     continue;
                 }
+                trace_admission(*request, decision, "bound");
                 const BeginSummary begin{
                     .prompt_tokens        = request->base_plan->summary().prompt_tokens,
                     .reused_prompt_tokens = source.reused_tokens,
@@ -2442,9 +2515,11 @@ private:
         generated_staged = false;
 
         ++cumulative_stats_.host_work.control_units;
+        const auto committed_at = Clock::now();
         for (const std::uint32_t lane : membership.lane_span()) {
             ++slots_[lane]->host_timing.control_units;
             slots_[lane]->committed_decode_tokens += membership.row_stride;
+            slots_[lane]->last_progress = committed_at;
         }
         cumulative_stats_.committed_decode_tokens += membership.size * membership.row_stride;
 
@@ -3132,6 +3207,7 @@ private:
                         }
                         request->replayed_tokens += progress.processed_tokens;
                         cumulative_stats_.replayed_tokens += progress.processed_tokens;
+                        if (progress.processed_tokens != 0) { request->last_progress = Clock::now(); }
                         if (progress.complete) {
                             // Qwen3.5 binds every resume as a replay from the reused prefix: one that recomputed
                             // nothing resumed from a snapshot at the paused frontier, or was paused before its
@@ -3233,6 +3309,7 @@ private:
     std::size_t current_decode_lane_count_ = 0;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    RequestMonitor published_monitor_;
     bool stopping_ = false;
     bool maintenance_requested_ = false; // guarded by queue_mutex_
     bool failed_   = false;

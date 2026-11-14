@@ -234,7 +234,7 @@ bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, cudaStream_t pr
         return false;
     }
     // The anchor must outlive the copy: the capturing lane may release its path before it lands.
-    if (capture.anchor.valid()) { index_->pin_node(capture.anchor); }
+    if (capture.anchor.valid()) { index_->retain_node(capture.anchor); }
     cudaEvent_t start = take_event();
     CUDA_CHECK(cudaEventRecord(start, producer));
     CUDA_CHECK(cudaStreamWaitEvent(transfer_, start, 0));
@@ -333,7 +333,7 @@ void PrefixCache::commit_staged_capture(std::uint64_t staged, Capture&& capture)
     }
     StagedCapture s = std::move(found->second);
     staged_.erase(found);
-    if (capture.anchor.valid()) { index_->pin_node(capture.anchor); }
+    if (capture.anchor.valid()) { index_->retain_node(capture.anchor); }
     write_state_image_header(lanes_->layout(), capture.meta, slab(s.image.slabs[0]));
     counters_.host_write_bytes += host_.image_bytes + (s.tail ? host_.page.page_stride : 0U);
     ++counters_.host_image_writes;
@@ -422,7 +422,7 @@ void PrefixCache::poll() {
             (!result.snapshot.valid() || *c.capture.supersedes != result.snapshot)) {
             index_->supersede(*c.capture.supersedes, c.capture.continuation);
         }
-        if (c.capture.anchor.valid()) { index_->unpin_node(c.capture.anchor); }
+        if (c.capture.anchor.valid()) { index_->unretain_node(c.capture.anchor); }
         published_[c.capture.id] = result;
         for (cudaEvent_t event : c.events) { recycle(event); }
         captures_.pop_front();
@@ -556,8 +556,9 @@ void PrefixCache::restore_node_page(pc::NodeRef node, DeviceKVPageHandle destina
     if (!restore_.open) { throw std::logic_error("Qwen4Exp prefix cache: no restore is open"); }
     const pc::NodeView view = index_->node(node);
     if (view.host != pc::CopyState::Resident) { throw std::logic_error("Qwen4Exp prefix cache: copied block has no Host copy"); }
-    index_->pin_node(node);
-    restore_.pins.push_back(node);
+    // The copy reads the node's Host slab only: the node stays indexed with it, its Device copy may go.
+    index_->retain_node(node);
+    restore_.retains.push_back(node);
     restore_.pages.push_back(PageCopy{destination, slab(view.host_slab), slab_group(view.host_slab)});
 }
 
@@ -657,6 +658,7 @@ void PrefixCache::await_restore(RestoreTicket ticket) {
 void PrefixCache::finish_restore(RestoreBatch& batch) noexcept {
     for (const pc::NodeRef node : batch.nodes) { index_->complete_device_fill(node); }
     for (const pc::NodeRef node : batch.pins) { index_->unpin_node(node); }
+    for (const pc::NodeRef node : batch.retains) { index_->unretain_node(node); }
     for (const pc::SnapshotRef snapshot : batch.snapshot_pins) { index_->unpin_snapshot(snapshot); }
     for (cudaEvent_t event : batch.events) { recycle(event); }
     batch.events.clear();
@@ -667,6 +669,7 @@ void PrefixCache::abort_restore() noexcept {
     // Nothing was enqueued yet: the destinations go back and the pins are dropped.
     for (const pc::NodeRef node : restore_.nodes) { index_->abort_device_fill(node); }
     for (const pc::NodeRef node : restore_.pins) { index_->unpin_node(node); }
+    for (const pc::NodeRef node : restore_.retains) { index_->unretain_node(node); }
     for (const pc::SnapshotRef snapshot : restore_.snapshot_pins) { index_->unpin_snapshot(snapshot); }
     restore_ = RestoreBatch{};
 }

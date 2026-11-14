@@ -63,7 +63,7 @@ struct GenerationOutcome {
     // 4-gram.
     std::optional<std::uint64_t> output_4grams;
     std::optional<std::uint64_t> output_4grams_in_prompt;
-    // With the request JSONL: why a large re-prefill missed the prefix cache (prefix_miss.h).
+    // Why a large re-prefill missed the prefix cache (prefix_miss.h).
     std::optional<PrefixMiss> prefix_miss;
     // That explanation gave up somewhere, so prefix_miss holds less than the request would explain
     // (prefix_miss.h). The generation itself is unaffected; only a real failure shows as one.
@@ -162,6 +162,9 @@ public:
     // One reading of the device's memory and of this process's use of it (infernix::Engine::device_memory); none
     // for a backend without a device.
     [[nodiscard]] virtual infernix::DeviceMemoryReading device_memory() const { return {}; }
+    // Each request the Engine holds (infernix::Engine::request_monitor, GET /monitor); none for a
+    // backend without an Engine.
+    [[nodiscard]] virtual infernix::RequestMonitor request_monitor() const { return {}; }
     virtual void reset_execution_maxima() noexcept = 0;
     [[nodiscard]] virtual bool is_available() const = 0;
     // An Engine-wide execution failure, as opposed to an orderly stop.
@@ -237,6 +240,10 @@ public:
 
     [[nodiscard]] infernix::DeviceMemoryReading device_memory() const override {
         return engine_->device_memory();
+    }
+
+    [[nodiscard]] infernix::RequestMonitor request_monitor() const override {
+        return engine_->request_monitor();
     }
 
     void reset_execution_maxima() noexcept override { engine_->reset_execution_maxima(); }
@@ -316,7 +323,7 @@ private:
 
     ServeOptions options_;
     std::unique_ptr<infernix::Engine> engine_;
-    // The recent contexts behind GenerationOutcome::prefix_miss (with the request JSONL only).
+    // The recent contexts behind GenerationOutcome::prefix_miss.
     std::unique_ptr<PrefixMissTracker> prefix_misses_;
     std::shared_ptr<RequestCapacity> request_capacity_;
     // Token counting runs the whole preparation path on handler threads, so it has its own bound:

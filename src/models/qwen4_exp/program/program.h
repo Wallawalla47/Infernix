@@ -667,7 +667,7 @@ public:
 
     // ---- execution units (design §19.3.13): a binding reserves the KV pages of its prompt (or
     // replay) plus one round; a decode or control unit grows the lane's pages to its next round, and
-    // a shortage the Engine cannot reclaim pauses the youngest resident ----
+    // a shortage the Engine cannot reclaim pauses a resident (Scheduler::preemption_victim) ----
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units);
     void release_units(std::span<const SequenceHandle>) noexcept {}
     [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept { return false; }
@@ -677,6 +677,10 @@ public:
     // Pause transaction that returns the ResumeState (a lane inside a layer walk's span publishes
     // nothing past the span's start). False while another transaction or a round is open.
     [[nodiscard]] bool start_pause(SequenceHandle sequence, runtime::ExecutionTiming* = nullptr);
+    // The tokens a pause of `sequence` now would recompute on its resume: none where the pause
+    // captures the lane's endpoint, else the frontier past the lineage's deepest snapshot (inside a
+    // layer walk's span). A prediction for choosing a pressure victim.
+    [[nodiscard]] std::uint32_t pause_replay_tokens(SequenceHandle sequence) const noexcept;
     // One prefill call of a resumed lane's ledger, without sampling, toward its paused frontier.
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle sequence, runtime::ExecutionTiming* = nullptr);
 

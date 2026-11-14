@@ -162,6 +162,14 @@ struct PreparedPromptData {
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
     PreparedTapHints tap_hints;
+    // Token frontiers where each earlier assistant reply's generated ids begin, in order: a request that
+    // resumed from an endpoint at or past the last one echoed its latest reply token for token.
+    std::vector<std::uint32_t> reply_frontiers;
+    // A reply whose first generated id is this one is not echoed token for token: a reasoning closed at once
+    // (`</think>` straight after the prompt's `<think>` "\n") comes back as `<think>\n\n</think>`, one id more, so
+    // the next turn departs from the reply's endpoint at this prompt's end. The hybrid cache keeps a snapshot
+    // there for such a reply (hybrid_after_begin). Absent unless the prompt ends by opening the reasoning.
+    std::optional<TokenId> prompt_end_tap_token;
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;
     std::string continuation_content;

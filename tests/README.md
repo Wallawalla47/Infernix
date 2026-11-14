@@ -337,7 +337,16 @@ INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
 ```
 
 `infernix_qwen3_5_native_transactions_test` also pauses a request before its first prefill chunk (an empty
-replay must be granted and complete at once). `infernix_serve_shutdown_real_test` starts `infernix-serve` and
+replay must be granted and complete at once), and runs the prefix cache's pause lifecycle on a Device-only
+cache: decode, prefill and long-prompt prefill pauses whose resumes must recompute exactly the tokens
+`pause_replay_tokens` predicted (none where the pause publishes the lane's state; with `dflash2` the long
+prompt's pause replays from its deepest tap, YE-01), a resume binding cancelled while its restore is staged
+and then resumed again, shutdown cleanup during a staged resume, each leaving no Device-pinned block, the
+tap retry (with every Device snapshot slot held the long prompt's first planned tap is skipped; once they
+return, the next boundary must take it, one skip and one retry counted, and a prompt departing past it must
+resume there), and the prompt-end tap: a prompt marked with its reply's first id as unechoed (`prompt_end_tap_token`) must leave
+a snapshot at its end that a prompt departing there resumes from, and a control marked with another id must
+not. `infernix_serve_shutdown_real_test` starts `infernix-serve` and
 stops it (Ctrl+Break on Windows, SIGTERM elsewhere) while a client streams: the stream must end with an error
 event, the prefix cache file must be saved and the process must exit 0 within 30 s.
 
@@ -398,7 +407,10 @@ test (skipped without it, and for a tokenizer.json of another size).
 as history renders as the prompt's ids then the ids the model generated, so its endpoint serves the next
 turn: through the real Frontend and the maintained Qwen3.8 and Qwen3.6 templates, an empty reasoning's
 `<think>` "\n" plus the model's "\n" `</think>` stay 198 198 (one encoding of the whole text would make them
-271), a reply with reasoning and a thinking-off answer render as generated too.
+271), a reply with reasoning and a thinking-off answer render as generated too, and each history's latest
+reply frontier (where that reply's generated ids begin) is its generation prompt's end; a reasoning closed at
+once (`</think>` straight after the prompt) departs from its endpoint exactly there, and a prompt that opens
+the reasoning marks `</think>` as the first id the template will not echo (a thinking-off prompt marks none).
 
 The agent entry checks multi-turn continuation and branching. The preemption entry exercises
 Replay recovery and cancellation while paused or replaying; `INFERNIX_PREEMPTION_REAL_SCENARIO`
@@ -406,7 +418,11 @@ selects `all`, `replay`, `cancel-paused`, `cancel-replay`, `cache-replay` (the p
 each resume binding from a snapshot of its own prompt; skipped by `all` under a test constraint),
 `fairness` or `cache-fairness` (two long generations in one context of KV: bounded service turns
 must give each at least two recoveries with new output before either ends, and a short request
-submitted under pressure keeps its queue deadline). Native transaction tests cover pause and
+submitted under pressure keeps its queue deadline), or `conversations` (two greedy three-turn
+conversations that do not fit the 4,096-token pool together: the turns must pause each other at least
+once, every later turn must resume from its previous turn's whole context less one block, and on `none`
+and `mtp` Replay may recompute at most one prefill chunk per pause; skipped by `all` under a test
+constraint). Native transaction tests cover pause and
 Replay with the exact ledger splits, grammar-row failure and replayed sampling counts; their
 positional backend is `none`, `mtp`, `dflash` or `dflash2`. Each backend requires an artifact containing that component.
 Public-HTTP latency and output gaps are measured separately by the

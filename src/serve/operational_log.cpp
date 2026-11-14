@@ -251,7 +251,16 @@ OperationalRecord render_request_done(const RequestLogContext& context,
         out << "; " << product::format_pretty_count(outcome.cached_block_tokens)
             << " in cached blocks, no state to resume";
     }
-    out << ") | TTFT " << product::format_pretty_duration(outcome.timings.first_token_seconds)
+    out << ')';
+    // A large re-prefill's cause (prefix_miss.h): the client changed the history, or the cache lost it.
+    if (outcome.prefix_miss) {
+        const PrefixMiss& miss = *outcome.prefix_miss;
+        out << " | miss " << prefix_miss_kind_name(miss.kind)
+            << (miss.kind == PrefixMiss::Kind::Diverged ? " at " : ", shared ")
+            << product::format_pretty_count(miss.common_prefix_tokens) << ", "
+            << product::format_pretty_count(miss.lost_reuse_tokens) << " tok recomputed";
+    }
+    out << " | TTFT " << product::format_pretty_duration(outcome.timings.first_token_seconds)
         << " | total " << product::format_pretty_duration(outcome.timings.total_seconds);
     if (outcome.engine_timing.queue_wait_seconds >= 0.01) {
         out << " | queue "
@@ -466,6 +475,25 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
     }
     if (report.current.terminal_pending_requests != 0) {
         out << " | terminal-pending " << report.current.terminal_pending_requests;
+    }
+    // Recovery over the interval: pauses, resumes from a snapshot at the paused frontier and by
+    // Replay, and the history tokens Replay recomputed (their share of the computed prefill).
+    const std::uint64_t pauses = monotonic_delta(report.previous.preemptions, report.current.preemptions);
+    const std::uint64_t direct =
+        monotonic_delta(report.previous.snapshot_restores, report.current.snapshot_restores);
+    const std::uint64_t replays = monotonic_delta(report.previous.replay_restores, report.current.replay_restores);
+    const std::uint64_t replayed =
+        monotonic_delta(report.previous.replayed_tokens, report.current.replayed_tokens);
+    if (pauses != 0 || direct != 0 || replays != 0 || replayed != 0) {
+        out << " | pauses " << pauses << ", resumes " << direct << " from snapshot, " << replays << " by replay";
+        if (replayed != 0) {
+            out << " (" << product::format_pretty_count(replayed) << " tok replayed";
+            if (const std::uint64_t computed = report.computed_prefill_tokens + replayed; computed != 0) {
+                out << ", " << product::format_pretty_percent(static_cast<double>(replayed) / static_cast<double>(computed))
+                    << " of prefill";
+            }
+            out << ')';
+        }
     }
     if (report.decode_rounds != 0) {
         out << " | batch " << std::fixed << std::setprecision(2)

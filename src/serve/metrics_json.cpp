@@ -340,6 +340,66 @@ std::string render_metrics_json(const MetricsJsonSnapshot& s) {
     return root.dump() + '\n';
 }
 
+const char* request_monitor_phase_name(infernix::RequestMonitorPhase phase) noexcept {
+    using Phase = infernix::RequestMonitorPhase;
+    switch (phase) {
+    case Phase::Queued: return "queued";
+    case Phase::Binding: return "binding";
+    case Phase::Prefill: return "prefill";
+    case Phase::Replay: return "replay";
+    case Phase::Pausing: return "pausing";
+    case Phase::Paused: return "paused";
+    case Phase::Decode: return "decode";
+    case Phase::Control: return "control";
+    case Phase::Finishing: return "finishing";
+    }
+    return "unknown";
+}
+
+std::string render_monitor_json(const infernix::RequestMonitor& monitor,
+                                const std::vector<MetricsJsonActiveRequest>& active, double time_unix) {
+    Json requests = Json::array();
+    for (const infernix::RequestMonitorEntry& entry : monitor.requests) {
+        const auto server = std::find_if(active.begin(), active.end(), [&](const MetricsJsonActiveRequest& row) {
+            return row.engine_request_id != 0 && row.engine_request_id == entry.engine_request_id;
+        });
+        const bool known = server != active.end();
+        requests.push_back(Json{
+            {"engine_id", entry.engine_request_id},
+            {"id", known ? Json(server->id) : Json(nullptr)},
+            {"label", known && !server->label.empty() ? Json(server->label) : Json(nullptr)},
+            {"protocol", known ? Json(server->protocol) : Json(nullptr)},
+            {"phase", request_monitor_phase_name(entry.phase)},
+            {"lane", entry.lane ? Json(*entry.lane) : Json(nullptr)},
+            {"background", entry.background},
+            {"progress_owner", entry.progress_owner},
+            {"recovery_pending", entry.recovery_pending},
+            {"recovery_route", entry.recovery_route == infernix::GenerationRecoveryRoute::Replay ? "replay" : "none"},
+            {"prompt_tokens", entry.prompt_tokens},
+            {"reused_tokens", entry.reused_prompt_tokens},
+            {"computed_prompt_tokens", entry.computed_prompt_tokens},
+            {"output_tokens", entry.output_tokens},
+            {"preemptions", entry.preemptions},
+            {"snapshot_restores", entry.snapshot_restores},
+            {"replay_restores", entry.replay_restores},
+            {"replayed_tokens", entry.replayed_tokens},
+            {"age_s", entry.age_seconds},
+            {"paused_s", entry.paused_seconds},
+            {"since_progress_s", entry.since_progress_seconds ? Json(*entry.since_progress_seconds) : Json(nullptr)},
+        });
+    }
+    const Json root{
+        {"schema", kMonitorJsonSchema},
+        {"time", time_unix},
+        {"progress_owner", monitor.progress_owner_request_id != 0 ? Json(monitor.progress_owner_request_id)
+                                                                  : Json(nullptr)},
+        {"no_progress_s", monitor.no_progress_seconds},
+        {"queued_not_listed", monitor.queued_not_listed},
+        {"requests", std::move(requests)},
+    };
+    return root.dump() + '\n';
+}
+
 void RequestHistory::done(const RequestLogContext& context, const GenerationOutcome& outcome) {
     std::lock_guard lock(mutex_);
     rows_.push_back(make_metrics_json_request(context.id, context, outcome, unix_time_seconds()));
@@ -407,7 +467,8 @@ std::vector<MetricsJsonActiveRequest> LiveRequests::rows(Clock::time_point now) 
     for (const auto& [id, entry] : entries_) {
         const infernix::GenerationProgressObservation& p = entry.position;
         MetricsJsonActiveRequest row;
-        row.id            = id;
+        row.id                = id;
+        row.engine_request_id = entry.admitted ? p.engine_request_id : 0U;
         row.label         = entry.label;
         row.protocol      = entry.protocol;
         row.phase         = !entry.admitted              ? ActiveRequestPhase::Queued

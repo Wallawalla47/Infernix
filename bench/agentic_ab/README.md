@@ -71,7 +71,8 @@ in the serve log.
 **Fixed send order.** Every request of a seed has a place in one global send order, computed
 from the plan alone (`workload.assign_send_order`), and the client sends a request only once every
 request before it has reached the server (its streamed response headers have arrived, which
-Infernix writes at the request's admission, or 5 s after it was queued while it still waits). The
+Infernix writes at the request's admission; Messages and Responses streams also 5 s after it was
+queued while it still waits). The
 order comes from logical rounds: each
 actor's requests take successive rounds, a session waiting on another continues in the round
 after the request it waited for, subagents start in the round after their parent's request and

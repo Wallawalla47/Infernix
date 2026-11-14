@@ -78,6 +78,7 @@ public:
         // Publication refusals (Qwen3.5's Device snapshot slots; other caches have none).
         if constexpr (requires { hybrid.device_slot_refusals; }) {
             out.hybrid_taps_skipped_no_slot       = hybrid.taps_skipped_no_slot;
+            out.hybrid_taps_retried               = hybrid.taps_retried;
             out.hybrid_endpoints_skipped          = hybrid.endpoints_skipped;
             out.hybrid_host_image_write_refusals  = hybrid.host_image_write_refusals;
             out.hybrid_host_block_write_refusals  = hybrid.host_block_write_refusals;

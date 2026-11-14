@@ -10,6 +10,7 @@ add_library(infernix_runtime_support STATIC
   prefix_cache/ssd_tier.cpp
   prefix_cache/ssd_write_budget.cpp
   prefix_cache/fp32_row_codec.cpp
+  prefix_cache/source_policy.cpp
   prefix_cache/tap_planner.cpp
 )
 infernix_internal_includes(infernix_runtime_support)

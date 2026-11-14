@@ -71,6 +71,9 @@ enum class ActiveRequestPhase : std::uint8_t { Queued, Prefill, Decode };
 // request continuing after a server-side tool shows its latest generation).
 struct MetricsJsonActiveRequest {
     std::uint64_t id = 0;
+    // The Engine's id once admitted (GenerationProgressObservation); 0 before. Joins GET /monitor's
+    // rows to the server's request; not rendered in live.active.
+    std::uint64_t engine_request_id = 0;
     std::string label; // X-Infernix-Request-Label; empty: none (rendered null)
     std::string protocol;
     ActiveRequestPhase phase       = ActiveRequestPhase::Queued;
@@ -149,6 +152,17 @@ enum class MetricsFormat : std::uint8_t { Prometheus, Json, Invalid };
                                                   std::string_view accept_header) noexcept;
 
 [[nodiscard]] std::string render_metrics_json(const MetricsJsonSnapshot& snapshot);
+
+inline constexpr const char* kMonitorJsonSchema = "infernix.monitor/1";
+
+[[nodiscard]] const char* request_monitor_phase_name(infernix::RequestMonitorPhase phase) noexcept;
+
+// GET /monitor: each request the Engine holds (infernix::Engine::request_monitor), with the server's
+// request id, label and protocol where it is one of the server's requests in flight (`active`, joined
+// by Engine id; an Engine idle-time prefill or a request not yet admitted has none).
+[[nodiscard]] std::string render_monitor_json(const infernix::RequestMonitor& monitor,
+                                              const std::vector<MetricsJsonActiveRequest>& active,
+                                              double time_unix);
 
 [[nodiscard]] MetricsJsonRequest make_metrics_json_request(std::uint64_t id,
                                                            const RequestLogContext& context,

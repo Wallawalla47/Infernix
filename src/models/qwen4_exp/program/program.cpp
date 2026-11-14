@@ -111,6 +111,10 @@ bool Program::start_pause(SequenceHandle sequence, runtime::ExecutionTiming*) {
     return impl_->start_pause(sequence);
 }
 
+std::uint32_t Program::pause_replay_tokens(SequenceHandle sequence) const noexcept {
+    return impl_->pause_replay_tokens(sequence);
+}
+
 ReplayProgress Program::advance_replay(SequenceHandle sequence, runtime::ExecutionTiming*) {
     impl_->settle_deferred();
     return impl_->advance_replay(sequence);

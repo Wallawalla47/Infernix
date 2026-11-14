@@ -60,20 +60,59 @@ bool ProgramImpl::start_pause(SequenceHandle handle, runtime::ExecutionTiming* o
     return true;
 }
 
+bool ProgramImpl::pause_state_consistent(const SequenceState& sequence, const RequestControl& request) noexcept {
+    const std::uint32_t frontier = sequence.text_kv_valid;
+    return (request.lifecycle == Lifecycle::Active && frontier == sequence.execution_frontier) ||
+           (request.lifecycle == Lifecycle::Prefilling && request.prefill && frontier == request.prefill->cursor) ||
+           (request.lifecycle == Lifecycle::Replaying && frontier == request.replay_cursor);
+}
+
+bool ProgramImpl::pause_context_appendable(const SequenceState& sequence) const noexcept {
+    const std::uint32_t frontier = sequence.text_kv_valid;
+    // Decode leaves the round's accepted tokens out of the drafter's context until the next round; a snapshot
+    // carries a whole ring. A drafter with its own paged KV would need pages mapped at the pause, under the
+    // pressure that is pausing the lane: it replays instead.
+    return !is_masked_draft_backend(speculative_backend) || sequence.dflash_context_frontier >= frontier ||
+           (backend_kv_cache() == nullptr && frontier - sequence.dflash_context_frontier <= draft_window + 1U);
+}
+
+bool ProgramImpl::pause_ring_whole(const SequenceState& sequence) const noexcept {
+    if (!is_masked_draft_backend(speculative_backend)) { return true; }
+    // The context append leaves the ring's first position alone.
+    return pause_context_appendable(sequence) && dflash_ring_whole(sequence, sequence.text_kv_valid);
+}
+
+std::uint32_t ProgramImpl::pause_replay_tokens(SequenceHandle handle) const noexcept {
+    if (!valid_sequence(handle)) { return 0; }
+    const auto lane               = ContractAccess::lane(handle).value;
+    const SequenceState& sequence = sequences[lane];
+    const RequestControl& request = requests[lane];
+    // The frontier the resume returns to (start_pause's ResumeState).
+    const std::uint32_t target = request.lifecycle == Lifecycle::Prefilling && request.prefill ? request.prefill->cursor
+                                 : request.lifecycle == Lifecycle::Replaying                   ? request.replay_target
+                                                                                               : sequence.execution_frontier;
+    if (!hybrid_ || lane >= max_concurrency) { return target; }
+    const HybridLaneState& lane_state = hybrid_lanes_[lane];
+    const std::uint32_t frontier      = sequence.text_kv_valid;
+    // hybrid_publish_endpoint's conditions for a pausing lane.
+    const bool grid     = !execution_schedule.grid_cache ||
+                          (frontier <= lane_state.prompt_tokens && frontier % prefill_chunk == 0);
+    const bool captures = sequence.kv && lane_state.active && lane_state.publish && frontier != 0 && grid &&
+                          frontier > lane_state.deepest_snapshot && pause_state_consistent(sequence, request) &&
+                          (!sequence.kv->backend ||
+                           backend_kv_valid(sequence) >= hybrid_backend_frontier(frontier)) &&
+                          pause_ring_whole(sequence);
+    const std::uint32_t cached = captures ? frontier : std::min(lane_state.deepest_snapshot, frontier);
+    return target > cached ? target - cached : 0U;
+}
+
 void ProgramImpl::hybrid_publish_pause(SequenceState& sequence, const RequestControl& request) {
     if (!hybrid_ || !sequence.kv || sequence.lane >= max_concurrency) { return; }
     const std::uint32_t frontier = sequence.text_kv_valid;
-    const bool consistent =
-        (request.lifecycle == Lifecycle::Active && frontier == sequence.execution_frontier) ||
-        (request.lifecycle == Lifecycle::Prefilling && request.prefill && frontier == request.prefill->cursor) ||
-        (request.lifecycle == Lifecycle::Replaying && frontier == request.replay_cursor);
-    if (!consistent || frontier == 0) { return; }
+    if (!pause_state_consistent(sequence, request) || frontier == 0) { return; }
     if (is_masked_draft_backend(speculative_backend) && sequence.dflash_context_frontier < frontier) {
-        // Decode leaves the round's accepted tokens out of the drafter's context until the next round; a snapshot
-        // carries a whole ring. A drafter with its own paged KV would need pages mapped here, under the pressure
-        // that is pausing the lane: it replays instead.
+        if (!pause_context_appendable(sequence)) { return; }
         const std::uint32_t lag = frontier - sequence.dflash_context_frontier;
-        if (backend_kv_cache() != nullptr || lag > draft_window + 1U) { return; }
         const std::array<std::uint32_t, 1> lanes{sequence.lane};
         const std::array<std::uint32_t, 1> starts{sequence.dflash_context_frontier};
         const std::array<std::uint32_t, 1> counts{lag};

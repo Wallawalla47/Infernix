@@ -195,6 +195,7 @@ struct HybridPrefixCacheStats {
     std::uint64_t taps_created               = 0;
     std::uint64_t taps_skipped               = 0;
     std::uint64_t taps_skipped_no_slot       = 0;
+    std::uint64_t taps_retried               = 0;
     std::uint64_t endpoints_created          = 0;
     std::uint64_t endpoints_skipped          = 0;
     std::uint64_t host_image_write_refusals  = 0;
@@ -402,6 +403,11 @@ public:
     // state up to the frontier and replays the rest.
     [[nodiscard]] bool start_pause(SequenceHandle sequence,
                                    runtime::ExecutionTiming* timing = nullptr);
+    // The tokens a pause of `sequence` now would recompute on its resume: none where the pause
+    // publishes the lane's state at its frontier, else the frontier past the lane's deepest
+    // snapshot (a prefill whose DFlash2 ring is not whole there, YE-01). A prediction for choosing
+    // a pressure victim; the pause's publication still decides.
+    [[nodiscard]] std::uint32_t pause_replay_tokens(SequenceHandle sequence) const noexcept;
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView cancellation);
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;

@@ -318,7 +318,8 @@ private:
         bool open = false;
         RestoreTicket ticket;
         std::vector<runtime::prefix_cache::NodeRef> nodes; // Filling until the batch lands
-        std::vector<runtime::prefix_cache::NodeRef> pins;
+        std::vector<runtime::prefix_cache::NodeRef> pins;    // restore destinations (pin_node)
+        std::vector<runtime::prefix_cache::NodeRef> retains; // Host slabs a copy reads (retain_node)
         std::vector<runtime::prefix_cache::SnapshotRef> snapshot_pins;
         std::vector<PageCopy> pages;
         std::optional<runtime::prefix_cache::SnapshotRef> image;

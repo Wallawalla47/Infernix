@@ -142,6 +142,10 @@ BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::
     return impl_->start_binding(base, lane, source, resume, kind, tokens);
 }
 
+std::uint32_t Program::pause_replay_tokens(SequenceHandle h) const noexcept {
+    return impl_->pause_replay_tokens(h);
+}
+
 bool Program::start_pause(SequenceHandle h, runtime::ExecutionTiming* timing) {
     return impl_->start_pause(h, timing);
 }

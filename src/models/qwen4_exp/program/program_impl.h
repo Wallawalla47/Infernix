@@ -1975,12 +1975,17 @@ public:
             lane.prefix.hints  = data.tap_hints.hints;
             lane.prefix.exclusions = prefix_exclusions(data);
             // Make room before reserving: an elastic pool grows only for what eviction cannot free, so
-            // idle cache blocks never hold memory the expert frames could use (design §19.3.11).
-            pc_make_room(selection->need);
-            if (pool_->available_pages() < selection->need) { (void)grow_kv(selection->need); }
-            auto reservation = pool_->reserve(selection->need);
+            // idle cache blocks never hold memory the expert frames could use (design §19.3.11). Only room
+            // the cache can give (binding_room_possible) is made.
+            const bool room_possible = binding_room_possible(index, selection->need);
+            if (room_possible) {
+                pc_make_room(selection->need);
+                if (pool_->available_pages() < selection->need) { (void)grow_kv(selection->need); }
+            }
+            auto reservation = room_possible ? pool_->reserve(selection->need) : std::nullopt;
             if (!reservation) {
-                const auto out = shortage_of(selection->need);
+                auto out          = shortage_of(selection->need);
+                out.reclaim_cache = room_possible;
                 prefix_unpin(*selection);
                 lane.row = KVExecutionRowLease{};
                 return out;
@@ -2221,12 +2226,16 @@ public:
             lane.prefix.trailing_extra = prefix_trailing_extra(prompt);
             lane.prefix.hints.clear();
             lane.prefix.exclusions = prefix_exclusions(prompt);
-            pc_make_room(selection->need);
-            if (pool_->available_pages() < selection->need) { (void)grow_kv(selection->need); }
-            auto reservation = pool_->reserve(selection->need);
+            const bool room_possible = binding_room_possible(index, selection->need);
+            if (room_possible) {
+                pc_make_room(selection->need);
+                if (pool_->available_pages() < selection->need) { (void)grow_kv(selection->need); }
+            }
+            auto reservation = room_possible ? pool_->reserve(selection->need) : std::nullopt;
             if (!reservation) {
                 BindingReservation out;
                 out.shortage.main_kv_pages = selection->need - std::min(selection->need, pool_->available_pages());
+                out.reclaim_cache          = room_possible;
                 prefix_unpin(*selection);
                 lane.row = KVExecutionRowLease{};
                 return out;
@@ -2374,6 +2383,28 @@ public:
         return true;
     }
 
+    // The tokens a pause of `sequence` now would recompute on its resume (Program::pause_replay_tokens):
+    // none where prefix_finish captures the lane's endpoint at its frontier, otherwise the frontier past
+    // the lineage's deepest snapshot (inside a layer walk's span, without free cache resume, or while
+    // the MTP blocks are unfinished).
+    std::uint32_t pause_replay_tokens(SequenceHandle sequence) const noexcept {
+        const auto slot = ContractAccess::lane(sequence);
+        if (ContractAccess::owner(sequence) != this || slot >= options_.max_concurrency ||
+            lanes_[slot].phase == Phase::Free || lanes_[slot].epoch != ContractAccess::epoch(sequence)) {
+            return 0;
+        }
+        const Lane& lane           = lanes_[slot];
+        const std::uint32_t target = lane.replay ? lane.prefill_end : lane.state_tokens;
+        if (!prefix_ || !lane.prefix.reuse) { return target; }
+        const std::uint32_t F  = lane.state_tokens;
+        const bool walking     = walk_.active && walk_.lane == slot;
+        const bool full_blocks = !lane.mtp_live || lane.mtp_cells >= F / runtime::prefix_cache::kBlockTokens * runtime::prefix_cache::kBlockTokens;
+        const bool captures    = !walking && options_.free_cache_resume && F > lane.prefix.deepest && full_blocks &&
+                              lane.prefix.path.size() >= F / runtime::prefix_cache::kBlockTokens;
+        const std::uint32_t cached = captures ? F : std::min(lane.prefix.deepest, F);
+        return target > cached ? target - cached : 0U;
+    }
+
     // One prefill call of a resumed lane's ledger toward its paused frontier, without sampling.
     ReplayProgress advance_replay(SequenceHandle sequence) {
         const std::uint32_t index = lane_of(sequence);
@@ -2391,7 +2422,7 @@ public:
     // Grows each unit's lane to its next round (design §19.3.13): a decode or control unit needs the
     // positions it writes, a verification's columns and the drafter's cells, within the request's
     // extent. A shortage cached blocks and the elastic pool cannot cover is reported, and the Engine
-    // reclaims or pauses the youngest resident.
+    // reclaims or pauses a resident (Scheduler::preemption_victim).
     runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units) {
         runtime::ResourceReservation out;
         for (const ExecutionUnit& unit : units) {
@@ -6898,6 +6929,22 @@ private:
     std::optional<PrefixSelection> prefix_select(const qwen3_5::PreparedPromptData& prompt, const BasePlanImpl& base,
                                                  std::uint32_t lane, bool resumed = false);
     void pc_make_room(std::uint32_t pages);
+    // Whether a binding on lane `index` needing `pages` (its selection pinned) can get them from the cache: every
+    // evictable cached page, those only in-flight transfers hold once they land, and the pool's growth. Always
+    // while no other lane holds KV, as every cached page can then go. Otherwise the binding makes no room and
+    // reports its shortage with reclaim_cache false: the Engine pauses a resident for a resume or defers a fresh
+    // request, instead of evicting the request's own cached history for nothing (source_policy.h).
+    [[nodiscard]] bool binding_room_possible(std::uint32_t index, std::uint32_t pages) const noexcept {
+        if (!prefix_) { return true; }
+        bool resident = false;
+        for (std::uint32_t other = 0; other < lanes_.size(); ++other) {
+            resident = resident || (other != index && lanes_[other].phase != Phase::Free);
+        }
+        const runtime::prefix_cache::PrefixCacheIndex& cache = prefix_->index();
+        return !resident || static_cast<std::uint64_t>(pages) <=
+                                static_cast<std::uint64_t>(pool_->available_pages()) + cache.device_evictable_blocks() +
+                                    cache.device_transfer_held_blocks() + kv_grow_pages();
+    }
     // Whether a fresh prompt reusing `reuse` tokens should wait for a prefilling sibling's snapshot
     // inside their shared prefix; plans that snapshot as a boundary tap of the sibling when so.
     bool prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt, std::uint32_t reuse);

@@ -352,6 +352,10 @@ struct HybridLaneState {
     std::size_t next_tap = 0;
     std::vector<runtime::prefix_cache::TapExclusion> exclusions;
     std::vector<HybridPendingTap> pending;
+    // A flexible tap was skipped for lack of room: it stays planned at next_tap, so the next chunk
+    // boundary takes it (deeper, as flexible taps may move), until one is taken or the prompt ends
+    // (after NInfer).
+    bool tap_retry = false;
     // Most recent snapshot frontier this sequence reused or captured.
     std::uint32_t last_capture = 0;
     // Deepest snapshot frontier known on this path (reused or created by this sequence).
@@ -409,6 +413,7 @@ public:
                                                    const SourceCandidate&, ResumeState*,
                                                    ExecutionUnitKind, std::uint32_t);
     [[nodiscard]] bool start_pause(SequenceHandle, runtime::ExecutionTiming*);
+    [[nodiscard]] std::uint32_t pause_replay_tokens(SequenceHandle) const noexcept;
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView);
 
     [[nodiscard]] bool has_context_transaction() const noexcept {
@@ -442,6 +447,12 @@ public:
     [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);
     [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
+    // The one answer to how many Device pages the prefix cache can give up for a binding (source
+    // choice, the binding's own check and the drain decision all ask it): its evictable blocks now,
+    // and with `after_transfers` those only in-flight transfers hold, evictable once they land; less
+    // the blocks of `path` the binding would pin.
+    [[nodiscard]] std::uint64_t hybrid_cache_room(std::span<const runtime::prefix_cache::NodeRef> path,
+                                                  bool after_transfers) const;
     void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue,
                            std::span<const ResumeState* const> resumes);
     // A paused request's ledger: its prompt and generated tokens (through the next input when it was
@@ -1021,11 +1032,16 @@ public:
     // publishes the pending taps those blocks complete.
     void hybrid_publish_blocks(SequenceState& sequence);
     // Snapshots the lane's committed state at the prefill frontier `frontier`; a boundary tap is
-    // published as SnapshotKind::Boundary.
-    void hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier, bool boundary);
+    // published as SnapshotKind::Boundary. True when it was skipped for lack of room (no Device
+    // snapshot slot or state image); a `retry` counts no second skip.
+    bool hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier, bool boundary, bool retry = false);
     // Realizes the planned taps a completed prefill chunk reached.
     void hybrid_after_prefill_chunk(SequenceState& sequence, std::uint32_t cursor,
                                     std::uint32_t prompt_tokens);
+    // After a prompt's first output token commits, while the lane's state is still at the prompt's end: a
+    // reply the template will not echo (its first id is PreparedPromptData::prompt_end_tap_token) leaves a
+    // tap there, with no prefill split, for the next turn that departs from its endpoint at the prompt's end.
+    void hybrid_after_begin(SequenceState& sequence);
     // The tokens a prefill step wider than prefill_chunk may take from `cursor` (at most
     // `tokens`): it ends no later than the chunk boundary where a chunk-wide prefill would
     // realize the lane's next flexible tap, so idle-wide-prefill snapshots where it does.
@@ -1058,6 +1074,16 @@ public:
     // context first takes the last round's accepted tokens, as the next round would. A prefill whose drafter ring
     // is not whole at the frontier (YE-01 skips what no planned read reaches) publishes nothing there.
     void hybrid_publish_pause(SequenceState& sequence, const RequestControl& request);
+    // Whether the lane's state is consistent at its committed KV frontier (a prefill or replay
+    // unit's end, a committed decode round): where a pause can publish it.
+    [[nodiscard]] static bool pause_state_consistent(const SequenceState& sequence,
+                                                     const RequestControl& request) noexcept;
+    // Whether hybrid_publish_pause can give the drafter's context the last round's accepted tokens (a DFlash2
+    // drafter without paged KV of its own, at most a round behind); always without a masked drafter.
+    [[nodiscard]] bool pause_context_appendable(const SequenceState& sequence) const noexcept;
+    // Whether the lane's DFlash2 ring will be whole at the frontier once the pause appended that context
+    // (YE-01 skipped nothing a read reaches); always without a masked drafter.
+    [[nodiscard]] bool pause_ring_whole(const SequenceState& sequence) const noexcept;
     // Drops the lane's index pins and pending taps. Safe on any lane state. A lane marked
     // `withdraw` writes nothing through and withdraws what it published (hybrid_withdraw).
     void hybrid_release_lane(std::uint32_t lane) noexcept;

@@ -187,9 +187,75 @@ void EngineCore<Instance>::publish_runtime_stats() {
         snapshot.memory.vram_headroom = instance_.kv_capacity_resolution.automatic_headroom_bytes;
     }
 
+    const Clock::time_point now = Clock::now();
+    RequestMonitor live;
+    live.progress_owner_request_id = scheduler_.progress_owner().value_or(0U);
+    const auto describe = [&](const Request& request, RequestMonitorPhase phase, std::optional<std::uint32_t> lane) {
+        RequestMonitorEntry out;
+        out.engine_request_id      = request.id;
+        out.phase                  = phase;
+        out.lane                   = lane;
+        out.background             = request.background;
+        out.progress_owner         = request.id == live.progress_owner_request_id;
+        out.recovery_pending       = request.recovery_pending;
+        out.recovery_route         = request.recovery_route;
+        out.prompt_tokens          = request.prompt_summary.prompt_tokens;
+        out.reused_prompt_tokens   = request.admitted_begin ? request.admitted_begin->reused_prompt_tokens : 0U;
+        out.computed_prompt_tokens = request.computed_prompt_tokens;
+        out.output_tokens          = request.generated.size();
+        out.preemptions            = request.preemption_count;
+        out.snapshot_restores      = request.snapshot_restores;
+        out.replay_restores        = request.replay_restores;
+        out.replayed_tokens        = request.replayed_tokens;
+        out.age_seconds            = std::chrono::duration<double>(now - request.submitted).count();
+        out.paused_seconds =
+            static_cast<double>(request.paused_ns + (request.paused_at ? elapsed_ns(*request.paused_at, now) : 0)) * 1.0e-9;
+        if (request.last_progress) {
+            out.since_progress_seconds = std::chrono::duration<double>(now - *request.last_progress).count();
+        }
+        return out;
+    };
+    const auto resident_phase = [](const Request& request) {
+        switch (request.model_state) {
+        case EngineRequestState::Waiting: return RequestMonitorPhase::Queued;
+        case EngineRequestState::Materializing: return RequestMonitorPhase::Binding;
+        case EngineRequestState::Prefill: return RequestMonitorPhase::Prefill;
+        case EngineRequestState::Replay: return RequestMonitorPhase::Replay;
+        case EngineRequestState::Pausing: return RequestMonitorPhase::Pausing;
+        case EngineRequestState::Paused: return RequestMonitorPhase::Paused;
+        case EngineRequestState::DecodeReady: return RequestMonitorPhase::Decode;
+        case EngineRequestState::ControlReady: return RequestMonitorPhase::Control;
+        case EngineRequestState::ModelFinished: break;
+        }
+        return RequestMonitorPhase::Finishing;
+    };
+    for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+        if (slots_[lane] != nullptr) { live.requests.push_back(describe(*slots_[lane], resident_phase(*slots_[lane]), lane)); }
+    }
+    if (materializing_) {
+        live.requests.push_back(describe(*materializing_->request, RequestMonitorPhase::Binding,
+                                         materializing_->destination.value));
+    }
+    // A pausing request is the context owner until its Pause transaction completes.
+    if (context_owner_ && context_owner_->model_state == EngineRequestState::Pausing &&
+        std::none_of(live.requests.begin(), live.requests.end(),
+                     [&](const RequestMonitorEntry& listed) { return listed.engine_request_id == context_owner_->id; })) {
+        live.requests.push_back(describe(*context_owner_, RequestMonitorPhase::Pausing, std::nullopt));
+    }
+    for (const auto& request : paused_) { live.requests.push_back(describe(*request, RequestMonitorPhase::Paused, std::nullopt)); }
+
     {
         std::lock_guard lock(queue_mutex_);
         snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
+        std::size_t queued_listed = 0;
+        for (const auto& request : pending_) {
+            if (queued_listed == RequestMonitor::kListedQueued) {
+                ++live.queued_not_listed;
+                continue;
+            }
+            ++queued_listed;
+            live.requests.push_back(describe(*request, RequestMonitorPhase::Queued, std::nullopt));
+        }
     }
     snapshot.prefilling_requests              = 0;
     snapshot.paused_requests                  = static_cast<std::uint32_t>(paused_.size());
@@ -213,9 +279,11 @@ void EngineCore<Instance>::publish_runtime_stats() {
                   &RuntimeHostWorkStats::stats_publication_invocations, detail_started);
     phase_range.reset();
     finish_engine_phase(measurement, EngineHostPhase::Maintenance);
-    snapshot.host_work = cumulative_stats_.host_work;
+    snapshot.host_work       = cumulative_stats_.host_work;
+    live.no_progress_seconds = snapshot.no_progress_seconds;
     std::lock_guard lock(stats_mutex_);
     published_stats_ = snapshot;
+    published_monitor_  = std::move(live);
 }
 
 template <class Instance>

@@ -1657,6 +1657,8 @@ using GenerationFirstTokenObserver = std::function<void(const GenerationFirstTok
 // prefix, as PromptProgress does; generated_tokens counts accepted tokens, as
 // GenerationTimingObservation does.
 struct GenerationProgressObservation {
+    // The Engine's request id (GenerationResult::engine_request_id, RequestMonitorEntry's).
+    std::uint64_t engine_request_id       = 0;
     std::uint32_t prompt_tokens           = 0;
     std::uint32_t reused_prompt_tokens    = 0;
     std::uint32_t processed_prompt_tokens = 0;
@@ -2354,6 +2356,7 @@ struct RuntimeStats {
     // refused Host slabs (they stay Device-only), Device snapshot slots taken from an owner, slot
     // requests refused, and the slots free now.
     std::uint64_t hybrid_taps_skipped_no_slot      = 0;
+    std::uint64_t hybrid_taps_retried              = 0; // flexible taps taken a boundary later after a skip for room
     std::uint64_t hybrid_endpoints_skipped         = 0;
     std::uint64_t hybrid_host_image_write_refusals = 0;
     std::uint64_t hybrid_host_block_write_refusals = 0;
@@ -2437,6 +2440,58 @@ struct RuntimeStats {
     std::uint64_t next_turn_prefills_skipped          = 0;
     std::uint64_t next_turn_prefills_dropped          = 0;
     std::uint64_t next_turn_prefill_tokens            = 0;
+};
+
+// Where a request the Engine holds stands (Engine::request_monitor).
+enum class RequestMonitorPhase : std::uint8_t {
+    Queued,    // waiting for admission
+    Binding,   // its binding restores cached state into a lane
+    Prefill,   // computing its prompt
+    Replay,    // a resume recomputing its history toward the paused frontier
+    Pausing,   // releasing its lane under resource pressure
+    Paused,    // holds no lane; resumed in its service turn
+    Decode,    // generating
+    Control,   // committing forced control tokens
+    Finishing, // the model finished; its output is being delivered
+};
+
+// One request the Engine holds, as its last runtime-stats publication saw it.
+struct RequestMonitorEntry {
+    std::uint64_t engine_request_id = 0;
+    RequestMonitorPhase phase          = RequestMonitorPhase::Queued;
+    std::optional<std::uint32_t> lane;
+    // The Engine's own idle-time prefill of a finished turn (no client).
+    bool background = false;
+    // It owns the current service turn (resource pressure), and a resumed request still protects
+    // its recovery capacity.
+    bool progress_owner   = false;
+    bool recovery_pending = false;
+    // Replay: the request's latest resume recomputes history (else it restored its state or was never paused).
+    GenerationRecoveryRoute recovery_route = GenerationRecoveryRoute::None;
+    std::uint32_t prompt_tokens            = 0;
+    // Admitted requests: the prompt prefix its binding reused, and the prompt tokens computed since.
+    std::uint32_t reused_prompt_tokens   = 0;
+    std::uint32_t computed_prompt_tokens = 0;
+    std::uint64_t output_tokens          = 0;
+    std::uint64_t preemptions            = 0;
+    std::uint64_t snapshot_restores      = 0;
+    std::uint64_t replay_restores        = 0;
+    std::uint64_t replayed_tokens        = 0;
+    double age_seconds                   = 0.0; // since submission
+    double paused_seconds                = 0.0; // in total, the current pause included
+    // Since its last committed progress (prompt prefilled, history replayed, output committed);
+    // none before any.
+    std::optional<double> since_progress_seconds;
+};
+
+// The requests the Engine holds: residents in lane order, the one binding, the paused ones, then
+// the queue in FIFO order (at most `kListedQueued`; `queued_not_listed` counts the rest).
+struct RequestMonitor {
+    static constexpr std::size_t kListedQueued = 32;
+    std::vector<RequestMonitorEntry> requests;
+    std::uint64_t progress_owner_request_id = 0; // 0: no service turn
+    double no_progress_seconds              = 0.0;
+    std::uint32_t queued_not_listed         = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

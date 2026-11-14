@@ -187,7 +187,7 @@ stay queued (their queue deadline still applies) until the admitted requests no 
 ```text
 unit shortfall → reclaim optional reservations and evict cached Device blocks
               → the blocked request takes a service turn (or, during one, waits for its own)
-              → the turn's owner pauses the youngest other resident
+              → the turn's owner pauses the other resident whose pause recomputes least
 ```
 
 **Service turns (adopted 2026-11-04, after NInfer `a754fcf3`, which fixed #434: long requests
@@ -195,7 +195,11 @@ silent for hours while short ones completed).** Every admitted request, resident
 place in a service order kept in admission order. When a resident cannot obtain its unit after the
 cache gave what it could, pressure begins and that request owns the first turn. The owner keeps the
 next capacity hand-over across reclamation, pause, binding and Replay: it pauses residents for its own
-unit (the youngest other one that is not binding, finished or protecting a recovery), it is resumed
+unit (among the others that are not binding, finished or protecting a recovery, the one whose pause
+the Program predicts recomputes the fewest tokens on resume, `pause_replay_tokens`, the youngest among
+equals: a pause that publishes the lane's state at its frontier recomputes nothing, a Qwen3.5 prefill
+whose DFlash2 ring YE-01 left incomplete recomputes from its deepest snapshot, so a generating
+resident is paused before it; adopted 2026-11-14 under the owner's fastest-overall rule), it is resumed
 first when it is the one paused, and while it is paused or binding no other resident reserves a unit,
 so no one borrows capacity released for it. Once it holds its permit, the others use what is left.
 During a turn only the owner may take capacity from a resident; another blocked request only records

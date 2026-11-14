@@ -187,6 +187,8 @@ public:
     // The device's memory now (the serving telemetry's `memory.device`): any thread, cheap enough to poll each second.
     [[nodiscard]] DeviceMemoryReading device_memory() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
+    // Each request the Engine holds, published with runtime_stats (the serving monitor).
+    [[nodiscard]] RequestMonitor request_monitor() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     // Which instruction positions the active chat template renders; prompt preparation lowers an
     // instruction turn that arrived in an unsupported position to a role the template does render.

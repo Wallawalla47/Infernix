@@ -308,16 +308,27 @@ struct BlockNode {                      // host-side; stored in a slab-allocated
     int32_t  host_slab;                 // -1 when not host resident
     Residency device_state;             // Absent | Resident | Filling(event)
     Residency host_state;               // Absent | Resident | Filling(event)
-    // Liveness
-    uint32_t active_refs;               // active sequences whose table maps this node
-    uint32_t restore_pins;              // in-flight transfers reading/writing this node
+    // Liveness: two kinds of pin (2026-11-14)
+    uint32_t pins;                      // existence: this node's own holders plus every pin below it
+                                        // (a pinned node keeps its ancestors indexed: parent.pins >= child.pins)
+    uint32_t device_pins;               // its own Device copy: sequence mappings and transfers of this node only
+    uint32_t transfer_pins;             // of device_pins: in-flight transfers (they release when they land)
     uint32_t live_snapshots_below;      // snapshots whose path includes this node
     uint64_t last_access_tick;
-    IntrusiveLink device_lru;           // present iff active_refs==0 && device Resident
+    IntrusiveLink device_lru;           // present iff device_pins==0 && device Resident
+                                        // && (backed || (pins==0 && io_pins==0))
     IntrusiveLink host_dead;            // present iff live_snapshots_below==0 && no refs && host Resident
     SnapshotId first_snapshot;          // snapshots anchored here (intrusive list)
 };
 ```
+
+Existence and the Device copy are pinned separately. Before 2026-11-14 one counter did both and was
+propagated to every ancestor, so a write in flight to a deep block made its whole path unevictable on
+the Device: a 27B pressure run showed 1,535 such blocks, room no binding could get until the writes
+landed. Now an ancestor of a pinned node stays indexed (`pins`) while its
+Device copy stays evictable when it is backed on the Host; only the node a sequence maps or a transfer
+reads holds its own copy (`device_pins`). A node whose only Device holders are transfers is counted as
+`transfer_held`: it is evictable once those land, which is what a drain gives a binding (§6.3).
 
 A node is only inserted when **all enabled pools** have committed all 64 positions of the block
 (§7.6). A node may be device-only, host-only or both. A node with neither copy is deleted, along
@@ -760,6 +771,12 @@ of the chosen source's cached history to compute again (a paused request: none);
 is offered and its binding waits for room (§8.2), since recomputing restorable history needs the same
 pages within a few units.
 
+Both families take that policy from one place (`runtime/prefix_cache/source_policy.h`, 2026-11-14):
+`source_order` (the choice first, a resume's candidates deepest first), `may_stand_in` (the chunk
+rule above), `extend_history_keys` (a paused ledger's block keys past its prompt) and
+`kResumePointClaim` (the infinite claim a pause's resume point is admitted with, §9.3). Qwen3.8-Flash-Next
+used to keep its own copies, which had drifted (it took the first fitting source).
+
 ### 6.3 Capacity
 
 ```text
@@ -772,7 +789,16 @@ need_state_slot = 1 active slot (a lane implies a free active slot)
 
 A quote keeps `s` when `need_pages(s) ≤ free + evictable`, where evictable pages exclude pages
 pinned by this source's own path; otherwise it tries the next cheaper-to-materialise candidate:
-`s_dev`, then root. Root is always quoted. Later units reserve their own growth as they run
+`s_dev`, then root. Root is always quoted.
+
+One function answers how many Device pages the cache can give up for a binding
+(`ProgramImpl::hybrid_cache_room`, 2026-11-14): the evictable blocks now, plus the blocks only
+in-flight transfers hold when the caller may drain them first, less the blocks of the binding's own
+path that are evictable now (the binding pins them). Source choice, the binding's own precheck and
+the decision to drain transfers all ask it, so they cannot disagree: before, the choice counted a
+drain's blocks, the precheck counted propagated pins as evictable, and a binding started that its
+eviction could not complete. When the answer cannot cover the shortage, the binding says so
+(`BindingReservation::reclaim_cache` false; both families) and evicts nothing. Later units reserve their own growth as they run
 (§9.5), so admission no longer holds a whole output window up front. When staging cannot make
 room from the cache, the shortage goes back to the Engine, which pauses a younger request or keeps
 the request queued, exactly as for a checkpoint source.
@@ -960,11 +986,21 @@ Candidates, in priority order:
   snapshots: conversations may share them, so a lineage moving past one supersedes it only while
   no other conversation has continued from it (§9.3). A cluster keeps this from any member it
   drops.
-- A request that resumed from an endpoint snapshot proves its client echoes generated turns token
-  for token (agent loops, preserved reasoning), so its own endpoint serves the next turn and the
-  generation opener is not tapped. Measured on a tool-calling agent trace (27B NVFP4, INT8 KV,
-  `--preserve-thinking`), the opener split cost about 15 ms of a ~70–130 ms turn TTFT. Requests
-  that resumed from a tap keep the exact opener: their client re-renders history.
+- A request that resumed from an endpoint snapshot at or past its latest reply's frontier (where
+  that reply's generated ids begin, `PreparedPromptData::reply_frontiers` from the template's
+  `generation_splits`) proves its client echoed that reply token for token (agent loops, preserved
+  reasoning), so its own endpoint serves the next turn and the generation opener is not tapped.
+  Measured on a tool-calling agent trace (27B NVFP4, INT8 KV, `--preserve-thinking`), the opener
+  split cost about 15 ms of a ~70–130 ms turn TTFT. Requests that resumed from a tap, or from an
+  endpoint older than the latest reply, keep the exact opener: their history was re-rendered.
+- **A reply the template will not echo** (2026-11-14). A reasoning closed at once (`</think>` straight
+  after the prompt's `<think>` "\n") comes back as `<think>\n\n</think>`, one id more, so the next
+  turn departs from the reply's endpoint exactly at the prompt's end. The Frontend marks a prompt that
+  opens the reasoning with the id that does this (`PreparedPromptData::prompt_end_tap_token`), and
+  when a reply's first committed id is that one the lane takes a tap at the prompt's end at once
+  (`hybrid_after_begin`): its state is still there until the next round, so the tap costs a state copy
+  and no prefill split. On the owner's two-conversation workload (greedy) such a turn had resumed from
+  the turn before it, recomputing 2,134 of a 100,497-token prompt.
 - **Forward snapshots** (`plan_taps`' `opener_near_base`, `PlannedTap::forward`; candidates ZK-03; Flash-Next only).
   The proximity rule above left a conversation of short turns that does not echo its generated turns with a
   snapshot only every other turn: the opener sat less than 64 tokens past the base, so the next turn recomputed
@@ -1063,6 +1099,13 @@ write-through of the image (and tail) into host slabs; `live_snapshots_below++` 
 Once write-through completes, the slot becomes an **evictable device snapshot** (§9.2). A finishing
 lane publishes its remaining pending taps from its own last page, or drops them.
 
+A flexible tap skipped for lack of room (no Device snapshot slot or state image) stays planned and
+is retried at the next chunk boundary, deeper, as flexible taps may move (after NInfer, 2026-11-14),
+until one is taken or the prompt ends; an exact tap is not, since its value is its position. Staying
+planned keeps it a read YE-01 projects the DFlash2 ring for, so the ring is whole at the retry (a
+separate retry flag would have found it incomplete past the window). A retry counts no second skip;
+one taken is counted in `taps_retried`.
+
 ### 7.5 Recomputed region
 
 When `F_s < 64k`, blocks `[F_s/64 .. k)` already exist in the tree but are recomputed, because the
@@ -1109,7 +1152,10 @@ output, such as an agent re-sending the assistant turn, can resume from the endp
 At terminal settlement (Finish, or Cancel after at least one committed unit):
 
 1. If the request is cache-enabled, every pool has committed the frontier (the backend up to its
-   own frontier, `F_end − 1` for MTP) and `F_end − (deepest snapshot on path) ≥ 64`:
+   own frontier, `F_end − 1` for MTP) and `F_end − (deepest snapshot on path) ≥ 64`, or the deepest
+   snapshot is the one the lane resumed from (its pause's capture or the previous turn's endpoint,
+   not a shared `Boundary`), which the endpoint supersedes and so replaces at no extra image
+   (2026-11-14: a DFlash2 turn resumed 57 tokens before its end and its next turn recomputed them):
    - The active StateImage itself becomes the snapshot image (frozen, no copy) in a device snapshot
      slot; if none is free, one is evicted (§9.2), otherwise the endpoint is skipped.
    - The partial last page (`F_end % 64 ≠ 0`) moves to the snapshot as its tail. There is no COW,
@@ -1388,6 +1434,18 @@ Allocation of `k` slabs:
 A snapshot image write stops at step 3 when the victim is worth more than the new snapshot
 (`H(victim) > H(new)`): GDSF never inserts what it would evict next, and the new snapshot stays
 Device-only (§9.2). KV block writes (write-through at release) are not bounded this way.
+
+**Jointly feasible eviction (2026-11-14, after NInfer).** Evicting one victim at a time lost victims
+even when the rest could not free enough: a pause's resume point against a Host tier of held
+snapshots evicted every unheld one and then failed. An allocation now first checks that the order
+above, at its claim, can free all `k` slabs (`host_room_possible`: the free and dead slabs, the
+superseded, SSD-backed and claimable retained snapshots, and the blocks their removal leaves dead),
+and evicts nothing when it cannot. The check passes a removal up to a node's parent only once every
+snapshot at or below the node is counted, so it visits each node at most once per snapshot anchored on
+it and once per child that empties: O(snapshots + nodes) however deep the lineages, not the depth of
+every lineage per snapshot. Operation counters (`PrefixIndexOperations`) guard this: a test drains
+dead blocks with no snapshot-table scan, evicts each snapshot with one scan, and bounds the
+feasibility walk on a 512-block lineage of 64 snapshots to the blocks between two snapshots.
 
 ```text
 H(s)  = L_s + F(s) · C(s) / Z(s)                // L_s: L when s was published or last hit
@@ -1675,6 +1733,13 @@ The test design follows. §13.1 and §13.3 are implemented (`infernix_prefix_cac
   - Blocked vs Infeasible classification;
   - backfill proof on constructed states;
   - quote staleness via `cache_epoch`.
+- **Pins, feasibility and operation counts** (2026-11-14)
+  - a transfer holds only its own block's Device copy, its ancestors stay evictable;
+  - an allocation that cannot complete evicts nothing;
+  - dead blocks drain with no snapshot-table scan, one scan per snapshot evicted, the feasibility
+    walk bounded by the blocks between two snapshots;
+  - NInfer #394's trap: short turns over a 5,120-token system prompt beside a full Host tier of
+    unrelated snapshots each resume from the previous turn's end.
 
 ### 13.2 Op qualification (op-development.md contract, real 27B and 35B-A3B shapes)
 
@@ -2392,6 +2457,125 @@ no frequency), the Qwen3.5 preemption real test on all scenarios with backends n
 (`cache-replay`: every resume from its pause snapshot, 0 replayed tokens; `cache-fairness`: 0 replayed
 against 4,420-5,188 without the cache), the native-transaction, prefix and hybrid-prefix real tests,
 and the Qwen3.8-Flash-Next prefix-cache and preemption real tests.
+
+### 16.11 Designs against the 16.10 failure modes, and NInfer's monitor and lifecycle ideas (2026-11-14)
+
+A review of 16.10 asked which designs would make such failures less likely, and what NInfer's
+upstream offered. The changes, each in the section it concerns:
+
+- **Two kinds of pin** (§5.2): existence (`pins`, propagated to ancestors) and the Device copy
+  (`device_pins`, this node only; `transfer_pins` the transfers among them). A write in flight no
+  longer makes its whole path unevictable.
+- **One capacity answer** (§6.3, `hybrid_cache_room`), asked by source choice, the binding's precheck
+  and the drain decision; Qwen3.8-Flash-Next's binding makes room only when its pages are reachable
+  and reports `reclaim_cache` as Qwen3.5's does.
+- **One source policy for both families** (§6.2, `source_policy.h`).
+- **Jointly feasible Host eviction** (§9.3): nothing is evicted for an allocation that cannot
+  complete; the feasibility check is O(snapshots + nodes) and guarded by operation counts.
+- **The pause victim** (resource-scheduling §5.2): the resident whose pause recomputes least
+  (`pause_replay_tokens`), the youngest among equals, so a Qwen3.5 DFlash2 prefill whose ring YE-01
+  left incomplete is paused after a generating resident.
+- **A flexible tap skipped for lack of room is retried** at the next chunk boundary (§7.4).
+- **An endpoint replaces its resume point however close** (§7.7), found by the new pressure test.
+- **The opener tap after an endpoint resume** (§7.1): dropped only when the resumed endpoint covers
+  the latest reply (`reply_frontiers`); and a reply whose reasoning closes at once, which the template
+  does not echo, leaves a tap at its prompt's end as its first token commits.
+- **Observability**: `GET /monitor` (serving.md, after NInfer's monitor snapshot), the throughput
+  record's pauses, resumes and replayed share, the `req#N done` record's miss kind (the tracker now
+  always on), a Debug admission trace, and the `taps_retried` counter.
+- **Serving**: a Chat Completions stream waits for admission instead of committing after 5 s, as
+  NInfer did for #420 (LiteLLM 1.98 and raw HTTP clients took the later error frame for an empty
+  success); Messages and Responses keep the grace.
+
+Not taken from NInfer: master's source fallthrough after `5cc161ca3` (it gives up the cost model's
+choice for the first fitting source, the 16.10 regression), `77418cfec`'s removal of execution splits
+(Replay repeats them), its unified Device pool, and request-window heat with joint set scoring (GDSF's
+`L` aging and the content-addressed tree cover them). The lifecycle tests are Program-level on the
+real 27B rather than an EngineCore over a fake Program, whose contract surface is too wide to fake
+faithfully.
+
+Tests added: index tests (a transfer pin holds only its block; an infeasible allocation evicts
+nothing; operation counts; NInfer #394's short turns over a 5,120-token system prompt beside a full
+Host tier each resume from the previous turn's end), the scheduler's victim order, the frontend's
+reply frontiers, the throughput, done-line and monitor renderings, the native-transaction test's
+cached lifecycle (decode, prefill and long-prompt prefill pauses whose resumes recompute exactly the
+predicted tokens: 0, 0 and, with DFlash2, 1,024 from a 2,048 tap for a 3,072-token pause; a resume
+binding cancelled while its restore is staged; shutdown during one; no Device-pinned block after
+each; a tap skipped with every slot held and taken a chunk later; the prompt-end tap and its
+control), and the preemption real test's `conversations` scenario (two greedy three-turn conversations
+over a 4,096-token pool: each later turn resumed from its previous turn's whole context, one pause
+resumed from its snapshot, 0 replayed tokens, on none, MTP and DFlash2; before the endpoint rule,
+DFlash2's second conversation resumed 57 tokens short).
+
+Checks on the final build: the CPU tests the change touches (39, Windows), the same tests and the
+affected targets under WSL2 Ubuntu with GCC (0 warnings), the reproducible route's request invariance
+(none, MTP, DFlash2: every request identical; the default-route control differs), Qwen3.5 resume
+against cold (reproducible route bit-exact for MTP and DFlash2), speculation invariance (five modes),
+the preemption real test's combined scenarios ten times on none and five on DFlash2 (no failure; the
+16.10 abort showed in about half such runs), the native-transaction, prefix and hybrid-prefix real
+tests, and Qwen3.8-Flash-Next's prefix-cache, preemption and resume-cold real tests. The reproducible
+route's bits are not expected to change (it takes the new taps only on the chunk grid, as before) and
+did not in these tests.
+
+Measurements, RTX 5090, the owner's 27B launch (§16.10's two-conversation driver, its corpus fixed to
+one checkout and `temperature: 0`, so both builds see the same conversations up to scheduling), main
+`8200dfa2` against this change, ten continuing turns per run:
+
+| build | continuing-turn TTFT mean / median / max | prompt tokens resumed | pauses / Replay restores / replayed tokens |
+|---|---|---|---|
+| 8200dfa2 (two runs) | 2.9 / 1.2 / 18.3 s; 2.6 / 0.9 / 18.4 s | 98.6 %; 98.9 % | 2 / 1 / 21,504 each |
+| this change before the prompt-end tap (two runs) | 2.8 / 1.2 / 18.4 s twice | 98.7 % | 2 / 1 / 21,504 each |
+| this change (two runs) | 2.7 / 1.1 / 18.4 s; 2.7 / 1.0 / 18.4 s | 98.8 %; 98.9 % | 2 / 1 / 21,504 each |
+
+The differences are within the base arm's own spread (its two runs differ by 0.3 s); greedy decoding
+still diverged between runs of one build where scheduling differed. The prompt-end tap's effect is
+direct: where a reply closed its reasoning at once, the next turn resumed from that reply's prompt end
+(the small conversation's turns 2-4: 98,418, 100,497 and 102,258 tokens) where the earlier runs
+resumed a whole turn earlier (turn 2 from 96,284, recomputing 2,134 tokens of its history, which the
+request log recorded as a diverged miss at 98,418), and no run of the final build recorded a miss. The max is the small conversation's turn
+waiting behind the large one's cold 186K prefill, paused once by a service turn and replayed from its
+deepest tap (YE-01), in every run. A sampled run of the same driver (as §16.10's) gave 3.5 / 1.4 /
+22.4 s with four pauses and 75K replayed tokens: its small conversation's turn 1 generated 411 tokens
+during the cold prefill instead of 81, which gave each conversation a second pause; the greedy runs
+show the same single pause for both builds.
+
+The agentic replay of §16.10 (`bench/agentic_ab`, seed 42, scale 1, `--kv-capacity 160000
+--host-context-mib 16000`, sampled, so each run generates different conversations), two runs per
+build:
+
+| build | TTFT mean / median / p90 / max | prompt tokens resumed | cached blocks past the resumable state | pauses (Replay restores, replayed tokens) | unbacked node losses | endpoints | wall |
+|---|---|---|---|---|---|---|---|
+| 8200dfa2 | 1.18 / 0.34 / 3.31 / 20.6 s; 1.32 / 0.30 / 5.25 / 17.2 s | 88.0 %; 87.9 % | 8 requests, 9.3K tokens; 6, 5.9K | 3 (0, 0); 8 (2, 14.3K) | 13; 51 | 133; 136 | 641; 624 s |
+| this change | 1.27 / 0.36 / 4.81 / 13.3 s; 1.00 / 0.34 / 2.34 / 11.5 s | 87.3 %; 88.9 % | 11, 29.0K; 6, 14.2K | 26 (0, 0); 15 (0, 0) | 136; 0 | 155; 145 | 625; 637 s |
+
+Latency and resumed share overlap between the builds; the maximum was lower in both runs (not
+attributed to one mechanism) and no pause replayed. Two differences held in both sampled runs: more pauses, all resumed
+from their snapshots (in the first run two large requests, 92K and 79K tokens with 3.8K and 1.7K
+output tokens, overlapped for about 30 s in the 160K pool and alternated service turns 20 times; the
+base runs' heavy pairs overlapped for 4 s), and more tokens in cached blocks past the request's
+resumable state (14-29K against 6-9K), whose likely cause is the extra Host images (endpoints that
+replace their resume point, prompt-end taps and the pauses' captures) in this deliberately small
+16 GiB Host tier. Three Host image writes per run were refused (0 and 1 in the base runs); the
+feasibility check now refuses a write that cannot complete before it evicts anything.
+
+The same replay at `AB_TEMPERATURE=0`, base, new, new, base (greedy still diverged between runs:
+the default route is not request-invariant and agent loops amplify a difference, so the runs prompted
+5.26-6.04M tokens):
+
+| run | TTFT mean / median / p90 / max | prompt tokens resumed | cached blocks past the resumable state | pauses (Replay restores, replayed tokens) | unbacked node losses | image write refusals |
+|---|---|---|---|---|---|---|
+| 8200dfa2 | 1.10 / 0.32 / 3.00 / 15.5 s | 87.7 % | 8 requests, 8.6K tokens | 0 | 1 | 0 |
+| this change | 1.08 / 0.32 / 2.73 / 16.7 s | 87.3 % | 8, 4.9K | 0 | 0 | 1 |
+| this change | 1.16 / 0.35 / 3.34 / 13.3 s | 87.0 % | 10, 12.4K | 0 | 26 | 1 |
+| 8200dfa2 | 1.61 / 0.35 / 5.61 / 18.4 s | 87.9 % | 10, 41.5K | 5 (1, 28.7K) | 46 | 2 |
+
+Neither difference of the sampled runs recurred: the greedy runs of this change paused nothing and
+left 4.9K and 12.4K tokens past the resumable state, against the base's 8.6K and 41.5K with five
+pauses, one of which replayed 28.7K tokens. The sampled runs' more pauses and past-state tokens are
+therefore within this workload's run-to-run range, which the base arm spans as well; no difference
+between the builds is shown either way at this sample size. The resumed share is 0.4-0.9 points lower
+in the change's greedy runs (87.0-87.3 % against 87.7-87.9 %), also within the sampled runs' range
+(87.3-88.9 % against 87.9-88.0 %).
 
 ## 17. Qwen4Exp binding (Qwen3.8-Flash-Next)
 

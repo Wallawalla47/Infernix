@@ -186,6 +186,9 @@ struct RequestRecord {
     std::optional<Clock::time_point> admitted_at;
     std::optional<Clock::time_point> first_token;
     std::optional<Clock::time_point> last_token;
+    // The last committed unit that advanced the request: prompt tokens prefilled, history replayed,
+    // or output or forced control tokens committed (the monitor's last progress).
+    std::optional<Clock::time_point> last_progress;
     bool queue_wait_recorded = false;
     std::optional<GenerationBudget> budget;
     std::optional<BeginSummary> admitted_begin;
@@ -213,6 +216,8 @@ struct RequestRecord {
     bool admission_observed            = false;
     GenerationAdmissionStats admission;
     std::optional<Clock::time_point> source_wait_started;
+    // The last admission trace line logged for it (EngineCore::trace_admission).
+    std::string admission_trace;
     bool recovery_pending                  = false;
     std::uint64_t committed_decode_tokens  = 0;
     GenerationRecoveryRoute recovery_route = GenerationRecoveryRoute::None;

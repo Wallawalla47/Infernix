@@ -85,8 +85,11 @@ public:
         refuse_at(Stage::Queued);
         throw std::logic_error("a refused request ran");
     }
-    bool admit(PreparedRequest&, std::function<bool()>, std::chrono::steady_clock::time_point) const override {
+    // A route that waits without a deadline (Chat Completions) waits through the queue: its answer
+    // arrives here, before the stream starts.
+    bool admit(PreparedRequest&, std::function<bool()>, std::chrono::steady_clock::time_point until) const override {
         refuse_at(Stage::Admission);
+        if (until == std::chrono::steady_clock::time_point::max()) { refuse_at(Stage::Queued); }
         std::lock_guard lock(mutex_);
         return stage_ != Stage::Queued;
     }
@@ -188,10 +191,11 @@ int test_admission_refusals(RefusingBackend& backend, httplib::Client& client) {
     return failures;
 }
 
-// A request still queued when its admission grace ends (kStreamAdmissionGrace) has its stream started, so
-// a client that gives up on a silent connection keeps it; the queue's later answer is the protocol's
-// in-stream error: Chat's unnamed error data event, Anthropic's message_start then error event, a
-// Response's created, in_progress, then failed.
+// A Messages or Responses request still queued when its admission grace ends (kStreamAdmissionGrace) has
+// its stream started, so a client that gives up on a silent connection keeps it; the queue's later answer
+// is the protocol's in-stream error: Anthropic's message_start then error event, a Response's created,
+// in_progress, then failed. Chat Completions has no such event, so it waits for admission and the queue's
+// answer stays a plain HTTP status.
 int test_queued_streams(RefusingBackend& backend, httplib::Client& client) {
     int failures = 0;
     const ApiError queue_timeout = request_error_to_api_error(
@@ -204,18 +208,17 @@ int test_queued_streams(RefusingBackend& backend, httplib::Client& client) {
         const httplib::Result result = client.Post(route.path, route.body.dump(), "application/json");
         failures += check(static_cast<bool>(result), what + ": no HTTP answer");
         if (!result) { continue; }
-        failures += check(result->status == 200 && event_stream(result), what + ": no event stream");
         if (std::string_view(route.path) == "/v1/chat/completions") {
-            // OpenAI's form: one unnamed data event carrying the error body, then the connection closes.
-            const std::string& body = result->body;
-            const bool one_error    = body.starts_with("data: ") && body.ends_with("\n\n") &&
-                                   body.find("\n\n") == body.size() - 2;
-            const Json error = one_error ? Json::parse(body.substr(6), nullptr, false) : Json(nullptr);
-            failures += check(error.is_object() && error.contains("error") &&
-                                  error.at("error").value("code", "") == queue_timeout.code,
-                              what + ": not one error data event: " + body);
+            failures += check(result->status == 503 && !event_stream(result) &&
+                                  result->get_header_value("Retry-After") == std::to_string(kRetryAfter),
+                              what + ": not the plain queue-timeout status: " + std::to_string(result->status));
+            const Json body = Json::parse(result->body, nullptr, false);
+            failures += check(body.is_object() && body.contains("error") &&
+                                  body.at("error").value("code", "") == queue_timeout.code,
+                              what + ": no error body: " + result->body);
             continue;
         }
+        failures += check(result->status == 200 && event_stream(result), what + ": no event stream");
         std::vector<Json> events;
         try {
             events = sse_events(result->body);

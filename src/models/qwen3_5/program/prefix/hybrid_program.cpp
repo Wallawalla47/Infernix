@@ -16,6 +16,7 @@
 #include "core/device.h"
 #include "core/startup.h"
 #include "runtime/prefix_cache/block_hash.h"
+#include "runtime/prefix_cache/source_policy.h"
 
 #include <algorithm>
 #include <array>
@@ -100,12 +101,7 @@ HistoryKeys history_keys(const PreparedPromptData& prompt, std::span<const Token
         throw std::logic_error("a paused ledger does not extend its prompt");
     }
     out.tokens = ledger;
-    if (trailing_extra != 0 && out.extras.empty()) { out.extras.assign(out.hashes.size(), 0ULL); }
-    for (std::size_t block = out.hashes.size(); block < ledger.size() / kBlock; ++block) {
-        const std::uint64_t previous = block == 0 ? pc::kRootLookupHash : out.hashes[block - 1U];
-        out.hashes.push_back(pc::block_lookup_hash(previous, ledger.subspan(block * kBlock, kBlock), trailing_extra));
-        if (!out.extras.empty()) { out.extras.push_back(trailing_extra); }
-    }
+    pc::extend_history_keys(ledger, out.hashes, out.extras, trailing_extra);
     return out;
 }
 
@@ -313,26 +309,20 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
     // The history a source leaves at least one token of: the prompt to prefill, or a paused
     // request's ledger through its next input.
     const auto n = static_cast<std::uint32_t>(keys.tokens.size());
-    // Device pages a source needs beyond what the pools have free plus the cache can give up:
-    // the restored blocks and tail, the private tail copy and the first unit's growth. Entries
-    // this source pins stop being evictable: its unpinned Device-resident path blocks and the
-    // snapshot's Device-resident tail.
-    // `pinned_room`: blocks only in-flight transfers pin, counted as evictable (they are once drained).
+    // Device pages a source needs beyond what the pools have free plus the cache can give up
+    // (hybrid_cache_room): the restored blocks and tail, the private tail copy and the first unit's
+    // growth. The source's snapshot tail on the Device stops being evictable once pinned. With
+    // `after_transfers`, the room once in-flight transfers land (after a drain).
     const auto fits = [&](const pc::MatchCandidate& candidate, std::span<const pc::NodeRef> path,
-                          std::uint64_t pinned_room = 0) {
+                          bool after_transfers = false) {
         const std::uint32_t frontier = candidate.frontier;
         const std::uint32_t restored =
             candidate.host_only_blocks + (candidate.tail && !candidate.tail_on_device ? 1U : 0U);
-        std::uint32_t evictable_on_path = 0;
-        for (const pc::NodeRef node : path) {
-            const pc::NodeView view = index.node(node);
-            if (view.pins == 0 && view.device == pc::CopyState::Resident) { ++evictable_on_path; }
+        std::uint64_t evictable = hybrid_cache_room(path, after_transfers);
+        if (candidate.tail && candidate.tail_on_device && index.snapshot(candidate.snapshot).pins == 0 &&
+            evictable != 0) {
+            --evictable;
         }
-        if (candidate.tail && candidate.tail_on_device &&
-            index.snapshot(candidate.snapshot).pins == 0) {
-            ++evictable_on_path;
-        }
-        const std::uint64_t evictable = index.device_evictable_blocks() - evictable_on_path + pinned_room;
         const std::uint32_t first     = std::min(n, frontier + prefill_chunk);
         const auto need               = [&](std::uint32_t reuse) {
             return static_cast<std::uint64_t>(kv_pages_for_frontier(first)) - reuse / kBlock +
@@ -367,47 +357,29 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
                candidate.frontier > maximum_frontier || inside_vision(candidate.frontier, ranges);
     });
     const pc::AdmissionChoice choice = index.choose(match, n);
-    std::vector<std::size_t> order;
-    if (resume) {
-        // A resumed request takes its deepest state, its pause's own snapshot when that is cached: every
-        // token above it would be replayed (as Flash-Next's resume, §17).
-        for (std::size_t i = 0; i < match.candidates.size(); ++i) { order.push_back(i); }
-        std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
-            return match.candidates[a].frontier > match.candidates[b].frontier;
-        });
-    } else {
-        if (choice.candidate) { order.push_back(*choice.candidate); }
-        for (std::size_t i = 0; i < match.candidates.size(); ++i) {
-            if (!choice.candidate || i != *choice.candidate) { order.push_back(i); }
-        }
-    }
-    // A source that fits beside the residents now is taken only when it leaves at most a prefill chunk
-    // of the preferred source's cached history to compute again (a resumed request: none). That history
-    // needs the same pages within the request's first units, and recomputing it costs far more than
-    // restoring it (2026-11-14: two agent conversations that did not fit the KV pool together took
-    // sources 65K and 71K tokens short of their cached history this way, 63-94 s to the first token,
-    // with 75 GiB of Host tier mostly free).
-    const std::uint32_t preferred = order.empty() ? 0U : match.candidates[order.front()].frontier;
-    const auto select = [&](std::uint64_t pinned_room) -> std::optional<pc::MatchCandidate> {
+    // The shared rules (runtime/prefix_cache/source_policy.h): a resumed request's deepest source
+    // first, a fitting stand-in only within a prefill chunk of the preferred one.
+    std::vector<std::size_t> order = pc::source_order(match, choice.candidate, resume != nullptr);
+    std::uint32_t preferred        = order.empty() ? 0U : match.candidates[order.front()].frontier;
+    const auto select = [&](bool after_transfers) -> std::optional<pc::MatchCandidate> {
         for (const std::size_t i : order) {
             const pc::MatchCandidate& candidate = match.candidates[i];
-            const bool close = resume ? candidate.frontier == preferred
-                                      : candidate.frontier + prefill_chunk >= preferred;
-            if (close && fits(candidate, std::span<const pc::NodeRef>(match.path.data(), candidate.path_blocks),
-                              pinned_room)) {
+            if (pc::may_stand_in(candidate.frontier, preferred, resume != nullptr, prefill_chunk) &&
+                fits(candidate, std::span<const pc::NodeRef>(match.path.data(), candidate.path_blocks),
+                     after_transfers)) {
                 return candidate;
             }
         }
         return std::nullopt;
     };
-    std::optional<pc::MatchCandidate> selected = select(0U);
+    std::optional<pc::MatchCandidate> selected = select(false);
     // Blocks pinned only by in-flight transfers (a finished lane's Host writes) become evictable once those
     // land: a cached source is not given up for a root bind while they land. Waited for only when that
     // makes a source fit; a request waiting for the residents' pages would otherwise wait for every copy
     // (its own prefetch among them) on each admission pass, stalling the residents' decode.
-    if (!selected && hybrid_->transfers_pending() && select(hybrid_->transfer_pinned_blocks())) {
+    if (!selected && hybrid_->transfers_pending() && select(true)) {
         hybrid_->drain();
-        selected = select(0U);
+        selected = select(false);
     }
     // Otherwise the preferred source is offered even when it does not fit beside the residents now:
     // its binding reports the shortage, and the Engine reclaims cached blocks for it or defers it
@@ -434,13 +406,9 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
         if (promotion == pc::SsdTier::Promotion::Unavailable) {
             // The Host tier cannot take it now: the best source above the SSD serves instead.
             std::erase_if(match.candidates, [](const pc::MatchCandidate& c) { return c.ssd_bytes != 0; });
-            const pc::AdmissionChoice fallback = index.choose(match, n);
-            order.clear();
-            if (fallback.candidate) { order.push_back(*fallback.candidate); }
-            for (std::size_t i = 0; i < match.candidates.size(); ++i) {
-                if (!fallback.candidate || i != *fallback.candidate) { order.push_back(i); }
-            }
-            selected = select(0U);
+            order     = pc::source_order(match, index.choose(match, n).candidate, resume != nullptr);
+            preferred = order.empty() ? 0U : match.candidates[order.front()].frontier;
+            selected  = select(false);
         }
         // Ready: it landed meanwhile; the binding validates the source as it stands.
     }
@@ -546,6 +514,18 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
     return started;
 }
 
+std::uint64_t ProgramImpl::hybrid_cache_room(std::span<const pc::NodeRef> path, bool after_transfers) const {
+    if (!hybrid_) { return 0U; }
+    const pc::PrefixCacheIndex& index = hybrid_->index();
+    std::uint64_t room =
+        index.device_evictable_blocks() + (after_transfers ? index.device_transfer_held_blocks() : 0U);
+    for (const pc::NodeRef node : path) {
+        const pc::NodeView view = index.node(node);
+        if (view.evictable || (after_transfers && view.transfer_held)) { --room; }
+    }
+    return room;
+}
+
 std::uint32_t ProgramImpl::hybrid_prefetch_room() const noexcept {
     if (!hybrid_ || !hybrid_->host_tier()) { return 0U; }
     const std::uint32_t cached = hybrid_->index().device_backed_evictable_blocks();
@@ -587,17 +567,10 @@ void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queu
         std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
             return candidate.frontier >= n || candidate.frontier > maximum || inside_vision(candidate.frontier, ranges);
         });
-        if (resume) {
-            // hybrid_sources' choice for a resume: the deepest.
-            const auto deepest = std::max_element(match.candidates.begin(), match.candidates.end(),
-                                                  [](const pc::MatchCandidate& a, const pc::MatchCandidate& b) {
-                                                      return a.frontier < b.frontier;
-                                                  });
-            if (deepest != match.candidates.end()) { holds.push_back(deepest->snapshot); }
-            continue;
-        }
-        const pc::AdmissionChoice choice = index.choose(match, n);
-        if (choice.candidate) { holds.push_back(match.candidates[*choice.candidate].snapshot); }
+        // hybrid_sources' first choice (source_policy.h): a resume's deepest source, else the cost model's.
+        const std::optional<std::size_t> choice = resume ? std::nullopt : index.choose(match, n).candidate;
+        const std::vector<std::size_t> order    = pc::source_order(match, choice, resume != nullptr);
+        if (!order.empty() && (resume || choice)) { holds.push_back(match.candidates[order.front()].snapshot); }
     }
     // Tool-call holds rank after every waiting request: a conversation whose client has not come
     // back yet gives way before any that has. The earliest deadline (the oldest tool call, the
@@ -896,22 +869,18 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
     };
     try {
         runtime::ContextResourceUsage shortage;
-        // A binding the pools cannot hold even with every cached Device block evicted and every transfer
-        // landed makes no room: it would evict the cache's Device copies (a waiting request's prefetched
-        // blocks among them) and wait for the copies, on every admission pass while it waits.
         // While another lane holds KV, a binding the pools cannot hold even with every evictable cached
-        // Device block evicted and every transfer landed makes no room: it would evict the cache's Device
-        // copies (a waiting request's prefetched blocks among them) and wait for the copies on every
-        // admission pass, and the Engine's reclaim would then evict the request's own cached history for
-        // nothing. Without another lane every cached block can go, so the binding makes room as before.
+        // Device block evicted and every transfer landed (hybrid_cache_room) makes no room: it would evict
+        // the cache's Device copies (a waiting request's prefetched blocks among them) and wait for the
+        // copies on every admission pass, and the Engine's reclaim would then evict the request's own
+        // cached history for nothing. Without another lane every cached block can go, so the binding
+        // makes room in any case.
         bool lane_resident = false;
         for (std::uint32_t other = 0; other < max_concurrency; ++other) {
             lane_resident = lane_resident || (other != lane && sequences[other].kv);
         }
-        const std::uint64_t cache_room =
-            cache != nullptr ? static_cast<std::uint64_t>(cache->device_evictable_blocks()) +
-                                   hybrid_->transfer_pinned_blocks()
-                             : 0U;
+        // This binding's path is pinned already: none of it counts.
+        const std::uint64_t cache_room = hybrid_cache_room({}, true);
         const auto reachable = [&](const DeviceKVPagePool& pool, std::uint32_t need, std::uint64_t growth) {
             return static_cast<std::uint64_t>(need) <=
                    static_cast<std::uint64_t>(pool.available_pages()) + cache_room + growth;
@@ -1165,13 +1134,19 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
         tx.resume ? std::max(reuse, tx.resume->frontier()) : reuse;
     std::vector<pc::PlannedTap> taps;
     if (publish && paused_at < n) {
-        // A request that resumed from a previous generation's endpoint proves its client echoes
-        // generated turns token for token (agent loops, preserved reasoning): its own endpoint
-        // will serve the next turn, so the generation opener is not worth the prefill split an
-        // exact tap costs. Otherwise the history is re-rendered (for example with reasoning
-        // stripped) and the next turn diverges at the opener.
+        // A request that resumed from its latest reply's endpoint (at or past where that reply's
+        // generated ids begin) proves the reply came back token for token (agent loops, preserved
+        // reasoning): its own endpoint will serve the next turn, so the generation opener is not worth
+        // the prefill split an exact tap costs. Otherwise the history is re-rendered (reasoning
+        // stripped, or an empty reasoning closed at once, `<think>\n</think>`, that the template
+        // echoes as `<think>\n\n</think>`) and the next turn diverges at the opener. An endpoint
+        // older than the latest reply proves nothing: without its opener tap each turn of such a
+        // run would fall back further (2026-11-14).
         std::vector<pc::TapHint> hints = prompt.tap_hints.hints;
-        if (reuse != 0 && index.snapshot(quote.snapshot).kind == pc::SnapshotKind::Endpoint) {
+        const bool latest_reply_echoed =
+            prompt.reply_frontiers.empty() || reuse >= prompt.reply_frontiers.back();
+        if (reuse != 0 && latest_reply_echoed &&
+            index.snapshot(quote.snapshot).kind == pc::SnapshotKind::Endpoint) {
             std::erase_if(hints, [](const pc::TapHint& hint) {
                 return hint.kind == pc::TapHintKind::GenerationOpener;
             });
@@ -1378,16 +1353,16 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
     }
 }
 
-void ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier,
-                                     bool boundary) {
+bool ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier,
+                                     bool boundary, bool retry) {
     HybridLaneState& lane         = hybrid_lanes_[sequence.lane];
     pc::PrefixCacheIndex& index   = hybrid_->index();
     HybridCacheCounters& counters = hybrid_->counters();
     // A tap no prefill plan foresaw (a coalescing sibling's) may find the DFlash2 ring missing
     // positions YE-01 skipped: a snapshot always carries a whole ring, so the tap is passed over.
     if (frontier == 0 || frontier > sequence.text_kv_valid || !dflash_ring_whole(sequence, frontier)) {
-        ++counters.taps_skipped;
-        return;
+        if (!retry) { ++counters.taps_skipped; }
+        return false;
     }
     // Superseded first so the slot can come from the lineage; undone if the tap is not taken.
     const HybridSupersession superseded{
@@ -1398,16 +1373,18 @@ void ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t fron
         index.estimate_priority(lane.last_capture, frontier, frontier % kBlock != 0));
     if (!slot) {
         hybrid_undo_supersession(lane, superseded);
-        ++counters.taps_skipped;
-        ++counters.taps_skipped_no_slot;
-        return;
+        if (!retry) {
+            ++counters.taps_skipped;
+            ++counters.taps_skipped_no_slot;
+        }
+        return true;
     }
     const std::optional<StateImageHandle> image = state_store->reserve_destination();
     if (!image) {
         index.release_device_slot(*slot);
         hybrid_undo_supersession(lane, superseded);
-        ++counters.taps_skipped;
-        return;
+        if (!retry) { ++counters.taps_skipped; }
+        return true;
     }
     try {
         state_images->copy_slot(state_store->physical_slot(sequence.state.write),
@@ -1425,7 +1402,9 @@ void ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t fron
         throw;
     }
     lane.last_capture = frontier;
+    if (retry) { ++counters.taps_retried; }
     hybrid_publish_pending(sequence, false);
+    return false;
 }
 
 void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint32_t cursor,
@@ -1447,16 +1426,25 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
     bool exact                  = false;
     bool flexible               = false;
     bool boundary               = false;
+    // A flexible tap skipped for lack of room stays planned (next_tap points at it): this boundary may take it,
+    // as a flexible tap may be realized at any boundary at or after its position. Kept planned, it also keeps
+    // the DFlash2 ring whole for it (YE-01 projects from the earliest planned read on).
+    const std::optional<std::size_t> pending = lane.tap_retry ? std::optional<std::size_t>(lane.next_tap) : std::nullopt;
+    std::optional<std::size_t> last_flexible;
+    bool fresh = false; // a tap is due here for the first time
     while (lane.next_tap < lane.taps.size()) {
         const pc::PlannedTap& tap = lane.taps[lane.next_tap];
         if (tap.placement == pc::TapPlacement::Exact && !invariant) {
             if (tap.position > cursor) { break; }
             exact    = exact || tap.position == cursor;
+            fresh    = fresh || tap.position == cursor;
             boundary = boundary || (tap.position == cursor && tap.boundary);
         } else if (tap.position > cursor && !final_chunk_next) {
             break;
         } else {
-            flexible = true;
+            flexible      = true;
+            last_flexible = lane.next_tap;
+            fresh         = fresh || !pending || lane.next_tap != *pending;
             // On the grid a coalescing tap (VR-01) lands at its grid boundary and stays a boundary, so
             // the sibling's deeper taps do not supersede the snapshot the waiting request resumes from.
             boundary = boundary || (invariant && tap.boundary && tap.position == cursor);
@@ -1464,12 +1452,40 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
         ++lane.next_tap;
     }
     if (!exact && !flexible) { return; }
+    // A retried tap counts no second skip; one taken counts in taps_retried.
+    const bool retry_only = pending.has_value() && !fresh;
+    const auto keep_planned = [&] {
+        lane.tap_retry = last_flexible.has_value();
+        if (last_flexible) { lane.next_tap = *last_flexible; }
+    };
     if (inside_exclusion(cursor, lane.exclusions) || cursor <= lane.last_capture ||
         (!exact && cursor - lane.last_capture < pc::kMinimumTapSeparation)) {
-        ++hybrid_->counters().taps_skipped;
+        if (!retry_only) { ++hybrid_->counters().taps_skipped; }
+        // A retried tap waits for a boundary it may take.
+        if (pending) { keep_planned(); }
         return;
     }
-    hybrid_capture_tap(sequence, cursor, boundary);
+    const bool no_room = hybrid_capture_tap(sequence, cursor, boundary, retry_only);
+    lane.tap_retry     = false;
+    if (no_room && flexible) { keep_planned(); }
+}
+
+void ProgramImpl::hybrid_after_begin(SequenceState& sequence) {
+    if (!hybrid_ || sequence.lane >= max_concurrency) { return; }
+    HybridLaneState& lane         = hybrid_lanes_[sequence.lane];
+    const RequestControl& request = requests[sequence.lane];
+    if (!lane.active || !lane.publish || !request.base || !request.base->prompt) { return; }
+    const std::optional<TokenId> unechoed = request.base->prompt->prompt_end_tap_token;
+    const std::uint32_t end               = lane.prompt_tokens;
+    // 2026-11-14 (a greedy two-conversation A/B): such a reply after a resume from the previous endpoint had
+    // dropped its opener tap, and the next turn recomputed the whole turn, 2,134 tokens of a 100K history.
+    // The reproducible route reuses prefill state on the chunk grid only (§7.9).
+    if (!unechoed || sequence.text_kv_valid != end || sequence.ledger.size() <= end ||
+        sequence.ledger[end] != *unechoed || end <= lane.last_capture || inside_exclusion(end, lane.exclusions) ||
+        (execution_schedule.grid_cache && end % prefill_chunk != 0)) {
+        return;
+    }
+    (void)hybrid_capture_tap(sequence, end, false);
 }
 
 std::uint32_t ProgramImpl::hybrid_wide_step_limit(std::uint32_t lane, std::uint32_t cursor,
@@ -1656,9 +1672,19 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence, bo
                                               ? pc::SnapshotKind::Tap
                                               : pc::SnapshotKind::Endpoint;
             // A pausing lane's snapshot is its resume point: without it the resume replays the tokens since
-            // the deepest snapshot, however few.
-            const bool far_enough = pausing ? frontier > lane_state.deepest_snapshot
-                                            : frontier >= lane_state.deepest_snapshot + pc::kMinimumTapSeparation;
+            // the deepest snapshot, however few. An endpoint whose deepest snapshot is the one the lane
+            // resumed from (its own pause's capture, or the previous turn's endpoint) replaces it, as the
+            // lineage supersedes it below, so it costs no image of its own however close it lies; the next
+            // turn resumes there instead of recomputing the tokens since (2026-11-14: a DFlash2 turn resumed
+            // 57 tokens past its pause capture and its next turn recomputed them). A shared boundary stays.
+            const bool replaces_resume =
+                !pausing && lane_state.resume_snapshot.valid() &&
+                lane_state.resume_frontier == lane_state.deepest_snapshot &&
+                hybrid_->index().valid(lane_state.resume_snapshot) &&
+                hybrid_->index().snapshot(lane_state.resume_snapshot).kind != pc::SnapshotKind::Boundary;
+            const bool far_enough = pausing || replaces_resume
+                                        ? frontier > lane_state.deepest_snapshot
+                                        : frontier >= lane_state.deepest_snapshot + pc::kMinimumTapSeparation;
             if (endpoint && (!execution_schedule.grid_cache || grid_state) && backend_caught_up &&
                 frontier != 0 && far_enough &&
                 frontier <= sequence.ledger.size() && lane_state.path.size() >= anchor_blocks &&
@@ -1677,7 +1703,7 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence, bo
                 // A pause's resume point takes a slot over any Device-only snapshot that is not pinned or
                 // held, as its Host image is admitted below.
                 const std::optional<std::uint32_t> slot = index.acquire_device_slot(
-                    pausing ? std::numeric_limits<double>::infinity()
+                    pausing ? pc::kResumePointClaim
                             : index.estimate_priority(lane_state.deepest_snapshot, frontier, frontier % kBlock != 0));
                 if (!slot) { skipped(); }
                 if (slot) {
@@ -1739,7 +1765,7 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence, bo
                             // the resume would replay); its retention priority is its own afterwards.
                             (void)hybrid_->start_snapshot_host_write(
                                 published.snapshot, device.stream, device.transfer_stream,
-                                pausing ? std::optional<double>(std::numeric_limits<double>::infinity())
+                                pausing ? std::optional<double>(pc::kResumePointClaim)
                                         : std::nullopt);
                         } else {
                             state_store->thaw(image);
@@ -1813,6 +1839,7 @@ HybridPrefixCacheStats ProgramImpl::hybrid_stats() const noexcept {
     out.taps_created                    = counters.taps_created;
     out.taps_skipped                    = counters.taps_skipped;
     out.taps_skipped_no_slot            = counters.taps_skipped_no_slot;
+    out.taps_retried                    = counters.taps_retried;
     out.endpoints_created               = counters.endpoints_created;
     out.endpoints_skipped               = counters.endpoints_skipped;
     out.host_image_write_refusals       = counters.host_image_write_refusals;

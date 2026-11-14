@@ -670,6 +670,9 @@ public:
                 "Frontend requires the parsed model tokenizer and public token domain");
         }
         markers               = output_marker_tokens(*tokenizer);
+        if (const fi::AddedToken* open = tokenizer->find_added_token("<think>"); open != nullptr) {
+            reasoning_open = static_cast<TokenId>(open->id);
+        }
         ngram_sources_enabled = options.ngram_sources_enabled;
         ngram_archive_enabled = options.ngram_archive_enabled;
         if (ngram_archive_enabled) {
@@ -742,6 +745,7 @@ public:
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     fi::OutputMarkerTokens markers;
+    TokenId reasoning_open = -1; // `<think>`
     fi::ProcessorOptions processor;
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
@@ -1003,8 +1007,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(processed.rewrite_execution_frontiers);
-        message_boundaries = std::move(processed.message_boundaries);
-        cache_boundaries   = std::move(processed.cache_boundaries);
+        message_boundaries     = std::move(processed.message_boundaries);
+        cache_boundaries       = std::move(processed.cache_boundaries);
+        result.reply_frontiers = std::move(processed.reply_frontiers);
     } else {
         const fi::RenderedChat rendered = impl_->chat_template.render(
             messages, render_options(options, rendered_markers), control);
@@ -1026,9 +1031,19 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(encoded.rewrite_execution_frontiers);
-        message_boundaries = std::move(encoded.message_boundaries);
-        cache_boundaries   = std::move(encoded.cache_boundaries);
+        message_boundaries     = std::move(encoded.message_boundaries);
+        cache_boundaries       = std::move(encoded.cache_boundaries);
+        result.reply_frontiers = std::move(encoded.reply_frontiers);
         assign_text_positions(result);
+    }
+    // A generation prompt that opens the reasoning (`<think>` "\n"): a reply that closes it at once with
+    // `</think>` comes back as `<think>\n\n</think>` (the template writes an empty reasoning with its
+    // inner newline), so its next turn departs from the reply's endpoint at this prompt's end.
+    const std::size_t prompt_ids = result.token_ids.size();
+    if (result.starts_in_reasoning && result.continuation_content.empty() && impl_->reasoning_open >= 0 &&
+        prompt_ids >= 2 && result.token_ids[prompt_ids - 2U] == impl_->reasoning_open &&
+        impl_->tokenizer->decode_token_bytes(result.token_ids[prompt_ids - 1U]) == "\n") {
+        result.prompt_end_tap_token = impl_->markers.reasoning_close;
     }
     (void)checked_token_count(result.token_ids.size());
     if (impl_->ngram_archive_enabled) {
