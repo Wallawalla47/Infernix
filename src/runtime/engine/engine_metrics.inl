@@ -178,6 +178,8 @@ void EngineCore<Instance>::publish_runtime_stats() {
     resources_.populate_runtime_stats(*instance_.program, snapshot);
     snapshot.expert_cache = instance_.program->expert_cache_totals();
     snapshot.memory       = instance_.program->memory_usage();
+    // The archive is the Engine's, not the Program's: what its sources hold now.
+    if (ngram_archive_) { snapshot.memory.host.ngram_archive = ngram_archive_->bytes(); }
     snapshot.memory.host.prefix      = snapshot.hybrid_host_capacity_bytes;
     snapshot.memory.host.prefix_used = snapshot.hybrid_host_used_bytes;
     snapshot.memory.ssd.prefix       = snapshot.hybrid_ssd_capacity_bytes;

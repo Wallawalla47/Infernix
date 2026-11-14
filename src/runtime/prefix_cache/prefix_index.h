@@ -549,7 +549,10 @@ public:
     //   one makes the caller wait before committing). Dead KV past the ceiling is dropped instead (allocation evicts
     //   it first anyway). An entry an SSD job I/O-pins after begin waits until the job ends. Each is planned once; the
     //   caller copies the bytes of `from` into `to`. Only begin_host_shrink scans every node; the rest stays
-    //   proportional to what lies past the ceiling (and the snapshots).
+    //   proportional to what lies past the ceiling (and the snapshots). Its bookkeeping is reserved first, so a throw
+    //   (an allocation) leaves no move half-planned.
+    // - cancel_host_moves undoes the last plan_host_moves, whose copies were never started (posting them threw): each
+    //   `to` is free again and each `from` movable, for a later plan. Nothing else may run in between.
     // - commit_host_moves, once the copies have landed and no restore reads a Host slab: each entry still holding a
     //   planned `from` takes its `to` (one I/O-pinned meanwhile keeps its move for a later call), and the `to` of an
     //   entry gone meanwhile is freed. Returns whether no move is left.
@@ -561,6 +564,7 @@ public:
     };
     std::uint32_t begin_host_shrink(std::uint32_t limit, std::uint32_t granule);
     [[nodiscard]] std::vector<HostMove> plan_host_moves();
+    void cancel_host_moves(std::span<const HostMove> moves) noexcept;
     bool commit_host_moves();
     bool finish_host_shrink();
     [[nodiscard]] bool host_shrinking() const noexcept { return ceiling_ < host_limit_; }
@@ -922,6 +926,9 @@ private:
     // Host slabs whose bytes the SSD tier also holds: blocks, and snapshot images with their tails.
     std::uint64_t host_clean_nodes_       = 0;
     std::uint64_t host_clean_image_slabs_ = 0;
+    // Nodes on the kCold or kCleanWarm list: the clean blocks evict_for_slabs may drop (unheld, under no
+    // queue hold, under a live snapshot; a dead clean block is on the dead list instead).
+    std::uint64_t host_clean_listed_ = 0;
     std::vector<std::uint32_t> free_ssd_slabs_; // a min-heap: the file fills from its start
     std::vector<bool> ssd_claimed_;             // during a restore: slabs restored copies hold
 

@@ -68,6 +68,7 @@ Json memory_json(const MetricsJsonSnapshot& s) {
     add_part(host_parts, "prefix_cache", m.host.prefix, m.host.prefix_used);
     add_part(host_parts, "weights", m.host.weights);
     add_part(host_parts, "ngram", m.host.ngram);
+    add_part(host_parts, "ngram_archive", m.host.ngram_archive);
     add_part(host_parts, "staging", m.host.staging);
     const infernix::DeviceMemoryReading& d = s.device_memory;
     const HostMemorySnapshot& h            = s.host_memory;

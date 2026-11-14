@@ -648,7 +648,8 @@ export type MemoryPartKey =
   | "workspace"
   | "cuda_graphs"
   | "staging"
-  | "ngram";
+  | "ngram"
+  | "ngram_archive";
 
 /** One category of what the server holds in a pool. Parts never overlap. */
 export interface MemoryPart {

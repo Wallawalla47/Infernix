@@ -1,6 +1,7 @@
 #include "runtime/prefix_cache/prefix_index.h"
 
 #include <algorithm>
+#include <exception>
 #include <functional>
 #include <stdexcept>
 
@@ -793,6 +794,7 @@ void PrefixCacheIndex::clean_remove(std::uint32_t index) {
     node.clean_prev = kNoId;
     node.clean_next = kNoId;
     node.clean_list = kNoList;
+    --host_clean_listed_;
 }
 
 void PrefixCacheIndex::clean_append(std::uint32_t index, std::uint8_t list) {
@@ -806,6 +808,7 @@ void PrefixCacheIndex::clean_append(std::uint32_t index, std::uint8_t list) {
     }
     clean_tail_[list] = index;
     node.clean_list   = list;
+    ++host_clean_listed_;
 }
 
 void PrefixCacheIndex::adjust_live(std::uint32_t anchor, int delta) {
@@ -1125,9 +1128,10 @@ bool PrefixCacheIndex::host_room_possible(std::uint32_t count, std::uint32_t pro
                                           double claim) const {
     std::uint64_t room = free_slabs_.size();
     if (room >= count) { return true; }
-    // evict_for_slabs' first victims go whatever the claim: dead blocks and Host copies the SSD tier
-    // also holds.
-    room += static_cast<std::uint64_t>(dead_count_) + host_clean_nodes_;
+    // evict_for_slabs' first victims go whatever the claim: dead blocks and the clean lists' Host copies
+    // the SSD tier also holds. The lists hold no dead block (those are on the dead list) and no held
+    // one, so each slab counts once and only where evict_for_slabs may take it.
+    room += static_cast<std::uint64_t>(dead_count_) + host_clean_listed_;
     if (room >= count) { return true; }
     // Then the snapshots its order may take: superseded and SSD-backed ones whatever the claim, retained
     // ones valued at most `claim`; held, pinned and queue-held ones never. A snapshot removed outright
@@ -1159,7 +1163,11 @@ bool PrefixCacheIndex::host_room_possible(std::uint32_t count, std::uint32_t pro
             std::uint32_t& removed = removed_below[node];
             removed += passed;
             if (removed != entry.live_below) { break; }
-            if (entry.host == CopyState::Resident && !held(entry) && !entry.in_dead) { ++room; }
+            // A block already dead, or on a clean list, is counted above.
+            if (entry.host == CopyState::Resident && !held(entry) && !entry.in_dead &&
+                entry.clean_list == kNoList) {
+                ++room;
+            }
             passed = entry.live_below;
         }
     }
@@ -1295,7 +1303,12 @@ std::vector<PrefixCacheIndex::HostMove> PrefixCacheIndex::plan_host_moves() {
         if (!evict_for_slabs(kNoId, std::numeric_limits<double>::infinity())) { break; }
         collect();
     }
+    // Reserved before the first slab is taken: the loop below cannot throw, so no `to` is taken without its move.
+    const std::size_t planned = std::min(wanted.size(), free_slabs_.size());
+    out.reserve(planned);
+    host_moves_.reserve(host_moves_.size() + planned);
     std::vector<std::uint32_t> to;
+    to.reserve(1);
     for (PendingHostMove move : wanted) {
         if (!take_free_slabs(1, to)) { break; } // the rest at a later call
         move.to                 = to.front();
@@ -1304,6 +1317,18 @@ std::vector<PrefixCacheIndex::HostMove> PrefixCacheIndex::plan_host_moves() {
         out.push_back({move.from, move.to});
     }
     return out;
+}
+
+void PrefixCacheIndex::cancel_host_moves(std::span<const HostMove> moves) noexcept {
+    // plan_host_moves appended them last, in order; each `to` came off the free list, which kept its capacity.
+    for (auto move = moves.rbegin(); move != moves.rend(); ++move) {
+        if (host_moves_.empty() || host_moves_.back().from != move->from || host_moves_.back().to != move->to) {
+            std::terminate(); // not the last plan: the slabs' ownership is unknown
+        }
+        slab_moving_[move->from] = false;
+        free_slab(move->to);
+        host_moves_.pop_back();
+    }
 }
 
 std::uint32_t* PrefixCacheIndex::host_move_holder(const PendingHostMove& move) noexcept {
@@ -2915,7 +2940,7 @@ void PrefixCacheIndex::check_invariants() const {
     std::vector<std::uint32_t> warm(nodes_.size(), 0);
     std::vector<std::uint32_t> slab_uses(config_.host_slabs, 0);
     std::vector<std::uint32_t> ssd_uses(config_.ssd_slabs, 0);
-    std::uint64_t clean_nodes = 0, clean_image_slabs = 0;
+    std::uint64_t clean_nodes = 0, clean_listed_nodes = 0, clean_image_slabs = 0;
     std::uint32_t dead_nodes          = 0;
     std::uint32_t ssd_dead_nodes      = 0;
     std::uint32_t occupied_nodes      = 0;
@@ -2976,11 +3001,13 @@ void PrefixCacheIndex::check_invariants() const {
                                             ? (node.warm_below == 0 ? kCold : kCleanWarm)
                                             : kNoList;
         if (clean_list != node.clean_list) { invariant("node clean list membership is inconsistent"); }
+        if (clean_list != kNoList) { ++clean_listed_nodes; }
         if (node.in_dead) { ++dead_nodes; }
         if (node.in_ssd_dead) { ++ssd_dead_nodes; }
     }
     if (ssd_dead_nodes != ssd_dead_count_) { invariant("SSD dead node count mismatch"); }
     if (clean_nodes != host_clean_nodes_) { invariant("clean node count mismatch"); }
+    if (clean_listed_nodes != host_clean_listed_) { invariant("clean list node count mismatch"); }
     if (dead_nodes != dead_count_) { invariant("dead node count mismatch"); }
     if (transfer_held_nodes != transfer_releasable_) { invariant("transfer-held node count mismatch"); }
     if (occupied_nodes != node_count_) { invariant("node count mismatch"); }

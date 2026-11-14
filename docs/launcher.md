@@ -107,8 +107,9 @@ One page, top to bottom:
   temperature past its limit is also named beside **All gauges** while its dial is not shown.
 - **Memory**: what the loaded `infernix-serve` holds, as one bar for VRAM and one for RAM: its
   parts (model weights, the drafter, experts with their count, model state, the KV cache, the prefix
-  cache, workspace, CUDA graphs, staging, the n-gram table; the KV cache and the prefix cache side by
-  side, since they trade pages with every request, so only their shared boundary moves), then
+  cache, workspace, CUDA graphs, staging, the n-gram table, the n-gram archive; the KV cache and the
+  prefix cache side by side, since they trade pages with every request, so only their shared boundary
+  moves), then
   **Infernix other** (its memory no
   part names: the CUDA context, the driver, heaps), **Other processes** and **Free**, beside which
   VRAM shows what the server keeps free for the display (its headroom). The KV cache and the prefix

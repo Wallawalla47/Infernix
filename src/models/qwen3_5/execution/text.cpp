@@ -1391,9 +1391,11 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto scope = work_.scope();
                 if (trim) {
                     Tensor columns = x.slice(1, x.ne[1] - kept, kept);
+                    // Reset however mlp_tail leaves (a recovered exception too): a later prefill on this context
+                    // must not route with this window's skip.
+                    ResetColumns reset_skipped{trim_route_skipped_};
                     trim_route_skipped_ = x.ne[1] - kept;
                     mlp_tail(block, columns, ph, next_projection_hints(static_cast<int>(layer)), layer);
-                    trim_route_skipped_ = 0;
                 } else {
                     mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)), layer);
                 }

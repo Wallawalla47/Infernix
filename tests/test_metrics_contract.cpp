@@ -390,6 +390,7 @@ int main() {
         m.host.prefix            = 9900;
         m.host.prefix_used       = 20000; // more than the part: clamped to it
         m.host.ngram             = 1000;
+        m.host.ngram_archive     = 500;
         m.ssd.prefix             = 50000;
         m.ssd.prefix_used        = 12000;
         m.ssd.experts            = 3000;
@@ -411,9 +412,10 @@ int main() {
                           "memory.device experts' frames and the KV cache's used pages");
         const Json& host = full["host"];
         failures += check(host["total_bytes"] == 102000 && host["available_bytes"] == 7000 && host["process_bytes"] == 85000 &&
-                              host["parts"].size() == 3 && host["parts"][0]["key"] == "experts" &&
+                              host["parts"].size() == 4 && host["parts"][0]["key"] == "experts" &&
                               host["parts"][0]["count"] == 2400 && host["parts"][1]["key"] == "prefix_cache" &&
-                              host["parts"][1]["used_bytes"] == 9900 && host["parts"][2]["key"] == "ngram",
+                              host["parts"][1]["used_bytes"] == 9900 && host["parts"][2]["key"] == "ngram" &&
+                              host["parts"][3]["key"] == "ngram_archive" && host["parts"][3]["bytes"] == 500,
                           "memory.host totals and parts (used clamped to the part)");
         const Json& ssd = full["ssd"];
         failures += check(ssd["parts"].size() == 2 && ssd["parts"][0]["key"] == "prefix_cache" &&

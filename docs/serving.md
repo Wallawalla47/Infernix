@@ -2282,6 +2282,7 @@ occupied share (KV pages holding requests' tokens, prefix-cache space holding en
 | `cuda_graphs` | CUDA Graph executables, as measured when they were prepared | | |
 | `staging` | expert-miss staging and the expert cache's tables | the pinned upload ring and the Program's pinned buffers | |
 | `ngram` | | Qwen3.8-Flash-Next's n-gram table in RAM, or its row cache | |
+| `ngram_archive` | | the n-gram drafter's conversation archive (`--ngram-archive-mib`): what its sources hold | |
 
 The [launcher](launcher.md)'s dashboard draws `memory` as one bar per member, with the server's unnamed use
 (`process_bytes` less the parts) and other processes' use beside the parts.

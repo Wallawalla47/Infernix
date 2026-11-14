@@ -23,8 +23,10 @@ GenerationOutcome combine_round_outcomes(std::span<const ServerToolRound> rounds
         // (infernix::GenerationResult), so every generation counts its own published creation once
         // and only the sum is the response's. A continuation that reused the whole earlier prefix
         // then holds the earlier creation inside its own reused prefix; after an eviction or a
-        // failed reuse it does not, which only leaves that round reporting less reused, never adds
-        // to this field twice. The optional stays unset when no generation published creation.
+        // failed reuse it does not: that round reports less reused, and the blocks it prefills
+        // and publishes again are its own creation, so a position can count in two rounds, each
+        // time for a creation that really ran. The optional stays unset when no generation
+        // published creation.
         if (earlier.cache_created_prompt_tokens) {
             total.cache_created_prompt_tokens =
                 total.cache_created_prompt_tokens.value_or(std::uint32_t{}) +

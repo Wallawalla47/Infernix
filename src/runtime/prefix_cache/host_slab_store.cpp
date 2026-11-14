@@ -139,12 +139,20 @@ std::uint64_t HostSlabStore::begin_growth(std::uint64_t bytes, HostMemoryWorker&
 void HostSlabStore::copy_moves(PrefixCacheIndex& index, HostMemoryWorker& worker) {
     const std::vector<PrefixCacheIndex::HostMove> moves = index.plan_host_moves();
     if (moves.empty()) { return; }
-    std::vector<std::pair<std::byte*, const std::byte*>> copies;
-    copies.reserve(moves.size());
-    for (const PrefixCacheIndex::HostMove& move : moves) { copies.emplace_back(slab(move.to), slab(move.from)); }
-    copy_ = worker.post([copies = std::move(copies), bytes = slab_bytes_] {
-        for (const auto& [to, from] : copies) { copy_streaming(to, from, bytes); }
-    });
+    // A move commits once copy_ is ready (step): one whose copy was never posted (an allocation failing under the very
+    // memory pressure a release answers, or a stopping worker) would hand its entry a `to` slab never written. The plan
+    // is undone instead, and a later step plans it again.
+    try {
+        std::vector<std::pair<std::byte*, const std::byte*>> copies;
+        copies.reserve(moves.size());
+        for (const PrefixCacheIndex::HostMove& move : moves) { copies.emplace_back(slab(move.to), slab(move.from)); }
+        copy_ = worker.post([copies = std::move(copies), bytes = slab_bytes_] {
+            for (const auto& [to, from] : copies) { copy_streaming(to, from, bytes); }
+        });
+    } catch (...) {
+        index.cancel_host_moves(moves);
+        throw;
+    }
 }
 
 HostSlabStore::Progress HostSlabStore::step(PrefixCacheIndex& index, bool restores_quiet, HostMemoryWorker& worker) {

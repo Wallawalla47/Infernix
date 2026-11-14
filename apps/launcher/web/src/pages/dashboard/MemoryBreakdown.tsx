@@ -22,7 +22,7 @@ interface KeySpec {
   label: string;
   /** Palette slot (0-based). Each key keeps its colour in every pool. */
   slot: number;
-  /** Staging and the n-gram table borrow a slot's hue, striped. */
+  /** Staging and the n-gram parts borrow a slot's hue, striped. */
   striped?: boolean;
   /** One sentence per pool the key appears in. */
   what: Partial<Record<Pool, string>>;
@@ -30,12 +30,13 @@ interface KeySpec {
 
 // The bars' order: the contract's keys, but with the KV cache beside the prefix cache. The two trade
 // pages with every request (the prefix cache gives up what a growing KV cache takes), so beside each
-// other only their shared boundary moves and the other parts keep their places. Ten keys share eight
-// hues: the slots were chosen so that neighbours in realistic bars (with or without a drafter,
+// other only their shared boundary moves and the other parts keep their places. Eleven keys share
+// eight hues: the slots were chosen so that neighbours in realistic bars (with or without a drafter,
 // experts, device prefix slots, CUDA graphs) stay apart for normal and colour-blind vision in both
 // themes (model state and the KV cache swapped hues when they swapped places, so the bar's run of
-// colours is the validated one); staging and the n-gram table, the two smallest and rarest, reuse
-// the hue of workspace and of the drafter, striped.
+// colours is the validated one); staging, the n-gram table and the n-gram archive, the smallest and
+// rarest, reuse the hue of workspace, of the drafter and of CUDA graphs (a Device-only part, so it
+// never shares a bar with the archive), striped.
 const KEYS: Record<MemoryPartKey, KeySpec> = {
   weights: {
     label: "Model weights",
@@ -82,7 +83,13 @@ const KEYS: Record<MemoryPartKey, KeySpec> = {
     label: "N-gram table",
     slot: 3,
     striped: true,
-    what: { host: "The n-gram drafter's table in RAM (the whole table or a cache of its rows)." },
+    what: { host: "Qwen3.8-Flash-Next's n-gram embedding table in RAM (the whole table or a cache of its rows)." },
+  },
+  ngram_archive: {
+    label: "N-gram archive",
+    slot: 1,
+    striped: true,
+    what: { host: "Earlier requests' text the n-gram drafter keeps per conversation to copy from." },
   },
 };
 

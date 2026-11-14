@@ -1460,6 +1460,25 @@ void test_host_tier_resize() {
     require(std::any_of(moves.begin(), moves.end(), [&](const auto& move) { return move.from == pinned_top; }),
             "a pinned path's block moves too");
     require(index.plan_host_moves().empty(), "a planned move is planned once");
+    // Posting the copies can throw (an allocation under the RAM pressure the shrink answers): the plan is undone, so no
+    // entry ever takes a destination nothing wrote; every entry keeps its slab, each destination is free again, and the
+    // next plan pairs the same entries.
+    const std::uint64_t free_planned = index.stats().host_free_slabs;
+    index.cancel_host_moves(moves);
+    index.check_invariants();
+    require(!index.host_moves_pending() && index.stats().host_free_slabs == free_planned + moves.size() &&
+                std::any_of(paths[5].begin(), paths[5].end(),
+                            [&](NodeRef node) { return index.node(node).host_slab == pinned_top; }),
+            "a cancelled plan frees its destinations and moves nothing");
+    const std::vector<PrefixCacheIndex::HostMove> again = index.plan_host_moves();
+    index.check_invariants();
+    const auto sources = [](std::vector<PrefixCacheIndex::HostMove> planned) {
+        std::vector<std::uint32_t> from;
+        for (const auto& move : planned) { from.push_back(move.from); }
+        std::sort(from.begin(), from.end());
+        return from;
+    };
+    require(sources(again) == sources(moves), "a cancelled plan is planned again");
     // An allocation meanwhile takes only slabs below the ceiling.
     auto during = index.reserve_host_image(false, kAny);
     require(during.has_value() && std::all_of(during->slabs.begin(), during->slabs.end(),
@@ -2223,6 +2242,42 @@ void test_ssd_eviction_order() {
     require(index.valid(end_b) && index.snapshot(end_b).ssd == CopyState::Resident, "the held snapshot stays");
 }
 
+// The feasibility check counts a clean block (on the Host and the SSD) as room only where evict_for_slabs may drop it:
+// a queue-held lineage's clean blocks stay, so they must not make an allocation that cannot complete look possible
+// (counted, a resume point's tailed image evicted the one unheld snapshot for nothing).
+void test_ssd_held_clean_blocks_are_no_room() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(ssd_config(16, 64), backend);
+    constexpr double kAny = std::numeric_limits<double>::infinity();
+    const SnapshotRef held = host_endpoint(index, backend, make_tokens(128, 320)); // 2 blocks + 4 image slabs
+    write_back(index);
+    require(index.snapshot(held).ssd == CopyState::Resident && index.host_lossless_slabs() == 16,
+            "the held lineage is clean");
+    index.set_queue_holds(std::span<const SnapshotRef>(&held, 1));
+    // A running sequence (pinned, 3 blocks) with an unclean snapshot (4 slabs), and another running one (3 blocks).
+    const auto running = insert_sequence(index, backend, make_tokens(192, 321));
+    for (const NodeRef node : running) { backup_node(index, node); }
+    auto image = index.reserve_host_image(false, kAny);
+    require(image.has_value(), "the unclean snapshot's image fits");
+    const SnapshotRef unclean =
+        index.publish_host_snapshot(running.back(), 192, {}, std::nullopt, std::move(*image), SnapshotKind::Tap).snapshot;
+    const auto other = insert_sequence(index, backend, make_tokens(192, 322));
+    for (const NodeRef node : other) { backup_node(index, node); }
+    index.check_invariants();
+    require(index.stats().host_free_slabs == 0, "the Host tier is full");
+    const std::uint64_t evictions = index.stats().host_snapshot_evictions;
+    // Five slabs (an image and its tail) against one unheld four-slab image: impossible, whatever the claim.
+    require(!index.reserve_host_image(true, kAny).has_value(), "five slabs cannot come from one unheld four-slab image");
+    require(index.valid(unclean) && index.snapshot(unclean).host == CopyState::Resident &&
+                index.stats().host_snapshot_evictions == evictions,
+            "an allocation that cannot complete evicts nothing, the held lineage's clean blocks not counted as room");
+    index.check_invariants();
+    index.set_queue_holds({});
+    index.release_path(running);
+    index.release_path(other);
+    index.check_invariants();
+}
+
 void test_ssd_promotion_abort() {
     RecordingBackend backend;
     PrefixCacheIndex index(ssd_config(12, 32), backend);
@@ -2746,6 +2801,7 @@ int main() {
         test_ssd_write_back_and_demotion();
         test_ssd_partial_image();
         test_ssd_eviction_order();
+        test_ssd_held_clean_blocks_are_no_room();
         test_ssd_promotion_abort();
         test_ssd_device_slots();
         test_ssd_random_stress();

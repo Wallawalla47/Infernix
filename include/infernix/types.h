@@ -2080,7 +2080,8 @@ struct MemoryUsage {
         std::uint64_t prefix         = 0; // the prefix cache's Host tier
         std::uint64_t prefix_used    = 0; // of it, slabs holding entries
         std::uint64_t weights        = 0; // weights kept in RAM (pinned mirrors and escapes, the embedding, a vision tower)
-        std::uint64_t ngram          = 0; // the n-gram table in RAM, or its row cache
+        std::uint64_t ngram          = 0; // Qwen3.8-Flash-Next's n-gram table in RAM, or its row cache
+        std::uint64_t ngram_archive  = 0; // the n-gram drafter's conversation archive (--ngram-archive-mib)
         std::uint64_t staging        = 0; // pinned staging buffers
     } host;
     struct Ssd {
