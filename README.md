@@ -522,7 +522,8 @@ download a model) under **Models**, press **Load**, and point your tools at the 
 ## Quick start (Windows)
 
 Prerequisites: Visual Studio 2026 (or 2022, MSVC 14.44) with its C++ CMake tools (they bring Ninja),
-the CUDA 13.4 toolkit or later (CMake refuses an older one), and FFmpeg, libjpeg-turbo and curl from vcpkg (`x64-windows`, at `C:\vcpkg`;
+the CUDA 13.4 toolkit (CMake refuses an older one; later ones are untested, and 13.5's device link may need over 46 GB of RAM:
+[build system](docs/maintainer/build-system.md)), and FFmpeg, libjpeg-turbo and curl from vcpkg (`x64-windows`, at `C:\vcpkg`;
 `vcpkg install libjpeg-turbo:x64-windows` adds libjpeg-turbo to an existing tree); adjust the paths at
 the top of `build_native.bat`. It builds with Ninja Multi-Config (about 30 % faster than the Visual
 Studio generator); a `build-windows` tree from the Visual Studio generator is configured afresh on its
@@ -625,8 +626,8 @@ DLLs beside `infernix-serve.exe` and install the Visual C++ redistributable if m
 
 ## Quick start (Linux)
 
-64-bit Linux and WSL2 (tested on Ubuntu 24.04, CUDA 13.4, GCC 13.3). Prerequisites: CUDA 13.4 or
-later (CMake refuses an older toolkit: CUDA 13.2 miscompiles sm_120a code), CMake 3.28+, a C++20
+64-bit Linux and WSL2 (tested on Ubuntu 24.04, CUDA 13.4, GCC 13.3). Prerequisites: CUDA 13.4
+(CMake refuses an older toolkit: CUDA 13.2 miscompiles sm_120a code; later ones are untested), CMake 3.28+, a C++20
 compiler, Ninja, `pkg-config`, and the FFmpeg, libjpeg-turbo and curl development packages:
 
 ```bash

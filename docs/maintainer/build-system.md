@@ -31,7 +31,12 @@ gate: an older CUDA compiler stops the configuration. CUDA 13.2 miscompiles `sm_
 `--a8-activations` row kernel `rows_mma_kernel<GGML_IQ4_NL, BF16, 1>` stops with an illegal
 instruction, #48; another engine measured silently wrong output, Strata #4879), the toolkits
 before 13.4 are untested, and a miscompiled build need not announce itself. The startup log prints
-the nvcc version beside the build id (`build <id> (CUDA 13.4.x)`).
+the nvcc version beside the build id (`build <id> (CUDA 13.4.x)`). Later toolkits pass the gate but
+are not validated: CUDA 13.5's release notes name no `sm_120` code-generation change, and a fork
+measured the `infernix_ops` device link at over 46 GB of RAM under its nvlink against 18.6 GB under
+13.4 (with `-lineinfo`; nmorgowicz/Infernix `01a687ae`). Moving to a new toolkit first checks the
+kernels' SASS against the 13.4 build (`sass_identity.py`), then the changed kernels against their
+oracles and the `--lossless` reference store bit for bit.
 CMake also discovers FFmpeg without imposing library version floors. Actual language/API support
 is exercised by compilation and tests. The libcurl 7.85 minimum has a concrete API basis:
 media acquisition uses `CURLOPT_PROTOCOLS_STR` and `CURLOPT_REDIR_PROTOCOLS_STR`, introduced in
