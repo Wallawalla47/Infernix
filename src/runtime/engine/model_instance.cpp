@@ -6,6 +6,7 @@
 #include "core/evictable_weight_pool.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
+#include "core/temporary_switches.h"
 #include "core/vmm_arena.h"
 #include "core/vram_budget.h"
 #include "models/qwen3_5/load.h"
@@ -21,6 +22,7 @@
 #include "runtime/expert_offload/memory_plan.h"
 #include "runtime/expert_offload/route_trace.h"
 #include "runtime/expert_offload/vram_monitor.h"
+#include "runtime/prefix_cache/persist_file.h"
 
 #include <algorithm>
 #include <system_error>
@@ -695,10 +697,14 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         if (!qwen4_exp) {
             // With offloaded experts and a Host tier one slot (candidates §22 VM-03, 2026-10-27): each further slot
             // is 146.5 MiB of the 122B's frames, and the VRAM defaults measured its one-request decode +1.0-1.7 %
-            // with one; its conversations' endpoints restore from the Host tier instead. Resident artifacts keep a
-            // slot per lane (their freed VRAM would be context, not speed, and restores were not measured there).
-            hybrid.device_snapshot_slots = hybrid.device_snapshot_slots.value_or(
-                offloaded_experts && host_tier ? 1U : concurrency + (host_tier ? 1U : 2U));
+            // with one; its conversations' endpoints restore from the Host tier instead. Resident artifacts take one
+            // too since 2026-11-15 (a slot per lane before): the slots' VRAM is KV capacity, and on the 27B at four
+            // lanes one slot against five gave 14,272 more tokens and, where two agent conversations did not fit
+            // the pool together, continuing turns of 1.9 s mean and 9.2 s worst against 2.5-2.6 s and 16.5 s
+            // (hybrid spec §16.13); an image restores from the Host tier in a few milliseconds, pipelined behind
+            // the first pass. Without a Host tier the slots are the only snapshot storage: one per lane and two.
+            hybrid.device_snapshot_slots =
+                hybrid.device_snapshot_slots.value_or(host_tier ? 1U : concurrency + 2U);
         }
         // Taps without a Host tier would evict other conversations' resident snapshots.
         hybrid.max_new_taps = hybrid.max_new_taps.value_or(host_tier ? 8U : 2U);
@@ -1086,7 +1092,21 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             }
         }
     }
+    // The native Parameters allocate the DFlash2 full head's screen (models::qwen3_5::execution::Parameters::
+    // draft_screen, 357.6 MB for the 27B's head) outside the weights' arena, after the check above: the same guard
+    // reads its step, so a screen the driver placed in shared system memory fails the start by name instead of
+    // slowing every proposal round.
+    if (spill) { spill->begin(); }
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
+    if (spill) {
+        const std::uint64_t screen_bytes = instance->parameters.draft_screen.bytes;
+        if (const std::uint64_t spilled = screen_bytes != 0 ? spill->end(screen_bytes, 0) : 0; spilled != 0) {
+            throw std::runtime_error(std::to_string(spilled >> 20) + " MiB of the DFlash2 draft screen (" +
+                                     std::to_string(screen_bytes >> 20) +
+                                     " MiB) were placed in shared system memory by the driver's sysmem fallback: free "
+                                     "VRAM and start again (" + spill->readings(screen_bytes) + ")");
+        }
+    }
     frontend.complete();
     // --a8-activations (LOSSY, opt-in; design §19.3.31): the 8-bit activation routes of this artifact
     // (models::qwen3_5::A8Routes, which the Program's ExecutionSchedule takes too), in decode and verification calls
@@ -1194,9 +1214,17 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             // whole, an automatic one down to every lane's full context. None fitting keeps chunk-wide steps.
             {
                 const std::uint64_t page_tokens = planner.capacity_curve().main_page_tokens;
-                const std::uint64_t lane_page_groups =
+                std::uint64_t lane_page_groups =
                     static_cast<std::uint64_t>(trial.max_concurrency) *
                     ((static_cast<std::uint64_t>(trial.max_context) + page_tokens - 1U) / page_tokens);
+                // INFERNIX_TMP_IDLE_WIDE_KV_PERCENT: the idle width may also cost that share of the pages.
+                if (const std::int64_t percent =
+                        temporary_switches::integer("INFERNIX_TMP_IDLE_WIDE_KV_PERCENT", 0, 0, 20);
+                    percent != 0) {
+                    lane_page_groups = std::min<std::uint64_t>(
+                        lane_page_groups,
+                        resolution.main_page_groups * static_cast<std::uint64_t>(100 - percent) / 100U);
+                }
                 for (const std::uint32_t width : models::qwen3_5::idle_prefill_widths(instance->parameters, trial)) {
                     auto wide = models::qwen3_5::make_sequence_planner(instance->parameters, device, trial, width, offload);
                     if (const auto fitted = resolve_kv_capacity_beside(kv_policy, wide.capacity_curve(), free_bytes,
@@ -1349,6 +1377,17 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         instance->program->set_hybrid_coalesce_wait_limit(
             static_cast<double>(options.pending_timeout_ms) / 1000.0 / 2.0);
         const std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
+        // A prefix cache file no longer used leaves its kept SSD file behind, which nothing removes: the start names
+        // each (another running server's is among them, so none is deleted).
+        if (!file.empty() && options.context_cache.ssd_capacity_bytes != 0) {
+            for (const runtime::prefix_cache::KeptSsdFile& other : runtime::prefix_cache::other_kept_ssd_files(
+                     options.context_cache.ssd_directory,
+                     runtime::prefix_cache::kept_ssd_file(options.context_cache.ssd_directory, file))) {
+                publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                   "SSD prefix cache: %s (%llu MiB) is not used by this server",
+                                   other.path.string().c_str(), static_cast<unsigned long long>(other.bytes >> 20));
+            }
+        }
         if (!file.empty()) {
             const runtime::prefix_cache::PersistResult loaded =
                 instance->program->attach_hybrid_cache_file(

@@ -20,11 +20,18 @@ std::atomic<std::int64_t> forced_tap_position{-1}; // -1: none
 std::atomic<std::uint32_t> restore_delay_us{0};
 std::atomic<bool> restore_fault{false};
 std::atomic<std::uint64_t> drain_count{0};
+std::atomic<std::uint64_t> tap_block_write_count{0};
 } // namespace
 
 void set_restore_fault() noexcept { restore_fault.store(true); }
 
 bool take_restore_fault() noexcept { return restore_fault.exchange(false); }
+
+void count_tap_block_writes(std::uint64_t blocks) noexcept {
+    tap_block_write_count.fetch_add(blocks, std::memory_order_relaxed);
+}
+
+std::uint64_t tap_block_writes() noexcept { return tap_block_write_count.load(std::memory_order_relaxed); }
 
 void count_drain() noexcept { drain_count.fetch_add(1, std::memory_order_relaxed); }
 
@@ -260,8 +267,8 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
     if (base.reuse && n > 1) {
         prefix_->poll();
         pc::MatchResult match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
-        if (prefix_->await_extended_endpoint(match.path, prompt.token_ids)) {
-            // The endpoint this prompt continues has just been published.
+        if (prefix_->await_extended_capture(match.path, prompt.token_ids, options_.free_cache_resume)) {
+            // The endpoint, or the sibling's tap, this prompt continues has just been published.
             match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
         }
         if (prefetch_landing() && std::any_of(match.candidates.begin(), match.candidates.end(),
@@ -970,11 +977,35 @@ bool ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
     // A paused request's frontier is its own resume point: its Host image is admitted over any retained
     // snapshot that is not pinned (a refused capture makes the resume replay, with prefill arithmetic).
     // The claim only admits it; its retention priority is the snapshot's own afterwards.
-    if (resume_point) { c.claim = pc::kResumePointClaim; }
+    if (resume_point) {
+        c.claim         = pc::kResumePointClaim;
+        c.publish_claim = pc::kResumePointClaim; // a full snapshot table yields an entry as the Host tier its slabs
+    }
     const std::uint64_t id = c.id;
     if (!prefix_->capture(index, std::move(c), device_.stream)) { return false; }
     prefix_captured(lane, id, F);
+    // An endpoint's blocks follow it with the rest of the lane's at its finish (prefix_finish).
+    if (kind != pc::SnapshotKind::Endpoint) { prefix_write_through(lane, F); }
     return true;
+}
+
+// Continuous write-through (hybrid-prefix-cache-spec §17, as Qwen3.5's since 2026-11-15): once a tap at F is taken
+// the lane's blocks below F are reachable from a snapshot, so their Host writes start now, behind the tap's image
+// on the transfer stream, and not in one batch when the lane releases. A pause or a finish then copies only the
+// blocks past the last tap: the batch that held gigabytes of a long lane's pages on the Device until it landed, and
+// that a waiting admission had to wait out, is gone. Blocks past the tap stay unwritten until a deeper snapshot
+// reaches them. The blocks are final (no write of the lane remains below its published frontier) and each is held
+// on the Device by its write until it lands, so no page returns to the pool under the copy; the copies are D2H,
+// beside the prefill's H2D expert stream, and take no Device memory. A capture the index later refuses leaves
+// blocks without a snapshot above them, which the Host tier reclaims first (dead KV).
+void ProgramImpl::prefix_write_through(Lane& lane, std::uint32_t F) {
+    if (lane.prefix.withdraw) { return; }
+    const std::size_t covered  = std::min<std::size_t>(lane.prefix.path.size(), F / kBlock);
+    const std::uint64_t before = prefix_->counters().host_block_writes;
+    try {
+        prefix_->write_blocks(std::span<const pc::NodeRef>(lane.prefix.path.data(), covered), device_.stream);
+    } catch (...) {} // as at release: a failed write leaves the blocks for the release's batch
+    testing::count_tap_block_writes(prefix_->counters().host_block_writes - before);
 }
 
 // A tap due at boundary B that the Host tier refused for room (hybrid-prefix-cache-spec §7.4): it is due again at

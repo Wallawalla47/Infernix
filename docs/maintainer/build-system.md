@@ -130,7 +130,10 @@ the warp-specialized Linear, LinearSwiGLU and causal-attention NVFP4 sources tha
 that would instantiate one fails to compile). Their
 owning family manifests register these sources into the non-RDC target; host launchers connect them to
 the normal Ops. All three CUDA archive targets
-retain `-lineinfo`.
+take `-lineinfo` only with `-DINFERNIX_CUDA_LINEINFO=ON` (off by default since 2026-11-15): the line tables and the
+PTX text they embed were 1.5 GiB of the 2.1 GiB Ops kernel image, which the driver reads into RAM (4,596 MiB against
+1,467 MiB without them, and 2.8 s of CUDA initialization against 0.85 s); the kernels' machine code is identical.
+Configure a profiling tree with the option on when Nsight Compute should attribute time to source lines.
 
 Source-list maintenance must preserve language, architecture, RDC mode, device-link ownership
 and numerical compiler options. Splitting a manifest does not reduce kernel instantiation work

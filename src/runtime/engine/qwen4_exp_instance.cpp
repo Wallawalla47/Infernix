@@ -545,28 +545,26 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // With --ram-resize auto it may grow later, into RAM other programs free.
     std::uint64_t prefix_growth = 0;
     if (prefix_auto) {
-        prefix_bytes = auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
+        // The exclusive layout's cap is the plan's own: where the tier no longer fits beside it, the layout gives way
+        // to the plain SSD tier (plan_auto_host_tier); an --expert-ram-mib cap is the user's and stays.
+        if (exclusive) {
+            const AutoHostTier tier = plan_auto_host_tier(snapshot, demand);
+            prefix_bytes            = tier.bytes;
+            if (!tier.keeps_cap) {
+                demand.expert_cap.reset();
+                exclusive                            = false;
+                program_options.expert_ram_exclusive = false;
+                program_options.expert_shadow_share  = 0.0;
+                program_options.expert_seed_share    = models::qwen4_exp::ProgramOptions{}.expert_seed_share;
+                report(options, DiagnosticLevel::Debug,
+                       "RAM plan: the exclusive expert layout does not fit beside the automatic prefix cache; using "
+                       "the SSD tier's layout");
+            }
+        } else {
+            prefix_bytes = auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
+        }
         if (options.ram_resize) { prefix_growth = auto_host_context_ceiling_bytes(snapshot, demand, prefix_bytes); }
         demand.prefix_cache = prefix_bytes;
-        // The exclusive layout's cap was tested before the automatic tier took its share, which is at least
-        // kMinAutoHostContextBytes however little the cap leaves: in the band where the cap fitted with less than
-        // that to spare, the plan with the tier no longer holds the cap, and the start was refused as if the user
-        // had asked for --expert-ram-mib. The layout is the plan's own choice, so it gives way as it does on a
-        // machine too small for it: the plain SSD tier, whose experts take what the tier leaves.
-        if (exclusive && expert_offload::plan_host_memory(snapshot, demand).cap_too_large) {
-            demand.expert_cap.reset();
-            exclusive                            = false;
-            program_options.expert_ram_exclusive = false;
-            program_options.expert_shadow_share  = 0.0;
-            program_options.expert_seed_share    = models::qwen4_exp::ProgramOptions{}.expert_seed_share;
-            demand.prefix_cache                  = 0;
-            prefix_bytes = auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
-            if (options.ram_resize) { prefix_growth = auto_host_context_ceiling_bytes(snapshot, demand, prefix_bytes); }
-            demand.prefix_cache = prefix_bytes;
-            report(options, DiagnosticLevel::Debug,
-                   "RAM plan: the exclusive expert layout does not fit beside the automatic prefix cache; using the "
-                   "SSD tier's layout");
-        }
     }
     if (cache.enabled) {
         program_options.prefix_host_bytes    = prefix_bytes;
@@ -579,6 +577,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         if (cache.ssd_capacity_bytes != 0 && !cache.hybrid.persistent_file.empty()) {
             program_options.prefix_ssd_kept_file =
                 runtime::prefix_cache::kept_ssd_file(cache.ssd_directory, cache.hybrid.persistent_file);
+            // A prefix cache file no longer used leaves its kept SSD file behind, which nothing removes: the start
+            // names each (another running server's is among them, so none is deleted).
+            if (!plan_only) {
+                for (const runtime::prefix_cache::KeptSsdFile& other : runtime::prefix_cache::other_kept_ssd_files(
+                         cache.ssd_directory, program_options.prefix_ssd_kept_file)) {
+                    report(options, DiagnosticLevel::Info,
+                           "SSD prefix cache: " + other.path.string() + " (" + std::to_string(other.bytes >> 20) +
+                               " MiB) is not used by this server");
+                }
+            }
         }
     }
     // The SSD tier (design §19.3.7): the banks stay in the artifact; the Program pins RAM slots for
@@ -691,7 +699,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     device.synchronize();
     // What the weights hold once loaded: packed projections replace the estimate with their size.
     const std::uint64_t loaded = model->device_weight_bytes();
-    if (const std::uint64_t spilled = guard.end(loaded); spilled != 0) {
+    // The load page-locks tens of GiB inside the guarded step (the pinned block with the expert banks, a packed
+    // embedding's own block, the CSF tables, the upload staging of the artifact and of a DFlash2 companion), which
+    // the guard takes off the shared system memory use it reads (Model::load_pinned_bytes).
+    if (const std::uint64_t spilled = guard.end(loaded, model->load_pinned_bytes()); spilled != 0) {
         throw std::runtime_error(std::to_string(mib(spilled)) +
                                  " MiB of the dense weights were placed in shared system memory by the driver's "
                                  "sysmem fallback: free VRAM and start again (" + guard.readings(loaded) + ")");

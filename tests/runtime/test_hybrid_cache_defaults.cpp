@@ -25,8 +25,8 @@ int main() {
     int failures = 0;
 
     // The prefix cache derives every tuning value from the rest of the configuration. With the
-    // default (automatic) Host tier at concurrency 2 and a 2048-token chunk: one resident snapshot per
-    // lane plus one staging slot = 3, 8 taps, ladder max(4096, 2 * 2048) = 4096 and minimum gap
+    // default (automatic) Host tier at concurrency 2 and a 2048-token chunk: one Device snapshot slot
+    // (snapshots restore from the Host tier, and further slots would be KV capacity), 8 taps, ladder max(4096, 2 * 2048) = 4096 and minimum gap
     // max(1024, 2048) = 2048. The snapshot slots are the extra Device StateImages. The size stays
     // unset here: construct_model sizes it once the model's RAM is planned.
     {
@@ -37,7 +37,7 @@ int main() {
         const infernix::ContextCacheOptions& out = normalized.context_cache;
         failures +=
             check(!out.host_capacity_bytes &&
-                      out.hybrid.device_snapshot_slots == 3U && out.hybrid.max_new_taps == 8U &&
+                      out.hybrid.device_snapshot_slots == 1U && out.hybrid.max_new_taps == 8U &&
                       out.hybrid.tap_ladder_tokens == 4096U &&
                       out.hybrid.tap_min_gap_tokens == 2048U,
                   "prefix cache defaults did not derive from concurrency, chunk and Host tier");
@@ -170,10 +170,10 @@ int main() {
                               qwen4.hybrid.device_snapshot_slots == 0U && qwen4.hybrid.max_new_taps == 8U,
                           "Qwen3.8-Flash-Next prefix cache defaults are wrong");
         const infernix::ContextCacheOptions qwen35 = normalize_engine_options(options).context_cache;
-        failures += check(!qwen35.host_capacity_bytes && qwen35.hybrid.device_snapshot_slots == 3U,
+        failures += check(!qwen35.host_capacity_bytes && qwen35.hybrid.device_snapshot_slots == 1U,
                           "Qwen3.5 prefix cache defaults changed");
-        // A Qwen3.5 artifact with offloaded experts keeps one Device slot beside its Host tier (the frames
-        // the others would take; candidates §22 VM-03), and the per-lane rule without a Host tier.
+        // With offloaded experts the same: one Device slot beside the Host tier (the frames the others would
+        // take; candidates §22 VM-03), and the per-lane rule without a Host tier.
         const infernix::ContextCacheOptions offloaded =
             normalize_engine_options(options, infernix::models::Architecture::Qwen3_5, true).context_cache;
         failures += check(offloaded.hybrid.device_snapshot_slots == 1U,

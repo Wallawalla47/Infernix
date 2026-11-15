@@ -6,5 +6,5 @@ function(infernix_add_op_bench name)
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/ops)
   target_link_libraries(${name} PRIVATE infernix_ops)
-  target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+  target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${INFERNIX_CUDA_LINEINFO_FLAG}>)
 endfunction()

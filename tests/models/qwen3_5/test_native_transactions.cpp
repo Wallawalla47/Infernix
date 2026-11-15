@@ -791,6 +791,7 @@ void host_restore_lifecycle(DeviceContext& device, const qwen::execution::Parame
     // then six more tokens. Returns the tokens it generated.
     const auto run = [&](bool delayed) {
         const std::string label = delayed ? "held restore" : "restore";
+        const auto at_start     = program.hybrid_stats();
         std::vector<TokenId> ids(kHostPrompt, 198);
         for (std::size_t at = 0; at < ids.size(); at += 5) { ids[at] = 4000 + static_cast<TokenId>(at % 89); }
         runtime::ResolvedExecutionOptions execution;
@@ -805,6 +806,11 @@ void host_restore_lifecycle(DeviceContext& device, const qwen::execution::Parame
                                                         qwen::ExecutionUnitKind::Prefill, 0U)),
                 label + ": the request could not bind");
         const qwen::SequenceHandle original = *settle().sequence;
+        // The sequence carries a rotary offset, as a prompt with a multi-row image before this text does: every
+        // text pass past the prompt's start, and every Replay pass after the pause, must run with it (they ran at 0).
+        constexpr std::int32_t kRopeDelta = -7;
+        program.sequences[0].rope_delta   = kRopeDelta;
+        qwen::testing::record_text_passes(true);
         bool reported = false;
         for (std::uint32_t processed = 0; processed < kHostPrompt;) {
             reserve(original, qwen::ExecutionUnitKind::Prefill);
@@ -835,11 +841,15 @@ void host_restore_lifecycle(DeviceContext& device, const qwen::execution::Parame
         device.synchronize();
         program.hybrid_->drain();
         for (const std::uint32_t slot : held) { program.hybrid_->index().release_device_slot(slot); }
-        // Only the blocks at or above the tap can serve a resume; the ones past it would be recomputed.
-        const std::uint64_t written = program.hybrid_stats().host_block_writes - before_pause.host_block_writes;
-        require(written == kTap / 64U, label + ": the release wrote " + std::to_string(written) +
-                                           " blocks to the Host tier, not the " + std::to_string(kTap / 64U) +
-                                           " a snapshot can resume through");
+        // Only the blocks at or above the tap can serve a resume; the ones past it would be recomputed. They went to
+        // the Host tier as the tap published (continuous write-through), so the release has nothing left to copy.
+        const std::uint64_t at_tap     = before_pause.host_block_writes - at_start.host_block_writes;
+        const std::uint64_t at_release = program.hybrid_stats().host_block_writes - before_pause.host_block_writes;
+        require(at_tap == kTap / 64U, label + ": the tap wrote " + std::to_string(at_tap) +
+                                          " blocks to the Host tier, not the " + std::to_string(kTap / 64U) +
+                                          " a snapshot can resume through");
+        require(at_release == 0, label + ": the release wrote " + std::to_string(at_release) +
+                                     " blocks no snapshot reaches");
         (void)program.hybrid_->index().evict_backed_device_blocks(kLongContext);
 
         const RestoreDelay delay(delayed ? 200'000U : 0U);
@@ -871,6 +881,17 @@ void host_restore_lifecycle(DeviceContext& device, const qwen::execution::Parame
             complete = program.advance_replay(resumed, nullptr).complete;
         }
         require(complete, label + ": the replay did not complete");
+        const std::vector<qwen::testing::TextPass> passes = qwen::testing::text_passes();
+        qwen::testing::record_text_passes(false);
+        std::size_t replayed_passes = 0;
+        for (const qwen::testing::TextPass& pass : passes) {
+            require(pass.rope_delta == kRopeDelta,
+                    label + ": a text pass at " + std::to_string(pass.base) + " ran with rotary offset " +
+                        std::to_string(pass.rope_delta) + ", not the sequence's " + std::to_string(kRopeDelta));
+            replayed_passes += pass.base >= kTap ? 1U : 0U;
+        }
+        // The prompt's last pass and the Replay's passes all begin at or past the tap.
+        require(replayed_passes >= 2, label + ": no Replay pass was recorded");
         for (int round = 0; round < 6; ++round) { decode(resumed, round == 5); }
         const std::vector<TokenId>& ledger = program.sequences[1].ledger;
         std::vector<TokenId> generated(ledger.begin() + kHostPrompt, ledger.end());

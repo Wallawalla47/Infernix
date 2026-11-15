@@ -10,6 +10,7 @@
 // loan, a sixteenth of the frames and the KV growth, the seeds never take the frames they cover, and RAM holds
 // every other expert.
 
+#include "runtime/engine/expert_memory.h"
 #include "runtime/expert_offload/memory_plan.h"
 #include "runtime/expert_offload/ram_monitor.h"
 
@@ -152,6 +153,57 @@ void test_expert_cap() {
     const HostMemoryLedger short_room = plan_host_memory(snapshot(30 * kGiB, 200 * kGiB), d);
     require(short_room.cap_too_large && short_room.placement == ExpertPlacement::Tier,
             "a cap larger than the ledger leaves is flagged");
+}
+
+// The automatic Host tier beside the exclusive layout's own cap (runtime::plan_auto_host_tier). The cap is tested
+// before the tier exists and the tier takes at least 1 GiB: with less than that left beside the cap, the plan with
+// the tier flags the cap (which a start reported as a refused --expert-ram-mib), so the layout must give way there
+// and nowhere else. Free RAM just above the band, inside it and below it (the cap not fitting at all).
+void test_auto_tier_beside_cap() {
+    HostMemoryDemand d        = flash_next();
+    d.expert_cap              = 32 * kGiB;
+    const std::uint64_t fixed = d.reserve + plan_host_memory(snapshot(0, 0), d).planned; // without a tier
+    const auto with_tier      = [&](std::uint64_t available, std::uint64_t tier) {
+        HostMemoryDemand planned = d;
+        planned.prefix_cache     = tier;
+        return plan_host_memory(snapshot(available, 200 * kGiB), planned);
+    };
+
+    // 3 GiB beside the cap: the tier takes them less its lock overhead, in 256 MiB steps, and the cap holds.
+    const std::uint64_t above       = fixed + 32 * kGiB + 3 * kGiB;
+    const runtime::AutoHostTier roomy = runtime::plan_auto_host_tier(snapshot(above, 200 * kGiB), d);
+    require(roomy.keeps_cap && roomy.bytes == 2816 * kMiB,
+            "3 GiB beside the cap give a 2,816 MiB tier and keep the cap");
+    require(!with_tier(above, roomy.bytes).cap_too_large, "the plan with that tier holds the cap");
+
+    // 512 MiB beside the cap: the cap fits alone, the 1 GiB least tier does not fit beside it.
+    const std::uint64_t inside = fixed + 32 * kGiB + 512 * kMiB;
+    require(!with_tier(inside, 0).cap_too_large, "inside the band the cap fits before the tier");
+    require(with_tier(inside, runtime::kMinAutoHostContextBytes).cap_too_large,
+            "inside the band the least tier no longer leaves the cap its room");
+    const runtime::AutoHostTier band = runtime::plan_auto_host_tier(snapshot(inside, 200 * kGiB), d);
+    require(!band.keeps_cap && band.bytes == runtime::kMinAutoHostContextBytes,
+            "inside the band the layout gives way and the tier is the least one");
+    HostMemoryDemand plain = d;
+    plain.expert_cap.reset();
+    plain.prefix_cache = band.bytes;
+    const HostMemoryLedger fallback = plan_host_memory(snapshot(inside, 200 * kGiB), plain);
+    require(!fallback.cap_too_large && fallback.placement == ExpertPlacement::Tier && fallback.expert_ram > 31 * kGiB,
+            "the fallback plan starts: the SSD tier with what the Host tier leaves");
+
+    // Below the band the cap does not fit even alone: the same fallback.
+    const runtime::AutoHostTier below =
+        runtime::plan_auto_host_tier(snapshot(fixed + 32 * kGiB - 512 * kMiB, 200 * kGiB), d);
+    require(!below.keeps_cap && below.bytes == runtime::kMinAutoHostContextBytes,
+            "below the band the layout gives way");
+
+    // The edge: exactly the least tier with its lock overhead beside the cap keeps it.
+    const std::uint64_t edge = fixed + 32 * kGiB + kGiB + 64 * kMiB;
+    require(runtime::plan_auto_host_tier(snapshot(edge, 200 * kGiB), d).keeps_cap, "just above the band the cap stays");
+
+    // Without a cap there is nothing to give way.
+    require(runtime::plan_auto_host_tier(snapshot(inside, 200 * kGiB), plain).keeps_cap,
+            "a plan without a cap keeps none");
 }
 
 // The page-locking limit (Windows: the GPU's shared system memory): the other pins draw on it first,
@@ -785,6 +837,7 @@ int main() {
         test_commit_limit();
         test_starved_and_describe();
         test_expert_cap();
+        test_auto_tier_beside_cap();
         test_pin_room();
         test_graph_bound();
         test_display_headroom();

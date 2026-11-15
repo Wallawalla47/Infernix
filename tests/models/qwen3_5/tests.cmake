@@ -26,6 +26,10 @@ infernix_add_test(infernix_qwen3_5_calibrated_order_test
 infernix_add_test(infernix_qwen3_5_idle_prefill_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_idle_prefill.cpp")
 
+# The prefix cache's online cost corrections: the measured Host-to-Device rate and the prefill scale (host only).
+infernix_add_test(infernix_qwen3_5_online_cost_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_online_cost.cpp")
+
 infernix_add_test(infernix_qwen3_5_tree_width_controller_test SOURCES
   "${CMAKE_CURRENT_LIST_DIR}/test_tree_width_controller.cpp"
   "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/speculative/tree_width_controller.cpp")

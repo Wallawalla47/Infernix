@@ -31,6 +31,11 @@ void set_restore_fault() noexcept;
 
 // Whole drains of the prefix cache's transfer and restore streams (PrefixCache::drain) since the process started: a
 // test reads the count around an operation that must not wait for every transfer. count_drain is the cache's.
+// Blocks whose Host write started when a tap was taken (continuous write-through), not at their lane's release,
+// since the process started. count_tap_block_writes is the Program's.
+void count_tap_block_writes(std::uint64_t blocks) noexcept;
+[[nodiscard]] std::uint64_t tap_block_writes() noexcept;
+
 void count_drain() noexcept;
 [[nodiscard]] std::uint64_t drains() noexcept;
 

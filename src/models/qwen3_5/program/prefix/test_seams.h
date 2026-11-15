@@ -8,9 +8,26 @@
 //   took (a reclaim that cannot evict takes none), and the overlay Vision encodes bindings ran (a binding that
 //   reports a shortage runs none).
 
+// - the rotary offset each prefill-shaped text pass ran with (a prompt's, a Replay's, forced tokens'): a pass at a
+//   base past 0 must carry its sequence's rope_delta (2026-11-15: all three ran at delta 0 after a member was
+//   inserted into the pass's context, so an image request's text passes computed at the wrong positions).
+
 #include <cstdint>
+#include <vector>
 
 namespace infernix::models::qwen3_5::testing {
+
+// One text pass (execution::prefill_text_chunk): where it began and the rotary offset it was given.
+struct TextPass {
+    std::uint32_t base      = 0;
+    std::int32_t rope_delta = 0;
+};
+
+// Starts (clearing what was recorded) or stops the recording of text passes. For tests only; off, a pass records
+// nothing.
+void record_text_passes(bool enabled);
+[[nodiscard]] std::vector<TextPass> text_passes();
+void note_text_pass(std::uint32_t base, std::int32_t rope_delta);
 
 // Every Host restore opened after the call (until it is reset with 0) holds its copy stream `microseconds` before
 // its first copy. For tests only.

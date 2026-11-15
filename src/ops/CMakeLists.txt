@@ -3,6 +3,12 @@ add_library(infernix_ops STATIC)
 infernix_internal_includes(infernix_ops)
 infernix_cuda_archive(infernix_ops)
 target_link_libraries(infernix_ops PUBLIC infernix_core PRIVATE infernix_nvfp4_non_rdc)
+# The kernel images' RAM estimate follows the build's image size (launcher/kernel_images.cu): one source's definition,
+# so switching the option recompiles every CUDA source for the flag itself and nothing else for this.
+if(INFERNIX_CUDA_LINEINFO)
+  set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/launcher/kernel_images.cu"
+    PROPERTIES COMPILE_DEFINITIONS INFERNIX_CUDA_LINEINFO=1)
+endif()
 
 # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
 # producer to consumer warpgroups. RDC makes ptxas discard that contract. These

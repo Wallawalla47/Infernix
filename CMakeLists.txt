@@ -30,6 +30,17 @@ endif()
 option(INFERNIX_BUILD_APPS "Build the Infernix CLI, server, launcher, perplexity evaluator and certifier" ON)
 option(BUILD_TESTING "Build Infernix tests" OFF)
 option(INFERNIX_BUILD_BENCHMARKS "Build Infernix benchmarks" OFF)
+# CUDA line information (-lineinfo) lets Nsight Compute attribute kernel time to source lines. It is carried in the
+# kernel images, which the driver reads into host RAM when the module's first kernel launches: embedded PTX text and
+# line tables were 1.5 GiB of the 2.1 GiB Ops image on 2026-11-14 (machine code and its metadata 0.6 GiB). Measured
+# 2026-11-15 on the 27B: 1,467 MiB of RAM and 0.85 s of CUDA initialization without it, 4,596 MiB and 2.8 s with it;
+# every kernel's machine code is byte-identical either way. Off by default; turn it on for a profiling build.
+option(INFERNIX_CUDA_LINEINFO "Compile CUDA sources with -lineinfo (profiling attribution; +3 GiB of RAM)" OFF)
+set(INFERNIX_CUDA_LINEINFO_FLAG "")
+if(INFERNIX_CUDA_LINEINFO)
+  set(INFERNIX_CUDA_LINEINFO_FLAG "-lineinfo")
+endif()
+
 # Test builds only: every PDL wait lets its dependents launch, waits, then spins (core/pdl.cuh), so producers
 # write late and a kernel that reads its producer's output before its wait reads stale data and the output
 # changes (docs/maintainer/op-development.md, programmatic dependent launch).

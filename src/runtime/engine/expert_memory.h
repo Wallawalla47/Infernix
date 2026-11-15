@@ -82,6 +82,20 @@ inline constexpr std::uint64_t kMinAutoHostContextBytes = 1ULL << 30;
                                                             const expert_offload::HostMemoryDemand& demand,
                                                             std::uint64_t startup) noexcept;
 
+// The automatic Host tier of a plan whose expert share is capped by the plan itself (Qwen3.8-Flash-Next's exclusive
+// RAM layout, HostMemoryDemand::expert_cap set by the instance, not by --expert-ram-mib). The cap is tested before
+// the tier exists, and the tier takes at least kMinAutoHostContextBytes however little the cap leaves: where the cap
+// fitted with less than that to spare, the plan with the tier no longer holds the cap (cap_too_large), which a start
+// reported as a refused --expert-ram-mib. The layout is the plan's own choice, so there it gives way: `keeps_cap`
+// false, and `bytes` the tier of the plan without the cap (the plain SSD tier, whose experts take what the tier
+// leaves). `demand.prefix_cache` is ignored; a demand without a cap keeps none.
+struct AutoHostTier {
+    std::uint64_t bytes = 0;
+    bool keeps_cap      = true;
+};
+[[nodiscard]] AutoHostTier plan_auto_host_tier(const HostMemorySnapshot& snapshot,
+                                               expert_offload::HostMemoryDemand demand) noexcept;
+
 // Plans `demand` against `snapshot`, reports the ledger (an Info summary, Debug details) and refuses
 // an --expert-ram-mib the ledger cannot give (std::runtime_error, expert_ram_refusal's message).
 // `always_tier`: the banks load as the SSD tier's even where every expert fits in RAM, the ledger's

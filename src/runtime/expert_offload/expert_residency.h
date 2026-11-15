@@ -213,6 +213,13 @@ public:
     [[nodiscard]] std::uint64_t frame_pitch(std::uint32_t layer) const noexcept;
     // The average frame's bytes (average_frame_bytes of the layers' strides).
     [[nodiscard]] std::uint64_t frame_bytes() const noexcept { return frame_bytes_; }
+    // The host memory this object has page-locked: the tables', route log's, landing tables' and (with a tier) record
+    // table's host copies, every pinned allocation it makes. For a caller that guards its device allocations by the
+    // process's shared system memory use (SpillGuard::end), which page-locked memory raises too.
+    [[nodiscard]] std::uint64_t pinned_bytes() const noexcept {
+        return table_host_.size() + route_host_.size() + landing_host_.size() + landed_host_.size() +
+               records_host_.size();
+    }
     [[nodiscard]] const std::int32_t* table(std::uint32_t layer) const noexcept;
     // The host copy of every layer's table (I32 [layers][experts]), equal to the device tables
     // once before_round has uploaded them.

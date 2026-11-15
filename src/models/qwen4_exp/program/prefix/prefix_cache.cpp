@@ -97,20 +97,31 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
     store_ = pc::HostSlabStore(host_.slab_bytes, host_.slabs, locked, kHostChunkBytes, "Qwen4Exp prefix cache Host tier");
     // A release keeps one snapshot and its block in service.
     store_.set_floor_chunks((host_.image_slabs + 2U + host_.slabs_per_chunk - 1U) / host_.slabs_per_chunk);
-    CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_, cudaStreamNonBlocking));
-    CUDA_CHECK(cudaStreamCreateWithFlags(&restore_stream_, cudaStreamNonBlocking));
-    if (index.ssd_slabs != 0) {
-        // Its slabs are Host slabs byte for byte (page records and image segments), so a transfer is a
-        // plain copy, and a snapshot's meta stays with its index entry.
-        ssd_ = std::make_unique<pc::SsdTier>(config.ssd_directory, index.ssd_slabs, host_.slab_bytes,
-                                             [this](std::uint32_t id) { return slab(id); }, config.ssd_write_bytes_per_hour,
-                                             /*codec=*/true, config.ssd_kept_file);
+    // The destructor does not run for a constructor that throws (the SSD tier's file cannot be opened, the second
+    // stream is refused): the streams made so far are destroyed here, the members unwind by themselves.
+    try {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&restore_stream_, cudaStreamNonBlocking));
+        if (index.ssd_slabs != 0) {
+            // Its slabs are Host slabs byte for byte (page records and image segments), so a transfer is a
+            // plain copy, and a snapshot's meta stays with its index entry.
+            ssd_ = std::make_unique<pc::SsdTier>(config.ssd_directory, index.ssd_slabs, host_.slab_bytes,
+                                                 [this](std::uint32_t id) { return slab(id); },
+                                                 config.ssd_write_bytes_per_hour, /*codec=*/true, config.ssd_kept_file);
+        }
+        node_mtp_next_.assign(index.max_nodes, -1);
+        snapshot_meta_.assign(index.max_snapshots, StateImageHeader{});
+        blocks_.reserve(index.max_nodes);
+        index_.emplace(index, *this);
+        store_.limit_index(*index_); // only the locked slabs serve until a growth links more
+    } catch (...) {
+        ssd_.reset(); // its threads end before the slabs they would read
+        index_.reset();
+        for (cudaStream_t stream : {transfer_, restore_stream_}) {
+            if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
+        }
+        throw;
     }
-    node_mtp_next_.assign(index.max_nodes, -1);
-    snapshot_meta_.assign(index.max_snapshots, StateImageHeader{});
-    blocks_.reserve(index.max_nodes);
-    index_.emplace(index, *this);
-    store_.limit_index(*index_); // only the locked slabs serve until a growth links more
 }
 
 PrefixCache::~PrefixCache() {
@@ -413,7 +424,7 @@ void PrefixCache::poll() {
         if (c.capture.tail_lease) { tail_device = adopt_tail(std::move(*c.capture.tail_lease)); }
         const pc::PublishResult result =
             index_->publish_host_snapshot(c.capture.anchor, c.capture.frontier, c.capture.tail, tail_device,
-                                          std::move(c.image), c.capture.kind);
+                                          std::move(c.image), c.capture.kind, c.capture.publish_claim);
         if (result.created) {
             snapshot_meta_[result.snapshot.index] = c.capture.meta;
             ++(c.capture.kind == pc::SnapshotKind::Endpoint ? counters_.endpoints_created : counters_.taps_created);
@@ -505,20 +516,26 @@ pc::SsdTier::Promotion PrefixCache::promote(pc::SnapshotRef snapshot) {
     return ssd_->promote(*index_, snapshot);
 }
 
-bool PrefixCache::await_extended_endpoint(std::span<const pc::NodeRef> path, std::span<const TokenId> tokens) {
+bool PrefixCache::await_extended_capture(std::span<const pc::NodeRef> path, std::span<const TokenId> tokens,
+                                         bool endpoints) {
+    // The last one in the transfer stream that the prompt extends: every capture before it lands first.
+    const PendingCapture* last = nullptr;
     for (const PendingCapture& c : captures_) {
-        if (c.capture.kind != pc::SnapshotKind::Endpoint || tokens.size() <= c.capture.frontier) { continue; }
+        if ((!endpoints && c.capture.kind == pc::SnapshotKind::Endpoint) || tokens.size() <= c.capture.frontier) {
+            continue;
+        }
         const std::uint32_t k = c.capture.frontier / pc::kBlockTokens;
         if (k > 0 && (path.size() < k || path[k - 1] != c.capture.anchor)) { continue; }
         if (!std::equal(c.capture.tail.begin(), c.capture.tail.end(),
                         tokens.begin() + static_cast<std::ptrdiff_t>(k) * pc::kBlockTokens)) {
             continue;
         }
-        CUDA_CHECK(cudaEventSynchronize(c.events.back()));
-        poll();
-        return true;
+        last = &c;
     }
-    return false;
+    if (last == nullptr) { return false; }
+    CUDA_CHECK(cudaEventSynchronize(last->events.back()));
+    poll();
+    return true;
 }
 
 std::optional<pc::PublishResult> PrefixCache::capture_result(std::uint64_t id) const {

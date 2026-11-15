@@ -27,10 +27,11 @@ with `--expert-stripe` in the SSD tier.
   `nvidia-smi --query-gpu=pcie.link.width.current --format=csv`.
 - **RAM.** About 96 GB for full speed. A run pins ~64.5 GiB. At startup a RAM ledger plans every
   allocation (experts, n-gram table, prefix cache) and keeps `--ram-free-mib` (default 4096 since
-  2026-11-13, when the ledger started counting the 4.5 GiB of CUDA kernel code Infernix reads at
-  startup, which had left less free than planned; 8192 from 2026-10-26; 2048 before, when a desktop
+  2026-11-13, when the ledger started counting the CUDA kernel code Infernix reads at startup, which
+  had left less free than planned: 1.5 GiB since 2026-11-15, 4.5 GiB before, when the build carried
+  profiling line information; 8192 from 2026-10-26; 2048 before, when a desktop
   paged once the experts and the n-gram table took the rest) free for other programs; with the
-  defaults about 76.7 GiB must be available when it starts, the kernel code included, with the
+  defaults about 73.6 GiB must be available when it starts, the kernel code included, with the
   smallest prefix cache, which takes whatever the experts leave beyond the reserve (see
   [Prefix cache](#prefix-cache)). With less, the [SSD expert tier](#ssd-expert-tier) keeps the
   experts that fit in RAM and reads the others from the artifact; the ledger line names every term.

@@ -27,6 +27,7 @@
 #include "models/qwen3_5/program/offload.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 #include "runtime/expert_offload/ram_monitor.h"
+#include "runtime/engine/context_cache/online_cost.h"
 #include "runtime/prefix_cache/cost.h"
 #include "runtime/prefix_cache/prefix_index.h"
 #include "runtime/prefix_cache/tap_planner.h"
@@ -939,6 +940,12 @@ public:
     std::unique_ptr<HybridPrefixCache> hybrid_;
     std::array<HybridLaneState, kMaximumConcurrency> hybrid_lanes_;
     runtime::prefix_cache::CacheCostModel hybrid_cost_;
+    // The prefill terms' measured scale (runtime/engine/context_cache/online_cost.h): hybrid_cost_ stays the
+    // Engine's model, and the index ranks and values with it scaled. hybrid_observe_prefill feeds it one finished
+    // prompt's prefill time (an artifact without fitted coefficients is otherwise priced as the generic 27B).
+    runtime::OnlinePrefillScale hybrid_prefill_scale_;
+    double hybrid_applied_prefill_scale_ = 1.0;
+    void hybrid_observe_prefill(std::uint32_t lane, std::uint32_t base, std::uint32_t prompt_tokens, double seconds);
     double hybrid_coalesce_wait_seconds_ = 0.0;
     // The last hybrid_sources call deferred its request to an SSD promotion (spec §5.7).
     bool hybrid_source_pending_ = false;

@@ -837,6 +837,19 @@ MemoryUsage ProgramImpl::memory_usage() const noexcept {
     // The KV: the decoder's pages and tables (and an elastic pool's mapped pages), less the pages only the prefix
     // cache holds (each page's share of the KV), which are its part.
     out.device.kv = persistent_kv_bytes + (kv_vmm ? kv_vmm->mapped_bytes() : 0);
+    // The MTP drafter's page pool is planned with the decoder's KV but is no text page: named on its own, so the
+    // per-page figure below (a text page's share, which sizes the prefix cache's part and the used pages) and the
+    // KV cache's row are the text KV's. The total is unchanged.
+    if (const PagedKVCache* mtp = decoder->mtp_cache(); mtp != nullptr) {
+        const DeviceKVPagePool& mtp_pool = mtp->page_pool();
+        std::uint64_t planes             = 0;
+        for (std::size_t i = 0; i < mtp_pool.plane_count(); ++i) {
+            const Tensor& plane = mtp_pool.plane(i);
+            planes += static_cast<std::uint64_t>(plane.nb[3]) * static_cast<std::uint64_t>(plane.ne[3]);
+        }
+        out.device.mtp_kv = std::min(planes, out.device.kv);
+        out.device.kv    -= out.device.mtp_kv;
+    }
     const DeviceKVPagePool& pool = decoder->text_kv.page_pool();
     if (const std::uint32_t backed = pool.backed_pages(); backed != 0) {
         const std::uint64_t page      = out.device.kv / backed;

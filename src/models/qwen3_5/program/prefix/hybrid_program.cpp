@@ -22,6 +22,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -193,7 +194,34 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
 void ProgramImpl::set_hybrid_cost(const pc::CacheCostModel& cost) {
     hybrid_cost_              = cost;
     hybrid_cost_.chunk_tokens = prefill_chunk;
-    if (hybrid_) { hybrid_->set_cost(hybrid_cost_); }
+    if (!hybrid_) { return; }
+    // Offloaded experts: the start measured the link for its expert traffic (ExpertOffload::measure_link), so the
+    // restore rate starts from it instead of the compiled coefficient (another machine's link). A resident start
+    // measures nothing: its first large Host restore does (HybridPrefixCache::finish_landing).
+    if (offload && hybrid_->measured_h2d_bytes_per_second() == 0.0) {
+        hybrid_->observe_h2d_rate(offload->engine().link_bytes_per_second());
+    }
+    hybrid_applied_prefill_scale_ = hybrid_prefill_scale_.scale();
+    hybrid_->set_cost(hybrid_prefill_scale_.apply(hybrid_cost_));
+}
+
+void ProgramImpl::hybrid_observe_prefill(std::uint32_t lane, std::uint32_t base, std::uint32_t prompt_tokens,
+                                         double seconds) {
+    if (!hybrid_ || lane >= max_concurrency || prompt_tokens <= base) { return; }
+    const HybridLaneState& state = hybrid_lanes_[lane];
+    // Only a prefill the model's terms describe and nothing else stretched: bound at this base (not a resume, whose
+    // time spans its pause), no Host restore to wait for, at least a chunk long, and no other lane on the device
+    // as it ended.
+    if (!state.active || state.restore_ticket != 0 || state.resume_frontier != base ||
+        prompt_tokens - base < prefill_chunk || other_lane_generating(lane) || other_lane_prefilling(lane)) {
+        return;
+    }
+    hybrid_prefill_scale_.observe(seconds, hybrid_cost_.prefill_seconds(base, prompt_tokens - base));
+    // The index revalues its snapshots with a new model, so it gets one only when the scale moved by 5 % or more.
+    const double scale = hybrid_prefill_scale_.scale();
+    if (std::abs(scale - hybrid_applied_prefill_scale_) < 0.05 * hybrid_applied_prefill_scale_) { return; }
+    hybrid_applied_prefill_scale_ = scale;
+    hybrid_->set_cost(hybrid_prefill_scale_.apply(hybrid_cost_));
 }
 
 runtime::prefix_cache::PersistResult ProgramImpl::attach_hybrid_cache_file(const std::filesystem::path& path,
@@ -1347,15 +1375,37 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
         const std::uint64_t evicted       = counters.evicted_blocks;
         const pc::PublishResult published = index.publish_snapshot(
             anchor, tap.frontier, tail_tokens, tail_id, tap.slot,
-            tap.boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap);
+            tap.boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap, std::nullopt, /*adopt=*/true);
         if (!published.created) {
             // The tail copy came back through release_device_block, which counts evictions: it was none.
             counters.evicted_blocks = evicted;
-            (void)state_store->release(tap.image);
-            // An identical snapshot serves the lineage; without one (a full snapshot table) the
-            // superseded snapshots stay its resume point.
-            if (!published.snapshot.valid()) { hybrid_undo_supersession(lane, tap.superseded); }
             ++counters.taps_skipped;
+            if (!published.snapshot.valid()) {
+                // A full snapshot table: the superseded snapshots stay the lineage's resume point.
+                (void)state_store->release(tap.image);
+                hybrid_undo_supersession(lane, tap.superseded);
+                continue;
+            }
+            // An identical snapshot serves the lineage. One that had lost its Device image took this tap's
+            // staging slot, so the image is its own now (a resume from it then needs no Host restore);
+            // otherwise the copy goes.
+            if (published.device_adopted) {
+                hybrid_->attach_image(published.snapshot, tap.image);
+            } else {
+                (void)state_store->release(tap.image);
+            }
+            // It is the lineage's snapshot at this frontier as one the lane created would be, so a deeper
+            // one supersedes it; the lane did not create it, so a withdrawal leaves it.
+            lane.deepest_snapshot = std::max(lane.deepest_snapshot, tap.frontier);
+            if (tap.frontier >= lane.latest_frontier) {
+                lane.latest_snapshot = published.snapshot;
+                lane.latest_frontier = tap.frontier;
+            }
+            if (!tap.boundary) {
+                hybrid_supersede_tap(lane, tap.frontier);
+                lane.tap_snapshot = published.snapshot;
+                lane.tap_frontier = tap.frontier;
+            }
             continue;
         }
         hybrid_->attach_image(published.snapshot, tap.image);
@@ -1375,6 +1425,19 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
         }
         (void)hybrid_->start_snapshot_host_write(published.snapshot, device.stream,
                                                  device.transfer_stream);
+        // Continuous write-through: the blocks up to this tap are now reachable from a snapshot, so they go to the
+        // Host tier as the prefill passes them (about 34 MB a 1,024-token chunk on the 27B's INT8 KV, behind the
+        // chunk on the transfer stream) and not in one batch when the lane releases. A pause or a finish then
+        // leaves only the blocks past the last tap to copy: the batch that pinned gigabytes of a paused lane's
+        // pages, and that room-making had to wait for, is gone. Blocks past the tap stay unwritten until a deeper
+        // snapshot reaches them (start_block_host_writes skips blocks no snapshot reaches).
+        if (!lane.withdraw) {
+            const std::size_t covered = std::min<std::size_t>(lane.path.size(), tap.frontier / kBlock);
+            try {
+                hybrid_->start_block_host_writes(std::span<const pc::NodeRef>(lane.path.data(), covered), device.stream,
+                                                 device.transfer_stream);
+            } catch (...) {} // as at release: a refused or failed write leaves the blocks for the release's batch
+        }
     }
 }
 
@@ -1765,8 +1828,11 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence, bo
                                                        ? pc::NodeRef{}
                                                        : lane_state.path[anchor_blocks - 1U];
                         const std::uint64_t evicted = hybrid_->counters().evicted_blocks;
-                        const pc::PublishResult published =
-                            index.publish_snapshot(anchor, frontier, tail_tokens, tail_id, *slot, kind);
+                        // A pause's resume point is admitted to a full snapshot table as it is to the Device
+                        // slots and the Host tier: over any snapshot that is not pinned or held.
+                        const pc::PublishResult published = index.publish_snapshot(
+                            anchor, frontier, tail_tokens, tail_id, *slot, kind,
+                            pausing ? std::optional<double>(pc::kResumePointClaim) : std::nullopt, /*adopt=*/true);
                         if (published.created) {
                             endpoint_published = true;
                             lane_state.deepest_snapshot =
@@ -1803,6 +1869,13 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence, bo
                                 published.snapshot, device.stream, device.transfer_stream,
                                 pausing ? std::optional<double>(pc::kResumePointClaim)
                                         : std::nullopt);
+                        } else if (published.device_adopted) {
+                            // The identical snapshot had lost its Device image and took this one's slot: the
+                            // lane's image is its own now, and backs it on the Host where it has no copy.
+                            hybrid_->attach_image(published.snapshot, image);
+                            sequence.state = {};
+                            (void)hybrid_->start_snapshot_host_write(published.snapshot, device.stream,
+                                                                     device.transfer_stream);
                         } else {
                             state_store->thaw(image);
                         }

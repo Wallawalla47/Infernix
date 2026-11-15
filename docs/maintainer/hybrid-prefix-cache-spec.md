@@ -383,8 +383,9 @@ struct Snapshot {
   with the cache enabled. Active admission still requires `M ≥ max(L, C)`.
 - **Device state pool**: `C` active slots plus `D = device_snapshot_slots` snapshot slots in the
   existing slot-indexed layout (`ssm_states [128,128,Hv,C+D]` per layer, and so on). Snapshot slots
-  are also the staging destination for taps (§7.4). Default `D = C + 1` with a Host tier (one
-  resident snapshot per live conversation plus one staging slot) and `C + 2` without one.
+  are also the staging destination for taps (§7.4). Default `D = 1` with a Host tier (the staging
+  slot: snapshots restore from the Host tier, and the other slots' VRAM is KV capacity, §16.13;
+  `C + 1` until 2026-11-15) and `C + 2` without one.
 - **HostSlabPool**: one pinned allocation of `host_cache_bytes`, divided into slabs. A slab holds
   one block bundle: the Main page packed with its Host page layout, then the backend page at the
   next 4 KiB boundary; `slab_bytes` is that record rounded up to 4 KiB. A snapshot image uses
@@ -1906,7 +1907,7 @@ prefill_chunk` and a Host tier present when the budget is nonzero:
 | value | default | reason |
 |---|---|---|
 | `host_capacity_bytes` | 8 GiB (`kDefaultHybridHostCacheBytes`); 0 disables the Host tier | the original cache's Host KV default |
-| `device_snapshot_slots` | `C + 1` with a Host tier, `C + 2` without | one resident snapshot per live conversation, plus staging; without Host the slots are the only snapshot storage |
+| `device_snapshot_slots` | `1` with a Host tier, `C + 2` without | the staging slot; snapshots restore from the Host tier and the freed VRAM is KV capacity (§16.13); without Host the slots are the only snapshot storage |
 | `max_new_taps` | 8 with a Host tier, 2 without | without Host, taps would evict other conversations' snapshots |
 | `tap_ladder_tokens` | `max(4096, 2·chunk)` | ladder taps land on chunk boundaries; a finer ladder only duplicates them |
 | `tap_min_gap_tokens` | `max(1024, chunk)` | the same |
@@ -2681,6 +2682,63 @@ Not measured: speed or TTFT on a served workload for any of these changes (the a
 §16.10 were not re-run), the 122B (no real test of it was run), Linux/WSL, and the SSD tier beyond its unit tests and
 the two real scenarios above. Not covered by a test: a paused image request, the full failed-round recovery (it needs
 offloaded experts), the Windows spill guards on a real spill.
+
+### 16.13 Measurements of 16.12, continuous write-through and KV capacity trades (2026-11-15)
+
+**16.12 measured.** RTX 5090, official 27B NVFP4, greedy, deployed `49893d9c` against `96201dc1`, in the order base,
+new, new, base. Two agent conversations (§16.10's driver, the owner's launch, ten continuing turns a run): TTFT mean
+/ median / max 3.1 / 1.2 / 19.1 s and 3.2 / 1.3 / 19.7 s before, 2.8 / 1.1 / 16.4 s and 2.6 / 1.2 / 16.5 s after;
+wall 59-61 s against 56 s. Agentic replay (§16.10's `bench/agentic_ab` launch, 132 requests): mean 1.39 and 1.42 s
+before, 1.23 and 1.20 s after; max 20.7 and 16.2 s against 13.9 and 13.2 s; wall 11.3 and 11.0 min against 10.4 and
+10.3 min; median (0.34-0.37 s) and p90 (4.0-5.5 s) overlap.
+
+**Continuous write-through (both families).** A lane's blocks go to the Host tier when a tap covering them publishes
+(Qwen3.5) or is taken (Qwen3.8-Flash-Next), not in one batch when the lane releases; a release writes only the blocks
+past its last tap, and blocks no snapshot reaches are still not written. No difference is shown: the two-conversation
+runs are level on the 27B (2.5-2.6 / 1.1-1.2 / 16.5 s in all four) and on Flash-Next Dense8 (2.3-2.4 / 2.0-2.1 /
+6.0-7.2 s; the cold 182K prompt 19.6-19.7 s against 20.4-21.1 s); the agentic replay gave mean 1.18-1.24 s against
+1.09-1.14 s and p90 3.7-3.9 s against 2.6-2.8 s with wall 9.4-10.1 min against 10.5-10.9 min, but the control build's
+p90 was 4.2-5.1 s as the treatment of the run above, so that workload's p90 moves 2.6-5.1 s between sessions for one
+build. It is kept for what it removes (the multi-gigabyte pinned batch behind a pause, whose wait regressed in
+16.12's testing), not for a measured gain.
+
+**Where a continuing turn's time goes** (the two-conversation runs' request records). Outside the Engine (HTTP body,
+template, tokenisation, framing): 0.07-0.13 s on 182-190K-token turns. The Engine's queue wait: 0.4-1.2 s on the turns
+that arrive while the other conversation has a request in flight, 0 otherwise. Its cause in that launch is KV
+capacity: the pool held 239,232 tokens and the conversations need about 288K together, so each turn waits for the
+other's request to finish (the §6.2 rule); two turns that still fitted waited out the other lane's prefill unit,
+4,096 tokens long because the launch sets `--prefill-chunk 4096`.
+
+**KV capacity trades on that workload** (same build, flags only, two runs an arm, identical within an arm):
+
+| launch | KV pool (tokens) | continuing-turn TTFT mean / median / max | wall |
+|---|---|---|---|
+| the owner's flags (`--prefill-chunk 4096`) | 239,232 | 2.5-2.6 / 1.1-1.2 / 16.5 s | 56 s |
+| + `--device-snapshot-slots 1` | 253,504 | 1.9 / 1.2 / 9.2 s | 52 s |
+| + `--device-snapshot-slots 1 --embedding-host` | 291,136 | 1.6 / 1.1 / 6.9 s | 51 s |
+| default prefill chunk (no `--prefill-chunk`) | 254,144 | 0.6 / 0.6 / 1.0-1.2 s | 59-61 s |
+| default chunk + `--device-snapshot-slots 1 --embedding-host` | 306,048 | 0.5 / 0.5 / 0.7 s | 53 s |
+
+The cold 182K prefill takes 48.3 s at the default chunk against about 49.7 s at 4,096 (idle-wide prefill takes
+4,096-token steps while nothing else runs), and 43.9 s with both conversations fitting. The Device snapshot slot
+default is therefore one with a Host tier (C + 1 before); one slot costs an image restore from the Host tier where
+a Device slot would have served it, which these runs do not show as a loss. `--embedding-host` stays an option and
+is the recommended setting for long conversations on a resident Qwen3.5 model; no launch should raise
+`--prefill-chunk` for a workload with more than one conversation. Letting idle-wide prefill take 5 % of an automatic pool
+(`INFERNIX_TMP_IDLE_WIDE_KV_PERCENT`) cost 7,616 tokens and gave cold prefills of 47.1 and 55.3 s against 48.3 s: not
+adopted, the switch stays unset.
+
+**Kernel images.** `-lineinfo` is off by default (`INFERNIX_CUDA_LINEINFO`): the Ops kernel image carried 1.5 GiB of
+PTX text and line tables beside 0.6 GiB of code; without them the driver reads 1,467 MiB of RAM instead of 4,596 MiB
+and CUDA initialization takes 0.85 s instead of 2.8 s (27B ready in 5.4 s against 7.3 s), with every kernel's
+machine code byte-identical. With the deployed FP4-Local flags the RAM plan holds every expert in RAM again.
+
+Also in this change: the Host-to-Device rate of the cost model is measured (the offload link probe, or the first
+restore of 64 MiB or more) instead of compiled at twice this machine's link; a prefill-cost scale fitted to executed
+prompts for artifacts without fitted coefficients (ranking and snapshot valuation only); spill-guard evidence for
+Flash-Next's guards and the draft screen; Device-slot adoption on a duplicate snapshot; a pause's resume point claims
+its place in a full snapshot table. Checks: 27 CPU tests, the real tests of 16.12 again, the 122B offloaded real
+test, the 35B MoE real test, and a WSL GCC build with 13 CPU tests.
 
 ## 17. Qwen4Exp binding (Qwen3.8-Flash-Next)
 

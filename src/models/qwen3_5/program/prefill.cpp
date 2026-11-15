@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/execution_context.h"
+#include "models/qwen3_5/program/prefix/test_seams.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/lossless.h"
 #include "models/qwen3_5/execution/vision_overlay.h"
@@ -104,6 +105,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_before_first_sample(state.before_first_sample);
     card.set_prefill_last_rows_only(state.last_rows_only);
     card.set_rope_delta(state.rope_delta);
+    testing::note_text_pass(state.text_kv_base, state.rope_delta); // a test's recorder; off, nothing
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
@@ -1013,6 +1015,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             }
         }
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
+        // The prefix cache's cost model learns its prefill scale from text prompts (ranking and valuation only).
+        if (!staged.vision_plan) {
+            hybrid_observe_prefill(sequence.lane, staged.base, prompt_tokens, request.timings.prefill_seconds);
+        }
         if (staged.vision) { staged.vision->retire_handoff(); }
 
         request.prefill.reset();

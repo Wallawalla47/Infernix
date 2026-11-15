@@ -295,7 +295,7 @@ const PREFIX_CACHE: FormSection = {
       kind: "number",
       flag: "--device-snapshot-slots",
       label: "GPU snapshot slots",
-      help: "State snapshot slots kept on the GPU (default: concurrency + 1; + 2 without a Host tier).",
+      help: "State snapshot slots kept on the GPU (default: 1, their VRAM being KV cache; concurrency + 2 without a Host tier).",
       placeholder: "default",
       min: 0,
       when: qwen35,

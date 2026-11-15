@@ -1160,6 +1160,9 @@ public:
         SpillGuard guard(*vram_);
         guard.begin();
         std::uint64_t allocated = 0;
+        // What the step page-locks beside its device allocations (the io images and the expert cache's host tables),
+        // which the guard takes off the shared system memory use it reads (SpillGuard::end).
+        const std::uint64_t pinned_before = pinned_buffer_bytes();
 
         allocate(state_backing_, plan_.gdn_bytes, allocated);
         state_backing_.fill(0);
@@ -1342,7 +1345,12 @@ public:
         if (allocated != plan_.bytes.fixed_bytes()) {
             throw std::logic_error("Qwen4Exp: the Program's device allocations differ from its device plan");
         }
-        if (const std::uint64_t spilled = guard.end(allocated); spilled != 0) {
+        // The Program's own pinned buffers as they grew in the step, and the residency's (built in it). The drafter
+        // pool's drain word and each buffer's rounding to pages are not counted: kilobytes, inside the guard's
+        // tolerance.
+        const std::uint64_t pinned_now  = pinned_buffer_bytes() + residency_->pinned_bytes();
+        const std::uint64_t pinned_step = pinned_now > pinned_before ? pinned_now - pinned_before : 0;
+        if (const std::uint64_t spilled = guard.end(allocated, pinned_step); spilled != 0) {
             throw std::runtime_error(spill_message(spilled, guard.readings(allocated)));
         }
         // The staging, shared-expert and split streams at the device's greatest priority (the decode graphs keep
@@ -7042,6 +7050,8 @@ private:
     // False when the Host tier had no room for the capture now.
     bool prefix_capture(Lane& lane, std::uint32_t index, runtime::prefix_cache::SnapshotKind kind, bool hand_over_tail,
                         bool resume_point = false);
+    // Starts the Host writes of the lane's blocks below a tap taken at F (continuous write-through).
+    void prefix_write_through(Lane& lane, std::uint32_t F);
     // Makes a tap refused for room at boundary B due again at the next call boundary.
     void prefix_retry_tap(Lane& lane, std::uint32_t B, bool forward);
     // Whether a capture was published to the index since the last call (PrefillProgress::snapshot_published): the

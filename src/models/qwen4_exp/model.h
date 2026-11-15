@@ -92,6 +92,22 @@ public:
         if (draft_backing_) { bytes += draft_backing_->stats().pinned_bytes + draft_backing_->stats().retained_host_bytes; }
         return bytes;
     }
+    // What the load page-locked, for a caller that guards the load's device allocations by the process's shared
+    // system memory use (SpillGuard::end), which page-locked memory raises too: host_weight_bytes (its retained
+    // objects are pageable, so the figure errs high, which only costs the guard sensitivity), the CSF tables of the
+    // compressed banks (one mapped pinned allocation; their records are compressed in place), and the upload staging
+    // of the artifact and of a DFlash2 companion, released by now but perhaps not yet off the process's use.
+    [[nodiscard]] std::uint64_t load_pinned_bytes() const noexcept {
+        std::uint64_t bytes = host_weight_bytes() + backing_.stats().peak_staging_bytes;
+        if (draft_backing_) { bytes += draft_backing_->stats().peak_staging_bytes; }
+        for (const ExpertBank& bank : banks_) {
+            if (bank.csf) {
+                bytes += static_cast<std::uint64_t>(config_.text.moe.experts) *
+                         ops::offloaded_moe::csf::Geometry::of(bank.shape()).table_words() * sizeof(std::uint32_t);
+            }
+        }
+        return bytes;
+    }
     // With vision offload: the pinned tower and its staging layout (no evictable pool: the encode
     // window borrows device memory from the expert cache, design §19.3.2).
     [[nodiscard]] const std::optional<qwen3_5::VisionOverlayAssets>& overlay_vision() const noexcept {

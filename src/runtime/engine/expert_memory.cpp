@@ -92,6 +92,20 @@ std::uint64_t auto_host_context_ceiling_bytes(HostMemorySnapshot snapshot, const
     return std::max(startup, auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand)));
 }
 
+AutoHostTier plan_auto_host_tier(const HostMemorySnapshot& snapshot, expert_offload::HostMemoryDemand demand) noexcept {
+    AutoHostTier out;
+    demand.prefix_cache = 0;
+    out.bytes           = auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
+    if (!demand.expert_cap) { return out; }
+    demand.prefix_cache = out.bytes;
+    if (!expert_offload::plan_host_memory(snapshot, demand).cap_too_large) { return out; }
+    demand.expert_cap.reset();
+    demand.prefix_cache = 0;
+    out.bytes           = auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
+    out.keeps_cap       = false;
+    return out;
+}
+
 ExpertRamPlan plan_expert_ram(const EngineOptions& options, const expert_offload::HostMemoryDemand& demand,
                               const HostMemorySnapshot& snapshot, bool always_tier) {
     ExpertRamPlan out;

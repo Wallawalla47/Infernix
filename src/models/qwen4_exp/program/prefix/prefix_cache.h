@@ -160,6 +160,10 @@ public:
         std::optional<DeviceKVPageLease> tail_lease; // handed over as the Device tail when present
         runtime::prefix_cache::SnapshotKind kind = runtime::prefix_cache::SnapshotKind::Tap;
         double claim = 0.0; // the new snapshot's estimate_priority
+        // The claim its publication takes a snapshot entry with when the table is full (absent: its own priority,
+        // PrefixCacheIndex::publish_host_snapshot). A pause's resume point passes kResumePointClaim, as for its
+        // slabs: refused an entry, its image is dropped and the resume replays.
+        std::optional<double> publish_claim;
         StateImageHeader meta;
         std::optional<runtime::prefix_cache::SnapshotRef> supersedes;
         // When `supersedes` is the snapshot the lane resumed from: the lane's tokens from its frontier
@@ -219,11 +223,15 @@ public:
     [[nodiscard]] bool transfers_pending() const noexcept {
         return !captures_.empty() || !writes_.empty() || !landing_.empty();
     }
-    // Waits for an endpoint copy-out a prompt extends (its anchor is on the prompt's matched `path`
-    // and its tail tokens continue the prompt), and publishes it. Only such a prompt waits; the
-    // copy is first in the transfer stream, at most an image's copy time. Returns whether it waited.
-    [[nodiscard]] bool await_extended_endpoint(std::span<const runtime::prefix_cache::NodeRef> path,
-                                               std::span<const TokenId> tokens);
+    // Waits for the copy-outs a prompt extends (a capture whose anchor is on the prompt's matched `path` and whose
+    // tail tokens continue the prompt), and publishes them. Only such a prompt waits, at most the copy time of the
+    // images queued up to the last of them. An endpoint is the previous turn's; a tap or boundary is one a lane
+    // still prefilling, or just past its prompt, took: a tap of a prompt's last unit lands after that unit's
+    // progress, so a request coalesced onto it finds it here at its next quote instead of at some later event.
+    // `endpoints` false (no free cache resume: an endpoint serves no resume) leaves endpoints out. Returns whether
+    // it waited.
+    [[nodiscard]] bool await_extended_capture(std::span<const runtime::prefix_cache::NodeRef> path,
+                                              std::span<const TokenId> tokens, bool endpoints);
     // Waits for capture `id` alone (and what the transfer stream holds before it) and publishes it; false when it
     // is not in flight (landed, skipped or unknown): nothing is waited for.
     bool await_capture(std::uint64_t id);

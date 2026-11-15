@@ -591,6 +591,14 @@ measured overall, and `auto` picks the draft length):
 | Qwen3.6-27B (NVFP4, groupwise) | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length where its configuration registers `adaptive-mtp` (startup reports it), else 3 every round |
 | Ornith-1.5-122B (and its UNCENSORED conversion) | `--spec mtp --draft-tokens auto` | 2 confidence-gated drafts: 14 % faster than plain decode at one request, about 6 % slower while two decode together; DFlash2's `auto` decodes plain |
 
+For long conversations on a model whose weights all sit in VRAM (the 27Bs, the 35B-A3B), add `--embedding-host`:
+the token embedding moves to pinned RAM and its VRAM (1.18 GiB on the 27B, about 37K tokens of INT8 KV) becomes
+KV cache, with the same output. Leave `--prefill-chunk` at its default: prefill already takes 4,096-token steps
+while nothing else runs, and a larger chunk makes every other request wait longer and takes KV cache for its
+workspace. On an RTX 5090, two agent conversations of 185K and 100K tokens on the 27B NVFP4 at four lanes reached
+their first token in 0.5 s on average (0.7 s at worst) with these settings, against 2.5 s (16.5 s) with
+`--prefill-chunk 4096` and neither option, where the two did not fit the KV cache together.
+
 Without `--spec`, `infernix-serve` and `infernix` speculate as `--spec auto --draft-tokens auto`: they make the
 table's drafter choice by themselves from the artifact's drafters and report it at startup. On Flash-Next that is
 DFlash2 when `--draft-model` names its drafter or the drafter's companion artifact is the only one in the model's

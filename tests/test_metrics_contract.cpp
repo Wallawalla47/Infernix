@@ -384,6 +384,7 @@ int main() {
         m.device.expert_frames   = 87;
         m.device.kv              = 1700;
         m.device.kv_used         = 400;
+        m.device.mtp_kv          = 90;
         m.device.cuda_graphs     = 140;
         m.host.experts           = 69000;
         m.host.expert_records    = 2400;
@@ -405,8 +406,10 @@ int main() {
                           "memory.device totals");
         std::vector<std::string> keys;
         for (const Json& part : device["parts"]) { keys.push_back(part["key"].get<std::string>()); }
-        failures += check(keys == std::vector<std::string>{"weights", "experts", "kv_cache", "cuda_graphs"},
+        failures += check(keys == std::vector<std::string>{"weights", "experts", "kv_cache", "mtp_kv", "cuda_graphs"},
                           "memory.device lists the parts that hold memory, in order");
+        failures += check(device["parts"][3]["bytes"] == 90 && !device["parts"][3].contains("used_bytes"),
+                          "memory.device names the MTP drafter's KV pool beside the KV cache");
         failures += check(device["parts"][1]["count"] == 87 && device["parts"][2]["used_bytes"] == 400 &&
                               !device["parts"][0].contains("used_bytes") && !device["parts"][0].contains("count"),
                           "memory.device experts' frames and the KV cache's used pages");

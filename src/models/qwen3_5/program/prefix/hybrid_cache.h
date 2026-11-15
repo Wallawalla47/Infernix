@@ -122,8 +122,14 @@ public:
 
     [[nodiscard]] const HybridHostLayout& host_layout() const noexcept { return host_layout_; }
 
-    // Replaces the admission/eviction machine model (the Engine's calibrated context costs).
+    // Replaces the admission/eviction machine model (the Engine's calibrated context costs). Its Host-to-Device
+    // rate gives way to the one this cache measured, once it has one.
     void set_cost(const runtime::prefix_cache::CacheCostModel& cost);
+    // The link's measured Host-to-Device rate: an offloaded start's probe, then each large restore's own copies
+    // (runtime/engine/context_cache/online_cost.h). It replaces the model's rate, for ranking and valuation only.
+    void observe_h2d_rate(double bytes_per_second);
+    // 0 until a rate was measured.
+    [[nodiscard]] double measured_h2d_bytes_per_second() const noexcept { return h2d_measured_; }
 
     // ---- blocks -------------------------------------------------------------------------------
     // Inserts a committed full block. The cache takes references on `pages` only when the index
@@ -370,6 +376,13 @@ private:
     std::deque<RestoreBatch> landing_;
     std::uint64_t next_ticket_ = 1;
     std::vector<cudaEvent_t> spare_events_;
+    // The link measurement: the timed events around one landing batch's copies (the batch of timed_ticket_, 0:
+    // none in flight), its bytes, and the rate measured so far (0: none).
+    cudaEvent_t timed_begin_    = nullptr;
+    cudaEvent_t timed_end_      = nullptr;
+    std::uint64_t timed_ticket_ = 0;
+    std::uint64_t timed_bytes_  = 0;
+    double h2d_measured_        = 0.0;
     PageCopies write_scratch_;
     HybridCacheCounters counters_;
     std::optional<runtime::prefix_cache::PrefixCacheIndex> index_;

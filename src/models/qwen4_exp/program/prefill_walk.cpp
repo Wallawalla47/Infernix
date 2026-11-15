@@ -458,6 +458,7 @@ void ProgramImpl::walk_commit_taps(Lane& lane) {
         const std::uint64_t id               = capture.id;
         prefix_->commit_staged_capture(staged, std::move(capture));
         prefix_captured(lane, id, tap.frontier);
+        prefix_write_through(lane, tap.frontier); // the blocks below it are reachable from a snapshot now
     }
 }
 

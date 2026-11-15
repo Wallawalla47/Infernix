@@ -3,12 +3,15 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "models/qwen3_5/program/prefix/test_seams.h"
+#include "runtime/engine/context_cache/online_cost.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -20,8 +23,28 @@ namespace {
 std::atomic<std::uint32_t> restore_delay_us{0};
 std::atomic<std::uint64_t> transfer_wait_count{0};
 std::atomic<std::uint64_t> binding_vision_encode_count{0};
+std::atomic<bool> text_pass_recording{false};
+std::mutex text_pass_mutex;
+std::vector<TextPass> recorded_text_passes;
 
 } // namespace
+
+void record_text_passes(bool enabled) {
+    const std::lock_guard lock(text_pass_mutex);
+    if (enabled) { recorded_text_passes.clear(); }
+    text_pass_recording.store(enabled);
+}
+
+std::vector<TextPass> text_passes() {
+    const std::lock_guard lock(text_pass_mutex);
+    return recorded_text_passes;
+}
+
+void note_text_pass(std::uint32_t base, std::int32_t rope_delta) {
+    if (!text_pass_recording.load(std::memory_order_relaxed)) { return; }
+    const std::lock_guard lock(text_pass_mutex);
+    recorded_text_passes.push_back(TextPass{.base = base, .rope_delta = rope_delta});
+}
 
 void set_restore_delay(std::uint32_t microseconds) noexcept { restore_delay_us.store(microseconds); }
 
@@ -158,11 +181,15 @@ HybridPrefixCache::~HybridPrefixCache() {
     recycle_events(restore_);
     for (RestoreBatch& batch : landing_) { recycle_events(batch); }
     for (cudaEvent_t event : spare_events_) { (void)cudaEventDestroy(event); }
+    if (timed_begin_ != nullptr) { (void)cudaEventDestroy(timed_begin_); }
+    if (timed_end_ != nullptr) { (void)cudaEventDestroy(timed_end_); }
 }
 
 void HybridPrefixCache::set_cost(const CacheCostModel& cost) {
     config_.cost = cost;
-    index_->set_cost(cost);
+    // The link this cache measured on its own restores stands in for the compiled coefficient.
+    if (h2d_measured_ > 0.0) { config_.cost.h2d_bytes_per_second = h2d_measured_; }
+    index_->set_cost(config_.cost);
     // The SSD read rate is this drive's measurement, not the Engine's calibration.
     if (ssd_ && ssd_->counters().read_bytes_per_second > 0.0) {
         index_->set_ssd_rate(ssd_->counters().read_bytes_per_second);
@@ -679,6 +706,17 @@ void HybridPrefixCache::submit_restore() {
     // Prelude: what activation reads (the snapshot tail), what a pass reads outside the layer
     // stack (backend KV, the continuation hidden, DFlash local state) and the StateImage's VQ KV
     // window (the rest of the image, landed whole before the pass starts).
+    // One batch at a time measures the link: a timed event before its first copy and one after its last, on the
+    // restore stream, so the interval is the copies' own (runtime/engine/context_cache/online_cost.h).
+    const std::uint64_t batch_bytes =
+        (restore_.nodes.size() + (restore_.tail ? 1U : 0U)) * host_layout_.block_payload_bytes +
+        (restore_.image ? host_layout_.image_bytes : 0U);
+    const bool timed = timed_ticket_ == 0 && batch_bytes >= runtime::kH2dSampleMinimumBytes;
+    if (timed) {
+        if (timed_begin_ == nullptr) { CUDA_CHECK(cudaEventCreate(&timed_begin_)); }
+        if (timed_end_ == nullptr) { CUDA_CHECK(cudaEventCreate(&timed_end_)); }
+        CUDA_CHECK(cudaEventRecord(timed_begin_, restore_stream_));
+    }
     std::uint64_t copies = enqueue_from_host(restore_.tail_copies, restore_stream_);
     if (!restore_.copies.backend_pages.empty()) {
         copies += backend_pages_->physical_pool().copy_from_host_records(
@@ -710,10 +748,16 @@ void HybridPrefixCache::submit_restore() {
                                         .layer = layer.index},
                 restore_stream_);
         }
+        // Before the last layer's event, so the interval is complete whenever the batch has landed.
+        if (timed && &layer == &layers_.back()) { CUDA_CHECK(cudaEventRecord(timed_end_, restore_stream_)); }
         restore_.layers.push_back(record());
     }
     restore_.submitted = true;
     restore_.ticket    = next_ticket_++;
+    if (timed) {
+        timed_ticket_ = restore_.ticket;
+        timed_bytes_  = batch_bytes;
+    }
     counters_.host_restore_copies += copies;
     counters_.host_block_restores += restore_.nodes.size();
     counters_.host_tail_restores += restore_.tail ? 1U : 0U;
@@ -792,7 +836,26 @@ void HybridPrefixCache::finish_landing(RestoreBatch& batch) {
     }
     if (batch.tail) { index_->complete_tail_device_fill(*batch.tail); }
     if (batch.pinned_snapshot) { index_->unpin_snapshot(*batch.pinned_snapshot); }
+    if (batch.ticket == timed_ticket_ && timed_ticket_ != 0) {
+        timed_ticket_ = 0;
+        float milliseconds = 0.0F;
+        // An interval that cannot be read is no sample.
+        if (cudaEventElapsedTime(&milliseconds, timed_begin_, timed_end_) == cudaSuccess) {
+            observe_h2d_rate(runtime::blend_h2d_rate(h2d_measured_, timed_bytes_,
+                                                     static_cast<double>(milliseconds) * 1.0e-3));
+        }
+    }
     recycle_events(batch);
+}
+
+void HybridPrefixCache::observe_h2d_rate(double bytes_per_second) {
+    if (!(bytes_per_second > 0.0)) { return; }
+    const double applied = config_.cost.h2d_bytes_per_second;
+    h2d_measured_        = bytes_per_second;
+    // The index revalues its snapshots with a new model, so it gets one only when the rate moved by 5 % or more.
+    if (std::abs(bytes_per_second - applied) < 0.05 * applied) { return; }
+    config_.cost.h2d_bytes_per_second = bytes_per_second;
+    index_->set_cost(config_.cost);
 }
 
 void HybridPrefixCache::recycle_events(RestoreBatch& batch) noexcept {
@@ -811,6 +874,7 @@ void HybridPrefixCache::recycle_events(RestoreBatch& batch) noexcept {
 void HybridPrefixCache::abort_restore() noexcept {
     if (!restore_.open) { return; }
     if (restore_stream_ != nullptr) { (void)cudaStreamSynchronize(restore_stream_); }
+    if (restore_.submitted && restore_.ticket == timed_ticket_) { timed_ticket_ = 0; } // no link sample from it
     // The destinations go back through release_device_block, which counts evictions: these are none.
     const std::uint64_t evicted = counters_.evicted_blocks;
     try {
@@ -850,6 +914,7 @@ void HybridPrefixCache::clear() noexcept {
     // are waited for and forgotten (the new index holds no SSD slab).
     for (RestoreBatch& batch : landing_) { recycle_events(batch); }
     landing_.clear();
+    timed_ticket_ = 0;
     reset_restore();
     if (ssd_) { ssd_->abandon(); }
     // A resize's copies land first; the new index gets the slabs the Host tier holds now, not its startup size.

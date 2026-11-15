@@ -2068,6 +2068,7 @@ struct MemoryUsage {
         std::uint32_t expert_frames = 0;
         std::uint64_t kv            = 0; // the KV cache's backed pages and tables, less `prefix`'s pages
         std::uint64_t kv_used       = 0; // of them, pages holding requests' tokens
+        std::uint64_t mtp_kv        = 0; // the MTP drafter's own KV page pool (Qwen3.5 with --spec mtp), not in `kv`
         std::uint64_t state         = 0; // recurrent (GDN) state, per-request rows and records, call inputs and outputs
         std::uint64_t prefix        = 0; // the prefix cache's device snapshots and the KV pages only it holds
         std::uint64_t workspace     = 0; // activation workspace, with frames the expert cache lends to prefill and vision

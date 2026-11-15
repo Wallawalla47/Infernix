@@ -24,6 +24,8 @@
 //   restore fault (plain mode, own Engines) An activation fails with its Host restore staged
 //                (testing::set_restore_fault): later resumes restore from the Host tier again, the stop saves
 //                the Host tier and a restart restores it.
+//   write-through (plain mode, own Engine) The blocks below a tap are written to the Host tier when the tap is
+//                taken (testing::tap_block_writes), the rest at the lane's finish.
 //   one context  (MTP mode, own Engine with kv_capacity = max_context) A recomputed cached prefix
 //                replaces the cached copies instead of pinning them beside its pages: the request
 //                completes, equals its cold run, and the Engine keeps serving.
@@ -391,6 +393,38 @@ int run_persistence(const char* artifact, const char* ngram) {
                               first_difference(after.generated_token_ids, before.generated_token_ids) + ")");
     }
     std::filesystem::remove(file, ignored);
+    return failures;
+}
+
+// Continuous write-through: a lane's blocks below a tap go to the Host tier when the tap is taken, and its release
+// writes only the blocks past its last tap. A is 1,500 tokens at chunk 512, so its one tap is the prompt tail's at
+// 1,024 (where B, which leaves A at 1,400, resumes): 16 blocks are written at the tap and the other 7 of A's 23
+// (1,500 prompt tokens and 8 outputs) at its finish.
+int run_write_through(const char* artifact, const char* ngram) {
+    std::printf("== continuous write-through\n");
+    namespace hooks = infernix::models::qwen4_exp::testing;
+    infernix::Engine engine(base_options(artifact, ngram), infernix::test::engine_host());
+    const std::vector<infernix::TokenId> a = synthetic_tokens(1500, 81);
+    std::vector<infernix::TokenId> b(a.begin(), a.begin() + 1400);
+    const std::vector<infernix::TokenId> suffix = synthetic_tokens(300, 82);
+    b.insert(b.end(), suffix.begin(), suffix.end());
+    const std::uint64_t taps_before      = hooks::tap_block_writes();
+    const infernix::RuntimeStats before  = engine.runtime_stats();
+    (void)generate(engine, a, 8, true);
+    const std::uint64_t at_taps          = hooks::tap_block_writes() - taps_before;
+    const infernix::RuntimeStats after   = engine.runtime_stats();
+    const std::uint64_t written          = after.hybrid_host_block_writes - before.hybrid_host_block_writes;
+    const Run resumed                    = generate(engine, b, 8, true);
+    std::printf("        %llu blocks written at taps, %llu in all; B resumed at %u\n",
+                static_cast<unsigned long long>(at_taps), static_cast<unsigned long long>(written), resumed.reused);
+    int failures = 0;
+    failures += check(resumed.reused != 0 && resumed.reused % 64 == 0, "B resumes at A's tap, on a block boundary");
+    failures += check(at_taps == resumed.reused / 64,
+                      "the blocks below the last tap were written when it was taken (" + std::to_string(at_taps) +
+                          " of " + std::to_string(resumed.reused / 64) + ")");
+    failures += check(written == (1500 + 8) / 64 && written > at_taps,
+                      "the release wrote only the blocks past the tap (" + std::to_string(written - at_taps) + " of " +
+                          std::to_string(written) + ")");
     return failures;
 }
 
@@ -915,6 +949,7 @@ int main(int argc, char** argv) {
         if (mtp) { failures += run_identical_burst(artifact, ngram); }
         if (plain) { failures += run_persistence(artifact, ngram); }
         if (plain) { failures += run_restore_fault(artifact, ngram); }
+        if (plain) { failures += run_write_through(artifact, ngram); }
         if (next_turn) {
             failures += run_next_turn(artifact, ngram, false);
             failures += run_next_turn(artifact, ngram, true);

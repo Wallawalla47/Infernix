@@ -57,6 +57,12 @@ constexpr Registration kSwitches[] = {
     // returns to the expert frames (models/qwen4_exp/program/program_impl.h apply_vram_target;
     // candidates §8.3 CF-06). Same bits.
     {"INFERNIX_TMP_KV_SHRINK_BUSY", Scope::Qwen4Exp, Kind::Flag},
+    // Qwen3.5 automatic KV capacity: =<percent> 1..20; idle-wide-prefill may take up to that share of the
+    // automatic capacity's pages for its wider prefill buffers and workspace (runtime/engine/model_instance.cpp).
+    // Unset: it takes pages only while every lane's full context still fits, so a pool below
+    // max-concurrency x max-context prefills chunk-wide (review 2026-11-14, M4). Same bits on every route that
+    // does not select idle-wide-prefill.
+    {"INFERNIX_TMP_IDLE_WIDE_KV_PERCENT", Scope::Qwen3_5, Kind::Value},
     // Offloaded-expert caches: =<fraction> (0, 1]; a prompt whose reused prefix covers at least that much
     // of it neither scores its prefill routes nor seeds its experts (Flash-Next: models/qwen4_exp/program/
     // program_impl.h apply_prompt_routes; the 122B: models/qwen3_5/program/offload.cpp end_pass; candidates

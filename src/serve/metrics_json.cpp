@@ -57,6 +57,7 @@ Json memory_json(const MetricsJsonSnapshot& s) {
     add_part(device_parts, "experts", m.device.experts, std::nullopt,
              m.device.experts != 0 ? std::optional<std::uint64_t>(m.device.expert_frames) : std::nullopt);
     add_part(device_parts, "kv_cache", m.device.kv, m.device.kv_used);
+    add_part(device_parts, "mtp_kv", m.device.mtp_kv);
     add_part(device_parts, "state", m.device.state);
     add_part(device_parts, "prefix_cache", m.device.prefix);
     add_part(device_parts, "workspace", m.device.workspace);
