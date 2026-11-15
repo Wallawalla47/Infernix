@@ -1602,7 +1602,11 @@ fields and semantics (`cache_n` equals `cache_read_input_tokens`). It is not an 
 stream attaches it only to the terminal `message_delta` event; `timings_per_token` and
 `return_progress` are Chat Completions options and have no Messages equivalent.
 
-Documents, Search Results, Files, Structured Outputs, server-tool blocks other than tool search,
+Text documents (`source.type` `text`, or `content` with text blocks) and search results, in a User
+message or a `tool_result`, are lowered in place to framed text (`<document>` with its `<title>` and
+`<context>`, `<search_result>` with its `<source>` and `<title>`, then the text) when they do not ask
+for citations; no citation blocks are produced. A document or search result with citations enabled,
+PDF / URL / file documents, Files, Structured Outputs, server-tool blocks other than tool search,
 container uploads, and other execution-dependent blocks are rejected with the missing capability
 identified. Metadata,
 service tier, inference geography, protocol-version/beta headers, cache TTL, and unknown advisory

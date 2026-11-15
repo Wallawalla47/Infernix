@@ -318,6 +318,76 @@ std::string require_tool_history_id(const Json& object, const char* key,
     return object.at(key).get<std::string>();
 }
 
+// Whether a document or search_result block asks for citations, which Infernix does not produce.
+bool requests_citations(const Json& block) {
+    if (!block.contains("citations") || block.at("citations").is_null()) { return false; }
+    const Json& citations = block.at("citations");
+    if (!citations.is_object()) { bad_request("citations must be an object", "messages"); }
+    return citations.value("enabled", false);
+}
+
+// The text blocks of a document's `content` source or a search_result's `content`, joined by blank lines.
+std::string text_blocks(const Json& content, const char* block) {
+    if (content.is_string()) { return content.get<std::string>(); }
+    if (!content.is_array()) { bad_request(std::string(block) + " content must be a string or an array", "messages"); }
+    std::string text;
+    for (const Json& part : content) {
+        if (require_block_type(part, "messages") != "text") {
+            bad_request(std::string(block) + " content supports text blocks only", "messages",
+                        "content_block_not_supported");
+        }
+        if (!text.empty()) { text += "\n\n"; }
+        text += require_string(part, "text", "messages", "text block");
+    }
+    return text;
+}
+
+// A text document or a search result, lowered to framed text in place (no citation blocks are produced, so one
+// that asks for citations, and a PDF, URL or file document, keep their refusal). The framing depends on the block
+// alone, so a replayed history renders the same tokens.
+ContentPart lower_document_block(const Json& block, const std::string& type) {
+    if (requests_citations(block)) {
+        bad_request(type + " blocks with citations enabled require citation semantics that Infernix does not provide",
+                    "messages", type == "document" ? "documents_not_supported" : "search_results_not_supported");
+    }
+    const auto optional_string = [&](const char* key) -> std::string {
+        if (!block.contains(key) || block.at(key).is_null()) { return {}; }
+        if (!block.at(key).is_string()) { bad_request(type + " " + key + " must be a string", "messages"); }
+        return block.at(key).get<std::string>();
+    };
+    std::string text = "<" + type + ">\n";
+    if (type == "document") {
+        if (!block.contains("source") || !block.at("source").is_object()) {
+            bad_request("document blocks must contain a source object", "messages");
+        }
+        const Json& source        = block.at("source");
+        const std::string kind    = source.value("type", std::string());
+        std::string body;
+        if (kind == "text") {
+            body = require_string(source, "data", "messages", "document text source");
+        } else if (kind == "content") {
+            if (!source.contains("content")) { bad_request("a content document source must contain content", "messages"); }
+            body = text_blocks(source.at("content"), "document");
+        } else {
+            bad_request("document blocks with a '" + kind +
+                            "' source (PDF, URL or file) need a document reader that Infernix does not provide",
+                        "messages", "documents_not_supported");
+        }
+        if (const std::string title = optional_string("title"); !title.empty()) { text += "<title>" + title + "</title>\n"; }
+        if (const std::string context = optional_string("context"); !context.empty()) {
+            text += "<context>" + context + "</context>\n";
+        }
+        text += body;
+    } else {
+        text += "<source>" + require_string(block, "source", "messages", "search_result block") + "</source>\n";
+        text += "<title>" + require_string(block, "title", "messages", "search_result block") + "</title>\n";
+        if (!block.contains("content")) { bad_request("search_result blocks must contain content", "messages"); }
+        text += text_blocks(block.at("content"), "search_result");
+    }
+    text += "\n</" + type + ">";
+    return text_part(std::move(text), cache_boundary(block, "messages"));
+}
+
 // tool_reference blocks (a client-side tool search) load the referenced definitions after the
 // result's text and images instead of standing at their own position.
 std::vector<ContentPart> parse_tool_result_content(const Json& block,
@@ -339,6 +409,8 @@ std::vector<ContentPart> parse_tool_result_content(const Json& block,
             result.push_back(parse_image(part));
         } else if (type == "tool_reference") {
             load_tool(loaded, referenced_tool(context, require_tool_reference_name(part)));
+        } else if (type == "document" || type == "search_result") {
+            result.push_back(lower_document_block(part, type));
         } else {
             bad_request("unsupported tool_result content block: " + type, "messages",
                         "content_block_not_supported");
@@ -389,14 +461,8 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content,
         } else if (type == "tool_reference") {
             bad_request("tool_reference blocks are valid only inside a tool_result", "messages",
                         "content_block_not_supported");
-        } else if (type == "document") {
-            bad_request("document blocks require document and citation semantics that Infernix does "
-                        "not provide",
-                        "messages", "documents_not_supported");
-        } else if (type == "search_result") {
-            bad_request("search_result blocks require source and citation semantics that Infernix "
-                        "does not provide",
-                        "messages", "search_results_not_supported");
+        } else if (type == "document" || type == "search_result") {
+            result.emplace_back(lower_document_block(block, type));
         } else if (is_server_tool_block(type)) {
             bad_request("server tool result blocks require an executor that Infernix does not "
                         "provide",
