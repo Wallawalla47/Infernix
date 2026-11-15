@@ -28,6 +28,12 @@
 
 namespace infernix::ops::offloaded_moe {
 
+// The idle waits' tiers (CpuMissService::idle_wait): a fresh-quiet spin decays to the short wait,
+// deepening to the long one after a full second without a request. Both are latencies the GPU pays
+// when it publishes to a sleeping service — keep the deep tier far below a decode step's budget.
+inline constexpr std::uint32_t kIdleSleepUs    = 50;
+inline constexpr std::uint32_t kIdleSleepDeepUs = 1000;
+
 class CpuMissService {
 public:
     struct Layer {
@@ -99,8 +105,11 @@ public:
     [[nodiscard]] std::string failure() const;
     // A round that may hand the service requests is about to be enqueued: an idle service thread
     // wakes now and spins again. Requests are served without it too, only later: after 20 ms
-    // without a request the thread idles in waits of about 0.5 ms (Windows: a high-resolution
-    // waitable timer; a plain sleep_for(50 us) there lasts one 15.6 ms timer tick).
+    // without a request the thread idles in waits of about 50 us, deepening to 1 ms once the
+    // quiet stretch passes 1 s (the arrival's own round calls wake() before its first request,
+    // so the deep tier costs at most one 1 ms wait even when a caller forgets to). On Windows the
+    // wait is a high-resolution timer; the 15.6 ms tick inflates a 1 ms request to one tick —
+    // accepted where the event handle already ends it early.
     void wake() const noexcept;
     // The team's speed against the caller's reference rates (CpuSpeed): each request's experts with their records in
     // memory are timed as the team computes them (tier reads excluded). Before set_reference_rates, 1.
@@ -124,6 +133,10 @@ private:
     std::uint32_t* sequence_ = nullptr; // device
     std::atomic<bool> stop_{false};
     mutable std::atomic<std::uint32_t> wakes_{0};   // wake() calls the service thread has not seen yet
+    // The idle_wait()'s current tier: the serve loop deepens it after 1 s quiet and restores it on
+    // a served request or a wake(); a round's pre-enqueue wake() races the restore harmlessly (the
+    // next check restores again — the worst cost is one stale short wait).
+    std::atomic<std::uint32_t> idle_sleep_us_{kIdleSleepUs};
     void* wake_event_ = nullptr;             // Windows: auto-reset event wake() signals
     void* idle_timer_ = nullptr;             // Windows: the idle wait's high-resolution timer
     std::atomic<std::uint64_t> served_{0}, experts_{0};
